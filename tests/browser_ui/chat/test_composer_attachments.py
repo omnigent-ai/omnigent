@@ -19,7 +19,7 @@ _ATTACH_BODY = "composer attachment e2e sample\n"
 
 # An unsupported type: ``addFiles`` rejects it (no chip) and shows an inline
 # error. Office documents and archives are accepted.
-_MEDIA_NAME = "clip.mp4"
+_MEDIA_NAME = "clip.webm"
 
 # JSON is its own MIME (``application/json``), which is NOT covered by the
 # ``text/*`` wildcard, so it has to be listed in the ``accept`` attr explicitly
@@ -36,8 +36,9 @@ _ZIP_NAME = "photos.zip"
 # The server's real 415 body for an unsupported upload, from
 # ``routes_resources.upload_session_file``. Used to drive the failed-send path.
 _SERVER_415_DETAIL = (
-    "Unsupported attachment type 'video/mp4'. Attach images, PDF, or text/code files, "
-    "or use Claude Code or Codex for archives, Office documents, and databases."
+    "Unsupported attachment type 'video/webm'. Attach images, PDF, or text/code files, "
+    "or use a supported native coding agent for archives, Office documents, "
+    "databases, and MP4 videos."
 )
 
 
@@ -108,18 +109,17 @@ def test_attach_supported_files_and_remove(
 def test_reject_unsupported_type(
     page: Page, chat_session_contract: ChatSessionContract, tmp_path: Path
 ) -> None:
-    """An unsupported type (mp4) is rejected client-side: no chip, inline error.
+    """An unsupported type (WebM) is rejected client-side: no chip, inline error.
 
     Covers the validation ``addFiles`` gained (``validateAttachments`` in
     lib/attachments.ts). Office documents and archives are no longer rejected
-    here, so this pins the shape
-    that is still refused: media no harness can open from disk. Driving the
+    here, so this pins a video format outside the default allowlist. Driving the
     hidden input directly (``set_input_files`` bypasses the accept filter, so
     the file reaches ``addFiles``) must yield NO chip and a visible error.
     """
     chat = chat_session_contract
     sample = tmp_path / _MEDIA_NAME
-    sample.write_bytes(b"\x00\x00\x00 not a real mp4, just an unsupported binary")
+    sample.write_bytes(b"\x00\x00\x00 not a real video, just an unsupported binary")
 
     page.goto(chat.url)
     expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
@@ -187,7 +187,7 @@ def test_landing_rejects_unsupported_type_and_keeps_message(
     base_url = chat.base_url
     chat.contract.json(f"/v1/hosts/{chat.host_id}/filesystem", {"path": "/", "entries": []})
     sample = tmp_path / _MEDIA_NAME
-    sample.write_bytes(b"\x00\x00\x00 not a real mp4, just an unsupported binary")
+    sample.write_bytes(b"\x00\x00\x00 not a real video, just an unsupported binary")
 
     page.goto(base_url)
     composer = page.get_by_test_id("new-chat-landing-input")
@@ -267,6 +267,92 @@ def test_failed_upload_restores_the_message(
     expect(page.get_by_text("Unsupported attachment type", exact=False)).to_be_visible()
     # And the message is back in the composer, ready to retry.
     expect(composer).to_have_value("look at this file", timeout=10_000)
+
+
+# Samples the first painted frame of each image tile. A ResizeObserver's first
+# callback runs after layout and before paint, so its state is what the user
+# sees first. The sampler is installed before the paste so it catches the mount.
+_FIRST_PAINT_SAMPLER = """
+(fileName) => {
+  window.__firstPaint = null;
+  let observed = false;
+  const read = () => {
+    const img = document.querySelector(`img[alt="${fileName}"]`);
+    return img ? { src: img.getAttribute("src"), complete: img.complete } : null;
+  };
+  const step = () => {
+    const img = document.querySelector(`img[alt="${fileName}"]`);
+    if (img && !observed) {
+      observed = true;
+      const tile = img.parentElement;
+      const observer = new ResizeObserver(() => {
+        observer.disconnect();
+        window.__firstPaint = read();
+      });
+      observer.observe(tile);
+    }
+    if (window.__firstPaint === null) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+"""
+
+# Pastes a 12-megapixel JPEG of random pixels. Large files reach the paint
+# race more often than a solid swatch, so a fixed trial count reliably catches it.
+_PASTE_LARGE_PHOTO = """
+async (composerInput, [fileName]) => {
+  const width = 4032;
+  const height = 3024;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  const pixels = context.createImageData(width, height);
+  for (let offset = 0; offset < pixels.data.length; offset += 65536) {
+    crypto.getRandomValues(pixels.data.subarray(offset, offset + 65536));
+  }
+  context.putImageData(pixels, 0, 0);
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.9));
+  const transfer = new DataTransfer();
+  transfer.items.add(new File([blob], fileName, { type: "image/jpeg" }));
+  composerInput.dispatchEvent(
+    new ClipboardEvent("paste", { clipboardData: transfer, bubbles: true, cancelable: true }),
+  );
+}
+"""
+
+
+def test_pasted_image_tile_paints_its_picture_on_first_frame(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    """A pasted image's first painted tile already has its picture source.
+
+    An empty first frame reads as a flicker: the tile paints with no image and the
+    picture appears a frame later. Each paste is an independent trial, so several
+    run on one page.
+    """
+    chat = chat_session_contract
+
+    page.goto(chat.url)
+    composer = page.get_by_placeholder(_COMPOSER)
+    expect(composer).to_be_visible(timeout=30_000)
+
+    unpainted: list[str] = []
+    trials = 6
+    for index in range(trials):
+        file_name = f"paste-{index}.jpg"
+        page.evaluate(_FIRST_PAINT_SAMPLER, file_name)
+        composer.evaluate(_PASTE_LARGE_PHOTO, [file_name])
+        page.wait_for_function("() => window.__firstPaint !== null", timeout=10_000)
+        first_paint = page.evaluate("() => window.__firstPaint")
+        if first_paint["src"] is None:
+            unpainted.append(file_name)
+        expect(page.get_by_role("img", name=file_name)).to_be_visible(timeout=10_000)
+        page.get_by_role("button", name=f"Remove {file_name}").click()
+
+    assert unpainted == [], (
+        f"{len(unpainted)} of {trials} pasted image tiles painted without a source: {unpainted}"
+    )
 
 
 # Synthesises an OS file drag: Playwright can't drive a real desktop-to-browser

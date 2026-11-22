@@ -67,8 +67,22 @@ be able to write resources without a separate Omnigent account.
   (refused, no browser), a window connected to a server on this computer
   (`localhost`; refused in the dialog before connecting), and failures, shown
   only in the app's own window.
-  Hidden where **Run on Arca** is offered (the Databricks-internal flag on a
-  Databricks-managed server).
+  Hidden where **Run on Arca** is offered (the managed-features flag on a
+  managed server).
+- `desktop-join-install-cli`: in desktop onboarding (the V2 server selector,
+  the macOS default), a new user without the `omnigent` CLI who joins a server
+  from the **Join your team** list, or from the managed-server landing when the
+  server has no runner to set up, chooses **Just join** (the default: opens the
+  server, installs nothing) or **Install CLI first** (installs the CLI, signs
+  in, connects this laptop as a host, then opens the server). States: a failed
+  install or host connect (Retry, Back, or Continue anyway without a host),
+  **Cancel** while installing or waiting on the sign-in (returns to the choice;
+  a cancelled sign-in stops and never connects the laptop; the installer and a
+  host connect already underway keep going), no Cancel while starting the local
+  server or connecting a remote environment, no
+  in-app install on Windows/Linux (manual instructions), and no choice for
+  returning users, an installed CLI, the local install, or a server that brings
+  its own host CLI.
 - `embedded-resource-write`: an identity from a custom `AuthProvider` can
   create, rename, and reorder its own projects; unauthenticated and other users
   remain restricted.
@@ -213,6 +227,14 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   `tests/host/test_service.py::test_service_entry_waits_while_another_daemon_serves_the_workspace`.
   A real check needs two URLs that reach one workspace, so run it only in a
   private-network sandbox against a disposable server.
+- **Foreground terminal hangup (own environment, Linux):**
+  `tests/e2e/test_host_terminal_hangup_mid_turn_e2e.py::test_terminal_hangup_lets_in_flight_turn_finish`
+  closes a real PTY while a mock reply is held. Direct and zygote runners finish
+  the same turn after the host dies by SIGHUP, without replay, then exit. SIGTERM
+  and Ctrl-C controls stop the busy runner before the reply is released. Run
+  with plain `uv run --no-sync pytest`; no live credentials are needed. This
+  proves the foreground terminal path; a generic SIGHUP report does not identify
+  its initiator. Installed system services and native browser journeys are separate.
 - **Background harness credentials (own environment, installed Codex/Claude SDK):**
   `tests/e2e/test_background_host_harness_credentials.py` compares real foreground
   and background hosts. Saved provider env references and named passthrough keep
@@ -308,6 +330,11 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   changing forwarded credentials. `host enable` saves explicitly forwarded values
   in plaintext in the per-user service definition, readable only by its owner
   (0600), so the service can retain them across logins.
+- Under a CLI wrapper (`OMNIGENT_WRAPPER_COMMAND`), `host enable` launches the
+  service through the wrapper's resolved path and the hidden `host-service-entry`
+  command, not the current interpreter, which can live in a cache venv deleted
+  between boots. Re-running `host enable` repairs a service definition that still
+  names a missing cache interpreter.
 - **Find out which credential kind the reporter's host uses before trusting a
   root cause.** A user OAuth login refreshes itself and a personal access
   token does not, so a story about a "stale pinned token" can be true for one

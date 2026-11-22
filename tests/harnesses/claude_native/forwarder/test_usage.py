@@ -16,6 +16,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 import omnigent.harnesses.claude_native.forwarder as forwarder
+from omnigent.harnesses.claude_native import bridge
 
 
 def test_usage_from_status_state_surfaces_cumulative_cost() -> None:
@@ -385,12 +386,19 @@ def test_session_cost_estimate_takes_max_of_status_and_transcript_sum(
         return per_path_cost.get(path)
 
     monkeypatch.setattr(forwarder, "compute_transcript_cumulative_cost", fake_compute)
-    entries = [forwarder.SubagentEntry(subagent_id="aaa", child_conversation_id="conv_child")]
+    entries = [
+        forwarder.SubagentEntry(subagent_id="aaa", child_conversation_id="conv_child"),
+        # No transcript on disk yet: unpriceable, so it has no estimate.
+        forwarder.SubagentEntry(subagent_id="bbb", child_conversation_id="conv_pending"),
+    ]
+    subagent_costs = forwarder._subagent_cost_estimates(parent, entries, {})
+    # Estimates are keyed by the child conversation, not the Claude agent id.
+    assert subagent_costs == {"conv_child": pytest.approx(0.55)}
 
     # S stale ($0.005) < C (0.10 + 0.55 = 0.65) → C wins (mid-run).
     assert forwarder._session_cost_estimate(
         parent_transcript_path=parent,
-        active_subagents=entries,
+        subagent_costs=subagent_costs,
         status_cost=0.005,
         cost_cache={},
     ) == pytest.approx(0.65)
@@ -398,7 +406,7 @@ def test_session_cost_estimate_takes_max_of_status_and_transcript_sum(
     # S settled ($2.00) > C → S wins (no double-count after settle).
     assert forwarder._session_cost_estimate(
         parent_transcript_path=parent,
-        active_subagents=entries,
+        subagent_costs=subagent_costs,
         status_cost=2.0,
         cost_cache={},
     ) == pytest.approx(2.0)
@@ -513,6 +521,84 @@ async def test_forward_session_cost_splits_display_and_policy(
         }
         assert dedupe.posted_cost == pytest.approx(0.95)
         assert dedupe.posted_policy_cost == pytest.approx(0.95)
+
+
+@pytest.mark.asyncio
+async def test_forward_session_cost_attaches_changed_subagent_estimates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Per-child estimates ride a cost post when they changed, and never post alone."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    parent = tmp_path / "sess.jsonl"
+    parent.write_text("parent", encoding="utf-8")
+    status_box = {"value": 0.01}
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge: {"total_cost_usd": status_box["value"]},
+    )
+    monkeypatch.setattr(forwarder, "_session_cost_estimate", lambda **_kw: status_box["value"])
+    estimates = {"value": {"conv_child": 0.2}}
+    monkeypatch.setattr(
+        forwarder, "_subagent_cost_estimates", lambda *_args: dict(estimates["value"])
+    )
+    subagent_state = forwarder.SubagentForwardState(
+        subagents={
+            "aaa": forwarder.SubagentEntry(subagent_id="aaa", child_conversation_id="conv_child")
+        }
+    )
+    dedupe = forwarder._ForwardDedupeState()
+    posted: list[dict[str, Any]] = []
+    fail_next = {"value": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content)["data"])
+        if fail_next["value"]:
+            fail_next["value"] = False
+            return httpx.Response(500, request=request)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+
+        async def run() -> None:
+            await forwarder._forward_session_cost(
+                client=client,
+                session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                parent_transcript_path=parent,
+                subagent_state=subagent_state,
+                dedupe=dedupe,
+                cost_cache={},
+            )
+
+        await run()
+        assert posted[-1]["subagent_costs_usd"] == {"conv_child": pytest.approx(0.2)}
+        # An estimate that moves while neither cost advances waits: an
+        # estimate-only post would be rejected by servers without the key.
+        estimates["value"] = {"conv_child": 0.3}
+        await run()
+        assert len(posted) == 1
+        status_box["value"] = 0.5
+        await run()
+        assert posted[-1]["subagent_costs_usd"] == {"conv_child": pytest.approx(0.3)}
+        # Unchanged estimates are not re-sent with the next cost advance.
+        status_box["value"] = 0.6
+        await run()
+        assert "subagent_costs_usd" not in posted[-1]
+        assert len(posted) == 3
+        # A failed post is not delivery: the retry carries the estimate again.
+        estimates["value"] = {"conv_child": 0.4}
+        status_box["value"] = 0.7
+        fail_next["value"] = True
+        await run()
+        dedupe.cost_retry_not_before = 0.0  # skip the backoff wait
+        await run()
+        assert [post.get("subagent_costs_usd") for post in posted[-2:]] == [
+            {"conv_child": pytest.approx(0.4)}
+        ] * 2
 
 
 @pytest.mark.asyncio
@@ -697,3 +783,154 @@ async def test_forward_session_cost_tags_display_advance_with_model(
         estimate_box["value"] = 0.90
         await run()
         assert posted[-1] == {"policy_cost_usd": pytest.approx(0.90)}
+
+
+def _seed_resume_cost(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, cost_usd: float) -> Path:
+    """Record a cold resume that seeded *cost_usd* into Claude session ``sid-resumed``."""
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    bridge_dir = bridge.bridge_dir_for_bridge_id("bridge_resumed")
+    bridge.record_resume_cost_baseline(
+        bridge_dir, claude_session_id="sid-resumed", cost_usd=cost_usd
+    )
+    return bridge_dir
+
+
+async def _forward_status_cost(
+    bridge_dir: Path,
+    transcript: Path,
+    dedupe: forwarder._ForwardDedupeState,
+    cost: float,
+    *,
+    api_duration_ms: float,
+) -> list[dict[str, Any]]:
+    """Forward one statusLine total; return the ``external_session_usage`` data posted."""
+    (bridge_dir / "context.json").write_text(
+        json.dumps(
+            {
+                "context_window_size": 200_000,
+                "total_cost_usd": cost,
+                "total_api_duration_ms": api_duration_ms,
+            }
+        ),
+        encoding="utf-8",
+    )
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") == "external_session_usage":
+            posted.append(body["data"])
+        return httpx.Response(200, json={})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder._forward_session_cost(
+            client=client,
+            session_id="conv_resumed",
+            bridge_dir=bridge_dir,
+            parent_transcript_path=transcript,
+            subagent_state=forwarder.SubagentForwardState(subagents={}),
+            dedupe=dedupe,
+            cost_cache={},
+        )
+    return posted
+
+
+@pytest.mark.parametrize(
+    ("seed", "snapshots", "expected"),
+    [
+        # Claude reported $0 before its first API call, so it counted from zero
+        # whatever that call then cost: a sub-cent seed, or a call above the seed.
+        (1.25, [(0.0, 0), (0.05, 900)], [1.25, 1.30]),
+        (0.005, [(0.0, 0), (0.003, 900)], [0.005, 0.008]),
+        (0.05, [(0.0, 0), (0.10, 900)], [0.05, 0.15]),
+        # The total from before the first call was missed, but any total below the
+        # seed still proves a fresh count, however close to the seed it is.
+        (1.25, [(0.05, 900)], [1.30]),
+        (0.005, [(0.003, 900)], [0.008]),
+        (100.0, [(99.995, 900)], [199.995]),
+    ],
+    ids=[
+        "dollar-seed",
+        "sub-cent-seed",
+        "first-call-over-seed",
+        "missed-startup-total",
+        "missed-startup-sub-cent-seed",
+        "missed-startup-just-below-seed",
+    ],
+)
+@pytest.mark.asyncio
+async def test_forward_session_cost_adds_a_seeded_cost_claude_did_not_restore(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    seed: float,
+    snapshots: list[tuple[float, float]],
+    expected: list[float],
+) -> None:
+    """
+    A resumed Claude that counted from $0 still reports the session's whole cost.
+
+    The server keeps only the highest total, so posting the new process's own
+    count would hold the session at the seed until that count passed it.
+    """
+    bridge_dir = _seed_resume_cost(monkeypatch, tmp_path, cost_usd=seed)
+    transcript = tmp_path / "sid-resumed.jsonl"
+    dedupe = forwarder._ForwardDedupeState()
+    posted: list[dict[str, Any]] = []
+    for cost, api_duration_ms in snapshots:
+        posted += await _forward_status_cost(
+            bridge_dir, transcript, dedupe, cost, api_duration_ms=api_duration_ms
+        )
+    # A forwarder restarted under the same Claude process keeps the decision.
+    restarted = forwarder._ForwardDedupeState()
+    posted += await _forward_status_cost(
+        bridge_dir, transcript, restarted, 0.5, api_duration_ms=5_000
+    )
+
+    totals = [*expected, seed + 0.5]
+    assert [entry["cumulative_cost_usd"] for entry in posted] == pytest.approx(totals)
+    assert [entry["policy_cost_usd"] for entry in posted] == pytest.approx(totals)
+    assert bridge.read_resume_cost_baseline(bridge_dir) == bridge.ResumeCostBaseline(
+        claude_session_id="sid-resumed", cost_usd=seed, restored=False
+    )
+
+
+@pytest.mark.parametrize(
+    ("seed", "transcript_stem", "snapshots", "restored"),
+    [
+        # Claude restored the seed, so its total is already the session's.
+        (1.25, "sid-resumed", [(1.25, 0), (1.30, 900)], True),
+        (0.005, "sid-resumed", [(0.005, 0), (0.008, 900)], True),
+        # The total from before the first call was missed; one above the seed is
+        # taken as restored, so the seed is never counted twice.
+        (0.05, "sid-resumed", [(0.10, 900)], True),
+        # A Claude session started after the resume, e.g. by /clear, never got it.
+        (1.25, "sid-cleared", [(0.05, 900)], None),
+    ],
+    ids=["restored", "restored-sub-cent-seed", "missed-startup-total", "other-claude-session"],
+)
+@pytest.mark.asyncio
+async def test_forward_session_cost_keeps_a_cost_that_needs_no_seed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    seed: float,
+    transcript_stem: str,
+    snapshots: list[tuple[float, float]],
+    restored: bool | None,
+) -> None:
+    """A restored total, or another Claude session's, is posted as reported."""
+    bridge_dir = _seed_resume_cost(monkeypatch, tmp_path, cost_usd=seed)
+    transcript = tmp_path / f"{transcript_stem}.jsonl"
+    dedupe = forwarder._ForwardDedupeState()
+    posted: list[dict[str, Any]] = []
+    for cost, api_duration_ms in snapshots:
+        posted += await _forward_status_cost(
+            bridge_dir, transcript, dedupe, cost, api_duration_ms=api_duration_ms
+        )
+
+    assert [entry["cumulative_cost_usd"] for entry in posted] == pytest.approx(
+        [cost for cost, _ in snapshots]
+    )
+    baseline = bridge.read_resume_cost_baseline(bridge_dir)
+    assert baseline is not None and baseline.restored is restored

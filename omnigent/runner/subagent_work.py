@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.inner.executor import NativeTurnAcceptance
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
 from omnigent.runner.policy_proxy import _ASK_GATE_DELIVERY_TIMEOUT
@@ -133,11 +134,24 @@ class _SubagentWorkEntry:
     :param delivered: Whether the terminal payload has been pushed to
         the parent's inbox.
     :param cancellation_confirmed: Whether a native terminal edge confirmed
-        an abort, rather than an interrupt merely being requested.
+        an abort, rather than an interrupt merely being requested. An
+        unconfirmed (optimistic grace-timer) cancellation can be corrected
+        by a surviving child's later confirmed completion.
+    :param corrected_status: The provisional status this terminal report
+        overturned, e.g. ``"cancelled"`` when a confirmed completion
+        corrected an optimistic cancellation. ``None`` for a direct report.
     :param launch_timed_out: Whether the recorded ``failed`` came from the
         launch-liveness reaper rather than from the child itself. Such a
         failure is a guess ("no start acknowledgment"), so a genuine
         terminal edge from the child afterwards must replace it.
+    :param child_start_reported: Whether the child itself reported a
+        running/waiting edge for this dispatch, or the dispatch joined a turn
+        already in flight.
+    :param child_start_response_id: Identity of a reported native start; ``None``
+        preserves unidentified or restart-recovered start evidence.
+    :param awaiting_child_start_since: Unix timestamp when runner delivery
+        finalization first recorded a validated native receipt, or ``None``
+        when no turn-start report is awaited.
     """
 
     parent_session_id: str
@@ -153,7 +167,12 @@ class _SubagentWorkEntry:
     completed_at: float | None = None
     delivered: bool = False
     cancellation_confirmed: bool = False
+    corrected_status: str | None = None
     launch_timed_out: bool = False
+    child_start_reported: bool = False
+    child_start_response_id: str | None = None
+    awaiting_child_start_since: float | None = None
+    native_acceptance: NativeTurnAcceptance | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -178,9 +197,39 @@ class _SubagentDeliveryAck:
     reason: str
 
 
+@dataclasses.dataclass(eq=False)
+class _ChildAcceptanceRequest:
+    """Identity evidence retained only while one delivery stream can still finalize."""
+
+    child_session_id: str
+    parent_session_id: str | None
+    settled_response_ids: set[str] = dataclasses.field(default_factory=set)
+    started_response_ids: set[str] = dataclasses.field(default_factory=set)
+    unidentified_settlement: bool = False
+    unidentified_settlement_work_ids: set[str | None] = dataclasses.field(default_factory=set)
+    finished: bool = False
+
+
+@dataclasses.dataclass
+class _AcceptedChildTurn:
+    acceptance: NativeTurnAcceptance
+    accepted_at: float
+    start_reported: bool = False
+
+
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
+# Turn evidence survives dispatch draining or replacement until the matching settlement.
+# Applying acceptance evidence does not consume the unresolved turn's original timestamp.
+_children_reporting_start: dict[str, str | None] = {}
+_children_accepted_turns: dict[str, _AcceptedChildTurn] = {}
+# Pending request evidence survives settlement until delivery finalization or deletion.
+_pending_child_acceptances: dict[str, set[_ChildAcceptanceRequest]] = {}
 _drained_delivered_subagent_children: set[str] = set()
+# Optimistic (grace-timer) cancellations, delivered then drained, kept so a
+# surviving child's confirmed completion can still correct the parent under the
+# same dispatch. Confirmed aborts are not kept; a new send or teardown clears it.
+_provisional_cancelled_subagent_work: dict[str, _SubagentWorkEntry] = {}
 # Parents whose restart-recovery scan completed in this process, plus a
 # per-parent lock so an init racing a sys_read_inbox drain cannot run two
 # scans that both pass the registry check and queue one result twice.
@@ -301,6 +350,7 @@ def register_subagent_work(
         created_by=created_by,
     )
     _drained_delivered_subagent_children.discard(child_session_id)
+    _provisional_cancelled_subagent_work.pop(child_session_id, None)
     _subagent_work_by_child[child_session_id] = entry
     _subagent_work_by_parent.setdefault(parent_session_id, set()).add(child_session_id)
     return entry
@@ -335,6 +385,204 @@ def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | No
     return entry
 
 
+def begin_subagent_child_acceptance(child_session_id: str) -> _ChildAcceptanceRequest:
+    """Retain native status identities until this delivery stream's finalizer exits."""
+    entry = get_subagent_work(child_session_id)
+    meta = _child_session_parents.get(child_session_id)
+    request = _ChildAcceptanceRequest(
+        child_session_id=child_session_id,
+        parent_session_id=entry.parent_session_id
+        if entry is not None
+        else meta.parent_id
+        if meta
+        else None,
+    )
+    _pending_child_acceptances.setdefault(child_session_id, set()).add(request)
+    return request
+
+
+def finish_subagent_child_acceptance(request: _ChildAcceptanceRequest) -> None:
+    """Release a delivery request and every settled identity retained for it."""
+    requests = _pending_child_acceptances.get(request.child_session_id)
+    if requests is not None:
+        requests.discard(request)
+        if not requests:
+            _pending_child_acceptances.pop(request.child_session_id, None)
+    request.finished = True
+    request.settled_response_ids.clear()
+    request.started_response_ids.clear()
+    request.unidentified_settlement = False
+    request.unidentified_settlement_work_ids.clear()
+
+
+def note_subagent_child_start_reported(
+    child_session_id: str, *, response_id: str | None = None
+) -> None:
+    """Record real native start evidence, retaining its existing response identity."""
+    if not response_id or not response_id.startswith("codex_") or response_id == "codex_":
+        response_id = None
+    _children_reporting_start[child_session_id] = response_id
+    for request in _pending_child_acceptances.get(child_session_id, ()):
+        if response_id is not None:
+            request.started_response_ids.add(response_id)
+    accepted = _children_accepted_turns.get(child_session_id)
+    if accepted is not None and (
+        response_id is None or accepted.acceptance.response_id == response_id
+    ):
+        accepted.start_reported = True
+    entry = _subagent_work_by_child.get(child_session_id)
+    if entry is not None and (
+        response_id is None
+        or entry.native_acceptance is None
+        or entry.native_acceptance.response_id == response_id
+    ):
+        if entry.child_start_reported and entry.child_start_response_id != response_id:
+            entry.child_start_response_id = None
+        else:
+            entry.child_start_response_id = response_id
+        entry.child_start_reported = True
+        entry.awaiting_child_start_since = None
+
+
+def note_subagent_child_turn_settled(
+    child_session_id: str, *, response_id: str | None = None
+) -> None:
+    """Settle only matching evidence; stale receipts live no longer than pending requests."""
+    if not response_id or not response_id.startswith("codex_") or response_id == "codex_":
+        response_id = None
+    entry = _subagent_work_by_child.get(child_session_id)
+    for request in _pending_child_acceptances.get(child_session_id, ()):
+        if response_id is None:
+            request.unidentified_settlement = True
+            request.unidentified_settlement_work_ids.add(entry.work_id if entry else None)
+        else:
+            request.settled_response_ids.add(response_id)
+            request.started_response_ids.discard(response_id)
+    if response_id is None or _children_reporting_start.get(child_session_id) == response_id:
+        _children_reporting_start.pop(child_session_id, None)
+    accepted = _children_accepted_turns.get(child_session_id)
+    if response_id is None or (
+        accepted is not None and accepted.acceptance.response_id == response_id
+    ):
+        _children_accepted_turns.pop(child_session_id, None)
+    if (
+        entry is not None
+        and response_id is not None
+        and entry.child_start_response_id == response_id
+    ):
+        entry.child_start_reported = False
+        entry.child_start_response_id = None
+    if entry is not None and (
+        response_id is None
+        or (
+            entry.native_acceptance is not None
+            and entry.native_acceptance.response_id == response_id
+        )
+    ):
+        entry.awaiting_child_start_since = None
+        entry.native_acceptance = None
+
+
+def apply_child_start_evidence(entry: _SubagentWorkEntry) -> None:
+    """Apply retained acceptance/start evidence to one newly registered dispatch."""
+    child_id = entry.child_session_id
+    accepted = _children_accepted_turns.get(child_id)
+    reported = child_id in _children_reporting_start and (
+        accepted is None
+        or _children_reporting_start[child_id] is None
+        or _children_reporting_start[child_id] == accepted.acceptance.response_id
+    )
+    if accepted is not None:
+        entry.native_acceptance = accepted.acceptance
+        entry.child_start_reported = accepted.start_reported or reported
+        if entry.child_start_reported:
+            entry.child_start_response_id = (
+                _children_reporting_start[child_id] if reported else None
+            )
+        entry.awaiting_child_start_since = (
+            None if entry.child_start_reported else accepted.accepted_at
+        )
+    elif reported:
+        entry.child_start_reported = True
+        entry.child_start_response_id = _children_reporting_start[child_id]
+        entry.awaiting_child_start_since = None
+
+
+def arm_subagent_child_start_timeout(
+    child_session_id: str,
+    *,
+    acceptance: NativeTurnAcceptance | None = None,
+    request: _ChildAcceptanceRequest | None = None,
+    now: float | None = None,
+) -> None:
+    """Bound an authoritative accepted native turn, never a settled or unidentified receipt.
+
+    The clock starts when runner delivery finalization records a validated receipt.
+    Repeated receipts for the same unresolved turn retain its first recorded time.
+    Missing identity cannot arm a deadline or erase unresolved evidence. The generic
+    response ID remains the request-ownership guard, independently of native identity.
+    """
+    if (
+        request is None
+        or request.finished
+        or request not in _pending_child_acceptances.get(child_session_id, ())
+    ):
+        return
+    entry = _subagent_work_by_child.get(child_session_id)
+    # An unidentified edge settles the tracked work, not an identified replacement.
+    # Without a tracked work boundary, retain the conservative exemption.
+    if request.unidentified_settlement and (
+        entry is None
+        or None in request.unidentified_settlement_work_ids
+        or entry.work_id in request.unidentified_settlement_work_ids
+    ):
+        _children_accepted_turns.pop(child_session_id, None)
+        if entry is not None:
+            entry.awaiting_child_start_since = None
+            entry.native_acceptance = None
+        return
+    if (
+        acceptance is None
+        or acceptance.session_id != child_session_id
+        or not acceptance.thread_id
+        or not acceptance.response_id.startswith("codex_")
+        or acceptance.response_id == "codex_"
+    ):
+        return
+    if acceptance.response_id in request.settled_response_ids:
+        return
+    reported = acceptance.response_id in request.started_response_ids or (
+        child_session_id in _children_reporting_start
+        and _children_reporting_start[child_session_id] in (None, acceptance.response_id)
+    )
+    stamp = time.time() if now is None else now
+    accepted = _children_accepted_turns.get(child_session_id)
+    if accepted is not None and accepted.acceptance == acceptance:
+        accepted.start_reported |= reported
+    else:
+        accepted = _AcceptedChildTurn(acceptance, stamp, reported)
+        _children_accepted_turns[child_session_id] = accepted
+    if entry is None or entry.status != "running":
+        return
+    if entry.child_start_reported:
+        if entry.child_start_response_id in (None, acceptance.response_id):
+            accepted.start_reported = True
+            return
+        entry.child_start_reported = False
+        entry.child_start_response_id = None
+    if accepted.start_reported:
+        entry.child_start_reported = True
+        entry.child_start_response_id = (
+            acceptance.response_id
+            if _children_reporting_start.get(child_session_id) == acceptance.response_id
+            else None
+        )
+        entry.awaiting_child_start_since = None
+    else:
+        entry.awaiting_child_start_since = accepted.accepted_at
+    entry.native_acceptance = acceptance
+
+
 def unregister_subagent_work(
     child_session_id: str,
     *,
@@ -363,6 +611,12 @@ def unregister_subagent_work(
         return
     if remember_drained_delivery and entry.delivered:
         _drained_delivered_subagent_children.add(child_session_id)
+        if entry.status == "cancelled" and not entry.cancellation_confirmed:
+            # Keep an optimistic cancellation so a surviving child's confirmed
+            # completion can still correct this drained record.
+            _provisional_cancelled_subagent_work[child_session_id] = entry
+        else:
+            _provisional_cancelled_subagent_work.pop(child_session_id, None)
     _subagent_work_by_child.pop(child_session_id, None)
     _in_flight_send_locks.pop(child_session_id, None)
     children = _subagent_work_by_parent.get(entry.parent_session_id)
@@ -386,12 +640,35 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     :returns: None.
     """
     unregister_subagent_work(session_id)
+    children_to_forget = {session_id} | _subagent_work_by_parent.get(session_id, set())
+    children_to_forget.update(
+        child_id
+        for child_id, meta in _child_session_parents.items()
+        if meta.parent_id == session_id
+    )
+    children_to_forget.update(
+        child_id
+        for child_id, requests in _pending_child_acceptances.items()
+        if any(request.parent_session_id == session_id for request in requests)
+    )
+    for child_id in children_to_forget:
+        for request in list(_pending_child_acceptances.get(child_id, ())):
+            finish_subagent_child_acceptance(request)
+        note_subagent_child_turn_settled(child_id)
     _drained_delivered_subagent_children.discard(session_id)
+    _provisional_cancelled_subagent_work.pop(session_id, None)
     _in_flight_send_locks.pop(session_id, None)
     for child_id in list(_subagent_work_by_parent.get(session_id, set())):
         _subagent_work_by_child.pop(child_id, None)
         _drained_delivered_subagent_children.discard(child_id)
+        _provisional_cancelled_subagent_work.pop(child_id, None)
         _in_flight_send_locks.pop(child_id, None)
+    # Drained optimistic cancellations are retained keyed by child id, outside the
+    # parent-child index, so clear this parent's retained records too: a late
+    # completion then acknowledges as delivered instead of re-registering work.
+    for child_id, provisional in list(_provisional_cancelled_subagent_work.items()):
+        if provisional.parent_session_id == session_id:
+            _provisional_cancelled_subagent_work.pop(child_id, None)
     _subagent_work_by_parent.pop(session_id, None)
 
 
@@ -636,6 +913,7 @@ async def _recover_subagent_results_from_server(
         if interrupted:
             # This dispatch already existed; a local launch timeout cannot judge it.
             entry.status = "waiting"
+            entry.child_start_reported = True
             continue
         ack = mark_subagent_work_terminal(child_id, status=status, output=output)
         if ack.delivered_now:
@@ -648,6 +926,8 @@ def mark_subagent_work_terminal(
     status: str,
     output: str | None,
     only_if_work_id: str | None = None,
+    confirmed_completion: bool = False,
+    confirmed_cancellation: bool = False,
 ) -> _SubagentDeliveryAck:
     """
     Mark a sub-agent dispatch terminal and notify the parent inbox.
@@ -670,9 +950,23 @@ def mark_subagent_work_terminal(
         entry is still that dispatch. A delayed op (an interrupt's grace-timer
         cancel) bound to the dispatch it was raised for is dropped when a newer
         send has replaced the entry, so an old timer never cancels new work.
+    :param confirmed_completion: Whether this ``completed`` report is a
+        confirmed turn-end (not a bare quiescence idle). A confirmed
+        completion corrects an optimistic cancellation that was already
+        delivered or drained for the same dispatch, so a child that survived
+        an interrupt still reaches the parent with its real result.
+    :param confirmed_cancellation: Whether this ``cancelled`` report is a
+        confirmed kill. It marks the dispatch's cancellation final (including
+        a delivered or drained provisional entry) so a late survivor
+        completion can no longer correct it.
     :returns: Delivery acknowledgement for this terminal report.
     :raises ValueError: If ``status`` is not terminal.
     """
+    # A confirmed completion is the only edge that corrects an optimistic
+    # cancellation: a surviving child that genuinely fails keeps the cancelled
+    # outcome, and a confirmed kill makes the abort final.
+    corrects_cancellation = confirmed_completion and status == "completed"
+    confirms_cancellation = confirmed_cancellation and status == "cancelled"
     if status not in _SUBAGENT_TERMINAL_STATUSES:
         raise ValueError(
             f"sub-agent terminal status must be one of "
@@ -680,6 +974,18 @@ def mark_subagent_work_terminal(
         )
     entry = _subagent_work_by_child.get(child_session_id)
     if entry is None:
+        provisional = _provisional_cancelled_subagent_work.get(child_session_id)
+        # Only act on a retained record that belongs to the reporting dispatch,
+        # matching the dispatch-binding guard on the live-entry path below.
+        if provisional is not None and (
+            only_if_work_id is None or provisional.work_id == only_if_work_id
+        ):
+            if confirms_cancellation:
+                # A confirmed kill finalizes the abort; the drained-delivery tombstone
+                # alone blocks a late survivor correction, so drop the retained entry.
+                _provisional_cancelled_subagent_work.pop(child_session_id, None)
+            elif corrects_cancellation:
+                return _deliver_corrected_completion(provisional, output)
         if child_session_id in _drained_delivered_subagent_children:
             return _SubagentDeliveryAck(
                 entry=None,
@@ -704,6 +1010,19 @@ def mark_subagent_work_terminal(
             reason=_SUBAGENT_DELIVERY_SUPERSEDED_DISPATCH,
         )
     if entry.status in _SUBAGENT_TERMINAL_STATUSES:
+        if confirms_cancellation and entry.status == "cancelled":
+            # A confirmed kill makes the delivered optimistic cancellation
+            # final; a late survivor completion can no longer correct it.
+            entry.cancellation_confirmed = True
+        if (
+            corrects_cancellation
+            and entry.status == "cancelled"
+            and not entry.cancellation_confirmed
+            and entry.delivered
+        ):
+            # The child survived an optimistic cancellation and finished; its
+            # confirmed completion corrects the already-delivered record.
+            return _deliver_corrected_completion(entry, output)
         # ``failed`` outranks ``completed``: a quiescence-derived ``completed``
         # (the watcher's ``idle`` edge) can be recorded — and delivered — before
         # the turn's real ``failed`` edge lands. The failure must replace it and
@@ -732,11 +1051,17 @@ def mark_subagent_work_terminal(
                 delivered_now=False,
                 reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
             )
-        # A late stop_session-driven "cancelled" must not downgrade an
-        # already-recorded "completed"/"failed" still awaiting delivery, and a
-        # trailing quiescence "completed" must not launder a recorded "failed".
-        keep_recorded = (status == "cancelled" and entry.status != "cancelled") or (
-            status == "completed" and entry.status == "failed"
+        # Only undelivered entries reach here. A late "cancelled" must not
+        # downgrade a recorded "completed"/"failed", a trailing "completed" must
+        # not launder a "failed", and only a confirmed kill outranks a completion.
+        keep_recorded = (
+            (status == "cancelled" and entry.status != "cancelled")
+            or (status == "completed" and entry.status == "failed")
+            or (
+                status == "completed"
+                and entry.status == "cancelled"
+                and entry.cancellation_confirmed
+            )
         )
         if not keep_recorded:
             entry.status = status
@@ -746,6 +1071,39 @@ def mark_subagent_work_terminal(
     entry.status = status
     entry.output = output
     entry.completed_at = time.time()
+    if confirms_cancellation:
+        entry.cancellation_confirmed = True
+    return _deliver_subagent_completion(entry)
+
+
+def _deliver_corrected_completion(
+    cancelled_entry: _SubagentWorkEntry, output: str | None
+) -> _SubagentDeliveryAck:
+    """
+    Overturn an optimistic cancellation with the child's confirmed completion.
+
+    Re-registers the dispatch under its original ``work_id`` (clearing the
+    drained-delivery and provisional-cancel tombstones) and delivers the real
+    result, noting the cancellation it superseded so the parent-readable line
+    can explain the correction.
+
+    :param cancelled_entry: The provisional-cancelled entry being corrected.
+    :param output: The surviving child's confirmed completion output.
+    :returns: Delivery acknowledgement for the corrected completion.
+    """
+    entry = register_subagent_work(
+        parent_session_id=cancelled_entry.parent_session_id,
+        child_session_id=cancelled_entry.child_session_id,
+        agent=cancelled_entry.agent,
+        title=cancelled_entry.title,
+        wrapper_label=cancelled_entry.wrapper_label,
+        created_by=cancelled_entry.created_by,
+        work_id=cancelled_entry.work_id,
+    )
+    entry.status = "completed"
+    entry.output = output
+    entry.completed_at = time.time()
+    entry.corrected_status = cancelled_entry.status
     return _deliver_subagent_completion(entry)
 
 
@@ -784,20 +1142,21 @@ def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDelivery
         output = (
             "[System: sub-agent completed with no output]" if entry.status == "completed" else ""
         )
-    inbox.put_nowait(
-        {
-            "type": "sub_agent",
-            "work_id": entry.work_id,
-            "task_id": entry.child_session_id,
-            "handle_id": entry.child_session_id,
-            "conversation_id": entry.child_session_id,
-            "tool_name": entry.agent,
-            "agent": entry.agent,
-            "title": entry.title,
-            "status": entry.status,
-            "output": output,
-        }
-    )
+    item: _JsonObject = {
+        "type": "sub_agent",
+        "work_id": entry.work_id,
+        "task_id": entry.child_session_id,
+        "handle_id": entry.child_session_id,
+        "conversation_id": entry.child_session_id,
+        "tool_name": entry.agent,
+        "agent": entry.agent,
+        "title": entry.title,
+        "status": entry.status,
+        "output": output,
+    }
+    if entry.corrected_status is not None:
+        item["corrected_status"] = entry.corrected_status
+    inbox.put_nowait(item)
     entry.delivered = True
     return _SubagentDeliveryAck(
         entry=entry,
@@ -817,7 +1176,9 @@ def reap_stalled_subagent_launches(
     Fail sub-agent dispatches stuck in ``launching`` beyond the liveness budget.
 
     A dispatch with no running/waiting/terminal status acknowledgment can
-    otherwise remain pending forever. Missing acknowledgment does not prove
+    otherwise remain pending forever. The same budget bounds a ``running``
+    dispatch armed by :func:`arm_subagent_child_start_timeout` whose child
+    has not reported a start. Missing acknowledgment does not prove
     that the child process never started. Each reaped entry is
     marked ``failed`` and its failure is delivered to the parent inbox through
     ``mark_terminal``.
@@ -839,24 +1200,38 @@ def reap_stalled_subagent_launches(
     current = time.time() if now is None else now
     reaped: list[_SubagentWorkEntry] = []
     for entry in list(_subagent_work_by_child.values()):
-        if entry.status != "launching":
+        if entry.status == "launching":
+            waited = current - entry.created_at
+            stall = "stuck in launching"
+            failure = (
+                f"Error: no start acknowledgment for sub-agent {entry.agent!r} "
+                f"title {entry.title!r} within {budget:.0f}s of dispatch."
+            )
+        elif entry.status == "running" and entry.awaiting_child_start_since is not None:
+            waited = current - entry.awaiting_child_start_since
+            stall = "accepted its prompt but reported no turn start"
+            failure = (
+                f"Error: sub-agent {entry.agent!r} title {entry.title!r} accepted its "
+                f"prompt but reported no turn start within {budget:.0f}s."
+            )
+        else:
             continue
-        if current - entry.created_at < budget:
+        if waited < budget:
             continue
         _logger.warning(
-            "Sub-agent dispatch stuck in launching for %.0fs; failing it: parent=%s child=%s",
-            current - entry.created_at,
+            "Sub-agent dispatch %s for %.0fs; failing it: parent=%s child=%s",
+            stall,
+            waited,
             entry.parent_session_id,
             entry.child_session_id,
         )
         entry.launch_timed_out = True
+        entry.awaiting_child_start_since = None
         deliver(
             entry.child_session_id,
             status="failed",
             output=(
-                f"Error: no start acknowledgment for sub-agent {entry.agent!r} "
-                f"title {entry.title!r} within {budget:.0f}s of dispatch. "
-                "The child may still be running; inspect its session before retrying."
+                f"{failure} The child may still be running; inspect its session before retrying."
             ),
         )
         reaped.append(entry)
@@ -870,7 +1245,7 @@ async def run_subagent_launch_reaper(
     reconcile_pending: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """
-    Periodically sweep for sub-agent dispatches wedged in ``launching``.
+    Periodically fail stalled sub-agent dispatches via :func:`reap_stalled_subagent_launches`.
 
     Runs until cancelled; started by the runner entrypoint alongside the
     process manager. Sweep errors are logged and never end the loop.
@@ -1094,6 +1469,27 @@ def _format_subagent_wake_notice(*, agent: str, title: str, status: str, pending
     noun = "result" if pending == 1 else "results"
     return (
         f"[System: sub-agent {agent}/{title} finished ({status}) — "
+        f"{pending} {noun} waiting in inbox. Call sys_read_inbox to collect.]"
+    )
+
+
+def _format_async_result_wake_notice(
+    *, handle_id: str, tool_name: str, status: str, pending: int
+) -> str:
+    """
+    Build the framework notice that wakes a session after a background task finishes.
+
+    :param handle_id: The ``sys_call_async`` handle, e.g. ``"handle_0123456789ab"``.
+    :param tool_name: The dispatched tool, e.g. ``"sys_os_shell"``.
+    :param status: Terminal task status, e.g. ``"completed"`` or ``"failed"``.
+    :param pending: Number of undrained items in the session inbox, e.g. ``1``.
+    :returns: A ``[System: ...]`` notice string, e.g. ``"[System: background task
+        handle_0123456789ab (sys_os_shell) finished (completed) — 1 result waiting
+        in inbox. Call sys_read_inbox to collect.]"``.
+    """
+    noun = "result" if pending == 1 else "results"
+    return (
+        f"[System: background task {handle_id} ({tool_name}) finished ({status}) — "
         f"{pending} {noun} waiting in inbox. Call sys_read_inbox to collect.]"
     )
 

@@ -337,3 +337,24 @@ def test_delete_all_for_session_returns_only_orphaned_blobs(
     # Deleting the fork finally orphans the shared blob.
     orphaned_after = file_store.delete_all_for_session(fork_session)
     assert set(orphaned_after) == {shared.blob_key}
+
+
+def test_delete_session_files_batch_bounds_each_transaction(
+    file_store: SqlAlchemyFileStore,
+) -> None:
+    """Each batch deletes at most *limit* rows and returns their blob keys, shared or not."""
+    src_session = "5f03c6b1d1ff7ec4a985a0d5b4a966b6"
+    fork_session = "b0f9bb9c7fa0a7fe5b17dc99d044819d"
+    shared, *solo = [file_store.create(f"f{i}.txt", 1, session_id=src_session) for i in range(3)]
+    file_store.create("f0.txt", 1, session_id=fork_session, blob_key=shared.blob_key)
+
+    batches = [file_store.delete_session_files_batch(src_session, limit=2) for _ in range(3)]
+
+    assert [deleted for deleted, _ in batches] == [2, 1, 0]
+    returned = sorted(key for _, keys in batches for key in keys)
+    assert returned == sorted([shared.id, *(f.id for f in solo)])
+    assert file_store.list(src_session).data == []
+    assert file_store.is_blob_key_orphaned(shared.id) is False
+    assert all(file_store.is_blob_key_orphaned(f.id) for f in solo)
+    with pytest.raises(ValueError):
+        file_store.delete_session_files_batch(src_session, limit=0)

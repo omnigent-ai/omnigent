@@ -440,8 +440,10 @@ The validator (`validator.py`) enforces:
 - **`agent.map` / `agent.spawn`** — batch and parallel fan-out over sub-agents.
   Deferred to v2.
 
-- **Builtin tools: `search.web`, `code.execute`, `memory.*`** — standardized
+- **Builtin tools: `search.web`, `code.execute`** — standardized
   runtime-provided tools. Interfaces and availability will be defined soon.
+  Long-term memory ships as the `memory_*` tools in the `tool_groups.memory`
+  group, opt-in per server (see `docs/AGENT_YAML_SPEC.md`).
 
 - **Memory policy declarations** — a `memory:` block for consent hints and
   scope declarations. Memory is purely a tool concern in v1.

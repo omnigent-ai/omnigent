@@ -417,6 +417,16 @@ class GitSshBinding:
     allow_loopback: bool = False
 
 
+@dataclass(frozen=True)
+class TcpEgressRoute:
+    """One named, exact TCP destination with optional address restrictions."""
+
+    name: str
+    host: str
+    port: int
+    allowed_cidrs: tuple[str, ...] = ()
+
+
 @dataclass
 class CredentialProxyEntry:
     """One normalized host binding for the secretless credential proxy.
@@ -480,7 +490,7 @@ class DatabricksProfileBinding:
     ``oa_cred_*`` placeholder written into a materialized ``.databrickscfg``.
 
     :param profile: The profile (section) name in ``~/.databrickscfg``,
-        e.g. ``"dbc-adb7b1a3-9097"``. Selected in the sandbox with
+        e.g. ``"dbc-87654321-dcba"``. Selected in the sandbox with
         ``databricks --profile <name>`` (or as the default profile).
     """
 
@@ -538,6 +548,15 @@ class WritePathSpec:
             raise ValueError("write_paths.path must be a non-empty string")
         if not isinstance(self.copy_on_write, bool):
             raise ValueError("write_paths.copy_on_write must be a boolean")
+
+
+@dataclass(frozen=True)
+class HostWritePathSpec(WritePathSpec):
+    """A persistent write grant added by the host's ``runner.sandbox_grants``.
+
+    YAML cannot produce it: :attr:`OSEnvSandboxSpec.write_path_specs` tags the entries
+    listed in :attr:`OSEnvSandboxSpec.host_write_paths`.
+    """
 
 
 def parse_write_paths(raw: object) -> list[str | WritePathSpec] | None:
@@ -802,16 +821,23 @@ class OSEnvSandboxSpec:
     # Git's SSH transport runs in the trusted parent. Only the private
     # broker socket and a Git helper command are exposed to the sandbox.
     git_ssh: list[GitSshBinding] | None = None
+    tcp_egress: list[TcpEgressRoute] | None = None
+    # ``write_paths`` strings the runner added from the host's ``runner.sandbox_grants``.
+    # A field rather than an entry type so the marker survives JSON transport to harnesses.
+    host_write_paths: list[str] | None = None
 
     @property
     def requires_network_enforcement(self) -> bool:
-        return bool(self.egress_rules or self.git_ssh)
+        return bool(self.egress_rules or self.git_ssh or self.tcp_egress)
 
     @property
     def write_path_specs(self) -> list[WritePathSpec]:
         """Normalize shorthand and structured grants at the policy boundary."""
+        host_paths = set(self.host_write_paths or ())
         return [
-            WritePathSpec(entry) if isinstance(entry, str) else entry
+            (HostWritePathSpec(entry) if entry in host_paths else WritePathSpec(entry))
+            if isinstance(entry, str)
+            else entry
             for entry in parse_write_paths(self.write_paths) or []
         ]
 

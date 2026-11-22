@@ -1,11 +1,27 @@
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import type * as NativeBridge from "@/lib/nativeBridge";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resetDesktopCommandsForTests, useDesktopCommand } from "@/lib/desktopCommands";
 import { BrowserPane } from "./BrowserPane";
 
 const getSessionSlim = vi.fn();
 vi.mock("@/lib/sessionsApi", () => ({
   getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
+}));
+
+// Desktop menu commands (Reload, Focus Address Bar); off unless a test turns them on.
+const desktop = vi.hoisted(() => ({
+  enabled: false,
+  send: (_event: { command: string; browserViewId: string | null }) => {},
 }));
 
 // supportsBrowser gates the whole pane. Force it true so the pane renders; the
@@ -14,6 +30,12 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   ...(await importOriginal<typeof NativeBridge>()),
   isElectronShell: () => true,
   supportsBrowser: () => true,
+  supportsDesktopCommands: () => desktop.enabled,
+  onDesktopCommand: (callback: typeof desktop.send) => {
+    desktop.send = callback;
+    return () => {};
+  },
+  setDesktopCommandState: () => {},
   // DialogContent sizes itself for the iOS keyboard and asks for the shell.
   isIOSShell: () => false,
   // Delegate to the per-test bridge stub so a test can assert the call.
@@ -81,6 +103,8 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  resetDesktopCommandsForTests();
+  desktop.enabled = false;
   vi.clearAllMocks();
   (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = undefined;
 });
@@ -225,6 +249,28 @@ describe("BrowserPane cold-start (no view yet)", () => {
       expect(screen.queryByText(/enter a url above to get started/i)).toBeNull();
     });
     expect(screen.getByRole("textbox", { name: /address bar/i })).toBeInTheDocument();
+  });
+});
+
+describe("BrowserPane focus requests", () => {
+  it("focuses the address bar once for a tab just opened", () => {
+    const onFocused = vi.fn();
+    render(<BrowserPane conversationId="conv_f" focus="address" onFocused={onFocused} />);
+    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveFocus();
+    expect(onFocused).toHaveBeenCalledTimes(1);
+  });
+
+  it("focuses the page of a tab returned to once its view is attached", async () => {
+    const bridge = installBridge({
+      browserHasView: vi.fn().mockResolvedValue({ exists: true, url: "https://example.com/" }),
+    });
+    const onFocused = vi.fn();
+    render(<BrowserPane conversationId="conv_g" focus="page" onFocused={onFocused} />);
+    expect(onFocused).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(bridge.browserSetActive).toHaveBeenCalledWith("conv_g", { focus: true }),
+    );
+    expect(onFocused).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -417,7 +463,7 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
   });
 
   it.each(["host lookup", "navigation result"])(
-    "keeps the latest URL submission when the earlier %s finishes last",
+    "keeps the latest URL submission while the earlier %s is pending",
     async (pendingStage) => {
       let resolveFirstHost!: (host: unknown) => void;
       const firstHost = new Promise((resolve) => {
@@ -452,14 +498,25 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
       fireEvent.change(bar, { target: { value: "https://latest.example" } });
       fireEvent.keyDown(bar, { key: "Enter" });
       await waitFor(() => expect(bar).toHaveValue("https://latest.example"));
+      if (pendingStage === "host lookup") {
+        expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+        await act(async () => {
+          resolveFirstHost({ id: "conv_preview", hostId: "local-host" });
+        });
+      }
       await waitFor(() =>
         expect(bridge.browserOpenOrNavigate).toHaveBeenLastCalledWith(
           "browser-tab:conv_preview:two",
           "https://latest.example",
           undefined,
-          { force: true, sourceHostId: "remote-host", sessionHostProtocol: 1 },
+          {
+            force: true,
+            sourceHostId: pendingStage === "host lookup" ? "local-host" : "remote-host",
+            sessionHostProtocol: 1,
+          },
         ),
       );
+      expect(getSessionSlim).toHaveBeenCalledTimes(pendingStage === "host lookup" ? 1 : 2);
       await act(async () => {
         resolveFirstHost({ id: "conv_preview", hostId: "local-host" });
         resolveFirstNavigation({ ok: false, error: "stale failure" });
@@ -471,6 +528,35 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
       expect(screen.queryByText("stale failure")).not.toBeInTheDocument();
     },
   );
+
+  it("reloads the page for desktop Reload from its toolbar, and passes it on elsewhere", async () => {
+    desktop.enabled = true;
+    const appReload = vi.fn();
+    renderHook(() => useDesktopCommand("reload", appReload));
+    const { bridge } = await renderActive("conv_cmd_r");
+    const bar = screen.getByRole("textbox", { name: /address bar/i });
+    expect(bar).toHaveAttribute("title", "Address bar (Ctrl+L)");
+    expect(screen.getByRole("button", { name: /reload/i })).toHaveAttribute(
+      "title",
+      "Reload (Ctrl+R)",
+    );
+
+    act(() => bar.focus());
+    act(() => desktop.send({ command: "reload", browserViewId: null }));
+    expect(bridge.browserReload).toHaveBeenCalledWith("conv_cmd_r");
+    expect(appReload).not.toHaveBeenCalled();
+
+    act(() => bar.blur());
+    act(() => desktop.send({ command: "reload", browserViewId: null }));
+    expect(appReload).toHaveBeenCalledTimes(1);
+  });
+
+  it("focuses and selects the address for desktop Focus Address Bar", async () => {
+    desktop.enabled = true;
+    await renderActive("conv_cmd_l");
+    act(() => desktop.send({ command: "focus-address-bar", browserViewId: null }));
+    expect(document.activeElement).toBe(screen.getByRole("textbox", { name: /address bar/i }));
+  });
 
   it("reload button calls the reload IPC once a view is active", async () => {
     const { bridge } = await renderActive("conv_reload");
@@ -789,6 +875,184 @@ describe("BrowserPane Chrome cookie import", () => {
         scope: HOST,
       }),
     );
+  });
+
+  describe("on a shell that offers every website", () => {
+    const ALL_SITES_PREVIEW = {
+      ...PREVIEW,
+      allSitesProfiles: [
+        { id: "Default", name: "Work", cookieCount: 40 },
+        // Holds nothing for this page's site, so only every website is on offer.
+        { id: "Profile 2", name: "Personal", cookieCount: 7 },
+      ],
+    };
+
+    it("imports every website's cookies by default", async () => {
+      const bridge = installCookieBridge({
+        preview: ALL_SITES_PREVIEW,
+        importResult: { ok: true, scope: "*", profileId: "Default", imported: 38, skipped: 2 },
+      });
+      render(<BrowserPane conversationId="conv_all" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+      const dialog = await screen.findByRole("dialog");
+
+      expect(within(dialog).getByRole("combobox", { name: "Site scope" })).toHaveTextContent(
+        "All websites",
+      );
+      expect(dialog).toHaveTextContent("Copies every website's cookies from this Chrome profile");
+      expect(dialog).toHaveTextContent("40 cookies for every website in this Chrome profile.");
+      expect(dialog).not.toHaveTextContent("Other sites' cookies stay out of Omnigent");
+      // The consent text has to say the agent gets every signed-in site, not one.
+      expect(dialog).toHaveTextContent(
+        "the agent can act as you on every site you're signed in to in this Chrome profile",
+      );
+
+      fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
+
+      await waitFor(() =>
+        expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_all", {
+          profileId: "Default",
+          expectedHost: HOST,
+          scope: "*",
+        }),
+      );
+      await waitFor(() => expect(bridge.browserReload).toHaveBeenCalledWith("conv_all"));
+      expect(toast.success).toHaveBeenCalledWith(
+        "Imported 38 cookies from Chrome (2 couldn't be used).",
+      );
+    });
+
+    it("still imports only the current site when the user picks it", async () => {
+      const bridge = installCookieBridge({ preview: ALL_SITES_PREVIEW });
+      render(<BrowserPane conversationId="conv_all_site" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Site scope" }));
+      expect(screen.getByRole("option", { name: "All websites (40)" })).toBeInTheDocument();
+      fireEvent.click(await screen.findByRole("option", { name: `${HOST} (4)` }));
+
+      expect(dialog).toHaveTextContent(
+        `4 cookies for ${HOST} and its subdomains. Other sites' cookies stay out of Omnigent entirely.`,
+      );
+      expect(dialog).toHaveTextContent("the agent can act as you on this site");
+      fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
+
+      await waitFor(() =>
+        expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_all_site", {
+          profileId: "Default",
+          expectedHost: HOST,
+          scope: HOST,
+        }),
+      );
+    });
+
+    it("narrows a picked site scope to the host, not to every website", async () => {
+      const bridge = installCookieBridge({
+        preview: {
+          ok: true,
+          host: HOST,
+          scopes: [HOST, PARENT],
+          profiles: [
+            {
+              id: "Default",
+              name: "Work",
+              cookieCount: 4,
+              scopes: [
+                { host: HOST, cookieCount: 4 },
+                { host: PARENT, cookieCount: 6 },
+              ],
+            },
+            {
+              id: "Profile 2",
+              name: "Personal",
+              cookieCount: 1,
+              scopes: [{ host: HOST, cookieCount: 1 }],
+            },
+          ],
+          allSitesProfiles: [
+            { id: "Default", name: "Work", cookieCount: 40 },
+            { id: "Profile 2", name: "Personal", cookieCount: 7 },
+          ],
+        },
+      });
+      render(<BrowserPane conversationId="conv_all_narrow" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Site scope" }));
+      fireEvent.click(await screen.findByRole("option", { name: `${PARENT} (6)` }));
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Chrome profile" }));
+      fireEvent.click(await screen.findByRole("option", { name: /^Personal/ }));
+
+      expect(within(dialog).getByRole("combobox", { name: "Site scope" })).toHaveTextContent(HOST);
+      fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
+      await waitFor(() =>
+        expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_all_narrow", {
+          profileId: "Profile 2",
+          expectedHost: HOST,
+          scope: HOST,
+        }),
+      );
+    });
+
+    it("offers a profile that has no cookies for the current site", async () => {
+      const bridge = installCookieBridge({ preview: ALL_SITES_PREVIEW });
+      render(<BrowserPane conversationId="conv_all_profile" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+      const dialog = await screen.findByRole("dialog");
+      // Pick the site first: the other profile can't cover it, so the scope
+      // must fall back to every website rather than import nothing.
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Site scope" }));
+      fireEvent.click(await screen.findByRole("option", { name: `${HOST} (4)` }));
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Chrome profile" }));
+      fireEvent.click(await screen.findByRole("option", { name: "Personal (7)" }));
+
+      expect(within(dialog).queryByRole("combobox", { name: "Site scope" })).toBeNull();
+      expect(dialog).toHaveTextContent("7 cookies for every website in this Chrome profile.");
+      fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
+
+      await waitFor(() =>
+        expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_all_profile", {
+          profileId: "Profile 2",
+          expectedHost: HOST,
+          scope: "*",
+        }),
+      );
+    });
+
+    it("opens for every website when Chrome has no cookies for the current site", async () => {
+      installCookieBridge({
+        preview: {
+          ok: true,
+          host: HOST,
+          scopes: [],
+          profiles: [],
+          allSitesProfiles: [{ id: "Default", name: "Work", cookieCount: 1 }],
+        },
+      });
+      render(<BrowserPane conversationId="conv_all_only" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+
+      const dialog = await screen.findByRole("dialog");
+      expect(dialog).toHaveTextContent("1 cookie for every website in this Chrome profile.");
+      expect(toast.info).not.toHaveBeenCalled();
+    });
+
+    it("says so when Chrome has no cookies at all", async () => {
+      installCookieBridge({
+        preview: { ok: true, host: HOST, scopes: [], profiles: [], allSitesProfiles: [] },
+      });
+      render(<BrowserPane conversationId="conv_all_none" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+
+      await waitFor(() => expect(toast.info).toHaveBeenCalledWith("No Chrome cookies found."));
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
   });
 
   it("explains a zero-cookie import that the session rejected", async () => {

@@ -38,10 +38,12 @@ import httpx
 
 from omnigent.harnesses.devin_native.questions import answered_question_input, question_payload
 from omnigent.native.native_policy_hook import (
+    TOOL_FAILED_PAYLOAD_KEY,
     _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
+    is_loopback_url,
     policy_hook_reauth,
     policy_hook_request_headers,
     post_evaluate_with_retry,
@@ -96,6 +98,8 @@ def _normalize_tool_result(payload: _JsonObject) -> _JsonObject:
     normalize here rather than teaching the shared seam a third spelling.
     Prefers the human-readable ``output``, falling back to ``error`` and then
     the whole object so a policy that matches on result text still sees it.
+    ``"success": false`` sets :data:`TOOL_FAILED_PAYLOAD_KEY`, because the
+    flattened text alone often doesn't look like an error.
     """
     if "tool_output" in payload:
         return payload
@@ -104,6 +108,8 @@ def _normalize_tool_result(payload: _JsonObject) -> _JsonObject:
         return payload
     normalized = dict(payload)
     if isinstance(response, dict):
+        if response.get("success") is False:
+            normalized[TOOL_FAILED_PAYLOAD_KEY] = True
         output = response.get("output")
         error = response.get("error")
         if isinstance(output, str) and output:
@@ -191,9 +197,14 @@ def _post_elicitation(
     timeout = httpx.Timeout(_PERMISSION_READ_TIMEOUT_S, connect=_PERMISSION_CONNECT_TIMEOUT_S)
     headers = policy_hook_request_headers()
     reauth = policy_hook_reauth(server_url, headers)
+    trust_env = not is_loopback_url(url)
     try:
         for attempt in range(2):
-            with httpx.Client(headers=headers, timeout=timeout) as client:
+            with httpx.Client(
+                headers=headers,
+                timeout=timeout,
+                trust_env=trust_env,
+            ) as client:
                 response = client.post(url, json=body)
                 if attempt == 0 and _is_login_redirect_or_unauthorized(response):
                     refreshed = reauth()

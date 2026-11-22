@@ -217,7 +217,9 @@ def build_opencode_config(
     return config
 
 
-def _with_gateway_attribution(config: Mapping[str, object]) -> Mapping[str, object]:
+def _with_gateway_attribution(
+    config: Mapping[str, object], *, client_surface: str | None = None
+) -> Mapping[str, object]:
     """
     Add usage-attribution headers to each model of a Unity Gateway provider.
 
@@ -253,13 +255,16 @@ def _with_gateway_attribution(config: Mapping[str, object]) -> Mapping[str, obje
                         headers if isinstance(headers, Mapping) else None,
                         OPENCODE_AGENT,
                         base_url,
+                        client_surface=client_surface,
                     ),
                 }
         stamped[provider_id] = {**provider, "models": stamped_models}
     return {**config, "providers": stamped}
 
 
-def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, object]) -> Path:
+def write_opencode_provider_config(
+    xdg_config_home: Path, config: Mapping[str, object], *, client_surface: str | None = None
+) -> Path:
     """
     Atomically write ``<xdg_config_home>/opencode/opencode.json`` (``0600``).
 
@@ -272,7 +277,14 @@ def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, o
     cfg_dir = xdg_config_home / "opencode"
     cfg_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = cfg_dir / "opencode.json"
-    payload = json.dumps(_with_gateway_attribution(config), indent=2, sort_keys=True) + "\n"
+    payload = (
+        json.dumps(
+            _with_gateway_attribution(config, client_surface=client_surface),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
     fd, tmp_name = tempfile.mkstemp(prefix="opencode.json.", dir=str(cfg_dir))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -924,19 +936,26 @@ def _user_mcp_servers(user: Mapping[str, object]) -> dict[str, object]:
     return servers
 
 
-def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, object]:
+def maybe_merge_user_provider_config(
+    config: dict[str, object], *, include_user_mcp_servers: bool = True
+) -> dict[str, object]:
     """
     Merge the user's global OpenCode config into the synthesized v2 config.
 
     The per-session ``XDG_CONFIG_HOME`` hides ``~/.config/opencode``, so resolve the
     user's config the way OpenCode does (``config.json``, ``opencode.json`` and
     ``opencode.jsonc`` deep-merged, later files win) and carry over its providers,
-    default model, plugins and MCP servers. Both v1
+    default model, plugins and (when explicitly requested) MCP servers. Both v1
     (``provider``, ``plugin``, flat ``mcp``) and v2 (``providers``, ``plugins``,
     ``mcp.servers``) spellings are read; the result uses v2 keys only.
     Synthesized entries always win; the user's model applies only when none is set.
 
     :param config: The synthesized config dict.
+    :param include_user_mcp_servers: Whether to copy ambient user MCP servers.
+        Bridge-owned sessions normally disable this: their declared agent-spec
+        servers plus the Omnigent relay are the complete task-scoped allowlist.
+        Copying an unrelated global tool inventory both weakens that boundary
+        and can exhaust a smaller local model before its first reply.
     :returns: A new dict with the user's entries merged in.
     """
     user = _read_user_opencode_config()
@@ -967,7 +986,7 @@ def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, obj
                 plugins.append(plugin)
         result["plugins"] = plugins
 
-    user_servers = _user_mcp_servers(user)
+    user_servers = _user_mcp_servers(user) if include_user_mcp_servers else {}
     if user_servers:
         mcp = result.get("mcp")
         if isinstance(mcp, Mapping) and "servers" not in mcp:

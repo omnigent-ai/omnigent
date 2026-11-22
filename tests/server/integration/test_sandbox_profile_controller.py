@@ -14,6 +14,8 @@ async def test_controller_recovers_after_last_session_deleted_and_restart(env: _
     source = env.conversations.get_conversation(source_id)
     host_id = source.host_id
     sandbox_id = env.hosts.get_host(host_id).sandbox_id
+    # Simulate an orphaned host; an ordinary last-session deletion tears it down.
+    env.conversations.clear_host_binding(source_id, clear_profile=True)
     await env.conversations.delete_conversation(source_id)
     assert env.catalog._store.get_host_snapshot(host_id) is None
     env.app.state.sandbox_profiles = SandboxProfileCatalog(
@@ -44,6 +46,8 @@ async def test_controller_recovers_after_last_session_deleted_and_restart(env: _
 async def test_controller_denial_is_sanitized_and_does_not_adopt(env: _Env):
     source_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
     host_id = env.conversations.get_conversation(source_id).host_id
+    # Simulate an orphaned host; an ordinary last-session deletion tears it down.
+    env.conversations.clear_host_binding(source_id, clear_profile=True)
     await env.conversations.delete_conversation(source_id)
     env.recording.allowed_users.clear()
     response = await env.client.get(f"/v1/hosts/{host_id}?include=sandbox_profile")
@@ -68,6 +72,7 @@ async def test_controller_missing_sandbox_replaces_at_saved_revision(env: _Env):
 async def test_orphan_missing_sandbox_has_no_default_profile(env: _Env):
     session_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
     host_id = env.conversations.get_conversation(session_id).host_id
+    env.conversations.clear_host_binding(session_id, clear_profile=True)
     await env.conversations.delete_conversation(session_id)
     env.recording.gone = True
     response = await env.client.get(f"/v1/hosts/{host_id}?include=sandbox_profile")

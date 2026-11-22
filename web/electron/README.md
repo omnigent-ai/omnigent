@@ -88,12 +88,14 @@ adds native niceties:
   > Electron's bundled Chromium does **not** ship. Electron therefore uses the
   > **server-side dictation fallback** instead: when the connected server has
   > the `dictation` extra and models installed (`GET /v1/info` reports
-  > `dictation_available`), a take that fails with Web Speech's `network`
-  > error falls back to streaming audio to `WS /v1/dictation/stream` and
-  > transcribing on the server — no cloud, no Chrome dependency. See
-  > `designs/server-dictation.md`. Without the server extra, the button still
-  > renders (the constructor exists) but shows "Dictation unavailable" when
-  > clicked, as before.
+  > `dictation_available`), a take streams audio to `WS /v1/dictation/stream`
+  > and is transcribed on the server — no cloud, no Chrome dependency. See
+  > `designs/server-dictation.md`. Without the server extra, macOS builds hand
+  > the mic to macOS Dictation (the Edit > Start Dictation… action, via
+  > `omnigent:start-system-dictation`), which types into the focused message
+  > box. Windows and Linux builds offer no mic button at all: with no working
+  > Web Speech backend, a button there could only fail with "Voice input isn't
+  > available on this device."
 
 ## How it works (zero UI duplication)
 
@@ -267,7 +269,7 @@ logs separately.
 - `phase: 'workspace landing'` means the bridge redirected and the status came
   from the destination page; it is not a rejection from the session-create endpoint.
 - For a direct `403 PERMISSION_DENIED`, give the request ID and custom client ID
-  to the Databricks platform owner to check the denial reason (client enablement,
+  to the workspace administrator to check the denial reason (client enablement,
   token scope, or workspace permissions). Do not infer the cause from status alone.
 
 ## OIDC sign-in through the system browser
@@ -360,7 +362,9 @@ defaults delete ai.omnigent.desktop DeveloperMode
 
 Development (`pnpm --dir web/electron dev`) builds keep Developer Tools enabled
 without this preference. The override is intentionally macOS-only and does not
-relax production update security checks.
+relax production update security checks. It covers the windows only: the
+production app's main process accepts no debugger (see
+[What a packaged app refuses to run](#what-a-packaged-app-refuses-to-run)).
 
 The native enhancements live on the web side in
 [`../src/lib/nativeBridge.ts`](../src/lib/nativeBridge.ts). It detects the
@@ -383,7 +387,7 @@ electron/
   src/browserViewRegistry.js  # per-conversation WebContentsView registry (browser pane)
   src/browserViewBounds.js    # CSS-px → window-DIP bounds conversion (browser pane)
   src/browserIpc.js           # omnigent:browser-* IPC handlers (extracted from main.js)
-  src/chromeCookieStore.js    # per-site Chrome cookie import for the browser pane
+  src/chromeCookieStore.js    # Chrome cookie import for the browser pane
   src/loopback-oauth.js       # RFC 8252 loopback listener shared by browser sign-ins
   src/oidc-credentials.js     # OIDC loopback sign-in, refresh, and revoke
   src/oidc-auth.js            # OIDC window session lifecycle (cookie, renewal, sign-out)
@@ -391,7 +395,7 @@ electron/
   about/index.html         # bundled About UI opened from the macOS app menu
   find/index.html          # the bundled find-in-page bar (Cmd/Ctrl+F)
   icons/                   # app icons
-  docs/managed-preferences.md # public MDM configuration contract
+  docs/managed-preferences.md # MDM configuration reference
 ```
 
 Native niceties beyond notifications/badge: a right-click context menu
@@ -497,9 +501,11 @@ sequenceDiagram
 ### Browser previews on this machine
 
 Sessions running on this desktop machine can open HTTP(S) `localhost`,
-`127.0.0.1`, and `[::1]` through the address bar, opted-in chat/file links,
-and the agent's browser tools. Start the app locally, open **+** > **Browser**,
-and enter its URL. `localhost` always names the desktop machine.
+`127.0.0.1`, `[::1]`, and `*.localhost` subdomains such as
+`spog.dev.localhost` through the address bar, opted-in chat/file links, and
+the agent's browser tools. Start the app locally, open **+** > **Browser**,
+and enter its URL. `localhost` and its subdomains always name the desktop
+machine; the page still receives the subdomain in its `Host` header.
 
 Main verifies this machine's current host identity and a live host daemon
 record enrolled with the window's server. That enrollment is the trust boundary:
@@ -508,31 +514,68 @@ request. Both an updated desktop and web bundle are required; older web bundles
 remain public-only without destroying existing public views.
 
 Eligibility is granted at navigation and re-checked at every navigation and agent
-read/action. A failed check revokes access before clearing the previous document;
-access stays revoked if clearing fails. Request and redirect checks use the
-in-memory grant and window trust gates, keeping disk reads off the request path.
+read/action. Local identity/enrollment results are cached per host/server pair for
+at most one second measured with a monotonic clock, so these checks can use
+enrollment information up to one second old. A failed check revokes access before
+clearing the previous document; access stays revoked if clearing fails. Request
+and redirect checks use the in-memory grant and window trust gates, keeping disk
+reads off the request path.
 
 Other remote and unknown sessions have public-only **document** access. Use a
 public preview URL or your regular browser.
 
 Eligibility is per view: a public page in an eligible view can frame loopback
-documents too. Private networks, link-local/metadata addresses, `*.localhost`,
-`0.0.0.0`, and DNS aliases resolving to loopback remain blocked. Normal TLS,
-CORS, authentication, and local-network permission rules still apply.
+documents too. A `*.localhost` request is sent only on a direct route and must
+connect to a loopback address. Chromium already sends these names around
+ordinary system and PAC proxies; a proxy rule that removes that bypass
+(`<-loopback>`) leaves the page blank. Private networks,
+link-local/metadata addresses, `0.0.0.0`, trailing-dot or empty-label forms
+such as `app.localhost.`, and DNS aliases resolving to loopback remain blocked.
+Normal TLS, CORS, authentication, and local-network permission rules still
+apply.
 
 Hide/reopen the Workspace or switch tabs to retain a page without reloading.
 Closing the tab destroys it. User-created Browser tabs are separate from the
 session's agent browser view and are not targeted by the agent relay.
 
+### Previews from hosts reached over SSH
+
+A session on a remote host can open localhost previews after the desktop
+proves the host's SSH destination and the user grants access. Existing
+destinations from **Connect over SSH** or token-checked file access can be
+used directly. For a new destination, the web app supplies a route hint from
+the host list, and the consent dialog explains the read-only SSH check.
+Only after **Allow** does main run `omnigent host status --server ... --json`
+over SSH. It requires one online daemon with the session's exact host ID and
+selected server/workspace before recording the destination. It never starts
+a daemon or signs in (`src/sshPreviewIdentity.js`, `src/sshPreviewHosts.js`).
+
+When such a session first opens a localhost page (address bar, link, or
+agent), a shell-owned dialog names the destination and asks whether its
+sessions may access this computer's localhost ports, including forwarded ones.
+**Allow** opens the page after any required verification; **Not now** keeps
+that host's localhost pages blocked until Omnigent restarts. The answer lasts
+for this app run and only while the host's recorded destination is unchanged
+(`src/sshPreviewHosts.js`). Failed verification also stays blocked until restart.
+Agent screenshots, snapshots, clicks, and typing revalidate the session host;
+moving the session to a different host revokes the old page's privileged access.
+
+`localhost` still names this computer, so forward the app's port first, for
+example with `ssh -N -L 127.0.0.1:5173:127.0.0.1:5173 <destination>`.
+This grants access to all permitted loopback ports, not only the forwarded
+port; it does not establish forwarding or prove the local endpoint's owner.
+The loopback rules above still apply. This path is available on macOS and
+Linux. New web bundles check the optional `sshLocalhostPreview` capability;
+older shells keep their existing behavior.
+
 ### Agent previews on Arca
 
 The verified Arca exception also applies to the address bar and chat/file links.
-Companion or another external tool must forward the remote app's port to the
-desktop first.
+The remote app's port must be forwarded to the desktop first.
 
-On a Databricks-managed server with internal desktop features enabled, an
-Arca session's agent can open and inspect an app through Companion forwarding
-using the existing browser tools and tool approval or autoapproval policy.
+On a managed server with the managed features enabled, an Arca session's agent
+can open and inspect an app through a forwarded port using the existing browser
+tools and tool approval or autoapproval policy.
 Provide the actual forwarded URL to the agent; its local port may differ from
 the app's remote port. Omnigent does not establish or verify forwarding or
 prove that the local endpoint belongs to the Arca host.
@@ -543,7 +586,7 @@ source session on that host, or a subagent inheriting that host, is eligible.
 An older CLI or an unrecognized, failed, or missing identity leaves localhost
 navigation denied; the remembered host-picker label alone does not grant it.
 Eligibility is scoped to the selected server/workspace, not all sessions on
-a Databricks server.
+the server.
 
 After restarting the desktop, launch-time auto-connect restores this identity
 for users who opted into it. Otherwise, the first loopback preview request with
@@ -560,8 +603,9 @@ A decline briefly suppresses repeat prompts, while failed runs remain retryable.
 **Run on Arca** is hidden for an online remembered host only when the desktop
 advertises preview recovery; older shells keep the action visible.
 
-The exception covers HTTP(S) `localhost`, `127.0.0.1`, and `[::1]`, including
-redirects and links that would open a new window (which stay in the same pane).
+The exception covers HTTP(S) `localhost`, `127.0.0.1`, `[::1]`, and
+`*.localhost` subdomains, including redirects and links that would open a new
+window (which stay in the same pane).
 Other loopback addresses, private-network and metadata destinations, hostnames
 that resolve to any of them, and non-web schemes remain restricted. Existing
 tool approvals are unchanged; whether a tool call asks for approval depends on
@@ -605,6 +649,30 @@ permission. Approval does not bypass CORS, TLS certificate validation, or the
 browser navigation policy. A helper that rejects this origin through its own CORS
 policy must be configured to allow it; the pane does not rewrite those headers.
 
+### Security keys
+
+Electron draws no WebAuthn UI, so a sign-in page waiting on a security key
+would otherwise sit with nothing on screen. On macOS and Linux, a preload in
+each pane page reports its WebAuthn requests, and the same popover window then
+tells the user to insert and touch their security key. It also says built-in
+biometrics and saved passkeys are unavailable (see
+[Passkeys](#passkeys-webauthn)). **Open in browser** hands the current page to
+the default browser; on macOS the popover also points to the cookie button.
+The popover closes when the request finishes or fails, or when the page navigates.
+It waits until the pane is visible and returns if the pane is hidden or covered
+while the request still waits. Clicking elsewhere leaves it open. Once the user
+closes it or presses Escape, it stays closed until the page makes a new request.
+Only requests from the top-level page are observed; requests inside iframes
+do not open the notice. Conditional (autofill) requests do not open it.
+Options with accessor-backed `publicKey` or `mediation` properties also bypass
+observation so the preload does not evaluate page getters a second time. Those
+requests still run through Chromium, but they do not open the notice.
+For observed requests, tracking completion marks rejected promises as handled,
+so the page does not receive an `unhandledrejection` event for them. Callers
+still receive the original rejected promise.
+Windows already shows its own WebAuthn dialog, so the shell skips this notice
+there.
+
 ### Browser implementation
 
 The browser runs on the user's machine (a native `WebContentsView`); the agent —
@@ -616,18 +684,20 @@ including the address bar, chat links, and agent actions, enforces this policy.
 **Pieces:**
 
 - `src/browserViewRegistry.js` — a per-**conversation** `Map` of
-  `WebContentsView`s (cap 10). `setActive` attaches one view to the host window
+  `WebContentsView`s (cap 20). `setActive` attaches one view to the host window
   and **detaches (does not destroy)** the previous one, so a background
   conversation's page keeps running when the user switches away; views are
   destroyed only on explicit close or window teardown. Each child view keeps
   `nodeIntegration:false, contextIsolation:true, sandbox:true`.
   Page-initiated `window.open` / `target=_blank` never spawns a window: an
   http(s) target navigates the same view in place (still allowlist-checked on
-  a policy-enforced view), and right-click offers "Open Link in Browser" /
+  a policy-enforced view). A Cmd/Ctrl- or middle-clicked link instead opens a
+  new background Browser tab in the same session when the loaded UI declares
+  support (`browser-open-tab`). Right-click offers "Open Link in Browser" /
   "Copy Link Address".
 - `src/browserUrlPolicy.js` — the browser navigation policy: http(s) only, and
   no private, link-local, metadata, or other non-public address in
-  any literal form, except exact loopback hosts for eligible views. A
+  any literal form, except loopback names for eligible views. A
   hostname is resolved through the view's Chromium session and refused if it
   does not resolve or any address is non-public. `main.js` also applies the
   policy to every HTTP(S) and WebSocket request of a policy-enforced view through
@@ -638,8 +708,13 @@ including the address bar, chat links, and agent actions, enforces this policy.
   tab makes sibling service-worker requests public-only until it navigates
   with an eligible context. Every guarded request to a named host resolves DNS
   through its partition before sending, including GET/HEAD subresources and
-  WebSockets. IP literals use the URL check without DNS. Exact loopback hosts
-  remain available to eligible Arca and this-machine sessions. Enforcement cancels requests and
+  WebSockets. IP literals use the URL check without DNS. Loopback names
+  (`localhost`, `127.0.0.1`, `[::1]`, and `*.localhost`) remain available to
+  eligible Arca and this-machine sessions without DNS. A `*.localhost` request
+  is cancelled before sending unless the partition's proxy lookup returns
+  `DIRECT` alone, and its response must come from a loopback address on a
+  route that is still direct, since a local proxy also answers from loopback.
+  Enforcement cancels requests and
   keeps the view open.
   Guarded HTTP requests skip cache reads to obtain connected-address metadata;
   a response whose address is missing
@@ -648,7 +723,11 @@ including the address bar, chat links, and agent actions, enforces this policy.
   network round trips and may increase latency and bandwidth. WebSocket upgrades
   can omit the connected IP; those repeat the partition DNS check at the 101
   response. This is not connected-IP verification and cannot rule out a DNS
-  change between check and connection. Limits: a DNS
+  change between check and connection. An IP-less `*.localhost` upgrade
+  repeats the direct-route check instead, because Chromium pins those names to
+  loopback and only a proxy could route them elsewhere. The route lookup uses
+  the WebSocket's own `ws:`/`wss:` URL, because Chromium can pick a different
+  proxy for it (an `https=` rule) than for plain HTTP. Limits: a DNS
   change between preflight and connection can still send a request to a private
   address; the HTTP response check prevents the page from reading its response.
   Pages restored from the back-forward cache and navigations answered by a service worker make no
@@ -681,8 +760,9 @@ including the address bar, chat links, and agent actions, enforces this policy.
   listeners that push `browser-url-changed` + `browser-nav-state` to the renderer
   so the toolbar's URL bar live-tracks the real URL (redirects, in-page link
   clicks, agent navigation) instead of going stale.
-- `src/chromeCookieStore.js` — reads the current site's cookies out of a local
-  Chrome profile for the toolbar's **Import cookies from Chrome** action (below).
+- `src/chromeCookieStore.js` — reads cookies out of a local Chrome profile, for
+  every website or the current site, for the toolbar's **Import cookies from
+  Chrome** action (below).
   Electron-free, so it is unit-tested with a stub session and a synthetic
   `Cookies` DB.
 - `src/preload.js` — adds `browserOpenOrNavigate/SetActive/Resize/Screenshot/`
@@ -751,19 +831,30 @@ the native view); no server flag.
 All renderer IPC navigation uses the same URL policy, including the URL bar.
 A renderer's `agent: false` flag does not exempt a tab from address checks.
 Main-owned eligibility for sessions on this machine and verified Arca sessions
-applies to exact loopback hosts. Other internal sites must be opened in a
-separate browser; this also keeps later redirects in these tabs under the same
-policy.
+applies to loopback names, including `*.localhost`. Other internal sites must
+be opened in a separate browser; this also keeps later redirects in these tabs
+under the same policy.
 
 **Importing cookies from Chrome (macOS).** Sites that reject embedded browsers
 (Google sign-in is the common one) can't be signed in from this pane, so the
-toolbar's cookie button copies the **current site's** cookies out of a local
-Chrome profile into this conversation's in-memory session and reloads the page.
-Scope is deliberately narrow:
+toolbar's cookie button copies cookies out of a local Chrome profile into this
+conversation's in-memory session and reloads the page. The dialog's _Site scope_
+picks how much:
 
-- Only cookies inside the page's own domain tree: its host, its subdomains, and
-  the leading-dot parent domains that reach it (`.google.com` for
-  `mail.google.com`). Nothing else in the jar is read into the app.
+- **All websites** (the default) copies every unexpired, unpartitioned cookie in
+  the chosen profile, so sign-ins that span several sites work without picking
+  each one. Any profile holding cookies can be chosen. The scope is the literal
+  `"*"`, which is not a hostname, and has its own store functions
+  (`previewAllSitesCookies` / `importAllSitesCookies`), so a site import can
+  never be widened into it. It is not tied to the tab's current site: main
+  validates only the profile, against its own preview. The agent can then act
+  as the user on every site that profile is signed in to; both prompts say so.
+  The preview reports these profiles as `allSitesProfiles`, a field a pane or
+  shell that predates it ignores, leaving the site scopes below.
+- A site scope copies only cookies inside the page's own domain tree: its host,
+  its subdomains, and the leading-dot parent domains that reach it
+  (`.google.com` for `mail.google.com`). Nothing else in the jar is read into
+  the app.
 - When the host has parent domains the dialog offers them as _Site scope_, each
   labelled with its own count (`accounts.google.com (25)` vs `google.com (64)`, the
   wider scope being a superset because it covers every subdomain's cookies).
@@ -793,9 +884,9 @@ Scope is deliberately narrow:
 - The secret-copying step itself needs consent from the main process, not just
   the pane's dialog: the connected page holds the bridge and could call it
   directly, so `browser-chrome-cookie-import` runs a native
-  `dialog.showMessageBox` naming the scope, the tab's host (when an ancestor
-  scope was picked), the Chrome profile and the count (that count comes from
-  main's own preview, never from the renderer). Like the shell's other consent
+  `dialog.showMessageBox` naming the scope (or that it covers all websites), the
+  tab's host (when an ancestor scope was picked), the Chrome profile and the
+  count (that count comes from main's own preview, never from the renderer). Like the shell's other consent
   dialogs it is parented to the sender's window, so it can't be approved while
   the tab it describes is hidden behind another app, and Chrome's profile name —
   a plain file on disk — is flattened to one short line so it can't add its own
@@ -804,24 +895,32 @@ Scope is deliberately narrow:
 - Values are decrypted with `v10`/`v11` (AES-128-CBC, key from the login
   Keychain's "Chrome Safe Storage" item) and never shown, logged, or persisted.
   App-bound `v20` values and non-macOS platforms are refused with a message, not
-  guessed at. The Keychain prompt is attributed to `security`; choose **Allow**
-  rather than **Always Allow**, because Always Allow adds `/usr/bin/security` to
-  the item's ACL, and any local process can then read Chrome's key without a
-  prompt. Partitioned (CHIPS) cookies are skipped rather than replayed
+  guessed at. Partitioned (CHIPS) cookies are skipped rather than replayed
   unpartitioned, which would widen the site they were scoped to.
+- The app reads that Keychain item in its own process, through the native
+  `@napi-rs/keyring` binding, so the macOS prompt names the app and **Always
+  Allow** is recorded against the app's signature. It never asks a helper such
+  as `/usr/bin/security` for the key, and does not fall back to one when the
+  binding can't load: a grant to a shared tool lets any local process run that
+  tool and read the key without a prompt. That grant is only as narrow as the
+  signed binary, so the packaged app restricts its main process to the app's
+  own sealed code (see [What a packaged app refuses to run](#what-a-packaged-app-refuses-to-run)).
+  Builds before this change did read the key through `security`; if
+  you chose Always Allow in one, remove `security` from the "Chrome Safe
+  Storage" item's Access Control list in Keychain Access.
 - Reading never touches Chrome's live database: `Cookies` (plus any
   `Cookies-wal` / `Cookies-journal`) is copied into a private temp directory and
   `sqlite3` only opens that copy, so Chrome's file is never locked or rewritten.
-  `sqlite3` and `security` are spawned by absolute path (`/usr/bin/...`, the
-  macOS system copies) instead of being resolved through `PATH`, so nothing on
-  the user's path can intercept Chrome's key or jar. Failures surface as a fixed
-  message, never the command line.
+  `sqlite3` is spawned by absolute path (`/usr/bin/sqlite3`, the macOS system
+  copy) instead of being resolved through `PATH`, so nothing on the user's path
+  can intercept Chrome's jar. Failures surface as a fixed message, never the
+  command line.
 - Cookies land in the conversation's existing in-memory partition, so they
   disappear when the app quits; nothing is written back to Chrome, and there is
   no background sync.
 - Cookies alone don't always reproduce a sign-in (localStorage, device checks,
   `HttpOnly` site state), and an agent-controlled tab means the agent can act as
-  you on that site while they're loaded — the dialog says so. For real SSO use
+  you on the imported sites while they're loaded — the dialog says so. For real SSO use
   system-browser sign-in above.
 
 **JS trust boundary:** `omnigent:browser-perform-action` accepts only snapshot,
@@ -877,6 +976,18 @@ server (see below), Connect, and you're in.
 > **not** run the Vite dev server. To develop the web UI itself with hot
 > reload, run `pnpm run dev` (plain Vite in a browser) from `web/` as usual.
 
+### Close shortcut
+
+Cmd/Ctrl+W closes what has focus: the focused workspace tab (a file confirms
+unsaved edits first), or the open session, which returns to the new-session
+page. On the new-session page it asks in an in-app dialog before closing the
+window. The page reports which menu commands it can act on (see
+`src/desktopCommands.js`); until it does, or while it is unresponsive, Cmd/Ctrl+W
+closes the window directly. Cmd/Ctrl+Shift+W always closes the window.
+
+Verify on each supported desktop OS with focus inside an embedded browser:
+Cmd/Ctrl+W must close only its tab, and Cmd/Ctrl+Shift+W must close the window.
+
 ### Test desktop updates
 
 To override the current version used by development update checks, launch the
@@ -913,12 +1024,41 @@ install production desktop updates. `build:mac:release` retains
 cross-platform publishing and update-feed checklist, see [the desktop release
 runbook](RELEASING.md).
 
-macOS apps, including unpackaged development, default to V2 onboarding only when the MDM preference
-`databricksInternalFeaturesEnabled` is `true`, for both new and existing profiles.
-Public macOS users and Windows/Linux keep the legacy
-default. The setup-page switch still persists an explicit choice on every
-platform, and `OMNIGENT_SERVER_SELECTOR_V2=1` forces V2 regardless of the saved
-choice. A saved server still reconnects on launch.
+### What a packaged app refuses to run
+
+macOS records a Keychain **Always Allow** against the app's signature, not
+against the code that asked. A packaged app therefore turns off, through
+Electron fuses (`build.electronFuses` in `package.json`), the ways to run other
+JavaScript in the signed binary:
+
+| Fuse                                          | Effect in a packaged app                                                                                       |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `runAsNode: false`                            | `ELECTRON_RUN_AS_NODE` is ignored, so the binary can't be used as a plain Node.js to run someone's script.     |
+| `enableNodeCliInspectArguments: false`        | `--inspect` and `SIGUSR1` don't open a debugger on the main process.                                           |
+| `enableNodeOptionsEnvironmentVariable: false` | `NODE_OPTIONS` and `NODE_EXTRA_CA_CERTS` are ignored.                                                          |
+| `enableEmbeddedAsarIntegrityValidation: true` | On macOS and Windows the app checks `app.asar` against the hash sealed at build time, and exits if it differs. |
+| `onlyLoadAppFromAsar: true`                   | The app loads its code from `app.asar` only, never from an `app/` folder placed beside it.                     |
+
+Two consequences to know about:
+
+- `NODE_EXTRA_CA_CERTS` no longer adds a certificate authority to the main
+  process's own requests (sign-in, server checks). Pages in the app's windows
+  never used that variable.
+- Local **Omnigent Dev** packages (`pnpm run build`, `build:mac`, `build:linux`,
+  `build:win`) keep `--inspect`, which Playwright needs to drive a packaged
+  binary. They are a different app (`ai.omnigent.desktop-dev`), so a grant made
+  to the release app never covers them. A grant made to Omnigent Dev itself is
+  open to anyone who can attach that debugger, so choose **Allow**, not
+  **Always Allow**, in Omnigent Dev. Every other fuse is the same.
+
+Unpackaged development (`pnpm start`) runs the stock Electron binary and is not
+affected.
+
+macOS apps, including unpackaged development, default to V2 onboarding for both
+new and existing profiles. Windows/Linux keep the legacy default. The setup-page
+switch still persists an explicit choice on every platform, and
+`OMNIGENT_SERVER_SELECTOR_V2=1` forces V2 regardless of the saved choice. A
+saved server still reconnects on launch.
 
 Unpackaged `pnpm start` / `just electron-dev` runs inside Electron's own macOS
 bundle, but reads local preferences from `ai.omnigent.desktop-dev` explicitly
@@ -1107,10 +1247,10 @@ reconnect this machine explicitly from the host menu when you want it.
 ## Passkeys (WebAuthn)
 
 External security keys (e.g. a YubiKey) work out of the box: Chromium's
-content layer speaks CTAP to the key directly. That's also why the flow is
-_invisible_ — the passkey sheet you see in Chrome/Safari is browser chrome,
-which Electron doesn't ship. Touching the key completes the ceremony with no
-UI.
+content layer speaks CTAP to the key directly. Electron doesn't ship the passkey
+sheet you see in Chrome/Safari, so touching the key completes the ceremony with
+no Chromium UI. The embedded browser pane shows its own
+[security-key notice](#security-keys) while the request waits.
 
 The shell intentionally does **not** enable Electron's Touch ID platform
 authenticator (`app.configureWebAuthn`). Doing so routes the entire WebAuthn

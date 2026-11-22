@@ -1,11 +1,12 @@
 # Codex forwarding tests
 
-Existing scenarios from `test_codex_native_forwarder.py`, grouped by behavior. Test names,
-assertions and parameter cases are retained. Counts below are test definitions;
+Existing scenarios from `test_codex_native_forwarder.py`, grouped by behavior.
+Assertions and parameter cases are retained. Counts below are test definitions;
 parameterization produces additional collected cases.
 
 | Module | Behavior | Test definitions |
 | --- | --- | ---: |
+| [test_background_work.py](test_background_work.py) | Background work | 27 |
 | [test_compaction.py](test_compaction.py) | Compaction | 8 |
 | [test_delivery.py](test_delivery.py) | Delivery | 15 |
 | [test_delivery_limits.py](test_delivery_limits.py) | Upload limits and completion after oversized events | 3 |
@@ -14,11 +15,11 @@ parameterization produces additional collected cases.
 | [test_health.py](test_health.py) | Health | 4 |
 | [test_instructions.py](test_instructions.py) | Instructions | 20 |
 | [test_mcp_startup.py](test_mcp_startup.py) | Mcp startup | 14 |
-| [test_replay_order.py](test_replay_order.py) | Replay order | 4 |
+| [test_replay_order.py](test_replay_order.py) | Replay order | 14 |
 | [test_settings.py](test_settings.py) | Settings | 20 |
 | [test_side_chat.py](test_side_chat.py) | Side chat | 1 |
 | [test_subagents.py](test_subagents.py) | Subagents | 16 |
-| [test_turn_errors.py](test_turn_errors.py) | Turn errors | 21 |
+| [test_turn_errors.py](test_turn_errors.py) | Turn errors | 50 |
 | [test_usage.py](test_usage.py) | Usage | 2 |
 | [test_user_messages.py](test_user_messages.py) | User messages | 6 |
 

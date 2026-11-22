@@ -13,6 +13,8 @@ import os
 import time
 import uuid
 from collections.abc import Callable, Iterator
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -26,7 +28,10 @@ from tests.e2e_ui.conftest import (
     configure_mock_llm,
     set_fallback_mock_llm,
 )
-from tests.e2e_ui.scheduled.test_scheduled_tasks_page import _open_automations_page
+from tests.e2e_ui.scheduled.test_scheduled_tasks_page import (
+    _builtin_agent_id,
+    _open_automations_page,
+)
 
 _APPROVAL_CARD = '[data-testid="approval-card"][data-state="pending"]'
 _TASK_ROW = '[data-testid="scheduled-task-row"]'
@@ -34,6 +39,7 @@ _RRULE = "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"
 _PROMPT = "Summarize yesterday's activity.\n" * 80 + "END OF AUTOMATION INSTRUCTIONS"
 _CREATE_REPLY = "Created the daily automation."
 _UPDATE_REPLY = "Paused the automation."
+_BROWSER_TIMEZONE = "America/Los_Angeles"
 _TURN_TIMEOUT_MS = 90_000
 _RECORD_HOLD_MS = 2_500
 
@@ -50,17 +56,6 @@ executor:
   config:
     harness: openai-agents
 """
-
-
-def _schedulable_agent_id(base_url: str) -> str:
-    """Prefer Claude Code so task permission overrides are supported."""
-    agents = httpx.get(f"{base_url}/v1/agents", timeout=10.0).json()["data"]
-    by_name = {agent["name"]: agent["id"] for agent in agents}
-    for name in (CLAUDE_NATIVE_AGENT_NAME, "hello_world", "polly"):
-        if name in by_name:
-            return by_name[name]
-    assert agents, "no agents registered to schedule a task against"
-    return agents[0]["id"]
 
 
 def _tasks_named(base_url: str, name: str) -> list[dict]:
@@ -82,7 +77,7 @@ def _seed_task(base_url: str, name: str) -> str:
             "name": name,
             "prompt": _PROMPT,
             "rrule": _RRULE,
-            "agent_id": _schedulable_agent_id(base_url),
+            "agent_id": _builtin_agent_id(base_url, CLAUDE_NATIVE_AGENT_NAME),
             "timezone": "UTC",
         },
         timeout=10.0,
@@ -205,6 +200,7 @@ def scheduling_session(
 
 
 @pytest.mark.timeout(300)
+@pytest.mark.browser_context_args(timezone_id=_BROWSER_TIMEZONE)
 @pytest.mark.parametrize("approve", [True, False], ids=["accept", "reject"])
 def test_agent_scheduled_task_create_requires_approval(
     request: pytest.FixtureRequest,
@@ -212,7 +208,7 @@ def test_agent_scheduled_task_create_requires_approval(
     scheduling_session: tuple[str, str, str, str],
     approve: bool,
 ) -> None:
-    """The agent's create call parks on an approval card before the task exists."""
+    """Creation waits for approval; an accepted unzoned call uses the browser zone."""
     base_url, session_id, model, task_name = scheduling_session
     _script_tool_call(
         mock_llm_server_url,
@@ -223,30 +219,43 @@ def test_agent_scheduled_task_create_requires_approval(
             "prompt": _PROMPT,
             "permission_mode": None,
             "rrule": _RRULE,
-            "agent_id": _schedulable_agent_id(base_url),
-            "timezone": "UTC",
+            "agent_id": _builtin_agent_id(base_url, CLAUDE_NATIVE_AGENT_NAME),
+            **({"timezone": "UTC"} if not approve else {}),
         },
         _CREATE_REPLY,
     )
     page: Page = request.getfixturevalue("page")
-    page.goto(f"{base_url}/c/{session_id}")
+    if approve:
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "PUT"
+                and response.url.endswith("/v1/scheduled-tasks/default-timezone")
+            )
+        ) as reported_timezone:
+            page.goto(f"{base_url}/c/{session_id}")
+        assert reported_timezone.value.status == 200
+        assert (
+            page.evaluate("Intl.DateTimeFormat().resolvedOptions().timeZone") == _BROWSER_TIMEZONE
+        )
+    else:
+        page.goto(f"{base_url}/c/{session_id}")
 
     def no_task_yet() -> None:
         card = page.locator(_APPROVAL_CARD).first
         expect(card).to_contain_text("create scheduled task")
         expect(card).to_contain_text(task_name)
         expect(card).to_contain_text(f"rrule={_RRULE}")
-        expect(card).to_contain_text("timezone=UTC")
+        if not approve:
+            expect(card).to_contain_text("timezone=UTC")
         expect(card).to_contain_text(_PROMPT)
-        expect(card).to_contain_text(
-            "Effective task permission mode: agent default (no task override)"
-        )
+        expect(card).to_contain_text("Task permission setting: agent default (no task override)")
         assert not _tasks_named(base_url, task_name), "task was created before approval"
 
+    requested_time = "9:00 AM local time" if approve else "09:00 UTC"
     outcome = _drive_gated_turn(
         page,
         f"Create an automation named '{task_name}' that summarizes yesterday's "
-        "activity every day at 09:00 UTC.",
+        f"activity every day at {requested_time}.",
         _CREATE_REPLY,
         no_task_yet,
         approve=approve,
@@ -257,8 +266,17 @@ def test_agent_scheduled_task_create_requires_approval(
         f"{_CREATE_REPLY!r} arrived with pending_elicitations={pending}"
     )
     if approve:
-        _open_task_row(page, base_url, task_name)
-        assert _tasks_named(base_url, task_name)[0]["prompt"] == _PROMPT
+        row = _open_task_row(page, base_url, task_name)
+        expect(row.get_by_test_id("task-schedule-line")).to_contain_text("Every day at 9:00 AM")
+        task = _tasks_named(base_url, task_name)[0]
+        assert task["prompt"] == _PROMPT
+        next_run = datetime.fromisoformat(task["next_run_at"]).astimezone(
+            ZoneInfo(_BROWSER_TIMEZONE)
+        )
+        assert (task["timezone"], next_run.strftime("%H:%M")) == (_BROWSER_TIMEZONE, "09:00"), (
+            f"automation requested for 9:00 AM from a {_BROWSER_TIMEZONE} browser was stored in "
+            f"{task['timezone']!r}; its next run is {next_run:%Y-%m-%d %H:%M %Z}"
+        )
     else:
         assert not _tasks_named(base_url, task_name), "rejected create changed automations"
 
@@ -293,7 +311,7 @@ def test_agent_scheduled_task_update_requires_approval(
     def still_active() -> None:
         card = page.locator(_APPROVAL_CARD).first
         expect(card).to_contain_text(_PROMPT)
-        expect(card).to_contain_text("Effective task permission mode: auto")
+        expect(card).to_contain_text("Task permission setting: auto")
         tasks = _tasks_named(base_url, task_name)
         assert tasks, f"seeded task {task_name!r} disappeared"
         assert tasks[0]["state"] == "active", "task was paused before approval"

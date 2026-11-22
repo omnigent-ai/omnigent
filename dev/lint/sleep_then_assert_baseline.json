@@ -17,7 +17,6 @@
   "tests/e2e/test_host_codex_native_e2e.py": 1,
   "tests/e2e/test_native_subagent_terminal_status_e2e.py": 2,
   "tests/e2e/test_pi_interrupt_reap_budget_race_e2e.py": 1,
-  "tests/e2e_ui/agents/test_add_agent_focus_ring_clipping.py": 1,
   "tests/e2e_ui/agents/test_spawn_bounds_fanout_cap.py": 1,
   "tests/e2e_ui/base_path/test_base_path.py": 1,
   "tests/e2e_ui/browser/test_browser_priority_guidance.py": 1,
@@ -51,7 +50,7 @@
   "tests/host/test_mcp_tools.py": 1,
   "tests/runner/test_app_sessions_native_supervision.py": 2,
   "tests/runner/test_app_sessions_native_workflow_messages.py": 4,
-  "tests/runner/test_claude_pending_prompt_queue.py": 2,
+  "tests/runner/test_claude_pending_prompt_queue.py": 1,
   "tests/runner/test_mcp_manager.py": 2,
   "tests/runner/test_native_interrupt_runner.py": 3,
   "tests/runner/test_pending_approvals.py": 5,
@@ -82,6 +81,5 @@
   "tests/test_opencode_native_mcp_timeout.py": 1,
   "tests/test_opencode_native_provider.py": 1,
   "tests/test_process_logging.py": 1,
-  "tests/test_qwen_native_permissions.py": 1,
-  "tests/testing/test_process_reaper.py": 1
+  "tests/test_qwen_native_permissions.py": 1
 }

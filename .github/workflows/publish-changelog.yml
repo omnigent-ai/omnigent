@@ -47,6 +47,9 @@ concurrency:
   group: publish-changelog-${{ github.event.release.tag_name || inputs.tag }}
   cancel-in-progress: false
 
+env:
+  OMNIGENT_CI_PIPELINE: publish-changelog
+
 jobs:
   resolve:
     name: Resolve release tag
@@ -257,6 +260,7 @@ jobs:
         if: steps.creds.outputs.available == 'true'
         uses: ./omnigent/.github/actions/run-omnigent-agent
         with:
+          pipeline: publish-changelog
           workdir: omnigent
           agent: release-post-formatter
           prompt-file: /tmp/format_prompt.txt

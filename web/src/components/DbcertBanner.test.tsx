@@ -273,7 +273,7 @@ describe("DbcertBanner", () => {
     expect(screen.getByText(/The dbcert on ip-10-90-21-195 has expired/)).toBeTruthy();
   });
 
-  it("never asks hosts outside a Databricks deployment", async () => {
+  it("never asks hosts outside a managed server", async () => {
     vi.mocked(isDatabricksWorkspace).mockReturnValue(false);
     renderBanner();
     await settle();

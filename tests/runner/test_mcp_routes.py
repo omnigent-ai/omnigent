@@ -151,6 +151,9 @@ class Harness:
         async def _runtime_cwd(session_id: str) -> Path | None:
             return Path("/tmp/runtime-cwd")
 
+        async def _explicit_workspace(session_id: str) -> Path | None:
+            return Path("/tmp/session-workspace")
+
         mcp_routes.register_mcp_routes(
             self.app,
             _publish_event=lambda sid, payload: self.published.append((sid, payload)),
@@ -163,6 +166,7 @@ class Harness:
             _session_harness_name=lambda sid: "claude-sdk",
             _session_inboxes=self.inboxes,
             _session_runtime_cwd=_runtime_cwd,
+            _session_explicit_workspace=_explicit_workspace,
             _session_spec_cache=self.spec_cache,
             filesystem_registry=None,
             mcp_execution_registry=self.registry,
@@ -173,6 +177,7 @@ class Harness:
             server_client=httpx.AsyncClient(base_url="http://server"),
             spec_resolver=spec_resolver,  # type: ignore[arg-type]
             terminal_registry=None,
+            wake_on_async_result=None,
         )
 
     @asynccontextmanager
@@ -382,6 +387,7 @@ async def test_builtin_tool_dispatch_passes_session_context(
     assert seen["agent_spec"] is spec
     assert seen["local_tool_workdir"] == Path("/tmp/bundle")
     assert seen["runner_workspace"] == Path("/tmp/runtime-cwd")
+    assert seen["session_workspace"] == Path("/tmp/session-workspace")
     assert seen["conversation_id"] == seen["task_id"] == SESSION
     assert seen["agent_id"] == "ag_1"
     assert seen["effective_harness"] == "claude-sdk"

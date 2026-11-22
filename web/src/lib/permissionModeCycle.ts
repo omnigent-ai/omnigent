@@ -1,6 +1,18 @@
 // Shift+Tab steps through every option in the permission chip's menu order.
 
+import {
+  CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
+  claudePermissionModeLabel,
+  isClaudeNativeSession,
+} from "@/lib/claudePermissionMode";
+import {
+  CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
+  codexApprovalModeLabel,
+} from "@/lib/codexApprovalMode";
+import { isCodexNativeSession } from "@/lib/codexPlanMode";
+import { modelPickerKindForConv } from "@/lib/composerCapabilities";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 
 /** The key fields the cycle check reads from a React keyboard event. */
 export interface PermissionModeCycleKeyEvent {
@@ -41,4 +53,71 @@ export function nextCycledPermissionMode(
     return candidate;
   }
   return null;
+}
+
+/** A Shift+Tab press that didn't land: the mode it started from and the one it tried. */
+export interface PermissionModeCycleMiss {
+  sessionId: string | null;
+  from: string;
+  past: string;
+}
+
+/**
+ * The mode a Shift+Tab press moves to from *selected*. After a press that missed,
+ * the next one continues past the mode it tried instead of retrying it.
+ */
+export function nextPermissionModePress(
+  options: readonly { value: string }[],
+  selected: string,
+  sessionId: string | null,
+  miss: PermissionModeCycleMiss | null,
+): string | null {
+  const resume = miss?.sessionId === sessionId && miss.from === selected ? miss.past : null;
+  const resumed =
+    resume === null ? null : nextCycledPermissionMode(options, resume, new Set([selected]));
+  // With nothing else to move to, retry the failed mode.
+  return resumed ?? nextCycledPermissionMode(options, selected);
+}
+
+/** Which vocabulary a session's permission chip uses. */
+export type PermissionChipKind = "claude" | "devin" | "codex";
+
+/**
+ * The vocabulary of a session's permission chip, or null when its harness has
+ * none. Same precedence as the main composer: Devin, then Claude, then Codex.
+ */
+export function permissionChipKind(
+  session: Parameters<typeof modelPickerKindForConv>[0],
+): PermissionChipKind | null {
+  if (modelPickerKindForConv(session) === "devin") return "devin";
+  if (isClaudeNativeSession(session)) return "claude";
+  if (isCodexNativeSession(session)) return "codex";
+  return null;
+}
+
+/** The chip's menu options, selected value and label for a session's current modes. */
+export function permissionChip(
+  kind: PermissionChipKind,
+  claudePermissionMode: string,
+  codexApprovalMode: string,
+): { options: readonly { value: string; label: string }[]; value: string; label: string } {
+  if (kind === "codex")
+    return {
+      options: CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
+      value: codexApprovalMode,
+      label: codexApprovalModeLabel(codexApprovalMode),
+    };
+  if (kind === "devin")
+    return {
+      options: DEVIN_NATIVE_PERMISSION_MODES,
+      value: claudePermissionMode,
+      label:
+        DEVIN_NATIVE_PERMISSION_MODES.find((mode) => mode.value === claudePermissionMode)?.label ??
+        claudePermissionMode,
+    };
+  return {
+    options: CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
+    value: claudePermissionMode,
+    label: claudePermissionModeLabel(claudePermissionMode),
+  };
 }

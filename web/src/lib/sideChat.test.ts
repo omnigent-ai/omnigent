@@ -18,15 +18,19 @@ describe("isSideChatCommand", () => {
 
 describe("supportsSideChat", () => {
   it("enables side chat for every harness (generic fork-and-continue)", () => {
-    expect(supportsSideChat("codex-native")).toBe(true);
-    expect(supportsSideChat("claude-native")).toBe(true);
-    expect(supportsSideChat("codex-sdk")).toBe(true);
+    expect(supportsSideChat("codex-native", true)).toBe(true);
+    expect(supportsSideChat("claude-native", true)).toBe(true);
+    expect(supportsSideChat("codex-sdk", true)).toBe(true);
   });
 
-  it("is off only when there is no harness", () => {
-    expect(supportsSideChat(null)).toBe(false);
-    expect(supportsSideChat(undefined)).toBe(false);
-    expect(supportsSideChat("")).toBe(false);
+  it("is off when there is no harness", () => {
+    expect(supportsSideChat(null, true)).toBe(false);
+    expect(supportsSideChat(undefined, true)).toBe(false);
+    expect(supportsSideChat("", true)).toBe(false);
+  });
+
+  it("is off for a viewer who can't start side chats", () => {
+    expect(supportsSideChat("claude-native", false)).toBe(false);
   });
 });
 

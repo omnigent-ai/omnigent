@@ -137,6 +137,30 @@ def test_resolved_alias_conflict_is_rejected(backend, tmp_path: Path) -> None:
         backend.resolve(spec, tmp_path)
 
 
+def test_host_grant_for_authored_cow_root_keeps_cow(backend, tmp_path: Path) -> None:
+    spec = OSEnvSpec(
+        sandbox=OSEnvSandboxSpec(
+            write_paths=[WritePathSpec(".", True), str(tmp_path)],
+            host_write_paths=[str(tmp_path)],
+        )
+    )
+    policy = backend.resolve(spec, tmp_path)
+    assert policy.write_roots == [tmp_path]
+    assert policy.copy_on_write_roots == [tmp_path]
+
+
+def test_host_grant_inside_cow_root_is_rejected(backend, tmp_path: Path) -> None:
+    (tmp_path / "deps").mkdir()
+    host_grant = str(tmp_path / "deps")
+    spec = OSEnvSpec(
+        sandbox=OSEnvSandboxSpec(
+            write_paths=[WritePathSpec(".", True), host_grant], host_write_paths=[host_grant]
+        )
+    )
+    with pytest.raises(ValueError, match="overlaps"):
+        backend.resolve(spec, tmp_path)
+
+
 def _policy(root: Path) -> SandboxPolicy:
     return SandboxPolicy(
         backend_type="linux_bwrap",
@@ -511,7 +535,11 @@ def test_agent_parser_rejects_unshared_harness(tmp_path, harness, legacy):
     (tmp_path / "config.yaml").write_text(yaml.safe_dump(config))
 
     def load():
-        return _parse_agent_def(config, allow_dynamic_tools=True) if legacy else parse(tmp_path)
+        return (
+            _parse_agent_def(config, expand_env=True, allow_dynamic_tools=True)
+            if legacy
+            else parse(tmp_path)
+        )
 
     if harness == "openai-agents":
         assert load().os_env is not None

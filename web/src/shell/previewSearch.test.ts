@@ -6,7 +6,7 @@
 // TreeWalker + Range, so ranges round-trip to their matched text.
 
 import { afterEach, describe, expect, it } from "vitest";
-import { findTextRanges } from "./previewSearch";
+import { findTextMatches, findTextRanges } from "./previewSearch";
 
 let container: HTMLElement | null = null;
 
@@ -23,6 +23,22 @@ afterEach(() => {
 });
 
 describe("findTextRanges", () => {
+  it("finds every match in a table-sized preview in time that grows linearly", () => {
+    // 40,000 one-character cells in rows of 200: a match per cell. Matches are
+    // timed before they become Ranges, whose cost in jsdom (not browsers)
+    // grows with every Range already alive.
+    const row = `<tr>${"<td>x</td>".repeat(200)}</tr>`;
+    const el = mount(`<table><tbody>${row.repeat(200)}</tbody></table>`);
+    const started = performance.now();
+    const matches = findTextMatches(el, "x");
+    const elapsed = performance.now() - started;
+    expect(matches).toHaveLength(40_000);
+    const last = matches[39_999];
+    expect(last.startNode.data.slice(last.startOffset, last.endOffset)).toBe("x");
+    // Scanning every segment per match took minutes here.
+    expect(elapsed).toBeLessThan(5_000);
+  });
+
   it("returns [] for an empty query", () => {
     expect(findTextRanges(mount("<p>hello world</p>"), "")).toEqual([]);
   });
