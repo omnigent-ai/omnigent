@@ -573,6 +573,79 @@ export function searchFilesViaWorkspaceApi(
   );
 }
 
+export interface RankedWorkspaceFile {
+  /** Path relative to the searched directory. */
+  entry: ListedEntry;
+  /** Higher is better; zero when a blank query lists files in path order. */
+  score: number;
+  /** UTF-16 indices of the path's matched characters, ascending, for highlighting. */
+  matchedIndices: number[];
+}
+
+export interface RankedWorkspaceFiles {
+  files: RankedWorkspaceFile[];
+  /** More files matched than were returned. */
+  hasMore: boolean;
+  /** Some files weren't searched, so a missing file may still exist. */
+  truncated: boolean;
+}
+
+export interface RankedFileSearchOptions {
+  /** Workspace-relative directory to search under, ``""`` for the root. */
+  path: string;
+  /** Maximum files, 1 to 10,000. */
+  limit: number;
+  /** Also rank files Git ignores. */
+  includeGitIgnored: boolean;
+}
+
+/**
+ * Rank workspace files against a fuzzy query through the workspace API, best
+ * first. A blank query lists files in path order, for a picker's first view.
+ *
+ * :returns: The files, or null when the caller should use another route: see
+ *     :func:`viaWorkspaceApi`, or the host doesn't rank paths ("search_files.fuzzy",
+ *     plus "search_files.browse" for a blank query), or its file list is being built.
+ */
+export function rankFilesViaWorkspaceApi(
+  sessionId: string,
+  query: string,
+  { path, limit, includeGitIgnored }: RankedFileSearchOptions,
+  signal?: AbortSignal,
+): Promise<RankedWorkspaceFiles | null> {
+  const blank = query.trim() === "";
+  return viaWorkspaceApi(
+    sessionId,
+    "searchFiles",
+    async (client) => {
+      const response = await client.searchFiles(
+        { query, mode: FileSearchMode.FUZZY, maximumResults: limit, path, includeGitIgnored },
+        { signal },
+      );
+      if (response.refreshing) return null;
+      return {
+        files: response.results.flatMap((result) =>
+          result.entry
+            ? [
+                {
+                  entry: listedEntry(result.entry),
+                  score: result.score,
+                  matchedIndices: result.matchedIndices,
+                },
+              ]
+            : [],
+        ),
+        hasMore: response.truncated,
+        truncated: response.indexIncomplete || response.untrackedUnavailable,
+      };
+    },
+    {
+      signal,
+      features: blank ? ["search_files.fuzzy", "search_files.browse"] : ["search_files.fuzzy"],
+    },
+  );
+}
+
 export interface TextSearchOptions {
   caseSensitive: boolean;
   /** Read the query as a ripgrep regular expression. */
