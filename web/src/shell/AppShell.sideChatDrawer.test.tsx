@@ -5,10 +5,12 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // must not surface over the conversation now on screen.
 
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
+import type * as UseIsMobileViewportModule from "@/hooks/useIsMobileViewport";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
@@ -28,7 +30,8 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
 }));
-vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseWorkspaceChangedFilesModule>()),
   useWorkspaceEnvironment: vi.fn(() => ({
     data: { available: true, root: null },
     isLoading: false,
@@ -59,7 +62,8 @@ vi.mock("@/hooks/useAgents", () => ({
   useUpdateMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
   useDeleteMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
 }));
-vi.mock("@/hooks/useIsMobileViewport", () => ({
+vi.mock("@/hooks/useIsMobileViewport", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseIsMobileViewportModule>()),
   useIsMobileViewport: () => true,
 }));
 // The pane itself is covered by its own suite; the stub just names its child.
@@ -73,6 +77,7 @@ vi.mock("./Sidebar", () => ({
   isMobileViewport: vi.fn(() => false),
 }));
 vi.mock("./PullRequestPanel", () => ({
+  selectPullRequestInPanel: vi.fn(),
   PullRequestPanel: () => <div data-testid="github-panel">Pull request details</div>,
 }));
 vi.mock("./FilesPanel", () => ({

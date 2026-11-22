@@ -31,7 +31,9 @@ const HOST_OWNER_ARCA_DESCRIPTION =
 const HOST_VIEWER_DESCRIPTION =
   "This session's host machine is offline and only its owner can reconnect it.";
 
-const RUN_DESCRIPTION =
+/** What a session that isn't host-bound and whose runner stopped says, here and in its shell tabs. */
+export const LOCAL_RECONNECT_TITLE = "Agent disconnected";
+export const LOCAL_RECONNECT_DESCRIPTION =
   "Run the command below from the machine where you started this session to reconnect.";
 
 /**
@@ -212,7 +214,7 @@ export function ReconnectSessionDialog({
   const command = buildReconnectCommand({ conversationId, serverUrl, wrapper, harness, state });
   // Titles mirror the unreachable banner's wording ("Host is offline —
   // click to reconnect" / "Agent disconnected — click to reconnect").
-  const title = isHostReconnect ? "Host is offline" : "Agent disconnected";
+  const title = isHostReconnect ? "Host is offline" : LOCAL_RECONNECT_TITLE;
   const description = isHostReconnect
     ? isOwner
       ? canReconnectArca
@@ -221,7 +223,7 @@ export function ReconnectSessionDialog({
           ? HOST_OWNER_THIS_MACHINE_DESCRIPTION
           : HOST_OWNER_DESCRIPTION
       : `${HOST_VIEWER_DESCRIPTION} ${forkRestriction ?? "Clone the session to continue in a copy you own."}`
-    : RUN_DESCRIPTION;
+    : LOCAL_RECONNECT_DESCRIPTION;
   return (
     <>
       <Dialog open={open} onOpenChange={onOpenChange}>

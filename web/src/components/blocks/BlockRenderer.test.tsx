@@ -7,10 +7,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { RenderItem } from "@/lib/renderItems";
+import type { RenderItem, ToolState } from "@/lib/renderItems";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
@@ -358,7 +360,7 @@ describe("BlockRenderer dispatch", () => {
 
   it("hides a live turn's reasoning duration after assistant text arrives", () => {
     const items: RenderItem[] = [
-      { kind: "reasoning", itemId: "live-reasoning", text: "still working", duration: 5 },
+      { kind: "reasoning", itemId: "live-reasoning", text: "", duration: 5 },
       { kind: "text", itemId: "live-text", text: "Partial answer", final: false },
     ];
 
@@ -383,7 +385,7 @@ describe("BlockRenderer dispatch", () => {
       </>,
     );
 
-    expect(screen.getByText("Thought for a few seconds")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Thinking: finished" })).toBeInTheDocument();
     expect(screen.getAllByText("Thinking...")).toHaveLength(1);
   });
 
@@ -727,7 +729,12 @@ describe("BlockRenderer dispatch", () => {
 
     it("keeps the answer and follow-up in order around separate work runs", () => {
       const items: RenderItem[] = [
-        { kind: "reasoning", itemId: "r0", text: "Considering the request.", duration: 4 },
+        {
+          kind: "reasoning",
+          itemId: "r0",
+          text: "Considering the request.\n\nChecking the inputs.",
+          duration: 4,
+        },
         tool(1, "Bash"),
         { kind: "text", itemId: "m0", text: "Here is the substantive answer.", final: true },
         tool(2, "Agent"),
@@ -750,13 +757,13 @@ describe("BlockRenderer dispatch", () => {
       expect(
         folds[1]!.compareDocumentPosition(followUp) & Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
-      expect(screen.queryByText("Considering the request.")).toBeNull();
+      expect(screen.queryByText("Checking the inputs.")).toBeNull();
       fireEvent.click(folds[0]!);
       expect(folds[0]).toHaveAttribute("aria-expanded", "true");
       expect(folds[1]).toHaveAttribute("aria-expanded", "false");
       expect(screen.getByText("Ran 1 shell command")).toBeDefined();
-      fireEvent.click(screen.getByText(/Thought for/));
-      expect(screen.getByText("Considering the request.")).toBeDefined();
+      fireEvent.click(screen.getByRole("button", { name: "Thinking: Considering the request." }));
+      expect(screen.getByText("Checking the inputs.")).toBeDefined();
       fireEvent.click(folds[1]!);
       expect(folds[0]).toHaveAttribute("aria-expanded", "true");
       expect(folds[1]).toHaveAttribute("aria-expanded", "true");
@@ -1363,6 +1370,113 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("Relayed.")).toBeDefined();
     });
 
+    const messageToWorker = (output: string | null, state: ToolState): RenderItem => ({
+      kind: "tool",
+      itemId: "fc_message",
+      execution: {
+        name: "mcp__omnigent__sys_session_message",
+        arguments: { session_id: "s_worker", message: "Reproduce the bug.\n\nList the carts." },
+        argsSummary: "",
+        callId: "c_message",
+        agentName: "nessie",
+        executedBy: "server",
+        output,
+      },
+      output,
+      state,
+      startedAt: null,
+      duration: undefined,
+    });
+
+    function renderWithWorker(items: RenderItem[], sessionStatus: "idle" | "running" = "idle") {
+      const client = new QueryClient();
+      client.setQueryData(["session", "s_worker"], {
+        title: "Repro worker",
+        parentSessionId: null,
+      });
+      render(
+        <QueryClientProvider client={client}>
+          <MemoryRouter>
+            <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+              <BlockRenderer items={items} sessionStatus={sessionStatus} />
+            </FileViewerContext.Provider>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    }
+
+    it("shows an accepted message to another session once, as a To… row outside the fold", () => {
+      renderWithWorker([
+        { kind: "text", itemId: "m0", text: "Briefing the worker.", final: true },
+        messageToWorker('{"queued": true, "item_id": "i_1"}', "output-available"),
+        tool(1),
+        { kind: "text", itemId: "m1", text: "Briefed.", final: true },
+      ]);
+      expect(screen.getByTestId("outbound-session-message")).toHaveAttribute("data-status", "sent");
+      expect(screen.getByTestId("message-destination").textContent).toBe("To@Repro worker");
+      expect(screen.getByRole("link", { name: "@Repro worker" })).toHaveAttribute(
+        "href",
+        "/c/s_worker",
+      );
+      expect(screen.getByTestId("expand-sent-message").textContent).toBe("Reproduce the bug.");
+      expect(screen.queryByText("List the carts.")).toBeNull();
+
+      // The fold holds only the other tool: the message is not also a tool row in there.
+      fireEvent.click(screen.getByRole("button", { name: "Worked" }));
+      expect(screen.getByText("Called 1 tool")).toBeDefined();
+      expect(screen.queryByText(/Session message/)).toBeNull();
+      expect(screen.getAllByTestId("outbound-session-message")).toHaveLength(1);
+
+      fireEvent.click(screen.getByTestId("expand-sent-message"));
+      expect(screen.getByText("List the carts.")).toBeDefined();
+      fireEvent.click(screen.getByTestId("collapse-sent-message"));
+      expect(screen.queryByText("List the carts.")).toBeNull();
+    });
+
+    it.each([
+      {
+        status: "sending",
+        output: null,
+        state: "input-available",
+        label: "Sending to@Repro worker",
+        note: "",
+        detail: null,
+      },
+      {
+        status: "not_sent",
+        output: '{"error": "Session message refused", "delivery": "refused"}',
+        state: "output-available",
+        label: "Not sent to@Repro worker",
+        note: "· Session message refused",
+        detail: "Session message refused",
+      },
+      {
+        status: "unconfirmed",
+        output: '{"error": "Delivery could not be confirmed", "delivery": "unconfirmed"}',
+        state: "output-available",
+        label: "Could not confirm send to@Repro worker",
+        note: "· don't resend automatically",
+        detail: "Delivery could not be confirmed",
+      },
+    ] as const)(
+      "labels a $status send without a message surface, expandable to its text",
+      ({ status, output, state, label, note, detail }) => {
+        renderWithWorker([messageToWorker(output, state)], "running");
+        const row = screen.getByTestId("outbound-session-message");
+        expect(row).toHaveAttribute("data-status", status);
+        expect(row).not.toHaveClass("ring-1");
+        expect(screen.getByTestId("message-destination").textContent).toBe(label);
+        const toggle = screen.getByTestId("toggle-unsent-message");
+        expect(toggle.textContent).toBe(note);
+        expect(screen.queryByText("List the carts.")).toBeNull();
+
+        fireEvent.click(toggle);
+        expect(toggle).toHaveAttribute("aria-expanded", "true");
+        expect(screen.getByText("List the carts.")).toBeDefined();
+        if (detail !== null) expect(screen.getByText(detail, { selector: "p" })).toBeDefined();
+      },
+    );
+
     const slashReceipt = (name = "dev-productivity:simplify"): RenderItem => ({
       kind: "slash_command",
       itemId: "sc_turn",
@@ -1552,6 +1666,50 @@ describe("BlockRenderer dispatch", () => {
       fireEvent.click(screen.getByText("Worked for 42s"));
       expect(screen.getByText("Dispatching two sub-agents.")).toBeDefined();
       expect(screen.getByText("Called 2 tools")).toBeDefined();
+    });
+
+    describe("task markers", () => {
+      const marker = (entryId: string, status: string, name: string): RenderItem => ({
+        kind: "subagent_activity",
+        itemId: `item_${entryId}`,
+        data: {
+          type: "resource_event",
+          event_type: "session.journal.task",
+          resource_type: "journal",
+          resource_id: "hello",
+          resource: { name, status, text: null, entry_id: entryId, native: false },
+        },
+      });
+
+      it("keeps a settled turn's task markers in view instead of folding its work", () => {
+        render(
+          <MemoryRouter>
+            <CapabilitiesProvider
+              info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
+            >
+              <BlockRenderer
+                items={[
+                  tool(1, "Agent"),
+                  marker("e1", "started", "Say hello"),
+                  tool(2, "Agent"),
+                  marker("e2", "done", "Say hello"),
+                  { kind: "text", itemId: "m1", text: "Said hello.", final: true },
+                ]}
+                sessionStatus="idle"
+                workedForS={9}
+              />
+            </CapabilitiesProvider>
+          </MemoryRouter>,
+        );
+        expect(screen.queryByRole("button", { name: "Worked for 9s" })).toBeNull();
+        expect(screen.getAllByTestId("task-activity").map((node) => node.textContent)).toEqual([
+          "Started Say hello",
+          "Completed Say hello",
+        ]);
+        // The tool calls on either side of a marker stay in their own group.
+        expect(screen.getAllByText("Called 1 tool")).toHaveLength(2);
+        expect(screen.getByText("Said hello.")).toBeDefined();
+      });
     });
 
     describe("sub-agent notices", () => {
@@ -1989,7 +2147,12 @@ describe("BlockRenderer dispatch", () => {
         { kind: "text", itemId: "m0", text: "Checking the CLI.", final: true },
         tool(1, "Bash"),
         { kind: "text", itemId: "m1", text: "Server started on 8838.", final: true },
-        { kind: "reasoning", itemId: null, text: "Finishing checks.", duration: undefined },
+        {
+          kind: "reasoning",
+          itemId: null,
+          text: "Finishing checks.\n\nAll green.",
+          duration: undefined,
+        },
       ];
       render(
         <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
@@ -2000,10 +2163,10 @@ describe("BlockRenderer dispatch", () => {
       // Both messages stay visible while the tool and trailing reasoning fold.
       expect(screen.getByText("Server started on 8838.")).toBeDefined();
       expect(screen.getByText("Checking the CLI.")).toBeDefined();
-      expect(screen.queryByText("Finishing checks.")).toBeNull();
+      expect(screen.queryByText("All green.")).toBeNull();
       fireEvent.click(screen.getByRole("button", { name: "Worked" }));
-      fireEvent.click(screen.getByText(/Thought/));
-      expect(screen.getByText("Finishing checks.")).toBeDefined();
+      fireEvent.click(screen.getByRole("button", { name: "Thinking: Finishing checks." }));
+      expect(screen.getByText("All green.")).toBeDefined();
     });
 
     it("never folds a bubble made only of streaming artifacts", () => {
@@ -2810,5 +2973,70 @@ describe("BlockRenderer inline file-path linkification", () => {
     const url = fetchMock.mock.calls[0][0] as string;
     expect(url).toContain("/filesystem/etc?");
     expect(url).toContain("base=host");
+  });
+});
+
+describe("BlockRenderer pull request references", () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<Response>(() => {})),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("links references in assistant text but not in tool output", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(["github-info", "conv_1"], {
+      object: "session.github.info",
+      available: true,
+      repo: { name_with_owner: "acme/app", host: "github.com" },
+      workspace_repo: { name_with_owner: "acme/app", host: "github.com" },
+    });
+    // A description field renders as Markdown prose, the same renderer as assistant text.
+    const output = JSON.stringify({
+      description: "Merged in #5551234 after **review**.\n\nThen deployed.",
+    });
+    const items: RenderItem[] = [
+      { kind: "text", itemId: "t1", text: "Landed in #4242.", final: true },
+      {
+        kind: "tool",
+        itemId: "fc_1",
+        execution: {
+          name: "read_file",
+          arguments: {},
+          argsSummary: "",
+          callId: "call_1",
+          agentName: "test",
+          executedBy: "server",
+          output,
+        },
+        output,
+        state: "output-available",
+        startedAt: null,
+        duration: undefined,
+      },
+    ];
+    render(
+      <TestProviders
+        queryClient={qc}
+        fileViewerContext={{ ...FILE_VIEWER_NOOP, conversationId: "conv_1" }}
+      >
+        <BlockRenderer items={items} sessionStatus="running" />
+      </TestProviders>,
+    );
+
+    expect(await screen.findByRole("link", { name: /#4242/ })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/pull/4242",
+    );
+    fireEvent.click(screen.getByText("Read file"));
+    const prose = await screen.findByTestId("tool-prose-value");
+    expect(await within(prose).findByText("review")).toBeVisible();
+    expect(prose).toHaveTextContent("Merged in #5551234");
+    expect(within(prose).queryByRole("link")).not.toBeInTheDocument();
   });
 });

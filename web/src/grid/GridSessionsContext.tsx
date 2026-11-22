@@ -10,8 +10,6 @@ import {
 import { toast } from "sonner";
 import { useIdentityReady, useViewerId } from "@/hooks/useViewerId";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
-import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -56,9 +54,7 @@ export function GridSessionsProvider({ children }: { children: ReactNode }) {
 }
 
 function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
-  const mobileViewport = useIsMobileViewport();
-  const coarsePointer = useIsCoarsePointer();
-  const desktop = !mobileViewport && !coarsePointer && !isIOSShell() && !isAndroidShell();
+  const desktop = !useIsMobileViewport();
   const viewerId = useViewerId();
   const identityReady = useIdentityReady();
   const { conversationId: routeConversationId, gridId } = useParams<{
@@ -178,6 +174,15 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
   return <GridSessionsContext.Provider value={value}>{children}</GridSessionsContext.Provider>;
 }
 
-export function gridTitle(grid: SessionGrid): string {
-  return `${grid.name || "Grid"} · ${gridSessionIds(grid.layout).length} sessions`;
+/** The grid's name, or its sessions' titles in pane order. */
+export function gridTitle(
+  grid: SessionGrid,
+  sessionTitles: ReadonlyMap<string, string | null | undefined>,
+): string {
+  return (
+    grid.name ||
+    gridSessionIds(grid.layout)
+      .map((id) => sessionTitles.get(id) || "Session")
+      .join(" + ")
+  );
 }

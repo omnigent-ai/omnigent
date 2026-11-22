@@ -140,7 +140,14 @@ earlier boot keeps its database row, so sessions bound to it keep working and
 their history is untouched; only the new-session picker omits it. The native
 CLI harness rows are always seeded, even when trimmed, because transcript
 imports bind to them. Adding a name back to the allowlist brings it straight
-back on the next restart.
+back on the next restart. A built-in an older release seeded under a name this
+release no longer packages (for example `devin`) is trimmed the same way.
+If its stored bundle cannot be read, the row stays visible because startup
+cannot rule out operator ownership.
+
+Settings → Harnesses follows the allowlist too: it leaves out a native harness
+whose agent is trimmed, unless an agent users can still pick runs on it, and
+drops Harnesses from Settings when no harness is left.
 
 Trimming is not access control: a hidden agent can still be read and launched
 by its id through the API.
@@ -320,7 +327,9 @@ If your trusted enterprise directory omits `email_verified`, the existing
 these compatibility options never enable it automatically. Likewise, if CLI or
 device sign-in fails with "IdP did not confirm re-authentication" because the
 IdP omits `auth_time` (for example, Cloudflare Access), opt out with
-`OMNIGENT_OIDC_REQUIRE_REAUTH=0`; see `.env.example` for the trade-off.
+`OMNIGENT_OIDC_REQUIRE_REAUTH=0`; see `.env.example` for the trade-off. If the
+IdP fails the sign-in itself when asked to re-authenticate (for example,
+self-managed GitLab), also set `OMNIGENT_OIDC_REAUTH_PROMPT=0`.
 
 ### Forced re-authentication window
 
@@ -458,6 +467,7 @@ trusts whatever value reaches it.
 | `OMNIGENT_OIDC_*` | unset | OIDC config — required in oidc mode (issuer set, or `AUTH_PROVIDER=oidc`). See `.env.example`. |
 | `OMNIGENT_BUILTIN_AGENT_DIRS` | unset | Colon-separated paths (in-container) to extra always-available built-in agents, seeded once at startup. See [Extra built-in agents](#extra-built-in-agents). |
 | `OMNIGENT_SEEDED_AGENTS` | unset (keep all) | Comma-separated allowlist of packaged built-in agent names to keep. Empty value keeps none. Never filters `OMNIGENT_BUILTIN_AGENT_DIRS` agents. See [Trimming the packaged built-in agents](#trimming-the-packaged-built-in-agents). |
+| `OMNIGENT_HIDE_COST` | unset (show cost) | `1` reports sessions as unpriced in the session view (agent-info popover, per-model breakdown): token counts stay, USD cost is hidden. For deployments where neither the model catalog nor the harness cost is authoritative. Cost-budget policies still enforce against the recorded cost, and the `omnigent usage` / `/v1/usage` spend report is unchanged. |
 | `PYPI_INDEX_URL` | `https://pypi.org/simple` | Build-time PyPI index — override only behind a corporate proxy. |
 
 `DATABASE_URL` and `ARTIFACT_DIR` are computed by compose and

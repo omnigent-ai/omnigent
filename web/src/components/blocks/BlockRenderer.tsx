@@ -9,14 +9,14 @@
 //    hidden ("Read 2 files", rendered by `ToolGroupSummary`). While
 //    the run is the live activity, the trailing `STREAMING_TAIL`
 //    tools stay visible as individual rows so the user can watch
-//    recent steps. Still-in-progress spinners and durable
-//    routing/fan-out cards never fold regardless of position.
+//    recent steps. Still-in-progress spinners, durable routing/fan-out
+//    cards and messages to other sessions never fold regardless of position.
 //
 // 2. Turn folding: once settled, each work run collapses behind a
 //    "Worked" row, sub-agent notices included. Pending elicitations,
-//    routing cards, the newest notices and assistant messages stay
-//    visible; opt-in `foldNarration` folds narration too (Codex
-//    commentary, else all but the last message).
+//    routing cards, messages to other sessions, the newest notices and
+//    assistant messages stay visible; opt-in `foldNarration` folds
+//    narration too (Codex commentary, else all but the last message).
 
 import type { ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -24,16 +24,20 @@ import { ChevronRightIcon } from "lucide-react";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
+import { formatDuration } from "@/lib/relativeTime";
 import type { RenderItem } from "@/lib/renderItems";
+import { outboundSessionMessage } from "@/lib/sessionMessageOrigin";
 import type { SessionStatus } from "@/lib/types";
 import type { ActiveResponse } from "@/store/types";
 import { cn } from "@/lib/utils";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
+import { OutboundSessionMessageCard } from "./SessionMessageCard";
 import { SlashCommandCard } from "./SlashCommandCard";
 import { SmartRoutingCard } from "./SmartRoutingCard";
-import { SubagentActivityMessage } from "./SubagentActivityMessage";
+import { readTaskActivity } from "@/lib/taskActivity";
+import { ActivityNotice } from "./TaskActivityMessage";
 import { TerminalCommandCard } from "./TerminalCommandCard";
 import { ErrorBanner, PolicyDeniedBanner, RetryIndicator } from "./StatusBlocks";
 import { ToolCard, ToolGroupSummary } from "./ToolCard";
@@ -186,6 +190,9 @@ function hasFoldableShape(
     .findLast((item) => !isTrailingWrapup(item) && item.kind !== "subagent_activity");
   // A terminal failure or denial must stay visible beside the assistant text.
   if (isFailureItem(lastItem)) return false;
+  // A turn that moves tasks keeps its task markers in view: they're the turn's
+  // outline, and its tool calls stay in their own "Called N tools" groups.
+  if (items.some(isTaskMarker)) return false;
   return (
     !isProvisionalTrace(items) &&
     segments.some((segment) => segment.kind === "work") &&
@@ -480,6 +487,11 @@ function isTrailingWrapup(item: RenderItem): boolean {
  * Split work from assistant text while preserving order. Every completed
  * message stays visible unless `foldNarration` asks to fold narration.
  */
+/** A task's start or end, or a plan change, in the chat (sub-agent notices aren't). */
+function isTaskMarker(item: RenderItem): boolean {
+  return item.kind === "subagent_activity" && readTaskActivity(item.data) !== null;
+}
+
 function partitionTurn(
   items: RenderItem[],
   foldNarration = false,
@@ -641,7 +653,7 @@ function TurnWorkedFold({
   defaultOpen: boolean;
   children: ReactNode;
 }) {
-  const label = workedForS !== undefined ? `Worked for ${formatWorkedFor(workedForS)}` : "Worked";
+  const label = workedForS !== undefined ? `Worked for ${formatDuration(workedForS)}` : "Worked";
   const [open, setOpen] = useState(animateCollapse || defaultOpen);
   // Closing over the trace it replaces, the fold keeps that trace laid out as it was on
   // screen, so only its height changes; an opened fold indents it under the row.
@@ -772,18 +784,6 @@ function nearestScrollContainer(el: HTMLElement): HTMLElement | null {
   return null;
 }
 
-/** "8s", "1m 46s", "1h 2m" — matches the native CLIs' worked-for stamps. */
-function formatWorkedFor(seconds: number): string {
-  const s = Math.max(1, Math.round(seconds));
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  const rem = s % 60;
-  if (m < 60) return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
-  const h = Math.floor(m / 60);
-  const mm = m % 60;
-  return mm > 0 ? `${h}h ${mm}m` : `${h}h`;
-}
-
 /**
  * Split a contiguous tool run into the part that folds into the
  * collapsed summary group versus the part rendered individually.
@@ -836,7 +836,9 @@ const SESSION_SEND_NAMES = new Set(["sys_session_send", "mcp__omnigent__sys_sess
 function isPersistentToolCard(item: RenderItem): boolean {
   return (
     item.kind === "tool" &&
-    (ADVISE_MODELS_NAMES.has(item.execution.name) || SESSION_SEND_NAMES.has(item.execution.name))
+    (ADVISE_MODELS_NAMES.has(item.execution.name) ||
+      SESSION_SEND_NAMES.has(item.execution.name) ||
+      outboundSessionMessage(item) !== null)
   );
 }
 
@@ -892,8 +894,11 @@ function renderItem(
         >
           <FilePathAwareMessageResponse
             className="chat-markdown text-message"
+            allowWorkspaceImages
+            allowShellCommands
             mode={isTextStreaming || keepsStreamingMode(item) ? "streaming" : "static"}
             isStreaming={isTextStreaming}
+            linkPullRequestRefs
           >
             {item.text}
           </FilePathAwareMessageResponse>
@@ -918,7 +923,7 @@ function renderItem(
           duration={suppressReasoningDuration ? undefined : item.duration}
         />
       );
-    case "tool":
+    case "tool": {
       // Intelligent routing's fan-out sizing gets a structured plan card
       // instead of the generic tool row.
       if (ADVISE_MODELS_NAMES.has(item.execution.name)) {
@@ -928,6 +933,18 @@ function renderItem(
             arguments={item.execution.arguments}
             output={item.output}
             state={item.state}
+          />
+        );
+      }
+      // A message to another session reads "To @recipient", once, in place of its call.
+      const outbound = outboundSessionMessage(item);
+      if (outbound !== null) {
+        return (
+          <OutboundSessionMessageCard
+            key={key}
+            message={outbound}
+            startedAt={item.startedAt}
+            duration={item.duration}
           />
         );
       }
@@ -942,6 +959,7 @@ function renderItem(
           duration={item.duration}
         />
       );
+    }
     case "native_tool":
       // Reuse the same tool card. Native tools are server-side
       // (provider-managed) so they're always "completed" by the
@@ -1016,7 +1034,7 @@ function renderItem(
     case "elicitation":
       return <ElicitationCard key={key} item={item} />;
     case "subagent_activity":
-      return <SubagentActivityMessage key={key} data={item.data} />;
+      return <ActivityNotice key={key} data={item.data} />;
   }
 }
 

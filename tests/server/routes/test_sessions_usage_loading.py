@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from omnigent.errors import OmnigentError
 from omnigent.runner.native.orchestration import (
     _codex_native_launch_config,
+    _load_legacy_claude_launch_metadata,
     _pi_native_launch_config,
 )
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
@@ -212,6 +213,73 @@ async def test_pi_launch_restores_only_own_usage_without_loading_display_usage(
     if complete is True:
         expected["cumulative_cost_usd"] = 0.25
     assert launch.native_usage_baseline == expected
+
+
+async def test_claude_launch_restores_only_own_cost_without_loading_display_usage(
+    usage_app: _UsageApp,
+    usage_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cold resume seeds Claude with the parent's own cost, not its tree's.
+
+    Claude-native stores Claude Code's own billing total, so the cost needs no
+    completeness flag. A child's spend is already counted under the child.
+    """
+    monkeypatch.setattr(
+        orchestration, "_resolve_harness", lambda *_args, **_kwargs: "claude-native"
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "load_session_usage",
+        Mock(side_effect=AssertionError("native launch must not aggregate the tree")),
+    )
+    usage_app.conversations.set_session_usage(usage_app.parent_id, {"total_cost_usd": 0.25})
+    usage_app.conversations.set_session_usage(usage_app.child_id, {"total_cost_usd": 99.5})
+
+    metadata = await _load_legacy_claude_launch_metadata(usage_client, usage_app.parent_id)
+
+    assert metadata.resume_cost_usd == 0.25
+
+
+@pytest.mark.parametrize("side_chat", [True, False], ids=["side-chat", "worker"])
+async def test_codex_side_chat_restores_own_usage_without_loading_display_usage(
+    usage_app: _UsageApp,
+    usage_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    side_chat: bool,
+) -> None:
+    load_usage = Mock(side_effect=AssertionError("side-chat recovery must not aggregate usage"))
+    monkeypatch.setattr(orchestration, "load_session_usage", load_usage)
+    usage_app.conversations.set_labels(
+        usage_app.child_id,
+        {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat" if side_chat else "Worker",
+        },
+    )
+    usage_app.conversations.set_session_usage(
+        usage_app.child_id,
+        {"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 30},
+    )
+    response = await usage_client.get(
+        f"/v1/sessions/{usage_app.child_id}",
+        params={**_USAGE_SNAPSHOT_PARAMS, "include_usage": "false"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    resume_label = "omnigent.codex_native.side_chat_resume"
+    assert body["labels"].get(resume_label) == ("false" if side_chat else None)
+    assert resume_label not in usage_app.conversations.get_conversation(usage_app.child_id).labels
+    if side_chat:
+        baseline = body["native_usage_baseline"]
+        assert baseline["cumulative_input_tokens"] == 130
+        assert baseline["cumulative_output_tokens"] == 20
+        assert baseline["cumulative_cache_read_input_tokens"] == 30
+    else:
+        assert body["native_usage_baseline"] is None
+    assert body["usage_included"] is False
+    assert body["usage_by_model"] is None
+    load_usage.assert_not_called()
 
 
 async def test_real_codex_launch_config_does_not_load_usage(

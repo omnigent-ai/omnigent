@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
+import { sandboxSessionCatalogKey, writeModelCatalogCache } from "@/lib/modelCatalogCache";
 import * as host from "@/lib/host";
 import type { SandboxStatus } from "@/lib/types";
 import {
@@ -35,6 +36,7 @@ const catalog = {
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
   fetchMock.mockReset();
   vi.restoreAllMocks();
 });
@@ -354,6 +356,34 @@ describe("useSandboxLaunchModelOptions", () => {
       expect(result.current).toBeUndefined();
     },
   );
+
+  it.each([
+    ["the agent's own saved catalog", "ag_1", ["opus"]],
+    ["another agent's saved catalog", "ag_other", ["gateway/opus", "gateway/gpt"]],
+  ])("prefers %s over the gateway list", async (_label, savedFor, expected) => {
+    writeModelCatalogCache(
+      sandboxSessionCatalogKey("agent_sandbox", "claude-native", savedFor),
+      [{ id: "opus", displayName: "Opus" }],
+      false,
+    );
+    serve();
+    const { result } = render();
+    await waitFor(() => expect(result.current?.map((row) => row.id)).toEqual(expected));
+  });
+
+  it("offers no saved catalog to an agent the provider's catalog cannot serve", async () => {
+    writeModelCatalogCache(
+      sandboxSessionCatalogKey("agent_sandbox", "claude-native", "ag_1"),
+      [{ id: "opus", displayName: "Opus" }],
+      false,
+    );
+    const preview = { ...ready, models: [], status: "unconfigured" };
+    serve(preview);
+    const { client, result } = render();
+    const key = sandboxModelOptionsKey("agent_sandbox", "claude-native", "ag_1", "alice");
+    await waitFor(() => expect(client.getQueryData(key)).toEqual(preview));
+    expect(result.current).toBeUndefined();
+  });
 
   it("recovers a launch's rows after an unavailable preview or a failed request", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });

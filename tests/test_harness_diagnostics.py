@@ -187,7 +187,7 @@ def test_cookie_redaction_precedes_diagnostic_tail_clipping() -> None:
             "https://databricks.okta.com/oauth2/v1/authorize?client_id=0oa1&state=T4IU",
             None,
         ),
-        # dbcert's real prompt: the address is the last thing printed while it waits.
+        # The launcher's prompt: the address is the last thing printed while it waits.
         (
             "dbcert: Certificate requested by: omnigent\n"
             "dbcert: Logging in via SSO...\n"
@@ -233,7 +233,7 @@ def test_detect_sign_in_prompt_ignores_an_address_the_launcher_moved_past() -> N
     """
     Once the sign-in completes, the launcher and the agent print below the address.
 
-    Codex draws its interface inline, so dbcert's lines stay on screen above
+    Codex draws its interface inline, so the launcher's lines stay on screen above
     the banner; the address is no longer a pending prompt. A card asking the
     host for the live link must then hear "nothing pending" instead of opening
     the spent address again.

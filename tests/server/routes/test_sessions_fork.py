@@ -1276,6 +1276,8 @@ async def test_fork_session_run_config_overrides_pass_through(side_chat: bool) -
     # Explicit launch args ⇒ drop the source's copied mode labels so a stale
     # permission-mode label can't shadow the freshly chosen mode.
     assert "omnigent.claude_native.permission_mode" in fork_call["dropped_label_keys"]
+    # The pick itself becomes the fork's recorded mode.
+    assert fork_call["extra_labels"]["omnigent.claude_native.permission_mode"] == "auto"
 
 
 @pytest.mark.asyncio

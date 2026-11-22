@@ -8,6 +8,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import urllib.parse
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping
 from pathlib import Path
@@ -16,11 +17,13 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+    from omnigent.inner.terminal import TerminalInstance
     from omnigent.terminals.registry import TerminalListEntry, TerminalRegistry
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import RangeNotSatisfiable
 
 from omnigent._platform import normalize_interactive_shells
 from omnigent.entities.session_resources import (
@@ -59,6 +62,7 @@ from omnigent.runner.native import (
     _is_runner_owned_codex_terminal,
     _log_terminal_lookup_miss,
     _publish_tmux_target_for_bridge,
+    _readvertise_live_claude_tmux_target,
     _resolved_spec_workdir,
     _unwrap_resolved_spec,
 )
@@ -81,6 +85,27 @@ if TYPE_CHECKING:
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
 
 _logger = logging.getLogger("omnigent.runner.app")
+
+
+def _download_byte_range(header: str, size: int) -> tuple[int, int] | None:
+    """Resolve one byte range; ignore malformed and multipart ranges."""
+    match = re.fullmatch(r"bytes=([0-9]*)-([0-9]*)", header.strip(), re.IGNORECASE)
+    if match is None or not any(match.groups()):
+        return None
+    first, last = match.groups()
+    try:
+        start = int(first) if first else 0
+        end = int(last) if last else size - 1
+    except ValueError:
+        return None
+    if first:
+        if last and end < start:
+            return None
+    else:
+        start, end = max(0, size - end), size - 1
+    if start >= size or start > end:
+        raise RangeNotSatisfiable(size)
+    return start, min(end + 1, size)
 
 
 class _EnsureCommentRelayStartedFn(Protocol):
@@ -645,6 +670,44 @@ def register_resource_routes(
             content=session_resource_view_to_dict(resource_view),
         )
 
+    async def _readvertise_live_claude_pane(
+        conv_id: str, instance: TerminalInstance, terminal_registry: TerminalRegistry
+    ) -> None:
+        """Restore a live Claude pane's missing or stale ``tmux.json`` before a turn.
+
+        The relay binding already knows the bridge dir; the session labels
+        (a server round trip) are the fallback. Best-effort.
+        """
+        from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
+
+        binding = _session_comment_relays.get(conv_id)
+        if binding is not None:
+            bridge_dir = binding.bridge_dir
+        else:
+            try:
+                bridge_id = await _claude_native_bridge_id_for_session(
+                    server_client=server_client,
+                    session_id=conv_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _logger.warning(
+                    "could not resolve the claude bridge dir for conv=%s; skipping re-advertise",
+                    conv_id,
+                    exc_info=True,
+                    extra={"session_id": conv_id},
+                )
+                return
+            bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await asyncio.to_thread(
+            _readvertise_live_claude_tmux_target,
+            bridge_dir,
+            instance,
+            terminal_registry=terminal_registry,
+            session_id=conv_id,
+        )
+
     async def _ensure_native_terminal_for_turn(conv_id: str, harness_name: str | None) -> None:
         """Re-create a reaped native pane before forwarding a turn (self-heal).
 
@@ -676,6 +739,9 @@ def register_resource_routes(
             return
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None and await instance.is_alive():
+            if terminal_name == "claude":
+                # A live pane still needs its advertisement for message delivery.
+                await _readvertise_live_claude_pane(conv_id, instance, terminal_registry)
             if terminal_name != "codex":
                 return
             terminal_id = terminal_resource_id("codex", "main")
@@ -1264,6 +1330,7 @@ def register_resource_routes(
                 "modified_at": rec.get("modified_at"),
                 "lines_added": rec.get("lines_added"),
                 "lines_removed": rec.get("lines_removed"),
+                "untracked_lines": rec.get("untracked_lines"),
                 **(
                     {"repository_root": rec["repository_root"]} if "repository_root" in rec else {}
                 ),
@@ -1519,6 +1586,25 @@ def register_resource_routes(
             default_pr_url=default_pr_url,
         )
 
+    @app.get("/v1/sessions/{session_id}/resources/github/compare-diff")
+    async def read_github_compare_diff(
+        session_id: str,
+        pr_url: str | None = None,
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
+        head_sha: str | None = None,
+        from_sha: str | None = None,
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id,
+            "pr_compare_diff",
+            head_sha=head_sha,
+            from_sha=from_sha,
+            pr_url=pr_url,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
+        )
+
     @app.get("/v1/sessions/{session_id}/resources/github/diff/{relative_path:path}")
     async def read_github_file_diff(
         session_id: str,
@@ -1615,6 +1701,21 @@ def register_resource_routes(
             **_server_tracking_fields(body),
             merge_method=body.get("merge_method"),
             expected_head=body.get("expected_head"),
+        )
+
+    @app.post("/v1/sessions/{session_id}/resources/github/merge-as")
+    async def merge_github_pr_as_route(session_id: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(
+            session_id,
+            "merge_pr_as",
+            pr_url=body["pr_url"],
+            **_server_tracking_fields(body),
+            merge_method=body.get("merge_method"),
+            expected_head=body.get("expected_head"),
+            account=body.get("account"),
         )
 
     @app.post("/v1/sessions/{session_id}/resources/github/disable-auto-merge")
@@ -1774,6 +1875,7 @@ def register_resource_routes(
         session_id: str,
         environment_id: str,
         relative_path: str,
+        request: Request,
         limit: int = Query(default=20, ge=1, le=1000),
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
@@ -1791,6 +1893,9 @@ def register_resource_routes(
                 session_id,
                 environment_id,
                 relative_path,
+                range_header=request.headers.get("range")
+                if "if-range" not in request.headers
+                else None,
                 follow_outward_links=follow_outward_links,
             )
         return await _fs_list_or_read(
@@ -1968,9 +2073,10 @@ def register_resource_routes(
         environment_id: str,
         path: str,
         *,
+        range_header: str | None = None,
         follow_outward_links: bool = False,
-    ) -> StreamingResponse:
-        """Serve a file's complete bytes as an attachment.
+    ) -> Response:
+        """Serve complete or ranged file bytes from the authorized descriptor.
 
         The read path inlines content in a JSON envelope, so it caps at
         ``_MAX_READ_BYTES``. A download streams from a descriptor and needs
@@ -1980,6 +2086,7 @@ def register_resource_routes(
         :param session_id: Session identifier.
         :param environment_id: Environment resource id.
         :param path: Path within the environment, or an absolute path.
+        :param range_header: An optional HTTP byte range for media seeking.
         :param follow_outward_links: Admit a workspace symlink whose target
             lies outside the workspace but within the environment's reach.
         :returns: The file streamed with ``Content-Disposition: attachment``.
@@ -1994,12 +2101,25 @@ def register_resource_routes(
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
         fs = CallerProcessFilesystem(env, follow_outward_links=follow_outward_links)
         fobj, resolved, size = await fs.open_download(path)
+        headers = {"Accept-Ranges": "bytes"}
+        try:
+            byte_range = _download_byte_range(range_header, size) if range_header else None
+        except RangeNotSatisfiable:
+            fobj.close()
+            headers["Content-Range"] = f"bytes */{size}"
+            return Response(status_code=416, headers=headers)
+        start, end = byte_range if byte_range is not None else (0, size)
+        length = end - start
+        if byte_range is not None:
+            headers["Content-Range"] = f"bytes {start}-{end - 1}/{size}"
 
         async def _chunks() -> AsyncIterator[bytes]:
             # Stop at the size announced in Content-Length so a file growing
             # underneath the download cannot overrun the response.
-            remaining = size
+            remaining = length
             try:
+                if start:
+                    await asyncio.to_thread(fobj.seek, start)
                 while remaining > 0:
                     chunk = await asyncio.to_thread(fobj.read, min(64 * 1024, remaining))
                     if not chunk:
@@ -2010,8 +2130,8 @@ def register_resource_routes(
                             "Download of %s aborted: file shrank while streaming "
                             "(sent %d of %d announced bytes)",
                             resolved.name,
-                            size - remaining,
-                            size,
+                            length - remaining,
+                            length,
                         )
                         raise RuntimeError(f"{resolved.name} shrank during download")
                     remaining -= len(chunk)
@@ -2029,9 +2149,11 @@ def register_resource_routes(
         )
         return StreamingResponse(
             _chunks(),
+            status_code=206 if byte_range is not None else 200,
             media_type=mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
             headers={
-                "Content-Length": str(size),
+                **headers,
+                "Content-Length": str(length),
                 "Content-Disposition": disposition,
                 "Cache-Control": "no-store",
                 "X-Content-Type-Options": "nosniff",

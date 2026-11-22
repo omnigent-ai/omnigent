@@ -73,5 +73,5 @@ block.
 ## Writing and environment
 
 Write PRs, comments, and commits in plain, direct prose. Add code comments only
-for non-obvious constraints. Under a Databricks-network `--server`, read
+for non-obvious constraints. Under a network-restricted `--server`, read
 `dev/agent-environment.md` in the Omnigent checkout before installing packages.

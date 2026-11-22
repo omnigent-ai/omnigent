@@ -2,7 +2,7 @@
 
 The iOS WKWebView shell shifts the floating chat header down by the OS
 safe-area inset (the ``[data-ios-native] .chat-header`` rule in ``index.css``),
-but the in-chat Plan tracker (``ChatPlanAccordion``) clears the header with a
+but the in-chat task preview (``ChatTasksPreview``) clears the header with a
 fixed ``mt-14`` tuned for the web header pinned at ``top: 0``. On a notched
 iPhone the safe-area shift pushes the header's floating controls — the left
 sidebar-toggle pill and the right session-actions kebab — down into the Plan
@@ -30,7 +30,7 @@ the native layer does.
 
 The plan is published straight through the Sessions events route (the same
 harness-agnostic path the native forwarders post to), mirroring
-``chat/test_plan_tracker.py``, so no live agent turn is needed.
+``chat/test_tasks_preview.py``, so no live agent turn is needed.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ import httpx
 import pytest
 from playwright.sync_api import FloatRect, Locator, Page, expect
 
-_TRACKER = '[data-testid="plan-tracker"]'
+_TRACKER = '[data-testid="tasks-preview"]'
 
 # iPhone 13-class portrait viewport (matches Playwright's "iPhone 13" device
 # profile, so a recorder run with ``--device "iPhone 13"`` films pixel-exact)
@@ -137,7 +137,7 @@ def _assert_clear_of_tracker(control: Locator, label: str, tracker_box: FloatRec
 
     :param control: The floating control's locator.
     :param label: Human-readable control name for the failure message.
-    :param tracker_box: The Plan tracker's bounding box.
+    :param tracker_box: The task preview's bounding box.
     :returns: None.
     """
     control_box = _box(control)
@@ -205,7 +205,7 @@ def test_native_shell_plan_header_clears_floating_controls(
 
     tracker = page.locator(_TRACKER)
     expect(tracker).to_be_visible(timeout=15_000)
-    expect(tracker).to_contain_text("Plan")
+    expect(tracker).to_contain_text("Tasks")
 
     # Left floating control: the sidebar-toggle pill (the sidebar starts
     # collapsed on a phone, so the pill is the only way to open it).

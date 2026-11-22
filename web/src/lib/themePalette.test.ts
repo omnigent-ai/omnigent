@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { UNFOCUSED_SELECTION_STRENGTH } from "@/shell/codeMirror/codeMirrorTheme";
 import { setEmbedRoot, setEmbedScopeRoot } from "./host";
 import {
   applyThemePalette,
@@ -272,6 +273,48 @@ describe("themePalette", () => {
         label,
       ).toBeGreaterThanOrEqual(4.5);
       expect(deltaE(highlight, page), label).toBeGreaterThanOrEqual(8);
+    }
+  });
+
+  // The viewer paints its selection as a layer under the text, so the wash must show on its own.
+  // Focused, the page's text selection also recolours the text; unfocused, the wash fades and
+  // the code keeps its own colour.
+  it.each(PALETTES)("keeps $label code selection visible and its code readable", (palette) => {
+    for (const mode of ["light", "dark"] as const) {
+      const { background, foreground, primary, selectionForeground, codeSelection } =
+        palette.tokens[mode];
+      const label = `${palette.label} ${mode}`;
+      const page = parseColor(background).rgb;
+      const wash = parseColor(codeSelection);
+      expect(wash.rgb, label).toEqual(parseColor(primary).rgb);
+      expect(wash.alpha, label).toBeLessThan(1);
+      const states = [
+        {
+          state: "focused",
+          alpha: wash.alpha,
+          text: selectionForeground,
+          minDeltaE: 10,
+          kept: 0.6,
+        },
+        {
+          state: "unfocused",
+          alpha: wash.alpha * UNFOCUSED_SELECTION_STRENGTH,
+          text: foreground,
+          minDeltaE: 8,
+          kept: 0.7,
+        },
+      ];
+      for (const { state, alpha, text, minDeltaE, kept } of states) {
+        const highlight = composite({ rgb: wash.rgb, alpha }, page);
+        const textColor = parseColor(text).rgb;
+        const where = `${label} ${state}`;
+        expect(deltaE(highlight, page), where).toBeGreaterThanOrEqual(minDeltaE);
+        expect(contrast(highlight, page), where).toBeGreaterThanOrEqual(1.12);
+        expect(
+          contrast(textColor, highlight) / contrast(textColor, page),
+          where,
+        ).toBeGreaterThanOrEqual(kept);
+      }
     }
   });
 });
