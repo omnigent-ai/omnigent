@@ -3056,7 +3056,7 @@ function ComposerImpl(
   }, [conversationId]);
   useEffect(() => {
     if (!canStartWorkflow || composerSessionId === null) return;
-    return registerStartWorkflow(composerSessionId, () => openWorkflowDialog());
+    return registerStartWorkflow(composerSessionId, openWorkflowDialog);
   }, [canStartWorkflow, composerSessionId, openWorkflowDialog]);
   useEffect(() => {
     if (!canSaveWorkflow || composerSessionId === null) return;

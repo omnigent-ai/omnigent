@@ -15,7 +15,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { WorkflowPicker } from "@/components/composer/WorkflowPicker";
+import { offersSavedWorkflows, WorkflowPicker } from "@/components/composer/WorkflowPicker";
 import type { SavedWorkflow, WorkflowPagination } from "@/hooks/useSavedWorkflows";
 
 const EMPTY_PROJECTS: readonly { name: string }[] = [];
@@ -78,7 +78,7 @@ export function ComposerAddMenu({
   /** Open the "Run a workflow" dialog, once the menu has closed, with an optional
    *  description to start from. Absent when the agent has no `workflow` skill. */
   onWorkflow?: (description?: string) => void;
-  /** The user's saved workflows; when there are some, Run a workflow lists them. */
+  /** The user's saved workflows; when any can run, Run a workflow lists them. */
   savedWorkflows?: readonly SavedWorkflow[];
   workflowPagination?: WorkflowPagination;
   /** Open the dialog that runs a saved workflow, once the menu has closed. */
@@ -91,10 +91,8 @@ export function ComposerAddMenu({
   const [open, setOpen] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
   const [showWorkflows, setShowWorkflows] = useState(false);
-  // A list whose loaded pages show nothing yet can still have more to load.
   const listsSavedWorkflows =
-    (savedWorkflows.length > 0 || workflowPagination?.hasMore === true) &&
-    onRunSavedWorkflow !== undefined;
+    onRunSavedWorkflow !== undefined && offersSavedWorkflows(savedWorkflows, workflowPagination);
   const pendingActionRef = useRef<(() => void) | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [geometry, setGeometry] = useState<{

@@ -198,6 +198,78 @@ describe("TasksPanel", () => {
     }
   });
 
+  it("offers the saved workflows to run, or a new one, as the composer's Run a workflow does", async () => {
+    showJournal([]);
+    const triage = {
+      id: "a".repeat(32),
+      name: "Triage flaky tests",
+      description: "Finds and fixes flaky tests.",
+    };
+    const draft = {
+      id: "b".repeat(32),
+      name: "Unfinished workflow",
+      description: "Still planning.",
+      is_draft: true,
+    };
+    const refresh = vi.fn();
+    vi.mocked(useSavedWorkflows).mockReturnValue({
+      workflows: [triage, draft],
+      isLoading: false,
+      isError: false,
+      refresh,
+      pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
+    });
+    const start = vi.fn();
+    const closeDrawer = vi.fn();
+    const withdraw = registerStartWorkflow("conv", start);
+    try {
+      renderPanel(closeDrawer);
+      const link = screen.getByRole("button", { name: "run a workflow" });
+      fireEvent.pointerDown(link, { button: 0 });
+      expect(
+        screen.queryAllByTestId("composer-saved-workflow").map((row) => row.textContent),
+      ).toEqual(["Triage flaky testsFinds and fixes flaky tests."]);
+      // A workflow saved since the list last loaded shows up.
+      expect(refresh).toHaveBeenCalled();
+      fireEvent.click(screen.getByTestId("composer-saved-workflow"));
+      await waitFor(() => expect(start).toHaveBeenCalledWith("", triage));
+      expect(closeDrawer).toHaveBeenCalledOnce();
+
+      fireEvent.pointerDown(link, { button: 0 });
+      fireEvent.change(screen.getByLabelText("Search workflows"), {
+        target: { value: "Bump deps" },
+      });
+      fireEvent.click(screen.getByTestId("composer-describe-workflow"));
+      await waitFor(() => expect(start).toHaveBeenLastCalledWith("Bump deps"));
+      expect(closeDrawer).toHaveBeenCalledTimes(2);
+    } finally {
+      act(withdraw);
+    }
+  });
+
+  it("goes straight to describing a workflow when no saved one can run", () => {
+    showJournal([]);
+    vi.mocked(useSavedWorkflows).mockReturnValue({
+      workflows: [{ id: "b".repeat(32), name: "Unfinished", description: "", is_draft: true }],
+      isLoading: false,
+      isError: false,
+      refresh: vi.fn(),
+      pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
+    });
+    const start = vi.fn();
+    const withdraw = registerStartWorkflow("conv", start);
+    try {
+      renderPanel();
+      const link = screen.getByRole("button", { name: "run a workflow" });
+      expect(link).not.toHaveAttribute("aria-haspopup");
+      fireEvent.click(link);
+      expect(start).toHaveBeenCalledWith();
+      expect(screen.queryByTestId("composer-workflow-picker")).toBeNull();
+    } finally {
+      act(withdraw);
+    }
+  });
+
   it("shows the agent's own task list when the session has no plan", () => {
     showJournal([]);
     setSession({
