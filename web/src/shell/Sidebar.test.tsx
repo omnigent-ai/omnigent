@@ -13,7 +13,9 @@ import * as automationInboxHook from "@/hooks/useAutomationInbox";
 import * as proactiveInboxHook from "@/hooks/useProactiveInbox";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { MUTED_LABEL_KEY } from "@/lib/sessionMute";
+import * as sessionsApi from "@/lib/sessionsApi";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
+import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
 // Integration tests for the Sidebar's session list. The search box no
 // longer carries a filter funnel (agent-type filter + "Show archived"
 // toggle were removed). The sidebar fetches a single session list with
@@ -5475,6 +5477,63 @@ describe("Sidebar view options", () => {
     } finally {
       viewer.mockRestore();
     }
+  });
+
+  it("names the session that started an agent-created session", async () => {
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("viewer@example.com");
+    const lookup = vi.spyOn(sessionsApi, "getSessionSlim").mockResolvedValue({
+      id: "conv_manager",
+      title: "Release manager",
+      archived: true,
+    } as Session);
+    onTestFinished(() => {
+      viewer.mockRestore();
+      lookup.mockRestore();
+    });
+    const family = { id: "conv_manager", representative_id: "conv_manager", pinned: false };
+    mockConversations([
+      conv("conv_manager", "Codex", { owner: "viewer@example.com", family, created_at: 1 }),
+      conv("conv_worker", "Codex", {
+        owner: "viewer@example.com",
+        family,
+        created_at: 2,
+        labels: { [CREATED_BY_SESSION_LABEL_KEY]: "conv_manager" },
+      }),
+    ]);
+    renderGroupingSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: "conv_worker" }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByTestId("session-tooltip-content");
+    await waitFor(() =>
+      expect(within(tooltip).getByTestId("session-tooltip-creator")).toHaveTextContent(
+        "Created byRelease manager · archived",
+      ),
+    );
+    expect(within(tooltip).getByTestId("session-tooltip-owner")).toHaveTextContent("OwnerYou");
+    // "Nested in" would name the creator again.
+    expect(within(tooltip).queryByTestId("session-tooltip-family")).toBeNull();
+    expect(lookup).toHaveBeenCalledWith("conv_manager");
+  });
+
+  it("does not name a creator the viewer can't read", async () => {
+    const lookup = vi
+      .spyOn(sessionsApi, "getSessionSlim")
+      .mockRejectedValue(new sessionsApi.ApiError("Not found", 404, null));
+    onTestFinished(() => lookup.mockRestore());
+    mockConversations([
+      conv("conv_worker", "Codex", { labels: { [CREATED_BY_SESSION_LABEL_KEY]: "conv_gone" } }),
+    ]);
+    renderGroupingSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: "conv_worker" }), {
+      pointerType: "mouse",
+    });
+    expect(await screen.findByText("Another session")).toBeInTheDocument();
+    expect(screen.getByTestId("session-tooltip-creator")).toHaveTextContent(
+      "Created byAnother session",
+    );
   });
 });
 

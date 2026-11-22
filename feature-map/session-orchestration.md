@@ -36,7 +36,12 @@ MCP independent creation.
 - `created-by`: independent workers record their creating session. The worker's
   Chat/Terminal header rechecks access when opened, hides attribution during the
   lookup, and links to the creator when accessible; otherwise it says "Created by
-  another session". `sys_session_list` and `sys_session_get_info` expose
+  another session". The worker's sidebar card rechecks too each time it opens: its
+  "Created by" row names the creator with a bot icon, adds "· archived" for an
+  archived one, or reads "Another session"; the owner moves to an "Owner" row,
+  and "Nested in" is omitted when it would name the creator again
+  (`tests/e2e_ui/sessions/test_sidebar_session_creator.py`).
+  `sys_session_list` and `sys_session_get_info` expose
   `created_by_session_id` so managers can identify their workers across restarts;
   `sys_session_list` with `include_archived` also lists archived workers, each
   marked `archived`. With `created_by_this_session`, the runner pages the global
