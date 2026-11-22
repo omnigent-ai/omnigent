@@ -386,9 +386,12 @@ describe("a size rule with no room for another pane", () => {
     allowTwoPanes(conversationId);
     expect(appPaneRoomRefusal(conversationId, "files", { agentKey: AGENT })).toBeUndefined();
     expect(openTabAsPane(conversationId, "files", { agentKey: AGENT })).toBe(true);
-    // A tab the split already shows needs no room: it only takes focus.
+    // A tab the split already shows needs no room, now that the rule has none: it only takes focus.
+    updatePaneSplit(conversationId, (state) => state && { ...state, focusedKey: AGENT });
+    const { layout } = readPaneSplit(conversationId)!;
     expect(appPaneRoomRefusal(conversationId, "files", { agentKey: AGENT })).toBeUndefined();
     expect(openTabAsPane(conversationId, "files", { agentKey: AGENT })).toBe(true);
+    expect(readPaneSplit(conversationId)).toEqual({ layout, focusedKey: "app:files" });
   });
 
   it("offers no drop spot, and refuses a drop the preview offered before it ran out", () => {
@@ -397,6 +400,8 @@ describe("a size rule with no room for another pane", () => {
     updatePaneSplit(conversationId, () => ({ layout: SPLIT, focusedKey: SHELL }));
     const drop = appPaneDropAt(conversationId, { x: 980, y: 250 }, AGENT);
     expect(drop).not.toBeNull();
+    // Both spots are offered while there's room, so the rule is what refuses them below.
+    expect(appPaneDropAt(conversationId, { x: 250, y: 490 }, AGENT)?.side).toBe("bottom");
 
     allowTwoPanes(conversationId);
     expect(appPaneDropAt(conversationId, { x: 980, y: 250 }, AGENT)).toBeNull();

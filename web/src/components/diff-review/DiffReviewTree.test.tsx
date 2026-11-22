@@ -116,9 +116,16 @@ describe("givenOrder", () => {
       reviewFile("README.md", "modified", { additions: 3 }),
       reviewFile("src/app/main.py", "modified", { additions: 1 }),
       reviewFile("src/app/session_list.py", "modified", { additions: 14, deletions: 6 }),
-      reviewFile("docs/guide.md", "added", { additions: 30 }),
+      reviewFile("docs/guide.md", "added", { additions: 2 }),
     ];
     const bySize = treeOrderedFiles(files, "size").map((file) => file.path);
+    // Largest first across folders: src before docs, and the root file between them.
+    expect(bySize).toEqual([
+      "src/app/session_list.py",
+      "src/app/main.py",
+      "README.md",
+      "docs/guide.md",
+    ]);
     const tree = (paths: string[]) =>
       orderTreePaths(paths, { flattenEmptyDirectories: true, sort: givenOrder(paths) });
     expect(tree(bySize)).toEqual(bySize);

@@ -762,28 +762,33 @@ describe("TerminalSession", () => {
     // WHY: the open handler must push a resize frame before the user sees the
     // default 80x24, then surface kind:"connected" to React. readyState is
     // OPEN by the time sendResize runs, so a JSON resize control frame is sent.
-    const { states, socket, session } = makeSession();
-
-    socket.open();
-
-    expect(states.at(-1)).toEqual({ kind: "connected" });
-    const resizeFrame = socket.sent.find(
-      (m) => typeof m === "string" && m.includes('"type":"resize"'),
-    );
-    expect(resizeFrame).toBeDefined();
-    session.dispose();
-  });
-
-  it("says its fitted size in cells on its container once it sends one", () => {
-    const { container, socket, session } = makeSession();
+    // The container says the same size in cells, for layouts that measure in cells.
+    const { states, container, socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    const resizes = () =>
+      socket.sent
+        .filter((m): m is string => typeof m === "string" && m.includes('"type":"resize"'))
+        .map((m) => JSON.parse(m) as { cols: number; rows: number });
+    const saidSize = () => ({
+      cols: Number(container.dataset.terminalCols),
+      rows: Number(container.dataset.terminalRows),
+    });
     expect(container.dataset.terminalCols).toBeUndefined();
 
     socket.open();
 
-    const term = (session as unknown as { term: Terminal }).term;
-    expect(container.dataset.terminalCols).toBe(String(term.cols));
-    expect(container.dataset.terminalRows).toBe(String(term.rows));
+    expect(states.at(-1)).toEqual({ kind: "connected" });
+    expect(resizes()).toHaveLength(1);
+    // Both carry xterm's own fitted size, not just the same size as each other.
+    expect(resizes()[0]).toMatchObject({ cols: term.cols, rows: term.rows });
+    expect(saidSize()).toEqual({ cols: term.cols, rows: term.rows });
     expect(container.dataset.terminalFitReserveWidth).toBe(String(terminalFitReserveWidth(term)));
+
+    // A later refit to another size sends it and says it on the container too.
+    (session as unknown as { fit: { fit: () => void } }).fit.fit = () => term.resize(97, 31);
+    FakeResizeObserver.instances[0]!.cb();
+    expect(resizes().at(-1)).toMatchObject({ cols: 97, rows: 31 });
+    expect(saidSize()).toEqual({ cols: 97, rows: 31 });
     session.dispose();
   });
 
