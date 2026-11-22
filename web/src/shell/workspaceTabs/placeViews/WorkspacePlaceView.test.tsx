@@ -93,6 +93,7 @@ function renderView(
     registerLeaveGuard,
     permissionLevel,
     keyboardTarget,
+    landing,
     files = {},
   }: Partial<
     Pick<
@@ -103,6 +104,7 @@ function renderView(
       | "position"
       | "registerLeaveGuard"
       | "keyboardTarget"
+      | "landing"
     > & {
       permissionLevel: number | null;
       files: Partial<WorkspacePlaceViewProps["files"]>;
@@ -147,6 +149,7 @@ function renderView(
         position={position}
         registerLeaveGuard={registerLeaveGuard}
         keyboardTarget={keyboardTarget}
+        landing={landing}
       />
     );
   }
@@ -496,6 +499,13 @@ describe("pull request tab", () => {
       { kind: "pull", url: PR, view: "changes", path: "src/a.ts" },
       { replace: true },
     );
+  });
+
+  it("hands the tab's landing to the page, so each Back or Forward onto it shows its target", () => {
+    const landing = { settled: false, choices: 0 };
+    renderView({ kind: "pull", url: PR, view: "commits", commit: "abcdef1" }, { landing });
+    expect(captured.page).toMatchObject({ target: { commit: "abcdef1" } });
+    expect(captured.page?.landing).toBe(landing);
   });
 
   it("opens a link's commit with nothing left to name", () => {

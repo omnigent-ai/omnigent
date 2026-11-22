@@ -126,6 +126,7 @@ import { PullRequestReviewers } from "./PullRequestReviewers";
 import {
   PanelMessage,
   PullRequestChangesTab,
+  type PullRequestChangesLanding,
   type PullRequestChangesTarget,
 } from "./PullRequestChangesTab";
 import { IconButton } from "./PullRequestFileSection";
@@ -1592,6 +1593,7 @@ export function PullRequestPanelDetails({
   activeTab,
   setActiveTab,
   changesTarget,
+  changesLanding,
 }: {
   conversationId: string;
   info: ReturnType<typeof usePullRequestInfo>;
@@ -1607,6 +1609,8 @@ export function PullRequestPanelDetails({
   setActiveTab: (value: PullRequestSubtab) => void;
   /** A commit or file a link opened the Changes tab at; only a pull request's own tab sets it. */
   changesTarget?: PullRequestChangesTarget;
+  /** The tab's latest landing on its place, so each landing shows `changesTarget` again. */
+  changesLanding?: PullRequestChangesLanding;
 }) {
   const baseRef = info.data?.base_ref ?? undefined;
   const prUrl = info.data?.selected_pr_url;
@@ -1996,6 +2000,7 @@ export function PullRequestPanelDetails({
           reviews={reviews}
           identity={identity}
           target={changesTarget}
+          landing={changesLanding}
         />
       </Tabs>
     </TooltipProvider>

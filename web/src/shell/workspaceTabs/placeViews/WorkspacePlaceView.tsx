@@ -342,6 +342,7 @@ function PullRequestPlaceView({
   active,
   onNavigate,
   onOpen,
+  landing,
 }: WorkspacePlaceViewProps & { place: PullRequestPlace }) {
   const run = useRunAction(onNavigate, onOpen);
   const unshown = unshownPullRequestParts(place);
@@ -382,6 +383,7 @@ function PullRequestPlaceView({
           section={place.view}
           active={active}
           target={pullRequestPageTarget(place)}
+          landing={landing}
           onSectionChange={(section) => run(pullRequestSectionChosen(place, section))}
           onShowAllPullRequests={() => run(allPullRequestsChosen())}
         />

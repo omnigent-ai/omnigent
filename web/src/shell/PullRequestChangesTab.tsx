@@ -79,7 +79,7 @@ import {
   unquoteGitPath,
   type Match,
 } from "./pullRequestReview";
-import { useChangesViewState, type FindState } from "./useChangesViewState";
+import { type ChangesViewState, useChangesViewState, type FindState } from "./useChangesViewState";
 import { useCommitViewState } from "./useCommitViewState";
 
 /** Index of the match a step moves to; with none active, the first or last by direction. */
@@ -471,6 +471,64 @@ function parsePatchByPath(
 /** A place in the pull request a link names: one of its commits, or one of its changed files. */
 export type PullRequestChangesTarget = { commit: string } | { path: string };
 
+/** A tab's landing on its place; the Changes tab marks it settled once it shows the target. */
+export interface PullRequestChangesLanding {
+  settled: boolean;
+}
+
+/**
+ * Shows a link's commit or file once per landing: a commit opens once its list can say
+ * whether commits show here; a file shows in the PR's own changes, unfiltered.
+ */
+function ShowChangesTarget({
+  target,
+  landing,
+  ready,
+  commitsSupported,
+  view,
+  jumpTo,
+}: {
+  target: PullRequestChangesTarget;
+  landing: PullRequestChangesLanding;
+  ready: boolean;
+  commitsSupported: boolean;
+  view: ChangesViewState;
+  jumpTo: (path: string) => void;
+}) {
+  const { mode, sinceSha, openCommit, setMode, setSinceSha, setPathFilter, setHideViewed } = view;
+  useEffect(() => {
+    if (landing.settled || !ready) return;
+    if ("commit" in target) {
+      landing.settled = true;
+      if (commitsSupported) openCommit(target.commit);
+      return;
+    }
+    if (mode !== "changes" || sinceSha) {
+      setMode("changes");
+      setSinceSha(null);
+      return;
+    }
+    landing.settled = true;
+    setPathFilter("");
+    setHideViewed(false);
+    jumpTo(target.path);
+  }, [
+    target,
+    landing,
+    ready,
+    commitsSupported,
+    mode,
+    sinceSha,
+    openCommit,
+    setMode,
+    setSinceSha,
+    setPathFilter,
+    setHideViewed,
+    jumpTo,
+  ]);
+  return null;
+}
+
 /**
  * The Changes tab content. Mounted beside the other tabs' content (it renders its
  * own TabsContent) so collapse and scroll-spy state survive tab switches.
@@ -487,6 +545,7 @@ export function PullRequestChangesTab({
   reviews,
   identity,
   target,
+  landing,
 }: {
   conversationId: string;
   data: NormalizedPullRequestInfo;
@@ -501,8 +560,10 @@ export function PullRequestChangesTab({
   reviews: ReturnType<typeof usePullRequestReviewThreads>;
   /** The PR's server identity, for the viewed-file key; null when unknown. */
   identity: PullRequestIdentity | null;
-  /** A commit or file a link opened this tab at; each new target is shown once. */
+  /** A commit or file a link opened this tab at, shown once for each landing on it. */
   target?: PullRequestChangesTarget;
+  /** The tab's latest landing on its place, by an open or a Back or Forward step. */
+  landing?: PullRequestChangesLanding;
 }) {
   const baseRef = data.base_ref ?? undefined;
   const headSha = pr.head_sha;
@@ -540,7 +601,6 @@ export function PullRequestChangesTab({
     setPathFilter,
     setHideViewed,
     setMode,
-    openCommit,
     setSinceSha,
     shownEarlierCommentPaths,
     setEarlierCommentsShown,
@@ -1058,46 +1118,6 @@ export function PullRequestChangesTab({
     [revealPane],
   );
 
-  // A link's commit opens once its list can say whether commits show here; a link's file
-  // shows in the PR's own changes, unfiltered, once they are read.
-  const targetKey = target ? JSON.stringify(target) : null;
-  const appliedTarget = useRef<string | null>(null);
-  useEffect(() => {
-    if (!target || !targetKey) {
-      appliedTarget.current = null;
-      return;
-    }
-    if (appliedTarget.current === targetKey || !selected || !changes.data) return;
-    if ("commit" in target) {
-      appliedTarget.current = targetKey;
-      if (commitsSupported) openCommit(target.commit);
-      return;
-    }
-    if (view.mode !== "changes" || view.sinceSha) {
-      setMode("changes");
-      setSinceSha(null);
-      return;
-    }
-    appliedTarget.current = targetKey;
-    setPathFilter("");
-    setHideViewed(false);
-    jumpTo(target.path);
-  }, [
-    target,
-    targetKey,
-    selected,
-    changes.data,
-    commitsSupported,
-    openCommit,
-    view.mode,
-    view.sinceSha,
-    setMode,
-    setSinceSha,
-    setPathFilter,
-    setHideViewed,
-    jumpTo,
-  ]);
-
   // A filtered-out target is visible only after the filter clears. With no filter left to
   // clear it can never show, so drop it rather than scroll to it when a filter changes later.
   useEffect(() => {
@@ -1412,6 +1432,16 @@ export function PullRequestChangesTab({
   // A controls row, then the sidebar (jump-to-file) + one scroll of all files' diffs.
   return (
     <TabsContent value="changes" className="flex min-h-0 flex-1 flex-col" onKeyDown={onTabKeyDown}>
+      {target && landing && !landing.settled && (
+        <ShowChangesTarget
+          target={target}
+          landing={landing}
+          ready={selected && !!changes.data}
+          commitsSupported={commitsSupported}
+          view={view}
+          jumpTo={jumpTo}
+        />
+      )}
       {reviewing &&
         data.capabilities.review_threads &&
         (reviews.page?.has_more ||

@@ -115,9 +115,11 @@ describe("PullRequestPageBody", () => {
     expect(onShowAllPullRequests).toHaveBeenCalledOnce();
   });
 
-  it("hands the place's commit or file to the Changes tab", () => {
-    renderBody({ section: "commits", target: { commit: "abcdef123" } });
+  it("hands the place's commit or file, and the tab's landing, to the Changes tab", () => {
+    const landing = { settled: false };
+    renderBody({ section: "commits", target: { commit: "abcdef123" }, landing });
     expect(captured.details?.changesTarget).toEqual({ commit: "abcdef123" });
+    expect(captured.details?.changesLanding).toBe(landing);
     cleanup();
     renderBody({ section: "summary", target: null });
     expect(captured.details?.changesTarget).toBeUndefined();
