@@ -7,15 +7,17 @@ Revises: 5ab01aaca219
 repeating hidden wake into its own session, which clients never list as an
 automation.
 
-Deployment order: run this migration first. Older binaries keep working, since
-they never write kind 3 and the wider check accepts what they write. Then deploy
-a release that reads timers to every server sharing the database, and only then
-enable its ``session_timers`` release feature: an older binary can't decode a
-timer row.
+Deployment order: run this migration first. Servers already running keep
+working, since they never write kind 3 and the wider check accepts what they
+write; as after any migration, though, a build from before it won't start
+against the migrated database. Then deploy a release that reads timers to every
+server sharing the database, and only then enable its ``session_timers`` release
+feature: an older binary can't decode a timer row.
 
-Rollback: before moving a server to a release that can't read timers, turn
-``session_timers`` off and drain the timers until no ``kind = 3`` row remains.
-The downgrade refuses while one does.
+Rollback: to run a release that has this migration but can't read timers, first
+turn ``session_timers`` off and drain the timers until no ``kind = 3`` row
+remains. Going back to a build from before this migration also needs this
+downgrade, which refuses while a timer row remains.
 """
 
 from __future__ import annotations

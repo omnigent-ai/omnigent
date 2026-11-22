@@ -112,7 +112,7 @@ A worker's first message starts with your instructions, then gives the item's te
 
 **Rolling timers out and back.** An older server can't read a timer row (a `scheduled_tasks` row with `kind = 3`): its due-task scan and its Automations list fail on one. Roll out in this order:
 
-1. Run the timer-kind migration (`bf30d7cbda61`) on the database. Older binaries keep working against it.
+1. Run the timer-kind migration (`bf30d7cbda61`) on the database. Servers already running keep working against it, but, as after any migration, a build from before it won't start against the migrated database.
 2. Deploy a release that reads timers to every server sharing the database, with `session_timers` off.
 3. Turn `session_timers` on.
 
@@ -124,7 +124,7 @@ Turning `session_timers` off stops new timers, not existing ones: they keep firi
 4. Wait for the scheduler to purge the deleted rows, which it does on each poll.
 5. Check that `SELECT count(*) FROM scheduled_tasks WHERE kind = 3` returns 0.
 
-The database downgrade also refuses while any timer row remains. Unlike reminders, they need neither `one_time_automations` nor an approval, and the automations gate does not hide them. `sys_timer_set` takes at most 1,000,000 seconds.
+That is enough to roll back to a release that has the migration but can't read timers. Going back to a build from before the migration also needs the database downgraded past `bf30d7cbda61`, because an older build won't start against a newer schema. That downgrade refuses while any timer row remains. Unlike reminders, they need neither `one_time_automations` nor an approval, and the automations gate does not hide them. `sys_timer_set` takes at most 1,000,000 seconds.
 
 Agent calls to `sys_scheduled_task_create` and `sys_scheduled_task_update`
 require interactive approval before persisting future work. Review the agent,
