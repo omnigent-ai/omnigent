@@ -122,9 +122,15 @@ export function usePaletteSessionSearch({
   open,
   sessionsOnly,
   matchLoaded = false,
+  includeArchived,
 }: {
   open: boolean;
   sessionsOnly: boolean;
+  /**
+   * Whether a session picker lists archived sessions, for an action that applies to them such
+   * as Unarchive. Unset, ⌘K's recent list includes them and Find a session doesn't.
+   */
+  includeArchived?: boolean;
   /**
    * Match the loaded sessions as the user types, ahead of the server's title matches, and
    * look up a pasted `#123` or pull request link among them instead of searching.
@@ -164,13 +170,13 @@ export function usePaletteSessionSearch({
 
   // ⌘K's recent list includes archived sessions, so one archived by mistake stays
   // a keystroke away; Find a session filters active ones by name.
-  const recentIncludesArchived = !sessionsOnly;
+  const recentIncludesArchived = includeArchived ?? !sessionsOnly;
   const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
     useConversations("", recentIncludesArchived, { enabled: open });
   // The sidebar's loaded sessions fill the recent rows until that list loads.
   const sidebarSessions = useOptionalLoadedConversations();
   const recentPages =
-    data?.pages ?? (recentIncludesArchived ? sidebarSessions?.pages : undefined) ?? EMPTY_PAGES;
+    data?.pages ?? (sessionsOnly ? undefined : sidebarSessions?.pages) ?? EMPTY_PAGES;
   const serverInfo = useServerInfo();
   // Older servers ignore `search_scope`, so they get one mixed group instead.
   const groupedSearch = serverInfo !== "loading" && serverInfo.session_search_scope === true;
@@ -254,7 +260,7 @@ export function usePaletteSessionSearch({
       const loaded = uniqueRows([
         ...recentPages.flatMap((page) => page.data),
         ...(sidebarRows ?? []),
-      ]).filter((row) => !row.archived);
+      ]).filter((row) => includeArchived === true || !row.archived);
       // A server group's page, so a short query doesn't list every loaded session; the
       // session switcher keeps its own bound, applied below.
       const allMatches = matchSessions(loaded, query);
@@ -293,6 +299,7 @@ export function usePaletteSessionSearch({
     showingServerMatches,
     matchingLoaded,
     sessionsOnly,
+    includeArchived,
     projects,
     parentTitles,
   ]);
