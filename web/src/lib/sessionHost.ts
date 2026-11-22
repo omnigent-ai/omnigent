@@ -10,8 +10,9 @@
 //
 // A small standalone map (rather than reading the TanStack Query cache) keeps
 // this decoupled from the query-key convention and needs no QueryClient handle.
-// A session's host_id is fixed for its lifetime, so the recorded value can't go
-// stale. Returns `null` when the session hasn't been loaded yet or is a hostless
+// Switching a session's host can leave a stale entry until the session is parsed
+// again or a wrong_replica refusal names the new host (`authenticatedFetch`).
+// Returns `null` when the session hasn't been loaded yet or is a hostless
 // local session; such requests carry the client's own key (`routingKey.ts`).
 
 import { clientRoutingKey } from "./routingKey.ts";
