@@ -312,3 +312,97 @@ async def test_sdk_side_chat_leaves_out_a_turn_whose_follow_up_was_sent_before_i
     await _mirror(client, session_id, "assistant", "Reviewing both", "r2")
 
     assert await _side_chat_history(client, session_id) == [_CODENAME, _NOTED]
+
+
+class _TurnRunner:
+    """A runner that answers a message the way the real one does: it starts a turn or waits."""
+
+    def __init__(self) -> None:
+        self.running: set[str] = set()
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.method != "POST" or not request.url.path.endswith("/events"):
+            return _runner(request)
+        session_id = request.url.path.split("/")[3]
+        if session_id in self.running:
+            detail = "Message buffered; active turn will process it."
+            return httpx.Response(202, json={"status": "buffered", "detail": detail})
+        self.running.add(session_id)
+        return httpx.Response(202, json={"status": "accepted", "detail": "Turn started."})
+
+    def start_turn(self, session_id: str) -> None:
+        """Start the turn the runner owes the messages it held."""
+        self.running.add(session_id)
+        sessions_module._publish_status(session_id, "running")
+
+    def end_turn(self, session_id: str) -> None:
+        self.running.discard(session_id)
+        sessions_module._publish_status(session_id, "idle")
+
+
+@pytest_asyncio.fixture
+async def turn_runner(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[_TurnRunner]:
+    """Route every session to a runner that starts turns and holds messages like the real one."""
+    turns = _TurnRunner()
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(turns), base_url="http://runner"
+    ) as client:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=client))
+        monkeypatch.setattr(
+            "omnigent.server.routes._sessions.orchestration._get_runner_client",
+            AsyncMock(return_value=client),
+        )
+        yield turns
+
+
+@pytest.mark.parametrize("held_kind", ["message", "skill"])
+async def test_sdk_side_chat_leaves_out_the_messages_a_runner_held_for_its_next_turn(
+    client: httpx.AsyncClient, turn_runner: _TurnRunner, held_kind: str
+) -> None:
+    """Messages a runner held while a turn ran start the next turn; a side chat leaves them out."""
+    session_id = await _session(client, native=False)
+    await _sdk_turn(client, session_id, lambda: _send(client, session_id, _CODENAME), _NOTED, "r1")
+    turn_runner.end_turn(session_id)
+    await _sdk_turn(
+        client, session_id, lambda: _send(client, session_id, "Review the parser"), "On it", "r2"
+    )
+    # A runner that cannot steer holds both for the turn after this one.
+    if held_kind == "message":
+        await _send(client, session_id, "Also check the lexer")
+    else:
+        skill = {"kind": "skill", "name": "grill-me", "arguments": "the parser"}
+        await _post(client, session_id, {"type": "slash_command", "data": skill})
+    await _send(client, session_id, "And the docs")
+    await _mirror(client, session_id, "assistant", "The parser looks fine", "r2")
+    turn_runner.end_turn(session_id)
+    turn_runner.start_turn(session_id)
+    await _mirror(client, session_id, "assistant", "Checking the rest", "r3")
+    await _send(client, session_id, "Then summarize")
+
+    history = await _side_chat_history(client, session_id)
+    assert history == [_CODENAME, _NOTED, "Review the parser", "On it"]
+
+
+async def test_sdk_side_chat_keeps_a_message_a_runner_steered_into_a_finished_turn(
+    client: httpx.AsyncClient, turn_runner: _TurnRunner
+) -> None:
+    """A held message that the ended turn took up stays in a later turn's side chat."""
+    session_id = await _session(client, native=False)
+    await _sdk_turn(client, session_id, lambda: _send(client, session_id, _CODENAME), _NOTED, "r1")
+    turn_runner.end_turn(session_id)
+    await _sdk_turn(
+        client, session_id, lambda: _send(client, session_id, "Review the parser"), "On it", "r2"
+    )
+    await _send(client, session_id, "Also check the lexer")
+    await _mirror(client, session_id, "assistant", "Both look fine", "r2")
+    turn_runner.end_turn(session_id)
+    await _sdk_turn(
+        client, session_id, lambda: _send(client, session_id, "Now add tests"), "Adding", "r3"
+    )
+
+    history = await _side_chat_history(client, session_id)
+    finished = ["Review the parser", "On it", "Also check the lexer", "Both look fine"]
+    assert history == [_CODENAME, _NOTED, *finished]
