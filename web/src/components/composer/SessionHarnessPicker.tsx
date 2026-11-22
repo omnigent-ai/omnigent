@@ -592,8 +592,6 @@ export function SessionHarnessPicker({
       )}
     </HarnessPicker>
   );
-  // Without a source this renders exactly the picker, and the ⌘K settings' hooks never run.
-  if (paletteSettingsSource === undefined) return picker;
   const routing = costRoutingEligible &&
     showModels && {
       active: routingOn,
@@ -603,15 +601,19 @@ export function SessionHarnessPicker({
         void apply(() => useChatStore.getState().setCostControlMode("on", ...target));
       },
     };
+  // The picker keeps its place as a source comes and goes, so it never remounts; without a
+  // source the ⌘K settings never mount and their hooks never run.
   return (
     <>
-      <ComposerPaletteSettings
-        source={paletteSettingsSource}
-        models={disabled ? undefined : modelSection}
-        efforts={disabled ? undefined : effortSection}
-        effortRouted={routingOn}
-        routing={routing || undefined}
-      />
+      {paletteSettingsSource !== undefined && (
+        <ComposerPaletteSettings
+          source={paletteSettingsSource}
+          models={disabled ? undefined : modelSection}
+          efforts={disabled ? undefined : effortSection}
+          effortRouted={routingOn}
+          routing={routing || undefined}
+        />
+      )}
       {picker}
     </>
   );

@@ -45,7 +45,11 @@ afterEach(() => {
 
 /** The open session's picker, as ChatPage's composer renders it, with `quick_pick_palette` on. */
 function renderOpenSessionPicker(paletteSettingsSource?: string) {
-  return render(
+  return render(openSessionPicker(paletteSettingsSource));
+}
+
+function openSessionPicker(paletteSettingsSource?: string) {
+  return (
     <CapabilitiesProvider
       info={{ ...FALLBACK_SERVER_INFO, features: { quick_pick_palette: true } }}
     >
@@ -70,7 +74,7 @@ function renderOpenSessionPicker(paletteSettingsSource?: string) {
           paletteSettingsSource={paletteSettingsSource}
         />
       </TooltipProvider>
-    </CapabilitiesProvider>,
+    </CapabilitiesProvider>
   );
 }
 
@@ -89,6 +93,17 @@ it("without a ⌘K source, mounts none of the settings and renders the same pick
   const withSource = renderOpenSessionPicker("composer:active");
   expect(settingsRenders.count).toBeGreaterThan(0);
   expect(markup(withSource.container)).toBe(withoutSource);
+});
+
+it("keeps the same picker when a new chat's draft becomes a session and gains a ⌘K source", () => {
+  useChatStore.setState({ conversationId: "active", llmModel: "opus" });
+  const { container, rerender } = renderOpenSessionPicker();
+  const picker = container.firstElementChild;
+  expect(picker).not.toBeNull();
+  rerender(openSessionPicker("composer:active"));
+  expect(settingsRenders.count).toBeGreaterThan(0);
+  // A remount would replace the picker's nodes and drop its open menu and focus.
+  expect(container.firstElementChild).toBe(picker);
 });
 
 it("with a ⌘K source, offers Model and Reasoning Effort that change the session as the menu does", async () => {
