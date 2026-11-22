@@ -245,6 +245,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _policy_evaluation_locks,
     _pushed_model_options_cache,
     _recent_mirrored_tool_calls,
+    _record_forwarded_request,
     _record_turn_request,
     _RelayHandle,
     _RelayStatusSnapshot,
@@ -257,6 +258,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_blocked_on_cache,
+    _session_held_request_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -8280,8 +8282,6 @@ async def _forward_event_to_runner(
             persisted = await asyncio.to_thread(
                 conversation_store.append, session_id, [replacement]
             )
-        if not persisted[0].deduplicated:
-            _record_turn_request(session_id, persisted[0].id)
         return persisted
 
     # Run controls wait for routing and a fresh guard before entering replayable history.
@@ -8777,6 +8777,12 @@ async def _forward_event_to_runner(
                 f"Runner rejected the message: {_reject_detail}",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
+        _record_forwarded_request(
+            session_id,
+            persisted_items[0].id,
+            _forward_resp,
+            turn_running=_session_status_from_cache(session_id, conv.live_status) == "running",
+        )
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         _publish_input_consumed(session_id, persisted_items[0])
@@ -9774,6 +9780,7 @@ def _relinquish_session_live_state(session_id: str) -> None:
     _session_status_cache.pop(session_id, None)
     _session_active_response_cache.pop(session_id, None)
     _session_turn_request_cache.pop(session_id, None)
+    _session_held_request_cache.pop(session_id, None)
     _session_blocked_on_cache.pop(session_id, None)
     session_live_state.forget_live_status(session_id)
 

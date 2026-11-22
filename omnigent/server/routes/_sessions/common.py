@@ -8,6 +8,7 @@ so a single instance is imported by reference across the package.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import re
@@ -665,8 +666,13 @@ _session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScoped
 
 
 # The input each running turn began with, so a side chat forked mid-turn copies
-# only what came before it. Set as that input is persisted; the turn's end drops it.
+# only what came before it. Set as that input is persisted or a runner starts a turn
+# with it; the turn's end drops it.
 _session_turn_request_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+
+# The first message a runner held for a running turn. It becomes the next turn's
+# start unless that turn begins with a message of its own.
+_session_held_request_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
 def _record_turn_request(session_id: str, item_id: str) -> None:
@@ -681,6 +687,34 @@ def _record_turn_request(session_id: str, item_id: str) -> None:
     :param item_id: The persisted input's item id.
     """
     _session_turn_request_cache.setdefault(session_id, item_id)
+
+
+def _record_forwarded_request(
+    session_id: str, item_id: str, reply: httpx.Response, *, turn_running: bool
+) -> None:
+    """
+    Record a message forwarded to *session_id*'s runner by what the runner did with it.
+
+    The runner replies ``{"status": "accepted"}`` when the message started a turn,
+    and ``{"status": "buffered"}`` when it holds the message for a running turn. A
+    runner that cannot steer takes held messages up together in its next turn. Any
+    other reply, e.g. from an older runner, falls back to :func:`_record_turn_request`.
+
+    :param session_id: Session the message was sent to, e.g. ``"conv_abc123"``.
+    :param item_id: The message's persisted item id.
+    :param reply: The runner's reply to the forwarded message.
+    :param turn_running: Whether the server has seen a turn running.
+    """
+    body: object = None
+    with contextlib.suppress(ValueError, AttributeError):
+        body = reply.json()
+    status = body.get("status") if isinstance(body, dict) else None
+    if status == "accepted":
+        _session_turn_request_cache[session_id] = item_id
+    elif status == "buffered" and turn_running:
+        _session_held_request_cache.setdefault(session_id, item_id)
+    else:
+        _record_turn_request(session_id, item_id)
 
 
 _session_background_task_count_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
@@ -1315,6 +1349,7 @@ __all__ = [
     "_read_explicit_unread",
     "_read_last_seen",
     "_recent_mirrored_tool_calls",
+    "_record_forwarded_request",
     "_record_turn_request",
     "_runner_relay_tasks",
     "_runner_status_probe_backoff",
@@ -1326,6 +1361,7 @@ __all__ = [
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
     "_session_blocked_on_cache",
+    "_session_held_request_cache",
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",

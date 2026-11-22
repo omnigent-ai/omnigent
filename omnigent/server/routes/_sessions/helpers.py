@@ -253,12 +253,13 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _pushed_model_options_cache,
     _read_explicit_unread,
     _read_last_seen,
-    _record_turn_request,
+    _record_forwarded_request,
     _session_active_response_cache,
     _session_background_agents_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_blocked_on_cache,
+    _session_held_request_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -5376,6 +5377,9 @@ def _publish_status(
     # A ``waiting`` edge naming background agents ends a claude-native turn too.
     if status not in ("running", "waiting") or background_agents:
         _session_turn_request_cache.pop(session_id, None)
+        # A message the runner held for the ended turn starts the next one.
+        if (held := _session_held_request_cache.pop(session_id, None)) is not None:
+            _session_turn_request_cache[session_id] = held
     # Keep the background-shell tally sticky alongside the status (see the
     # cache's declaration). A ``Stop`` hook reports an authoritative count
     # (``None`` is never sent by it): a positive count sets the tally, and
@@ -8682,8 +8686,6 @@ async def _dispatch_skill_slash_command_to_runner(
         [visible_item, meta_item],
     )
     visible = persisted_items[0]
-    if not visible.deduplicated:
-        _record_turn_request(session_id, visible.id)
 
     # Mirror the plain-message path's title seeding: a session whose FIRST
     # message is a skill invocation (web landing composer, REPL) would
@@ -8730,10 +8732,16 @@ async def _dispatch_skill_slash_command_to_runner(
         runner_body["harness_override"] = conv.harness_override
 
     try:
-        await runner_client.post(
+        reply = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=runner_body,
             timeout=_RUNNER_FORWARD_TIMEOUT,
+        )
+        _record_forwarded_request(
+            session_id,
+            visible.id,
+            reply,
+            turn_running=_session_status_from_cache(session_id, conv.live_status) == "running",
         )
         event = OutputItemDoneEvent(type="response.output_item.done", item=visible.to_api_dict())
         session_stream.publish(session_id, event.model_dump())
