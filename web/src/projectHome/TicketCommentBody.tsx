@@ -1,10 +1,8 @@
 import { useId, useMemo, useState } from "react";
-import { ChevronDownIcon } from "lucide-react";
 import { parseMarkdownIntoBlocks } from "streamdown";
 import { ProseMarkdown } from "@/components/blocks/ChatMarkdown";
 import { Button } from "@/components/ui/button";
 import { markdownPreviewText } from "@/lib/markdownPreviewText";
-import { cn } from "@/lib/utils";
 
 const PREVIEW_CHARACTERS = 600;
 const PREVIEW_LINES = 8;
@@ -60,21 +58,17 @@ export function TicketCommentBody({ body }: { body: string }) {
         )}
       </div>
       {preview && (
-        <div className="flex items-center gap-2">
-          {!expanded && <span className="text-xs text-muted-foreground">Preview</span>}
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="-ml-2 text-muted-foreground"
-            aria-controls={contentId}
-            aria-expanded={expanded}
-            onClick={() => setExpanded(!expanded)}
-          >
-            {expanded ? "Show less" : "Show full comment"}
-            <ChevronDownIcon aria-hidden className={cn("size-3.5", expanded && "rotate-180")} />
-          </Button>
-        </div>
+        <Button
+          type="button"
+          variant="link"
+          size="sm"
+          className="h-auto px-0 py-1 text-xs text-muted-foreground hover:text-foreground"
+          aria-controls={contentId}
+          aria-expanded={expanded}
+          onClick={() => setExpanded(!expanded)}
+        >
+          {expanded ? "Show less" : "Show more"}
+        </Button>
       )}
     </div>
   );

@@ -1,4 +1,4 @@
-import { useId, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   BotIcon,
@@ -515,7 +515,6 @@ function TicketCommentComposer({
   const [attaching, setAttaching] = useState(false);
   const [outputUrl, setOutputUrl] = useState("");
   const [outputType, setOutputType] = useState<TicketOutput["type"]>("pull_request");
-  const helpId = useId();
   return (
     <form
       className="space-y-2"
@@ -545,7 +544,6 @@ function TicketCommentComposer({
         <Textarea
           name="comment"
           aria-label="Add a comment"
-          aria-describedby={helpId}
           required
           maxLength={2000}
           rows={2}
@@ -617,10 +615,6 @@ function TicketCommentComposer({
           </Button>
         </div>
       </div>
-      <p id={helpId} className="px-1 text-xs text-muted-foreground">
-        Lead with the outcome. Use <code>**bold labels**</code> and{" "}
-        <code>[details](message URL)</code>; copy a message’s link from its chat.
-      </p>
       <TicketError error={comment.error} />
       <span role="status" className="sr-only">
         {comment.isSuccess ? "Comment added" : ""}

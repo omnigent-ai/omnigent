@@ -188,7 +188,8 @@ describe("Ticket comment previews", () => {
     );
     expect(screen.queryByText("Details")).toBeNull();
     expect(screen.queryByText("Pending owner confirmation.")).toBeNull();
-    const toggle = screen.getByRole("button", { name: "Show full comment" });
+    expect(screen.queryByText("Preview")).toBeNull();
+    const toggle = screen.getByRole("button", { name: "Show more" });
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     expect(document.getElementById(toggle.getAttribute("aria-controls")!)).toBeInTheDocument();
     toggle.focus();
@@ -199,7 +200,10 @@ describe("Ticket comment previews", () => {
     expect(screen.getByText("Details")).toHaveAttribute("data-streamdown", "strong");
     expect(screen.getByText(diagnostics.trim())).toBeInTheDocument();
     expect(screen.queryByText("Preview")).toBeNull();
-    await user.click(screen.getByRole("button", { name: "Show less" }));
+    expect(toggle).toHaveAccessibleName("Show less");
+    await user.keyboard(" ");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveFocus();
     expect(screen.queryByText("Pending owner confirmation.")).toBeNull();
     expect(screen.getByRole("link", { name: "Full verification" })).toHaveAttribute(
       "href",
@@ -223,7 +227,7 @@ describe("Ticket comment previews", () => {
     async (_label, body) => {
       const user = userEvent.setup();
       renderBoard(<TicketCommentBody body={body} />);
-      const toggle = screen.getByRole("button", { name: "Show full comment" });
+      const toggle = screen.getByRole("button", { name: "Show more" });
       const content = document.getElementById(toggle.getAttribute("aria-controls")!)!;
       expect(content.textContent!.length).toBeLessThanOrEqual(601);
       expect(content).toHaveTextContent("Diagnostic record.");
@@ -244,7 +248,7 @@ describe("Ticket comment previews", () => {
     const body = Array.from({ length: 16 }, (_, index) => `- Check ${index + 1}`).join("\n");
     renderBoard(<TicketCommentBody body={body} />);
     expect(screen.queryByRole("list")).toBeNull();
-    await user.click(screen.getByRole("button", { name: "Show full comment" }));
+    await user.click(screen.getByRole("button", { name: "Show more" }));
     expect(screen.getAllByRole("listitem")).toHaveLength(16);
     expect(screen.getByText("Check 16")).toBeInTheDocument();
   });
@@ -687,6 +691,8 @@ describe("Project ticket board", () => {
       const activity = await screen.findByRole("region", { name: "Ticket activity" });
       expect(within(activity).getAllByRole("link", { name: "org/repo #42" })).toHaveLength(2);
       expect(screen.queryByLabelText("Output URL")).toBeNull();
+      expect(screen.queryByText(/Lead with the outcome/)).toBeNull();
+      expect(screen.getByLabelText("Add a comment")).not.toHaveAttribute("aria-describedby");
       fireEvent.change(screen.getByLabelText("Add a comment"), {
         target: { value: "Ready for review" },
       });
@@ -786,7 +792,7 @@ describe("Project ticket board", () => {
     expect(screen.queryByRole("heading", { name: "Tags" })).toBeNull();
     expect(screen.queryByRole("heading", { name: "Pull requests" })).toBeNull();
     expect(screen.queryByRole("heading", { name: "Links" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Show full comment" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
     expect(screen.queryByRole("heading", { name: "Sessions" })).toBeNull();
     expect(screen.queryByRole("combobox", { name: "Output type" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Add plan" })).toBeNull();
