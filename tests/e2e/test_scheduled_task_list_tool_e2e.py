@@ -37,10 +37,11 @@ _TRIGGER_RULE = "FREQ=MINUTELY;INTERVAL=10;BYDAY=MO,TU,WE,TH,FR"
 _SCHEDULE_RULE = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0"
 
 
-def _create_paused_task(client: httpx.Client, body: dict[str, object]) -> str:
+def _create_paused_task(client: httpx.Client, body: dict[str, object], task_ids: list[str]) -> str:
     created = client.post("/v1/scheduled-tasks", json=body)
     assert created.status_code == 200, created.text
     task_id = str(created.json()["id"])
+    task_ids.append(task_id)  # cleaned up by the caller even if pausing fails
     # Paused, so neither automation fires while the agent lists them.
     client.patch(f"/v1/scheduled-tasks/{task_id}", json={"state": "paused"}).raise_for_status()
     return task_id
@@ -74,8 +75,8 @@ def test_scheduled_task_list_reads_a_trigger_rrule_as_null(
                 "agent_id": agent_id,
                 "session_mode": "continue",
             },
+            task_ids,
         )
-        task_ids.append(trigger_id)
         scheduled_id = _create_paused_task(
             http_client,
             {
@@ -84,8 +85,8 @@ def test_scheduled_task_list_reads_a_trigger_rrule_as_null(
                 "rrule": _SCHEDULE_RULE,
                 "agent_id": agent_id,
             },
+            task_ids,
         )
-        task_ids.append(scheduled_id)
         configure_mock_llm(
             mock_llm_server_url,
             [

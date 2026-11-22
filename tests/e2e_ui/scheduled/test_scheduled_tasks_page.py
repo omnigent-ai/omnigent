@@ -19,9 +19,10 @@ never exercised.
 from __future__ import annotations
 
 import re
+import sqlite3
 import uuid
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager, suppress
+from contextlib import closing, contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,6 @@ import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
-from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests._helpers.host import Host, isolated_host
 from tests._helpers.live_server import terminate_process
 
@@ -1253,12 +1253,12 @@ def test_editing_a_trigger_keeps_its_withheld_rule(
     expect(_row_by_name(page, name)).to_be_visible(timeout=30_000)
     tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
     task = next(t for t in tasks if t["name"] == name)
-    assert task["rrule"] is None, task
     url = f"{live_server}/v1/scheduled-tasks/{task['id']}"
-    # A weekday rule an agent might save for the trigger, which the form never builds.
-    weekday_rule = "FREQ=MINUTELY;INTERVAL=10;BYDAY=MO,TU,WE,TH,FR"
-    httpx.patch(url, json={"rrule": weekday_rule}, timeout=10).raise_for_status()
     try:
+        assert task["rrule"] is None, task
+        # A weekday rule an agent might save for the trigger, which the form never builds.
+        weekday_rule = "FREQ=MINUTELY;INTERVAL=10;BYDAY=MO,TU,WE,TH,FR"
+        httpx.patch(url, json={"rrule": weekday_rule}, timeout=10).raise_for_status()
         _row_by_name(page, name).get_by_test_id("task-row-menu").click()
         page.get_by_test_id("task-edit").click()
         page.get_by_role("button", name="Advanced settings (optional)", exact=True).click()
@@ -1271,8 +1271,13 @@ def test_editing_a_trigger_keeps_its_withheld_rule(
         saved = httpx.get(url, timeout=10).json()
         assert "Investigate the ticket." in saved["prompt"], saved
         assert saved["rrule"] is None, saved
-        stored = SqlAlchemyScheduledTaskStore(f"sqlite:///{automations_v2_server_dir / 'chat.db'}")
-        assert stored.get(task["id"]).rrule == weekday_rule
+        # Read-only, so the check can't migrate an older server's database.
+        database = automations_v2_server_dir / "chat.db"
+        with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as db:
+            rows = db.execute(
+                "SELECT rrule FROM scheduled_tasks WHERE id = ?", (bytes.fromhex(task["id"]),)
+            ).fetchall()
+        assert rows == [(weekday_rule,)]
     finally:
         httpx.delete(url, timeout=10)
 
