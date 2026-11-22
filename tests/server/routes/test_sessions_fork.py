@@ -250,9 +250,9 @@ class _ConversationStore:
             Mirrors the real store: ``None`` copies everything; a value
             matching no item's ``response_id`` raises ValueError.
         :param before_item_id: Cutoff for a continuation or a side chat
-            forked mid-turn; recorded only.
-        :param copy_items: ``False`` for a continuation that keeps no
-            history; recorded only.
+            forked mid-turn: copy only the items before this one.
+        :param copy_items: ``False`` copies none of the source's items, as
+            the real store does.
         :param continue_source: Whether the fork continues its source on the
             same placement; recorded only.
         :param conversation_id: Id chosen by the caller; recorded only.
@@ -314,7 +314,7 @@ class _ConversationStore:
         # the copied items (mirrors real store behavior, including the
         # up-to-and-including-last-item-of-the-response truncation).
         fork_id = "c538360473d41c84c1eee13918fbeca0"
-        source_items = list(self._items.get(source_conversation_id, []))
+        source_items = list(self._items.get(source_conversation_id, [])) if copy_items else []
         if up_to_response_id is not None:
             cutoff_index = max(
                 index
@@ -322,6 +322,11 @@ class _ConversationStore:
                 if item.response_id == up_to_response_id
             )
             source_items = source_items[: cutoff_index + 1]
+        if before_item_id is not None:
+            cutoff = next(
+                index for index, item in enumerate(source_items) if item.id == before_item_id
+            )
+            source_items = source_items[:cutoff]
         self._items[fork_id] = source_items
         # Mirror the real store's label handling for the three rules the route
         # depends on: source labels are copied EXCEPT the store's own fork-only
@@ -790,6 +795,8 @@ def _delivering(conversation_id: str, delivery: str | None) -> Iterator[None]:
         (True, "running", ("request", "progress", "notice"), None, "msg_running", None, False),
         (True, "running", ("skill", "progress"), None, "msg_skill", None, False),
         (True, "running", ("skill_prompt", "progress"), None, "msg_skill_prompt", None, False),
+        # A skill the server ran keeps its command and prompt together.
+        (True, "running", ("skill", "skill_prompt", "progress"), None, "msg_skill", None, False),
         (True, "running", ("request", "progress"), "follow_up", "msg_running", None, False),
         (True, "idle", ("request",), "dispatch", "msg_running", None, False),
         # The request is not in history yet, so the copy stops at what is.
@@ -829,13 +836,18 @@ def test_side_chat_forked_mid_turn_leaves_out_the_running_request(
     assert store.fork_calls[-1]["resume_source_native_session"] is clones_native
 
 
-def test_side_chat_fork_ignores_a_request_that_lands_while_it_is_prepared() -> None:
+@pytest.mark.parametrize(
+    ("history", "copied"),
+    [(_side_chat_fork_history, ["resp_001", "resp_002"]), (list, [])],
+    ids=["after_an_exchange", "empty"],
+)
+def test_side_chat_fork_ignores_a_request_that_lands_while_it_is_prepared(
+    history: Any, copied: list[str]
+) -> None:
     """The history a side chat copies is fixed before the parent's request lands."""
     source = _make_conversation()
     source.live_status = "running"
-    store = _ConversationStore(
-        {source.id: source}, items_by_conv={source.id: _side_chat_fork_history()}
-    )
+    store = _ConversationStore({source.id: source}, items_by_conv={source.id: history()})
     fork = store.fork_conversation
 
     def mirror_then_fork(*args: Any, **kwargs: Any) -> Conversation:
@@ -847,6 +859,36 @@ def test_side_chat_fork_ignores_a_request_that_lands_while_it_is_prepared() -> N
 
     with _delivering(source.id, "turn_start"):
         response = client.post(f"/v1/sessions/{source.id}/fork", json={"side_chat": True})
+
+    assert response.status_code == 201, response.text
+    assert [item["response_id"] for item in response.json()["items"]] == copied
+
+
+def test_side_chat_fork_keeps_the_exchange_before_a_request_that_settles() -> None:
+    """A request that reaches history while the fork reads it costs no earlier exchange."""
+    source = _make_conversation()
+    source.live_status = "running"
+    store = _ConversationStore(
+        {source.id: source}, items_by_conv={source.id: _side_chat_fork_history()}
+    )
+    pending_id = pending_inputs.record(source.id, [{"type": "input_text", "text": "Run it"}])
+    list_items = store.list_items
+
+    def read_then_settle(*args: Any, **kwargs: Any) -> PagedList[ConversationItem]:
+        page = list_items(*args, **kwargs)
+        # Right after the fork's lookup, the request persists and stops pending.
+        if kwargs.get("limit") == routes_core._SIDE_CHAT_REQUEST_LOOKBACK and (
+            pending_inputs.resolve(source.id, pending_id) is not None
+        ):
+            store._items[source.id] += _side_chat_fork_history("request")[2:]
+        return page
+
+    store.list_items = read_then_settle  # type: ignore[method-assign]
+    client = TestClient(_build_app(store))
+    try:
+        response = client.post(f"/v1/sessions/{source.id}/fork", json={"side_chat": True})
+    finally:
+        pending_inputs.resolve(source.id, pending_id)
 
     assert response.status_code == 201, response.text
     assert [item["response_id"] for item in response.json()["items"]] == ["resp_001", "resp_002"]
