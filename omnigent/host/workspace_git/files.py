@@ -7,6 +7,7 @@ write the repository's configuration. This never writes the index or config.
 
 from __future__ import annotations
 
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -29,7 +30,8 @@ _MAX_CACHED_WORKSPACES = 64
 class FileListing:
     """The files Git knows beneath a workspace, relative to it.
 
-    :param tracked: Paths in the index.
+    :param tracked: Paths in the index. Shared with later listings while the
+        index is unchanged, so it must not be modified.
     :param untracked: Untracked, unignored files; a nested repository is
         its directory. ``None`` when they couldn't be listed.
     :param incomplete: A listing stopped at its size cap.
@@ -78,6 +80,7 @@ class WorkspaceFiles:
 
     def __init__(self, root: Path) -> None:
         self._root = root
+        self._tracked: tuple[tuple[int, ...], list[str], bool] | None = None
         self._untracked: tuple[float, list[str], bool] | None = None
 
     async def list_files(
@@ -92,22 +95,36 @@ class WorkspaceFiles:
         repository = await GitRepository.discover(self._root, deadline)
         if repository is None:
             return None
-        tracked = await repository.run_unchecked(
+        tracked, tracked_incomplete = await self._list_tracked(repository, deadline)
+        untracked, untracked_incomplete = await self._list_untracked(
+            repository, deadline, retry=retry_untracked
+        )
+        return FileListing(
+            tracked=tracked,
+            untracked=untracked,
+            incomplete=tracked_incomplete or untracked_incomplete,
+        )
+
+    async def _list_tracked(
+        self, repository: GitRepository, deadline: Deadline
+    ) -> tuple[list[str], bool]:
+        # The index alone decides the listing, so an unchanged index reuses it.
+        index = _index_state(repository.git_directory)
+        cached = self._tracked
+        if index is not None and cached is not None and cached[0] == index:
+            return cached[1], cached[2]
+        output = await repository.run_unchecked(
             ["ls-files", "--cached", "-z", "--", "."],
             deadline=deadline,
             stdout_bytes=LISTING_OUTPUT_BYTES,
             allow_partial=True,
         )
-        if not tracked.success and not tracked.overflowed:
-            raise failure(tracked, "ls-files")
-        untracked, untracked_incomplete = await self._list_untracked(
-            repository, deadline, retry=retry_untracked
-        )
-        return FileListing(
-            tracked=_paths(tracked.stdout),
-            untracked=untracked,
-            incomplete=tracked.overflowed or untracked_incomplete,
-        )
+        if not output.success and not output.overflowed:
+            raise failure(output, "ls-files")
+        paths = _paths(output.stdout)
+        if index is not None:
+            self._tracked = (index, paths, output.overflowed)
+        return paths, output.overflowed
 
     async def _list_untracked(
         self, repository: GitRepository, deadline: Deadline, *, retry: bool
@@ -131,11 +148,20 @@ class WorkspaceFiles:
         return paths, output.overflowed
 
 
+def _index_state(git_directory: Path) -> tuple[int, ...] | None:
+    """What changes whenever Git writes the index, or ``None`` without one."""
+    try:
+        found = os.stat(git_directory / "index")
+    except OSError:
+        return None
+    return (found.st_ino, found.st_size, found.st_mtime_ns, found.st_ctime_ns)
+
+
 _by_root: OrderedDict[Path, WorkspaceFiles] = OrderedDict()
 
 
 def workspace_files(root: Path) -> WorkspaceFiles:
-    """The shared lister for ``root``, so its untracked list is reused across calls."""
+    """The shared lister for ``root``, so its listings are reused across calls."""
     files = _by_root.pop(root, None) or WorkspaceFiles(root)
     _by_root[root] = files
     while len(_by_root) > _MAX_CACHED_WORKSPACES:
