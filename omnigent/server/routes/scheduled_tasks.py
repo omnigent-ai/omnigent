@@ -84,7 +84,7 @@ from omnigent.server.scheduled.rrule import (
 )
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.run_sharing import delete_task_grants
-from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+from omnigent.server.scheduled.schedule import continued_sandbox_host_id, is_trigger_automation
 from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.scheduled.workflow_automations import workflow_session_reuse_error
 from omnigent.server.session_mcp_selection import (
@@ -152,7 +152,8 @@ class CreateScheduledTaskRequest(BaseModel):
     prompt: str
     rrule: str
     agent_id: str
-    timezone: str = "UTC"
+    # Only explicit null opts into the owner's recorded zone; omission stays UTC.
+    timezone: str | None = "UTC"
     model_override: str | None = None
     reasoning_effort: str | None = None
     # Native-harness permission or execution mode; validated against the agent.
@@ -205,6 +206,14 @@ class CreateScheduledTaskRequest(BaseModel):
             self.base_branch, self.execution_target, self.host_id, self.workspace
         )
         return self
+
+
+class SetDefaultTimezoneRequest(BaseModel):
+    """Body for ``PUT /v1/scheduled-tasks/default-timezone``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    timezone: str
 
 
 class UpdateScheduledTaskRequest(BaseModel):
@@ -274,10 +283,20 @@ def _next_run_at(task: ScheduledTask, request: Request) -> str | None:
     return scheduler.next_run_at(task.id) if scheduler is not None else None
 
 
+def _hides_trigger_rrule(request: Request) -> bool:
+    """Whether trigger automations' rules are withheld from responses.
+
+    With automations v2 the server decides when a trigger polls; the legacy timers
+    poll it on its saved rule, so they return it.
+    """
+    return getattr(request.app.state, "scheduled_task_dispatch_enabled", False)
+
+
 def _to_response(
     task: ScheduledTask,
     *,
     shareable: bool,
+    hide_trigger_rrule: bool,
     last_run_status: str | None = None,
     next_run_at: str | None = None,
     viewer_role: ScheduledTaskViewerRole = "owner",
@@ -287,6 +306,8 @@ def _to_response(
 
     :param shareable: Whether the automation itself can be shared, from
         :func:`scheduled_task_shareable`.
+    :param hide_trigger_rrule: Send a trigger automation's ``rrule`` as ``None``, from
+        :func:`_hides_trigger_rrule`.
     :param last_run_status: The status of the task's most recent run
         (``succeeded`` / ``failed`` / ``skipped`` / ``running`` / ``scheduled``),
         or ``None`` when the task has never run. Surfaced so the Tasks list can
@@ -304,7 +325,7 @@ def _to_response(
         "id": task.id,
         "name": task.name,
         "prompt": task.prompt,
-        "rrule": task.rrule,
+        "rrule": None if hide_trigger_rrule and is_trigger_automation(task) else task.rrule,
         # JSON key preserved for API/UI stability; the DB column + entity
         # attribute are now ``user_id``.
         "owner_user_id": task.user_id,
@@ -431,11 +452,22 @@ def _validate_timezone_or_400(timezone: str) -> None:
     """Raise a 400 ``OmnigentError`` if *timezone* is not a valid IANA timezone."""
     try:
         ZoneInfo(timezone)
-    except (ZoneInfoNotFoundError, KeyError, ValueError) as exc:
+    except (ZoneInfoNotFoundError, KeyError, ValueError, OSError) as exc:
         raise OmnigentError(
             f"invalid timezone {timezone!r}: must be a valid IANA timezone name",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+
+
+def _resolve_create_timezone(
+    body: CreateScheduledTaskRequest, store: ScheduledTaskStore, user_id: str | None
+) -> str:
+    """Resolve an explicit request for the owner's default without changing legacy creates."""
+    timezone = body.timezone
+    if timezone is None:
+        timezone = store.get_default_timezone(user_id) or "UTC"
+    _validate_timezone_or_400(timezone)
+    return timezone
 
 
 async def _workflow_reuse_problem(prompt: str, session_mode: str) -> str | None:
@@ -1189,7 +1221,8 @@ def create_scheduled_tasks_router(
                 "first_run_at needs one-time automations, which this server does not enable",
                 code=ErrorCode.INVALID_INPUT,
             )
-        _validate_timezone_or_400(body.timezone)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        timezone = await asyncio.to_thread(_resolve_create_timezone, body, store, owner_id)
         permission_mode = validate_scheduled_permission_mode(body.permission_mode)
         agent, workspace, model_override, reasoning_effort = await _validate_launch_inputs(
             request,
@@ -1202,7 +1235,6 @@ def create_scheduled_tasks_router(
             permission_mode=permission_mode,
             execution_target=body.execution_target,
         )
-        owner_id = None if owner == RESERVED_USER_LOCAL else owner
         project_owner = _project_owner(owner)
         # Known before the task exists, since a sandbox session must run on the
         # sandbox host derived from it.
@@ -1226,7 +1258,7 @@ def create_scheduled_tasks_router(
                         rrule=body.rrule,
                         user_id=owner_id,
                         agent_id=agent.id,
-                        timezone=body.timezone,
+                        timezone=timezone,
                         created_at=0,
                         workspace=workspace,
                         base_branch=body.base_branch,
@@ -1278,7 +1310,7 @@ def create_scheduled_tasks_router(
                     rrule=body.rrule,
                     user_id=owner_id,
                     agent_id=bound.id,
-                    timezone=body.timezone,
+                    timezone=timezone,
                     model_override=model_override,
                     reasoning_effort=reasoning_effort,
                     permission_mode=permission_mode,
@@ -1351,8 +1383,29 @@ def create_scheduled_tasks_router(
         return _to_response(
             task,
             shareable=scheduled_task_shareable(permission_store, task.id),
+            hide_trigger_rrule=_hides_trigger_rrule(request),
             next_run_at=_next_run_at(task, request),
         )
+
+    @router.put("/scheduled-tasks/default-timezone")
+    async def set_default_timezone(
+        request: Request,
+        body: SetDefaultTimezoneRequest,
+    ) -> dict[str, str]:
+        """Record the caller's local zone for tasks that explicitly request the default."""
+        owner = _owner(request)
+        _validate_timezone_or_400(body.timezone)
+        try:
+            await asyncio.to_thread(
+                store.set_default_timezone,
+                None if owner == RESERVED_USER_LOCAL else owner,
+                body.timezone,
+            )
+        except NotImplementedError as exc:
+            raise HTTPException(
+                status_code=501, detail="default timezone is not supported"
+            ) from exc
+        return {"timezone": body.timezone}
 
     @router.get("/scheduled-tasks")
     async def list_scheduled_tasks(
@@ -1388,11 +1441,13 @@ def create_scheduled_tasks_router(
         # dead run as ``failed`` rather than a stuck ``running``.
         force_fail_stale_runs(store, running)
         latest_status = store.list_latest_run_status_for_tasks(task_ids)
+        hide_trigger_rrule = _hides_trigger_rrule(request)
         return {
             "scheduled_tasks": [
                 _to_response(
                     t,
                     shareable=scheduled_task_shareable(permission_store, t.id),
+                    hide_trigger_rrule=hide_trigger_rrule,
                     last_run_status=latest_status.get(t.id),
                     next_run_at=_next_run_at(t, request),
                 )
@@ -1495,11 +1550,13 @@ def create_scheduled_tasks_router(
         # Reads one run per automation; a stale running run fails when its history is read.
         latest_status = await asyncio.to_thread(store.list_latest_run_status_for_tasks, ids)
         names = await _owner_display_names(tasks)
+        hide_trigger_rrule = _hides_trigger_rrule(request)
         return {
             "scheduled_tasks": [
                 _to_response(
                     task,
                     shareable=scheduled_task_shareable(permission_store, task.id),
+                    hide_trigger_rrule=hide_trigger_rrule,
                     last_run_status=latest_status.get(task.id),
                     next_run_at=_next_run_at(task, request),
                     viewer_role="viewer",
@@ -1530,6 +1587,7 @@ def create_scheduled_tasks_router(
         return _to_response(
             task,
             shareable=scheduled_task_shareable(permission_store, task.id),
+            hide_trigger_rrule=_hides_trigger_rrule(request),
             last_run_status=latest_status.get(task.id),
             next_run_at=_next_run_at(task, request),
             viewer_role=role,
@@ -2102,6 +2160,7 @@ def create_scheduled_tasks_router(
         return _to_response(
             updated,
             shareable=scheduled_task_shareable(permission_store, updated.id),
+            hide_trigger_rrule=_hides_trigger_rrule(request),
             last_run_status=latest_status.get(updated.id),
             next_run_at=_next_run_at(updated, request),
         )

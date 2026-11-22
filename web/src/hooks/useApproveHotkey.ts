@@ -45,6 +45,15 @@ export const APPROVE_KEYS = shortcutKeys("approval.accept");
 export const DECLINE_KEYS = shortcutKeys("approval.decline");
 
 /**
+ * Marks an element that binds ⌘↵ (Ctrl+↵ off macOS) itself, such as a row that opens
+ * in a new tab: with it focused, the chord is its own, never a prompt's accept.
+ */
+export const OWNS_COMMAND_ENTER_ATTRIBUTE = "data-owns-command-enter";
+
+/** Elements marked as owning ⌘↵, such as the file editor, which inserts a line below with it. */
+const COMMAND_ENTER_OWNERS = `[${OWNS_COMMAND_ENTER_ATTRIBUTE}]`;
+
+/**
  * Whether Esc belongs to something else: an open dialog or modal, menu, composer
  * suggestion list, /btw answer, open panel or dictation that closes on Escape, or a
  * text field other than the chat composer.
@@ -165,6 +174,9 @@ export function useApproveHotkey(isMac = isMacPlatform()): void {
       // verdict. Leave the event for the composer's own handler (whose
       // send path is separately gated while a prompt is pending).
       if (isDraftingTarget(e.target)) return;
+      // A marked owner of ⌘↵ keeps it. The chat composer is a CodeMirror editor too, but an
+      // empty one still answers the prompt, so being an editor alone isn't enough.
+      if (e.target instanceof Element && e.target.closest(COMMAND_ENTER_OWNERS)) return;
 
       const { blocks, submitApproval } = useChatStore.getState();
       const target = approveHotkeyTarget(blocks);

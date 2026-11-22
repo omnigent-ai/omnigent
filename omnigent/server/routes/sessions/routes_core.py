@@ -277,6 +277,7 @@ from omnigent.server.schemas import (
     SupersessionReason,
     UpdateSessionRequest,
 )
+from omnigent.server.session_journal import titled_for_workflow_run
 from omnigent.server.session_orchestration import (
     require_archive_outside_source_lineage,
     require_named_source_private,
@@ -3537,6 +3538,11 @@ def register_core_routes(
         if seed_title is None:
             return AutomaticSessionRenameResponse(renamed=False, reason="no_seed")
         if conv.title != seed_title:
+            return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
+        # A run's workflow name isn't a seed, even when its first message reads the same.
+        if await asyncio.to_thread(
+            titled_for_workflow_run, conversation_store, session_id, conv.title
+        ):
             return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
         updated = await asyncio.to_thread(
             conversation_store.rename_conversation_if_title_matches,

@@ -271,7 +271,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `new-command`: `/new` opens a blank new-session composer in the same project;
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
-  be removed. State: unsupported file type rejected without losing the message.
+  be removed. Supported native coding agents receive binary attachments, including
+  MP4 uploads up to 50 MiB, as local files.
+  State: unsupported file type rejected without losing the message.
 - `at-mentions`: a bare `@` in the in-session or new-session composer shows a
   "Sessions" row. Opening it (click, Enter, Tab or →) shows a "Subagents" row
   for the current session's subagents, then every other session the sidebar
@@ -324,8 +326,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   can be steered into the running turn. Side-chat composers queue and steer the
   same way, with their own queue strip.
   A message sent mid-turn to a native session says the agent will read it
-  after its current step in the timestamp row. It appears on desktop hover or
-  focus and stays visible with truncation on touch, without adding row height.
+  after its current step in the timestamp row. The note stays visible, with
+  truncation, on desktop and touch until the agent reads the message, while the
+  row's timestamp and actions keep their hover reveal on desktop.
 - `host-offline-hold`: a message sent to a native session whose host is offline
   waits in the queue as "Waiting for host", ahead of other queued messages, and
   sends once the host reconnects; no failed turn is recorded.
@@ -369,6 +372,15 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   transcript shows a yellow banner with the deployment's instructions. Provisioning
   continues, and the banner leaves when the launch moves on. Dismissing hides
   only that warning; a later one shows again.
+- `palette-model-effort`: with `quick_pick_palette` on (off by default), ⌘K lists
+  the open session composer's **Model** and **Reasoning Effort** (**Thinking
+  Level** for Pi) under **Composer**, each showing its current value. Enter opens
+  the menu's choices; picking one runs the menu's own handler. Model lists Smart
+  Routing first where the composer offers it, and the whole effort row is greyed
+  while Smart Routing picks the effort. A value the menu greys says why. With the
+  flag off the picker mounts none of it
+  (`web/src/components/composer/composerSectionSettings.test.tsx`,
+  `web/src/components/composer/SessionHarnessPicker.test.tsx`).
 - `custom-agent-placement`: New session and Add nested agent can launch an uploaded
   custom agent on a fresh sandbox with repositories when `session_bundle_workspaces`
   is advertised. Nested custom agents can also use new or existing worktrees on a
@@ -379,6 +391,14 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   bundle and selects it. States: import in flight (Cancel and Create locked),
   rejected bundle, imported agent missing from the refreshed list, and hidden on
   a server without agent install.
+- `palette-add-actions`: with `quick_pick_palette` on (off by default), ⌘K lists
+  the open session composer's Add menu under **Composer**: Attach files and
+  images…, Start a new side chat, Set goal… (View or update goal… once one is
+  set), and Enter or Exit Plan mode. Each reads the menu item's availability
+  and runs its handler, so a row the menu hides is absent and a greyed one says
+  why. Only the open session's composer offers them; side chats and the
+  new-session composer add none
+  (`web/src/components/composer/useComposerAddPaletteCommands.test.tsx`).
 - `mobile-labels`: on narrow screens labels collapse to icons without
   overlapping the stop button.
 
@@ -471,7 +491,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - Change Settings → Always steer (on by default) to choose whether
   busy-session Design-mode follow-ups queue or send immediately. Existing queued
   messages retain FIFO ordering. Annotate/Draw requests ignore it: they wait above
-  the composer (Send/Enter, then Retry or Remove) until the turn ends.
+  the composer (Send/Enter, then Retry or Remove) until the turn ends. With
+  `quick_pick_palette` on, ⌘K also lists Always steer as a setting row: type
+  "always steer", press Enter, and pick On or Off
+  (`web/src/shell/QuickPickCommandPalette.appCommands.test.tsx`).
+- With `quick_pick_palette` on, in an open session press Cmd/Ctrl+K, type
+  "model" or "reasoning effort", press Enter, then pick a value.
 
 **New-session composer** (landing page, or New session):
 
@@ -581,6 +606,10 @@ and opens the composer with its prompt`).
   Under picker curation (`restrict_to_agent_names`, see
   `native-harnesses.md`) this New Chat entry point is absent: a curated
   deployment offers no bundle import from New Chat.
+
+- With `quick_pick_palette` on, open a session, press Cmd/Ctrl+K and type
+  "attach", "side chat", "goal" or "plan mode", then press Enter to run the
+  Add menu's action. A row that can't run stays listed with the reason.
 
 **Fork dialog** (Fork in the session header menu, or Fork from here on a
 message, with a native target): the same model, effort, and permission mode
@@ -1061,7 +1090,9 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   The native mid-turn notice has component coverage in
   `web/src/pages/ChatPage.userBubble.test.tsx`.
   `tests/browser_ui/chat/test_status_indicators.py::test_mobile_layout_reveals_timestamps_and_pending_steering`
-  verifies their visibility without hover in the mobile layout.
+  verifies their visibility without hover in the mobile layout, and
+  `test_steering_explanation_stays_visible_on_desktop` keeps the notice visible
+  without hover on desktop.
 - **`host-offline-hold`:** no browser-level coverage.
   `tests/server/integration/test_session_host_launch.py::test_offline_host_send_held_by_client_records_nothing`
   (plain `uv run pytest`) checks that a held send is refused with nothing

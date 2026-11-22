@@ -227,10 +227,37 @@ export async function fetchTerminals(conversationId: string): Promise<TerminalIn
   return (await fetchTerminalList(conversationId)) ?? [];
 }
 
+/**
+ * How long a shell-list read may take, body included, before it fails. Longer than a shell tab's
+ * wait, so a Try Again then joins the read, and the next one after it fails starts afresh.
+ */
+export const TERMINAL_LIST_TIMEOUT_MS = 30_000;
+
 /** {@link fetchTerminals}, but null when the runner could not answer (a soft status). */
 async function fetchTerminalList(conversationId: string): Promise<TerminalInfo[] | null> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(`terminals fetch timed out after ${TERMINAL_LIST_TIMEOUT_MS} ms`);
+      controller.abort(error);
+      reject(error);
+    }, TERMINAL_LIST_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([readTerminalList(conversationId, controller.signal), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readTerminalList(
+  conversationId: string,
+  signal: AbortSignal,
+): Promise<TerminalInfo[] | null> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals?order=asc&limit=1000`,
+    { signal },
   );
   if (SOFT_TERMINAL_LIST_STATUSES.has(res.status)) return null;
   if (!res.ok) throw new Error(`terminals fetch failed: ${res.status} ${res.statusText}`);

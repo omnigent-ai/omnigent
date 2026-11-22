@@ -128,7 +128,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   walkthrough, capability-dependent content, and browser-local dismissal.
 
 - [Pull request conversations](./pull-request-conversations.md) covers inline
-  GitHub threads and replies through Workspace, composer, mobile and Canvas.
+  GitHub threads and replies through Workspace, composer, mobile and Canvas, and
+  PR reference links in chat messages.
 
 - [Pull request review navigation](./pull-request-review-navigation.md) covers the
   Changes tab's path filter, find in the fetched patch, copy and open actions, and
@@ -182,6 +183,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Sandbox profiles](./sandbox-profiles.md) covers provider-owned discovery,
   desktop and mobile profile selection, and the boundary between browser
   request proof and live resource/network enforcement.
+- [Floating New Agent panel](./floating-new-agent.md) covers the macOS desktop
+  app's ⇧⌘Space panel: opening it from any app, hiding it with its draft, launching
+  on This Mac or a new sandbox, and its release flag.
 
 - [GitLab merge requests](./gitlab.md) covers the shared MR panel, composer,
   Canvas links, and native tracking.

@@ -215,6 +215,7 @@ import {
 } from "@/components/chat/chatBubbleParts";
 import { useSession } from "@/hooks/useSession";
 import { useOpenGithubTab } from "@/shell/FileViewerContext";
+import { useTabsSidebar } from "@/shell/useTabsSidebar";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useReleaseHostHeldSends } from "@/hooks/useReleaseHostHeldSends";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
@@ -333,6 +334,7 @@ import {
 } from "@/components/composer/useSessionHarnessPickerProps";
 import { nextTranscriptBottomPin, type TranscriptBottomPin } from "./transcriptBottomPin";
 import { Transcript } from "@/components/chat/Transcript";
+import { canStopResponse, useStopResponsePaletteCommand } from "@/components/chat/stopResponse";
 
 /**
  * Whether the deployment has smart routing at all. `"loading"` (the `/v1/info`
@@ -427,6 +429,15 @@ function truncateTitle(raw: string, max = 60): string {
   const lastSpace = slice.lastIndexOf(" ");
   const cut = lastSpace > max - 10 ? lastSpace : slice.length;
   return slice.slice(0, cut).join("").trimEnd() + "…";
+}
+
+/** A /btw side question's answer, an agent reply like any other. */
+export function BtwSidechatAnswer({ answer }: { answer: string }) {
+  return (
+    <FilePathAwareMessageResponse mode="static" linkPullRequestRefs>
+      {answer}
+    </FilePathAwareMessageResponse>
+  );
 }
 
 /**
@@ -2579,6 +2590,12 @@ function ComposerImpl(
   // No server session behind a temp id — gate goal/workspace fetches on it so
   // the create window issues no `/v1/sessions/temp:*` requests.
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
+  useStopResponsePaletteCommand({
+    conversationId: composerSessionId,
+    working: isWorking,
+    readOnly: isReadOnly,
+    stop: onStop,
+  });
   // A send held while the host was offline goes out once the host is back.
   useReleaseHostHeldSends(composerSessionId);
   const { session: composerSession } = useSession(composerSessionId);
@@ -2710,7 +2727,20 @@ function ComposerImpl(
   const hasQueuedComposerMessages = composerQueuedMessages.length > 0;
   const composerContextWindow = useChatStore((s) => s.contextWindow);
   const composerTokensUsed = useChatStore((s) => s.tokensUsed);
-  const openComposerGithubTab = useOpenGithubTab();
+  const openGithubTab = useOpenGithubTab();
+  const tabsSidebar = useTabsSidebar();
+  const lonePrUrl =
+    composerGit.prCount === 1 && composerGit.prs.length === 1 ? composerGit.prs[0]!.url : null;
+  // The tabs sidebar shows a lone PR in its own tab; the classic panel shows it by itself
+  // and keeps the section it was on, so it gets the plain open.
+  const openComposerGithubTab = useMemo(() => {
+    if (!openGithubTab) return null;
+    return (prUrl?: string) => {
+      const url = prUrl ?? (tabsSidebar ? lonePrUrl : null);
+      if (url) openGithubTab(url);
+      else openGithubTab();
+    };
+  }, [openGithubTab, tabsSidebar, lonePrUrl]);
   // Devin shares this control but not Claude's vocabulary: its rungs are
   // normal / accept-edits / smart / dangerous, cycled in the TUI.
   let permissionKind: PermissionChipKind = "codex";
@@ -2825,6 +2855,12 @@ function ComposerImpl(
   const preventsKeyboardSubmit = isMobile;
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
+  // Mobile moves a bound host's button, with its Reconnect host item, into the
+  // header; a session with no host still reconnects from the banner below.
+  const offlinePlaceholder =
+    isMobile && composerSession?.hostId
+      ? "Session offline — reconnect from the host menu"
+      : "Session offline — reconnect below to continue";
 
   // Ctrl+Shift+L focuses the composer input from anywhere in the session view.
   // No-op on mobile, where programmatic focus would pop the software keyboard.
@@ -3023,7 +3059,7 @@ function ComposerImpl(
   }, [conversationId]);
   useEffect(() => {
     if (!canStartWorkflow || composerSessionId === null) return;
-    return registerStartWorkflow(composerSessionId, () => openWorkflowDialog());
+    return registerStartWorkflow(composerSessionId, openWorkflowDialog);
   }, [canStartWorkflow, composerSessionId, openWorkflowDialog]);
   useEffect(() => {
     if (!canSaveWorkflow || composerSessionId === null) return;
@@ -3217,7 +3253,10 @@ function ComposerImpl(
   const highlight = useComposerHighlight({
     value,
     commandNames: slashCommandNames,
-    anyCaseCommandNames: anyCaseBuiltinNames,
+    // With context the text goes out as typed, so only exact-case commands run.
+    anyCaseCommandNames: carriesMessageContext(draft, files, sendContext)
+      ? []
+      : anyCaseBuiltinNames,
     enabled: draft.quotes.length === 0 && files.length === 0,
     // Files go out as separate blocks, so the message is no longer a lone `!` text.
     shellEnabled: files.length === 0,
@@ -4314,7 +4353,7 @@ function ComposerImpl(
     // Esc cancels an in-flight turn. When idle it's a no-op — clearing on
     // Esc destroys typed prompts with no undo (common muscle memory after
     // dismissing autocomplete suggestions).
-    if (e.key === "Escape" && isWorking && !isReadOnly) {
+    if (e.key === "Escape" && canStopResponse({ working: isWorking, readOnly: isReadOnly })) {
       e.preventDefault();
       onStop();
       return;
@@ -4541,7 +4580,7 @@ function ComposerImpl(
               : isReadOnly
                 ? "You have read-only access to this session"
                 : unreachable && !sendReconnectsArca && sendDisabledReason === null
-                  ? "Session offline — reconnect below to continue"
+                  ? offlinePlaceholder
                   : hasPendingElicitation
                     ? "Respond to the pending request above to continue"
                     : disabled && sendDisabledReason === null
@@ -4680,9 +4719,7 @@ function ComposerImpl(
                   <div className="mb-2">
                     <p className="mb-1 text-xs text-muted-foreground">Answer:</p>
                     <div className="prose prose-sm dark:prose-invert max-w-none text-sm">
-                      <FilePathAwareMessageResponse mode="static">
-                        {btwSidechat.answer}
-                      </FilePathAwareMessageResponse>
+                      <BtwSidechatAnswer answer={btwSidechat.answer} />
                     </div>
                   </div>
                   {btwSidechat.truncated && (
@@ -4721,6 +4758,7 @@ function ComposerImpl(
                   disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw
                 }
                 onAttach={() => fileInputRef.current?.click()}
+                paletteSource={composerSessionId ? `composer:${composerSessionId}` : undefined}
                 showGoal={showGoalControl || showClaudeGoalControl || showPollyCodexGoalControl}
                 onGoal={() => setGoalDialogOpen(true)}
                 goalDisabled={!composerSessionId || (!showGoalControl && isReadOnly)}
@@ -4814,6 +4852,12 @@ function ComposerImpl(
                     setBusy={setConfigBusy}
                     openNonce={pickerOpenNonce}
                     modelPickerShortcutEnabled={modelPickerHotkeyEnabled}
+                    paletteSettingsSource={
+                      composerSessionId &&
+                      isFeatureEnabled(composerServerInfo, "quick_pick_palette")
+                        ? `composer:${composerSessionId}`
+                        : undefined
+                    }
                     {...sessionHarnessPicker}
                   />
                 </div>

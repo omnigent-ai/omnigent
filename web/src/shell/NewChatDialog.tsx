@@ -105,7 +105,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
-import { iconForAgent } from "@/components/AgentCard";
+import { iconForAgent } from "@/components/agentIcon";
 import claudeCodeLogo from "@/assets/claude-code-logo.svg";
 import { showToast } from "@/components/ui/toast";
 import {
@@ -417,6 +417,7 @@ import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import type { CostControlMode } from "@/components/CostRoutingControl";
 import {
+  ARIA_MOD_KEY,
   composerSendShortcutKeys,
   CompactShortcutKeys,
   KeyboardShortcutTooltipContent,
@@ -6525,9 +6526,11 @@ function NewChatLandingContent({
         }
         const metadata: Parameters<typeof createBundledSession>[1] = { labels: createLabels };
         if (siblingSourceId) metadata.sibling_source_id = siblingSourceId;
+        // The new sandbox's host id, minted client-side as the JSON create does.
+        const managedBundleHostId = sandboxSelected ? await managedSandboxHostId(info) : undefined;
         if (sandboxSelected) {
-          // Bundle creates send no host id until the server's multipart host_id is deployed.
           metadata.host_type = "managed";
+          if (managedBundleHostId) metadata.host_id = managedBundleHostId;
           metadata.workspaces = composeSandboxWorkspaces(sandboxRepoSelections);
           if (sandboxProvider !== null) metadata.sandbox_provider = sandboxProvider;
           if (selectedSandboxProfile !== null) {
@@ -6577,6 +6580,8 @@ function NewChatLandingContent({
         data = { id: bundled.id };
         createdSessionId = data.id;
         launchedAgentId = bundled.agentId ?? null;
+        // Route the new session's first requests by the host id it was created with.
+        if (managedBundleHostId) setSessionHost(data.id, managedBundleHostId);
         // Register create_session for the custom-agent (bundled) path too —
         // otherwise both sandbox and computer bundled creates emit nothing. Split
         // by the picked host; interactionTelemetry completes/settles the span.
@@ -6942,7 +6947,10 @@ function NewChatLandingContent({
           files,
           localConv.pendingMsgTempId,
           skill,
-          returnToCanvas ? (_to, options) => navigate(sessionLocation(data.id), options) : navigate,
+          returnToCanvas
+            ? (_to, options) => navigate(sessionLocation(data.id), options)
+            : // Still on the temporary session's page: its requests, such as a cited file, move too.
+              (to, options) => navigate(`${to}${window.location.search}`, options),
           () => stillViewingLocalSession(tempConvId),
           localProject,
           serverOwnsInitialInput,
@@ -7512,6 +7520,12 @@ function NewChatLandingContent({
     </NewChatWorkspaceControls>
   );
 
+  // The chord the panel advertises beside Send, in ARIA's spelling.
+  const sendKeyShortcuts = submitWithModEnter ? `${ARIA_MOD_KEY}+Enter` : "Enter";
+  let composerAppearance: "panel" | "glass" | "default" = "default";
+  if (floating) composerAppearance = "panel";
+  else if (isMobileViewport) composerAppearance = "glass";
+
   return (
     // Desktop keeps the centered composition; mobile docks the composer. The
     // project home floats just the composer over its board.
@@ -7612,13 +7626,13 @@ function NewChatLandingContent({
               e.preventDefault();
               void handleCreate();
             }}
-            className="relative z-30"
+            className={cn("relative z-30", floating && "flex min-h-0 flex-1 flex-col")}
           >
             <ChatComposer
               engine={composerEngine}
               dictating={dictation.hasInterim}
               onActiveInputChange={bindTextarea}
-              appearance={isMobileViewport ? "glass" : "default"}
+              appearance={composerAppearance}
               hasContent={
                 files.length > 0 ||
                 mentionedItems.length > 0 ||
@@ -8248,6 +8262,12 @@ function NewChatLandingContent({
                       onTranscript={dictation.appendFinal}
                       onInterim={dictation.replaceInterim}
                     />
+                    {/* Plain ↵ adds a line in the panel, so its send chord stays in view. */}
+                    {floating && (
+                      <span className="px-1" data-testid="new-chat-landing-send-shortcut">
+                        <CompactShortcutKeys keys={composerSendShortcutKeys(submitWithModEnter)} />
+                      </span>
+                    )}
                     <TooltipProvider>
                       <Tooltip
                         open={submitTooltipState !== "closed"}
@@ -8288,6 +8308,7 @@ function NewChatLandingContent({
                               disabled={!canSubmit}
                               label={creating ? "Starting session" : "Start session"}
                               busy={creating}
+                              aria-keyshortcuts={floating ? sendKeyShortcuts : undefined}
                               data-testid="new-chat-landing-submit"
                             />
                           </span>

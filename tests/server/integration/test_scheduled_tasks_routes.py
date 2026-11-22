@@ -15,10 +15,12 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -2365,7 +2367,10 @@ async def test_other_users_task_is_not_visible(
     assert listed.json()["scheduled_tasks"] == []
 
 
-@pytest.mark.parametrize("tz", ["Not/A_Timezone", "", "../UTC"])
+_INVALID_TIMEZONES = ["Not/A_Timezone", "", "../UTC", "America"]
+
+
+@pytest.mark.parametrize("tz", _INVALID_TIMEZONES)
 async def test_create_rejects_invalid_timezone(
     auth_client: httpx.AsyncClient, db_uri: str, tz: str
 ) -> None:
@@ -2378,7 +2383,7 @@ async def test_create_rejects_invalid_timezone(
     assert resp.status_code == 400, resp.text
 
 
-@pytest.mark.parametrize("tz", ["Bogus/Zone", "", "../UTC"])
+@pytest.mark.parametrize("tz", _INVALID_TIMEZONES)
 async def test_update_rejects_invalid_timezone(
     auth_client: httpx.AsyncClient, db_uri: str, tz: str
 ) -> None:
@@ -2394,6 +2399,89 @@ async def test_update_rejects_invalid_timezone(
         headers=_headers(),
     )
     assert bad.status_code == 400, bad.text
+
+
+async def test_create_keeps_utc_unless_the_owners_recorded_zone_is_requested(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri, "alice@example.com")
+    _make_user(db_uri, "bob@example.com")
+    unzoned = {
+        key: value
+        for key, value in _create_body().items()
+        if key not in ("timezone", "host_id", "workspace")
+    }
+
+    async def create(email: str, body: dict[str, object]) -> dict[str, object]:
+        resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers(email))
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    assert (await create("alice@example.com", unzoned))["timezone"] == "UTC"
+    recorded = await auth_client.put(
+        "/v1/scheduled-tasks/default-timezone",
+        json={"timezone": "America/Chicago"},
+        headers=_headers("alice@example.com"),
+    )
+    assert recorded.status_code == 200, recorded.text
+    assert recorded.json() == {"timezone": "America/Chicago"}
+
+    assert (await create("alice@example.com", unzoned))["timezone"] == "UTC"
+    task = await create("alice@example.com", {**unzoned, "timezone": None})
+    assert task["timezone"] == "America/Chicago"
+    next_run = datetime.fromisoformat(str(task["next_run_at"]))
+    assert next_run.astimezone(ZoneInfo("America/Chicago")).hour == 9
+    assert (await create("bob@example.com", unzoned))["timezone"] == "UTC"
+    assert (await create("bob@example.com", {**unzoned, "timezone": None}))["timezone"] == "UTC"
+
+    changed = await auth_client.put(
+        "/v1/scheduled-tasks/default-timezone",
+        json={"timezone": "Asia/Tokyo"},
+        headers=_headers("alice@example.com"),
+    )
+    assert changed.status_code == 200, changed.text
+    retained = await auth_client.get(
+        f"/v1/scheduled-tasks/{task['id']}", headers=_headers("alice@example.com")
+    )
+    assert retained.status_code == 200, retained.text
+    assert retained.json()["timezone"] == "America/Chicago"
+    assert retained.json()["next_run_at"] == task["next_run_at"]
+
+
+async def test_set_default_timezone_reports_unsupported_store(
+    auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _make_user(db_uri)
+    monkeypatch.setattr(
+        auth_app.state.scheduled_task_store,
+        "set_default_timezone",
+        Mock(side_effect=NotImplementedError("preferences unsupported")),
+    )
+
+    response = await auth_client.put(
+        "/v1/scheduled-tasks/default-timezone",
+        json={"timezone": "America/Chicago"},
+        headers=_headers(),
+    )
+
+    assert response.status_code == 501, response.text
+    assert response.json() == {"detail": "default timezone is not supported"}
+
+
+@pytest.mark.parametrize("tz", _INVALID_TIMEZONES)
+async def test_set_default_timezone_rejects_invalid_timezone(
+    auth_client: httpx.AsyncClient, db_uri: str, tz: str
+) -> None:
+    _make_user(db_uri)
+    resp = await auth_client.put(
+        "/v1/scheduled-tasks/default-timezone",
+        json={"timezone": tz},
+        headers=_headers(),
+    )
+    assert resp.status_code == 400, resp.text
 
 
 async def test_scheduler_synced_on_create_and_delete(
@@ -6790,6 +6878,60 @@ async def test_the_local_user_has_no_automations_shared_with_them(
         listed = await client.get("/v1/scheduled-tasks/shared")
     assert listed.status_code == 200, listed.text
     assert listed.json() == {"scheduled_tasks": [], "next_cursor": None}
+
+
+_SLACK_TRIGGER = {
+    "prompt": "This automation watches Slack and starts one Omnigent session per message.",
+    "session_mode": "continue",
+}
+
+
+@_SHARING
+async def test_a_trigger_reads_its_rrule_as_null(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    _make_user(db_uri, "bob@example.com")
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(**_SLACK_TRIGGER), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["rrule"] is None
+    trigger_id = created.json()["id"]
+    scheduled_id = await _create_task(auth_client)
+    for task_id in (trigger_id, scheduled_id):
+        assert (await _share(auth_client, task_id, "bob@example.com")).status_code == 200
+
+    expected = {trigger_id: None, scheduled_id: _VALID_RRULE}
+    listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert {t["id"]: t["rrule"] for t in listed.json()["scheduled_tasks"]} == expected
+    shared = await auth_client.get("/v1/scheduled-tasks/shared", headers=_BOB)
+    assert {t["id"]: t["rrule"] for t in shared.json()["scheduled_tasks"]} == expected
+    url = f"/v1/scheduled-tasks/{trigger_id}"
+    assert (await auth_client.get(url, headers=_headers())).json()["rrule"] is None
+    renamed = await auth_client.patch(url, json={"name": "renamed"}, headers=_headers())
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["rrule"] is None
+    cloned = await auth_client.post(f"{url}/clone", headers=_headers())
+    assert cloned.status_code == 200, cloned.text
+    assert cloned.json()["rrule"] is None
+    # The saved rule and timezone are kept, and a clone copies them.
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    for task_id in (trigger_id, cloned.json()["id"]):
+        saved = store.get(task_id)
+        assert (saved.rrule, saved.timezone) == (_VALID_RRULE, "America/Los_Angeles")
+
+
+async def test_the_legacy_scheduler_returns_a_triggers_saved_rule(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    # Its timers poll a trigger on the saved rule.
+    _make_user(db_uri)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(**_SLACK_TRIGGER), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["rrule"] == _VALID_RRULE
 
 
 @_SHARING

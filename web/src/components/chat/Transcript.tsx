@@ -65,6 +65,7 @@ import {
   userMessageOrigin,
   withUncommittedUserBubbles,
 } from "@/components/chat/chatBubbleParts";
+import { TranscriptPaletteCommands } from "@/components/chat/TranscriptPaletteCommands";
 import { usePeerSessionMessageDisplay } from "@/lib/peerSessionMessagePreferences";
 import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
 
@@ -525,6 +526,10 @@ function TranscriptImpl({
           </ConversationContent>
           {/* After the content, so the scroll element's ref is attached when its layout effect runs. */}
           <ConversationScrollRefBridge onScroller={setScroller} />
+          <TranscriptPaletteCommands
+            conversationId={display.conversationId}
+            bubbles={display.streamBubbles}
+          />
           <ConversationScrollButton
             className={
               isMobileViewport

@@ -33,6 +33,7 @@ import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
 import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
+  conversationRowFromSession,
   filtersFromConversationQueryKey,
   findCachedListRow,
   lastIdAfterFiltering,
@@ -1997,20 +1998,7 @@ function findCachedConversationRow(queryClient: QueryClient, id: string): Conver
 
 function cachedSessionRow(queryClient: QueryClient, id: string): Conversation | undefined {
   const session = queryClient.getQueryData<Session>(["session", id]);
-  if (!session) return undefined;
-  return {
-    id,
-    object: "conversation",
-    title: session.title,
-    created_at: session.createdAt,
-    updated_at: session.createdAt,
-    labels: session.labels ?? {},
-    permission_level: session.permissionLevel,
-    agent_id: session.agentId,
-    harness: session.harness,
-    archived: session.archived,
-    family: session.family,
-  };
+  return session ? conversationRowFromSession(session) : undefined;
 }
 
 function invalidateFamilyLists(queryClient: QueryClient) {

@@ -15,8 +15,8 @@ function loadPreload({ platform = "linux", fullScreen = false } = {}) {
   const attributes = new Set();
   let updateStatus = { state: "idle" };
   const ipcRenderer = {
-    invoke: async (channel, args) => {
-      invokes.push({ channel, args });
+    invoke: async (channel, args, ...rest) => {
+      invokes.push({ channel, args, ...(rest.some((arg) => arg !== undefined) ? { rest } : {}) });
       if (channel === "omnigent:get-update-status") return updateStatus;
       if (channel === "omnigent:is-full-screen") return fullScreen;
       return null;
@@ -306,6 +306,27 @@ describe("global show shortcut bridge", () => {
     assert.equal(h.invokes.at(-1).channel, "omnigent:record-global-shortcut");
     await h.desktop.cancelGlobalShortcutRecording();
     assert.equal(h.invokes.at(-1).channel, "omnigent:cancel-global-shortcut-recording");
+  });
+
+  it("names the shortcut by id for the shell to check, and drops ids that aren't strings", async () => {
+    const h = loadPreload();
+    const sent = () => JSON.parse(JSON.stringify(h.invokes.at(-1)));
+
+    await h.desktop.getGlobalShortcut("floatingComposer");
+    assert.deepEqual(sent(), { channel: "omnigent:get-global-shortcut", args: "floatingComposer" });
+    await h.desktop.setGlobalShortcut({ enabled: false }, "floatingComposer");
+    assert.deepEqual(sent(), {
+      channel: "omnigent:set-global-shortcut",
+      args: { enabled: false },
+      rest: ["floatingComposer"],
+    });
+    await h.desktop.recordGlobalShortcut("floatingComposer");
+    assert.deepEqual(sent(), {
+      channel: "omnigent:record-global-shortcut",
+      args: "floatingComposer",
+    });
+    await h.desktop.getGlobalShortcut({ id: "floatingComposer" });
+    assert.deepEqual(sent(), { channel: "omnigent:get-global-shortcut" });
   });
 });
 

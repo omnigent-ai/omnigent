@@ -138,6 +138,7 @@ async def test_create_posts_payload() -> None:
     )
     verb, url, body = client.calls[-1]
     assert (verb, url) == ("POST", "/v1/scheduled-tasks")
+    assert [url for verb, url, _ in client.calls if verb == "GET"] == ["/v1/info"]
     assert body == {
         **_REVIEW_FIELDS,
         "name": "nightly",
@@ -207,9 +208,114 @@ async def test_create_without_session_args_sends_no_session_fields() -> None:
         json.dumps({**_REVIEW_FIELDS, "name": "n", "rrule": "FREQ=DAILY", "agent_id": "ag_1"}),
         server_client=client,
     )
-    _, _, body = client.calls[0]
+    _, _, body = client.calls[-1]
     assert not {"session_mode", "session_id"} & set(body)
-    assert "/v1/info" not in [url for _, url, _ in client.calls]
+    assert [url for _, url, _ in client.calls] == ["/v1/info", "/v1/scheduled-tasks"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("current_server", "fields", "expected_zone"),
+    [
+        (False, {}, {}),
+        (True, {}, {"timezone": None}),
+        (False, {"timezone": None}, {}),
+        (True, {"timezone": None}, {"timezone": None}),
+        (True, {"timezone": "UTC"}, {"timezone": "UTC"}),
+        (True, {"timezone": "Asia/Tokyo"}, {"timezone": "Asia/Tokyo"}),
+    ],
+    ids=["old-omitted", "new-omitted", "old-null", "new-null", "explicit-utc", "explicit-zone"],
+)
+async def test_current_runner_timezone_contract_across_server_versions(
+    current_server: bool, fields: dict[str, str | None], expected_zone: dict[str, str | None]
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            capability = {"scheduled_task_default_timezone": True} if current_server else {}
+            return httpx.Response(200, json=capability)
+        return httpx.Response(200, json={"id": _TASK_ID})
+
+    async with httpx.AsyncClient(
+        base_url="https://server.example", transport=httpx.MockTransport(respond)
+    ) as client:
+        result = await execute_tool(
+            tool_name="sys_scheduled_task_create",
+            arguments=json.dumps(
+                {
+                    **_REVIEW_FIELDS,
+                    "name": "daily",
+                    "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+                    "agent_id": "ag_1",
+                    **fields,
+                }
+            ),
+            server_client=client,
+        )
+
+    assert json.loads(result) == {"id": _TASK_ID}
+    assert [(request.method, request.url.path) for request in requests] == (
+        [("GET", "/v1/info"), ("POST", "/v1/scheduled-tasks")]
+        if fields.get("timezone") is None
+        else [("POST", "/v1/scheduled-tasks")]
+    )
+    payload = json.loads(requests[-1].content)
+    assert {key: value for key, value in payload.items() if key == "timezone"} == expected_zone
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "http",
+        "transport",
+        "json",
+        "shape",
+        "false",
+        "truthy-string",
+        "truthy-integer",
+        "truthy-object",
+    ],
+)
+async def test_create_timezone_falls_back_when_capability_is_unavailable(failure: str) -> None:
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            if failure == "transport":
+                raise httpx.ConnectError("offline", request=request)
+            if failure == "json":
+                return httpx.Response(200, text="not json")
+            if failure == "shape":
+                return httpx.Response(200, json=[])
+            capabilities = {
+                "false": False,
+                "truthy-string": "true",
+                "truthy-integer": 1,
+                "truthy-object": {"enabled": True},
+            }
+            if failure in capabilities:
+                return httpx.Response(
+                    200, json={"scheduled_task_default_timezone": capabilities[failure]}
+                )
+            return httpx.Response(500)
+        assert "timezone" not in json.loads(request.content)
+        return httpx.Response(200, json={"id": _TASK_ID, "timezone": "UTC"})
+
+    async with httpx.AsyncClient(
+        base_url="https://server.example", transport=httpx.MockTransport(respond)
+    ) as client:
+        result = await _execute_scheduled_task_tool(
+            "sys_scheduled_task_create",
+            json.dumps({**_REVIEW_FIELDS, "name": "daily", "timezone": None}),
+            server_client=client,
+        )
+
+    assert json.loads(result) == {"id": _TASK_ID, "timezone": "UTC"}
+    assert [request.method for request in requests] == ["GET", "POST"]
 
 
 @pytest.mark.asyncio
@@ -448,6 +554,7 @@ async def test_project_name_is_sent_as_the_resolved_project_id(
         args["scheduled_task_id"] = _TASK_ID
     await _execute_scheduled_task_tool(tool_name, json.dumps(args), server_client=client)
 
+    assert [url for verb, url, _ in client.calls if verb == "GET"].count("/v1/info") == 1
     creates = [body for verb, url, body in client.calls if (verb, url) == ("POST", "/v1/projects")]
     assert creates == ([{"name": "triage"}] if created else [])
     _, url, body = client.calls[-1]
@@ -679,6 +786,15 @@ def test_create_tool_schema_makes_workspace_and_host_optional() -> None:
         "agent_id",
         "permission_mode",
     }
+
+
+def test_current_create_schema_accepts_legacy_omission_and_local_opt_in() -> None:
+    schema = SysScheduledTaskCreateTool().get_schema()["function"]["parameters"]
+    arguments = {**_REVIEW_FIELDS, "name": "daily", "rrule": "FREQ=DAILY", "agent_id": "ag_1"}
+
+    jsonschema.validate(arguments, schema)
+    jsonschema.validate({**arguments, "timezone": None}, schema)
+    jsonschema.validate({**arguments, "timezone": "Asia/Tokyo"}, schema)
 
 
 def test_update_tool_schema_allows_connected_host_changes() -> None:

@@ -7,7 +7,7 @@
 // policy hooks (useDefaultPolicies / usePolicyRegistry + add/update/delete
 // mutations) so no QueryClient or network is needed.
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PoliciesPage } from "./PoliciesPage";
@@ -36,10 +36,20 @@ const updateMutate = vi.fn();
 const deleteMutate = vi.fn();
 const refetchMock = vi.fn();
 
-vi.mock("@/lib/identity", () => ({
+const identityUpdates = vi.hoisted(() => new Set<() => void>());
+
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof identity>()),
   resolveIdentity: vi.fn(),
   getCurrentIsAdmin: vi.fn(),
+  getCurrentUserId: vi.fn(),
+  subscribeIdentity: (listener: () => void) => {
+    identityUpdates.add(listener);
+    return () => identityUpdates.delete(listener);
+  },
 }));
+
+beforeEach(() => identityUpdates.clear());
 vi.mock("@/hooks/useDefaultPolicies", () => ({
   useDefaultPolicies: vi.fn(),
   useAddDefaultPolicy: vi.fn(),
@@ -127,6 +137,25 @@ describe("PoliciesPage gating", () => {
     vi.mocked(identity.resolveIdentity).mockReturnValue(new Promise(() => {}));
     renderPage();
     expect(screen.getByText("Loading...")).toBeInTheDocument();
+  });
+
+  it("shows policy controls when identity recovers while the page stays open", async () => {
+    vi.mocked(identity.resolveIdentity).mockResolvedValue(null);
+    vi.mocked(identity.getCurrentUserId).mockReturnValue(null);
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
+    const view = renderPage();
+    await waitFor(() => expect(identity.resolveIdentity).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "Add policy" })).not.toBeInTheDocument();
+
+    vi.mocked(identity.getCurrentUserId).mockReturnValue("admin");
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
+    act(() => {
+      for (const listener of identityUpdates) listener();
+    });
+
+    expect(await screen.findByRole("button", { name: "Add policy" })).toBeInTheDocument();
+    view.unmount();
+    expect(identityUpdates.size).toBe(0);
   });
 
   it("blocks non-admins with a permission message", async () => {

@@ -1,10 +1,14 @@
 import { create } from "zustand";
 
+import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 import type { TaskAction } from "@/lib/workflow";
+
+/** Opens the composer's workflow dialog, to describe one from `description` or to run `savedWorkflow`. */
+export type StartWorkflow = (description?: string, savedWorkflow?: SavedWorkflow | null) => void;
 
 interface SessionTasksActionsState {
   /** Per session: how its composer starts a workflow, when it offers one. */
-  startWorkflow: Readonly<Record<string, () => void>>;
+  startWorkflow: Readonly<Record<string, StartWorkflow>>;
   /** Per session: how its composer saves the plan as a workflow, given the plan's name. */
   saveWorkflow: Readonly<Partial<Record<string, (planName: string) => void>>>;
   /** Per session: how its composer asks the agent to continue the plan, given its name. */
@@ -44,7 +48,7 @@ export const useSessionTasksActions = create<SessionTasksActionsState>(() => ({
  *
  * @returns A function that withdraws the action, unless another took its place.
  */
-export function registerStartWorkflow(conversationId: string, start: () => void): () => void {
+export function registerStartWorkflow(conversationId: string, start: StartWorkflow): () => void {
   return registerSessionAction("startWorkflow", conversationId, start);
 }
 

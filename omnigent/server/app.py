@@ -336,6 +336,8 @@ class ServerInfoResponse(BaseModel):
     # Scheduled tasks accept ``session_mode`` and ``session_id``; older servers
     # reject them.
     scheduled_task_session_modes: bool = True
+    # Explicit null timezone requests the owner's recorded default; omission stays UTC.
+    scheduled_task_default_timezone: bool = True
     # Scheduled tasks accept ``source_session_id``: each run starts from a copy
     # of a session. Older servers reject it.
     scheduled_task_source_sessions: bool = True

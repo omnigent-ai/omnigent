@@ -25,6 +25,7 @@ from omnigent.inner.claude_model_access import (
     _MAX_REQUEST_BODY_BYTES,
     HELPER_ENV,
     ClaudeAuthRequired,
+    ClaudeCredentialConfigurationError,
     ClaudeModelAccess,
     _ClaudeCredential,
     _ClaudeRelay,
@@ -37,7 +38,12 @@ from omnigent.inner.egress.proxy import EgressProxy
 from omnigent.inner.egress.rules import parse_rules
 from omnigent.inner.model_signer_service import _VALIDATION_BEARER, _parse_strict_request_headers
 from omnigent.inner.model_signing import SigningRejected
-from omnigent.inner.sandbox import SandboxPolicy, _default_sandbox_for_platform
+from omnigent.inner.sandbox import (
+    HarnessSandboxPreparationError,
+    HarnessSandboxValidationError,
+    SandboxPolicy,
+    _default_sandbox_for_platform,
+)
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals.registry import TerminalRegistry
@@ -299,10 +305,12 @@ def test_relay_accepts_provider_sized_bodies_without_raising_the_shared_limit() 
         "https://model.test/%2e%2e",
         "https://model.test/../path",
         "https://*.model.test",
+        "https://model.test:invalid",
+        "https://[model.test",
     ],
 )
 def test_rejects_ambiguous_model_authority(endpoint: str) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ClaudeCredentialConfigurationError):
         ClaudeModelAccess(endpoint, "authorization", lambda: "secret")
 
 
@@ -417,8 +425,9 @@ def test_static_helper_never_executes_a_shell(monkeypatch: pytest.MonkeyPatch) -
     access = resolve_claude_model_access({HELPER_ENV: "printf %s 'private-key'"})
     assert access.credential() == "private-key"
     assert access.auth_header == "x-api-key"
-    with pytest.raises(ValueError, match="shell auth helper"):
-        resolve_claude_model_access({HELPER_ENV: "./workspace-helper.sh"})
+    for helper in ("./workspace-helper.sh", "printf 'private-key"):
+        with pytest.raises(ClaudeCredentialConfigurationError, match="shell auth helper"):
+            resolve_claude_model_access({HELPER_ENV: helper})
     run.assert_not_called()
 
 
@@ -435,10 +444,31 @@ def test_custom_provider_config_cannot_be_granted_to_the_worker(tmp_path: Path) 
     assert repr(str(tmp_path.resolve())) in str(error.value)
 
 
-@pytest.mark.parametrize("explicit_token", [None, "parent-only-provider-token"])
-def test_user_settings_helper_cannot_fall_back_to_saved_oauth(
-    tmp_path: Path, explicit_token: str | None
+@pytest.mark.parametrize(
+    "entrypoint,explicit_token,transport",
+    [
+        ("resolver", None, None),
+        ("resolver", "parent-only-provider-token", None),
+        ("prepared", None, None),
+        ("prepared-unowned", None, None),
+        ("prepared", None, "CLAUDE_CODE_USE_BEDROCK"),
+        ("prepared", None, "CLAUDE_CODE_USE_VERTEX"),
+        ("prepared", None, "CLAUDE_CODE_USE_FOUNDRY"),
+        ("prepared-renewable-helper", None, None),
+        ("prepared-invalid-endpoint", None, None),
+    ],
+)
+def test_model_access_configuration_preserves_refusal_guidance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+    explicit_token: str | None,
+    transport: str | None,
 ) -> None:
+    from omnigent.inner import claude_sdk_executor as claude
+    from omnigent.inner.model_auth import ProviderAuthRequired
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
     config_dir = tmp_path / "claude-config"
     config_dir.mkdir()
     _write_oauth(config_dir / ".credentials.json", "parent-only-oauth")
@@ -446,13 +476,83 @@ def test_user_settings_helper_cannot_fall_back_to_saved_oauth(
         "ANTHROPIC_BASE_URL": "https://gateway.example.test/anthropic",
         "CLAUDE_CONFIG_DIR": str(config_dir),
     }
+    if entrypoint == "prepared-renewable-helper":
+        env[HELPER_ENV] = "./private-credential-helper.sh"
+    elif entrypoint == "prepared-invalid-endpoint":
+        env["ANTHROPIC_BASE_URL"] = "http://private-model.example.test"
+        env["ANTHROPIC_API_KEY"] = "parent-only-provider-token"
+    if transport is not None:
+        env[transport] = "1"
     if explicit_token is not None:
         env["ANTHROPIC_AUTH_TOKEN"] = explicit_token
         access = resolve_claude_model_access(env, user_settings_has_api_key_helper=True)
         assert access.credential() == explicit_token
-    else:
-        with pytest.raises(ValueError, match="user settings apiKeyHelper"):
+    elif entrypoint == "resolver":
+        with pytest.raises(ProviderAuthRequired, match="user settings apiKeyHelper"):
             resolve_claude_model_access(env, user_settings_has_api_key_helper=True)
+    else:
+        for name in tuple(os.environ):
+            if name.startswith(("CLAUDE_", "ANTHROPIC_", "HARNESS_")):
+                monkeypatch.delenv(name)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        policy = SandboxPolicy("linux_bwrap", True, [workspace], [], [], False)
+        monkeypatch.setattr(claude, "resolve_sandbox", lambda *_: policy)
+        proxy = Mock()
+        launcher = Mock()
+        monkeypatch.setattr(claude, "start_egress_proxy", proxy)
+        monkeypatch.setattr(claude, "create_exec_launcher", launcher)
+        unowned_environment = entrypoint == "prepared-unowned"
+        error_type = (
+            HarnessSandboxValidationError
+            if transport or unowned_environment
+            else ProviderAuthRequired
+        )
+        with pytest.raises(error_type) as raised:
+            claude.prepare_claude_cli_path(
+                "/bin/claude",
+                OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+                cwd=workspace,
+                worker_env=None if unowned_environment else env,
+                model_access=(
+                    ClaudeModelAccess(
+                        "https://model.example.test",
+                        "x-api-key",
+                        lambda: "parent-only-provider-token",
+                    )
+                    if unowned_environment
+                    else None
+                ),
+                user_settings_has_api_key_helper=transport is None,
+            )
+        detail = ExecutorAdapter(executor_factory=Mock())._build_error_detail(raised.value)
+        if unowned_environment:
+            assert detail.code == "HarnessSandboxValidationError"
+            assert (
+                "Brokered Claude model access requires an Omnigent-owned worker environment; "
+                "this configuration is not supported."
+            ) in detail.message
+        elif transport is not None:
+            assert detail.code == "HarnessSandboxValidationError"
+            assert "Anthropic-compatible API" in detail.message
+            assert "Bedrock, Vertex or Foundry" in detail.message
+        else:
+            assert detail.code == "PROVIDER_AUTH_REQUIRED"
+            assert detail.title is not None and "credential configuration" in detail.title
+            if entrypoint == "prepared-renewable-helper":
+                assert "renewable shell auth helper" in detail.message
+                assert "parent-owned credential source" in detail.message
+            elif entrypoint == "prepared-invalid-endpoint":
+                assert "exact HTTPS model endpoint on port 443" in detail.message
+            else:
+                assert "user settings apiKeyHelper" in detail.message
+                assert "configure a supported provider credential" in detail.message
+        assert "parent-only-oauth" not in detail.message
+        assert "parent-only-refresh" not in detail.message
+        assert "private-credential-helper" not in detail.message
+        assert "private-model.example.test" not in detail.message
+        proxy.assert_not_called()
+        launcher.assert_not_called()
 
 
 @pytest.mark.parametrize("custom_home", [False, True])
@@ -681,7 +781,9 @@ def test_actual_oauth_files_cannot_alias_a_worker_grant(
         access.protect_sources(policy, workspace)
 
 
-@pytest.mark.parametrize("entrypoint", ["cli_callback", "terminal", "terminal_override"])
+@pytest.mark.parametrize(
+    "entrypoint", ["cli_callback", "sdk_constructor", "terminal", "terminal_override"]
+)
 def test_relative_config_dir_provenance_uses_session_cwd(
     oauth_paths: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, entrypoint: str
 ) -> None:
@@ -689,25 +791,42 @@ def test_relative_config_dir_provenance_uses_session_cwd(
     from omnigent.runtime import workflow
 
     config, workspace = oauth_paths
+    session_root = workspace
+    if entrypoint == "sdk_constructor":
+        workspace = session_root / "project"
+        workspace.mkdir()
+        config = session_root / "auth"
+        config.mkdir()
+        _write_oauth(config / ".credentials.json", "session-only-oauth")
     parent = workspace.parent / "daemon" / "cwd"
     parent.mkdir(parents=True)
     monkeypatch.chdir(parent)
-    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(session_root))
     for name in tuple(os.environ):
         if name.startswith(("CLAUDE_", "ANTHROPIC_", "HARNESS_")):
             monkeypatch.delenv(name)
     env = {"CLAUDE_CONFIG_DIR": os.path.relpath(config, workspace)}
     # Parent settings must not replace the session's credential provenance.
     settings = {"env": {"ANTHROPIC_AUTH_TOKEN": "session-only-key"}}
+    if entrypoint == "sdk_constructor":
+        settings = {"env": {"ANTHROPIC_BASE_URL": "https://session.example.test/anthropic"}}
     (config / "settings.json").write_text(json.dumps(settings))
-    parent_config = parent / env["CLAUDE_CONFIG_DIR"]
+    # The constructor must select the named policy cwd before loading settings.
+    wrong_cwd = session_root if entrypoint == "sdk_constructor" else parent
+    parent_config = wrong_cwd / env["CLAUDE_CONFIG_DIR"]
     parent_config.mkdir(parents=True)
     (parent_config / "settings.json").write_text(
-        json.dumps({"env": {"ANTHROPIC_AUTH_TOKEN": "wrong-parent-key"}})
+        json.dumps(
+            {
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": "wrong-parent-key",
+                    "ANTHROPIC_BASE_URL": "https://wrong.example.test/anthropic",
+                }
+            }
+        )
     )
     policy = SandboxPolicy("linux_bwrap", True, [workspace], [workspace], [], False)
-    if entrypoint == "cli_callback":
-        env["ANTHROPIC_AUTH_TOKEN"] = "session-only-key"
+    if entrypoint in ("cli_callback", "sdk_constructor"):
         monkeypatch.setattr(claude, "resolve_sandbox", lambda *_: policy)
         backend = Mock()
         backend.wrap_launcher_argv.side_effect = lambda argv, *args, **kwargs: ["bwrap", *argv]
@@ -723,17 +842,34 @@ def test_relative_config_dir_provenance_uses_session_cwd(
         launcher.touch()
         launch = Mock(return_value=str(launcher))
         monkeypatch.setattr(claude, "create_exec_launcher", launch)
-        spec = OSEnvSpec(cwd=".", sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
-        prepared = claude.prepare_claude_cli_path(
-            "/bin/claude",
-            spec,
-            worker_env=dict(env),
-            response_header_timeout_seconds=75.5,
+        spec = OSEnvSpec(
+            cwd="./project" if entrypoint == "sdk_constructor" else ".",
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
         )
+        if entrypoint == "sdk_constructor":
+            monkeypatch.setenv("CLAUDE_CONFIG_DIR", env["CLAUDE_CONFIG_DIR"])
+            monkeypatch.setattr(claude, "_find_system_claude", lambda: "/bin/claude")
+            executor = claude.ClaudeSDKExecutor(cwd=str(session_root), os_env=spec)
+            prepared = executor._prepared_cli
+            assert prepared is not None
+            assert executor._cwd == str(workspace)
+        else:
+            env["ANTHROPIC_AUTH_TOKEN"] = "session-only-key"
+            prepared = claude.prepare_claude_cli_path(
+                "/bin/claude",
+                spec,
+                worker_env=dict(env),
+                response_header_timeout_seconds=75.5,
+            )
         try:
             access = prepared.model_access
             assert access is not None
-            assert access.response_header_timeout_seconds == 75.5
+            if entrypoint == "sdk_constructor":
+                assert access.base_url == "https://session.example.test/anthropic"
+                assert config / "settings.json" in access.source_paths
+                assert launch.call_args.kwargs["cwd"] == str(workspace)
+            else:
+                assert access.response_header_timeout_seconds == 75.5
             assert prepared.sandbox is not None
             assert config in (prepared.sandbox.credential_source_paths or [])
         finally:
@@ -741,8 +877,9 @@ def test_relative_config_dir_provenance_uses_session_cwd(
         start_proxy.reset_mock()
         launch.reset_mock()
         policy.read_roots.append(config)
-        with pytest.raises(ValueError, match="outside sandbox"):
+        with pytest.raises(HarnessSandboxPreparationError, match="outside sandbox") as raised:
             claude.prepare_claude_cli_path("/bin/claude", spec, worker_env=dict(env))
+        assert isinstance(raised.value.__cause__, ValueError)
         start_proxy.assert_not_called()
         launch.assert_not_called()
     else:
@@ -763,7 +900,9 @@ def test_relative_config_dir_provenance_uses_session_cwd(
         with pytest.raises(ValueError, match="outside sandbox"):
             access.protect_sources(policy, workspace)
     assert config in access.source_paths
-    assert access.credential() == "session-only-key"
+    assert access.credential() == (
+        "session-only-oauth" if entrypoint == "sdk_constructor" else "session-only-key"
+    )
 
 
 def test_private_oauth_symlink_is_protected_and_atomic_rotation_works(

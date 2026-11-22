@@ -244,11 +244,12 @@ def _unsupported_attachment_detail(content_type: str, policy: FilesystemAttachme
     )
     if policy == DEFAULT_FILESYSTEM_ATTACHMENT_POLICY:
         return (
-            f"{detail}, or use Claude Code or Codex for archives, Office documents, and databases."
+            f"{detail}, or use a supported native coding agent for archives, "
+            "Office documents, databases, and MP4 videos."
         )
     if policy.extensions:
         extensions = ", ".join(sorted(policy.extensions))
-        return f"{detail}, or use Claude Code or Codex for {extensions} files."
+        return f"{detail}, or use a supported native coding agent for {extensions} files."
     return f"{detail}."
 
 
@@ -2872,7 +2873,10 @@ def register_resources_routes(
             )
         else:
             target = HostTarget(host_registry, host, reach[2])
-        app = WorkspaceServiceASGIApplication(HostWorkspaceService(target))
+        forwarder = HostWorkspaceService(
+            target, content_search=flags.enabled(Feature.WORKSPACE_CONTENT_SEARCH)
+        )
+        app = WorkspaceServiceASGIApplication(forwarder)
         # connectrpc types ASGI with asgiref's TypedDicts; Starlette's are plain mappings.
         return ConnectCallResponse(cast("ASGIApp", app), f"/{service}/{method}")
 
