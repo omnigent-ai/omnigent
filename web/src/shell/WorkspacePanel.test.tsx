@@ -173,7 +173,10 @@ vi.mock("@/hooks/usePermissions", async (importOriginal) => ({
 const isMobileMock = vi.hoisted(() => vi.fn(() => false));
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => isMobileMock() }));
 const floatingPanesMock = vi.hoisted(() => vi.fn(() => false));
-vi.mock("./useFloatingPanes", () => ({ useFloatingPanes: () => floatingPanesMock() }));
+vi.mock("./useFloatingPanes", () => ({
+  useFloatingPanes: () => floatingPanesMock(),
+  useFloatingPanesShown: () => floatingPanesMock(),
+}));
 
 const useTerminalsMock = vi.mocked(useTerminals);
 const useCreateTerminalMock = vi.mocked(useCreateTerminal);

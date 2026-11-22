@@ -12,7 +12,7 @@ import { FileTypeIcon } from "@/shell/FileTypeIcon";
 
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { WorkspaceTabTooltip } from "@/shell/WorkspacePanel";
-import { useFloatingPanes } from "@/shell/useFloatingPanes";
+import { useFloatingPanesShown } from "@/shell/useFloatingPanes";
 
 export interface TabSearchEntry {
   tabId: string;
@@ -80,7 +80,7 @@ export function WorkspaceTabSearch({
   reopen: TabSearchReopen;
   onChoose: (choice: TabSearchChoice) => void;
 }) {
-  const floatingPanes = useFloatingPanes();
+  const floatingPanes = useFloatingPanesShown();
   return (
     <Popover open={open} onOpenChange={onOpenChange}>
       <WorkspaceTabTooltip label="All tabs">

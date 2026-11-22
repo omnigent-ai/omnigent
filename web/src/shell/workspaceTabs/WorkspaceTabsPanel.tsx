@@ -105,7 +105,7 @@ import {
 import { UNSUPPORTED_TAB_TITLE, UnsupportedTabContent } from "../workspaceSidebar/unsupportedTab";
 import { useWorkspaceSidebarTabActions } from "../workspaceSidebar/useWorkspaceSidebarTabActions";
 import { useCanStartSideChat } from "@/hooks/usePermissions";
-import { useFloatingPanes } from "../useFloatingPanes";
+import { useFloatingPanesShown } from "../useFloatingPanes";
 import { WorkspaceRailEdgeHandle, WorkspaceRailGutterHandle } from "../WorkspaceRailResizeHandle";
 import { RailTerminalView, WorkspaceTabTooltip } from "../WorkspacePanel";
 import { NewTabPage, type NewTabRecent } from "./NewTabPage";
@@ -532,7 +532,8 @@ function WorkspaceTabsPanelImpl({
     onReveal?.();
   };
   const inDrawer = placement === "drawer";
-  const floatingPanes = useFloatingPanes();
+  // Where the panes float now: the flag on and 48rem or wider, so a narrow drawer keeps its strip.
+  const floatingPanes = useFloatingPanesShown();
   // Hotkeys and ⌘K rows act only while this panel is the keyboard target.
   const commandsActive = !pending && keyboardTarget;
   useNewBrowserHotkey(() => addBrowser(), showBrowserTab && commandsActive);

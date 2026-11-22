@@ -71,7 +71,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
-import { useFloatingPanes } from "./useFloatingPanes";
+import { useFloatingPanesShown } from "./useFloatingPanes";
 import { WorkspaceRailEdgeHandle, WorkspaceRailGutterHandle } from "./WorkspaceRailResizeHandle";
 import { SUBAGENT_TAB_FALLBACK_LABEL, SubagentTabPane, useSubagentTabLabels } from "./SubagentTab";
 import { type SubagentPanelOpener, SubagentPanelOpenerContext } from "./subagentPanelOpener";
@@ -951,7 +951,7 @@ function WorkspacePanelImpl({
   const sideChats = useSideChats(conversationId);
   const mobileViewport = useIsMobileViewport();
   const isMobile = mobileViewport && !contained;
-  const floatingPanes = useFloatingPanes();
+  const floatingPanes = useFloatingPanesShown();
   const activeView = resolveWorkspaceActiveView(
     {
       rightRailTab,

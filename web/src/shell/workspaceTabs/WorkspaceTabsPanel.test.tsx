@@ -73,8 +73,11 @@ vi.mock("@/components/blocks/TerminalView", () => ({
   ),
 }));
 
-const floatingPanes = vi.hoisted(() => ({ on: false }));
-vi.mock("../useFloatingPanes", () => ({ useFloatingPanes: () => floatingPanes.on }));
+const floatingPanes = vi.hoisted(() => ({ on: false, wide: true }));
+vi.mock("../useFloatingPanes", () => ({
+  useFloatingPanes: () => floatingPanes.on,
+  useFloatingPanesShown: () => floatingPanes.on && floatingPanes.wide,
+}));
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
@@ -155,6 +158,7 @@ beforeEach(() => {
   placeViews.latest.clear();
   placeViews.bySession.clear();
   floatingPanes.on = false;
+  floatingPanes.wide = true;
 });
 
 afterEach(() => {
@@ -374,6 +378,23 @@ describe("All tabs' place in the strip", () => {
     expect(stripDividers()).toHaveLength(1);
     expect(precedes(button("New tab"), stripDividers()[0]!)).toBe(true);
     expect(precedes(stripDividers()[0]!, allTabs)).toBe(true);
+  });
+
+  it("in a narrow window's drawer, stays before the tabs as layers with the flag on", async () => {
+    floatingPanes.on = true;
+    floatingPanes.wide = false;
+    renderPanels([{ conversationId: "conv_a", open: true, placement: "drawer" }]);
+    const allTabs = button("All tabs");
+    expect(precedes(allTabs, firstTab())).toBe(true);
+    expect(allTabs.querySelector(".lucide-layers")).not.toBeNull();
+    expect(allTabs.querySelector(".lucide-chevron-down")).toBeNull();
+    expect(stripDividers()).toHaveLength(1);
+    expect(precedes(button("New tab"), stripDividers()[0]!)).toBe(true);
+    await userEvent.click(allTabs);
+    expect(await screen.findByRole("dialog", { hidden: true })).toHaveAttribute(
+      "data-align",
+      "start",
+    );
   });
 
   it("with floating panes, lines its list up with the button's end", async () => {
