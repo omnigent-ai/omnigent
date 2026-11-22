@@ -7,7 +7,6 @@ write the repository's configuration. This never writes the index or config.
 
 from __future__ import annotations
 
-import hashlib
 import itertools
 import operator
 import os
@@ -97,6 +96,59 @@ def _checked_paths(output: bytes) -> list[str]:
     return list(paths)
 
 
+class _TrackedListReader:
+    """Parses ``git ls-files -z`` output as it arrives, reusing ``kept`` while it matches.
+
+    Git lists in path order, so an unmerged file's repeated records are adjacent.
+    """
+
+    def __init__(self, kept: list[str] | None) -> None:
+        self._kept = kept if kept is not None else []
+        self._matched = 0  # leading paths of ``kept`` listed again so far
+        # The paths listed, once they differ from ``kept``.
+        self._built: list[str] | None = None if kept is not None else []
+        self._rest = bytearray()  # a record not yet ended by its NUL
+
+    def feed(self, chunk: bytes) -> None:
+        # Only the new chunk is searched, and a long record is copied once as it grows.
+        end = chunk.rfind(b"\0") + 1
+        if not end:
+            self._rest += chunk
+            return
+        records = bytes(self._rest) + chunk[:end] if self._rest else chunk[:end]
+        self._rest = bytearray(chunk[end:])
+        self._add(_paths(records))
+
+    def _add(self, paths: list[str]) -> None:
+        if self._built is not None:
+            self._built.extend(paths)
+            return
+        kept, matched = self._kept, self._matched
+        for index, path in enumerate(paths):
+            if matched < len(kept) and kept[matched] == path:
+                matched += 1
+            elif not (matched and kept[matched - 1] == path):
+                self._built = [*kept[:matched], *paths[index:]]
+                return
+        self._matched = matched
+
+    def finish(self) -> list[str]:
+        """The paths in path order, once each: ``kept`` itself when they're the same.
+
+        A record cut off at the cap is left out.
+        """
+        if self._built is None:
+            if self._matched == len(self._kept):
+                return self._kept
+            self._built = self._kept[: self._matched]
+        paths = self._built
+        if not all(map(operator.le, paths, itertools.islice(paths, 1, None))):
+            paths.sort()  # Git lists in byte order, which is path order for UTF-8
+        if any(map(operator.eq, paths, itertools.islice(paths, 1, None))):
+            paths = list(dict.fromkeys(paths))
+        return paths
+
+
 class WorkspaceFiles:
     """Lists one workspace's files through the runner.
 
@@ -105,8 +157,8 @@ class WorkspaceFiles:
 
     def __init__(self, root: Path) -> None:
         self._root = root
-        # The index state, the listing's digest, its paths, and whether it hit the cap.
-        self._tracked: tuple[tuple[int, ...], bytes, list[str], bool] | None = None
+        # The index state, its paths, and whether the listing hit the cap.
+        self._tracked: tuple[tuple[int, ...], list[str], bool] | None = None
         self._untracked: tuple[float, list[str], bool] | None = None
 
     async def list_files(
@@ -138,31 +190,29 @@ class WorkspaceFiles:
         index = _index_state(repository.git_directory)
         cached = self._tracked
         if index is not None and cached is not None and cached[0] == index:
-            return cached[2], cached[3]
+            return cached[1], cached[2]
+        # Parsed as it arrives, so the output is never held whole. Git rewrites the
+        # index often without changing its paths, e.g. for `git status`: then the
+        # kept list is returned, and nothing new is held.
+        reader = _TrackedListReader(cached[1] if cached is not None else None)
         output = await repository.run_unchecked(
             ["ls-files", "--cached", "-z", "--", "."],
             deadline=deadline,
             stdout_bytes=TRACKED_LISTING_BYTES,
             allow_partial=True,
+            stdout_sink=reader.feed,
         )
         if not output.success and not output.overflowed:
             raise failure(output, "ls-files")
-        # Git rewrites the index often without changing its paths, e.g. for `git status`.
-        digest = hashlib.blake2b(output.stdout, digest_size=16).digest()
-        if cached is not None and cached[1] == digest:
-            paths = cached[2]
-        else:
-            paths = _paths(output.stdout)
-            if not all(map(operator.le, paths, itertools.islice(paths, 1, None))):
-                paths.sort()  # Git lists in byte order, which is path order for UTF-8
+        paths = reader.finish()
         if index is not None:
-            self._tracked = (index, digest, paths, output.overflowed)
+            self._tracked = (index, paths, output.overflowed)
             _keep_tracked_budget(self)
         return paths, output.overflowed
 
     def tracked_paths_held(self) -> int:
         """How many tracked paths this lister keeps for reuse."""
-        return len(self._tracked[2]) if self._tracked is not None else 0
+        return len(self._tracked[1]) if self._tracked is not None else 0
 
     def forget_tracked(self) -> None:
         """Drop the kept tracked list; the next listing reads it again."""

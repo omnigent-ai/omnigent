@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -195,8 +196,50 @@ async def test_a_tracked_list_past_the_other_listings_cap_is_read_whole(
         b"",
     ],
 )
-def test_the_fast_parse_agrees_with_checking_each_record(output: bytes) -> None:
+@pytest.mark.parametrize("chunk_size", [1, 3, 64])
+def test_the_fast_parse_agrees_with_checking_each_record(output: bytes, chunk_size: int) -> None:
+    reader = files_module._TrackedListReader(None)
+    for start in range(0, len(output), chunk_size):
+        reader.feed(output[start : start + chunk_size])
+
     assert files_module._paths(output) == files_module._checked_paths(output)
+    # Streamed in chunks that split records anywhere, then in path order.
+    assert reader.finish() == sorted(files_module._checked_paths(output))
+
+
+def test_a_record_spanning_many_chunks_is_read_in_time_linear_in_its_length() -> None:
+    reader = files_module._TrackedListReader(None)
+    chunk = b"x" * 65536
+    started = time.perf_counter()
+    for _ in range(1024):  # one 64 MiB name, as a crafted index could hold
+        reader.feed(chunk)
+    reader.feed(b"\0ok.txt\0")
+    elapsed = time.perf_counter() - started
+
+    assert [len(path) for path in reader.finish()] == [6, 64 * 1024 * 1024]
+    assert elapsed < 2  # copying the pending record on every chunk took far longer
+
+
+@pytest.mark.parametrize(
+    ("output", "same"),
+    [
+        (b"a.txt\0b.txt\0b.txt\0", True),  # b.txt unmerged
+        (b"a.txt\0", False),
+        (b"a.txt\0b.txt\0c.txt\0", False),
+        (b"a.txt\0c.txt\0", False),
+    ],
+)
+def test_a_relisting_returns_the_kept_list_only_when_its_paths_are_the_same(
+    output: bytes, same: bool
+) -> None:
+    kept = ["a.txt", "b.txt"]
+    reader = files_module._TrackedListReader(kept)
+    reader.feed(output)
+
+    paths = reader.finish()
+
+    assert (paths is kept) is same
+    assert paths == sorted(files_module._checked_paths(output))
 
 
 async def test_an_index_rewritten_with_the_same_paths_keeps_the_same_list(

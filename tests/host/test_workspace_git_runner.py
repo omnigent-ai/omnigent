@@ -312,9 +312,20 @@ async def test_output_past_its_cap_is_refused_or_kept_partially(
     partial = await repository.run_unchecked(
         ["ls-files"], deadline=Deadline(10), stdout_bytes=100_000, allow_partial=True
     )
+    chunks: list[bytes] = []
+    streamed = await repository.run_unchecked(
+        ["ls-files"],
+        deadline=Deadline(10),
+        stdout_bytes=100_000,
+        allow_partial=True,
+        stdout_sink=chunks.append,
+    )
 
     assert flooded.value.problem is GitProblem.OUTPUT_TOO_LARGE
     assert partial.overflowed and len(partial.stdout) == 100_000
+    # A sink takes the same bytes as they arrive, and none are kept.
+    assert streamed.overflowed and streamed.stdout == b""
+    assert b"".join(chunks) == partial.stdout
 
 
 async def test_failures_summarize_gits_last_error_line(
@@ -633,9 +644,11 @@ async def test_partial_output_never_signals_a_reaped_git(
     reaped = _guard_signals(monkeypatch)
     real_read_capped = runner._read_capped
 
-    async def read_after_git_exits(stream: asyncio.StreamReader, limit: int) -> tuple[bytes, bool]:
+    async def read_after_git_exits(
+        stream: asyncio.StreamReader, limit: int, *rest: object
+    ) -> tuple[bytes, bool]:
         await asyncio.sleep(0.5)
-        return await real_read_capped(stream, limit)
+        return await real_read_capped(stream, limit, *rest)  # type: ignore[arg-type]
 
     monkeypatch.setattr(runner, "_read_capped", read_after_git_exits)
 
