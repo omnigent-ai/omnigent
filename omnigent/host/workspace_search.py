@@ -21,7 +21,7 @@ import os
 import re
 import stat
 import sys
-from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,6 +35,7 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     FILE_SEARCH_MODE_FUZZY,
     FILE_SEARCH_MODE_SUBSTRING,
     FILE_SEARCH_MODE_UNSPECIFIED,
+    SEARCH_ORDER_PRIORITY,
     Entry,
     FileSearchResult,
     SearchFilesRequest,
@@ -53,6 +54,7 @@ from omnigent.host.workspace_git.runner import (
     start_owned_process,
     trusted_search_path,
 )
+from omnigent.host.workspace_text_priority import SearchRun, priority_runs
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
@@ -69,8 +71,10 @@ from omnigent.workspace_content_search import (
     MAX_MATCHES,
     MAX_QUERY_LENGTH,
     MAX_SCRIPT_OUTPUT,
+    RIPGREP_TIME_LIMIT_S,
     SCRIPT_TIMEOUT_S,
     ContentSearchError,
+    content_search_globs,
     content_search_script,
     literal_glob,
     parse_record,
@@ -517,10 +521,14 @@ def text_search_arguments(
     return options, [f"./{d}" for d in present] or ["."]
 
 
-async def _content_search_records(root: Path, script: str) -> AsyncGenerator[dict[str, object]]:
+async def _content_search_records(
+    root: Path, script: str, timeout: float = SCRIPT_TIMEOUT_S
+) -> AsyncGenerator[dict[str, object]]:
     """Run the content search script in ``root``, yielding its records.
 
     Closing the iterator early kills and reaps the script and ripgrep.
+
+    :param timeout: Seconds the reads may take in all.
 
     :raises ContentSearchError: For ripgrep's own refusals, such as a bad regex.
     :raises ConnectError: UNAVAILABLE when the search couldn't run or finish.
@@ -537,7 +545,7 @@ async def _content_search_records(root: Path, script: str) -> AsyncGenerator[dic
     received = 0
     loop = asyncio.get_running_loop()
     # Only the reads count: a client slow to take the matches doesn't end the search.
-    remaining = float(SCRIPT_TIMEOUT_S)
+    remaining = float(timeout)
     try:
         while True:
             started = loop.time()
@@ -564,44 +572,120 @@ async def _content_search_records(root: Path, script: str) -> AsyncGenerator[dic
         await process.close()
 
 
+def _skip_globs(run: SearchRun) -> list[str]:
+    """Anchored, escaped excludes for what earlier runs of a search searched."""
+    files = [f"--glob=!/{literal_glob(path)}" for path in run.skip_files]
+    folders = [
+        glob
+        for directory in run.skip_directories
+        for glob in (
+            f"--glob=!/{literal_glob(directory)}",
+            f"--glob=!/{literal_glob(directory)}/**",
+        )
+    ]
+    return [*files, *folders]
+
+
+async def _walk_run(start_paths: list[str]) -> AsyncGenerator[SearchRun]:
+    yield SearchRun(start_paths, [], [])
+
+
 async def search_text(
     root: Path, request: SearchTextRequest
 ) -> AsyncGenerator[SearchTextResponse]:
     """Stream a SearchText's matches in batches, then a final ``done`` message.
 
-    ``order``, ``focused_paths`` and ``changed_against`` are ignored, as this
-    host doesn't offer the ``text_search_priority`` feature.
+    In priority order (feature ``text_search_priority``), focused files come
+    first, then their folders, then the folders with the most changes against
+    ``changed_against``, then the rest of the scope. Each file is searched once,
+    and every pass shares the result cap and the time limit.
     """
     arguments = text_search_arguments(root, request)
     if arguments is None:
         yield SearchTextResponse(done=True)
         return
     options, start_paths = arguments
-    try:
-        script = content_search_script(
+    limit = min(request.maximum_results or MAX_MATCHES, MAX_MATCHES)
+
+    def script(run: SearchRun, remaining: int, time_limit: float = RIPGREP_TIME_LIMIT_S) -> str:
+        return content_search_script(
             request.query,
             case_sensitive=request.case_sensitive,
             regex=request.regular_expression,
             include=request.include,
             exclude=request.exclude,
-            limit=min(request.maximum_results or MAX_MATCHES, MAX_MATCHES),
-            extra_args=options,
-            search_paths=start_paths,
+            limit=remaining,
+            extra_args=[*options, *_skip_globs(run), *(["--threads=1"] if run.in_order else [])],
+            search_paths=run.start_paths,
+            time_limit=time_limit,
         )
+
+    try:
+        # Invalid queries and filters are refused before anything runs.
+        script(SearchRun(start_paths, [], []), limit)
+        if request.order == SEARCH_ORDER_PRIORITY:
+            scope = DirectoryScope.parse(
+                root, request.include_directories, request.exclude_directories
+            )
+            walk_options = [
+                *content_search_globs(request.include, request.exclude),
+                "--glob=!.git",
+                *options,
+            ]
+            runs = priority_runs(
+                root,
+                request,
+                start_paths=start_paths,
+                in_scope=scope.allows,
+                walk_options=walk_options,
+            )
+        else:
+            runs = _walk_run(start_paths)
+        loop = asyncio.get_running_loop()
+        # Seconds spent waiting for passes and their matches, shared by all passes; the
+        # time a client takes to read the matches doesn't count.
+        used = 0.0
+
+        async def timed[T](waiting: Awaitable[T]) -> T:
+            nonlocal used
+            started = loop.time()
+            try:
+                return await waiting
+            finally:
+                used += loop.time() - started
+
         batch: list[TextSearchMatch] = []
-        async with contextlib.aclosing(_content_search_records(root, script)) as records:
-            async for record in records:
-                if "match" not in record:
-                    yield SearchTextResponse(
-                        matches=batch,
-                        done=True,
-                        truncated=bool(record["truncated"]),
-                        warning=str(record["warning"] or ""),
-                    )
-                    return
-                batch.append(TextSearchMatch(**record["match"]))  # type: ignore[arg-type]
-                if len(batch) == _TEXT_MATCH_BATCH:
+        found = 0
+        truncated = False
+        warning = ""
+        async with contextlib.aclosing(runs) as passes:
+            while (run := await timed(anext(passes, None))) is not None:
+                if found == limit or used >= RIPGREP_TIME_LIMIT_S:
+                    truncated = True  # later passes may match more
+                    break
+                # Each script stops its ripgrep with time left to report the results cut short.
+                records = _content_search_records(
+                    root,
+                    script(run, limit - found, RIPGREP_TIME_LIMIT_S - used),
+                    SCRIPT_TIMEOUT_S - used,
+                )
+                async with contextlib.aclosing(records) as stream:
+                    while (record := await timed(anext(stream, None))) is not None:
+                        if "match" not in record:
+                            truncated = bool(record["truncated"])
+                            warning = warning or str(record["warning"] or "")
+                            break
+                        batch.append(TextSearchMatch(**record["match"]))  # type: ignore[arg-type]
+                        found += 1
+                        if len(batch) == _TEXT_MATCH_BATCH:
+                            yield SearchTextResponse(matches=batch)
+                            batch = []
+                if truncated:
+                    break
+                if batch and request.order == SEARCH_ORDER_PRIORITY:
+                    # A pass's matches go out before the next pass starts.
                     yield SearchTextResponse(matches=batch)
                     batch = []
+        yield SearchTextResponse(matches=batch, done=True, truncated=truncated, warning=warning)
     except ContentSearchError as exc:
         raise ConnectError(Code.INVALID_ARGUMENT, exc.message) from exc

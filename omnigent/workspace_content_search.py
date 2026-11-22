@@ -19,7 +19,8 @@ from omnigent.runner.environment_filesystem import split_glob_list
 MAX_MATCHES = 500
 # Longest query or filter list a search accepts.
 MAX_QUERY_LENGTH = 4096
-# The whole run is bounded at this, after ripgrep's own 15 s.
+# Ripgrep stops itself after this, and the whole run is bounded a little later.
+RIPGREP_TIME_LIMIT_S = 15
 SCRIPT_TIMEOUT_S = 20
 MAX_SCRIPT_OUTPUT = 4 * 1024 * 1024
 COULD_NOT_RUN = "Content search could not run in this workspace. Try again."
@@ -73,7 +74,7 @@ with tempfile.TemporaryFile() as errors:
     def expire():
         expired.set()
         process.kill()
-    timer = threading.Timer(15, expire)
+    timer = threading.Timer(time_limit, expire)
     timer.start()
     reached_end = False
     searched = False
@@ -157,6 +158,7 @@ def content_search_script(
     limit: int = MAX_MATCHES,
     extra_args: Sequence[str] = (),
     search_paths: Sequence[str] = (".",),
+    time_limit: float = RIPGREP_TIME_LIMIT_S,
 ) -> str:
     """The script that searches the current directory with ripgrep.
 
@@ -169,6 +171,8 @@ def content_search_script(
     :param extra_args: Options the caller built, after the user's globs, so their
         globs take precedence.
     :param search_paths: Where ripgrep starts, relative to the current directory.
+    :param time_limit: Seconds before the script stops ripgrep and reports the results
+        as truncated.
     :returns: Python source to run with ``python3 -I -c``.
     :raises ContentSearchError: When the query or filters are invalid.
     """
@@ -181,6 +185,7 @@ def content_search_script(
         f"query = {query!r}\ncase_sensitive = {case_sensitive!r}\n"
         f"regex = {regex!r}\nlimit = {limit!r}\nglob_args = {glob_args!r}\n"
         f"extra_args = {list(extra_args)!r}\nsearch_paths = {list(search_paths)!r}\n"
+        f"time_limit = {float(time_limit)!r}\n"
     )
     return parameters + _SEARCH_SCRIPT
 
