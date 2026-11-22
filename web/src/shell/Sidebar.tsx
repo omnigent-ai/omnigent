@@ -1645,7 +1645,7 @@ function SidebarImpl({
                     : "[scrollbar-color:transparent_transparent] [&::-webkit-scrollbar-thumb]:bg-transparent",
                 )}
               >
-                <GridSidebar onNavigate={onNavClick} />
+                <GridSidebar onNavigate={onNavClick} onOpenSidebar={open ? undefined : onOpen} />
                 {sidebarData.identityReady ? (
                   <ConversationList
                     conversationsQuery={displayQuery}
