@@ -156,6 +156,28 @@ describe("useTerminalPaneActions", () => {
     expect(read()?.focusedKey).toBe(AGENT_KEY);
   });
 
+  it.each([
+    ["takes the keyboard once its shell starts, nothing having moved it", false, ZSH_KEY],
+    ["leaves the keyboard where the person moved it while its shell started", true, AGENT_KEY],
+  ])("a new pane %s", (_case, focusMoved, focusedKey) => {
+    const elsewhere = document.body.appendChild(document.createElement("input"));
+    try {
+      const { target, read } = memoryTarget();
+      const { result } = renderHook(() => useTerminalPaneActions(target, [AGENT]));
+      act(() => result.current.splitPane(AGENT_KEY, "columns"));
+      const [, callbacks] = fixture.launch.mock.calls[0]!;
+      setTerminalLaunching(ZSH.id, "attach", target.conversationId);
+      act(() => callbacks.onOpen?.(ZSH));
+      // Still starting: the pane shows, the keyboard waits.
+      expect(read()?.focusedKey).toBe(AGENT_KEY);
+      if (focusMoved) elsewhere.focus();
+      act(() => setTerminalLaunching(ZSH.id, null));
+      expect(read()).toEqual({ layout: SIDE_BY_SIDE.layout, focusedKey });
+    } finally {
+      elsewhere.remove();
+    }
+  });
+
   it("closes nothing from a stale row or dialog whose pane is gone, and says so", () => {
     const { target, read } = memoryTarget(SIDE_BY_SIDE);
     const { result } = renderHook(() => useTerminalPaneActions(target, [AGENT, ZSH]));

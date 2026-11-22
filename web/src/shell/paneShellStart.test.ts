@@ -131,6 +131,34 @@ describe("a failed pane start", () => {
     );
   });
 
+  it.each([
+    ["asks the slot's new shell to take the keyboard once it starts", false],
+    ["leaves the keyboard alone if the person moved it while the shell started", true],
+  ])("completing with the id it guessed, the retry %s", (_case, focusMoved) => {
+    const conversationId = `session-retry-same-id-${focusMoved}`;
+    const { target, read } = memoryTarget(conversationId);
+    recordPaneStartFailure(conversationId, FAILED, { terminal: "zsh", reason: "x" });
+    const launch = vi.fn<(terminal: string, callbacks: TerminalLaunchCallbacks) => void>();
+    retryPaneStart(target, FAILED, launch);
+    const [, callbacks] = launch.mock.calls[0]!;
+    const retried = shell("terminal_zsh_s2");
+    const elsewhere = document.body.appendChild(document.createElement("input"));
+    setTerminalLaunching(retried.id, "attach", conversationId);
+    try {
+      // The server keeps the guessed id, so the launch opens the slot only once.
+      callbacks.onOpen?.(retried);
+      expect(pendingTerminalFocus(conversationId, "main")).toBeNull();
+      if (focusMoved) elsewhere.focus();
+    } finally {
+      setTerminalLaunching(retried.id, null);
+      elsewhere.remove();
+    }
+    expect(read()?.focusedKey).toBe("terminal:terminal_zsh_s2");
+    expect(pendingTerminalFocus(conversationId, "main")?.tabKey ?? null).toBe(
+      focusMoved ? null : "terminal:terminal_zsh_s2",
+    );
+  });
+
   it("waits while another shell is starting in the session, keeping its error", () => {
     const { target } = memoryTarget("session-busy");
     recordPaneStartFailure(target.conversationId, FAILED, { terminal: "zsh", reason: "x" });

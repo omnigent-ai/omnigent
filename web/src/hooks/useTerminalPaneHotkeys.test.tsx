@@ -105,6 +105,9 @@ function press(
   return { claimed: event.defaultPrevented };
 }
 
+const readRatio = (split: TerminalSplitState | undefined) =>
+  split && typeof split.layout !== "string" ? split.layout.ratio : Number.NaN;
+
 const SPLIT_RIGHT = { metaKey: true, code: "KeyD", key: "d" };
 const MAXIMIZE = { metaKey: true, shiftKey: true, key: "Enter" };
 
@@ -168,6 +171,20 @@ describe("useTerminalPaneHotkeys", () => {
     const { byTestId, actions } = setup({ actions: commandsDouble({ splitting: true }) });
     expect(press(byTestId("terminal-a"), SPLIT_RIGHT).claimed).toBe(true);
     expect(actions.splitPane).not.toHaveBeenCalled();
+  });
+
+  it("claims a held split key without opening a shell per repeat, while a held divider key moves", () => {
+    const { byTestId, actions, read } = setup();
+    expect(press(byTestId("terminal-a"), { ...SPLIT_RIGHT, repeat: true }).claimed).toBe(true);
+    expect(actions.splitPane).not.toHaveBeenCalled();
+
+    const grow = { metaKey: true, ctrlKey: true, key: "ArrowRight", repeat: false };
+    press(byTestId("terminal-a"), grow);
+    const afterPress = readRatio(read());
+    press(byTestId("terminal-a"), { ...grow, repeat: true });
+    press(byTestId("terminal-a"), { ...grow, repeat: true });
+    expect(afterPress).toBeGreaterThan(0.5);
+    expect(readRatio(read())).toBeGreaterThan(afterPress);
   });
 
   it("maximizes a split's pane, and leaves ⇧⌘↩ to a lone pane's terminal", () => {
