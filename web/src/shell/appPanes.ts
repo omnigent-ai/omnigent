@@ -368,6 +368,8 @@ export function followReplacedAppPane(
 ): void {
   const fromKey = appPaneKey(from);
   const toKey = toTerminalKey ?? appPaneKey(to);
+  // A New tab filled in place keeps its id, and so its pane.
+  if (fromKey === toKey) return;
   mainSplitTarget(conversationId).update((current) => {
     if (!current) return current;
     const keys = terminalLayoutKeys(current.layout);

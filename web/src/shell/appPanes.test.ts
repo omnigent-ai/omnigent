@@ -150,6 +150,21 @@ describe("followReplacedAppPane", () => {
     });
   });
 
+  it("keeps the pane and its focus when a New tab is filled in place, keeping its id", () => {
+    const conversationId = nextConversation();
+    updatePaneSplit(conversationId, () => ({
+      layout: {
+        axis: "columns",
+        ratio: 0.5,
+        children: [AGENT, { axis: "rows", ratio: 0.5, children: ["app:new-1", SHELL] }],
+      },
+      focusedKey: "app:new-1",
+    }));
+    const before = readPaneSplit(conversationId);
+    followReplacedAppPane(conversationId, "new-1", "new-1");
+    expect(readPaneSplit(conversationId)).toEqual(before);
+  });
+
   it("leaves the split alone for a tab that isn't a pane", () => {
     const conversationId = nextConversation();
     openTabAsPane(conversationId, "files", { agentKey: AGENT });
