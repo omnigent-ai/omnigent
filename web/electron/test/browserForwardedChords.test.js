@@ -90,8 +90,15 @@ describe("matchesForwardedChord", () => {
 describe("keys that write text stay with the page", () => {
   const NEW_TAB = { code: "KeyN", metaKey: false, ctrlKey: true, altKey: true, shiftKey: true };
   const CTRL_K = { key: "k", metaKey: false, ctrlKey: true, altKey: false, shiftKey: false };
+  const CTRL_KEY_K = {
+    code: "KeyK",
+    metaKey: false,
+    ctrlKey: true,
+    altKey: false,
+    shiftKey: false,
+  };
   const MAC_NEW_TAB = { code: "KeyN", metaKey: true, ctrlKey: false, altKey: true, shiftKey: true };
-  const chords = normalizeForwardedChords([COMMAND_K, CTRL_K, NEW_TAB, MAC_NEW_TAB]);
+  const chords = normalizeForwardedChords([COMMAND_K, CTRL_K, CTRL_KEY_K, NEW_TAB, MAC_NEW_TAB]);
   const keyDown = (fields) => ({ type: "keyDown", ...fields });
 
   it("never forwards a composing or dead key, even a listed chord", () => {

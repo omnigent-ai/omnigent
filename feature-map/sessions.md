@@ -53,7 +53,9 @@ the header menu), and each place is a separate entry point.
   `session_title_instructions`; Clear removes only the personal guidance, so
   titles fall back to the operator setting or, without one, the default prompt.
 - `search`: the sidebar's Search or ⌘K / Ctrl+K opens the command palette.
-  Sessions whose title matches list under **Sessions**, then sessions matching
+  With the tabs sidebar (`workspace_sidebar_v2`) in a desktop app that can hand
+  keys over, ⌘K and the tab chords also work while a browser tab's page has
+  focus. Sessions whose title matches list under **Sessions**, then sessions matching
   only in chat content under **In messages** with a snippet; each group has its
   own Show more. Archived sessions match too, marked **Archived**. Before typing,
   ⌘K lists the five most recently updated sessions, archived ones included and

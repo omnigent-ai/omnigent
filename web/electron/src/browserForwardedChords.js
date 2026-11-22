@@ -1,9 +1,5 @@
-// App chords a focused embedded page hands to the shell renderer. The page owns
-// a separate WebContents, so its keystrokes never reach the renderer's window
-// listeners; the renderer lists the chords it wants (from its own shortcut
-// registry) and main forwards exactly those, leaving all other keys to the page.
-// Text input always stays with the page: a composing key, a dead key, and off the
-// Mac any Ctrl+Alt chord, which is how AltGr arrives there.
+// App chords a focused page hands to the shell renderer, which can't hear the page's keys.
+// Text input (composing, dead keys, and Ctrl+Alt/AltGr off the Mac) always stays with the page.
 "use strict";
 
 /** More than any renderer needs; bounds what a renderer can make main match per key. */

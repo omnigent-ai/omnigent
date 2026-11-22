@@ -1,9 +1,7 @@
 "use strict";
 
-// An agent's protocol input stays in the page. Electron 42
-// doesn't raise before-input-event for it, but the shell's Ctrl+Tab session
-// switcher and the app chords a page hands to the shell also ignore it explicitly
-// in case a later Electron does.
+// An agent's protocol input stays in the page. Electron 42 doesn't raise before-input-event
+// for it, but the Ctrl+Tab switcher and forwarded app chords ignore it in case one later does.
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
