@@ -4,10 +4,24 @@ vi.mock("@/lib/fetchSessionHostId", () => ({
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
+// Counts renders of the ⌘K Mark all as read command, which renders nothing itself.
+const markAllReadCommand = vi.hoisted(() => ({ renders: 0 }));
+vi.mock("@/shell/markAllReadPaletteCommand", async (importOriginal) => {
+  const original = await importOriginal<typeof MarkAllReadPaletteCommandModule>();
+  return {
+    ...original,
+    MarkAllReadPaletteCommand: () => {
+      markAllReadCommand.renders += 1;
+      return original.MarkAllReadPaletteCommand();
+    },
+  };
+});
+
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>canvas board</div> }));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type * as MarkAllReadPaletteCommandModule from "@/shell/markAllReadPaletteCommand";
 import type { TerminalInfo } from "@/lib/terminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
@@ -7510,5 +7524,16 @@ describe("AppShell desktop Close", () => {
     expect(screen.queryByText("home")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
     expect(screen.getByText("home")).toBeInTheDocument();
+  });
+});
+
+describe("Mark all as read in ⌘K", () => {
+  it.each([false, true])("mounts only with quick_pick_palette on (%s)", async (quickPick) => {
+    markAllReadCommand.renders = 0;
+    mockConversations([{ id: "conv_mark_all", permission_level: null }]);
+    renderShell("/c/conv_mark_all", serverInfo({ features: { quick_pick_palette: quickPick } }));
+    await waitFor(() => expect(document.querySelector("header.chat-header")).not.toBeNull());
+    if (quickPick) expect(markAllReadCommand.renders).toBeGreaterThan(0);
+    else expect(markAllReadCommand.renders).toBe(0);
   });
 });
