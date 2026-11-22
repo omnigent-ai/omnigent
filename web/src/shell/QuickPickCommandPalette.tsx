@@ -31,12 +31,15 @@ import {
 } from "./commandContext";
 import { useCommandOptionsPage } from "./commandOptionsPage";
 import {
+  leavePaletteChildPage,
   type PaletteParentPlace,
   paletteChildPageStore,
+  rememberPaletteParent,
   resetPaletteToRoot,
 } from "./commandPaletteChildPage";
 import { currentPaletteCommand, paletteCommandItems } from "./paletteCommandRows";
 import { PaletteSessionContext } from "./PaletteSessionContext";
+import { SESSION_COMMAND_PICKS, type SessionCommandId } from "./sessionCommands/model";
 import { useSessionActionsPage } from "./sessionCommands/useSessionActionsPage";
 import type { PaletteTarget as PaletteRow } from "./paletteTarget";
 import { useSettingChoicesPage } from "./settingChoicesPage";
@@ -59,6 +62,11 @@ const CHILD_PAGE_COPY = {
     label: "Choose one",
     placeholder: "Choose one…",
     empty: "Nothing to choose from.",
+  },
+  "pick-session": {
+    label: "Pick a session",
+    placeholder: "Pick a session, or paste a pull request link…",
+    empty: "No matching sessions.",
   },
   "session-actions": {
     label: "Session actions",
@@ -101,7 +109,14 @@ export function QuickPickCommandPalette({
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
-  const search = usePaletteSessionSearch({ open, sessionsOnly, matchLoaded: true });
+  const childPage = useStore(paletteChildPageStore, (state) => state.page);
+  // A verb-first row such as "Archive a Session…" lists sessions alone, searched as the root is.
+  const picking = childPage?.kind === "pick-session" ? childPage : null;
+  const search = usePaletteSessionSearch({
+    open,
+    sessionsOnly: sessionsOnly || picking !== null,
+    matchLoaded: true,
+  });
   const { query, debouncedQuery, titleSearch, contentSearch } = search;
   const close = (): void => onOpenChange(false);
   const actions = useAppCommands({
@@ -145,12 +160,18 @@ export function QuickPickCommandPalette({
   const [parkedId, setParkedId] = useState<string | null>(null);
   // A child page has its own query; the root's stays as it was for Back.
   const [pageQuery, setPageQuery] = useState("");
+  // The action a picked session's actions page opened for, so the page can say if it doesn't apply.
+  const [pickedAction, setPickedAction] = useState<{
+    sessionId: string;
+    title: string;
+    command: SessionCommandId;
+  } | null>(null);
   // Every opening starts from the top row of a fresh root, and a close drops what a page awaited.
   useEffect(() => {
     if (!open) setParkedId(null);
+    setPickedAction(null);
     resetPaletteToRoot();
   }, [open]);
-  const childPage = useStore(paletteChildPageStore, (state) => state.page);
   // Back on the row that opened the page, once a choice applies or its setting goes away.
   const restoreParent = (parent: PaletteParentPlace | null) => {
     setPageQuery("");
@@ -224,6 +245,16 @@ export function QuickPickCommandPalette({
         return sessionPage;
       case "command-options":
         return optionsPage;
+      case "pick-session":
+        return {
+          items: [
+            ...visibleSessions.map((session) => sessionItem(session, "Sessions")),
+            ...(showingServerMatches
+              ? showMoreItem("title", titleSearch, visibleSessions, "Sessions")
+              : []),
+          ],
+          back: leavePaletteChildPage,
+        };
       default:
         return null;
     }
@@ -280,9 +311,12 @@ export function QuickPickCommandPalette({
           ],
     },
   ];
-  const segments: QuickPickSegment<PaletteRow>[] = pageItems
-    ? [{ sourceId: "page", ranking: "client", fuzzyMatching: "words", items: pageItems }]
-    : rootSegments;
+  const segments: QuickPickSegment<PaletteRow>[] = picking
+    ? // The session search already matched them, as on the root.
+      [{ sourceId: "sessions", ranking: "provider", origin: "source", items: pageItems ?? [] }]
+    : pageItems
+      ? [{ sourceId: "page", ranking: "client", fuzzyMatching: "words", items: pageItems }]
+      : rootSegments;
 
   const accept = (
     item: QuickPickItem<PaletteRow>,
@@ -322,7 +356,15 @@ export function QuickPickCommandPalette({
         return "keepOpen";
       }
       if (command.keepsPaletteOpen) {
+        const pageBefore = paletteChildPageStore.getState().page;
         command.run();
+        const pageAfter = paletteChildPageStore.getState().page;
+        // It opened the session picker: Back returns to this row, and the search starts empty.
+        if (pageAfter !== pageBefore && pageAfter?.kind === "pick-session") {
+          rememberPaletteParent({ query, activeId: item.id });
+          search.setQuery("");
+          setParkedId(null);
+        }
         return command.continuesAs ? { handOffTo: command.continuesAs } : "keepOpen";
       }
       // A command that moves focus runs once the palette has closed and restored it; it's read
@@ -333,6 +375,17 @@ export function QuickPickCommandPalette({
       }
       command.run();
       return undefined;
+    }
+    // A picked session opens its actions on the one the verb named, still checked as it runs.
+    if (picking && row.kind === "session") {
+      const picked = visibleSessions.find((candidate) => candidate.id === row.id);
+      if (!picked) return "keepOpen";
+      const parent = paletteChildPageStore.getState().parent ?? { query: "", activeId: null };
+      sessionPage.openActions(picked.conversation, picked.label, parent);
+      setPageQuery("");
+      setParkedId(`session-action:${picked.id}:${picking.command}`);
+      setPickedAction({ sessionId: picked.id, title: picked.label, command: picking.command });
+      return "keepOpen";
     }
     // ⌘↵ on a session lists its actions, with Back returning to this row.
     const session = alternate
@@ -406,13 +459,27 @@ export function QuickPickCommandPalette({
 
   const pageCopy = childPage ? CHILD_PAGE_COPY[childPage.kind] : null;
   // What a page waits on or why a choice didn't apply; on the root, that a page's setting went away.
+  const pickedRowId =
+    pickedAction && `session-action:${pickedAction.sessionId}:${pickedAction.command}`;
+  // The verb's action isn't one this session offers, such as Unpin on a session that isn't pinned.
+  const pickNotice =
+    pickedAction && sessionPage.open && !sessionPage.items.some((row) => row.id === pickedRowId)
+      ? (SESSION_COMMAND_PICKS[pickedAction.command]?.notAvailable(pickedAction.title) ?? null)
+      : null;
   const pageStatus = settingPage.open
     ? settingPage.status
     : optionsPage.open
       ? optionsPage.status
-      : settingPage.notice;
-  const back = () => restoreParent((activePage ?? optionsPage).back());
-  const pageHeading = settingPage.heading ?? sessionPage.heading ?? optionsPage.heading;
+      : (pickNotice ?? settingPage.notice);
+  const back = () => {
+    setPickedAction(null);
+    restoreParent((activePage ?? optionsPage).back());
+  };
+  const pageHeading =
+    settingPage.heading ??
+    sessionPage.heading ??
+    optionsPage.heading ??
+    (picking ? (SESSION_COMMAND_PICKS[picking.command]?.question ?? null) : null);
 
   return (
     <QuickPickDialog
@@ -441,7 +508,7 @@ export function QuickPickCommandPalette({
       }
       summary={pageStatus !== null ? pageStatusSummary(pageStatus) : undefined}
       // Commands picked lately lead the commands, under Recent; sessions keep their own order.
-      historyKey={sessionsOnly ? undefined : COMMAND_HISTORY_KEY}
+      historyKey={sessionsOnly || picking ? undefined : COMMAND_HISTORY_KEY}
       // Sessions lead, unless the query names a command from a word's start, such as "settings".
       sourcesFirst
       placeholder={
@@ -449,11 +516,11 @@ export function QuickPickCommandPalette({
         (sessionsOnly ? "Search sessions by name…" : "Search sessions or run a command")
       }
       segments={segments}
-      query={childPage ? pageQuery : query}
+      query={childPage && !picking ? pageQuery : query}
       onQueryChange={(next) => {
         setParkedId(null);
         settingPage.clearNotice();
-        if (childPage) setPageQuery(next);
+        if (childPage && !picking) setPageQuery(next);
         else search.setQuery(next);
       }}
       onAccept={accept}
@@ -461,7 +528,7 @@ export function QuickPickCommandPalette({
       onActiveIdChange={() => setParkedId(null)}
       inputTestId="command-palette-input"
       emptyMessage={childPage ? (optionsPage.empty ?? pageCopy?.empty) : rootEmptyMessage()}
-      status={childPage ? undefined : status}
+      status={childPage && !picking ? undefined : status}
       listEnd={childPage ? undefined : olderSessions}
       inputEnd={
         isMobile && (

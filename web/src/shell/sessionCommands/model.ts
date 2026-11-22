@@ -270,3 +270,52 @@ export function sessionCommands(facts: SessionCommandFacts): SessionCommand[] {
 export function sessionCommand(facts: SessionCommandFacts, id: SessionCommandId): SessionCommand {
   return sessionCommands(facts).find((command) => command.id === id)!;
 }
+
+/** How ⌘K offers an action on a session the user picks, rather than the open one. */
+export interface SessionCommandPick {
+  /** The Commands row, such as "Archive a Session…". */
+  label: string;
+  /** The picker's heading while it waits for a session, such as "Archive which session?". */
+  question: string;
+  /** What the actions page says when the action doesn't apply to `title`. */
+  notAvailable: (title: string) => string;
+}
+
+function pick(label: string, question: string, verb: string): SessionCommandPick {
+  return { label, question, notAvailable: (title) => `${verb} isn't available for “${title}”.` };
+}
+
+/** The sidebar row actions ⌘K can start from a verb, then run on a session the user picks. */
+export const SESSION_COMMAND_PICKS: Partial<Record<SessionCommandId, SessionCommandPick>> = {
+  "add-sibling": pick(
+    "Add a Nested Agent to a Session…",
+    "Add a nested agent to which session?",
+    "Add nested agent",
+  ),
+  pin: pick("Pin a Session…", "Pin which session?", "Pin"),
+  unpin: pick("Unpin a Session…", "Unpin which session?", "Unpin"),
+  share: pick("Share a Session…", "Share which session?", "Share"),
+  fork: pick("Fork a Session…", "Fork which session?", "Fork"),
+  rename: pick("Rename a Session…", "Rename which session?", "Rename"),
+  "mark-unread": pick(
+    "Mark a Session as Unread…",
+    "Mark which session as unread?",
+    "Mark as unread",
+  ),
+  "mark-read": pick("Mark a Session as Read…", "Mark which session as read?", "Mark as read"),
+  "create-automation": pick(
+    "Create an Automation from a Session…",
+    "Create an automation from which session?",
+    "Create automation",
+  ),
+  "move-to-project": pick(
+    "Add a Session to a Project…",
+    "Add which session to a project?",
+    "Add to project",
+  ),
+  stop: pick("Stop a Session…", "Stop which session?", "Stop"),
+  archive: pick("Archive a Session…", "Archive which session?", "Archive"),
+  unarchive: pick("Unarchive a Session…", "Unarchive which session?", "Unarchive"),
+  delete: pick("Delete a Session…", "Delete which session?", "Delete"),
+  leave: pick("Leave a Session…", "Leave which session?", "Leave"),
+};
