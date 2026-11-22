@@ -5,6 +5,7 @@
 import type { OpenOptions } from "../planOpen";
 import type { ComparisonChoice } from "@/lib/comparisonChoice";
 import type { FilePosition } from "@/shell/FileViewerContext";
+import type { PullRequestChangesTarget } from "@/shell/PullRequestChangesTab";
 
 import { pullRequestTabPlace } from "../pullRequestSubpage";
 import type { LineRange, WorkspaceLink, WorkspacePlace } from "../workspacePlace";
@@ -162,32 +163,53 @@ export function pullRequestSectionChosen(
 const SECTION_NAMES = { summary: "summary", comments: "comments" } as const;
 
 /**
- * Parts of a pull request place its page can't show: a file or line in its changes, one
- * commit, or the checks. The tab names them and what it shows instead, rather than quietly
+ * What a pull request place opens in its page: one commit in Commits, or one file of the
+ * pull request's own changes. A file named beside a commit is neither.
+ */
+export function pullRequestPageTarget(place: PullRequestPlace): PullRequestChangesTarget | null {
+  if (place.kind !== "pull") return null;
+  if (place.view === "commits" && place.commit !== undefined) return { commit: place.commit };
+  if (place.view === "changes" && place.path !== undefined && place.commit === undefined) {
+    return { path: place.path };
+  }
+  return null;
+}
+
+/**
+ * Parts of a pull request place its page can't show: a line, a file or commit it doesn't
+ * open, or the checks. The tab names them and what it shows instead, rather than quietly
  * showing something else.
  */
 export function unshownPullRequestParts(place: PullRequestPlace): string | null {
   if (place.kind !== "pull") return null;
+  const target = pullRequestPageTarget(place);
+  const opensFile = target !== null && "path" in target;
   const parts: string[] = [];
-  if (place.path !== undefined) {
+  if (place.path !== undefined && !opensFile) {
     parts.push(place.line ? `${place.path} line ${place.line.start}` : place.path);
   } else if (place.line) {
     parts.push(`line ${place.line.start}`);
   }
-  if (place.commit !== undefined) parts.push(`commit ${place.commit.slice(0, 7)}`);
+  if (place.commit !== undefined && target === null) {
+    parts.push(`commit ${place.commit.slice(0, 7)}`);
+  }
   if (place.focus === "checks") parts.push("the checks");
   if (parts.length === 0) return null;
   const named =
     parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`;
   const shown =
-    place.view === "changes" || place.view === "commits"
-      ? "all of the pull request's changes"
-      : `the pull request's ${SECTION_NAMES[place.view]}`;
+    target && "path" in target
+      ? `${target.path} in the pull request's changes`
+      : target
+        ? `commit ${target.commit.slice(0, 7)}`
+        : place.view === "changes" || place.view === "commits"
+          ? "all of the pull request's changes"
+          : `the pull request's ${SECTION_NAMES[place.view]}`;
   return `This link points at ${named}, which this tab can't open yet. It shows ${shown} instead.`;
 }
 
 /** The place without the parts its page can't show, which is what the tab shows. */
 export function shownPullRequestPlace(place: PullRequestPlace): PullRequestPlace {
   if (place.kind !== "pull") return place;
-  return { kind: "pull", url: place.url, view: place.view };
+  return { kind: "pull", url: place.url, view: place.view, ...pullRequestPageTarget(place) };
 }

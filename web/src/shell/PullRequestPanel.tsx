@@ -123,7 +123,11 @@ import {
 import { PullRequestLabels } from "./PullRequestLabels";
 import { mergeButtonState, PullRequestMerge } from "./PullRequestMerge";
 import { PullRequestReviewers } from "./PullRequestReviewers";
-import { PanelMessage, PullRequestChangesTab } from "./PullRequestChangesTab";
+import {
+  PanelMessage,
+  PullRequestChangesTab,
+  type PullRequestChangesTarget,
+} from "./PullRequestChangesTab";
 import { IconButton } from "./PullRequestFileSection";
 
 export { LARGE_DIFF_THRESHOLD } from "./PullRequestFileSection";
@@ -1587,6 +1591,7 @@ export function PullRequestPanelDetails({
   emptyStateAction,
   activeTab,
   setActiveTab,
+  changesTarget,
 }: {
   conversationId: string;
   info: ReturnType<typeof usePullRequestInfo>;
@@ -1600,6 +1605,8 @@ export function PullRequestPanelDetails({
   emptyStateAction?: React.ReactNode;
   activeTab: PullRequestSubtab;
   setActiveTab: (value: PullRequestSubtab) => void;
+  /** A commit or file a link opened the Changes tab at; only a pull request's own tab sets it. */
+  changesTarget?: PullRequestChangesTarget;
 }) {
   const baseRef = info.data?.base_ref ?? undefined;
   const prUrl = info.data?.selected_pr_url;
@@ -1988,6 +1995,7 @@ export function PullRequestPanelDetails({
           prDiff={prDiff}
           reviews={reviews}
           identity={identity}
+          target={changesTarget}
         />
       </Tabs>
     </TooltipProvider>

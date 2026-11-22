@@ -12,6 +12,7 @@ import {
   fileViewDiffRequested,
   pullRequestChosen,
   pullRequestSectionChosen,
+  pullRequestPageTarget,
   shownPullRequestPlace,
   treeFileChosen,
   unshownPullRequestParts,
@@ -159,16 +160,40 @@ describe("pull request parts the tab can't show yet", () => {
       "This link points at a.ts and commit abcdef1, which this tab can't open yet. It shows all of the pull request's changes instead.",
     ],
     [
-      { kind: "pull", url: PR, view: "commits", commit: "abcdef123" },
-      "This link points at commit abcdef1, which this tab can't open yet. It shows all of the pull request's changes instead.",
-    ],
-    [
       { kind: "pull", url: PR, view: "summary", focus: "checks" },
       "This link points at the checks, which this tab can't open yet. It shows the pull request's summary instead.",
     ],
   ] as const)("names everything in %o", (place, text) => {
     expect(unshownPullRequestParts(place)).toBe(text);
     expect(shownPullRequestPlace(place)).toEqual({ kind: "pull", url: PR, view: place.view });
+  });
+
+  it("opens one commit in Commits, or one file in Changes, and names only a line it can't reach", () => {
+    const commit = { kind: "pull", url: PR, view: "commits", commit: "abcdef123" } as const;
+    expect(pullRequestPageTarget(commit)).toEqual({ commit: "abcdef123" });
+    expect(unshownPullRequestParts(commit)).toBeNull();
+    expect(shownPullRequestPlace(commit)).toEqual(commit);
+
+    const file = { kind: "pull", url: PR, view: "changes", path: "a.ts" } as const;
+    expect(pullRequestPageTarget(file)).toEqual({ path: "a.ts" });
+    expect(unshownPullRequestParts(file)).toBeNull();
+
+    const line = { ...file, line: { start: 4 } };
+    expect(unshownPullRequestParts(line)).toBe(
+      "This link points at line 4, which this tab can't open yet. It shows a.ts in the pull request's changes instead.",
+    );
+    expect(shownPullRequestPlace(line)).toEqual(file);
+  });
+
+  it("opens nothing for a file beside a commit, or a file or commit outside its section", () => {
+    for (const place of [
+      { kind: "pull", url: PR, view: "changes", path: "a.ts", commit: "abcdef123" },
+      { kind: "pull", url: PR, view: "summary", path: "a.ts" },
+      { kind: "pull", url: PR, view: "changes", commit: "abcdef123" },
+      { kind: "pulls" },
+    ] as const) {
+      expect(pullRequestPageTarget(place)).toBeNull();
+    }
   });
 
   it("has nothing to say about a section or the list, which the tab shows", () => {

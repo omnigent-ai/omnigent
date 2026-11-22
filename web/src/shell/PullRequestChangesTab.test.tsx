@@ -24,7 +24,7 @@ import type { Comment } from "@/hooks/useComments";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { requestLocalReviewNavigation, useLocalReviewNavigation } from "@/lib/localReviewContext";
 import type * as SonnerModule from "sonner";
-import { PullRequestChangesTab } from "./PullRequestChangesTab";
+import { PullRequestChangesTab, type PullRequestChangesTarget } from "./PullRequestChangesTab";
 import { useChangesViewState } from "./useChangesViewState";
 
 const toast = vi.hoisted(() =>
@@ -195,6 +195,7 @@ function renderTab({
   headRepositoryUrl,
   loading = false,
   selected = true,
+  target,
 }: {
   conversationId: string;
   files?: PullRequestChangedFile[];
@@ -208,6 +209,8 @@ function renderTab({
   headRepositoryUrl?: string;
   loading?: boolean;
   selected?: boolean;
+  /** A commit or file a link opened the tab at. */
+  target?: PullRequestChangesTarget;
 }) {
   const prUrl = prUrlFor(conversationId);
   let patchLoading = loading;
@@ -243,6 +246,7 @@ function renderTab({
         loadComments: () => {},
         loadingComments: null,
       },
+      target,
     }) as unknown as React.ComponentProps<typeof PullRequestChangesTab>;
   const element = (current: string) => (
     <TooltipProvider>
@@ -804,6 +808,37 @@ describe("PullRequestChangesTab", () => {
     });
     openFind("needle");
     expect(screen.getByText("Search covers the fetched patch: 2 of 5 files")).toBeInTheDocument();
+  });
+
+  it("opens a link's file in the pull request's own changes, clearing filters and the since view", () => {
+    const conversationId = "link-file";
+    const store = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
+    act(() => {
+      store.result.current.setPathFilter("a.ts");
+      store.result.current.setHideViewed(true);
+      store.result.current.setSinceSha("c1");
+    });
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+
+    renderTab({ conversationId, target: { path: "b.ts" } });
+
+    expect(store.result.current).toMatchObject({
+      pathFilter: "",
+      hideViewed: false,
+      sinceSha: null,
+    });
+    expect(store.result.current.mode).toBe("changes");
+    expect(scroll.mock.contexts).toContain(document.querySelector('[data-github-file="b.ts"]'));
+  });
+
+  it("leaves the view as it is without a target", () => {
+    const conversationId = "no-link";
+    const store = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
+    act(() => store.result.current.setPathFilter("a.ts"));
+
+    renderTab({ conversationId, commitHistory: true, listing: { head_sha: "head" } });
+
+    expect(store.result.current).toMatchObject({ pathFilter: "a.ts", mode: "changes" });
   });
 
   it("scrolls to a file header when the first match is a path match", () => {
@@ -1867,6 +1902,38 @@ describe("PullRequestChangesTab commits", () => {
     mocks.commitsRefetch.mockClear();
     mocks.draftAnchor = null;
     mocks.commitsUnsupported = false;
+  });
+
+  it("opens a link's commit, and shows a target once so the reader can move on", () => {
+    const conversationId = "link-commit";
+    const store = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
+    const tab = renderTab({
+      conversationId,
+      commitHistory: true,
+      listing: { head_sha: "head" },
+      target: { commit: SHA_B },
+    });
+
+    expect(store.result.current).toMatchObject({ mode: "commit", commitSha: SHA_B });
+    expect(isListed("b.ts")).toBe(true);
+    expect(isListed("a.ts")).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Back to commits" }));
+    tab.rerender(PATCH);
+    expect(store.result.current).toMatchObject({ mode: "commits", commitSha: null });
+  });
+
+  it("shows the commit list for a link to a commit the pull request doesn't have", () => {
+    const conversationId = "link-missing-commit";
+    const store = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
+    renderTab({
+      conversationId,
+      commitHistory: true,
+      listing: { head_sha: "head" },
+      target: { commit: "c".repeat(40) },
+    });
+
+    expect(store.result.current).toMatchObject({ mode: "commits", commitSha: null });
   });
 
   it("lists commits, opens one with its own files, and steps between commits", () => {

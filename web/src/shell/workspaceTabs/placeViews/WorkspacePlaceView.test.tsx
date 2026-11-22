@@ -479,7 +479,7 @@ describe("pull request tab", () => {
     expect(onNavigate).not.toHaveBeenCalled();
   });
 
-  it("says what a link points at that the tab can't show, and can settle on what's shown", async () => {
+  it("opens a link's file in Changes, and says it can't reach the line", async () => {
     const { onNavigate } = renderView({
       kind: "pull",
       url: PR,
@@ -487,12 +487,38 @@ describe("pull request tab", () => {
       path: "src/a.ts",
       line: { start: 4 },
     });
+    expect(captured.page?.target).toEqual({ path: "src/a.ts" });
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "This link points at line 4, which this tab can't open yet. It shows src/a.ts in the pull request's changes instead.",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Show what's here" }));
+    expect(onNavigate).toHaveBeenCalledWith(
+      { kind: "pull", url: PR, view: "changes", path: "src/a.ts" },
+      { replace: true },
+    );
+  });
+
+  it("opens a link's commit with nothing left to name", () => {
+    renderView({ kind: "pull", url: PR, view: "commits", commit: "abcdef123" });
+    expect(captured.page).toMatchObject({ section: "commits", target: { commit: "abcdef123" } });
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("says what a link points at that the tab can't show, and can settle on what's shown", async () => {
+    const { onNavigate } = renderView({
+      kind: "pull",
+      url: PR,
+      view: "summary",
+      path: "src/a.ts",
+      line: { start: 4 },
+    });
+    expect(captured.page?.target).toBeNull();
     expect(screen.getByRole("status")).toHaveTextContent(
       "This link points at src/a.ts line 4, which this tab can't open yet.",
     );
     await userEvent.click(screen.getByRole("button", { name: "Show what's here" }));
     expect(onNavigate).toHaveBeenCalledWith(
-      { kind: "pull", url: PR, view: "changes" },
+      { kind: "pull", url: PR, view: "summary" },
       { replace: true },
     );
   });

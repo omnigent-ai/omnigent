@@ -13,6 +13,7 @@ import {
   type PullRequestSubtab,
   refreshSessionPullRequests,
 } from "@/shell/PullRequestPanel";
+import type { PullRequestChangesTarget } from "@/shell/PullRequestChangesTab";
 import { ALL_PULL_REQUESTS_LABEL } from "@/shell/workspaceCommands/model";
 
 import { useStoredPullRequestFallback } from "./useStoredPullRequestFallback";
@@ -33,6 +34,8 @@ export interface PullRequestPageBodyProps {
   active: boolean;
   /** Show the session's list of pull requests, as ⌘K's Show all pull requests does. */
   onShowAllPullRequests: () => void;
+  /** A commit or file the tab's place names, opened in Changes. */
+  target?: PullRequestChangesTarget | null;
 }
 
 export function PullRequestPageBody({
@@ -42,6 +45,7 @@ export function PullRequestPageBody({
   onSectionChange,
   active,
   onShowAllPullRequests,
+  target,
 }: PullRequestPageBodyProps) {
   const queryClient = useQueryClient();
   const info = usePullRequestInfo(conversationId, { poll: active, prUrl });
@@ -68,6 +72,7 @@ export function PullRequestPageBody({
         active={active}
         showHeading={false}
         activeTab={tab}
+        changesTarget={target ?? undefined}
         // Tabs report a change twice; only a real one is a step.
         setActiveTab={(next) => {
           if (next !== tab) onSectionChange(next);

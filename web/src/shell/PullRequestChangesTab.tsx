@@ -468,6 +468,9 @@ function parsePatchByPath(
   return { filesByPath, parseError: undefined };
 }
 
+/** A place in the pull request a link names: one of its commits, or one of its changed files. */
+export type PullRequestChangesTarget = { commit: string } | { path: string };
+
 /**
  * The Changes tab content. Mounted beside the other tabs' content (it renders its
  * own TabsContent) so collapse and scroll-spy state survive tab switches.
@@ -483,6 +486,7 @@ export function PullRequestChangesTab({
   prDiff,
   reviews,
   identity,
+  target,
 }: {
   conversationId: string;
   data: NormalizedPullRequestInfo;
@@ -497,6 +501,8 @@ export function PullRequestChangesTab({
   reviews: ReturnType<typeof usePullRequestReviewThreads>;
   /** The PR's server identity, for the viewed-file key; null when unknown. */
   identity: PullRequestIdentity | null;
+  /** A commit or file a link opened this tab at; each new target is shown once. */
+  target?: PullRequestChangesTarget;
 }) {
   const baseRef = data.base_ref ?? undefined;
   const headSha = pr.head_sha;
@@ -534,6 +540,7 @@ export function PullRequestChangesTab({
     setPathFilter,
     setHideViewed,
     setMode,
+    openCommit,
     setSinceSha,
     shownEarlierCommentPaths,
     setEarlierCommentsShown,
@@ -1050,6 +1057,46 @@ export function PullRequestChangesTab({
     },
     [revealPane],
   );
+
+  // A link's commit opens once its list can say whether commits show here; a link's file
+  // shows in the PR's own changes, unfiltered, once they are read.
+  const targetKey = target ? JSON.stringify(target) : null;
+  const appliedTarget = useRef<string | null>(null);
+  useEffect(() => {
+    if (!target || !targetKey) {
+      appliedTarget.current = null;
+      return;
+    }
+    if (appliedTarget.current === targetKey || !selected || !changes.data) return;
+    if ("commit" in target) {
+      appliedTarget.current = targetKey;
+      if (commitsSupported) openCommit(target.commit);
+      return;
+    }
+    if (view.mode !== "changes" || view.sinceSha) {
+      setMode("changes");
+      setSinceSha(null);
+      return;
+    }
+    appliedTarget.current = targetKey;
+    setPathFilter("");
+    setHideViewed(false);
+    jumpTo(target.path);
+  }, [
+    target,
+    targetKey,
+    selected,
+    changes.data,
+    commitsSupported,
+    openCommit,
+    view.mode,
+    view.sinceSha,
+    setMode,
+    setSinceSha,
+    setPathFilter,
+    setHideViewed,
+    jumpTo,
+  ]);
 
   // A filtered-out target is visible only after the filter clears. With no filter left to
   // clear it can never show, so drop it rather than scroll to it when a filter changes later.

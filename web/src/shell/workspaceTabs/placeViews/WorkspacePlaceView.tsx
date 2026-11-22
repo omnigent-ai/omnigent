@@ -42,6 +42,7 @@ import {
   allPullRequestsChosen,
   pullRequestChosen,
   pullRequestSectionChosen,
+  pullRequestPageTarget,
   shownPullRequestPlace,
   treeFileChosen,
   unshownPullRequestParts,
@@ -380,6 +381,7 @@ function PullRequestPlaceView({
           prUrl={place.url}
           section={place.view}
           active={active}
+          target={pullRequestPageTarget(place)}
           onSectionChange={(section) => run(pullRequestSectionChosen(place, section))}
           onShowAllPullRequests={() => run(allPullRequestsChosen())}
         />

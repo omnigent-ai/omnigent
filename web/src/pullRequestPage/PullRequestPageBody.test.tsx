@@ -115,6 +115,14 @@ describe("PullRequestPageBody", () => {
     expect(onShowAllPullRequests).toHaveBeenCalledOnce();
   });
 
+  it("hands the place's commit or file to the Changes tab", () => {
+    renderBody({ section: "commits", target: { commit: "abcdef123" } });
+    expect(captured.details?.changesTarget).toEqual({ commit: "abcdef123" });
+    cleanup();
+    renderBody({ section: "summary", target: null });
+    expect(captured.details?.changesTarget).toBeUndefined();
+  });
+
   it("refreshes the session's pull requests, disabled until the refresh settles", async () => {
     let finish!: () => void;
     vi.mocked(refreshSessionPullRequests).mockReturnValue(
