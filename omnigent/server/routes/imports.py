@@ -497,11 +497,13 @@ def create_imports_router(
                     conversation.id,
                     LEVEL_OWNER,
                 )
+            # Inside the rollback, so a failed replacement leaves no second session
+            # with this external id for a retry to conflict with.
+            if replace_conversation_id is not None and replace_conversation_id != conversation.id:
+                await _delete_replaced_session(replace_conversation_id)
         except Exception:
             await conversation_store.delete_conversation(conversation.id)
             raise
-        if replace_conversation_id is not None and replace_conversation_id != conversation.id:
-            await _delete_replaced_session(replace_conversation_id)
         return conversation.id, title
 
     @router.post(
