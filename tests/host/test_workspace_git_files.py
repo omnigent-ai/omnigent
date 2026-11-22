@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import sys
 from pathlib import Path
 
 import pytest
 
+from omnigent.host.workspace_git import files as files_module
 from omnigent.host.workspace_git.files import WorkspaceFiles, workspace_files
 from omnigent.host.workspace_git.runner import Deadline, GitError
 from tests.host.test_workspace_git_runner import _fake_git, _git, _repository
@@ -131,7 +133,7 @@ async def test_a_tracked_listing_failure_is_an_error(
 async def test_a_listing_past_its_cap_keeps_whole_records_and_says_so(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("omnigent.host.workspace_git.files.LISTING_OUTPUT_BYTES", 20)
+    monkeypatch.setattr("omnigent.host.workspace_git.files.TRACKED_LISTING_BYTES", 20)
     root = _fake_git(
         tmp_path, monkeypatch, 'printf "aaaa\\0bbbb\\0cccc\\0dddd\\0eeee\\0\\377\\0"\n'
     )
@@ -155,3 +157,84 @@ async def test_index_paths_that_climb_out_of_the_workspace_are_dropped(
 
     assert listing is not None
     assert listing.tracked == ["kept.txt"]
+
+
+async def test_a_tracked_list_past_the_other_listings_cap_is_read_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 200,000 paths of about 70 bytes: 14 MB, past the 8 MiB the other listings keep.
+    root = _fake_git(
+        tmp_path,
+        monkeypatch,
+        'case "$*" in *--others*) exit 0;; esac\n'
+        "seq 1 200000 | sed 's|^|src/a-fairly-long-folder-name/another-long-folder-name/file|'"
+        " | tr '\\n' '\\0'\n",
+    )
+
+    listing = await WorkspaceFiles(root).list_files(Deadline(30))
+
+    assert listing is not None and not listing.incomplete
+    assert len(listing.tracked) == 200_000
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        b"a.txt\0src/b.py\0src/b.py\0",  # an unmerged file, once per stage
+        b"a.txt\0../escape\0b.txt\0",
+        b"/etc/passwd\0a.txt\0",
+        b"a/./b\0a//b\0a/b/.\0a/..\0.\0..\0",
+        b"./a\0a.txt\0",
+        b".\0a.txt\0",
+        b"..\0a.txt\0",
+        b"../a\0a.txt\0",
+        b"nested/\0a.txt\0",  # a nested repository ends in "/"
+        b"\0a.txt\0",
+        b"caf\xc3\xa9.txt\0bad\xff.txt\0ok.txt\0",
+        b"a.txt\0partial/fi",  # cut off at the cap
+        b"",
+    ],
+)
+def test_the_fast_parse_agrees_with_checking_each_record(output: bytes) -> None:
+    assert files_module._paths(output) == files_module._checked_paths(output)
+
+
+async def test_an_index_rewritten_with_the_same_paths_keeps_the_same_list(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path / "repo")
+    files = WorkspaceFiles(root)
+    first = await files.list_files(Deadline(10))
+    _git(root, "update-index", "--index-version", "4")  # rewrites the index, same paths
+    rewritten = await files.list_files(Deadline(10))
+    (root / "b.txt").write_text("x")
+    _git(root, "add", "b.txt")
+    added = await files.list_files(Deadline(10))
+
+    assert first is not None and rewritten is not None and added is not None
+    assert rewritten.tracked is first.tracked
+    assert added.tracked == ["a.txt", "b.txt"]
+
+
+async def test_older_workspaces_lists_are_dropped_once_a_list_is_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(files_module, "_MAX_CACHED_TRACKED_PATHS", 2)
+    monkeypatch.setattr(files_module, "_by_root", files_module.OrderedDict())
+    roots = []
+    for name in ("older", "newer", "one", "two", "three"):
+        root = _repository(tmp_path / name)  # tracks a.txt
+        (root / "b.txt").write_text("x")
+        _git(root, "add", "b.txt")
+        roots.append(root)
+
+    def held(loaded: list[Path]) -> list[int]:
+        return [files_module._by_root[root].tracked_paths_held() for root in loaded]
+
+    for root in roots[:2]:
+        await workspace_files(root).list_files(Deadline(10))
+    one_after_another = held(roots[:2])
+    await asyncio.gather(*(workspace_files(root).list_files(Deadline(10)) for root in roots[2:]))
+
+    assert one_after_another == [0, 2]  # the newest list is kept
+    assert sum(held(roots)) == 2  # loads that overlap stay within the budget too

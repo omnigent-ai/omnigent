@@ -7,6 +7,9 @@ write the repository's configuration. This never writes the index or config.
 
 from __future__ import annotations
 
+import hashlib
+import itertools
+import operator
 import os
 import time
 from collections import OrderedDict
@@ -24,14 +27,21 @@ from omnigent.host.workspace_git.runner import (
 # How long an untracked listing is reused; `retry_untracked` skips it.
 _UNTRACKED_TTL_S = 5.0
 _MAX_CACHED_WORKSPACES = 64
+# The tracked list's own cap: a repository with 1.6 million files lists 136 MB.
+TRACKED_LISTING_BYTES = 512 * 1024 * 1024
+# Tracked paths kept across workspaces; older workspaces' lists go first.
+_MAX_CACHED_TRACKED_PATHS = 4_000_000
+# Records that could name a path outside the workspace, framed by NULs.
+_UNSAFE_RECORD_PARTS = (b"\0/", b"//", b"/./", b"/../", b"\0./", b"\0../", b"/.\0", b"/..\0")
+_UNSAFE_RECORDS = (b"\0.\0", b"\0..\0", b"\0\0", b"/\0")
 
 
 @dataclass(frozen=True)
 class FileListing:
     """The files Git knows beneath a workspace, relative to it.
 
-    :param tracked: Paths in the index. Shared with later listings while the
-        index is unchanged, so it must not be modified.
+    :param tracked: Paths in the index, in path order. Shared with later
+        listings while the paths are unchanged, so it must not be modified.
     :param untracked: Untracked, unignored files; a nested repository is
         its directory. ``None`` when they couldn't be listed.
     :param incomplete: A listing stopped at its size cap.
@@ -55,6 +65,21 @@ def is_inside(path: str) -> bool:
 
 
 def _paths(output: bytes) -> list[str]:
+    """The paths in ``git ls-files -z`` output that stay inside the workspace, once each."""
+    # Decoded at once when no record could leave the workspace; else record by record.
+    framed = b"\0" + output
+    if not any(part in framed for part in (*_UNSAFE_RECORD_PARTS, *_UNSAFE_RECORDS)):
+        try:
+            records = output.decode().split("\0")
+        except UnicodeDecodeError:
+            pass
+        else:
+            records.pop()  # empty, or cut off at the cap
+            return list(dict.fromkeys(records))
+    return _checked_paths(output)
+
+
+def _checked_paths(output: bytes) -> list[str]:
     records = output.split(b"\0")
     # The last record is empty after a complete listing, or cut off after a partial one.
     records.pop()
@@ -80,7 +105,8 @@ class WorkspaceFiles:
 
     def __init__(self, root: Path) -> None:
         self._root = root
-        self._tracked: tuple[tuple[int, ...], list[str], bool] | None = None
+        # The index state, the listing's digest, its paths, and whether it hit the cap.
+        self._tracked: tuple[tuple[int, ...], bytes, list[str], bool] | None = None
         self._untracked: tuple[float, list[str], bool] | None = None
 
     async def list_files(
@@ -112,19 +138,35 @@ class WorkspaceFiles:
         index = _index_state(repository.git_directory)
         cached = self._tracked
         if index is not None and cached is not None and cached[0] == index:
-            return cached[1], cached[2]
+            return cached[2], cached[3]
         output = await repository.run_unchecked(
             ["ls-files", "--cached", "-z", "--", "."],
             deadline=deadline,
-            stdout_bytes=LISTING_OUTPUT_BYTES,
+            stdout_bytes=TRACKED_LISTING_BYTES,
             allow_partial=True,
         )
         if not output.success and not output.overflowed:
             raise failure(output, "ls-files")
-        paths = _paths(output.stdout)
+        # Git rewrites the index often without changing its paths, e.g. for `git status`.
+        digest = hashlib.blake2b(output.stdout, digest_size=16).digest()
+        if cached is not None and cached[1] == digest:
+            paths = cached[2]
+        else:
+            paths = _paths(output.stdout)
+            if not all(map(operator.le, paths, itertools.islice(paths, 1, None))):
+                paths.sort()  # Git lists in byte order, which is path order for UTF-8
         if index is not None:
-            self._tracked = (index, paths, output.overflowed)
+            self._tracked = (index, digest, paths, output.overflowed)
+            _keep_tracked_budget(self)
         return paths, output.overflowed
+
+    def tracked_paths_held(self) -> int:
+        """How many tracked paths this lister keeps for reuse."""
+        return len(self._tracked[2]) if self._tracked is not None else 0
+
+    def forget_tracked(self) -> None:
+        """Drop the kept tracked list; the next listing reads it again."""
+        self._tracked = None
 
     async def _list_untracked(
         self, repository: GitRepository, deadline: Deadline, *, retry: bool
@@ -167,3 +209,14 @@ def workspace_files(root: Path) -> WorkspaceFiles:
     while len(_by_root) > _MAX_CACHED_WORKSPACES:
         _by_root.popitem(last=False)
     return files
+
+
+def _keep_tracked_budget(loaded: WorkspaceFiles) -> None:
+    """Past the budget, drop the least recently used workspaces' tracked lists but ``loaded``'s."""
+    others = [lister for lister in _by_root.values() if lister is not loaded]
+    held = loaded.tracked_paths_held() + sum(lister.tracked_paths_held() for lister in others)
+    for lister in others:
+        if held <= _MAX_CACHED_TRACKED_PATHS:
+            break
+        held -= lister.tracked_paths_held()
+        lister.forget_tracked()
