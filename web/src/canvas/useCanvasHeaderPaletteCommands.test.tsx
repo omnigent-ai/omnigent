@@ -1,12 +1,16 @@
-import { act, cleanup, renderHook } from "@testing-library/react";
+import { act, cleanup, render, renderHook } from "@testing-library/react";
 import type { ReactNode } from "react";
+import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { usePaletteCommandsStore } from "@/store/paletteCommands";
 
+import { CanvasWorkspace, useCanvasWorkspace } from "./CanvasWorkspace";
 import { useCanvasHeaderPaletteCommands } from "./useCanvasHeaderPaletteCommands";
+
+vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>Board</div> }));
 
 function wrapper(flag: boolean) {
   const info = { ...FALLBACK_SERVER_INFO, features: { quick_pick_palette: flag } };
@@ -27,6 +31,7 @@ afterEach(() => {
 describe("useCanvasHeaderPaletteCommands", () => {
   it("runs the header's handlers for the pane's layout", () => {
     const canvas = {
+      conversationOpen: true,
       compact: false,
       focused: false,
       toggleFocus: vi.fn(),
@@ -51,6 +56,7 @@ describe("useCanvasHeaderPaletteCommands", () => {
     expect(labels()).toEqual([]);
     cleanup();
     const canvas = {
+      conversationOpen: true,
       compact: true,
       focused: false,
       toggleFocus: vi.fn(),
@@ -58,5 +64,41 @@ describe("useCanvasHeaderPaletteCommands", () => {
     };
     renderHook(() => useCanvasHeaderPaletteCommands(canvas), { wrapper: wrapper(false) });
     expect(labels()).toEqual([]);
+  });
+
+  it("offers nothing on the bare board, whose hidden header stays mounted", () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    let navigateTo: (path: string) => void = () => {};
+    function Header() {
+      useCanvasHeaderPaletteCommands(useCanvasWorkspace());
+      navigateTo = useNavigate();
+      return null;
+    }
+    const workspace = (conversationId?: string) => (
+      <CanvasWorkspace active conversationId={conversationId}>
+        <Header />
+      </CanvasWorkspace>
+    );
+    const info = { ...FALLBACK_SERVER_INFO, features: { quick_pick_palette: true } };
+    render(
+      <CapabilitiesProvider info={info}>
+        <MemoryRouter initialEntries={["/canvas/c/c1"]}>
+          <Routes>
+            <Route path="/canvas/c/:id" element={workspace("c1")} />
+            <Route path="/canvas" element={workspace()} />
+          </Routes>
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+    expect(labels()).toEqual(["Focus conversation", "Close conversation pane"]);
+    act(() => navigateTo("/canvas"));
+    expect(labels()).toEqual([]);
+    vi.unstubAllGlobals();
   });
 });

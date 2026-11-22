@@ -15,7 +15,8 @@ type CanvasControls = NonNullable<ReturnType<typeof useCanvasWorkspace>>;
 export function useCanvasHeaderPaletteCommands(canvas: CanvasControls | null): void {
   const commands = useMemo<PaletteCommand[]>(
     () =>
-      canvasHeaderActions(canvas).map((action) => {
+      // Only while a conversation pane is open: the bare board has no header actions.
+      canvasHeaderActions(canvas?.conversationOpen ? canvas : null).map((action) => {
         const icon: LucideIcon =
           action.id === "toggle-focus"
             ? canvas?.focused
