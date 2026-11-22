@@ -1823,13 +1823,21 @@ def test_host_status_json_reports_daemon_host_and_sessions(
     )
 
     runner_status_calls: list[str] = []
+    session_list_scopes: list[object] = []
 
     def _fake_http_json(**kwargs: object) -> cli._HostHttpResult:
         """Return host/session fixtures keyed by request path."""
         path = kwargs["path"]
+        if path == "/v1/info":
+            return cli._HostHttpResult(
+                status_code=200, body={"session_list_scoped_archives": True}
+            )
         if path == "/v1/hosts/host_abc":
             return cli._HostHttpResult(status_code=200, body={"status": "online"})
         if path == "/v1/sessions":
+            params = kwargs["params"]
+            assert isinstance(params, dict)
+            session_list_scopes.append(params["visibility"])
             return cli._HostHttpResult(
                 status_code=200,
                 body={
@@ -1868,6 +1876,7 @@ def test_host_status_json_reports_daemon_host_and_sessions(
     assert '"runner_online": true' in result.output
     assert '"id": "conv_other"' not in result.output
     assert runner_status_calls == ["runner_abc"]
+    assert session_list_scopes == ["mine"]
 
 
 def test_host_status_reports_unreachable_daemon_without_traceback(
@@ -2080,6 +2089,10 @@ def test_host_stop_stops_sessions_before_daemon(
         method = str(kwargs["method"])
         path = str(kwargs["path"])
         events.append((method, path))
+        if method == "GET" and path == "/v1/info":
+            return cli._HostHttpResult(
+                status_code=200, body={"session_list_scoped_archives": True}
+            )
         if method == "GET" and path == "/v1/sessions":
             params = kwargs["params"]
             assert isinstance(params, dict)
@@ -2088,7 +2101,7 @@ def test_host_stop_stops_sessions_before_daemon(
             assert params == {
                 "limit": 1000,
                 "include_archived": "true",
-                "visibility": "all",
+                "visibility": "mine",
             }
             return cli._HostHttpResult(
                 status_code=200,
@@ -2139,6 +2152,7 @@ def test_host_stop_stops_sessions_before_daemon(
 
     assert result.exit_code == 0, result.output
     assert events == [
+        ("GET", "/v1/info"),
         ("GET", "/v1/sessions"),
         ("GET", "/v1/sessions"),
         ("GET", "/v1/sessions/conv_owned"),
@@ -4817,6 +4831,10 @@ def test_host_stop_drains_sub_agent_sessions_before_signalling(
     requests: list[dict[str, str | int]] = []
 
     def _fake_http(**kwargs: Any) -> cli._HostHttpResult:
+        if kwargs["path"] == "/v1/info":
+            return cli._HostHttpResult(
+                status_code=200, body={"session_list_scoped_archives": True}
+            )
         params = kwargs["params"]
         requests.append(params)
         kind = params.get("kind", "default")
@@ -4867,6 +4885,63 @@ def test_host_stop_drains_sub_agent_sessions_before_signalling(
         ("sub_agent", None),
         ("sub_agent", "conv_grandchild"),
     ]
+    assert {params["visibility"] for params in requests} == {"mine"}
+
+
+@pytest.mark.parametrize(
+    ("info", "scope"),
+    [
+        (
+            cli._HostHttpResult(status_code=200, body={"session_list_scoped_archives": True}),
+            "mine",
+        ),
+        (cli._HostHttpResult(status_code=200, body={"version": "0.20.0"}), "all"),
+        (cli._HostHttpResult(status_code=404, body={"detail": "Not Found"}), "all"),
+        (cli._HostHttpResult(status_code=0, body="Connection refused", unreachable=True), "all"),
+    ],
+    ids=["scoped-archives", "older-server", "no-info-route", "info-unreachable"],
+)
+def test_host_session_lookup_lists_only_the_callers_sessions_where_archives_stay_listed(
+    monkeypatch: pytest.MonkeyPatch, info: cli._HostHttpResult, scope: str
+) -> None:
+    """
+    A daemon's lookup lists only the caller's own sessions, unless that would drop archives.
+
+    A host only runs sessions its owner started, so listing every session the
+    caller can read only adds other users' shared sessions for the server to go
+    through. A server that drops archived rows from owner-scoped lists keeps ``all``.
+    """
+    scopes: list[object] = []
+
+    def _fake_http(**kwargs: Any) -> cli._HostHttpResult:
+        if kwargs["path"] == "/v1/info":
+            return info
+        scopes.append(kwargs["params"]["visibility"])
+        return cli._HostHttpResult(
+            status_code=200,
+            body={
+                "data": [{"id": "conv_mine", "host_id": "host_a", "status": "running"}],
+                "has_more": False,
+            },
+        )
+
+    monkeypatch.setattr(cli, "_host_http_json", _fake_http)
+    monkeypatch.setattr(cli, "_daemon_base_url", lambda record: "https://server.example.com")
+    record = cli._HostDaemonRecord(
+        pid=42,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=None,
+        started_at=1,
+        host_id="host_a",
+    )
+
+    result = cli._sessions_for_daemon(record, include_sub_agents=True)
+
+    assert result.error is None
+    assert [session["id"] for session in result.sessions] == ["conv_mine"]
+    assert scopes == [scope, scope]
 
 
 def test_stop_request_row_skips_a_stale_daemon_record(monkeypatch, caplog) -> None:

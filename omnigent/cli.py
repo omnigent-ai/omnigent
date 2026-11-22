@@ -10408,6 +10408,7 @@ def _daemon_session_request_params(
     connected_only: bool,
     after: str | None,
     kind: Literal["default", "sub_agent"] = "default",
+    visibility: Literal["all", "mine"] = "all",
 ) -> dict[str, str | int]:
     """
     Build query parameters for one sessions page.
@@ -10417,12 +10418,14 @@ def _daemon_session_request_params(
     :param after: Optional cursor from the prior page, e.g.
         ``"conv_abc123"``.
     :param kind: Session kind to fetch; the server omits sub-agents by default.
+    :param visibility: Which sessions to list: ``"mine"`` for the caller's
+        own, ``"all"`` for every session the caller can read.
     :returns: Query parameters for ``GET /v1/sessions``.
     """
     params: dict[str, str | int] = {
         "limit": 1000,
         "include_archived": "true",
-        "visibility": "all",
+        "visibility": visibility,
     }
     if kind != "default":
         params["kind"] = kind
@@ -10491,6 +10494,7 @@ def _fetch_session_pages(
     base_url: str,
     connected_only: bool,
     kind: Literal["default", "sub_agent"] = "default",
+    visibility: Literal["all", "mine"] = "all",
 ) -> _SessionPagesResult:
     """
     Fetch every available session page from a server.
@@ -10500,6 +10504,8 @@ def _fetch_session_pages(
     :param connected_only: When ``True``, ask the server for connected
         sessions only.
     :param kind: Session kind to fetch, e.g. ``"sub_agent"``.
+    :param visibility: Which sessions to list, e.g. ``"mine"``; see
+        :func:`_daemon_session_request_params`.
     :returns: Accumulated sessions result. ``error`` is ``None`` on success.
     """
     after: str | None = None
@@ -10513,6 +10519,7 @@ def _fetch_session_pages(
                 connected_only=connected_only,
                 after=after,
                 kind=kind,
+                visibility=visibility,
             ),
         )
         page = _decode_sessions_page(page_result)
@@ -10592,6 +10599,27 @@ def _daemon_owned_sessions(
     return owned
 
 
+def _host_session_visibility(base_url: str) -> Literal["all", "mine"]:
+    """
+    Pick the session-list scope that finds a daemon's host sessions.
+
+    A host only runs sessions its owner started, so the caller's own sessions
+    hold all of them; listing ``"all"`` makes the server read every session the
+    caller can see, including everyone's shared ones. A server that doesn't
+    advertise ``session_list_scoped_archives`` in ``GET /v1/info`` drops archived
+    rows from ``"mine"`` lists, so it keeps ``"all"``.
+
+    :param base_url: Omnigent server base URL, e.g.
+        ``"https://example.databricksapps.com"``.
+    :returns: ``"mine"`` when the server keeps archived rows in owner-scoped
+        lists, otherwise ``"all"``.
+    """
+    info = _host_http_json(base_url=base_url, method="GET", path="/v1/info")
+    body = info.body if info.status_code == 200 else None
+    scoped = isinstance(body, dict) and body.get("session_list_scoped_archives") is True
+    return "mine" if scoped else "all"
+
+
 def _sessions_for_daemon(
     record: _HostDaemonRecord,
     *,
@@ -10627,9 +10655,11 @@ def _sessions_for_daemon(
             sessions=[],
             error="host id is not available in local config",
         )
+    visibility = _host_session_visibility(base_url)
     pages = _fetch_session_pages(
         base_url=base_url,
         connected_only=connected_only,
+        visibility=visibility,
     )
     if pages.error is not None:
         return _DaemonSessionsResult(
@@ -10644,6 +10674,7 @@ def _sessions_for_daemon(
             base_url=base_url,
             connected_only=connected_only,
             kind="sub_agent",
+            visibility=visibility,
         )
         if children.error is not None:
             # The root listing succeeded, so a child-list failure is not proof
