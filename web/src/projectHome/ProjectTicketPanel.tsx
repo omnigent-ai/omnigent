@@ -847,8 +847,6 @@ function ActivityChange({ event }: { event: TicketEvent }) {
     );
   const changes = event.payload.changes as Partial<ProjectTicket> | undefined;
   const stage = ticketEventStage(event);
-  const leadChanged = !!changes && "lead_session_id" in changes;
-  const leadSessionId = changes?.lead_session_id;
   const fields = Object.keys(changes ?? {})
     .filter(
       (field) =>
@@ -862,26 +860,13 @@ function ActivityChange({ event }: { event: TicketEvent }) {
           moved to <span className="font-medium text-foreground">{stage.name}</span>
         </>
       )}
-      {leadChanged && (
-        <>
-          {stage && "; "}
-          {leadSessionId ? (
-            <>
-              set the response contact to{" "}
-              <TicketSessionLink sessionId={leadSessionId} ticketId={event.ticket_id} />
-            </>
-          ) : (
-            "cleared the response contact"
-          )}
-        </>
-      )}
       {fields.length > 0 && (
         <>
-          {(stage || leadChanged) && "; "}
+          {stage && "; "}
           updated {fields.join(", ")}
         </>
       )}
-      {!stage && !leadChanged && !fields.length && "updated the ticket"}
+      {!stage && !fields.length && "updated the ticket"}
     </>
   );
 }
@@ -890,7 +875,17 @@ function TicketActivity({ projectId, ticketId }: { projectId: string; ticketId: 
   const query = useTicketEvents(projectId, ticketId);
   const now = useNow();
   const viewerId = useViewerId();
-  const events = query.data?.pages.flatMap((page) => page.data) ?? [];
+  const events = (query.data?.pages.flatMap((page) => page.data) ?? []).filter((event) => {
+    const changes = event.payload.changes;
+    return !(
+      event.kind === "updated" &&
+      Object.keys(event.payload).length === 1 &&
+      typeof changes === "object" &&
+      changes !== null &&
+      Object.keys(changes).length === 1 &&
+      "lead_session_id" in changes
+    );
+  });
   if (!query.isPending && !query.error && !query.hasNextPage && events.length === 0) return null;
   return (
     <section aria-label="Ticket activity" className="space-y-4 border-t border-border/60 pt-5">
@@ -996,12 +991,9 @@ function TicketActivityItem({
           </time>
         </div>
         {involvement && (
-          <details className="text-sm text-muted-foreground">
-            <summary className="w-fit cursor-pointer rounded-sm hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-              Agent role
-            </summary>
-            <p className="mt-2 leading-relaxed whitespace-pre-wrap wrap-anywhere">{involvement}</p>
-          </details>
+          <p className="text-sm leading-relaxed whitespace-pre-wrap wrap-anywhere text-muted-foreground">
+            {involvement}
+          </p>
         )}
         {body && <TicketCommentBody body={body} />}
       </div>

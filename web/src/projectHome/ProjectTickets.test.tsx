@@ -570,7 +570,7 @@ describe("Project ticket board", () => {
               agent_id: null,
               created_at: 1000,
               payload: {
-                changes: { stage_id: "removed" },
+                changes: { stage_id: "removed", lead_session_id: "worker" },
                 stage: {
                   id: "removed",
                   name: "Investigating",
@@ -816,7 +816,6 @@ describe("Project ticket board", () => {
   ])(
     "names workers and actors using one shared lookup per session (mobile=$mobile)",
     async ({ mobile, href }) => {
-      const user = userEvent.setup();
       vi.mocked(useIsMobileViewport).mockReturnValue(mobile);
       const involvement =
         "Stage owner; independently research, build and test the panel, author findings and report evidence.";
@@ -875,9 +874,27 @@ describe("Project ticket board", () => {
                     changes: { lead_session_id: null },
                   },
                 },
+                {
+                  ...event,
+                  id: "lead-only",
+                  position: 4,
+                  kind: "updated",
+                  payload: { changes: { lead_session_id: "worker" } },
+                },
+                {
+                  ...event,
+                  id: "unlinked",
+                  position: 5,
+                  kind: "updated",
+                  payload: {
+                    action: "remove",
+                    session_id: "worker",
+                    changes: { lead_session_id: null },
+                  },
+                },
               ],
           has_more: false,
-          last_position: 3,
+          last_position: 5,
         }),
       );
       const { client } = renderBoard(
@@ -897,23 +914,19 @@ describe("Project ticket board", () => {
       expect(await screen.findAllByRole("link", { name: "Shipping orchestrator" })).toHaveLength(4);
       const activity = screen.getByRole("region", { name: "Ticket activity" });
       expect(activity).toHaveTextContent("updated the role for Build ticket panel");
-      expect(activity).toHaveTextContent(
-        "set the response contact to Build ticket panel; updated labels",
-      );
-      expect(activity).toHaveTextContent("cleared the response contact");
+      expect(activity).toHaveTextContent("updated labels");
+      expect(activity).toHaveTextContent("unlinked Build ticket panel");
+      expect(activity).not.toHaveTextContent("response contact");
       expect(activity).not.toHaveTextContent("lead session id");
+      expect(within(activity).getAllByRole("listitem")).toHaveLength(4);
       expect(within(activity).getAllByRole("link", { name: "Build ticket panel" })).toHaveLength(2);
       for (const link of within(activity).getAllByRole("link", { name: "Build ticket panel" })) {
         expect(link).toHaveAttribute("href", href);
       }
       const role = within(activity).getByText(involvement);
-      expect(role).not.toBeVisible();
-      expect(role.closest("details")).not.toHaveAttribute("open");
-      await user.click(within(activity).getByText("Agent role"));
       expect(role).toBeVisible();
-      expect(role.closest("details")).toHaveAttribute("open");
-      await user.click(within(activity).getByText("Agent role"));
-      expect(role).not.toBeVisible();
+      expect(role.closest("details")).toBeNull();
+      expect(within(activity).queryByText("Agent role")).toBeNull();
       expect(screen.queryByText(/Agent agent-id/)).toBeNull();
       expect(
         vi
@@ -932,6 +945,7 @@ describe("Project ticket board", () => {
       ).toHaveAttribute("href", href);
       expect(within(sessions).queryByText("Needs response")).toBeNull();
       expect(within(sessions).queryByText("Running")).toBeNull();
+      expect(api.updateTicket).not.toHaveBeenCalled();
     },
   );
 
@@ -1015,40 +1029,84 @@ describe("Project ticket board", () => {
     expect(ticket.labels).toEqual([{ key: "needs-human", value: "approval" }]);
   });
 
-  it("keeps earlier activity when loading another page", async () => {
-    vi.mocked(api.listTicketEvents).mockImplementation(async (_project, _ticket, after, kind) => ({
-      data: kind
-        ? []
-        : [
-            {
-              id: after === -1 ? "first" : "second",
-              ticket_id: ticket.id,
-              position: after === -1 ? 0 : 1,
-              kind: "comment",
-              user_id: "local",
-              session_id: null,
-              agent_id: null,
-              payload: { text: after === -1 ? "First update" : "Second update" },
-              created_at: 1000,
-            },
-          ],
-      has_more: !kind && after === -1,
-      last_position: after === -1 ? 0 : 1,
-    }));
-    renderBoard(
-      <ProjectTicketPanel
-        projectName="Shipping"
-        ticketId="ticket"
-        onClose={vi.fn()}
-        onCreated={vi.fn()}
-      />,
-    );
-    expect(await screen.findByText("First update")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "More activity" }));
-    expect(await screen.findByText("Second update")).toBeInTheDocument();
-    expect(screen.getByText("First update")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "More activity" })).toBeNull();
-  });
+  it.each([false, true])(
+    "keeps earlier activity when loading another page (hidden first page=%s)",
+    async (hiddenFirstPage) => {
+      const hiddenEvent: TicketEvent = {
+        id: "lead-only",
+        ticket_id: ticket.id,
+        position: 0,
+        kind: "updated",
+        user_id: "local",
+        session_id: null,
+        agent_id: null,
+        payload: { changes: { lead_session_id: "worker" } },
+        created_at: 1000,
+      };
+      let failNextPage = hiddenFirstPage;
+      vi.mocked(api.listTicketEvents).mockImplementation(async (_project, _ticket, after, kind) => {
+        const position = (after ?? -1) + 1;
+        const firstCommentPosition = hiddenFirstPage ? 1 : 0;
+        if (!kind && position === 1 && failNextPage) {
+          failNextPage = false;
+          throw new Error("Activity unavailable");
+        }
+        return {
+          data: kind
+            ? []
+            : hiddenFirstPage && position === 0
+              ? [hiddenEvent]
+              : [
+                  {
+                    ...hiddenEvent,
+                    id: `comment-${position}`,
+                    position,
+                    kind: "comment",
+                    payload: {
+                      text: position === firstCommentPosition ? "First update" : "Second update",
+                    },
+                  },
+                ],
+          has_more: !kind && position <= firstCommentPosition,
+          last_position: position,
+        };
+      });
+      const { client } = renderBoard(
+        <ProjectTicketPanel
+          projectName="Shipping"
+          ticketId="ticket"
+          onClose={vi.fn()}
+          onCreated={vi.fn()}
+        />,
+      );
+      if (hiddenFirstPage) {
+        const activity = await screen.findByRole("region", { name: "Ticket activity" });
+        expect(within(activity).queryAllByRole("listitem")).toHaveLength(0);
+        fireEvent.click(await within(activity).findByRole("button", { name: "More activity" }));
+        expect(await within(activity).findByRole("alert")).toHaveTextContent(
+          "Activity unavailable",
+        );
+        fireEvent.click(within(activity).getByRole("button", { name: "More activity" }));
+      }
+      expect(await screen.findByText("First update")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "More activity" }));
+      expect(await screen.findByText("Second update")).toBeInTheDocument();
+      expect(screen.getByText("First update")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "More activity" })).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+      if (hiddenFirstPage) {
+        act(() =>
+          client.setQueryData(["project-tickets", "project", "ticket", "events", undefined], {
+            pages: [{ data: [hiddenEvent], has_more: false, last_position: 0 }],
+            pageParams: [-1],
+          }),
+        );
+        await waitFor(() =>
+          expect(screen.queryByRole("region", { name: "Ticket activity" })).toBeNull(),
+        );
+      }
+    },
+  );
 
   it("surfaces load failures instead of showing an empty board", async () => {
     vi.mocked(api.listTickets).mockRejectedValue(new Error("Board unavailable"));
