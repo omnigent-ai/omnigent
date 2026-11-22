@@ -57,6 +57,30 @@ export interface SidebarTerminalPanesProps {
   mainSplitMembers?: ReadonlySet<string>;
 }
 
+/** The sidebar's shell groups as it shows them, and the shells the main view owns. */
+export function useShownTerminalGroups(
+  conversationId: string,
+  mainSplitMembers: ReadonlySet<string> = NO_MAIN_SPLIT_MEMBERS,
+) {
+  const storedGroups = useTerminalGroups(conversationId);
+  const mainOwned = useMainOwnedTerminalKeys(conversationId, { splitMembers: mainSplitMembers });
+  const mainKeys = [...mainOwned];
+  // Placed as it renders, so a group with a main-owned shell (restored, or from another window)
+  // never shows it here, even before its saved copy is fixed.
+  const groups = normalizeTerminalGroups(storedGroups, { mainKeys, isGone: () => false });
+  return { storedGroups, mainOwned, mainKeys, groups };
+}
+
+/** The shells that mount with `key`'s when its tab shows: its split's members, or it alone. */
+export function sidebarShellUnit(
+  groups: readonly TerminalGroup[],
+  splitAllowed: boolean,
+  key: string,
+): readonly string[] {
+  const group = splitAllowed ? groupOfTerminal(groups, key) : undefined;
+  return group ? groupKeys(group) : [key];
+}
+
 export function SidebarTerminalPanes({
   conversationId,
   shownKey,
@@ -71,12 +95,10 @@ export function SidebarTerminalPanes({
   const { setTerminalConnectionState, markTerminalActive } = useTerminalStatuses(terminals);
   // Splits are managed only by desktop owners; everyone else sees one shell per tab.
   const splitAllowed = usePanesSplitsAllowed(readOnly);
-  const storedGroups = useTerminalGroups(conversationId);
-  const mainOwned = useMainOwnedTerminalKeys(conversationId, { splitMembers: mainSplitMembers });
-  const mainKeys = [...mainOwned];
-  // Placed as it renders, so a group with a main-owned shell (restored, or from another window)
-  // never shows it here, even before its saved copy is fixed.
-  const groups = normalizeTerminalGroups(storedGroups, { mainKeys, isGone: () => false });
+  const { storedGroups, mainOwned, mainKeys, groups } = useShownTerminalGroups(
+    conversationId,
+    mainSplitMembers,
+  );
   const storedGroup =
     splitAllowed && shownKey !== null ? groupOfTerminal(groups, shownKey) : undefined;
   // Whichever moved last wins: selecting a member (its tab, Back) focuses that pane; a focus move

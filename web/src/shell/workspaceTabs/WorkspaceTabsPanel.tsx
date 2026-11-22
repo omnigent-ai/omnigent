@@ -104,8 +104,16 @@ import {
 import { UNSUPPORTED_TAB_TITLE, UnsupportedTabContent } from "../workspaceSidebar/unsupportedTab";
 import { useWorkspaceSidebarTabActions } from "../workspaceSidebar/useWorkspaceSidebarTabActions";
 import { useCanStartSideChat } from "@/hooks/usePermissions";
-import { RailTerminalView, WorkspaceTabTooltip } from "../WorkspacePanel";
+import { usePanesSplitsAllowed } from "../panesViewGate";
+import {
+  SidebarTerminalPanes,
+  sidebarShellUnit,
+  useShownTerminalGroups,
+} from "../SidebarTerminalPanes";
+import { useTerminalOpenRequests } from "../terminalOpenRequest";
+import { WorkspaceTabTooltip } from "../WorkspacePanel";
 import { NewTabPage, type NewTabRecent } from "./NewTabPage";
+import { useMountedShellKeys } from "./shellTabBudget";
 import { recentPullRequestRows, recentPullRequestUrl } from "./recentPullRequestRow";
 import { useRecentPullRequestFacts } from "./useRecentPullRequestFacts";
 import { FileTypeIcon } from "@/shell/FileTypeIcon";
@@ -172,7 +180,8 @@ export interface WorkspaceTabsPanelProps {
   terminalKeys: readonly string[] | null;
   /** The shell the user just opened by hand, whose terminal may take focus. */
   autoFocusTerminalKey?: string | null;
-  openTerminalTab: (key: string) => void;
+  /** Select the shell's tab and reveal the sidebar; `focus: false` leaves the keyboard where it is. */
+  openTerminalTab: (key: string, options?: { focus?: boolean }) => void;
   /** Ask before a shell ends; resolves false when the user keeps it. Ends nothing itself. */
   confirmCloseShell: (key: string) => Promise<boolean>;
   /** End a shell; false when it couldn't be ended. */
@@ -360,6 +369,40 @@ function WorkspaceTabsPanelImpl({
       return unchanged ? previous : next;
     });
   }, [shellTabsSignature, liveShellTabsSignature]);
+  // A shell tab shows its live shell, or the one it attached to while the shell list is
+  // unavailable. A shell known to be gone never shows.
+  const shellShows = (tab: WorkspaceTab): boolean => {
+    if (tab.binding?.kind !== "terminal") return false;
+    const state = store.resourceState(tab.id);
+    if (state === "live") return true;
+    return state !== "gone" && attachedShells.has(attachedShellKey(tab.id, tab.binding.key));
+  };
+  // One host shows the selected tab's shell, or its split; the most recently shown other shell
+  // tabs keep their terminals mounted there, hidden, so switching back doesn't reconnect them.
+  const selectedShellKey =
+    selectedTab?.binding?.kind === "terminal" && shellShows(selectedTab)
+      ? selectedTab.binding.key
+      : null;
+  const shownShellKeys = [
+    ...new Set(
+      knownTabs.flatMap((tab) =>
+        tab.binding?.kind === "terminal" && shellShows(tab) ? [tab.binding.key] : [],
+      ),
+    ),
+  ];
+  // Each shell's split comes along as one unit, every member counted against the budget.
+  const { groups: shellGroups } = useShownTerminalGroups(conversationId);
+  const shellSplitsAllowed = usePanesSplitsAllowed(!isOwnerLevel(permissionLevel));
+  const mountedShellKeys = useMountedShellKeys(
+    shownShellKeys,
+    selectedShellKey,
+    open && !inert,
+    (key) => sidebarShellUnit(shellGroups, shellSplitsAllowed, key),
+  );
+  // A pane's shell moving here, or a sidebar split's survivor, opens through the shell tab opener.
+  useTerminalOpenRequests(contained ? null : conversationId, (request) =>
+    openTerminalTab(request.key, { focus: request.focus }),
+  );
   useEffect(() => {
     if (pending) return;
     store.setTerminalInventory(
@@ -920,37 +963,23 @@ function WorkspaceTabsPanelImpl({
           />
         );
       case "terminal": {
-        const shellState = store.resourceState(tab.id);
-        // Until the shell list confirms it, a shell isn't ended; an attached one stays put.
-        if (
-          tab.binding?.kind !== "terminal" ||
-          shellState === "gone" ||
-          (shellState !== "live" && !attachedShells.has(attachedShellKey(tab.id, tab.binding.key)))
-        ) {
-          const connection: TerminalTabConnection =
-            tab.binding?.kind === "terminal"
-              ? tabConnections.connectionOf(shellOf(tab, tab.binding.key))
-              : { kind: "ended" };
-          return (
-            <TerminalTabStatus
-              connection={connection}
-              sandboxNotice={tabConnections.sandboxNotice(connection)}
-              onResumeSession={isEditorLevel(permissionLevel) ? resumeSession : undefined}
-              resumingSession={tabConnections.resumingSession}
-              onTryAgain={retryTerminals}
-              // Only the owner can attach a runner, so only the owner gets the command.
-              localReconnectCommand={
-                isOwnerLevel(permissionLevel) ? tabConnections.localReconnectCommand : undefined
-              }
-            />
-          );
-        }
+        // A shown shell renders in the shell host below; its tab panel stays empty.
+        if (shellShows(tab)) return null;
+        const connection: TerminalTabConnection =
+          tab.binding?.kind === "terminal"
+            ? tabConnections.connectionOf(shellOf(tab, tab.binding.key))
+            : { kind: "ended" };
         return (
-          <RailTerminalView
-            conversationId={conversationId}
-            terminalKey={tab.binding.key}
-            readOnly={!isOwnerLevel(permissionLevel)}
-            autoFocus={active && autoFocusTerminalKey === tab.binding.key}
+          <TerminalTabStatus
+            connection={connection}
+            sandboxNotice={tabConnections.sandboxNotice(connection)}
+            onResumeSession={isEditorLevel(permissionLevel) ? resumeSession : undefined}
+            resumingSession={tabConnections.resumingSession}
+            onTryAgain={retryTerminals}
+            // Only the owner can attach a runner, so only the owner gets the command.
+            localReconnectCommand={
+              isOwnerLevel(permissionLevel) ? tabConnections.localReconnectCommand : undefined
+            }
           />
         );
       }
@@ -1246,6 +1275,24 @@ function WorkspaceTabsPanelImpl({
                   </WorkspaceSidebarTabPanel>
                 );
               })}
+              {shownShellKeys.length > 0 && (
+                <div
+                  data-workspace-terminal-host=""
+                  className={cn(
+                    "absolute inset-0 flex min-h-0 flex-col bg-card",
+                    selectedShellKey === null && "invisible",
+                  )}
+                >
+                  <SidebarTerminalPanes
+                    conversationId={conversationId}
+                    shownKey={selectedShellKey}
+                    mountedKeys={mountedShellKeys}
+                    readOnly={!isOwnerLevel(permissionLevel)}
+                    visible={selectedShellKey !== null && open && !inert}
+                    autoFocusKey={autoFocusTerminalKey}
+                  />
+                </div>
+              )}
               {selectedUnknown && (
                 <UnsupportedTabContent onClose={() => closeTab(selectedUnknown.id)} />
               )}

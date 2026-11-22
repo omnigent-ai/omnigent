@@ -27,7 +27,7 @@ import {
   openTerminalAsPane,
   type TerminalMoveScope,
 } from "./terminalPaneMoves";
-import { resetTerminalPlacement, useMainSplitMembers } from "./terminalPlacement";
+import { resetTerminalPlacement } from "./terminalPlacement";
 import { readPaneSplit, updatePaneSplit } from "./paneSplitStore";
 import { resetTerminalGroupsCache } from "./terminalGroupsStore";
 
@@ -145,10 +145,16 @@ interface SessionProps {
   initialTerminalKey?: string | null;
   /** The session shows its Terminal view, rather than another tab of the page. */
   visible?: boolean;
+  /** The person can't split the main view, which then shows the Terminal view unsplit. */
+  readOnly?: boolean;
 }
 
-function Session({ conversationId, initialTerminalKey = null, visible = true }: SessionProps) {
-  const mainSplitMembers = useMainSplitMembers(conversationId, true);
+function Session({
+  conversationId,
+  initialTerminalKey = null,
+  visible = true,
+  readOnly = false,
+}: SessionProps) {
   // The sidebar's own opener, which AppShell answers by selecting the shell's tab.
   useTerminalOpenRequests(conversationId, (request) => openRequests.push(request));
   return (
@@ -160,7 +166,7 @@ function Session({ conversationId, initialTerminalKey = null, visible = true }: 
           conversationId={conversationId}
           initialTerminalKey={initialTerminalKey}
           visible={visible}
-          readOnly={false}
+          readOnly={readOnly}
           chatShown
         />
         <aside aria-label="Workspace">
@@ -171,7 +177,6 @@ function Session({ conversationId, initialTerminalKey = null, visible = true }: 
             readOnly={false}
             visible
             autoFocusKey={null}
-            mainSplitMembers={mainSplitMembers}
           />
         </aside>
       </>
@@ -385,6 +390,26 @@ describe.each([
     expect(liveFor(SHELL_ID)).toBe(1);
     expect(sessions.peak.get(SHELL_ID)).toBe(1);
   });
+
+  it.each([
+    ["a viewer who can't split", { readOnly: true }, TERMINALS],
+    ["the agent's terminal isn't listed", {}, [TERMINALS[1]!]],
+  ])(
+    "shows a saved split's shell in the sidebar, attached once, while the main view shows %s",
+    async (_case, props, terminals) => {
+      const conversationId = nextConversation();
+      updatePaneSplit(conversationId, () => ({
+        layout: { axis: "columns", ratio: 0.5, children: [AGENT, SHELL] },
+        focusedKey: SHELL,
+      }));
+      listed.terminals = terminals;
+      await renderSession(conversationId, wrap, props);
+      // The Terminal view shows no split, so the sidebar's tab shows the shell itself.
+      expect(screen.queryByText("This shell is open in the Terminal view.")).toBeNull();
+      expect(liveFor(SHELL_ID)).toBe(1);
+      expect(sessions.peak.get(SHELL_ID)).toBe(1);
+    },
+  );
 
   it("is attached once at every step of a quick out, back and out again", async () => {
     const conversationId = nextConversation();

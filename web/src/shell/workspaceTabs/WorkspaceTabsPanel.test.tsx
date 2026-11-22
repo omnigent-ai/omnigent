@@ -1,4 +1,13 @@
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
@@ -7,6 +16,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import type * as PanesViewGateModule from "../panesViewGate";
+import { resetPaneSplitsCache, updatePaneSplit } from "../paneSplitStore";
+import { resetTerminalGroupsCache, updateTerminalGroups } from "../terminalGroupsStore";
+import { requestTerminalOpen, resetTerminalOpenRequestsForTests } from "../terminalOpenRequest";
+import { resetTerminalPlacement, usePublishMainTerminalKeys } from "../terminalPlacement";
+import { MOUNTED_SHELL_TAB_LIMIT } from "./shellTabBudget";
 import { LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ } from "@/lib/permissionsApi";
 import { terminalsQueryKey } from "@/lib/terminals";
 import { LOCAL_RECONNECT_DESCRIPTION, LOCAL_RECONNECT_TITLE } from "@/shell/ReconnectSessionDialog";
@@ -21,6 +36,7 @@ import { resetSessionResumes } from "./useTerminalTabConnection";
 import { WorkspaceTabsPanel, type WorkspaceTabsPanelProps } from "./WorkspaceTabsPanel";
 import {
   openWorkspaceFile,
+  openWorkspaceNewTab,
   resetWorkspaceTabsSessionsForTests,
   workspaceTabsSession,
 } from "./workspaceTabsSessions";
@@ -71,6 +87,14 @@ vi.mock("@/components/blocks/TerminalView", () => ({
   TerminalView: ({ terminalId }: { terminalId: string }) => (
     <div data-testid="terminal-view-stub" data-terminal={terminalId} />
   ),
+}));
+
+// Whether the session's main area shows the panes view; off unless a case turns it on.
+const panesGate = vi.hoisted(() => ({ shown: false }));
+vi.mock("../panesViewGate", async (importOriginal) => ({
+  ...(await importOriginal<typeof PanesViewGateModule>()),
+  usePanesView: () => panesGate.shown,
+  usePanesSplitsAllowed: (readOnly: boolean) => panesGate.shown && !readOnly,
 }));
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -161,6 +185,12 @@ afterEach(() => {
   usePullRequestListCounts.setState({ counts: {} });
   queryClient.clear();
   resetSessionResumes();
+  panesGate.shown = false;
+  resetPaneSplitsCache();
+  resetTerminalPlacement();
+  resetTerminalOpenRequestsForTests();
+  resetTerminalGroupsCache();
+  window.localStorage.clear();
 });
 
 describe("WorkspaceTabsPanel keyboard target", () => {
@@ -614,6 +644,182 @@ describe("a shell's tab", () => {
         name: "Loading",
       }),
     ).toBeNull();
+  });
+
+  /** Listed shells, each open in its own tab, the last selected; returns each shell's tab. */
+  async function openShells(
+    conversationId: string,
+    ids: readonly string[],
+    overrides: Partial<PanelOverrides> = {},
+  ) {
+    const { useTerminals } = await import("@/hooks/useTerminals");
+    vi.mocked(useTerminals).mockReturnValue({
+      terminals: ids.map((id) => ({
+        id,
+        name: `${id}:s`,
+        terminalName: "zsh",
+        sessionKey: "s",
+        running: true,
+      })),
+      isLoading: false,
+      isFetching: false,
+      error: null,
+      listCompleteAt: 1,
+    } as unknown as ReturnType<typeof useTerminals>);
+    const panels = [
+      { conversationId, terminalKeys: ids.map((id) => `terminal:${id}`), ...overrides },
+    ];
+    const view = renderPanels(panels);
+    const { store } = workspaceTabsSession(conversationId);
+    const tabOf = new Map<string, string>();
+    await act(async () => {
+      for (const id of ids) {
+        // oxlint-disable-next-line no-await-in-loop -- each tab opens after the one before
+        const opened = await store.open(
+          { place: { kind: "terminal", key: `terminal:${id}` } },
+          { opener: "user", disposition: "new" },
+        );
+        if (opened.ok) tabOf.set(id, opened.tabId);
+      }
+    });
+    const select = (id: string) => act(() => void store.select(tabOf.get(id)!));
+    return { view, panels, store, select };
+  }
+
+  const shownTerminals = () =>
+    screen
+      .queryAllByTestId("terminal-view-stub")
+      .map((stub) => stub.dataset.terminal)
+      .sort();
+  const stubOf = (id: string) =>
+    screen.queryAllByTestId("terminal-view-stub").find((stub) => stub.dataset.terminal === id) ??
+    null;
+
+  it("keeps a shown shell tab's terminal attached while another tab shows, and back", async () => {
+    const { select } = await openShells("s-two-shells", ["term_a", "term_b"]);
+    select("term_a");
+    await waitFor(() => expect(shownTerminals()).toEqual(["term_a", "term_b"]));
+    const attached = screen.getAllByTestId("terminal-view-stub");
+    act(() => void openWorkspaceNewTab("s-two-shells"));
+    select("term_a");
+    // The same two terminals, never remounted.
+    expect(attached.every((stub) => stub.isConnected)).toBe(true);
+    expect(shownTerminals()).toEqual(["term_a", "term_b"]);
+  });
+
+  it(`keeps the ${MOUNTED_SHELL_TAB_LIMIT} most recently shown shells attached, and reconnects an older one`, async () => {
+    const ids = Array.from({ length: MOUNTED_SHELL_TAB_LIMIT + 2 }, (_, index) => `term_${index}`);
+    const { select } = await openShells("s-many-shells", ids);
+    for (const id of ids) select(id);
+    await waitFor(() => expect(shownTerminals()).toHaveLength(MOUNTED_SHELL_TAB_LIMIT));
+    // The two shown longest ago let their terminals go.
+    expect(stubOf("term_0")).toBeNull();
+    expect(stubOf("term_1")).toBeNull();
+    const newest = stubOf(ids.at(-1)!);
+
+    select("term_0");
+    await waitFor(() => expect(stubOf("term_0")).not.toBeNull());
+    expect(shownTerminals()).toHaveLength(MOUNTED_SHELL_TAB_LIMIT);
+    // It takes the place of the next oldest; the newest stays as it was.
+    expect(stubOf("term_2")).toBeNull();
+    expect(stubOf(ids.at(-1)!)).toBe(newest);
+  });
+
+  it("counts a selected split's every shell against the budget, though it joins an evicted one", async () => {
+    panesGate.shown = true;
+    const ids = Array.from({ length: MOUNTED_SHELL_TAB_LIMIT + 1 }, (_, index) => `term_${index}`);
+    const { select } = await openShells("s-split-budget", ids, { permissionLevel: LEVEL_OWNER });
+    for (const id of ids) select(id);
+    await waitFor(() => expect(stubOf("term_0")).toBeNull());
+    // The newest shell and the evicted oldest become one sidebar split, which then shows.
+    act(() =>
+      updateTerminalGroups("s-split-budget", () => [
+        {
+          id: "g_newest_oldest",
+          split: {
+            layout: {
+              axis: "columns",
+              ratio: 0.5,
+              children: ["terminal:term_8", "terminal:term_0"],
+            },
+            focusedKey: "terminal:term_8",
+          },
+        },
+      ]),
+    );
+    await waitFor(() => expect(stubOf("term_0")).not.toBeNull());
+    expect(shownTerminals()).toHaveLength(MOUNTED_SHELL_TAB_LIMIT);
+  });
+
+  it("keeps only the selected split's shells attached while the sidebar is closed", async () => {
+    panesGate.shown = true;
+    const { view, panels, select } = await openShells(
+      "s-closed-split",
+      ["term_a", "term_b", "term_c"],
+      { permissionLevel: LEVEL_OWNER },
+    );
+    act(() =>
+      updateTerminalGroups("s-closed-split", () => [
+        {
+          id: "g_ab",
+          split: {
+            layout: {
+              axis: "columns",
+              ratio: 0.5,
+              children: ["terminal:term_a", "terminal:term_b"],
+            },
+            focusedKey: "terminal:term_a",
+          },
+        },
+      ]),
+    );
+    select("term_c");
+    select("term_a");
+    await waitFor(() => expect(shownTerminals()).toEqual(["term_a", "term_b", "term_c"]));
+    view.rerender(panels.map((current) => ({ ...current, open: false })));
+    await waitFor(() => expect(shownTerminals()).toEqual(["term_a", "term_b"]));
+  });
+
+  it("keeps only the selected shell attached while the sidebar is closed", async () => {
+    const { view, panels, select } = await openShells("s-closed", ["term_a", "term_b"]);
+    select("term_a");
+    select("term_b");
+    await waitFor(() => expect(shownTerminals()).toEqual(["term_a", "term_b"]));
+    view.rerender(panels.map((current) => ({ ...current, open: false })));
+    await waitFor(() => expect(shownTerminals()).toEqual(["term_b"]));
+  });
+
+  it("leaves out a shell the main view shows, and says where it is", async () => {
+    renderHook(() => usePublishMainTerminalKeys("s-main-shows", ["terminal:term_b"]));
+    await openShells("s-main-shows", ["term_a", "term_b"]);
+    expect(await screen.findByText("This shell is open in the Terminal view.")).toBeVisible();
+    expect(stubOf("term_b")).toBeNull();
+  });
+
+  it("mounts a saved split's shell while no view shows that split", async () => {
+    // The panes view is on, but the main view fell back and shows no split.
+    panesGate.shown = true;
+    updatePaneSplit("s-split-unshown", () => ({
+      layout: { axis: "columns", ratio: 0.5, children: ["terminal:agent", "terminal:term_b"] },
+      focusedKey: "terminal:term_b",
+    }));
+    await openShells("s-split-unshown", ["term_a", "term_b"]);
+    await waitFor(() => expect(stubOf("term_b")).not.toBeNull());
+    expect(screen.queryByText("This shell is open in the Terminal view.")).toBeNull();
+  });
+
+  it("opens a shell's tab when a pane asks, as its own open does", async () => {
+    const openTerminalTab = vi.fn();
+    await openShells("s-open-request", ["term_a", "term_b"], { openTerminalTab });
+    act(() => requestTerminalOpen("s-open-request", { key: "terminal:term_a", focus: false }));
+    expect(openTerminalTab).toHaveBeenCalledExactlyOnceWith("terminal:term_a", { focus: false });
+  });
+
+  it("leaves a pane's open request to the session's own sidebar, not a grid cell's", async () => {
+    const openTerminalTab = vi.fn();
+    await openShells("s-open-grid", ["term_a", "term_b"], { openTerminalTab, contained: true });
+    act(() => requestTerminalOpen("s-open-grid", { key: "terminal:term_a", focus: true }));
+    expect(openTerminalTab).not.toHaveBeenCalled();
   });
 
   /** The session's shell list as the panel reads it. */
