@@ -12,8 +12,10 @@ from omnigent.entities import (
     Agent,
     Conversation,
     ConversationItem,
+    MessageData,
     NewConversationItem,
     PagedList,
+    SlashCommandData,
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 from omnigent.session_recovery import SessionRecovery
@@ -25,6 +27,25 @@ from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY
 
 # Pending inputs share the item store, but are not harness transcript history yet.
 PENDING_INPUT_RESPONSE_ID = "pending_input"
+
+
+def is_human_input(data: object) -> bool:
+    """
+    Report whether an item's data is input a person sent.
+
+    That is a user message, unless it is an internal record such as a task
+    notification that the person did not write, or a skill they ran.
+
+    :param data: An item's ``data``, e.g. a :class:`MessageData`.
+    :returns: ``True`` for a person's message or skill invocation.
+    """
+    return (
+        isinstance(data, MessageData)
+        and data.role == "user"
+        and (not data.is_meta or data.user_authored)
+    ) or (isinstance(data, SlashCommandData) and data.kind == "skill")
+
+
 MAX_PENDING_INPUTS = 100
 # Most sub-agents of one spawn tree read in a single bounded read; a bigger
 # tree is read in pages or not at all, depending on the reader.

@@ -299,6 +299,7 @@ from omnigent.stores.conversation_store import (
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
+    is_human_input,
     muted_label_key,
     pinned_label_key,
     runner_seen_is_fresh,
@@ -329,6 +330,9 @@ from omnigent.version import VERSION
 
 # Harnesses whose sessions offer ``/rewind``.
 _REWIND_HARNESSES = frozenset({"claude-sdk", "claude-native"})
+
+# Newest items a side chat fork reads to find its source's active request.
+_SIDE_CHAT_REQUEST_LOOKBACK = 200
 
 # An image a prompt carries inline rather than as a stored file.
 _INLINE_IMAGE_URL = re.compile(r"^data:image/[\w.+-]+;base64,", re.IGNORECASE)
@@ -4860,10 +4864,11 @@ def register_core_routes(
 
         A side chat (``body.side_chat``) forked while the source answers a
         request, or while a message is still reaching its runner, leaves that
-        request out: it copies only the history before the source's newest
-        request, unless the message starting the turn is not in history yet,
-        and a native target rebuilds its transcript from those items instead
-        of cloning the source's live one.
+        request out. It copies the history before the source's newest request
+        (a message or skill a person sent), or, while that request has not
+        reached history, the history as it stands when the fork is made. A
+        native target rebuilds its transcript from those items instead of
+        cloning the source's live one.
 
         The dialog's run-config picks (``body.model_override``,
         ``body.reasoning_effort``, ``body.terminal_launch_args`` — the
@@ -5096,19 +5101,26 @@ def register_core_routes(
             )
         # A side chat must not inherit a request its source is answering or about
         # to answer, or the side chat's model takes that request up as its own.
+        source_running = _session_status_from_cache(source.id, source.live_status) == "running"
         side_chat_mid_turn = (
             body.side_chat
             and copy_history
             and before_item_id is None
             and body.up_to_response_id is None
-            and (
-                _session_status_from_cache(source.id, source.live_status) == "running"
-                or _session_is_starting(source.id)
-            )
+            and (source_running or _session_is_starting(source.id))
         )
-        # A message that will start the source's next turn is not in history yet.
-        if side_chat_mid_turn and not pending_inputs.has_pending_turn_start(source.id):
-            before_item_id = await asyncio.to_thread(_latest_request_id, source.id)
+        up_to_response_id = body.up_to_response_id
+        if side_chat_mid_turn:
+            request_id, answered, end_response_id = await asyncio.to_thread(
+                _newest_request, source.id
+            )
+            if pending_inputs.has_pending_turn_start(source.id) or not (
+                source_running or (request_id is not None and not answered)
+            ):
+                # The request is not in history yet: copy only what is there now.
+                up_to_response_id = end_response_id
+            else:
+                before_item_id = request_id
         # A fork that keeps no history has no attachments to replay.
         if copy_history:
             await asyncio.to_thread(
@@ -5117,7 +5129,7 @@ def register_core_routes(
                 base_agent,
                 conversation_store,
                 file_store,
-                up_to_response_id=body.up_to_response_id,
+                up_to_response_id=up_to_response_id,
                 before_item_id=before_item_id,
                 target_harness=continuation_harness,
             )
@@ -5537,7 +5549,7 @@ def register_core_routes(
                 carry_history_into_native=carry_history_into_native,
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,
-                up_to_response_id=body.up_to_response_id,
+                up_to_response_id=up_to_response_id,
                 before_item_id=before_item_id,
                 copy_items=copy_history,
                 continue_source=continue_source,
@@ -6400,32 +6412,36 @@ def register_core_routes(
                 return False
             after = page.last_id
 
-    def _latest_request_id(session_id: str) -> str | None:
+    def _newest_request(session_id: str) -> tuple[str | None, bool, str | None]:
         """
-        Return the id of *session_id*'s newest request.
+        Find the newest request among *session_id*'s most recent items.
 
-        A request is a user message that is not an internal record, such as a
-        task notification Claude Code adds while a turn runs.
+        A request is input a person sent (:func:`is_human_input`), so internal
+        records such as task notifications are skipped. Reads at most
+        :data:`_SIDE_CHAT_REQUEST_LOOKBACK` items, newest first.
 
         :param session_id: Session to search, e.g. ``"conv_abc"``.
-        :returns: The message's item id, e.g. ``"msg_abc"``, or ``None`` when
-            the session has no request.
+        :returns: The request's item id (``None`` when none is in reach),
+            whether the agent has answered it yet, and the response id of the
+            newest item a copy can end on (``None`` when there is none).
         """
-        after: str | None = None
-        while True:
-            page = conversation_store.list_items(
-                session_id, limit=100, after=after, order="desc", type="message"
+        page = conversation_store.list_items(
+            session_id, limit=_SIDE_CHAT_REQUEST_LOOKBACK, order="desc"
+        )
+        answered = False
+        end_response_id: str | None = None
+        for item in page.data:
+            if is_human_input(item.data):
+                return item.id, answered, end_response_id or item.response_id
+            # Resource events share one response id with later events.
+            if item.type == "resource_event":
+                continue
+            end_response_id = end_response_id or item.response_id
+            answered = answered or (
+                item.type in ("function_call", "function_call_output", "reasoning")
+                or (isinstance(item.data, MessageData) and item.data.role == "assistant")
             )
-            for item in page.data:
-                if (
-                    isinstance(item.data, MessageData)
-                    and item.data.role == "user"
-                    and not item.data.is_meta
-                ):
-                    return item.id
-            if not page.has_more or page.last_id is None:
-                return None
-            after = page.last_id
+        return None, answered, end_response_id
 
     def _rewind_prompt(session_id: str, item_id: str) -> MessageData:
         """

@@ -93,7 +93,6 @@ from omnigent.entities import (
     MessageData,
     NewConversationItem,
     PagedList,
-    SlashCommandData,
     parse_item_data,
 )
 from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
@@ -141,6 +140,7 @@ from omnigent.stores.conversation_store import (
     SessionTodosUpdate,
     SpawnTreeUsage,
     family_pinned_label_key,
+    is_human_input,
     pinned_label_key,
     runner_seen_is_fresh,
 )
@@ -3484,11 +3484,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         input_candidates: set[int] = set()
         interruption_notices: set[int] = set()
         for index, item in enumerate(items):
-            if (
-                isinstance(item.data, MessageData)
-                and item.data.role == "user"
-                and (not item.data.is_meta or item.data.user_authored)
-            ) or (isinstance(item.data, SlashCommandData) and item.data.kind == "skill"):
+            if is_human_input(item.data):
                 input_candidates.add(index)
             if isinstance(item.data, MessageData) and not item.data.user_authored:
                 from omnigent.inner.executor import is_interruption_marker
