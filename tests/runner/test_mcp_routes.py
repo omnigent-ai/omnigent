@@ -379,10 +379,10 @@ async def test_builtin_tool_dispatch_passes_session_context(
     h = Harness()
     spec = _spec()
     h.spec_cache[SESSION] = ResolvedSpec(spec=spec, workdir=Path("/tmp/bundle"))
-    status, body = await h.execute(_call("sys_list_files", arguments={"path": "."}))
+    status, body = await h.execute(_call("sys_files_list", arguments={"path": "."}))
     assert status == 200
     assert body == {"result": {"output": "listed"}}
-    assert seen["tool_name"] == "sys_list_files"
+    assert seen["tool_name"] == "sys_files_list"
     assert json.loads(seen["arguments"]) == {"path": "."}
     assert seen["agent_spec"] is spec
     assert seen["local_tool_workdir"] == Path("/tmp/bundle")
@@ -432,7 +432,7 @@ async def test_builtin_tool_resolves_the_spec_entry_when_uncached(
     h = Harness(spec_resolver=object())
     spec = _spec()
     h.resolved_entry = ResolvedSpec(spec=spec, workdir=Path("/tmp/resolved"))
-    await h.execute(_call("sys_list_files"))
+    await h.execute(_call("sys_files_list"))
     assert seen["agent_spec"] is spec
     assert seen["local_tool_workdir"] == Path("/tmp/resolved")
 
@@ -449,11 +449,24 @@ async def test_builtin_tool_tolerates_a_failed_spec_resolution(
     monkeypatch.setattr("omnigent.runner.tool_dispatch.execute_tool", _execute_tool)
     h = Harness(spec_resolver=object())
     h.resolve_error = OmnigentError("agent gone", code=ErrorCode.NOT_FOUND)
-    status, body = await h.execute(_call("sys_list_files"))
+    status, body = await h.execute(_call("sys_files_list"))
     assert status == 200
     assert body == {"result": {"output": "ok"}}
     assert seen["agent_spec"] is None
     assert seen["local_tool_workdir"] == Path("/tmp/runner-workspace")
+
+
+async def test_file_tool_is_refused_when_the_spec_fails_to_resolve() -> None:
+    """
+    The real dispatch can't see a ``tool_groups.files`` opt-in without the
+    spec, so it refuses the file tool instead of calling the server's file API.
+    """
+    h = Harness(spec_resolver=object())
+    h.resolve_error = OmnigentError("agent gone", code=ErrorCode.NOT_FOUND)
+    status, body = await h.execute(_call("sys_files_list"))
+    assert status == 200
+    output = json.loads(body["result"]["output"])
+    assert output["error"].startswith("tool 'sys_files_list' is not enabled"), output
 
 
 async def test_builtin_tool_failure_is_generic_to_the_client(
@@ -465,7 +478,7 @@ async def test_builtin_tool_failure_is_generic_to_the_client(
     monkeypatch.setattr("omnigent.runner.tool_dispatch.execute_tool", _execute_tool)
     h = Harness()
     h.spec_cache[SESSION] = _spec()
-    status, body = await h.execute(_call("sys_list_files"))
+    status, body = await h.execute(_call("sys_files_list"))
     assert status == 200
     assert body["error"]["code"] == -32000
     assert "/etc/shadow" not in body["error"]["message"]

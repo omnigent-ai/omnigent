@@ -64,7 +64,7 @@ guardrails:
           action: deny
           reason: The proactive agent does not share or read session files.
           on_phases: [tool_call]
-          on_tools: [sys_upload_file, sys_list_files, sys_download_file]
+          on_tools: [sys_files_upload, sys_files_list, sys_files_download]
 
 prompt: |
   You are the user's proactive assistant. You run on a schedule, without the

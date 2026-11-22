@@ -20,14 +20,15 @@ from typing import Any
 
 import httpx
 import pytest
+import yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import ServerRunner, server_runner
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e.conftest import (
     configure_mock_llm,
-    create_runner_bound_session,
     lookup_agent_id,
     poll_session_until_terminal,
     register_inline_agent,
@@ -60,33 +61,62 @@ def _stack(root: Path, *, runner: bool) -> Iterator[tuple[httpx.Client, ServerRu
 
 
 def _register_agent(client: httpx.Client, mock_llm_url: str, uid: str) -> str:
-    """An agent whose ``worker`` sub-agent has its own mock model queue."""
-    base_url = f"{mock_llm_url}/v1"
+    """Register a minimal agent for sessions that run no turn."""
     return register_inline_agent(
         client,
         name=f"delete-files-{uid}",
         harness="openai-agents",
         model=f"mock-delete-parent-{uid}",
         profile="",
-        prompt="Follow the scripted mock tool calls exactly.",
-        mock_llm_base_url=base_url,
-        extra_config={
-            "os_env": _OS_ENV,
-            "tools": {
-                "worker": {
-                    "type": "agent",
-                    "description": "Uploads its notes.",
-                    "executor": {
-                        "harness": "openai-agents",
-                        "model": f"mock-delete-child-{uid}",
-                        "auth": {"type": "api_key", "api_key": "mock-key", "base_url": base_url},
-                    },
-                    "prompt": "Follow the scripted mock tool calls exactly.",
-                    "os_env": "inherit",
-                }
-            },
-        },
+        prompt="Unused: these sessions run no turn.",
+        mock_llm_base_url=f"{mock_llm_url}/v1",
     )
+
+
+def _file_sharing_session(
+    client: httpx.Client, mock_llm_url: str, uid: str, runner_id: str
+) -> str:
+    """
+    A runner-bound session whose agent and ``worker`` sub-agent both turn the
+    file tools on, each on its own mock model queue.
+
+    An inline sub-agent can't set ``tool_groups``, so the worker is a bundled
+    ``agents/worker`` agent.
+    """
+    auth = {"type": "api_key", "api_key": "mock-key", "base_url": f"{mock_llm_url}/v1"}
+
+    def agent_config(name: str, model: str, **extra: Any) -> bytes:
+        config = {
+            "spec_version": 1,
+            "name": name,
+            "prompt": "Follow the scripted mock tool calls exactly.",
+            "executor": {
+                "type": "omnigent",
+                "model": model,
+                "config": {"harness": "openai-agents"},
+                "auth": auth,
+            },
+            "os_env": _OS_ENV,
+            "tool_groups": {"files": True},
+            **extra,
+        }
+        return yaml.safe_dump(config).encode()
+
+    bundle = bundle_files(
+        {
+            "config.yaml": agent_config(
+                f"delete-files-{uid}", f"mock-delete-parent-{uid}", tools={"agents": ["worker"]}
+            ),
+            "agents/worker/config.yaml": agent_config(
+                "worker", f"mock-delete-child-{uid}", description="Uploads its notes."
+            ),
+        }
+    )
+    created = post_session_bundle(client.post, "/v1/sessions", bundle)
+    created.raise_for_status()
+    session_id = str(created.json()["session_id"])
+    bind_session_runner(client.patch, "", session_id, runner_id)
+    return session_id
 
 
 def _tool_call(call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -101,7 +131,7 @@ def _create(client: httpx.Client, **body: Any) -> str:
 
 
 def _upload(client: httpx.Client, session_id: str, name: str, content: bytes) -> str:
-    """Upload a file as the web composer and the runner's ``sys_upload_file`` do."""
+    """Upload a file as the web composer and the runner's ``sys_files_upload`` do."""
     response = client.post(
         f"/v1/sessions/{session_id}/resources/files",
         files={"file": (name, content, "text/plain")},
@@ -160,16 +190,13 @@ def test_deleting_a_parent_removes_its_sub_agents_files(
     mock = isolated_mock_llm_server_url
     uid = uuid.uuid4().hex[:6]
     with _stack(tmp_path / "stack", runner=True) as (client, stack):
-        agent_name = _register_agent(client, mock, uid)
-        parent_id = create_runner_bound_session(
-            client, agent_name=agent_name, runner_id=stack.runner_id
-        )
+        parent_id = _file_sharing_session(client, mock, uid, stack.runner_id)
         brief_id = _upload(client, parent_id, "brief.txt", b"brief from the user")
         configure_mock_llm(
             mock,
             [
                 _tool_call("write", "sys_os_write", {"path": "report.md", "content": "report"}),
-                _tool_call("parent_upload", "sys_upload_file", {"path": "report.md"}),
+                _tool_call("parent_upload", "sys_files_upload", {"path": "report.md"}),
                 _tool_call(
                     "dispatch",
                     "sys_session_send",
@@ -189,7 +216,7 @@ def test_deleting_a_parent_removes_its_sub_agents_files(
             mock,
             [
                 _tool_call("notes", "sys_os_write", {"path": "notes.md", "content": "notes"}),
-                _tool_call("child_upload", "sys_upload_file", {"path": "notes.md"}),
+                _tool_call("child_upload", "sys_files_upload", {"path": "notes.md"}),
                 {"text": "Uploaded."},
             ],
             key=f"mock-delete-child-{uid}",
