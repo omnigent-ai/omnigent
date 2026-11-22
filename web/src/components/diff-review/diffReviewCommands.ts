@@ -2,6 +2,7 @@
 // definitions, so a control and its command share a label, state, and handler.
 
 import {
+  ArrowDownWideNarrowIcon,
   ChartBarIcon,
   ChevronsDownUpIcon,
   ChevronsUpDownIcon,
@@ -19,7 +20,12 @@ import {
 } from "lucide-react";
 import { AVAILABLE, unavailableBecause, type PaletteCommand } from "@/store/paletteCommands";
 import { settingCommand } from "@/store/paletteSettings";
-import { nextTestFileView, testFileViewLabel, type DiffTestFileView } from "./diffReviewModel";
+import {
+  nextTestFileView,
+  testFileViewLabel,
+  type DiffFileOrder,
+  type DiffTestFileView,
+} from "./diffReviewModel";
 
 export type DiffReviewCommandId =
   | "toggle-tree"
@@ -34,6 +40,7 @@ export type DiffReviewCommandId =
   | "toggle-layout"
   | "toggle-whitespace"
   | "toggle-wrap"
+  | "sort-files"
   | "toggle-collapse-all";
 
 export interface DiffReviewCommand {
@@ -64,6 +71,12 @@ export interface DiffReviewSetting {
 /** The view settings as ⌘K names them, in the review and the file viewer alike. */
 export const DIFF_LAYOUT_SETTING_LABEL = "Diff layout";
 export const WRAP_LINES_SETTING_LABEL = "Wrap long lines";
+export const FILE_ORDER_SETTING_LABEL = "Sort changed files";
+/** The file orders as the options popover and ⌘K name them. */
+export const FILE_ORDER_CHOICES: readonly { value: DiffFileOrder; label: string }[] = [
+  { value: "path", label: "By path" },
+  { value: "size", label: "By size, largest first" },
+];
 export const HIDE_WHITESPACE_SETTING_LABEL = "Hide whitespace changes";
 export const TEST_FILES_SETTING_LABEL = "Test files";
 export const GENERATED_FILES_SETTING_LABEL = "Generated files";
@@ -133,6 +146,8 @@ export interface DiffReviewCommandState {
   setIgnoreWhitespace?: (ignore: boolean) => void;
   wrapLines: boolean;
   setWrapLines?: (wrap: boolean) => void;
+  fileOrder: DiffFileOrder;
+  setFileOrder: (order: DiffFileOrder) => void;
   allCollapsed: boolean;
   canCollapse: boolean;
   toggleAllFiles: () => void;
@@ -347,6 +362,24 @@ export function diffReviewCommands(state: DiffReviewCommandState): DiffReviewCom
       run: () => setWrapLines(!wrapping),
     });
   }
+  const { fileOrder, setFileOrder } = state;
+  const bySize = fileOrder === "size";
+  commands.push({
+    id: "sort-files",
+    label: bySize ? "Sort files by path" : "Sort files by size",
+    icon: ArrowDownWideNarrowIcon,
+    keywords: ["sort", "order", "size", "largest", "biggest", "lines", "path"],
+    pressed: bySize,
+    setting: {
+      label: FILE_ORDER_SETTING_LABEL,
+      current: fileOrder,
+      choices: FILE_ORDER_CHOICES,
+      choose: (value) => {
+        if (value === "path" || value === "size") setFileOrder(value);
+      },
+    },
+    run: () => setFileOrder(bySize ? "path" : "size"),
+  });
   commands.push({
     id: "toggle-collapse-all",
     label: state.allCollapsed ? "Expand all files" : "Collapse all files",

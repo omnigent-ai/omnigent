@@ -1,6 +1,6 @@
-// The toolbar's +N −M: a button that opens the listed files' changed lines by
-// language. Choosing a language shows only its files; choosing the one shown
-// alone shows every language again.
+// The toolbar's +N −M, counting the listed files not yet viewed: a button that opens
+// every listed file's changed lines by language. Choosing a language shows only its
+// files; choosing the one shown alone shows every language again.
 
 import { CheckIcon } from "lucide-react";
 import { useId } from "react";
@@ -13,6 +13,7 @@ import {
   onlySelectedLanguage,
   type DiffFilterAction,
   type DiffReviewFilters,
+  type FileLineTotals,
   type LanguageLineCounts,
   type LineBreakdown,
 } from "./diffReviewModel";
@@ -32,6 +33,19 @@ function LineCounts({ additions, deletions }: { additions: number; deletions: nu
       <span className="text-success">+{formatCount(additions)}</span>
       <span className="text-destructive">−{formatCount(deletions)}</span>
     </span>
+  );
+}
+
+/** One of the popover's totals once some files are viewed: what it counts, its files and lines. */
+function TotalsRow({ label, totals }: { label: string; totals: FileLineTotals }) {
+  return (
+    <div className="flex items-center gap-2">
+      <dt className="text-foreground">{label}</dt>
+      <dd className="flex flex-1 items-center justify-end gap-2">
+        <span className="whitespace-nowrap">{filesLabel(totals.files)}</span>
+        <LineCounts additions={totals.additions} deletions={totals.deletions} />
+      </dd>
+    </div>
   );
 }
 
@@ -71,8 +85,8 @@ export function LanguageBreakdown({
   restoreFocus?: boolean;
 }) {
   const ids = useId();
-  const { totals, languages } = breakdown;
-  const fileCount = languages.reduce((sum, entry) => sum + entry.files, 0);
+  const { totals, notViewed, languages } = breakdown;
+  const someViewed = notViewed.files < totals.files;
   const changedLines = totals.additions + totals.deletions;
   const only = onlySelectedLanguage(filters);
   const unavailable = !command || command.unavailableReason !== undefined;
@@ -80,7 +94,8 @@ export function LanguageBreakdown({
     dispatchFilter(action);
     onOpenChange(false);
   };
-  const counts = `${formatCount(totals.additions)} added, ${formatCount(totals.deletions)} removed`;
+  const shown = someViewed ? notViewed : totals;
+  const counts = `${formatCount(shown.additions)} added, ${formatCount(shown.deletions)} removed${someViewed ? " in files not viewed" : ""}`;
   return (
     <Popover open={open && !unavailable} onOpenChange={onOpenChange}>
       <PopoverTrigger asChild>
@@ -94,7 +109,7 @@ export function LanguageBreakdown({
           data-testid="diff-review-line-counts"
           className="h-6 px-1.5 font-normal disabled:opacity-100 data-[state=open]:bg-accent"
         >
-          <LineCounts additions={totals.additions} deletions={totals.deletions} />
+          <LineCounts additions={shown.additions} deletions={shown.deletions} />
         </Button>
       </PopoverTrigger>
       <PopoverContent
@@ -105,10 +120,17 @@ export function LanguageBreakdown({
           if (!restoreFocus) event.preventDefault();
         }}
       >
-        <div className="flex items-center justify-between gap-2 px-2 pt-0.5 text-xs text-muted-foreground">
-          <span>{filesLabel(fileCount)}</span>
-          <LineCounts additions={totals.additions} deletions={totals.deletions} />
-        </div>
+        {someViewed ? (
+          <dl className="flex flex-col gap-0.5 px-2 pt-0.5 text-xs text-muted-foreground">
+            <TotalsRow label="Not viewed" totals={notViewed} />
+            <TotalsRow label="All files" totals={totals} />
+          </dl>
+        ) : (
+          <div className="flex items-center justify-between gap-2 px-2 pt-0.5 text-xs text-muted-foreground">
+            <span>{filesLabel(totals.files)}</span>
+            <LineCounts additions={totals.additions} deletions={totals.deletions} />
+          </div>
+        )}
         <div
           role="group"
           aria-label="Languages"

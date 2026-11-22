@@ -7,11 +7,13 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import {
+  compareTreeEntries,
   FILE_TREE_ROOT_SELECTOR,
   FileTree,
   type FileTreeDirectoryHandle,
   type FileTreeItemHandle,
   type FileTreeRowDecoration,
+  type FileTreeSortComparator,
   type FileTreeVisibleRow,
   useFileTree,
 } from "@/components/file-tree/vendored";
@@ -219,6 +221,17 @@ export function DiffReviewTree({
   );
 }
 
+/** Sorts the tree in `paths`' order, which the review chose; anything else keeps the default. */
+export function givenOrder(paths: readonly string[]): FileTreeSortComparator {
+  const positions = new Map(paths.map((path, index) => [path, index]));
+  return (left, right) => {
+    const leftAt = positions.get(left.path);
+    const rightAt = positions.get(right.path);
+    if (leftAt === undefined || rightAt === undefined) return compareTreeEntries(left, right);
+    return leftAt - rightAt;
+  };
+}
+
 /** The tree's rows for one set of paths; a different set mounts a fresh tree. */
 function ChangedFileRows({
   files,
@@ -257,10 +270,10 @@ function ChangedFileRows({
   } | null>(null);
   const treeHolder = useRef<HTMLDivElement>(null);
   const selection = useRef<readonly string[]>([]);
-  // The review hands its files over in the tree's own order, which the diff shares. The tree
-  // reads its input once, and a different set of paths remounts these rows.
+  // The tree keeps the review's order; it reads input once, and a new set or order remounts it.
   const { model } = useFileTree({
     paths,
+    sort: givenOrder(paths),
     gitStatus: treeGitStatusEntries(files, appearance),
     flattenEmptyDirectories: true,
     initialExpansion: "open",
