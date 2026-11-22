@@ -92,6 +92,16 @@ runs' sessions in their own Omnigent Automation folder.
   in Pinned. The Shared with me filter lists every shared session flat. Grouped
   views have no folders, so grouped My sessions leaves the runs out. Shared runs
   can't be moved to a project.
+- `palette-automation-actions`: with `quick_pick_palette` on (off by default),
+  an automation's page lists its header actions in ⌘K: Run automation now
+  (absent for trigger automations), Edit automation…, Share automation…, and
+  Pause or Resume automation. Each runs the header button's handler. Run now,
+  Edit, Pause and Resume are greyed while a change is saving; Share stays
+  available then, as its button does. A viewer of a shared automation sees them
+  greyed with the owner-only reason, as the header's buttons are; the owner sees Share
+  only where sharing applies. Delete stays on its button, which deletes without
+  asking (`web/src/components/scheduled/AutomationPaletteCommands.test.tsx`,
+  `tests/e2e_ui/scheduled/test_quick_pick_automation_commands.py`).
 
 ## How to get to it (user POV)
 
@@ -99,6 +109,8 @@ runs' sessions in their own Omnigent Automation folder.
   then the Share button left of Edit in the header.
 - **Automations list:** open an owned automation's ⋯ menu, or right-click its
   card, then choose Share. The dialog opens over the list.
+- **⌘K:** with `quick_pick_palette` on, open an automation's page, press
+  Cmd/Ctrl+K and type "share automation", then press Enter.
 - **Clone:** open an owned automation's ⋯ menu on the Automations list, or
   right-click its card, then choose Clone. The copy's page opens.
 - **Session share dialog:** open Share on the session a shared continue-session

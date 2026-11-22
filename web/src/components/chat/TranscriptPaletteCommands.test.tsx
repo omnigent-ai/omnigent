@@ -3,6 +3,7 @@ import { act, cleanup, render, renderHook } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { StickToBottom } from "use-stick-to-bottom";
+import type * as StickToBottomModule from "use-stick-to-bottom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -17,7 +18,7 @@ import { useChatStore } from "@/store/chatStore";
 
 import { useStopResponsePaletteCommand } from "./stopResponse";
 import { Transcript } from "./Transcript";
-import { TranscriptPaletteCommands } from "./TranscriptPaletteCommands";
+import { AT_NEWEST_MESSAGE, TranscriptPaletteCommands } from "./TranscriptPaletteCommands";
 
 const clipboard = vi.hoisted(() => ({
   text: vi.fn(async (_text: string) => {}),
@@ -25,6 +26,17 @@ const clipboard = vi.hoisted(() => ({
 }));
 vi.mock("@/lib/clipboard", () => ({ copyText: clipboard.text }));
 vi.mock("@/lib/copyMarkdown", () => ({ copyMarkdown: clipboard.markdown }));
+// Set to stand in for the transcript's scroll state; unset, the real one is used.
+const scroll = vi.hoisted(() => ({
+  state: null as { isAtBottom: boolean; scrollToBottom: (behavior: string) => void } | null,
+}));
+vi.mock("use-stick-to-bottom", async (importOriginal) => {
+  const original = await importOriginal<typeof StickToBottomModule>();
+  return {
+    ...original,
+    useStickToBottomContext: () => scroll.state ?? original.useStickToBottomContext(),
+  };
+});
 
 const BUBBLES: Bubble[] = [
   { kind: "user", itemId: "u1", content: [{ type: "input_text", text: "Fix the parser" }] },
@@ -63,6 +75,7 @@ const command = (label: string) => {
 
 afterEach(() => {
   cleanup();
+  scroll.state = null;
   vi.clearAllMocks();
   useChatStore.setState({ blocks: [], conversationId: null });
   writePeerSessionMessageDisplay("collapse");
@@ -95,6 +108,62 @@ describe("TranscriptPaletteCommands", () => {
     expect(clipboard.text).toHaveBeenLastCalledWith("Fix the parser");
     await act(async () => command("Copy link to latest prompt").run());
     expect(clipboard.text).toHaveBeenLastCalledWith(expect.stringContaining("message=u1"));
+  });
+
+  it("links the latest response, and copies what shows when run, not when listed", async () => {
+    const { rerender } = render(
+      <TranscriptPaletteCommands conversationId="c1" bubbles={BUBBLES} />,
+      {
+        wrapper: withFlag(true),
+      },
+    );
+    await act(async () => command("Copy link to latest response").run());
+    expect(clipboard.text).toHaveBeenLastCalledWith(expect.stringContaining("r1"));
+
+    // New text with the same availability keeps the rows, and Copy reads the text then.
+    const listed = command("Copy latest response");
+    const edited = BUBBLES.map((bubble) =>
+      bubble.kind === "assistant"
+        ? {
+            ...bubble,
+            items: [{ kind: "text", text: "Done, and tested." } as (typeof bubble.items)[0]],
+          }
+        : bubble,
+    );
+    rerender(<TranscriptPaletteCommands conversationId="c1" bubbles={edited} />);
+    expect(command("Copy latest response")).toBe(listed);
+    await act(async () => listed.run());
+    expect(clipboard.markdown).toHaveBeenLastCalledWith("Done, and tested.");
+
+    // A newer response with the same availability keeps the link row, which links it then.
+    const listedLink = command("Copy link to latest response");
+    const newer = edited.map((bubble) =>
+      bubble.kind === "assistant" ? { ...bubble, responseId: "r2" } : bubble,
+    );
+    rerender(<TranscriptPaletteCommands conversationId="c1" bubbles={newer} />);
+    expect(command("Copy link to latest response")).toBe(listedLink);
+    await act(async () => listedLink.run());
+    expect(clipboard.text).toHaveBeenLastCalledWith(expect.stringContaining("r2"));
+  });
+
+  it("scrolls to the newest message as the transcript's arrow does, greyed once there", () => {
+    const scrollToBottom = vi.fn();
+    scroll.state = { isAtBottom: false, scrollToBottom };
+    const { rerender } = render(
+      <TranscriptPaletteCommands conversationId="c1" bubbles={BUBBLES} />,
+      {
+        wrapper: withFlag(true),
+      },
+    );
+    act(() => command("Scroll to newest message").run());
+    expect(scrollToBottom).toHaveBeenCalledWith("instant");
+
+    scroll.state = { isAtBottom: true, scrollToBottom };
+    rerender(<TranscriptPaletteCommands conversationId="c1" bubbles={BUBBLES} />);
+    expect(command("Scroll to newest message").availability).toEqual({
+      available: false,
+      reason: AT_NEWEST_MESSAGE,
+    });
   });
 
   it("forks from the latest response through the fork dialog", () => {

@@ -13,14 +13,13 @@ the session's own actions.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Page, expect
 
 from tests._helpers.compat import (
     COMPAT_SERVER_VERSION_ENV,
@@ -31,7 +30,8 @@ from tests._helpers.compat import (
     server_pythonpath,
 )
 from tests._helpers.live_server import isolated_local_server
-from tests.e2e_ui.conftest import _BUILD_OUTPUT, _REPO_ROOT, fetch_with_retry
+from tests.e2e_ui._quick_pick_palette import enable_quick_pick_palette, run_palette_command
+from tests.e2e_ui.conftest import _BUILD_OUTPUT, _REPO_ROOT
 
 _PALETTE_INPUT = "command-palette-input"
 # "Go to Settings" navigates to /settings, which redirects to the general section.
@@ -125,36 +125,13 @@ def test_flag_on_runs_the_quick_pick_palette(page: Page, quick_pick_server: str)
     expect(page.get_by_test_id(_PALETTE_INPUT)).to_have_count(0)
 
 
-def _enable_quick_pick(page: Page) -> None:
-    """Report ``quick_pick_palette`` on from ``/v1/info``, for the shared seeded server."""
-
-    def info(route: Route) -> None:
-        response = fetch_with_retry(route)
-        body = response.json()
-        body["features"] = {**(body.get("features") or {}), "quick_pick_palette": True}
-        route.fulfill(response=response, body=json.dumps(body))
-
-    page.route("**/v1/info", info)
-
-
-def _run_command(page: Page, query: str, name: str) -> None:
-    """Open ⌘K, filter to ``query`` and run the option named ``name``."""
-    page.keyboard.press("ControlOrMeta+k")
-    palette_input = page.get_by_role("combobox", name="Command palette")
-    expect(palette_input).to_be_focused(timeout=10_000)
-    palette_input.fill(query)
-    first = page.get_by_role("dialog").get_by_role("option").first
-    expect(first).to_contain_text(name)
-    page.keyboard.press("Enter")
-
-
 def test_quick_pick_on_an_open_session(
     request: pytest.FixtureRequest, seeded_session: tuple[str, str]
 ) -> None:
     """Theme preview and selection, Go to Session focus, and a session action."""
     base_url, session_id = seeded_session
     page: Page = request.getfixturevalue("page")
-    _enable_quick_pick(page)
+    enable_quick_pick_palette(page)
     page.goto(f"{base_url}/c/{session_id}")
     composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible(timeout=30_000)
@@ -163,7 +140,7 @@ def test_quick_pick_on_an_open_session(
     original_theme = root.get_attribute("data-theme")
 
     # Moving through Select theme… previews each palette; Escape restores the original.
-    _run_command(page, "select theme", "Select theme…")
+    run_palette_command(page, "select theme", "Select theme…")
     theme_input = page.get_by_role("combobox", name="Select theme")
     expect(theme_input).to_be_focused(timeout=10_000)
     theme_input.fill("dracula")
@@ -180,7 +157,7 @@ def test_quick_pick_on_an_open_session(
         expect(root).to_have_attribute("data-theme", original_theme)
 
     # Enter keeps the chosen palette, across a reload.
-    _run_command(page, "select theme", "Select theme…")
+    run_palette_command(page, "select theme", "Select theme…")
     expect(theme_input).to_be_focused(timeout=10_000)
     theme_input.fill("nord")
     expect(root).to_have_attribute("data-theme", "nord")
@@ -193,7 +170,7 @@ def test_quick_pick_on_an_open_session(
 
     # Go to Session… hands focus to the switcher, and Escape returns it to the composer.
     composer.focus()
-    _run_command(page, "go to session", "Go to Session…")
+    run_palette_command(page, "go to session", "Go to Session…")
     switcher = page.get_by_role("combobox", name="Switch session")
     expect(switcher).to_be_focused(timeout=10_000)
     page.keyboard.press("Escape")
@@ -201,7 +178,7 @@ def test_quick_pick_on_an_open_session(
     expect(composer).to_be_focused()
 
     # The open session's actions run from ⌘K: Rename opens its dialog, focused on the name.
-    _run_command(page, "rename session", "Rename session")
+    run_palette_command(page, "rename session", "Rename session")
     rename = page.get_by_role("dialog", name="Rename session")
     expect(rename).to_be_visible(timeout=10_000)
     expect(rename.get_by_role("textbox", name="Session name")).to_be_focused()
