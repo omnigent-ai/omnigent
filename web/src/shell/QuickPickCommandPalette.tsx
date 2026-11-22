@@ -7,6 +7,10 @@ import { useStore } from "zustand";
 import { XIcon } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import {
+  openRecentSessionSwitcher,
+  useClaimRecentSessionChord,
+} from "@/hooks/useRecentSessionSwitch";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -124,6 +128,11 @@ export function QuickPickCommandPalette({
   });
   const { query, debouncedQuery, titleSearch, contentSearch } = search;
   const close = (): void => onOpenChange(false);
+  // ⌃] / ⌃[ close the palette and open the held recent-session switcher in its place.
+  useClaimRecentSessionChord(open, (direction) => {
+    close();
+    openRecentSessionSwitcher(direction, { holding: true, navigate });
+  });
   const actions = useAppCommands({
     onToggleLeftSidebar,
     onToggleRightSidebar,

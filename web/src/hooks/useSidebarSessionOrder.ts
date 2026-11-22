@@ -89,12 +89,15 @@ export function stepSidebarSession(
   navigate: (path: string) => void,
 ): boolean {
   const { orderedSessionIds } = useSidebarSessionOrderStore.getState();
-  const current = currentSidebarSessionId();
-  const target = steppedSessionId(orderedSessionIds, current, direction);
+  const target = steppedSessionId(orderedSessionIds, currentSidebarSessionId(), direction);
   if (!target) return false;
-  if (target !== current) {
-    navigate(`/c/${target}`);
-    useSidebarSessionOrderStore.setState({ pendingSessionId: target });
-  }
+  openSidebarSession(target, navigate);
   return true;
+}
+
+/** Opens `sessionId` from a shortcut, unless it's already the current one; see `pendingSessionId`. */
+export function openSidebarSession(sessionId: string, navigate: (path: string) => void): void {
+  if (sessionId === currentSidebarSessionId()) return;
+  navigate(`/c/${sessionId}`);
+  useSidebarSessionOrderStore.setState({ pendingSessionId: sessionId });
 }

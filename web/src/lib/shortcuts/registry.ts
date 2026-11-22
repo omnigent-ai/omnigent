@@ -347,6 +347,22 @@ const APP_BINDINGS = {
       ),
     flag: "quick_pick_palette",
   },
+  // Hold Control and press ] or [ to walk recently visited sessions, then release to switch.
+  // macOS only: elsewhere Ctrl is the command key, and Ctrl+[ and Ctrl+] are taken.
+  "session.recent": {
+    group: "navigation",
+    paletteCommand: "recent-session",
+    label: "Switch to recent session",
+    chords: (environment) => (environment.mac ? [{ ctrl: true, code: "BracketRight" }] : []),
+    flag: "quick_pick_palette",
+  },
+  "session.recentReverse": {
+    group: "navigation",
+    paletteExempt: "It steps back while the switcher is held; Switch to recent session opens it.",
+    label: "Switch to recent session (reverse)",
+    chords: (environment) => (environment.mac ? [{ ctrl: true, code: "BracketLeft" }] : []),
+    flag: "quick_pick_palette",
+  },
   // QuickPickShortcutHost runs these browser chords; the desktop menu keeps its own.
   "session.pin": {
     group: "general",

@@ -1,10 +1,11 @@
 // ⌘K's commands that move between sessions: one step down or up the sidebar's list, as the
-// numbered session shortcuts count it, and back to the session that was active last.
+// numbered session shortcuts count it, and the recent-session switcher.
 
 import { ArrowDownIcon, ArrowUpIcon, HistoryIcon } from "lucide-react";
 import { useContext, useMemo } from "react";
 
 import type { Conversation } from "@/hooks/useConversations";
+import { openRecentSessionSwitcher } from "@/hooks/useRecentSessionSwitch";
 import { SidebarDataContext } from "@/hooks/useSidebarData";
 import {
   type SessionStepDirection,
@@ -64,11 +65,14 @@ export function useSessionNavigationCommands(): PaletteCommand[] {
       {
         id: "recent-session",
         label: "Switch to recent session",
+        shortcut: "session.recent",
         icon: HistoryIcon,
-        keywords: ["last", "previous", "back", "recent", "toggle", "session"],
+        keywords: ["last", "previous", "back", "recent", "toggle", "session", "switcher"],
         availability: recentId ? AVAILABLE : HIDDEN,
+        // The switcher, one step back through the visits, opens once the palette has closed.
+        movesFocus: true,
         run: () => {
-          if (recentId) navigate(`/c/${recentId}`);
+          openRecentSessionSwitcher(1, { holding: false, navigate });
         },
       },
     ];

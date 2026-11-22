@@ -28,6 +28,8 @@ terminal.splitRight | Split terminal right | chords=mod+alt+shift+code:Backslash
 terminal.splitDown | Split terminal down | chords=mod+alt+code:Minus | keys=⌘ ⌥ - | aria=Meta+Alt+- | editor=Mod-Alt-- | matches=true
 session.next | Next session | chords=ctrl+key:Tab+exact ctrl+alt+shift+key:ArrowDown+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Alt-Shift-ArrowDown | matches=true true
 session.previous | Previous session | chords=ctrl+shift+key:Tab+exact ctrl+alt+shift+key:ArrowUp+exact | keys=⌃ ⇧ Tab | aria=Control+Shift+Tab | editor=Ctrl-Shift-Tab Ctrl-Alt-Shift-ArrowUp | matches=true true
+session.recent | Switch to recent session | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
+session.recentReverse | Switch to recent session (reverse) | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 session.pin | Pin or unpin current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.archive | Archive current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.fork | Fork current session | chords=- | keys=- | aria=- | editor=- | matches=-
@@ -131,6 +133,8 @@ terminal.splitRight | Split terminal right | chords=mod+alt+shift+code:Backslash
 terminal.splitDown | Split terminal down | chords=mod+alt+code:Minus | keys=⌘ ⌥ - | aria=Meta+Alt+- | editor=Mod-Alt-- | matches=true
 session.next | Next session | chords=ctrl+key:Tab+exact ctrl+alt+shift+key:ArrowDown+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Alt-Shift-ArrowDown | matches=true true
 session.previous | Previous session | chords=ctrl+shift+key:Tab+exact ctrl+alt+shift+key:ArrowUp+exact | keys=⌃ ⇧ Tab | aria=Control+Shift+Tab | editor=Ctrl-Shift-Tab Ctrl-Alt-Shift-ArrowUp | matches=true true
+session.recent | Switch to recent session | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
+session.recentReverse | Switch to recent session (reverse) | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 session.pin | Pin or unpin current session | chords=mod+alt+code:KeyP | keys=⌘ ⌥ P | aria=Meta+Alt+P | editor=Mod-Alt-p | matches=true
 session.archive | Archive current session | chords=mod+shift+key:a | keys=⌘ ⇧ A | aria=Meta+Shift+A | editor=Mod-Shift-a | matches=true
 session.fork | Fork current session | chords=mod+alt+code:KeyF | keys=⌘ ⌥ F | aria=Meta+Alt+F | editor=Mod-Alt-f | matches=true
@@ -234,6 +238,8 @@ terminal.splitRight | Split terminal right | chords=mod+alt+shift+code:Backslash
 terminal.splitDown | Split terminal down | chords=mod+alt+code:Minus | keys=⌘ ⌥ - | aria=Meta+Alt+- | editor=Mod-Alt-- | matches=true
 session.next | Next session | chords=ctrl+alt+shift+key:ArrowDown+exact ctrl+key:Tab+exact | keys=⌃ ⌥ ⇧ ↓ | aria=Control+Alt+Shift+ArrowDown | editor=Ctrl-Alt-Shift-ArrowDown Ctrl-Tab | matches=true true
 session.previous | Previous session | chords=ctrl+alt+shift+key:ArrowUp+exact ctrl+shift+key:Tab+exact | keys=⌃ ⌥ ⇧ ↑ | aria=Control+Alt+Shift+ArrowUp | editor=Ctrl-Alt-Shift-ArrowUp Ctrl-Shift-Tab | matches=true true
+session.recent | Switch to recent session | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
+session.recentReverse | Switch to recent session (reverse) | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 session.pin | Pin or unpin current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.archive | Archive current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.fork | Fork current session | chords=- | keys=- | aria=- | editor=- | matches=-
@@ -337,6 +343,8 @@ terminal.splitRight | Split terminal right | chords=mod+alt+shift+code:Backslash
 terminal.splitDown | Split terminal down | chords=mod+alt+code:Minus | keys=⌘ ⌥ - | aria=Meta+Alt+- | editor=Mod-Alt-- | matches=true
 session.next | Next session | chords=ctrl+alt+shift+key:ArrowDown+exact ctrl+key:Tab+exact | keys=⌃ ⌥ ⇧ ↓ | aria=Control+Alt+Shift+ArrowDown | editor=Ctrl-Alt-Shift-ArrowDown Ctrl-Tab | matches=true true
 session.previous | Previous session | chords=ctrl+alt+shift+key:ArrowUp+exact ctrl+shift+key:Tab+exact | keys=⌃ ⌥ ⇧ ↑ | aria=Control+Alt+Shift+ArrowUp | editor=Ctrl-Alt-Shift-ArrowUp Ctrl-Shift-Tab | matches=true true
+session.recent | Switch to recent session | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
+session.recentReverse | Switch to recent session (reverse) | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 session.pin | Pin or unpin current session | chords=mod+alt+code:KeyP | keys=⌘ ⌥ P | aria=Meta+Alt+P | editor=Mod-Alt-p | matches=true
 session.archive | Archive current session | chords=mod+shift+key:a | keys=⌘ ⇧ A | aria=Meta+Shift+A | editor=Mod-Shift-a | matches=true
 session.fork | Fork current session | chords=mod+alt+code:KeyF | keys=⌘ ⌥ F | aria=Meta+Alt+F | editor=Mod-Alt-f | matches=true
@@ -440,6 +448,8 @@ terminal.splitRight | Split terminal right | chords=mod+alt+shift+code:Backslash
 terminal.splitDown | Split terminal down | chords=mod+alt+code:Minus | keys=Ctrl Alt - | aria=Control+Alt+- | editor=Mod-Alt-- | matches=true
 session.next | Next session | chords=ctrl+key:Tab+exact ctrl+alt+shift+key:ArrowDown+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Alt-Shift-ArrowDown | matches=true true
 session.previous | Previous session | chords=ctrl+shift+key:Tab+exact ctrl+alt+shift+key:ArrowUp+exact | keys=Ctrl ⇧ Tab | aria=Control+Shift+Tab | editor=Ctrl-Shift-Tab Ctrl-Alt-Shift-ArrowUp | matches=true true
+session.recent | Switch to recent session | chords=- | keys=- | aria=- | editor=- | matches=-
+session.recentReverse | Switch to recent session (reverse) | chords=- | keys=- | aria=- | editor=- | matches=-
 session.pin | Pin or unpin current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.archive | Archive current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.fork | Fork current session | chords=- | keys=- | aria=- | editor=- | matches=-
@@ -543,6 +553,8 @@ terminal.splitRight | Split terminal right | chords=mod+alt+shift+code:Backslash
 terminal.splitDown | Split terminal down | chords=mod+alt+code:Minus | keys=Ctrl Alt - | aria=Control+Alt+- | editor=Mod-Alt-- | matches=true
 session.next | Next session | chords=ctrl+key:Tab+exact ctrl+alt+shift+key:ArrowDown+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Alt-Shift-ArrowDown | matches=true true
 session.previous | Previous session | chords=ctrl+shift+key:Tab+exact ctrl+alt+shift+key:ArrowUp+exact | keys=Ctrl ⇧ Tab | aria=Control+Shift+Tab | editor=Ctrl-Shift-Tab Ctrl-Alt-Shift-ArrowUp | matches=true true
+session.recent | Switch to recent session | chords=- | keys=- | aria=- | editor=- | matches=-
+session.recentReverse | Switch to recent session (reverse) | chords=- | keys=- | aria=- | editor=- | matches=-
 session.pin | Pin or unpin current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.archive | Archive current session | chords=mod+shift+key:a | keys=Ctrl ⇧ A | aria=Control+Shift+A | editor=Mod-Shift-a | matches=true
 session.fork | Fork current session | chords=- | keys=- | aria=- | editor=- | matches=-
@@ -646,6 +658,8 @@ terminal.splitRight | Split terminal right | chords=mod+alt+shift+code:Backslash
 terminal.splitDown | Split terminal down | chords=mod+alt+code:Minus | keys=Ctrl Alt - | aria=Control+Alt+- | editor=Mod-Alt-- | matches=true
 session.next | Next session | chords=ctrl+alt+shift+key:ArrowDown+exact ctrl+key:Tab+exact | keys=Ctrl Alt ⇧ ↓ | aria=Control+Alt+Shift+ArrowDown | editor=Ctrl-Alt-Shift-ArrowDown Ctrl-Tab | matches=true true
 session.previous | Previous session | chords=ctrl+alt+shift+key:ArrowUp+exact ctrl+shift+key:Tab+exact | keys=Ctrl Alt ⇧ ↑ | aria=Control+Alt+Shift+ArrowUp | editor=Ctrl-Alt-Shift-ArrowUp Ctrl-Shift-Tab | matches=true true
+session.recent | Switch to recent session | chords=- | keys=- | aria=- | editor=- | matches=-
+session.recentReverse | Switch to recent session (reverse) | chords=- | keys=- | aria=- | editor=- | matches=-
 session.pin | Pin or unpin current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.archive | Archive current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.fork | Fork current session | chords=- | keys=- | aria=- | editor=- | matches=-
@@ -749,6 +763,8 @@ terminal.splitRight | Split terminal right | chords=mod+alt+shift+code:Backslash
 terminal.splitDown | Split terminal down | chords=mod+alt+code:Minus | keys=Ctrl Alt - | aria=Control+Alt+- | editor=Mod-Alt-- | matches=true
 session.next | Next session | chords=ctrl+alt+shift+key:ArrowDown+exact ctrl+key:Tab+exact | keys=Ctrl Alt ⇧ ↓ | aria=Control+Alt+Shift+ArrowDown | editor=Ctrl-Alt-Shift-ArrowDown Ctrl-Tab | matches=true true
 session.previous | Previous session | chords=ctrl+alt+shift+key:ArrowUp+exact ctrl+shift+key:Tab+exact | keys=Ctrl Alt ⇧ ↑ | aria=Control+Alt+Shift+ArrowUp | editor=Ctrl-Alt-Shift-ArrowUp Ctrl-Shift-Tab | matches=true true
+session.recent | Switch to recent session | chords=- | keys=- | aria=- | editor=- | matches=-
+session.recentReverse | Switch to recent session (reverse) | chords=- | keys=- | aria=- | editor=- | matches=-
 session.pin | Pin or unpin current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.archive | Archive current session | chords=mod+shift+key:a | keys=Ctrl ⇧ A | aria=Control+Shift+A | editor=Mod-Shift-a | matches=true
 session.fork | Fork current session | chords=- | keys=- | aria=- | editor=- | matches=-

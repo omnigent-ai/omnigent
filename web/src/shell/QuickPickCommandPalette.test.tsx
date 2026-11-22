@@ -11,6 +11,12 @@ import {
   usePaletteCommandsStore,
 } from "@/store/paletteCommands";
 
+import {
+  useRecentSessionHotkey,
+  useRecentSessionSwitchStore,
+} from "@/hooks/useRecentSessionSwitch";
+import { useSidebarSessionOrderStore } from "@/hooks/useSidebarSessionOrder";
+
 import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
 
 // Behavior specific to the QuickPick palette; CommandPalette.quickPick.test.tsx runs
@@ -64,6 +70,29 @@ function renderPalette() {
 }
 
 describe("QuickPickCommandPalette", () => {
+  it("hands ⌃] to the recent-session switcher, held, in the palette's place", () => {
+    useSidebarSessionOrderStore.setState({ orderedSessionIds: ["a", "b"], activeSessionId: "a" });
+    useRecentSessionSwitchStore.setState({
+      history: ["a", "b"],
+      readLiveSessionIds: () => new Set(["a", "b"]),
+      sessionsKnown: true,
+      switcher: null,
+    });
+    function RecentSessionHotkey() {
+      useRecentSessionHotkey(true);
+      return null;
+    }
+    render(<RecentSessionHotkey />);
+    const { input, onOpenChange } = renderPalette();
+    fireEvent.keyDown(input, { key: "]", code: "BracketRight", ctrlKey: true });
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(useRecentSessionSwitchStore.getState().switcher).toMatchObject({
+      holding: true,
+      selectedId: "b",
+    });
+    act(() => useRecentSessionSwitchStore.setState({ switcher: null, chordOwner: null }));
+  });
+
   it("lines session labels up with action labels through a blank icon slot", () => {
     renderPalette();
     const session = screen.getByRole("option", { name: /Fix the parser/ });
