@@ -103,6 +103,40 @@ describe("createPastedTextLedger", () => {
     expect(valueOf("quote")).toBe(`QQx${FIRST}yz`);
   });
 
+  it("lets other restores run once a waiting restore's chip is removed", () => {
+    const { shown, ledger, owner, context, paste, valueOf } = twoInputOwner("tail", "");
+    const quoted = paste("quote", FIRST, 0);
+    const tailPaste = paste("tail", SECOND, 4);
+    // The owner has shown both chips, so removing one is a real removal.
+    ledger.sync(context());
+    shown.delete("quote");
+    expect(ledger.insertAsText(quoted, context())).toBe(true);
+
+    owner.files = owner.files.filter((file) => file !== quoted);
+    ledger.sync(context());
+    ledger.completePendingRestore(context());
+
+    expect(ledger.insertAsText(tailPaste, context())).toBe(true);
+    expect(valueOf("tail")).toBe(`tail${SECOND}`);
+    expect(valueOf("quote")).toBe("");
+  });
+
+  it("lets other restores run once a waiting restore fails", () => {
+    const { inputs, shown, ledger, owner, context, paste } = twoInputOwner("tail", "");
+    const quoted = paste("quote", FIRST, 0);
+    const tailPaste = paste("tail", SECOND, 4);
+    shown.delete("quote");
+    expect(ledger.insertAsText(quoted, context())).toBe(true);
+
+    // The input shows again but refuses the edit, so the waiting restore keeps its chip.
+    shown.add("quote");
+    inputs.quote.insertText = () => false;
+    ledger.completePendingRestore(context());
+    expect(owner.files).toContain(quoted);
+
+    expect(ledger.insertAsText(tailPaste, context())).toBe(true);
+  });
+
   it("refuses a second restore while one waits for its input, then finishes the first", () => {
     const { shown, ledger, owner, context, paste, valueOf } = twoInputOwner("tail", "");
     const quoted = paste("quote", FIRST, 0);

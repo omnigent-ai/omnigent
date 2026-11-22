@@ -128,9 +128,16 @@ export function createPastedTextLedger(environment: PastedTextEnvironment): Past
     landed.has(file) && !context.files.includes(file);
 
   const sync = (context: PastedTextContext) => {
-    if (pastes.length === 0) return;
+    if (pastes.length === 0) {
+      pendingRestore = null;
+      return;
+    }
     for (const paste of pastes) if (context.files.includes(paste.file)) landed.add(paste.file);
     const kept = mapped(context).filter((paste) => !isGone(paste.file, context));
+    // A waiting restore whose chip went away has nothing left to restore.
+    if (pendingRestore !== null && !kept.some((paste) => paste.file === pendingRestore)) {
+      pendingRestore = null;
+    }
     const changed =
       kept.length !== pastes.length || kept.some((paste, index) => paste !== pastes[index]);
     for (const paste of kept) remember(paste.inputId, context.valueOf(paste.inputId));
@@ -144,7 +151,10 @@ export function createPastedTextLedger(environment: PastedTextEnvironment): Past
     // Offsets are brought up to now once, before the restore edits the draft.
     const current = mapped(context);
     const paste = current.find((each) => each.file === file);
-    if (!paste || isGone(file, context) || context.locked) return false;
+    if (!paste || isGone(file, context) || context.locked) {
+      if (pendingRestore === file && (!paste || isGone(file, context))) pendingRestore = null;
+      return false;
+    }
     // One restore waits for its input at a time; another runs once it has finished.
     if (pendingRestore !== null && pendingRestore !== file) return false;
     // A reply quote removed since the paste sends the text to the end of the tail.
