@@ -43,6 +43,7 @@ from omnigent.entities.project_ticket import (
     UpdateTicketStages,
     default_ticket_stages,
 )
+from omnigent.entities.project_ticket_legacy import legacy_ticket_notes
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
@@ -95,9 +96,6 @@ def _ticket(row: SqlProjectTicket) -> dict[str, Any]:
         "description": row.description,
         "stage_id": _stage_id(row),
         "tags": row.tags,
-        "completion_summary": row.completion_summary,
-        "plan": row.plan or "",
-        "review_summary": row.review_summary or "",
         "lead_session_id": row.lead_session_id,
         "latest_update": row.latest_update,
         "comment_count": row.comment_count,
@@ -107,6 +105,12 @@ def _ticket(row: SqlProjectTicket) -> dict[str, Any]:
 
 
 def _event(row: SqlProjectTicketEvent) -> dict[str, Any]:
+    payload = row.payload
+    changes = payload.get("changes")
+    if isinstance(changes, dict) and "text" not in payload:
+        notes = legacy_ticket_notes(changes)
+        if notes:
+            payload = {**payload, "text": "\n\n".join(notes.values())}
     return {
         "id": row.id,
         "ticket_id": row.ticket_id,
@@ -116,7 +120,7 @@ def _event(row: SqlProjectTicketEvent) -> dict[str, Any]:
         "user_id": row.user_id,
         "session_id": row.session_id,
         "agent_id": row.agent_id,
-        "payload": row.payload,
+        "payload": payload,
         "created_at": row.created_at,
         "notification_pending": row.notification_state == NOTIFICATION_PENDING,
     }
@@ -208,7 +212,6 @@ class ProjectTicketStore:
                 status=LEGACY_STATUS_CODES.get(stage.id, 0),
                 stage_id=stage.id,
                 tags=[tag.model_dump(exclude_none=True) for tag in body.tags],
-                completion_summary=None,
                 latest_update="Created the ticket",
                 comment_count=0,
                 next_event_position=0,
@@ -455,9 +458,7 @@ class ProjectTicketStore:
                 row.status = LEGACY_STATUS_CODES.get(target.id, 2 if target.is_complete else 0)
             if changes:
                 row.latest_update = (
-                    body.completion_summary
-                    or body.review_summary
-                    or (f"Moved to {target.name}" if target is not None else "Updated the ticket")
+                    f"Moved to {target.name}" if target is not None else "Updated the ticket"
                 )[:300]
                 self._append(
                     session,

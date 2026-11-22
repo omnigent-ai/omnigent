@@ -78,19 +78,19 @@ TICKET = "c" * 32
             {
                 "ticket_id": TICKET,
                 "stage_id": "planning",
-                "plan": "Agreed scope",
+                "description": "Agreed scope",
                 "lead_session_id": SOURCE,
             },
             "PATCH",
             f"/{TICKET}",
-            {"stage_id": "planning", "plan": "Agreed scope", "lead_session_id": SOURCE},
+            {"stage_id": "planning", "description": "Agreed scope", "lead_session_id": SOURCE},
         ),
         (
             "sys_ticket_update",
-            {"ticket_id": TICKET, "stage_id": "review", "review_summary": "Check the demo"},
+            {"ticket_id": TICKET, "stage_id": "review", "comment": "Check the demo"},
             "PATCH",
             f"/{TICKET}",
-            {"stage_id": "review", "review_summary": "Check the demo"},
+            {"stage_id": "review", "comment": "Check the demo"},
         ),
     ],
 )
@@ -167,6 +167,10 @@ async def test_get_returns_paged_activity_outputs_and_sessions():
         ("sys_ticket_create", {"title": " ", "project_id": PROJECT}),
         ("sys_ticket_update", {"ticket_id": TICKET, "stage_id": "../other"}),
         ("sys_ticket_update", {"ticket_id": TICKET, "stage_id": "x" * 65}),
+        ("sys_ticket_update", {"ticket_id": TICKET, "plan": "Old approach"}),
+        ("sys_ticket_update", {"ticket_id": TICKET, "review_summary": "Old review"}),
+        ("sys_ticket_update", {"ticket_id": TICKET, "completion_summary": "Old result"}),
+        ("sys_ticket_update", {"ticket_id": TICKET, "review_action": "approve"}),
         ("sys_ticket_link", {"ticket_id": TICKET, "related_ticket_id": "../../other"}),
         ("sys_ticket_get", {"ticket_id": TICKET, "related_after": "../other"}),
         ("sys_ticket_get", {"ticket_id": "../../other"}),
@@ -203,5 +207,16 @@ def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
     assert len(TICKET_TOOLS) == 7
     for tool in TICKET_TOOLS.values():
         properties = tool().get_schema()["function"]["parameters"]["properties"]
-        assert not {"project_id", "notify_orchestrator", "version"} & properties.keys()
+        assert (
+            not {
+                "project_id",
+                "notify_orchestrator",
+                "version",
+                "plan",
+                "review_summary",
+                "completion_summary",
+                "review_action",
+            }
+            & properties.keys()
+        )
         assert "delete" not in tool.name()

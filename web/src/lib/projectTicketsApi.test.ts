@@ -100,13 +100,19 @@ it.each([false, true])(
       `/v1/projects/project/tickets?limit=50&${legacy ? "status" : "stage_id"}=${stageId}&after=previous`,
     );
     expect(
-      (await updateTicket("project", "ticket", { stage_id: stageId, plan: "Saved plan" }, legacy))
-        .stage_id,
+      (
+        await updateTicket(
+          "project",
+          "ticket",
+          { stage_id: stageId, description: "Saved approach" },
+          legacy,
+        )
+      ).stage_id,
     ).toBe(stageId);
     const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({
       [legacy ? "status" : "stage_id"]: stageId,
-      plan: "Saved plan",
+      description: "Saved approach",
     });
     expect((await getTicket("project", "ticket")).stage_id).toBe(stageId);
   },

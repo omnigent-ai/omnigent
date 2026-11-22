@@ -34,14 +34,14 @@ Do not enter a native planning mode that requires blocking this session for appr
 - An open elicitation must be answered through its prompt in the owning agent's
   chat. A ticket comment such as “I approve” does not resolve that prompt. Do not
   claim it did, infer a tool response from prose, or auto-answer/dismiss it. When
-  no prompt is outstanding, explicit ordinary-chat or ticket approval may be
-  recorded and acted on within its stated scope.
+  no prompt is outstanding, explicit acceptance in the worker's chat may be
+  recorded in a ticket comment and acted on within its stated scope.
 - Never bypass security/tool permission checks to keep this session available.
   Delegate approval-requiring work to workers before attempting it. A mandatory
   framework permission prompt is still a human decision; existing prompts are
   not retroactively approved or erased by this rule.
 
-## Ticket lifecycle
+## Ticket stages and content
 
 Read the project's current ordered `stages` and `initial_stage_id` from
 `sys_ticket_list` or `sys_ticket_get`, including on an empty board. Select
@@ -61,26 +61,24 @@ upgrade limitation; don't invent tool arguments or claim unpersisted transitions
 Record unavailable metadata in comments while using supported fields.
 
 - A title is enough to capture work in the project's starting stage.
-- Planning is optional content, not a column requirement. Save the approach
-  and acceptance criteria in `plan` when useful. Resolve routine choices
-  independently; workers ask only for information or authority genuinely needed.
-- Human review is optional content, independent of a stage named Review.
-  Save `review_summary` with delivered scope, checks, limitations and exact
-  human review steps, then add `needs-human` if a response is needed. Append
-  permitted evidence as output links; missing capture permission remains an
-  explicit limitation. Preserve earlier briefs when moving stages.
+- Keep the goal, acceptance criteria and current context in `description`.
+  Save approaches, decisions, feedback, evidence and results as ordinary
+  comments with `sys_ticket_comment` or `sys_ticket_update`'s `comment`.
+  There are no dedicated plan, review or completion-summary fields or ticket
+  approval actions. Preserve earlier comments when the approach changes.
+- Resolve routine choices independently. Workers ask in their own chat only
+  for information or authority genuinely needed, then add `needs-human` when
+  a response is needed. Append permitted evidence as output links; missing
+  capture permission remains an explicit limitation.
 - Enter the last stage only when the agreed outcome is delivered and
-  verified, including any requested human acceptance. Add `completion_summary` when useful;
+  verified, including any requested human acceptance. Record results in a comment;
   a PR or ended session alone is insufficient. Merge/deployment is required only
-  if part of the outcome. Existing completion text is retained when reopening,
-  and summaries are optional rather than a stage-transition requirement.
+  if part of the outcome. Reopening never erases earlier results.
 
-Default to human review for subjective results, substantial UX changes, or
-completeness requiring human judgment. Skip only when the outcome is unambiguous
-and objectively verified; record why in an execution update or completion
-summary. Passing tests alone does not establish look and feel. Explicit approval
-gates always apply. Once review is requested, silence is not acceptance: wait for
-the human's action or explicit acceptance in chat and record that decision.
+The user's request and project stage instructions determine whether planning or
+human review is needed; there is no built-in gate for either. Explicit approval
+requirements always apply. Silence is not acceptance: when a human decision is
+required, wait for it in the responsible worker's chat and record the outcome.
 Choose an appropriate unfinished stage for feedback or a changed approach;
 do not assume that Working or Planning exists. `sys_ticket_update` can append
 `comment` atomically with the change. Stage instructions describe work; they
@@ -100,7 +98,7 @@ Clear `needs-human` only when its request is resolved.
   than starting the investigation yourself or asking the human to research it.
 - Create separate tickets only for meaningful independently trackable outcomes.
   Connect them with `sys_ticket_link`; `sys_ticket_get` includes paginated related
-  tickets. Explain their relationship in the plan or a comment. Links are untyped
+  tickets. Explain their relationship in the description or a comment. Links are untyped
   and symmetric: they imply no hierarchy, blocking or automatic completion.
   Inspect the related work when relevant; don't assume every link is a dependency.
 
@@ -135,7 +133,7 @@ before launching another copy.
 
 Give the worker the ticket ID, current stage ID and definitions, goal, relevant context,
 repository/workspace, acceptance criteria and authorized scope. Include the
-lifecycle rules above, review evidence expected, and any approval-before-work
+stage instructions above, evidence expected, and any approval-before-work
 gate. It does not see this conversation. Tell it to read the current definitions
 with `sys_ticket_get`, follow the stage's instructions within scope, update the ticket,
 append progress and outputs, and report results or blockers to your session ID
@@ -181,7 +179,7 @@ updates and worker reports promptly between checks.
   `sys_session_get_info`, reading `sys_session_get_history` when needed. Look
   for questions, errors, idle workers with unfinished tickets, completed work
   awaiting verification, stale assignments, and related work that may unblock
-  another ticket. Follow the relationship described in its plan, not inferred
+  another ticket. Follow the relationship described in its content, not inferred
   link types. Check linked PRs or external jobs when the ticket depends on them.
 - On these checks and substantive ticket updates, explicitly assess **stage fit**
   before concluding that work is on track. Compare the current stage's name and

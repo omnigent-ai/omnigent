@@ -74,15 +74,17 @@ def test_atomic_edits_and_append_only_outputs(board):
     done = tickets.update(
         project.id,
         ticket["id"],
-        UpdateTicket(stage_id="done", completion_summary="Delivered and tested"),
+        UpdateTicket(stage_id="done", comment="Delivered and tested"),
         actor,
     )
-    assert done["completion_summary"] == "Delivered and tested"
+    assert not {"plan", "review_summary", "completion_summary"} & done.keys()
     reopened = tickets.update(
         project.id, ticket["id"], UpdateTicket(stage_id="open", tags=[]), actor
     )
-    assert reopened["completion_summary"] == done["completion_summary"] and reopened["tags"] == []
-    assert len(tickets.events(project.id, ticket["id"], user_id="alice")["data"]) == 8
+    assert reopened["tags"] == []
+    history = tickets.events(project.id, ticket["id"], user_id="alice")["data"]
+    assert len(history) == 9
+    assert history[-2]["payload"] == {"text": "Delivered and tested"}
 
 
 def test_failed_event_write_rolls_back_ticket_and_link_changes(board, monkeypatch):
@@ -298,7 +300,7 @@ async def test_linked_session_deletion_preserves_ticket_and_history(board, db_ur
     assert tickets.events(project.id, ticket["id"], user_id="alice")["data"][:-1] == history
 
 
-def test_plan_review_and_feedback_change_atomically(board, monkeypatch):
+def test_description_stages_and_feedback_change_atomically(board, monkeypatch):
     tickets, _, project = board
     actor = TicketActor("alice")
     ticket = tickets.create(project.id, CreateTicket(title="Build"), actor)
@@ -308,24 +310,24 @@ def test_plan_review_and_feedback_change_atomically(board, monkeypatch):
         ticket_id,
         UpdateTicket(
             stage_id="planning",
-            plan="## Approach\n\n- [ ] Verified outcome",
+            description="## Approach\n\n- [ ] Verified outcome",
             comment="Agreed in chat",
         ),
         actor,
     )
-    assert planning["plan"].startswith("## Approach")
+    assert planning["description"].startswith("## Approach")
     assert planning["comment_count"] == 1
     review = tickets.update(
         project.id,
         ticket_id,
         UpdateTicket(
             stage_id="review",
-            review_summary="Tests passed; please check the layout",
+            comment="Tests passed; please check the layout",
             tags=[{"key": "needs-human"}],
         ),
         actor,
     )
-    assert review["review_summary"] and review["stage_id"] == "review"
+    assert review["comment_count"] == 2 and review["stage_id"] == "review"
     append = tickets._append
 
     def fail_comment(session, project_row, ticket_row, who, kind, payload):
@@ -357,12 +359,14 @@ def test_plan_review_and_feedback_change_atomically(board, monkeypatch):
         ),
         actor,
     )
-    assert (
-        working["review_summary"] == review["review_summary"]
-        and working["plan"] == planning["plan"]
-    )
-    assert working["comment_count"] == 2 and working["tags"] == []
+    assert working["description"] == planning["description"]
+    assert working["comment_count"] == 3 and working["tags"] == []
     events = tickets.events(project.id, ticket_id, user_id="alice")["data"]
+    assert [event["payload"]["text"] for event in events if event["kind"] == "comment"] == [
+        "Agreed in chat",
+        "Tests passed; please check the layout",
+        "Adjust spacing",
+    ]
     assert [event["kind"] for event in events[-2:]] == ["updated", "comment"]
     assert events[-1]["payload"] == {"text": "Adjust spacing"}
 
@@ -458,7 +462,7 @@ def test_stage_edit_reorder_start_and_removal_preserve_ticket_content_and_histor
     tickets.update(
         project.id,
         ticket["id"],
-        UpdateTicket(plan="Plan", review_summary="Review", tags=[{"key": "needs-human"}]),
+        UpdateTicket(description="Approach", comment="Evidence", tags=[{"key": "needs-human"}]),
         actor,
     )
     tickets.comment(project.id, ticket["id"], CommentOnTicket(text="Keep me"), actor)
@@ -513,9 +517,9 @@ def test_stage_edit_reorder_start_and_removal_preserve_ticket_content_and_histor
     )
     moved = tickets.get(project.id, ticket["id"], user_id="alice")
     assert moved["stage_id"] == "resolved"
-    assert moved["completion_summary"] is None
+    assert "completion_summary" not in moved
     assert tickets.get(project.id, sibling["id"], user_id="alice")["stage_id"] == "resolved"
-    for field in ("id", "title", "description", "plan", "review_summary", "tags", "comment_count"):
+    for field in ("id", "title", "description", "tags", "comment_count"):
         assert moved[field] == original[field]
     assert (
         tickets.sessions(project.id, ticket["id"], user_id="alice")["data"][0]["session_id"]
@@ -548,7 +552,7 @@ def test_stage_edit_reorder_start_and_removal_preserve_ticket_content_and_histor
     assert tickets.get(project.id, ticket["id"], user_id="alice")["stage_id"] == "resolved"
 
 
-def test_completion_summary_is_optional_and_stage_moves_preserve_content_and_human_tags(board):
+def test_stage_moves_preserve_ordinary_content_and_human_tags(board):
     tickets, _, project = board
     actor = TicketActor("alice")
     configuration = UpdateTicketStages(
@@ -570,23 +574,25 @@ def test_completion_summary_is_optional_and_stage_moves_preserve_content_and_hum
         )
     completed = tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="verified"), actor)
     assert completed["stage_id"] == "verified"
-    assert completed["completion_summary"] is None
+    assert "completion_summary" not in completed
     assert completed["tags"] == ticket["tags"]
     completed = tickets.update(
         project.id,
         ticket["id"],
-        UpdateTicket(
-            stage_id="verified", completion_summary="Recovery confirmed", review_summary="Evidence"
-        ),
+        UpdateTicket(stage_id="verified", description="Evidence", comment="Recovery confirmed"),
         actor,
     )
     assert completed["tags"] == ticket["tags"]
     reopened = tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="done"), actor)
-    assert reopened["review_summary"] == "Evidence"
-    assert reopened["completion_summary"] == "Recovery confirmed"
+    assert reopened["description"] == "Evidence"
     completed = tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="verified"), actor)
-    assert completed["completion_summary"] == "Recovery confirmed"
+    assert completed["description"] == "Evidence"
     assert completed["tags"] == ticket["tags"]
+    assert [
+        event["payload"]["text"]
+        for event in tickets.events(project.id, ticket["id"], user_id="alice")["data"]
+        if event["kind"] == "comment"
+    ] == ["Recovery confirmed"]
 
 
 def test_reordering_occupied_stages_needs_no_summary_and_preserves_project_boundaries(board):

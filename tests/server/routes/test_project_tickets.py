@@ -237,7 +237,7 @@ async def test_board_api_lifecycle_and_no_deletion(project_client):
     assert (await project_client.get(base, params={"stage_id": "in_progress", "limit": 1})).json()[
         "data"
     ][0]["id"] == ticket["id"]
-    assert (await project_client.patch(path, json={"stage_id": "done"})).status_code == 400
+    assert (await project_client.patch(path, json={"stage_id": "done"})).status_code == 200
     comment = await project_client.post(
         path + "/comments",
         json={
@@ -256,9 +256,19 @@ async def test_board_api_lifecycle_and_no_deletion(project_client):
         "url": "https://git.example.com/org/repo/pull/42",
     }
     completed = await project_client.patch(
-        path, json={"stage_id": "done", "completion_summary": "Tests passed"}
+        path, json={"stage_id": "done", "comment": "Tests passed"}
     )
-    assert completed.json()["completion_summary"] == "Tests passed"
+    assert completed.status_code == 200
+    assert completed.json()["comment_count"] == 2
+    assert completed.json()["tags"] == [{"key": "needs-human", "value": "review"}]
+    assert {"plan", "review_summary", "completion_summary"}.isdisjoint(completed.json())
+    events_before = (await project_client.get(path + "/events")).json()
+    rejected = await project_client.patch(
+        path, json={"description": "Must not be applied", "review_action": "approve"}
+    )
+    assert rejected.status_code == 422
+    assert (await project_client.get(path)).json()["description"] == ""
+    assert (await project_client.get(path + "/events")).json() == events_before
     assert (await project_client.delete(path)).status_code in (404, 405)
     assert (await project_client.delete(f"/v1/projects/{project['id']}")).status_code == 409
     assert (await project_client.get(path)).status_code == 200
@@ -326,7 +336,7 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
             {
                 "ticket_id": ticket["id"],
                 "stage_id": "verifying",
-                "review_summary": "Recovery looks good",
+                "description": "Recovery looks good",
             },
             project_client,
             source,
@@ -342,21 +352,21 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
         )
     )
     assert completed_without_summary["stage_id"] == "resolved"
-    assert completed_without_summary["completion_summary"] is None
+    assert "completion_summary" not in completed_without_summary
     completed = json.loads(
         await execute_ticket_tool(
             "sys_ticket_update",
             {
                 "ticket_id": ticket["id"],
                 "stage_id": "resolved",
-                "completion_summary": "Evidence attached",
+                "comment": "Evidence attached",
             },
             project_client,
             source,
         )
     )
     assert completed["stage_id"] == "resolved"
-    assert completed["review_summary"] == "Recovery looks good"
+    assert completed["description"] == "Recovery looks good"
     for invalid in (
         {**configuration, "stages": [configuration["stages"][0]] * 2},
         {**configuration, "stages": []},
@@ -569,20 +579,20 @@ async def test_lifecycle_related_links_and_lead_api(project_client, db_uri):
     related = (await project_client.post(base, json={"title": "Related work"})).json()
     path, other_path = f"{base}/{ticket['id']}", f"{base}/{related['id']}"
     planned = await project_client.patch(
-        path, json={"stage_id": "planning", "plan": "## Plan\n\n- Acceptance"}
+        path, json={"stage_id": "planning", "description": "## Approach\n\n- Acceptance"}
     )
-    assert planned.status_code == 200 and planned.json()["plan"].startswith("## Plan")
+    assert planned.status_code == 200 and planned.json()["description"].startswith("## Approach")
     assert (await project_client.patch(path, json={"stage_id": "review"})).status_code == 200
     review = await project_client.patch(
-        path, json={"stage_id": "review", "review_summary": "Verify the demo"}
+        path, json={"stage_id": "review", "comment": "Verify the demo"}
     )
     assert review.status_code == 200
     changed = await project_client.patch(
         path, json={"stage_id": "in_progress", "comment": "Adjust the layout"}
     )
     assert (
-        changed.json()["review_summary"] == "Verify the demo"
-        and changed.json()["comment_count"] == 1
+        changed.json()["description"] == "## Approach\n\n- Acceptance"
+        and changed.json()["comment_count"] == 2
     )
     for source, target in ((path, related["id"]), (other_path, ticket["id"])):
         assert (

@@ -185,15 +185,12 @@ class UpdateTicket(BaseModel):
         description="A stage ID from this project's ticket list or stage definitions.",
     )
     tags: list[TicketTag] | None = Field(default=None, max_length=20)
-    completion_summary: str | None = Field(default=None, min_length=1, max_length=1500)
-    plan: str | None = Field(default=None, max_length=3000)
-    review_summary: str | None = Field(default=None, max_length=1500)
     lead_session_id: str | None = Field(
         default=None, description="An already linked session to contact; null clears the lead."
     )
     comment: str | None = Field(default=None, min_length=1, max_length=2000)
 
-    @field_validator("title", "completion_summary", "comment")
+    @field_validator("title", "comment")
     @classmethod
     def trim_nonempty(cls, value: str | None) -> str | None:
         if value is not None and not value.strip():

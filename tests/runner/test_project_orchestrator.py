@@ -50,6 +50,9 @@ async def test_project_guidance_and_designated_role_in_native_and_sdk_prompts(ro
 
 
 def test_stage_fit_contract_requires_a_decision_without_phase_or_approval_shortcuts():
+    assert "ordinary comments, not dedicated" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "There is no built-in planning or review gate" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "responsible agent's chat" in PROJECT_TICKET_WORK_INSTRUCTION
     assert "stage fit" in PROJECT_TICKET_WORK_INSTRUCTION
     assert "actual work and next step" in PROJECT_TICKET_WORK_INSTRUCTION
     assert "ticket owner" in PROJECT_TICKET_WORK_INSTRUCTION

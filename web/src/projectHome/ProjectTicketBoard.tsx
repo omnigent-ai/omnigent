@@ -18,12 +18,7 @@ import { Link } from "@/lib/routing";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import type { ProjectTicket, TicketStage } from "@/lib/projectTicketsApi";
 import { cn } from "@/lib/utils";
-import {
-  CompleteTicketDialog,
-  ReviewTicketDialog,
-  TicketError,
-  TicketTags,
-} from "./TicketControls";
+import { TicketError, TicketTags } from "./TicketControls";
 import { TicketStageBadge } from "./TicketStageAppearance";
 import {
   useRelatedTickets,
@@ -73,10 +68,6 @@ function TicketBoard({
   overlayClearance?: string;
 }) {
   const [dragged, setDragged] = useState<ProjectTicket | null>(null);
-  const [completing, setCompleting] = useState<{ ticket: ProjectTicket; stageId: string } | null>(
-    null,
-  );
-  const [reviewing, setReviewing] = useState<ProjectTicket | null>(null);
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const lifecycle = useTicketLifecycleEnabled();
@@ -98,7 +89,7 @@ function TicketBoard({
   );
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-      <TicketError error={completing || reviewing ? null : update.error} />
+      <TicketError error={update.error} />
       {configuration.isPending && <Spinner className="m-6" aria-label="Loading stages" />}
       <TicketError error={configuration.error} />
       {configuration.isError && (
@@ -120,10 +111,7 @@ function TicketBoard({
           const stage = stages.find((candidate) => candidate.id === over?.id);
           if (!ticket || !stage || ticket.stage_id === stage.id) return;
           update.reset();
-          if (!configuration.supported && stage.is_complete)
-            setCompleting({ ticket, stageId: stage.id });
-          else if (!configuration.supported && stage.id === "review") setReviewing(ticket);
-          else update.mutate({ id: ticket.id, changes: { stage_id: stage.id } });
+          update.mutate({ id: ticket.id, changes: { stage_id: stage.id } });
         }}
       >
         <div
@@ -157,58 +145,6 @@ function TicketBoard({
           )}
         </DragOverlay>
       </DndContext>
-      {completing && (
-        <CompleteTicketDialog
-          title={completing.ticket.title}
-          stages={stages}
-          initialStageId={completing.stageId}
-          onClose={() => {
-            setCompleting(null);
-            update.reset();
-          }}
-          pending={update.isPending}
-          error={update.error}
-          onComplete={(summary, stageId) =>
-            update.mutate(
-              {
-                id: completing.ticket.id,
-                changes: {
-                  stage_id: stageId,
-                  completion_summary: summary,
-                },
-              },
-              { onSuccess: () => setCompleting(null) },
-            )
-          }
-        />
-      )}
-      {reviewing && (
-        <ReviewTicketDialog
-          title={reviewing.title}
-          initialSummary={reviewing.review_summary}
-          pending={update.isPending}
-          error={update.error}
-          onClose={() => {
-            setReviewing(null);
-            update.reset();
-          }}
-          onComplete={(summary) =>
-            update.mutate(
-              {
-                id: reviewing.id,
-                changes: {
-                  stage_id: "review",
-                  review_summary: summary,
-                  tags: reviewing.tags.some((tag) => tag.key === "needs-human")
-                    ? reviewing.tags
-                    : [...reviewing.tags, { key: "needs-human" }],
-                },
-              },
-              { onSuccess: () => setReviewing(null) },
-            )
-          }
-        />
-      )}
     </div>
   );
 }

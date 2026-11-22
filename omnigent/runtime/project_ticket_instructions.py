@@ -1,6 +1,13 @@
 """Shared ticket-work guidance for project prompts and fresh agent ticket reads."""
 
 PROJECT_TICKET_WORK_INSTRUCTION = (
+    "Tickets use a description, project-defined stages and ordinary comments, not dedicated "
+    "plan, review or completion-summary fields or ticket approval actions. Save the goal and "
+    "current context in description; use sys_ticket_comment or sys_ticket_update's comment "
+    "for approaches, decisions, feedback, evidence and results. There is no built-in planning "
+    "or review gate: follow the user's request and project stage instructions. Explicit "
+    "approvals and permission prompts remain in the responsible agent's chat; never treat "
+    "a stage move or a ticket comment as answering an outstanding prompt. "
     "When working on a project ticket, explicitly check stage fit at substantive progress "
     "updates, before changing the kind of work, requesting input, or handing off. "
     "Read the latest ticket and stage definitions with sys_ticket_get; compare the current "

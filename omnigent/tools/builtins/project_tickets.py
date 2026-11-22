@@ -94,7 +94,7 @@ class SysTicketListTool(_TicketTool):
 class SysTicketGetTool(_TicketTool):
     tool_name = "sys_ticket_get"
     help_text = (
-        "Read a ticket, its plan/review brief/lead, and pages of activity, sessions "
+        "Read a ticket, its description/response contact, and pages of activity, sessions "
         "and related tickets, plus the project's current stage definitions. "
         "Compare the stage's meaning with actual work and the next step at progress and "
         "handoff checkpoints. "
@@ -117,9 +117,10 @@ class SysTicketUpdateTool(_TicketTool):
     help_text = (
         "Edit a ticket; omit unchanged fields. Select stage_id from the current definitions in "
         "sys_ticket_list or sys_ticket_get and follow its instructions within authorized scope. "
-        "The last stage means complete; completion_summary is optional. Stage changes and "
+        "The last stage means complete. Stage changes and "
         "instructions never grant approval or bypass human/permission prompts. "
-        "Plan and review_summary are optional content independent of stages. "
+        "Keep the goal and current context in description; append approaches, feedback and "
+        "results as ordinary comments. "
         "Set lead_session_id to an already "
         "linked session (null clears it). Optional comment is appended atomically. "
         "Tags replace the whole list: use needs-human plus a comment when a person must act, "

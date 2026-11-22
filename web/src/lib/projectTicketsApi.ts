@@ -66,9 +66,6 @@ export interface ProjectTicket {
   description: string;
   stage_id: string;
   tags: TicketTag[];
-  completion_summary: string | null;
-  plan?: string;
-  review_summary?: string;
   lead_session_id?: string | null;
   /** Latest linked-agent activity; absent or null means unknown. */
   has_running_agents?: boolean | null;
@@ -104,17 +101,7 @@ export interface TicketSession {
   involvement?: string;
 }
 export type TicketChanges = Partial<
-  Pick<
-    ProjectTicket,
-    | "title"
-    | "description"
-    | "stage_id"
-    | "tags"
-    | "completion_summary"
-    | "plan"
-    | "review_summary"
-    | "lead_session_id"
-  >
+  Pick<ProjectTicket, "title" | "description" | "stage_id" | "tags" | "lead_session_id">
 > & { comment?: string };
 export interface TicketComment {
   text: string;

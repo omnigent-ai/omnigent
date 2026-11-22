@@ -33,17 +33,16 @@ header, new-session composer, session quick view and side chat, and UI primitive
 - R19: Tags have a key and optional value. The presence of `needs-human` shows
   the pink Needs response pill. A comment explains the request; removing the
   tag resolves it. This is independent of a session's pending approval prompt.
-- R20: Completion summaries are optional. A finished session does not finish a ticket.
+- R20: Results are ordinary comments, not a dedicated completion field. A finished
+  session does not finish a ticket.
 - R21: Keep New ticket and New session. No search or tag-filter UI.
-- R22: Persist a concise plan containing the approach and acceptance criteria.
+- R22: Use the description and ordinary comments for approach and acceptance criteria.
   Agents investigate routine choices; ask humans only for necessary decisions
   or authority. Explicit approval gates cannot be skipped.
-- R23: When requesting human review, verify the work and save a review brief: delivered scope,
-  evidence, limitations and exact human checks. Default to human review for
-  subjective results; skipping requires an unambiguous, objectively verified
-  outcome and recorded reason. Silence is not approval.
-- R24: Review offers Approve & mark done and Request changes. Feedback returns
-  work to Working with an attributed comment; scope changes may return to Planning.
+- R23: Record feedback, evidence, limitations and human checks as ordinary comments.
+  Project stages define the workflow; tickets impose no built-in plan or review gate.
+- R24: Explicit approvals stay in the responsible agent's chat. Ticket comments
+  and stage moves do not answer prompts, imply approval or clear response routing.
 - R25: Persist symmetric, untyped related-ticket links. Link/unlink is idempotent,
   same-project, and recorded on both tickets; no self-links or implied dependencies.
 - R26: An optional `lead_session_id` identifies the linked same-project session
@@ -63,7 +62,7 @@ header, new-session composer, session quick view and side chat, and UI primitive
   a named Respond action for the saved contact, even when idle, as well as agents
   with pending prompts. If no contact is recorded, say so and offer orchestrator
   routing rather than inferring an owner. Open the exact session; comments and
-  ticket review actions do not resolve an elicitation or authorize auto-approval.
+  stage moves do not resolve an elicitation or authorize auto-approval.
 - R32: The orchestrator must never initiate human elicitations or synchronously
   wait for a worker's human answer. Workers own prompts. The orchestrator records
   the question and worker, stays available for messages and independent work,
@@ -98,10 +97,12 @@ header, new-session composer, session quick view and side chat, and UI primitive
   and creating a session does not create a ticket.
 - AC28: GIVEN existing tickets WHEN the schema is upgraded THEN their status
   codes, content and history survive; the board exposes all five phases.
-- AC29: GIVEN a ticket WHEN its plan or review brief is saved THEN it is readable
-  as Markdown on the ticket and the attributed change notifies the orchestrator.
-- AC30: Plan, Review and completion summaries are optional content independent
-  of stage position. Moving stages preserves that content and Needs response.
+- AC29: GIVEN saved ticket notes WHEN upgrading to ordinary content THEN all text
+  remains readable as Markdown with original history/attribution intact; missing
+  snapshots become System comments once, without notifications or timestamp changes.
+- AC30: GIVEN ordinary content and Needs response WHEN moving stages THEN both
+  survive without built-in review/completion actions. Removed narrative arguments
+  are rejected by the API and tools, not translated through a compatibility layer.
 - AC31: GIVEN two same-project tickets WHEN linked from either side THEN each
   lists the other once; unlinking retains both histories and changes neither phase.
 - AC32: GIVEN unrelated ownership, projects or tenants WHEN linking tickets or
@@ -143,10 +144,12 @@ answers/dismissal of existing human prompts are also out of scope.
 
 ## Plan
 
-Extend ticket entities/store/API/tools with two status codes, bounded optional
-`plan` and `review_summary`, nullable `lead_session_id`, and a canonical-pair
-related-ticket table. Preserve existing status codes. Update may append a comment
-atomically. Leads must already be linked; unlinking a lead clears its reference.
+Use project-defined stages, description and ordinary comments, with nullable
+`lead_session_id` and canonical-pair related tickets. Preserve retired notes in
+readable historical activity; import missing snapshots with stable IDs, truthful
+System attribution and skipped notifications. Keep source columns inert, with no
+legacy API/tool inputs. Update may append a comment atomically. Leads must already
+be linked; unlinking a lead clears its reference.
 
 Add paginated related-ticket reads and `sys_ticket_link` attach/remove; include
 related tickets in `sys_ticket_get`. Reuse existing permissions, output events

@@ -2,8 +2,6 @@ import { useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   BotIcon,
-  CheckIcon,
-  ChevronRightIcon,
   ExternalLinkIcon,
   GitPullRequestIcon,
   LinkIcon,
@@ -17,7 +15,6 @@ import {
 } from "lucide-react";
 import { ProseMarkdown } from "@/components/blocks/ChatMarkdown";
 import { Button } from "@/components/ui/button";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
@@ -33,7 +30,6 @@ import { Spinner } from "@/components/ui/spinner";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useNow } from "@/hooks/useNow";
 import { useViewerId } from "@/hooks/useViewerId";
-import { markdownPreviewText } from "@/lib/markdownPreviewText";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { Link, useSearchParams, useReplaceSearchParams } from "@/lib/routing";
@@ -52,14 +48,7 @@ import { ProjectSessionPanel } from "./ProjectSessionPanel";
 import { ticketPanelSearch } from "./projectHomeNavigation";
 import { TicketAgents } from "./TicketAgents";
 import { TicketSessionLink } from "./TicketSessionLink";
-import {
-  CompleteTicketDialog,
-  ReviewTicketDialog,
-  RequestTicketChangesDialog,
-  TicketError,
-  TicketStageIcon,
-  TicketTags,
-} from "./TicketControls";
+import { TicketError, TicketStageIcon, TicketTags } from "./TicketControls";
 import { TicketRelatedTickets } from "./TicketRelatedTickets";
 import {
   useTicket,
@@ -363,11 +352,6 @@ function TicketDetails({
   const query = useTicket(projectId, ticketId);
   const { update, comment } = useTicketActions(projectId);
   const [editing, setEditing] = useState(false);
-  const [completing, setCompleting] = useState<{ stageId?: string; approving: boolean } | null>(
-    null,
-  );
-  const [reviewing, setReviewing] = useState(false);
-  const [requestingChanges, setRequestingChanges] = useState(false);
   const lifecycle = useTicketLifecycleEnabled();
   const configuration = useTicketStages(projectId);
   const stages = configuration.data?.stages ?? [];
@@ -395,7 +379,6 @@ function TicketDetails({
         )}
       </Panel>
     );
-  const currentStage = stages.find((stage) => stage.id === ticket.stage_id);
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <div
@@ -451,10 +434,7 @@ function TicketDetails({
                     update.reset();
                     const stage = stages.find((candidate) => candidate.id === value);
                     if (!stage) return;
-                    if (!configuration.supported && stage.is_complete)
-                      setCompleting({ stageId: stage.id, approving: false });
-                    else if (!configuration.supported && value === "review") setReviewing(true);
-                    else update.mutate({ id: ticketId, changes: { stage_id: value } });
+                    update.mutate({ id: ticketId, changes: { stage_id: value } });
                   }}
                 >
                   <SelectTrigger
@@ -506,162 +486,10 @@ function TicketDetails({
               </section>
             </div>
           )}
-          {!editing && !completing && !reviewing && !requestingChanges && (
-            <TicketError error={update.error} />
-          )}
-          {(lifecycle || ticket.review_summary || ticket.completion_summary) && (
-            <div className="space-y-2">
-              {lifecycle && <TicketPlan projectId={projectId} ticket={ticket} />}
-              {ticket.review_summary && (
-                <TicketDisclosure
-                  label="Human review"
-                  title="Review brief"
-                  preview={markdownPreviewText(ticket.review_summary ?? "")}
-                  action={
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="Edit review brief"
-                      onClick={() => {
-                        update.reset();
-                        setReviewing(true);
-                      }}
-                    >
-                      <PencilIcon aria-hidden />
-                    </Button>
-                  }
-                  footer={
-                    <div className="flex flex-wrap gap-2">
-                      <Button
-                        size="sm"
-                        disabled={
-                          update.isPending ||
-                          currentStage?.is_complete ||
-                          !stages.some((stage) => stage.is_complete)
-                        }
-                        onClick={() => {
-                          update.reset();
-                          setCompleting({ approving: true });
-                        }}
-                      >
-                        <CheckIcon aria-hidden />
-                        Approve &amp; complete
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={update.isPending}
-                        onClick={() => {
-                          update.reset();
-                          setRequestingChanges(true);
-                        }}
-                      >
-                        Request changes
-                      </Button>
-                    </div>
-                  }
-                >
-                  <ProseMarkdown className="text-ui leading-relaxed">
-                    {ticket.review_summary ?? ""}
-                  </ProseMarkdown>
-                  <p className="mt-3 text-sm text-muted-foreground">
-                    These actions update the ticket, not agent prompts. Needs response stays
-                    unchanged; resolve it separately when its request is answered.
-                  </p>
-                </TicketDisclosure>
-              )}
-              {ticket.completion_summary && (
-                <TicketDisclosure
-                  title="Completion summary"
-                  icon={<CheckIcon aria-hidden className="size-4 text-success" />}
-                  preview={markdownPreviewText(ticket.completion_summary)}
-                >
-                  <ProseMarkdown className="text-ui">{ticket.completion_summary}</ProseMarkdown>
-                </TicketDisclosure>
-              )}
-            </div>
-          )}
+          {!editing && <TicketError error={update.error} />}
           <TicketOutputs projectId={projectId} ticketId={ticketId} />
           {lifecycle && <TicketRelatedTickets projectId={projectId} ticketId={ticketId} />}
           <TicketActivity projectId={projectId} ticketId={ticketId} />
-          {completing && (
-            <CompleteTicketDialog
-              title={ticket.title}
-              approving={completing.approving}
-              stages={stages}
-              initialStageId={completing.stageId}
-              required={!configuration.supported}
-              pending={update.isPending}
-              error={update.error}
-              onClose={() => {
-                setCompleting(null);
-                update.reset();
-              }}
-              onComplete={(summary, stageId) =>
-                update.mutate(
-                  {
-                    id: ticketId,
-                    changes: {
-                      stage_id: stageId,
-                      ...(summary ? { completion_summary: summary } : {}),
-                      ...(completing.approving ? { comment: "Accepted the ticket review." } : {}),
-                    },
-                  },
-                  { onSuccess: () => setCompleting(null) },
-                )
-              }
-            />
-          )}
-          {reviewing && (
-            <ReviewTicketDialog
-              title={ticket.title}
-              initialSummary={ticket.review_summary}
-              pending={update.isPending}
-              error={update.error}
-              onClose={() => {
-                setReviewing(false);
-                update.reset();
-              }}
-              onComplete={(summary) =>
-                update.mutate(
-                  {
-                    id: ticketId,
-                    changes: {
-                      ...(!configuration.supported ? { stage_id: "review" } : {}),
-                      review_summary: summary,
-                      tags: ticket.tags.some((tag) => tag.key === "needs-human")
-                        ? ticket.tags
-                        : [...ticket.tags, { key: "needs-human" }],
-                    },
-                  },
-                  { onSuccess: () => setReviewing(false) },
-                )
-              }
-            />
-          )}
-          {requestingChanges && (
-            <RequestTicketChangesDialog
-              title={ticket.title}
-              pending={update.isPending}
-              error={update.error}
-              onClose={() => {
-                setRequestingChanges(false);
-                update.reset();
-              }}
-              onComplete={(feedback) =>
-                update.mutate(
-                  {
-                    id: ticketId,
-                    changes: {
-                      ...(!configuration.supported ? { stage_id: "in_progress" } : {}),
-                      comment: feedback,
-                    },
-                  },
-                  { onSuccess: () => setRequestingChanges(false) },
-                )
-              }
-            />
-          )}
         </Panel>
       </div>
       {chatSessionId ? (
@@ -672,142 +500,6 @@ function TicketDetails({
         )
       )}
     </div>
-  );
-}
-
-function TicketDisclosure({
-  title,
-  label = title,
-  preview,
-  icon,
-  action,
-  children,
-  footer,
-  open,
-  onOpenChange,
-}: {
-  title: string;
-  label?: string;
-  preview: string;
-  icon?: ReactNode;
-  action?: ReactNode;
-  children: ReactNode;
-  footer?: ReactNode;
-  open?: boolean;
-  onOpenChange?: (open: boolean) => void;
-}) {
-  return (
-    <Collapsible open={open} onOpenChange={onOpenChange} asChild>
-      <section aria-label={label} className="rounded-lg border border-border/60">
-        <div className="flex items-center gap-1 pr-1.5">
-          <h3 className="min-w-0 flex-1">
-            <CollapsibleTrigger className="group flex w-full min-w-0 items-center gap-3 rounded-md p-3 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring">
-              <span className="min-w-0 flex-1">
-                <span className="flex items-center gap-2 text-sm font-medium">
-                  {icon}
-                  {title}
-                </span>
-                {preview && (
-                  <span
-                    aria-hidden
-                    className="mt-0.5 block truncate text-xs font-normal text-muted-foreground group-data-[state=open]:hidden"
-                  >
-                    {preview}
-                  </span>
-                )}
-              </span>
-              <ChevronRightIcon
-                aria-hidden
-                className="size-4 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-90"
-              />
-            </CollapsibleTrigger>
-          </h3>
-          {action}
-        </div>
-        <CollapsibleContent className="px-3 pb-3">{children}</CollapsibleContent>
-        {footer && <div className="px-3 pb-3">{footer}</div>}
-      </section>
-    </Collapsible>
-  );
-}
-
-function TicketPlan({ projectId, ticket }: { projectId: string; ticket: ProjectTicket }) {
-  const [open, setOpen] = useState(false);
-  const [editing, setEditing] = useState(false);
-  const [plan, setPlan] = useState("");
-  const { update } = useTicketActions(projectId);
-  const edit = () => {
-    setPlan(ticket.plan ?? "");
-    update.reset();
-    setEditing(true);
-    setOpen(true);
-  };
-  if (!editing && !ticket.plan) return null;
-  return (
-    <TicketDisclosure
-      label="Ticket plan"
-      title="Plan"
-      preview={
-        editing
-          ? "Unsaved changes"
-          : markdownPreviewText(ticket.plan ?? "") || "Approach and acceptance criteria"
-      }
-      open={open}
-      onOpenChange={setOpen}
-      action={
-        !editing && (
-          <Button variant="ghost" size="icon-sm" aria-label="Edit plan" onClick={edit}>
-            <PencilIcon aria-hidden />
-          </Button>
-        )
-      }
-    >
-      {editing ? (
-        <form
-          className="space-y-3"
-          onSubmit={(event) => {
-            event.preventDefault();
-            update.mutate(
-              { id: ticket.id, changes: { plan: plan.trim() } },
-              { onSuccess: () => setEditing(false), onError: () => setOpen(true) },
-            );
-          }}
-        >
-          <Textarea
-            aria-label="Plan"
-            className="focus-visible:ring-0"
-            rows={7}
-            maxLength={3000}
-            value={plan}
-            disabled={update.isPending}
-            onChange={(event) => setPlan(event.target.value)}
-            placeholder="Approach, acceptance criteria, and decisions still needed…"
-          />
-          <TicketError error={update.error} />
-          <div className="flex justify-end gap-2">
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              disabled={update.isPending}
-              onClick={() => setEditing(false)}
-            >
-              Cancel
-            </Button>
-            <Button type="submit" size="sm" loading={update.isPending}>
-              Save plan
-            </Button>
-          </div>
-        </form>
-      ) : ticket.plan ? (
-        <ProseMarkdown className="text-ui leading-relaxed">{ticket.plan}</ProseMarkdown>
-      ) : (
-        <p className="text-sm text-muted-foreground">
-          Align on the approach and what counts as done in the agent chat. Save the agreed plan
-          here.
-        </p>
-      )}
-    </TicketDisclosure>
   );
 }
 
@@ -1202,11 +894,7 @@ function TicketActivityItem({
   viewerId: string | null;
 }) {
   const note = event.kind === "comment" || event.kind === "execution";
-  const changes = event.payload.changes as Partial<ProjectTicket> | undefined;
-  const body =
-    typeof event.payload.text === "string"
-      ? event.payload.text
-      : (changes?.completion_summary ?? changes?.review_summary);
+  const body = typeof event.payload.text === "string" ? event.payload.text : null;
   const agent = !!(event.session_id || event.agent_id);
   const author =
     event.user_id && event.user_id === viewerId

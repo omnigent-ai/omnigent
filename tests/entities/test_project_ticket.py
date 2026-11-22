@@ -31,35 +31,39 @@ def test_title_only_and_key_value_tags():
 
 def test_stage_ids_are_dynamic_and_comments_have_no_notification_option():
     assert UpdateTicket(stage_id="investigating").stage_id == "investigating"
-    assert UpdateTicket(stage_id="done").completion_summary is None
-    with pytest.raises(ValidationError):
-        UpdateTicket(stage_id="resolved", completion_summary="  ")
-    assert (
-        UpdateTicket(stage_id="resolved", completion_summary=" Tested ").completion_summary
-        == "Tested"
-    )
+    assert UpdateTicket(stage_id="done").stage_id == "done"
+    assert UpdateTicket(stage_id="resolved", comment=" Tested ").comment == "Tested"
     with pytest.raises(ValidationError):
         CommentOnTicket(text="Progress", notify_orchestrator=False)
 
 
-def test_legacy_codes_and_optional_plan_review_content_are_preserved():
+def test_stage_codes_and_generic_content_are_independent():
     assert {name: LEGACY_STATUS_CODES[name] for name in ("open", "in_progress", "done")} == {
         "open": 0,
         "in_progress": 1,
         "done": 2,
     }
     assert len(set(LEGACY_STATUS_CODES.values())) == 5
-    assert UpdateTicket(stage_id="investigating", plan="Approach and done when").plan
-    for summary in (None, "", "  "):
-        assert UpdateTicket(stage_id="review", review_summary=summary).stage_id == "review"
+    assert UpdateTicket(stage_id="investigating", description="Approach and done when").description
+    assert UpdateTicket(stage_id="review").stage_id == "review"
     assert (
-        UpdateTicket(stage_id="verifying", review_summary="Verify the attached demo").stage_id
+        UpdateTicket(stage_id="verifying", comment="Verify the attached demo").stage_id
         == "verifying"
     )
     assert "lead_session_id" not in UpdateTicket(title="Keep lead").model_fields_set
     assert "lead_session_id" in UpdateTicket(lead_session_id=None).model_fields_set
     with pytest.raises(ValidationError):
         UpdateTicket(comment=" ")
+
+
+@pytest.mark.parametrize(
+    "field", ["plan", "review_summary", "completion_summary", "review_action"]
+)
+@pytest.mark.parametrize("value", [None, "", "Saved text"])
+def test_removed_ticket_fields_are_rejected_not_translated(field, value):
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        UpdateTicket.model_validate({field: value})
+    assert field not in UpdateTicket.model_json_schema()["properties"]
 
 
 def test_stage_definitions_have_stable_defaults_and_trimmed_content():

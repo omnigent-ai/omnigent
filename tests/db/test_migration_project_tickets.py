@@ -229,7 +229,7 @@ def test_lifecycle_migration_preserves_existing_ticket_statuses_and_history(tmp_
                 ticket["id"],
                 UpdateTicket(
                     stage_id=status,
-                    completion_summary="Verified" if status == "done" else None,
+                    comment="Verified" if status == "done" else None,
                 ),
                 actor,
             )
@@ -246,12 +246,223 @@ def test_lifecycle_migration_preserves_existing_ticket_statuses_and_history(tmp_
         assert "lead_session_id" not in {
             column["name"] for column in sa.inspect(engine).get_columns("project_tickets")
         }
-        with engine.begin() as connection:
+        with engine.connect() as connection:
             config.attributes["connection"] = connection
             command.upgrade(config, "head")
         for ticket, events in records:
             assert tickets.get(project.id, ticket["id"], user_id=actor.user_id) == ticket
             assert tickets.events(project.id, ticket["id"], user_id=actor.user_id) == events
+    finally:
+        engine.dispose()
+        clear_engine_cache()
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_note_migration_preserves_text_metadata_and_retries_without_duplicates(
+    tmp_path, interrupt
+):
+    from omnigent.entities.project_ticket import CreateTicket, TicketActor, UpdateTicket
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+    from omnigent.stores.project_ticket_store import ProjectTicketStore
+
+    uri = f"sqlite:///{tmp_path / 'notes.db'}"
+    engine = get_or_create_engine(uri)
+    config = _build_alembic_config(uri)
+    actor = TicketActor("owner", uuid4().hex, uuid4().hex)
+    project = SqlAlchemyProjectStore(uri).create(uuid4().hex, "Existing notes", actor.user_id)
+    tickets = ProjectTicketStore(uri)
+    history_ticket, snapshot_ticket, empty_ticket = [
+        tickets.create(
+            project.id, CreateTicket(title=name, description="Keep this description"), actor
+        )
+        for name in ("History", "Snapshot", "Empty")
+    ]
+    tickets.link_session(project.id, history_ticket["id"], actor.session_id, "attach", actor)
+    tickets.update(
+        project.id,
+        history_ticket["id"],
+        UpdateTicket(lead_session_id=actor.session_id, tags=[{"key": "needs-human"}]),
+        actor,
+    )
+    tickets.link_ticket(project.id, history_ticket["id"], snapshot_ticket["id"], "attach", actor)
+    plan = "  **Approach**\n\n- café 🦊\n\n"
+    review = "Evidence: `check`\n  Keep the spacing.  "
+    result = "**Delivered**\n\n[Evidence](https://example.com/result)\n"
+    ticket_table = SqlProjectTicket.__table__
+    event_table = SqlProjectTicketEvent.__table__
+    original_tables = (*TABLES, SqlProject.__table__)
+    try:
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, "1b2c3d4e5f6a")
+            for record in (history_ticket, snapshot_ticket):
+                connection.execute(
+                    ticket_table.update()
+                    .where(ticket_table.c.id == record["id"])
+                    .values(
+                        plan=plan,
+                        review_summary=review,
+                        completion_summary=result,
+                    )
+                )
+            connection.execute(
+                ticket_table.update()
+                .where(ticket_table.c.id == empty_ticket["id"])
+                .values(
+                    plan="",
+                    review_summary=None,
+                    completion_summary="",
+                )
+            )
+            position = connection.execute(
+                sa.select(ticket_table.c.next_event_position).where(
+                    ticket_table.c.id == history_ticket["id"]
+                )
+            ).scalar_one()
+            historical_ids = [uuid4().hex for _ in range(103)]
+            for offset, event_id in enumerate(historical_ids):
+                changes = (
+                    {"plan": plan, "review_summary": review}
+                    if offset < 2
+                    else {"title": f"Previous title {offset}"}
+                )
+                connection.execute(
+                    event_table.insert().values(
+                        workspace_id=0,
+                        project_id=project.id,
+                        ticket_id=history_ticket["id"],
+                        id=event_id,
+                        position=position + offset,
+                        kind=1,
+                        user_id=actor.user_id,
+                        session_id=actor.session_id,
+                        agent_id=actor.agent_id,
+                        payload={"changes": changes},
+                        created_at=1000 + offset,
+                        notification_state=1,
+                    )
+                )
+            connection.execute(
+                ticket_table.update()
+                .where(ticket_table.c.id == history_ticket["id"])
+                .values(
+                    next_event_position=position + len(historical_ids),
+                )
+            )
+            before = {
+                table.name: [dict(row) for row in connection.execute(sa.select(table)).mappings()]
+                for table in original_tables
+            }
+
+        first_ticket = None
+
+        def fail_next_ticket(_conn, _cursor, statement, _parameters, context, _many):
+            nonlocal first_ticket
+            if not statement.startswith("INSERT INTO project_ticket_events"):
+                return
+            ticket_id = context.compiled_parameters[0]["ticket_id"]
+            if first_ticket is None:
+                first_ticket = ticket_id
+            elif ticket_id != first_ticket:
+                raise RuntimeError("Interrupted note import")
+
+        if interrupt:
+            sa.event.listen(engine, "before_cursor_execute", fail_next_ticket)
+            try:
+                with pytest.raises(RuntimeError, match="Interrupted note import"):
+                    with engine.connect() as connection:
+                        config.attributes["connection"] = connection
+                        command.upgrade(config, "head")
+            finally:
+                sa.event.remove(engine, "before_cursor_execute", fail_next_ticket)
+            with engine.connect() as connection:
+                assert (
+                    connection.execute(
+                        sa.text("SELECT version_num FROM alembic_version")
+                    ).scalar_one()
+                    == "1b2c3d4e5f6a"
+                )
+                partial_count = connection.execute(
+                    sa.select(sa.func.count()).select_from(event_table)
+                ).scalar_one()
+                assert (
+                    len(before[event_table.name])
+                    < partial_count
+                    < len(before[event_table.name]) + 4
+                )
+
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "head")
+        with engine.connect() as connection:
+            after = {
+                table.name: [dict(row) for row in connection.execute(sa.select(table)).mappings()]
+                for table in original_tables
+            }
+        original_ids = {row["id"] for row in before[event_table.name]}
+        preserved = {
+            row["id"]: row for row in after[event_table.name] if row["id"] in original_ids
+        }
+        assert preserved == {row["id"]: row for row in before[event_table.name]}
+        imports = [row for row in after[event_table.name] if row["id"] not in original_ids]
+        assert len(imports) == 4
+        for row in imports:
+            assert row["kind"] == 2 and row["notification_state"] == 2
+            assert row["user_id"] is row["session_id"] is row["agent_id"] is None
+            assert row["payload"]["imported"] is True
+        expected_snapshot = [
+            f"### Plan\n\n{plan}",
+            f"### Review notes\n\n{review}",
+            f"### Result\n\n{result}",
+        ]
+        assert sorted(
+            row["payload"]["text"] for row in imports if row["ticket_id"] == snapshot_ticket["id"]
+        ) == sorted(expected_snapshot)
+        assert [
+            row["payload"]["text"] for row in imports if row["ticket_id"] == history_ticket["id"]
+        ] == [expected_snapshot[-1]]
+        for original in before[ticket_table.name]:
+            saved = next(
+                row.copy() for row in after[ticket_table.name] if row["id"] == original["id"]
+            )
+            added = [row for row in imports if row["ticket_id"] == original["id"]]
+            assert sorted(row["position"] for row in added) == list(
+                range(
+                    original["next_event_position"], original["next_event_position"] + len(added)
+                )
+            )
+            saved["next_event_position"] -= len(added)
+            saved["comment_count"] -= len(added)
+            assert saved == original
+        for table in (
+            SqlProject.__table__,
+            SqlProjectTicketSession.__table__,
+            SqlProjectTicketLink.__table__,
+        ):
+            assert after[table.name] == before[table.name]
+
+        events = tickets.events(project.id, history_ticket["id"], user_id=actor.user_id)["data"]
+        projected = [event for event in events if event["id"] in historical_ids[:2]]
+        assert len(projected) == 2
+        assert all(
+            event["payload"]["text"] == "\n\n".join(expected_snapshot[:2]) for event in projected
+        )
+        assert [event["created_at"] for event in projected] == [1000, 1001]
+        assert all(
+            event["user_id"] == actor.user_id and event["session_id"] == actor.session_id
+            for event in projected
+        )
+
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, "1b2c3d4e5f6a")
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "head")
+            for table in original_tables:
+                assert [
+                    dict(row) for row in connection.execute(sa.select(table)).mappings()
+                ] == after[table.name]
     finally:
         engine.dispose()
         clear_engine_cache()

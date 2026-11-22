@@ -5,7 +5,6 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectTicketBoard } from "./ProjectTicketBoard";
 import { ProjectOrchestratorPanel, ProjectTicketPanel } from "./ProjectTicketPanel";
-import { CompleteTicketDialog } from "./TicketControls";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { fetchConversationById } from "@/hooks/useOpenSessionRow";
@@ -115,7 +114,6 @@ beforeEach(() => {
     description: "",
     stage_id: "open",
     tags: [{ key: "needs-human", value: "approval" }],
-    completion_summary: null,
     latest_update: "Created the ticket",
     comment_count: 0,
     created_at: 1000,
@@ -296,11 +294,9 @@ describe("Project ticket board", () => {
     },
   );
 
-  it("moves to the last stage without requiring a summary and preserves optional content", async () => {
+  it("moves between project stages without special actions and preserves ordinary content", async () => {
     ticket.stage_id = "verifying";
-    ticket.plan = "Gather recovery evidence.";
-    ticket.review_summary = "Inspect the evidence in any stage.";
-    ticket.completion_summary = "Earlier result";
+    ticket.description = "Gather recovery evidence.";
     vi.mocked(api.getTicketStages).mockResolvedValue({
       stages: [
         {
@@ -332,21 +328,12 @@ describe("Project ticket board", () => {
       ).toHaveClass("text-orange-600"),
     );
     expect(screen.queryByText("Confirm recovery before resolving.")).toBeNull();
-    await user.click(screen.getByRole("button", { name: "Edit plan" }));
-    fireEvent.change(screen.getByLabelText("Plan"), {
-      target: { value: "Verify recovery evidence." },
-    });
-    await user.click(screen.getByRole("button", { name: "Save plan" }));
-    await screen.findByRole("button", { name: "Edit plan" });
     await user.click(screen.getByRole("combobox", { name: "Ticket stage" }));
     await user.click(screen.getByRole("option", { name: "Done" }));
     await waitFor(() =>
       expect(api.updateTicket).toHaveBeenLastCalledWith("project", "ticket", { stage_id: "done" }),
     );
     expect(screen.queryByRole("dialog")).toBeNull();
-    expect(screen.getByRole("button", { name: "Completion summary" })).toHaveTextContent(
-      "Earlier result",
-    );
     await user.click(screen.getByRole("combobox", { name: "Ticket stage" }));
     await user.click(screen.getByRole("option", { name: "Resolved" }));
     await waitFor(() =>
@@ -362,14 +349,9 @@ describe("Project ticket board", () => {
       }),
     );
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    expect(ticket.completion_summary).toBe("Earlier result");
     expect(ticket.tags).toEqual([{ key: "needs-human", value: "approval" }]);
-    expect(ticket.plan).toBe("Verify recovery evidence.");
-    expect(ticket.review_summary).toBe("Inspect the evidence in any stage.");
-    expect(screen.getByRole("button", { name: "Review brief" })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
+    expect(ticket.description).toBe("Gather recovery evidence.");
+    expect(screen.getByText("Gather recovery evidence.")).toBeInTheDocument();
     expect(screen.getByText("Needs response")).toBeInTheDocument();
   });
 
@@ -466,26 +448,6 @@ describe("Project ticket board", () => {
     expect(projectsApi.initializeProjectOrchestrator).not.toHaveBeenCalled();
   });
 
-  it("retains required completion summaries for legacy servers", () => {
-    const complete = vi.fn();
-    renderBoard(
-      <CompleteTicketDialog
-        title="Ship"
-        stages={api.DEFAULT_TICKET_STAGES.stages}
-        onClose={vi.fn()}
-        onComplete={complete}
-        pending={false}
-        error={null}
-      />,
-    );
-    expect(screen.getByRole("button", { name: "Complete ticket" })).toBeDisabled();
-    fireEvent.change(screen.getByLabelText("Completion summary"), {
-      target: { value: " Delivered and tested " },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Complete ticket" }));
-    expect(complete).toHaveBeenCalledWith("Delivered and tested", "done");
-  });
-
   it("deduplicates PR outputs while retaining both events, and appends comments", async () => {
     const url = "https://git.example.com/org/repo/pull/42";
     const event: TicketEvent = {
@@ -565,7 +527,6 @@ describe("Project ticket board", () => {
   it("renders ticket prose as Markdown and hides empty optional sections", async () => {
     ticket.description = "## Acceptance\n\n- **Readable** descriptions\n- Keep `status` simple";
     ticket.tags = [];
-    ticket.completion_summary = "**Delivered** and verified.";
     vi.mocked(api.listTicketEvents).mockImplementation(async (_project, _ticket, _after, kind) => ({
       data: kind
         ? []
@@ -581,9 +542,20 @@ describe("Project ticket board", () => {
               payload: { text: "**Reviewed** the result." },
               created_at: 1000,
             },
+            {
+              id: "imported-result",
+              ticket_id: ticket.id,
+              position: 1,
+              kind: "comment",
+              user_id: null,
+              session_id: null,
+              agent_id: null,
+              payload: { text: "### Result\n\n**Delivered** and verified.", imported: true },
+              created_at: 1001,
+            },
           ],
       has_more: false,
-      last_position: 0,
+      last_position: 1,
     }));
     renderBoard(
       <ProjectTicketPanel
@@ -598,18 +570,13 @@ describe("Project ticket board", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Description", level: 3 })).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "Acceptance" })).toBeInTheDocument();
-    const completion = screen.getByRole("button", { name: "Completion summary" });
-    expect(completion).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByText("Delivered")).toBeNull();
-    expect(completion).toHaveTextContent("Delivered and verified.");
-    fireEvent.click(completion);
-    expect(completion).toHaveAttribute("aria-expanded", "true");
     const emphasized = await Promise.all(
       ["Readable", "Delivered", "Reviewed"].map((word) => screen.findByText(word)),
     );
     for (const element of emphasized) expect(element).toHaveAttribute("data-streamdown", "strong");
     expect(screen.getByText("status")).toHaveProperty("tagName", "CODE");
     expect(screen.getByText("You")).toBeInTheDocument();
+    expect(screen.getByText("System")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add tags" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Tags" })).toBeNull();
     expect(screen.queryByRole("heading", { name: "Outputs" })).toBeNull();
@@ -619,6 +586,9 @@ describe("Project ticket board", () => {
     expect(screen.queryByRole("button", { name: "Request review" })).toBeNull();
     expect(screen.queryByRole("region", { name: "Ticket plan" })).toBeNull();
     expect(screen.queryByRole("region", { name: "Human review" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Approve & complete" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Request changes" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Completion summary" })).toBeNull();
     await waitFor(() =>
       expect(screen.queryByRole("region", { name: "Related tickets" })).toBeNull(),
     );
@@ -766,8 +736,7 @@ describe("Project ticket board", () => {
     await waitFor(() => expect(input).toHaveValue(""));
   });
 
-  it("retains title editing and legacy completion through the compact status control", async () => {
-    capabilities.stages = false;
+  it("retains title editing and direct moves through the compact stage control", async () => {
     const user = userEvent.setup();
     renderBoard(
       <ProjectTicketPanel
@@ -787,20 +756,11 @@ describe("Project ticket board", () => {
     ).toBeInTheDocument();
     await user.click(screen.getByRole("combobox", { name: "Ticket stage" }));
     await user.click(screen.getByRole("option", { name: "Done" }));
-    expect(screen.getByRole("button", { name: "Complete ticket" })).toBeDisabled();
-    fireEvent.change(screen.getByLabelText("Completion summary"), {
-      target: { value: "Built and tested" },
-    });
-    await user.click(screen.getByRole("button", { name: "Complete ticket" }));
     await waitFor(() =>
-      expect(api.updateTicket).toHaveBeenLastCalledWith(
-        "project",
-        "ticket",
-        { stage_id: "done", completion_summary: "Built and tested" },
-        true,
-      ),
+      expect(api.updateTicket).toHaveBeenLastCalledWith("project", "ticket", { stage_id: "done" }),
     );
-    expect(await screen.findByText("Built and tested")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(ticket.tags).toEqual([{ key: "needs-human", value: "approval" }]);
   });
 
   it("keeps earlier activity when loading another page", async () => {
@@ -857,10 +817,9 @@ describe("Project ticket board", () => {
     expect(api.getTicketStages).not.toHaveBeenCalled();
   });
 
-  it("saves the current plan and renders its acceptance criteria as Markdown", async () => {
+  it("saves the description and renders its acceptance criteria as Markdown", async () => {
     ticket.stage_id = "planning";
-    ticket.plan = "Approach and acceptance criteria";
-    const user = userEvent.setup();
+    ticket.description = "Approach and acceptance criteria";
     renderBoard(
       <ProjectTicketPanel
         projectName="Shipping"
@@ -869,34 +828,25 @@ describe("Project ticket board", () => {
         onCreated={vi.fn()}
       />,
     );
-    const disclosure = await screen.findByRole("button", { name: "Plan" });
-    expect(disclosure).toHaveAttribute("aria-expanded", "false");
-    disclosure.focus();
-    await user.keyboard("{Enter}");
-    expect(disclosure).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getAllByText("Approach and acceptance criteria").length).toBeGreaterThan(0);
-    await user.keyboard(" ");
-    expect(disclosure).toHaveAttribute("aria-expanded", "false");
-    fireEvent.click(screen.getByRole("button", { name: "Edit plan" }));
-    expect(disclosure).toHaveAttribute("aria-expanded", "true");
-    fireEvent.change(screen.getByLabelText("Plan"), {
+    expect(await screen.findByText("Approach and acceptance criteria")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit ticket" }));
+    expect(screen.getByLabelText("Description (optional)")).toHaveValue(
+      "Approach and acceptance criteria",
+    );
+    fireEvent.change(screen.getByLabelText("Description (optional)"), {
       target: { value: "## Acceptance\n\n- **Readable** UI" },
     });
-    fireEvent.click(disclosure);
-    expect(screen.queryByRole("textbox", { name: "Plan" })).toBeNull();
-    expect(disclosure).toHaveTextContent("Unsaved changes");
-    fireEvent.click(disclosure);
-    expect(screen.getByLabelText("Plan")).toHaveValue("## Acceptance\n\n- **Readable** UI");
-    fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
     expect(await screen.findByRole("heading", { name: "Acceptance" })).toBeInTheDocument();
     expect(api.updateTicket).toHaveBeenCalledWith("project", "ticket", {
-      plan: "## Acceptance\n\n- **Readable** UI",
+      title: "Ship the board",
+      description: "## Acceptance\n\n- **Readable** UI",
     });
   });
 
-  it("edits an existing review and records feedback independently of the ticket stage", async () => {
-    ticket.review_summary = "Inspect the existing evidence.";
-    const user = userEvent.setup();
+  it("records feedback as an ordinary comment independently of stages and response routing", async () => {
+    ticket.stage_id = "review";
+    ticket.description = "Inspect the existing evidence.";
     renderBoard(
       <ProjectTicketPanel
         projectName="Shipping"
@@ -905,44 +855,28 @@ describe("Project ticket board", () => {
         onCreated={vi.fn()}
       />,
     );
-    await user.click(await screen.findByRole("button", { name: "Edit review brief" }));
-    expect(screen.getByLabelText("Review brief")).toHaveValue("Inspect the existing evidence.");
-    fireEvent.change(screen.getByLabelText("Review brief"), { target: { value: "" } });
-    expect(screen.getByRole("button", { name: "Send for review" })).toBeDisabled();
-    fireEvent.change(screen.getByLabelText("Review brief"), {
-      target: { value: "**Verified** tests. Please inspect the demo." },
-    });
-    await user.click(screen.getByRole("button", { name: "Send for review" }));
-    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    const review = await screen.findByRole("region", { name: "Human review" });
-    const disclosure = within(review).getByRole("button", { name: "Review brief" });
-    expect(disclosure).toHaveAttribute("aria-expanded", "false");
-    expect(disclosure).toHaveTextContent("Verified tests. Please inspect the demo.");
-    expect(screen.queryByText("Verified")).toBeNull();
-    await user.click(disclosure);
-    expect(await screen.findByText("Verified")).toHaveAttribute("data-streamdown", "strong");
-    await user.click(disclosure);
-    expect(disclosure).toHaveAttribute("aria-expanded", "false");
-    await user.click(screen.getByRole("button", { name: "Request changes" }));
-    const dialog = screen.getByRole("dialog");
-    expect(within(dialog).getByRole("button", { name: "Request changes" })).toBeDisabled();
-    fireEvent.change(within(dialog).getByLabelText("Feedback"), {
+    await screen.findByText("Inspect the existing evidence.");
+    expect(screen.queryByRole("button", { name: "Request changes" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Approve & complete" })).toBeNull();
+    fireEvent.change(screen.getByLabelText("Add a comment"), {
       target: { value: "Increase the contrast" },
     });
-    await user.click(within(dialog).getByRole("button", { name: "Request changes" }));
+    fireEvent.click(screen.getByRole("button", { name: "Comment" }));
     await waitFor(() =>
-      expect(api.updateTicket).toHaveBeenLastCalledWith("project", "ticket", {
-        comment: "Increase the contrast",
+      expect(api.commentOnTicket).toHaveBeenLastCalledWith("project", "ticket", {
+        text: "Increase the contrast",
+        outputs: [],
       }),
     );
-    expect(screen.getByRole("region", { name: "Human review" })).toBeInTheDocument();
-    expect(ticket.stage_id).toBe("open");
+    expect(api.updateTicket).not.toHaveBeenCalled();
+    expect(ticket.stage_id).toBe("review");
+    expect(ticket.description).toBe("Inspect the existing evidence.");
     expect(ticket.tags).toEqual([{ key: "needs-human", value: "approval" }]);
   });
 
-  it("reopens a collapsed plan on save failure without losing its draft", async () => {
+  it("keeps a description draft through fullscreen changes and save failure", async () => {
     ticket.stage_id = "planning";
-    ticket.plan = "Original plan";
+    ticket.description = "Original description";
     let rejectSave!: (error: Error) => void;
     vi.mocked(api.updateTicket).mockImplementationOnce(
       () =>
@@ -950,60 +884,33 @@ describe("Project ticket board", () => {
           rejectSave = reject;
         }),
     );
-    renderBoard(
-      <ProjectTicketPanel
-        projectName="Shipping"
-        ticketId="ticket"
-        onClose={vi.fn()}
-        onCreated={vi.fn()}
-      />,
-    );
-    fireEvent.click(await screen.findByRole("button", { name: "Edit plan" }));
-    fireEvent.change(screen.getByLabelText("Plan"), { target: { value: "Keep the draft" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+    const onExpandedChange = vi.fn();
+    const props = {
+      projectName: "Shipping",
+      ticketId: "ticket",
+      onClose: vi.fn(),
+      onCreated: vi.fn(),
+      onExpandedChange,
+    };
+    const { rerender } = renderBoard(<ProjectTicketPanel {...props} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Edit ticket" }));
+    fireEvent.change(screen.getByLabelText("Description (optional)"), {
+      target: { value: "Keep the draft" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Expand ticket" }));
+    expect(onExpandedChange).toHaveBeenLastCalledWith(true);
+    rerender(<ProjectTicketPanel {...props} expanded />);
+    expect(screen.getByLabelText("Description (optional)")).toHaveValue("Keep the draft");
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
     await waitFor(() => expect(api.updateTicket).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole("button", { name: "Plan" }));
-    expect(screen.queryByRole("textbox", { name: "Plan" })).toBeNull();
-    await act(async () => rejectSave(new Error("Could not save plan")));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Could not save plan");
-    expect(screen.getByRole("button", { name: "Plan" })).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByLabelText("Plan")).toHaveValue("Keep the draft");
+    fireEvent.click(screen.getByRole("button", { name: "Restore ticket panel" }));
+    expect(onExpandedChange).toHaveBeenLastCalledWith(false);
+    rerender(<ProjectTicketPanel {...props} expanded={false} />);
+    await act(async () => rejectSave(new Error("Could not save description")));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not save description");
+    expect(screen.getByLabelText("Description (optional)")).toHaveValue("Keep the draft");
+    expect(ticket.description).toBe("Original description");
   });
-
-  it.each(["", "Reviewed the demo and accepted"])(
-    "records human acceptance with optional summary '%s'",
-    async (summary) => {
-      ticket.stage_id = "review";
-      ticket.review_summary = "Tested and ready; check the demo.";
-      renderBoard(
-        <ProjectTicketPanel
-          projectName="Shipping"
-          ticketId="ticket"
-          onClose={vi.fn()}
-          onCreated={vi.fn()}
-        />,
-      );
-      expect(await screen.findByRole("button", { name: "Review brief" })).toHaveAttribute(
-        "aria-expanded",
-        "false",
-      );
-      fireEvent.click(await screen.findByRole("button", { name: "Approve & complete" }));
-      const dialog = screen.getByRole("dialog");
-      expect(within(dialog).getByLabelText("Completion summary")).not.toBeRequired();
-      expect(within(dialog).getByRole("button", { name: "Approve & complete" })).toBeEnabled();
-      fireEvent.change(within(dialog).getByLabelText("Completion summary"), {
-        target: { value: summary },
-      });
-      fireEvent.click(within(dialog).getByRole("button", { name: "Approve & complete" }));
-      await waitFor(() =>
-        expect(api.updateTicket).toHaveBeenLastCalledWith("project", "ticket", {
-          stage_id: "done",
-          ...(summary ? { completion_summary: summary } : {}),
-          comment: "Accepted the ticket review.",
-        }),
-      );
-    },
-  );
 
   it("shows related tickets read-only with pagination and visible query errors", async () => {
     const peer: ProjectTicket = {
@@ -1060,7 +967,6 @@ describe("Project ticket board", () => {
       vi.mocked(useIsMobileViewport).mockReturnValue(mobile);
       ticket.stage_id = "planning";
       ticket.lead_session_id = "planner";
-      ticket.plan = "Original plan";
       vi.mocked(fetchConversationById).mockImplementation(async (id) =>
         conversation(id, {
           title: id === "planner" ? "Design the board" : "Shipping orchestrator",
@@ -1099,11 +1005,6 @@ describe("Project ticket board", () => {
       fireEvent.change(screen.getByLabelText("Add a comment"), {
         target: { value: "Comment draft" },
       });
-      const plan = screen.getByRole("button", { name: "Plan" });
-      expect(plan).toHaveAttribute("aria-expanded", "false");
-      expect(plan).toHaveTextContent("Original plan");
-      await user.click(screen.getByRole("button", { name: "Edit plan" }));
-      fireEvent.change(screen.getByLabelText("Plan"), { target: { value: "Plan draft" } });
       if (!mobile) {
         await user.click(screen.getByRole("button", { name: "Expand ticket" }));
         expect(onExpandedChange).toHaveBeenLastCalledWith(true);
@@ -1114,13 +1015,11 @@ describe("Project ticket board", () => {
       expect(screen.queryByRole("textbox", { name: "Add a comment" })).toBeNull();
       await user.click(screen.getByRole("link", { name: "Back to ticket" }));
       expect(screen.getByLabelText("Add a comment")).toHaveValue("Comment draft");
-      expect(screen.getByLabelText("Plan")).toHaveValue("Plan draft");
       if (!mobile) {
         await user.click(screen.getByRole("button", { name: "Restore ticket panel" }));
         expect(onExpandedChange).toHaveBeenLastCalledWith(false);
         rerender(<ProjectTicketPanel {...props} expanded={false} />);
         expect(screen.getByLabelText("Add a comment")).toHaveValue("Comment draft");
-        expect(screen.getByLabelText("Plan")).toHaveValue("Plan draft");
       }
       expect(projectsApi.initializeProjectOrchestrator).not.toHaveBeenCalled();
     },
