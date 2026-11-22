@@ -264,10 +264,9 @@ def test_cursor_main_terminal_survives_cursor_agent_exit_without_tmux_unavailabl
         assert "Cursor Agent" in pane_text or "cursor" in pane_text.lower(), (
             f"the cursor-agent TUI never painted in pane {target!r} on {socket_path}:\n{pane_text}"
         )
-        time.sleep(2.5)
-
         pid = _cursor_agent_pid(socket_path, target)
         assert pid is not None, f"no live cursor-agent process found in pane {target!r}"
+        time.sleep(2.5)
         os.kill(pid, signal.SIGKILL)
 
         # Generous window so a slow box cannot mask the signature; the
