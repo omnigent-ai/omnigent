@@ -70,6 +70,11 @@ interface MonacoDiffViewerProps {
   /** Whether the session's agent opens an attached workspace path. */
   attachToAgent?: boolean;
   /**
+   * Whether the after side is the working copy, which comments and attachments refer to.
+   * Defaults to true; a committed snapshot shows no comments and offers neither.
+   */
+  commentable?: boolean;
+  /**
    * Toolbar / Cmd+F "Find in file" toggle. The diff mirrors Monaco's native
    * find widget (on the modified side) to it: true opens find, false closes it.
    * Cmd+F is driven through this flag rather than Monaco's own keybinding so it
@@ -94,6 +99,9 @@ export function prepareDiffEditor(lang: ReturnType<typeof detectLang>) {
   return Promise.all([ensureMonacoReady(), ensureLanguage(lang)]);
 }
 
+/** A committed snapshot's diff shows none of the working copy's comments. */
+const NO_COMMENTS: Comment[] = [];
+
 /**
  * Render a file's before/after diff in Monaco, with the comment layer on the
  * modified side. Comments are gated on edit permission; the diff itself is
@@ -116,6 +124,7 @@ export function MonacoDiffViewer({
   onSetActiveSelection,
   pendingBodyRef,
   attachToAgent,
+  commentable = true,
   searchOpen,
   searchFocusNonce,
   onSearchHandled,
@@ -284,13 +293,13 @@ export function MonacoDiffViewer({
   const commentButton = useMonacoCommentLayer({
     editorRef: modifiedEditorRef,
     mounted,
-    comments,
-    activeSelection,
+    comments: commentable ? comments : NO_COMMENTS,
+    activeSelection: commentable ? activeSelection : null,
     onSetActiveSelection,
-    canComment: canEdit,
+    canComment: canEdit && commentable,
     pendingBodyRef,
     path,
-    attachToAgent,
+    attachToAgent: commentable && attachToAgent,
   });
 
   const options = useMemo<DiffEditorProps["options"]>(() => {

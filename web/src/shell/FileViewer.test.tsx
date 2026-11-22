@@ -123,14 +123,17 @@ vi.mock("./MonacoDiffViewer", () => ({
     wrapLines,
     hideWhitespace,
     searchOpen,
+    commentable,
   }: {
     position?: { line: number };
     wrapLines?: boolean;
     hideWhitespace?: boolean;
     searchOpen?: boolean;
+    commentable?: boolean;
   }) => (
     <div
       data-testid="diff-viewer"
+      data-commentable={String(commentable ?? true)}
       data-line={position?.line}
       data-wrap-lines={String(!!wrapLines)}
       data-hide-whitespace={String(!!hideWhitespace)}
@@ -914,11 +917,32 @@ describe("FileViewer URL sync — diff param", () => {
           base: "comparison",
           changed: true,
           deleted: false,
+          headIsWorkingCopy: true,
           query: comparisonQuery("base", "work"),
         },
       });
       expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
       expect(useFileDiff).toHaveBeenLastCalledWith("conv_1", null, { requested: true });
+    });
+
+    it("keeps comments off a committed snapshot's after side, and on for the working copy", async () => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      const snapshot = (headIsWorkingCopy: boolean) => ({
+        base: "comparison" as const,
+        changed: true,
+        deleted: false,
+        headIsWorkingCopy,
+        query: comparisonQuery("v1", "v2 on another branch"),
+      });
+      const { unmount } = renderViewer({
+        open: true,
+        initialSearch: "diff=1",
+        comparisonDiff: snapshot(false),
+      });
+      expect(await screen.findByTestId("diff-viewer")).toHaveAttribute("data-commentable", "false");
+      unmount();
+      renderViewer({ open: true, initialSearch: "diff=1", comparisonDiff: snapshot(true) });
+      expect(await screen.findByTestId("diff-viewer")).toHaveAttribute("data-commentable", "true");
     });
 
     it("offers no diff for a file the comparison doesn't list, even one the last commit changed", async () => {
@@ -930,6 +954,7 @@ describe("FileViewer URL sync — diff param", () => {
           base: "comparison",
           changed: false,
           deleted: false,
+          headIsWorkingCopy: true,
           query: comparisonQuery("", ""),
         },
       });

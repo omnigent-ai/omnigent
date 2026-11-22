@@ -114,7 +114,12 @@ describe("useComparisonFileDiff", () => {
     state.comparison = branchPoint(entry("src/a.ts"));
     const { result, client } = renderDiff("src/a.ts");
     const shown = result.current;
-    expect(shown).toMatchObject({ base: "comparison", changed: true, deleted: false });
+    expect(shown).toMatchObject({
+      base: "comparison",
+      changed: true,
+      deleted: false,
+      headIsWorkingCopy: true,
+    });
     await waitFor(() =>
       expect(result.current.base === "comparison" && result.current.query.data).toMatchObject({
         before: "base",
@@ -157,6 +162,18 @@ describe("useComparisonFileDiff", () => {
     );
     expect(owner.recover).toHaveBeenCalledTimes(1);
     expect(owner.recover).toHaveBeenCalledWith(SESSION, "cmp_1", "src/a.ts", 1);
+  });
+
+  it("says when a typed comparison's head is a commit, not the working copy", () => {
+    const committed = branchPoint(entry("src/a.ts"));
+    (committed.comparison as Record<string, unknown>).revisions = {
+      spec: { base: "main", head: "feature" },
+      baseDisplay: "main",
+      headDisplay: "feature",
+      headIsWorkingCopy: false,
+    };
+    state.comparison = committed;
+    expect(renderDiff("src/a.ts").result.current).toMatchObject({ headIsWorkingCopy: false });
   });
 
   it("has no diff for a file the comparison doesn't list, and names a deleted one", () => {

@@ -15,6 +15,7 @@ import {
 import {
   type ComparisonEntry,
   ComparisonFileError,
+  comparisonHeadIsWorkingCopy,
   isSettledFileReason,
   needsRelist,
   StaleComparisonReadError,
@@ -29,6 +30,8 @@ export type ComparisonFileDiff =
       changed: boolean;
       /** The comparison lists the file as deleted. */
       deleted: boolean;
+      /** The after side is the working copy, which comments and attachments refer to. */
+      headIsWorkingCopy: boolean;
       /** Disabled while the comparison is still being decided or can't be listed. */
       query: UseQueryResult<FileDiffResponse>;
     };
@@ -69,5 +72,11 @@ export function useComparisonFileDiff(
     staleTime: Infinity,
   });
   if (comparison.base === "head") return { base: "head" };
-  return { base: "comparison", changed: !!entry, deleted: entry?.status === "deleted", query };
+  return {
+    base: "comparison",
+    changed: !!entry,
+    deleted: entry?.status === "deleted",
+    headIsWorkingCopy: comparisonHeadIsWorkingCopy(comparison),
+    query,
+  };
 }

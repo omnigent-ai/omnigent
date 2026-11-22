@@ -2141,6 +2141,7 @@ function FileViewerBody({
                       onSetActiveSelection={handleSetActiveSelection}
                       pendingBodyRef={pendingBodyRef}
                       attachToAgent={attachToAgent}
+                      commentable={comparisonListing?.headIsWorkingCopy ?? true}
                       searchOpen={searchOpen}
                       searchFocusNonce={searchFocusNonce}
                       onSearchHandled={handleSearchHandled}
