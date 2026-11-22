@@ -25,6 +25,7 @@ import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { requestLocalReviewNavigation, useLocalReviewNavigation } from "@/lib/localReviewContext";
 import type * as SonnerModule from "sonner";
 import {
+  commitTargetUnavailable,
   type PullRequestChangesLanding,
   PullRequestChangesTab,
   type PullRequestChangesTarget,
@@ -200,6 +201,7 @@ function renderTab({
   loading = false,
   selected = true,
   target,
+  landed = true,
 }: {
   conversationId: string;
   files?: PullRequestChangedFile[];
@@ -215,9 +217,12 @@ function renderTab({
   selected?: boolean;
   /** A commit or file a link opened the tab at, shown on the tab's landing. */
   target?: PullRequestChangesTarget;
+  /** The tab landed on its place as it mounted; false is a tab restored after a reload. */
+  landed?: boolean;
 }) {
   const prUrl = prUrlFor(conversationId);
-  let landing: PullRequestChangesLanding | undefined = target ? { settled: false } : undefined;
+  let landing: PullRequestChangesLanding | undefined =
+    target && landed ? { settled: false } : undefined;
   let patchLoading = loading;
   let tabSelected = selected;
   const tabProps = (current: string) =>
@@ -269,6 +274,7 @@ function renderTab({
       tabSelected = true;
       result.rerender(element(next));
     },
+    landing: () => landing,
     /** A fresh landing on the same place, as a Back or Forward step makes; none is a reload. */
     land: (fresh = true) => {
       landing = fresh ? { settled: false } : undefined;
@@ -276,6 +282,17 @@ function renderTab({
       return landing;
     },
   };
+}
+
+/** Resolves once `count` animation frames have run. */
+function afterFrames(count: number): Promise<void> {
+  return new Promise((resolve) => {
+    const step = (left: number) => {
+      if (left === 0) resolve();
+      else requestAnimationFrame(() => step(left - 1));
+    };
+    step(count);
+  });
 }
 
 const findInput = () => screen.getByRole("textbox", { name: "Find in changes" });
@@ -822,7 +839,7 @@ describe("PullRequestChangesTab", () => {
     expect(screen.getByText("Search covers the fetched patch: 2 of 5 files")).toBeInTheDocument();
   });
 
-  it("opens a link's file in the pull request's own changes, clearing filters and the since view", () => {
+  it("opens a link's file in the pull request's own changes, clearing filters and the since view", async () => {
     const conversationId = "link-file";
     const store = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
     act(() => {
@@ -834,19 +851,56 @@ describe("PullRequestChangesTab", () => {
 
     renderTab({ conversationId, target: { path: "b.ts" } });
 
+    await waitFor(() =>
+      expect(scroll.mock.contexts).toContain(document.querySelector('[data-github-file="b.ts"]')),
+    );
     expect(store.result.current).toMatchObject({
       pathFilter: "",
       hideViewed: false,
       sinceSha: null,
     });
     expect(store.result.current.mode).toBe("changes");
-    expect(scroll.mock.contexts).toContain(document.querySelector('[data-github-file="b.ts"]'));
   });
 
-  it("shows a link's file again on each landing, as Forward back onto it does", () => {
+  it("scrolls to a link's file on a fresh mount with the files already read", async () => {
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    renderTab({ conversationId: "link-file-mount", target: { path: "c.ts" } });
+    await waitFor(() =>
+      expect(scroll.mock.contexts).toContain(document.querySelector('[data-github-file="c.ts"]')),
+    );
+  });
+
+  it("keeps a link's file waiting while the patch reads, and scrolls once it arrives", async () => {
+    const conversationId = "link-file-late-patch";
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    const tab = renderTab({ conversationId, target: { path: "b.ts" }, patch: "", loading: true });
+    // Longer than a reveal waits for a section to mount.
+    await act(() => afterFrames(40));
+    expect(scroll).not.toHaveBeenCalled();
+
+    tab.rerender(PATCH);
+
+    await waitFor(() =>
+      expect(scroll.mock.contexts).toContain(document.querySelector('[data-github-file="b.ts"]')),
+    );
+  });
+
+  it("says a link's commit can't open where the pull request's commits don't show", () => {
+    const conversationId = "link-commit-unsupported";
+    const store = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
+    renderTab({ conversationId, target: { commit: "abcdef123" } });
+
+    expect(toast).toHaveBeenCalledWith(commitTargetUnavailable("abcdef123"), {
+      id: "pr-commit-target-unavailable",
+    });
+    expect(store.result.current).toMatchObject({ mode: "changes", commitSha: null });
+  });
+
+  it("shows a link's file again on each landing, as Forward back onto it does", async () => {
     const conversationId = "link-file-forward";
     const store = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
     const tab = renderTab({ conversationId, target: { path: "b.ts" } });
+    await waitFor(() => expect(tab.landing()?.settled).toBe(true));
     act(() => store.result.current.setPathFilter("a.ts"));
     // Shown again without a landing, as after a click on its tab, it keeps the reader's view.
     tab.rerender(PATCH);
@@ -855,9 +909,11 @@ describe("PullRequestChangesTab", () => {
     const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
     const landing = tab.land();
 
+    await waitFor(() =>
+      expect(scroll.mock.contexts).toContain(document.querySelector('[data-github-file="b.ts"]')),
+    );
     expect(store.result.current.pathFilter).toBe("");
     expect(landing?.settled).toBe(true);
-    expect(scroll.mock.contexts).toContain(document.querySelector('[data-github-file="b.ts"]'));
   });
 
   it("leaves the view as it is without a target or a landing", () => {
@@ -874,15 +930,17 @@ describe("PullRequestChangesTab", () => {
     expect(store.result.current).toMatchObject({ pathFilter: "a.ts", mode: "changes" });
   });
 
-  it("shows nothing for a target without a landing, as a restored tab after a reload", () => {
+  it("shows nothing for a target without a landing, as a restored tab after a reload", async () => {
     const conversationId = "link-reload";
     const store = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
-    const tab = renderTab({ conversationId, target: { path: "b.ts" } });
     act(() => store.result.current.setPathFilter("a.ts"));
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
 
-    tab.land(false);
+    renderTab({ conversationId, target: { path: "b.ts" }, landed: false });
+    await act(() => afterFrames(1));
 
     expect(store.result.current.pathFilter).toBe("a.ts");
+    expect(scroll).not.toHaveBeenCalled();
   });
 
   it("scrolls to a file header when the first match is a path match", () => {
@@ -1969,6 +2027,25 @@ describe("PullRequestChangesTab commits", () => {
     // Back onto the place, from another tab, lands on it again and reopens the commit.
     tab.land();
     expect(store.result.current).toMatchObject({ mode: "commit", commitSha: SHA_B });
+  });
+
+  it("leaves an open commit for a link's file, and still scrolls to it", async () => {
+    const conversationId = "link-file-from-commit";
+    const store = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
+    act(() => store.result.current.openCommit(SHA_A));
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+
+    renderTab({
+      conversationId,
+      commitHistory: true,
+      listing: { head_sha: "head" },
+      target: { path: "c.ts" },
+    });
+
+    await waitFor(() =>
+      expect(scroll.mock.contexts).toContain(document.querySelector('[data-github-file="c.ts"]')),
+    );
+    expect(store.result.current).toMatchObject({ mode: "changes", commitSha: null });
   });
 
   it("shows the commit list for a link to a commit the pull request doesn't have", () => {

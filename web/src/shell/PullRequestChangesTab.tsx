@@ -476,46 +476,63 @@ export interface PullRequestChangesLanding {
   settled: boolean;
 }
 
+/** Said when a link's commit can't open because this pull request's commits don't show here. */
+export function commitTargetUnavailable(commit: string): string {
+  return `Commit ${commit.slice(0, 7)} can't be shown here, so the tab shows all of the pull request's changes.`;
+}
+
 /**
- * Shows a link's commit or file once per landing: a commit opens once its list can say
- * whether commits show here; a file shows in the PR's own changes, unfiltered.
+ * Shows a link's commit or file once per landing. A commit opens once its list can say whether
+ * commits show here, and says so when they don't. A file shows in the PR's own changes,
+ * unfiltered, once its patch is read; its jump waits a frame, so the tab's reset of a jump on
+ * a view change, which runs after this, can't cancel it.
  */
 function ShowChangesTarget({
   target,
   landing,
-  ready,
+  listed,
+  patchRead,
   commitsSupported,
   view,
   jumpTo,
 }: {
   target: PullRequestChangesTarget;
   landing: PullRequestChangesLanding;
-  ready: boolean;
+  /** The tab is selected and its changed files are read. */
+  listed: boolean;
+  /** The PR's patch is read, so the file's section can mount. */
+  patchRead: boolean;
   commitsSupported: boolean;
   view: ChangesViewState;
   jumpTo: (path: string) => void;
 }) {
   const { mode, sinceSha, openCommit, setMode, setSinceSha, setPathFilter, setHideViewed } = view;
   useEffect(() => {
-    if (landing.settled || !ready) return;
+    if (landing.settled || !listed) return;
     if ("commit" in target) {
       landing.settled = true;
       if (commitsSupported) openCommit(target.commit);
+      else toast(commitTargetUnavailable(target.commit), { id: "pr-commit-target-unavailable" });
       return;
     }
-    if (mode !== "changes" || sinceSha) {
+    if ((commitsSupported && mode !== "changes") || sinceSha) {
       setMode("changes");
       setSinceSha(null);
       return;
     }
-    landing.settled = true;
-    setPathFilter("");
-    setHideViewed(false);
-    jumpTo(target.path);
+    if (!patchRead) return;
+    const frame = requestAnimationFrame(() => {
+      landing.settled = true;
+      setPathFilter("");
+      setHideViewed(false);
+      jumpTo(target.path);
+    });
+    return () => cancelAnimationFrame(frame);
   }, [
     target,
     landing,
-    ready,
+    listed,
+    patchRead,
     commitsSupported,
     mode,
     sinceSha,
@@ -1436,7 +1453,8 @@ export function PullRequestChangesTab({
         <ShowChangesTarget
           target={target}
           landing={landing}
-          ready={selected && !!changes.data}
+          listed={selected && !!changes.data}
+          patchRead={!!prDiff.data && !prDiff.isLoading}
           commitsSupported={commitsSupported}
           view={view}
           jumpTo={jumpTo}
