@@ -36,19 +36,29 @@ final class WatchConversation {
       if generation == loadGeneration { isLoading = false }
     }
     let failureBeforeLoad = resolveError
-    let path = "sessions/\(session.id)"
+    let path = ["sessions", session.id]
     let snapshotQuery = [
       "include_items": "false", "include_liveness": "false", "include_usage": "false",
     ]
     // Committed items live in the store, independently of runner availability or affinity.
-    async let items = recentItems(path + "/items")
+    async let items = recentItems(path + ["items"])
     do {
       let host = try await client.routingHost(for: session.id)
-      async let snapshot: WatchSnapshot = client.get(path, snapshotQuery, host: host)
-      let (state, transcript) = try await (snapshot, items)
+      let state: WatchSnapshot = try await client.get(path, snapshotQuery, host: host)
+      var transcript: [WatchItem]?
+      var transcriptError: String?
+      do {
+        transcript = try await items
+      } catch is CancellationError {
+        throw CancellationError()
+      } catch let failure as URLError where failure.code == .cancelled {
+        throw failure
+      } catch {
+        transcriptError = error.localizedDescription
+      }
       guard generation == loadGeneration else { return }
-      pollDelay = .seconds(5)
-      messages = state.messages(items: transcript)
+      pollDelay = transcriptError == nil ? .seconds(5) : min(pollDelay * 2, .seconds(120))
+      if let transcript { messages = state.messages(items: transcript) }
       approvals = (state.pendingElicitations ?? []).filter {
         $0.params.nativeDelivery != nil || !answered.contains($0.id)
       }
@@ -60,7 +70,9 @@ final class WatchConversation {
       }
       session.status = state.status ?? session.status
       session.pendingElicitationsCount = approvals.count
-      loadError = state.status == "failed" ? state.lastTaskError?.message ?? "Session failed." : nil
+      loadError =
+        transcriptError
+        ?? (state.status == "failed" ? state.lastTaskError?.message ?? "Session failed." : nil)
     } catch is CancellationError {
     } catch let failure as URLError where failure.code == .cancelled {
     } catch {
@@ -74,7 +86,7 @@ final class WatchConversation {
     }
   }
 
-  private func recentItems(_ path: String) async throws -> [WatchItem] {
+  private func recentItems(_ path: [String]) async throws -> [WatchItem] {
     var query = ["order": "desc", "limit": "30"]
     var items: [WatchItem] = []
     var cursors: Set<String> = []
@@ -98,7 +110,7 @@ final class WatchConversation {
     do {
       let host = try await client.routingHost(for: target)
       try await client.post(
-        "sessions/\(target)/elicitations/\(approval.id)/resolve",
+        ["sessions", target, "elicitations", approval.id, "resolve"],
         ["action": accept ? "accept" : "decline"],
         host: host)
       resolveError = nil

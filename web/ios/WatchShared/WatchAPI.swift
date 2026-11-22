@@ -210,6 +210,7 @@ enum WatchError: LocalizedError, Equatable {
   case forbidden
   case status(Int)
   case routingUnavailable
+  case invalidIdentifier
 
   var errorDescription: String? {
     switch self {
@@ -220,6 +221,7 @@ enum WatchError: LocalizedError, Equatable {
     case .status(let code): "The server returned HTTP \(code)."
     case .routingUnavailable:
       "Couldn't find this session's host. Open it on your iPhone to respond."
+    case .invalidIdentifier: "The server returned an invalid identifier."
     }
   }
 }
@@ -249,7 +251,7 @@ struct WatchClient: Sendable {
     for _ in 0..<16 {
       guard visited.insert(current).inserted else { throw WatchError.routingUnavailable }
       let state: WatchSnapshot = try await get(
-        "sessions/\(current)",
+        ["sessions", current],
         [
           "include_items": "false", "include_liveness": "false", "include_live_status": "false",
           "include_usage": "false",
@@ -263,7 +265,8 @@ struct WatchClient: Sendable {
           // A bounded, read-only runner inventory verifies affinity first.
           if let probeSessionID {
             _ = try await send(
-              request("sessions/\(probeSessionID)/resources/terminals", ["limit": "1"], host: host))
+              request(
+                ["sessions", probeSessionID, "resources", "terminals"], ["limit": "1"], host: host))
           }
           return host
         }
@@ -279,21 +282,29 @@ struct WatchClient: Sendable {
   }
 
   func get<Response: Decodable>(
-    _ path: String, _ query: [String: String] = [:], host: String? = nil
+    _ path: [String], _ query: [String: String] = [:], host: String? = nil
   ) async throws -> Response {
     try Self.decoder.decode(Response.self, from: await send(request(path, query, host: host)))
   }
 
-  func post(_ path: String, _ body: [String: Any], host: String?) async throws {
-    var request = request(path, host: host)
+  func post(_ path: [String], _ body: [String: Any], host: String?) async throws {
+    var request = try request(path, host: host)
     request.httpMethod = "POST"
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.httpBody = try JSONSerialization.data(withJSONObject: body)
     _ = try await send(request)
   }
 
-  func request(_ path: String, _ query: [String: String] = [:], host: String?) -> URLRequest {
-    var url = credentials.apiURL.appending(path: path)
+  func request(_ path: [String], _ query: [String: String] = [:], host: String?) throws
+    -> URLRequest
+  {
+    var url = credentials.apiURL
+    for component in path {
+      guard !component.isEmpty, component != ".", component != ".." else {
+        throw WatchError.invalidIdentifier
+      }
+      url.append(component: component, directoryHint: .notDirectory)
+    }
     url.append(queryItems: query.sorted { $0.key < $1.key }.map(URLQueryItem.init))
     var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
     request.setValue(

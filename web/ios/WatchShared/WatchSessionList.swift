@@ -18,8 +18,8 @@ final class WatchSessionList {
     let generation = loadGeneration
     do {
       let query = ["order": "desc", "sort_by": "updated_at", "limit": "25", "visibility": "all"]
-      async let page: WatchPage<WatchSession> = client.get("sessions", query)
-      let projects: [WatchProject] = (try? await client.get("sessions/projects")) ?? []
+      async let page: WatchPage<WatchSession> = client.get(["sessions"], query)
+      let projects: [WatchProject] = (try? await client.get(["sessions", "projects"])) ?? []
       let loaded = try await page.data
       guard generation == loadGeneration else { return }
       (sessions, groups) = (loaded, loaded.grouped(projects: projects))

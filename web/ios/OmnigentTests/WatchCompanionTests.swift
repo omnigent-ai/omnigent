@@ -255,7 +255,7 @@ final class WatchCompanionTests: XCTestCase {
       XCTAssertEqual(conversation.approvals.map(\.id), ["e1"])
       if resolvedElsewhere {
         try await client.post(
-          "sessions/s1/elicitations/e1/resolve", ["action": "decline"], host: nil)
+          ["sessions", "s1", "elicitations", "e1", "resolve"], ["action": "decline"], host: nil)
         await conversation.load()
       } else {
         await conversation.resolve(approval, accept: false)
@@ -314,7 +314,7 @@ final class WatchCompanionTests: XCTestCase {
       if nativeFromStart {
         XCTAssertEqual(conversation.approvals.map(\.id), ["e1"])
         try await client.post(
-          "sessions/s1/elicitations/e1/resolve", ["action": "accept"], host: nil)
+          ["sessions", "s1", "elicitations", "e1", "resolve"], ["action": "accept"], host: nil)
         await conversation.load()
       }
       for _ in 0..<2 {
@@ -326,7 +326,7 @@ final class WatchCompanionTests: XCTestCase {
         await conversation.load()
       }
       try await client.post(
-        "sessions/s1/events",
+        ["sessions", "s1", "events"],
         ["type": "external_elicitation_resolved", "data": ["elicitation_id": "e1"]], host: nil)
       await conversation.load()
       XCTAssertNil(conversation.error)
@@ -518,7 +518,7 @@ final class WatchCompanionTests: XCTestCase {
     // A shared host's workspace selector survives; the rest of the page's query does not.
     XCTAssertEqual(https.apiURL.absoluteString, "https://omnigent.example.com/omnigent/v1?o=42")
     XCTAssertEqual(
-      WatchClient(credentials: https).request("sessions", ["limit": "5"], host: nil).url?
+      try WatchClient(credentials: https).request(["sessions"], ["limit": "5"], host: nil).url?
         .absoluteString,
       "https://omnigent.example.com/omnigent/v1/sessions?o=42&limit=5")
     XCTAssertEqual(https.cookie, "session=1; parent=1; secure=1")
@@ -583,16 +583,52 @@ final class WatchCompanionTests: XCTestCase {
     let client = WatchClient(
       credentials: WatchCredentials(
         apiURL: URL(string: "https://omnigent.example.com/v1")!, cookie: "session=1"))
-    let request = client.request(
-      "sessions/conv_1/items", ["order": "desc", "limit": "5"], host: "h1")
+    let request = try client.request(
+      ["sessions", "conv_1", "items"], ["order": "desc", "limit": "5"], host: "h1")
     XCTAssertEqual(
       request.url?.absoluteString,
       "https://omnigent.example.com/v1/sessions/conv_1/items?limit=5&order=desc")
     XCTAssertEqual(request.value(forHTTPHeaderField: "Cookie"), "session=1")
     XCTAssertEqual(request.value(forHTTPHeaderField: "X-Databricks-Omnigent-Slice-Key"), "h1")
     XCTAssertNil(
-      client.request("sessions", host: nil).value(
+      try client.request(["sessions"], host: nil).value(
         forHTTPHeaderField: "X-Databricks-Omnigent-Slice-Key"))
+    for (identifier, encoded) in [
+      ("../outside", "..%2Foutside"), ("a/b", "a%2Fb"), ("a%2Fb", "a%252Fb"),
+      ("a?b", "a%3Fb"), ("a#b", "a%23b"),
+    ] {
+      let scoped = try client.request(
+        ["sessions", identifier, "elicitations", identifier, "resolve"], host: nil)
+      XCTAssertEqual(
+        scoped.url?.path(percentEncoded: true),
+        "/v1/sessions/\(encoded)/elicitations/\(encoded)/resolve")
+    }
+    for identifier in ["", ".", ".."] {
+      for path in [
+        ["sessions", identifier, "items"],
+        ["sessions", "s1", "elicitations", identifier, "resolve"],
+      ] {
+        XCTAssertThrowsError(try client.request(path, host: nil)) {
+          XCTAssertEqual($0 as? WatchError, .invalidIdentifier)
+        }
+      }
+    }
+    let escapedServer = try MockHTTPServer(requestHandler: { request in
+      let url = URLComponents(string: request.path)
+      XCTAssertEqual(request.method, "POST")
+      XCTAssertEqual(
+        url?.percentEncodedPath, "/omnigent/v1/sessions/..%2Foutside/elicitations/a%2Fb/resolve")
+      XCTAssertEqual(url?.queryItems?.first { $0.name == "o" }?.value, "42")
+      XCTAssertEqual(request.headers["cookie"], "session=test")
+      return (200, [:], Data())
+    })
+    let escapedClient = WatchClient(
+      credentials: WatchCredentials(
+        apiURL: URL(string: "http://127.0.0.1:\(escapedServer.port)/omnigent/v1?o=42")!,
+        cookie: "session=test"))
+    try await escapedClient.post(
+      ["sessions", "../outside", "elicitations", "a/b", "resolve"], ["action": "decline"], host: nil
+    )
 
     let cases: [(metadata: String, host: String?, succeeds: Bool)] = [
       (#"{"parent_session_id":"parent"}"#, "inherited-host", true),
@@ -836,13 +872,35 @@ final class WatchCompanionTests: XCTestCase {
     let olderPage = try JSONSerialization.data(withJSONObject: [
       "data": olderItems, "last_id": "question", "has_more": false,
     ])
+    var itemFailure: Int?
+    var pendingID: String?
+    var responses = 0
     let server = try MockHTTPServer(requestHandler: { request in
       let url = URLComponents(string: request.path)
+      if request.method == "POST" {
+        XCTAssertEqual(url?.path, pendingID.map { "/v1/sessions/s1/elicitations/\($0)/resolve" })
+        pendingID = nil
+        responses += 1
+        return (200, [:], Data())
+      }
       switch url?.path {
-      case "/v1/sessions/s1": return (200, [:], Data(#"{"status":"running"}"#.utf8))
+      case "/v1/sessions/s1":
+        let pending: [[String: Any]] =
+          pendingID.map {
+            [["elicitation_id": $0, "params": ["message": "Run it?"]]]
+          } ?? []
+        return (
+          200, [:],
+          try! JSONSerialization.data(withJSONObject: [
+            "status": "running", "pending_elicitations": pending,
+          ])
+        )
       case "/v1/sessions/s1/items":
         let cursor = url?.queryItems?.first { $0.name == "after" }?.value
         XCTAssertTrue(cursor == nil || cursor == "tool-6")
+        if cursor != nil, let itemFailure {
+          return (itemFailure, [:], Data("invalid page".utf8))
+        }
         return (200, [:], cursor == nil ? newestPage : olderPage)
       default:
         XCTFail("Unexpected watch request: \(request.path)")
@@ -860,6 +918,25 @@ final class WatchCompanionTests: XCTestCase {
     XCTAssertNil(conversation.error)
     XCTAssertEqual(conversation.messages.map(\.id), ["question", "reply", "error:failure"])
     XCTAssertEqual(conversation.messages.map(\.text), ["Please check", "Working", "Task failed"])
+    for failure in [503, 200] {
+      itemFailure = failure
+      pendingID = "pending-\(failure)"
+      await conversation.load()
+      XCTAssertEqual(conversation.approvals.map(\.id), ["pending-\(failure)"])
+      XCTAssertEqual(conversation.session.pendingElicitationsCount, 1)
+      XCTAssertEqual(conversation.messages.map(\.id), ["question", "reply", "error:failure"])
+      XCTAssertNotNil(conversation.error)
+      XCTAssertEqual(conversation.pollDelay, .seconds(10))
+      await conversation.resolve(try XCTUnwrap(conversation.approvals.first), accept: false)
+      XCTAssertTrue(conversation.approvals.isEmpty)
+      XCTAssertEqual(conversation.session.pendingElicitationsCount, 0)
+      itemFailure = nil
+      await conversation.load()
+      XCTAssertNil(conversation.error)
+      XCTAssertEqual(conversation.pollDelay, .seconds(5))
+    }
+    XCTAssertEqual(
+      responses, 2, "Transcript failures must not prevent a verified approval response")
   }
 
   func testClientRejectsRedirectsWithoutForwardingCredentials() async throws {
@@ -878,10 +955,11 @@ final class WatchCompanionTests: XCTestCase {
       for method in ["GET", "POST"] {
         do {
           if method == "GET" {
-            let _: WatchPage<WatchSession> = try await client.get("sessions")
+            let _: WatchPage<WatchSession> = try await client.get(["sessions"])
           } else {
             try await client.post(
-              "sessions/session/elicitations/prompt/resolve", ["action": "accept"], host: nil)
+              ["sessions", "session", "elicitations", "prompt", "resolve"], ["action": "accept"],
+              host: nil)
           }
           XCTFail("Expected \(method) to reject HTTP \(status)")
         } catch {
@@ -915,7 +993,7 @@ final class WatchCompanionTests: XCTestCase {
       credentials: WatchCredentials(
         apiURL: URL(string: "http://127.0.0.1:\(server.port)/v1")!, cookie: "session=test"))
     do {
-      let _: WatchPage<WatchSession> = try await client.get("sessions", host: "stale-host")
+      let _: WatchPage<WatchSession> = try await client.get(["sessions"], host: "stale-host")
       XCTFail("Expected the retry to reject the redirect outside the cookie's path")
     } catch {
       XCTAssertEqual(error as? WatchError, .status(307))

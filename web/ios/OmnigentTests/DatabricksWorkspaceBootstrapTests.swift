@@ -735,9 +735,26 @@ final class DatabricksLifecycleTests: XCTestCase {
     let h = try await coordinatorFixture(
       recover: { _ in recovered.fulfill() }, failure: { _ in XCTFail("Unexpected failure") })
     let cookieStore = h.coordinator.websiteDataStore.httpCookieStore
-    for cookie in await cookieStore.allCookies() { await cookieStore.deleteCookie(cookie) }
+    let cookies = await cookieStore.allCookies()
+    let signedIn = try XCTUnwrap(
+      h.coordinator.syncWatchCredentials(afterLoading: h.context.pageURL, cookieStore: cookieStore))
+    await signedIn.value
+    let publishedCount = h.watchTransport.contexts.count
+    XCTAssertFalse(
+      try XCTUnwrap(h.watchTransport.contexts.last?[WatchCredentials.contextKey] as? Data).isEmpty)
+    let pendingCookies = PendingWatchCookies()
+    let lateSync = try XCTUnwrap(
+      h.coordinator.syncWatchCredentials(
+        afterLoading: h.context.pageURL, cookieStore: pendingCookies))
+    for cookie in cookies { await cookieStore.deleteCookie(cookie) }
     NotificationCenter.default.post(name: UIApplication.didBecomeActiveNotification, object: nil)
     await fulfillment(of: [recovered], timeout: 2)
+    XCTAssertEqual(h.watchTransport.contexts.count, publishedCount + 1)
+    XCTAssertEqual(h.watchTransport.contexts.last?[WatchCredentials.contextKey] as? Data, Data())
+    pendingCookies.cookies.continuation.yield(cookies)
+    await lateSync.value
+    XCTAssertEqual(h.watchTransport.contexts.count, publishedCount + 1)
+    XCTAssertEqual(h.watchTransport.contexts.last?[WatchCredentials.contextKey] as? Data, Data())
     NotificationCenter.default.post(name: UIApplication.didBecomeActiveNotification, object: nil)
     h.coordinator.detach()
     h.view.removeFromSuperview()

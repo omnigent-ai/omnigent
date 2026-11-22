@@ -739,9 +739,9 @@ struct OmnigentWebView: UIViewRepresentable {
           webView.load(URLRequest(url: session.pageURL))
         } catch {
           guard navigationID == id, self.webView === webView else { return }
-          if error as? DatabricksSessionError == .reauthenticationRequired,
-            let reauthenticate = parent.reauthenticateWorkspace
-          {
+          let needsReauthentication = error as? DatabricksSessionError == .reauthenticationRequired
+          if needsReauthentication { watchBridge.signOut() }
+          if needsReauthentication, let reauthenticate = parent.reauthenticateWorkspace {
             parent.model.isAuthenticating = false
             parent.model.isLoading = false
             parent.model.cancelAuthentication = nil
@@ -756,6 +756,7 @@ struct OmnigentWebView: UIViewRepresentable {
 
     private func requestWorkspaceRecovery() {
       guard let session = workspaceSession else { return }
+      watchBridge.signOut()
       let pageURL = lastWorkspacePageURL ?? session.pageURL
       guard let recover = parent.recoverWorkspace else {
         showWorkspaceFailure(DatabricksSessionError.recoveryExhausted)
