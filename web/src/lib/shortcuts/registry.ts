@@ -175,6 +175,13 @@ const BINDINGS = {
     label: "Focus chat input",
     chords: () => [{ ctrl: true, shift: true, code: "KeyL" }],
   },
+  // ⇧⌘M in the macOS desktop app only: a browser keeps it for its profile switcher, and off
+  // macOS ⌘ is Ctrl, where Ctrl+Shift+M opens the model picker. ⌘K runs it everywhere.
+  "composer.toggleHeight": {
+    label: "Expand or collapse message box",
+    chords: (environment) =>
+      environment.native && environment.mac ? [{ mod: true, shift: true, code: "KeyM" }] : [],
+  },
   "dictation.toggle": {
     label: "Toggle voice dictation",
     chords: () => [{ mod: true, alt: true, code: "KeyV" }],

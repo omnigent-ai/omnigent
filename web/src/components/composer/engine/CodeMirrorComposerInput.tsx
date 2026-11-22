@@ -34,14 +34,15 @@ import {
 
 import { cn } from "@/lib/utils";
 
-import type {
-  ComposerEditorSurface,
-  ComposerInputEvent,
-  ComposerInputHeightMode,
-  ComposerInputProps,
-  ComposerKeyboardEvent,
-  ComposerTextTarget,
-  ComposerTokenAt,
+import {
+  COMPOSER_TALL_HEIGHT_VAR,
+  type ComposerEditorSurface,
+  type ComposerInputEvent,
+  type ComposerInputHeightMode,
+  type ComposerInputProps,
+  type ComposerKeyboardEvent,
+  type ComposerTextTarget,
+  type ComposerTokenAt,
 } from "./composerInput";
 import { readlineKeys } from "./codeMirrorReadline";
 
@@ -202,7 +203,9 @@ function theme(heightMode: ComposerInputHeightMode): Extension {
       lineHeight: "inherit",
       overflowX: "hidden",
       overflowY: unbounded ? "visible" : "auto",
-      maxHeight: unbounded ? "none" : `${COMPOSER_MAX_HEIGHT_PX}px`,
+      ...(heightMode === "tall"
+        ? { height: `var(${COMPOSER_TALL_HEIGHT_VAR})`, maxHeight: "none" }
+        : { maxHeight: unbounded ? "none" : `${COMPOSER_MAX_HEIGHT_PX}px` }),
       scrollbarWidth: "thin",
       scrollbarColor: "color-mix(in srgb, var(--foreground) 28%, transparent) transparent",
     },

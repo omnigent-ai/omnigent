@@ -19,7 +19,7 @@ export function ComposerHeightToggle({
   const label = composerHeightActionLabel(expanded ? "expanded" : "compact");
   const Icon = expanded ? Minimize2Icon : Maximize2Icon;
   return (
-    <KeyboardShortcutTooltip label={label} keys={keys}>
+    <KeyboardShortcutTooltip label={label} keys={keys && keys.length > 0 ? keys : undefined}>
       <Button
         type="button"
         variant="ghost"

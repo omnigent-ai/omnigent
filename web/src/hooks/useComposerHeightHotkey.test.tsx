@@ -1,5 +1,8 @@
-import { act, cleanup, renderHook } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { act, cleanup, fireEvent, renderHook } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import type * as HotkeysModule from "@/lib/hotkeys";
+import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
 import {
   composerHeightOf,
@@ -14,8 +17,21 @@ import {
   useComposerHeightHotkey,
 } from "./useComposerHeightHotkey";
 
+// ⇧⌘M is bound only in the macOS desktop app, so each test picks the shell it runs in.
+const shell = vi.hoisted(() => ({ native: true, mac: true }));
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridgeModule>()),
+  isNativeShell: () => shell.native,
+}));
+vi.mock("@/lib/hotkeys", async (importOriginal) => ({
+  ...(await importOriginal<typeof HotkeysModule>()),
+  isMacPlatform: () => shell.mac,
+}));
+
 afterEach(() => {
   cleanup();
+  shell.native = true;
+  shell.mac = true;
   resetComposerHeightsForTests();
   usePaletteCommandsStore.setState({ groups: {} });
   document.body.replaceChildren();
@@ -51,15 +67,18 @@ const leaveForThePalette = () => {
 
 describe("useComposerHeightHotkey", () => {
   it("offers one ⌘K row named for what it does next, withdrawn where the box can't expand", () => {
-    const { rerender } = mount("session:a");
-    mount("session:b");
+    const first = mount("session:a");
+    const second = mount("session:b");
     expect(rows()).toHaveLength(1);
     expect(heightGroups().map((group) => group.heading)).toEqual(["Message"]);
     expect(row()?.label).toBe("Expand message box");
 
-    rerender({ scope: "session:a", enabled: false });
-    // The other box still can.
+    // The box the row acts on can't expand any more; the other box still can.
+    second.rerender({ scope: "session:b", enabled: false });
     expect(rows()).toHaveLength(1);
+    expect(targetComposerScope()).toBe("session:a");
+    first.rerender({ scope: "session:a", enabled: false });
+    expect(rows()).toHaveLength(0);
   });
 
   it("acts on the newest box until focus enters one, then on the one focused last", () => {
@@ -120,7 +139,9 @@ describe("useComposerHeightHotkey", () => {
   });
 
   it("acts on a box that mounts with focus already in it", () => {
-    mount("session:a");
+    // Focus entered the first box, so the second wins only by holding focus as it mounts.
+    const first = mount("session:a");
+    act(() => first.input.focus());
     const root = document.createElement("div");
     const input = document.createElement("textarea");
     root.append(input);
@@ -142,5 +163,77 @@ describe("useComposerHeightHotkey", () => {
     first.unmount();
     expect(targetComposerScope()).toBeNull();
     expect(rows()).toHaveLength(0);
+  });
+});
+
+describe("the ⇧⌘M chord", () => {
+  const pressChord = (target: Element = document.body, init: KeyboardEventInit = {}) =>
+    fireEvent.keyDown(target, {
+      key: "M",
+      code: "KeyM",
+      metaKey: true,
+      shiftKey: true,
+      ...init,
+    });
+
+  it("toggles the box ⌘K acts on, once however many boxes are up", () => {
+    const first = mount("session:a");
+    mount("session:b");
+    act(() => first.input.focus());
+    expect(pressChord(first.input)).toBe(false);
+    expect(composerHeightOf("session:a")).toBe("expanded");
+    expect(composerHeightOf("session:b")).toBe("compact");
+    pressChord(first.input);
+    expect(composerHeightOf("session:a")).toBe("compact");
+  });
+
+  it("leaves held repeats, terminals and the file editor alone", () => {
+    mount("session:a");
+    pressChord(document.body, { repeat: true });
+    const terminal = document.createElement("div");
+    terminal.className = "xterm";
+    const terminalInput = document.createElement("textarea");
+    terminal.append(terminalInput);
+    document.body.append(terminal);
+    act(() => terminalInput.focus());
+    expect(pressChord(terminalInput)).toBe(true);
+    expect(composerHeightOf("session:a")).toBe("compact");
+  });
+
+  it("isn't bound in a browser, or in the desktop app off macOS", () => {
+    for (const [native, mac] of [
+      [false, true],
+      [true, false],
+    ]) {
+      shell.native = native;
+      shell.mac = mac;
+      mount("session:a");
+      pressChord();
+      pressChord(document.body, { metaKey: false, ctrlKey: true });
+      expect(composerHeightOf("session:a")).toBe("compact");
+      cleanup();
+    }
+  });
+
+  it("listens once for every box up, and stops with the last one", () => {
+    const listening = () => {
+      const added = add.mock.calls.filter(([type]) => type === "keydown").length;
+      return added - remove.mock.calls.filter(([type]) => type === "keydown").length;
+    };
+    const add = vi.spyOn(window, "addEventListener");
+    const remove = vi.spyOn(window, "removeEventListener");
+    const first = mount("session:a");
+    const second = mount("session:b");
+    expect(listening()).toBe(1);
+    first.unmount();
+    expect(listening()).toBe(1);
+    second.unmount();
+    expect(listening()).toBe(0);
+    vi.restoreAllMocks();
+  });
+
+  it("shows the chord on the ⌘K row", () => {
+    mount("session:a");
+    expect(row()?.shortcut).toBe("composer.toggleHeight");
   });
 });

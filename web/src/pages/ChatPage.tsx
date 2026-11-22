@@ -137,6 +137,7 @@ import { shouldQueueSend } from "@/lib/messageQueue";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
+import { useComposerHeightScope } from "@/lib/composerHeightState";
 import {
   composerInlineMentions,
   fileMentionToken,
@@ -2561,6 +2562,9 @@ function ComposerImpl(
   // tabs and coming back restores the draft. The shared draft store also lets
   // the sidebar surface which sessions have unfinished composer content.
   const conversationId = useChatStore((s) => s.conversationId);
+  // Each session keeps its own compact or expanded message box; a new one starts compact.
+  const { scope: composerHeightScope, collapse: collapseComposerHeight } =
+    useComposerHeightScope(conversationId);
   const localReviewComments = usePendingLocalReviewContexts(conversationId);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
@@ -4042,6 +4046,9 @@ function ComposerImpl(
     // reach here via the form submit) and Enter-key sends. Placed after the
     // guard so guarded no-ops don't emit, matching the disabled Send button.
     trackClick("chat.composer.send", "button");
+    // The message goes out, so an expanded box returns to compact. Only the editor expands, so
+    // with it off the session's height stays as it was.
+    if (composerEngine === "codemirror") collapseComposerHeight();
 
     // A generic (non-Codex) side chat forks the conversation and runs it on the
     // SAME host/sandbox as the source (no new sandbox), then opens it as a rail
@@ -4550,6 +4557,7 @@ function ComposerImpl(
         )}
         data-suggestions-open={slashCompletion.open || mentionOpen ? "true" : undefined}
         engine={composerEngine}
+        heightScope={composerHeightScope}
         dictating={dictation.hasInterim}
         draftKey={conversationId ?? null}
         activeInputId={activeTextId ?? COMPOSER_TAIL_INPUT_ID}

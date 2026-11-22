@@ -97,6 +97,7 @@ const HOTKEYS_WITHOUT_COMMANDS: Partial<Record<ShortcutId, string>> = {
   "model.cycle": WHERE_PRESSED,
   "effort.cycle": WHERE_PRESSED,
   "composer.focus": WHERE_PRESSED,
+  "composer.toggleHeight": "The message box offers its own ⌘K row while it can expand.",
   "dictation.toggle": WHERE_PRESSED,
   "approval.accept": WHERE_PRESSED,
   "approval.decline": WHERE_PRESSED,

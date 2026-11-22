@@ -31,7 +31,17 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 import * as CodeMirrorModule from "@/components/composer/engine/CodeMirrorComposerInput";
-import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
+import {
+  codeMirrorComposerLoad,
+  loadCodeMirrorComposer,
+  resetCodeMirrorComposerLoadForTests,
+} from "@/components/composer/engine/codeMirrorComposerLoader";
+import {
+  composerHeightOf,
+  resetComposerHeightsForTests,
+  setComposerHeight,
+} from "@/lib/composerHeightState";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { insertComposerText } from "@/lib/composerText";
 
@@ -10379,5 +10389,109 @@ describe("Composer with the CodeMirror release flag on", () => {
 
     fireEvent.keyDown(editor, { key: "Enter" });
     expect(props.onSend).toHaveBeenCalledExactlyOnceWith("!git status", undefined);
+  });
+});
+
+describe("Composer's expandable message box", () => {
+  const LONG_DRAFT = Array.from({ length: 30 }, (_, index) => `line ${index + 1}`).join("\n");
+  const withFlag = (on: boolean, element: ReactElement) => (
+    <CapabilitiesProvider
+      info={{ ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: on } }}
+    >
+      {element}
+    </CapabilitiesProvider>
+  );
+  const toggle = () => screen.queryByTestId("composer-height-toggle");
+  const scroller = () => document.querySelector<HTMLElement>(".cm-scroller")!;
+  const heightRows = () =>
+    Object.values(usePaletteCommandsStore.getState().groups)
+      .flatMap((group) => group.commands)
+      .filter((command) => command.id.startsWith("composer-toggle-height:"));
+  const isTall = () => getComputedStyle(scroller()).height === "var(--composer-tall-height)";
+  let scrollHeight: { mockRestore: () => void };
+
+  beforeEach(async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    loadCodeMirrorComposer();
+    await waitFor(() => expect(codeMirrorComposerLoad().status).toBe("ready"));
+    // Every input holds more draft than it shows, as a long draft makes it.
+    scrollHeight = vi.spyOn(Element.prototype, "scrollHeight", "get").mockImplementation(function (
+      this: Element,
+    ) {
+      return this.matches("textarea, .cm-scroller") ? 500 : 0;
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    scrollHeight.mockRestore();
+    clearSessionDrafts();
+    resetComposerHeightsForTests();
+    resetCodeMirrorComposerLoadForTests();
+    usePaletteCommandsStore.setState({ groups: {} });
+  });
+
+  it("stays as it was with the flag off: no toggle and no ⌘K row, even with the editor loaded and a long draft", async () => {
+    setComposerState({ conversationId: "conv_tall_off" });
+    setComposerHeight("session:conv_tall_off", "expanded");
+    render(withFlag(false, <Composer {...composerProps()} />));
+    const input = screen.getByLabelText("Message the agent");
+    fireEvent.change(input, { target: { value: LONG_DRAFT } });
+    // Give a deferred overflow measure its frame.
+    await act(async () => {
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => resolve());
+      });
+    });
+
+    expect(input.tagName).toBe("TEXTAREA");
+    expect(document.querySelector(".cm-content")).toBeNull();
+    expect(toggle()).toBeNull();
+    expect(heightRows()).toEqual([]);
+    expect(document.querySelector("[data-composer-card]")!.className).not.toContain(
+      "--composer-tall-height",
+    );
+  });
+
+  it("leaves the session's stored height alone when a send goes out with the flag off", () => {
+    setComposerState({ conversationId: "conv_tall_off_send" });
+    setComposerHeight("session:conv_tall_off_send", "expanded");
+    const props = composerProps();
+    render(withFlag(false, <Composer {...props} />));
+    const input = screen.getByLabelText("Message the agent");
+    fireEvent.change(input, { target: { value: "send from the textarea" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith("send from the textarea", undefined);
+    expect(composerHeightOf("session:conv_tall_off_send")).toBe("expanded");
+  });
+
+  it("expands on the editor, keeps each session's height, and returns to compact after a send", async () => {
+    setComposerState({ conversationId: "conv_tall_a" });
+    const props = composerProps();
+    render(withFlag(true, <Composer {...props} />));
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    const editor = () => screen.getByLabelText("Message the agent");
+    act(() => insertComposerText(composerTargetOf(editor())!, LONG_DRAFT));
+    await waitFor(() => expect(toggle()).toHaveAccessibleName("Expand message box"));
+    expect(heightRows().map((row) => row.label)).toEqual(["Expand message box"]);
+
+    fireEvent.click(toggle()!);
+    expect(composerHeightOf("session:conv_tall_a")).toBe("expanded");
+    expect(isTall()).toBe(true);
+    expect(heightRows().map((row) => row.label)).toEqual(["Collapse message box"]);
+
+    act(() => useChatStore.setState({ conversationId: "conv_tall_b" }));
+    expect(isTall()).toBe(false);
+    act(() => useChatStore.setState({ conversationId: "conv_tall_a" }));
+    expect(isTall()).toBe(true);
+
+    const target = composerTargetOf(editor())!;
+    act(() => insertComposerText(target, "ship the long prompt", 0, target.value.length));
+    fireEvent.keyDown(editor(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith("ship the long prompt", undefined);
+    expect(composerHeightOf("session:conv_tall_a")).toBe("compact");
+    expect(isTall()).toBe(false);
   });
 });

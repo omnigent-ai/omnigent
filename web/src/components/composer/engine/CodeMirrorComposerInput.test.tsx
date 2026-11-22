@@ -63,6 +63,14 @@ describe("CodeMirrorComposerInput", () => {
     expect(scroller.maxHeight).toBe("none");
   });
 
+  it("is a fixed tall editor that scrolls in the tall height", () => {
+    const { container } = mount({ heightMode: "tall" });
+    const scroller = getComputedStyle(container.querySelector(".cm-scroller")!);
+    expect(scroller.height).toBe("var(--composer-tall-height)");
+    expect(scroller.maxHeight).toBe("none");
+    expect(scroller.overflowY).toBe("auto");
+  });
+
   it("is a labelled multi-line composer input", () => {
     const { content } = mount();
     expect(isComposerInput(content)).toBe(true);

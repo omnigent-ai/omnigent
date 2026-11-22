@@ -29,6 +29,9 @@ import {
 } from "@/components/composer/engine/composerInput";
 import { useCodeMirrorComposerLoad } from "@/components/composer/engine/composerEnginePolicy";
 import { useComposerEngineHandoff } from "@/components/composer/engine/useComposerEngineHandoff";
+import { ComposerHeightToggle } from "@/components/composer/ComposerHeightToggle";
+import { useComposerTallEditor } from "@/components/composer/useComposerTallEditor";
+import { composerHeightKeys } from "@/hooks/useComposerHeightHotkey";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
@@ -135,6 +138,11 @@ interface ChatComposerBaseProps extends Omit<ComponentPropsWithoutRef<"div">, "c
   appearance?: "default" | "glass" | "panel";
   /** Attachments, mentions, or feedback that need the expanded mobile layout. */
   hasContent?: boolean;
+  /**
+   * Whose compact or expanded height the box shows, such as its session's. With one, the
+   * CodeMirror input can expand to a tall editor; the textarea never does.
+   */
+  heightScope?: string;
   keyboard: {
     submitWithModEnter: boolean;
     preventsKeyboardSubmit: boolean;
@@ -179,6 +187,8 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
     actions,
     onFocusCapture,
     onBlurCapture,
+    onPasteCapture,
+    heightScope,
     ...props
   },
   ref,
@@ -218,6 +228,20 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
   const trackUncontrolled = (value: string) => {
     if (input.value === undefined) setUncontrolledValue(value);
   };
+  const inputAreaRef = useRef<HTMLDivElement>(null);
+  // A card on the CodeMirror input can expand to a tall editor; a panel already fills its window.
+  // Both engines count: a handoff can keep the editor up a moment after it was turned off.
+  const tallEditor = useComposerTallEditor({
+    scope: heightScope,
+    enabled: engine === "codemirror" && renderedEngine === "codemirror" && !panel && !isMobile,
+    rootRef,
+    inputAreaRef,
+    draftText: String(input.value ?? uncontrolledValue),
+    hasInputPrefix: Boolean(slots?.inputPrefix),
+  });
+  // Quote blocks make the whole input area the scroller, so it takes the tall height instead.
+  const tallArea = tallEditor.tall && Boolean(slots?.inputPrefix);
+  const tallInput = tallEditor.tall && !tallArea;
   const actionRowRef = useRef<HTMLDivElement>(null);
   const actionWidthRef = useRef<HTMLDivElement>(null);
   const leadingRef = useRef<HTMLDivElement>(null);
@@ -230,7 +254,13 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
       data-mobile-composer={isMobile ? (expanded ? "expanded" : "collapsed") : undefined}
       data-composer-hint-placeholder={needsHintPlaceholder || undefined}
       data-composer-appearance={panel ? "panel" : undefined}
-      className={cn("relative flex w-full flex-col", COMPOSER_SURFACE_CLASS[appearance], className)}
+      className={cn(
+        "relative flex w-full flex-col",
+        COMPOSER_SURFACE_CLASS[appearance],
+        // The expanded box: tall for a long draft, short enough to keep the chat in view.
+        tallEditor.tall && "[--composer-tall-height:min(55dvh,36rem)]",
+        className,
+      )}
       {...props}
       onFocusCapture={(event) => {
         // Header controls bubble through React portals outside this card.
@@ -248,16 +278,27 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
         }
         onBlurCapture?.(event);
       }}
+      onPasteCapture={(event) => {
+        tallEditor.onPasteCapture(event);
+        onPasteCapture?.(event);
+      }}
     >
       {appearance === "glass" && (
         <OmniGlassSurface variant="composer" borderRadius={20} className="-z-10" />
       )}
       {slots?.beforeInput}
       <ComposerInputArea
+        ref={inputAreaRef}
         data-composer-input-area
         className={cn(
           panel && "flex min-h-0 flex-1 flex-col overflow-y-auto",
-          !panel && slots?.inputPrefix && "max-h-[320px] overflow-y-auto",
+          !panel &&
+            slots?.inputPrefix &&
+            (tallArea
+              ? "h-(--composer-tall-height) overflow-y-auto"
+              : "max-h-[320px] overflow-y-auto"),
+          // The draft's text keeps clear of the corner toggle; the scrollbar still runs to the edge.
+          tallEditor.showToggle && "[&_.cm-content]:pr-7!",
         )}
       >
         <ComposerEngineContext.Provider value={renderedEngine}>
@@ -283,6 +324,7 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
                 ...inputLayout,
                 inputId: input.inputId ?? COMPOSER_TAIL_INPUT_ID,
                 ...(panel && { heightMode: "unbounded" as const }),
+                ...(tallInput && { heightMode: "tall" as const }),
                 onChange: (event) => {
                   trackUncontrolled(event.currentTarget.value);
                   input.onChange?.(event);
@@ -294,6 +336,13 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
         </ComposerEngineContext.Provider>
         {slots?.inputHint}
       </ComposerInputArea>
+      {tallEditor.showToggle ? (
+        <ComposerHeightToggle
+          expanded={tallEditor.tall}
+          onToggle={tallEditor.toggle}
+          keys={composerHeightKeys()}
+        />
+      ) : null}
       {slots?.attachments}
       <ComposerActionRow
         ref={actionRowRef}
@@ -596,18 +645,21 @@ function composerListEdit(target: ComposerTextTarget) {
   return { start: selectionStart, end: selectionEnd, text: `\n${indent}${nextMarker}${spacing}` };
 }
 
-export function ComposerInputArea({ className, ...props }: ComponentPropsWithoutRef<"div">) {
-  return (
-    <div
-      className={cn(
-        "composer-input-text relative overflow-hidden pt-3 pb-1 text-ui",
-        COMPOSER_CONTENT_INSET_CLASS,
-        className,
-      )}
-      {...props}
-    />
-  );
-}
+export const ComposerInputArea = forwardRef<HTMLDivElement, ComponentPropsWithoutRef<"div">>(
+  function ComposerInputArea({ className, ...props }, ref) {
+    return (
+      <div
+        ref={ref}
+        className={cn(
+          "composer-input-text relative overflow-hidden pt-3 pb-1 text-ui",
+          COMPOSER_CONTENT_INSET_CLASS,
+          className,
+        )}
+        {...props}
+      />
+    );
+  },
+);
 
 /**
  * One wrapping row of chips (attachment tiles, mention chips) on the shared

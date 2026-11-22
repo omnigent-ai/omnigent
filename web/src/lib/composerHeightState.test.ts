@@ -5,7 +5,6 @@ import {
   composerHeightOf,
   DEFAULT_COMPOSER_HEIGHT,
   pasteExpandsComposer,
-  PASTE_EXPANDS_COMPOSER,
   resetComposerHeightsForTests,
   setComposerHeight,
   toggleComposerHeight,
@@ -64,14 +63,14 @@ describe("composerHeightState", () => {
 describe("pasteExpandsComposer", () => {
   const lines = (count: number) => Array.from({ length: count }, (_, index) => `line ${index}`);
 
-  it("expands from the line threshold, and not one line short of it", () => {
-    expect(pasteExpandsComposer(lines(PASTE_EXPANDS_COMPOSER.lines).join("\n"))).toBe(true);
-    expect(pasteExpandsComposer(lines(PASTE_EXPANDS_COMPOSER.lines - 1).join("\n"))).toBe(false);
+  it("expands from 15 lines, and not at 14", () => {
+    expect(pasteExpandsComposer(lines(15).join("\n"))).toBe(true);
+    expect(pasteExpandsComposer(lines(14).join("\n"))).toBe(false);
   });
 
-  it("expands from the character threshold on one line", () => {
-    expect(pasteExpandsComposer("x".repeat(PASTE_EXPANDS_COMPOSER.characters))).toBe(true);
-    expect(pasteExpandsComposer("x".repeat(PASTE_EXPANDS_COMPOSER.characters - 1))).toBe(false);
+  it("expands from 1,500 characters on one line, and not at 1,499", () => {
+    expect(pasteExpandsComposer("x".repeat(1500))).toBe(true);
+    expect(pasteExpandsComposer("x".repeat(1499))).toBe(false);
     expect(pasteExpandsComposer("")).toBe(false);
   });
 });

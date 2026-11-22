@@ -81,7 +81,9 @@ describe("useComposerInputOverflow", () => {
     const area = sized(document.createElement("div"), 200, 200);
     area.append(...inputs);
     document.body.append(area);
-    const view = renderHook(() => useComposerInputOverflow({ current: area }, true));
+    // One ref for the fixture's life, as a component's useRef gives.
+    const areaRef = { current: area };
+    const view = renderHook(() => useComposerInputOverflow(areaRef, true));
     return { area, view };
   }
   /** The input's box shrinks to `clientHeight`, while the area around it keeps its size. */
@@ -92,6 +94,20 @@ describe("useComposerInputOverflow", () => {
       vi.advanceTimersByTime(16);
     });
   };
+
+  it("measures again on input alone, with no resize or DOM change", () => {
+    const textarea = sized(document.createElement("textarea"), 120, 120);
+    const { view } = watchArea(textarea);
+    expect(view.result.current).toBe(false);
+
+    sized(textarea, 400, 120);
+    act(() => {
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+      vi.advanceTimersByTime(16);
+    });
+
+    expect(view.result.current).toBe(true);
+  });
 
   it("sees a textarea that shrinks inside an area that doesn't", () => {
     const textarea = sized(document.createElement("textarea"), 120, 120);

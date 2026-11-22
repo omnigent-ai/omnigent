@@ -45,6 +45,7 @@ describe("shortcut registry", () => {
       "model.cycle",
       "effort.cycle",
       "composer.focus",
+      "composer.toggleHeight",
       "dictation.toggle",
       "approval.accept",
       "approval.decline",
@@ -435,6 +436,42 @@ describe("Chat and Pane bindings", () => {
         mac,
       ),
     ).toBe(false);
+  });
+});
+
+describe("expanding the message box", () => {
+  const environments = [true, false].flatMap((isMac) =>
+    [true, false].flatMap((native) =>
+      [true, false].map((desktopMenu) => ({ mac: isMac, native, desktopMenu })),
+    ),
+  );
+  const shiftCommandM = press({ key: "M", code: "KeyM", metaKey: true, shiftKey: true });
+
+  it("binds ⇧⌘M in the macOS desktop app only", () => {
+    for (const environment of environments) {
+      const bound = environment.mac && environment.native;
+      expect(matchesShortcut(shiftCommandM, "composer.toggleHeight", environment)).toBe(bound);
+      expect(shortcutKeys("composer.toggleHeight", environment)).toEqual(
+        bound ? ["⌘", "⇧", "M"] : [],
+      );
+    }
+  });
+
+  it("leaves Control+Shift+M to the model picker everywhere, including the desktop app off macOS", () => {
+    const controlShiftM = press({ key: "M", code: "KeyM", ctrlKey: true, shiftKey: true });
+    for (const environment of environments) {
+      expect(matchesShortcut(controlShiftM, "composer.toggleHeight", environment)).toBe(false);
+      expect(matchesShortcut(controlShiftM, "model.picker", environment)).toBe(true);
+    }
+  });
+
+  it("shares its keys with no other binding", () => {
+    for (const environment of environments) {
+      for (const binding of SHORTCUT_BINDINGS) {
+        if (binding.id === "composer.toggleHeight") continue;
+        expect(matchesShortcut(shiftCommandM, binding.id, environment), binding.id).toBe(false);
+      }
+    }
   });
 });
 

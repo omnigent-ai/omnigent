@@ -121,9 +121,13 @@ export function isHistoryInput(event: ComposerInputEvent): boolean {
 
 /**
  * `compact` grows with the draft up to the composer's cap, then scrolls. `unbounded` grows
- * with it, for an input whose surroundings scroll.
+ * with it, for an input whose surroundings scroll. `tall` is the expanded message box, a fixed
+ * tall editor that scrolls past its height.
  */
-export type ComposerInputHeightMode = "compact" | "unbounded";
+export type ComposerInputHeightMode = "compact" | "unbounded" | "tall";
+
+/** The CSS variable a composer sets to the height of its `tall` input. */
+export const COMPOSER_TALL_HEIGHT_VAR = "--composer-tall-height";
 
 /** Which engine renders the composer's editable surface. */
 export type ComposerInputEngine = "textarea" | "codemirror";
