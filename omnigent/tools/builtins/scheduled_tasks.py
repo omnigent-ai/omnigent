@@ -248,7 +248,11 @@ class SysScheduledTaskListTool(Tool):
     @classmethod
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
-        return "List your scheduled tasks (recurring agent runs) with their schedules and state."
+        return (
+            "List your scheduled tasks (recurring agent runs) with their schedules and state. "
+            "A trigger automation, which watches a service such as Jira or Slack for new "
+            "items, is listed with rrule null when the server decides when it polls."
+        )
 
     def get_schema(self) -> dict[str, Any]:
         """:returns: The OpenAI-format tool schema."""

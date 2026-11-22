@@ -6880,6 +6880,60 @@ async def test_the_local_user_has_no_automations_shared_with_them(
     assert listed.json() == {"scheduled_tasks": [], "next_cursor": None}
 
 
+_SLACK_TRIGGER = {
+    "prompt": "This automation watches Slack and starts one Omnigent session per message.",
+    "session_mode": "continue",
+}
+
+
+@_SHARING
+async def test_a_trigger_reads_its_rrule_as_null(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    _make_user(db_uri, "bob@example.com")
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(**_SLACK_TRIGGER), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["rrule"] is None
+    trigger_id = created.json()["id"]
+    scheduled_id = await _create_task(auth_client)
+    for task_id in (trigger_id, scheduled_id):
+        assert (await _share(auth_client, task_id, "bob@example.com")).status_code == 200
+
+    expected = {trigger_id: None, scheduled_id: _VALID_RRULE}
+    listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert {t["id"]: t["rrule"] for t in listed.json()["scheduled_tasks"]} == expected
+    shared = await auth_client.get("/v1/scheduled-tasks/shared", headers=_BOB)
+    assert {t["id"]: t["rrule"] for t in shared.json()["scheduled_tasks"]} == expected
+    url = f"/v1/scheduled-tasks/{trigger_id}"
+    assert (await auth_client.get(url, headers=_headers())).json()["rrule"] is None
+    renamed = await auth_client.patch(url, json={"name": "renamed"}, headers=_headers())
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["rrule"] is None
+    cloned = await auth_client.post(f"{url}/clone", headers=_headers())
+    assert cloned.status_code == 200, cloned.text
+    assert cloned.json()["rrule"] is None
+    # The saved rule and timezone are kept, and a clone copies them.
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    for task_id in (trigger_id, cloned.json()["id"]):
+        saved = store.get(task_id)
+        assert (saved.rrule, saved.timezone) == (_VALID_RRULE, "America/Los_Angeles")
+
+
+async def test_the_legacy_scheduler_returns_a_triggers_saved_rule(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    # Its timers poll a trigger on the saved rule.
+    _make_user(db_uri)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(**_SLACK_TRIGGER), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["rrule"] == _VALID_RRULE
+
+
 @_SHARING
 async def test_a_shared_run_session_lists_with_its_run_labels(
     auth_client: httpx.AsyncClient, db_uri: str
