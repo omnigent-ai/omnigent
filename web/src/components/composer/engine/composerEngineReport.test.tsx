@@ -94,10 +94,11 @@ describe("composerEngineReportFor", () => {
 });
 
 describe("useComposerEngineReport", () => {
+  // No default for `send`: an explicit undefined must reach the hook as a missing sink.
   function renderReport(
     flagOn: boolean,
-    initialRendered: ComposerInputEngine = "textarea",
-    send: ((report: ComposerEngineReport) => void) | undefined = vi.fn(),
+    initialRendered: ComposerInputEngine,
+    send: ((report: ComposerEngineReport) => void) | undefined,
   ) {
     return renderHook(
       ({ rendered }: { rendered: ComposerInputEngine }) =>
@@ -106,11 +107,22 @@ describe("useComposerEngineReport", () => {
     );
   }
 
-  it("sends nothing with the flag off, or without a sink", () => {
+  it("sends nothing with the flag off, or without a sink", async () => {
     const send = vi.fn();
     renderReport(false, "textarea", send);
     expect(send).not.toHaveBeenCalled();
-    expect(() => renderReport(true, "textarea", undefined)).not.toThrow();
+
+    // A missing sink is never called: nothing throws and nothing warns, settled or held.
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    loadCodeMirrorComposer();
+    await waitFor(() => expect(codeMirrorComposerLoad().status).toBe("ready"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    const { rerender } = renderReport(true, "textarea", undefined);
+    act(() => vi.advanceTimersByTime(HELD_SWITCH_REPORT_DELAY_MS));
+    rerender({ rendered: "codemirror" });
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
   });
 
   it("sends once per change as the editor loads, then once it renders", async () => {
