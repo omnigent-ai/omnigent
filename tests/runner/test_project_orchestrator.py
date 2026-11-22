@@ -49,6 +49,21 @@ async def test_project_guidance_and_designated_role_in_native_and_sdk_prompts(ro
     assert spec.instructions == "Shared agent instructions"
 
 
+def test_comment_guidance_keeps_decisions_local_and_requires_real_message_targets():
+    assert "lead with the outcome or current blocker" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert (
+        "decisions, asks and next actions in the ticket itself" in PROJECT_TICKET_WORK_INSTRUCTION
+    )
+    assert "**Outcome**, **Evidence** and **Next** only when helpful" in (
+        PROJECT_TICKET_WORK_INSTRUCTION
+    )
+    assert "durable message link is known" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "Never invent message IDs" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "session-only link as a specific-message link" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "keep the necessary detail in the comment" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "Preserve earlier comments and their provenance" in PROJECT_TICKET_WORK_INSTRUCTION
+
+
 def test_stage_fit_contract_requires_a_decision_without_phase_or_approval_shortcuts():
     assert "ordinary comments, not dedicated" in PROJECT_TICKET_WORK_INSTRUCTION
     assert "There is no built-in planning or review gate" in PROJECT_TICKET_WORK_INSTRUCTION
