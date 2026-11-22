@@ -23,18 +23,23 @@ from omnigent.entities.conversation import (
 from omnigent.entities.file import StoredFile
 from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 from omnigent.runner.session_history import build_session_history
+from omnigent.runtime.context_breakdown import IMAGE_TOKEN_ESTIMATE, estimate_text_tokens
 from omnigent.runtime.prompt import (
+    build_instructions,
     build_instructions_nullable,
     build_native_startup_instructions,
     dedupe_tool_output_images,
 )
 from omnigent.server.context_breakdown import (
-    IMAGE_TOKEN_ESTIMATE,
+    HistoryEstimate,
     build_context_breakdown,
-    estimate_text_tokens,
     scan_history,
 )
-from omnigent.server.schemas import SessionContextBreakdown
+from omnigent.server.schemas import (
+    ContextBreakdownCategory,
+    ContextBreakdownMeasured,
+    SessionContextBreakdown,
+)
 from omnigent.spec.types import AgentSpec, MCPServerConfig, SkillSpec
 
 
@@ -63,6 +68,15 @@ def _assistant(item_id: str, text: str) -> ConversationItem:
 
 def _text(text: str) -> dict[str, object]:
     return {"type": "input_text", "text": text}
+
+
+def _category(breakdown: SessionContextBreakdown, kind: str) -> ContextBreakdownCategory:
+    (category,) = [row for row in breakdown.categories if row.kind == kind]
+    return category
+
+
+def _kinds(breakdown: SessionContextBreakdown) -> list[str]:
+    return [row.kind for row in breakdown.categories]
 
 
 def test_estimate_text_tokens_rounds_utf8_bytes_up() -> None:
@@ -364,14 +378,28 @@ def test_scan_history_sizes_a_native_summary_without_a_token_count() -> None:
             lookup_file={"file_img": stored_image}.get,
         )
 
+    def history_for(harness: str) -> HistoryEstimate:
+        history, _ = scan_history(
+            reversed(items), session_id="conv_1", native=harness == "claude-native"
+        )
+        return history
+
     native = breakdown_for("claude-native")
+    native_history = history_for("claude-native")
     checkpoint_tokens = 100 + 10_000 + 100 + estimate_text_tokens(json.dumps(function_call)) + 10
     # The retained messages, not the placeholder summary, size the checkpoint.
-    assert native.history.summary_tokens == checkpoint_tokens
+    assert native_history.summary_tokens == checkpoint_tokens
     # Native replay drops everything before the checkpoint and the item it carries.
-    assert native.history.item_count == 1
-    assert native.history.summarized_item_count == 2
-    assert native.history.estimated_tokens == checkpoint_tokens + 10
+    assert native_history.item_count == 1
+    assert native_history.summarized_item_count == 2
+    assert native_history.estimated_tokens == checkpoint_tokens + 10
+    history_row = _category(native, "history")
+    assert (history_row.tokens, history_row.source, history_row.count) == (
+        checkpoint_tokens + 10,
+        "estimated",
+        1,
+    )
+    assert history_row.detail == ("1 message or tool call · 2 earlier items replaced by a summary")
     # The retained image is listed once; the snapshot-stripped one was not delivered.
     rows = [(row.filename, row.delivery, row.estimated_tokens) for row in native.attachments]
     assert rows == [
@@ -381,20 +409,18 @@ def test_scan_history_sizes_a_native_summary_without_a_token_count() -> None:
     ]
 
     # The runner replays the latest compaction, summary-only or not, in place of all before it.
-    runtime = breakdown_for("claude-sdk")
-    assert runtime.history.summary_tokens == _REPLAY_PROMPT_TOKENS + estimate_text_tokens(
-        "placeholder"
-    )
-    assert runtime.history.item_count == 1
-    assert runtime.history.summarized_item_count == 3
+    runtime = history_for("claude-sdk")
+    assert runtime.summary_tokens == _REPLAY_PROMPT_TOKENS + estimate_text_tokens("placeholder")
+    assert runtime.item_count == 1
+    assert runtime.summarized_item_count == 3
 
     # Without it, the runner replays the retained messages and every item after them.
     items = [item for item in items if item.id != "cmp_fallback"]
-    runtime = breakdown_for("claude-sdk")
-    assert runtime.history.summary_tokens == checkpoint_tokens
+    runtime = history_for("claude-sdk")
+    assert runtime.summary_tokens == checkpoint_tokens
     assert _replayed_live_ids(items) == [covered_id, "msg_new"]
-    assert runtime.history.item_count == 2
-    assert runtime.history.summarized_item_count == 2
+    assert runtime.item_count == 2
+    assert runtime.summarized_item_count == 2
 
 
 def _stored(
@@ -459,8 +485,19 @@ def test_breakdown_reports_attachment_delivery_and_estimates() -> None:
         (None, "inline", None, IMAGE_TOKEN_ESTIMATE),
     ]
     # Attachments are reported separately, not inside the history estimate.
-    assert breakdown.history.estimated_tokens == 1
-    assert breakdown.system_prompt_tokens is None
+    assert _category(breakdown, "history").tokens == 1
+    attachments = _category(breakdown, "attachments")
+    assert (attachments.tokens, attachments.count, attachments.source) == (
+        IMAGE_TOKEN_ESTIMATE + 1_001 + 1 + IMAGE_TOKEN_ESTIMATE,
+        7,
+        "estimated",
+    )
+    assert attachments.detail == "Plus 1 sent without an estimate, counted in Other"
+    # Without a spec the prompt row has no figure, and without a report no remainder.
+    prompt = _category(breakdown, "system_prompt")
+    assert (prompt.tokens, prompt.source) == (None, "unknown")
+    assert _kinds(breakdown) == ["system_prompt", "tools", "attachments", "history"]
+    assert breakdown.measured is None
     assert breakdown.bytes_per_token == 4
 
 
@@ -476,7 +513,7 @@ def _spec() -> AgentSpec:
     )
 
 
-def test_breakdown_estimates_spec_prompt_skills_and_selected_tools() -> None:
+def test_breakdown_estimates_the_composed_prompt_and_lists_selected_tools() -> None:
     spec = _spec()
 
     breakdown = build_context_breakdown(
@@ -488,15 +525,246 @@ def test_breakdown_estimates_spec_prompt_skills_and_selected_tools() -> None:
         lookup_file=lambda _file_id: None,
     )
 
-    composed = build_instructions_nullable(spec, None, [])
-    assert composed is not None
-    assert breakdown.system_prompt_tokens == estimate_text_tokens(composed)
-    assert breakdown.skill_count == 1
-    assert breakdown.skill_listing_tokens == estimate_text_tokens(
-        "- triage: Sort incoming issues."
+    prompt = _category(breakdown, "system_prompt")
+    assert prompt.tokens == estimate_text_tokens(build_instructions(spec, None, []))
+    assert (prompt.source, prompt.origin) == ("estimated", "server")
+    assert prompt.detail == "Agent instructions and Omnigent guidance"
+    # The runner composes without tool schemas, so the prompt carries no skill listing.
+    assert _kinds(breakdown) == ["system_prompt", "tools", "history"]
+    tools = _category(breakdown, "tools")
+    assert (tools.tokens, tools.source) == (None, "unknown")
+    assert tools.detail == "MCP: github, linear"
+    history = _category(breakdown, "history")
+    assert (history.tokens, history.count, history.detail) == (0, 0, "0 messages and tool calls")
+
+
+_LOAD_SKILL_SCHEMA = {"type": "function", "function": {"name": "load_skill"}}
+
+
+def test_breakdown_lists_skills_only_when_the_prompt_carries_the_listing() -> None:
+    spec = _spec()
+
+    def breakdown_with(tool_schemas: list[dict[str, object]]) -> SessionContextBreakdown:
+        return build_context_breakdown(
+            "conv_1",
+            spec=spec,
+            harness="openai-agents",
+            labels={},
+            items_newest_first=[],
+            lookup_file=lambda _file_id: None,
+            tool_schemas=tool_schemas,
+        )
+
+    without = breakdown_with([])
+    assert "skills" not in _kinds(without)
+
+    injected = breakdown_with([_LOAD_SKILL_SCHEMA])
+    skills = _category(injected, "skills")
+    listing = (
+        "Available skills (use the load_skill tool to load one):\n- triage: Sort incoming issues."
     )
-    assert breakdown.tools.mcp_servers == ["github", "linear"]
-    assert breakdown.history.item_count == 0
+    assert (skills.tokens, skills.count, skills.source) == (
+        estimate_text_tokens(listing),
+        1,
+        "estimated",
+    )
+    # The listing is part of the composed prompt, so the two rows add up to it.
+    composed = build_instructions(spec, None, [_LOAD_SKILL_SCHEMA])
+    assert listing in composed
+    prompt_tokens = _category(injected, "system_prompt").tokens
+    assert prompt_tokens is not None
+    assert prompt_tokens + (skills.tokens or 0) == estimate_text_tokens(composed)
+    # A startup channel never carries the listing, whatever tools the turn lists.
+    native = build_context_breakdown(
+        "conv_1",
+        spec=spec,
+        harness="claude-native",
+        labels={},
+        items_newest_first=[],
+        lookup_file=lambda _file_id: None,
+        tool_schemas=[_LOAD_SKILL_SCHEMA],
+    )
+    assert "skills" not in _kinds(native)
+
+
+@pytest.mark.parametrize(
+    ("harness", "tokens_of", "source", "detail"),
+    [
+        # composed-per-turn and session-snapshot harnesses get the turn instructions.
+        ("openai-agents", "composed", "estimated", "Agent instructions and Omnigent guidance"),
+        ("claude-sdk", "composed", "estimated", "Agent instructions and Omnigent guidance"),
+        ("opencode-native", "composed", "estimated", "Agent instructions and Omnigent guidance"),
+        # A startup channel carries the native startup form.
+        ("codex-native", "startup", "estimated", "Agent instructions and Omnigent guidance"),
+        (
+            "cursor",
+            "composed",
+            "estimated",
+            "Agent instructions and Omnigent guidance, sent with the first message",
+        ),
+        ("cursor-native", None, "unknown", "Not delivered by this harness"),
+        ("kimi", None, "unknown", "Not delivered by this harness"),
+        # An in-process harness that declares no mode is still handed the instructions.
+        ("agents_sdk", "composed", "estimated", "Agent instructions and Omnigent guidance"),
+    ],
+)
+def test_breakdown_system_prompt_follows_the_harness_instruction_delivery(
+    harness: str, tokens_of: str | None, source: str, detail: str
+) -> None:
+    spec = _spec()
+    expected = {
+        "composed": estimate_text_tokens(build_instructions(spec, None, [])),
+        "startup": estimate_text_tokens(build_native_startup_instructions(spec)),
+        None: None,
+    }[tokens_of]
+
+    breakdown = build_context_breakdown(
+        "conv_1",
+        spec=spec,
+        harness=harness,
+        labels={},
+        items_newest_first=[],
+        lookup_file=lambda _file_id: None,
+        measured=ContextBreakdownMeasured(total_tokens=10_000, context_window=200_000),
+    )
+
+    prompt = _category(breakdown, "system_prompt")
+    assert (prompt.tokens, prompt.source, prompt.detail) == (expected, source, detail)
+    # An undelivered prompt is not itemized, so the remainder keeps the whole total.
+    assert _category(breakdown, "other").tokens == 10_000 - (expected or 0)
+
+
+def test_breakdown_gated_harness_omits_the_fallback_line_for_an_empty_spec() -> None:
+    bare = AgentSpec(spec_version=1)
+
+    def prompt_tokens(harness: str) -> int | None:
+        breakdown = build_context_breakdown(
+            "conv_1",
+            spec=bare,
+            harness=harness,
+            labels={},
+            items_newest_first=[],
+            lookup_file=lambda _file_id: None,
+        )
+        return _category(breakdown, "system_prompt").tokens
+
+    # A gated harness gets the nullable form; the others get the fallback line too.
+    assert prompt_tokens("opencode-native") == estimate_text_tokens(
+        build_instructions_nullable(bare, None, []) or ""
+    )
+    assert prompt_tokens("openai-agents") == estimate_text_tokens(
+        build_instructions(bare, None, [])
+    )
+    assert prompt_tokens("opencode-native") != prompt_tokens("openai-agents")
+
+
+def _measured_breakdown(
+    total_tokens: int | None, *, context_window: int | None = 200_000, text_bytes: int = 4_000
+) -> SessionContextBreakdown:
+    return build_context_breakdown(
+        "conv_1",
+        spec=None,
+        harness="claude-sdk",
+        labels={},
+        items_newest_first=[_user("msg_1", _text("a" * text_bytes))],
+        lookup_file=lambda _file_id: None,
+        measured=(
+            None
+            if total_tokens is None
+            else ContextBreakdownMeasured(total_tokens=total_tokens, context_window=context_window)
+        ),
+    )
+
+
+def test_breakdown_derives_the_remainder_from_the_measured_total() -> None:
+    breakdown = _measured_breakdown(5_000)
+
+    assert breakdown.measured == ContextBreakdownMeasured(
+        total_tokens=5_000, context_window=200_000
+    )
+    assert _kinds(breakdown) == ["system_prompt", "tools", "history", "other", "free"]
+    other = _category(breakdown, "other")
+    # The history estimate is 1,000 tokens; rows without a figure count as nothing.
+    assert (other.tokens, other.source) == (4_000, "estimated")
+    # The spec did not load, so the instructions are part of the remainder too.
+    assert other.detail == (
+        "Instructions, tool schemas, content the harness adds itself and the last reply"
+    )
+    free = _category(breakdown, "free")
+    assert (free.tokens, free.source) == (195_000, "measured")
+    assert breakdown.estimates_exceed_measured is False
+
+
+def test_breakdown_without_a_measured_total_has_no_remainder_rows() -> None:
+    breakdown = _measured_breakdown(None)
+
+    assert breakdown.measured is None
+    assert _kinds(breakdown) == ["system_prompt", "tools", "history"]
+    assert breakdown.estimates_exceed_measured is False
+
+
+def test_breakdown_flags_estimates_that_exceed_the_measured_total() -> None:
+    breakdown = _measured_breakdown(600)
+
+    assert breakdown.estimates_exceed_measured is True
+    other = _category(breakdown, "other")
+    assert other.tokens == 0
+    assert other.detail == "The estimates above add up to more than the last measured total"
+    # The itemized row keeps its own estimate rather than being scaled to fit.
+    assert _category(breakdown, "history").tokens == 1_000
+
+
+def test_breakdown_omits_free_space_when_the_window_is_unknown() -> None:
+    breakdown = _measured_breakdown(5_000, context_window=None)
+
+    assert _kinds(breakdown) == ["system_prompt", "tools", "history", "other"]
+
+
+def test_breakdown_leaves_history_unsized_for_a_native_harness_with_its_own_rules() -> None:
+    items = [_user("msg_1", _text("a" * 4_000)), _assistant("msg_2", "b" * 40)]
+
+    def history_row(harness: str) -> ContextBreakdownCategory:
+        breakdown = build_context_breakdown(
+            "conv_1",
+            spec=None,
+            harness=harness,
+            labels={},
+            items_newest_first=reversed(items),
+            lookup_file=lambda _file_id: None,
+            measured=ContextBreakdownMeasured(total_tokens=5_000, context_window=200_000),
+        )
+        assert _category(breakdown, "other").tokens == 5_000 - (
+            _category(breakdown, "history").tokens or 0
+        )
+        return _category(breakdown, "history")
+
+    sized = history_row("claude-native")
+    assert (sized.tokens, sized.source) == (1_010, "estimated")
+    unsized = history_row("codex-native")
+    assert (unsized.tokens, unsized.source, unsized.count) == (None, "unknown", 2)
+    assert unsized.detail == (
+        "2 messages and tool calls stored; this harness keeps its own history"
+    )
+
+
+def test_breakdown_remainder_names_every_row_it_absorbs() -> None:
+    breakdown = build_context_breakdown(
+        "conv_1",
+        spec=_spec(),
+        harness="cursor-native",
+        labels={},
+        items_newest_first=[_user("msg_1", _text("a" * 4_000))],
+        lookup_file=lambda _file_id: None,
+        measured=ContextBreakdownMeasured(total_tokens=5_000, context_window=200_000),
+    )
+
+    # No row carries a figure on this harness, so the remainder is the whole total.
+    other = _category(breakdown, "other")
+    assert other.tokens == 5_000
+    assert other.detail == (
+        "Instructions, tool schemas, conversation history, content the harness adds itself"
+        " and the last reply"
+    )
 
 
 def test_breakdown_reflects_native_harness_prompt_and_attachment_paths() -> None:
@@ -525,7 +793,7 @@ def test_breakdown_reflects_native_harness_prompt_and_attachment_paths() -> None
         lookup_file={"file_img": image}.get,
     )
 
-    assert breakdown.system_prompt_tokens == estimate_text_tokens(
+    assert _category(breakdown, "system_prompt").tokens == estimate_text_tokens(
         build_native_startup_instructions(spec)
     )
     # A native CLI receives every attachment as a path, uploaded or sent as a data URI.
@@ -552,4 +820,4 @@ def test_breakdown_lists_declared_servers_when_a_selection_label_is_malformed() 
         lookup_file=lambda _file_id: None,
     )
 
-    assert breakdown.tools.mcp_servers == ["github", "slack"]
+    assert _category(breakdown, "tools").detail == "MCP: github, slack"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from omnigent.entities import (
@@ -14,6 +15,9 @@ from omnigent.entities import (
     MessageData,
     NativeToolData,
 )
+from omnigent.harness_aliases import canonicalize_harness, is_native_harness
+from omnigent.harness_capabilities import InstructionDelivery
+from omnigent.harness_plugins import harness_capabilities
 from omnigent.inner.native_attachments import expand_framework_notices
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.runtime.tool_result_replay import (
@@ -131,20 +135,30 @@ def _assemble_instruction_parts(
     if per_request_instructions and per_request_instructions.strip():
         parts.append(per_request_instructions)
 
-    # Only mention skills in the system prompt when load_skill is
-    # available as a tool. Executors that handle skills natively
-    # (e.g. Claude SDK with its built-in Skill tool) don't need
-    # this hint — the SDK informs the model about skills itself.
+    skill_listing = _skill_listing(spec, tool_schemas)
+    if skill_listing is not None:
+        parts.append(skill_listing)
+
+    return parts
+
+
+def _skill_listing(spec: AgentSpec, tool_schemas: Sequence[dict[str, Any]]) -> str | None:
+    """
+    The skill listing the system prompt carries, or ``None`` when it has none.
+
+    Skills are only mentioned when ``load_skill`` is available as a tool.
+    Executors that handle skills natively (e.g. Claude SDK with its built-in
+    Skill tool) inform the model about skills themselves.
+    """
     has_load_skill = any(
         schema.get("function", {}).get("name") == "load_skill" for schema in tool_schemas
     )
-    if spec.skills and has_load_skill:
-        skill_lines = ["Available skills (use the load_skill tool to load one):"]
-        for skill in spec.skills:
-            skill_lines.append(f"- {skill.name}: {skill.description}")
-        parts.append("\n".join(skill_lines))
-
-    return parts
+    if not spec.skills or not has_load_skill:
+        return None
+    skill_lines = ["Available skills (use the load_skill tool to load one):"]
+    for skill in spec.skills:
+        skill_lines.append(f"- {skill.name}: {skill.description}")
+    return "\n".join(skill_lines)
 
 
 def build_instructions(
@@ -242,6 +256,75 @@ def build_native_startup_instructions(spec: AgentSpec | None) -> str:
         append_framework_instructions(authored, (WORKSPACE_IMAGE_INSTRUCTION,))
         or WORKSPACE_IMAGE_INSTRUCTION
     )
+
+
+# Harnesses whose executor reads the wire ``instructions`` field itself, so
+# their composed instructions must not fall back to a generic assistant line
+# when the spec gives nothing to compose.
+GATED_COMPOSED_INSTRUCTION_HARNESSES = frozenset({"opencode-native", "hermes"})
+
+
+@dataclass(frozen=True)
+class DeliveredInstructions:
+    """
+    The instructions Omnigent hands one harness for a spec.
+
+    :param delivery: How the harness receives ``AgentSpec.instructions``.
+    :param text: The composed text; ``None`` when the harness has no delivery
+        channel, or is a native harness that declares none.
+    :param skill_listing: The skill listing inside ``text``; ``None`` when the
+        prompt carries none.
+    """
+
+    delivery: InstructionDelivery
+    text: str | None = None
+    skill_listing: str | None = None
+
+
+def instruction_delivery_for(harness: str | None) -> InstructionDelivery:
+    """
+    How *harness* receives agent instructions.
+
+    :param harness: A harness id or alias, e.g. ``"claude-native"``.
+    :returns: Its declared delivery; ``UNKNOWN`` when it declares none.
+    """
+    capabilities = harness_capabilities().get(canonicalize_harness(harness) or "")
+    return capabilities.instruction_delivery if capabilities else InstructionDelivery.UNKNOWN
+
+
+def compose_delivered_instructions(
+    spec: AgentSpec,
+    harness: str | None,
+    *,
+    per_request_instructions: str | None = None,
+    tool_schemas: Sequence[dict[str, Any]] = (),
+) -> DeliveredInstructions:
+    """
+    Compose the instructions *harness* receives for *spec*, by its delivery mode.
+
+    A startup channel carries the native startup form; every other delivering
+    mode carries the composed turn instructions, wherever the harness puts them
+    (system prompt, session snapshot or a first-message prefix). An in-process
+    harness that declares no mode is still handed the composed instructions.
+
+    :param spec: The resolved agent spec.
+    :param harness: A harness id or alias, e.g. ``"opencode-native"``.
+    :param per_request_instructions: Extra instructions of one request, if any.
+    :param tool_schemas: The turn's tool schemas; the runner composes with none.
+    :returns: The delivery mode and the text it carries.
+    """
+    delivery = instruction_delivery_for(harness)
+    undeclared_native = delivery is InstructionDelivery.UNKNOWN and is_native_harness(harness)
+    if delivery is InstructionDelivery.NOT_DELIVERED or undeclared_native:
+        return DeliveredInstructions(delivery)
+    if delivery is InstructionDelivery.AGENT_STARTUP_ADDITIVE:
+        return DeliveredInstructions(delivery, build_native_startup_instructions(spec))
+    schemas = list(tool_schemas)
+    if canonicalize_harness(harness) in GATED_COMPOSED_INSTRUCTION_HARNESSES:
+        text = build_instructions_nullable(spec, per_request_instructions, schemas)
+    else:
+        text = build_instructions(spec, per_request_instructions, schemas)
+    return DeliveredInstructions(delivery, text, _skill_listing(spec, schemas))
 
 
 def _strip_output_annotations(

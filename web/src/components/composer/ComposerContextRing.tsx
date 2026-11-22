@@ -6,7 +6,6 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { formatTokenCount } from "@/lib/formatCost";
 import { getSessionContextBreakdown } from "@/lib/sessionsApi";
 import { cn } from "@/lib/utils";
-import { useChatStore } from "@/store/chatStore";
 import { ComposerContextBreakdown } from "./ComposerContextBreakdown";
 
 /** Circumference of the progress ring (r=5.5). */
@@ -26,8 +25,8 @@ const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
  * @param sessionId - The session whose breakdown a click opens; without one
  *   the ring is a plain tooltip.
  * @param turnActive - Whether a turn is running. An open breakdown refreshes
- *   when a turn starts and ends, and when the transcript's newest entry changes
- *   between turns, since history can change while the measured total stays the same.
+ *   when a turn starts and when it ends, since history can change while the
+ *   measured total stays the same.
  */
 export function ComposerContextRing({
   contextWindow,
@@ -141,31 +140,23 @@ function ContextBreakdownLoader({
   contextWindow: number;
   tokensUsed: number;
 }) {
-  // The newest transcript entry changes when one is appended, committed or merged
-  // into; paging older history in prepends, so it leaves the newest entry alone.
-  const newestBlock = useChatStore((s) =>
-    s.conversationId === sessionId ? s.blocks[s.blocks.length - 1] : undefined,
-  );
   const breakdown = useQuery({
-    // A new measured total keys a new estimate; history changes refetch below.
+    // A new measured total keys a new breakdown; turn boundaries refetch below.
     queryKey: ["session-context-breakdown", sessionId, tokensUsed],
     queryFn: ({ signal }) => getSessionContextBreakdown(sessionId, { signal }),
-    // Keep this session's last breakdown on screen while a new total's estimate loads.
+    // Keep this session's last breakdown on screen while a new total's one loads.
     placeholderData: (previous, previousQuery) =>
       previousQuery?.queryKey[1] === sessionId ? previous : undefined,
     staleTime: 0,
     retry: false,
   });
   const { refetch } = breakdown;
-  const lastSeen = useRef({ newestBlock, turnActive });
+  const wasTurnActive = useRef(turnActive);
   useEffect(() => {
-    const before = lastSeen.current;
-    lastSeen.current = { newestBlock, turnActive };
-    // Refresh when a turn starts and once it settles, not per streamed entry.
-    const turnStarted = turnActive && !before.turnActive;
-    const settledChange = !turnActive && (before.turnActive || before.newestBlock !== newestBlock);
-    if (turnStarted || settledChange) void refetch();
-  }, [newestBlock, turnActive, refetch]);
+    // Refresh when a turn starts and once it settles, not per transcript entry.
+    if (wasTurnActive.current !== turnActive) void refetch();
+    wasTurnActive.current = turnActive;
+  }, [turnActive, refetch]);
   return (
     <ComposerContextBreakdown
       contextWindow={contextWindow}

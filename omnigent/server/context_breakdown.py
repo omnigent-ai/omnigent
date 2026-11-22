@@ -1,15 +1,14 @@
 """Estimate what fills a session's context window, for the web breakdown view.
 
 Every figure here is derived from content size (see
-:data:`~omnigent.llms.errors.APPROX_BYTES_PER_TOKEN`), not from a tokenizer:
-the provider-reported total on the session snapshot stays the measured value.
+:mod:`omnigent.runtime.context_breakdown`), not from a tokenizer: the
+provider-reported total stays the measured value the rows are relative to.
 """
 
 from __future__ import annotations
 
-import json
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from omnigent.entities import ConversationItem
@@ -25,104 +24,91 @@ from omnigent.entities.conversation import (
 )
 from omnigent.entities.file import StoredFile
 from omnigent.errors import OmnigentError
-from omnigent.harness_aliases import is_native_harness
+from omnigent.harness_aliases import canonicalize_harness, is_native_harness
+from omnigent.harness_capabilities import InstructionDelivery
 from omnigent.inner.native_attachments import uses_filesystem_delivery
-from omnigent.llms.adapters._content import redact_binary_payloads
 from omnigent.llms.errors import APPROX_BYTES_PER_TOKEN
 from omnigent.mcp_selection import selected_mcp_spec
-from omnigent.runtime.content_resolver import is_text_like_attachment
-from omnigent.runtime.prompt import (
-    build_instructions_nullable,
-    build_native_startup_instructions,
-    dedupe_tool_output_images,
+from omnigent.runtime.context_breakdown import (
+    ATTACHMENT_BLOCK_TYPES,
+    IMAGE_TOKEN_ESTIMATE,
+    TEXT_BLOCK_TYPES,
+    estimate_attachment_tokens,
+    estimate_text_tokens,
+    estimate_without_binary,
+    inline_payload_bytes,
 )
+from omnigent.runtime.prompt import compose_delivered_instructions, dedupe_tool_output_images
 from omnigent.server.schemas import (
     ContextBreakdownAttachment,
-    ContextBreakdownHistory,
-    ContextBreakdownTools,
+    ContextBreakdownCategory,
+    ContextBreakdownMeasured,
     SessionContextBreakdown,
 )
 from omnigent.spec.types import AgentSpec
 
-# Roughly one full-resolution image on current vision models; its token cost
-# does not follow its encoded size.
-IMAGE_TOKEN_ESTIMATE = 1_600
-
 # Most recent items read per breakdown, so a very long session stays cheap.
 MAX_SCANNED_ITEMS = 2_000
 
-_TEXT_BLOCK_TYPES = frozenset({"input_text", "output_text", "text", "refusal"})
-_ATTACHMENT_BLOCK_TYPES = frozenset({"input_image", "input_file"})
 # Provider-shaped binary blocks, e.g. in a native harness's checkpoint messages.
 _PROVIDER_BINARY_BLOCK_TYPES = frozenset({"image", "document"})
 _THINKING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
 # Bookkeeping keys on a retained checkpoint entry that are never sent to the model.
 _SNAPSHOT_ENVELOPE_KEYS = frozenset({"id", "forwarded_source_ids", "message_id", "status"})
-
-
-def estimate_text_tokens(text: str) -> int:
-    """
-    Estimate prompt tokens for *text* from its UTF-8 size.
-
-    :param text: Any prompt text, e.g. ``"Hello"``.
-    :returns: Estimated tokens, rounded up, e.g. ``2``.
-    """
-    return _bytes_to_tokens(len(text.encode("utf-8")))
-
-
-def _bytes_to_tokens(size: int) -> int:
-    """Estimated tokens for *size* bytes of text, rounded up."""
-    return -(-size // APPROX_BYTES_PER_TOKEN)
-
-
-def _estimate_without_binary(value: object) -> int:
-    """Estimate structured content, counting each embedded image as one image."""
-    images = 0
-
-    def drop_payload(media_type: str, _length: int) -> str:
-        nonlocal images
-        if media_type.startswith("image/"):
-            images += 1
-        return ""
-
-    stripped = redact_binary_payloads(value, drop_payload)
-    text = stripped if isinstance(stripped, str) else json.dumps(stripped, ensure_ascii=False)
-    return estimate_text_tokens(text) + images * IMAGE_TOKEN_ESTIMATE
+# Native harnesses whose mirrored transcript and checkpoints follow the replay
+# rules the history scan models; the others keep a history it cannot size.
+_SIZED_NATIVE_HISTORY_HARNESSES = frozenset({"claude-native"})
 
 
 def _estimate_tool_output_tokens(output: str) -> int:
     """Estimate a tool result as it is replayed, with stored images reduced to placeholders."""
-    return _estimate_without_binary(dedupe_tool_output_images(output))
+    return estimate_without_binary(dedupe_tool_output_images(output))
 
 
-def estimate_system_prompt_tokens(spec: AgentSpec, harness: str | None) -> int:
+@dataclass
+class ToolSources:
     """
-    Estimate the instructions Omnigent composes for *spec*.
+    Tool sources declared by a session's agent. Schemas are listed by the
+    runner at turn time, so their size is not estimated here.
 
-    :param spec: The session's resolved agent spec.
-    :param harness: The session's canonical harness, e.g. ``"claude-native"``.
-        Native harnesses receive only the startup instructions.
-    :returns: Estimated tokens; ``0`` when nothing is composed.
+    :param mcp_servers: Enabled MCP server names, e.g. ``["github"]``.
+    :param local_tool_count: Agent-bundled tools, e.g. ``2``.
+    :param builtin_tool_count: Configured built-in tools, e.g. ``1``.
     """
-    if is_native_harness(harness):
-        text: str | None = build_native_startup_instructions(spec)
-    else:
-        text = build_instructions_nullable(spec, None, [])
-    return estimate_text_tokens(text) if text else 0
+
+    mcp_servers: list[str] = field(default_factory=list)
+    local_tool_count: int = 0
+    builtin_tool_count: int = 0
 
 
-def estimate_skill_listing_tokens(spec: AgentSpec) -> int:
+@dataclass
+class HistoryEstimate:
     """
-    Estimate the skill name/description listing a harness shows the model.
+    Estimated size of a session's live conversation history.
 
-    :param spec: The session's resolved agent spec.
-    :returns: Estimated tokens; ``0`` without bundled skills.
+    :param estimated_tokens: Estimated tokens of the live history, including
+        the latest compaction summary and excluding attachments.
+    :param item_count: Messages and tool calls/results still sent in full.
+    :param summarized_item_count: Earlier messages and tool calls/results
+        replaced by a compaction summary.
+    :param summary_tokens: Estimated size of what replaces the compacted
+        history: the checkpoint's retained messages when it has them, else the
+        replayed summary and its prompt; ``0`` when never compacted.
+    :param partial: The scan stopped at its item cap before the summarized
+        range, so the live counts are lower bounds.
+    :param summarized_partial: The scan stopped inside the summarized range,
+        so ``summarized_item_count`` is a lower bound.
     """
-    listing = "\n".join(f"- {skill.name}: {skill.description}" for skill in spec.skills)
-    return estimate_text_tokens(listing) if listing else 0
+
+    estimated_tokens: int = 0
+    item_count: int = 0
+    summarized_item_count: int = 0
+    summary_tokens: int = 0
+    partial: bool = False
+    summarized_partial: bool = False
 
 
-def summarize_tools(spec: AgentSpec, labels: dict[str, str]) -> ContextBreakdownTools:
+def summarize_tools(spec: AgentSpec, labels: dict[str, str]) -> ToolSources:
     """
     List the tool sources the session's agent declares.
 
@@ -135,7 +121,7 @@ def summarize_tools(spec: AgentSpec, labels: dict[str, str]) -> ContextBreakdown
     except OmnigentError:
         # A malformed selection label fails the turn elsewhere; list the declared servers.
         selected = spec
-    return ContextBreakdownTools(
+    return ToolSources(
         mcp_servers=[server.name for server in selected.mcp_servers],
         local_tool_count=len(spec.local_tools),
         builtin_tool_count=len(spec.tools.builtins),
@@ -181,21 +167,6 @@ def _block_payload(block: dict[str, Any]) -> object:
     return block.get("image_url") or block.get("file_data")
 
 
-def _inline_payload_bytes(block: dict[str, Any]) -> int | None:
-    """Decoded size of a block's inline base64 payload, if it carries one."""
-    for key in ("file_data", "image_url"):
-        payload = block.get(key)
-        if not isinstance(payload, str) or not payload or is_omitted_binary_payload(payload):
-            continue
-        if payload.startswith("data:"):
-            payload = payload.split(",", 1)[-1]
-        elif "://" in payload:
-            # A remote URL carries no payload of its own.
-            return None
-        return len(payload.rstrip("=")) * 3 // 4
-    return None
-
-
 def _attachment_ref(block: dict[str, Any]) -> _AttachmentRef:
     """Describe an ``input_image`` / ``input_file`` block."""
     file_id = block.get("file_id")
@@ -205,7 +176,7 @@ def _attachment_ref(block: dict[str, Any]) -> _AttachmentRef:
         file_id=file_id if isinstance(file_id, str) else None,
         filename=filename if isinstance(filename, str) else None,
         is_image=block.get("type") == "input_image",
-        inline_bytes=_inline_payload_bytes(block),
+        inline_bytes=inline_payload_bytes(block),
         has_data_uri=isinstance(payload, str) and payload.startswith("data:"),
         omitted=is_omitted_binary_payload(payload),
     )
@@ -238,7 +209,7 @@ def _snapshot_block_tokens(block: dict[str, Any]) -> tuple[int, _AttachmentRef |
             return (estimate_text_tokens(data) if isinstance(data, str) else 0), None
         return 0, _provider_block_ref(block)
     # Tool calls and results inside a transcript message.
-    return _estimate_without_binary(block), None
+    return estimate_without_binary(block), None
 
 
 def _content_tokens(
@@ -258,11 +229,11 @@ def _content_tokens(
         if not isinstance(block, dict):
             continue
         block_type = block.get("type")
-        if block_type in _TEXT_BLOCK_TYPES:
+        if block_type in TEXT_BLOCK_TYPES:
             text = block.get("text")
             if isinstance(text, str):
                 tokens += estimate_text_tokens(text)
-        elif block_type in _ATTACHMENT_BLOCK_TYPES:
+        elif block_type in ATTACHMENT_BLOCK_TYPES:
             attachments.append(_attachment_ref(block))
         elif snapshot:
             block_tokens, ref = _snapshot_block_tokens(block)
@@ -277,7 +248,7 @@ def _snapshot_entry_tokens(entry: dict[str, Any]) -> tuple[int, list[_Attachment
     if entry.get("type", "message") == "message" and "content" in entry:
         return _content_tokens(entry["content"], snapshot=True)
     payload = {key: value for key, value in entry.items() if key not in _SNAPSHOT_ENVELOPE_KEYS}
-    return _estimate_without_binary(payload), []
+    return estimate_without_binary(payload), []
 
 
 def _item_tokens(item: ConversationItem) -> tuple[int, list[_AttachmentRef]] | None:
@@ -298,8 +269,8 @@ def _item_tokens(item: ConversationItem) -> tuple[int, list[_AttachmentRef]] | N
         if native_item.get("type") == "image_generation_call" and "result" in native_item:
             # The generated image is stored as bare base64 under ``result``.
             rest = {key: value for key, value in native_item.items() if key != "result"}
-            return _estimate_without_binary(rest) + IMAGE_TOKEN_ESTIMATE, []
-        return _estimate_without_binary(native_item), []
+            return estimate_without_binary(rest) + IMAGE_TOKEN_ESTIMATE, []
+        return estimate_without_binary(native_item), []
     return None
 
 
@@ -355,7 +326,7 @@ def scan_history(
     session_id: str | None = None,
     native: bool = False,
     max_items: int = MAX_SCANNED_ITEMS,
-) -> tuple[ContextBreakdownHistory, list[_AttachmentRef]]:
+) -> tuple[HistoryEstimate, list[_AttachmentRef]]:
     """
     Estimate the live history from items read newest first.
 
@@ -375,7 +346,7 @@ def scan_history(
     :param max_items: Items to read before marking the result partial.
     :returns: The history estimate and live attachments, oldest first.
     """
-    history = ContextBreakdownHistory()
+    history = HistoryEstimate()
     live: list[_LiveEntry] = []
     checkpoint: _Checkpoint | None = None
     summarized = False
@@ -451,13 +422,13 @@ def resolve_attachment(
                 bytes=size,
                 delivery="workspace" if ref.has_data_uri else "missing",
             )
-        tokens: int | None = None
-        if ref.is_image:
-            tokens = IMAGE_TOKEN_ESTIMATE
-        elif size is not None and is_text_like_attachment("", ref.filename):
-            tokens = _bytes_to_tokens(size)
         return ContextBreakdownAttachment(
-            filename=ref.filename, bytes=size, delivery="inline", estimated_tokens=tokens
+            filename=ref.filename,
+            bytes=size,
+            delivery="inline",
+            estimated_tokens=estimate_attachment_tokens(
+                is_image=ref.is_image, content_type=None, filename=ref.filename, size=size
+            ),
         )
     stored = lookup_file(ref.file_id)
     if stored is None:
@@ -474,19 +445,186 @@ def resolve_attachment(
             bytes=stored.bytes,
             delivery="workspace",
         )
-    estimated: int | None = None
-    if ref.is_image or (content_type or "").startswith("image/"):
-        estimated = IMAGE_TOKEN_ESTIMATE
-    elif is_text_like_attachment(content_type or "", filename):
-        estimated = _bytes_to_tokens(stored.bytes)
     return ContextBreakdownAttachment(
         file_id=ref.file_id,
         filename=filename,
         content_type=content_type,
         bytes=stored.bytes,
         delivery="inline",
-        estimated_tokens=estimated,
+        estimated_tokens=estimate_attachment_tokens(
+            is_image=ref.is_image,
+            content_type=content_type,
+            filename=filename,
+            size=stored.bytes,
+        ),
     )
+
+
+def _plural(count: int, noun: str) -> str:
+    """``"1 tool"`` / ``"2 tools"``."""
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def _instruction_categories(
+    spec: AgentSpec | None, harness: str | None, tool_schemas: Sequence[dict[str, Any]]
+) -> list[ContextBreakdownCategory]:
+    """The system-prompt row, and the skill-listing row when the prompt carries one."""
+    if spec is None:
+        return [
+            ContextBreakdownCategory(
+                kind="system_prompt",
+                source="unknown",
+                detail="The agent's configuration could not be loaded",
+            )
+        ]
+    delivered = compose_delivered_instructions(spec, harness, tool_schemas=tool_schemas)
+    if delivered.text is None:
+        not_delivered = delivered.delivery is InstructionDelivery.NOT_DELIVERED
+        return [
+            ContextBreakdownCategory(
+                kind="system_prompt",
+                source="unknown",
+                detail=(
+                    "Not delivered by this harness"
+                    if not_delivered
+                    else "This harness does not declare how it receives instructions"
+                ),
+            )
+        ]
+    detail = "Agent instructions and Omnigent guidance"
+    if delivered.delivery is InstructionDelivery.FIRST_USER_PREFIX:
+        detail += ", sent with the first message"
+    listing_tokens = estimate_text_tokens(delivered.skill_listing or "")
+    # The listing is part of the composed text, so it is not counted twice.
+    prompt_tokens = max(estimate_text_tokens(delivered.text or "") - listing_tokens, 0)
+    categories = [
+        ContextBreakdownCategory(
+            kind="system_prompt", tokens=prompt_tokens, source="estimated", detail=detail
+        )
+    ]
+    if delivered.skill_listing is not None:
+        categories.append(
+            ContextBreakdownCategory(
+                kind="skills", tokens=listing_tokens, source="estimated", count=len(spec.skills)
+            )
+        )
+    return categories
+
+
+def _tools_category(tools: ToolSources | None) -> ContextBreakdownCategory:
+    """The tool-definitions row: sources are listed, schema size is not known here."""
+    parts: list[str] = []
+    if tools is not None:
+        if tools.mcp_servers:
+            parts.append(f"MCP: {', '.join(tools.mcp_servers)}")
+        if tools.builtin_tool_count:
+            parts.append(_plural(tools.builtin_tool_count, "built-in tool"))
+        if tools.local_tool_count:
+            parts.append(_plural(tools.local_tool_count, "agent tool"))
+    return ContextBreakdownCategory(
+        kind="tools",
+        source="unknown",
+        detail=" · ".join(parts) if parts else "Harness and Omnigent tools only",
+    )
+
+
+def _attachments_category(
+    attachments: list[ContextBreakdownAttachment],
+) -> ContextBreakdownCategory | None:
+    """The attachments row, totalling the inline ones that have an estimate."""
+    if not attachments:
+        return None
+    inline = [attachment for attachment in attachments if attachment.delivery == "inline"]
+    unestimated = sum(1 for attachment in inline if attachment.estimated_tokens is None)
+    return ContextBreakdownCategory(
+        kind="attachments",
+        tokens=sum(attachment.estimated_tokens or 0 for attachment in inline),
+        source="estimated",
+        count=len(attachments),
+        detail=(
+            f"Plus {unestimated} sent without an estimate, counted in Other"
+            if unestimated
+            else None
+        ),
+    )
+
+
+def _history_category(history: HistoryEstimate, *, sized: bool) -> ContextBreakdownCategory:
+    """The conversation-history row; unsized for a harness that keeps its own history."""
+    noun = "message or tool call" if history.item_count == 1 else "messages and tool calls"
+    count = f"{'At least ' if history.partial else ''}{history.item_count} {noun}"
+    if not sized:
+        return ContextBreakdownCategory(
+            kind="history",
+            source="unknown",
+            count=history.item_count,
+            detail=f"{count} stored; this harness keeps its own history",
+        )
+    parts = [count]
+    if history.summarized_item_count:
+        at_least = "at least " if history.summarized_partial else ""
+        items = "item" if history.summarized_item_count == 1 else "items"
+        parts.append(
+            f"{at_least}{history.summarized_item_count} earlier {items} replaced by a summary"
+        )
+    return ContextBreakdownCategory(
+        kind="history",
+        tokens=history.estimated_tokens,
+        source="estimated",
+        count=history.item_count,
+        detail=" · ".join(parts),
+    )
+
+
+# What the remainder row absorbs for each row that carries no figure of its own.
+_UNSIZED_ROW_NOUNS = {
+    "system_prompt": "instructions",
+    "tools": "tool schemas",
+    "history": "conversation history",
+}
+
+
+def remainder_categories(
+    categories: Sequence[ContextBreakdownCategory], measured: ContextBreakdownMeasured
+) -> tuple[list[ContextBreakdownCategory], bool]:
+    """
+    The rows derived from the measured total: what the itemized rows leave over.
+
+    :param categories: The itemized rows; rows without a figure count as ``0``.
+    :param measured: The provider-reported usage the rows are relative to.
+    :returns: The ``"other"`` row, plus ``"free"`` when the window is known,
+        and whether the itemized estimates exceed the measured total.
+    """
+    itemized = sum(category.tokens or 0 for category in categories)
+    exceeded = itemized > measured.total_tokens
+    if exceeded:
+        # The history can also be newer than the measurement, e.g. mid-turn.
+        detail = "The estimates above add up to more than the last measured total"
+    else:
+        unsized = [
+            _UNSIZED_ROW_NOUNS[category.kind]
+            for category in categories
+            if category.tokens is None and category.kind in _UNSIZED_ROW_NOUNS
+        ]
+        parts = ", ".join([*unsized, "content the harness adds itself"])
+        detail = f"{parts[0].upper()}{parts[1:]} and the last reply"
+    derived = [
+        ContextBreakdownCategory(
+            kind="other",
+            tokens=max(measured.total_tokens - itemized, 0),
+            source="estimated",
+            detail=detail,
+        )
+    ]
+    if measured.context_window is not None:
+        derived.append(
+            ContextBreakdownCategory(
+                kind="free",
+                tokens=max(measured.context_window - measured.total_tokens, 0),
+                source="measured",
+            )
+        )
+    return derived, exceeded
 
 
 def build_context_breakdown(
@@ -497,34 +635,48 @@ def build_context_breakdown(
     labels: dict[str, str],
     items_newest_first: Iterable[ConversationItem],
     lookup_file: Callable[[str], StoredFile | None],
+    measured: ContextBreakdownMeasured | None = None,
+    tool_schemas: Sequence[dict[str, Any]] = (),
     max_items: int = MAX_SCANNED_ITEMS,
 ) -> SessionContextBreakdown:
     """
-    Estimate what fills a session's context window.
+    Resolve what fills a session's context window into display rows.
 
     :param session_id: The session, e.g. ``"conv_abc123"``.
     :param spec: The session's resolved agent spec, or ``None`` when it could
-        not load (the prompt, skill and tool rows are then left empty).
+        not load (the prompt and tool rows then carry no figures).
     :param harness: The session's canonical harness, e.g. ``"claude-sdk"``.
     :param labels: Session labels carrying per-session MCP selections.
     :param items_newest_first: The session's items in descending position.
     :param lookup_file: Returns the session's stored file for an id, or ``None``.
+    :param measured: The provider-reported usage, or ``None`` when the harness
+        has reported none (no remainder rows are then derived).
+    :param tool_schemas: Tool schemas the instructions are composed with; the
+        runner composes with none, so the default matches a real turn.
     :param max_items: Items to read before marking the history partial.
-    :returns: The estimated breakdown.
+    :returns: The resolved breakdown.
     """
     native = is_native_harness(harness)
     history, refs = scan_history(
         items_newest_first, session_id=session_id, native=native, max_items=max_items
     )
-    breakdown = SessionContextBreakdown(
+    attachments = [resolve_attachment(ref, lookup_file, native=native) for ref in refs]
+    sized_history = not native or canonicalize_harness(harness) in _SIZED_NATIVE_HISTORY_HARNESSES
+    categories = _instruction_categories(spec, harness, tool_schemas)
+    categories.append(_tools_category(summarize_tools(spec, labels) if spec else None))
+    attachments_category = _attachments_category(attachments)
+    if attachments_category is not None:
+        categories.append(attachments_category)
+    categories.append(_history_category(history, sized=sized_history))
+    exceeded = False
+    if measured is not None:
+        derived, exceeded = remainder_categories(categories, measured)
+        categories.extend(derived)
+    return SessionContextBreakdown(
         session_id=session_id,
-        history=history,
-        attachments=[resolve_attachment(ref, lookup_file, native=native) for ref in refs],
+        measured=measured,
+        categories=categories,
+        estimates_exceed_measured=exceeded,
+        attachments=attachments,
         bytes_per_token=APPROX_BYTES_PER_TOKEN,
     )
-    if spec is not None:
-        breakdown.system_prompt_tokens = estimate_system_prompt_tokens(spec, harness)
-        breakdown.skill_count = len(spec.skills)
-        breakdown.skill_listing_tokens = estimate_skill_listing_tokens(spec)
-        breakdown.tools = summarize_tools(spec, labels)
-    return breakdown

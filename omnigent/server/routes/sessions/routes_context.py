@@ -11,6 +11,8 @@ from fastapi import APIRouter, Request
 from omnigent.entities import Conversation, ConversationItem
 from omnigent.entities.file import StoredFile
 from omnigent.errors import StaleCursorError
+from omnigent.llms.context_window import resolve_effective_context_window
+from omnigent.onboarding.provider_config import harness_owns_its_credential
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_READ, AuthProvider
 from omnigent.server.context_breakdown import MAX_SCANNED_ITEMS, build_context_breakdown
@@ -21,12 +23,16 @@ from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
-from omnigent.server.routes._sessions.common import _logger
+from omnigent.server.routes._sessions.common import (
+    _LAST_CONTEXT_TOKENS_LABEL_KEY,
+    _LAST_CONTEXT_WINDOW_LABEL_KEY,
+    _logger,
+)
 from omnigent.server.routes._sessions.helpers import (
     _load_agent_spec_for_session,
     _spec_harness,
 )
-from omnigent.server.schemas import SessionContextBreakdown
+from omnigent.server.schemas import ContextBreakdownMeasured, SessionContextBreakdown
 from omnigent.spec.types import AgentSpec
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.file_store import FileStore
@@ -34,6 +40,47 @@ from omnigent.stores.permission_store import PermissionStore
 
 # Items read per store page while scanning the history newest first.
 _SCAN_PAGE_SIZE = 500
+
+
+def _positive_int_label(labels: dict[str, str], key: str) -> int | None:
+    """A label's value as a positive int, or ``None`` when absent or malformed."""
+    raw = labels.get(key)
+    if isinstance(raw, str) and raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return None
+
+
+def _measured_usage(
+    conv: Conversation, spec: AgentSpec | None, harness: str | None
+) -> ContextBreakdownMeasured | None:
+    """
+    The provider-reported usage the session snapshot shows, read from the same row.
+
+    :param conv: The session row whose labels carry the last turn's usage.
+    :param spec: The session's resolved spec, or ``None`` when it could not load.
+    :param harness: The session's effective harness, e.g. ``"claude-sdk"``.
+    :returns: The measured total and window, or ``None`` before any report.
+    """
+    raw_total = conv.labels.get(_LAST_CONTEXT_TOKENS_LABEL_KEY)
+    if not (isinstance(raw_total, str) and raw_total.isdigit()):
+        return None
+    # The harness's observed window outranks the spec's, as on the snapshot.
+    window = _positive_int_label(conv.labels, _LAST_CONTEXT_WINDOW_LABEL_KEY)
+    if window is None and spec is not None:
+        # A harness that authenticates itself picks its own model.
+        owns_model = harness_owns_its_credential(harness) if harness else False
+        try:
+            window = resolve_effective_context_window(
+                None if owns_model else spec.executor.context_window,
+                None if owns_model else spec.executor.model,
+                model_override=conv.model_override,
+            )
+        except Exception:
+            # Same tolerance as the snapshot: a failed catalog lookup leaves it unknown.
+            _logger.debug(
+                "Context breakdown could not resolve a window for %s", conv.id, exc_info=True
+            )
+    return ContextBreakdownMeasured(total_tokens=int(raw_total), context_window=window)
 
 
 def register_context_routes(
@@ -105,6 +152,7 @@ def register_context_routes(
             labels=conv.labels,
             items_newest_first=_items_newest_first(conv.id),
             lookup_file=_file_lookup(conv.id),
+            measured=_measured_usage(conv, spec, harness),
         )
 
     @router.get(
@@ -116,16 +164,16 @@ def register_context_routes(
         session_id: str,
     ) -> SessionContextBreakdown:
         """
-        Estimate what fills the session's context window.
+        Resolve what fills the session's context window into display rows.
 
-        Splits the window into the agent's system prompt, skill listing,
-        declared tool sources, attachments and conversation history. Every
-        token figure is a size-based estimate; the measured total stays on
-        the session snapshot.
+        Returns the provider-reported total with the rows it splits into: the
+        agent's system prompt, declared tool sources, attachments and
+        conversation history as size-based estimates, then the remainder and
+        the free space.
 
         :param request: The incoming FastAPI request.
         :param session_id: Session identifier, e.g. ``"conv_abc123"``.
-        :returns: The estimated :class:`SessionContextBreakdown`.
+        :returns: The resolved :class:`SessionContextBreakdown`.
         :raises OmnigentError: 404 if the session does not exist or the
             caller cannot read it.
         """

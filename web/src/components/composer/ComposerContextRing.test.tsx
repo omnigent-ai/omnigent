@@ -34,22 +34,26 @@ function renderRing(
   );
 }
 
-const BREAKDOWN: SessionContextBreakdown = {
-  systemPromptTokens: 1_200,
-  skillCount: 0,
-  skillListingTokens: 0,
-  mcpServers: ["github"],
-  localToolCount: 0,
-  builtinToolCount: 0,
-  attachments: [],
-  historyTokens: 40_000,
-  historyItemCount: 12,
-  summarizedItemCount: 0,
-  summaryTokens: 0,
-  historyPartial: false,
-  summarizedPartial: false,
-  bytesPerToken: 4,
-};
+function breakdownWithHistory(historyTokens: number): SessionContextBreakdown {
+  return {
+    measured: { totalTokens: 50_000, contextWindow: 200_000 },
+    categories: [
+      {
+        kind: "history",
+        tokens: historyTokens,
+        source: "estimated",
+        origin: "server",
+        count: 12,
+        detail: "12 messages and tool calls",
+      },
+    ],
+    estimatesExceedMeasured: false,
+    attachments: [],
+    bytesPerToken: 4,
+  };
+}
+
+const BREAKDOWN = breakdownWithHistory(40_000);
 
 afterEach(() => {
   cleanup();
@@ -115,26 +119,24 @@ describe("ComposerContextRing", () => {
     expect(screen.queryByText("25% context used")).not.toBeInTheDocument();
   });
 
-  it("refreshes an open breakdown when a turn finishes with the same total", async () => {
+  it("refreshes an open breakdown at turn boundaries and on a new total only", async () => {
     vi.mocked(getSessionContextBreakdown)
       .mockResolvedValueOnce(BREAKDOWN)
-      .mockResolvedValueOnce({ ...BREAKDOWN, historyTokens: 45_000 })
-      .mockResolvedValueOnce({ ...BREAKDOWN, historyTokens: 60_000 })
-      .mockResolvedValueOnce({ ...BREAKDOWN, historyTokens: 61_000 })
-      .mockResolvedValueOnce({ ...BREAKDOWN, historyTokens: 62_000 })
-      .mockResolvedValueOnce({ ...BREAKDOWN, historyTokens: 63_000 })
+      .mockResolvedValueOnce(breakdownWithHistory(45_000))
+      .mockResolvedValueOnce(breakdownWithHistory(60_000))
+      .mockResolvedValueOnce(breakdownWithHistory(61_000))
+      .mockResolvedValueOnce(breakdownWithHistory(62_000))
+      .mockResolvedValueOnce(breakdownWithHistory(63_000))
       .mockReturnValueOnce(new Promise(() => {}));
     const entry = (itemId: string) => ({ ctx: { itemId } }) as unknown as AnyBlock;
-    const older = entry("msg_0");
-    const newest = entry("msg_1");
-    useChatStore.setState({ conversationId: "conv_1", blocks: [newest] });
+    useChatStore.setState({ conversationId: "conv_1", blocks: [entry("msg_1")] });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const ring = (turnActive: boolean) => (
+    const ring = (turnActive: boolean, tokensUsed = 50_000) => (
       <QueryClientProvider client={queryClient}>
         <TooltipProvider>
           <ComposerContextRing
             contextWindow={200_000}
-            tokensUsed={50_000}
+            tokensUsed={tokensUsed}
             sessionId="conv_1"
             turnActive={turnActive}
           />
@@ -148,13 +150,10 @@ describe("ComposerContextRing", () => {
     const history = () => within(dialog).getByTestId("context-row-history");
     await waitFor(() => expect(history()).toHaveTextContent("~40K"));
 
-    // Paging older history in leaves the newest entry alone: no refetch.
-    act(() => useChatStore.setState({ blocks: [older, newest] }));
     // A turn starting refetches once; entries streamed during it don't.
     rerender(ring(true));
     await waitFor(() => expect(history()).toHaveTextContent("~45K"));
-    act(() => useChatStore.setState({ blocks: [older, newest, entry("msg_2")] }));
-    act(() => useChatStore.setState({ blocks: [older, newest, entry("msg_3")] }));
+    act(() => useChatStore.setState({ blocks: [entry("msg_1"), entry("msg_2")] }));
     await act(async () => {});
     expect(getSessionContextBreakdown).toHaveBeenCalledTimes(2);
 
@@ -162,18 +161,25 @@ describe("ComposerContextRing", () => {
     rerender(ring(false));
     await waitFor(() => expect(history()).toHaveTextContent("~60K"));
 
-    // An entry that lands after the turn ended, e.g. a native forwarder's, refetches too.
-    act(() => useChatStore.setState({ blocks: [older, newest, entry("msg_3"), entry("msg_4")] }));
+    // Transcript entries between turns leave the breakdown alone.
+    act(() => useChatStore.setState({ blocks: [entry("msg_1"), entry("msg_2"), entry("msg_3")] }));
+    rerender(ring(false));
+    await act(async () => {});
+    expect(getSessionContextBreakdown).toHaveBeenCalledTimes(3);
+
+    // A new measured total fetches again, keeping the last figure until it lands.
+    rerender(ring(false, 51_000));
+    expect(history()).toHaveTextContent("~60K");
     await waitFor(() => expect(history()).toHaveTextContent("~61K"));
     expect(getSessionContextBreakdown).toHaveBeenCalledTimes(4);
 
     // A second turn with the same total never falls back to an earlier figure.
-    rerender(ring(true));
+    rerender(ring(true, 51_000));
     expect(history()).toHaveTextContent("~61K");
     await waitFor(() => expect(history()).toHaveTextContent("~62K"));
 
     // Reopening shows the latest breakdown while it refreshes.
-    rerender(ring(false));
+    rerender(ring(false, 51_000));
     await waitFor(() => expect(getSessionContextBreakdown).toHaveBeenCalledTimes(6));
     await user.keyboard("{Escape}");
     await user.click(screen.getByTestId("composer-context-ring"));

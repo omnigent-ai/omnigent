@@ -296,19 +296,24 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   agent from the file viewer (adds a token at the end).
 - `context-breakdown`: the context ring in the in-session workspace bar shows
   the measured share of the window on hover; clicking it opens a breakdown of
-  what fills the window. The header and Free space come from the last turn's
-  reported usage; the system prompt, skill listing, attachments and
-  conversation history are size-based estimates; Other is the measured total
-  minus those estimates (tool schemas, harness-added content, the last reply).
-  Tool definitions list the agent's MCP servers and tool counts without a size.
-  Each attachment shows its size and whether it was sent inline (with an
-  estimate, or "Size only" for PDFs and other binary files), saved to the
-  workspace, or not delivered (file removed, or a native harness could not
-  write it to disk); a native harness receives each attachment it can decode
-  as a file path. History notes how many earlier items a compaction summary
-  replaced. An open breakdown refreshes when a turn starts, when it ends, and
-  when a later entry arrives. A server without the breakdown route still shows
-  the measured header.
+  what fills the window. The server resolves every row against the last turn's
+  reported usage it reads in the same request, and the popover only renders
+  them: the header and Free space are measured; the system prompt, attachments
+  and conversation history are size-based estimates; Other is the measured
+  total minus those estimates (tool schemas, harness-added content, the last
+  reply) and says so when the estimates exceed the total. The system prompt
+  follows how the harness receives instructions: no figure and "Not delivered
+  by this harness" where it has no channel for them. Tool definitions list the
+  agent's MCP servers and tool counts without a size. Each attachment shows its
+  size and whether it was sent inline (with an estimate, or "Size only" for
+  PDFs and other binary files), saved to the workspace, or not delivered (file
+  removed, or a native harness could not write it to disk); a native harness
+  receives each attachment it can decode as a file path. History notes how
+  many earlier items a compaction summary replaced, and has no figure for a
+  native harness that keeps its own history (all but Claude Code). An open
+  breakdown refreshes when a turn starts, when it ends, and when the measured
+  total changes. A server without the breakdown route still shows the measured
+  header.
 - `review-context`: submitting an Agent comment in PR Changes attaches a chip
   to the session composer. Hover previews the comment, click reveals it in
   Changes, and X deletes the saved comment. Failed deletion retains the chip.
@@ -716,11 +721,14 @@ composer with its prompt`).
 - **`context-breakdown`:** in a session with a finished turn and an attached
   image or text file, click the context ring. Check that the header matches the
   hover tooltip, that each row is labelled measured or estimate, and that the
-  attachment rows name the files with their sizes. Cross-check with
-  `GET /v1/sessions/<id>/context-breakdown`. Component coverage:
+  attachment rows name the files with their sizes. Cross-check the rows with
+  `measured` and `categories` from `GET /v1/sessions/<id>/context-breakdown`;
+  on a harness without an instruction channel (e.g. Cursor's terminal agent)
+  the System prompt row reads "Not delivered by this harness". Component coverage:
   `web/src/components/composer/ComposerContextBreakdown.test.tsx` and
   `web/src/components/composer/ComposerContextRing.test.tsx`; server
-  estimates: `tests/server/test_context_breakdown.py`; read access:
+  rows: `tests/server/test_context_breakdown.py`; instruction delivery:
+  `tests/runtime/test_prompt.py`; read access and measured total:
   `tests/server/integration/test_sessions_permissions.py::test_context_breakdown_requires_read_access`.
 
 - **`blocked-start`:** on a fresh new-session page with no working directory,

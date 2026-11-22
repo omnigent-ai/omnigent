@@ -3305,75 +3305,77 @@ class ContextBreakdownAttachment(BaseModel):
     estimated_tokens: int | None = None
 
 
-class ContextBreakdownTools(BaseModel):
+class ContextBreakdownMeasured(BaseModel):
     """
-    Tool sources declared by a session's agent. Schemas are listed by the
-    runner at turn time, so their size is not estimated here.
+    The provider-reported usage a breakdown is relative to.
 
-    :param mcp_servers: Enabled MCP server names, e.g. ``["github"]``.
-    :param local_tool_count: Agent-bundled tools, e.g. ``2``.
-    :param builtin_tool_count: Configured built-in tools, e.g. ``1``.
-    """
-
-    mcp_servers: list[str] = Field(default_factory=list)
-    local_tool_count: int = 0
-    builtin_tool_count: int = 0
-
-
-class ContextBreakdownHistory(BaseModel):
-    """
-    Estimated size of a session's live conversation history.
-
-    :param estimated_tokens: Estimated tokens of the live history, including
-        the latest compaction summary and excluding attachments.
-    :param item_count: Messages and tool calls/results still sent in full.
-    :param summarized_item_count: Earlier messages and tool calls/results
-        replaced by a compaction summary.
-    :param summary_tokens: Estimated size of what replaces the compacted
-        history: the checkpoint's retained messages when it has them, else the
-        replayed summary and its prompt; ``0`` when never compacted.
-    :param partial: The scan stopped at its item cap before the summarized
-        range, so the live counts are lower bounds.
-    :param summarized_partial: The scan stopped inside the summarized range,
-        so ``summarized_item_count`` is a lower bound.
+    :param total_tokens: Tokens the last turn's request used, e.g. ``48200``.
+    :param context_window: The model's window in tokens, e.g. ``200000``;
+        ``None`` when it is not known.
     """
 
-    estimated_tokens: int = 0
-    item_count: int = 0
-    summarized_item_count: int = 0
-    summary_tokens: int = 0
-    partial: bool = False
-    summarized_partial: bool = False
+    total_tokens: int
+    context_window: int | None = None
+
+
+class ContextBreakdownCategory(BaseModel):
+    """
+    One row of a context breakdown.
+
+    :param kind: What the row covers: ``"system_prompt"`` (instructions
+        Omnigent composes), ``"skills"`` (the skill listing inside them),
+        ``"tools"`` (tool schemas), ``"attachments"`` (inline attachments),
+        ``"history"`` (earlier messages and tool calls/results),
+        ``"message"`` (the current message, itemized only by a runner),
+        ``"other"`` (the measured total minus the itemized rows) or
+        ``"free"`` (the window minus the measured total).
+    :param tokens: The row's size in tokens; ``None`` when it has no figure.
+    :param source: ``"measured"`` (from the provider's report),
+        ``"estimated"`` (from content size, or derived from an estimate) or
+        ``"unknown"`` (no figure).
+    :param origin: Who produced the row: the ``"server"`` from stored
+        content, or the ``"runner"`` from the request it sent.
+    :param count: Items the row covers, e.g. ``2`` attachments; ``None``
+        when a count does not apply.
+    :param detail: A short explanation to show under the row, e.g.
+        ``"12 messages and tool calls"``.
+    """
+
+    kind: Literal[
+        "system_prompt", "skills", "tools", "attachments", "history", "message", "other", "free"
+    ]
+    tokens: int | None = None
+    source: Literal["measured", "estimated", "unknown"]
+    origin: Literal["runner", "server"] = "server"
+    count: int | None = None
+    detail: str | None = None
 
 
 class SessionContextBreakdown(BaseModel):
     """
     Response for ``GET /v1/sessions/{session_id}/context-breakdown``.
 
-    Every token figure is an estimate from content size; the measured total
-    stays on the session snapshot (``last_total_tokens`` / ``context_window``).
-    Content a harness adds itself (its own system prompt, tool schemas,
-    project instructions) is not visible here.
+    One resolved view: the server picks each row's figure and computes the
+    remainder, so clients only render ``categories`` in order. Content a
+    harness adds itself (its own system prompt, tool schemas, project
+    instructions) is only visible as part of the ``"other"`` row.
 
     :param session_id: The session, e.g. ``"conv_abc123"``.
-    :param system_prompt_tokens: Estimated agent instructions plus
-        Omnigent's own guidance; ``None`` when the agent spec could not load.
-    :param skill_count: Skills the agent bundles, e.g. ``3``.
-    :param skill_listing_tokens: Estimated tokens of their name/description
-        listing.
-    :param tools: Declared tool sources.
+    :param measured: The provider-reported usage read with this breakdown;
+        ``None`` when the harness has reported none, in which case there is
+        no ``"other"`` or ``"free"`` row.
+    :param categories: The rows, in display order.
+    :param estimates_exceed_measured: The itemized estimates add up to more
+        than the measured total, so they run high and ``"other"`` is ``0``.
     :param attachments: Attachments in the live history, oldest first.
-    :param history: Live conversation history estimate.
     :param bytes_per_token: Ratio behind the text estimates, e.g. ``4``.
     """
 
     session_id: str
-    system_prompt_tokens: int | None = None
-    skill_count: int = 0
-    skill_listing_tokens: int = 0
-    tools: ContextBreakdownTools = Field(default_factory=ContextBreakdownTools)
+    measured: ContextBreakdownMeasured | None = None
+    categories: list[ContextBreakdownCategory] = Field(default_factory=list)
+    estimates_exceed_measured: bool = False
     attachments: list[ContextBreakdownAttachment] = Field(default_factory=list)
-    history: ContextBreakdownHistory = Field(default_factory=ContextBreakdownHistory)
     bytes_per_token: int
 
 

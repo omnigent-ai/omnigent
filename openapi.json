@@ -2236,80 +2236,117 @@
         "title": "ContextBreakdownAttachment",
         "type": "object"
       },
-      "ContextBreakdownHistory": {
-        "description": "Estimated size of a session's live conversation history.",
+      "ContextBreakdownCategory": {
+        "description": "One row of a context breakdown.",
         "properties": {
-          "estimated_tokens": {
-            "default": 0,
-            "description": "Estimated tokens of the live history, including the latest compaction summary and excluding attachments.",
-            "format": "int64",
-            "title": "Estimated Tokens",
-            "type": "integer"
+          "count": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Items the row covers, e.g. `2` attachments; `None` when a count does not apply.",
+            "title": "Count"
           },
-          "item_count": {
-            "default": 0,
-            "description": "Messages and tool calls/results still sent in full.",
-            "format": "int64",
-            "title": "Item Count",
-            "type": "integer"
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A short explanation to show under the row, e.g. `\"12 messages and tool calls\"`.",
+            "title": "Detail"
           },
-          "partial": {
-            "default": false,
-            "description": "The scan stopped at its item cap before the summarized range, so the live counts are lower bounds.",
-            "title": "Partial",
-            "type": "boolean"
+          "kind": {
+            "description": "What the row covers: `\"system_prompt\"` (instructions Omnigent composes), `\"skills\"` (the skill listing inside them), `\"tools\"` (tool schemas), `\"attachments\"` (inline attachments), `\"history\"` (earlier messages and tool calls/results), `\"message\"` (the current message, itemized only by a runner), `\"other\"` (the measured total minus the itemized rows) or `\"free\"` (the window minus the measured total).",
+            "enum": [
+              "system_prompt",
+              "skills",
+              "tools",
+              "attachments",
+              "history",
+              "message",
+              "other",
+              "free"
+            ],
+            "title": "Kind",
+            "type": "string"
           },
-          "summarized_item_count": {
-            "default": 0,
-            "description": "Earlier messages and tool calls/results replaced by a compaction summary.",
-            "format": "int64",
-            "title": "Summarized Item Count",
-            "type": "integer"
+          "origin": {
+            "default": "server",
+            "description": "Who produced the row: the `\"server\"` from stored content, or the `\"runner\"` from the request it sent.",
+            "enum": [
+              "runner",
+              "server"
+            ],
+            "title": "Origin",
+            "type": "string"
           },
-          "summarized_partial": {
-            "default": false,
-            "description": "The scan stopped inside the summarized range, so `summarized_item_count` is a lower bound.",
-            "title": "Summarized Partial",
-            "type": "boolean"
+          "source": {
+            "description": "`\"measured\"` (from the provider's report), `\"estimated\"` (from content size, or derived from an estimate) or `\"unknown\"` (no figure).",
+            "enum": [
+              "measured",
+              "estimated",
+              "unknown"
+            ],
+            "title": "Source",
+            "type": "string"
           },
-          "summary_tokens": {
-            "default": 0,
-            "description": "Estimated size of what replaces the compacted history: the checkpoint's retained messages when it has them, else the replayed summary and its prompt; `0` when never compacted.",
-            "format": "int64",
-            "title": "Summary Tokens",
-            "type": "integer"
+          "tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The row's size in tokens; `None` when it has no figure.",
+            "title": "Tokens"
           }
         },
-        "title": "ContextBreakdownHistory",
+        "required": [
+          "kind",
+          "source"
+        ],
+        "title": "ContextBreakdownCategory",
         "type": "object"
       },
-      "ContextBreakdownTools": {
-        "description": "Tool sources declared by a session's agent. Schemas are listed by the\nrunner at turn time, so their size is not estimated here.",
+      "ContextBreakdownMeasured": {
+        "description": "The provider-reported usage a breakdown is relative to.",
         "properties": {
-          "builtin_tool_count": {
-            "default": 0,
-            "description": "Configured built-in tools, e.g. `1`.",
-            "format": "int64",
-            "title": "Builtin Tool Count",
-            "type": "integer"
+          "context_window": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The model's window in tokens, e.g. `200000`; `None` when it is not known.",
+            "title": "Context Window"
           },
-          "local_tool_count": {
-            "default": 0,
-            "description": "Agent-bundled tools, e.g. `2`.",
+          "total_tokens": {
+            "description": "Tokens the last turn's request used, e.g. `48200`.",
             "format": "int64",
-            "title": "Local Tool Count",
+            "title": "Total Tokens",
             "type": "integer"
-          },
-          "mcp_servers": {
-            "description": "Enabled MCP server names, e.g. `[\"github\"]`.",
-            "items": {
-              "type": "string"
-            },
-            "title": "Mcp Servers",
-            "type": "array"
           }
         },
-        "title": "ContextBreakdownTools",
+        "required": [
+          "total_tokens"
+        ],
+        "title": "ContextBreakdownMeasured",
         "type": "object"
       },
       "ConversationDeleted": {
@@ -9320,7 +9357,7 @@
         "type": "object"
       },
       "SessionContextBreakdown": {
-        "description": "Response for `GET /v1/sessions/{session_id}/context-breakdown`.\n\nEvery token figure is an estimate from content size; the measured total\nstays on the session snapshot (`last_total_tokens` / `context_window`).\nContent a harness adds itself (its own system prompt, tool schemas,\nproject instructions) is not visible here.",
+        "description": "Response for `GET /v1/sessions/{session_id}/context-breakdown`.\n\nOne resolved view: the server picks each row's figure and computes the\nremainder, so clients only render `categories` in order. Content a\nharness adds itself (its own system prompt, tool schemas, project\ninstructions) is only visible as part of the `\"other\"` row.",
         "properties": {
           "attachments": {
             "description": "Attachments in the live history, oldest first.",
@@ -9336,45 +9373,35 @@
             "title": "Bytes Per Token",
             "type": "integer"
           },
-          "history": {
-            "$ref": "#/components/schemas/ContextBreakdownHistory",
-            "description": "Live conversation history estimate."
+          "categories": {
+            "description": "The rows, in display order.",
+            "items": {
+              "$ref": "#/components/schemas/ContextBreakdownCategory"
+            },
+            "title": "Categories",
+            "type": "array"
           },
-          "session_id": {
-            "description": "The session, e.g. `\"conv_abc123\"`.",
-            "title": "Session Id",
-            "type": "string"
+          "estimates_exceed_measured": {
+            "default": false,
+            "description": "The itemized estimates add up to more than the measured total, so they run high and `\"other\"` is `0`.",
+            "title": "Estimates Exceed Measured",
+            "type": "boolean"
           },
-          "skill_count": {
-            "default": 0,
-            "description": "Skills the agent bundles, e.g. `3`.",
-            "format": "int64",
-            "title": "Skill Count",
-            "type": "integer"
-          },
-          "skill_listing_tokens": {
-            "default": 0,
-            "description": "Estimated tokens of their name/description listing.",
-            "format": "int64",
-            "title": "Skill Listing Tokens",
-            "type": "integer"
-          },
-          "system_prompt_tokens": {
+          "measured": {
             "anyOf": [
               {
-                "format": "int64",
-                "type": "integer"
+                "$ref": "#/components/schemas/ContextBreakdownMeasured"
               },
               {
                 "type": "null"
               }
             ],
-            "description": "Estimated agent instructions plus Omnigent's own guidance; `None` when the agent spec could not load.",
-            "title": "System Prompt Tokens"
+            "description": "The provider-reported usage read with this breakdown; `None` when the harness has reported none, in which case there is no `\"other\"` or `\"free\"` row."
           },
-          "tools": {
-            "$ref": "#/components/schemas/ContextBreakdownTools",
-            "description": "Declared tool sources."
+          "session_id": {
+            "description": "The session, e.g. `\"conv_abc123\"`.",
+            "title": "Session Id",
+            "type": "string"
           }
         },
         "required": [
@@ -24377,7 +24404,7 @@
     },
     "/v1/sessions/{session_id}/context-breakdown": {
       "get": {
-        "description": "Estimate what fills the session's context window.\n\nSplits the window into the agent's system prompt, skill listing,\ndeclared tool sources, attachments and conversation history. Every\ntoken figure is a size-based estimate; the measured total stays on\nthe session snapshot.\n\n**Returns:** The estimated `SessionContextBreakdown`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session does not exist or the caller cannot read it.",
+        "description": "Resolve what fills the session's context window into display rows.\n\nReturns the provider-reported total with the rows it splits into: the\nagent's system prompt, declared tool sources, attachments and\nconversation history as size-based estimates, then the remainder and\nthe free space.\n\n**Returns:** The resolved `SessionContextBreakdown`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session does not exist or the caller cannot read it.",
         "operationId": "get_session_context_breakdown_v1_sessions__session_id__context_breakdown_get",
         "parameters": [
           {

@@ -660,16 +660,30 @@ async def test_context_breakdown_requires_read_access(
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["session_id"] == session_id
+    rows = {row["kind"]: row for row in body["categories"]}
     # The spec loaded through the real agent cache, so the prompt row is filled.
-    assert body["system_prompt_tokens"] > 0
-    assert body["history"] == {
-        "estimated_tokens": 3,
-        "item_count": 3,
-        "summarized_item_count": 0,
-        "summary_tokens": 0,
-        "partial": False,
-        "summarized_partial": False,
+    assert rows["system_prompt"]["tokens"] > 0
+    assert rows["history"] == {
+        "kind": "history",
+        "tokens": 3,
+        "source": "estimated",
+        "origin": "server",
+        "count": 3,
+        "detail": "3 messages and tool calls",
     }
+    # No turn has reported usage, so there is no total to take a remainder from.
+    assert body["measured"] is None
+    assert "other" not in rows
+
+    SqlAlchemyConversationStore(db_uri).set_labels(
+        session_id,
+        {"omnigent.last_context_tokens": "9000", "omnigent.last_context_window": "200000"},
+    )
+    body = (await auth_client.get(path, headers={"X-Forwarded-Email": "user-b"})).json()
+    assert body["measured"] == {"total_tokens": 9000, "context_window": 200000}
+    rows = {row["kind"]: row for row in body["categories"]}
+    assert rows["other"]["tokens"] == 9000 - rows["system_prompt"]["tokens"] - 3
+    assert rows["free"]["tokens"] == 191000
 
 
 async def test_edit_grant_blocked_from_stop_session_requires_owner(

@@ -1,24 +1,43 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { SessionContextBreakdown } from "@/lib/sessionsApi";
-import { ComposerContextBreakdown, itemizedEstimate } from "./ComposerContextBreakdown";
+import type {
+  ContextBreakdownCategory,
+  ContextCategoryKind,
+  SessionContextBreakdown,
+} from "@/lib/sessionsApi";
+import { ComposerContextBreakdown } from "./ComposerContextBreakdown";
+
+function row(
+  kind: ContextCategoryKind,
+  tokens: number | null,
+  overrides: Partial<ContextBreakdownCategory> = {},
+): ContextBreakdownCategory {
+  return {
+    kind,
+    tokens,
+    source: tokens == null ? "unknown" : "estimated",
+    origin: "server",
+    count: null,
+    detail: null,
+    ...overrides,
+  };
+}
 
 function breakdown(overrides: Partial<SessionContextBreakdown> = {}): SessionContextBreakdown {
   return {
-    systemPromptTokens: 2_000,
-    skillCount: 0,
-    skillListingTokens: 0,
-    mcpServers: [],
-    localToolCount: 0,
-    builtinToolCount: 0,
+    measured: { totalTokens: 20_000, contextWindow: 100_000 },
+    categories: [
+      row("system_prompt", 2_000, { detail: "Agent instructions and Omnigent guidance" }),
+      row("tools", null, { detail: "MCP: github, slack · 1 built-in tool" }),
+      row("history", 10_000, { count: 8, detail: "8 messages and tool calls" }),
+      row("other", 8_000, {
+        detail: "Tool schemas, content the harness adds itself and the last reply",
+      }),
+      row("free", 80_000, { source: "measured" }),
+    ],
+    estimatesExceedMeasured: false,
     attachments: [],
-    historyTokens: 10_000,
-    historyItemCount: 8,
-    summarizedItemCount: 0,
-    summaryTokens: 0,
-    historyPartial: false,
-    summarizedPartial: false,
     bytesPerToken: 4,
     ...overrides,
   };
@@ -42,33 +61,89 @@ function renderBreakdown(
 afterEach(cleanup);
 
 describe("ComposerContextBreakdown", () => {
-  it("labels estimated rows apart from the measured total and free space", () => {
+  it("renders the server's rows in order with their source and detail", () => {
     renderBreakdown(breakdown());
 
-    expect(screen.getByText("20% used")).toBeInTheDocument();
-    expect(screen.getByText(/20K \/ 100K tokens, measured on the\s+last turn/)).toBeInTheDocument();
+    const rows = screen.getAllByRole("listitem").map((item) => item.dataset.testid);
+    expect(rows).toEqual([
+      "context-row-system-prompt",
+      "context-row-tools",
+      "context-row-history",
+      "context-row-other",
+      "context-row-free",
+    ]);
     const prompt = screen.getByTestId("context-row-system-prompt");
     expect(prompt).toHaveAttribute("data-source", "estimated");
+    expect(prompt).toHaveTextContent("System prompt");
     expect(prompt).toHaveTextContent("~2K");
+    expect(prompt).toHaveTextContent("Agent instructions and Omnigent guidance");
     const free = screen.getByTestId("context-row-free");
     expect(free).toHaveAttribute("data-source", "measured");
     expect(free).toHaveTextContent("80K");
     expect(free).not.toHaveTextContent("~");
-    expect(screen.getByTestId("context-row-tools")).toHaveTextContent("Not measured");
+    const tools = screen.getByTestId("context-row-tools");
+    expect(tools).toHaveAttribute("data-source", "unknown");
+    expect(tools).toHaveTextContent("Not measured");
+    expect(tools).toHaveTextContent("MCP: github, slack · 1 built-in tool");
+    expect(screen.getByTestId("context-row-history")).toHaveTextContent(
+      "8 messages and tool calls",
+    );
   });
 
-  it("attributes the measured remainder to an Other row and never shows it negative", () => {
-    const { unmount } = renderBreakdown(breakdown({ skillCount: 2, skillListingTokens: 500 }));
-    // 20K measured minus 2K prompt, 0.5K skills and 10K history.
-    expect(screen.getByTestId("context-row-other")).toHaveTextContent("~7.5K");
-    unmount();
+  it("takes the header and every figure from the response, not the ring's own total", () => {
+    // The ring still holds an older total than the one the server read its rows against.
+    renderBreakdown(
+      breakdown({
+        measured: { totalTokens: 60_000, contextWindow: 200_000 },
+        categories: [row("history", 90_000), row("other", 0, { detail: "They run high" })],
+        estimatesExceedMeasured: true,
+      }),
+    );
 
-    renderBreakdown(breakdown({ historyTokens: 90_000 }));
-    expect(screen.getByTestId("context-row-other")).toHaveTextContent("~0");
+    expect(screen.getByText("30% used")).toBeInTheDocument();
+    expect(screen.getByText(/60K \/ 200K tokens, measured on the last turn/)).toBeInTheDocument();
+    // The remainder is shown as sent: nothing is subtracted or clamped here.
+    const other = screen.getByTestId("context-row-other");
+    expect(other).toHaveTextContent("~0");
+    expect(other).toHaveTextContent("They run high");
+    expect(screen.queryByTestId("context-row-free")).not.toBeInTheDocument();
   });
 
-  it("lists each attachment with its size and how it reached the model", () => {
+  it("shows only the rows it was sent when nothing was measured", () => {
+    renderBreakdown(
+      breakdown({
+        measured: null,
+        categories: [
+          row("system_prompt", null, { detail: "Not delivered by this harness" }),
+          row("skills", 300, { count: 3 }),
+          row("message", 120, { origin: "runner" }),
+          // A kind this client does not know yet still renders.
+          row("cache_overhead" as ContextCategoryKind, 40),
+        ],
+      }),
+    );
+
+    // The ring's own figures still head the popover.
+    expect(screen.getByText("20% used")).toBeInTheDocument();
+    const prompt = screen.getByTestId("context-row-system-prompt");
+    expect(prompt).toHaveAttribute("data-source", "unknown");
+    expect(prompt).toHaveTextContent("Not delivered by this harness");
+    expect(screen.getByTestId("context-row-skills")).toHaveTextContent("Skill listing (3)");
+    expect(screen.getByTestId("context-row-message")).toHaveTextContent("Current message");
+    expect(screen.getByTestId("context-row-cache-overhead")).toHaveTextContent("cache overhead");
+    expect(screen.queryByTestId("context-row-other")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("context-row-free")).not.toBeInTheDocument();
+  });
+
+  it("lists each attachment under its row with its size and how it reached the model", () => {
     const data = breakdown({
+      categories: [
+        row("attachments", 1_600, {
+          count: 4,
+          detail: "Plus 1 sent without an estimate, counted in Other",
+        }),
+        row("history", 10_000),
+      ],
       attachments: [
         {
           fileId: "file_1",
@@ -115,30 +190,10 @@ describe("ComposerContextBreakdown", () => {
     expect(screen.getByText("spec.pdf · 4.0 KB").closest("li")).toHaveTextContent("Size only");
     expect(screen.getByText("logs.zip · 1.0 KB").closest("li")).toHaveTextContent("In workspace");
     expect(screen.getByText("old.csv").closest("li")).toHaveTextContent("Not delivered");
-    expect(itemizedEstimate(data)).toBe(2_000 + 1_600 + 10_000);
-  });
-
-  it("says when earlier history was replaced by a summary", () => {
-    const { unmount } = renderBreakdown(
-      breakdown({ summarizedItemCount: 31, historyPartial: true }),
-    );
-    expect(screen.getByTestId("context-row-history")).toHaveTextContent(
-      "At least 8 messages and tool calls · 31 earlier items replaced by a summary",
-    );
-    unmount();
-
-    renderBreakdown(breakdown({ summarizedItemCount: 1_995, summarizedPartial: true }));
-    expect(screen.getByTestId("context-row-history")).toHaveTextContent(
-      "8 messages and tool calls · at least 1995 earlier items replaced by a summary",
-    );
-  });
-
-  it("names declared tool sources without inventing their size", () => {
-    renderBreakdown(breakdown({ mcpServers: ["github", "slack"], builtinToolCount: 1 }));
-
-    const tools = screen.getByTestId("context-row-tools");
-    expect(tools).toHaveTextContent("MCP: github, slack · 1 built-in tool");
-    expect(tools).toHaveAttribute("data-source", "unknown");
+    // The files sit between their row and the next one.
+    const items = screen.getAllByRole("listitem");
+    expect(items[0]).toHaveAttribute("data-testid", "context-row-attachments");
+    expect(items[5]).toHaveAttribute("data-testid", "context-row-history");
   });
 
   it("keeps the measured header when the breakdown is loading or unavailable", () => {

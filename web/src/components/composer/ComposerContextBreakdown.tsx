@@ -1,16 +1,20 @@
+import { Fragment } from "react";
+
 import { formatTokenCount } from "@/lib/formatCost";
-import type { ContextBreakdownAttachment, SessionContextBreakdown } from "@/lib/sessionsApi";
+import type {
+  ContextBreakdownAttachment,
+  ContextBreakdownCategory,
+  ContextCategorySource,
+  SessionContextBreakdown,
+} from "@/lib/sessionsApi";
 import { formatBytes } from "@/shell/fileStatusUtils";
 import { cn } from "@/lib/utils";
-
-/** Whether a row's figure comes from the provider's report or a size-based estimate. */
-type RowSource = "measured" | "estimated" | "unknown";
 
 interface BreakdownRowProps {
   label: string;
   tokens: number | null;
-  source: RowSource;
-  detail?: string;
+  source: ContextCategorySource;
+  detail?: string | null;
   /** Replaces the token figure, e.g. "In workspace". */
   valueLabel?: string;
   nested?: boolean;
@@ -64,10 +68,6 @@ function BreakdownRow({
   );
 }
 
-function plural(count: number, noun: string): string {
-  return `${count} ${noun}${count === 1 ? "" : "s"}`;
-}
-
 function attachmentRow(attachment: ContextBreakdownAttachment, index: number) {
   const name = attachment.filename ?? "Attachment";
   const size = attachment.bytes != null ? formatBytes(attachment.bytes) : null;
@@ -109,52 +109,37 @@ function attachmentRow(attachment: ContextBreakdownAttachment, index: number) {
   );
 }
 
-function toolsDetail(breakdown: SessionContextBreakdown): string {
-  const parts: string[] = [];
-  if (breakdown.mcpServers.length > 0) parts.push(`MCP: ${breakdown.mcpServers.join(", ")}`);
-  if (breakdown.builtinToolCount > 0)
-    parts.push(plural(breakdown.builtinToolCount, "built-in tool"));
-  if (breakdown.localToolCount > 0) parts.push(plural(breakdown.localToolCount, "agent tool"));
-  return parts.length > 0 ? parts.join(" · ") : "Harness and Omnigent tools only";
-}
-
-function historyDetail(breakdown: SessionContextBreakdown): string {
-  const prefix = breakdown.historyPartial ? "At least " : "";
-  const count = breakdown.historyItemCount;
-  const noun = count === 1 ? "message or tool call" : "messages and tool calls";
-  const parts = [`${prefix}${count} ${noun}`];
-  if (breakdown.summarizedItemCount > 0) {
-    const atLeast = breakdown.summarizedPartial ? "at least " : "";
-    const items = breakdown.summarizedItemCount === 1 ? "item" : "items";
-    parts.push(`${atLeast}${breakdown.summarizedItemCount} earlier ${items} replaced by a summary`);
+/** The row title for a category the server resolved. */
+function categoryLabel(category: ContextBreakdownCategory): string {
+  switch (category.kind) {
+    case "system_prompt":
+      return "System prompt";
+    case "skills":
+      return category.count == null ? "Skill listing" : `Skill listing (${category.count})`;
+    case "tools":
+      return "Tool definitions";
+    case "attachments":
+      return category.count == null ? "Attachments" : `Attachments (${category.count})`;
+    case "history":
+      return "Conversation history";
+    case "message":
+      return "Current message";
+    case "other":
+      return "Other";
+    case "free":
+      return "Free space";
+    default:
+      // A kind added by a newer server still gets a readable row.
+      return String(category.kind).replaceAll("_", " ");
   }
-  return parts.join(" · ");
-}
-
-/**
- * Sum of the token estimates the breakdown itemizes, used to derive the
- * unattributed remainder of the measured total.
- */
-export function itemizedEstimate(breakdown: SessionContextBreakdown): number {
-  const attachments = breakdown.attachments.reduce(
-    (sum, attachment) =>
-      attachment.delivery === "inline" ? sum + (attachment.estimatedTokens ?? 0) : sum,
-    0,
-  );
-  return (
-    (breakdown.systemPromptTokens ?? 0) +
-    breakdown.skillListingTokens +
-    attachments +
-    breakdown.historyTokens
-  );
 }
 
 /**
  * Popover body splitting the context window into what fills it.
  *
- * The header and free space come from the provider-reported total of the last
- * turn; every other row is a size-based estimate from the server, and the
- * "Other" row is the measured total minus those estimates.
+ * The server resolves every row, including the remainder and the free space,
+ * against the measured total it read with them; this only renders them. The
+ * ring's own figures fill the header until that response arrives.
  */
 export function ComposerContextBreakdown({
   contextWindow,
@@ -167,14 +152,10 @@ export function ComposerContextBreakdown({
   breakdown: SessionContextBreakdown | undefined;
   status: "pending" | "error" | "success";
 }) {
-  const usedPct = Math.round(Math.min(tokensUsed / contextWindow, 1) * 100);
-  const free = Math.max(contextWindow - tokensUsed, 0);
-  const inlineAttachments = breakdown?.attachments.filter((a) => a.delivery === "inline") ?? [];
-  const unestimated = inlineAttachments.filter((a) => a.estimatedTokens == null).length;
-  const attachmentTokens = inlineAttachments.reduce(
-    (sum, attachment) => sum + (attachment.estimatedTokens ?? 0),
-    0,
-  );
+  const measured = status === "success" ? breakdown?.measured : null;
+  const total = measured?.totalTokens ?? tokensUsed;
+  const windowTokens = measured?.contextWindow || contextWindow;
+  const usedPct = Math.round(Math.min(total / windowTokens, 1) * 100);
   return (
     <div className="flex flex-col gap-2" data-testid="composer-context-breakdown">
       <div className="flex flex-col gap-0.5">
@@ -183,8 +164,8 @@ export function ComposerContextBreakdown({
           <span className="text-sm tabular-nums text-foreground">{usedPct}% used</span>
         </div>
         <span className="text-xs tabular-nums text-muted-foreground">
-          {formatTokenCount(tokensUsed)} / {formatTokenCount(contextWindow)} tokens, measured on the
-          last turn
+          {formatTokenCount(total)} / {formatTokenCount(windowTokens)} tokens, measured on the last
+          turn
         </span>
       </div>
       {status === "pending" ? (
@@ -195,64 +176,18 @@ export function ComposerContextBreakdown({
         </p>
       ) : (
         <ul className="flex flex-col gap-1.5" aria-label="What fills the context window">
-          <BreakdownRow
-            testId="context-row-system-prompt"
-            label="System prompt"
-            tokens={breakdown.systemPromptTokens}
-            source={breakdown.systemPromptTokens == null ? "unknown" : "estimated"}
-            detail="Agent instructions and Omnigent guidance"
-          />
-          {breakdown.skillCount > 0 ? (
-            <BreakdownRow
-              testId="context-row-skills"
-              label={`Skill listing (${breakdown.skillCount})`}
-              tokens={breakdown.skillListingTokens}
-              source="estimated"
-            />
-          ) : null}
-          <BreakdownRow
-            testId="context-row-tools"
-            label="Tool definitions"
-            tokens={null}
-            source="unknown"
-            detail={toolsDetail(breakdown)}
-          />
-          {breakdown.attachments.length > 0 ? (
-            <>
+          {breakdown.categories.map((category) => (
+            <Fragment key={`${category.origin}-${category.kind}`}>
               <BreakdownRow
-                testId="context-row-attachments"
-                label={`Attachments (${breakdown.attachments.length})`}
-                tokens={attachmentTokens}
-                source="estimated"
-                detail={
-                  unestimated > 0
-                    ? `Plus ${unestimated} sent without an estimate, counted in Other`
-                    : undefined
-                }
+                testId={`context-row-${category.kind.replaceAll("_", "-")}`}
+                label={categoryLabel(category)}
+                tokens={category.tokens}
+                source={category.source}
+                detail={category.detail}
               />
-              {breakdown.attachments.map(attachmentRow)}
-            </>
-          ) : null}
-          <BreakdownRow
-            testId="context-row-history"
-            label="Conversation history"
-            tokens={breakdown.historyTokens}
-            source="estimated"
-            detail={historyDetail(breakdown)}
-          />
-          <BreakdownRow
-            testId="context-row-other"
-            label="Other"
-            tokens={Math.max(tokensUsed - itemizedEstimate(breakdown), 0)}
-            source="estimated"
-            detail="Tool schemas, content the harness adds itself, and the last reply"
-          />
-          <BreakdownRow
-            testId="context-row-free"
-            label="Free space"
-            tokens={free}
-            source="measured"
-          />
+              {category.kind === "attachments" ? breakdown.attachments.map(attachmentRow) : null}
+            </Fragment>
+          ))}
         </ul>
       )}
       <p className="text-[11px] text-muted-foreground">

@@ -1702,24 +1702,34 @@ export interface ContextBreakdownAttachment {
   estimatedTokens: number | null;
 }
 
-/** Size-based estimates of what fills a session's context window. */
+export type ContextCategoryKind =
+  "system_prompt" | "skills" | "tools" | "attachments" | "history" | "message" | "other" | "free";
+
+/** Whether a figure is the provider's report, a size-based estimate, or absent. */
+export type ContextCategorySource = "measured" | "estimated" | "unknown";
+
+/** One row of the breakdown, resolved by the server. */
+export interface ContextBreakdownCategory {
+  kind: ContextCategoryKind;
+  /** Null when the row has no figure. */
+  tokens: number | null;
+  source: ContextCategorySource;
+  /** Who produced the row: the server from stored content, or the runner from its request. */
+  origin: "runner" | "server";
+  /** Items the row covers, e.g. attachments; null when a count does not apply. */
+  count: number | null;
+  detail: string | null;
+}
+
+/** What fills a session's context window: the measured total and the rows it splits into. */
 export interface SessionContextBreakdown {
-  /** Null when the server could not load the agent spec. */
-  systemPromptTokens: number | null;
-  skillCount: number;
-  skillListingTokens: number;
-  mcpServers: string[];
-  localToolCount: number;
-  builtinToolCount: number;
+  /** The provider-reported usage read with this breakdown; null before any report. */
+  measured: { totalTokens: number; contextWindow: number | null } | null;
+  /** Rows in display order, including the remainder and free space. */
+  categories: ContextBreakdownCategory[];
+  /** The itemized estimates add up to more than the measured total. */
+  estimatesExceedMeasured: boolean;
   attachments: ContextBreakdownAttachment[];
-  historyTokens: number;
-  historyItemCount: number;
-  summarizedItemCount: number;
-  summaryTokens: number;
-  /** The server stopped scanning at its item cap; history counts are lower bounds. */
-  historyPartial: boolean;
-  /** The scan stopped inside the summarized range; that count is a lower bound. */
-  summarizedPartial: boolean;
   /** Ratio behind the text estimates, e.g. 4. */
   bytesPerToken: number;
 }
@@ -1733,24 +1743,24 @@ interface ContextBreakdownAttachmentWire {
   estimated_tokens?: number | null;
 }
 
+interface ContextBreakdownCategoryWire {
+  kind: ContextCategoryKind;
+  tokens?: number | null;
+  source: ContextCategorySource;
+  origin?: "runner" | "server";
+  count?: number | null;
+  detail?: string | null;
+}
+
 interface SessionContextBreakdownWire {
-  system_prompt_tokens?: number | null;
-  skill_count?: number;
-  skill_listing_tokens?: number;
-  tools?: { mcp_servers?: string[]; local_tool_count?: number; builtin_tool_count?: number };
+  measured?: { total_tokens: number; context_window?: number | null } | null;
+  categories?: ContextBreakdownCategoryWire[];
+  estimates_exceed_measured?: boolean;
   attachments?: ContextBreakdownAttachmentWire[];
-  history?: {
-    estimated_tokens?: number;
-    item_count?: number;
-    summarized_item_count?: number;
-    summary_tokens?: number;
-    partial?: boolean;
-    summarized_partial?: boolean;
-  };
   bytes_per_token?: number;
 }
 
-/** Estimate what fills a session's context window (system prompt, tools, attachments, history). */
+/** Fetch what fills a session's context window (system prompt, tools, attachments, history). */
 export async function getSessionContextBreakdown(
   sessionId: string,
   options: { signal?: AbortSignal } = {},
@@ -1761,12 +1771,21 @@ export async function getSessionContextBreakdown(
   );
   const wire = await readJsonOrThrow<SessionContextBreakdownWire>(res);
   return {
-    systemPromptTokens: wire.system_prompt_tokens ?? null,
-    skillCount: wire.skill_count ?? 0,
-    skillListingTokens: wire.skill_listing_tokens ?? 0,
-    mcpServers: wire.tools?.mcp_servers ?? [],
-    localToolCount: wire.tools?.local_tool_count ?? 0,
-    builtinToolCount: wire.tools?.builtin_tool_count ?? 0,
+    measured: wire.measured
+      ? {
+          totalTokens: wire.measured.total_tokens,
+          contextWindow: wire.measured.context_window ?? null,
+        }
+      : null,
+    categories: (wire.categories ?? []).map((category) => ({
+      kind: category.kind,
+      tokens: category.tokens ?? null,
+      source: category.source,
+      origin: category.origin ?? "server",
+      count: category.count ?? null,
+      detail: category.detail ?? null,
+    })),
+    estimatesExceedMeasured: wire.estimates_exceed_measured ?? false,
     attachments: (wire.attachments ?? []).map((attachment) => ({
       fileId: attachment.file_id ?? null,
       filename: attachment.filename ?? null,
@@ -1775,12 +1794,6 @@ export async function getSessionContextBreakdown(
       delivery: attachment.delivery,
       estimatedTokens: attachment.estimated_tokens ?? null,
     })),
-    historyTokens: wire.history?.estimated_tokens ?? 0,
-    historyItemCount: wire.history?.item_count ?? 0,
-    summarizedItemCount: wire.history?.summarized_item_count ?? 0,
-    summaryTokens: wire.history?.summary_tokens ?? 0,
-    historyPartial: wire.history?.partial ?? false,
-    summarizedPartial: wire.history?.summarized_partial ?? false,
     bytesPerToken: wire.bytes_per_token ?? 4,
   };
 }
