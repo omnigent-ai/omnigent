@@ -1,14 +1,15 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, renderHook } from "@testing-library/react";
-import type { ContextType, ReactNode } from "react";
+import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Conversation } from "@/hooks/useConversations";
 import { useRecentSessionSwitchStore } from "@/hooks/useRecentSessionSwitch";
-import { SidebarDataContext } from "@/hooks/useSidebarData";
 import { useSidebarSessionOrderStore } from "@/hooks/useSidebarSessionOrder";
+import { liveSessionIdsInCache } from "@/lib/liveSessions";
 import { isCommandListed } from "@/store/paletteCommands";
 
-import { recentSessionId, useSessionNavigationCommands } from "./sessionNavigationCommands";
+import { hasOtherLiveSession, useSessionNavigationCommands } from "./sessionNavigationCommands";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({ useNavigate: () => navigate }));
@@ -27,18 +28,15 @@ function row(id: string, updated: number, overrides: Partial<Conversation> = {})
   };
 }
 
-type SidebarData = ContextType<typeof SidebarDataContext>;
-const loaded = (rows: Conversation[]) => ({ loadedRows: rows }) as unknown as SidebarData;
-const SEVERAL_LOADED = loaded([row("a", 1), row("b", 9), row("c", 5)]);
-const ONLY_OPEN_LOADED = loaded([row("b", 9)]);
-/** The sidebar's loaded rows, as the shell provides them. */
-const withRows = (sidebarData: SidebarData) => ({
-  wrapper: ({ children }: { children: ReactNode }) => (
-    <SidebarDataContext.Provider value={sidebarData}>{children}</SidebarDataContext.Provider>
-  ),
-});
+let queryClient = new QueryClient();
+function WithQueryClient({ children }: { children: ReactNode }) {
+  return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+}
+const renderCommands = () =>
+  renderHook(() => useSessionNavigationCommands(), { wrapper: WithQueryClient });
 
 afterEach(() => {
+  queryClient = new QueryClient();
   navigate.mockClear();
   useSidebarSessionOrderStore.setState({
     orderedSessionIds: [],
@@ -53,7 +51,7 @@ const command = (commands: ReturnType<typeof useSessionNavigationCommands>, id: 
 describe("useSessionNavigationCommands", () => {
   it("steps to the sidebar's next and previous rows, read when run", () => {
     useSidebarSessionOrderStore.setState({ orderedSessionIds: ["a", "b"], activeSessionId: "a" });
-    const { result } = renderHook(() => useSessionNavigationCommands());
+    const { result } = renderCommands();
     // The list changed after the palette built its rows.
     act(() =>
       useSidebarSessionOrderStore.setState({
@@ -69,51 +67,46 @@ describe("useSessionNavigationCommands", () => {
   });
 
   it("offers no steps while no sidebar lists sessions", () => {
-    const { result } = renderHook(() => useSessionNavigationCommands());
+    const { result } = renderCommands();
     expect(isCommandListed(command(result.current, "next-session").availability)).toBe(false);
     expect(isCommandListed(command(result.current, "previous-session").availability)).toBe(false);
   });
 
-  it("offers Switch to recent session only with another session to switch to", () => {
-    const { result } = renderHook(() => useSessionNavigationCommands(), withRows(SEVERAL_LOADED));
-    expect(isCommandListed(command(result.current, "recent-session").availability)).toBe(true);
-
-    const alone = renderHook(() => useSessionNavigationCommands(), withRows(ONLY_OPEN_LOADED));
-    expect(isCommandListed(command(alone.result.current, "recent-session").availability)).toBe(
-      false,
-    );
-  });
-
   it("stays put on a single listed session that's already open", () => {
     useSidebarSessionOrderStore.setState({ orderedSessionIds: ["a"], activeSessionId: "a" });
-    const { result } = renderHook(() => useSessionNavigationCommands());
+    const { result } = renderCommands();
     command(result.current, "next-session").run();
     expect(navigate).not.toHaveBeenCalled();
   });
 });
 
-const LOADED_ROWS_AB = { loadedRows: [row("a", 1), row("b", 2)] } as never;
-
-function LoadedRowsAB({ children }: { children: ReactNode }) {
-  return (
-    <SidebarDataContext.Provider value={LOADED_ROWS_AB}>{children}</SidebarDataContext.Provider>
-  );
-}
+/** One page of a cached session list, as the sidebar's and folders' queries hold them. */
+const listPage = (rows: Conversation[]) => ({ pages: [{ data: rows }], pageParams: [null] });
 
 describe("Switch to recent session", () => {
-  afterEach(() => useRecentSessionSwitchStore.setState({ switcher: null, history: [] }));
+  afterEach(() =>
+    useRecentSessionSwitchStore.setState({
+      switcher: null,
+      history: [],
+      readLiveSessionIds: null,
+      sessionsKnown: false,
+    }),
+  );
+
+  /** The switcher reads the cached lists, as the mounted host registers them. */
+  function registerCachedSessions() {
+    useRecentSessionSwitchStore.setState({
+      readLiveSessionIds: () => liveSessionIdsInCache(queryClient),
+      sessionsKnown: true,
+    });
+  }
 
   it("opens the switcher one visit back, without the Control hold, once the palette closes", () => {
     useSidebarSessionOrderStore.setState({ orderedSessionIds: ["a", "b"], activeSessionId: "b" });
-    useRecentSessionSwitchStore.setState({
-      history: ["b", "a"],
-      readLiveSessionIds: () => new Set(["a", "b"]),
-      sessionsKnown: true,
-      switcher: null,
-    });
-    const { result } = renderHook(() => useSessionNavigationCommands(), {
-      wrapper: LoadedRowsAB,
-    });
+    queryClient.setQueryData(["conversations", "mine"], listPage([row("a", 1), row("b", 2)]));
+    registerCachedSessions();
+    useRecentSessionSwitchStore.setState({ history: ["b", "a"] });
+    const { result } = renderCommands();
     const recent = command(result.current, "recent-session");
     expect(recent.shortcut).toBe("session.recent");
     expect(recent.movesFocus).toBe(true);
@@ -124,20 +117,36 @@ describe("Switch to recent session", () => {
     });
     expect(navigate).not.toHaveBeenCalled();
   });
-});
 
-describe("recentSessionId", () => {
-  it("picks the most recently active session other than the open one", () => {
-    expect(recentSessionId([row("a", 1), row("b", 9), row("c", 5)], "b")).toBe("c");
+  it("is offered for a session cached outside the sidebar's rows, once it's cached", () => {
+    // The sidebar lists only the open session; the other sits in a project folder's list.
+    useSidebarSessionOrderStore.setState({ orderedSessionIds: ["b"], activeSessionId: "b" });
+    queryClient.setQueryData(["conversations", "mine"], listPage([row("b", 2)]));
+    registerCachedSessions();
+    const { result } = renderCommands();
+    expect(isCommandListed(command(result.current, "recent-session").availability)).toBe(false);
+
+    act(() => queryClient.setQueryData(["project-sessions", "p1"], listPage([row("z", 1)])));
+    expect(isCommandListed(command(result.current, "recent-session").availability)).toBe(true);
   });
 
-  it("skips archived and not-yet-created sessions, and has none to pick alone", () => {
-    expect(
-      recentSessionId(
-        [row("a", 1), row("x", 9, { archived: true }), row("y", 8, { provisional: true })],
-        null,
-      ),
-    ).toBe("a");
-    expect(recentSessionId([row("b", 1)], "b")).toBeUndefined();
+  it("isn't offered with no recent-session host, or none but the open session live", () => {
+    const { result } = renderCommands();
+    expect(isCommandListed(command(result.current, "recent-session").availability)).toBe(false);
+
+    queryClient.setQueryData(
+      ["conversations", "mine"],
+      listPage([row("b", 2), row("x", 9, { archived: true })]),
+    );
+    act(registerCachedSessions);
+    expect(isCommandListed(command(result.current, "recent-session").availability)).toBe(false);
+  });
+});
+
+describe("hasOtherLiveSession", () => {
+  it("looks past the open session and its sub-agent's root", () => {
+    expect(hasOtherLiveSession(new Set(["a", "b"]), ["b", null])).toBe(true);
+    expect(hasOtherLiveSession(new Set(["root"]), ["child", "root"])).toBe(false);
+    expect(hasOtherLiveSession(new Set(), [null, null])).toBe(false);
   });
 });
