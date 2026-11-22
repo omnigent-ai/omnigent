@@ -227,11 +227,11 @@ export function newFileMentionToken(item: MentionItem, taken: readonly string[])
 }
 
 /**
- * The token a tagged session stands as in the composer: its own, else ``@`` and its cleaned
- * title, e.g. ``@Fix CI``, or ``@Untitled session`` when the title is empty.
+ * The token a tagged session is sent as: its own, else ``@`` and its cleaned title, e.g.
+ * ``@Fix CI``. An empty title leaves a bare ``@``.
  */
 export function sessionTagToken(session: SessionMention): string {
-  return session.token ?? `@${cleanSessionTitle(session.title) || "Untitled session"}`;
+  return session.token ?? `@${cleanSessionTitle(session.title)}`;
 }
 
 /**
@@ -239,7 +239,7 @@ export function sessionTagToken(session: SessionMention): string {
  * item already uses gets an id-prefix suffix, lengthened until it is free.
  */
 export function sessionMentionToken(session: SessionMention, taken: readonly string[]): string {
-  const base = sessionTagToken({ ...session, token: undefined });
+  const base = `@${cleanSessionTitle(session.title) || "Untitled session"}`;
   const { id } = session;
   return uniqueMentionToken(base, taken, [id.slice(0, 6), id.slice(0, 12), id]);
 }

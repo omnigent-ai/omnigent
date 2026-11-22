@@ -75,7 +75,15 @@ describe("a session tagged without a token of its own", () => {
       token,
     ]);
     expect(tagTokens(tags([], [messy]))).toEqual([token]);
-    expect(sessionTagToken({ ...messy, title: " \n " })).toBe("@Untitled session");
+  });
+
+  it("keeps the bare @ the composer sends for an empty title", () => {
+    const blank = { ...messy, title: " \n " };
+    expect(composerInlineMentions([], [blank], null).map((mention) => mention.token)).toEqual([
+      "@",
+    ]);
+    expect(sessionTagToken(blank)).toBe("@");
+    expect(tagTokens(tags([], [blank]))).toEqual(["@"]);
   });
 
   it("stays tagged while its token is in the draft, and an undo restores it", () => {
