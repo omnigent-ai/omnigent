@@ -71,9 +71,8 @@ def test_comment_guidance_keeps_decisions_local_and_requires_real_message_target
     assert "State a blocker's impact and the exact action needed in the ticket" in (
         PROJECT_TICKET_WORK_INSTRUCTION
     )
-    assert "short responsibility phrase, retaining required stage-owner information" in (
-        PROJECT_TICKET_WORK_INSTRUCTION
-    )
+    assert "short responsibility phrase" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "stage owner" not in PROJECT_TICKET_WORK_INSTRUCTION.replace("-", " ")
     assert "put the full task checklist in the linked chat" in PROJECT_TICKET_WORK_INSTRUCTION
     assert "durable message link is known" in PROJECT_TICKET_WORK_INSTRUCTION
     assert "Never invent message IDs" in PROJECT_TICKET_WORK_INSTRUCTION
