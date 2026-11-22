@@ -380,17 +380,32 @@ def test_create_refuses_a_file_owned_by_a_session_and_a_project(
         file_store.create("plan.md", 1, session_id=_SID, project_id=_PROJECT)
 
 
-def test_list_for_project_paginates(file_store: SqlAlchemyFileStore) -> None:
-    created = {
-        file_store.create(f"f{index}.txt", index, project_id=_PROJECT).id for index in range(3)
-    }
+def test_list_for_project_paginates(
+    file_store: SqlAlchemyFileStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Cursor pages follow ``(created_at, id)`` order across distinct and tied creation times.
+    """
+    # Fixed creation times: three files tie at 200, between one older and one newer file.
+    created_at = iter([100, 200, 200, 200, 300])
+    monkeypatch.setattr(
+        "omnigent.stores.file_store.sqlalchemy_store.now_epoch", lambda: next(created_at)
+    )
+    for index in range(5):
+        file_store.create(f"f{index}.txt", index, project_id=_PROJECT)
+    newest_first = [f.id for f in file_store.list_for_project(_PROJECT, limit=10).data]
 
-    first = file_store.list_for_project(_PROJECT, limit=2, order="asc")
-    rest = file_store.list_for_project(_PROJECT, limit=2, order="asc", after=first.last_id)
+    first = file_store.list_for_project(_PROJECT, limit=2)
+    second = file_store.list_for_project(_PROJECT, limit=2, after=first.last_id)
+    third = file_store.list_for_project(_PROJECT, limit=2, after=second.last_id)
+    newer = file_store.list_for_project(_PROJECT, limit=2, before=newest_first[2])
+    ascending = file_store.list_for_project(_PROJECT, limit=2, order="asc", after=newest_first[3])
 
-    assert len(first.data) == 2 and first.has_more
-    assert len(rest.data) == 1 and not rest.has_more
-    assert {f.id for f in first.data} | {f.id for f in rest.data} == created
+    assert len(newest_first) == 5
+    assert [f.id for f in first.data + second.data + third.data] == newest_first
+    assert [first.has_more, second.has_more, third.has_more] == [True, True, False]
+    assert [f.id for f in newer.data] == newest_first[:2]
+    assert [f.id for f in ascending.data] == [newest_first[2], newest_first[1]]
 
 
 def test_delete_all_for_project_keeps_blobs_other_rows_share(

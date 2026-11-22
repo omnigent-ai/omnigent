@@ -66,22 +66,25 @@ def _effective_blob_key(row: SqlFile) -> str:
     return row.blob_key if row.blob_key is not None else row.id
 
 
-def _references_blob(blob_key: str) -> ColumnElement[bool]:
+def _blob_is_referenced(session: Session, blob_key: str) -> bool:
     """
-    Match the rows whose bytes live under *blob_key*.
+    Whether any of the workspace's rows still keeps its bytes under *blob_key*.
 
-    Equivalent to ``COALESCE(blob_key, id) = :key``, written so it can use the
-    ``blob_key`` index and the primary key: new rows always store ``blob_key``,
-    and only rows from before it existed fall back to ``id``.
+    Matches ``COALESCE(blob_key, id) = :key`` with two lookups that each read at
+    most one row: the ``blob_key`` index, then the primary key for a row from
+    before ``blob_key`` existed, whose bytes live under its own id.
 
+    :param session: The calling transaction's session.
     :param blob_key: The artifact-store key, e.g. ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
-    :returns: The filter for the workspace's rows that reference it.
+    :returns: ``True`` while some row still references the blob.
     """
     key = normalize_uuid(blob_key)
-    return and_(
-        SqlFile.workspace_id == current_workspace_id(),
-        or_(SqlFile.blob_key == key, and_(SqlFile.blob_key.is_(None), SqlFile.id == key)),
-    )
+    in_workspace = SqlFile.workspace_id == current_workspace_id()
+    by_key = select(SqlFile.id).where(in_workspace, SqlFile.blob_key == key).limit(1)
+    if session.execute(by_key).first() is not None:
+        return True
+    legacy = select(SqlFile.id).where(in_workspace, SqlFile.id == key, SqlFile.blob_key.is_(None))
+    return session.execute(legacy).first() is not None
 
 
 def _owned_by(row: SqlFile, session_id: str | None, project_id: str | None) -> bool:
@@ -198,10 +201,7 @@ class SqlAlchemyFileStore(FileStore):
         :returns: ``True`` when the blob is safe to delete (no referrers).
         """
         with self._session("count_blob_key_refs") as session:
-            row = session.execute(
-                select(SqlFile.id).where(_references_blob(blob_key)).limit(1)
-            ).first()
-            return row is None
+            return not _blob_is_referenced(session, blob_key)
 
     def get(
         self,
@@ -378,10 +378,8 @@ class SqlAlchemyFileStore(FileStore):
             orphaned: builtins.list[str] = []
             for blob_key in blob_keys:
                 with query_name_scope("omnigent.file_store.count_blob_key_refs"):
-                    still_referenced = session.execute(
-                        select(SqlFile.id).where(_references_blob(blob_key)).limit(1)
-                    ).first()
-                if still_referenced is None:
+                    still_referenced = _blob_is_referenced(session, blob_key)
+                if not still_referenced:
                     orphaned.append(blob_key)
             return _DeletedBatch(deleted=len(rows), orphaned=orphaned)
 
@@ -441,6 +439,9 @@ def _beyond_cursor(cursor: str, *, older: bool) -> ColumnElement[bool]:
     """
     Match rows strictly older or newer than the cursor row, by ``(created_at, id)``.
 
+    The ``created_at`` bound comes first so the owner's index seeks straight to
+    the cursor; only rows tied on ``created_at`` are then filtered by ``id``.
+
     :param cursor: The cursor file ID.
     :param older: ``True`` for rows before the cursor, ``False`` for rows after it.
     :returns: The filter.
@@ -451,11 +452,11 @@ def _beyond_cursor(cursor: str, *, older: bool) -> ColumnElement[bool]:
         .scalar_subquery()
     )
     if older:
-        return or_(
-            SqlFile.created_at < cursor_created_at,
-            and_(SqlFile.created_at == cursor_created_at, SqlFile.id < cursor),
+        return and_(
+            SqlFile.created_at <= cursor_created_at,
+            or_(SqlFile.created_at < cursor_created_at, SqlFile.id < cursor),
         )
-    return or_(
-        SqlFile.created_at > cursor_created_at,
-        and_(SqlFile.created_at == cursor_created_at, SqlFile.id > cursor),
+    return and_(
+        SqlFile.created_at >= cursor_created_at,
+        or_(SqlFile.created_at > cursor_created_at, SqlFile.id > cursor),
     )

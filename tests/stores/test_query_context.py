@@ -141,6 +141,8 @@ def test_file_store_names_each_application_query(db_uri: str) -> None:
         assert query_names == [
             "omnigent.file_store.list_session_files_for_delete",
             "omnigent.file_store.delete_session_files",
+            # The blob_key lookup, then the primary-key lookup for a pre-blob_key row.
+            "omnigent.file_store.count_blob_key_refs",
             "omnigent.file_store.count_blob_key_refs",
         ]
 
@@ -155,6 +157,8 @@ def test_file_store_names_each_application_query(db_uri: str) -> None:
         assert query_names == [
             "omnigent.file_store.list_project_files_for_delete",
             "omnigent.file_store.delete_project_files",
+            # The blob_key lookup, then the primary-key lookup for a pre-blob_key row.
+            "omnigent.file_store.count_blob_key_refs",
             "omnigent.file_store.count_blob_key_refs",
         ]
 

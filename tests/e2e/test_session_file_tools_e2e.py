@@ -811,9 +811,9 @@ def test_model_turns_in_one_project_share_a_file(
         timeout=120,
     )
     assert writer_turn["status"] == "completed", writer_turn.get("error")
-    share_output = _outputs_by_call_id(writer_turn).get("share", "")
-    assert share_output.startswith("{"), share_output
-    shared = json.loads(share_output)
+    writer_outputs = _outputs_by_call_id(writer_turn)
+    assert "share" in writer_outputs and writer_outputs["share"].startswith("{"), writer_outputs
+    shared = json.loads(writer_outputs["share"])
     configure_mock_llm(
         mock_llm_server_url,
         [
