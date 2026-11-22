@@ -223,6 +223,34 @@ describe("QuickPickCommandPalette feature commands", () => {
     fireEvent.keyDown(input, { key: "Enter" });
   };
 
+  it("puts an exact name first, whichever heading it's under", () => {
+    offer([command("Archive old builds")]);
+    act(() =>
+      usePaletteCommandsStore
+        .getState()
+        .register("sessions", { heading: "Sessions", commands: [command("Archive")] }),
+    );
+    const { input } = renderPalette();
+    fireEvent.change(input, { target: { value: "archive" } });
+    const options = screen.getAllByRole("option").map((option) => option.textContent ?? "");
+    expect(options[0]).toContain("Archive");
+    expect(options[0]).not.toContain("old builds");
+    // Headings stay, led by the exact match's.
+    expect(within(screen.getByRole("group", { name: "Sessions" })).getByRole("option")).toBe(
+      screen.getAllByRole("option")[0],
+    );
+  });
+
+  it("puts a feature's exact name above an app action that only starts with it", () => {
+    offer([command("Settings")]);
+    const { input } = renderPalette();
+    fireEvent.change(input, { target: { value: "settings" } });
+    const first = screen.getAllByRole("option")[0];
+    expect(within(screen.getByRole("group", { name: "Workspace" })).getByRole("option")).toBe(
+      first,
+    );
+  });
+
   it("lists a feature's commands under its heading and runs one", () => {
     const reopen = command("Reopen closed tab");
     offer([reopen]);
