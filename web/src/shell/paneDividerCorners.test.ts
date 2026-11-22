@@ -244,28 +244,38 @@ describe("divider drag sessions", () => {
   it("holds a corner's dividers, or one divider, with no sizes before the pointer moves", () => {
     const dividers = dividersOf(columns("a", rows("b", "c")));
     const [corner] = dividerCorners(dividers);
-    expect(dividerDragSession(corner)).toEqual({
+    const layout = columns("a", rows("b", "c"));
+    expect(dividerDragSession(corner, layout)).toEqual({
       held: [
-        { path: [], axis: "columns" },
-        { path: [1], axis: "rows" },
+        { path: [], axis: "columns", sides: [["a"], ["b", "c"]] },
+        { path: [1], axis: "rows", sides: [["b"], ["c"]] },
       ],
       corner,
       resizes: null,
     });
-    expect(dividerDragSession(dividers[1])).toEqual({
-      held: [{ path: [1], axis: "rows" }],
+    expect(dividerDragSession(dividers[1], layout)).toEqual({
+      held: [{ path: [1], axis: "rows", sides: [["b"], ["c"]] }],
       corner: null,
       resizes: null,
     });
   });
 
   it("lives while every divider it holds is there the same way, wherever it moved", () => {
-    const [corner] = dividerCorners(dividersOf(columns("a", rows("b", "c"))));
-    const session = dividerDragSession(corner);
-    expect(holdsItsDividers(session, dividersOf(columns("a", rows("b", "c", 0.8), 0.2)))).toBe(
-      true,
-    );
-    expect(holdsItsDividers(session, dividersOf(columns("a", "b")))).toBe(false);
-    expect(holdsItsDividers(session, dividersOf(columns("a", columns("b", "c"))))).toBe(false);
+    const layout = columns("a", rows("b", "c"));
+    const [corner] = dividerCorners(dividersOf(layout));
+    const session = dividerDragSession(corner, layout);
+    expect(holdsItsDividers(session, columns("a", rows("b", "c", 0.8), 0.2))).toBe(true);
+    expect(holdsItsDividers(session, columns("a", "b"))).toBe(false);
+    expect(holdsItsDividers(session, columns("a", columns("b", "c")))).toBe(false);
+  });
+
+  it("ends when another split takes the held one's place, though the path and axis match", () => {
+    const layout = columns("a", columns("b", "c"));
+    const [root] = dividersOf(layout);
+    const session = dividerDragSession(root, layout);
+    // a closes: b | c is promoted to the root, its divider at the same path the same way.
+    expect(holdsItsDividers(session, columns("b", "c"))).toBe(false);
+    // c closes: the root still parts a from what is left beside it.
+    expect(holdsItsDividers(session, columns("a", "b"))).toBe(true);
   });
 });

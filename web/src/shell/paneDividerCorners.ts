@@ -6,6 +6,7 @@ import {
   type TerminalDivider,
   type TerminalLayout,
   terminalLayoutGeometry,
+  terminalLayoutKeys,
 } from "@/lib/paneSplitLayout";
 
 export interface DividerCorner {
@@ -217,33 +218,64 @@ export function cornerDragResizes(
  * One pointer drag on a divider or a corner, from press to release. Its sizes show only while it
  * lives, and are saved only by its release.
  */
+/** A divider a drag holds: where it is, and the panes on either side of it when taken. */
+export interface HeldDivider extends Pick<TerminalDivider, "path" | "axis"> {
+  sides: readonly [readonly string[], readonly string[]];
+}
+
 export interface DividerDragSession {
   /** The dividers the drag took: one, or a corner's. */
-  held: readonly Pick<TerminalDivider, "path" | "axis">[];
+  held: readonly HeldDivider[];
   /** The corner it took, kept as taken; null for a single divider. */
   corner: DividerCorner | null;
   /** Where the drag has its dividers; null before the pointer moved. */
   resizes: readonly DividerResize[] | null;
 }
 
-/** A drag taking `corner`, or the one divider `divider`. */
-export function dividerDragSession(taken: DividerCorner | TerminalDivider): DividerDragSession {
+/** The panes on either side of the split at `path` in `layout`, or null with no split there. */
+function splitSides(
+  layout: TerminalLayout,
+  path: readonly number[],
+): { axis: TerminalDivider["axis"]; sides: HeldDivider["sides"] } | null {
+  let node = layout;
+  for (const index of path) {
+    if (typeof node === "string") return null;
+    node = node.children[index];
+  }
+  if (typeof node === "string") return null;
+  const [first, second] = node.children;
+  return { axis: node.axis, sides: [terminalLayoutKeys(first), terminalLayoutKeys(second)] };
+}
+
+/** A drag in `layout` taking `corner`, or the one divider `divider`. */
+export function dividerDragSession(
+  taken: DividerCorner | TerminalDivider,
+  layout: TerminalLayout,
+): DividerDragSession {
   const corner = "dividers" in taken ? taken : null;
   const held = (corner ? corner.dividers : [taken as TerminalDivider]).map(({ path, axis }) => ({
     path,
     axis,
+    sides: splitSides(layout, path)?.sides ?? [[], []],
   }));
   return { held, corner, resizes: null };
 }
 
-/** Whether every divider the drag holds is still in the split, the same way. */
-export function holdsItsDividers(
-  session: DividerDragSession,
-  dividers: readonly TerminalDivider[],
-): boolean {
-  return session.held.every((held) =>
-    dividers.some(
-      (divider) => divider.axis === held.axis && divider.path.join(".") === held.path.join("."),
-    ),
-  );
+const shareAPane = (before: readonly string[], now: readonly string[]) =>
+  before.some((key) => now.includes(key));
+
+/**
+ * Whether every divider the drag holds is still in `layout`, the same way between the same
+ * panes. A split another took the place of, as when a pane beside it closed, ends the drag.
+ */
+export function holdsItsDividers(session: DividerDragSession, layout: TerminalLayout): boolean {
+  return session.held.every((held) => {
+    const now = splitSides(layout, held.path);
+    return (
+      now !== null &&
+      now.axis === held.axis &&
+      shareAPane(held.sides[0], now.sides[0]) &&
+      shareAPane(held.sides[1], now.sides[1])
+    );
+  });
 }
