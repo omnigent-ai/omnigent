@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -70,5 +71,36 @@ describe("the open grid's actions in ⌘K", () => {
   it("offers nothing with quick_pick_palette off", () => {
     renderSidebar(false);
     expect(commands()).toEqual([]);
+  });
+
+  it("opens a collapsed sidebar before editing the name there, so the editor can be seen", () => {
+    // As the sidebar does while collapsed: its rows stay mounted, hidden and inert.
+    function CollapsedSidebar() {
+      const [open, setOpen] = useState(false);
+      return (
+        <aside data-testid="sidebar" aria-hidden={!open} inert={!open}>
+          <GridSidebar onOpenSidebar={open ? undefined : () => setOpen(true)} />
+        </aside>
+      );
+    }
+    render(
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { quick_pick_palette: true } }}
+      >
+        <MemoryRouter>
+          <CollapsedSidebar />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+    act(() =>
+      commands()
+        .find((command) => command.label === "Rename grid…")!
+        .run(),
+    );
+    expect(screen.getByTestId("sidebar")).not.toHaveAttribute("aria-hidden", "true");
+    expect(screen.getByTestId("sidebar")).not.toHaveAttribute("inert");
+    const editor = screen.getByRole("textbox", { name: "Rename grid" });
+    expect(editor).toHaveFocus();
+    expect(editor).toHaveValue("Review");
   });
 });
