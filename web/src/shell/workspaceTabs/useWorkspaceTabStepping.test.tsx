@@ -191,11 +191,14 @@ describe("useWorkspaceTabStepping", () => {
       expect(event.defaultPrevented).toBe(true);
     });
 
-    it("steps from the chord on an older shell without desktop commands, and reports none", async () => {
-      Object.assign(window, { omnigentDesktop: { kind: "electron" } });
+    it("steps from the chord on an older shell whose menu sends no commands, and enables neither", async () => {
+      const setDesktopCommandState = vi.fn<(state: { commands: string[] }) => void>();
+      Object.assign(window, { omnigentDesktop: { kind: "electron", setDesktopCommandState } });
       render(<Strip entryIds={["files", "terminal:zsh", "browser:1"]} />);
       await act(async () => {});
-      expect(reported).toEqual([]);
+      const enabled = setDesktopCommandState.mock.calls.flatMap(([state]) => state.commands);
+      expect(enabled).not.toContain("next-tab");
+      expect(enabled).not.toContain("previous-tab");
       await pressChord("next");
       expect(pressed()).toBe("browser:1");
       await pressChord("next");
