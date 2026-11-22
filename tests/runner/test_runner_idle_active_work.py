@@ -268,6 +268,34 @@ async def test_done_approval_future_does_not_pin_runner() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_saved_timer_leaves_the_runner_idle() -> None:
+    """A timer lives on the server, which wakes the session's runner when it fires.
+
+    :returns: None.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    app = _scaffold_app()
+
+    async def timer_server(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"session_timers": True})
+        return httpx.Response(201, json={"timer_id": "t1", "status": "scheduled"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(timer_server), base_url="http://server"
+    ) as client:
+        output = await execute_tool(
+            tool_name="sys_timer_set",
+            arguments=json.dumps({"seconds": 5, "repeat": True}),
+            conversation_id="conv_timer",
+            server_client=client,
+        )
+    assert json.loads(output)["status"] == "scheduled"
+    assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
 async def test_drain_session_streams_enqueues_done_sentinel() -> None:
     """Graceful shutdown signals end-of-stream to every open session stream.
 
