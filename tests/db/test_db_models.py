@@ -232,6 +232,42 @@ class TestSqlFile:
             assert loaded is not None
             assert loaded.content_type is None
 
+    def test_project_file_and_its_indexes(self, db_uri: str) -> None:
+        """
+        A project file keeps its project, and the indexes for listing a project's files
+        and for checking a blob's references end with the primary key.
+        """
+        engine = get_or_create_engine(db_uri)
+        managed = make_managed_session_maker(engine)
+
+        with managed() as session:
+            session.add(
+                SqlFile(
+                    id="3e5d0c2b9a8f4e7d6c5b4a3f2e1d0c9b",
+                    created_at=_now(),
+                    filename="plan.md",
+                    bytes=8,
+                    project_id="5f0c6b1e2d3a4b5c6d7e8f9a0b1c2d3e",
+                )
+            )
+
+        with managed() as session:
+            loaded = session.get(SqlFile, (0, "3e5d0c2b9a8f4e7d6c5b4a3f2e1d0c9b"))
+            assert loaded is not None
+            assert loaded.project_id == "5f0c6b1e2d3a4b5c6d7e8f9a0b1c2d3e"
+            assert loaded.session_id is None
+        indexes = {
+            index["name"]: index["column_names"]
+            for index in sa.inspect(engine).get_indexes("files")
+        }
+        assert indexes["ix_files_project_id_created_at"] == [
+            "workspace_id",
+            "project_id",
+            "created_at",
+            "id",
+        ]
+        assert indexes["ix_files_blob_key"] == ["workspace_id", "blob_key", "id"]
+
 
 # ── SqlUser ───────────────────────────────────────────
 

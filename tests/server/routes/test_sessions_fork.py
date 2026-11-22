@@ -404,7 +404,6 @@ class _FileStore:
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
-        include_unscoped: bool = False,
     ) -> PagedList[StoredFile]:
         """
         Return the session's files (single page — stub keeps few).
@@ -414,10 +413,9 @@ class _FileStore:
         :param after: Cursor (unused by the stub).
         :param before: Cursor (unused by the stub).
         :param order: Sort order (unused by the stub).
-        :param include_unscoped: Unused by the stub.
         :returns: A PagedList of the session's files.
         """
-        del before, include_unscoped
+        del before
         data = [f for f in self.files.values() if f.session_id == session_id]
         if order == "desc":
             data.reverse()

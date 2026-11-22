@@ -115,21 +115,19 @@ class FileStore(ABC):
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
-        include_unscoped: bool = False,
     ) -> PagedList[StoredFile]:
         """
-        List a session's files with cursor-based pagination.
+        List a session's own files with cursor-based pagination.
 
         Always scoped to a session — there is no cross-session
-        listing (files are only ever surfaced per session).
+        listing (files are only ever surfaced per session), and global
+        and project files are not a session's.
 
         :param session_id: Owning session whose files to list.
         :param limit: Maximum number of files to return.
         :param after: Cursor file ID for forward pagination.
         :param before: Cursor file ID for backward pagination.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param include_unscoped: When ``True``, also return files
-            with ``session_id IS NULL`` (global/unscoped files).
         :returns: A :class:`PagedList` of :class:`StoredFile`.
         """
         ...

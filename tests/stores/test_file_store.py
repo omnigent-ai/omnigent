@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import pytest
 
+from omnigent.db.db_models import SqlFile
+from omnigent.db.utils import (
+    generate_file_id,
+    get_or_create_engine,
+    make_managed_session_maker,
+    now_epoch,
+)
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 
 # Files are always listed per session, so pagination/ordering tests
 # scope their fixtures to a single session id.
 _SID = "94c349190e241f85a984b3df8f129696"
+_PROJECT = "7d3b1f4e2a9c4b6d8e0f1a2b3c4d5e6f"
 
 
 @pytest.fixture()
@@ -202,32 +210,58 @@ def test_delete_all_for_session(
     assert file_store.get(global_f.id) is not None
 
 
-# ── include_unscoped ──────────────────────────────────────────────
+# ── session listing ───────────────────────────────────────────────
 
 
-def test_list_include_unscoped_returns_session_and_global_files(
-    file_store: SqlAlchemyFileStore,
+def _store_project_file(db_uri: str, filename: str) -> str:
+    """
+    Insert a project file the way the project-file writer will: a project, no session.
+
+    :param db_uri: The test database.
+    :param filename: The file's name, e.g. ``"plan.md"``.
+    :returns: The new row's id.
+    """
+    file_id = generate_file_id()
+    with make_managed_session_maker(get_or_create_engine(db_uri))() as session:
+        session.add(
+            SqlFile(
+                id=file_id,
+                created_at=now_epoch(),
+                filename=filename,
+                bytes=1,
+                blob_key=file_id,
+                project_id=_PROJECT,
+            )
+        )
+    return file_id
+
+
+def test_list_returns_only_the_sessions_own_files(
+    db_uri: str, file_store: SqlAlchemyFileStore
 ) -> None:
-    """list with include_unscoped=True includes global (session_id=NULL) files."""
+    """
+    A session's listing leaves out other sessions', project and global files.
+    """
     file_store.create("session.txt", 10, session_id="8af356d908005a65f872c246158c6293")
     file_store.create("global.txt", 20)
+    plan_id = _store_project_file(db_uri, "plan.md")
     file_store.create("other.txt", 30, session_id="1dacb16c401901ed250049177f59e84e")
 
-    page = file_store.list(session_id="8af356d908005a65f872c246158c6293", include_unscoped=True)
-    filenames = {f.filename for f in page.data}
-    assert "session.txt" in filenames
-    assert "global.txt" in filenames
-    assert "other.txt" not in filenames
+    page = file_store.list(session_id="8af356d908005a65f872c246158c6293")
+    plan = file_store.get(plan_id)
+
+    assert [f.filename for f in page.data] == ["session.txt"]
+    assert plan is not None and plan.project_id == _PROJECT and plan.session_id is None
 
 
-def test_list_include_unscoped_false_excludes_global_files(
+def test_list_excludes_global_files(
     file_store: SqlAlchemyFileStore,
 ) -> None:
-    """list with include_unscoped=False (default) excludes global files."""
+    """list excludes global files, which belong to no session."""
     file_store.create("session.txt", 10, session_id="8af356d908005a65f872c246158c6293")
     file_store.create("global.txt", 20)
 
-    page = file_store.list(session_id="8af356d908005a65f872c246158c6293", include_unscoped=False)
+    page = file_store.list(session_id="8af356d908005a65f872c246158c6293")
     filenames = {f.filename for f in page.data}
     assert "session.txt" in filenames
     assert "global.txt" not in filenames

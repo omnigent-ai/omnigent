@@ -122,15 +122,13 @@ class ListFilesTool(Tool):
         if file_store is None:
             return json.dumps({"error": "File store not configured."})
 
-        # Scope to the current session + global (unscoped) files so
-        # agents see their own files but not other users'.
+        # Only the current session's own files, so agents never see other users'.
         page = file_store.list(
             limit=limit,
             after=after,
             before=None,
             order="desc",
             session_id=conversation_id,
-            include_unscoped=True,
         )
 
         files = [

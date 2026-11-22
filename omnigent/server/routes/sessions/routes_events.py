@@ -1773,7 +1773,12 @@ def register_events_routes(
                     if not isinstance(file_id, str):
                         continue
                     stored = await asyncio.to_thread(file_store.get, file_id)
-                    if stored is None or stored.session_id not in (None, session_id):
+                    # A project file has no session but isn't global; messages can't use it.
+                    if (
+                        stored is None
+                        or stored.project_id is not None
+                        or stored.session_id not in (None, session_id)
+                    ):
                         continue
                     if stored.filename is not None and uses_filesystem_delivery(
                         stored.filename, stored.source_metadata
