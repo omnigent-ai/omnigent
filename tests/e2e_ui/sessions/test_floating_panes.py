@@ -491,9 +491,10 @@ _TOP_ROW_JS = """() => {
 }"""
 
 
-@pytest.mark.parametrize("zoom", [None, 1.25], ids=["older-preload", "zoom-125"])
+@pytest.mark.parametrize("scheme", ["light", "dark"])
+@pytest.mark.parametrize("zoom", [None, 1.0, 1.25], ids=["older-preload", "zoom-100", "zoom-125"])
 def test_the_mac_top_row_is_the_title_bar_beside_the_window_buttons(
-    page: Page, seeded_session: tuple[str, str], zoom: float | None
+    page: Page, seeded_session: tuple[str, str], zoom: float | None, scheme: str
 ) -> None:
     """In the macOS shell the top row is the title bar: 48 window px, on the window buttons'
     centre line with the title-bar cluster, at any page zoom and with the sidebar open or
@@ -506,7 +507,7 @@ def test_the_mac_top_row_is_the_title_bar_beside_the_window_buttons(
             "document.addEventListener('DOMContentLoaded', () => document.documentElement"
             f".style.setProperty('--omnigent-electron-zoom', '{zoom}'));"
         )
-    _open(page, base_url, session_id, scheme="light", floating=True)
+    _open(page, base_url, session_id, scheme=scheme, floating=True)
     expect(page.locator("html")).to_have_attribute("data-electron-mac", "true")
     open_right_rail(page)
     title_bar = 48 / (zoom or 1)
@@ -519,6 +520,8 @@ def test_the_mac_top_row_is_the_title_bar_beside_the_window_buttons(
                 "data-collapsed", "true"
             )
             page.wait_for_timeout(500)  # custom-lint: disable=sleep-then-assert -- the slide
+        zoom_name = "older-preload" if zoom is None else f"zoom-{round(zoom * 100)}"
+        _capture(page, f"mac-top-row-{zoom_name}-{scheme}-sidebar-{sidebar}")
         row = page.evaluate(_TOP_ROW_JS)
         for part in ("header", "tabs"):
             assert abs(row[part]["height"] - title_bar) <= 0.5, (sidebar, part, row)
