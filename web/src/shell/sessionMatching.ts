@@ -14,7 +14,11 @@ import {
   tokenizeQuery,
 } from "@/components/ui/quick-pick";
 import type { Conversation } from "@/hooks/useConversations";
-import { canonicalPullRequestUrl } from "@/lib/pullRequestReference";
+import {
+  parsePullRequestReference,
+  type PullRequestReferenceContext,
+  pullRequestKey,
+} from "@/lib/pullRequestReference";
 
 import { conversationDisplayLabel } from "./sidebarNav";
 
@@ -75,12 +79,34 @@ function prepareSession(session: Conversation): PreparedSession {
 }
 
 const PULL_REQUEST_NUMBER = /^#(\d+)$/;
-const LINK = /^https?:\/\//i;
+// The pull request pages of the providers sessions link to, other than GitHub's.
+const OTHER_PULL_REQUEST_PATH = /\/(?:merge_requests|pullrequest|pull-requests)\/\d+(?:\/|$)/i;
+// What a GitHub link parses with: nothing known about the session, as none is open here.
+const NO_SESSION_CONTEXT: PullRequestReferenceContext = {
+  numberPrefix: "#",
+  sessionPullRequests: [],
+  accountHosts: [],
+};
 
-/** Whether `query` is a pasted `#123` or link, which looks up linked pull requests instead. */
+/** Whether `link` names a pull request, rather than any other page. */
+function isPullRequestLink(link: string): boolean {
+  if (!/^https?:\/\//i.test(link)) return false;
+  const parsed = parsePullRequestReference(link, NO_SESSION_CONTEXT);
+  if (parsed?.kind === "link" && parsed.number !== null) return true;
+  try {
+    return OTHER_PULL_REQUEST_PATH.test(new URL(link).pathname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether `query` is a pasted `#123` or pull request link, which looks up linked pull
+ * requests instead. Any other link is searched for as text.
+ */
 export function isPullRequestLookup(query: string): boolean {
   const trimmed = query.trim();
-  return PULL_REQUEST_NUMBER.test(trimmed) || LINK.test(trimmed);
+  return PULL_REQUEST_NUMBER.test(trimmed) || isPullRequestLink(trimmed);
 }
 
 /** Tests a linked pull request against `#123` or a pasted link, which can be a sub-page. */
@@ -89,9 +115,10 @@ function pullRequestLookup(
 ): (pullRequest: { url: string; number: number }) => boolean {
   const number = PULL_REQUEST_NUMBER.exec(query);
   if (number) return (pullRequest) => pullRequest.number === Number(number[1]);
-  const pasted = canonicalPullRequestUrl(query);
+  // One pull request however its link is cased, as elsewhere in the app.
+  const pasted = pullRequestKey(query);
   return (pullRequest) => {
-    const linked = canonicalPullRequestUrl(pullRequest.url);
+    const linked = pullRequestKey(pullRequest.url);
     return pasted === linked || pasted.startsWith(`${linked}/`);
   };
 }
