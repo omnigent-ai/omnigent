@@ -389,36 +389,65 @@ describe("routing after a session switches hosts", () => {
     expect(isHostKeyless("old-host")).toBe(false);
   });
 
-  it("tries the default replica when the named host misses too", async () => {
-    const { authenticatedFetch, setSessionHost, isHostKeyless } = await setup();
+  it.each([
+    [200, true],
+    [400, false],
+  ])(
+    "tries the default replica when the named host misses too (default replica %i)",
+    async (status, demoted) => {
+      const { authenticatedFetch, getSessionHost, setSessionHost, isHostKeyless } = await setup();
+      setSessionHost(SESSION_ID, "old-host");
+      fetchMock
+        .mockResolvedValueOnce(wrongReplica("new-host"))
+        .mockResolvedValueOnce(wrongReplica(null))
+        .mockResolvedValueOnce(status === 200 ? Response.json({}) : wrongReplica(null));
+
+      const response = await authenticatedFetch(EVENTS_URL, { method: "POST", body: "{}" });
+
+      expect(response.status).toBe(status);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(requestHeaders(1).get(SLICE_KEY)).toBe("new-host");
+      expect(requestHeaders(2).has(SLICE_KEY)).toBe(false);
+      expect(getSessionHost(SESSION_ID)).toBe("new-host");
+      expect(isHostKeyless("new-host")).toBe(demoted);
+      expect(isHostKeyless("old-host")).toBe(false);
+    },
+  );
+
+  it.each([200, 400])(
+    "keys a demoted host again when the default replica names its key (keyed reply %i)",
+    async (status) => {
+      const { authenticatedFetch, setSessionHost, markHostKeyless, isHostKeyless } = await setup();
+      setSessionHost(SESSION_ID, "new-host");
+      markHostKeyless("new-host");
+      fetchMock
+        .mockResolvedValueOnce(wrongReplica("new-host"))
+        .mockResolvedValueOnce(status === 200 ? Response.json({}) : wrongReplica("new-host"))
+        .mockResolvedValue(Response.json({}));
+
+      const response = await authenticatedFetch(EVENTS_URL, { method: "POST", body: "{}" });
+
+      expect(response.status).toBe(status);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(requestHeaders(0).has(SLICE_KEY)).toBe(false);
+      expect(requestHeaders(1).get(SLICE_KEY)).toBe("new-host");
+      expect(isHostKeyless("new-host")).toBe(false);
+    },
+  );
+
+  it("corrects a child's host on the ancestor it routes by", async () => {
+    const { authenticatedFetch, getSessionHost, setSessionHost, setSessionParent } = await setup();
     setSessionHost(SESSION_ID, "old-host");
-    fetchMock
-      .mockResolvedValueOnce(wrongReplica("new-host"))
-      .mockResolvedValueOnce(wrongReplica(null))
-      .mockResolvedValueOnce(Response.json({}));
+    setSessionParent("child-session", SESSION_ID);
+    fetchMock.mockResolvedValueOnce(wrongReplica("new-host")).mockResolvedValue(Response.json({}));
 
-    expect((await authenticatedFetch(EVENTS_URL, { method: "POST", body: "{}" })).ok).toBe(true);
+    await authenticatedFetch("/v1/sessions/child-session/events", { method: "POST", body: "{}" });
 
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(requestHeaders(0).get(SLICE_KEY)).toBe("old-host");
     expect(requestHeaders(1).get(SLICE_KEY)).toBe("new-host");
-    expect(requestHeaders(2).has(SLICE_KEY)).toBe(false);
-    expect(isHostKeyless("new-host")).toBe(true);
-    expect(isHostKeyless("old-host")).toBe(false);
-  });
-
-  it("keys a demoted host again when the default replica names its key", async () => {
-    const { authenticatedFetch, setSessionHost, markHostKeyless, isHostKeyless } = await setup();
-    setSessionHost(SESSION_ID, "new-host");
-    markHostKeyless("new-host");
-    fetchMock
-      .mockResolvedValueOnce(wrongReplica("new-host"))
-      .mockResolvedValueOnce(Response.json({}));
-
-    expect((await authenticatedFetch(EVENTS_URL, { method: "POST", body: "{}" })).ok).toBe(true);
-
-    expect(requestHeaders(0).has(SLICE_KEY)).toBe(false);
-    expect(requestHeaders(1).get(SLICE_KEY)).toBe("new-host");
-    expect(isHostKeyless("new-host")).toBe(false);
+    expect(getSessionHost(SESSION_ID)).toBe("new-host");
+    setSessionHost(SESSION_ID, "third-host");
+    expect(getSessionHost("child-session")).toBe("third-host");
   });
 
   it("keeps a managed fork keyed by its new host when the refusal names the source's", async () => {

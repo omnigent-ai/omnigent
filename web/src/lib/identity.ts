@@ -30,6 +30,7 @@ import {
   getSessionHost,
   isHostKeyless,
   markHostKeyless,
+  sessionHostOwner,
   setSessionHost,
   updatesRoutingKey,
 } from "@/lib/sessionHost";
@@ -624,43 +625,35 @@ export function getCurrentAuthorId(): string | null {
  * redirects to the login page.
  */
 /**
- * Whether a response is the server's wrong-replica signal
- * ({@link WRONG_REPLICA_CODE}). Gated on 400 first so the body is only read
- * on the rare failure; reads a CLONE so the original response body stays intact
- * for the caller when this returns false.
+ * The `error` object of the server's wrong-replica signal
+ * ({@link WRONG_REPLICA_CODE}), or `null` for any other response. Gated on 400
+ * first so the body is only read on the rare failure; reads a CLONE so the
+ * original response body stays intact for the caller.
  *
  * @param res The response to inspect.
- * @returns `true` when the JSON body carries `error.code === "wrong_replica"`.
+ * @returns The JSON body's `error` when it carries `code === "wrong_replica"`.
  */
-async function _isWrongReplica(res: Response): Promise<boolean> {
-  if (res.status !== 400) return false;
-  try {
-    const body = (await res.clone().json()) as { error?: { code?: string } };
-    return body.error?.code === WRONG_REPLICA_CODE;
-  } catch {
-    // Non-JSON / empty body — not the structured wrong_replica error.
-    return false;
-  }
-}
-
-/**
- * The host key a wrong_replica refusal names to resend with, or `null` when the
- * response isn't a refusal or must be resent without a key.
- *
- * @param res The response to inspect.
- * @returns The refusal's `slice_key`, e.g. `"0123456789abcdef0123456789abcdef"`.
- */
-async function _wrongReplicaResendKey(res: Response): Promise<string | null> {
+async function _wrongReplicaError(res: Response): Promise<{ slice_key?: unknown } | null> {
   if (res.status !== 400) return null;
   try {
     const body = (await res.clone().json()) as {
       error?: { code?: string; slice_key?: unknown };
     };
-    const sliceKey = body.error?.code === WRONG_REPLICA_CODE ? body.error.slice_key : null;
-    return typeof sliceKey === "string" && sliceKey !== "" ? sliceKey : null;
+    return body.error?.code === WRONG_REPLICA_CODE ? body.error : null;
   } catch {
+    // Non-JSON / empty body — not the structured wrong_replica error.
     return null;
   }
+}
+
+async function _isWrongReplica(res: Response): Promise<boolean> {
+  return (await _wrongReplicaError(res)) !== null;
+}
+
+/** Return the nonempty host key named by a 400 wrong_replica response. */
+async function _wrongReplicaResendKey(res: Response): Promise<string | null> {
+  const sliceKey = (await _wrongReplicaError(res))?.slice_key;
+  return typeof sliceKey === "string" && sliceKey !== "" ? sliceKey : null;
 }
 
 export async function authenticatedFetch(
@@ -754,14 +747,15 @@ export async function authenticatedFetch(
       : null;
   const sentKey = unkeyed ? null : headers.get(SLICE_KEY_HEADER);
   if (recoverySessionId !== null && resendKey !== null && resendKey !== sentKey) {
-    setSessionHost(recoverySessionId, resendKey);
-    // A keyless miss shows the default replica doesn't hold this host.
+    // A child's refusal names its ancestor's host, so correct the entry it routes by.
+    setSessionHost(sessionHostOwner(recoverySessionId) ?? recoverySessionId, resendKey);
+    // A keyless miss shows the default replica doesn't hold this host; don't retry it.
     if (sentKey === null) clearHostKeyless(resendKey);
     const keyedHeaders = new Headers(headers);
     keyedHeaders.set(SLICE_KEY_HEADER, resendKey);
     res = await hostFetch(url, { ...init, headers: keyedHeaders, cache: "no-store" });
     derivedHostId = resendKey;
-    stampedSliceKey = true;
+    stampedSliceKey = sentKey !== null;
     unkeyed = false;
   }
 

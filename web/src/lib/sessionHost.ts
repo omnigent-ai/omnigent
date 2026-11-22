@@ -10,8 +10,7 @@
 //
 // A small standalone map (rather than reading the TanStack Query cache) keeps
 // this decoupled from the query-key convention and needs no QueryClient handle.
-// Switching a session's host can leave a stale entry until the session is parsed
-// again or a wrong_replica refusal names the new host (`authenticatedFetch`).
+// A host switch can leave an entry stale until reparsed or a wrong_replica refusal corrects it.
 // Returns `null` when the session hasn't been loaded yet or is a hostless
 // local session; such requests carry the client's own key (`routingKey.ts`).
 
@@ -112,12 +111,20 @@ export function getSessionParent(sessionId: string): string | null {
  * depth limit, so only a revisited id (a malformed cycle) ends the walk.
  */
 export function getSessionHost(sessionId: string): string | null {
+  const owner = sessionHostOwner(sessionId);
+  return owner === null ? null : (_sessionHosts.get(owner) ?? null);
+}
+
+/**
+ * The session whose recorded host {@link getSessionHost} returns for `sessionId`:
+ * itself or its nearest host-bound ancestor, or `null` when none has a host.
+ */
+export function sessionHostOwner(sessionId: string): string | null {
   const visited = new Set<string>();
   let id: string | null = sessionId;
   while (id !== null && !visited.has(id)) {
     visited.add(id);
-    const host = _sessionHosts.get(id);
-    if (host) return host;
+    if (_sessionHosts.has(id)) return id;
     id = _sessionParents.get(id) ?? null;
   }
   return null;
