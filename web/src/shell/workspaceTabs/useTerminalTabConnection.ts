@@ -112,6 +112,7 @@ export function useTerminalTabConnections(
     return wait ? [[shell.key, wait] as const] : [];
   });
   const waitingSignature = JSON.stringify(waiting);
+  const waitOf = new Map<string, string>(waiting);
   const [now, setNow] = useState(() => Date.now());
   // Bumped when the waits start over, which the clock alone may not show.
   const [, setRevision] = useState(0);
@@ -168,8 +169,8 @@ export function useTerminalTabConnections(
   // A tab changes only when a wait reaches its limit, so the clock wakes then and not before.
   let nextDeadline: number | null = null;
   for (const [key, wait] of waiting) {
-    // A wait the store hasn't taken in yet starts now.
-    const deadline = (shellWaits.since(key) ?? now) + terminalTabWaitLimit(wait);
+    // A wait the store hasn't taken in yet, or that waits for something new, starts now.
+    const deadline = (shellWaits.since(key, wait) ?? now) + terminalTabWaitLimit(wait);
     if (deadline > now && (nextDeadline === null || deadline < nextDeadline))
       nextDeadline = deadline;
   }
@@ -182,7 +183,8 @@ export function useTerminalTabConnections(
   const { resume } = sandbox;
   return {
     connectionOf: ({ key, inventory }) => {
-      const since = shellWaits.since(key);
+      const wait = waitOf.get(key);
+      const since = wait === undefined ? undefined : shellWaits.since(key, wait);
       const waited = since === undefined ? 0 : now - since;
       return terminalTabConnection({ ...facts, inventory, waited });
     },

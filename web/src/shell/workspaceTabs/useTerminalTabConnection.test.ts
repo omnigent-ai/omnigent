@@ -9,6 +9,7 @@ import { refreshRunnerHealth } from "@/hooks/useRunnerHealth";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { wakeSandboxSession } from "@/hooks/useSessionReconnect";
 import { fetchTerminals, TERMINAL_LIST_TIMEOUT_MS, useTerminals } from "@/hooks/useTerminals";
+import { SANDBOX_RESUME_TOTAL_LIMIT_MS } from "@/lib/sandboxResume";
 import { retrySession } from "@/lib/sessionsApi";
 import { terminalsQueryKey } from "@/lib/terminals";
 
@@ -236,6 +237,53 @@ describe("a shell tab whose wait changes", () => {
       vi.useRealTimers();
     }
   });
+
+  /** A panel showing one unlisted shell, timed by `shellWaits`, for the session's `liveness`. */
+  function renderShellPanel(
+    shellWaits: ReturnType<typeof createShellWaits>,
+    liveness: "starting" | "online",
+    client: QueryClient,
+  ) {
+    const shell = { key: "terminal:t1", inventory: "unknown" } as const;
+    const view = renderHook(
+      () =>
+        useTerminalTabConnections("s-replaced", shellWaits, {
+          liveness,
+          listFailed: false,
+          shells: [shell],
+        }),
+      { wrapper: ({ children }) => createElement(QueryClientProvider, { client }, children) },
+    );
+    return { ...view, kind: () => view.result.current.connectionOf(shell).kind };
+  }
+
+  it.each([
+    ["a while", 30_000],
+    ["until its own limit", SANDBOX_RESUME_TOTAL_LIMIT_MS],
+  ])(
+    "times the shell list's wait in a panel that replaces one that waited for the start %s",
+    async (_case, startingFor) => {
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+      try {
+        const client = new QueryClient();
+        const shellWaits = createShellWaits();
+        const starting = renderShellPanel(shellWaits, "starting", client);
+        await act(async () => vi.advanceTimersByTime(startingFor));
+        starting.unmount();
+
+        // The new panel mounts on the same clock reading, with the session now online.
+        const online = renderShellPanel(shellWaits, "online", client);
+        expect(online.kind()).toBe("connecting");
+        await act(async () => vi.advanceTimersByTime(SHELL_LIST_LIMIT_MS - 1_000));
+        expect(online.kind()).toBe("connecting");
+        await act(async () => vi.advanceTimersByTime(1_000));
+        expect(online.kind()).toBe("unreachable");
+        client.clear();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("wakes only when a wait reaches its limit, and not at all once every wait has", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
