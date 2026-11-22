@@ -52,9 +52,19 @@ describe("SidebarSavedViewItems", () => {
     expect(onDelete).toHaveBeenCalledWith(VIEWS[0]);
   });
 
-  it("offers only saving with no views, or no delete when none matches", () => {
+  it("offers only saving with no views", () => {
     renderItems([], null);
     expect(screen.queryAllByRole("menuitemradio")).toHaveLength(0);
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+      "Save current view…",
+    ]);
+  });
+
+  it("checks no view and offers no delete when views exist but none matches", () => {
+    renderItems(VIEWS, null);
+    const radios = screen.getAllByRole("menuitemradio");
+    expect(radios).toHaveLength(2);
+    for (const radio of radios) expect(radio).toHaveAttribute("aria-checked", "false");
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
       "Save current view…",
     ]);
