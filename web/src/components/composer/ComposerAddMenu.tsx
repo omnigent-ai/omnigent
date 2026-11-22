@@ -23,6 +23,7 @@ import {
   composerAddAction,
   composerAddActions,
 } from "./composerAddActions";
+import { useComposerAddPaletteCommands } from "./useComposerAddPaletteCommands";
 
 const EMPTY_PROJECTS: readonly { name: string }[] = [];
 const EMPTY_WORKFLOWS: readonly SavedWorkflow[] = [];
@@ -62,6 +63,7 @@ export function ComposerAddMenu({
   onOpen,
   projects = EMPTY_PROJECTS,
   onProjectSelect,
+  paletteSource,
 }: {
   disabled: boolean;
   onAttach: () => void;
@@ -93,6 +95,8 @@ export function ComposerAddMenu({
   onOpen?: () => void;
   projects?: readonly { name: string }[];
   onProjectSelect?: (name: string) => void;
+  /** Where ⌘K offers these actions too, with quick_pick_palette on; one composer sets it. */
+  paletteSource?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
@@ -116,6 +120,12 @@ export function ComposerAddMenu({
   });
   const unavailable = (id: ComposerAddActionId) =>
     !isCommandAvailable(composerAddAction(actions, id).availability);
+  useComposerAddPaletteCommands(paletteSource, actions, {
+    attach: onAttach,
+    "side-chat": onSideChat,
+    goal: onGoal,
+    plan: onPlan,
+  });
   const pendingActionRef = useRef<(() => void) | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [geometry, setGeometry] = useState<{

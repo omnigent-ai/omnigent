@@ -4762,6 +4762,7 @@ function ComposerImpl(
                   disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw
                 }
                 onAttach={() => fileInputRef.current?.click()}
+                paletteSource={composerSessionId ? `composer:${composerSessionId}` : undefined}
                 showGoal={showGoalControl || showClaudeGoalControl || showPollyCodexGoalControl}
                 onGoal={() => setGoalDialogOpen(true)}
                 goalDisabled={!composerSessionId || (!showGoalControl && isReadOnly)}
