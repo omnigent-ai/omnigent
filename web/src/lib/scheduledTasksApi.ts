@@ -49,7 +49,7 @@ export interface ScheduledTask {
   prompt: string;
   /**
    * RFC-5545 recurrence rule, e.g. `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0`.
-   * Null for a trigger automation: the server decides when it polls.
+   * Null for a trigger automation when the server decides when it polls (automations v2).
    */
   rrule: string | null;
   /** Owning user, or `null` in single-user / auth-disabled deployments. */

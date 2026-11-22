@@ -251,7 +251,7 @@ class SysScheduledTaskListTool(Tool):
         return (
             "List your scheduled tasks (recurring agent runs) with their schedules and state. "
             "A trigger automation, which watches a service such as Jira or Slack for new "
-            "items, has no schedule: the server decides when it polls, so its rrule is null."
+            "items, is listed with rrule null when the server decides when it polls."
         )
 
     def get_schema(self) -> dict[str, Any]:

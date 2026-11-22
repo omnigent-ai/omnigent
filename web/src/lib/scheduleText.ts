@@ -339,7 +339,7 @@ const MONTH_NAMES = [
  * something readable rather than blank.
  */
 export function describeSchedule(rrule: string | null, timezone?: string): string {
-  // A trigger automation has no rule: the server decides when it polls.
+  // The server withholds a trigger automation's rule when it decides when the trigger polls.
   if (rrule === null) return "";
   const rule = tryParse(rrule);
   if (!rule) return rrule;

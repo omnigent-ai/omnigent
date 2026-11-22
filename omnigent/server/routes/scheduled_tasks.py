@@ -283,10 +283,20 @@ def _next_run_at(task: ScheduledTask, request: Request) -> str | None:
     return scheduler.next_run_at(task.id) if scheduler is not None else None
 
 
+def _hides_trigger_rrule(request: Request) -> bool:
+    """Whether trigger automations' rules are withheld from responses.
+
+    With automations v2 the server decides when a trigger polls; the legacy timers
+    poll it on its saved rule, so they return it.
+    """
+    return getattr(request.app.state, "scheduled_task_dispatch_enabled", False)
+
+
 def _to_response(
     task: ScheduledTask,
     *,
     shareable: bool,
+    hide_trigger_rrule: bool,
     last_run_status: str | None = None,
     next_run_at: str | None = None,
     viewer_role: ScheduledTaskViewerRole = "owner",
@@ -296,6 +306,8 @@ def _to_response(
 
     :param shareable: Whether the automation itself can be shared, from
         :func:`scheduled_task_shareable`.
+    :param hide_trigger_rrule: Send a trigger automation's ``rrule`` as ``None``, from
+        :func:`_hides_trigger_rrule`.
     :param last_run_status: The status of the task's most recent run
         (``succeeded`` / ``failed`` / ``skipped`` / ``running`` / ``scheduled``),
         or ``None`` when the task has never run. Surfaced so the Tasks list can
@@ -313,8 +325,7 @@ def _to_response(
         "id": task.id,
         "name": task.name,
         "prompt": task.prompt,
-        # The server decides when a trigger polls, so its saved rule isn't its schedule.
-        "rrule": None if is_trigger_automation(task) else task.rrule,
+        "rrule": None if hide_trigger_rrule and is_trigger_automation(task) else task.rrule,
         # JSON key preserved for API/UI stability; the DB column + entity
         # attribute are now ``user_id``.
         "owner_user_id": task.user_id,
@@ -1372,6 +1383,7 @@ def create_scheduled_tasks_router(
         return _to_response(
             task,
             shareable=scheduled_task_shareable(permission_store, task.id),
+            hide_trigger_rrule=_hides_trigger_rrule(request),
             next_run_at=_next_run_at(task, request),
         )
 
@@ -1429,11 +1441,13 @@ def create_scheduled_tasks_router(
         # dead run as ``failed`` rather than a stuck ``running``.
         force_fail_stale_runs(store, running)
         latest_status = store.list_latest_run_status_for_tasks(task_ids)
+        hide_trigger_rrule = _hides_trigger_rrule(request)
         return {
             "scheduled_tasks": [
                 _to_response(
                     t,
                     shareable=scheduled_task_shareable(permission_store, t.id),
+                    hide_trigger_rrule=hide_trigger_rrule,
                     last_run_status=latest_status.get(t.id),
                     next_run_at=_next_run_at(t, request),
                 )
@@ -1536,11 +1550,13 @@ def create_scheduled_tasks_router(
         # Reads one run per automation; a stale running run fails when its history is read.
         latest_status = await asyncio.to_thread(store.list_latest_run_status_for_tasks, ids)
         names = await _owner_display_names(tasks)
+        hide_trigger_rrule = _hides_trigger_rrule(request)
         return {
             "scheduled_tasks": [
                 _to_response(
                     task,
                     shareable=scheduled_task_shareable(permission_store, task.id),
+                    hide_trigger_rrule=hide_trigger_rrule,
                     last_run_status=latest_status.get(task.id),
                     next_run_at=_next_run_at(task, request),
                     viewer_role="viewer",
@@ -1571,6 +1587,7 @@ def create_scheduled_tasks_router(
         return _to_response(
             task,
             shareable=scheduled_task_shareable(permission_store, task.id),
+            hide_trigger_rrule=_hides_trigger_rrule(request),
             last_run_status=latest_status.get(task.id),
             next_run_at=_next_run_at(task, request),
             viewer_role=role,
@@ -2143,6 +2160,7 @@ def create_scheduled_tasks_router(
         return _to_response(
             updated,
             shareable=scheduled_task_shareable(permission_store, updated.id),
+            hide_trigger_rrule=_hides_trigger_rrule(request),
             last_run_status=latest_status.get(updated.id),
             next_run_at=_next_run_at(updated, request),
         )

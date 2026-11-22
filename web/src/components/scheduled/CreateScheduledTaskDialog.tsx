@@ -663,7 +663,7 @@ export function CreateScheduledTaskDialog({
         setPickedModel(editingTask.modelOverride ?? "");
         setPickedEffort(editingTask.reasoningEffort ?? "");
         setPickedPermission(editingTask.permissionMode ?? "");
-        // A trigger has no rule to edit: the server decides when it polls.
+        // The server withholds a trigger's rule when it decides when the trigger polls.
         const ruleless = editingTask.rrule === null;
         setSchedule(parsedSchedule ?? (ruleless ? defaultTriggerSchedule : DEFAULT_SCHEDULE_MODEL));
         setScheduleUnsupported(parsedSchedule === null && !ruleless);
@@ -1742,7 +1742,7 @@ export function CreateScheduledTaskDialog({
           id: editingTask.id,
           input: {
             ...input,
-            // A trigger has no rule to send back.
+            // Keep the trigger's withheld rule.
             ...(editingTask.rrule === null ? { rrule: undefined } : {}),
             ...overrides,
             ...projectInput,

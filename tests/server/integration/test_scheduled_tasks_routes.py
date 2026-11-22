@@ -6880,17 +6880,21 @@ async def test_the_local_user_has_no_automations_shared_with_them(
     assert listed.json() == {"scheduled_tasks": [], "next_cursor": None}
 
 
+_SLACK_TRIGGER = {
+    "prompt": "This automation watches Slack and starts one Omnigent session per message.",
+    "session_mode": "continue",
+}
+
+
 @_SHARING
 async def test_a_trigger_reads_its_rrule_as_null(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
     _make_user(db_uri)
     _make_user(db_uri, "bob@example.com")
-    trigger_body = _create_body(
-        prompt="This automation watches Slack and starts one Omnigent session per message.",
-        session_mode="continue",
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(**_SLACK_TRIGGER), headers=_headers()
     )
-    created = await auth_client.post("/v1/scheduled-tasks", json=trigger_body, headers=_headers())
     assert created.status_code == 200, created.text
     assert created.json()["rrule"] is None
     trigger_id = created.json()["id"]
@@ -6916,6 +6920,18 @@ async def test_a_trigger_reads_its_rrule_as_null(
     for task_id in (trigger_id, cloned.json()["id"]):
         saved = store.get(task_id)
         assert (saved.rrule, saved.timezone) == (_VALID_RRULE, "America/Los_Angeles")
+
+
+async def test_the_legacy_scheduler_returns_a_triggers_saved_rule(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    # Its timers poll a trigger on the saved rule.
+    _make_user(db_uri)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(**_SLACK_TRIGGER), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["rrule"] == _VALID_RRULE
 
 
 @_SHARING

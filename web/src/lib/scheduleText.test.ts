@@ -199,7 +199,7 @@ describe("validateSchedule — 1-hour floor + required selections", () => {
 });
 
 describe("describeSchedule", () => {
-  it("describes no rule, as a trigger automation has, as nothing", () => {
+  it("describes a withheld trigger rule as nothing", () => {
     expect(describeSchedule(null)).toBe("");
   });
 
