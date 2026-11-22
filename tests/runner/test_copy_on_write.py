@@ -195,7 +195,7 @@ async def test_tool_grant_probe_keeps_session_relative_cow_configuration(tmp_pat
     from unittest.mock import AsyncMock
 
     from omnigent.runner import tool_dispatch
-    from omnigent.spec.types import AgentSpec, ExecutorSpec
+    from omnigent.spec.types import AgentSpec, ExecutorSpec, ToolGroupsConfig
 
     workspace = tmp_path / "workspace"
     (workspace / "dependencies").mkdir(parents=True)
@@ -212,6 +212,7 @@ async def test_tool_grant_probe_keeps_session_relative_cow_configuration(tmp_pat
         spec_version=1,
         os_env=os_spec,
         executor=ExecutorSpec(type="omnigent", config={"harness": "openai-agents"}),
+        tool_groups=ToolGroupsConfig(files=True),
     )
     execute = AsyncMock(return_value="session file")
     monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", execute)

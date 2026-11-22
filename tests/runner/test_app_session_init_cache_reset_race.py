@@ -255,7 +255,11 @@ async def test_upload_refuses_while_the_session_workspace_is_unreadable(tmp_path
     server = _MetadataReadsServerClient(session_root)
     app = create_runner_app(
         process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        spec_resolver=AsyncMock(return_value=AgentSpec(spec_version=1, skills_filter="none")),
+        spec_resolver=AsyncMock(
+            return_value=AgentSpec(
+                spec_version=1, skills_filter="none", tool_groups=ToolGroupsConfig(files=True)
+            )
+        ),
         server_client=server,  # type: ignore[arg-type]
         resource_registry=SessionResourceRegistry(
             runner_workspace=runner_root, terminal_registry=None

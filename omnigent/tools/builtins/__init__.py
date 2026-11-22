@@ -269,8 +269,8 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "web_fetch": None,
     "list_comments": None,
     "update_comment": None,
-    # Session file tools: auto-registered by ``ToolManager._register_file_tools``
-    # unless the spec sets ``tool_groups.files: false``.
+    # Session file tools: registered by ``ToolManager._register_file_tools``
+    # only when the spec sets ``tool_groups.files: true``.
     "sys_upload_file": None,
     "sys_list_files": None,
     "sys_download_file": None,

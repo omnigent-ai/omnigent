@@ -890,9 +890,10 @@ class ToolGroupsConfig:
     """
     Which framework-owned tool groups an agent advertises.
 
-    Every group defaults to ``True``: groups register on every agent unless
-    the spec opts out under a top-level ``tool_groups:`` block (a mapping of
-    group name to boolean). Trimming a group the agent cannot use keeps the
+    Every group except ``files`` defaults to ``True``: groups register on every
+    agent unless the spec opts out under a top-level ``tool_groups:`` block (a
+    mapping of group name to boolean). ``files`` is off until an agent opts in
+    with ``files: true``. Trimming a group the agent cannot use keeps the
     advertised tool payload under a strict provider's byte limit and stops a
     small model from picking an irrelevant tool.
 
@@ -910,7 +911,8 @@ class ToolGroupsConfig:
         unless the server offers the Inbox to the session's owner.
     :param memory: The ``memory_*`` long-term memory tools (5).
     :param files: ``sys_upload_file``, ``sys_list_files`` and ``sys_download_file``,
-        which share workspace files through the session's file store.
+        which share workspace files through the session's file store. Off by
+        default.
     """
 
     browser: bool = True
@@ -922,7 +924,7 @@ class ToolGroupsConfig:
     projects: bool = True
     user_inbox: bool = True
     memory: bool = True
-    files: bool = True
+    files: bool = False
 
 
 @dataclass

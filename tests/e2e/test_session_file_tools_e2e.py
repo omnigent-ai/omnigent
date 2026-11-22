@@ -1,10 +1,10 @@
-"""E2E: the session file tools are default system tools on every path agents use.
+"""E2E: the opt-in session file tools work on every path agents use.
 
 The server, runner, harness subprocesses, native CLIs, host, MCP proxy and the
 session file store are real. Only the model endpoint is scripted, so each
-journey's tool calls are deterministic. On a build without ``sys_upload_file``,
-``sys_list_files`` and ``sys_download_file`` registered by default, every
-journey here fails.
+journey's tool calls are deterministic. An agent turns ``sys_upload_file``,
+``sys_list_files`` and ``sys_download_file`` on with ``tool_groups.files:
+true``; an agent that doesn't is offered none of them.
 
 Run: uv run --no-sync pytest tests/e2e/test_session_file_tools_e2e.py -v
 """
@@ -43,6 +43,7 @@ from tests.e2e.routing._helpers import wait_for
 _REPO = Path(__file__).resolve().parents[2]
 _FILE_TOOLS = {"sys_upload_file", "sys_list_files", "sys_download_file"}
 _OLD_NAMES = {"upload_file", "list_files", "download_file"}
+_FILES_ON = {"files": True}
 _OS_ENV = {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}}
 _NATIVE_MODELS = {"claude": "claude-sonnet-4-20250514", "codex": "gpt-4o"}
 _SYSTEM_CODEX_CONFIG = Path("/etc/codex/managed_config.toml")
@@ -172,17 +173,17 @@ def _model_session(
     return session_id
 
 
-def test_model_turn_shares_and_reads_session_files_with_the_default_tools(
+def test_model_turn_shares_and_reads_session_files_with_the_file_tools_on(
     http_client: httpx.Client,
     live_runner_id: str,
     mock_llm_server_url: str,
 ) -> None:
     """
-    An agent that declares no file builtins is offered the three system tools.
-    Its turn writes a report with ``sys_os_write``, uploads it and a file the
-    user put in the session's filesystem, lists the session's files, and reads
-    back the user's attachment as text. The shared runner has no workspace, so
-    the two uploads come from the session's two default directories.
+    An agent that sets ``tool_groups.files: true`` is offered the three system
+    tools. Its turn writes a report with ``sys_os_write``, uploads it and a file
+    the user put in the session's filesystem, lists the session's files, and
+    reads back the user's attachment as text. The shared runner has no
+    workspace, so the two uploads come from the session's two default directories.
     """
     model = f"mock-files-{uuid.uuid4().hex[:8]}"
     session_id = _model_session(
@@ -190,7 +191,7 @@ def test_model_turn_shares_and_reads_session_files_with_the_default_tools(
         runner_id=live_runner_id,
         mock_llm_server_url=mock_llm_server_url,
         model=model,
-        spec_overrides={"os_env": _OS_ENV},
+        spec_overrides={"os_env": _OS_ENV, "tool_groups": _FILES_ON},
     )
     attachment = http_client.post(
         f"/v1/sessions/{session_id}/resources/files",
@@ -247,10 +248,12 @@ def test_model_turn_shares_and_reads_session_files_with_the_default_tools(
 @pytest.mark.parametrize(
     ("spec_overrides", "expected"),
     [
+        ({}, set()),
+        ({"tool_groups": _FILES_ON}, _FILE_TOOLS),
         ({"tool_groups": {"files": False}}, set()),
         ({"tools": {"builtins": sorted(_OLD_NAMES)}}, set()),
     ],
-    ids=["files-group-off", "old-builtin-names"],
+    ids=["default", "files-group-on", "files-group-off", "old-builtin-names"],
 )
 def test_spec_controls_which_file_tools_a_turn_is_offered(
     http_client: httpx.Client,
@@ -260,10 +263,11 @@ def test_spec_controls_which_file_tools_a_turn_is_offered(
     expected: set[str],
 ) -> None:
     """
-    ``tool_groups.files: false`` removes the three tools from what the model is
-    offered. An agent that still lists the removed names in ``tools.builtins``
-    is offered none of them either, so a policy written for the old names is
-    never bypassed by the new ones.
+    The model is offered the three tools only when the spec sets
+    ``tool_groups.files: true``: without a ``tool_groups`` block, or with
+    ``files: false``, it gets none. An agent that still lists the removed names
+    in ``tools.builtins`` gets none either, so a policy written for the old
+    names is never bypassed by the new ones.
     """
     model = f"mock-files-spec-{uuid.uuid4().hex[:8]}"
     configure_mock_llm(
@@ -326,8 +330,8 @@ def test_native_cli_uploads_a_workspace_file_through_the_omnigent_relay(
 ) -> None:
     """
     A real Claude Code or Codex CLI, launched by a real host for an agent that
-    declares no file builtins, is offered the three tools by Omnigent's relay and
-    uploads a file from its workspace with ``sys_upload_file``.
+    sets ``tool_groups.files: true``, is offered the three tools by Omnigent's
+    relay and uploads a file from its workspace with ``sys_upload_file``.
     """
     for binary in (harness, "tmux"):
         if shutil.which(binary) is None:
@@ -424,6 +428,7 @@ def test_native_cli_uploads_a_workspace_file_through_the_omnigent_relay(
                 "yolo": True,
             },
             "os_env": _OS_ENV,
+            "tool_groups": _FILES_ON,
         }
         created = post_session_bundle(
             client.post,
@@ -544,6 +549,7 @@ def test_isolating_runner_keeps_uploads_inside_each_session(tmp_path: Path) -> N
                 "prompt": "Share files with the user.",
                 "executor": {"harness": "openai-agents", "model": "unused-model"},
                 "os_env": _OS_ENV,
+                "tool_groups": _FILES_ON,
             }
 
             def new_session() -> str:
@@ -630,7 +636,7 @@ def test_model_turn_uploads_only_from_the_session_workspace(
                 runner_id=stack.runner_id,
                 mock_llm_server_url=mock_llm_server_url,
                 model=model,
-                spec_overrides={"os_env": _OS_ENV},
+                spec_overrides={"os_env": _OS_ENV, "tool_groups": _FILES_ON},
                 metadata={"workspace": str(session_workspace)},
             )
             response_id = send_user_message_to_session(

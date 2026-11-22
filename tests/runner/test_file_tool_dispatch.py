@@ -35,7 +35,10 @@ from omnigent.runner.tool_dispatch import (
     execute_tool,
     should_dispatch_locally,
 )
-from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.spec.types import AgentSpec, ExecutorSpec, ToolGroupsConfig
+
+# The session file tools are off by default; these tests exercise them, so opt in.
+_FILE_TOOLS_ON = ToolGroupsConfig(files=True)
 
 _CONVERSATION_ID = "conv_sec20870"
 
@@ -225,8 +228,9 @@ async def test_native_relay_upload_keeps_workspace_containment(
     tmp_path: Path,
 ) -> None:
     """
-    A native harness's relayed ``sys_upload_file`` is granted without any spec
-    opt-in, yet a path outside the session workspace is still rejected unread.
+    A native harness's relayed ``sys_upload_file`` is granted to a spec that
+    turns the file tools on, yet a path outside the session workspace is still
+    rejected unread.
 
     The relay reaches ``execute_tool`` with the session's spec, harness, runtime
     cwd and own workspace, as the runner's ``/mcp/execute`` route passes them.
@@ -239,6 +243,7 @@ async def test_native_relay_upload_keeps_workspace_containment(
         spec_version=1,
         skills_filter="none",
         executor=ExecutorSpec(config={"harness": harness}),
+        tool_groups=_FILE_TOOLS_ON,
     )
 
     captured: list[httpx.Request] = []
@@ -257,7 +262,7 @@ async def test_native_relay_upload_keeps_workspace_containment(
     finally:
         await client.aclose()
 
-    # The containment error (not a grant refusal) proves the default surface
+    # The containment error (not a grant refusal) proves the opted-in surface
     # admitted the call and the workspace check still ran.
     assert result.startswith("Error: sys_upload_file failed:"), result
     assert "escapes" in result, result
@@ -270,6 +275,7 @@ def _placeholder_cwd_spec() -> AgentSpec:
         spec_version=1,
         skills_filter="none",
         os_env=OSEnvSpec(type="caller_process", cwd=".", sandbox=OSEnvSandboxSpec(type="none")),
+        tool_groups=_FILE_TOOLS_ON,
     )
 
 
@@ -499,6 +505,7 @@ async def test_upload_reads_the_explicit_session_workspace_on_an_isolating_runne
         spec_version=1,
         skills_filter="none",
         executor=ExecutorSpec(config={"harness": "claude-native"}),
+        tool_groups=_FILE_TOOLS_ON,
     )
 
     captured: list[httpx.Request] = []
@@ -584,7 +591,7 @@ async def test_async_upload_keeps_the_session_workspace(tmp_path: Path) -> None:
                 {"tool": "sys_upload_file", "args": json.dumps({"path": "report.txt"})}
             ),
             server_client=client,
-            agent_spec=AgentSpec(spec_version=1, skills_filter="none"),
+            agent_spec=AgentSpec(spec_version=1, skills_filter="none", tool_groups=_FILE_TOOLS_ON),
             conversation_id=_CONVERSATION_ID,
             session_workspace=tmp_path,
             session_inbox=inbox,

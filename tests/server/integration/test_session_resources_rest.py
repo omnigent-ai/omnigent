@@ -20,7 +20,7 @@ import httpx
 import pytest
 
 from omnigent.runner.tool_dispatch import execute_tool
-from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.spec.types import AgentSpec, ExecutorSpec, ToolGroupsConfig
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -159,6 +159,7 @@ async def _file_tool(
             spec_version=1,
             skills_filter="none",
             executor=ExecutorSpec(config={"harness": "claude-native"}),
+            tool_groups=ToolGroupsConfig(files=True),
         ),
         conversation_id=session_id,
         runner_workspace=workspace,
@@ -171,7 +172,7 @@ async def test_file_tools_round_trip_through_the_real_server(
     client: httpx.AsyncClient, tmp_path: Path
 ) -> None:
     """
-    The default file tools, called from a native harness with no spec opt-in,
+    The file tools, called from a native harness whose spec turns them on,
     upload a workspace file to the calling session, list it and read it back,
     while another session can neither list nor read it.
     """

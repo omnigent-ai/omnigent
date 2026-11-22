@@ -3,8 +3,8 @@
 ``test_markdown_file_attachment`` runs against the mock LLM server.
 ``test_list_files_finds_uploaded_file`` and
 ``test_download_file_retrieves_content`` require a real LLM: the model
-must choose to call the default ``sys_list_files`` / ``sys_download_file``
-tools on the bundled archer agent.
+must choose to call the ``sys_list_files`` / ``sys_download_file`` tools
+the bundled archer agent turns on with ``tool_groups.files: true``.
 
 Usage::
 
@@ -96,7 +96,7 @@ def test_markdown_file_attachment(
     assert text.strip(), f"Agent produced no text. Output: {body.get('output', [])}"
 
 
-# ── Real-LLM tests (archer_agent with the default file tools) ──
+# ── Real-LLM tests (archer_agent, which turns the file tools on) ──
 
 
 def _has_tool_call(body: dict[str, Any], name: str) -> bool:

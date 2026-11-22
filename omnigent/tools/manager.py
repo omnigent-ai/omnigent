@@ -651,13 +651,13 @@ class ToolManager:
 
     def _register_file_tools(self) -> None:
         """
-        Auto-register ``sys_upload_file``, ``sys_list_files`` and ``sys_download_file``.
+        Register ``sys_upload_file``, ``sys_list_files`` and ``sys_download_file``.
 
-        Registered without spec opt-in so every agent can share workspace files
-        with the user and read the session's files; ``tool_groups.files: false``
-        drops all three. The runner dispatches them through the server's
-        session-scoped ``/v1/sessions/{id}/resources/files`` routes, and uploads
-        only read files inside the session workspace.
+        Off by default: an agent opts in with ``tool_groups.files: true`` to
+        share workspace files with the user and read the session's files. The
+        runner dispatches them through the server's session-scoped
+        ``/v1/sessions/{id}/resources/files`` routes, and uploads only read
+        files inside the session workspace.
         """
         if not self._spec.tool_groups.files:
             return

@@ -44,6 +44,9 @@ os_env:
   type: caller_process
   cwd: .
 
+tool_groups:
+  files: true
+
 tools:
   fact_checker:
     type: agent

@@ -85,8 +85,6 @@ def test_bundle_opts_into_the_inbox_tools_only() -> None:
     groups = dataclasses.asdict(spec.tool_groups)
     # A new framework group defaults to on, so the bundle must turn it off explicitly.
     assert groups.pop("user_inbox") is True
-    # Older runners reject `files: false`; test_bundle_denies_the_session_file_tools.
-    assert groups.pop("files") is True
     assert not any(groups.values()), groups
 
 
