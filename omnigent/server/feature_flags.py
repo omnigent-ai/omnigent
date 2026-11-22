@@ -61,6 +61,7 @@ class Feature(StrEnum):
     QUICK_PICK_PALETTE = "quick_pick_palette"
     FLOATING_COMPOSER = "floating_composer"
     WORKSPACE_SIDEBAR_V2 = "workspace_sidebar_v2"
+    SIDEBAR_SAVED_VIEWS = "sidebar_saved_views"
 
 
 @dataclass(frozen=True)
@@ -340,6 +341,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Show the workspace sidebar as tabs: Files, Changes and pull request pages",
         owner="web",
         review_by_release="0.26.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.SIDEBAR_SAVED_VIEWS,
+        description="Filter the sidebar's sessions by their pull request, and save views",
+        owner="web",
+        review_by_release="0.28.0",
     ),
 )
 
