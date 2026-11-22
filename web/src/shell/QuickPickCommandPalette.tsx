@@ -215,7 +215,7 @@ export function QuickPickCommandPalette({
         ]
       : [];
 
-  const { visibleSessions, contentSessions, searching } = search;
+  const { visibleSessions, contentSessions, showingServerMatches } = search;
   const activePage = (() => {
     switch (childPage?.kind) {
       case "setting-choices":
@@ -236,7 +236,9 @@ export function QuickPickCommandPalette({
       origin: "source",
       items: [
         ...visibleSessions.map((session) => sessionItem(session, "Sessions")),
-        ...(searching ? showMoreItem("title", titleSearch, visibleSessions, "Sessions") : []),
+        ...(showingServerMatches
+          ? showMoreItem("title", titleSearch, visibleSessions, "Sessions")
+          : []),
       ],
     },
     {
