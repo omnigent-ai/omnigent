@@ -10,6 +10,7 @@ import { type ComponentProps, createElement } from "react";
 import { createPortal } from "react-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "./components/ui/tooltip";
@@ -742,9 +743,14 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
       ),
       {
         container: shell,
-        // The panel reads session snapshots for its tab labels.
+        // The panel reads session snapshots for its tab labels, and the URL for
+        // a gadget filling the screen.
         wrapper: ({ children }) =>
-          createElement(QueryClientProvider, { client: queryClient }, children),
+          createElement(
+            MemoryRouter,
+            null,
+            createElement(QueryClientProvider, { client: queryClient }, children),
+          ),
       },
     );
     const rail = shell.querySelector<HTMLElement>('aside[aria-label="Workspace"]');
