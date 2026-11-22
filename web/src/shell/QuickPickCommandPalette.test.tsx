@@ -153,6 +153,28 @@ describe("QuickPickCommandPalette ordering", () => {
     expect(commandHistory()).toEqual([]);
   });
 
+  it("offers Show more only for the query the server's matches answer", async () => {
+    useSessionSearch.mockImplementation((query: unknown, scope: unknown) =>
+      scope === "title" && query !== ""
+        ? {
+            isFetching: false,
+            data: { pages: [{ data: [{ id: "k1", title: `${String(query)} notes` }] }] },
+            hasNextPage: true,
+            fetchNextPage: vi.fn(),
+          }
+        : { isFetching: false },
+    );
+    const { input } = renderPalette();
+    fireEvent.change(input, { target: { value: "parser" } });
+    expect(await screen.findByRole("option", { name: /Show more/ })).toBeTruthy();
+    // Its page would be the last query's, so it waits for the server to catch up.
+    fireEvent.change(input, { target: { value: "parse" } });
+    expect(screen.queryByRole("option", { name: /Show more/ })).toBeNull();
+    expect(screen.queryByRole("option", { name: /parser notes/ })).toBeNull();
+    expect(await screen.findByRole("option", { name: /parse notes/ })).toBeTruthy();
+    expect(screen.getByRole("option", { name: /Show more/ })).toBeTruthy();
+  });
+
   it("steps through its rows with Ctrl-N and Ctrl-P", () => {
     const { input } = renderPalette();
     const active = () =>

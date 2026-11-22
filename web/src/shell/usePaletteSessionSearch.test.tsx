@@ -183,6 +183,84 @@ describe("usePaletteSessionSearch", () => {
       expect(ids(result.current.visibleSessions)).toEqual(["c1"]);
     });
 
+    describe("shows the server's matches only for the query they answer", () => {
+      // Each query's server matches, by scope; any other query has none.
+      const serverHits = (hits: Record<string, { title?: string[]; content?: string[] }>) =>
+        useSessionSearch.mockImplementation((query: string, scope: "title" | "content") => {
+          const found = hits[query]?.[scope] ?? [];
+          return {
+            isFetching: false,
+            data: { pages: [{ data: found.map((id) => conv(id, `Server ${id}`)) }] },
+          };
+        });
+      const settle = () =>
+        act(() => {
+          vi.advanceTimersByTime(300);
+        });
+      const shown = (result: { current: ReturnType<typeof usePaletteSessionSearch> }) => ({
+        sessions: ids(result.current.visibleSessions),
+        content: ids(result.current.contentSessions),
+        serverMatches: result.current.showingServerMatches,
+      });
+
+      beforeEach(() => {
+        loaded(conv("kestrel-local", "Kestrel plan"), conv("parser-local", "Parser rewrite"));
+        serverHits({
+          kestrel: { title: ["kestrel-title"], content: ["kestrel-content"] },
+          parser: { title: ["parser-title"], content: ["parser-content"] },
+        });
+      });
+
+      it("drops the last query's title and content matches until the new one is answered", () => {
+        const { result } = renderSearch({ open: true, sessionsOnly: false, matchLoaded: true });
+        act(() => result.current.setQuery("kestrel"));
+        settle();
+        expect(shown(result)).toEqual({
+          sessions: ["kestrel-local", "kestrel-title"],
+          content: ["kestrel-content"],
+          serverMatches: true,
+        });
+        act(() => result.current.setQuery("parser"));
+        expect(shown(result)).toEqual({
+          sessions: ["parser-local"],
+          content: [],
+          serverMatches: false,
+        });
+        settle();
+        expect(shown(result)).toEqual({
+          sessions: ["parser-local", "parser-title"],
+          content: ["parser-content"],
+          serverMatches: true,
+        });
+      });
+
+      it("lists the recent sessions once the query is cleared, not the last query's matches", () => {
+        const { result } = renderSearch({ open: true, sessionsOnly: false, matchLoaded: true });
+        act(() => result.current.setQuery("kestrel"));
+        settle();
+        act(() => result.current.setQuery(""));
+        expect(shown(result)).toEqual({
+          sessions: ["kestrel-local", "parser-local"],
+          content: [],
+          serverMatches: false,
+        });
+        settle();
+        expect(shown(result).sessions).toEqual(["kestrel-local", "parser-local"]);
+      });
+
+      it("keeps the classic palette's matches while it waits, as it did", () => {
+        const { result } = renderSearch({ open: true, sessionsOnly: false });
+        act(() => result.current.setQuery("kestrel"));
+        settle();
+        act(() => result.current.setQuery("parser"));
+        expect(shown(result)).toEqual({
+          sessions: ["kestrel-title"],
+          content: ["kestrel-content"],
+          serverMatches: true,
+        });
+      });
+    });
+
     it("lists at most a search group's page of loaded matches", () => {
       loaded(...Array.from({ length: 20 }, (_, index) => conv(`c${index}`, `Alpha ${index}`)));
       const { result } = renderSearch({ open: true, sessionsOnly: false, matchLoaded: true });
