@@ -47,9 +47,28 @@ export function mapOffsetThroughEdit(offset: number, before: string, after: stri
   ) {
     suffix += 1;
   }
-  if (offset <= prefix) return offset;
-  if (offset >= before.length - suffix) return offset + (after.length - before.length);
-  return prefix;
+  return mapOffsetThroughReplace(
+    offset,
+    prefix,
+    before.length - suffix,
+    after.length - prefix - suffix,
+  );
+}
+
+/**
+ * `offset` carried through replacing the known span `[start, end)` with `insertedLength`
+ * characters: an offset at or before `start` stays, one at or after `end` shifts by the
+ * change's length, and one inside the span moves to `start`.
+ */
+export function mapOffsetThroughReplace(
+  offset: number,
+  start: number,
+  end: number,
+  insertedLength: number,
+): number {
+  if (offset <= start) return offset;
+  if (offset >= end) return offset + insertedLength - (end - start);
+  return start;
 }
 
 /** `value` with `text` inserted at `offset`, clamped into range; never removes anything. */

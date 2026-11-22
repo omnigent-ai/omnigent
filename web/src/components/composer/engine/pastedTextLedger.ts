@@ -10,11 +10,15 @@ import {
   insertAtOffset,
   lineCount,
   mapOffsetThroughEdit,
+  mapOffsetThroughReplace,
   pastedPlainText,
   pastedTextFile,
 } from "./pasteToAttachment";
 
-/** The owner's draft and attachments, read fresh on every call. */
+/**
+ * The owner's draft and attachments, read fresh on every call. `files` holds the very File
+ * objects the ledger attached: a paste is matched by identity, so a copy reads as removed.
+ */
 export interface PastedTextContext {
   files: readonly File[];
   /** The text of one input ("tail" or a reply quote's id), or undefined once it's gone. */
@@ -219,16 +223,18 @@ export function createPastedTextLedger(environment: PastedTextEnvironment): Past
       pastes = mapped(context);
       for (const paste of pastes) remember(paste.inputId, context.valueOf(paste.inputId));
       if (selectionStart !== selectionEnd) {
-        const before = target.value;
         // A locked input refuses the deletion: take the attachment back and leave it as it was.
         if (!environment.insertText(target, "", selectionStart, selectionEnd)) {
           context.removeFile(file);
           return true;
         }
-        const after = target.value;
+        // The deleted span is known, so repeated characters around it can't misplace an offset.
         pastes = pastes.map((paste) =>
           paste.inputId === inputId
-            ? { ...paste, offset: mapOffsetThroughEdit(paste.offset, before, after) }
+            ? {
+                ...paste,
+                offset: mapOffsetThroughReplace(paste.offset, selectionStart, selectionEnd, 0),
+              }
             : paste,
         );
       }

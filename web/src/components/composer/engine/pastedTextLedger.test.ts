@@ -89,6 +89,52 @@ function twoInputOwner(tail: string, quote: string) {
 }
 
 describe("createPastedTextLedger", () => {
+  it("carries an earlier paste through a later paste's replaced selection", () => {
+    const { surface, ledger, owner, context, paste } = liveOwner("aaaa");
+    paste(FIRST, 3);
+    const first = owner.files[0]!;
+    // The second paste replaces [0, 1) of a run of identical characters.
+    surface.setSelectionRange(0, 1);
+    ledger.offerPaste(surface, clipboard(SECOND), context());
+    expect(surface.value).toBe("aaa");
+
+    expect(ledger.insertAsText(first, context())).toBe(true);
+    expect(surface.value).toBe(`aa${FIRST}a`);
+  });
+
+  it("takes the attachment back when the input refuses to delete the replaced selection", () => {
+    const surface = createFakeComposerSurface("keep this");
+    surfaces.push(surface);
+    const ledger = createPastedTextLedger({
+      tailInputId: "tail",
+      inputIdOf: () => "tail",
+      insertText: () => false,
+    });
+    const owner = { files: [] as File[] };
+    const context: PastedTextContext = {
+      files: owner.files,
+      valueOf: () => surface.value,
+      attach: (file) => {
+        owner.files = [...owner.files, file];
+        return true;
+      },
+      removeFile: (file) => {
+        owner.files = owner.files.filter((each) => each !== file);
+      },
+      targetOf: () => surface,
+      writeInput: () => {},
+      revealInput: () => {},
+      locked: false,
+    };
+    surface.setSelectionRange(0, 4);
+
+    expect(ledger.offerPaste(surface, clipboard(FIRST), context)).toBe(true);
+    expect(owner.files).toEqual([]);
+    expect(surface.value).toBe("keep this");
+    expect(ledger.snapshot()).toEqual({ chips: [], undoable: false });
+    expect(ledger.holdsDraftText()).toBe(false);
+  });
+
   it("keeps another input's edit counted once across a restore elsewhere", () => {
     const { inputs, ledger, context, paste, valueOf } = twoInputOwner("abcdef", "xyz");
     const quoted = paste("quote", FIRST, 1);

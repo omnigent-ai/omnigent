@@ -50,7 +50,7 @@ export function useComposerPastedText({
       event.preventDefault();
       return;
     }
-    // The textarea keeps today's paste, so switching back restores it exactly.
+    // The textarea keeps the browser's own paste, so its behaviour is unchanged.
     if (
       !isComposerTextarea(event.currentTarget) &&
       clipboardFiles(event.clipboardData).length === 0 &&

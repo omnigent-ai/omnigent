@@ -4,6 +4,7 @@ import {
   insertAtOffset,
   lineCount,
   mapOffsetThroughEdit,
+  mapOffsetThroughReplace,
   pastedPlainText,
   pastedTextFile,
 } from "./pasteToAttachment";
@@ -65,5 +66,15 @@ describe("following a remembered offset through edits", () => {
     expect(insertAtOffset("draft", 99, " pasted")).toBe("draft pasted");
     expect(insertAtOffset("draft", -3, "pasted ")).toBe("pasted draft");
     expect(insertAtOffset("ab", 1, "X")).toBe("aXb");
+  });
+});
+
+describe("mapOffsetThroughReplace", () => {
+  it("keeps offsets before the span, shifts those after it, and pulls those inside to its start", () => {
+    expect(mapOffsetThroughReplace(0, 0, 1, 0)).toBe(0);
+    expect(mapOffsetThroughReplace(3, 0, 1, 0)).toBe(2);
+    expect(mapOffsetThroughReplace(1, 0, 1, 0)).toBe(0);
+    expect(mapOffsetThroughReplace(2, 1, 4, 5)).toBe(1);
+    expect(mapOffsetThroughReplace(4, 1, 4, 5)).toBe(6);
   });
 });
