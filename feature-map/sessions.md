@@ -311,6 +311,11 @@ the header menu), and each place is a separate entry point.
 
 ## How to get to it (user POV)
 
+- For project cost, on desktop open a project from the sidebar to reach its
+  project home. Once any of its sessions is priced, the cost shows beside the
+  project name; hover it for what is counted. To see it change, let a session
+  in the project finish a priced turn, or move a priced session to another
+  project, and wait up to 30 seconds.
 - For ⌘K session actions, open a session you own and press Cmd/Ctrl+K, then
   type an action such as "rename session" and press Enter. With
   `quick_pick_palette` on, type "go to session" and press Enter to switch

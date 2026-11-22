@@ -472,16 +472,57 @@ async def test_usage_landing_mid_deletion_never_skews_the_totals(
     _assert_usage_equal(projects.get_usage(project_id, user_id=_OWNER), _turn(100, 1.0))
 
 
+def _overlap_with_paused_usage_write(
+    store: SqlAlchemyConversationStore, write: Any, other: Any
+) -> list[BaseException]:
+    """
+    Run *other* while *write* holds its first usage row lock, then let *write* go on.
+
+    On engines with row locks, *other* then waits for that row; one that took
+    rows in a different order would deadlock with the paused writer instead.
+    SQLite serializes the two transactions, so *other* only starts afterwards.
+
+    :returns: The errors either side raised.
+    """
+    import threading
+
+    holds_first_row = threading.Event()
+    other_started = threading.Event()
+    errors: list[BaseException] = []
+    lock_row = store._lock_usage_row
+
+    def paused_lock_row(session: Any, row_id: Any) -> Any:
+        row = lock_row(session, row_id)
+        if threading.current_thread().name == "usage-writer" and not holds_first_row.is_set():
+            holds_first_row.set()
+            if other_started.wait(timeout=2):
+                time.sleep(0.5)
+        return row
+
+    def run(target: Any, started: Any = None) -> None:
+        try:
+            if started is not None:
+                started.set()
+            target()
+        except BaseException as error:  # Surfaced by the caller's assertion.
+            errors.append(error)
+
+    store._lock_usage_row = paused_lock_row  # type: ignore[method-assign]
+    writer = threading.Thread(name="usage-writer", target=run, args=(write,))
+    writer.start()
+    assert holds_first_row.wait(timeout=10)
+    racer = threading.Thread(target=run, args=(other, other_started))
+    racer.start()
+    writer.join(timeout=60)
+    racer.join(timeout=60)
+    assert not writer.is_alive() and not racer.is_alive()
+    return errors
+
+
 def test_whole_tree_deletion_waits_for_a_child_usage_write(
     conversation_store: SqlAlchemyConversationStore, projects: SqlAlchemyProjectStore
 ) -> None:
-    """A child's usage write and its tree's deletion lock rows in one order, so neither fails.
-
-    The writer pauses holding the child's row until the deletion's metadata
-    cleanup has started; on engines with row locks the cleanup then waits for it.
-    """
     import asyncio
-    import threading
 
     project_id = _project(projects, "Factory")
     root = conversation_store.create_conversation(project_id=project_id)
@@ -490,48 +531,38 @@ def test_whole_tree_deletion_waits_for_a_child_usage_write(
     )
     conversation_store.increment_session_usage(root.id, _turn(100, 1.0))
     conversation_store.increment_session_usage(child.id, _turn(10, 0.5))
-    writer_holds_child = threading.Event()
-    cleanup_started = threading.Event()
-    errors: list[BaseException] = []
-    lock_tree = conversation_store._lock_tree_usage_totals
-    remove_deleted = conversation_store._remove_deleted_usage
 
-    def paused_lock_tree(session: Any, root_id: Any) -> Any:
-        if threading.current_thread().name == "usage-writer":
-            writer_holds_child.set()
-            # SQLite serializes the two transactions, so the cleanup never starts here.
-            if cleanup_started.wait(timeout=2):
-                time.sleep(0.5)
-        return lock_tree(session, root_id)
-
-    def signalling_remove_deleted(*args: Any, **kwargs: Any) -> Any:
-        cleanup_started.set()
-        return remove_deleted(*args, **kwargs)
-
-    def run(target: Any) -> None:
-        try:
-            target()
-        except BaseException as error:  # Surfaced by the assertion below.
-            errors.append(error)
-
-    conversation_store._lock_tree_usage_totals = paused_lock_tree  # type: ignore[method-assign]
-    conversation_store._remove_deleted_usage = signalling_remove_deleted  # type: ignore[method-assign]
-    writer = threading.Thread(
-        name="usage-writer",
-        target=run,
-        args=(lambda: conversation_store.increment_session_usage(child.id, _turn(1, 2.0)),),
+    errors = _overlap_with_paused_usage_write(
+        conversation_store,
+        lambda: conversation_store.increment_session_usage(child.id, _turn(1, 2.0)),
+        lambda: asyncio.run(conversation_store.delete_conversation(root.id)),
     )
-    writer.start()
-    assert writer_holds_child.wait(timeout=10)
-    deleter = threading.Thread(
-        target=run, args=(lambda: asyncio.run(conversation_store.delete_conversation(root.id)),)
-    )
-    deleter.start()
-    writer.join(timeout=60)
-    deleter.join(timeout=60)
 
-    assert not writer.is_alive() and not deleter.is_alive()
     assert errors == []
     totals = projects.get_usage(project_id, user_id=_OWNER)
     assert "total_cost_usd" not in totals
     assert totals.get("input_tokens", 0) == 0
+
+
+def test_child_usage_and_runner_liveness_lock_rows_in_one_order(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Runner liveness locks a runner's rows by ascending id, as usage writes do."""
+    low, high = sorted(uuid.uuid4().hex for _ in range(2))
+    root = conversation_store.create_conversation(conversation_id=low, runner_id="runner-1")
+    child = conversation_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=root.id,
+        conversation_id=high,
+        runner_id="runner-1",
+    )
+
+    errors = _overlap_with_paused_usage_write(
+        conversation_store,
+        lambda: conversation_store.increment_session_usage(child.id, _turn(10, 0.5)),
+        lambda: conversation_store.touch_profile_runner_liveness("runner-1", now_epoch()),
+    )
+
+    assert errors == []
+    assert conversation_store.get_conversation(child.id).session_usage["input_tokens"] == 10
+    assert _tree_totals(conversation_store, root.id)["input_tokens"] == 10

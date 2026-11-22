@@ -1,7 +1,7 @@
 // Unit tests for the conversation-mutation HTTP helpers, plus the
 // query-invalidation contract of the stop mutation hook.
 
-import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, focusManager, useQuery } from "@tanstack/react-query";
 import { act, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
@@ -2951,7 +2951,18 @@ describe("useProjectUsage", () => {
         await vi.advanceTimersByTimeAsync(PROJECT_USAGE_REFETCH_INTERVAL_MS * 3);
       });
       expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      // Returning to the tab does not ask again either.
+      act(() => {
+        focusManager.setFocused(false);
+        focusManager.setFocused(true);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
+      focusManager.setFocused(undefined);
       vi.useRealTimers();
     }
   });
