@@ -1,6 +1,6 @@
 // Previous / Next Sidebar Tab (⇧⌘[ / ⇧⌘]) in the workspace sidebar. The page steps on the chord
 // and keeps it from the Go menu; the menu gets the keys the page didn't handle, such as from a
-// browser page with focus. A code editor keeps them, where they fold and unfold.
+// browser page with focus. A code editor keeps them where these keys are folding shortcuts.
 import { useEffect, useRef } from "react";
 
 import { useDesktopCommand } from "@/lib/desktopCommands";
