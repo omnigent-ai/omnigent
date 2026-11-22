@@ -246,7 +246,7 @@ function safariLookbehindWorkarounds(): Plugin {
   };
 }
 
-export default defineConfig(({ command }) => ({
+export default defineConfig(({ command, mode }) => ({
   // Relative asset base for production builds so the SPA can be served under
   // any path prefix (e.g. code-server's `/proxy/6767/`), decided purely at
   // server runtime via OMNIGENT_WEB_BASE_PATH — no separate build needed per
@@ -261,11 +261,11 @@ export default defineConfig(({ command }) => ({
     safariLookbehindWorkarounds(),
     react(),
     tailwindcss(),
-    ...devServerWorkerExports.plugins(),
+    ...devServerWorkerExports(command, mode).plugins,
   ],
   // Workers have no DOM, so they take a package's worker entry over its browser one.
   worker: workerBuildOptions,
-  optimizeDeps: devServerWorkerExports.optimizeDeps,
+  optimizeDeps: devServerWorkerExports(command, mode).optimizeDeps,
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
