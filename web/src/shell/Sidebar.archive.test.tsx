@@ -8,8 +8,8 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Settings unarchive: SettingsPage.test.tsx; cache overlays: useConversations.test.ts.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
@@ -36,7 +36,9 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { Toaster } from "@/components/ui/sonner";
+import { useRecentSessionSwitchStore } from "@/hooks/useRecentSessionSwitch";
 import { Sidebar } from "./Sidebar";
+import { resetArchiveNavigationForTests } from "./sessionCommands/archiveNavigation";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -351,6 +353,101 @@ describe("archive running-session prompt", () => {
     const [{ ids, archived }] = mocks.bulkArchive.mutate.mock.calls[0];
     expect(archived).toBe(true);
     expect([...ids].sort()).toEqual(["conv_busy", "conv_idle"]);
+  });
+});
+
+describe("archiving the open session", () => {
+  const SESSIONS = [
+    { ...CONV, id: "conv_a", title: "Alpha" },
+    { ...CONV, id: "conv_b", title: "Bravo" },
+    { ...CONV, id: "conv_c", title: "Charlie" },
+  ];
+
+  function LocationProbe() {
+    return <output data-testid="location">{useLocation().pathname}</output>;
+  }
+
+  // On a session route, so the sidebar knows which session is open.
+  function renderOnSession(sessionId: string) {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={[`/c/${sessionId}`]}>
+                <Routes>
+                  <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+                </Routes>
+                <LocationProbe />
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </CapabilitiesProvider>
+      </QueryClientProvider>,
+    );
+  }
+
+  /** The recent-session host's registration, as quick_pick_palette mounts it. */
+  function registerRecentSessions(history: string[]) {
+    useRecentSessionSwitchStore.setState({
+      history,
+      readLiveSessionIds: () => new Set(SESSIONS.map((session) => session.id)),
+      sessionsKnown: true,
+      sessionsFailed: false,
+    });
+  }
+
+  const location = () => screen.getByTestId("location").textContent;
+  const openRowMenu = (title: string) => {
+    const row = screen.getByRole("link", { name: new RegExp(title) }).closest("li")!;
+    fireEvent.pointerDown(within(row).getByTestId("conversation-actions"), { button: 0 });
+  };
+
+  afterEach(() => {
+    resetArchiveNavigationForTests();
+    useRecentSessionSwitchStore.setState({
+      history: [],
+      readLiveSessionIds: null,
+      sessionsKnown: false,
+      sessionsFailed: false,
+    });
+  });
+
+  it("opens the session visited before it from the row menu, as ⌃[ would", () => {
+    mockConversations(SESSIONS);
+    registerRecentSessions(["conv_b", "conv_c", "conv_a"]);
+    renderOnSession("conv_b");
+    openRowMenu("Bravo");
+    fireEvent.click(screen.getByTestId("archive-conversation"));
+
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "conv_b", archived: true }),
+    );
+    expect(location()).toBe("/c/conv_c");
+  });
+
+  it("opens the most recent session not being archived after a bulk archive", () => {
+    mockConversations(SESSIONS);
+    registerRecentSessions(["conv_b", "conv_c", "conv_a"]);
+    renderOnSession("conv_b");
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+    fireEvent.click(screen.getByRole("link", { name: /Bravo/ }));
+    fireEvent.click(screen.getByRole("link", { name: /Charlie/ }));
+    fireEvent.click(screen.getByTestId("bulk-archive"));
+
+    expect(mocks.bulkArchive.mutate).toHaveBeenCalledTimes(1);
+    expect(location()).toBe("/c/conv_a");
+  });
+
+  it("goes home, as before, without quick_pick_palette's recent-session host", () => {
+    mockConversations(SESSIONS);
+    renderOnSession("conv_b");
+    openRowMenu("Bravo");
+    fireEvent.click(screen.getByTestId("archive-conversation"));
+
+    expect(mocks.archive.mutate).toHaveBeenCalled();
+    expect(location()).toBe("/");
   });
 });
 

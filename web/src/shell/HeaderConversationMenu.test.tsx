@@ -1,8 +1,9 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
+import { useRecentSessionSwitchStore } from "@/hooks/useRecentSessionSwitch";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as UnseenConversationsModule from "@/hooks/useUnseenConversations";
 import type * as UseFileContentModule from "@/hooks/useFileContent";
@@ -437,6 +438,33 @@ describe("HeaderConversationMenu", () => {
     fireEvent.change(input, { target: { value: "Roadmap planning" } });
     fireEvent.click(screen.getByRole("button", { name: "Rename" }));
     expect(mocks.rename).toHaveBeenCalledWith({ id: "conv-1", title: "Roadmap planning" });
+  });
+
+  it("opens the session visited before the archived one, with quick_pick_palette's host", () => {
+    useRecentSessionSwitchStore.setState({
+      history: ["conv-1", "conv-2"],
+      readLiveSessionIds: () => new Set(["conv-1", "conv-2"]),
+      sessionsKnown: true,
+      sessionsFailed: false,
+    });
+    onTestFinished(() =>
+      useRecentSessionSwitchStore.setState({ history: [], readLiveSessionIds: null }),
+    );
+    renderMenu();
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
+    fireEvent.click(screen.getByRole("button", { name: "No, archive only" }));
+
+    expect(mocks.archive).toHaveBeenCalledWith(expect.objectContaining({ archived: true }));
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/c\/conv-2$/);
+  });
+
+  it("goes home after archiving without that host, as with the flag off", () => {
+    renderMenu();
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
+    fireEvent.click(screen.getByRole("button", { name: "No, archive only" }));
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
   });
 
   it("runs archive and delete actions for the active session", () => {

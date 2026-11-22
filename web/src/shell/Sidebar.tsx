@@ -226,6 +226,12 @@ import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
+import {
+  isLeavingOpenSession,
+  leaveSessionView,
+  navigateAfterArchiving,
+  newSessionPathFor,
+} from "./sessionCommands/archiveNavigation";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchivePrompt } from "./ArchivePrompt";
 import { useSessionActions } from "./useSessionActions";
@@ -6255,7 +6261,10 @@ function ConversationRowImpl({
     label,
     viewerId,
     serverInfo,
-    onLeave: isActive ? () => navigate("/", { replace: true }) : undefined,
+    onLeave: isActive
+      ? (cause) =>
+          leaveSessionView(cause, { conversation, source: "sidebar_menu", navigate, queryClient })
+      : undefined,
     componentIdPrefix: "sidebar.conversation",
   });
   // Subscribed so the just-recorded optimistic label flips the row
@@ -8169,7 +8178,16 @@ function BulkActionBar({
     // mutate-level callback — a callback on the unmounted observer never fires,
     // and it would carry a stale `activeId` that could jump the user off a
     // session they switched to meanwhile. Mirrors handleDelete.
-    if (activeId && toArchive.some((c) => c.id === activeId)) navigate("/", { replace: true });
+    const leavingIds = toArchive.map((c) => c.id);
+    if (isLeavingOpenSession(queryClient, activeId, leavingIds)) {
+      navigateAfterArchiving({
+        leavingIds,
+        source: "bulk",
+        navigate,
+        newSessionPath: newSessionPathFor(toArchive.find((c) => c.id === activeId) ?? toArchive[0]),
+        queryClient,
+      });
+    }
     onDeselectAll();
     bulkArchive.mutate({ ids: toArchive.map((c) => c.id), archived: true, deleteWorktreeIds });
     // Offer Undo for the whole batch. Fire now, before this bar unmounts with

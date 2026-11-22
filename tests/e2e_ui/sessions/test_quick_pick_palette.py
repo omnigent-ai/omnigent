@@ -543,6 +543,23 @@ def test_quick_pick_switch_to_recent_session_from_the_palette(
     expect(switcher).to_have_count(0)
 
 
+def test_quick_pick_archiving_the_open_session_opens_the_previous_visit(
+    request: pytest.FixtureRequest, seeded_session_pair: tuple[str, str, str]
+) -> None:
+    """Archiving the open session opens the session ⌃[ would, not New session."""
+    base_url, first, second = seeded_session_pair
+    patch_session(base_url, first, title="Heron notes")
+    patch_session(base_url, second, title="Kestrel notes")
+    page: Page = request.getfixturevalue("page")
+    enable_quick_pick_palette(page)
+    _open_one_then_the_other(page, base_url, first, second)
+
+    run_palette_command(page, "archive session", "Archive session", closes=True)
+    poll_until(lambda: session_archived(base_url, second), timeout_s=15.0)
+    expect(page).to_have_url(re.compile(rf"/c/{first}$"), timeout=10_000)
+    expect(page).to_have_title(re.compile("Heron"), timeout=10_000)
+
+
 def _viewer_unread(base_url: str, session_id: str) -> bool:
     """Read the server's ``viewer_unread`` for one session from ``GET /v1/sessions``."""
     response = httpx.get(f"{base_url}/v1/sessions", params={"visibility": "all"}, timeout=10.0)
