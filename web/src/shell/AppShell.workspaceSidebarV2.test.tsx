@@ -440,6 +440,23 @@ describe("workspace_sidebar_v2", () => {
     );
   });
 
+  it("offers ⌘K's Show all pull requests with the sidebar collapsed, and reveals the list", async () => {
+    writeWorkspacePanelDefault("collapsed");
+    setViewport(DESKTOP);
+    renderShell(withFlag(true));
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Collapse right panel" })).toBeNull();
+
+    await waitFor(() => expect(showAllPullRequestsRows()).toHaveLength(1));
+    act(() => showAllPullRequestsRows()[0]!.run());
+    await waitFor(() =>
+      expect(workspaceTabsSessions.showWorkspacePullRequests).toHaveBeenCalledWith("conv_ws", {
+        kind: "overview",
+      }),
+    );
+    expect(await screen.findByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
+  });
+
   it("shows the tabs in the Workspace drawer in a narrow desktop window", async () => {
     setViewport(NARROW_DESKTOP);
     renderShell(withFlag(true));

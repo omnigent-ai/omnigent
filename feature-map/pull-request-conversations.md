@@ -71,7 +71,10 @@ together in Comments.
   Pull Requests from the session-actions menu, which opens the Workspace drawer.
   The list shows even when the session has one pull request; select one to open
   it in that tab, then open Changes. The desktop composer's PR link opens a
-  session's only pull request in its own tab.
+  session's only pull request in its own tab. ⌘K → **Show all pull requests**
+  selects the session's Pull Requests tab, or opens one, and shows a collapsed
+  workspace sidebar. A pull request's page has an **All pull requests** button
+  that does the same and leaves the pull request's own tab open.
 - `session-mobile`: Open the session-actions menu, choose Pull Requests, then open Changes in the drawer.
 - `canvas`: Open a conversation beside Canvas, click its composer PR link,
   then open Changes.
