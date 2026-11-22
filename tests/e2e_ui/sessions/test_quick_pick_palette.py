@@ -159,8 +159,11 @@ def test_quick_pick_reopened_over_its_picker_takes_the_keys(
     page.keyboard.press("ControlOrMeta+k")
     expect(palette_input).to_be_focused(timeout=10_000)
     expect(themes).to_have_count(0)
-    page.keyboard.type("settings")
-    expect(palette_input).to_have_value("settings")
+
+    # Its Escape closes only the palette; the theme picker doesn't come back.
+    page.keyboard.press("Escape")
+    expect(palette_input).to_have_count(0)
+    expect(themes).to_have_count(0)
 
 
 def test_quick_pick_on_an_open_session(
