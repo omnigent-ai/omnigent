@@ -454,6 +454,58 @@ async def test_delete_session_survives_blob_delete_failure(
     assert "RuntimeError" in caplog.text
 
 
+async def test_delete_session_removes_sub_agent_files(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """Deleting a parent removes the files of every sub-agent deleted with it.
+
+    Covers a child's upload, the child's copy of a parent file (what
+    ``sys_session_send`` with ``file_ids`` makes) and a grandchild's upload,
+    while a blob another session still shares, as a fork's row does, stays.
+    """
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    file_store = SqlAlchemyFileStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="worker:notes", parent_conversation_id=session_id
+    )
+    grandchild = conv_store.create_conversation(
+        kind="sub_agent", title="worker:deep", parent_conversation_id=child.id
+    )
+    uploaded: dict[str, str] = {}
+    for owner in (session_id, child.id, grandchild.id):
+        resp = await client.post(
+            f"/v1/sessions/{owner}/resources/files",
+            files={"file": ("notes.txt", owner.encode(), "text/plain")},
+        )
+        assert resp.status_code == 201, resp.text
+        uploaded[owner] = resp.json()["id"]
+    copied = await client.post(
+        f"/v1/sessions/{child.id}/resources/files:copy",
+        json={"source_session_id": session_id, "file_ids": [uploaded[session_id]]},
+    )
+    assert copied.status_code == 200, copied.text
+    copy_id = copied.json()["mapping"][uploaded[session_id]]["new_id"]
+    other = conv_store.create_conversation(title="fork")
+    file_store.create(
+        "notes.txt", 1, "text/plain", session_id=other.id, blob_key=uploaded[session_id]
+    )
+    artifacts = tmp_path / "artifacts"
+
+    resp = await client.delete(f"/v1/sessions/{session_id}")
+
+    assert resp.status_code == 200, resp.text
+    owners = (session_id, child.id, grandchild.id)
+    assert [owner for owner in owners if file_store.list(owner).data] == []
+    blob_keys = (uploaded[child.id], uploaded[grandchild.id], copy_id)
+    assert [key for key in blob_keys if (artifacts / key).exists()] == []
+    assert (artifacts / uploaded[session_id]).exists()
+
+
 async def test_delete_session_not_found(client: httpx.AsyncClient) -> None:
     """Deleting a nonexistent session returns 404."""
     resp = await client.delete("/v1/sessions/4fe12335002377c209e501c3fe3bcffc")

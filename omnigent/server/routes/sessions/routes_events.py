@@ -4540,11 +4540,14 @@ def register_events_routes(
             )
         # Session file cleanup. delete_all_for_session returns only the blob
         # keys that became orphaned — a blob still shared by a fork in another
-        # session is not returned, so the fork's attachment survives.
+        # session is not returned, so the fork's attachment survives. The
+        # subtree delete below removes every sub-agent too, so clean theirs.
         if file_store is not None and artifact_store is not None:
-            orphaned_blob_keys = await asyncio.to_thread(
-                file_store.delete_all_for_session, session_id
-            )
+            orphaned_blob_keys: list[str] = []
+            for owner_id in (session_id, *descendant_ids):
+                orphaned_blob_keys.extend(
+                    await asyncio.to_thread(file_store.delete_all_for_session, owner_id)
+                )
             # Best-effort: a backend failure on one blob must not abort the
             # delete after the file rows are already gone.
             failed_blob_count = 0

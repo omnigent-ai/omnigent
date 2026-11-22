@@ -4377,6 +4377,8 @@ def create_app(
             project_store=project_store,
             host_registry=host_registry,
             host_store=host_store,
+            file_store=file_store,
+            artifact_store=artifact_store,
         ),
         prefix="/v1",
         tags=["imports"],

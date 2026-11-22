@@ -458,6 +458,57 @@ async def test_force_import_replaces_existing_session(
     assert [item["content"][0]["text"] for item in items.json()["data"]] == ["new prompt"]
 
 
+@pytest.mark.parametrize("replaced", ["import", "native"])
+async def test_force_import_deletes_the_replaced_sessions_files(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+    replaced: str,
+) -> None:
+    """A forced re-import deletes the replaced session's and its sub-agents' files."""
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    agent_id = _seed_claude_agent(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    payload: dict[str, Any] = {
+        "source": "claude",
+        "external_session_id": f"claude-files-{replaced}",
+        "items": [
+            {
+                "type": "message",
+                "response_id": "claude:turn-1",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            }
+        ],
+    }
+    if replaced == "import":
+        created = await client.post("/v1/imports", json=payload)
+        assert created.status_code == 201, created.text
+        replaced_id = created.json()["session_id"]
+    else:
+        native = store.create_conversation(agent_id=agent_id, title="native run")
+        store.set_external_session_id(native.id, payload["external_session_id"])
+        replaced_id = native.id
+    child = store.create_conversation(
+        kind="sub_agent", title="worker:notes", parent_conversation_id=replaced_id
+    )
+    uploaded: list[str] = []
+    for owner in (replaced_id, child.id):
+        resp = await client.post(
+            f"/v1/sessions/{owner}/resources/files",
+            files={"file": ("notes.txt", owner.encode(), "text/plain")},
+        )
+        assert resp.status_code == 201, resp.text
+        uploaded.append(resp.json()["id"])
+
+    resp = await client.post("/v1/imports", json={**payload, "force": True})
+
+    assert resp.status_code == 201, resp.text
+    file_store = SqlAlchemyFileStore(db_uri)
+    assert [owner for owner in (replaced_id, child.id) if file_store.list(owner).data] == []
+    assert [key for key in uploaded if (tmp_path / "artifacts" / key).exists()] == []
+
+
 @pytest.mark.parametrize("host_owner,expected_status", [(None, 404), ("bob@example.com", 403)])
 async def test_rejected_force_import_preserves_existing_session(
     db_uri: str, host_owner: str | None, expected_status: int

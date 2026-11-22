@@ -28,6 +28,7 @@ from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._session_create_validation import resolve_project_session_create
+from omnigent.server.routes._sessions.helpers import _collect_descendant_conversation_ids
 from omnigent.server.schemas import SessionCreateRequest
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
@@ -36,7 +37,7 @@ from omnigent.session_import import (
     ImportSource,
     title_from_items,
 )
-from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores import AgentStore, ArtifactStore, ConversationStore, FileStore
 from omnigent.stores.conversation_store import ConversationAlreadyExistsError
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
@@ -362,9 +363,29 @@ def create_imports_router(
     project_store: ProjectStore | None = None,
     host_registry: HostRegistry | None = None,
     host_store: HostStore | None = None,
+    file_store: FileStore | None = None,
+    artifact_store: ArtifactStore | None = None,
 ) -> APIRouter:
     """Create the local-session import router."""
     router = APIRouter()
+
+    async def _delete_replaced_session(session_id: str, **delete_options: Any) -> None:
+        """Delete a replaced session and its sub-agents with their unshared files."""
+        if file_store is not None:
+            descendant_ids = await _collect_descendant_conversation_ids(
+                conversation_store, session_id
+            )
+            for owner_id in (session_id, *descendant_ids):
+                orphaned = await asyncio.to_thread(file_store.delete_all_for_session, owner_id)
+                if artifact_store is None:
+                    continue
+                for blob_key in orphaned:
+                    try:
+                        await asyncio.to_thread(artifact_store.delete, blob_key)
+                    except Exception:
+                        # A blob that won't delete must not fail the import.
+                        _logger.warning("could not delete blob %s", blob_key, exc_info=True)
+        await conversation_store.delete_conversation(session_id, **delete_options)
 
     async def _persist_import(
         *,
@@ -440,9 +461,7 @@ def create_imports_router(
         title = (native_title or "").strip() or title_from_items(items)
         conversation_id = _import_conversation_id(source, external_session_id)
         if replace_conversation_id == conversation_id:
-            await conversation_store.delete_conversation(
-                conversation_id, preserve_host_binding=resolved_host_id
-            )
+            await _delete_replaced_session(conversation_id, preserve_host_binding=resolved_host_id)
         try:
             conversation = await asyncio.to_thread(
                 conversation_store.create_conversation,
@@ -492,7 +511,7 @@ def create_imports_router(
             await conversation_store.delete_conversation(conversation.id)
             raise
         if replace_conversation_id is not None and replace_conversation_id != conversation.id:
-            await conversation_store.delete_conversation(replace_conversation_id)
+            await _delete_replaced_session(replace_conversation_id)
         return conversation.id, title
 
     @router.post(
