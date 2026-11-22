@@ -168,15 +168,14 @@ export function useSessionActions({
     // nothing left to show progress against. A failure surfaces as a toast
     // (the row is still there to retry from).
     setLeaveOpen(false);
-    leave.mutate(
-      { id: conversation.id, viewerId },
-      {
-        // The session 404s for this user now, so don't leave them staring at it.
-        onSuccess: () => onLeave?.(),
-        onError: (err) => {
-          const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
-          showToast(`Couldn't leave the session${detail}`);
-        },
+    // The promise settles even once the caller has unmounted, which a per-call
+    // mutate callback wouldn't.
+    leave.mutateAsync({ id: conversation.id, viewerId }).then(
+      // The session 404s for this user now, so don't leave them staring at it.
+      () => onLeave?.(),
+      (err: unknown) => {
+        const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
+        showToast(`Couldn't leave the session${detail}`);
       },
     );
   }
@@ -363,11 +362,10 @@ export function useSessionActions({
                   // for the whole kill blocks the rest of the page. A failure
                   // surfaces as a toast since the dialog is already gone.
                   setStopOpen(false);
-                  stopSession.mutate(conversation.id, {
-                    onError: (err) => {
-                      const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
-                      showToast(`Couldn't stop the session${detail}`);
-                    },
+                  // As for Leave, the promise reports even once the caller has unmounted.
+                  stopSession.mutateAsync(conversation.id).catch((err: unknown) => {
+                    const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
+                    showToast(`Couldn't stop the session${detail}`);
                   });
                 }}
                 componentId={`${componentIdPrefix}.stop`}
