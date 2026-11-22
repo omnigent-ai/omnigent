@@ -74,12 +74,10 @@ import { actionsOnlyCommentContext } from "./useReviewCommentLayer";
 import { unrepresentableNote, WorkingCopyDiffReviewBody } from "./WorkingCopyDiffReview";
 import { useLastInteractedSurface } from "./useLastInteractedSurface";
 
-// The reference design has no wrap button; ⌘K still offers wrapping.
-const WITHOUT_WRAP = ["toggle-wrap"] as const;
 const REVIEW_METADATA_KEYS = [BRANCH_COMMITS_KEY, REPOSITORY_REFS_KEY] as const;
 /** A commit's review toolbar: how its diff shows, with nothing about the session's comparison. */
 function renderCommitToolbar(toolbar: DiffReviewToolbarProps) {
-  return <DiffReviewToolbar {...toolbar} omit={WITHOUT_WRAP} />;
+  return <DiffReviewToolbar {...toolbar} />;
 }
 const NO_ACTIONS: readonly { label: string; run: () => void; primary?: boolean }[] = [];
 
@@ -751,7 +749,7 @@ export function ChangesReview({
     (toolbar: DiffReviewToolbarProps) => (
       <>
         {/* The compared revisions sit in the header above; this row is how the diff shows. */}
-        <DiffReviewToolbar {...toolbar} omit={WITHOUT_WRAP} />
+        <DiffReviewToolbar {...toolbar} />
         <ComparisonNotes view={view} comparison={changes.comparison} asleep={sandboxAsleep} />
       </>
     ),

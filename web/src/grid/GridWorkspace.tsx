@@ -63,11 +63,18 @@ import { gridPanes, gridSessionIds, type SessionGrid } from "./gridLayout";
 import { GridSessionPane, type GridWorkspacePanelProps } from "./GridSessionPane";
 import { GridDropOverlay, type GridDropTarget } from "./GridDropTargets";
 import { gridTitle, useGridSessions } from "./GridSessionsContext";
+import { useGridPaletteCommands } from "./useGridPaletteCommands";
 
-export function GridSidebar({ onNavigate }: { onNavigate?: MouseEventHandler<HTMLAnchorElement> }) {
+interface GridSidebarProps {
+  onNavigate?: MouseEventHandler<HTMLAnchorElement>;
+  /** Opens the collapsed sidebar, so a rename from ⌘K edits a row that can be seen. */
+  onOpenSidebar?: () => void;
+}
+
+export function GridSidebar(props: GridSidebarProps) {
   const grids = useGridSessions();
   if (!grids?.enabled || grids.grids.length === 0) return null;
-  return <SavedGridSidebar onNavigate={onNavigate} />;
+  return <SavedGridSidebar {...props} />;
 }
 
 function useSessionTitles() {
@@ -77,7 +84,7 @@ function useSessionTitles() {
   );
 }
 
-function SavedGridSidebar({ onNavigate }: { onNavigate?: MouseEventHandler<HTMLAnchorElement> }) {
+function SavedGridSidebar({ onNavigate, onOpenSidebar }: GridSidebarProps) {
   const grids = useGridSessions()!;
   const titles = useSessionTitles();
   return (
@@ -90,6 +97,7 @@ function SavedGridSidebar({ onNavigate }: { onNavigate?: MouseEventHandler<HTMLA
             grid={grid}
             title={gridTitle(grid, titles)}
             onNavigate={onNavigate}
+            onOpenSidebar={onOpenSidebar}
           />
         ))}
       </ul>
@@ -101,14 +109,21 @@ function GridSidebarRow({
   grid,
   title,
   onNavigate,
-}: {
-  grid: SessionGrid;
-  title: string;
-  onNavigate?: MouseEventHandler<HTMLAnchorElement>;
-}) {
+  onOpenSidebar,
+}: GridSidebarProps & { grid: SessionGrid; title: string }) {
   const grids = useGridSessions()!;
   const [editing, setEditing] = useState(false);
   const active = grids.activeGrid?.id === grid.id;
+  useGridPaletteCommands({
+    gridId: grid.id,
+    title,
+    open: active,
+    rename: () => {
+      onOpenSidebar?.();
+      setEditing(true);
+    },
+    remove: () => grids.deleteGrid(grid.id),
+  });
   if (editing)
     return (
       <li>

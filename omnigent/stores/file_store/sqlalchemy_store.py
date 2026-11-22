@@ -89,6 +89,29 @@ def _blob_is_referenced(session: Session, blob_key: str) -> bool:
     return session.execute(legacy).first() is not None
 
 
+def _delete_rows_returning_orphans(
+    session: Session, rows: builtins.list[SqlFile]
+) -> builtins.list[str]:
+    """
+    Delete *rows* and return the blob keys no surviving row (any session or project) still uses.
+
+    :param session: The calling transaction's session.
+    :param rows: The file rows to delete.
+    :returns: The deleted rows' blob keys that nothing references any more.
+    """
+    blob_keys = {_effective_blob_key(row) for row in rows}
+    for row in rows:
+        session.delete(row)
+    session.flush()
+    orphaned: builtins.list[str] = []
+    for blob_key in blob_keys:
+        with query_name_scope("omnigent.file_store.count_blob_key_refs"):
+            still_referenced = _blob_is_referenced(session, blob_key)
+        if not still_referenced:
+            orphaned.append(blob_key)
+    return orphaned
+
+
 def _owned_by(row: SqlFile, session_id: str | None, project_id: str | None) -> bool:
     """
     Whether *row* belongs to the given session or project, when one is given.
@@ -377,25 +400,50 @@ class SqlAlchemyFileStore(FileStore):
             )
             with query_name_scope(f"omnigent.file_store.{select_name}"):
                 rows = list(session.execute(stmt).scalars().all())
-            blob_keys = {_effective_blob_key(row) for row in rows}
-            for row in rows:
-                session.delete(row)
-            session.flush()
-            # After the rows are gone, a blob is orphaned only if no surviving
-            # row (any session or project) still references it.
-            orphaned: builtins.list[str] = []
-            for blob_key in blob_keys:
-                with query_name_scope("omnigent.file_store.count_blob_key_refs"):
-                    still_referenced = _blob_is_referenced(session, blob_key)
-                if not still_referenced:
-                    orphaned.append(blob_key)
-            return _DeletedBatch(deleted=len(rows), orphaned=orphaned)
+            return _DeletedBatch(
+                deleted=len(rows), orphaned=_delete_rows_returning_orphans(session, rows)
+            )
 
         while True:
             batch = run_write_transaction(self._session_immediate, transaction_name, delete_batch)
             on_orphaned(batch.orphaned)
             if batch.deleted < _DELETE_BATCH_SIZE:
                 return
+
+    def delete_session_files_batch(
+        self, session_id: str, *, limit: int
+    ) -> tuple[int, builtins.list[str]]:
+        """
+        Delete up to *limit* of a session's file rows, oldest first, in one transaction.
+
+        Reads them through the session/creation-time index, so each call
+        examines at most *limit* of the session's rows.
+
+        :param session_id: Owning session/conversation id.
+        :param limit: Most rows to delete, e.g. ``100``.
+        :returns: The number of rows deleted and their blob keys.
+        """
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+
+        def write(session: Session) -> tuple[int, builtins.list[str]]:
+            stmt = (
+                select(SqlFile)
+                .where(
+                    SqlFile.workspace_id == current_workspace_id(),
+                    SqlFile.session_id == session_id,
+                )
+                .order_by(asc(SqlFile.created_at), asc(SqlFile.id))
+                .limit(limit)
+            )
+            with query_name_scope("omnigent.file_store.list_session_files_batch_for_delete"):
+                rows = list(session.execute(stmt).scalars().all())
+            blob_keys = sorted({_effective_blob_key(row) for row in rows})
+            for row in rows:
+                session.delete(row)
+            return len(rows), blob_keys
+
+        return run_write_transaction(self._session_immediate, "delete_session_files_batch", write)
 
 
 def _page(

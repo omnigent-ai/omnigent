@@ -17,7 +17,6 @@ a span in the request's trace.
 
 from __future__ import annotations
 
-import secrets
 import threading
 from collections import Counter
 from collections.abc import Iterator
@@ -31,6 +30,7 @@ from tests._helpers.live_server import isolated_local_server
 from tests._helpers.native_session import create_native_session
 from tests._helpers.otlp import OtlpTraceCollector
 from tests._helpers.polling import poll_until
+from tests._helpers.session import create_sub_agent_sessions
 
 # Query string the web chat sends when it opens a session.
 SNAPSHOT_QUERY = (
@@ -40,33 +40,6 @@ SNAPSHOT_ROUTE_SPAN = "GET /v1/sessions/{session_id}"
 CHILDREN = 3
 GRANDCHILDREN_PER_CHILD_BEFORE = 3
 GRANDCHILDREN_PER_CHILD_AFTER = 12
-
-
-def _telemetry_env(collector: OtlpTraceCollector) -> dict[str, str]:
-    return {
-        "OMNIGENT_TELEMETRY_ENABLED": "true",
-        "OTEL_EXPORTER_OTLP_ENDPOINT": collector.endpoint,
-        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
-        "OTEL_METRICS_EXPORTER": "none",
-        "OTEL_LOGS_EXPORTER": "none",
-        # Export each request's spans promptly instead of on the default 5s timer.
-        "OTEL_BSP_SCHEDULE_DELAY": "200",
-        "NO_PROXY": "127.0.0.1,localhost",
-        "no_proxy": "127.0.0.1,localhost",
-    }
-
-
-def _create_sub_agents(
-    client: httpx.Client, *, agent_id: str, parent_id: str, count: int
-) -> list[str]:
-    session_ids = []
-    for _ in range(count):
-        response = client.post(
-            "/v1/sessions", json={"agent_id": agent_id, "parent_session_id": parent_id}
-        )
-        assert response.status_code == 201, response.text
-        session_ids.append(response.json()["id"])
-    return session_ids
 
 
 @contextmanager
@@ -127,22 +100,14 @@ def _open_session(
     client: httpx.Client, collector: OtlpTraceCollector, session_id: str
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Open ``session_id`` as the web chat does; return the snapshot and its database spans."""
-    trace_id = secrets.token_hex(16)
-    response = client.get(
+    response, spans = collector.traced_request(
+        client,
+        "GET",
         f"/v1/sessions/{session_id}?{SNAPSHOT_QUERY}",
-        headers={"traceparent": f"00-{trace_id}-{secrets.token_hex(8)}-01"},
+        route_span=SNAPSHOT_ROUTE_SPAN,
     )
     assert response.status_code == 200, response.text
-    # The route span ends last, so once it is exported the statements it waited on are too.
-    poll_until(
-        lambda: any(span["name"] == SNAPSHOT_ROUTE_SPAN for span in collector.snapshot(trace_id)),
-        timeout_s=30,
-        interval_s=0.2,
-    )
-    database_spans = [
-        span for span in collector.snapshot(trace_id) if "db.system" in span["attributes"]
-    ]
-    return response.json(), database_spans
+    return response.json(), [span for span in spans if "db.system" in span["attributes"]]
 
 
 def _steady_open(
@@ -158,7 +123,12 @@ def test_open_cost_with_a_pending_sub_agent_prompt_does_not_grow_with_the_tree(
 ) -> None:
     with (
         OtlpTraceCollector() as collector,
-        isolated_local_server(tmp_path / "server", env=_telemetry_env(collector)) as base_url,
+        isolated_local_server(
+            tmp_path / "server",
+            # Read the session's grants on every request: the 5 s access cache
+            # could expire inside one measured open and not the other.
+            env={**collector.exporter_env(), "OMNIGENT_ACL_RESOLVE_CACHE_TTL_S": "0"},
+        ) as base_url,
         httpx.Client(base_url=base_url, trust_env=False, timeout=60) as client,
     ):
         root = create_native_session(
@@ -166,9 +136,11 @@ def test_open_cost_with_a_pending_sub_agent_prompt_does_not_grow_with_the_tree(
         )
         root_id = root["session_id"]
         agent_id = root["agent_id"]
-        children = _create_sub_agents(client, agent_id=agent_id, parent_id=root_id, count=CHILDREN)
+        children = create_sub_agent_sessions(
+            client, agent_id=agent_id, parent_id=root_id, count=CHILDREN
+        )
         grandchildren = {
-            child: _create_sub_agents(
+            child: create_sub_agent_sessions(
                 client, agent_id=agent_id, parent_id=child, count=GRANDCHILDREN_PER_CHILD_BEFORE
             )
             for child in children
@@ -188,7 +160,7 @@ def test_open_cost_with_a_pending_sub_agent_prompt_does_not_grow_with_the_tree(
 
             small_snapshot, small_tree = _steady_open(client, collector, root_id)
             for child in children:
-                _create_sub_agents(
+                create_sub_agent_sessions(
                     client,
                     agent_id=agent_id,
                     parent_id=child,

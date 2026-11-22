@@ -300,6 +300,7 @@ export function FileTree({
                   row === parkedRow ? (row.index - rowWindow.start) * itemHeight : undefined
                 }
                 activeGuidePath={activeGuidePath}
+                hasMenuButton={menuRow?.path === row.path}
                 {...rowProps}
               />
             ))}
@@ -375,6 +376,7 @@ function FileTreeRow({
   itemHeight,
   parkedTop,
   activeGuidePath,
+  hasMenuButton = false,
   registerRow,
   renderRowDecoration,
   onRowMenu,
@@ -384,6 +386,8 @@ function FileTreeRow({
   itemHeight: number;
   parkedTop?: number;
   activeGuidePath?: string;
+  /** The actions button sits on this row, so the row keeps room for it. */
+  hasMenuButton?: boolean;
   registerRow: (path: string, element: HTMLButtonElement | null) => void;
   renderRowDecoration?: FileTreeProps["renderRowDecoration"];
   onRowMenu?: FileTreeProps["onRowMenu"];
@@ -428,6 +432,7 @@ function FileTreeRow({
       data-item-type={row.kind === "directory" ? "folder" : "file"}
       data-item-git-status={status ?? undefined}
       data-item-contains-git-change={containsChange ? "" : undefined}
+      data-item-has-menu-button={hasMenuButton ? "" : undefined}
       style={
         parkedTop === undefined
           ? undefined

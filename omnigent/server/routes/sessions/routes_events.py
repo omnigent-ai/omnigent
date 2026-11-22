@@ -206,6 +206,7 @@ from omnigent.server.routes._sessions.helpers import (
     _background_task_delivery_status,
     _build_actor,
     _build_skill_slash_command_policy_body,
+    _delete_session_tree_files,
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
     _extract_user_text_from_event,
@@ -1017,40 +1018,6 @@ _RUNNER_EVENT_TYPES = frozenset(
 _TURN_STARTING_EVENT_TYPES = frozenset({"message", "session_message", _SLASH_COMMAND_TYPE})
 # Also given ``in_flight``: a claude-sdk ``/compact`` runs a harness turn.
 _IN_FLIGHT_EVENT_TYPES = _TURN_STARTING_EVENT_TYPES | {_COMPACT_TYPE}
-
-
-async def _delete_session_blobs(
-    artifact_store: ArtifactStore, session_id: str, blob_keys: list[str]
-) -> None:
-    """
-    Delete the blobs a deleted session's file rows no longer share, best-effort.
-
-    A backend failure on one blob must not abort the delete after the file rows
-    are already gone, so each failure is logged and the rest still go.
-
-    :param artifact_store: Store holding the bytes.
-    :param session_id: The session being deleted, for the log.
-    :param blob_keys: Blobs no file row references any more.
-    """
-    failed_blob_count = 0
-    for blob_key in blob_keys:
-        try:
-            await asyncio.to_thread(artifact_store.delete, blob_key)
-        except Exception as exc:
-            failed_blob_count += 1
-            _logger.warning(
-                "Failed to delete attachment blob %s for session %s: %s",
-                blob_key,
-                session_id,
-                type(exc).__name__,
-            )
-    if failed_blob_count:
-        _logger.warning(
-            "Session %s deleted with %d of %d attachment blobs left behind",
-            session_id,
-            failed_blob_count,
-            len(blob_keys),
-        )
 
 
 def _legacy_side_chat_attachment(
@@ -4577,18 +4544,12 @@ def register_events_routes(
                 exclude_conversation_id=conv.id,
                 fail_if_unavailable=True,
             )
-        # Session file cleanup. delete_all_for_session returns only the blob
-        # keys that became orphaned — a blob still shared by a fork in another
-        # session is not returned, so the fork's attachment survives.
+        # The subtree delete below also removes every sub-agent, so clean their
+        # files too; a blob a fork in another session still shares survives.
         if file_store is not None and artifact_store is not None:
-            orphaned_blob_keys: list[str] = []
-            try:
-                await asyncio.to_thread(
-                    file_store.delete_all_for_session, session_id, orphaned_blob_keys.extend
-                )
-            finally:
-                # Also after a failed batch: rows earlier batches deleted are gone.
-                await _delete_session_blobs(artifact_store, session_id, orphaned_blob_keys)
+            await _delete_session_tree_files(
+                conversation_store, file_store, artifact_store, session_id
+            )
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.pop(session_id, None)
         deleted = await conversation_store.delete_conversation(session_id)

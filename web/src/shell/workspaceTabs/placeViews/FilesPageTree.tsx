@@ -1,6 +1,7 @@
 // The workspace Files tab's tree: the workspace root's listing and its uncommitted
 // changes, read through the session's file queries, shown in the Files tree.
 
+import { Button } from "@/components/ui/button";
 import type { ChangedSort } from "@/lib/changedSort";
 import {
   RunnerOfflineError,
@@ -16,6 +17,8 @@ export interface FilesPageTreeProps {
   activePath: string | undefined;
   sort: ChangedSort;
   showHidden: boolean;
+  /** Shows hidden files, for a workspace whose every file is hidden. */
+  onShowHidden?: () => void;
   /** `newTab` for a ⌘-click (Ctrl-click off macOS) or a middle click, which want the file in its own tab. */
   onFileSelect: (path: string, options?: { newTab: true }) => void;
 }
@@ -38,6 +41,7 @@ export function FilesPageTree({
   activePath,
   sort,
   showHidden,
+  onShowHidden,
   onFileSelect,
 }: FilesPageTreeProps) {
   const files = useWorkspaceAllFiles(conversationId);
@@ -54,7 +58,16 @@ export function FilesPageTree({
   const entries = files.data.data;
   if (entries.length === 0) return <TreeMessage>No files in the workspace.</TreeMessage>;
   if (visibleEntries(entries, showHidden).length === 0) {
-    return <TreeMessage>Every file here is hidden. Show hidden files to see them.</TreeMessage>;
+    return (
+      <div className="flex flex-col items-start gap-2 pb-2">
+        <TreeMessage>Every file here is hidden.</TreeMessage>
+        {onShowHidden ? (
+          <Button type="button" variant="outline" size="sm" className="mx-3" onClick={onShowHidden}>
+            Show hidden files
+          </Button>
+        ) : null}
+      </div>
+    );
   }
   return (
     <FilesTree

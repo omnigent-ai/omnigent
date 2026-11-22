@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import gzip
+import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import TracebackType
 from typing import Any
 
+import httpx
+
 from tests._helpers.live_server import find_free_port
+from tests._helpers.polling import poll_until
 
 
 class OtlpTraceCollector:
@@ -50,6 +54,55 @@ class OtlpTraceCollector:
     def endpoint(self) -> str:
         """Base URL for ``OTEL_EXPORTER_OTLP_ENDPOINT``, e.g. ``"http://127.0.0.1:4318"``."""
         return f"http://127.0.0.1:{self._port}"
+
+    def exporter_env(self) -> dict[str, str]:
+        """Environment for an Omnigent process that exports its traces here, per request."""
+        return {
+            "OMNIGENT_TELEMETRY_ENABLED": "true",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": self.endpoint,
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_METRICS_EXPORTER": "none",
+            "OTEL_LOGS_EXPORTER": "none",
+            # Export each request's spans promptly instead of on the default 5s timer.
+            "OTEL_BSP_SCHEDULE_DELAY": "200",
+            "NO_PROXY": "127.0.0.1,localhost",
+            "no_proxy": "127.0.0.1,localhost",
+        }
+
+    def traced_request(
+        self,
+        client: httpx.Client,
+        method: str,
+        url: str,
+        *,
+        route_span: str,
+        **request_options: Any,
+    ) -> tuple[httpx.Response, list[dict[str, Any]]]:
+        """
+        Send one request in a fresh trace; return it and that trace's spans.
+
+        The server's route span ends after the work it waited on, so once it
+        is exported the request's other spans are too.
+
+        :param client: Client for the process exporting to this collector.
+        :param method: HTTP method, e.g. ``"GET"``.
+        :param url: Request URL, e.g. ``"/v1/sessions/abc"``.
+        :param route_span: The route span's name, e.g.
+            ``"GET /v1/sessions/{session_id}"``.
+        :param request_options: Passed to :meth:`httpx.Client.request`.
+        """
+        trace_id = secrets.token_hex(16)
+        headers = {
+            **request_options.pop("headers", {}),
+            "traceparent": f"00-{trace_id}-{secrets.token_hex(8)}-01",
+        }
+        response = client.request(method, url, headers=headers, **request_options)
+        poll_until(
+            lambda: any(span["name"] == route_span for span in self.snapshot(trace_id)),
+            timeout_s=30,
+            interval_s=0.2,
+        )
+        return response, self.snapshot(trace_id)
 
     def _record(self, body: bytes) -> None:
         from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (

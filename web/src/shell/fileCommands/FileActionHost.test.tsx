@@ -62,7 +62,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
-  useFileActionStore.setState({ request: null });
+  useFileActionStore.setState({ pending: [] });
   useFocusedFileStore.setState({ target: null, element: null });
 });
 
@@ -115,6 +115,41 @@ describe("FileActionHost", () => {
     const link = new URL(copyText.mock.calls[0]![0]);
     expect(link.pathname).toBe("/c/conv_2");
     expect(link.searchParams.get("file")).toBe("docs/a b.md");
+  });
+
+  it("runs each session's action once, with that session's path and link", () => {
+    const first = target("src/a.ts", {
+      root: "/repo-a",
+      hostId: "this-mac",
+      conversationId: "conv_a",
+    });
+    const second = target("lib/b.ts", {
+      root: "/repo-b",
+      hostId: "this-mac",
+      conversationId: "conv_b",
+    });
+    act(() => requestFileAction(first, "copy-link"));
+    act(() => requestFileAction(second, "copy-link"));
+    act(() => requestFileAction(first, "copy-path"));
+    act(() => requestFileAction(second, "copy-path"));
+
+    const copied = copyText.mock.calls.map(([text]) => text);
+    expect(copied).toHaveLength(4);
+    const links = copied.slice(0, 2).map((text) => new URL(text));
+    expect(links.map((link) => [link.pathname, link.searchParams.get("file")])).toEqual([
+      ["/c/conv_a", "src/a.ts"],
+      ["/c/conv_b", "lib/b.ts"],
+    ]);
+    expect(copied.slice(2)).toEqual(["/repo-a/src/a.ts", "/repo-b/lib/b.ts"]);
+  });
+
+  it("runs two requests made at once, in order", () => {
+    act(() => {
+      requestFileAction(target("src/a.ts"), "copy-path");
+      requestFileAction(target("src/b.ts"), "copy-relative-path");
+    });
+    expect(copyText.mock.calls.map(([text]) => text)).toEqual(["/repo/src/a.ts", "src/b.ts"]);
+    expect(useFileActionStore.getState().pending).toEqual([]);
   });
 
   it("shows this machine's files in the file manager", () => {
@@ -195,7 +230,7 @@ describe("FileActionHost", () => {
     expect(launchEditorLink).not.toHaveBeenCalled();
     expect(copyText).not.toHaveBeenCalled();
     expect(toast.success).not.toHaveBeenCalled();
-    expect(useFileActionStore.getState().request).toBeNull();
+    expect(useFileActionStore.getState().pending).toEqual([]);
   });
 
   it("builds links under the deployment's base path, keeping the surface's link state", () => {

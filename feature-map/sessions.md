@@ -68,6 +68,22 @@ the header menu), and each place is a separate entry point.
   stays listed with the reason, and a dialog such as Rename opens with focus in
   it. With `quick_pick_palette`, **Go to Session…** turns the open palette into
   the session switcher; Escape returns focus to where ⌘K was opened.
+- `palette-screen-commands`: with `quick_pick_palette` on (off by default), ⌘K
+  also lists the open screen's own actions, each run by its button's handler.
+  Under **Conversation**: Copy latest response, Copy link to latest response,
+  Fork from latest response… (the message's Fork, opening the same dialog), Copy
+  latest prompt, Copy link to latest prompt, Scroll to newest message, and Stop
+  response while a turn runs. They target the latest message the transcript
+  shows, and one that can't run yet, such as before the first response or for
+  an attachment-only prompt, stays listed with the reason. Under **Canvas**,
+  while a conversation pane is open: Back to canvas when it fills the window,
+  else Focus conversation or Show canvas beside conversation, and Close
+  conversation pane. The open grid's sidebar row adds Rename grid…, which edits
+  the row's name in place (opening a collapsed sidebar first), and Delete grid,
+  each naming the grid; other grids add none
+  (`web/src/components/chat/TranscriptPaletteCommands.test.tsx`,
+  `web/src/canvas/useCanvasHeaderPaletteCommands.test.tsx`,
+  `web/src/grid/useGridPaletteCommands.test.tsx`).
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
@@ -307,6 +323,10 @@ the header menu), and each place is a separate entry point.
   type an action such as "rename session" and press Enter. With
   `quick_pick_palette` on, type "go to session" and press Enter to switch
   sessions, or Escape to return to where you were.
+- For the open screen's ⌘K actions, with `quick_pick_palette` on, press
+  Cmd/Ctrl+K in a conversation and type "fork from latest" or "scroll to
+  newest"; on a canvas with a conversation open, type "close conversation";
+  in an open grid, type "rename grid".
 - For siblings, open an owned active session's sidebar kebab, right-click menu,
   or header menu and choose **Add nested agent**. Mobile row/header menus offer
   the same action. On desktop, Cmd/Ctrl+Alt+A opens **Add nested agent** for the active
@@ -607,11 +627,14 @@ Changes or Pull Requests in the Workspace rail. This only happens for editors,
 on an idle session whose launch isn't already running, and does exactly what
 pressing Reconnect host does. Each opening checks once, so a session that sleeps again
 while it stays open waits for Reconnect host, a Files, Changes or Pull
-Requests pick, or a message. Every way of waking
-the sandbox (Reconnect host, opening the session, Files or Changes, the
-terminal's Resume, and a tabs-sidebar shell tab's Resume sandbox or Retry) joins one wake per session, including after switching to
-another session and back, and the Files and Pull Requests views say the
-sandbox is starting while it runs or the server reports its launch.
+Requests pick, or a message. Reconnect host, opening the session, a Files,
+Changes or Pull Requests pick, the terminal's Resume and a tabs-sidebar shell
+tab's Resume session join one wake per session, including after switching to
+another session and back. The Resume sandbox notices (the Changes view, the
+tabs sidebar's panels and shell tabs, with their Retry, and ⌘K) share a resume
+of their own, so the two groups show their own progress until the server
+reports the launch, which every surface then shows. The Files and Pull Requests
+views say the sandbox is starting while it runs or the server reports its launch.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation

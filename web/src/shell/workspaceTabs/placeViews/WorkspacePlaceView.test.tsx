@@ -1,12 +1,13 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { ComponentProps } from "react";
+import { useState, type ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { isMacPlatform } from "@/lib/hotkeys";
 import type { PullRequestPageBody } from "@/pullRequestPage/PullRequestPageBody";
+import type * as ReviewLayout from "@/components/diff-review/reviewLayout";
 import type { ChangesReview } from "@/shell/ChangesReview";
 import type { PullRequestPanel } from "@/shell/PullRequestPanel";
 import { stopFilePosition } from "@/shell/filePositionState";
@@ -31,6 +32,13 @@ const captured = vi.hoisted(() => ({
   list: null as ComponentProps<typeof PullRequestPanel> | null,
   page: null as ComponentProps<typeof PullRequestPageBody> | null,
   review: null as ComponentProps<typeof ChangesReview> | null,
+}));
+
+// Unmeasured counts as wide; a test sets a width to see the narrow page's popover tree.
+const pageWidth = vi.hoisted(() => ({ value: null as number | null }));
+vi.mock("@/components/diff-review/reviewLayout", async (importOriginal) => ({
+  ...(await importOriginal<typeof ReviewLayout>()),
+  useElementWidth: () => pageWidth.value,
 }));
 
 vi.mock("./FilesPageTree", () => ({
@@ -85,6 +93,7 @@ function renderView(
     registerLeaveGuard,
     permissionLevel,
     keyboardTarget,
+    files = {},
   }: Partial<
     Pick<
       WorkspacePlaceViewProps,
@@ -94,38 +103,61 @@ function renderView(
       | "position"
       | "registerLeaveGuard"
       | "keyboardTarget"
-    > & { permissionLevel: number | null }
+    > & {
+      permissionLevel: number | null;
+      files: Partial<WorkspacePlaceViewProps["files"]>;
+    }
   > = {},
 ) {
+  type FileSettings = WorkspacePlaceViewProps["files"];
+  const fileSettings = {
+    onSortChange: vi.fn<FileSettings["onSortChange"]>(),
+    onShowHiddenChange: vi.fn<FileSettings["onShowHiddenChange"]>(),
+  };
   const onNavigate = vi.fn();
   const onOpen = vi.fn();
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  // The settings follow each change, as the sidebar's preferences do.
+  function View() {
+    const [sort, setSort] = useState<FileSettings["sort"]>(files.sort ?? "recent");
+    const [showHidden, setShowHidden] = useState(files.showHidden ?? false);
+    return (
+      <WorkspacePlaceView
+        conversationId="conv_1"
+        place={place}
+        filesTab={filesTab}
+        active={active}
+        onNavigate={onNavigate}
+        onOpen={onOpen}
+        onCommentOnFile={onCommentOnFile}
+        files={{
+          permissionLevel,
+          ...files,
+          sort,
+          showHidden,
+          onSortChange: (next) => {
+            fileSettings.onSortChange(next);
+            setSort(next);
+          },
+          onShowHiddenChange: (next) => {
+            fileSettings.onShowHiddenChange(next);
+            setShowHidden(next);
+          },
+        }}
+        position={position}
+        registerLeaveGuard={registerLeaveGuard}
+        keyboardTarget={keyboardTarget}
+      />
+    );
+  }
   render(
     <QueryClientProvider client={client}>
       <TooltipProvider>
-        <WorkspacePlaceView
-          conversationId="conv_1"
-          place={place}
-          filesTab={filesTab}
-          active={active}
-          onNavigate={onNavigate}
-          onOpen={onOpen}
-          onCommentOnFile={onCommentOnFile}
-          files={{
-            sort: "recent",
-            onSortChange: vi.fn(),
-            showHidden: false,
-            onShowHiddenChange: vi.fn(),
-            permissionLevel,
-          }}
-          position={position}
-          registerLeaveGuard={registerLeaveGuard}
-          keyboardTarget={keyboardTarget}
-        />
+        <View />
       </TooltipProvider>
     </QueryClientProvider>,
   );
-  return { onNavigate, onOpen };
+  return { onNavigate, onOpen, fileSettings };
 }
 
 const toggleCommands = () =>
@@ -141,6 +173,7 @@ const pressToggleChord = (target: Element | Window = window) =>
   });
 
 beforeEach(() => {
+  pageWidth.value = null;
   window.localStorage.clear();
   for (const key of Object.keys(captured) as (keyof typeof captured)[]) captured[key] = null;
   usePaletteCommandsStore.setState({ groups: {} });
@@ -307,6 +340,85 @@ describe("Files tab", () => {
     expect(screen.getAllByRole("button", { name: "Hide Files Tree" })).toHaveLength(1);
   });
 
+  it("sorts the tree and shows hidden files from the toolbar's options", async () => {
+    const { fileSettings } = renderView({ kind: "files", path: "a.ts" });
+    const options = () =>
+      within(screen.getByTestId("file-viewer")).getByRole("button", { name: "Files tree options" });
+    await userEvent.click(options());
+    expect(screen.getByRole("menuitemradio", { name: "Last edited" })).toBeChecked();
+    await userEvent.click(screen.getByRole("menuitemradio", { name: "Size" }));
+    expect(fileSettings.onSortChange).toHaveBeenCalledWith("size");
+    expect(captured.tree!.sort).toBe("size");
+
+    await userEvent.click(options());
+    expect(screen.getByRole("menuitemradio", { name: "Size" })).toBeChecked();
+    const showHidden = screen.getByRole("menuitemcheckbox", { name: "Show hidden files" });
+    expect(showHidden).not.toBeChecked();
+    await userEvent.click(showHidden);
+    expect(fileSettings.onShowHiddenChange).toHaveBeenCalledWith(true);
+    expect(captured.tree!.showHidden).toBe(true);
+    await userEvent.click(options());
+    expect(screen.getByRole("menuitemcheckbox", { name: "Show hidden files" })).toBeChecked();
+    await userEvent.keyboard("{Escape}");
+  });
+
+  it("shows hidden files when an all-hidden workspace's tree asks", () => {
+    const { fileSettings } = renderView({ kind: "files", path: "a.ts" });
+    act(() => captured.tree!.onShowHidden!());
+    expect(fileSettings.onShowHiddenChange).toHaveBeenCalledTimes(1);
+    expect(fileSettings.onShowHiddenChange).toHaveBeenCalledWith(true);
+    expect(captured.tree!.showHidden).toBe(true);
+  });
+
+  it("leaves the options to ⌘K while the tree is hidden", async () => {
+    renderView({ kind: "files", path: "a.ts" });
+    await userEvent.click(screen.getByRole("button", { name: "Hide Files Tree" }));
+    expect(screen.queryByRole("button", { name: "Files tree options" })).toBeNull();
+    expect(registeredPaletteCommands().some((row) => row.id === "files-tree-hidden")).toBe(true);
+  });
+
+  it("leaves the options to ⌘K on a narrow page, whose tree opens as a popover", async () => {
+    pageWidth.value = 400;
+    renderView({ kind: "files", path: "a.ts" });
+    await userEvent.click(screen.getByRole("button", { name: "Show Files Tree" }));
+    expect(screen.getByRole("dialog", { name: "Workspace files" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Files tree options" })).toBeNull();
+    expect(registeredPaletteCommands().some((row) => row.id === "files-tree-hidden")).toBe(true);
+  });
+
+  it("sorts the tree and shows hidden files from ⌘K, for the keyboard target only", () => {
+    renderView({ kind: "files", path: "a.ts" }, { keyboardTarget: false });
+    const { fileSettings } = renderView(
+      { kind: "files", path: "b.ts" },
+      { files: { showHidden: true } },
+    );
+    const listed = registeredPaletteCommands().filter(
+      (row) => row.id.startsWith("files-tree-") && row.availability?.available !== false,
+    );
+    // The current order isn't offered again.
+    expect(listed.map((row) => row.label)).toEqual([
+      "Sort Files Tree by Filename",
+      "Sort Files Tree by Size",
+      "Sort Files Tree by Type",
+      "Hide Hidden Files",
+    ]);
+    act(() => listed.find((row) => row.label === "Sort Files Tree by Type")!.run());
+    expect(fileSettings.onSortChange).toHaveBeenCalledWith("type");
+    act(() => listed.find((row) => row.label === "Hide Hidden Files")!.run());
+    expect(fileSettings.onShowHiddenChange).toHaveBeenCalledWith(false);
+    // The rows follow: the new order isn't offered, and hidden files can be shown again.
+    expect(
+      registeredPaletteCommands()
+        .filter((row) => row.id.startsWith("files-tree-") && row.availability?.available !== false)
+        .map((row) => row.label),
+    ).toEqual([
+      "Sort Files Tree by Filename",
+      "Sort Files Tree by Last edited",
+      "Sort Files Tree by Size",
+      "Show Hidden Files",
+    ]);
+  });
+
   it("leaves ⌘K and ⇧⌘E to the keyboard target when two Files places are on screen", () => {
     renderView({ kind: "files", path: "a.ts" }, { keyboardTarget: false });
     renderView({ kind: "files", path: "b.ts" }, { keyboardTarget: true });
@@ -354,6 +466,16 @@ describe("pull request tab", () => {
     );
     onNavigate.mockClear();
     captured.page!.onSectionChange("comments");
+    expect(onNavigate).not.toHaveBeenCalled();
+  });
+
+  it("opens or selects the session's pull requests tab from a pull request's page", () => {
+    const { onNavigate, onOpen } = renderView({ kind: "pull", url: PR, view: "summary" });
+    captured.page!.onShowAllPullRequests();
+    expect(onOpen).toHaveBeenCalledWith(
+      { place: { kind: "pulls" } },
+      { opener: "user", disposition: "focus" },
+    );
     expect(onNavigate).not.toHaveBeenCalled();
   });
 

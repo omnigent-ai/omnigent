@@ -201,6 +201,14 @@ function toolbarCommandGroups() {
     .map(([, group]) => group);
 }
 
+/** Opens the toolbar's Diff options menu, as a pointer press does. */
+function openDiffOptions(scope: HTMLElement = document.body) {
+  fireEvent.pointerDown(within(scope).getByRole("button", { name: "Diff options" }), {
+    button: 0,
+  });
+  return screen.getByRole("menu", { name: "Diff options" });
+}
+
 const lineScrolls = () => codeView.scrolls.filter((target) => target.type === "line");
 
 // Every case starts from the same state, whatever order the cases run in.
@@ -408,7 +416,10 @@ describe("DiffReview toolbar", () => {
     );
     const toolbar = screen.getByRole("toolbar", { name: "Diff review" });
     fireEvent.click(within(toolbar).getByRole("button", { name: "Switch to split view" }));
-    fireEvent.click(within(toolbar).getByRole("button", { name: "Wrap lines" }));
+    // Wrapping sits in the Diff options menu, not as a toolbar button.
+    expect(within(toolbar).queryByRole("button", { name: "Wrap lines" })).toBeNull();
+    openDiffOptions(toolbar);
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Wrap long lines" }));
     fireEvent.click(within(toolbar).getByRole("button", { name: "Hide whitespace changes" }));
     expect(onLayoutChange).toHaveBeenCalledWith("split");
     expect(onWrapLinesChange).toHaveBeenCalledWith(true);
@@ -428,9 +439,11 @@ describe("DiffReview toolbar", () => {
         })}
       />,
     );
-    for (const name of ["Switch to unified view", "Don’t wrap lines", "Show whitespace changes"]) {
+    for (const name of ["Switch to unified view", "Show whitespace changes"]) {
       expect(screen.getByRole("button", { name })).toHaveAttribute("aria-pressed", "true");
     }
+    openDiffOptions();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Wrap long lines" })).toBeChecked();
   });
 
   it("hides the layout choice while too narrow to split, keeping the saved layout", () => {
@@ -464,16 +477,86 @@ describe("DiffReview toolbar", () => {
       within(menu)
         .getAllByRole("menuitem")
         .map((item) => item.textContent),
-    ).toEqual(["Skip test files", "Hide whitespace changes", "Wrap lines", "Collapse all files"]);
+    ).toEqual(["Skip test files", "Hide whitespace changes", "Collapse all files"]);
     // A toggle keeps the menu open and shows the setting's new action.
-    fireEvent.click(within(menu).getByRole("menuitem", { name: "Wrap lines" }));
-    expect(onWrapLinesChange).toHaveBeenCalledWith(true);
+    fireEvent.click(within(menu).getByRole("menuitem", { name: "Hide whitespace changes" }));
     expect(screen.getByRole("menu")).toBeInTheDocument();
     fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    // Wrapping and sorting keep their own menu while narrow.
+    openDiffOptions(toolbar);
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Wrap long lines" }));
+    expect(onWrapLinesChange).toHaveBeenCalledWith(true);
 
     resize(900);
     expect(within(toolbar).queryByRole("button", { name: "More view options" })).toBeNull();
-    expect(within(toolbar).getByRole("button", { name: "Wrap lines" })).toBeInTheDocument();
+    expect(within(toolbar).getByRole("button", { name: "Diff options" })).toBeInTheDocument();
+  });
+
+  it("sorts the diff by size from its options, as every review then does", () => {
+    const sized = [
+      reviewFile("a.ts", "modified", { additions: 1 }),
+      reviewFile("big/b.ts", "modified", { additions: 12, deletions: 8 }),
+      reviewFile("c.ts", "modified", { additions: 5 }),
+    ];
+    const onWrapLinesChange = vi.fn();
+    const sizedProps = props(ready, {
+      files: sized,
+      contents: new Map(sized.map((file) => [file.path, contentFor(file.path)])),
+      revealPath: null,
+      onWrapLinesChange,
+    });
+    const shownOrder = () =>
+      codeView.items.filter((item) => item.id.startsWith("diff:")).map((item) => item.id);
+    const view = render(<DiffReview {...sizedProps} />);
+    expect(shownOrder()).toEqual(["diff:big/b.ts", "diff:a.ts", "diff:c.ts"]);
+
+    // The menu is named after its button, so a screen reader says what opened.
+    expect(openDiffOptions()).toBeVisible();
+    expect(screen.getByRole("menuitemradio", { name: "By path" })).toBeChecked();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "By size, largest first" }));
+    expect(shownOrder()).toEqual(["diff:big/b.ts", "diff:c.ts", "diff:a.ts"]);
+    // Wrapping is untouched by sorting.
+    openDiffOptions();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Wrap long lines" })).not.toBeChecked();
+    expect(onWrapLinesChange).not.toHaveBeenCalled();
+
+    // Another review opened later starts in the order chosen here.
+    view.unmount();
+    render(<DiffReview {...sizedProps} />);
+    expect(shownOrder()).toEqual(["diff:big/b.ts", "diff:c.ts", "diff:a.ts"]);
+  });
+
+  it("sorts by size from ⌘K's setting, through the popover's own command", () => {
+    const sized = [
+      reviewFile("a.ts", "modified", { additions: 1 }),
+      reviewFile("z.ts", "modified", { additions: 9 }),
+    ];
+    render(
+      <DiffReview
+        {...props(ready, {
+          files: sized,
+          contents: new Map(sized.map((file) => [file.path, contentFor(file.path)])),
+          revealPath: null,
+        })}
+      />,
+    );
+    const commands = toolbarCommandGroups()[0]!.commands;
+    expectSetting(commands, "Sort changed files", {
+      current: "By path",
+      choices: ["By path", "By size, largest first"],
+    });
+    act(
+      () =>
+        void chooseSettingValue(
+          settingIn(commands, "Sort changed files"),
+          "By size, largest first",
+        ),
+    );
+    expect(
+      codeView.items.filter((item) => item.id.startsWith("diff:")).map((item) => item.id),
+    ).toEqual(["diff:z.ts", "diff:a.ts"]);
+    openDiffOptions();
+    expect(screen.getByRole("menuitemradio", { name: "By size, largest first" })).toBeChecked();
   });
 
   it("leaves out the controls a source doesn't offer", () => {
@@ -499,6 +582,7 @@ describe("DiffReview toolbar", () => {
       "Show hidden matches",
       "Test files",
       "Wrap long lines",
+      "Sort changed files",
       "Collapse all files",
     ]);
     // The view settings show their value, as the toolbar's pressed controls do.
@@ -1534,6 +1618,18 @@ describe("file headers", () => {
     expect(itemFor(SECOND).collapsed).toBe(false);
   });
 
+  it("leaves a viewed file out of the toolbar's line counts, and counts it again once cleared", () => {
+    render(<DiffReview {...review()} />);
+    const lineCounts = () => screen.getByTestId("diff-review-line-counts");
+    const allCounts = lineCounts().textContent;
+    clickViewed(SECOND);
+    expect(lineCounts()).toHaveAccessibleName(/ in files not viewed\. /);
+    expect(lineCounts().textContent).not.toBe(allCounts);
+    clickViewed(SECOND);
+    expect(lineCounts().textContent).toBe(allCounts);
+    expect(lineCounts()).not.toHaveAccessibleName(/not viewed/);
+  });
+
   it("opens a viewed file again once its changes are edited", () => {
     const view = render(<DiffReview {...review()} />);
     clickViewed(SECOND);
@@ -1733,7 +1829,7 @@ describe("an opt-in presentation", () => {
     render(<DiffReview {...props(ready, { presentation: { toolbar } })} />);
     expect(screen.getByTestId("reference-toolbar")).toHaveTextContent("1 file");
     const given = toolbar.mock.calls.at(-1)![0];
-    expect(given.breakdown.totals).toEqual({ additions: 1, deletions: 1 });
+    expect(given.breakdown.totals).toEqual({ files: 1, additions: 1, deletions: 1 });
     expect(given.commands.length).toBeGreaterThan(0);
     expect(given.dispatchFilter).toBeTypeOf("function");
     expect(given.setFiltersOpen).toBeTypeOf("function");
