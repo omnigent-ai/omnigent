@@ -265,6 +265,9 @@ class SqlFile(OmnigentBase):
         equals ``id``; a forked row points it at the source row's blob
         so the fork shares the bytes instead of duplicating them.
         NULL on pre-``blob_key`` rows, read as ``COALESCE(blob_key, id)``.
+    :param project_id: Owning project for a project file, which every session
+        filed in that project can read and write. Set only when ``session_id``
+        is NULL.
     """
 
     __tablename__ = "files"
@@ -283,6 +286,7 @@ class SqlFile(OmnigentBase):
     bytes: Mapped[int] = mapped_column(Integer)
     content_type: Mapped[str | None] = mapped_column(String(256), nullable=True)
     session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    project_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     # Artifact-store key for the bytes. NULL means "under id" (pre-blob_key
     # rows); a fork copy sets it to the source's blob so many rows share one
     # blob. Read as COALESCE(blob_key, id); reference-count it before deleting
@@ -292,9 +296,8 @@ class SqlFile(OmnigentBase):
     source_metadata: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
-        # Files are only ever listed per session (WHERE session_id = ?),
-        # so a session-scoped composite is the only index needed. There is
-        # no session-less "all files" listing.
+        # Files are listed per session or per project; there is no listing
+        # across all of a workspace's files.
         Index(
             "ix_files_session_id_created_at",
             "workspace_id",
@@ -302,6 +305,15 @@ class SqlFile(OmnigentBase):
             "created_at",
             "id",
         ),
+        Index(
+            "ix_files_project_id_created_at",
+            "workspace_id",
+            "project_id",
+            "created_at",
+            "id",
+        ),
+        # Serves the reference check made before a shared blob is deleted.
+        Index("ix_files_blob_key", "workspace_id", "blob_key", "id"),
     )
 
 
