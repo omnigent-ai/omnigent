@@ -886,6 +886,10 @@ final class WatchCompanionTests: XCTestCase {
           XCTFail("Expected \(method) to reject HTTP \(status)")
         } catch {
           XCTAssertEqual(error as? WatchError, .status(status))
+          XCTAssertEqual(
+            error.localizedDescription,
+            "The server redirected this request (HTTP \(status)). Check the server URL or sign in again on iPhone."
+          )
         }
       }
     }

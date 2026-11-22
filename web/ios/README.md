@@ -31,6 +31,8 @@ activity, plus queued inputs.
 For bound runners, each refresh first checks a one-item terminal inventory to verify routing
 before trusting live approvals. This read does not launch or attach to a terminal. Successful
 keyless retries are reused; later refreshes can recover if the host reconnects with a key.
+Inherited-host lookup checks at most 16 sessions, including the selected session; deeper
+ancestry requires the phone for live approvals, while stored messages remain readable.
 Receipt-based native approvals stay visible but require the phone for confirmation/retry;
 the watch does not expose approval buttons for that delivery protocol.
 Only form-mode yes/no prompts have watch buttons. URL-mode prompts, including internal

@@ -215,6 +215,8 @@ enum WatchError: LocalizedError, Equatable {
     switch self {
     case .signedOut: "Open Omnigent on your iPhone to sign in again."
     case .forbidden: "You don't have permission to perform this action."
+    case .status(let code) where [301, 302, 303, 307, 308].contains(code):
+      "The server redirected this request (HTTP \(code)). Check the server URL or sign in again on iPhone."
     case .status(let code): "The server returned HTTP \(code)."
     case .routingUnavailable:
       "Couldn't find this session's host. Open it on your iPhone to respond."
