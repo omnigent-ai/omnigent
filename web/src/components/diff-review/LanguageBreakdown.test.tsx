@@ -103,18 +103,13 @@ describe("LanguageBreakdown", () => {
     expect(row("TypeScript")).toHaveTextContent("TypeScript3 files+1,000−200");
   });
 
-  it("shows one total while no file is viewed", async () => {
+  it("lists each language's files, lines and share, most changed first, with one total", async () => {
     const user = userEvent.setup();
     render(<Harness dispatchFilter={vi.fn()} />);
     await user.click(trigger());
+    // With no file viewed there's one total, not a Not viewed and an All files pair.
     expect(within(popover()).queryByRole("term")).toBeNull();
     expect(within(popover()).queryByText("Not viewed")).toBeNull();
-  });
-
-  it("lists each language's files, lines and share, most changed first, with the totals", async () => {
-    const user = userEvent.setup();
-    render(<Harness dispatchFilter={vi.fn()} />);
-    await user.click(trigger());
     expect(within(popover()).getAllByText("6 files")).toHaveLength(1);
     const rows = within(screen.getByRole("group", { name: "Languages" })).getAllByRole("button");
     expect(rows.map((entry) => entry.dataset.language)).toEqual([

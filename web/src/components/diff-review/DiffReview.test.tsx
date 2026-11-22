@@ -416,7 +416,7 @@ describe("DiffReview toolbar", () => {
     );
     const toolbar = screen.getByRole("toolbar", { name: "Diff review" });
     fireEvent.click(within(toolbar).getByRole("button", { name: "Switch to split view" }));
-    // Wrapping sits in the options menu, where its button used to be.
+    // Wrapping sits in the Diff options menu, not as a toolbar button.
     expect(within(toolbar).queryByRole("button", { name: "Wrap lines" })).toBeNull();
     openDiffOptions(toolbar);
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Wrap long lines" }));

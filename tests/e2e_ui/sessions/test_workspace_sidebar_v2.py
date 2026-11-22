@@ -27,6 +27,7 @@ import httpx
 import pytest
 from playwright.sync_api import Locator, Page, Request, Route, expect
 
+from tests._helpers.polling import poll_until
 from tests._helpers.pull_request_ui import open_session_pull_requests
 from tests._helpers.server_runner import server_runner
 from tests.e2e_ui.conftest import _BUILD_OUTPUT, open_right_rail
@@ -566,14 +567,16 @@ def test_changes_compare_branches_and_tags_through_the_workspace_api(
     expect(trigger).to_contain_text("All branch changes", timeout=30_000)
 
     # Diff options sorts by size: the longer file moves above the one before it by path.
+    def shows_above(name: str, other: str) -> bool:
+        first = changed(name).bounding_box()
+        second = changed(other).bounding_box()
+        return first is not None and second is not None and first["y"] < second["y"]
+
     def expect_first(name: str, other: str) -> None:
-        for _ in range(100):
-            first = changed(name).bounding_box()
-            second = changed(other).bounding_box()
-            if first is not None and second is not None and first["y"] < second["y"]:
-                return
-            page.wait_for_timeout(100)
-        raise AssertionError(f"{name}'s diff never showed above {other}'s")
+        try:
+            poll_until(lambda: shows_above(name, other), timeout_s=10, interval_s=0.1)
+        except AssertionError:
+            raise AssertionError(f"{name}'s diff never showed above {other}'s") from None
 
     expect_first("feature_first.txt", "feature_last.txt")
     sidebar.get_by_role("button", name="Diff options").click()

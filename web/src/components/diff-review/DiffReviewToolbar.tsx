@@ -192,7 +192,7 @@ export function DiffReviewToolbar({
             .map((command) => (
               <ToolbarButton key={command.id} command={command} />
             ))}
-          {/* Sorting and wrapping share one popover, where the wrap button used to be. */}
+          {/* Sorting and wrapping share one popover. */}
           <DiffReviewOptions sort={byId.get("sort-files")} wrap={byId.get("toggle-wrap")} />
           {collapseAll && <ToolbarButton command={collapseAll} />}
         </>

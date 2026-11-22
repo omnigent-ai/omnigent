@@ -270,8 +270,7 @@ function ChangedFileRows({
   } | null>(null);
   const treeHolder = useRef<HTMLDivElement>(null);
   const selection = useRef<readonly string[]>([]);
-  // The review hands its files over in the tree's own order, which the diff shares, and the
-  // tree keeps it. It reads its input once; a different set or order of paths remounts it.
+  // The tree keeps the review's order; it reads input once, and a new set or order remounts it.
   const { model } = useFileTree({
     paths,
     sort: givenOrder(paths),
