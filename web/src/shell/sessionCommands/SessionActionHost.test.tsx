@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type * as ConversationsModule from "@/hooks/useConversations";
@@ -8,15 +8,10 @@ import type { Conversation } from "@/hooks/useConversations";
 import type * as SessionModule from "@/hooks/useSession";
 import type * as UnseenModule from "@/hooks/useUnseenConversations";
 import type * as PermissionsApiModule from "@/lib/permissionsApi";
-import type * as RoutingModule from "@/lib/routing";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 import { SessionActionHost } from "./SessionActionHost";
-import {
-  latestSessionActionRequest,
-  requestSessionAction,
-  useSessionActionStore,
-} from "./sessionActionStore";
+import { requestSessionAction, useSessionActionStore } from "./sessionActionStore";
 
 const writes = vi.hoisted(() => ({
   pin: vi.fn(),
@@ -50,16 +45,8 @@ vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof PermissionsApiModule>()),
   revokePermission: server.revokePermission,
 }));
-const ui = vi.hoisted(() => ({
-  toast: vi.fn(),
-  navigate: vi.fn(),
-  viewing: null as string | null,
-}));
+const ui = vi.hoisted(() => ({ toast: vi.fn(), viewing: null as string | null }));
 vi.mock("@/components/ui/toast", () => ({ showToast: ui.toast }));
-vi.mock("@/lib/routing", async (importOriginal) => ({
-  ...(await importOriginal<typeof RoutingModule>()),
-  useNavigate: () => ui.navigate,
-}));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   ...(await importOriginal<typeof SessionModule>()),
   useActiveRootSessionId: () => ui.viewing,
@@ -88,20 +75,34 @@ const SESSION: Conversation = {
   owner: "viewer",
 };
 
-function renderHost(queryClient = new QueryClient()) {
-  render(
-    <QueryClientProvider client={queryClient}>
-      <MemoryRouter>
-        <SessionActionHost />
-      </MemoryRouter>
-    </QueryClientProvider>,
-  );
+function Location() {
+  return <output data-testid="location">{useLocation().pathname}</output>;
 }
+
+/** On the open session's page; `remountHost` mounts the host again in the same app. */
+function renderHost(queryClient = new QueryClient()) {
+  const app = (hostMounted: boolean) => (
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={["/c/c1"]}>
+        {hostMounted && <SessionActionHost />}
+        <Location />
+      </MemoryRouter>
+    </QueryClientProvider>
+  );
+  const { rerender } = render(app(true));
+  return {
+    remountHost: () => {
+      rerender(app(false));
+      rerender(app(true));
+    },
+  };
+}
+const location = () => screen.getByTestId("location").textContent;
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
-  useSessionActionStore.setState({ requests: [] });
+  useSessionActionStore.setState({ request: null });
   ui.viewing = null;
 });
 
@@ -191,43 +192,81 @@ describe("SessionActionHost", () => {
   });
 
   it("runs an action once, even on a host mounted again", () => {
-    renderHost();
+    const { remountHost } = renderHost();
     act(() => requestSessionAction(SESSION, "pin"));
-    cleanup();
-    renderHost();
+    remountHost();
     expect(writes.pin).toHaveBeenCalledTimes(1);
   });
 
-  describe("keeps a replaced action until its write settles", () => {
+  describe("reports a Stop or Leave however the host changed while it saved", () => {
     const RUNNING: Conversation = { ...SESSION, host_id: "h1", runner_id: "r1" };
+    const SHARED: Conversation = { ...SESSION, owner: "someone-else" };
 
-    it("still reports a Stop that fails after another action started", async () => {
+    async function startStop() {
       const stop = deferred();
       server.stopSession.mockReturnValue(stop.promise);
-      renderHost();
+      const host = renderHost();
       act(() => requestSessionAction(RUNNING, "stop"));
       fireEvent.click(await screen.findByTestId("stop-session-confirm"));
-      act(() => requestSessionAction(SESSION, "mark-unread"));
-      expect(useSessionActionStore.getState().requests).toHaveLength(2);
-      await act(async () => stop.reject(new Error("runner unreachable")));
-      await waitFor(() =>
-        expect(ui.toast).toHaveBeenCalledWith("Couldn't stop the session: runner unreachable"),
-      );
-      await waitFor(() => expect(useSessionActionStore.getState().requests).toHaveLength(1));
-      expect(latestSessionActionRequest()?.command).toBe("mark-unread");
-    });
+      await waitFor(() => expect(server.stopSession).toHaveBeenCalledWith("c1"));
+      return { stop, ...host };
+    }
 
-    it("still leaves the page after Leave succeeds, though another action started", async () => {
+    async function startLeave() {
       const leave = deferred();
       server.revokePermission.mockReturnValue(leave.promise);
       ui.viewing = "c1";
-      renderHost();
-      act(() => requestSessionAction({ ...SESSION, owner: "someone-else" }, "leave"));
+      const host = renderHost();
+      act(() => requestSessionAction(SHARED, "leave"));
       fireEvent.click(await screen.findByTestId("confirm-leave-conversation"));
       await waitFor(() => expect(server.revokePermission).toHaveBeenCalledWith("c1", "viewer"));
+      return { leave, ...host };
+    }
+
+    it("shows a failed Stop's error after another action replaced it", async () => {
+      const { stop } = await startStop();
+      act(() => requestSessionAction(SESSION, "mark-unread"));
+      await act(async () => stop.reject(new Error("runner unreachable")));
+      expect(ui.toast).toHaveBeenCalledWith("Couldn't stop the session: runner unreachable");
+    });
+
+    it("shows a failed Stop's error after the host mounted again, stopping once", async () => {
+      const { stop, remountHost } = await startStop();
+      remountHost();
+      await act(async () => stop.reject(new Error("runner unreachable")));
+      expect(ui.toast).toHaveBeenCalledWith("Couldn't stop the session: runner unreachable");
+      expect(server.stopSession).toHaveBeenCalledTimes(1);
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+
+    it("says nothing when the Stop succeeds after the host mounted again", async () => {
+      const { stop, remountHost } = await startStop();
+      remountHost();
+      await act(async () => stop.resolve());
+      expect(ui.toast).not.toHaveBeenCalled();
+    });
+
+    it("leaves the open session after Leave succeeds, though another action replaced it", async () => {
+      const { leave } = await startLeave();
       act(() => requestSessionAction(SESSION, "mark-unread"));
       await act(async () => leave.resolve());
-      await waitFor(() => expect(ui.navigate).toHaveBeenCalledWith("/", { replace: true }));
+      expect(location()).toBe("/");
+    });
+
+    it("leaves the open session after Leave succeeds, though the host mounted again", async () => {
+      const { leave, remountHost } = await startLeave();
+      remountHost();
+      await act(async () => leave.resolve());
+      expect(location()).toBe("/");
+      expect(server.revokePermission).toHaveBeenCalledTimes(1);
+    });
+
+    it("stays and says why when Leave fails after the host mounted again", async () => {
+      const { leave, remountHost } = await startLeave();
+      remountHost();
+      await act(async () => leave.reject(new Error("offline")));
+      expect(ui.toast).toHaveBeenCalledWith("Couldn't leave the session: offline");
+      expect(location()).toBe("/c/c1");
     });
   });
 
