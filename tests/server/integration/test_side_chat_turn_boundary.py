@@ -357,10 +357,16 @@ class _TurnRunner:
     def __init__(self) -> None:
         self.running: set[str] = set()
         self.held: dict[str, list[str]] = {}
+        # Cleared by a test to hold the reply to a message until it is set again.
+        self.replies = asyncio.Event()
+        self.replies.set()
+        self.message_received = asyncio.Event()
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
         if request.method != "POST" or not request.url.path.endswith("/events"):
             return _runner(request)
+        self.message_received.set()
+        await self.replies.wait()
         session_id = request.url.path.split("/")[3]
         if session_id in self.running:
             item_id = json.loads(request.content)["persisted_item_id"]
@@ -432,10 +438,20 @@ async def test_sdk_side_chat_keeps_a_message_a_runner_steered_into_a_finished_tu
     await _send(client, session_id, "Also check the lexer")
     await _mirror(client, session_id, "assistant", "Both look fine", "r2")
     turn_runner.end_turn(session_id)
-    await _sdk_turn(
-        client, session_id, lambda: _send(client, session_id, "Now add tests"), "Adding", "r3"
-    )
+    finished = ["Review the parser", "On it", "Also check the lexer", "Both look fine"]
+
+    # Also while the next message is persisted but still on its way to the runner.
+    turn_runner.replies.clear()
+    turn_runner.message_received.clear()
+    sending = asyncio.create_task(_send(client, session_id, "Now add tests"))
+    await asyncio.wait_for(turn_runner.message_received.wait(), timeout=30)
+    try:
+        assert await _side_chat_history(client, session_id) == [_CODENAME, _NOTED, *finished]
+    finally:
+        turn_runner.replies.set()
+        await sending
+    sessions_module._publish_status(session_id, "running")
+    await _mirror(client, session_id, "assistant", "Adding", "r3")
 
     history = await _side_chat_history(client, session_id)
-    finished = ["Review the parser", "On it", "Also check the lexer", "Both look fine"]
     assert history == [_CODENAME, _NOTED, *finished]

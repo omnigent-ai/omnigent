@@ -837,20 +837,27 @@ def test_side_chat_forked_mid_turn_leaves_out_the_running_request(
     assert store.fork_calls[-1]["resume_source_native_session"] is clones_native
 
 
-def _resource_events_only() -> list[ConversationItem]:
-    """A history holding only a resource event, with nothing a copy can end on."""
+def _resource_events_only(count: int = 1) -> list[ConversationItem]:
+    """A history holding only resource events, with nothing a copy can end on."""
     return [
         ConversationItem(
-            id="evt_file",
+            id=f"evt_file_{n}",
             type="resource_event",
             status="completed",
             response_id="e9f8f58523cec9a57d3bdf93be543e8c",
             created_at=1,
             data=ResourceEventData(
-                event_type="file.created", resource_id="file_1", resource_type="file"
+                event_type="file.created", resource_id=f"file_{n}", resource_type="file"
             ),
         )
+        for n in range(count)
     ]
+
+
+def _resource_events_beyond_the_lookup() -> list[ConversationItem]:
+    """An exchange, then more resource events than the side chat lookup reads."""
+    events = _resource_events_only(routes_core._SIDE_CHAT_REQUEST_LOOKBACK)
+    return [*_side_chat_fork_history(), *events]
 
 
 @pytest.mark.parametrize(
@@ -859,8 +866,14 @@ def _resource_events_only() -> list[ConversationItem]:
         (_side_chat_fork_history, ["resp_001", "resp_002"]),
         (list, []),
         (_resource_events_only, []),
+        (_resource_events_beyond_the_lookup, []),
     ],
-    ids=["after_an_exchange", "empty", "resource_events_only"],
+    ids=[
+        "after_an_exchange",
+        "empty",
+        "resource_events_only",
+        "resource_events_beyond_the_lookup",
+    ],
 )
 def test_side_chat_fork_ignores_a_request_that_lands_while_it_is_prepared(
     history: Any, copied: list[str]
