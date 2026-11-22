@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import ColumnElement, Select, and_, asc, desc, or_, select
+from sqlalchemy import ColumnElement, Select, asc, desc, select
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlFile, current_workspace_id, normalize_uuid
@@ -236,10 +236,9 @@ class SqlAlchemyFileStore(FileStore):
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
-        include_unscoped: bool = False,
     ) -> PagedList[StoredFile]:
         """
-        List a session's files with cursor-based pagination.
+        List a session's own files with cursor-based pagination.
 
         Always scoped to ``session_id`` — the query filters on it, so
         it is served by ``ix_files_session_id_created_at``.
@@ -249,14 +248,9 @@ class SqlAlchemyFileStore(FileStore):
         :param after: Cursor file ID for forward pagination.
         :param before: Cursor file ID for backward pagination.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param include_unscoped: When ``True``, also return global
-            files, which belong to no session and no project.
         :returns: A :class:`PagedList` of :class:`StoredFile`.
         """
         owner = SqlFile.session_id == session_id
-        if include_unscoped:
-            unscoped = and_(SqlFile.session_id.is_(None), SqlFile.project_id.is_(None))
-            owner = or_(owner, unscoped)
         with self._session("list_files") as session:
             return _page(session, owner, limit=limit, after=after, before=before, order=order)
 

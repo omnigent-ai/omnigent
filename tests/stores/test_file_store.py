@@ -211,32 +211,33 @@ def test_delete_all_for_session(
     assert file_store.get(global_f.id) is not None
 
 
-# ── include_unscoped ──────────────────────────────────────────────
+# ── session listing ───────────────────────────────────────────────
 
 
-def test_list_include_unscoped_returns_session_and_global_files(
+def test_list_returns_only_the_sessions_own_files(
     file_store: SqlAlchemyFileStore,
 ) -> None:
-    """list with include_unscoped=True includes global (session_id=NULL) files."""
+    """
+    A session's listing leaves out other sessions', project and global files.
+    """
     file_store.create("session.txt", 10, session_id="8af356d908005a65f872c246158c6293")
     file_store.create("global.txt", 20)
+    file_store.create("plan.md", 25, project_id=_PROJECT)
     file_store.create("other.txt", 30, session_id="1dacb16c401901ed250049177f59e84e")
 
-    page = file_store.list(session_id="8af356d908005a65f872c246158c6293", include_unscoped=True)
-    filenames = {f.filename for f in page.data}
-    assert "session.txt" in filenames
-    assert "global.txt" in filenames
-    assert "other.txt" not in filenames
+    page = file_store.list(session_id="8af356d908005a65f872c246158c6293")
+
+    assert [f.filename for f in page.data] == ["session.txt"]
 
 
-def test_list_include_unscoped_false_excludes_global_files(
+def test_list_excludes_global_files(
     file_store: SqlAlchemyFileStore,
 ) -> None:
-    """list with include_unscoped=False (default) excludes global files."""
+    """list excludes global files, which belong to no session."""
     file_store.create("session.txt", 10, session_id="8af356d908005a65f872c246158c6293")
     file_store.create("global.txt", 20)
 
-    page = file_store.list(session_id="8af356d908005a65f872c246158c6293", include_unscoped=False)
+    page = file_store.list(session_id="8af356d908005a65f872c246158c6293")
     filenames = {f.filename for f in page.data}
     assert "session.txt" in filenames
     assert "global.txt" not in filenames
@@ -369,16 +370,6 @@ def test_project_files_are_reachable_only_through_their_project(
     assert file_store.delete(mine.id, project_id=_OTHER_PROJECT) is False
     assert file_store.delete(mine.id, project_id=_PROJECT) is True
     assert file_store.list_for_project(_PROJECT).data == []
-
-
-def test_a_project_file_is_not_a_global_file(file_store: SqlAlchemyFileStore) -> None:
-    """Project files have no session, but unscoped listing returns only true global files."""
-    file_store.create("global.txt", 1)
-    file_store.create("plan.md", 2, project_id=_PROJECT)
-
-    page = file_store.list(session_id=_SID, include_unscoped=True)
-
-    assert [f.filename for f in page.data] == ["global.txt"]
 
 
 def test_create_refuses_a_file_owned_by_a_session_and_a_project(

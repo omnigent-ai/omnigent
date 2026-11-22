@@ -78,7 +78,6 @@ class _FakeFileStore:
         before: str | None = None,
         order: str = "desc",
         session_id: str | None = None,
-        include_unscoped: bool = False,
     ) -> _FakePage:
         """
         Return files, optionally filtered by session_id.
@@ -89,16 +88,10 @@ class _FakeFileStore:
         :param order: Ignored in stub.
         :param session_id: When set, only return files belonging
             to this session. ``None`` returns all files.
-        :param include_unscoped: When ``True`` and ``session_id``
-            is set, also include global files (``session_id=None``).
         :returns: A page of files.
         """
         if session_id is not None:
-            data = [
-                f
-                for f in self._files.values()
-                if f.session_id == session_id or (include_unscoped and f.session_id is None)
-            ]
+            data = [f for f in self._files.values() if f.session_id == session_id]
         else:
             data = list(self._files.values())
         return _FakePage(data=data[:limit])
@@ -352,7 +345,7 @@ def test_list_files_excludes_other_sessions(
 ) -> None:
     """
     sys_list_files only returns files belonging to the calling
-    conversation — files from other sessions are invisible.
+    conversation — files from other sessions, and global files, are invisible.
 
     Regression test for file enumeration across sessions.
 
@@ -374,10 +367,8 @@ def test_list_files_excludes_other_sessions(
     result = json.loads(tool.invoke("{}", tool_ctx))
 
     returned_ids = {f["file_id"] for f in result["files"]}
-    # Alice's own file and global files are visible; Bob's is hidden.
-    assert "file_a" in returned_ids
-    assert "file_b" not in returned_ids, "Bob's file must not be visible to Alice"
-    assert "file_g" in returned_ids, "Global (unscoped) files must be visible"
+    # Only Alice's own file is listed; Bob's and the global file are not hers.
+    assert returned_ids == {"file_a"}
 
 
 # ── sys_download_file tests ──────────────────────────────────
