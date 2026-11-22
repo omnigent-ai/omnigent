@@ -453,24 +453,21 @@ deployment:
 
 ## Agent timers
 
-`sys_timer_set` saves a timer as one `kind="timer"` task through
-`POST /v1/sessions/{id}/timers`, and `sys_timer_cancel` deletes it through
-`DELETE /v1/sessions/{id}/timers/{timer_id}`. Both authorize the caller as posting a
-message would; cancelling also needs the same session and owner. The task ID is the
-`timer_id`. The automations gate does not hide these routes, but they need the
-database scheduler and the default-off `session_timers` release feature (both
-reflected in `session_timers` in `/v1/info`). Enable it only once every server on
-the database reads timer rows. Turning it off stops new timers, while existing ones
-keep firing and can still be cancelled. The task's host is the one
-serving the session's runner tunnel (`routing_host_id`): a sub-agent or side chat
-with no host of its own takes its parent's or source's, so the replica holding that
-tunnel claims its firings. Each firing resolves that host again before it commits.
-If the session now routes through another host, say because a side chat's source
-moved, `hand_back_timer_firing` returns the firing unsent, under the run's lease and
-the task lock: the timer takes the new host and is due again a second later (a
-one-shot's claim reopens), and the run records `skipped` (`timer_host_moved`). The
-new host's owner claims it at its next poll, or at once when it is the same replica.
-A host that doesn't resolve, such as a broken parent chain, keeps the saved one.
+`sys_timer_set` saves a timer of at least `DURABLE_TIMER_MIN_SECONDS` (120) in a
+top-level session as one `kind="timer"` task through `POST /v1/sessions/{id}/timers`,
+and `sys_timer_cancel` deletes it through `DELETE /v1/sessions/{id}/timers/{timer_id}`.
+Both authorize the caller as posting a message would; cancelling also needs the same
+session and owner. The task ID is the `timer_id`. The automations gate does not hide
+these routes, but they need the database scheduler and the default-off
+`session_timers` release feature (both reflected in `session_timers` in `/v1/info`).
+Enable it only once every server on the database reads timer rows. Turning it off
+stops new timers, while existing ones keep firing and can still be cancelled.
+
+The runner keeps every other timer in its own memory and says so in the tool's result
+(`durable: false` and a `warning`): a shorter timer, one on a server without
+`session_timers`, and one in a sub-agent's session or a side chat. For those the
+route answers `200` with `durable: false` and a `reason` instead of saving: they run
+on another session's runner, which a timer task couldn't follow when it moves.
 
 - **Schedule.** The rule is `FREQ=SECONDLY;INTERVAL=<n>`, plus `COUNT=1` for a
   one-shot timer, with `n` the delay rounded up to whole seconds. Firings fall at
@@ -478,37 +475,24 @@ A host that doesn't resolve, such as a broken parent chain, keeps the saved one.
   whole second at least the delay away, and saves that time as `next_run_at`.
   `next_timer_time` computes later firings directly, skipping missed ones, instead of
   using the midnight-anchored RRULE search, and a timer is exempt from the automation
-  minimum interval.
+  minimum interval. A firing comes up to one poll (`poll_seconds`, 15 by default) late.
 - **Delivery.** The built-in executor skips the automation steps (budgets, sharing,
   run labels) for a timer. A session that was deleted, archived or closed (its
-  `omnigent.closed` label, or an older row's title marker), that the owner can no
-  longer send to, or whose permission mode skips approval (the route refuses each
-  of these at creation, as a continued automation must) records `skipped`
-  (`timer_session_unavailable`) and deletes the timer without waking anything.
-  Otherwise `begin_timer_delivery` commits the firing under the task lock that
-  deleting takes, then the prompt, a hidden
-  (`is_meta`) user message, goes in through the continued-session wake and dispatch.
-  Before any runner is woken, the wake meets the session's REQUEST-phase policies
-  as a message does (`_evaluate_input_policy`). A denial, or an ASK, which no one
-  can approve for a timer, records `skipped` (`timer_policy_denied`) and leaves the
-  `[Denied by policy: …]` reply in the session, as for a message; a repeating timer
-  tries again at its next tick.
-  A sub-agent session whose runner is gone first moves to its parent's live runner,
-  output relay included, before anything launches a runner of its own, as a message
-  to it would. If no ancestor runner is live, the session owning their host (while
-  the timer's owner may still send to it) is woken and the sub-agent follows it. A
-  side chat recovers its source's runner through the message path's
-  `_recover_side_chat_runner_via_source`.
-  The run records `succeeded`, or `failed` (`launch_failed`) when no runner can be
-  reached or woken or the runner declines the wake; a firing is never retried.
-- **Cancelling.** A cancel that commits before a claimed firing does suppresses it:
-  the run records `skipped` (`timer_cancelled`). A firing committed first still goes
-  out. A one-shot firing deletes its timer as it commits, so a later cancel finds
-  nothing.
-- **Busy sessions.** A repeating timer uses the trigger automations' busy check
-  without the quiet period: a tick due while the session runs a turn, waits on an
-  approval or question, or still delivers the previous tick is moved, recording no
-  run, to the next check, never past the next tick. One-shot timers always fire.
+  `omnigent.closed` label, or an older row's title marker), or that the owner can no
+  longer send to, records `skipped` (`timer_session_unavailable`) and deletes the
+  timer without waking anything; the route refuses an archived or closed session at
+  creation. Otherwise the wake, a hidden (`is_meta`) user message, goes in through
+  the continued-session wake and dispatch, into the session in whatever permission
+  mode it is in. Before any runner is woken, the wake meets the session's
+  REQUEST-phase policies as a message does (`_evaluate_input_policy`). A denial, or an
+  ASK, which no one can approve for a timer, records `skipped` (`timer_policy_denied`)
+  and leaves the `[Denied by policy: …]` reply in the session, as for a message. The
+  run records `succeeded`, or `failed` (`launch_failed`) when no runner can be reached
+  or woken or the runner declines the wake; a firing is never retried, and a
+  repeating timer goes on from its next tick. A tick that lands during a turn joins
+  it, as a message would.
+- **Cancelling.** Deleting the task stops every later firing. A firing already
+  claimed may still arrive.
 - **History.** A timer claims one firing at a time: while its previous run is
   unfinished, a claim changes nothing and a later poll tries again. Otherwise the
   claim first deletes the timer's finished runs, reading at most two through the
@@ -517,13 +501,12 @@ A host that doesn't resolve, such as a broken parent chain, keeps the saved one.
   so a tick's bookkeeping can't race the next claim. Automation lists filter by
   kind in the query, and the automation Inbox never lists timers.
 - **Recovery.** An expired timer startup records `failed` without inspecting the
-  session or resending. So if the server stops, or a session or host read fails,
-  after a one-shot timer's firing is claimed and before it commits, the firing is
-  lost; a repeating timer goes on from its next tick.
-- **Moves during delivery.** The host check comes before the commit, and the runner
-  lookup after it. If the session moves to another replica's host in between, that
-  firing fails (`launch_failed`) and a one-shot is spent; a repeating timer's next
-  firing is handed to the new host.
+  session or resending. So if the server stops, or a read fails, after a one-shot
+  timer's firing is claimed and before it is sent, the firing is lost; a repeating
+  timer goes on from its next tick.
+- **Hosts.** The task keeps the session's host, so the replica that owns it claims
+  every firing. On a server with several replicas, a session that later switches to
+  a host another replica owns gets failed firings, as a continued automation does.
 - **Rollout.** Kind 3 needs this release's migration and code on every replica that
   shares the database: an older binary can't decode a timer row.
 
@@ -635,7 +618,7 @@ These are the defaults, set in the server YAML configuration:
 ```yaml
 scheduled_task_scheduler:
   startup_retry_seconds: 30  # Wait before retrying a failed scheduler start, in either mode
-  poll_seconds: 30       # Time between checks for due tasks and expired startups
+  poll_seconds: 15       # Time between checks for due tasks and expired startups
   renewal_seconds: 30    # Time between startup heartbeats
   lease_seconds: 120     # How long a lease lasts after each renewal
   recovery_seconds: 30   # Time limit for inspecting and recovering one run

@@ -21,7 +21,6 @@ from omnigent.server.scheduled.config import DEFAULT_SCHEDULER_CONFIG, Scheduled
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.schedule import (
     host_ownership_key,
-    is_repeating_timer,
     is_trigger_automation,
     manual_trigger_key,
     next_scheduled_time,
@@ -39,7 +38,6 @@ from omnigent.stores.scheduled_task_store.dispatch import (
     DispatchCursor,
     ScheduledTaskDispatchStore,
     TaskCursor,
-    TimerDelivery,
 )
 
 _logger = logging.getLogger(__name__)
@@ -168,19 +166,12 @@ class StartupLease:
         now: Callable[[], float],
         lease_seconds: int,
         target: str | None = None,
-        wake: Callable[[], None] | None = None,
     ) -> None:
-        """
-        :param wake: Makes this replica's scheduler look for due runs again, e.g.
-            :meth:`PersistentTaskScheduler.wake`; called after a timer firing is handed
-            back, in case this replica also owns its new host.
-        """
         self.run = run
         self._store = store
         self._now = now
         self._lease_seconds = lease_seconds
         self._target = target
-        self._wake = wake
         self._lock = asyncio.Lock()
         self._writes: set[asyncio.Task[None]] = set()
 
@@ -215,46 +206,6 @@ class StartupLease:
 
         await self._transition("starting", conversation_id=conversation_id, committed=log_session)
 
-    async def begin_timer_delivery(self, conversation_id: str, *, consume: bool) -> bool:
-        """Commit a timer firing for delivery into *conversation_id*, unless it was cancelled.
-
-        :param conversation_id: The session the timer wakes, e.g. ``"conv_abc123"``.
-        :param consume: Also delete a one-shot timer, which this firing spends.
-        :returns: ``False`` when the timer was cancelled first; then nothing may be sent.
-        :raises StartupLeaseLost: If the run's lease no longer matches.
-        """
-        delivery: TimerDelivery | None = None
-
-        def commit() -> ScheduledTaskRun | None:
-            nonlocal delivery
-            delivery = self._store.begin_timer_delivery(
-                self.run, now=self._now, conversation_id=conversation_id, consume=consume
-            )
-            return None if delivery is None else delivery.run
-
-        await self._write(commit)
-        assert delivery is not None
-        return delivery.deliver
-
-    async def hand_back_timer_firing(self, host_id: str) -> None:
-        """Return this timer firing unsent, for the replica that owns *host_id* to claim.
-
-        The run records ``skipped``: ``timer_host_moved``, or ``timer_cancelled`` when the
-        timer was cancelled first, which leaves nothing to claim.
-
-        :param host_id: The host the timer's session now routes through, e.g. ``"host_2"``.
-        :raises StartupLeaseLost: If the run's lease no longer matches.
-        """
-        finished_at = self._now()
-        await self._write(
-            lambda: self._store.hand_back_timer_firing(self.run, now=self._now, host_id=host_id),
-            committed=lambda _previous: self._log_startup_ended(
-                "skipped", error_code=self.run.error_code, finished_at=finished_at
-            ),
-        )
-        if self._wake is not None and self.run.error_code == "timer_host_moved":
-            self._wake()
-
     async def finish(
         self,
         status: str,
@@ -278,43 +229,32 @@ class StartupLease:
             )
 
         finished_at = self._now()
+
+        def log_outcome(_previous: ScheduledTaskRun) -> None:
+            _logger.info(
+                "Scheduled run %s startup ended with status %s",
+                self.run.id,
+                status,
+                extra=_run_event(
+                    "scheduled_run_startup_ended",
+                    self.run,
+                    target=self._target,
+                    outcome=status,
+                    error_code=error_code,
+                    failure_stage=failure_stage or startup_failure_stage(error_code),
+                    startup_delay_seconds=_seconds(finished_at - self.run.scheduled_at),
+                    prompt_delay_seconds=_seconds(finished_at - self.run.scheduled_at)
+                    if status in ("running", "succeeded")
+                    else None,
+                ),
+            )
+
         await self._transition(
             status,
             conversation_id=conversation_id,
             error=error,
             error_code=error_code,
-            committed=lambda _previous: self._log_startup_ended(
-                status,
-                error_code=error_code,
-                failure_stage=failure_stage,
-                finished_at=finished_at,
-            ),
-        )
-
-    def _log_startup_ended(
-        self,
-        status: str,
-        *,
-        error_code: str | None,
-        finished_at: float,
-        failure_stage: str | None = None,
-    ) -> None:
-        _logger.info(
-            "Scheduled run %s startup ended with status %s",
-            self.run.id,
-            status,
-            extra=_run_event(
-                "scheduled_run_startup_ended",
-                self.run,
-                target=self._target,
-                outcome=status,
-                error_code=error_code,
-                failure_stage=failure_stage or startup_failure_stage(error_code),
-                startup_delay_seconds=_seconds(finished_at - self.run.scheduled_at),
-                prompt_delay_seconds=_seconds(finished_at - self.run.scheduled_at)
-                if status in ("running", "succeeded")
-                else None,
-            ),
+            committed=log_outcome,
         )
 
     def _when_writes_settle(self, callback: Callable[[], None]) -> None:
@@ -420,9 +360,8 @@ FireIdentity = Callable[[ScheduledTask], AbstractAsyncContextManager[object]]
 DispatchEnabled = Callable[[], bool]
 # Read before each wait between polls.
 PollInterval = Callable[[], float]
-# Given the current time, when a busy session should next be checked, skipping this
-# occurrence unrecorded; ``None`` sends it now. Asked only for trigger automations and
-# repeating timers.
+# Given the current time, when a trigger automation's busy session should next be checked,
+# skipping this poll unrecorded; ``None`` polls now. Asked only for trigger automations.
 BusyUntil = Callable[[ScheduledTask, int], Awaitable[int | None]]
 
 # With a busy check, the server tries to poll a trigger automation this often instead of
@@ -534,25 +473,16 @@ class PersistentTaskScheduler:
         self._recovery_cursor: DispatchCursor | None = None
         self._recovery_cutoff: int | None = None
         self._pending_cursor: TaskCursor | None = None
-        self._wake = asyncio.Event()
-        # The newest due-task scan's cutoff: later runs are ones that scan did not consider.
-        self._due_scan_cutoff: int | None = None
 
     @property
     def is_started(self) -> bool:
         return self._loop is not None
-
-    def wake(self) -> None:
-        """Look for due runs now, e.g. after a timer was set to fire before the next poll."""
-        self._wake.set()
 
     async def start(self) -> None:
         """Start a self-retrying poll loop; a DB outage must not disable scheduling."""
         async with self._poll_lock:
             if self._loop is None:
                 self._stopped = False
-                # Made on the loop that waits on it, which a restart may change.
-                self._wake = asyncio.Event()
                 self._loop = asyncio.create_task(self._run(), name="scheduled-task-poller")
 
     async def stop(self) -> None:
@@ -574,7 +504,6 @@ class PersistentTaskScheduler:
         self._recovery_cursor = None
         self._recovery_cutoff = None
         self._pending_cursor = None
-        self._due_scan_cutoff = None
 
     async def _run(self) -> None:
         while True:
@@ -585,46 +514,7 @@ class PersistentTaskScheduler:
                     "Could not check scheduled tasks for work; will check again on the next poll",
                     extra=debug_event("scheduled_task_operation_failed", operation="poll"),
                 )
-            await self._claim_due_until(self._now() + self._next_poll_delay())
-
-    async def _claim_due_until(self, poll_at: float) -> None:
-        """Until the next full poll, claim saved runs as they come due, such as a timer's.
-
-        Wakes at the soonest saved run time or on :meth:`wake`. Recovery, initialization
-        and Run now requests keep the poll interval.
-        """
-        while True:
-            # Cleared before the read, so a wake for a run saved meanwhile is kept.
-            self._wake.clear()
-            now = self._now()
-            if now >= poll_at:
-                return
-            # Read past the last scan, not past now: a run that came due since then,
-            # say while that scan ran, starts at once instead of at the next poll.
-            after = int(now) if self._due_scan_cutoff is None else self._due_scan_cutoff
-            try:
-                due_at = await asyncio.to_thread(self._store.next_due_at, after)
-            except Exception:
-                _logger.exception("Could not read the next due run time; waiting for the poll")
-                due_at = None
-            wait_until = poll_at if due_at is None else min(poll_at, due_at)
-            with contextlib.suppress(TimeoutError):
-                async with asyncio.timeout(max(0.0, wait_until - self._now())):
-                    await self._wake.wait()
-            if self._now() >= poll_at:
-                return
-            async with self._poll_lock:
-                if self._stopped or not self._dispatching():
-                    # Leave runs already due to the poll, which checks dispatch too.
-                    self._due_scan_cutoff = int(self._now())
-                    continue
-                try:
-                    await self._claim_due()
-                except Exception:
-                    _logger.exception(
-                        "Could not claim due scheduled runs; will check again on the next poll",
-                        extra=debug_event("scheduled_task_operation_failed", operation="poll"),
-                    )
+            await asyncio.sleep(self._next_poll_delay())
 
     def _next_poll_delay(self) -> float:
         """Return the live poll interval, or the configured one if it is unusable."""
@@ -785,15 +675,13 @@ class PersistentTaskScheduler:
         return occurrence
 
     async def _skip_busy_occurrence(self, task: ScheduledTask, *, now: int, next_run: int) -> bool:
-        """Defer a due trigger poll or timer tick while its session is busy, recording no run.
+        """Move a busy trigger automation's due poll to its next check, recording no run.
 
         The next check is no later than *next_run*, the schedule's next occurrence. Returns
         True when this occurrence must not be claimed. A failed busy check returns False, so
         the occurrence is sent as it would be without skipping.
         """
-        if self._busy_until is None or not (
-            is_trigger_automation(task) or is_repeating_timer(task)
-        ):
+        if self._busy_until is None or not is_trigger_automation(task):
             return False
         assert task.next_run_at is not None
         try:
@@ -983,7 +871,6 @@ class PersistentTaskScheduler:
 
     async def _claim_due(self) -> None:
         cutoff = int(self._now())
-        self._due_scan_cutoff = cutoff
         cursor: DispatchCursor | None = None
         while not self._stopped and len(self._startups) < self._max_startups:
             tasks = await asyncio.to_thread(
@@ -1139,7 +1026,6 @@ class PersistentTaskScheduler:
             now=self._now,
             lease_seconds=self._lease_seconds,
             target=task.execution_target,
-            wake=self.wake,
         )
         # Logged only if startup ends without a final status from the executor.
         outcome = "unfinished"

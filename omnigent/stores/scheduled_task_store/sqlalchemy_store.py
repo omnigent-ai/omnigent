@@ -18,7 +18,6 @@ from sqlalchemy import (
     asc,
     delete,
     desc,
-    func,
     or_,
     select,
     tuple_,
@@ -89,7 +88,6 @@ from omnigent.stores.scheduled_task_store.dispatch import (
     DeletedTaskCursor,
     DispatchCursor,
     TaskCursor,
-    TimerDelivery,
 )
 
 _logger = logging.getLogger(__name__)
@@ -142,18 +140,6 @@ def _purge_finished_deleted_task(
     )
     if remaining is None:
         session.delete(task)
-
-
-def _holds_live_startup_lease(
-    row: SqlScheduledTaskRun, run: ScheduledTaskRun, timestamp: int
-) -> bool:
-    """Whether *row* is still *run*'s startup, under the same lease, unexpired at *timestamp*."""
-    return (
-        row.status == encode_scheduled_task_run_status("starting")
-        and row.lease_expires_at is not None
-        and row.lease_expires_at == run.lease_expires_at
-        and row.lease_expires_at > timestamp
-    )
 
 
 def _clear_timer_history(session: Session, task: SqlScheduledTask) -> bool:
@@ -1583,16 +1569,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 stmt = stmt.where(self._cursor_after(columns, after))
             return [_to_entity(row) for row in session.scalars(stmt)]
 
-    def next_due_at(self, after: int) -> int | None:
-        """Seek the due index for the soonest saved run later than *after*. See protocol."""
-        with self._session("read_next_due_time") as session:
-            return session.scalar(
-                select(func.min(SqlScheduledTask.next_run_at)).where(
-                    SqlScheduledTask.state == encode_scheduled_task_state("active"),
-                    SqlScheduledTask.next_run_at > after,
-                )
-            )
-
     def claim_scheduled_run(
         self,
         task: ScheduledTask,
@@ -1911,78 +1887,3 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return result
 
         return run_write_transaction(self._session_immediate, "finish_startup", write)
-
-    def begin_timer_delivery(
-        self,
-        run: ScheduledTaskRun,
-        *,
-        now: Callable[[], float],
-        conversation_id: str,
-        consume: bool,
-    ) -> TimerDelivery | None:
-        """Lock the task, then the run, as deleting does. See protocol."""
-        if run.workspace_id != current_workspace_id():
-            return None
-
-        def write(session: Session) -> TimerDelivery | None:
-            task = session.get(
-                SqlScheduledTask, (run.workspace_id, run.scheduled_task_id), with_for_update=True
-            )
-            row = session.get(
-                SqlScheduledTaskRun, (run.workspace_id, run.id), with_for_update=True
-            )
-            # Read once the locks are held, so a lease that lapsed meanwhile is refused.
-            timestamp = int(now())
-            if row is None or not _holds_live_startup_lease(row, run, timestamp):
-                return None
-            if task is None or task.state == encode_scheduled_task_state("deleted"):
-                return TimerDelivery(run=_run_to_entity(row), deliver=False)
-            if consume:
-                # A one-shot timer is spent once its firing goes out; its run then
-                # removes it, so a later cancel finds nothing left to stop.
-                task.state = encode_scheduled_task_state("deleted")
-                task.next_run_at = None
-                task.updated_at = timestamp
-            row.conversation_id = conversation_id
-            return TimerDelivery(run=_run_to_entity(row), deliver=True)
-
-        return run_write_transaction(self._session_immediate, "begin_timer_delivery", write)
-
-    def hand_back_timer_firing(
-        self, run: ScheduledTaskRun, *, now: Callable[[], float], host_id: str
-    ) -> ScheduledTaskRun | None:
-        """Lock the task, then the run, as deleting does. See protocol."""
-        if run.workspace_id != current_workspace_id():
-            return None
-
-        def write(session: Session) -> ScheduledTaskRun | None:
-            task = session.get(
-                SqlScheduledTask, (run.workspace_id, run.scheduled_task_id), with_for_update=True
-            )
-            row = session.get(
-                SqlScheduledTaskRun, (run.workspace_id, run.id), with_for_update=True
-            )
-            timestamp = int(now())
-            if row is None or not _holds_live_startup_lease(row, run, timestamp):
-                return None
-            row.status = encode_scheduled_task_run_status("skipped")
-            row.lease_expires_at = None
-            row.finished_at = timestamp
-            if task is None or task.state == encode_scheduled_task_state("deleted"):
-                row.error = "the timer was cancelled before this firing went out"
-                row.error_code = "timer_cancelled"
-                result = _run_to_entity(row)
-                _purge_finished_deleted_task(session, task, row)
-                return result
-            row.error = f"the timer's session moved to host {host_id}"
-            row.error_code = "timer_host_moved"
-            task.host_id = host_id
-            # Later than the claimed occurrence and any scan already under way, so the
-            # new claim gets its own trigger key and an early wake finds it.
-            task.next_run_at = timestamp + 1
-            if task.state == encode_scheduled_task_state("completed"):
-                task.state = encode_scheduled_task_state("active")
-            task.updated_at = timestamp
-            return _run_to_entity(row)
-
-        return run_write_transaction(self._session_immediate, "hand_back_timer_firing", write)

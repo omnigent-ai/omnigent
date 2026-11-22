@@ -90,7 +90,6 @@ from omnigent.native.permission_modes import (
     APPROVAL_SKIPPING_PERMISSION_MODES,
     PERMISSION_LAUNCH_ARGS,
 )
-from omnigent.runner.routing import routing_host_id, routing_host_session
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -182,8 +181,6 @@ from omnigent.stores.conversation_store import (
 from omnigent.util.session_lifecycle import is_session_closed
 
 if TYPE_CHECKING:
-    import httpx
-
     from omnigent.server.managed_hosts import ManagedLaunch, ManagedLaunchTracker
 
 _logger = logging.getLogger(__name__)
@@ -598,9 +595,7 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
     :data:`BUSY_RECHECK_SECONDS` from now while it shows as running (a turn in progress,
     or waiting on an approval or question), has an approval or question pending, or the
     previous poll is still being delivered. It never waits past
-    :data:`BUSY_SKIP_MAX_SECONDS` after the latest poll went out. A repeating timer's
-    tick waits the same way while the session is busy, including its first tick, which
-    counts the limit from when the timer was set, but not for an idle session's quiet.
+    :data:`BUSY_SKIP_MAX_SECONDS` after the latest poll went out.
     """
 
     async def busy_until(task: ScheduledTask, now: int) -> int | None:
@@ -627,17 +622,13 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
         delivering = latest is not None and latest.status in ("scheduled", "starting")
         if running or waiting or delivering:
             until = now + BUSY_RECHECK_SECONDS
-        elif task.kind == "timer":
-            # An idle session takes a timer's tick at once; only triggers wait for quiet.
-            return None
         else:
             until = session.updated_at + BUSY_QUIET_SECONDS
         if until <= now:
             return None
         # The latest poll went out at the task's last firing or when its newest run started,
-        # whichever is later; either can be later than the poll was due. A timer never
-        # records a last firing, and its first tick counts from when the timer was set.
-        sent_times = [task.created_at if task.kind == "timer" else task.last_run_at]
+        # whichever is later; either can be later than the poll was due.
+        sent_times = [task.last_run_at]
         if latest is not None:
             sent_times.append(
                 latest.fired_at if latest.fired_at is not None else latest.scheduled_at
@@ -2692,164 +2683,18 @@ def _make_reuse_dispatch(deps: FireDeps) -> LaunchDispatch:
                 # A sandbox automation's prompt never goes to a runner outside its
                 # sandbox, such as a local one a hostless session may have.
                 raise RuntimeError(f"session {conv.id} is not bound to the automation's sandbox")
-            runner_client = None
-            if conv.kind == "sub_agent":
-                runner_client, conv = await _sub_agent_runner(deps, task, conv)
-            if runner_client is None:
-                runner_client, conv = await _side_chat_runner(deps, task, conv)
-            if runner_client is None:
-                runner_client, conv = await ensure_runner_connected(
-                    session_id=conv.id,
-                    conv=conv,
-                    app_state=deps.app_state,
-                    conversation_store=deps.conversation_store,
-                    runner_router=deps.runner_router,
-                )
+            runner_client, conv = await ensure_runner_connected(
+                session_id=conv.id,
+                conv=conv,
+                app_state=deps.app_state,
+                conversation_store=deps.conversation_store,
+                runner_router=deps.runner_router,
+            )
             if runner_client is None:
                 raise RuntimeError(f"no runner can be reached or woken for session {conv.id}")
         await _send_prompt(deps, conv, runner_client, task)
 
     return _dispatch
-
-
-async def _sub_agent_runner(
-    deps: FireDeps, task: ScheduledTask, conv: Conversation
-) -> tuple[httpx.AsyncClient | None, Conversation]:
-    """Find the runner a sub-agent shares with its parent, as a message to it would.
-
-    It tries the sub-agent's current runner, then its parent's live one, then wakes
-    the session that owns their host, before anything launches it a runner of its own.
-
-    :param deps: The fire's stores and runner registries.
-    :param task: The timer waking *conv*.
-    :param conv: The sub-agent session.
-    :returns: The runner's client and the session as last read, or ``None`` and *conv*.
-    """
-    from omnigent.server.routes.sessions import _get_runner_client
-
-    runner_client = await _get_runner_client(conv.id, deps.runner_router, conversation=conv)
-    if runner_client is not None:
-        return runner_client, conv
-    runner_client, conv = await _follow_parent_runner(deps, conv)
-    if runner_client is not None:
-        return runner_client, conv
-    return await _wake_host_owner(deps, task, conv)
-
-
-async def _side_chat_runner(
-    deps: FireDeps, task: ScheduledTask, conv: Conversation
-) -> tuple[httpx.AsyncClient | None, Conversation]:
-    """Find the runner a side chat shares with its source, as a message to it would.
-
-    A side chat has no host of its own: its source's runner is relaunched on the
-    source's host if needed, while a timer may still wake the source.
-
-    :param deps: The fire's stores and runner registries.
-    :param task: The timer waking *conv*.
-    :param conv: The session, e.g. a side chat whose source's runner idled out.
-    :returns: The runner's client and the side chat as last read, or ``None`` and
-        *conv* when it is not a side chat or its source's runner can't be recovered.
-    """
-    from omnigent.server.routes._sessions.orchestration import (
-        _recover_side_chat_runner_via_source,
-        _side_chat_source_id,
-    )
-    from omnigent.server.routes.sessions import _ensure_runner_relay_ready, _get_runner_client
-
-    source_id = _side_chat_source_id(conv)
-    if source_id is None:
-        return None, conv
-    runner_client = await _get_runner_client(conv.id, deps.runner_router, conversation=conv)
-    if runner_client is not None:
-        return runner_client, conv
-    # Recovery relaunches the source's runner, so the source must be one a timer may wake.
-    source = await asyncio.to_thread(deps.conversation_store.get_conversation, source_id)
-    if await _timer_session_problem(deps, task, source) is not None:
-        return None, conv
-    runner_client, conv = await _recover_side_chat_runner_via_source(
-        conv,
-        app_state=deps.app_state,
-        conversation_store=deps.conversation_store,
-        runner_router=deps.runner_router,
-        user_id=task.user_id or RESERVED_USER_LOCAL,
-        permission_store=deps.permission_store,
-    )
-    if runner_client is None:
-        return None, conv
-    # The side chat's output relay still follows the stopped runner.
-    await _ensure_runner_relay_ready(
-        conv.id, conv.runner_id, runner_client, deps.conversation_store, conversation=conv
-    )
-    return runner_client, conv
-
-
-async def _wake_host_owner(
-    deps: FireDeps, task: ScheduledTask, conv: Conversation
-) -> tuple[httpx.AsyncClient | None, Conversation]:
-    """Relaunch an exited shared runner through the session that owns its host.
-
-    A sub-agent with no host of its own can't relaunch the runner it shares; the
-    ancestor that owns the host can, while a timer may still wake it: its owner may
-    send to it, and its permission mode asks for approval.
-
-    :param deps: The fire's stores and runner registries.
-    :param task: The timer waking *conv*.
-    :param conv: The sub-agent session, e.g. one whose shared runner idled out.
-    :returns: The new runner's client and the re-read session, or ``None`` and *conv*.
-    """
-    from omnigent.server.routes.sessions import ensure_runner_connected
-
-    owner = await asyncio.to_thread(routing_host_session, conv, deps.conversation_store)
-    if owner is None or owner.id == conv.id:
-        return None, conv
-    if await _timer_session_problem(deps, task, owner) is not None:
-        return None, conv
-    owner_client, _ = await ensure_runner_connected(
-        session_id=owner.id,
-        conv=owner,
-        app_state=deps.app_state,
-        conversation_store=deps.conversation_store,
-        runner_router=deps.runner_router,
-    )
-    if owner_client is None:
-        return None, conv
-    return await _follow_parent_runner(deps, conv)
-
-
-async def _follow_parent_runner(
-    deps: FireDeps, conv: Conversation
-) -> tuple[httpx.AsyncClient | None, Conversation]:
-    """Move a sub-agent session to its parent's live runner, as a message to it would.
-
-    A sub-agent keeps the runner its parent had when it was created, so the binding
-    goes stale once the parent moves to another runner. Only agent timers continue
-    sub-agent sessions.
-
-    :param deps: The fire's stores and runner registries.
-    :param conv: The sub-agent session, e.g. one whose ``runner_id`` names a runner
-        that has stopped.
-    :returns: The live runner's client and the re-read session, or ``None`` and *conv*
-        when no ancestor has a live runner.
-    """
-    from omnigent.server.routes.sessions import (
-        _ensure_runner_relay_ready,
-        _heal_subagent_runner_binding_via_parent,
-    )
-
-    runner_client = await _heal_subagent_runner_binding_via_parent(
-        conv, deps.runner_router, deps.tunnel_registry, deps.conversation_store
-    )
-    if runner_client is None:
-        return None, conv
-    healed = await asyncio.to_thread(deps.conversation_store.get_conversation, conv.id)
-    if healed is None:
-        raise RuntimeError(f"session {conv.id} was deleted while its runner was found")
-    # The session's output relay still follows the stopped runner; listen to the new
-    # one before the prompt goes out, or the turn's reply is lost.
-    await _ensure_runner_relay_ready(
-        healed.id, healed.runner_id, runner_client, deps.conversation_store, conversation=healed
-    )
-    return runner_client, healed
 
 
 async def _send_prompt(
@@ -3308,8 +3153,7 @@ async def _timer_session_problem(
 ) -> str | None:
     """Why a timer can no longer wake *conv*, its session, or ``None`` if it can.
 
-    A timer selects no permission mode of its own, so, like a continued automation that
-    doesn't select one, it never wakes a session whose mode skips approval.
+    A timer wakes the session in whatever permission mode the session is in.
     """
     if conv is None:
         return "the session no longer exists"
@@ -3327,12 +3171,6 @@ async def _timer_session_problem(
         conversation=conv,
     ):
         return "the timer's owner can no longer send messages to the session"
-    skipping_mode = session_approval_skipping_mode(conv)
-    if skipping_mode is not None:
-        return (
-            f"the session is in permission mode {skipping_mode!r}, which skips approval, "
-            "so a timer can't wake it unattended"
-        )
     return None
 
 
@@ -3384,21 +3222,14 @@ async def _check_timer_wake(deps: FireDeps, task: ScheduledTask, conv: Conversat
 
 
 async def _fire_timer(
-    deps: FireDeps,
-    task: ScheduledTask,
-    lease: StartupLease,
-    recorder: _ClaimedRunRecorder,
-    dispatch: LaunchDispatch,
+    deps: FireDeps, task: ScheduledTask, recorder: _ClaimedRunRecorder, dispatch: LaunchDispatch
 ) -> None:
-    """Wake a timer's session with its hidden firing message, unless it was cancelled.
+    """Wake a timer's session with its hidden firing message.
 
-    A session that was deleted or archived, or that the timer's owner can no longer
-    send to, stops the timer instead: it is never woken or recreated. A session that
-    now routes through another host, such as a side chat whose source moved, gets the
-    firing handed back unsent, for that host's replica to claim. The firing is
-    committed under the task lock before anything is sent, so a cancel that lands
-    first suppresses it; a committed firing goes out even if a cancel follows, unless
-    the session's input policies refuse the wake, as they would a message.
+    A session that was deleted, archived or closed, or that the timer's owner can no
+    longer send to, stops the timer instead: it is never woken or recreated. The
+    session's input policies check the wake as they would a message. A cancel stops
+    later firings; one already on its way may still arrive.
     """
     session_id = task.session_id
     assert session_id is not None  # a timer always names its session
@@ -3411,20 +3242,6 @@ async def _fire_timer(
         await asyncio.to_thread(deps.scheduled_task_store.delete, task.id)
         return
     assert conv is not None
-    # An unresolved host (None) keeps the saved one: it may only mean an unreadable chain.
-    host_id = await asyncio.to_thread(routing_host_id, conv, deps.conversation_store)
-    if host_id is not None and host_id != task.host_id:
-        _logger.info("scheduled fire: timer %s handed to host %s", task.id, host_id)
-        await lease.hand_back_timer_firing(host_id)
-        return
-    if not await lease.begin_timer_delivery(conv.id, consume=is_one_time_rule(task.rrule)):
-        await recorder.finish(
-            "skipped",
-            conversation_id=conv.id,
-            error="the timer was cancelled before this firing went out",
-            error_code="timer_cancelled",
-        )
-        return
     try:
         await dispatch(conv, task)
     except TimerWakeRefused as refused:
@@ -3508,7 +3325,6 @@ class ClaimedRunExecutor:
                 await _fire_timer(
                     self._deps,
                     task,
-                    lease,
                     recorder,
                     self._fire_dispatch.reuse or _make_reuse_dispatch(self._deps),
                 )

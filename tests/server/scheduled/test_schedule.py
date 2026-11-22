@@ -9,7 +9,6 @@ from omnigent.entities import ScheduledTask
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError
 from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
-    is_repeating_timer,
     is_trigger_automation,
     next_scheduled_time,
     occurrence_host_id,
@@ -221,7 +220,6 @@ def test_timer_firings_fall_on_whole_intervals_from_the_anchor(
         session_mode="continue",
     )
     assert next_scheduled_time(timer, after) == expected
-    assert is_repeating_timer(timer) is repeat
 
 
 def test_timer_rules_round_trip_their_interval() -> None:

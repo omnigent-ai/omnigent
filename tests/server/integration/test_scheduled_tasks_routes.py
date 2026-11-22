@@ -7242,10 +7242,10 @@ async def test_a_clones_routing_host_must_be_the_originals(
 @pytest.mark.parametrize(
     "seconds,repeat,rule,interval",
     [
-        (90.5, True, "FREQ=SECONDLY;INTERVAL=91", 91),
-        (0, False, "FREQ=SECONDLY;INTERVAL=1;COUNT=1", None),
+        (150.5, True, "FREQ=SECONDLY;INTERVAL=151", 151),
+        (120, False, "FREQ=SECONDLY;INTERVAL=120;COUNT=1", None),
     ],
-    ids=["repeating", "immediate_one_shot"],
+    ids=["repeating", "one_shot"],
 )
 async def test_a_timer_is_one_hidden_task_its_session_can_cancel(
     auth_app: FastAPI,
@@ -7271,7 +7271,14 @@ async def test_a_timer_is_one_hidden_task_its_session_can_cancel(
     assert created.status_code == 201, created.text
     timer = created.json()
     timer_id = timer["timer_id"]
-    assert (timer["status"], timer["interval_seconds"], timer["repeat"], timer["note"]) == (
+    assert (
+        timer["durable"],
+        timer["status"],
+        timer["interval_seconds"],
+        timer["repeat"],
+        timer["note"],
+    ) == (
+        True,
         "scheduled",
         interval,
         repeat,
@@ -7336,12 +7343,12 @@ async def test_timer_routes_keep_to_the_callers_own_session(
     _make_user(db_uri, "bob@example.com")
     outsider = await auth_client.post(
         f"/v1/sessions/{session_id}/timers",
-        json={"seconds": 60},
+        json={"seconds": 300},
         headers=_headers("bob@example.com"),
     )
     assert outsider.status_code == 404, outsider.text
     created = await auth_client.post(
-        f"/v1/sessions/{session_id}/timers", json={"seconds": 60}, headers=_headers()
+        f"/v1/sessions/{session_id}/timers", json={"seconds": 300}, headers=_headers()
     )
     timer_id = created.json()["timer_id"]
     automation_id = await _create_task(
@@ -7362,7 +7369,7 @@ async def test_timer_routes_keep_to_the_callers_own_session(
     assert (tasks.get(timer_id).state, tasks.get(automation_id).state) == ("active", "active")
     archived = _owned_session(db_uri, archived=True)
     late = await auth_client.post(
-        f"/v1/sessions/{archived}/timers", json={"seconds": 60}, headers=_headers()
+        f"/v1/sessions/{archived}/timers", json={"seconds": 300}, headers=_headers()
     )
     assert late.status_code == 400, late.text
     assert "archived" in late.text
@@ -7377,17 +7384,16 @@ async def test_timer_routes_keep_to_the_callers_own_session(
     ],
     ids=["mode-label", "launch-flag"],
 )
-async def test_a_session_whose_mode_skips_approval_cant_set_timers(
+async def test_a_session_whose_mode_skips_approval_can_set_timers(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, fields: dict
 ) -> None:
     session_id = _owned_session(db_uri, **fields)
-    refused = await auth_client.post(
-        f"/v1/sessions/{session_id}/timers", json={"seconds": 60}, headers=_headers()
+    created = await auth_client.post(
+        f"/v1/sessions/{session_id}/timers", json={"seconds": 300}, headers=_headers()
     )
-    # A timer would wake the session unattended in that mode.
-    assert refused.status_code == 400, refused.text
-    assert "which skips approval" in refused.text
-    assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
+    # A timer wakes the session in whatever mode it is in, as the agent's own runner would.
+    assert created.status_code == 201, created.text
+    assert created.json()["durable"] is True
 
 
 @pytest.mark.parametrize("auth_app", [True], indirect=True)
@@ -7402,7 +7408,7 @@ async def test_a_closed_session_cant_set_timers(
     # Closed without being archived, so it refuses messages but is still listed.
     session_id = _owned_session(db_uri, **fields)
     refused = await auth_client.post(
-        f"/v1/sessions/{session_id}/timers", json={"seconds": 60}, headers=_headers()
+        f"/v1/sessions/{session_id}/timers", json={"seconds": 300}, headers=_headers()
     )
     assert refused.status_code == 400, refused.text
     assert "closed to new messages" in refused.text
@@ -7411,7 +7417,7 @@ async def test_a_closed_session_cant_set_timers(
 
 @pytest.mark.parametrize("auth_app", [True], indirect=True)
 @pytest.mark.parametrize("shape", ["sub_agent", "side_chat"])
-async def test_a_sub_agent_or_side_chat_timer_routes_to_the_host_it_shares(
+async def test_a_sub_agent_or_side_chat_timer_is_left_to_its_runner(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, shape: str
 ) -> None:
     from omnigent.stores.conversation_store import (
@@ -7431,13 +7437,16 @@ async def test_a_sub_agent_or_side_chat_timer_routes_to_the_host_it_shares(
             labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: parent_id},
         )
     )
-    created = await auth_client.post(
-        f"/v1/sessions/{child_id}/timers", json={"seconds": 60}, headers=_headers()
+    reply = await auth_client.post(
+        f"/v1/sessions/{child_id}/timers", json={"seconds": 300}, headers=_headers()
     )
-    assert created.status_code == 201, created.text
-    task = SqlAlchemyScheduledTaskStore(db_uri).get(created.json()["timer_id"])
-    # Its runs go to the replica holding that session's host, and so the shared runner.
-    assert (task.session_id, task.host_id) == (child_id, _HOST_ID)
+    # The runner keeps it in memory instead, and warns the agent.
+    assert reply.status_code == 200, reply.text
+    assert reply.json() == {
+        "durable": False,
+        "reason": "a sub-agent's or side chat's timers aren't saved",
+    }
+    assert SqlAlchemyScheduledTaskStore(db_uri).list(kinds=None) == []
 
 
 @pytest.mark.parametrize("auth_app", [True], indirect=True)
@@ -7447,6 +7456,7 @@ async def test_a_sub_agent_or_side_chat_timer_routes_to_the_host_it_shares(
         ({"seconds": -1}, "seconds must be non-negative"),
         ({"seconds": True}, "seconds must be a number"),
         ({"seconds": 1_000_001}, "seconds must be <="),
+        ({"seconds": 119}, "saves timers of at least 120 seconds"),
         ({"seconds": 0, "repeat": True}, "seconds must be > 0 when repeat is true"),
         ({"seconds": 5, "note": 5}, "note must be a string"),
         ({"seconds": 5, "every": 5}, "unknown timer fields: every"),
@@ -7484,7 +7494,7 @@ async def test_timers_need_the_database_scheduler_and_their_feature(
         info = (await client.get("/v1/info", headers=_headers())).json()
         assert info["session_timers"] is False
         resp = await client.post(
-            f"/v1/sessions/{session_id}/timers", json={"seconds": 60}, headers=_headers()
+            f"/v1/sessions/{session_id}/timers", json={"seconds": 300}, headers=_headers()
         )
     assert resp.status_code == 400, resp.text
     assert "database scheduler and the session_timers feature" in resp.text
@@ -7524,7 +7534,7 @@ async def test_the_automations_gate_does_not_hide_timers(
         hidden = await client.get("/v1/scheduled-tasks", headers=_headers())
         assert hidden.status_code == 404, hidden.text
         created = await client.post(
-            f"/v1/sessions/{session_id}/timers", json={"seconds": 60}, headers=_headers()
+            f"/v1/sessions/{session_id}/timers", json={"seconds": 300}, headers=_headers()
         )
         assert created.status_code == 201, created.text
         cancelled = await client.delete(

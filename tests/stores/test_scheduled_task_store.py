@@ -3213,83 +3213,6 @@ def test_claiming_a_timer_keeps_only_its_newest_outcome(
     assert store.get(timer.id).next_run_at == _TIMER_FIRST_RUN + 15
 
 
-@pytest.mark.parametrize("repeat", [False, True], ids=["one_shot", "repeating"])
-def test_a_cancel_before_the_commit_suppresses_the_firing(
-    store: SqlAlchemyScheduledTaskStore, repeat: bool
-) -> None:
-    timer = _timer(store, repeat=repeat)
-    run = _claim_timer(store, timer)
-    assert store.delete(timer.id)
-    delivery = store.begin_timer_delivery(
-        run, now=lambda: _TIMER_FIRST_RUN, conversation_id=_uid("conv"), consume=not repeat
-    )
-    assert delivery is not None
-    assert delivery.deliver is False
-    assert delivery.run.conversation_id is None
-    # Recording the suppressed run purges the cancelled timer.
-    store.transition_starting_run(
-        run, now=lambda: _TIMER_FIRST_RUN, status="skipped", error_code="timer_cancelled"
-    )
-    assert store.get(timer.id) is None
-
-
-def test_a_committed_repeating_firing_survives_a_cancel_that_stops_the_rest(
-    store: SqlAlchemyScheduledTaskStore,
-) -> None:
-    timer = _timer(store, repeat=True, interval=5)
-    run = _claim_timer(store, timer)
-    delivery = store.begin_timer_delivery(
-        run, now=lambda: _TIMER_FIRST_RUN, conversation_id=_uid("conv"), consume=False
-    )
-    assert delivery is not None and delivery.deliver is True
-    assert delivery.run.conversation_id == _uid("conv")
-    assert store.get(timer.id).state == "active"
-    # The cancel still lands: it stops every later tick.
-    assert store.delete(timer.id)
-    assert store.list_due_tasks(_TIMER_FIRST_RUN + 60) == []
-    store.transition_starting_run(
-        delivery.run,
-        now=lambda: _TIMER_FIRST_RUN,
-        status="succeeded",
-        conversation_id=_uid("conv"),
-    )
-    assert store.get(timer.id) is None
-
-
-def test_a_one_shot_firing_spends_its_timer_when_it_commits(
-    store: SqlAlchemyScheduledTaskStore,
-) -> None:
-    timer = _timer(store)
-    run = _claim_timer(store, timer)
-    assert store.get(timer.id).state == "completed"
-    delivery = store.begin_timer_delivery(
-        run, now=lambda: _TIMER_FIRST_RUN, conversation_id=_uid("conv"), consume=True
-    )
-    assert delivery is not None and delivery.deliver is True
-    # Nothing is left to cancel once the only firing is on its way.
-    assert store.get(timer.id).state == "deleted"
-    assert not store.delete(timer.id)
-    store.transition_starting_run(
-        delivery.run,
-        now=lambda: _TIMER_FIRST_RUN,
-        status="succeeded",
-        conversation_id=_uid("conv"),
-    )
-    assert store.get(timer.id) is None
-    assert store.list_runs(timer.id)[0] == []
-
-
-def test_timer_delivery_needs_the_live_claimed_lease(store: SqlAlchemyScheduledTaskStore) -> None:
-    timer = _timer(store, repeat=True)
-    run = _claim_timer(store, timer)
-    assert run is not None and run.lease_expires_at is not None
-    expired = store.begin_timer_delivery(
-        run, now=lambda: run.lease_expires_at, conversation_id=_uid("conv"), consume=False
-    )
-    assert expired is None
-    assert store.list_runs(timer.id)[0][0].conversation_id is None
-
-
 @pytest.mark.parametrize("status", ["succeeded", "failed", "skipped"])
 def test_a_spent_one_shot_timer_is_removed_once_its_run_finishes(
     store: SqlAlchemyScheduledTaskStore, status: str
@@ -3371,74 +3294,6 @@ def test_a_timer_claim_cleans_up_a_bounded_number_of_runs(
     assert "TEMP B-TREE" not in plan, plan
 
 
-@pytest.mark.parametrize("repeat", [False, True], ids=["one_shot", "repeating"])
-def test_a_handed_back_timer_firing_stays_due_for_its_new_host(
-    store: SqlAlchemyScheduledTaskStore, repeat: bool
-) -> None:
-    timer = _timer(store, repeat=repeat, interval=5)
-    run = _claim_timer(store, timer)
-    handed_back = store.hand_back_timer_firing(
-        run, now=lambda: _TIMER_FIRST_RUN, host_id=_uid("new-host")
-    )
-    assert handed_back is not None
-    assert (handed_back.status, handed_back.error_code, handed_back.lease_expires_at) == (
-        "skipped",
-        "timer_host_moved",
-        None,
-    )
-    # A one-shot's claim reopens: the firing is due again a second later, on the new host.
-    saved = store.get(timer.id)
-    assert (saved.state, saved.host_id, saved.next_run_at) == (
-        "active",
-        _uid("new-host"),
-        _TIMER_FIRST_RUN + 1,
-    )
-    refired = _claim_timer(store, saved)
-    assert refired is not None
-    assert [kept.id for kept in store.list_runs(timer.id)[0]] == [refired.id]
-    assert store.get(timer.id).state == ("active" if repeat else "completed")
-
-
-@pytest.mark.parametrize("repeat", [False, True], ids=["one_shot", "repeating"])
-def test_a_hand_back_never_revives_a_cancelled_timer(
-    store: SqlAlchemyScheduledTaskStore, repeat: bool
-) -> None:
-    timer = _timer(store, repeat=repeat)
-    run = _claim_timer(store, timer)
-    assert store.delete(timer.id)
-    handed_back = store.hand_back_timer_firing(
-        run, now=lambda: _TIMER_FIRST_RUN, host_id=_uid("new-host")
-    )
-    assert handed_back is not None
-    assert (handed_back.status, handed_back.error_code) == ("skipped", "timer_cancelled")
-    # Recording the run purged the cancelled timer, so no host has a firing to claim.
-    assert store.get(timer.id) is None
-    assert store.list_due_tasks(_TIMER_FIRST_RUN + 3600) == []
-
-
-@pytest.mark.parametrize("stale", ["expired", "recovered"])
-def test_a_stale_lease_cannot_hand_a_firing_back(
-    store: SqlAlchemyScheduledTaskStore, stale: str
-) -> None:
-    timer = _timer(store, repeat=True, interval=5)
-    run = _claim_timer(store, timer)
-    assert run is not None and run.lease_expires_at is not None
-    if stale == "recovered":
-        # Recovery fails the expired startup, and the next tick is claimed after it.
-        store.transition_starting_run(
-            run, now=lambda: run.lease_expires_at, status="failed", expired=True
-        )
-        assert _claim_timer(store, store.get(timer.id)) is not None
-    before = store.get(timer.id)
-    runs_before = store.list_runs(timer.id)[0]
-    handed_back = store.hand_back_timer_firing(
-        run, now=lambda: run.lease_expires_at, host_id=_uid("new-host")
-    )
-    assert handed_back is None
-    assert store.get(timer.id) == before
-    assert store.list_runs(timer.id)[0] == runs_before
-
-
 def test_list_reads_only_the_requested_kinds(store: SqlAlchemyScheduledTaskStore) -> None:
     automation = store.create(
         scheduled_task_id=_uid("st_kinds_automation"),
@@ -3517,17 +3372,3 @@ def test_inbox_failures_never_list_timers(store: SqlAlchemyScheduledTaskStore) -
     rest, last_cursor = store.list_inbox_failures(owner_user_id="u", after=cursor, limit=1)
     assert [failure.task_id for failure in rest] == [automation.id]
     assert last_cursor is None
-
-
-def test_next_due_at_reads_the_soonest_later_active_run(
-    store: SqlAlchemyScheduledTaskStore,
-) -> None:
-    now = _TIMER_FIRST_RUN
-    _timer(store, "due_now", repeat=True, first_run_at=now)
-    soonest = _timer(store, "due_soon", repeat=True, first_run_at=now + 10)
-    _timer(store, "due_later", repeat=True, first_run_at=now + 20)
-    paused = _timer(store, "paused_sooner", repeat=True, first_run_at=now + 5)
-    with workspace_scope(paused.workspace_id):
-        store.pause_invalid_schedule(paused)
-    assert store.next_due_at(now) == soonest.next_run_at == now + 10
-    assert store.next_due_at(now + 20) is None

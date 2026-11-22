@@ -2783,11 +2783,10 @@ async def test_a_timer_ticks_on_its_own_interval_below_the_automation_minimum(st
 
 
 @pytest.mark.parametrize("repeat", [True, False], ids=["repeating", "one_shot"])
-async def test_a_busy_session_defers_a_repeating_timer_but_never_a_one_shot(
-    store, repeat: bool
-) -> None:
+async def test_a_busy_session_never_holds_back_a_timer(store, repeat: bool) -> None:
+    """A tick that lands mid-turn joins it, as a message would; only triggers wait."""
     task = _timer_task(
-        store, f"busy_timer_{repeat}", repeat=repeat, interval=60, first_run_at=1_800_000_000
+        store, f"busy_timer_{repeat}", repeat=repeat, interval=120, first_run_at=1_800_000_000
     )
     clock = FakeClock(task.next_run_at)
     fire = AsyncMock()
@@ -2797,98 +2796,5 @@ async def test_a_busy_session_defers_a_repeating_timer_but_never_a_one_shot(
     )
     await scheduler.poll_once()
     await _drain(scheduler)
-    if not repeat:
-        busy.assert_not_awaited()
-        fire.assert_awaited_once()
-        return
-    busy.assert_awaited_once_with(task, task.next_run_at)
-    fire.assert_not_awaited()
-    assert store.list_runs(task.id)[0] == []
-    # The deferred tick is checked again no later than the next one, which replaces it.
-    assert store.get(task.id).next_run_at == task.next_run_at + 60
-
-
-async def test_a_run_due_before_the_next_poll_starts_at_its_time(store) -> None:
-    due = int(time.time()) + 2
-    task = _timer_task(store, "due_soon", repeat=False, interval=2, first_run_at=due)
-    fired = asyncio.Event()
-
-    async def fire(_task, _lease) -> None:
-        fired.set()
-
-    # The hour-long poll would leave the run for an hour after the first poll.
-    scheduler = PersistentTaskScheduler(
-        store, fire, AsyncMock(return_value=None), poll_seconds=3600
-    )
-    await scheduler.start()
-    try:
-        await asyncio.wait_for(fired.wait(), 10)
-    finally:
-        await scheduler.stop()
-    [run] = store.list_runs(task.id)[0]
-    assert due <= run.fired_at <= due + 2
-
-
-async def test_wake_looks_again_for_a_run_saved_after_the_last_read(store, monkeypatch) -> None:
-    read = threading.Event()
-    read_next_due = store.next_due_at
-
-    def next_due_at(after: int) -> int | None:
-        due_at = read_next_due(after)
-        read.set()
-        return due_at
-
-    monkeypatch.setattr(store, "next_due_at", next_due_at)
-    fired = asyncio.Event()
-
-    async def fire(_task, _lease) -> None:
-        fired.set()
-
-    scheduler = PersistentTaskScheduler(
-        store, fire, AsyncMock(return_value=None), poll_seconds=3600
-    )
-    await scheduler.start()
-    try:
-        # The loop read that nothing is due, so it would wait out its hour-long poll.
-        assert await asyncio.to_thread(read.wait, 10)
-        due = int(time.time()) + 2
-        task = _timer_task(store, "saved_later", repeat=False, interval=2, first_run_at=due)
-        scheduler.wake()
-        await asyncio.wait_for(fired.wait(), 10)
-    finally:
-        await scheduler.stop()
-    [run] = store.list_runs(task.id)[0]
-    assert due <= run.fired_at <= due + 2
-
-
-async def test_a_run_that_comes_due_during_a_scan_still_starts_before_the_next_poll(
-    store, monkeypatch
-) -> None:
-    """The second can turn after a scan but before the next run time is read."""
-    clock = FakeClock(1_800_000_000.5)
-    task = _timer_task(
-        store, "due_during_scan", repeat=False, interval=1, first_run_at=1_800_000_001
-    )
-    scan = store.list_due_tasks
-
-    def scan_while_the_second_turns(now: int, **kwargs: object) -> list:
-        rows = scan(now, **kwargs)
-        clock.advance(1)
-        return rows
-
-    monkeypatch.setattr(store, "list_due_tasks", scan_while_the_second_turns)
-    fired = asyncio.Event()
-
-    async def fire(_task, _lease) -> None:
-        fired.set()
-
-    scheduler = PersistentTaskScheduler(
-        store, fire, AsyncMock(return_value=None), now=clock.now, poll_seconds=3600
-    )
-    await scheduler.start()
-    try:
-        await asyncio.wait_for(fired.wait(), 10)
-    finally:
-        await scheduler.stop()
-    [run] = store.list_runs(task.id)[0]
-    assert run.scheduled_at == task.next_run_at
+    busy.assert_not_awaited()
+    fire.assert_awaited_once()

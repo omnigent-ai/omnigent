@@ -1,11 +1,12 @@
-"""Agent timers wake their session through the database scheduler, across restarts.
+"""Agent timers wake their session, durably when they are long enough.
 
-``sys_timer_set`` saves one ``kind="timer"`` scheduled task on the server, and
-the server's scheduler delivers each firing into the same session as a hidden
-``[System: timer <id> fired]`` message, waking the agent for a new turn. A mock
-model calls the real tools; the server, runner, scheduler and tunnel are real
-processes, restarted mid-flight. The server keeps its default 30 s poll, so a
-firing that lands within seconds of its time shows the scheduler woke for it.
+A ``sys_timer_set`` timer of 2 minutes or more in a top-level session is one
+``kind="timer"`` scheduled task on the server, whose scheduler delivers each firing
+into the same session as a hidden ``[System: timer <id> fired]`` message, across
+runner and server restarts. A shorter timer, or one in a sub-agent's session,
+stays in the runner's memory, and the tool's result says so. A mock model calls
+the real tools; the server, runner, scheduler and tunnel are real processes,
+restarted mid-flight, and the server keeps its default 15 s poll.
 
 Excluded from default ``pytest`` runs via ``--ignore=tests/e2e``. Invoke with::
 
@@ -15,10 +16,6 @@ Excluded from default ``pytest`` runs via ``--ignore=tests/e2e``. Invoke with::
 from __future__ import annotations
 
 import json
-import os
-import re
-import secrets
-import signal
 import time
 import uuid
 from collections.abc import Iterator, Mapping
@@ -31,7 +28,7 @@ import httpx
 import pytest
 import yaml
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests._helpers.live_server import terminate_process
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import ServerRunner, server_runner
@@ -43,15 +40,16 @@ from tests.e2e.conftest import (
     set_fallback_mock_llm,
 )
 
-pytestmark = pytest.mark.timeout(600, method="signal")
+pytestmark = pytest.mark.timeout(900, method="signal")
 
-# Seconds a firing may trail its due time: the scheduler wakes for it instead of
-# waiting out its 30 s poll, then wakes the runner and persists the message.
-_FIRING_SLACK_S = 6.0
+# Seconds a durable firing may trail its due time: up to one 15 s poll, then waking
+# the runner and persisting the message.
+_FIRING_SLACK_S = 25.0
+# The shortest timer the server saves; shorter ones stay in the runner.
+_DURABLE_SECONDS = 120
 _REPLY = "Noted the timer."
-# A runner stopped mid-turn leaves its session looking busy, which holds a repeating
-# timer's ticks for up to ten minutes, so these tests stop runners between turns, with
-# at least this long before the next tick.
+# Stopping a runner mid-turn would cut that turn off, so these tests stop runners
+# between turns, with at least this long before the next tick.
 _STOP_MARGIN_S = 4.0
 # Timers are off until a server enables their release feature.
 _TIMERS_FEATURE = {"OMNIGENT_FEATURES": "session_timers"}
@@ -78,26 +76,6 @@ def _timer_stack(
         ) as client,
     ):
         stack.start_runner()
-        yield stack, client
-
-
-@contextmanager
-def _host_stack(tmp_path: Path) -> Iterator[tuple[ServerRunner, httpx.Client]]:
-    """A server and a host that launches each session's runner itself."""
-    with (
-        # Host-launched runners bind their own tunnel tokens.
-        server_runner(
-            tmp_path / "stack",
-            server_env={**_TIMERS_FEATURE, "OMNIGENT_RUNNER_TUNNEL_TOKEN": None},
-        ) as stack,
-        httpx.Client(
-            base_url=stack.base_url,
-            trust_env=False,
-            timeout=60,
-            headers={"x-omnigent-background-session-titles": "off"},
-        ) as client,
-    ):
-        stack.start_host()
         yield stack, client
 
 
@@ -244,9 +222,13 @@ def test_one_shot_timer_fires_once_after_runner_and_server_restarts(
     with _timer_stack(tmp_path) as (stack, client):
         session_id = _timer_session(client, stack, mock_url, model)
         timer = _set_timer(
-            client, mock_url, session_id, model, {"seconds": 45, "note": "check the build"}
+            client,
+            mock_url,
+            session_id,
+            model,
+            {"seconds": _DURABLE_SECONDS, "note": "check the build"},
         )
-        assert timer["status"] == "scheduled", timer
+        assert (timer["status"], timer["durable"]) == ("scheduled", True), timer
         timer_id = timer["timer_id"]
         fire_at = datetime.fromisoformat(timer["fire_at"]).timestamp()
 
@@ -254,7 +236,7 @@ def test_one_shot_timer_fires_once_after_runner_and_server_restarts(
         task = client.get(f"/v1/scheduled-tasks/{timer_id}").json()
         assert task["kind"] == "timer"
         assert task["session_id"] == session_id
-        assert task["rrule"] == "FREQ=SECONDLY;INTERVAL=45;COUNT=1"
+        assert task["rrule"] == f"FREQ=SECONDLY;INTERVAL={_DURABLE_SECONDS};COUNT=1"
         assert datetime.fromisoformat(task["next_run_at"]).timestamp() == fire_at
         listed = client.get("/v1/scheduled-tasks").json()["scheduled_tasks"]
         assert timer_id not in {listed_task["id"] for listed_task in listed}
@@ -308,7 +290,7 @@ def test_repeating_timer_keeps_its_id_and_stays_cancelled_across_restarts(
     """Repeated ticks reuse one task, survive a runner restart, and stop for good on cancel."""
     mock_url = isolated_mock_llm_server_url
     model = f"mock-timer-repeat-{uuid.uuid4().hex[:6]}"
-    interval = 10
+    interval = _DURABLE_SECONDS
     set_fallback_mock_llm(mock_url, model, _REPLY)
     with _timer_stack(tmp_path) as (stack, client):
         session_id = _timer_session(client, stack, mock_url, model)
@@ -319,7 +301,7 @@ def test_repeating_timer_keeps_its_id_and_stays_cancelled_across_restarts(
             model,
             {"seconds": interval, "repeat": True, "note": "poll workers"},
         )
-        assert timer["status"] == "scheduled", timer
+        assert (timer["status"], timer["durable"]) == ("scheduled", True), timer
         assert timer["interval_seconds"] == interval
         timer_id = timer["timer_id"]
         first_tick_at = datetime.fromisoformat(timer["fire_at"]).timestamp()
@@ -327,32 +309,18 @@ def test_repeating_timer_keeps_its_id_and_stays_cancelled_across_restarts(
         # The timer outlives a runner restart that begins before its first tick.
         _wait_until_idle_before(client, session_id, first_tick_at)
         _restart_runner(stack, client)
-        poll_until(lambda: len(_firings(client, session_id, timer_id)) >= 2, timeout_s=60)
+        poll_until(
+            lambda: len(_firings(client, session_id, timer_id)) >= 2,
+            timeout_s=first_tick_at + interval - time.time() + _FIRING_SLACK_S,
+        )
         # Every tick is the same task: the task stays active with its next tick saved.
         task = client.get(f"/v1/scheduled-tasks/{timer_id}").json()
         assert (task["kind"], task["state"]) == ("timer", "active")
         assert task["rrule"] == f"FREQ=SECONDLY;INTERVAL={interval}"
 
-        # The agent cancels the timer from the turn its next tick starts.
-        cancel_call = f"call_cancel_{uuid.uuid4().hex[:8]}"
-        configure_mock_llm(
-            mock_url,
-            [
-                {
-                    "tool_calls": [
-                        {
-                            "call_id": cancel_call,
-                            "name": "sys_timer_cancel",
-                            "arguments": json.dumps({"timer_id": timer_id}),
-                        }
-                    ]
-                },
-                {"text": "Timer cancelled."},
-            ],
-            key=model,
-            required_tools=["sys_timer_cancel"],
-        )
-        assert _tool_output(client, session_id, cancel_call) == {
+        # The agent cancels the timer between ticks.
+        _wait_until_idle_before(client, session_id, first_tick_at + 2 * interval)
+        assert _cancel_timer(client, mock_url, session_id, model, timer_id) == {
             "timer_id": timer_id,
             "status": "cancelled",
         }
@@ -361,8 +329,8 @@ def test_repeating_timer_keeps_its_id_and_stays_cancelled_across_restarts(
 
         _restart_runner(stack, client)
         stack.restart_server()
-        # Several intervals across both restarts: a cancelled timer never ticks again.
-        time.sleep(3 * interval)
+        # A full interval across both restarts: a cancelled timer never ticks again.
+        time.sleep(interval + _FIRING_SLACK_S)
         assert len(_firings(client, session_id, timer_id)) == cancelled_count
         assert client.get(f"/v1/scheduled-tasks/{timer_id}").status_code == 404
 
@@ -389,121 +357,72 @@ def _replies(client: httpx.Client, session_id: str) -> int:
     )
 
 
-def test_a_sub_agent_timer_wakes_its_child_after_the_parent_moves_runners(
+def _cancel_timer(
+    client: httpx.Client, mock_url: str, session_id: str, model: str, timer_id: str
+) -> dict[str, Any]:
+    """Have the agent call ``sys_timer_cancel`` for one user turn; return the tool output."""
+    call_id = f"call_cancel_{uuid.uuid4().hex[:8]}"
+    configure_mock_llm(
+        mock_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": call_id,
+                        "name": "sys_timer_cancel",
+                        "arguments": json.dumps({"timer_id": timer_id}),
+                    }
+                ]
+            },
+            {"text": "Timer cancelled."},
+        ],
+        key=model,
+        required_tools=["sys_timer_cancel"],
+    )
+    send_user_message_to_session(client, session_id=session_id, content="Cancel the timer.")
+    return _tool_output(client, session_id, call_id)
+
+
+def test_a_short_timer_stays_in_the_runner_and_still_wakes_the_session(
     tmp_path: Path, isolated_mock_llm_server_url: str
 ) -> None:
-    """A sub-agent's timer wakes the child, and still does once its parent's runner changes."""
+    """A timer under 2 minutes is the runner's own; it warns that it isn't durable."""
+    mock_url = isolated_mock_llm_server_url
+    model = f"mock-timer-short-{uuid.uuid4().hex[:6]}"
+    set_fallback_mock_llm(mock_url, model, _REPLY)
+    with _timer_stack(tmp_path) as (stack, client):
+        session_id = _timer_session(client, stack, mock_url, model)
+        timer = _set_timer(client, mock_url, session_id, model, {"seconds": 3, "note": "soon"})
+        assert (timer["status"], timer["durable"]) == ("scheduled", False), timer
+        assert "timers under 2 minutes aren't saved on the server" in timer["warning"]
+        timer_id = timer["timer_id"]
+        # The server keeps no task for it.
+        assert client.get(f"/v1/scheduled-tasks/{timer_id}").status_code == 404
+        listed = client.get("/v1/scheduled-tasks", params={"kind": "all"}).json()
+        assert listed["scheduled_tasks"] == []
+
+        # The runner's own timer wakes the agent with the same hidden message.
+        poll_until(lambda: _firings(client, session_id, timer_id), timeout_s=60)
+        (firing,) = _firings(client, session_id, timer_id)
+        assert firing["is_meta"] is True
+        poll_until(lambda: _model_saw(mock_url, model, f"timer {timer_id} fired"), timeout_s=60)
+
+
+def test_a_sub_agent_timer_stays_in_its_runner(
+    tmp_path: Path, isolated_mock_llm_server_url: str
+) -> None:
+    """The server saves no timers for a sub-agent, which shares its parent's runner."""
     mock_url = isolated_mock_llm_server_url
     model = f"mock-timer-child-{uuid.uuid4().hex[:6]}"
-    interval = 10
     set_fallback_mock_llm(mock_url, model, _REPLY)
-    # Any token-bound runner may connect, so the parent can move to a new runner.
-    with _timer_stack(tmp_path, server_env={"OMNIGENT_RUNNER_TUNNEL_TOKEN": None}) as (
-        stack,
-        client,
-    ):
+    with _timer_stack(tmp_path) as (stack, client):
         parent_id = _timer_session(client, stack, mock_url, model)
         child_id = _child_session(client, parent_id)
-        child = client.get(f"/v1/sessions/{child_id}").json()
-        assert (child["kind"], child["runner_id"]) == ("sub_agent", stack.runner_id)
-        timer = _set_timer(
-            client,
-            mock_url,
-            child_id,
-            model,
-            {"seconds": interval, "repeat": True, "note": "check the child's work"},
-        )
-        timer_id = timer["timer_id"]
-        first_tick_at = datetime.fromisoformat(timer["fire_at"]).timestamp()
-        poll_until(lambda: _firings(client, child_id, timer_id), timeout_s=60)
-        poll_until(lambda: _replies(client, child_id) >= 1, timeout_s=60)
-        _wait_until_idle_before(client, child_id, first_tick_at + interval)
-
-        # The parent moves to a runner with a new identity while the child is idle, so
-        # the child still names the stopped runner, which a message to it would repair.
-        terminate_process(stack.runner)
-        stack.runner = None
-        new_token = secrets.token_urlsafe(32)
-        new_runner_id = token_bound_runner_id(new_token)
-        stack.start_runner(
-            env={
-                "OMNIGENT_RUNNER_ID": new_runner_id,
-                "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": new_token,
-            },
-            wait_ready=False,
-        )
-        poll_until(
-            lambda: client.get(f"/v1/runners/{new_runner_id}/status").json().get("online"),
-            timeout_s=120,
-        )
-        # Until the parent names its new runner, no tick can move the child to it.
-        assert client.get(f"/v1/sessions/{child_id}").json()["runner_id"] == stack.runner_id
-        replies_before = _replies(client, child_id)
-        bind_session_runner(client.patch, "", parent_id, new_runner_id)
-
-        # A later tick finds the parent's new runner and wakes the child's agent there.
-        poll_until(
-            lambda: _replies(client, child_id) > replies_before,
-            timeout_s=4 * interval,
-            interval_s=0.5,
-        )
-        assert client.get(f"/v1/sessions/{child_id}").json()["runner_id"] == new_runner_id
-        assert _firings(client, parent_id, timer_id) == []
-
-
-def test_a_sub_agent_timer_has_its_parents_host_relaunch_their_exited_runner(
-    tmp_path: Path, isolated_mock_llm_server_url: str
-) -> None:
-    """A sub-agent can't relaunch the runner it shares; its parent's host does, for its timer."""
-    mock_url = isolated_mock_llm_server_url
-    model = f"mock-timer-host-{uuid.uuid4().hex[:6]}"
-    interval = 15
-    set_fallback_mock_llm(mock_url, model, _REPLY)
-    with _host_stack(tmp_path) as (stack, client):
-        parent_id = _timer_session(client, stack, mock_url, model, on_host=True)
-        # The parent's first turn has the host launch the runner its sub-agent shares.
-        send_user_message_to_session(client, session_id=parent_id, content="Hello.")
-        poll_until(lambda: _replies(client, parent_id) >= 1, timeout_s=120)
-        runner_id = client.get(f"/v1/sessions/{parent_id}").json()["runner_id"]
-        child_id = _child_session(client, parent_id)
-        child = client.get(f"/v1/sessions/{child_id}").json()
-        assert (child["kind"], child["runner_id"], child["host_id"]) == (
-            "sub_agent",
-            runner_id,
-            None,
-        )
-        timer = _set_timer(
-            client,
-            mock_url,
-            child_id,
-            model,
-            {"seconds": interval, "repeat": True, "note": "check in"},
-        )
-        timer_id = timer["timer_id"]
-        first_tick_at = datetime.fromisoformat(timer["fire_at"]).timestamp()
-        poll_until(lambda: _replies(client, child_id) >= 1, timeout_s=60)
-        _wait_until_idle_before(client, child_id, first_tick_at + interval)
-
-        # The shared runner exits, as an idle runner does, before the next tick.
-        launched = re.search(
-            rf"Runner started: {re.escape(runner_id)} \(pid=(\d+)\)",
-            stack.log_path("host").read_text(),
-        )
-        assert launched is not None, stack.log_tail()
-        os.kill(int(launched.group(1)), signal.SIGTERM)
-        poll_until(
-            lambda: not client.get(f"/v1/runners/{runner_id}/status").json().get("online"),
-            timeout_s=60,
-        )
-        replies_before = _replies(client, child_id)
-
-        # A later tick has the parent's host relaunch the runner, and reaches the child.
-        poll_until(
-            lambda: _replies(client, child_id) > replies_before,
-            timeout_s=4 * interval,
-            interval_s=0.5,
-        )
-        relaunched = client.get(f"/v1/sessions/{parent_id}").json()["runner_id"]
-        assert client.get(f"/v1/runners/{relaunched}/status").json()["online"] is True
-        assert client.get(f"/v1/sessions/{child_id}").json()["runner_id"] == relaunched
-        assert _firings(client, parent_id, timer_id) == []
+        timer = _set_timer(client, mock_url, child_id, model, {"seconds": 600, "repeat": True})
+        assert (timer["status"], timer["durable"]) == ("scheduled", False), timer
+        assert "a sub-agent's or side chat's timers aren't saved" in timer["warning"]
+        listed = client.get("/v1/scheduled-tasks", params={"kind": "all"}).json()
+        assert listed["scheduled_tasks"] == []
+        # The runner cancels its own timer.
+        cancelled = _cancel_timer(client, mock_url, child_id, model, timer["timer_id"])
+        assert cancelled == {"timer_id": timer["timer_id"], "status": "cancelled"}

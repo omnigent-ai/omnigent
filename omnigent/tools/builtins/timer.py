@@ -15,11 +15,14 @@ These classes own the LLM-facing schema and argument validation.
 The runner's ``execute_tool`` intercepts ``sys_timer_set`` /
 ``sys_timer_cancel`` and dispatches to
 :func:`omnigent.runner.tool_dispatch._execute_timer_set` /
-``_execute_timer_cancel``, which save or delete the timer on the server.
-There each timer is one scheduled task (``kind="timer"``) that the
-database scheduler fires, so it survives runner exits and restarts. The
-shared :func:`validate_timer_set_args` helper keeps the tools, the runner
-and the server route rejecting the same inputs.
+``_execute_timer_cancel``. A timer of at least
+:data:`DURABLE_TIMER_MIN_SECONDS` in a top-level session is saved on the
+server as one scheduled task (``kind="timer"``) that the database scheduler
+fires, so it survives runner exits and restarts. Any other timer runs in
+the runner's sleep-and-wake loop and per-session registry, and the result
+warns that it is not durable. The shared :func:`validate_timer_set_args`
+helper keeps the tools, the runner and the server route rejecting the
+same inputs.
 
 The tools are **synchronous** (``is_async() == False``): the LLM
 gets the ``timer_id`` back immediately so it can later cancel by ID.
@@ -27,9 +30,9 @@ A firing arrives as a hidden ``[System: timer X fired]`` meta message
 that wakes the session on the normal ingest path.
 
 Invoked in-process (off the runner dispatch path) these tools have no
-server to schedule or cancel against, so ``invoke`` validates its
-arguments and then reports that no timer was scheduled or found rather
-than raising.
+timer registry to schedule or cancel against, so ``invoke`` validates
+its arguments and then reports that no timer was scheduled or found
+rather than raising.
 
 See ``designs/SERVER_HARNESS_CONTRACT.md`` §Timers.
 """
@@ -53,6 +56,9 @@ _logger = logging.getLogger(__name__)
 # revisited together with the design tradeoffs of long-lived
 # timer workflows.
 MAX_TIMER_SECONDS = 1_000_000
+# A timer this long or longer in a top-level session is saved on the server, which fires
+# it at most one scheduler poll late. A shorter one stays in the runner's memory.
+DURABLE_TIMER_MIN_SECONDS = 120
 
 
 def validate_timer_set_args(
@@ -100,15 +106,15 @@ def validate_timer_set_args(
 
 class SysTimerSetTool(Tool):
     """
-    Schedule a timer that wakes this session after a delay.
+    Schedule a timer that fires a notification after a delay.
 
     The LLM passes ``seconds`` (delay), optional ``repeat`` (default
     ``False``), and optional ``note`` (echoed back in each firing). On
-    the runner dispatch path the server saves the timer as a scheduled
-    task whose ID is returned immediately as ``timer_id``; each firing
-    arrives later as a hidden ``[System: timer X fired]`` meta message
-    that wakes the session. Repeating timers continue until
-    ``sys_timer_cancel`` is called.
+    the runner dispatch path the ``timer_id`` is returned immediately:
+    a server-saved timer's scheduled-task ID, or ``"timer_<32-char hex>"``
+    for one kept in the runner. The firing arrives later as a hidden
+    ``[System: timer X fired]`` meta message that wakes the session.
+    Repeating timers continue until ``sys_timer_cancel`` is called.
     """
 
     @classmethod
@@ -122,17 +128,18 @@ class SysTimerSetTool(Tool):
         :returns: Description visible to the LLM in tool listings.
         """
         return (
-            "Schedule a timer that wakes this session after a delay, even if "
-            "the session has gone idle or its runner restarted. The firing "
-            "appears as a [System: timer X fired] message in the conversation; "
-            "you can include an optional note that's echoed back in the firing. "
-            "Set repeat=true for a recurring timer (cancel via sys_timer_cancel); "
-            "a repeating timer skips a tick while this session is busy, and ticks "
-            "missed while the server was down arrive as one late firing. Times are "
-            "rounded up to whole seconds and are best effort: a firing can arrive "
-            "a little late, never early. Sessions in a permission mode that skips "
-            "approval can't set timers. The tool returns immediately with the "
-            "timer_id and the first fire_at."
+            "Schedule a timer that fires after a delay. The firing "
+            "appears as a [System: timer X fired] message in the "
+            "conversation; you can include an optional note that's "
+            "echoed back in the firing. Set repeat=true for a "
+            "recurring timer (cancel via sys_timer_cancel). A timer "
+            "of 2 minutes or more in a top-level session is saved on "
+            "the server: it survives the runner going idle or "
+            "restarting, and can fire up to about 15 seconds late, never early. "
+            "Shorter timers, and timers in sub-agents or side chats, "
+            "stay in this runner's memory; the result then has "
+            "durable=false and a warning saying when the timer would "
+            "be lost. The tool returns immediately with the timer_id."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -155,12 +162,10 @@ class SysTimerSetTool(Tool):
                                 "Delay before the timer fires, in "
                                 "seconds. Must be a finite "
                                 "non-negative number; the first "
-                                "firing happens after this delay, "
-                                "rounded up to a whole second. "
+                                "firing happens after this delay. "
                                 "For repeat=true, must be > 0 and "
                                 "is also the interval between "
-                                "firings, rounded up to a whole "
-                                "second."
+                                "firings."
                             ),
                         },
                         "repeat": {
@@ -193,12 +198,12 @@ class SysTimerSetTool(Tool):
         Validate arguments; report that the in-process path scheduled
         no timer.
 
-        The runner intercepts ``sys_timer_set`` before this builtin is
-        reached and saves the timer on the server. When ``invoke`` does
-        run (off the runner dispatch path) there is no server to schedule
-        against, so it validates its input for a consistent error surface
-        and then returns a structured error instead of falsely reporting
-        success.
+        The firing loop runs in the runner, which intercepts
+        ``sys_timer_set`` before this builtin is reached. When
+        ``invoke`` does run (off the runner dispatch path) there is no
+        timer registry to schedule against, so it validates its input
+        for a consistent error surface and then returns a structured
+        error instead of falsely reporting success.
 
         :param arguments: JSON-encoded args, e.g.
             ``'{"seconds": 5, "repeat": false, "note": "x"}'``.
@@ -235,10 +240,10 @@ class SysTimerCancelTool(Tool):
     """
     Cancel a scheduled timer by ``timer_id``.
 
-    The runner intercepts ``sys_timer_cancel`` and deletes the timer's
-    scheduled task on the server, which suppresses a firing that has not
-    gone out yet. When this builtin runs in-process (off the runner
-    dispatch path) there is no server to consult, so a valid
+    Cancellation is executed by the runner, which intercepts
+    ``sys_timer_cancel`` and drops the timer from its per-session
+    registry. When this builtin runs in-process (off the runner
+    dispatch path) there is no registry to consult, so a valid
     ``timer_id`` reports ``status="not_found"`` — a timer that already
     fired and cleaned up is indistinguishable from one that never
     existed.
@@ -257,9 +262,8 @@ class SysTimerCancelTool(Tool):
         return (
             "Cancel a previously scheduled timer by timer_id. "
             "Returns status='cancelled' if the timer was active, "
-            "or status='not_found' if no such timer exists, it was "
-            "already cancelled, or a one-shot timer has already fired. "
-            "A firing already on its way when you cancel may still arrive."
+            "or status='not_found' if no such timer exists or the "
+            "timer has already fired and finished."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -278,7 +282,9 @@ class SysTimerCancelTool(Tool):
                     "properties": {
                         "timer_id": {
                             "type": "string",
-                            "description": "The timer_id returned by sys_timer_set.",
+                            "description": (
+                                "The timer_id returned by sys_timer_set, e.g. 'timer_a1b2c3d4...'."
+                            ),
                         },
                     },
                     "required": ["timer_id"],
@@ -291,9 +297,9 @@ class SysTimerCancelTool(Tool):
         """
         Report cancellation for a ``timer_id`` (in-process fallback).
 
-        The runner intercepts this tool before the builtin is reached and
-        cancels on the server; this in-process path has no server, so a
-        valid id reports ``not_found``.
+        The runner owns the timer registry and intercepts this tool
+        before the builtin is reached; this in-process path has no
+        registry, so a valid id reports ``not_found``.
 
         :param arguments: JSON-encoded args, e.g.
             ``'{"timer_id": "timer_..."}'``.
@@ -312,5 +318,5 @@ class SysTimerCancelTool(Tool):
         if not isinstance(timer_id, str) or not timer_id:
             return json.dumps({"error": "timer_id is required"})
 
-        # No server is reachable on the in-process path.
+        # No timer registry exists on the in-process path.
         return json.dumps({"timer_id": timer_id, "status": "not_found"})

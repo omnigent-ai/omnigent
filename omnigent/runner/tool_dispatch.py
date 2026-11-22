@@ -142,6 +142,7 @@ from omnigent.tools.builtins.sys_terminal import (
 from omnigent.tools.builtins.timer import (
     # Shared with the in-process tool and the server's timer route, so every
     # surface rejects the same arguments and honors one delay ceiling.
+    DURABLE_TIMER_MIN_SECONDS,
     validate_timer_set_args,
 )
 from omnigent.tools.builtins.ui import OpenFileRequest, UiOpenFileTool
@@ -4843,30 +4844,30 @@ def _has_subagent(
 
 
 # ── Timer dispatch ─────────────────────────────────────────────
-# The server saves and fires timers, so they survive runner restarts; the
-# server checks arguments with the same ``validate_timer_set_args``.
+# A timer of DURABLE_TIMER_MIN_SECONDS or more in a top-level session is saved and fired by
+# the server, so it survives runner restarts. Others stay in this runner's memory. Both
+# check arguments with the same ``validate_timer_set_args``.
 
 
-async def _timer_support_error(server_client: httpx.AsyncClient) -> str | None:
-    """
-    Check that the server runs timers before asking it to save one.
+def _runner_timer_warning(reason: str) -> str:
+    """The agent-facing caveat for a timer kept in this runner's memory, for *reason*."""
+    return (
+        f"This timer is kept only in this runner's memory: {reason}. It is lost if the "
+        "runner stops or restarts before it fires (a crash or update, the host sleeping or "
+        "rebooting, or the session moving to another runner), and a firing is skipped if "
+        "the server can't be reached at that moment. Until it fires, it keeps the runner "
+        "from shutting down when idle."
+    )
 
-    :param server_client: HTTP client pointed at the Omnigent server.
-    :returns: Why no timer can be set, or ``None`` when the server runs timers.
-    """
+
+async def _server_saves_timers(server_client: httpx.AsyncClient) -> bool:
+    """Whether the server advertises durable timers; an unreachable one saves none."""
     try:
         info = await server_client.get("/v1/info", timeout=30.0)
         info.raise_for_status()
-        supported = info.json().get("session_timers") is True
-    except (httpx.HTTPError, ValueError) as exc:
-        # Nothing was sent to save yet, so trying again is safe.
-        return f"sys_timer_set could not check server support, so no timer was set: {exc}"
-    if supported:
-        return None
-    return (
-        "sys_timer_set: this Omnigent server does not run timers; they need its database "
-        "scheduler and the session_timers feature"
-    )
+        return info.json().get("session_timers") is True
+    except (httpx.HTTPError, ValueError):
+        return False
 
 
 async def _execute_timer_set(
@@ -4876,13 +4877,14 @@ async def _execute_timer_set(
     conversation_id: str | None = None,
 ) -> str:
     """
-    Save a timer that wakes this session after a delay.
+    Set a timer that wakes this session: on the server when it can save it, else here.
 
     :param args: Parsed arguments. Keys: ``seconds`` (number),
         ``repeat`` (bool, default False), ``note`` (optional str).
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: Session the timer wakes, e.g. ``"conv_abc123"``.
-    :returns: The server's JSON result with ``timer_id`` and ``fire_at``, or ``{"error"}``.
+    :returns: JSON with ``timer_id``, ``status`` and ``durable``, plus a ``warning`` for a
+        timer kept in this runner, or ``{"error"}``.
     """
     validated = validate_timer_set_args(args)
     if isinstance(validated, str):
@@ -4890,9 +4892,32 @@ async def _execute_timer_set(
     seconds, repeat, note = validated
     if server_client is None or conversation_id is None:
         return json.dumps({"error": "timer requires server_client and conversation_id"})
-    unsupported = await _timer_support_error(server_client)
-    if unsupported is not None:
-        return json.dumps({"error": unsupported})
+    if seconds < DURABLE_TIMER_MIN_SECONDS:
+        minutes = DURABLE_TIMER_MIN_SECONDS // 60
+        reason = f"timers under {minutes} minutes aren't saved on the server"
+    elif not await _server_saves_timers(server_client):
+        reason = "this server doesn't save timers, or couldn't be reached to save it"
+    else:
+        saved = await _save_server_timer(server_client, conversation_id, seconds, repeat, note)
+        if "error" in saved or saved.get("durable") is True:
+            return json.dumps(saved)
+        reason = str(saved.get("reason") or "the server didn't save it")
+    return _set_runner_timer(conversation_id, server_client, seconds, repeat, note, reason)
+
+
+async def _save_server_timer(
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    seconds: float,
+    repeat: bool,
+    note: str | None,
+) -> _JsonObject:
+    """
+    Ask the server to save the timer.
+
+    :returns: The server's reply: ``durable`` true with the saved timer, or ``durable``
+        false with the ``reason`` it keeps none for this session; else ``{"error"}``.
+    """
     try:
         resp = await server_client.post(
             f"{_session_url(conversation_id)}/timers",
@@ -4900,17 +4925,117 @@ async def _execute_timer_set(
             timeout=30.0,
         )
         if resp.status_code < 400:
-            return json.dumps(resp.json())
+            return resp.json()
     except (httpx.HTTPError, ValueError) as exc:
         # The server may have saved the timer before its reply was lost.
-        return json.dumps(
-            {"error": f"sys_timer_set failed ({exc}); the timer may still have been set"}
-        )
+        return {"error": f"sys_timer_set failed ({exc}); the timer may still have been set"}
     error = f"server returned {resp.status_code}"
     if resp.status_code >= 500:
         # A gateway can answer 502 or 504 after the server saved the timer.
         error += "; the timer may still have been set"
-    return json.dumps({"error": error, "details": resp.text[:1000]})
+    return {"error": error, "details": resp.text[:1000]}
+
+
+def _set_runner_timer(
+    conversation_id: str,
+    server_client: httpx.AsyncClient,
+    seconds: float,
+    repeat: bool,
+    note: str | None,
+    reason: str,
+) -> str:
+    """
+    Start a timer in this runner's memory, which posts its wake to the session.
+
+    :param reason: Why the server isn't keeping it, e.g. ``"this server doesn't save
+        timers"``; the result's ``warning`` names it.
+    :returns: JSON with ``timer_id``, ``status``, ``durable`` false and the ``warning``.
+    """
+    from omnigent.runner import app as _app
+
+    timer_id = f"timer_{uuid.uuid4().hex}"
+    task = asyncio.create_task(
+        _timer_loop(
+            timer_id=timer_id,
+            conversation_id=conversation_id,
+            seconds=seconds,
+            repeat=repeat,
+            note=note,
+            server_client=server_client,
+        ),
+        name=f"timer-{timer_id}",
+    )
+    _app.register_timer(conversation_id, timer_id, task)
+    return json.dumps(
+        {
+            "timer_id": timer_id,
+            "status": "scheduled",
+            "durable": False,
+            "warning": _runner_timer_warning(reason),
+            "seconds": seconds,
+            "repeat": repeat,
+            "note": note,
+        }
+    )
+
+
+async def _timer_loop(
+    *,
+    timer_id: str,
+    conversation_id: str,
+    seconds: float,
+    repeat: bool,
+    note: str | None,
+    server_client: httpx.AsyncClient,
+) -> None:
+    """
+    Background loop: sleep then fire timer notifications.
+
+    :param timer_id: Unique timer id, e.g. ``"timer_a1b2..."``.
+    :param conversation_id: Session to fire into.
+    :param seconds: Delay between firings.
+    :param repeat: Loop indefinitely when True.
+    :param note: Optional note echoed in firing text.
+    :param server_client: httpx client for persistence.
+    """
+    from omnigent.runner import app as _app
+
+    try:
+        while True:
+            await asyncio.sleep(seconds)
+            text = f"[System: timer {timer_id} fired]"
+            if note:
+                text += f"\nnote: {note!r}"
+            try:
+                resp = await server_client.post(
+                    f"{_session_url(conversation_id)}/events",
+                    json={
+                        "type": "message",
+                        "data": {
+                            "role": "user",
+                            "is_meta": True,
+                            "content": [{"type": "input_text", "text": text}],
+                        },
+                    },
+                    timeout=30.0,
+                )
+                # httpx does not raise on 4xx/5xx by default; treat those
+                # as delivery failures so they share the warning path below.
+                resp.raise_for_status()
+            except (TimeoutError, httpx.HTTPError, ValueError):
+                _logger.warning(
+                    "Timer %s firing persist failed for %s",
+                    timer_id,
+                    conversation_id,
+                    exc_info=True,
+                    extra={"session_id": conversation_id},
+                )
+            if not repeat:
+                break
+    except asyncio.CancelledError:
+        return
+    finally:
+        _app.unregister_timer(conversation_id, timer_id)
 
 
 async def _execute_timer_cancel(
@@ -4920,19 +5045,23 @@ async def _execute_timer_cancel(
     conversation_id: str | None = None,
 ) -> str:
     """
-    Cancel one of this session's timers by ``timer_id``.
+    Cancel one of this session's timers by ``timer_id``: this runner's own, or the server's.
 
     :param args: Parsed arguments with ``timer_id`` (string).
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: Session the timer belongs to.
     :returns: JSON with ``status`` ``"cancelled"`` or ``"not_found"``, or ``{"error"}``.
     """
+    from omnigent.runner import app as _app
+
     timer_id = args.get("timer_id")
     if not isinstance(timer_id, str) or not timer_id:
         return json.dumps({"error": "timer_id is required"})
-    if server_client is None or conversation_id is None:
-        return json.dumps({"error": "timer_cancel requires server_client and conversation_id"})
-    if not _SCHEDULED_TASK_ID_RE.fullmatch(timer_id):
+    if conversation_id is None:
+        return json.dumps({"error": "timer_cancel requires conversation_id"})
+    if _app.cancel_timer(conversation_id, timer_id):
+        return json.dumps({"timer_id": timer_id, "status": "cancelled"})
+    if server_client is None or not _SCHEDULED_TASK_ID_RE.fullmatch(timer_id):
         return json.dumps({"timer_id": timer_id, "status": "not_found"})
     try:
         resp = await server_client.delete(

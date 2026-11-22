@@ -30,13 +30,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner._subprocess_lifecycle import await_cleanup_task
-from omnigent.runner.routing import routing_host_id
 from omnigent.runtime import pending_elicitations
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.bundles import agent_for_user
@@ -112,7 +112,7 @@ from omnigent.tools.browser_agent_tools import (
     BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS,
     browser_agent_tools_creation_labels,
 )
-from omnigent.tools.builtins.timer import validate_timer_set_args
+from omnigent.tools.builtins.timer import DURABLE_TIMER_MIN_SECONDS, validate_timer_set_args
 from omnigent.util.session_lifecycle import is_session_closed
 from omnigent.util.uuid import normalize_uuid
 
@@ -2249,27 +2249,35 @@ def create_scheduled_tasks_router(
         return (None if user_id == RESERVED_USER_LOCAL else user_id), conv
 
     # Called by the runner's timer tools, so hidden from the public API reference.
-    @timers.post("/sessions/{session_id}/timers", status_code=201, include_in_schema=False)
+    @timers.post(
+        "/sessions/{session_id}/timers",
+        status_code=201,
+        include_in_schema=False,
+        # The reply is a saved timer, or a JSONResponse telling the runner to keep it.
+        response_model=None,
+    )
     async def set_session_timer(
         request: Request, session_id: str, body: dict[str, Any]
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | JSONResponse:
         """Save a ``sys_timer_set`` timer: a hidden wake into this session.
 
         One scheduled task holds the timer, so it survives runner and server restarts,
         and its ID is the ``timer_id``. The first firing falls on the whole second at or
         after ``seconds`` from now, so it never comes early; a repeating timer then fires
         every ``seconds`` rounded up to a whole second. Firings that come due while the
-        server is down make one late firing when it is back, not one each.
+        server is down make one late firing when it is back, not one each. A sub-agent's
+        or side chat's timer isn't saved: the reply, ``200`` with ``durable`` false and a
+        ``reason``, tells the runner to keep it in memory.
 
         :param body: ``{"seconds": number, "repeat": bool, "note": str | null}``, checked
             like the tool's arguments, e.g. ``{"seconds": 120, "repeat": true}``.
-        :returns: ``timer_id``, ``status`` ``"scheduled"``, the UTC ``fire_at`` of the
-            first firing, ``interval_seconds`` for a repeating timer (else ``None``),
-            and the ``seconds``, ``repeat`` and ``note`` it was set with.
-        :raises OmnigentError: 400 for bad arguments, an archived or closed session, a
-            session whose permission mode skips approval, or a server with timers off (no database
-            scheduler, or the ``session_timers`` feature off); 403/404 as for posting a
-            message.
+        :returns: ``durable`` true, ``timer_id``, ``status`` ``"scheduled"``, the UTC
+            ``fire_at`` of the first firing, ``interval_seconds`` for a repeating timer
+            (else ``None``), and the ``seconds``, ``repeat`` and ``note`` it was set with.
+        :raises OmnigentError: 400 for bad arguments, a delay under
+            ``DURABLE_TIMER_MIN_SECONDS``, an archived or closed session, or a server with
+            timers off (no database scheduler, or the ``session_timers`` feature off);
+            403/404 as for posting a message.
         """
         if not getattr(request.app.state, "session_timers_enabled", False):
             raise OmnigentError(
@@ -2286,6 +2294,12 @@ def create_scheduled_tasks_router(
         if isinstance(validated, str):
             raise OmnigentError(validated, code=ErrorCode.INVALID_INPUT)
         seconds, repeat, note = validated
+        if seconds < DURABLE_TIMER_MIN_SECONDS:
+            raise OmnigentError(
+                f"The server saves timers of at least {DURABLE_TIMER_MIN_SECONDS} seconds; "
+                "the runner keeps shorter ones",
+                code=ErrorCode.INVALID_INPUT,
+            )
         user_id, conv = await _timer_session(request, session_id)
         if conv.archived:
             raise OmnigentError(
@@ -2301,20 +2315,14 @@ def create_scheduled_tasks_router(
             raise OmnigentError(
                 "This session has no agent for a timer to wake", code=ErrorCode.INVALID_INPUT
             )
-        from omnigent.server.scheduled.fire import session_approval_skipping_mode
+        from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
 
-        # A timer selects no permission mode, so it never runs a session unattended in one
-        # that skips approval, as a continued automation can't without choosing it.
-        skipping_mode = session_approval_skipping_mode(conv)
-        if skipping_mode is not None:
-            raise OmnigentError(
-                f"This session is in permission mode {skipping_mode!r}, which skips approval, "
-                "so a timer can't wake it unattended; switch to a mode that asks for "
-                "approval or uses the auto classifier",
-                code=ErrorCode.INVALID_INPUT,
+        if conv.parent_conversation_id is not None or conv.labels.get(SIDE_CHAT_LABEL_KEY):
+            # It runs on another session's runner, so its timers stay in that runner.
+            return JSONResponse(
+                {"durable": False, "reason": "a sub-agent's or side chat's timers aren't saved"}
             )
         agent_id = conv.agent_id
-        routing_host = await asyncio.to_thread(routing_host_id, conv, conversation_store)
         interval = max(1, math.ceil(seconds))
         fire_at = math.ceil(time.time() + seconds)
         async with _allocated_task_id(user_id, "Timer") as task_id:
@@ -2330,19 +2338,15 @@ def create_scheduled_tasks_router(
                 timezone="UTC",
                 session_mode="continue",
                 session_id=conv.id,
-                # Runs route to the replica holding the session's runner tunnel, which a
-                # sub-agent or side chat shares through its parent's or source's host.
-                host_id=routing_host,
+                # Runs route to the replica holding the session's host.
+                host_id=conv.host_id,
                 first_run_at=fire_at,
                 kind="timer",
                 # Firings fall at the anchor plus whole intervals, the first at fire_at.
                 schedule_anchor=fire_at - interval,
             )
-        scheduler = _scheduler(request)
-        if scheduler is not None:
-            # The poll may be up to its interval away; look again before then.
-            scheduler.wake()
         return {
+            "durable": True,
             "timer_id": task.id,
             "status": "scheduled",
             "fire_at": datetime.fromtimestamp(fire_at, UTC).isoformat(),

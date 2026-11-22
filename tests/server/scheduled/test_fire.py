@@ -59,7 +59,7 @@ from omnigent.server.scheduled.fire import (
     build_on_fire,
     build_run_now,
 )
-from omnigent.server.scheduled.schedule import continued_sandbox_host_id, timer_rule
+from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 from omnigent.server.scheduled.source_session import (
     run_copy_dropped_label_keys,
     run_prompt_text,
@@ -73,8 +73,6 @@ from omnigent.stores.conversation_store import (
     FORK_SOURCE_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
-    SIDE_CHAT_LABEL_KEY,
-    SIDE_CHAT_SOURCE_LABEL_KEY,
     SessionActivity,
 )
 from omnigent.stores.permission_store import PermissionStore
@@ -102,7 +100,6 @@ class _FakeConversation:
     parent_conversation_id: str | None = None
     root_conversation_id: str = ""
     terminal_launch_args: list[str] | None = None
-    kind: str = "default"
     title: str | None = None
 
     def __post_init__(self) -> None:
@@ -4319,175 +4316,6 @@ async def test_a_sandbox_continue_never_reaches_a_runner_outside_its_sandbox(
 
 
 @pytest.mark.asyncio
-async def test_a_sub_agent_follows_its_parents_new_runner_before_its_host_launches_one(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A timer wakes a sub-agent on its parent's live runner, as a message to it would.
-
-    The sub-agent's own runner is gone, and its online host could launch it a new one.
-    """
-    from omnigent.server.routes import sessions
-
-    child = _continued_session(
-        kind="sub_agent", parent_conversation_id="conv_parent", runner_id="runner_gone"
-    )
-    healed = _continued_session(
-        kind="sub_agent", parent_conversation_id="conv_parent", runner_id="runner_parent"
-    )
-    parent_runner, relaunched_runner = object(), object()
-    monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=None))
-    heal = AsyncMock(return_value=parent_runner)
-    monkeypatch.setattr(sessions, "_heal_subagent_runner_binding_via_parent", heal)
-    relay = AsyncMock()
-    monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", relay)
-    relaunch = AsyncMock(return_value=(relaunched_runner, child))
-    monkeypatch.setattr(sessions, "ensure_runner_connected", relaunch)
-    send = AsyncMock()
-    monkeypatch.setattr(fire_mod, "_send_prompt", send)
-    task = _continuing_task()
-    conv_store = _ExistingConversationStore(healed)
-    dispatch = fire_mod._make_reuse_dispatch(
-        _deps(FakeScheduledTaskStore(rows={"task_1": task}), conversation_store=conv_store)
-    )
-
-    await dispatch(child, task)
-
-    relaunch.assert_not_awaited()
-    heal.assert_awaited_once()
-    assert heal.await_args.args[0] is child
-    # The session's output relay moves with it before the prompt goes out.
-    relay.assert_awaited_once()
-    assert relay.await_args.args[:3] == ("conv_prev", "runner_parent", parent_runner)
-    send.assert_awaited_once()
-    assert send.await_args.args[1:] == (healed, parent_runner, task)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("source_mode", ["asks", "skips-approval"])
-async def test_a_side_chat_timer_recovers_its_sources_runner_as_a_message_would(
-    monkeypatch: pytest.MonkeyPatch, source_mode: str
-) -> None:
-    """A side chat has no host: its source's runner is recovered for it, never its own.
-
-    A source whose permission mode skips approval is never relaunched for a timer.
-    """
-    from omnigent.server.routes import sessions
-    from omnigent.server.routes._sessions import orchestration
-
-    labels = {SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: "conv_source"}
-    side_chat = _continued_session(host_id=None, runner_id="gone", labels=labels)
-    rebound = _continued_session(host_id=None, runner_id="source_runner", labels=labels)
-    source = _continued_session(
-        id="conv_source",
-        labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
-        if source_mode == "skips-approval"
-        else {},
-    )
-    source_runner = object()
-    monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=None))
-    recover = AsyncMock(return_value=(source_runner, rebound))
-    monkeypatch.setattr(orchestration, "_recover_side_chat_runner_via_source", recover)
-    relay = AsyncMock()
-    monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", relay)
-    # A hostless side chat's own wake finds no runner, as the real one would.
-    relaunch = AsyncMock(side_effect=lambda **kwargs: (None, kwargs["conv"]))
-    monkeypatch.setattr(sessions, "ensure_runner_connected", relaunch)
-    send = AsyncMock()
-    monkeypatch.setattr(fire_mod, "_send_prompt", send)
-    task = _continuing_task(user_id="alice@example.com")
-    dispatch = fire_mod._make_reuse_dispatch(
-        _deps(
-            FakeScheduledTaskStore(rows={"task_1": task}),
-            conversation_store=_ExistingConversationStore(rebound, source),
-        )
-    )
-
-    if source_mode == "skips-approval":
-        with pytest.raises(RuntimeError, match="no runner can be reached"):
-            await dispatch(side_chat, task)
-        recover.assert_not_awaited()
-        send.assert_not_awaited()
-        return
-    await dispatch(side_chat, task)
-
-    relaunch.assert_not_awaited()
-    recover.assert_awaited_once()
-    # The source is recovered as the timer's owner, who must still be able to edit it.
-    assert recover.await_args.args[0] is side_chat
-    assert recover.await_args.kwargs["user_id"] == "alice@example.com"
-    relay.assert_awaited_once()
-    assert relay.await_args.args[:3] == ("conv_prev", "source_runner", source_runner)
-    send.assert_awaited_once()
-    assert send.await_args.args[1:] == (rebound, source_runner, task)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("owner", ["usable", "inaccessible", "skips-approval"])
-async def test_a_sub_agents_exited_runner_is_relaunched_through_the_session_owning_its_host(
-    monkeypatch: pytest.MonkeyPatch, owner: str
-) -> None:
-    """A runner-created sub-agent has no host; its parent's host relaunches their runner.
-
-    The parent is only woken while a timer may still wake it: the timer's owner may
-    send to it, and its permission mode asks for approval.
-    """
-    from omnigent.server.routes import sessions
-
-    child = _continued_session(
-        kind="sub_agent", parent_conversation_id="conv_parent", runner_id="gone", host_id=None
-    )
-    healed = _continued_session(
-        kind="sub_agent", parent_conversation_id="conv_parent", runner_id="new", host_id=None
-    )
-    parent = _continued_session(
-        id="conv_parent",
-        labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
-        if owner == "skips-approval"
-        else {},
-    )
-    parent_runner = object()
-    monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=None))
-    # No ancestor runner is live until the parent's is relaunched.
-    heal = AsyncMock(side_effect=[None, parent_runner])
-    monkeypatch.setattr(sessions, "_heal_subagent_runner_binding_via_parent", heal)
-    monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", AsyncMock())
-
-    async def _wake(*, conv: Any, **_: Any) -> tuple[object | None, Any]:
-        # Only a session bound to a host can have its runner relaunched.
-        return (parent_runner if conv.host_id is not None else None), conv
-
-    wake = AsyncMock(side_effect=_wake)
-    monkeypatch.setattr(sessions, "ensure_runner_connected", wake)
-    send = AsyncMock()
-    monkeypatch.setattr(fire_mod, "_send_prompt", send)
-    permissions = FakePermissionStore()
-    if owner == "inaccessible":
-        permissions.unowned.add("conv_parent")
-    task = _continuing_task()
-    dispatch = fire_mod._make_reuse_dispatch(
-        _deps(
-            FakeScheduledTaskStore(rows={"task_1": task}),
-            conversation_store=_ExistingConversationStore(healed, parent),
-            permission_store=permissions,
-        )
-    )
-    woken = lambda: [call.kwargs["session_id"] for call in wake.await_args_list]  # noqa: E731
-
-    if owner == "usable":
-        await dispatch(child, task)
-        assert woken() == ["conv_parent"]
-        assert heal.await_count == 2
-        send.assert_awaited_once()
-        assert send.await_args.args[1:] == (healed, parent_runner, task)
-    else:
-        with pytest.raises(RuntimeError, match="no runner can be reached"):
-            await dispatch(child, task)
-        # Only the sub-agent's own wake was tried, which its missing host can't do.
-        assert woken() == ["conv_prev"]
-        send.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_continue_dispatch_failure_records_a_failed_run() -> None:
     conv_store = _ExistingConversationStore(_continued_session())
     store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
@@ -5364,34 +5192,6 @@ async def test_a_busy_session_is_checked_again_later(
     task = _task(
         session_mode=session_mode,
         session_id="sess_busy_check" if session_mode == "continue" else None,
-        next_run_at=due,
-    )
-    assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)
-
-
-@pytest.mark.parametrize(
-    ("live_status", "minutes_since_set", "wait_seconds"),
-    [
-        # The first tick waits for the turn that set the timer...
-        pytest.param("running", 1, BUSY_RECHECK_SECONDS, id="first-tick-while-busy"),
-        # ...but never past ten minutes after the timer was set.
-        pytest.param("running", BUSY_SKIP_MAX_SECONDS // 60, None, id="ten-minutes-after-set"),
-        # An idle session takes it at once, without a trigger's quiet wait.
-        pytest.param("idle", 1, None, id="idle-session"),
-    ],
-)
-async def test_a_timer_that_has_not_fired_waits_only_while_its_session_is_busy(
-    live_status, minutes_since_set, wait_seconds
-) -> None:
-    due = 1_800_003_600
-    # The session changed ten seconds ago, and the timer has no run yet.
-    check = _busy_until_check(live_status, None, updated_at=due - 10)
-    task = _task(
-        kind="timer",
-        rrule=timer_rule(60, repeat=True),
-        session_mode="continue",
-        session_id="sess_busy_check",
-        created_at=due - minutes_since_set * 60,
         next_run_at=due,
     )
     assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)

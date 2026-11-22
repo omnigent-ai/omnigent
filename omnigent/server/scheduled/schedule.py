@@ -108,11 +108,6 @@ def next_timer_time(task: ScheduledTask, after: int) -> int | None:
     return first + ((after - first) // interval + 1) * interval
 
 
-def is_repeating_timer(task: ScheduledTask) -> bool:
-    """Whether *task* is a timer that fires more than once."""
-    return task.kind == "timer" and not is_one_time_rule(task.rrule)
-
-
 def scheduled_trigger_key(scheduled_at: int) -> str:
     """Canonical occurrence key, distinct from manual requests and event deliveries."""
     return f"schedule:{scheduled_at}"

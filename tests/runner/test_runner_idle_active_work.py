@@ -1,10 +1,9 @@
 """Idle-monitor active-work accounting for background runner work.
 
 Pins that ``app.state.has_active_work`` keeps the inactivity watchdog from
-shutting down while ``sys_call_async`` tools or parked approvals are still
-live — and that completion / cancel / failure release the pin so a short idle
-timeout can shut down. Timers live on the server, which wakes the session's
-runner when one fires, so they never pin it.
+shutting down while ``sys_call_async`` tools, scheduled timers, or parked
+approvals are still live — and that completion / cancel / failure release
+the pin so a short idle timeout can shut down.
 """
 
 from __future__ import annotations
@@ -24,7 +23,12 @@ from fastapi import FastAPI
 
 from omnigent.runner import create_runner_app, pending_approvals
 from omnigent.runner._entry import _run_inactivity_monitor
-from omnigent.runner.app import _has_live_async_tasks
+from omnigent.runner.app import (
+    _has_live_async_tasks,
+    _session_timers,
+    register_timer,
+    unregister_timer,
+)
 from tests._helpers.polling import poll_until_async
 from tests.runner.helpers import NullServerClient
 
@@ -34,7 +38,7 @@ _HUMAN_WAIT_HOLD_ENV = "OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S"
 @pytest.fixture(autouse=True)
 def _clean_global_active_work_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Reset the module-global approval registry between tests.
+    Reset module-global timer / approval registries between tests.
 
     Also clears an ambient human-wait hold so the default applies.
 
@@ -43,8 +47,16 @@ def _clean_global_active_work_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.delenv(_HUMAN_WAIT_HOLD_ENV, raising=False)
     pending_approvals.reset_for_tests()
+    for session_timers in list(_session_timers.values()):
+        for task in list(session_timers.values()):
+            task.cancel()
+    _session_timers.clear()
     yield
     pending_approvals.reset_for_tests()
+    for session_timers in list(_session_timers.values()):
+        for task in list(session_timers.values()):
+            task.cancel()
+    _session_timers.clear()
 
 
 def _scaffold_app() -> FastAPI:
@@ -234,6 +246,62 @@ async def test_failed_async_tool_releases_active_work() -> None:
 
 
 @pytest.mark.asyncio
+async def test_live_timer_blocks_idle_shutdown() -> None:
+    """A registered timer task pins the runner until it completes.
+
+    :returns: None.
+    """
+    app = _scaffold_app()
+    finish = asyncio.Event()
+
+    async def _timer() -> None:
+        await finish.wait()
+
+    task = asyncio.create_task(_timer(), name="timer-pin")
+    register_timer("conv_timer", "timer_pin", task)
+    assert app.state.has_active_work() is True
+
+    async def _release() -> None:
+        finish.set()
+        await task
+        unregister_timer("conv_timer", "timer_pin")
+
+    await _assert_monitor_blocked_then_shuts_down(
+        has_active_work=app.state.has_active_work,
+        release=_release,
+    )
+    assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_a_timer_saved_on_the_server_leaves_the_runner_idle() -> None:
+    """The server keeps a durable timer and wakes the session's runner when it fires.
+
+    :returns: None.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    app = _scaffold_app()
+
+    async def timer_server(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"session_timers": True})
+        return httpx.Response(201, json={"durable": True, "timer_id": "t1", "status": "scheduled"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(timer_server), base_url="http://server"
+    ) as client:
+        output = await execute_tool(
+            tool_name="sys_timer_set",
+            arguments=json.dumps({"seconds": 300, "repeat": True}),
+            conversation_id="conv_timer",
+            server_client=client,
+        )
+    assert json.loads(output)["durable"] is True
+    assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
 async def test_parked_approval_blocks_idle_shutdown() -> None:
     """A parked ASK Future keeps the runner alive until resolved.
 
@@ -264,34 +332,6 @@ async def test_done_approval_future_does_not_pin_runner() -> None:
     fut = pending_approvals.register("elicit_stale")
     fut.set_result(pending_approvals.Verdict(approved=False))
     assert fut.done()
-    assert app.state.has_active_work() is False
-
-
-@pytest.mark.asyncio
-async def test_a_saved_timer_leaves_the_runner_idle() -> None:
-    """A timer lives on the server, which wakes the session's runner when it fires.
-
-    :returns: None.
-    """
-    from omnigent.runner.tool_dispatch import execute_tool
-
-    app = _scaffold_app()
-
-    async def timer_server(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/info":
-            return httpx.Response(200, json={"session_timers": True})
-        return httpx.Response(201, json={"timer_id": "t1", "status": "scheduled"})
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(timer_server), base_url="http://server"
-    ) as client:
-        output = await execute_tool(
-            tool_name="sys_timer_set",
-            arguments=json.dumps({"seconds": 5, "repeat": True}),
-            conversation_id="conv_timer",
-            server_client=client,
-        )
-    assert json.loads(output)["status"] == "scheduled"
     assert app.state.has_active_work() is False
 
 
