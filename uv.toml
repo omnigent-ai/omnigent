@@ -25,9 +25,6 @@ exclude-newer = "P7D"
 # guards every other dependency):
 # - cwsandbox: first-party CoreWeave SDK pinned to an exact, tested version
 #   (the `cwsandbox` extra), published 2026-06-11. Drop once aged past P7D.
-# - google-antigravity: the SDK the `antigravity` harness drives (the
-#   `antigravity` extra in pyproject), published 2026-06-11. Drop once aged
-#   past P7D.
 # - nimble-python: the verified Agent API V2 1.2 contract release, required by
 #   nimble_research for typed run fields. Drop once it has aged past P7D.
-exclude-newer-package = { cwsandbox = "2026-06-12T00:00:00Z", google-antigravity = "2026-06-12T00:00:00Z", nimble-python = "2026-07-29T00:00:00Z" }
+exclude-newer-package = { cwsandbox = "2026-06-12T00:00:00Z", nimble-python = "2026-07-29T00:00:00Z" }
