@@ -327,7 +327,8 @@ def test_native_cli_uploads_a_workspace_file_through_the_omnigent_relay(
     """
     A real Claude Code or Codex CLI, launched by a real host for an agent that
     declares no file builtins, is offered the three tools by Omnigent's relay and
-    uploads a file from its workspace with ``sys_upload_file``.
+    uploads a file from its workspace with ``sys_upload_file``: to the session,
+    then with ``scope: "project"`` to the project the session is filed in.
     """
     for binary in (harness, "tmux"):
         if shutil.which(binary) is None:
@@ -483,15 +484,30 @@ def test_native_cli_uploads_a_workspace_file_through_the_omnigent_relay(
         assert offered >= _FILE_TOOLS, sorted(offered)
         assert not offered & _OLD_NAMES, sorted(offered)
 
+        project = client.post("/v1/projects", json={"name": f"native-files-{harness}"})
+        project.raise_for_status()
+        project_id = project.json()["id"]
+        client.patch(
+            f"/v1/sessions/{session_id}", json={"project_id": project_id}
+        ).raise_for_status()
         upload_call: dict[str, Any] = {
             "call_id": "share_report",
             "name": "mcp__omnigent__sys_upload_file" if harness == "claude" else "sys_upload_file",
             **({"namespace": "mcp__omnigent"} if harness == "codex" else {}),
             "arguments": json.dumps({"path": "report.md"}),
         }
+        project_upload_call = {
+            **upload_call,
+            "call_id": "share_report_with_project",
+            "arguments": json.dumps({"path": "report.md", "scope": "project"}),
+        }
         configure_mock_llm(
             mock_url,
-            [{"tool_calls": [upload_call]}, {"text": "Shared report.md."}],
+            [
+                {"tool_calls": [upload_call]},
+                {"tool_calls": [project_upload_call]},
+                {"text": "Shared report.md."},
+            ],
             key=f"native-files-{harness}",
             match=upload_prompt,
             # Codex's approval review quotes the prompt but advertises no relay tools.
@@ -522,6 +538,24 @@ def test_native_cli_uploads_a_workspace_file_through_the_omnigent_relay(
             interval=0.2,
         )
         assert _file_bytes(client, session_id, file_id) == b"native report"
+
+        def project_report() -> str | None:
+            uploaded_report()  # Approves the project upload when the CLI asks.
+            listed = client.get(f"/v1/projects/{project_id}/resources/files")
+            listed.raise_for_status()
+            names = {entry["name"]: entry["id"] for entry in listed.json()["data"]}
+            return names.get("report.md")
+
+        project_file_id = wait_for(
+            project_report,
+            timeout=180,
+            what="the native CLI's upload to reach the session's project",
+            interval=0.2,
+        )
+        content = client.get(
+            f"/v1/projects/{project_id}/resources/files/{project_file_id}/content"
+        )
+        assert content.content == b"native report"
 
 
 def test_isolating_runner_keeps_uploads_inside_each_session(tmp_path: Path) -> None:
@@ -711,3 +745,168 @@ def test_sessions_in_a_project_share_its_files(
     assert json.loads(outsider_listed)["data"] == [], outsider_listed
     assert outsider_read.startswith("Error: download returned 404"), outsider_read
     assert [entry["id"] for entry in owner_listed.json()["data"]] == [file_id], owner_listed.text
+
+
+def _offered_parameters(requests: list[dict[str, Any]], tool_name: str) -> dict[str, Any]:
+    """
+    The parameter schema a model request offered for *tool_name*.
+
+    :param requests: Captured model requests.
+    :param tool_name: The tool, e.g. ``"sys_upload_file"``.
+    :returns: Its ``parameters`` object, or ``{}`` when no request offered it.
+    """
+    for request in requests:
+        for tool in request.get("tools") or []:
+            function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+            if isinstance(function, dict) and function.get("name") == tool_name:
+                return dict(function.get("parameters") or {})
+    return {}
+
+
+def test_model_turns_in_one_project_share_a_file(
+    http_client: httpx.Client, live_runner_id: str, mock_llm_server_url: str
+) -> None:
+    """
+    Two agents' turns, in sessions filed in the same project: one writes a plan
+    and shares it with ``scope: "project"``, the other lists the project's files
+    and reads the plan back. The model is offered the ``scope`` parameter.
+    """
+    created = http_client.post("/v1/projects", json={"name": f"turns-{uuid.uuid4().hex[:8]}"})
+    created.raise_for_status()
+    project_id = created.json()["id"]
+    writer_model, reader_model = (f"mock-project-turn-{uuid.uuid4().hex[:8]}" for _ in range(2))
+    sessions = []
+    for model in (writer_model, reader_model):
+        session_id = _model_session(
+            http_client,
+            runner_id=live_runner_id,
+            mock_llm_server_url=mock_llm_server_url,
+            model=model,
+            spec_overrides={"os_env": _OS_ENV},
+        )
+        http_client.patch(
+            f"/v1/sessions/{session_id}", json={"project_id": project_id}
+        ).raise_for_status()
+        sessions.append(session_id)
+    writer, reader = sessions
+
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            _tool_call("write", "sys_os_write", {"path": "plan.md", "content": "the plan"}),
+            _tool_call("share", "sys_upload_file", {"path": "plan.md", "scope": "project"}),
+            {"text": "Shared the plan with the project."},
+        ],
+        key=writer_model,
+        required_tools=["sys_upload_file"],
+    )
+    writer_turn = poll_session_until_terminal(
+        http_client,
+        session_id=writer,
+        response_id=send_user_message_to_session(
+            http_client, session_id=writer, content="Write the plan and share it."
+        ),
+        timeout=120,
+    )
+    shared = json.loads(_outputs_by_call_id(writer_turn)["share"])
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            _tool_call("list", "sys_list_files", {"scope": "project"}),
+            _tool_call(
+                "read", "sys_download_file", {"file_id": shared["file_id"], "scope": "project"}
+            ),
+            {"text": "Read the plan."},
+        ],
+        key=reader_model,
+        required_tools=["sys_list_files"],
+    )
+    reader_turn = poll_session_until_terminal(
+        http_client,
+        session_id=reader,
+        response_id=send_user_message_to_session(
+            http_client, session_id=reader, content="Read the project's plan."
+        ),
+        timeout=120,
+    )
+
+    offered = _offered_parameters(
+        get_mock_requests(mock_llm_server_url, key=writer_model), "sys_upload_file"
+    )
+    assert offered.get("properties", {}).get("scope", {}).get("enum") == ["session", "project"]
+    assert writer_turn["status"] == "completed", writer_turn.get("error")
+    assert reader_turn["status"] == "completed", reader_turn.get("error")
+    outputs = _outputs_by_call_id(reader_turn)
+    assert [entry["name"] for entry in json.loads(outputs["list"])["data"]] == ["plan.md"]
+    assert outputs["read"] == "the plan"
+    assert _session_files(http_client, writer) == {}
+
+
+def test_deleting_a_project_removes_its_files(tmp_path: Path) -> None:
+    """
+    The owner shares a brief with a project and the project's agent reads it and
+    adds a plan. Deleting the project removes both files' bytes from the artifact
+    store and every route to them.
+    """
+    with server_runner(tmp_path, base_env=_stack_base_env(), poll_interval=0.2) as stack:
+        stack.start_runner()
+        with httpx.Client(
+            base_url=stack.base_url,
+            trust_env=False,
+            timeout=60,
+            headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+        ) as client:
+            created = client.post("/v1/projects", json={"name": "Launch"})
+            created.raise_for_status()
+            project_id = created.json()["id"]
+            spec = {
+                "name": "project-files",
+                "prompt": "Share files with the project.",
+                "executor": {"harness": "openai-agents", "model": "unused-model"},
+                "os_env": _OS_ENV,
+            }
+            response = post_session_bundle(
+                client.post,
+                "/v1/sessions",
+                bundle_files({"agent.yaml": yaml.safe_dump(spec).encode()}),
+            )
+            response.raise_for_status()
+            session_id = response.json()["session_id"]
+            bind_session_runner(client.patch, "", session_id, stack.runner_id)
+            client.patch(
+                f"/v1/sessions/{session_id}", json={"project_id": project_id}
+            ).raise_for_status()
+
+            brief = client.post(
+                f"/v1/projects/{project_id}/resources/files",
+                files={"file": ("brief.md", b"the brief", "text/markdown")},
+            )
+            brief.raise_for_status()
+            brief_id = brief.json()["id"]
+            read_brief = _mcp_tool_call(
+                client, session_id, "sys_download_file", {"file_id": brief_id, "scope": "project"}
+            )
+            client.put(
+                f"/v1/sessions/{session_id}/resources/environments/default/filesystem/plan.md",
+                json={"content": "the plan", "encoding": "utf-8"},
+            ).raise_for_status()
+            plan_id = json.loads(
+                _mcp_tool_call(
+                    client, session_id, "sys_upload_file", {"path": "plan.md", "scope": "project"}
+                )
+            )["file_id"]
+            stored_before = {path.name for path in stack.artifact_location.iterdir()}
+
+            deleted = client.delete(f"/v1/projects/{project_id}")
+            owner_after = client.get(f"/v1/projects/{project_id}/resources/files")
+            agent_after = _mcp_tool_call(
+                client, session_id, "sys_list_files", {"scope": "project"}
+            )
+            stored_after = {path.name for path in stack.artifact_location.iterdir()}
+
+    assert read_brief == "the brief"
+    assert {brief_id, plan_id} <= stored_before
+    assert deleted.status_code == 200, deleted.text
+    assert owner_after.status_code == 404, owner_after.text
+    assert agent_after.startswith("Error: sys_list_files returned 404"), agent_after
+    assert not {brief_id, plan_id} & stored_after
