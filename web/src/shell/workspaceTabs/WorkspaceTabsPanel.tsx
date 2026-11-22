@@ -110,6 +110,8 @@ import {
   sidebarShellUnit,
   useShownTerminalGroups,
 } from "../SidebarTerminalPanes";
+import { normalizeTerminalGroups } from "@/lib/terminalGroups";
+import { readTerminalGroups } from "../terminalGroupsStore";
 import { useTerminalOpenRequests } from "../terminalOpenRequest";
 import { WorkspaceTabTooltip } from "../WorkspacePanel";
 import { NewTabPage, type NewTabRecent } from "./NewTabPage";
@@ -391,7 +393,7 @@ function WorkspaceTabsPanelImpl({
     ),
   ];
   // Each shell's split comes along as one unit, every member counted against the budget.
-  const { groups: shellGroups } = useShownTerminalGroups(conversationId);
+  const { groups: shellGroups, mainKeys: shellMainKeys } = useShownTerminalGroups(conversationId);
   const shellSplitsAllowed = usePanesSplitsAllowed(!isOwnerLevel(permissionLevel));
   const mountedShellKeys = useMountedShellKeys(
     shownShellKeys,
@@ -399,6 +401,32 @@ function WorkspaceTabsPanelImpl({
     open && !inert,
     (key) => sidebarShellUnit(shellGroups, shellSplitsAllowed, key),
   );
+  // Focus moving to another pane of the shown split selects that shell's tab, with no step of its
+  // own. Read live: the split or the selection may have changed since this render.
+  const selectFocusedShell = (shellKey: string) => {
+    const selected = store.selectedTab();
+    if (selected?.binding?.kind !== "terminal") return;
+    const liveGroups = normalizeTerminalGroups(readTerminalGroups(conversationId), {
+      mainKeys: shellMainKeys,
+      isGone: () => false,
+    });
+    const unit = sidebarShellUnit(liveGroups, shellSplitsAllowed, selected.binding.key);
+    if (!unit.includes(shellKey)) return;
+    const unitTabs = store
+      .tabs()
+      .filter(
+        (tab): tab is WorkspaceTab =>
+          !isUnknownTab(tab) && tab.binding?.kind === "terminal" && unit.includes(tab.binding.key),
+      );
+    const focused = unitTabs.find(
+      (tab) => tab.binding?.kind === "terminal" && tab.binding.key === shellKey,
+    );
+    if (focused)
+      store.selectAmong(
+        focused.id,
+        unitTabs.map((tab) => tab.id),
+      );
+  };
   // A pane's shell moving here, or a sidebar split's survivor, opens through the shell tab opener.
   useTerminalOpenRequests(contained ? null : conversationId, (request) =>
     openTerminalTab(request.key, { focus: request.focus }),
@@ -1290,6 +1318,7 @@ function WorkspaceTabsPanelImpl({
                     readOnly={!isOwnerLevel(permissionLevel)}
                     visible={selectedShellKey !== null && open && !inert}
                     autoFocusKey={autoFocusTerminalKey}
+                    onFocusShell={selectFocusedShell}
                   />
                 </div>
               )}

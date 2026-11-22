@@ -18,6 +18,8 @@ import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 import type * as PanesViewGateModule from "../panesViewGate";
 import { resetPaneSplitsCache, updatePaneSplit } from "../paneSplitStore";
+import type { TerminalGroup } from "@/lib/terminalGroups";
+
 import { resetTerminalGroupsCache, updateTerminalGroups } from "../terminalGroupsStore";
 import { requestTerminalOpen, resetTerminalOpenRequestsForTests } from "../terminalOpenRequest";
 import { resetTerminalPlacement, usePublishMainTerminalKeys } from "../terminalPlacement";
@@ -779,6 +781,100 @@ describe("a shell's tab", () => {
     view.rerender(panels.map((current) => ({ ...current, open: false })));
     await waitFor(() => expect(shownTerminals()).toEqual(["term_a", "term_b"]));
   });
+
+  it("selects a split shell's tab as its pane takes focus, in place of the current step", async () => {
+    panesGate.shown = true;
+    const { store, select } = await openShells("s-split-focus", ["term_a", "term_b", "term_c"], {
+      permissionLevel: LEVEL_OWNER,
+    });
+    act(() =>
+      updateTerminalGroups("s-split-focus", () => [
+        {
+          id: "g_ab",
+          split: {
+            layout: {
+              axis: "columns",
+              ratio: 0.5,
+              children: ["terminal:term_a", "terminal:term_b"],
+            },
+            focusedKey: "terminal:term_a",
+          },
+        },
+      ]),
+    );
+    select("term_c");
+    select("term_a");
+    const tabA = store.selectedTabId();
+    await waitFor(() => expect(stubOf("term_b")).not.toBeNull());
+    fireEvent.focusIn(stubOf("term_b")!);
+    const tabB = store.selectedTab();
+    expect(tabB?.binding).toEqual({ kind: "terminal", key: "terminal:term_b" });
+    // The step a's selection made is b's now, so Back goes where it would have from a.
+    expect(store.history.canGoForward()).toBe(false);
+    await act(async () => void (await store.go("back")));
+    expect(store.selectedTab()?.binding).toEqual({ kind: "terminal", key: "terminal:term_c" });
+    expect(store.selectedTabId()).not.toBe(tabA);
+    // A shell outside the shown split taking focus selects nothing.
+    select("term_a");
+    fireEvent.focusIn(stubOf("term_c")!);
+    expect(store.selectedTabId()).toBe(tabA);
+  });
+
+  it.each<[string, () => readonly TerminalGroup[]]>([
+    ["goes", () => []],
+    [
+      "becomes a/c",
+      () => [
+        {
+          id: "g_ac",
+          split: {
+            layout: {
+              axis: "columns",
+              ratio: 0.5,
+              children: ["terminal:term_a", "terminal:term_c"],
+            },
+            focusedKey: "terminal:term_a",
+          },
+        },
+      ],
+    ],
+  ])(
+    "selects nothing for focus from a split that %s before the sidebar rerenders",
+    async (_change, nextGroups) => {
+      const conversationId = `s-split-stale-${nextGroups().length}`;
+      panesGate.shown = true;
+      const { store, select } = await openShells(conversationId, ["term_a", "term_b", "term_c"], {
+        permissionLevel: LEVEL_OWNER,
+      });
+      act(() =>
+        updateTerminalGroups(conversationId, () => [
+          {
+            id: "g_ab",
+            split: {
+              layout: {
+                axis: "columns",
+                ratio: 0.5,
+                children: ["terminal:term_a", "terminal:term_b"],
+              },
+              focusedKey: "terminal:term_a",
+            },
+          },
+        ]),
+      );
+      select("term_a");
+      const tabA = store.selectedTabId();
+      await waitFor(() => expect(stubOf("term_b")).not.toBeNull());
+      const paneB = stubOf("term_b")!;
+      const visits = store.history.state.visits;
+      // The split changes and b's focus lands in one batch, before the panel renders again.
+      act(() => {
+        updateTerminalGroups(conversationId, nextGroups);
+        paneB.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+      });
+      expect(store.selectedTabId()).toBe(tabA);
+      expect(store.history.state.visits).toEqual(visits);
+    },
+  );
 
   it("keeps only the selected shell attached while the sidebar is closed", async () => {
     const { view, panels, select } = await openShells("s-closed", ["term_a", "term_b"]);

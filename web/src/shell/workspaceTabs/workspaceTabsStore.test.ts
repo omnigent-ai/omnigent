@@ -417,6 +417,54 @@ describe("shells", () => {
     ).resolves.toEqual({ ok: false, reason: "That shell has ended." });
   });
 
+  describe("moving between a split's shells", () => {
+    const shellTab = (id: string, key: string): WorkspaceTab => ({
+      id,
+      place: { kind: "terminal", key },
+      binding: { kind: "terminal", key },
+      openedBy: "user",
+    });
+    const [left, right, other] = [shellTab("A", "a"), shellTab("B", "b"), shellTab("C", "c")];
+    const split = ["A", "B"];
+
+    it("selects the other shell's tab in place of the current step", async () => {
+      const { store } = makeStore({ initial: initial([files, left, right], "F") });
+      expect(store.select("A")).toBe(true);
+      expect(store.selectAmong("B", split)).toBe(true);
+      expect(store.selectedTabId()).toBe("B");
+      expectInvariant(store);
+      // The plain select's step stays one step: Back goes where it went from A.
+      expect(store.history.state.visits.map((visit) => visit.tabId)).toEqual(["F", "B"]);
+      await store.go("back");
+      expect(store.selectedTabId()).toBe("F");
+    });
+
+    it("keeps a plain select made meanwhile, of a tab outside the split", () => {
+      const { store } = makeStore({ initial: initial([files, left, right, other], "A") });
+      expect(store.select("C")).toBe(true);
+      expect(store.selectAmong("B", split)).toBe(false);
+      expect(store.selectedTabId()).toBe("C");
+      expect(store.history.state.visits.map((visit) => visit.tabId)).toEqual(["A", "C"]);
+    });
+
+    it("keeps Forward", async () => {
+      const { store } = makeStore({ initial: initial([files, left, right], "F") });
+      store.select("A");
+      store.select("F");
+      await store.go("back");
+      expect(store.selectAmong("B", split)).toBe(true);
+      expect(store.history.state.visits.map((visit) => visit.tabId)).toEqual(["F", "B", "F"]);
+      await store.go("forward");
+      expect(store.selectedTabId()).toBe("F");
+    });
+
+    it("refuses a tab outside the split", () => {
+      const { store } = makeStore({ initial: initial([files, left, right, other], "A") });
+      expect(store.selectAmong("C", split)).toBe(false);
+      expect(store.selectedTabId()).toBe("A");
+    });
+  });
+
   it("drops a restored shell missing from the first loaded list", () => {
     const restored = { ...shell, openedBy: "restore" as const };
     const { store } = makeStore({ initial: initial([files, restored], "F") });

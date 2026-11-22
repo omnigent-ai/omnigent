@@ -632,6 +632,28 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     return true;
   }
 
+  /**
+   * Move the selection between tabs shown together, such as a split's shells as focus moves
+   * between their panes, in place of the current step. Changes nothing and returns false once
+   * the selected tab isn't one of `together`, so a selection made meanwhile stands.
+   */
+  function selectAmong(tabId: TabId, together: readonly TabId[]): boolean {
+    if (tabId === selectedTabId) return true;
+    if (selectedTabId === null || !together.includes(selectedTabId) || !together.includes(tabId))
+      return false;
+    const tab = findTab(tabId);
+    if (!tab) return false;
+    const onSelected = history.state.visits[history.state.cursor]?.tabId === selectedTabId;
+    markSelected(tabId);
+    const shown = tab.unseen ? withoutUnseen(tab) : tab;
+    if (shown !== tab) replaceTab(shown);
+    // The cursor is on the tab it leaves unless history lost it; then this is a step after all.
+    if (onSelected) history.swapCurrent(visitOf(shown));
+    else history.recordStep(visitOf(shown));
+    commit();
+    return true;
+  }
+
   /** Land after the selected tab went away: the nearest surviving visit, a neighbour, or none. */
   function landAfterRemoval(removedIndex: number, restore: Visit | null) {
     if (restore && tabs.some((tab) => tab.id === restore.tabId)) {
@@ -1143,6 +1165,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     /** Whether `tabId` is selected right now, even inside a transition not yet published. */
     isSelected: (tabId: TabId) => selectedTabId === tabId,
     select,
+    selectAmong,
     go,
     close,
     closeOthers,
