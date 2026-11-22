@@ -67,6 +67,22 @@ describe("saveView", () => {
     expect(readSavedViews(SCOPE).map((view) => view.name)).toEqual(["Review", "Mine"]);
   });
 
+  it("saves a saved view's settings under a new name and id, never its own", () => {
+    const first = saveView(SCOPE, "Review", SETTINGS);
+    if (!first.ok) throw new Error("not saved");
+    const second = saveView(SCOPE, "Copy", first.view);
+    if (!second.ok) throw new Error("not saved");
+    expect(second.view.name).toBe("Copy");
+    expect(second.view.id).not.toBe(first.view.id);
+    expect(readSavedViews(SCOPE).map((view) => view.name)).toEqual(["Review", "Copy"]);
+    // Only the settings a view keeps are stored, whatever else the object carries.
+    const extra = { ...SETTINGS, label: "stray" } as typeof SETTINGS;
+    const third = saveView(SCOPE, "Third", extra);
+    expect(third.ok && Object.keys(third.view).sort()).toEqual(
+      ["id", "name", ...Object.keys(SETTINGS)].sort(),
+    );
+  });
+
   it("refuses an empty name or one already taken, ignoring case", () => {
     saveView(SCOPE, "Review", SETTINGS);
     expect(saveView(SCOPE, "   ", SETTINGS)).toEqual({ ok: false, problem: "empty" });
@@ -214,6 +230,27 @@ describe("deleteView", () => {
     expect(readSavedViews(SCOPE).map((view) => view.name)).toEqual(["review"]);
   });
 
+  it("leaves the view deleted, and says so, when storage fails as it's put back", () => {
+    const saved = saveView(SCOPE, "Review", SETTINGS);
+    if (!saved.ok) throw new Error("not saved");
+    const restore = deleteView(SCOPE, saved.view.id);
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("full");
+    });
+    expect(restore?.()).toEqual({ ok: false, problem: "storage" });
+    setItem.mockRestore();
+    expect(readSavedViews(SCOPE)).toEqual([]);
+
+    // Storage that can't be read by then changes nothing either.
+    const getItem = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new Error("blocked");
+    });
+    expect(restore?.()).toEqual({ ok: false, problem: "storage" });
+    getItem.mockRestore();
+    expect(readSavedViews(SCOPE)).toEqual([]);
+    expect(restore?.()).toEqual({ ok: true });
+  });
+
   it("deletes nothing for an id it doesn't keep", () => {
     saveView(SCOPE, "A", SETTINGS);
     expect(deleteView(SCOPE, "missing")).toBeNull();
@@ -250,6 +287,16 @@ describe("useSidebarSavedViews", () => {
     act(() => void saveView(SCOPE, "Review", SETTINGS));
     expect(result.current.map((view) => view.name)).toEqual(["Review"]);
     act(() => void deleteView(SCOPE, result.current[0]!.id));
+    expect(result.current).toEqual([]);
+  });
+
+  it("follows another window clearing storage", () => {
+    saveView(SCOPE, "Review", SETTINGS);
+    const { result } = renderHook(() => useSidebarSavedViews(SCOPE));
+    expect(result.current).toHaveLength(1);
+    // Another window's localStorage.clear() reaches this one as a storage event with no key.
+    localStorage.clear();
+    act(() => void window.dispatchEvent(new StorageEvent("storage", { key: null })));
     expect(result.current).toEqual([]);
   });
 });

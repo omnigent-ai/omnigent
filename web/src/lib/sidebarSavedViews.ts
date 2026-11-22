@@ -125,7 +125,8 @@ function notify() {
 function subscribe(listener: () => void) {
   listeners.add(listener);
   const onStorage = (event: StorageEvent) => {
-    if (event.key === STORAGE_KEY) listener();
+    // A null key is another window clearing storage.
+    if (event.key === STORAGE_KEY || event.key === null) listener();
   };
   window.addEventListener("storage", onStorage);
   return () => {
@@ -165,6 +166,12 @@ function addProblem(entries: readonly unknown[], name: string): "duplicate" | "l
   return null;
 }
 
+/** Only the settings a view keeps, so a view passed as settings lends neither its id nor its name. */
+function savedViewSettings(settings: SavedViewSettings): SavedViewSettings {
+  const { grouping, ordering, show, sessionFilter, pullRequestFilter } = settings;
+  return { grouping, ordering, show, sessionFilter, pullRequestFilter };
+}
+
 /** Saves `settings` as a new view named `name`, or says why it can't. */
 export function saveView(
   scope: SavedViewScope,
@@ -177,7 +184,11 @@ export function saveView(
   if (entries === null) return { ok: false, problem: "storage" };
   const problem = addProblem(entries, trimmed);
   if (problem) return { ok: false, problem };
-  const view: SidebarSavedView = { id: randomUUID(), name: trimmed, ...settings };
+  const view: SidebarSavedView = {
+    ...savedViewSettings(settings),
+    id: randomUUID(),
+    name: trimmed,
+  };
   return writeScope(scope, [...entries, view])
     ? { ok: true, view }
     : { ok: false, problem: "storage" };
