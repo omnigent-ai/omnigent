@@ -47,6 +47,11 @@ def test_lane_recording_blockers_are_explicit_and_do_not_block_delivery() -> Non
 def test_repository_browser_rule_grants_workflow_agents_their_recordings() -> None:
     repository_rules = _normalized(_DEV.parent / "CLAUDE.md")
 
+    assert (
+        "Do not run browser-based verification: no manual browser interaction, "
+        "Playwright or other browser E2E runs, browser screenshots, or recordings"
+        in repository_rules
+    )
     assert "Only an explicit user request for browser verification" in repository_rules
     assert (
         "The Repro, Resolve, and Feature workflow agents (`dev/repro-agent`, "
