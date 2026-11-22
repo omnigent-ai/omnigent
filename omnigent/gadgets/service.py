@@ -171,6 +171,12 @@ def canonical_bytes(value: Any) -> bytes:
         raise InvalidInput("Expected a finite JSON value") from exc
 
 
+def _requested_by(value: Any) -> str | None:
+    """Who asked for a ledger entry, or ``None`` for one that doesn't say."""
+    requester = value.get("requested_by") if isinstance(value, dict) else None
+    return requester if isinstance(requester, str) and requester else None
+
+
 def _digest(value: Any, length: int = 32) -> str:
     return hashlib.sha256(canonical_bytes(value)).hexdigest()[:length]
 
@@ -1189,8 +1195,16 @@ class GadgetService:
         return {"items": items}
 
     def list_actions(self, app_id: str, limit: Any = 50, cursor: Any = None) -> dict:
+        """The gadget's whole ledger, readable by everyone who can read the gadget.
+
+        Each entry says whether the caller requested it (``yours``): only those are the
+        caller's to carry out (see :meth:`update_action`).
+        """
         gadget, _ = self._resolve(app_id)
-        return self._ledger(gadget).list("actions", limit, cursor).to_dict()
+        page = self._ledger(gadget).list("actions", limit, cursor).to_dict()
+        for item in page["items"]:
+            item["yours"] = _requested_by(item["value"]) in (None, self.viewer.user_id)
+        return page
 
     def update_action(self, app_id: str, body: dict) -> dict:
         gadget, permissions = self._resolve(app_id)
@@ -1203,6 +1217,14 @@ class GadgetService:
         current = store.get_version("actions", record_id, version)
         if current is None:
             raise NotFound("The action was deleted")
+        # An action runs in its requester's gadget session, with their access: another
+        # person's session (even the owner's) may read it but not take it on.
+        if _requested_by(current.value) not in (None, self.viewer.user_id):
+            raise GadgetError(
+                "PERMISSION_DENIED",
+                "Someone else requested this action; only their gadget session carries it out",
+                403,
+            )
         changes = {
             key: value
             for key, value in body.items()

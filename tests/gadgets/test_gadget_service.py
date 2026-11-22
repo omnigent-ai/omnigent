@@ -791,6 +791,30 @@ def test_actions_and_gadget_sessions_need_edit_access_to_the_gadget(gadgets: Fix
         assert error.value.code == "PERMISSION_DENIED"
 
 
+def test_the_owner_sees_an_editors_queued_action_but_only_the_editor_carries_it_out(
+    gadgets: Fixture,
+) -> None:
+    owner = gadgets.service()
+    app = publish_actions_board(owner)
+    gadgets.access.share(app, 2, EDIT)
+    editor = gadgets.service(2)
+    queued = editor.request_action(
+        app["id"], {"action": "run_card", "params": {"cardId": "c1"}, "operation_id": "r"}
+    )
+
+    # Everyone who reads the gadget sees the ledger; it says whose each entry is.
+    [seen] = owner.list_actions(app["id"])["items"]
+    assert seen["id"] == queued["id"] and seen["yours"] is False
+    assert editor.list_actions(app["id"])["items"][0]["yours"] is True
+
+    take = {"id": queued["id"], "if_version": queued["version"], "operation_id": "u"}
+    with pytest.raises(GadgetError) as error:
+        owner.update_action(app["id"], {**take, "state": "running"})
+    assert error.value.code == "PERMISSION_DENIED"
+    running = editor.update_action(app["id"], {**take, "state": "running"})
+    assert running["value"]["state"] == "running"
+
+
 def test_each_viewer_keeps_their_own_gadget_session(gadgets: Fixture) -> None:
     owner = gadgets.service()
     app = publish_actions_board(owner)

@@ -116,8 +116,8 @@ SysGadgetRenameTool = _gadget_tool(
 )
 SysGadgetActionListTool = _gadget_tool(
     "sys_gadget_action_list",
-    "Read a page of a gadget's action ledger: each requested action's params, state, summary "
-    "and version.",
+    "Read a page of a gadget's action ledger: each requested action's params, state, summary, "
+    "version, and whether you requested it (`yours`).",
     {
         "gadget_id": _ID,
         "limit": {"type": "integer", "minimum": 1, "maximum": GADGET_LIST_PAGE_MAX},

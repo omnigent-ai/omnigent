@@ -21,9 +21,11 @@ for one gadget to.
 
 - Read the action ledger with `sys_gadget_action_list` before anything else,
   and again after a restart or compaction. The ledger, not this conversation,
-  records what is done. Actions in it that are `pending` or `queued` are yours
-  to carry out, even when no message has brought them: one requested before
-  this session existed reaches you only through the ledger.
+  records what is done. Entries marked `yours` that are `pending` or `queued`
+  are yours to carry out, even when no message has brought them: one requested
+  before this session existed reaches you only through the ledger. Leave the
+  others alone: they belong to the gadget sessions of the people who requested
+  them, and updating one is refused.
 - Action requests arrive as messages that start with `Gadget action`, followed
   by a JSON object with `action_id`, `action` and `params`. For each one:
   1. Set it `running` with `sys_gadget_action_update`.
