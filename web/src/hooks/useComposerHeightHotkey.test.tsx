@@ -30,8 +30,9 @@ function mount(scope = "session:a", enabled = true) {
   // One ref for the composer's life, as a component's useRef gives.
   const rootRef = { current: root };
   const view = renderHook(
-    (props: { enabled: boolean }) => useComposerHeightHotkey({ scope, root: rootRef, ...props }),
-    { initialProps: { enabled } },
+    (props: { scope: string; enabled: boolean }) =>
+      useComposerHeightHotkey({ root: rootRef, ...props }),
+    { initialProps: { scope, enabled } },
   );
   return { ...view, input };
 }
@@ -56,7 +57,7 @@ describe("useComposerHeightHotkey", () => {
     expect(heightGroups().map((group) => group.heading)).toEqual(["Message"]);
     expect(row()?.label).toBe("Expand message box");
 
-    rerender({ enabled: false });
+    rerender({ scope: "session:a", enabled: false });
     // The other box still can.
     expect(rows()).toHaveLength(1);
   });
@@ -100,6 +101,21 @@ describe("useComposerHeightHotkey", () => {
     expect(targetComposerScope()).toBe("session:a");
     act(() => row()!.run());
     expect(composerHeightOf("session:a")).toBe("expanded");
+    expect(composerHeightOf("session:b")).toBe("compact");
+  });
+
+  it("keeps acting on the box focused last when it switches to another session", () => {
+    const first = mount("session:a");
+    const second = mount("session:b");
+    act(() => second.input.focus());
+    act(() => first.input.focus());
+    // Focus leaves for the sidebar, where the first box's session is switched.
+    act(() => first.input.blur());
+    first.rerender({ scope: "session:c", enabled: true });
+
+    expect(targetComposerScope()).toBe("session:c");
+    act(() => row()!.run());
+    expect(composerHeightOf("session:c")).toBe("expanded");
     expect(composerHeightOf("session:b")).toBe("compact");
   });
 

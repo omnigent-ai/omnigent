@@ -77,12 +77,14 @@ export function useComposerHeightHotkey({
   enabled: boolean;
   root: RefObject<HTMLElement | null>;
 }): void {
-  const mine = useRef<MountedComposer | null>(null);
+  // One entry for the composer's life: a session switch changes its scope, not when focus last
+  // entered it.
+  const composer = useRef<MountedComposer>({ scope, focusedAt: 0 }).current;
   // Each composer offers under its own source, so one withdrawing never takes another's row.
   const source = `${COMPOSER_HEIGHT_COMMAND_SOURCE}:${useId()}`;
   const isTarget = useSyncExternalStore(
     subscribeTarget,
-    () => mine.current !== null && targetComposer() === mine.current,
+    () => targetComposer() === composer,
     () => false,
   );
   const height = useSyncExternalStore(
@@ -92,27 +94,30 @@ export function useComposerHeightHotkey({
   );
 
   useEffect(() => {
+    if (composer.scope === scope) return;
+    composer.scope = scope;
+    targetChanged();
+  }, [composer, scope]);
+
+  useEffect(() => {
     if (!enabled) return;
     const element = root.current;
     // A composer mounting with focus already in it, as on autofocus, is the one focused last.
     const focused = document.activeElement;
-    const holdsFocus = focused instanceof Node && !!element?.contains(focused);
-    const composer: MountedComposer = { scope, focusedAt: holdsFocus ? ++focusCount : 0 };
+    if (focused instanceof Node && element?.contains(focused)) composer.focusedAt = ++focusCount;
     const onFocusIn = () => {
       composer.focusedAt = ++focusCount;
       targetChanged();
     };
     element?.addEventListener("focusin", onFocusIn);
     mountedComposers.push(composer);
-    mine.current = composer;
     targetChanged();
     return () => {
       element?.removeEventListener("focusin", onFocusIn);
       mountedComposers.splice(mountedComposers.indexOf(composer), 1);
-      mine.current = null;
       targetChanged();
     };
-  }, [enabled, root, scope]);
+  }, [composer, enabled, root]);
 
   const commands = useMemo<PaletteCommand[]>(
     () =>
