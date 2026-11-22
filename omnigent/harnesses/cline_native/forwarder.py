@@ -370,9 +370,7 @@ async def _refresh_hub_endpoint(
         ):
             write_bridge_state(
                 bridge_dir,
-                dataclasses.replace(
-                    state, ws_url=endpoint.ws_url, auth_token=endpoint.auth_token
-                ),
+                dataclasses.replace(state, ws_url=endpoint.ws_url, auth_token=endpoint.auth_token),
             )
             logger.info(
                 "cline forwarder %s: refreshed bridge state for hub restart",

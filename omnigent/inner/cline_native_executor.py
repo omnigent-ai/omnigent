@@ -139,9 +139,7 @@ def _describe_session_record(record: dict[str, Any]) -> str:
     )
 
 
-async def _refresh_state_if_needed(
-    state: ClineBridgeState, bridge_dir: Path
-) -> ClineBridgeState:
+async def _refresh_state_if_needed(state: ClineBridgeState, bridge_dir: Path) -> ClineBridgeState:
     """Re-run ``cline hub start`` and persist fresh coordinates when they changed.
 
     A hub restart rotates the auth token, so persisted state goes stale; the
@@ -154,12 +152,8 @@ async def _refresh_state_if_needed(
         raise ClineHubError(
             "cline hub coordinates stale and bridge state has no workspace to re-ensure"
         )
-    endpoint = await ensure_cline_hub(
-        cwd=state.workspace, executable=state.cline_command or None
-    )
-    refreshed = dataclasses.replace(
-        state, ws_url=endpoint.ws_url, auth_token=endpoint.auth_token
-    )
+    endpoint = await ensure_cline_hub(cwd=state.workspace, executable=state.cline_command or None)
+    refreshed = dataclasses.replace(state, ws_url=endpoint.ws_url, auth_token=endpoint.auth_token)
     write_bridge_state(bridge_dir, refreshed)
     logger.info(
         "cline-native: hub re-ensured at %s (token fp %s)",
@@ -169,9 +163,7 @@ async def _refresh_state_if_needed(
     return refreshed
 
 
-async def _connect(
-    state: ClineBridgeState, bridge_dir: Path
-) -> tuple[Any, ClineBridgeState]:
+async def _connect(state: ClineBridgeState, bridge_dir: Path) -> tuple[Any, ClineBridgeState]:
     """Connect to the hub, refreshing stale coordinates once on failure."""
     from omnigent.harnesses.cline_native.client import ClineHubClient
 
@@ -181,9 +173,7 @@ async def _connect(
         )
         return client, state
     except (ClineHubError, OSError) as exc:
-        logger.info(
-            "cline-native: hub connect failed (%s); refreshing coordinates", exc
-        )
+        logger.info("cline-native: hub connect failed (%s); refreshing coordinates", exc)
     state = await _refresh_state_if_needed(state, bridge_dir)
     client = await ClineHubClient.connect(
         state.ws_url, state.auth_token, workspace_root=state.workspace, cwd=state.workspace
@@ -278,8 +268,7 @@ async def _resume_or_resend(
             record = await client.session_get(state.session_id)
         except ClineHubError as exc:
             raise ClineHubError(
-                f"cline hub session {state.session_id} lookup failed after "
-                f"reconnect: {exc}"
+                f"cline hub session {state.session_id} lookup failed after reconnect: {exc}"
             ) from exc
         _require_live_session(record, state.session_id)
         if str(record.get("status") or "") == "running":
