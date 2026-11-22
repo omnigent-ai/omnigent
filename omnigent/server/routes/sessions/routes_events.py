@@ -319,7 +319,7 @@ from omnigent.server.session_live_state import (
 )
 from omnigent.server.session_metadata_logging import log_session_metadata
 from omnigent.server.session_orchestration import require_orchestration_source
-from omnigent.server.startup_inputs import StartupDispatch, StartupInputContext
+from omnigent.server.startup_inputs import STARTUP_LABEL, StartupDispatch, StartupInputContext
 from omnigent.server.subagent_activity import (
     native_subagent_terminal_status,
     record_subagent_activity,
@@ -1860,13 +1860,11 @@ def register_events_routes(
             )
         )
 
-        async def wait_for_startup(current: Conversation) -> dict[str, Any] | None:
-            """Save this input behind *current*'s startup for its launch to deliver, if it has one."""
-            if not may_wait_for_startup or startup is None:
-                return None
-            if not await startup.accepts(current, request.app):
-                return None
+        async def queue_for_startup() -> dict[str, Any]:
+            """Save an authorized input for background delivery, not runner readiness."""
+            assert startup is not None
             if peer_message:
+                assert isinstance(request, Request)
                 await asyncio.to_thread(
                     require_orchestration_source,
                     request,
@@ -1885,6 +1883,14 @@ def register_events_routes(
                 "queued": True,
                 "pending_id": pending_inputs.make_pending_id(session_id, saved.id),
             }
+
+        async def wait_for_startup(current: Conversation) -> dict[str, Any] | None:
+            """Save this input behind *current*'s startup for its launch to deliver, if it has one."""
+            if not may_wait_for_startup or startup is None:
+                return None
+            if not await startup.accepts(current, request.app):
+                return None
+            return await queue_for_startup()
 
         if (held := await wait_for_startup(conv)) is not None:
             return held
@@ -3447,6 +3453,21 @@ def register_events_routes(
         # re-addresses rather than healing against this replica's registry.
         if runner_client is None:
             await _raise_if_runner_on_another_replica(conv, request.app.state, conversation_store)
+            startup_host = (
+                startup.hosts.get(conv.host_id)
+                if startup is not None and conv.host_id is not None
+                else None
+            )
+            if (
+                peer_message
+                and startup is not None
+                and startup_host is not None
+                and STARTUP_LABEL not in conv.labels
+                and (startup.include_external_hosts or startup_host.registered_with_managed_token)
+            ):
+                # A cold worker must not hold its caller through runner/harness startup.
+                # Authorization and input policy ran above; delivery rechecks the saved input.
+                return await queue_for_startup()
         if runner_client is None and conv.kind == "sub_agent":
             # A sub-agent copies its parent's runner_id at creation and is
             # never repointed when the parent's runner is relaunched.  If the

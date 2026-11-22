@@ -1,5 +1,6 @@
 """Runner dispatch through authenticated routes and real ownership/sharing stores."""
 
+import asyncio
 import json
 from contextvars import ContextVar
 from unittest.mock import Mock
@@ -1908,6 +1909,178 @@ async def test_startup_queue_admission_and_replay(
         assert f"[Message from session {source['id']}]" in json.dumps(delivered)
         assert store.list_pending_inputs(target["id"]) == []
         assert refusal in (await _send(auth_client, source, target))["detail"]
+
+
+@pytest.mark.parametrize(
+    "outcome", ["ready", "replacement", "reconnect", "denied", "start_failed"]
+)
+async def test_cold_nested_create_returns_before_first_task_delivery(
+    auth_client, auth_app, peers, db_uri, monkeypatch, outcome
+):
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes.sessions import routes_events
+    from omnigent.server.startup_inputs import ManagedStartupInputs
+    from tests._helpers.polling import poll_until_async
+    from tests.budgets import budget
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    source, _, captured = peers
+    host_id = uuid4().hex
+    _register_online_host(auth_app, host_id, "alice")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(source["id"], host_id, "/tmp/workspace")
+    startup = auth_app.state.startup_inputs
+    startup.include_external_hosts = True
+    dispatch = startup.dispatch
+    resolve_runner = sessions._get_runner_client
+    release_startup = asyncio.Event()
+    launches = []
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            launches.append(frame)
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+        else:
+            pytest.fail(f"Unexpected host frame: {frame}")
+
+    async def resolve_when_ready(session_id, *args, **kwargs):
+        if session_id == source["id"] or release_startup.is_set():
+            return await resolve_runner(session_id, *args, **kwargs)
+        return None
+
+    async def held_dispatch(*args):
+        await release_startup.wait()
+        if outcome == "start_failed":
+            raise OmnigentError("Worker startup failed", code=ErrorCode.RUNNER_UNAVAILABLE)
+        return await dispatch(*args)
+
+    async def unexpected_foreground_wait(*args, **kwargs):
+        pytest.fail("The caller must not wait for the cold worker to connect")
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    monkeypatch.setattr(sessions, "_get_runner_client", resolve_when_ready)
+    monkeypatch.setattr(
+        routes_events, "_wait_for_host_bound_runner_client", unexpected_foreground_wait
+    )
+    startup.dispatch = held_dispatch
+    try:
+        result = await asyncio.wait_for(
+            _launch_worker(
+                auth_client, source["agent_id"], source["id"], "same_host", message="First task"
+            ),
+            timeout=budget(10),
+        )
+        worker_id = result["conversation_id"]
+        assert result["initial_message"]["queued"] is True
+        assert result["initial_message"]["pending_id"]
+        assert not release_startup.is_set()
+        assert len(launches) == 1
+        assert not [path for path, _ in captured.get("posts", []) if path.endswith("/events")]
+        [saved] = store.list_pending_inputs(worker_id)
+        assert saved.created_by == "alice" and saved.status == "in_progress"
+        assert (
+            saved.data.content[0]["text"] == f"[Message from session {source['id']}]\nFirst task"
+        )
+        snapshot = (await auth_client.get(f"/v1/sessions/{worker_id}")).json()
+        assert (
+            snapshot["pending_inputs"][0]["pending_id"] == result["initial_message"]["pending_id"]
+        )
+
+        if outcome == "replacement":
+            current = store.get_conversation(worker_id)
+            store.clear_runner_id(worker_id, expected_binding=current)
+            assert store.set_runner_id(worker_id, "replacement-runner")
+        elif outcome == "reconnect":
+            await startup.shutdown()
+            _register_online_host(auth_app, host_id, "alice")
+            startup = ManagedStartupInputs(
+                store, auth_app.state.host_registry, include_external_hosts=True
+            )
+            startup.dispatch = dispatch
+            auth_app.state.startup_inputs = startup
+        elif outcome == "denied":
+
+            async def deny_task(*args, **kwargs):
+                return {"verdict": "deny", "reason": "Task needs approval"}
+
+            monkeypatch.setattr(routes_events, "_evaluate_input_policy", deny_task)
+
+        release_startup.set()
+        await startup.deliver_pending(auth_app, worker_id)
+
+        def settled():
+            pending = store.list_pending_inputs(worker_id)
+            if outcome in ("denied", "start_failed"):
+                return bool(pending and pending[0].status == "failed")
+            return not pending
+
+        await poll_until_async(settled, timeout_s=budget(5))
+        await asyncio.gather(*startup._deliveries.values())
+        await startup._deliver(auth_app, worker_id, saved)
+        delivered = [body for path, body in captured.get("posts", []) if path.endswith("/events")]
+        if outcome in ("denied", "start_failed"):
+            assert delivered == []
+            [failed] = store.list_pending_inputs(worker_id)
+            assert failed.id == saved.id and failed.data.content == saved.data.content
+            snapshot = (await auth_client.get(f"/v1/sessions/{worker_id}")).json()
+            assert (
+                snapshot["failed_inputs"][0]["pending_id"]
+                == result["initial_message"]["pending_id"]
+            )
+            assert (
+                "Task needs approval" if outcome == "denied" else "Worker startup failed"
+            ) in json.dumps(snapshot)
+        else:
+            assert len(delivered) == 1
+            assert delivered[0]["content"][0]["text"] == saved.data.content[0]["text"]
+            assert store.get_item(worker_id, saved.id).created_by == "alice"
+    finally:
+        await startup.shutdown()
+
+
+@pytest.mark.parametrize("startup_state", ["failed", "cancelled", "withdrawn"])
+async def test_cold_peer_keeps_normal_recovery_after_startup_settled(
+    auth_client, auth_app, peers, db_uri, monkeypatch, startup_state
+):
+    from unittest.mock import AsyncMock
+
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes.sessions import routes_events
+    from omnigent.server.startup_inputs import STARTUP_LABEL
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+    from tests.server.integration.test_sessions_web_send_stable_id import _stub_runner
+
+    source, target, _ = peers
+    host_id = uuid4().hex
+    _register_online_host(auth_app, host_id, "alice")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(target["id"], host_id, "/tmp/workspace")
+    store.set_runner_id(target["id"], "starting-runner")
+    store.set_labels(target["id"], {STARTUP_LABEL: startup_state})
+    auth_app.state.startup_inputs.include_external_hosts = True
+    forwarded = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    wait = AsyncMock(return_value=runner)
+    monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=None))
+    monkeypatch.setattr(routes_events, "_wait_for_host_bound_runner_client", wait)
+    monkeypatch.setattr(
+        routes_events, "_ensure_runner_session_initialized", AsyncMock(return_value=False)
+    )
+    try:
+        result = await _send(auth_client, source, target)
+        assert result["queued"] is True, result
+        wait.assert_awaited_once()
+        assert store.list_pending_inputs(target["id"]) == []
+        assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+    finally:
+        await runner.aclose()
 
 
 @pytest.mark.parametrize("two_replica_stack", ["authenticated"], indirect=True)

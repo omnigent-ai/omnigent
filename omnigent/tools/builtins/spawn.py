@@ -986,7 +986,9 @@ class SysSessionCreateTool(Tool):
             "read their status/history, and use sys_session_message for subsequent work. "
             "Returns {conversation_id, agent_id, title, status}, plus project_id "
             "and project_name for an independent session; the "
-            "session runs asynchronously — monitor it with "
+            "session runs asynchronously. A queued first message is accepted, not proof "
+            "the worker is ready or has completed it; startup/delivery can still fail. "
+            "Continue independent work and monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
             "with sys_session_send for children or sys_session_message for independent sessions."
         )

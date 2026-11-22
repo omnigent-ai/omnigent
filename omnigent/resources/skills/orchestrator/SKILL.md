@@ -110,6 +110,14 @@ the worker is a nested Omnigent agent visible and messageable by the human.
 Do not substitute a harness-internal Agent/Task worker for this delegation.
 Keep workers in this project; normally omit a project override.
 
+Dispatch independent ready work in parallel batches when the harness supports
+concurrent tool calls. Otherwise issue the creates back-to-back: do not wait
+for one worker to become ready or reply before dispatching unrelated work.
+A returned session ID or queued first task means accepted, not running or
+complete; check startup failures through the worker's status/history using the
+existing monitor. Bound concurrency by host capacity, real dependencies and
+isolated ownership; never parallelize conflicting writers or bypass approvals.
+
 Choose placement using the same rules as the workflow skill:
 
 - `same_host`: shares your workspace, tools and credentials. Good for quick
