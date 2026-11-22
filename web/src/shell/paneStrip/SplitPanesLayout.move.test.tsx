@@ -115,8 +115,11 @@ describe("SplitPanesLayout: dragging a pane by its row", () => {
       expect(row(key).hasAttribute("data-pane-strip-movable")).toBe(true);
       expect(handle(key)).not.toBeNull();
     }
-    // Only a hint: presses go through it to the row.
+    // Only a hint, shown while the pointer is over the row: presses go through it to the row.
     expect(handle("a")!.className).toMatch(/pointer-events-none/);
+    expect(handle("a")!.className).toMatch(/(^|\s)opacity-0(\s|$)/);
+    expect(handle("a")!.className).toMatch(/group-hover\/pane-strip:opacity-100/);
+    expect(row("a").className).toMatch(/group\/pane-strip/);
     // Movable, it looks and points as any row: no grip dots, no grab cursor.
     expect(row("a").querySelector("[data-pane-strip-grip]")).toBeNull();
     expect(row("a").className).not.toMatch(/cursor-grab/);
@@ -126,15 +129,11 @@ describe("SplitPanesLayout: dragging a pane by its row", () => {
       setup(options);
       expect(row("a").hasAttribute("data-pane-strip-movable")).toBe(false);
       expect(handle("a")).toBeNull();
+      // Nor does a press lift it.
+      press("a", 200);
+      expect(row("a").hasAttribute("data-pane-strip-held")).toBe(false);
+      release(200, 10);
     }
-  });
-
-  it("shows the drag handle only while the pointer is over the row", () => {
-    setup();
-    const handle = row("a").querySelector<HTMLElement>("[data-pane-strip-drag-handle]")!;
-    expect(handle.className).toMatch(/(^|\s)opacity-0(\s|$)/);
-    expect(handle.className).toMatch(/group-hover\/pane-strip:opacity-100/);
-    expect(row("a").className).toMatch(/group\/pane-strip/);
   });
 
   it("lifts the pane from the press, before it drags, until the drag ends", () => {
@@ -184,19 +183,10 @@ describe("SplitPanesLayout: dragging a pane by its row", () => {
     expect(onMovePane).toHaveBeenCalledTimes(1);
   });
 
-  it("never lifts a pane that can't move, nor on a Ctrl-press", () => {
-    setup({ movable: false });
-    press("a", 200);
-    expect(row("a").hasAttribute("data-pane-strip-held")).toBe(false);
-    cleanup();
-    setup();
-    fireEvent.pointerDown(row("a"), { button: 0, ctrlKey: true, pointerId: 1, clientX: 200 });
-    expect(row("a").hasAttribute("data-pane-strip-held")).toBe(false);
-  });
-
-  it("never drags on a Ctrl-press, the Mac's right-click, which opens the row's menu", () => {
+  it("never lifts or drags on a Ctrl-press, the Mac's right-click, which opens the row's menu", () => {
     const { onMovePane } = setup();
     fireEvent.pointerDown(row("a"), { button: 0, ctrlKey: true, pointerId: 1, clientX: 200 });
+    expect(row("a").hasAttribute("data-pane-strip-held")).toBe(false);
     moveTo(780, 300);
     expect(dropShown()).toBeUndefined();
     release(780, 300);

@@ -1470,8 +1470,11 @@ html[data-electron-mac] .app-shell:not([data-sidebar-open]) .pane-strip-window-i
 }
 /* A pane's row under the title bar is as tall as the title bar, so it lines up with the headers
  * beside it. A movable row drags its pane, not the window; its corner room still moves the window. */
+html[data-electron-mac] {
+  --pane-window-top-row: var(--mac-titlebar-height);
+}
 html[data-electron-mac] [data-pane-strip][data-pane-strip-window-top] {
-  height: var(--mac-titlebar-height);
+  height: var(--pane-window-top-row);
 }
 html[data-electron-mac] [data-pane-strip][data-pane-strip-window-top][data-pane-strip-movable],
 html[data-electron-mac] [data-pane-strip][data-pane-strip-window-top][data-pane-strip-zoomable] {

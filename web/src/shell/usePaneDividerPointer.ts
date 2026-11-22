@@ -59,6 +59,8 @@ export function usePaneDividerPointer({
     };
   return {
     onPointerDown: (event: PointerEvent<HTMLElement>) => {
+      // Only a primary press starts a drag, and a drag stays its own pointer's until that ends it.
+      if (event.button !== 0 || held.current !== null) return;
       event.preventDefault();
       event.currentTarget.setPointerCapture(event.pointerId);
       finishDrag();

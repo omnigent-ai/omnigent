@@ -16,7 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { TerminalSplitState } from "@/lib/paneSplitLayout";
 import { PANE_ZOOM_LABELS } from "@/shell/paneCommandTable";
-import { SplitPanesLayout } from "@/shell/SplitPanesLayout";
+import { SplitPanesLayout, WINDOW_TOP_ROW_HEIGHT } from "@/shell/SplitPanesLayout";
 
 import { HOVER_GRACE_MS } from "./paneHover";
 import { focusPaneToolbar } from "./paneToolbarFocus";
@@ -54,6 +54,7 @@ function setup({
   zoomedKey = null as string | null,
   withStrip = true,
   paneOf = null as PaneStripSource["paneOf"] | null,
+  bodyPaneKey = null as string | null,
 } = {}) {
   const commands = new Map<string, PaneStripCommands>();
   const focus = new Map<string, () => void>();
@@ -95,6 +96,7 @@ function setup({
         refocusPane={refocusPane}
         onFocusPane={onFocusPane}
         strip={withStrip ? strip : undefined}
+        bodySlot={bodyPaneKey === null ? undefined : { paneKey: bodyPaneKey, ref: () => {} }}
       />
     </TooltipProvider>
   );
@@ -836,19 +838,31 @@ describe("SplitPanesLayout: every pane's strip row", () => {
       expect(document.querySelector("[data-pane-strip-window-top]")).toBeNull();
     });
 
-    it("marks the rows along the window's top, and a maximized pane's", () => {
+    const bodyTop = () =>
+      document.querySelector<HTMLElement>("[data-chat-pane-body-host]")!.style.top;
+
+    it("marks the rows along the window's top, and a maximized pane's, and starts the chat below them", () => {
       const strip = document.body.appendChild(document.createElement("div"));
       strip.className = "electron-drag-strip";
       atCorner(800, 120);
-      setup();
+      setup({ bodyPaneKey: "a" });
       for (const key of ["a", "b"]) {
         expect(row(key).hasAttribute("data-pane-strip-window-top")).toBe(true);
       }
+      // The Mac makes these rows as tall as the title bar, so the chat starts below that height.
+      expect(bodyTop()).toBe(WINDOW_TOP_ROW_HEIGHT);
       cleanup();
       atCorner(800, 120);
-      setup({ zoomedKey: "b" });
+      setup({ zoomedKey: "b", bodyPaneKey: "b" });
       expect(row("b").hasAttribute("data-pane-strip-window-top")).toBe(true);
+      expect(bodyTop()).toBe(WINDOW_TOP_ROW_HEIGHT);
       strip.remove();
+    });
+
+    it("starts the chat one plain row down on a view below the title bar", () => {
+      setup({ bodyPaneKey: "a" });
+      expect(row("a").hasAttribute("data-pane-strip-window-top")).toBe(false);
+      expect(bodyTop()).toBe("28px");
     });
   });
 

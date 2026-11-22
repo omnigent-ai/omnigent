@@ -46,6 +46,9 @@ import { usePaneMoveDrag } from "./paneStrip/usePaneMoveDrag";
 import { type PaneStripSource, usePaneStrips } from "./paneStrip/usePaneStrips";
 import { usePendingAppPaneDrop } from "./appPanes";
 
+/** A row along the window's top, as tall as index.css makes it: the Mac title bar there. */
+export const WINDOW_TOP_ROW_HEIGHT = `var(--pane-window-top-row, ${PANE_ROW_PX}px)`;
+
 export interface SplitPanesLayoutProps {
   conversationId: string;
   /** The split shown, or undefined for one pane: ``singlePaneKey``. */
@@ -360,7 +363,13 @@ export function SplitPanesLayout({
               {bodySlot?.paneKey === pane.key ? (
                 <ChatPaneBodyHost
                   hostRef={bodySlot.ref}
-                  top={paneStrip ? PANE_ROW_PX : 0}
+                  top={
+                    !paneStrip
+                      ? 0
+                      : paneStrip.windowTop && !zoomedAway
+                        ? WINDOW_TOP_ROW_HEIGHT
+                        : PANE_ROW_PX
+                  }
                   onChatClick={(event) => givePaneKeyboardFromChat(event, pane.key)}
                 />
               ) : null}
@@ -511,7 +520,8 @@ function ChatPaneBodyHost({
   onChatClick,
 }: {
   hostRef: (element: HTMLElement | null) => void;
-  top: number;
+  /** Below the pane's row: its height in pixels, or the window-top row's CSS height. */
+  top: number | string;
   onChatClick: (event: MouseEvent) => void;
 }) {
   const [host, setHost] = useState<HTMLElement | null>(null);

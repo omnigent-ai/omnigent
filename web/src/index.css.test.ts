@@ -1740,9 +1740,13 @@ describe("index.css pane strip window-corner inset", () => {
     expect(shown).toContain("width: var(--mac-header-actions-clearance)");
   });
 
-  it("makes a row under the title bar as tall as the title bar", () => {
+  it("makes a row under the title bar as tall as the title bar, as the chat body's offset reads it", () => {
+    const macRoot = blocks.filter(
+      (block) => block.slice(0, block.indexOf("{")).trim() === "html[data-electron-mac]",
+    );
+    expect(macRoot.join("\n")).toContain("--pane-window-top-row: var(--mac-titlebar-height)");
     expect(
       ruleFor("html[data-electron-mac] [data-pane-strip][data-pane-strip-window-top]"),
-    ).toContain("height: var(--mac-titlebar-height)");
+    ).toContain("height: var(--pane-window-top-row)");
   });
 });

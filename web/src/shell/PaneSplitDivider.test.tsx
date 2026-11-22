@@ -65,21 +65,32 @@ describe("PaneSplitDivider drags", () => {
     expect(onAbort).not.toHaveBeenCalled();
   });
 
-  it("keeps its drag through another finger's lifting or cancelling", () => {
+  it("keeps its drag through another finger's press, lifting or cancelling", () => {
     const { element, onCommit, onAbort } = renderDivider();
-    const pointer = (type: string, pointerId: number) => {
-      const event = new Event(type, { bubbles: true });
-      Object.defineProperty(event, "pointerId", { value: pointerId });
-      fireEvent(element, event);
-    };
-    pointer("pointerdown", 1);
-    pointer("pointerup", 2);
-    pointer("pointercancel", 2);
+    fireEvent.pointerDown(element, { pointerId: 1, button: 0 });
+    fireEvent.pointerDown(element, { pointerId: 2, button: 0 });
+    expect(element.setPointerCapture).toHaveBeenCalledTimes(1);
+    fireEvent.pointerUp(element, { pointerId: 2 });
+    fireEvent.pointerCancel(element, { pointerId: 2 });
     expect(paneDividerDrag.dragging()).toBe(true);
     expect(onCommit).not.toHaveBeenCalled();
     expect(onAbort).not.toHaveBeenCalled();
-    pointer("pointerup", 1);
+    fireEvent.pointerUp(element, { pointerId: 1 });
     expect(onCommit).toHaveBeenCalledOnce();
+    expect(paneDividerDrag.dragging()).toBe(false);
+  });
+
+  it.each([
+    [1, "middle"],
+    [2, "right"],
+  ])("isn't a drag from button %i, the %s button", (button) => {
+    const { element, onCommit, onAbort } = renderDivider();
+    fireEvent.pointerDown(element, { pointerId: 1, button });
+    expect(paneDividerDrag.dragging()).toBe(false);
+    expect(element.setPointerCapture).not.toHaveBeenCalled();
+    fireEvent.pointerUp(element, { pointerId: 1, button });
+    expect(onCommit).not.toHaveBeenCalled();
+    expect(onAbort).not.toHaveBeenCalled();
   });
 
   it("lets the pointer go once the layout ends its drag", () => {
