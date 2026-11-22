@@ -220,11 +220,12 @@ describe("cornerDragResizes", () => {
     expect(applyDividerResizes(layout, resizes)).toBe(layout);
   });
 
-  it("still holds an accepted move to the resize limits", () => {
-    const layout = columns("a", rows("b", "c"), 0.9);
-    expect(applyDividerResizes(layout, [{ path: [], ratio: 0.95 }])).toEqual(
+  it("holds a move past the limits at the limit, and a split already past it where it is", () => {
+    expect(applyDividerResizes(columns("a", rows("b", "c")), [{ path: [], ratio: 0.95 }])).toEqual(
       columns("a", rows("b", "c"), 0.85),
     );
+    const pastLimit = columns("a", rows("b", "c"), 0.9);
+    expect(applyDividerResizes(pastLimit, [{ path: [], ratio: 0.95 }])).toEqual(pastLimit);
   });
 
   it("applies resizes in turn", () => {

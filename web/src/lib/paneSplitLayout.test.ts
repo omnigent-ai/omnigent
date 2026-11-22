@@ -175,6 +175,16 @@ describe("paneSplitLayout", () => {
     expect(clampSplitRatio(Number.NaN)).toBe(0.5);
   });
 
+  it("keeps a split past a limit where it is when dragged further out, and lets it move back", () => {
+    const pastLimit: TerminalLayout = { axis: "columns", ratio: 0.9, children: ["a", "b"] };
+    const ratioOf = (layout: TerminalLayout) => (layout as Exclude<TerminalLayout, string>).ratio;
+    expect(ratioOf(resizeTerminalSplit(pastLimit, [], 0.95))).toBe(0.9);
+    expect(ratioOf(resizeTerminalSplit(pastLimit, [], 0.88))).toBe(0.88);
+    expect(ratioOf(resizeTerminalSplit(pastLimit, [], 0.5))).toBe(0.5);
+    const lowRow: TerminalLayout = { ...pastLimit, ratio: 0.1 };
+    expect(ratioOf(resizeTerminalSplit(lowRow, [], 0.05))).toBe(0.1);
+  });
+
   it("reconciles missing panes only when they are known gone", () => {
     const state = { layout: twoByOne, focusedKey: "b" };
     const live = new Set(["agent", "a"]);

@@ -43,6 +43,13 @@ export function clampSplitRatio(ratio: number): number {
   return Math.min(MAX_SPLIT_RATIO, Math.max(MIN_SPLIT_RATIO, ratio));
 }
 
+function clampResizedRatio(ratio: number, current: number): number {
+  if (!Number.isFinite(ratio)) return clampSplitRatio(ratio);
+  const low = Math.min(MIN_SPLIT_RATIO, current);
+  const high = Math.max(MAX_SPLIT_RATIO, current);
+  return Math.min(high, Math.max(low, ratio));
+}
+
 interface Insertion {
   layout: TerminalLayout;
   inserted: boolean;
@@ -229,13 +236,17 @@ function mapLayoutLeaves(
   };
 }
 
+/**
+ * Set the split at ``path`` to ``ratio``, within the resize limits. A split already past a limit,
+ * as in a long row, may move back in but never further out, and never jumps to the limit.
+ */
 export function resizeTerminalSplit(
   layout: TerminalLayout,
   path: readonly number[],
   ratio: number,
 ): TerminalLayout {
   if (typeof layout === "string") return layout;
-  if (path.length === 0) return { ...layout, ratio: clampSplitRatio(ratio) };
+  if (path.length === 0) return { ...layout, ratio: clampResizedRatio(ratio, layout.ratio) };
   const [index, ...rest] = path;
   const children: [TerminalLayout, TerminalLayout] = [...layout.children];
   children[index] = resizeTerminalSplit(children[index], rest, ratio);
