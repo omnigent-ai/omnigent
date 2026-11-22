@@ -664,7 +664,7 @@ describe("a shell's tab", () => {
   describe("a shell the loaded list doesn't show", () => {
     beforeEach(async () => {
       await listShells({ listCompleteAt: 1 });
-      vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
     });
     afterEach(() => vi.useRealTimers());
     const openUnlisted = async (conversationId: string) => {
