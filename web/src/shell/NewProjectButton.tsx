@@ -1,4 +1,4 @@
-import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   ChevronRightIcon,
   FolderIcon,
@@ -469,7 +469,9 @@ export function NewProjectButton({
         : NO_COMMANDS,
     [inPalette],
   );
-  useQuickPickPaletteCommands("new-project", "Project", paletteCommands);
+  // Each button's own key: one that doesn't offer the command (Canvas) never withdraws another's.
+  const paletteSource = `new-project:${useId()}`;
+  useQuickPickPaletteCommands(paletteSource, "Project", paletteCommands);
 
   const dialog = (
     <Dialog

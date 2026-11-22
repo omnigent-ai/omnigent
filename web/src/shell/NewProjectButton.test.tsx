@@ -754,6 +754,20 @@ describe("New project… in the QuickPick ⌘K palette", () => {
     expect(screen.getByPlaceholderText("Project name…")).toHaveValue("");
   });
 
+  it("keeps the sidebar's command while Canvas's own button mounts and unmounts", () => {
+    const sidebar = render(paletteButton(true));
+    const offered = () =>
+      registeredPaletteCommands().filter((command) => command.label === "New project…").length;
+    expect(offered()).toBe(1);
+    // Canvas renders its own New project button, which doesn't offer the command.
+    const canvas = render(paletteButton(false));
+    expect(offered()).toBe(1);
+    canvas.unmount();
+    expect(offered()).toBe(1);
+    sidebar.unmount();
+    expect(offered()).toBe(0);
+  });
+
   it("is offered only by the button that asks, and only with the flag on", () => {
     render(paletteButton(false));
     expect(registeredPaletteCommands()).toEqual([]);
