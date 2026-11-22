@@ -6,6 +6,8 @@ import { create } from "zustand";
 
 import type { Conversation } from "@/hooks/useConversations";
 
+import type { SessionCommandId } from "./sessionCommands/model";
+
 /** Where Back returns to: the parent page's query and active row. */
 export interface PaletteParentPlace {
   query: string;
@@ -13,6 +15,8 @@ export interface PaletteParentPlace {
 }
 
 export type PaletteChildPage =
+  /** The sessions to run `command` on, from a verb-first row such as "Archive a Session…". */
+  | { kind: "pick-session"; command: SessionCommandId }
   /** A session's actions, from ⌘↵ on its row; `conversation` is that row as listed. */
   | {
       kind: "session-actions";

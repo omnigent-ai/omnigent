@@ -30,6 +30,7 @@ import {
   useSessionActionStore,
 } from "./sessionActionStore";
 import { useSessionCommandFacts } from "./useSessionCommandFacts";
+import { useSessionPickPaletteCommands } from "./useSessionPickCommands";
 
 // The open session, or its sub-agent's root, as the host last saw it. A Leave that settles
 // later reads it then, so it leaves only the session that's still open.
@@ -37,6 +38,7 @@ let openRootSessionId: string | null = null;
 
 /** Mount once, beside the palette. */
 export function SessionActionHost() {
+  useSessionPickPaletteCommands();
   const request = useSessionActionStore((state) => state.request);
   const openRoot = useActiveRootSessionId(useCommandContext().session?.id ?? null);
   useEffect(() => {

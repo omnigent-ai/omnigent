@@ -11,12 +11,18 @@ import type { Conversation } from "@/hooks/useConversations";
 import { LEVEL_READ } from "@/lib/permissionsApi";
 import { openPaletteDialog } from "@/test/paletteCommands";
 
+import { usePaletteCommands, usePaletteCommandsStore } from "@/store/paletteCommands";
+
 import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
 import { OWNER_ONLY_REASONS, UNKNOWN_OWNER_REASON } from "./sessionCommands/model";
 import {
   latestSessionActionRequest,
   useSessionActionStore,
 } from "./sessionCommands/sessionActionStore";
+import {
+  SESSION_PICK_COMMANDS_HEADING,
+  sessionPickCommands,
+} from "./sessionCommands/useSessionPickCommands";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({
@@ -300,5 +306,73 @@ describe("QuickPick ⌘K session actions", () => {
     fireEvent.change(input, { target: { value: "unarchive" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(latestSessionActionRequest()).toBeNull();
+  });
+});
+
+describe("QuickPick ⌘K verb-first session actions", () => {
+  // As the session action host does with quick_pick_palette on.
+  function PickRows() {
+    usePaletteCommands("session-picks", SESSION_PICK_COMMANDS_HEADING, sessionPickCommands());
+    return null;
+  }
+  function renderWithPicks() {
+    render(<PickRows />);
+    // It closes as the shell does, so an action that opens a dialog reaches its host.
+    return renderPalette(undefined, { closes: true });
+  }
+  afterEach(() => usePaletteCommandsStore.setState({ groups: {} }));
+  const activeRow = (input: HTMLElement) =>
+    document.getElementById(input.getAttribute("aria-activedescendant") ?? "");
+
+  it("asks which session, then opens its actions on the one the verb named", async () => {
+    const { input } = renderWithPicks();
+    fireEvent.change(input, { target: { value: "archive a session" } });
+    await screen.findByRole("option", { name: /Archive a Session…/ });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(heading()).toBe("Archive which session?"));
+    expect(input).toHaveValue("");
+    expect(optionNames()).toEqual([
+      expect.stringContaining("Fix the parser"),
+      expect.stringContaining("Review notes"),
+    ]);
+
+    fireEvent.change(input, { target: { value: "parser" } });
+    await waitFor(() => expect(optionNames()).toEqual([expect.stringContaining("Fix the parser")]));
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(heading()).toBe("Actions for “Fix the parser”"));
+    await waitFor(() => expect(activeRow(input)).toHaveTextContent("Archive"));
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() =>
+      expect(latestSessionActionRequest()).toMatchObject({
+        command: "archive",
+        conversation: { id: "c1" },
+      }),
+    );
+  });
+
+  it("says when the session doesn't offer the verb's action", async () => {
+    const { input } = renderWithPicks();
+    fireEvent.change(input, { target: { value: "unpin a session" } });
+    await screen.findByRole("option", { name: /Unpin a Session…/ });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(heading()).toBe("Unpin which session?"));
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(heading()).toBe("Actions for “Fix the parser”"));
+    expect(document.querySelector('[data-slot="palette-page-status"]')).toHaveTextContent(
+      "Unpin isn't available for “Fix the parser”.",
+    );
+    expect(optionNames()).not.toContain("Unpin");
+  });
+
+  it("goes back from the session picker to the row that opened it, with its query", async () => {
+    const { input } = renderWithPicks();
+    fireEvent.change(input, { target: { value: "rename a session" } });
+    await screen.findByRole("option", { name: /Rename a Session…/ });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(heading()).toBe("Rename which session?"));
+    fireEvent.keyDown(input, { key: "Escape" });
+    await waitFor(() => expect(heading()).toBeNull());
+    expect(input).toHaveValue("rename a session");
+    await waitFor(() => expect(activeRow(input)).toHaveTextContent("Rename a Session…"));
   });
 });
