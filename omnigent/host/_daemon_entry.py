@@ -70,6 +70,11 @@ def main() -> None:
         # Both or neither — the CLI always passes exactly one; fail loud.
         parser.error("exactly one of --server <url> or --local is required")
 
+    from omnigent.util.open_file_limit import raise_soft_open_file_limit
+
+    # Raised before the local server and runner zygote spawn so they inherit it.
+    open_file_limit = raise_soft_open_file_limit()
+
     from omnigent.cli_auth import (
         PINNED_DATABRICKS_ORG_ENV_VAR,
         pin_databricks_org_id,
@@ -129,6 +134,7 @@ def main() -> None:
             started_at=int(time.time()),
             host_id=identity.host_id,
             config_sig=os.environ.get(DAEMON_CONFIG_SIG_ENV_VAR),
+            open_file_limit=open_file_limit.soft if open_file_limit else None,
             workspace_id=workspace_id,
             org_pin=os.environ.get(PINNED_DATABRICKS_ORG_ENV_VAR) if workspace_hosted else None,
         )
