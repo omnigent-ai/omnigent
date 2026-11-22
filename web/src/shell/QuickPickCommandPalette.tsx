@@ -251,8 +251,11 @@ export function QuickPickCommandPalette({
       ],
     },
     {
-      sourceId: "actions",
+      // One segment for every command, so the best match leads whichever group it's in: an
+      // exact name such as "Archive" beats a longer one under an earlier heading.
+      sourceId: "commands",
       ranking: "client",
+      groupOrder: "bestMatch",
       fuzzyMatching: "words",
       items: sessionsOnly
         ? []
@@ -269,24 +272,12 @@ export function QuickPickCommandPalette({
               value: { kind: "action", action },
             })),
             // Registry commands without a feature are the app's own, so they list as Actions.
-            ...commandItems
-              .filter((item) => item.group === undefined)
-              .map((item): QuickPickItem<PaletteRow> => ({
-                ...item,
-                group: "Actions",
-                matchHighlight: "underline",
-              })),
+            ...commandItems.map((item): QuickPickItem<PaletteRow> => ({
+              ...item,
+              group: item.group ?? "Actions",
+              matchHighlight: "underline",
+            })),
           ],
-    },
-    {
-      sourceId: "features",
-      ranking: "client",
-      fuzzyMatching: "words",
-      items: sessionsOnly
-        ? []
-        : commandItems
-            .filter((item) => item.group !== undefined)
-            .map((item) => ({ ...item, matchHighlight: "underline" })),
     },
   ];
   const segments: QuickPickSegment<PaletteRow>[] = pageItems

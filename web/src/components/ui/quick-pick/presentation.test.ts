@@ -313,7 +313,7 @@ describe("buildQuickPickRows ranked across groups", () => {
       keywords: ["theme"],
     }),
   ];
-  const rows = (groupOrder?: "source" | "match") =>
+  const rows = (groupOrder?: "source" | "match" | "bestMatch") =>
     buildQuickPickRows({
       segments: [
         { sourceId: "commands", ranking: "client", groupOrder, fuzzyMatching: "words", items },
@@ -342,6 +342,41 @@ describe("buildQuickPickRows ranked across groups", () => {
       "Settings/terminal-theme",
       "/appearance",
       "Settings/settings-appearance",
+    ]);
+  });
+
+  it("can keep each group together, led by the group whose best row matches best", () => {
+    const groups = [
+      item("archive-builds", { label: "Archive old builds", group: "Builds" }),
+      item("archive-session", { label: "Archive", group: "Sessions" }),
+    ];
+    const ordered = (groupOrder: "source" | "bestMatch") =>
+      describeRows(
+        buildQuickPickRows({
+          segments: [
+            {
+              sourceId: "commands",
+              ranking: "client",
+              groupOrder,
+              fuzzyMatching: "words",
+              items: groups,
+            },
+          ],
+          query: "archive",
+        }),
+      );
+    expect(ordered("source")).toEqual([
+      "# Builds",
+      "archive-builds",
+      "# Sessions",
+      "archive-session",
+    ]);
+    // The exact name leads, and each group keeps its heading.
+    expect(ordered("bestMatch")).toEqual([
+      "# Sessions",
+      "archive-session",
+      "# Builds",
+      "archive-builds",
     ]);
   });
 
