@@ -676,6 +676,10 @@ _session_held_request_cache: WorkspaceScopedCache[str, dict[str, str]] = Workspa
 # Most messages tracked per session for the turn after the running one.
 _MAX_HELD_REQUESTS = 64
 
+# The start recorded for a running turn that took up no stored request, e.g. a
+# buffered /compact, so a side chat leaves none of the history out.
+_NO_TURN_REQUEST = ""
+
 
 def _record_turn_request(session_id: str, item_id: str) -> None:
     """
@@ -706,9 +710,13 @@ def _record_sent_request(
     :param runner_item_id: The stored item the runner knows the message by, when it
         is not *item_id*, e.g. a skill's hidden prompt.
     """
-    if session_id not in _session_turn_request_cache:
+    record = _session_turn_request_cache.get(session_id)
+    if record is None:
         _session_turn_request_cache[session_id] = item_id
         return
+    if record == _NO_TURN_REQUEST:
+        # The running turn answers no request, so a side chat leaves this one out first.
+        _session_turn_request_cache[session_id] = item_id
     held = _session_held_request_cache.setdefault(session_id, {})
     if len(held) < _MAX_HELD_REQUESTS:
         held.setdefault(runner_item_id or item_id, item_id)
@@ -732,9 +740,11 @@ def _record_held_turn_start(session_id: str, input_item_ids: object, *, continue
     """
     if isinstance(input_item_ids, list):
         named = [item_id for item_id in input_item_ids if isinstance(item_id, str)]
-        if not named:
-            return
         held = _session_held_request_cache.get(session_id) or {}
+        if not named:
+            # The turn takes up no stored request, so only messages still held stay out.
+            _session_turn_request_cache[session_id] = next(iter(held.values()), _NO_TURN_REQUEST)
+            return
         _session_turn_request_cache[session_id] = held.get(named[0], named[0])
         for item_id in named:
             held.pop(item_id, None)
@@ -1322,6 +1332,7 @@ __all__ = [
     "_NATIVE_POLICY_NOT_ENFORCED_CODE",
     "_NATIVE_TERMINAL_ENSURE_FAILED_CODE",
     "_NATIVE_TERMINAL_START_FAILED_CODE",
+    "_NO_TURN_REQUEST",
     "_OPENCODE_NATIVE_WRAPPER_LABEL_VALUE",
     "_PI_EXTENSION_UI_HOOK_TIMEOUT_S",
     "_PI_NATIVE_WRAPPER_LABEL_VALUE",

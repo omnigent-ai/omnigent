@@ -161,6 +161,7 @@ from omnigent.server.routes._sessions.common import (
     _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
     _EXTERNAL_CONVERSATION_ITEM_TYPE,
     _FORK_HISTORY_NATIVE_HARNESSES,
+    _NO_TURN_REQUEST,
     _logger,
     _session_background_agents_cache,
     _session_turn_request_cache,
@@ -5135,12 +5136,17 @@ def register_core_routes(
         # A side chat must not inherit a request its source is answering or about
         # to answer, or the side chat's model takes that request up as its own.
         source_running = _session_status_from_cache(source.id, source.live_status) == "running"
+        # A recorded turn start counts too: its running edge can trail the runner's reply.
         side_chat_mid_turn = (
             body.side_chat
             and copy_history
             and before_item_id is None
             and body.up_to_response_id is None
-            and (source_running or _session_is_starting(source.id))
+            and (
+                source_running
+                or _session_is_starting(source.id)
+                or _session_turn_request_cache.get(source.id) is not None
+            )
         )
         up_to_response_id = body.up_to_response_id
         copy_items = copy_history
@@ -6449,13 +6455,14 @@ def register_core_routes(
         that turn's request. Without a recorded start, e.g. after a restart, it
         stops before the newest request, which still copies the turn's request
         once a follow-up has been steered in, or copies nothing when none is in reach.
+        A turn that took up no stored request, e.g. a compaction, leaves out none.
 
         :param session_id: The side chat's source session, e.g. ``"conv_abc"``.
         :param turn_in_flight: Whether the source is answering a request.
         :returns: The copy's cutoff.
         """
         turn_request = _session_turn_request_cache.get(session_id)
-        if turn_request is not None:
+        if turn_request:
             return _SideChatCutoff(before_item_id=turn_request)
         # Checked before the read too, so a request that settles meanwhile
         # cannot make the earlier read look like the running turn.
@@ -6464,13 +6471,16 @@ def register_core_routes(
         # A request that lands during the read is recorded before it stops pending.
         turn_request = _session_turn_request_cache.get(session_id)
         delivering = delivering or pending_inputs.has_pending_turn_start(session_id)
-        if turn_request is not None:
+        if turn_request:
             return _SideChatCutoff(before_item_id=turn_request)
-        if newest.item_id is not None and (
-            not newest.answered or (turn_in_flight and not delivering)
+        answers_request = turn_request != _NO_TURN_REQUEST
+        if (
+            newest.item_id is not None
+            and answers_request
+            and (not newest.answered or (turn_in_flight and not delivering))
         ):
             return _SideChatCutoff(before_item_id=newest.item_id)
-        if delivering or not turn_in_flight:
+        if delivering or not turn_in_flight or not answers_request:
             # The request has not reached history: copy only what is there now,
             # which is nothing when no item a copy can end on is in reach.
             return _SideChatCutoff(
