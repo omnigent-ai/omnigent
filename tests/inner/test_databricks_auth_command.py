@@ -104,7 +104,7 @@ def _offline_databricks_sdk(root: Path) -> dict[str, str]:
     (sdk / "__init__.py").write_text("")
     (sdk / "config.py").write_text(
         "class Config:\n"
-        "    host = 'https://example.databricks.com'\n"
+        "    host = 'https://workspace.example.test'\n"
         "    def __init__(self, **kwargs): pass\n"
         "    @classmethod\n"
         "    def attributes(cls): return []\n"
@@ -343,12 +343,12 @@ def test_the_broker_fallback_runs_under_omnigents_interpreter_not_path_python3(
 
     # A closed port, so the real broker fetch declines at once and the sdk mint runs.
     _write_broker_sidecar(
-        monkeypatch, tmp_path, "https://example.databricks.com", server="http://127.0.0.1:9"
+        monkeypatch, tmp_path, "https://workspace.example.test", server="http://127.0.0.1:9"
     )
     bin_dir = tmp_path / "bin"
     ran = tmp_path / "path-python3-ran"
     _write_script(bin_dir / "python3", f": > {shlex.quote(str(ran))}\n")
-    command = databricks_bearer_token_command("https://example.databricks.com", "omnigent")
+    command = databricks_bearer_token_command("https://workspace.example.test", "omnigent")
 
     token = _run_generated_helper(
         command,
@@ -413,7 +413,7 @@ def test_no_sidecar_falls_back_to_the_sdk_mint_not_the_broker(
 
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / ".databrickscfg"))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
-    cmd = databricks_bearer_token_command("https://example.databricks.com", "myprofile")
+    cmd = databricks_bearer_token_command("https://workspace.example.test", "myprofile")
     assert "omnigent.host.databricks_credential" not in cmd
     sdk_mint = shlex.join(
         [
@@ -422,7 +422,7 @@ def test_no_sidecar_falls_back_to_the_sdk_mint_not_the_broker(
             "-m",
             "omnigent.inner.databricks_token",
             "--host",
-            "https://example.databricks.com",
+            "https://workspace.example.test",
             "--profile",
             "myprofile",
         ]
@@ -441,7 +441,7 @@ def test_the_sdk_fallback_selects_by_host_when_no_profile(
 
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / ".databrickscfg"))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
-    cmd = databricks_bearer_token_command("https://example.databricks.com/", None)
+    cmd = databricks_bearer_token_command("https://workspace.example.test/", None)
     sdk_mint = shlex.join(
         [
             sys.executable,
@@ -449,7 +449,7 @@ def test_the_sdk_fallback_selects_by_host_when_no_profile(
             "-m",
             "omnigent.inner.databricks_token",
             "--host",
-            "https://example.databricks.com",
+            "https://workspace.example.test",
         ]
     )
     sdk_mint = f"cd / && exec {sdk_mint}"
@@ -478,7 +478,7 @@ def test_the_sdk_fallback_runs_under_omnigents_interpreter_not_path_python3(
     interpreter = tmp_path / "omnigent python" / "python3"
     _write_script(interpreter, f'exec {shlex.quote(sys.executable)} "$@"\n')
     monkeypatch.setattr(sys, "executable", str(interpreter))
-    command = databricks_bearer_token_command("https://example.databricks.com", "agent")
+    command = databricks_bearer_token_command("https://workspace.example.test", "agent")
 
     token = _run_generated_helper(
         command,
@@ -511,7 +511,7 @@ def test_an_omnigent_package_in_the_workspace_cannot_stand_in_for_the_sdk_mint(
     # PATH's python3 is omnigent's own here, so only the cwd could mislead it.
     bin_dir = tmp_path / "bin"
     _write_script(bin_dir / "python3", f'exec {shlex.quote(sys.executable)} "$@"\n')
-    command = databricks_bearer_token_command("https://example.databricks.com", "agent")
+    command = databricks_bearer_token_command("https://workspace.example.test", "agent")
 
     token = _run_generated_helper(
         command,
@@ -535,7 +535,7 @@ def test_the_sdk_fallback_names_python3_when_the_interpreter_is_unknown(
     from omnigent.inner.databricks_executor import _databricks_sdk_token_command
 
     monkeypatch.setattr(sys, "executable", "")
-    command = _databricks_sdk_token_command("https://example.databricks.com", None)
+    command = _databricks_sdk_token_command("https://workspace.example.test", None)
     assert shlex.split(command)[:8] == [
         "cd",
         "/",
