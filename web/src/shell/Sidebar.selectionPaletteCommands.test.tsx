@@ -157,5 +157,9 @@ describe("Sidebar selection in ⌘K", () => {
     const before = command("Delete selected").id;
     fireEvent.click(screen.getByRole("link", { name: /Beta/ }));
     expect(command("Delete selected").id).not.toBe(before);
+    // ⌘K runs a picked row by its ID; the old one now finds no command, so nothing starts.
+    expect(selectionCommands().find((candidate) => candidate.id === before)).toBeUndefined();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(writes.move.mutate).not.toHaveBeenCalled();
   });
 });

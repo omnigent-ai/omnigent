@@ -26,6 +26,12 @@ import {
   sessionCommands,
 } from "./model";
 
+// The row's Fork reads its restriction from this hook; each case sets it from its facts.
+const forkRestriction = vi.hoisted(() => ({ reason: undefined as string | undefined }));
+vi.mock("@/hooks/useSessionActionRestrictions", () => ({
+  useSessionActionRestrictions: () => ({ forkDisabledReason: forkRestriction.reason }),
+}));
+
 const FACTS: SessionCommandFacts = {
   provisional: false,
   owner: true,
@@ -165,6 +171,7 @@ function rowMenu(facts: SessionCommandFacts) {
   const labels: Record<string, string> = facts.muted ? { [MUTED_LABEL_KEY]: "1" } : {};
   const row: Conversation = { ...conversation, labels };
   queryClient.setQueryData(["conversation-backfill", row.id], row);
+  forkRestriction.reason = facts.forkDisabledReason;
   const noop = vi.fn();
   render(
     <QueryClientProvider client={queryClient}>
@@ -218,7 +225,13 @@ function rowMenu(facts: SessionCommandFacts) {
   const name = (item: HTMLElement) => item.textContent?.trim() ?? "";
   return {
     names: items.map(name),
-    greyed: items.filter((item) => item.hasAttribute("data-disabled")).map(name),
+    // Plain disabled items set data-disabled; ones that explain why set aria-disabled.
+    greyed: items
+      .filter(
+        (item) =>
+          item.hasAttribute("data-disabled") || item.getAttribute("aria-disabled") === "true",
+      )
+      .map(name),
   };
 }
 
@@ -232,6 +245,7 @@ describe("sessionCommands against the sidebar row's menu", () => {
     ["the owner's session", FACTS],
     ["a session shared with the viewer", { ...FACTS, owner: false, canCreateAutomation: false }],
     ["an archived session", { ...FACTS, archived: true }],
+    ["a session that can't be forked", { ...FACTS, forkDisabledReason: "Fork is off." }],
     ["a pinned, unread session", { ...FACTS, pinned: true, unread: true }],
     ["a full set of pins", { ...FACTS, atPinCapacity: true }],
     ["a muted session", { ...FACTS, muted: true }],

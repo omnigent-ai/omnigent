@@ -260,18 +260,8 @@ describe("SessionActionHost", () => {
       expect(screen.queryByRole("dialog")).toBeNull();
     });
 
-    it("keeps a shared search result's owner when only its detail is cached", () => {
-      const queryClient = cachedSessions();
-      // The session's own fetch carries no owner; read access only.
-      queryClient.setQueryData(["session", "c1"], {
-        id: "c1",
-        title: "Fix the parser",
-        createdAt: 0,
-        permissionLevel: 1,
-        labels: {},
-        archived: false,
-      });
-      renderHost(queryClient);
+    it("checks the owner of a search result no list holds by the row it showed", () => {
+      renderHost(cachedSessions());
       act(() => requestSessionAction({ ...SESSION, owner: "someone-else" }, "rename"));
       expect(screen.queryByRole("dialog")).toBeNull();
     });
