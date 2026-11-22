@@ -4,7 +4,7 @@ import hashlib
 import math
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
@@ -535,6 +535,167 @@ def apply_session_usage_delta(current: dict[str, Any], delta: dict[str, Any]) ->
                     bucket[sub_key] = bucket.get(sub_key, 0) + sub_value
         elif _is_addable_usage_increment(value):
             current[key] = current.get(key, 0) + value
+
+
+# Set on a stored total whose per-model map was dropped for size; the map is
+# then never rebuilt, so a partial breakdown can't pass for a complete one.
+USAGE_TOTALS_BY_MODEL_DROPPED_KEY = "by_model_dropped"
+
+# How many counted sessions a stored total (or a per-model bucket) has priced. The
+# total keeps ``total_cost_usd`` only while this is positive, so removing the last
+# priced session leaves it unpriced rather than at $0.00.
+USAGE_TOTALS_PRICED_SESSIONS_KEY = "priced_sessions"
+
+# The flat ``session_usage`` counters a displayed subtree total sums.
+SUMMABLE_USAGE_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "total_cost_usd",
+)
+
+
+def _usage_number(value: Any) -> int | float | None:
+    """Return *value* when it is a finite, non-bool number, else ``None``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _usage_counter_changes(
+    old: Mapping[str, Any], new: Mapping[str, Any], keys: Iterable[str]
+) -> dict[str, int | float]:
+    """Signed per-counter differences, keeping a newly recorded key even at zero."""
+    changes: dict[str, int | float] = {}
+    for key in keys:
+        before = _usage_number(old.get(key))
+        after = _usage_number(new.get(key))
+        if before is None and after is None:
+            continue
+        change = (after or 0) - (before or 0)
+        # A cost key appearing at 0 still marks the usage as priced.
+        if change or (before is None and after is not None):
+            changes[key] = change
+    return changes
+
+
+def _priced_sessions(usage: Mapping[str, Any]) -> int:
+    """Priced sessions a document stands for: a total's count, else whether it has a cost."""
+    count = usage.get(USAGE_TOTALS_PRICED_SESSIONS_KEY)
+    if isinstance(count, int) and not isinstance(count, bool):
+        return count
+    return 0 if _usage_number(usage.get("total_cost_usd")) is None else 1
+
+
+def _usage_changes(
+    old: Mapping[str, Any], new: Mapping[str, Any], keys: Iterable[str]
+) -> dict[str, int | float]:
+    """Counter changes plus the change in how many priced sessions are counted."""
+    changes = _usage_counter_changes(
+        old, new, (key for key in keys if key != USAGE_TOTALS_PRICED_SESSIONS_KEY)
+    )
+    priced_change = _priced_sessions(new) - _priced_sessions(old)
+    if priced_change:
+        changes[USAGE_TOTALS_PRICED_SESSIONS_KEY] = priced_change
+    return changes
+
+
+def _usage_models(usage: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    """The well-formed per-model buckets of a ``session_usage`` document."""
+    by_model = usage.get("by_model")
+    if not isinstance(by_model, dict):
+        return {}
+    return {model: bucket for model, bucket in by_model.items() if isinstance(bucket, dict)}
+
+
+def usage_totals_change(old: Mapping[str, Any], new: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    Return how replacing usage *old* with *new* changes the totals summing it.
+
+    Covers the parts of ``session_usage`` that displayed subtree totals sum:
+    the flat :data:`SUMMABLE_USAGE_KEYS` counters and every numeric field of
+    each ``by_model`` bucket. Display-only estimates (``subagent_costs_usd``)
+    and the enforcement-only ``policy_cost_usd`` are excluded, so a parent's
+    total never counts a nested worker twice.
+
+    The change also carries how many priced sessions it adds or removes
+    (:data:`USAGE_TOTALS_PRICED_SESSIONS_KEY`), overall and per model. A stored
+    total whose per-model map was dropped marks the change, so the total
+    receiving it drops its map too.
+
+    :param old: The usage before the change, e.g. ``{"input_tokens": 100}``.
+    :param new: The usage after it, e.g. ``{"input_tokens": 150,
+        "total_cost_usd": 0.0}``.
+    :returns: Signed changes in the same layout, e.g. ``{"input_tokens": 50,
+        "total_cost_usd": 0.0, "priced_sessions": 1}``. Empty when nothing
+        summed changed.
+    """
+    change: dict[str, Any] = dict(_usage_changes(old, new, SUMMABLE_USAGE_KEYS))
+    if old.get(USAGE_TOTALS_BY_MODEL_DROPPED_KEY) or new.get(USAGE_TOTALS_BY_MODEL_DROPPED_KEY):
+        change[USAGE_TOTALS_BY_MODEL_DROPPED_KEY] = True
+        return change
+    old_models = _usage_models(old)
+    new_models = _usage_models(new)
+    model_changes: dict[str, dict[str, int | float]] = {}
+    for model in sorted(old_models.keys() | new_models.keys()):
+        old_bucket = old_models.get(model, {})
+        new_bucket = new_models.get(model, {})
+        bucket_change = _usage_changes(
+            old_bucket, new_bucket, sorted(old_bucket.keys() | new_bucket.keys())
+        )
+        if bucket_change:
+            model_changes[model] = bucket_change
+    if model_changes:
+        change["by_model"] = model_changes
+    return change
+
+
+def _add_usage_counters(totals: dict[str, Any], changes: Mapping[str, Any]) -> None:
+    for key, raw_change in changes.items():
+        change = _usage_number(raw_change)
+        if change is None:
+            continue
+        # Totals sum non-negative counters; clamp float rounding below zero.
+        totals[key] = max(0, (_usage_number(totals.get(key)) or 0) + change)
+    if _usage_number(totals.get(USAGE_TOTALS_PRICED_SESSIONS_KEY)) is None or (
+        totals[USAGE_TOTALS_PRICED_SESSIONS_KEY] <= 0
+    ):
+        # Nothing counted is priced any more: report unpriced, not $0.00.
+        totals.pop(USAGE_TOTALS_PRICED_SESSIONS_KEY, None)
+        totals.pop("total_cost_usd", None)
+
+
+def add_usage_totals(totals: dict[str, Any], change: Mapping[str, Any]) -> None:
+    """
+    Add a :func:`usage_totals_change` result into a stored total, in place.
+
+    :param totals: A ``subtree_usage`` or ``project_usage`` document.
+    :param change: Signed changes from :func:`usage_totals_change`.
+    """
+    _add_usage_counters(
+        totals,
+        {
+            key: value
+            for key, value in change.items()
+            if key not in ("by_model", USAGE_TOTALS_BY_MODEL_DROPPED_KEY)
+        },
+    )
+    if change.get(USAGE_TOTALS_BY_MODEL_DROPPED_KEY):
+        totals.pop("by_model", None)
+        totals[USAGE_TOTALS_BY_MODEL_DROPPED_KEY] = True
+    model_changes = change.get("by_model")
+    if totals.get(USAGE_TOTALS_BY_MODEL_DROPPED_KEY) or not isinstance(model_changes, dict):
+        return
+    by_model = totals.get("by_model")
+    if not isinstance(by_model, dict):
+        by_model = totals["by_model"] = {}
+    for model, bucket_change in model_changes.items():
+        bucket = by_model.get(model)
+        if not isinstance(bucket, dict):
+            bucket = by_model[model] = {}
+        _add_usage_counters(bucket, bucket_change)
 
 
 @dataclass(frozen=True)
@@ -1609,7 +1770,8 @@ class ConversationStore(ABC):
         Overwrites the existing ``session_usage`` JSON column with
         the serialized *usage* dict. Called by
         :meth:`PolicyEngine.record_usage` after incrementing the
-        in-memory counters.
+        in-memory counters. The change from the stored usage also moves
+        the spawn tree's and its project's stored totals.
 
         :param conversation_id: The conversation to update,
             e.g. ``"conv_abc123"``.
@@ -1700,6 +1862,9 @@ class ConversationStore(ABC):
 
         :param conversation_id: The conversation to update,
             e.g. ``"conv_abc123"``.
+        The same transaction adds the applied increment to the spawn tree's
+        and its project's stored totals.
+
         :param delta: Usage increments to apply, e.g.
             ``{"input_tokens": 1000, "total_cost_usd": 0.05,
             "by_model": {"claude-sonnet-4-6": {"input_tokens": 1000,

@@ -52,7 +52,11 @@ from omnigent.spec.types import (
     Phase,
     PolicySpec,
 )
-from omnigent.stores.conversation_store import ConversationStore, DailyCostState
+from omnigent.stores.conversation_store import (
+    SUMMABLE_USAGE_KEYS,
+    ConversationStore,
+    DailyCostState,
+)
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
@@ -1220,17 +1224,9 @@ def _load_session_state(
 # large tree is not silently truncated (see load_session_usage).
 _SUBTREE_USAGE_PAGE_SIZE = 100
 
-# Usage counters summed across a conversation subtree. Restricted to the
-# known numeric keys the PolicyEngine reads so an unexpected key in one
-# conversation's persisted usage can't leak into the aggregate.
-_SUMMABLE_USAGE_KEYS = (
-    "input_tokens",
-    "output_tokens",
-    "total_tokens",
-    "cache_read_input_tokens",
-    "cache_creation_input_tokens",
-    "total_cost_usd",
-)
+# Usage counters summed across a conversation subtree; the stored spawn-tree
+# and project totals sum the same ones (see SUMMABLE_USAGE_KEYS).
+_SUMMABLE_USAGE_KEYS = SUMMABLE_USAGE_KEYS
 
 
 def _merge_by_model(

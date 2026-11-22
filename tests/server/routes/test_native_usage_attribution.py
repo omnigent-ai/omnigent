@@ -28,6 +28,7 @@ from omnigent.server.routes._sessions.orchestration import (
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
 # Agent ids are stored as 16-byte uuids, so tests use a valid 32-char hex id.
 _AGENT_ID = "0123456789abcdef0123456789abcdef"
@@ -88,7 +89,9 @@ def test_subagent_cost_estimates_stay_display_only(
 ) -> None:
     monkeypatch.setenv("OMNIGENT_HIDE_COST", "1" if hide_cost else "0")
     store = SqlAlchemyConversationStore(db_uri)
-    parent = store.create_conversation(title="claude", agent_id=_AGENT_ID)
+    projects = SqlAlchemyProjectStore(db_uri)
+    project = projects.create(_AGENT_ID, "Factory", None)
+    parent = store.create_conversation(title="claude", agent_id=_AGENT_ID, project_id=project.id)
     child = store.create_conversation(
         kind="sub_agent", title="Explore:a", parent_conversation_id=parent.id, agent_id=_AGENT_ID
     )
@@ -108,6 +111,7 @@ def test_subagent_cost_estimates_stay_display_only(
     assert usage["total_cost_usd"] == 1.0
     assert usage["policy_cost_usd"] == 1.2
     assert load_session_usage(parent.id, store)["total_cost_usd"] == 1.0
+    assert projects.get_usage(project.id, user_id=None)["total_cost_usd"] == 1.0
     tree = store.list_spawn_tree_usage(parent.id, limit=10).data
     costs = {cost.id: cost for cost in _agent_costs(tree, parent.id)}
     assert (costs[parent.id].cost_usd, costs[parent.id].estimated_cost_usd) == (
@@ -131,6 +135,9 @@ def test_subagent_cost_estimates_stay_display_only(
     totals = load_session_usage(parent.id, store)
     assert totals["total_cost_usd"] == 1.3
     assert totals["policy_cost_usd"] == 1.5
+    project_totals = projects.get_usage(project.id, user_id=None)
+    assert project_totals["total_cost_usd"] == pytest.approx(1.3)
+    assert "policy_cost_usd" not in project_totals
 
 
 @pytest.mark.parametrize(

@@ -71,7 +71,7 @@ import {
   readPinnedConversationIds,
   setLegacyPinnedConversationId,
 } from "@/shell/sidebarNav";
-import { apiErrorFromResponse, stopSession } from "@/lib/sessionsApi";
+import { ApiError, apiErrorFromResponse, stopSession } from "@/lib/sessionsApi";
 import { isStaleCursorError, useRestartOnStaleCursor } from "@/lib/staleCursor";
 import { isRetryableRequestError } from "@/lib/queryRetry";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
@@ -79,8 +79,10 @@ import {
   createProject as apiCreateProject,
   deleteProject as apiDeleteProject,
   getProject as apiGetProject,
+  getProjectUsage as apiGetProjectUsage,
   listProjects as apiListProjects,
   type ProjectConfig,
+  type ProjectUsage,
   renameProject as apiRenameProject,
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
@@ -3266,6 +3268,32 @@ export function useProjectConfig(id: string | null) {
     queryFn: async () => (await apiGetProject(id as string)).config ?? {},
     enabled: id !== null,
     staleTime: 30_000,
+  });
+}
+
+/** How often an open project home re-reads its cost; each read is one stored row. */
+export const PROJECT_USAGE_REFETCH_INTERVAL_MS = 30_000;
+
+/** A server without the usage endpoint, or a deleted project, answers 404: stop asking. */
+function isProjectUsageMissing(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 404;
+}
+
+/**
+ * Fetch a project's summed usage from `GET /v1/projects/{id}/usage`, refreshed
+ * while the project home is open. Disabled when `id` is `null` (a label-only
+ * folder keeps no total).
+ */
+export function useProjectUsage(id: string | null) {
+  return useQuery<ProjectUsage>({
+    queryKey: ["project-usage", id],
+    queryFn: ({ signal }) => apiGetProjectUsage(id as string, signal),
+    enabled: id !== null,
+    staleTime: PROJECT_USAGE_REFETCH_INTERVAL_MS,
+    refetchInterval: (query) =>
+      isProjectUsageMissing(query.state.error) ? false : PROJECT_USAGE_REFETCH_INTERVAL_MS,
+    refetchOnWindowFocus: (query) => !isProjectUsageMissing(query.state.error),
+    retry: (failureCount, error) => !isProjectUsageMissing(error) && failureCount < 3,
   });
 }
 

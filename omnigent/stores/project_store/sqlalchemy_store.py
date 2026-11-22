@@ -244,6 +244,20 @@ class SqlAlchemyProjectStore(ProjectStore):
                 return None
             return _to_entity(row)
 
+    def get_usage(self, project_id: str, *, user_id: str | None) -> dict[str, Any] | None:
+        """Return an owned project's stored usage total, or ``None`` if not found."""
+        with self._session("select_project_usage") as session:
+            row = session.execute(
+                select(SqlProject.user_id, SqlProject.project_usage).where(
+                    SqlProject.workspace_id == current_workspace_id(),
+                    SqlProject.id == project_id,
+                )
+            ).one_or_none()
+        if row is None or row.user_id != user_id:
+            return None
+        # Same JSON-object decoding as config; NULL means nothing counted yet.
+        return _decode_config(row.project_usage)
+
     def list(self, *, user_id: str | None) -> list[Project]:
         """List the owner's projects ordered by ``created_at ASC, id ASC``."""
         with self._session("list_projects") as session:

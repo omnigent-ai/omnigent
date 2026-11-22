@@ -300,9 +300,22 @@ the header menu), and each place is a separate entry point.
   with its cost, including its own sub-agents; an unpriced one shows no cost.
   A Claude sub-agent shows its Claude session's transcript estimate as `~$x.xx`. The
   Agents list and graph show the same costs beside each agent.
+- `project-home-cost`: on desktop, a project home shows the project's total cost
+  as `$x.xx` beside its name: the lifetime spend of the sessions filed in the
+  project, archived ones included, each with its sub-agents. Hovering it says
+  what is counted. It refreshes about every 30 seconds while the page is open,
+  and moving a session to another project moves its cost with it. A project with
+  nothing priced shows no cost, while a priced $0.00 shows `$0.00`. Sessions
+  created before project cost tracking aren't counted. Phones and folders that
+  are only a project label show no cost.
 
 ## How to get to it (user POV)
 
+- For project cost, on desktop open a project from the sidebar to reach its
+  project home. Once any of its sessions is priced, the cost shows beside the
+  project name; hover it for what is counted. To see it change, let a session
+  in the project finish a priced turn, or move a priced session to another
+  project, and wait up to 30 seconds.
 - For ⌘K session actions, open a session you own and press Cmd/Ctrl+K, then
   type an action such as "rename session" and press Enter. With
   `quick_pick_palette` on, type "go to session" and press Enter to switch

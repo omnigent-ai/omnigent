@@ -108,6 +108,29 @@ export async function getProject(id: string): Promise<Project> {
 }
 
 /**
+ * A project's summed usage: its sessions, each with their sub-agents. Mirrors
+ * the `ProjectUsage` response. Absent fields were never recorded; an absent
+ * `total_cost_usd` means unpriced (or hidden), not `$0.00`.
+ */
+export interface ProjectUsage {
+  project_id: string;
+  total_cost_usd?: number;
+  cost_hidden?: boolean;
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+}
+
+/** Fetch a project's summed usage (one stored-row read server-side). 404s if not owned. */
+export async function getProjectUsage(id: string, signal?: AbortSignal): Promise<ProjectUsage> {
+  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}/usage`, {
+    signal,
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as ProjectUsage;
+}
+
+/**
  * Create a project, optionally with initial `config` defaults. Rejects with the
  * server's message on a duplicate name (409) so callers can surface it inline.
  */

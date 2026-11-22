@@ -78,6 +78,25 @@ class ProjectStore(ABC):
         ...
 
     @abstractmethod
+    def get_usage(self, project_id: str, *, user_id: str | None) -> dict[str, Any] | None:
+        """
+        Return an owned project's stored usage total.
+
+        The conversation store keeps it current: each usage write by a member
+        session or its sub-agents adds its change, and refiling or deleting a
+        member moves its total. Sessions whose spawn-tree total is not tracked
+        are not counted.
+
+        :param project_id: Opaque project identifier.
+        :param user_id: The requesting owner; a project owned by someone
+            else is treated as not found.
+        :returns: The total in the ``session_usage`` layout, e.g.
+            ``{"input_tokens": 1200, "total_cost_usd": 0.42}`` (empty when no
+            tracked member has reported usage), or ``None`` if not found.
+        """
+        ...
+
+    @abstractmethod
     def list(self, *, user_id: str | None) -> list[Project]:
         """
         List the owner's projects ordered by ``created_at ASC, id ASC``.

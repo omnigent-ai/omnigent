@@ -3,6 +3,7 @@ import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as ConversationsModule from "@/hooks/useConversations";
+import type { ProjectUsage } from "@/lib/projectsApi";
 import {
   ProjectBoardSearch,
   ProjectHomeHeaderActions,
@@ -15,6 +16,8 @@ import {
 const mocks = vi.hoisted(() => ({
   isMobile: false,
   menuArgs: [] as unknown[],
+  usage: undefined as ProjectUsage | undefined,
+  usageProjectIds: [] as (string | null)[],
   actions: {
     openRename: vi.fn(),
     openSettings: vi.fn(),
@@ -35,6 +38,10 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
     ...actual,
     useProjects: () => ({ data: [{ id: "project-1", name: "Payments" }], isLoading: false }),
     useProjectConfig: () => ({ data: { icon: "💸" } }),
+    useProjectUsage: (projectId: string | null) => {
+      mocks.usageProjectIds.push(projectId);
+      return { data: mocks.usage };
+    },
   };
 });
 
@@ -62,6 +69,8 @@ function renderButton() {
 
 beforeEach(() => {
   mocks.isMobile = false;
+  mocks.usage = undefined;
+  mocks.usageProjectIds = [];
   useProjectComposerStore.setState({ open: false });
   useProjectBoardSearchStore.setState({ query: "" });
   vi.clearAllMocks();
@@ -71,7 +80,7 @@ afterEach(cleanup);
 
 describe("ProjectHomeTitle", () => {
   function renderTitle() {
-    render(
+    return render(
       <MemoryRouter initialEntries={["/projects/Payments"]}>
         <TooltipProvider>
           <ProjectHomeTitle projectName="Payments" />
@@ -114,6 +123,29 @@ describe("ProjectHomeTitle", () => {
     expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
   });
 
+  it("shows the project's cost beside its name, including a priced $0.00", () => {
+    mocks.usage = { project_id: "project-1", total_cost_usd: 12.3, total_tokens: 4200 };
+    const { unmount } = renderTitle();
+    expect(mocks.usageProjectIds).toContain("project-1");
+    expect(screen.getByTestId("project-home-cost")).toHaveTextContent("$12.30");
+    expect(screen.getByLabelText("Project cost $12.30")).toBeInTheDocument();
+    unmount();
+
+    mocks.usage = { project_id: "project-1", total_cost_usd: 0 };
+    renderTitle();
+    expect(screen.getByTestId("project-home-cost")).toHaveTextContent("$0.00");
+  });
+
+  it("shows no cost while loading or when nothing in the project is priced", () => {
+    const { unmount } = renderTitle();
+    expect(screen.queryByTestId("project-home-cost")).toBeNull();
+    unmount();
+
+    mocks.usage = { project_id: "project-1", input_tokens: 900, total_tokens: 900 };
+    renderTitle();
+    expect(screen.queryByTestId("project-home-cost")).toBeNull();
+  });
+
   it("hides the title and moves the project actions beside New session on phones", () => {
     mocks.isMobile = true;
     render(
@@ -129,6 +161,8 @@ describe("ProjectHomeTitle", () => {
       </MemoryRouter>,
     );
     expect(screen.getByRole("heading", { name: "Payments" })).toHaveClass("sr-only");
+    // Phones show no project cost, so they never poll for it.
+    expect(mocks.usageProjectIds).toEqual([]);
     expect(screen.getByRole("banner").querySelectorAll("button")).toHaveLength(0);
     const actions = screen.getByRole("navigation", { name: "Header actions" });
     expect(
