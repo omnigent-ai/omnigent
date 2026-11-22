@@ -36,6 +36,7 @@ import { Switch } from "@/components/ui/switch";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { AutomationPaletteCommands } from "@/components/scheduled/AutomationPaletteCommands";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { RunPullRequests } from "@/components/scheduled/RunPullRequests";
 import {
@@ -478,6 +479,17 @@ function TaskDetail({ taskId }: { taskId: string }) {
   return (
     <PageScroll contentClassName="px-6" data-testid="task-detail-page">
       <BackLink />
+      <AutomationPaletteCommands
+        taskId={task.id}
+        actions={actions}
+        run={{
+          "run-now": handleRunNow,
+          edit: () => setEditOpen(true),
+          share: () => setShareOpen(true),
+          pause: handlePauseToggle,
+          resume: handlePauseToggle,
+        }}
+      />
 
       {/* Header: title + right-aligned actions. */}
       <div className="mt-4 flex items-start justify-between gap-4">
