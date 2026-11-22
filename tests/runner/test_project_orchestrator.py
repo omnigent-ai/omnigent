@@ -54,9 +54,27 @@ def test_comment_guidance_keeps_decisions_local_and_requires_real_message_target
     assert (
         "decisions, asks and next actions in the ticket itself" in PROJECT_TICKET_WORK_INSTRUCTION
     )
-    assert "**Outcome**, **Evidence** and **Next** only when helpful" in (
+    assert "one short status sentence plus the important next action or ask" in (
         PROJECT_TICKET_WORK_INSTRUCTION
     )
+    assert "separate short paragraphs or bullets" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "**Status**, **Blocked** and **Next** when helpful, not as a required template" in (
+        PROJECT_TICKET_WORK_INSTRUCTION
+    )
+    assert "Do not pack setup, diagnostics and next steps into one dense paragraph" in (
+        PROJECT_TICKET_WORK_INSTRUCTION
+    )
+    assert "user-facing progress and impact, not a transcript of tool activity" in (
+        PROJECT_TICKET_WORK_INSTRUCTION
+    )
+    assert "session unless needed for a decision or action" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "State a blocker's impact and the exact action needed in the ticket" in (
+        PROJECT_TICKET_WORK_INSTRUCTION
+    )
+    assert "short responsibility phrase, retaining required stage-owner information" in (
+        PROJECT_TICKET_WORK_INSTRUCTION
+    )
+    assert "put the full task checklist in the linked chat" in PROJECT_TICKET_WORK_INSTRUCTION
     assert "durable message link is known" in PROJECT_TICKET_WORK_INSTRUCTION
     assert "Never invent message IDs" in PROJECT_TICKET_WORK_INSTRUCTION
     assert "session-only link as a specific-message link" in PROJECT_TICKET_WORK_INSTRUCTION
