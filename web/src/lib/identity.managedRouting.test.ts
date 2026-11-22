@@ -275,7 +275,7 @@ describe("managed first-message routing", () => {
     ["create", 2],
     ["snapshot", 2],
   ])("leaves %s requests outside the forced host refresh", async (mode, calls) => {
-    const { authenticatedFetch, resolve } = await setup();
+    const { authenticatedFetch, getSessionHost, resolve } = await setup();
     if (mode === "standalone") isWorkspace.mockReturnValue(false);
     const url =
       mode === "create"
@@ -285,11 +285,13 @@ describe("managed first-message routing", () => {
           : EVENTS_URL;
     const headers = mode === "explicit-key" ? { [SLICE_KEY]: "caller-host" } : undefined;
     const init = mode === "create" ? { method: "POST", body: "{}" } : {};
-    fetchMock.mockImplementation(async () => wrongReplica());
+    // Excluded session requests ignore a named key too.
+    fetchMock.mockImplementation(async () => wrongReplica(calls === 1 ? "named-host" : undefined));
 
     expect((await authenticatedFetch(url, { ...init, headers })).status).toBe(400);
     // A client-keyed create or snapshot still tries the unkeyed default replica once.
     expect(fetchMock).toHaveBeenCalledTimes(calls);
+    expect(getSessionHost(SESSION_ID)).toBeNull();
     if (calls === 2) expect(requestHeaders(1).has(SLICE_KEY)).toBe(false);
     expect(resolve.mock.calls.every((call) => call[1]?.force !== true)).toBe(true);
   });
@@ -387,6 +389,28 @@ describe("routing after a session switches hosts", () => {
     expect(requestHeaders(2).get(SLICE_KEY)).toBe("new-host");
     expect(getSessionHost(SESSION_ID)).toBe("new-host");
     expect(isHostKeyless("old-host")).toBe(false);
+  });
+
+  it("keeps a host recorded while a refused request was in flight", async () => {
+    const { authenticatedFetch, getSessionHost, setSessionHost } = await setup();
+    setSessionHost(SESSION_ID, "old-host");
+    let refuse: (response: Response) => void = () => {};
+    fetchMock
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          refuse = resolve;
+        }),
+      )
+      .mockResolvedValueOnce(Response.json({ queued: true }));
+
+    const pending = authenticatedFetch(EVENTS_URL, { method: "POST", body: "{}" });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    setSessionHost(SESSION_ID, "third-host");
+    refuse(wrongReplica("new-host"));
+
+    expect((await pending).ok).toBe(true);
+    expect(requestHeaders(1).get(SLICE_KEY)).toBe("new-host");
+    expect(getSessionHost(SESSION_ID)).toBe("third-host");
   });
 
   it.each([

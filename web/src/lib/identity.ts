@@ -718,6 +718,8 @@ export async function authenticatedFetch(
       headers.set(SLICE_KEY_HEADER, clientRoutingKey());
     }
   }
+  const recoverySessionId = sessionIdForRecovery(url, init?.method);
+  const sentHost = recoverySessionId === null ? null : getSessionHost(recoverySessionId);
   // Bypass the browser HTTP cache for all API calls. Session
   // endpoints (GET /v1/sessions/{id}) carry volatile in-memory state
   // (pending_elicitations) that changes between fetches without any
@@ -737,7 +739,6 @@ export async function authenticatedFetch(
   // After a host switch this page can still key a session by its old host, which
   // neither that key nor the default replica reaches; follow the host the refusal
   // names. A managed launch stays keyed by the new host it launches.
-  const recoverySessionId = sessionIdForRecovery(url, init?.method);
   const resendKey =
     isDatabricksWorkspace() &&
     !callerKeyed &&
@@ -747,8 +748,11 @@ export async function authenticatedFetch(
       : null;
   const sentKey = unkeyed ? null : headers.get(SLICE_KEY_HEADER);
   if (recoverySessionId !== null && resendKey !== null && resendKey !== sentKey) {
-    // A child's refusal names its ancestor's host, so correct the entry it routes by.
-    setSessionHost(sessionHostOwner(recoverySessionId) ?? recoverySessionId, resendKey);
+    // A child's refusal names its ancestor's host, so correct the entry it routes by,
+    // unless a newer record replaced it while this request was in flight.
+    if (getSessionHost(recoverySessionId) === sentHost) {
+      setSessionHost(sessionHostOwner(recoverySessionId) ?? recoverySessionId, resendKey);
+    }
     // A keyless miss shows the default replica doesn't hold this host; don't retry it.
     if (sentKey === null) clearHostKeyless(resendKey);
     const keyedHeaders = new Headers(headers);
