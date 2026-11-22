@@ -38,12 +38,13 @@ vi.mock("@/hooks/useSessionActionRestrictions", () => ({
   useSessionActionRestrictions: () => ({ forkDisabledReason: undefined }),
 }));
 const useConversations = vi.fn();
+const useSessionSearch = vi.fn((..._args: unknown[]) => ({ isFetching: false }));
 vi.mock("@/hooks/useConversations", async (importOriginal) => {
   const { isSessionDeleting, PINNED_CONVERSATIONS_KEY } =
     await importOriginal<typeof ConversationsModule>();
   return {
     useConversations: (...args: unknown[]) => useConversations(...args),
-    useSessionSearch: () => ({ isFetching: false }),
+    useSessionSearch: (...args: unknown[]) => useSessionSearch(...args),
     useProjects: () => ({ data: [] }),
     isSessionDeleting,
     PINNED_CONVERSATIONS_KEY,
@@ -362,6 +363,40 @@ describe("QuickPick ⌘K verb-first session actions", () => {
       "Unpin isn't available for “Fix the parser”.",
     );
     expect(optionNames()).not.toContain("Unpin");
+  });
+
+  it("lists archived sessions only for a verb that applies to them, such as Unarchive", async () => {
+    const archived: Conversation = { ...MINE, id: "c3", title: "Old spike", archived: true };
+    listSessions(MINE, archived);
+    const { input } = renderWithPicks();
+    fireEvent.change(input, { target: { value: "archive a session" } });
+    fireEvent.click(await screen.findByRole("option", { name: /^Archive a Session…/ }));
+    await waitFor(() => expect(heading()).toBe("Archive which session?"));
+    expect(optionNames().some((name) => name.includes("Old spike"))).toBe(false);
+
+    fireEvent.keyDown(input, { key: "Escape" });
+    await waitFor(() => expect(heading()).toBeNull());
+    fireEvent.change(input, { target: { value: "unarchive a session" } });
+    fireEvent.click(await screen.findByRole("option", { name: /^Unarchive a Session…/ }));
+    await waitFor(() => expect(heading()).toBe("Unarchive which session?"));
+    // The list it reads asks the server for archived sessions too.
+    expect(useConversations).toHaveBeenLastCalledWith("", true, expect.anything());
+    expect(optionNames().some((name) => name.includes("Old spike"))).toBe(true);
+  });
+
+  it("searches the server from the session picker, so a session not loaded yet can be found", async () => {
+    const { input } = renderWithPicks();
+    fireEvent.change(input, { target: { value: "rename a session" } });
+    fireEvent.click(await screen.findByRole("option", { name: /^Rename a Session…/ }));
+    await waitFor(() => expect(heading()).toBe("Rename which session?"));
+    fireEvent.change(input, { target: { value: "quarterly" } });
+    await waitFor(() =>
+      expect(useSessionSearch).toHaveBeenCalledWith(
+        "quarterly",
+        expect.anything(),
+        expect.objectContaining({ enabled: true }),
+      ),
+    );
   });
 
   it("goes back from the session picker to the row that opened it, with its query", async () => {

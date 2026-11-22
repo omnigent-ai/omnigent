@@ -110,12 +110,17 @@ export function QuickPickCommandPalette({
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
   const childPage = useStore(paletteChildPageStore, (state) => state.page);
-  // A verb-first row such as "Archive a Session…" lists sessions alone, searched as the root is.
+  // A verb-first row such as "Archive a Session…" lists sessions alone, searched as the root is:
+  // loaded matches, the server's title and message matches with their paging, and archived
+  // sessions where the action applies to them.
   const picking = childPage?.kind === "pick-session" ? childPage : null;
   const search = usePaletteSessionSearch({
     open,
-    sessionsOnly: sessionsOnly || picking !== null,
+    sessionsOnly,
     matchLoaded: true,
+    includeArchived: picking
+      ? (SESSION_COMMAND_PICKS[picking.command]?.includesArchived ?? false)
+      : undefined,
   });
   const { query, debouncedQuery, titleSearch, contentSearch } = search;
   const close = (): void => onOpenChange(false);
@@ -252,6 +257,8 @@ export function QuickPickCommandPalette({
             ...(showingServerMatches
               ? showMoreItem("title", titleSearch, visibleSessions, "Sessions")
               : []),
+            ...contentSessions.map((session) => sessionItem(session, "In messages")),
+            ...showMoreItem("content", contentSearch, contentSessions, "In messages"),
           ],
           back: leavePaletteChildPage,
         };
@@ -378,7 +385,9 @@ export function QuickPickCommandPalette({
     }
     // A picked session opens its actions on the one the verb named, still checked as it runs.
     if (picking && row.kind === "session") {
-      const picked = visibleSessions.find((candidate) => candidate.id === row.id);
+      const picked = [...visibleSessions, ...contentSessions].find(
+        (candidate) => candidate.id === row.id,
+      );
       if (!picked) return "keepOpen";
       const parent = paletteChildPageStore.getState().parent ?? { query: "", activeId: null };
       sessionPage.openActions(picked.conversation, picked.label, parent);

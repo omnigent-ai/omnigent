@@ -279,10 +279,22 @@ export interface SessionCommandPick {
   question: string;
   /** What the actions page says when the action doesn't apply to `title`. */
   notAvailable: (title: string) => string;
+  /** The picker lists archived sessions too, since the action applies to them. */
+  includesArchived: boolean;
 }
 
-function pick(label: string, question: string, verb: string): SessionCommandPick {
-  return { label, question, notAvailable: (title) => `${verb} isn't available for “${title}”.` };
+function pick(
+  label: string,
+  question: string,
+  verb: string,
+  { includesArchived = false } = {},
+): SessionCommandPick {
+  return {
+    label,
+    question,
+    notAvailable: (title) => `${verb} isn't available for “${title}”.`,
+    includesArchived,
+  };
 }
 
 /** The sidebar row actions ⌘K can start from a verb, then run on a session the user picks. */
@@ -315,7 +327,11 @@ export const SESSION_COMMAND_PICKS: Partial<Record<SessionCommandId, SessionComm
   ),
   stop: pick("Stop a Session…", "Stop which session?", "Stop"),
   archive: pick("Archive a Session…", "Archive which session?", "Archive"),
-  unarchive: pick("Unarchive a Session…", "Unarchive which session?", "Unarchive"),
-  delete: pick("Delete a Session…", "Delete which session?", "Delete"),
+  unarchive: pick("Unarchive a Session…", "Unarchive which session?", "Unarchive", {
+    includesArchived: true,
+  }),
+  delete: pick("Delete a Session…", "Delete which session?", "Delete", {
+    includesArchived: true,
+  }),
   leave: pick("Leave a Session…", "Leave which session?", "Leave"),
 };
