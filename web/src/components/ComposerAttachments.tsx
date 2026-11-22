@@ -11,14 +11,17 @@ import {
   FileText,
   FileType,
   FileVideo,
+  ClipboardType,
   Presentation,
   XIcon,
   type LucideIcon,
 } from "lucide-react";
 
 import { attachmentFilename, attachmentKey } from "@/lib/attachments";
+import { cn } from "@/lib/utils";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import { ComposerChipRow } from "@/components/composer/ChatComposer";
+import { Button } from "@/components/ui/button";
 
 /**
  * Pending (pre-send) attachments shown under the composer textarea. A supported
@@ -30,20 +33,38 @@ import { ComposerChipRow } from "@/components/composer/ChatComposer";
 export function ComposerAttachments({
   files,
   onRemove,
+  actionFor,
   className,
 }: {
   files: File[];
   onRemove: (index: number) => void;
+  /** An extra action on a file's card, such as putting pasted text back inline. */
+  actionFor?: (file: File) => AttachmentAction | undefined;
   className?: string;
 }) {
   if (files.length === 0) return null;
   return (
     <ComposerChipRow className={className}>
       {files.map((file, i) => (
-        <AttachmentTile key={attachmentKey(file)} file={file} onRemove={() => onRemove(i)} />
+        <AttachmentTile
+          key={attachmentKey(file)}
+          file={file}
+          action={actionFor?.(file)}
+          onRemove={() => onRemove(i)}
+        />
       ))}
     </ComposerChipRow>
   );
+}
+
+/** An extra action on one attachment's card. */
+export interface AttachmentAction {
+  label: string;
+  /** Read by screen readers in place of `label`, naming the file. */
+  ariaLabel: string;
+  /** Replaces the card's "TYPE · SIZE" line, such as "200 lines". */
+  detail?: string;
+  onSelect: () => void;
 }
 
 /** Human-readable file size, e.g. 6815744 -> "6.5 MB". */
@@ -131,7 +152,15 @@ function useObjectUrl(file: File | null): string | undefined {
   return url;
 }
 
-function AttachmentTile({ file, onRemove }: { file: File; onRemove: () => void }) {
+function AttachmentTile({
+  file,
+  action,
+  onRemove,
+}: {
+  file: File;
+  action?: AttachmentAction;
+  onRemove: () => void;
+}) {
   // An image whose blob can't decode falls back to the file card (spec rule 4).
   const [thumbFailed, setThumbFailed] = useState(false);
   const showThumb = file.type.startsWith("image/") && !thumbFailed;
@@ -160,14 +189,35 @@ function AttachmentTile({ file, onRemove }: { file: File; onRemove: () => void }
   const Icon = iconForFile(file);
   return (
     <div className="relative shrink-0">
-      <div className="flex h-14 w-[180px] items-center gap-2 rounded-xl border border-border bg-background p-2">
+      {/* A card with an action is wider, so the name and its detail stay readable. */}
+      <div
+        className={cn(
+          "flex h-14 items-center gap-2 rounded-xl border border-border bg-background p-2",
+          action ? "w-[224px]" : "w-[180px]",
+        )}
+      >
         <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground">
           <Icon className="size-5" />
         </span>
-        <span className="flex min-w-0 flex-col">
+        <span className="flex min-w-0 flex-1 flex-col">
           <span className="truncate text-sm font-medium text-foreground">{name}</span>
-          <span className="truncate text-xs text-muted-foreground">{meta}</span>
+          <span className="truncate text-xs text-muted-foreground">{action?.detail ?? meta}</span>
         </span>
+        {action && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            // Keep focus in the message so typing carries on where it was.
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={action.onSelect}
+            aria-label={action.ariaLabel}
+            title={action.label}
+            className="shrink-0 text-muted-foreground hover:text-foreground"
+          >
+            <ClipboardType aria-hidden className="size-4" />
+          </Button>
+        )}
       </div>
       <RemoveButton name={name} onRemove={onRemove} />
     </div>

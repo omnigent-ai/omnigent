@@ -101,7 +101,11 @@ describe("useComposerAttachments", () => {
     const notes = textFile();
     const zip = new File([new Uint8Array(4)], "bundle.zip", { type: "application/zip" });
     // The defaults accept a .zip until the server says otherwise.
-    act(() => result.current.addFiles([notes, zip]));
+    let validation: ReturnType<typeof result.current.addFiles> | undefined;
+    act(() => {
+      validation = result.current.addFiles([notes, zip]);
+    });
+    expect(validation?.accepted).toEqual([notes, zip]);
     expect(result.current.files).toEqual([notes, zip]);
 
     info = {
@@ -113,6 +117,13 @@ describe("useComposerAttachments", () => {
     expect(result.current.files).toEqual([notes]);
     expect(result.current.attachmentError).toContain("bundle.zip");
     expect(onRemoved).toHaveBeenCalledOnce();
+
+    // A refused file comes back as not accepted, with the reason.
+    act(() => {
+      validation = result.current.addFiles([zip]);
+    });
+    expect(validation?.accepted).toEqual([]);
+    expect(validation?.errors.join()).toContain("bundle.zip");
   });
 
   it("starts empty by default and seeds from initialFiles", () => {

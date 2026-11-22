@@ -63,6 +63,35 @@ describe("ComposerAttachments", () => {
     expect(screen.queryByText("workspace")).toBeNull();
   });
 
+  it("shows a card's extra action with its detail, keeping focus where it was", () => {
+    const onSelect = vi.fn();
+    const pasted = new File(["text"], "pasted-text-1.txt", { type: "text/plain" });
+    const other = new File([new Uint8Array(4)], "notes.txt", { type: "text/plain" });
+    render(
+      <ComposerAttachments
+        files={[pasted, other]}
+        onRemove={() => {}}
+        actionFor={(file) =>
+          file === pasted
+            ? {
+                label: "Insert as text",
+                ariaLabel: "Insert pasted-text-1.txt as text",
+                detail: "60 lines",
+                onSelect,
+              }
+            : undefined
+        }
+      />,
+    );
+    expect(screen.getByText("60 lines")).toBeInTheDocument();
+    expect(screen.getByText("TXT · 4 B")).toBeInTheDocument();
+    const action = screen.getByRole("button", { name: "Insert pasted-text-1.txt as text" });
+    expect(screen.getAllByRole("button", { name: /as text/ })).toHaveLength(1);
+    expect(fireEvent.mouseDown(action)).toBe(false);
+    fireEvent.click(action);
+    expect(onSelect).toHaveBeenCalledOnce();
+  });
+
   it("removes the clicked attachment by index", () => {
     const { onRemove } = renderList([
       new File([new Uint8Array(4)], "a.png", { type: "image/png" }),

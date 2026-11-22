@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
+import {
+  attachmentAccept,
+  clipboardFiles,
+  validateAttachments,
+  type AttachmentValidation,
+} from "@/lib/attachments";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { insertPastedText } from "@/lib/composerText";
 import type { ComposerPasteEvent } from "@/components/composer/engine/composerInput";
@@ -26,7 +31,8 @@ export interface ComposerAttachmentsApi {
   /** The file picker's `accept` filter for the server's attachment policy. */
   accept: string | undefined;
   /** Validate, append the accepted files, and surface the rejections. */
-  addFiles: (incoming: File[]) => void;
+  /** Validate and attach `incoming`; returns what was accepted and why the rest wasn't. */
+  addFiles: (incoming: File[]) => AttachmentValidation;
   /** Drop one file by index and clear the rejection notice. */
   removeFile: (index: number) => void;
   /**
@@ -90,13 +96,15 @@ export function useComposerAttachments({
     onRemovedRef.current?.();
   }, [policy]);
 
-  const addFiles = useCallback((incoming: File[]) => {
-    const { accepted, errors } = validateAttachments(incoming, policyRef.current);
+  const addFiles = useCallback((incoming: File[]): AttachmentValidation => {
+    const validation = validateAttachments(incoming, policyRef.current);
+    const { accepted, errors } = validation;
     if (accepted.length > 0) {
       setFiles((prev) => [...prev, ...accepted]);
       onAcceptedRef.current?.(accepted);
     }
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
+    return validation;
   }, []);
 
   const removeFile = useCallback((index: number) => {

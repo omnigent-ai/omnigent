@@ -88,6 +88,15 @@ export function composerTargetOf(element: Element | null | undefined): ComposerT
   return surfaces.get(element) ?? null;
 }
 
+/** The live input named `inputId` inside `root`, whichever engine renders it. */
+export function composerInputWithId(
+  root: ParentNode | null | undefined,
+  inputId: string,
+): ComposerTextTarget | null {
+  const selector = `${COMPOSER_INPUT_SELECTOR}[${COMPOSER_INPUT_ID_ATTRIBUTE}="${CSS.escape(inputId)}"]`;
+  return composerTargetOf(root?.querySelector(selector));
+}
+
 /** A keydown as composer logic sees it; React's textarea events satisfy it. */
 export interface ComposerKeyboardEvent {
   readonly key: string;

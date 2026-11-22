@@ -3,17 +3,12 @@
 
 import { ClipboardTypeIcon } from "lucide-react";
 import { useMemo } from "react";
+import type { AttachmentAction } from "@/components/ComposerAttachments";
 import { usePaletteCommands, type PaletteCommand } from "@/store/paletteCommands";
 import type { PastedTextAttachments } from "./usePastedTextAttachments";
 
-/** A pasted attachment chip's Insert as text, for the chip to show as its own action. */
-export interface PastedTextChipAction {
-  label: string;
-  ariaLabel: string;
-  /** The paste's size, such as "60 lines". */
-  detail: string;
-  onSelect: () => void;
-}
+/** A pasted attachment chip's Insert as text, shown as the chip's own action. */
+export type PastedTextChipAction = AttachmentAction;
 
 type RestoreSource = Pick<PastedTextAttachments, "chips" | "insertAsText" | "canRestore">;
 

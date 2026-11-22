@@ -31,9 +31,19 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 import * as CodeMirrorModule from "@/components/composer/engine/CodeMirrorComposerInput";
-import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
+import {
+  codeMirrorComposerLoad,
+  loadCodeMirrorComposer,
+  resetCodeMirrorComposerLoadForTests,
+} from "@/components/composer/engine/codeMirrorComposerLoader";
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { insertComposerText } from "@/lib/composerText";
+import {
+  loadPastedTextLedger,
+  resetPastedTextLedgerForTests,
+} from "@/hooks/usePastedTextAttachments";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -10379,5 +10389,141 @@ describe("Composer with the CodeMirror release flag on", () => {
 
     fireEvent.keyDown(editor, { key: "Enter" });
     expect(props.onSend).toHaveBeenCalledExactlyOnceWith("!git status", undefined);
+  });
+});
+
+describe("Composer with a large text paste", () => {
+  const LARGE = Array.from({ length: 60 }, (_, index) => `log line ${index}`).join("\n");
+  const paste = (text: string) => ({
+    clipboardData: {
+      items: [{ kind: "string", type: "text/plain", getAsFile: () => null }],
+      getData: (type: string) => (type === "text/plain" ? text : ""),
+    },
+  });
+  const undoKey = { key: "z", metaKey: isMacPlatform(), ctrlKey: !isMacPlatform() };
+  const pastedCommands = () => usePaletteCommandsStore.getState().groups["composer-pasted-text"];
+  const withFlag = (enabled: boolean) => ({
+    ...FALLBACK_SERVER_INFO,
+    features: { chat_composer_codemirror: enabled },
+  });
+
+  let session = 0;
+  beforeEach(async () => {
+    setComposerState({ conversationId: `conv_large_paste_${++session}`, blocks: [] });
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    await loadPastedTextLedger();
+  });
+  afterEach(() => {
+    resetCodeMirrorComposerLoadForTests();
+    resetPastedTextLedgerForTests();
+  });
+
+  it("keeps today's paste with chat_composer_codemirror off: inline text, no attachment", async () => {
+    // Even with the editor already loaded, as after the flag was on earlier in this window.
+    loadCodeMirrorComposer();
+    await waitFor(() => expect(codeMirrorComposerLoad().status).toBe("ready"));
+    render(
+      <CapabilitiesProvider info={withFlag(false)}>
+        <Composer {...composerProps()} />
+      </CapabilitiesProvider>,
+    );
+    expect(textarea()).not.toHaveClass("cm-content");
+
+    fireEvent.paste(textarea(), paste(LARGE));
+    expect(textarea().value).toBe(LARGE);
+    fireEvent.keyDown(textarea(), undoKey);
+
+    expect(screen.queryByText("pasted-text-1.txt")).toBeNull();
+    expect(screen.queryByTestId("composer-pasted-text-hint")).toBeNull();
+    expect(screen.queryByRole("button", { name: /as text/ })).toBeNull();
+    expect(pastedCommands()).toBeUndefined();
+  });
+
+  it("turns it into an attachment on CodeMirror, and ⌘Z types it back", async () => {
+    const props = composerProps();
+    render(
+      <CapabilitiesProvider info={withFlag(true)}>
+        <Composer {...props} />
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    const editor = screen.getByLabelText("Message the agent");
+    act(() => insertComposerText(composerTargetOf(editor)!, "see: "));
+    act(() => composerTargetOf(editor)!.setSelectionRange(5, 5));
+
+    fireEvent.paste(editor, paste(LARGE));
+
+    expect(screen.getByText("pasted-text-1.txt")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-pasted-text-hint")).toHaveTextContent(
+      "Large paste (60 lines) added as an attachment.",
+    );
+    expect(screen.getByRole("button", { name: "Insert pasted-text-1.txt as text" })).toBeVisible();
+    expect(pastedCommands()?.commands.map((command) => command.label)).toEqual([
+      "Insert pasted-text-1.txt as Text",
+    ]);
+    expect(composerTargetOf(editor)?.value).toBe("see: ");
+
+    fireEvent.keyDown(editor, undoKey);
+
+    expect(composerTargetOf(editor)?.value).toBe(`see: ${LARGE}`);
+    expect(screen.queryByText("pasted-text-1.txt")).toBeNull();
+    expect(screen.queryByTestId("composer-pasted-text-hint")).toBeNull();
+    expect(pastedCommands()).toBeUndefined();
+  });
+
+  it("keeps the attachment but offers no way back once the flag turns off", async () => {
+    const props = composerProps();
+    const tree = (enabled: boolean) => (
+      <CapabilitiesProvider info={withFlag(enabled)}>
+        <Composer {...props} />
+      </CapabilitiesProvider>
+    );
+    const { rerender } = render(tree(true));
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    const editor = screen.getByLabelText("Message the agent");
+    act(() => insertComposerText(composerTargetOf(editor)!, "see: "));
+    act(() => composerTargetOf(editor)!.setSelectionRange(5, 5));
+    fireEvent.paste(editor, paste(LARGE));
+    expect(screen.getByTestId("composer-pasted-text-hint")).toBeInTheDocument();
+
+    rerender(tree(false));
+    await waitFor(() => expect(textarea()).not.toHaveClass("cm-content"));
+
+    expect(screen.getByText("pasted-text-1.txt")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-pasted-text-hint")).toBeNull();
+    expect(screen.queryByRole("button", { name: /as text/ })).toBeNull();
+    expect(pastedCommands()).toBeUndefined();
+    fireEvent.keyDown(textarea(), undoKey);
+    expect(textarea().value).toBe("see: ");
+    expect(screen.getByText("pasted-text-1.txt")).toBeInTheDocument();
+  });
+
+  it("restores an older paste from its card, after ⌘Z's moment has passed", async () => {
+    render(
+      <CapabilitiesProvider info={withFlag(true)}>
+        <Composer {...composerProps()} />
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    const editor = screen.getByLabelText("Message the agent");
+    act(() => insertComposerText(composerTargetOf(editor)!, "see: "));
+    act(() => composerTargetOf(editor)!.setSelectionRange(5, 5));
+    fireEvent.paste(editor, paste(LARGE));
+    // An edit since the paste ends ⌘Z's restore; the card's action still works.
+    const hint = screen.getByTestId("composer-pasted-text-hint");
+    expect(within(hint).getByText("Z")).toBeInTheDocument();
+    act(() => insertComposerText(composerTargetOf(editor)!, "Look, ", 0, 0));
+    expect(within(hint).queryByText("Z")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Insert pasted-text-1.txt as text" }));
+
+    expect(composerTargetOf(editor)?.value).toBe(`Look, see: ${LARGE}`);
+    expect(screen.queryByText("pasted-text-1.txt")).toBeNull();
   });
 });

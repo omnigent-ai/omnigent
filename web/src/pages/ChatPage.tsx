@@ -51,6 +51,7 @@ import {
 } from "@/components/composer/composerHighlight";
 import {
   COMPOSER_TAIL_INPUT_ID,
+  composerInputWithId,
   composerTargetElement,
   isComposerTargetFocused,
   isComposerTextarea,
@@ -230,6 +231,7 @@ import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
+import { useComposerPastedText } from "@/hooks/useComposerPastedText";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
 import {
   INVENTORY_HARNESS_IDS,
@@ -266,6 +268,7 @@ import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
+import { PastedTextHintRow } from "@/components/composer/PastedTextHintRow";
 import { ComposerLocalReviewChips } from "@/components/composer/ComposerLocalReviewChips";
 import { isSubagentRoutingSession } from "@/components/CostRoutingControl";
 import { useHosts } from "@/hooks/useHosts";
@@ -3837,6 +3840,43 @@ function ComposerImpl(
 
   // Mobile reserves the overlay height in the transcript's trailing padding.
   const composerFormRef = useRef<HTMLFormElement>(null);
+
+  // On the CodeMirror input, a large text paste becomes an attachment with a way back. The
+  // textarea, and so every composer with `chat_composer_codemirror` off, keeps today's paste.
+  const largePasteAttaches = composerEngine === "codemirror";
+  // Changes only with the draft, so the paste ledger never syncs against stale attachments.
+  const draftInputValue = useCallback(
+    (inputId: string) =>
+      inputId === COMPOSER_TAIL_INPUT_ID
+        ? draft.text
+        : draft.quotes.find((quote) => quote.id === inputId)?.before,
+    [draft],
+  );
+  const pastedText = useComposerPastedText({
+    commandSource: "composer-pasted-text",
+    draftKey: conversationId ?? null,
+    files,
+    valueOf: draftInputValue,
+    attach: (file) => addFiles([file]).accepted.includes(file),
+    removeFile: (file) => {
+      const index = filesRef.current.indexOf(file);
+      if (index >= 0) removeFile(index);
+    },
+    writeInput: (inputId, text) => {
+      editText(inputId === COMPOSER_TAIL_INPUT_ID ? null : inputId, text);
+      dirtyRef.current = true;
+    },
+    targetOf: (inputId) => composerInputWithId(composerFormRef.current, inputId),
+    // A reply quote with no text before it shows its input only while active.
+    revealInput: (inputId) => {
+      if (inputId !== COMPOSER_TAIL_INPUT_ID) focusText(inputId);
+    },
+    // Off CodeMirror, as once the flag turns off, a pasted file stays an attachment, but
+    // nothing offers to put it back: no hint, chip action or ⌘K command.
+    locked: inputDisabled || !largePasteAttaches,
+    onOtherPaste: onPaste,
+  });
+  const handlePaste = largePasteAttaches ? pastedText.onPaste : onPaste;
   const measureComposerOverlayRef = useRef<(() => boolean) | null>(null);
   // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.
   // The onGrowth pin re-locks the transcript bottom in the same task as the
@@ -4304,6 +4344,8 @@ function ComposerImpl(
       shouldSteerAllFromKeyboard,
     }: ComposerKeyIntent,
   ) => {
+    // ⌘Z right after a large paste became an attachment types it back in.
+    if (largePasteAttaches && pastedText.onKeyDown(e)) return;
     // Mod+Enter (Mod+Shift+Enter when Mod+Enter is already the send chord)
     // steers everything: the draft, if any, is submitted first so it joins the
     // queue tail (or sends directly when idle), then every queued message is
@@ -4402,6 +4444,7 @@ function ComposerImpl(
 
   const handleTextChange = (id: string | null, e: ComposerInputEvent) => {
     const input = e.currentTarget;
+    pastedText.endUndo();
     slashCompletion.onSelectionChange(input);
     editText(id, input.value);
     dirtyRef.current = true;
@@ -4553,7 +4596,10 @@ function ComposerImpl(
         dictating={dictation.hasInterim}
         draftKey={conversationId ?? null}
         activeInputId={activeTextId ?? COMPOSER_TAIL_INPUT_ID}
-        onActiveInputChange={rebindActiveInput}
+        onActiveInputChange={(target) => {
+          rebindActiveInput(target);
+          pastedText.endUndo();
+        }}
         input={{
           ref: bindTailTextarea,
           value: draft.text,
@@ -4561,7 +4607,10 @@ function ComposerImpl(
           commandToken: highlight.input.commandToken,
           mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
           onChange: (e) => handleTextChange(null, e),
-          onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
+          onSelect: (e) => {
+            slashCompletion.onSelectionChange(e.currentTarget);
+            pastedText.endUndo();
+          },
           onFocus: (e) => {
             setInputFocused(true);
             handleTextFocus(null, e.currentTarget);
@@ -4572,7 +4621,7 @@ function ComposerImpl(
             setInputFocused(false);
             dismissMention();
           },
-          onPaste,
+          onPaste: handlePaste,
           onScroll: highlight.input.onScroll,
           "aria-label": "Message the agent",
           "aria-describedby": highlight.input["aria-describedby"],
@@ -4619,6 +4668,7 @@ function ComposerImpl(
                 onGrowth={onViewportShrinkPinScroll}
                 onRemove={(id) => {
                   removeQuote(id);
+                  pastedText.endUndo();
                   resetCursor();
                   recallingRef.current = false;
                   textareaRef.current = tailTextareaRef.current;
@@ -4629,8 +4679,10 @@ function ComposerImpl(
                   onChange: (e) => handleTextChange(quote.id, e),
                   onFocus: (e) => handleTextFocus(quote.id, e.currentTarget),
                   onBlur: dismissMention,
+                  // Moving the selection in a quote ends ⌘Z's paste restore too.
+                  onSelect: () => pastedText.endUndo(),
                   onKeyDown: handleKeyDown,
-                  onPaste,
+                  onPaste: handlePaste,
                   "data-has-draft": hasDraft ? "true" : undefined,
                 })}
               />
@@ -4739,7 +4791,18 @@ function ComposerImpl(
           attachments: (
             <>
               {/* Pending attachments — image thumbnails (click to view) + file rows. */}
-              <ComposerAttachments files={files} onRemove={removeFile} />
+              <ComposerAttachments
+                files={files}
+                onRemove={removeFile}
+                actionFor={pastedText.actionFor}
+              />
+              {largePasteAttaches && pastedText.hint && (
+                <PastedTextHintRow
+                  hint={pastedText.hint}
+                  disabled={!pastedText.canRestore}
+                  onInsertAsText={() => pastedText.insertAsText(pastedText.hint!.file)}
+                />
+              )}
               {/* Rejected-attachment feedback: unsupported type or too large */}
               {attachmentError !== null && (
                 <ComposerFeedbackRow tone="error">{attachmentError}</ComposerFeedbackRow>

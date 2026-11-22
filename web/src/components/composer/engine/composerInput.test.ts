@@ -3,6 +3,8 @@ import { isDraftingTarget } from "@/hooks/useApproveHotkey";
 import { insertComposerText, insertPastedText } from "@/lib/composerText";
 import {
   COMPOSER_INPUT_ATTRIBUTE,
+  COMPOSER_INPUT_ID_ATTRIBUTE,
+  composerInputWithId,
   ENABLED_COMPOSER_INPUT_SELECTOR,
   composerTargetElement,
   composerTargetOf,
@@ -31,6 +33,20 @@ describe("composer input targets", () => {
     expect(isComposerInput(textarea)).toBe(true);
     expect(composerTargetOf(textarea)).toBe(textarea);
     expect(composerTargetElement(textarea)).toBe(textarea);
+  });
+
+  it("finds a live input by its id under a root, whichever engine renders it", () => {
+    const tail = markedTextarea("tail");
+    tail.setAttribute(COMPOSER_INPUT_ID_ATTRIBUTE, "tail");
+    const quote = createFakeComposerSurface("quote");
+    quote.element.setAttribute(COMPOSER_INPUT_ID_ATTRIBUTE, 'q"1');
+    document.body.append(quote.element);
+
+    expect(composerInputWithId(document.body, "tail")).toBe(tail);
+    expect(composerInputWithId(document.body, 'q"1')).toBe(quote);
+    expect(composerInputWithId(document.body, "q2")).toBeNull();
+    expect(composerInputWithId(null, "tail")).toBeNull();
+    quote.unregister();
   });
 
   it("ignores text fields that aren't composer inputs", () => {
