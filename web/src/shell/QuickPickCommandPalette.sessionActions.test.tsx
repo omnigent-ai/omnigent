@@ -9,6 +9,7 @@ import type * as ConversationsModule from "@/hooks/useConversations";
 import type { Conversation } from "@/hooks/useConversations";
 
 import { LEVEL_READ } from "@/lib/permissionsApi";
+import { openPaletteDialog } from "@/test/paletteCommands";
 
 import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
 import { OWNER_ONLY_REASONS, UNKNOWN_OWNER_REASON } from "./sessionCommands/model";
@@ -162,14 +163,15 @@ describe("QuickPick ⌘K session actions", () => {
     const { input, onOpenChange } = renderPalette(undefined, { closes: true });
     openActions(input);
     await waitFor(() => expect(heading()).not.toBeNull());
-    const asked = vi.fn();
+    const paletteOpenWhenAsked: boolean[] = [];
+    const asked = vi.fn(() => paletteOpenWhenAsked.push(openPaletteDialog() !== null));
     onTestFinished(useSessionActionStore.subscribe(asked));
     fireEvent.change(input, { target: { value: "rename" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onOpenChange).toHaveBeenCalledWith(false);
-    // The dialog is still closing, so the host hasn't been asked yet.
-    expect(asked).not.toHaveBeenCalled();
     await waitFor(() => expect(asked).toHaveBeenCalledTimes(1));
+    // The host is asked only once the palette is no longer open.
+    expect(paletteOpenWhenAsked).toEqual([false]);
     expect(latestSessionActionRequest()).toMatchObject({
       command: "rename",
       conversation: { id: "c1" },

@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { create } from "zustand";
 
 import { type PaletteCommand, usePaletteCommands } from "@/store/paletteCommands";
+import { openPaletteDialog } from "@/test/paletteCommands";
 
 import { CommandContextProvider } from "./commandContext";
 import { OPTION_GONE_STATUS } from "./commandOptionsPage";
@@ -130,11 +131,14 @@ describe("a command's options in ⌘K", () => {
   it("runs the chosen option once the palette has closed", async () => {
     renderPalette();
     await openMoveTab();
+    let paletteOpenAtRun: boolean | null = null;
+    moved.mockImplementation(() => {
+      paletteOpenAtRun = openPaletteDialog() !== null;
+    });
     type("right");
     press("Enter");
-    expect(moved).not.toHaveBeenCalled();
-    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     await waitFor(() => expect(moved).toHaveBeenCalledExactlyOnceWith("Right"));
+    expect(paletteOpenAtRun).toBe(false);
   });
 
   it.each([
@@ -144,9 +148,11 @@ describe("a command's options in ⌘K", () => {
     renderPalette();
     await openMoveTab();
     type("right");
-    press("Enter");
-    // Before the close finishes and runs the option.
-    act(() => change());
+    // Changed with the accept, before the close it asks for runs the option.
+    act(() => {
+      press("Enter");
+      change();
+    });
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     await act(async () => {
       await new Promise((resolve) => {

@@ -110,7 +110,10 @@ const IOS_PICKER_ANCHOR: CSSProperties = {
   maxHeight: `calc(var(--omnigent-viewport-height, 100lvh) - ${IOS_PICKER_TOP} - var(--omnigent-safe-bottom, 0px) - 0.5rem)`,
 };
 
-/** The standard modal QuickPick; an accepted close restores focus before running its `afterClose`. */
+/**
+ * The standard modal QuickPick. An accepted close returns focus where it was before opening as
+ * soon as it commits, then runs the `afterClose` action `onAccept` returned, free to move it.
+ */
 export function QuickPickDialog<Value>({
   open,
   onOpenChange,
@@ -139,6 +142,8 @@ export function QuickPickDialog<Value>({
     },
     [ownership],
   );
+  // The accepted close already returned focus and ran its action, so Radix's late autofocus mustn't.
+  const closeFinishedRef = useRef(false);
   const latestOnOpenChange = useRef(onOpenChange);
   latestOnOpenChange.current = onOpenChange;
   // Counts the closes asked for, so the commit after each shows whether the owner closed.
@@ -167,26 +172,61 @@ export function QuickPickDialog<Value>({
     // A new opening, even one during the last one's exit, owns nothing from before: an earlier
     // accept's result or close action would act on a picker the user came back to.
     ownership.revoke();
+    closeFinishedRef.current = false;
     // Only the next picker to open sees a handoff: the one it names takes it, any other drops it.
     const handoff = successorHandoff;
     successorHandoff = null;
     const active = document.activeElement;
     // Opened in another still-mounted picker's place: return where that one would.
     const replaced = active?.closest(QUICK_PICK_DIALOG_SELECTOR);
+    // Reopened before the last close finished, whose content the remount took focus from: return
+    // where that opening would.
+    const unfinished = returnFocusRef.current;
+    const reopenedDuringExit = (active === null || active === document.body) && unfinished !== null;
     returnFocusRef.current =
       handoff && successorName !== undefined && handoff.successor === successorName
         ? handoff.target
         : replaced
           ? (returnFocusTargets.get(replaced) ?? null)
-          : active instanceof HTMLElement
-            ? active
-            : null;
+          : reopenedDuringExit
+            ? unfinished
+            : active instanceof HTMLElement
+              ? active
+              : null;
     // oxlint-disable-next-line react-hooks/exhaustive-deps -- the name is read as it opens.
   }, [open, ownership]);
-  // Reopened during its exit animation, the content survived, so Radix won't autofocus it again.
+  /**
+   * Returns focus where it was before opening, then runs the accepted close's action, if any.
+   * True when it placed focus, or left it where the choice moved it; false leaves it to Radix.
+   */
+  const finishClose = (): boolean => {
+    const target = returnFocusRef.current;
+    // Only the close the current acceptance asked for runs its action.
+    const afterClose = ownership.takeAfterClose();
+    returnFocusRef.current = null;
+    // A picker opened in this one's place already holds focus and the return target.
+    const { movedOn, restore } = closingDialogFocus(target, QUICK_PICK_DIALOG_SELECTOR);
+    // An action the choice ran moved focus while this closed: it stays there.
+    if (movedOn && !afterClose) return true;
+    // Restore first, so a picker the action opens returns focus here too.
+    restore?.focus();
+    afterClose?.();
+    return !!(afterClose || target?.isConnected);
+  };
+  // An accepted close returns focus and runs its action as soon as it commits, not after the exit
+  // animation, so keys typed right after the accept reach where focus went. The commit has
+  // stopped the content trapping focus by the time this runs.
   useEffect(() => {
-    if (open) claimFocus();
+    if (open || !ownership.closing()) return;
+    closeFinishedRef.current = finishClose();
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- finishClose reads only refs.
   }, [open]);
+  // Each opening mounts its own content, even one during the last one's exit, so Radix stacks
+  // its focus scope over a picker it replaces and autofocuses it as on any opening.
+  const [openings, setOpenings] = useState({ open, count: 0 });
+  if (openings.open !== open) setOpenings({ open, count: openings.count + (open ? 1 : 0) });
+  // The content of the latest opening; an earlier one's late close autofocus is stale.
+  const contentRef = useRef<HTMLElement | null>(null);
   /** Close for `token`'s result, unless another acceptance, a cancel or a reopen took over. */
   const settle = (token: AcceptanceToken, result: QuickPickDialogSettledResult) => {
     if (!ownership.isCurrent(token) || result === "keepOpen") return;
@@ -252,6 +292,7 @@ export function QuickPickDialog<Value>({
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
+        key={openings.count}
         data-quick-pick-dialog=""
         showCloseButton={false}
         overlayClassName={overlayClassName}
@@ -269,25 +310,23 @@ export function QuickPickDialog<Value>({
         }}
         onOpenAutoFocus={(event) => {
           event.preventDefault();
+          contentRef.current = event.currentTarget as HTMLElement;
           // A fresh content mounts after `open` changes, so it's known only here.
           claimFocus();
         }}
+        // A cancel, or an accepted close whose owner unmounted the dialog, finishes here.
         onCloseAutoFocus={(event) => {
-          const target = returnFocusRef.current;
-          // Only the close the current acceptance asked for runs its action.
-          const afterClose = ownership.takeAfterClose();
-          returnFocusRef.current = null;
-          const { movedOn, restore } = closingDialogFocus(target, QUICK_PICK_DIALOG_SELECTOR);
-          // An action the choice ran moved focus while this closed: it stays there.
-          if (movedOn && !afterClose) {
+          // Removed by a reopening during its exit: focus and the close belong to the new one.
+          if (event.currentTarget !== contentRef.current) {
             event.preventDefault();
             return;
           }
-          // A picker opened in this one's place already holds focus and the return target.
-          if (afterClose || target?.isConnected) event.preventDefault();
-          // Restore first, so a picker the action opens returns focus here too.
-          restore?.focus();
-          afterClose?.();
+          if (closeFinishedRef.current) {
+            closeFinishedRef.current = false;
+            event.preventDefault();
+            return;
+          }
+          if (finishClose()) event.preventDefault();
         }}
         className={cn(
           "top-[12vh] translate-y-0 gap-0 overflow-hidden rounded-xl p-0 sm:max-w-xl",

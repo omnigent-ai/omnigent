@@ -12,6 +12,7 @@ import { readFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
 import { useSidebarSessionOrderStore } from "@/hooks/useSidebarSessionOrder";
 import { useThemePickerStore } from "@/store/themePicker";
 import { readTerminalThemeMode } from "@/lib/terminalThemePreferences";
+import { openPaletteDialog } from "@/test/paletteCommands";
 
 import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
 
@@ -177,25 +178,30 @@ describe("QuickPick ⌘K app commands", () => {
   });
 
   it("opens the keyboard shortcuts once the palette has closed", async () => {
-    const opened = vi.fn(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const opened = vi.fn(() => expect(openPaletteDialog()).toBeNull());
     window.addEventListener(KEYBOARD_SHORTCUTS_EVENT, opened);
     onTestFinished(() => window.removeEventListener(KEYBOARD_SHORTCUTS_EVENT, opened));
     const input = renderPalette();
     fireEvent.change(input, { target: { value: "keyboard shortcuts" } });
     expect(actionNames()[0]).toContain("Show keyboard shortcuts");
     fireEvent.keyDown(input, { key: "Enter" });
-    expect(opened).not.toHaveBeenCalled();
     await waitFor(() => expect(opened).toHaveBeenCalledOnce());
   });
 
   it("opens the theme picker once the palette has closed", async () => {
     onTestFinished(() => useThemePickerStore.setState({ open: false, replaced: false }));
+    const paletteOpenAtOpening: boolean[] = [];
+    onTestFinished(
+      useThemePickerStore.subscribe(({ open }) => {
+        if (open) paletteOpenAtOpening.push(openPaletteDialog() !== null);
+      }),
+    );
     const input = renderPalette();
     fireEvent.change(input, { target: { value: "select theme" } });
     expect(actionNames()[0]).toContain("Select theme…");
     fireEvent.keyDown(input, { key: "Enter" });
-    expect(useThemePickerStore.getState().open).toBe(false);
     await waitFor(() => expect(useThemePickerStore.getState().open).toBe(true));
+    expect(paletteOpenAtOpening).toEqual([false]);
   });
 
   it("offers Find only while something on screen can find, and opens it there", async () => {

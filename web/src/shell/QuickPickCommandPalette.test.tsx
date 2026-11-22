@@ -304,9 +304,11 @@ describe("QuickPickCommandPalette feature commands", () => {
         <Palette />
       </QueryClientProvider>,
     );
-    accept(screen.getByTestId("command-palette-input"), "filter files");
-    // The feature unmounts after the accept, before the palette has finished closing.
-    usePaletteCommandsStore.setState({ groups: {} });
+    // The feature unmounts with the accept, before the close it asks for runs the command.
+    act(() => {
+      accept(screen.getByTestId("command-palette-input"), "filter files");
+      usePaletteCommandsStore.setState({ groups: {} });
+    });
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     await act(async () => {
       await new Promise((resolve) => {

@@ -141,6 +141,28 @@ def test_flag_on_runs_the_quick_pick_palette(page: Page, quick_pick_server: str)
     expect(page.get_by_test_id(_PALETTE_INPUT)).to_have_count(0)
 
 
+def test_quick_pick_reopened_over_its_picker_takes_the_keys(
+    page: Page, quick_pick_server: str
+) -> None:
+    """⌘K pressed right after a row opens another picker brings the palette back with the keys."""
+    page.goto(f"{quick_pick_server}/")
+    expect(page.get_by_role("heading", name="What should we build?")).to_be_visible(timeout=30_000)
+    page.keyboard.press("ControlOrMeta+k")
+    palette_input = page.get_by_role("combobox", name="Command palette")
+    expect(palette_input).to_be_focused(timeout=10_000)
+    palette_input.fill("select theme")
+    page.keyboard.press("Enter")
+    themes = page.get_by_role("combobox", name="Select theme")
+    expect(themes).to_be_focused(timeout=10_000)
+
+    # At once, while the palette may still be animating out: it replaces the theme picker.
+    page.keyboard.press("ControlOrMeta+k")
+    expect(palette_input).to_be_focused(timeout=10_000)
+    expect(themes).to_have_count(0)
+    page.keyboard.type("settings")
+    expect(palette_input).to_have_value("settings")
+
+
 def test_quick_pick_on_an_open_session(
     request: pytest.FixtureRequest, seeded_session: tuple[str, str]
 ) -> None:
