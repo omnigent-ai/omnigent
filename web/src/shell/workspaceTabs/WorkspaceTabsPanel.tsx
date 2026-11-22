@@ -62,7 +62,7 @@ import { terminalDisplayLabel, terminalTabKey, useTerminals } from "@/hooks/useT
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
 import { closeBrowserView, forgetBrowserTab } from "@/hooks/useBrowserTabs";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
-import { shortcutAriaKeys, shortcutKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { shortcutAriaKeys, shortcutKeys } from "@/lib/shortcuts/registry";
 import { supportsSideChat } from "@/lib/sideChat";
 import { subagentSessionIdFromTab, subagentTabId } from "@/lib/subagentTabs";
 import { ApiError, getSessionSlim } from "@/lib/sessionsApi";

@@ -9,7 +9,10 @@ that run against both palettes (``CommandPalette.quickPick.test.tsx``).
 On an open session, the QuickPick palette also previews themes as the user moves
 through Select theme…, hands focus to the session switcher and back, and runs
 the session's own actions. ⌘↵ on another session's row lists that session's
-actions, which archive it without leaving the open one.
+actions, which archive it without leaving the open one. Its shortcuts step
+through the sidebar's sessions, and ⌘K's rows show them and the message steps' keys.
+In the browser the open session's Archive takes the desktop menu's ⇧⌘A (Ctrl+Shift+A),
+and Pin takes ⌘⌥P on macOS only, where Ctrl+Alt+P isn't Go to a file.
 """
 
 from __future__ import annotations
@@ -355,3 +358,83 @@ def test_quick_pick_marks_all_read_and_filters_the_inbox(
     expect(page.get_by_role("tab", name="Unread")).to_have_attribute(
         "aria-selected", "true", timeout=10_000
     )
+
+
+def _palette_row_keys(page: Page, query: str, name: str) -> list[str]:
+    """Open ⌘K, filter to ``query`` and read the key caps of the option named ``name``."""
+    page.keyboard.press("ControlOrMeta+k")
+    palette_input = page.get_by_role("combobox", name="Command palette")
+    expect(palette_input).to_be_focused(timeout=10_000)
+    palette_input.fill(query)
+    option = page.get_by_role("dialog").get_by_role("option", name=name).first
+    expect(option).to_be_visible()
+    keys = option.locator('[data-slot="shortcut-keys"] kbd').all_inner_texts()
+    page.keyboard.press("Escape")
+    expect(palette_input).to_have_count(0)
+    return keys
+
+
+def test_quick_pick_session_shortcuts(
+    request: pytest.FixtureRequest, seeded_session_pair: tuple[str, str, str]
+) -> None:
+    """Next and Previous session step through the sidebar, and ⌘K shows their keys."""
+    base_url, open_id, _other_id = seeded_session_pair
+    page: Page = request.getfixturevalue("page")
+    enable_quick_pick_palette(page)
+    page.goto(f"{base_url}/c/{open_id}")
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible(timeout=30_000)
+    expect(page.locator(f'nav a[href="/c/{open_id}"]').first).to_be_visible(timeout=30_000)
+    mac = bool(
+        page.evaluate("/Mac/i.test(navigator.userAgentData?.platform ?? navigator.platform)")
+    )
+
+    # ⌘K lists the shortcuts on their rows, in the runner's own key caps.
+    assert _palette_row_keys(page, "next session", "Next session") == (
+        ["⌃", "⌥", "⇧", "↓"] if mac else ["Ctrl", "Alt", "⇧", "↓"]
+    )
+    assert _palette_row_keys(page, "previous message", "Go to previous message") == (
+        ["⌘", "⌥", "↑"] if mac else ["Ctrl", "Alt", "↑"]
+    )
+
+    # Next session leaves for the sidebar's neighbouring row; Previous comes back.
+    page.keyboard.press("Control+Alt+Shift+ArrowDown")
+    expect(page).not_to_have_url(f"{base_url}/c/{open_id}", timeout=10_000)
+    expect(page).to_have_url(re.compile(rf"{re.escape(base_url)}/c/[^/]+$"))
+    # Previous steps from the row the sidebar highlights as open, so wait for it to move.
+    page.wait_for_function(
+        """(path) => [...document.querySelectorAll(`nav a[href="${path}"]`)].some((link) => {
+          for (let node = link; node && node.tagName !== "NAV"; node = node.parentElement) {
+            if (node.className?.includes?.("bg-[var(--sidebar-active)]")) return true;
+          }
+          return false;
+        })""",
+        arg=page.url.removeprefix(base_url),
+        timeout=10_000,
+    )
+    page.keyboard.press("Control+Alt+Shift+ArrowUp")
+    expect(page).to_have_url(f"{base_url}/c/{open_id}", timeout=10_000)
+
+
+def test_quick_pick_open_session_keys(
+    request: pytest.FixtureRequest, seeded_session_pair: tuple[str, str, str]
+) -> None:
+    """The open session's ⌘K rows show the browser's keys, and Archive's archives it."""
+    base_url, open_id, _other_id = seeded_session_pair
+    page: Page = request.getfixturevalue("page")
+    enable_quick_pick_palette(page)
+    page.goto(f"{base_url}/c/{open_id}")
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible(timeout=30_000)
+    mac = bool(
+        page.evaluate("/Mac/i.test(navigator.userAgentData?.platform ?? navigator.platform)")
+    )
+
+    assert _palette_row_keys(page, "archive session", "Archive session") == (
+        ["⌘", "⇧", "A"] if mac else ["Ctrl", "⇧", "A"]
+    )
+    # Off macOS, Ctrl+Alt+P is Go to a file, so Pin has no browser key there.
+    assert _palette_row_keys(page, "pin session", "Pin session") == (
+        ["⌘", "⌥", "P"] if mac else []
+    )
+
+    page.keyboard.press("Meta+Shift+KeyA" if mac else "Control+Shift+KeyA")
+    poll_until(lambda: session_archived(base_url, open_id), timeout_s=15.0)

@@ -529,6 +529,7 @@ function TranscriptImpl({
           <TranscriptPaletteCommands
             conversationId={display.conversationId}
             bubbles={display.streamBubbles}
+            messageNav={nav}
           />
           <ConversationScrollButton
             className={

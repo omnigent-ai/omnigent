@@ -47,6 +47,7 @@ export function useSessionNavigationCommands(): PaletteCommand[] {
       {
         id: "next-session",
         label: "Next session",
+        shortcut: "session.next",
         icon: ArrowDownIcon,
         keywords: ["down", "below", "sidebar", "switch", "session"],
         // Only while a sidebar lists sessions to step through.
@@ -56,6 +57,7 @@ export function useSessionNavigationCommands(): PaletteCommand[] {
       {
         id: "previous-session",
         label: "Previous session",
+        shortcut: "session.previous",
         icon: ArrowUpIcon,
         keywords: ["up", "above", "sidebar", "switch", "session"],
         availability: listed ? AVAILABLE : HIDDEN,

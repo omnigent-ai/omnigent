@@ -5,7 +5,7 @@
 
 import type { KeyboardEvent } from "react";
 
-import { matchesShortcut, type ShortcutId } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { matchesShortcut, type ShortcutId } from "@/lib/shortcuts/registry";
 import { isCommandAvailable } from "@/store/paletteCommands";
 
 import {

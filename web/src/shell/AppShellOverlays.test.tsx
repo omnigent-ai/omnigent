@@ -38,6 +38,10 @@ beforeEach(() => {
     loaded.add("SessionActionHost");
     return { SessionActionHost: () => <div data-testid="session-action-host" /> };
   });
+  vi.doMock("./quickPickShortcuts/QuickPickShortcutHost", () => {
+    loaded.add("QuickPickShortcutHost");
+    return { QuickPickShortcutHost: () => <div data-testid="quick-pick-shortcut-host" /> };
+  });
 });
 
 async function renderOverlays(
@@ -103,8 +107,10 @@ describe("AppShellOverlays palette flag", () => {
       expect(await findByTestId("theme-picker")).toBeTruthy();
       expect(queryByTestId("cmdk-palette")).toBeNull();
       expect(await findByTestId("session-action-host")).toBeTruthy();
+      expect(await findByTestId("quick-pick-shortcut-host")).toBeTruthy();
       expect([...loaded].sort()).toEqual([
         "QuickPickCommandPalette",
+        "QuickPickShortcutHost",
         "SessionActionHost",
         "ThemePicker",
       ]);

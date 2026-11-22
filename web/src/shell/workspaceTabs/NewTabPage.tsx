@@ -21,7 +21,7 @@ import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import type { QuickPickItem } from "@/components/ui/quick-pick/model";
 import { QuickPick } from "@/components/ui/quick-pick/QuickPick";
 import type { SandboxResumeStatus } from "@/lib/sandboxResume";
-import { shortcutKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { shortcutKeys } from "@/lib/shortcuts/registry";
 import type { WorkspaceCommand } from "@/shell/workspaceCommands/model";
 
 import {

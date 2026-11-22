@@ -5,21 +5,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { adjacentStripEntry, useWorkspaceTabStepping } from "./useWorkspaceTabStepping";
 import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
 import type * as Hotkeys from "@/lib/hotkeys";
-import type * as ShortcutRegistry from "@/lib/shortcuts/registry";
+import type * as NativeBridge from "@/lib/nativeBridge";
 
 const platform = vi.hoisted(() => ({ mac: true, native: false }));
 vi.mock("@/lib/hotkeys", async (importOriginal) => ({
   ...(await importOriginal<typeof Hotkeys>()),
   isMacPlatform: () => platform.mac,
 }));
-vi.mock("@/lib/shortcuts/registry", async (importOriginal) => {
-  const registry = await importOriginal<typeof ShortcutRegistry>();
-  return {
-    ...registry,
-    currentShortcutEnvironment: (overrides = {}) =>
-      registry.currentShortcutEnvironment({ native: platform.native, ...overrides }),
-  };
-});
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridge>()),
+  isNativeShell: () => platform.native,
+}));
 
 describe("adjacentStripEntry", () => {
   const strip = ["files", "terminal:zsh", "browser:1", "file:README.md"];

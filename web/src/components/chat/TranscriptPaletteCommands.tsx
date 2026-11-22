@@ -1,11 +1,20 @@
 // The open conversation's ⌘K commands, with quick_pick_palette on: its latest response and
 // prompt, and Scroll to newest message. Rendered inside the transcript's scroll container.
 
-import { ArrowDownIcon, CopyIcon, Link2Icon, type LucideIcon, SplitIcon } from "lucide-react";
+import {
+  ArrowDownIcon,
+  ChevronDownIcon,
+  ChevronUpIcon,
+  CopyIcon,
+  Link2Icon,
+  type LucideIcon,
+  SplitIcon,
+} from "lucide-react";
 import { useMemo, useRef } from "react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 
 import { showToast } from "@/components/ui/toast";
+import type { UserMessageNav } from "@/hooks/useUserMessageNav";
 import { copyText } from "@/lib/clipboard";
 import { copyMarkdown } from "@/lib/copyMarkdown";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
@@ -22,6 +31,7 @@ import {
   type LatestMessageCommandId,
   latestMessageCommands,
   latestMessages,
+  NO_PROMPT_YET,
 } from "./latestMessageCommands";
 import { userMessageLinkId } from "./messageActions";
 
@@ -46,6 +56,8 @@ function copied(write: Promise<void>, message: string): void {
 interface TranscriptPaletteCommandsProps {
   conversationId: string | null;
   bubbles: readonly Bubble[];
+  /** The transcript's own message steps, which its ⌘⌥↑ and ⌘⌥↓ run. */
+  messageNav?: Pick<UserMessageNav, "goPrev" | "goNext">;
 }
 
 /** Does no work per streamed frame with the flag off. */
@@ -53,7 +65,11 @@ export function TranscriptPaletteCommands(props: TranscriptPaletteCommandsProps)
   return useQuickPickPaletteEnabled() ? <ConversationCommands {...props} /> : null;
 }
 
-function ConversationCommands({ conversationId, bubbles }: TranscriptPaletteCommandsProps) {
+function ConversationCommands({
+  conversationId,
+  bubbles,
+  messageNav,
+}: TranscriptPaletteCommandsProps) {
   const fork = useForkDialog();
   const { isAtBottom, scrollToBottom } = useStickToBottomContext();
   const latest = latestMessages(bubbles);
@@ -67,8 +83,9 @@ function ConversationCommands({ conversationId, bubbles }: TranscriptPaletteComm
     fork,
   });
   // Read when run, so a command copies the message showing then, not one from a frame ago.
-  const current = useRef({ latest, fork });
-  current.current = { latest, fork };
+  const current = useRef({ latest, fork, messageNav });
+  current.current = { latest, fork, messageNav };
+  const hasMessageNav = messageNav !== undefined;
   // The transcript re-renders per streamed frame; the rows change only when this does.
   const signature = JSON.stringify(commands.map(({ id, availability }) => [id, availability]));
   const paletteCommands = useMemo<PaletteCommand[]>(
@@ -109,6 +126,24 @@ function ConversationCommands({ conversationId, bubbles }: TranscriptPaletteComm
           }
         },
       })),
+      ...(hasMessageNav
+        ? (["previous", "next"] as const).map(
+            (direction) =>
+              ({
+                id: `conversation.${direction}-message:${conversationId}`,
+                label: direction === "previous" ? "Go to previous message" : "Go to next message",
+                icon: direction === "previous" ? ChevronUpIcon : ChevronDownIcon,
+                keywords: ["message", "jump", "scroll", "prompt", "step"],
+                shortcut: direction === "previous" ? "message.previous" : "message.next",
+                availability: latest.prompt ? AVAILABLE : unavailableBecause(NO_PROMPT_YET),
+                run: () => {
+                  const nav = current.current.messageNav;
+                  if (direction === "previous") nav?.goPrev();
+                  else nav?.goNext();
+                },
+              }) satisfies PaletteCommand,
+          )
+        : []),
       {
         id: `conversation.scroll-to-newest:${conversationId}`,
         label: SCROLL_TO_NEWEST_LABEL,
@@ -120,7 +155,7 @@ function ConversationCommands({ conversationId, bubbles }: TranscriptPaletteComm
       },
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps -- the signature covers `commands`.
-    [conversationId, signature, isAtBottom, scrollToBottom],
+    [conversationId, signature, isAtBottom, scrollToBottom, hasMessageNav],
   );
   useQuickPickPaletteCommands(
     `conversation:${conversationId}`,

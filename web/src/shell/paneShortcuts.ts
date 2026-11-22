@@ -2,8 +2,11 @@
 // extend the app's registry without joining it, so they bind only where a panes view is mounted.
 
 import { type Chord, chordKeys, chordMatches } from "@/lib/shortcuts/chord";
-import { currentShortcutEnvironment, type ShortcutEnvironment } from "@/lib/shortcuts/registry";
-import { chordAriaShortcut } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import {
+  chordAriaShortcut,
+  currentShortcutEnvironment,
+  type ShortcutEnvironment,
+} from "@/lib/shortcuts/registry";
 
 import { type PaneCommandId, paneCommandLabel } from "./paneCommandTable";
 

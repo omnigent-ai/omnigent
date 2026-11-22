@@ -30,7 +30,7 @@ import { createPortal } from "react-dom";
 import { FindBar } from "@/components/FindBar";
 import { OWNS_COMMAND_ENTER_ATTRIBUTE } from "@/hooks/useApproveHotkey";
 import { GO_TO_LINE_LABEL, GoToLineBar } from "@/components/GoToLineBar";
-import { codeMirrorKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { codeMirrorKeys } from "@/lib/shortcuts/registry";
 import { readCodeFont, subscribeCodeFont } from "@/lib/codeFontPreferences";
 import { type PaletteCommand, usePaletteCommands } from "@/store/paletteCommands";
 import type { FilePosition } from "../FileViewerContext";
