@@ -1152,6 +1152,19 @@ describe("AppShell header", () => {
       }
     });
 
+    it("adds no row while the session is still being created, as there's no switch yet", () => {
+      windowWidth(1440);
+      mockConversations([
+        { id: "temp:new", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+      ]);
+      renderShell("/c/temp:new", FLOATING);
+
+      expect(strip()).toBeNull();
+      expect(document.querySelector("main[data-session-id]")).not.toHaveAttribute(
+        "data-chat-pane-strip",
+      );
+    });
+
     it("takes the switch out of the header's Tab order and puts it first in the chat's", async () => {
       windowWidth(1440);
       terminalFirstSession();

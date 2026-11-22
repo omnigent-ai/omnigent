@@ -532,8 +532,8 @@ function WorkspaceTabsPanelImpl({
     onReveal?.();
   };
   const inDrawer = placement === "drawer";
-  // Where the panes float now: the flag on and 48rem or wider, so a narrow drawer keeps its strip.
-  const floatingPanes = useFloatingPanesShown();
+  // Where the panes float now: the flag on and 48rem or wider. The drawer keeps its classic strip.
+  const floatingPanes = useFloatingPanesShown() && !inDrawer;
   // Hotkeys and ⌘K rows act only while this panel is the keyboard target.
   const commandsActive = !pending && keyboardTarget;
   useNewBrowserHotkey(() => addBrowser(), showBrowserTab && commandsActive);
@@ -1014,7 +1014,7 @@ function WorkspaceTabsPanelImpl({
   // tabs, and the list opens from beside Full screen.
   const tabSearch = !pending && tabs.length > 0 && (
     <WorkspaceTabSearch
-      menuAlign={floatingPanes ? "end" : "start"}
+      trailing={floatingPanes}
       open={tabSearchOpen}
       onOpenChange={setTabSearchOpen}
       entries={tabSearchEntries}

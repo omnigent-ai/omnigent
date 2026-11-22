@@ -12,7 +12,6 @@ import { FileTypeIcon } from "@/shell/FileTypeIcon";
 
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { WorkspaceTabTooltip } from "@/shell/WorkspacePanel";
-import { useFloatingPanesShown } from "@/shell/useFloatingPanes";
 
 export interface TabSearchEntry {
   tabId: string;
@@ -70,17 +69,19 @@ export function WorkspaceTabSearch({
   entries,
   reopen,
   onChoose,
-  menuAlign = "start",
+  trailing = false,
 }: {
-  /** Which edge of the button the list lines up with. */
-  menuAlign?: "start" | "end";
+  /**
+   * With floating panes the button ends the strip: it shows a chevron, and the list lines up
+   * with its end. The strip that places it decides, so a drawer keeps the classic button.
+   */
+  trailing?: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   entries: readonly TabSearchEntry[];
   reopen: TabSearchReopen;
   onChoose: (choice: TabSearchChoice) => void;
 }) {
-  const floatingPanes = useFloatingPanesShown();
   return (
     <Popover open={open} onOpenChange={onOpenChange}>
       <WorkspaceTabTooltip label="All tabs">
@@ -93,15 +94,14 @@ export function WorkspaceTabSearch({
             aria-label="All tabs"
           >
             {/* Floating panes open the list from a chevron, as a menu of the tabs. */}
-            {floatingPanes ? (
-              <ChevronDownIcon className="size-4" />
-            ) : (
-              <LayersIcon className="size-4" />
-            )}
+            {trailing ? <ChevronDownIcon className="size-4" /> : <LayersIcon className="size-4" />}
           </Button>
         </PopoverTrigger>
       </WorkspaceTabTooltip>
-      <PopoverContent align={menuAlign} className="w-[min(26rem,calc(100vw-2rem))] p-0">
+      <PopoverContent
+        align={trailing ? "end" : "start"}
+        className="w-[min(26rem,calc(100vw-2rem))] p-0"
+      >
         <SuppressBrowserView />
         <TabSearchPicker
           entries={entries}

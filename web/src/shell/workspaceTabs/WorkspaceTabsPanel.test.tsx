@@ -380,9 +380,13 @@ describe("All tabs' place in the strip", () => {
     expect(precedes(stripDividers()[0]!, allTabs)).toBe(true);
   });
 
-  it("in a narrow window's drawer, stays before the tabs as layers with the flag on", async () => {
+  // The drawer holds the tabs below the desktop breakpoint, past 48rem too, where the panes float.
+  it.each([
+    ["a narrow window's", false],
+    ["a wider window's", true],
+  ])("in %s drawer, stays before the tabs as layers with the flag on", async (_, wide) => {
     floatingPanes.on = true;
-    floatingPanes.wide = false;
+    floatingPanes.wide = wide;
     renderPanels([{ conversationId: "conv_a", open: true, placement: "drawer" }]);
     const allTabs = button("All tabs");
     expect(precedes(allTabs, firstTab())).toBe(true);
