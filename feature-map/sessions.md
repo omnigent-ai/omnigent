@@ -280,6 +280,16 @@ the header menu), and each place is a separate entry point.
   the `sidebar_grouping_ui` release flag, on by default; with
   `OMNIGENT_FEATURES=-sidebar_grouping_ui`, the Sessions header keeps a flat
   Display filter and the tooltip keeps its plain layout.
+- `floating-panes`: behind the `floating_panes` release flag, a standalone
+  session's chat and workspace sidebar float as rounded cards on the left
+  sidebar's color, below one 48px top row holding the session header and the
+  sidebar's tabs. Only windows 48rem and wider float, in a browser and the
+  desktop app alike, and touch clients never do. While `OMNIGENT_FEATURES`
+  doesn't name it, the flag follows `workspace_sidebar_v2`'s resolved value, so
+  turning sidebar v2 on brings floating panes. `floating_panes` turns it on and
+  `-floating_panes` turns it off, whatever sidebar v2 does. Grids keep their own
+  cells and workspace sidebar, and Settings keeps its layout, on the shared
+  background.
 - `mobile-drawer-swipe`: on phone layouts, swiping left on the open sidebar
   drawer or the dimmed chat strip beside it drags the drawer shut. Lifting past
   a third of its width, or after a quick flick, closes it; a shorter drag springs
