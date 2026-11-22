@@ -114,6 +114,8 @@ def test_orchestrator_skill_is_available_without_workflows_and_respects_project_
 
     _ensure_orchestrator_skills_in_bundle(tmp_path, AgentSpec(spec_version=1))
     skill = (tmp_path / "skills" / "orchestrator" / "SKILL.md").read_text()
+    source = Path(omnigent.__file__).resolve().parent / "resources" / "skills" / "orchestrator"
+    assert skill == (source / "SKILL.md").read_text()
     assert "explicitly assess **stage fit**" in skill
     assert "Progress alone is not stage fit" in skill
     assert "A stage decision never grants approval or resolves `needs-human`" in skill

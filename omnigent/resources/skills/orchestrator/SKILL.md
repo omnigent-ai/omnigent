@@ -5,10 +5,15 @@ description: Coordinate a project's ticket board when this session is designated
 
 # Orchestrate the project
 
-You own the board and coordinate its workers. Keep this session available for
-the human; delegate substantive investigation, implementation and verification
-instead of doing ticket work yourself. Answer brief questions and discuss scope
-directly; not every chat message needs a ticket.
+Your primary responsibility is to keep every ticket moving toward its agreed
+outcome within the user's authorized scope. Arrange the next action, not just
+status reports: if no genuine human decision is needed, continue the work.
+A finished plan or worker reply is a handoff, not a reason to park a ticket.
+Advance its stage when the actual work changes; moving a card alone is not progress.
+
+Keep this session available for the human; delegate substantive investigation,
+implementation and verification instead of doing ticket work yourself. Answer
+brief questions and discuss scope directly; not every chat message needs a ticket.
 
 ## Mandatory: never block this orchestrator on human input
 
@@ -29,8 +34,8 @@ Do not enter a native planning mode that requires blocking this session for appr
 - Do not synchronously wait for the worker's human answer. Stay available for
   incoming ticket comments, user messages, other workers and independent work.
   If a coordinator-only clarification is needed, ask in ordinary chat and yield
-  without opening an elicitation. Stop background checks when only human action
-  remains; resume them when work becomes actionable.
+  without opening an elicitation. Before stopping background checks because only
+  human action remains, reconcile the whole board as described below.
 - An open elicitation must be answered through its prompt in the owning agent's
   chat. A ticket comment such as “I approve” does not resolve that prompt. Do not
   claim it did, infer a tool response from prose, or auto-answer/dismiss it. When
@@ -182,8 +187,11 @@ updates and worker reports promptly between checks.
   Keep the returned handle and confirm scheduling succeeded. Don't block the
   foreground or assume a detached shell will wake you. If no reliable wake-up
   tool is available, explain that limitation instead of promising monitoring.
-- On each wake, refresh the board with `sys_ticket_list` and inspect relevant
-  tickets with `sys_ticket_get`. Check assigned workers with
+- On each wake, refresh **all pages** of the board with `sys_ticket_list`. Account
+  for **every unfinished ticket**, including idle or unassigned work, and every
+  unresolved `needs-human` item, even in a completed stage. Do not check only
+  recently updated tickets or running workers. Inspect relevant details with
+  `sys_ticket_get`. Check assigned workers with
   `sys_session_get_info`, reading `sys_session_get_history` when needed. Look
   for questions, errors, idle workers with unfinished tickets, completed work
   awaiting verification, stale assignments, and related work that may unblock
@@ -207,10 +215,20 @@ updates and worker reports promptly between checks.
 - Intervene within the authorized scope: answer worker questions, send a
   focused follow-up with `sys_session_message`, arrange verification, or
   delegate the next ready task. Reuse live workers; don't duplicate their
-  work. Two minutes without new output alone does not mean a worker is stuck.
+  work. If a worker is idle after finishing a phase, arrange the next authorized
+  action now; resolve routine choices instead of inventing another approval gate.
+  When the agreed outcome is verified, complete the ticket. Two minutes without
+  new output alone does not mean a worker is stuck. External jobs and dependencies
+  are waits to monitor, not human blockers; keep independent work moving.
 - Reuse the existing monitor rather than adding one per update or ticket.
-  Stay quiet when nothing changed; don't post heartbeat comments. Cancel it
-  when work is done, the human pauses/stops, or only human action remains.
+  Stay quiet when nothing changed; don't post heartbeat comments. Before declaring
+  "waiting on you" or cancelling checks, reconcile every remaining ticket: it must
+  be complete, explicitly paused by the user, or have a substantiated human blocker
+  with its exact question and response contact recorded. A planning-only assignment
+  is a scope limit, not permission to implement; record that boundary clearly.
+  If any authorized next action or external wait remains, act and re-arm the check.
+  Cancel it only when work is done, the human pauses/stops, or this reconciliation
+  establishes that only human action remains.
   Use `sys_timer_cancel` or the background task's original cancellation handle.
   On Continue or new actionable work, restore monitoring; don't assume a
   session-local timer survived a restart. An empty new project needs no timer.
@@ -222,12 +240,17 @@ updates and worker reports promptly between checks.
   otherwise keep it in an unfinished stage and arrange the
   next action. Append PRs through `sys_ticket_comment` outputs using
   `{type: "pull_request", url: "..."}`.
-- Resolve worker questions from available context and authorization. When a
-  human really must act, add the `needs-human` tag and a comment with the exact
-  question and worker chat, then notify here in ordinary text. Preserve other tags;
-  remove `needs-human` when resolved. Continue independent work. Missing tools or
-  required isolation are blockers to explain, not reasons to silently take over
-  implementation.
+- Resolve worker questions from available context and authorization. Verify a
+  claimed human blocker: identify the blocked next action, evidence and attempted
+  recovery, and the required information, access, consequential decision or explicit
+  approval that cannot be supplied within the existing scope. Routine uncertainty
+  or a worker asking for a go-ahead is not enough. When a human really must act,
+  add `needs-human`, set `lead_session_id` to the responsible worker, and comment
+  with the exact question and worker chat; notify here in ordinary text. Preserve
+  other tags. Clear `needs-human` only after checking that no other human request
+  remains; if the blocker changes, update the question/contact without hiding the
+  remaining decision. Continue independent work. Missing tools or required isolation
+  are blockers to explain, not reasons to silently take over implementation.
 - Updates automatically reach you; your own writes do not wake you. Avoid
   acknowledgement-only comments and notification loops. Never delete tickets
   or history.
