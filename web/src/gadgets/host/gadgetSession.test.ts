@@ -415,6 +415,89 @@ describe("gadget session", () => {
     expect(exitGadgetRailFullScreen).not.toHaveBeenCalled();
   });
 
+  // Gadget full screen contract: an action from a gadget filling the screen keeps it filling the
+  // screen. These pin intended behavior; change them only on purpose.
+  describe("gadget full screen contract", () => {
+    beforeEach(() => {
+      fillsScreen = true;
+    });
+
+    it.each([
+      ["the viewer's gadget session", undefined],
+      ["the session the gadget is shown beside", "s_rail"],
+    ])(
+      "sends an action to %s without leaving full screen or opening anything",
+      async (_case, railSessionId) => {
+        const sessionId = railSessionId ?? "s_1";
+        server.use(
+          rest.post(`${API}/app-1/actions`, (_req, res, ctx) =>
+            res(ctx.status(201), ctx.json(ENTRY)),
+          ),
+          rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
+            res(ctx.json({ session_id: "s_1", version: "v" })),
+          ),
+          rest.post(`${API}/app-1/actions/act1/delivery`, (_req, res, ctx) =>
+            res(ctx.json({ items: [] })),
+          ),
+        );
+        const delivered = waitForRequest("post", `${API}/app-1/actions/act1/delivery`);
+
+        const receipt = await requestGadgetAction(
+          EDITOR,
+          { action: "run_card", params: { cardId: "c1" } },
+          navigate,
+          railSessionId,
+        );
+
+        expect(receipt).toEqual({ actionId: "act1", delivery: "sent" });
+        expect(sendUserMessage).toHaveBeenCalledWith(
+          sessionId,
+          expect.stringContaining("Gadget action"),
+        );
+        expect(await (await delivered).json()).toEqual({ session_id: sessionId });
+        expect(navigate).not.toHaveBeenCalled();
+        expect(exitGadgetRailFullScreen).not.toHaveBeenCalled();
+        expect(requestGadgetCreateSessionMenu).not.toHaveBeenCalled();
+      },
+    );
+
+    it("with no session yet, keeps it full screen, asks for the Create session menu, and delivers the action in the session created", async () => {
+      server.use(
+        rest.post(`${API}/app-1/actions`, (_req, res, ctx) =>
+          res(ctx.status(201), ctx.json(ENTRY)),
+        ),
+        rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
+          res(ctx.json({ session_id: null, version: null })),
+        ),
+        rest.put(`${API}/app-1/sessions/:sessionId`, (_req, res, ctx) =>
+          res(ctx.json({ items: [] })),
+        ),
+        rest.post(`${API}/app-1/actions/act1/delivery`, (_req, res, ctx) =>
+          res(ctx.json({ items: [] })),
+        ),
+      );
+
+      await requestGadgetAction(EDITOR, { action: "run_card", params: { cardId: "c1" } }, navigate);
+
+      // New session, with the gadget still full screen and the action as its first message.
+      const opened = parse(navigate.mock.calls[0][0]);
+      expect(opened.searchParams.get("gadget")).toBe("app-1");
+      expect(opened.searchParams.get("gadget_start")).toBe("app-1");
+      expect(opened.searchParams.get("prompt")).toContain('"action_id":"act1"');
+      expect(sendUserMessage).not.toHaveBeenCalled();
+      expect(requestGadgetCreateSessionMenu).toHaveBeenCalledTimes(1);
+      expect(exitGadgetRailFullScreen).not.toHaveBeenCalled();
+
+      // Create session: the session that starts is linked to the gadget and gets the action.
+      const linked = waitForRequest("put", `${API}/app-1/sessions/s_new`);
+      const delivered = waitForRequest("post", `${API}/app-1/actions/act1/delivery`);
+      expect(await adoptStartedGadgetSession("app-1", "s_new")).toBe(true);
+      expect(await (await linked).json()).toEqual({ linked: true });
+      expect(await (await delivered).json()).toEqual({ session_id: "s_new" });
+      expect(exitGadgetRailFullScreen).not.toHaveBeenCalled();
+    });
+  });
+
   it("starts one session for several requests made before it exists", async () => {
     const second = { ...ENTRY, id: "act2", value: { ...ENTRY.value, params: { cardId: "c2" } } };
     let next = ENTRY;
