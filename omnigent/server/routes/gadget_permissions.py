@@ -101,27 +101,6 @@ def _grantee_to_remove(store: PermissionStore, gadget_id: str, user_id: str) -> 
     return grantee
 
 
-def _existing_spelling(store: PermissionStore, gadget_id: str, grantee: str) -> str:
-    """The ID the gadget already holds a grant under for *grantee* in another letter case.
-
-    So re-sharing with ``Bob@Example.com`` changes ``bob@example.com``'s grant rather
-    than add a second row for the same person.
-    """
-    folded = grantee.casefold()
-    cursor: str | None = None
-    while True:
-        grants, cursor = store.list_for_gadget(
-            gadget_id, limit=MAX_GRANTS_PAGE_SIZE, after_user_id=cursor
-        )
-        for grant in grants:
-            if grant.user_id == grantee:
-                return grantee
-            if grant.user_id.casefold() == folded:
-                return grant.user_id
-        if cursor is None:
-            return grantee
-
-
 def _permission_object(grant: GadgetPermission, names: dict[str, str]) -> GadgetPermissionObject:
     return GadgetPermissionObject(
         user_id=grant.user_id,
@@ -243,7 +222,11 @@ def register_gadget_permissions_routes(
                 "Gadgets cannot be shared publicly or with the local user; name a user or group",
                 code=ErrorCode.INVALID_INPUT,
             )
-        grantee = await asyncio.to_thread(_existing_spelling, store, gadget.id, grantee)
+        # The ID the gadget already holds a grant under for this person in another letter
+        # case, so one person keeps one grant.
+        grantee = (
+            await asyncio.to_thread(store.gadget_grantee_spelling, gadget.id, grantee) or grantee
+        )
         target = await asyncio.to_thread(store.get_user, grantee)
         with target_account_scope(grantee, target.account_generation if target else None):
             await asyncio.to_thread(store.ensure_user, grantee)

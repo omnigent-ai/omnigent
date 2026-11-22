@@ -2212,6 +2212,14 @@ class SqlGadgetShare(OmnigentBase):
             "user_id",
             "gadget_id",
         ),
+        # Finds a grantee's existing grant on a gadget in any letter case, so sharing
+        # with ``Bob@Example.com`` updates ``bob@example.com``'s grant in one lookup.
+        Index(
+            "ix_gadget_shares_gadget_user_lower",
+            "workspace_id",
+            "gadget_id",
+            text("lower(user_id)"),
+        ),
     )
 
 

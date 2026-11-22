@@ -488,6 +488,24 @@ async def test_grantee_ids_are_trimmed_and_one_person_keeps_one_grant(
     assert [(grant.user_id, grant.level) for grant in grants] == [(BOB, 2)]
 
 
+async def test_a_grant_finds_an_existing_spelling_without_reading_the_grant_list(
+    client: httpx.AsyncClient, stores: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gadget = await _published(client)
+    base = f"/v1/gadgets/{gadget['id']}"
+    await client.put(f"{base}/permissions", json={"user_id": BOB, "level": 1}, headers=_as(ALICE))
+
+    def no_listing(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("one grant must not page through the gadget's grants")
+
+    monkeypatch.setattr(stores.permissions, "list_for_gadget", no_listing)
+    upper = await client.put(
+        f"{base}/permissions", json={"user_id": BOB.upper(), "level": 2}, headers=_as(ALICE)
+    )
+    assert upper.status_code == 200, upper.text
+    assert upper.json()["user_id"] == BOB and upper.json()["level"] == 2
+
+
 async def test_a_grant_racing_the_gadgets_deletion_leaves_no_grant(
     client: httpx.AsyncClient, stores: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:

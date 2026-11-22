@@ -75,9 +75,17 @@ def upgrade() -> None:
         ["workspace_id", "user_id", "gadget_id"],
         unique=False,
     )
+    # Finds a grantee's existing grant on a gadget in any letter case.
+    op.create_index(
+        "ix_gadget_shares_gadget_user_lower",
+        "gadget_shares",
+        ["workspace_id", "gadget_id", sa.text("lower(user_id)")],
+        unique=False,
+    )
 
 
 def downgrade() -> None:
     """Drop the ``gadget_shares`` index and table."""
+    op.drop_index("ix_gadget_shares_gadget_user_lower", table_name="gadget_shares")
     op.drop_index("ix_gadget_shares_user_id", table_name="gadget_shares")
     op.drop_table("gadget_shares")

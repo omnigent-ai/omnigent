@@ -1735,6 +1735,27 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 after_user_id=after_user_id,
             )
 
+    def gadget_grantee_spelling(self, gadget_id: str, user_id: str) -> str | None:
+        """The stored ID of *user_id*'s grant in any letter case. See base class.
+
+        Prefers the exact ID; served by ``ix_gadget_shares_gadget_user_lower``.
+        """
+        with self._session("gadget_grantee_spelling") as session:
+            rows = session.execute(
+                select(SqlGadgetShare.user_id)
+                .where(
+                    SqlGadgetShare.workspace_id == current_workspace_id(),
+                    SqlGadgetShare.gadget_id == gadget_id,
+                    func.lower(SqlGadgetShare.user_id) == user_id.lower(),
+                )
+                .order_by(SqlGadgetShare.user_id)
+                .limit(2)
+            ).scalars()
+            matches = list(rows)
+        if user_id in matches:
+            return user_id
+        return matches[0] if matches else None
+
     def resolve_gadget_access(self, principals: Sequence[str], gadget_id: str) -> int | None:
         """Return the highest level any principal holds. See base class for contract."""
         if not principals:
