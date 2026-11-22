@@ -9,7 +9,7 @@ import {
 
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
-import { isBehindOpenLayer } from "@/lib/automaticFocus";
+import { closingDialogFocus } from "@/lib/automaticFocus";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { isIOSShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
@@ -277,18 +277,13 @@ export function QuickPickDialog<Value>({
           // Only the close the current acceptance asked for runs its action.
           const afterClose = ownership.takeAfterClose();
           returnFocusRef.current = null;
+          const { movedOn, restore } = closingDialogFocus(target, QUICK_PICK_DIALOG_SELECTOR);
           // An action the choice ran moved focus while this closed: it stays there.
-          const active = document.activeElement;
-          const movedOn =
-            active instanceof HTMLElement &&
-            active !== document.body &&
-            !active.closest(QUICK_PICK_DIALOG_SELECTOR);
           if (movedOn && !afterClose) {
             event.preventDefault();
             return;
           }
           // A picker opened in this one's place already holds focus and the return target.
-          const restore = target?.isConnected && !isBehindOpenLayer(target) ? target : null;
           if (afterClose || target?.isConnected) event.preventDefault();
           // Restore first, so a picker the action opens returns focus here too.
           restore?.focus();
