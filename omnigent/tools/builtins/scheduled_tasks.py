@@ -35,10 +35,6 @@ REMINDER_NAME_CHARS = 60
 _TOO_SOON = (
     f"A reminder must be at least {MIN_REMINDER_DELAY.seconds // 60} minutes in the future."
 )
-# Sent with TRIGGER_RRULE_OMIT to read a trigger automation's rrule as null, since the
-# server picks when a trigger polls. Older clients expect every task to have a rule.
-TRIGGER_RRULE_HEADER = "X-Omnigent-Trigger-Rrule"
-TRIGGER_RRULE_OMIT = "omit"
 
 _RRULE_DESC = (
     "RFC 5545 recurrence rule, e.g. 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0' (daily at "

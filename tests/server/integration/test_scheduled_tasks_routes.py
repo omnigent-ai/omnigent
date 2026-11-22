@@ -58,7 +58,6 @@ from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStor
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
     SqlAlchemyScheduledTaskStore,
 )
-from omnigent.tools.builtins.scheduled_tasks import TRIGGER_RRULE_HEADER, TRIGGER_RRULE_OMIT
 from tests.budgets import budget
 from tests.debug_log_helpers import capture_debug_rows
 from tests.server.conftest import ControllableMockClient
@@ -6882,19 +6881,16 @@ async def test_the_local_user_has_no_automations_shared_with_them(
 
 
 @_SHARING
-async def test_a_trigger_reads_its_rrule_as_null_only_for_clients_that_ask(
+async def test_a_trigger_reads_its_rrule_as_null(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
     _make_user(db_uri)
     _make_user(db_uri, "bob@example.com")
-    omit = {TRIGGER_RRULE_HEADER: TRIGGER_RRULE_OMIT}
     trigger_body = _create_body(
         prompt="This automation watches Slack and starts one Omnigent session per message.",
         session_mode="continue",
     )
-    created = await auth_client.post(
-        "/v1/scheduled-tasks", json=trigger_body, headers={**_headers(), **omit}
-    )
+    created = await auth_client.post("/v1/scheduled-tasks", json=trigger_body, headers=_headers())
     assert created.status_code == 200, created.text
     assert created.json()["rrule"] is None
     trigger_id = created.json()["id"]
@@ -6903,19 +6899,15 @@ async def test_a_trigger_reads_its_rrule_as_null_only_for_clients_that_ask(
         assert (await _share(auth_client, task_id, "bob@example.com")).status_code == 200
 
     expected = {trigger_id: None, scheduled_id: _VALID_RRULE}
-    listed = await auth_client.get("/v1/scheduled-tasks", headers={**_headers(), **omit})
+    listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
     assert {t["id"]: t["rrule"] for t in listed.json()["scheduled_tasks"]} == expected
-    shared = await auth_client.get("/v1/scheduled-tasks/shared", headers={**_BOB, **omit})
+    shared = await auth_client.get("/v1/scheduled-tasks/shared", headers=_BOB)
     assert {t["id"]: t["rrule"] for t in shared.json()["scheduled_tasks"]} == expected
     url = f"/v1/scheduled-tasks/{trigger_id}"
-    assert (await auth_client.get(url, headers={**_headers(), **omit})).json()["rrule"] is None
-    renamed = await auth_client.patch(
-        url, json={"name": "renamed"}, headers={**_headers(), **omit}
-    )
+    assert (await auth_client.get(url, headers=_headers())).json()["rrule"] is None
+    renamed = await auth_client.patch(url, json={"name": "renamed"}, headers=_headers())
     assert renamed.status_code == 200, renamed.text
     assert renamed.json()["rrule"] is None
-    # Older clients still read the saved rule.
-    assert (await auth_client.get(url, headers=_headers())).json()["rrule"] == _VALID_RRULE
 
 
 @_SHARING

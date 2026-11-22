@@ -33,8 +33,6 @@ from omnigent.runner.tool_dispatch import (
 from omnigent.server.scheduled.harness_settings import validate_scheduled_permission_mode
 from omnigent.tools.base import Tool
 from omnigent.tools.builtins.scheduled_tasks import (
-    TRIGGER_RRULE_HEADER,
-    TRIGGER_RRULE_OMIT,
     SysScheduledTaskCreateTool,
     SysScheduledTaskUpdateTool,
 )
@@ -73,22 +71,15 @@ class _RecordingClient:
     def __init__(self, response: _Resp | None = None, *, info: _Resp | None = None) -> None:
         self.calls: list[tuple[str, str, dict[str, object] | None]] = []
         self.headers: list[dict[str, str] | None] = []
-        self.get_headers: list[dict[str, str] | None] = []
         self._response = response or _Resp(body={"id": "t1"})
         self._info = info or _Resp(
             body={"scheduled_task_projects": True, "scheduled_task_session_modes": True}
         )
 
     async def get(
-        self,
-        url: str,
-        *,
-        params: dict[str, str] | None = None,
-        headers: dict[str, str] | None = None,
-        timeout: object = None,
+        self, url: str, *, params: dict[str, str] | None = None, timeout: object = None
     ) -> _Resp:
         self.calls.append(("GET", url, params))
-        self.get_headers.append(headers)
         return self._info if url == "/v1/info" else self._response
 
     async def post(
@@ -163,7 +154,6 @@ async def test_create_posts_payload() -> None:
     }  # unknown fields filtered out
     assert json.loads(out)["id"] == "t1"
     assert client.headers[-1] == {
-        TRIGGER_RRULE_HEADER: TRIGGER_RRULE_OMIT,
         ORCHESTRATION_SOURCE_HEADER: "conv_source",
         "x-omnigent-automation-source": "agent",
     }
@@ -427,7 +417,6 @@ async def test_list_gets() -> None:
     out = await _execute_scheduled_task_tool("sys_scheduled_task_list", "", server_client=client)
     # Reminders are left out of the list by default; an agent needs them to cancel one.
     assert client.calls[0] == ("GET", "/v1/scheduled-tasks", {"kind": "all"})
-    assert client.get_headers[0] == {TRIGGER_RRULE_HEADER: TRIGGER_RRULE_OMIT}
     assert json.loads(out) == {"scheduled_tasks": []}
 
 
@@ -459,10 +448,7 @@ async def test_update_patches_by_id(placement: dict[str, str | None]) -> None:
         "state": "paused",
         **placement,
     }
-    assert client.headers[-1] == {
-        TRIGGER_RRULE_HEADER: TRIGGER_RRULE_OMIT,
-        ORCHESTRATION_SOURCE_HEADER: "conv_source",
-    }
+    assert client.headers[-1] == {ORCHESTRATION_SOURCE_HEADER: "conv_source"}
 
 
 @pytest.mark.asyncio
