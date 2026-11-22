@@ -216,7 +216,8 @@ def test_quick_pick_sets_the_open_sessions_reasoning_effort(
         run_palette_command(page, "reasoning effort", "Reasoning Effort")
         heading = page.locator('[data-slot="quick-pick-heading"]')
         expect(heading).to_have_text("Reasoning Effort")
-        page.get_by_role("combobox", name="Command palette").fill("max")
+        # The values page names its query after the setting, so find it by role alone.
+        page.get_by_role("dialog").get_by_role("combobox").fill("max")
         expect(page.get_by_role("dialog").get_by_role("option").first).to_contain_text("Max")
         page.keyboard.press("Enter")
         expect(heading).to_have_count(0)
