@@ -42,6 +42,10 @@ reattach when the session moves to another host.
   detailed transcript view to its input box with Ctrl+O before typing.
 - `split-panes`: behind `splittable_terminal_view_ui`, split the Terminal view
   into shell panes, resize them (each side stays within 25–75%), and close them.
+- `panes-view`: behind `workspace_sidebar_v2`, the session page and a tabs-sidebar
+  shell tab show their terminals as panes. Split, move, swap, resize, maximize
+  and close a pane with its own keys and commands, and Try Again a pane whose
+  shell didn't start.
 
 ## How to get to it (user POV)
 
@@ -67,6 +71,42 @@ with their own terminal retain the switcher.
   ⌘/Ctrl+Alt+- splits down with the default shell, skipping the picker; the
   chords work only while those buttons show. ⌘/Ctrl+Alt+Shift+] / [ focus the
   next / previous pane. All of them work with focus inside a terminal.
+- On desktop with `workspace_sidebar_v2` on, the session's owner splits the
+  session's terminal, or a shell tab in the tabs sidebar, into panes; anyone
+  else sees one terminal, and touch and phone-sized windows keep the Terminal
+  view as before. With a split shown, Chat keeps it on screen and the web chat
+  is the agent's pane. The keys act on the pane with the keyboard, from its
+  terminal or, for split, maximize and focus keys, from the chat's composer:
+  - ⌘D splits right and ⇧⌘D splits down with the remembered shell type (the
+    agent's first declared shell until one is picked).
+  - ⌘⌥ plus an arrow focuses the pane that way.
+  - ⌘⌃ plus an arrow moves the divider, and holding it keeps moving it.
+  - ⌘⌃= equalizes the panes.
+  - ⇧⌘↩ maximizes the pane or restores the split; a lone pane leaves it to its
+    terminal.
+  - On other platforms only maximize has a key, Shift+Ctrl+Enter, since Ctrl+D
+    and Ctrl+arrows belong to the shell; the rest are in ⌘K, and the strip's
+    buttons and menu.
+
+  Each pane has a title strip. On the focused or hovered pane it shows Split
+  Right, Split Down, Maximize Pane, Move to Sidebar (main view only) and Close
+  Pane buttons, as many as fit, Close folding first. A maximized pane shows
+  Restore Panes instead. Right-click or Ctrl-click the strip for its menu:
+  Restore Panes or Split Right, Split Down and Maximize Pane; a Move Pane
+  submenu of the spots it can go to (greyed with why when none has room);
+  Swap with Pane Left / Right / Above / Below where a pane is there; Move to
+  Sidebar; and Close Pane. Double-click the strip's blank space to maximize or
+  restore, and drag it to move the pane beside another. Equalize Panes has no
+  button or menu entry: use its key or ⌘K.
+
+  ⌘K lists, under "Panes", for the pane with the keyboard: Split Right, Split
+  Down, Focus Pane Left / Right / Above / Below, Move Divider Left / Right / Up /
+  Down, Equalize Panes, Maximize Pane / Restore Panes, Swap with Pane Left /
+  Right / Above / Below, Close Pane, Show Pane Toolbar (which moves the keyboard
+  into the strip), and Move Pane… (greyed with why when the split has no room).
+  Close Pane asks before ending a shell. A pane whose shell didn't start keeps
+  its place, says why, and offers Try Again (it starts the shell in the same
+  slot) and Close Pane (it ends nothing, so it doesn't ask).
 
 **User shells:**
 
@@ -167,6 +207,16 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   in Terminal view with the agent terminal focused, press ⌘/Ctrl+Alt+Shift+\
   and expect a default shell pane on the right that takes typing; press
   ⌘/Ctrl+Alt+Shift+] and expect typing to reach the agent pane again.
+- **`panes-view`:** no e2e coverage; component tests
+  `web/src/hooks/useTerminalPaneHotkeys.test.tsx`,
+  `web/src/shell/terminalPaneActions.test.tsx`,
+  `web/src/shell/paneShellStart.test.ts`,
+  `web/src/shell/SplitPanesMainView.test.tsx` and
+  `web/src/shell/SidebarTerminalPanes.test.tsx`. Manually, with
+  `workspace_sidebar_v2` on, in Terminal view on a Mac with the agent terminal
+  focused: press ⌘D and expect a default shell pane on the right that takes
+  typing; press ⌘⌥← and expect typing to reach the agent pane; open ⌘K and
+  expect a "Panes" group with Move Pane… and Swap with Pane Right.
 - **`scrollback`, wheel:**
   `tests/e2e_ui/shells/test_new_shell.py::test_shell_wheel_scroll_reaches_mouse_tracking_program`
 - **`scrollback`, touch:**

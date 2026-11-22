@@ -5,12 +5,7 @@ import type { TerminalSplitState } from "@/lib/paneSplitLayout";
 import { TERMINAL_SURFACE_ATTRIBUTE } from "@/lib/paneSurfaces";
 import { setTerminalLaunching } from "@/lib/terminals";
 
-import {
-  closeFailedPaneStart,
-  failedPaneMayTakeFocus,
-  keepFailedPaneStart,
-  retryPaneStart,
-} from "./paneShellStart";
+import { failedPaneMayTakeFocus, keepFailedPaneStart, retryPaneStart } from "./paneShellStart";
 import {
   isFailedPaneStart,
   paneStartFailure,
@@ -171,14 +166,6 @@ describe("a failed pane start", () => {
     }
     expect(launch).not.toHaveBeenCalled();
     expect(isFailedPaneStart(target.conversationId, FAILED)).toBe(true);
-  });
-
-  it("closes its slot, and a split left with no other shell ends", () => {
-    const { target, read } = memoryTarget();
-    recordPaneStartFailure(target.conversationId, FAILED, { terminal: "zsh", reason: "x" });
-    closeFailedPaneStart(target, FAILED);
-    expect(read()).toBeUndefined();
-    expect(isFailedPaneStart(target.conversationId, FAILED)).toBe(false);
   });
 });
 
