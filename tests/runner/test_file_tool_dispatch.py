@@ -40,18 +40,26 @@ from omnigent.spec.types import AgentSpec, ExecutorSpec
 _CONVERSATION_ID = "conv_sec20870"
 
 
-def _recording_client(captured: list[httpx.Request]) -> httpx.AsyncClient:
+def _recording_client(
+    captured: list[httpx.Request], *, info: dict[str, Any] | None = None
+) -> httpx.AsyncClient:
     """
     Build an AP-server client that records requests and returns a
     created-file response.
 
     :param captured: List the handler appends each inbound request to,
         so the test can assert whether (and what) the dispatch POSTed.
+        ``/v1/info`` requests aren't recorded.
+    :param info: The ``/v1/info`` body; defaults to one advertising project
+        files, e.g. ``{"version": "0.23.0"}`` for an older server.
     :returns: An ``httpx.AsyncClient`` backed by a mock transport that
         answers the files endpoint with ``201`` and a fixed file id.
     """
+    info_body = {"project_files": True} if info is None else info
 
     def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json=info_body)
         captured.append(request)
         return httpx.Response(201, json={"id": "file_abc123"})
 
@@ -1172,51 +1180,44 @@ async def test_send_message_failure_surfaces_child_delete_http_error(
 _PROJECT_FILE_ID = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
 
 
-def _project_files_server(
-    captured: list[httpx.Request], *, info: dict[str, Any] | None = None
-) -> httpx.AsyncClient:
-    """
-    A server client that answers ``/v1/info`` with *info* and records every other request.
-
-    :param captured: Receives each non-info request.
-    :param info: The ``/v1/info`` body; defaults to one advertising project files.
-    :returns: An ``httpx.AsyncClient`` over a mock transport.
-    """
-    body = {"project_files": True} if info is None else info
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/info":
-            return httpx.Response(200, json=body)
-        captured.append(request)
-        return httpx.Response(201, json={"id": "file_abc123"})
-
-    return httpx.AsyncClient(transport=httpx.MockTransport(_handler), base_url="http://ap-server")
-
-
 @pytest.mark.parametrize(
-    ("tool_name", "arguments", "method", "route"),
+    ("tool_name", "arguments", "method", "route", "query"),
     [
-        ("sys_upload_file", {"path": "plan.md", "scope": "project"}, "POST", "project-files"),
-        ("sys_list_files", {"scope": "project"}, "GET", "project-files"),
+        ("sys_upload_file", {"path": "plan.md", "scope": "project"}, "POST", "project-files", {}),
+        (
+            "sys_list_files",
+            {"scope": "project", "limit": 5, "after": _PROJECT_FILE_ID},
+            "GET",
+            "project-files",
+            {"limit": "5", "after": _PROJECT_FILE_ID},
+        ),
         (
             "sys_download_file",
             {"file_id": _PROJECT_FILE_ID, "scope": "project"},
             "GET",
             f"project-files/{_PROJECT_FILE_ID}/content",
+            {},
         ),
-        ("sys_list_files", {}, "GET", "files"),
+        ("sys_list_files", {}, "GET", "files", {}),
+        ("sys_list_files", {"scope": None}, "GET", "files", {}),
     ],
-    ids=["upload", "list", "download", "session-default"],
+    ids=["upload", "list", "download", "session-default", "null-is-session"],
 )
 @pytest.mark.asyncio
 async def test_scope_picks_the_session_or_project_file_routes(
-    tool_name: str, arguments: dict[str, Any], method: str, route: str, tmp_path: Path
+    tool_name: str,
+    arguments: dict[str, Any],
+    method: str,
+    route: str,
+    query: dict[str, str],
+    tmp_path: Path,
 ) -> None:
     """The project scope goes through the session's project-file routes, where the
-    server resolves and authorizes the project; the agent never names one."""
+    server resolves and authorizes the project; the agent never names one. A list
+    passes its page arguments on."""
     (tmp_path / "plan.md").write_text("plan")
     captured: list[httpx.Request] = []
-    client = _project_files_server(captured)
+    client = _recording_client(captured)
     try:
         await execute_tool(
             tool_name=tool_name,
@@ -1229,19 +1230,30 @@ async def test_scope_picks_the_session_or_project_file_routes(
     finally:
         await client.aclose()
 
-    assert [(request.method, request.url.path) for request in captured] == [
-        (method, f"/v1/sessions/{_CONVERSATION_ID}/resources/{route}")
-    ]
+    assert [
+        (request.method, request.url.path, dict(request.url.params)) for request in captured
+    ] == [(method, f"/v1/sessions/{_CONVERSATION_ID}/resources/{route}", query)]
 
 
+@pytest.mark.parametrize(
+    ("arguments", "reason"),
+    [
+        ({"scope": "team"}, "scope must be 'session' or 'project'"),
+        ({"limit": "5"}, "'limit' must be an integer"),
+        ({"after": 7}, "'after' must be a string"),
+    ],
+    ids=["scope", "limit", "after"],
+)
 @pytest.mark.asyncio
-async def test_an_unknown_scope_is_refused_before_any_request() -> None:
+async def test_bad_list_arguments_are_refused_before_any_request(
+    arguments: dict[str, Any], reason: str
+) -> None:
     captured: list[httpx.Request] = []
     client = _recording_client(captured)
     try:
         output = await execute_tool(
             tool_name="sys_list_files",
-            arguments=json.dumps({"scope": "team"}),
+            arguments=json.dumps(arguments),
             server_client=client,
             agent_spec=_placeholder_cwd_spec(),
             conversation_id=_CONVERSATION_ID,
@@ -1249,7 +1261,7 @@ async def test_an_unknown_scope_is_refused_before_any_request() -> None:
     finally:
         await client.aclose()
 
-    assert output == "Error: sys_list_files failed: scope must be 'session' or 'project'"
+    assert output == f"Error: sys_list_files failed: {reason}"
     assert captured == []
 
 
@@ -1282,7 +1294,7 @@ async def test_project_scope_fails_closed_on_an_older_server(tmp_path: Path) -> 
     """A server without project files is told no, and nothing goes to its session routes."""
     (tmp_path / "plan.md").write_text("plan")
     captured: list[httpx.Request] = []
-    client = _project_files_server(captured, info={"version": "0.23.0"})
+    client = _recording_client(captured, info={"version": "0.23.0"})
     try:
         output = await execute_tool(
             tool_name="sys_upload_file",

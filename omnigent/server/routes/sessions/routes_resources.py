@@ -60,6 +60,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
+    effective_admin,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry
@@ -2456,6 +2457,34 @@ def register_resources_routes(
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         return _ProjectAccess(project_id=project.id, owner_id=user_id)
 
+    async def _require_named_grant(
+        request: Request, root_session_id: str, required_level: int
+    ) -> None:
+        """
+        Refuse a caller who reaches a project session only through its public link.
+
+        A project's files come from all of its sessions, so a link to one of them
+        doesn't share the rest. The owner, an admin, or a collaborator granted
+        access by name gets through.
+
+        :param request: The incoming request, for the caller's identity.
+        :param root_session_id: The calling session's root, which holds its grants.
+        :param required_level: Minimum level the caller's own grant needs, e.g. ``LEVEL_READ``.
+        :raises OmnigentError: 403 when only the public link grants that level.
+        """
+        if permission_store is None:
+            return
+        user_id = _get_user_id(request, auth_provider)
+        access = await asyncio.to_thread(permission_store.resolve_access, user_id, root_session_id)
+        if effective_admin(access.is_admin):
+            return
+        if access.user_grant_level is not None and access.user_grant_level >= required_level:
+            return
+        raise OmnigentError(
+            "A session shared by link doesn't share its project's files",
+            code=ErrorCode.FORBIDDEN,
+        )
+
     async def _session_project_access(
         request: Request, session_id: str, required_level: int
     ) -> _ProjectAccess:
@@ -2470,12 +2499,14 @@ def register_resources_routes(
         :param session_id: The calling session, e.g. ``"conv_abc123"``.
         :param required_level: Minimum level on the session, e.g. ``LEVEL_EDIT``.
         :returns: The project and its owner.
-        :raises OmnigentError: 404 when the session is in no project, or its
-            project is gone or not its owner's.
+        :raises OmnigentError: 403 when only the session's public link grants the
+            level; 404 when the session is in no project, or its project is gone or
+            not its owner's.
         """
         _require_project_file_store()
         assert project_store is not None
         conv = await _validate_session(session_id, request, required_level)
+        await _require_named_grant(request, conv.root_conversation_id, required_level)
         root: Conversation | None = conv
         if conv.root_conversation_id != conv.id:
             root = await asyncio.to_thread(

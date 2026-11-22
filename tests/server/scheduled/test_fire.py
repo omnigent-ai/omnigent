@@ -22,7 +22,7 @@ import json
 import re
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -4976,8 +4976,10 @@ async def test_a_run_copy_that_cannot_bind_its_host_is_deleted() -> None:
         def list(self, session_id: str, **kwargs: Any) -> SimpleNamespace:
             return SimpleNamespace(data=[], has_more=False, last_id=None)
 
-        def delete_all_for_session(self, session_id: str) -> list[str]:
-            return ["blob_orphaned"]
+        def delete_all_for_session(
+            self, session_id: str, on_orphaned: Callable[[list[str]], None]
+        ) -> None:
+            on_orphaned(["blob_orphaned"])
 
     class _FailingArtifactStore:
         def delete(self, key: str) -> None:
@@ -5111,8 +5113,10 @@ async def test_a_run_copy_that_cannot_take_every_file_is_deleted(tmp_path: Path)
         def create(self, **kwargs: Any) -> None:
             raise RuntimeError("database unavailable")
 
-        def delete_all_for_session(self, session_id: str) -> list[str]:
-            return []
+        def delete_all_for_session(
+            self, session_id: str, on_orphaned: Callable[[list[str]], None]
+        ) -> None:
+            on_orphaned([])
 
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})

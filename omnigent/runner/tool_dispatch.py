@@ -9426,8 +9426,19 @@ async def _execute_file_tool(
             return f"Error: {DownloadFileTool.name()} failed: {exc}"
 
     if tool_name == ListFilesTool.name():
+        # Pass the advertised page arguments on, so a returned cursor reaches older files.
+        page: dict[str, int | str] = {}
+        limit, after = args.get("limit"), args.get("after")
+        if isinstance(limit, int) and not isinstance(limit, bool):
+            page["limit"] = limit
+        elif limit is not None:
+            return f"Error: {tool_name} failed: 'limit' must be an integer"
+        if isinstance(after, str):
+            page["after"] = after
+        elif after is not None:
+            return f"Error: {tool_name} failed: 'after' must be a string"
         try:
-            resp = await server_client.get(files_path, timeout=30.0)
+            resp = await server_client.get(files_path, params=page, timeout=30.0)
             if resp.status_code == 200:
                 return json.dumps(resp.json())
             return f"Error: {tool_name} returned {resp.status_code}{_file_error_detail(resp)}"

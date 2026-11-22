@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 import sqlalchemy
+from sqlalchemy.orm import Session
 
+from omnigent.db.utils import NamedManagedSessionMaker
+from omnigent.stores.file_store import sqlalchemy_store
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 
 # Files are always listed per session, so pagination/ordering tests
@@ -193,7 +198,8 @@ def test_delete_all_for_session(
     file_store.create("c.txt", 3, session_id="aef8aa8b6e9cf6eda406cb88cf33708c")
     global_f = file_store.create("global.txt", 4)
 
-    deleted_ids = file_store.delete_all_for_session("4e92b5a0c0ee6db3f874f9c4a3f855a5")
+    deleted_ids: list[str] = []
+    file_store.delete_all_for_session("4e92b5a0c0ee6db3f874f9c4a3f855a5", deleted_ids.extend)
     assert set(deleted_ids) == {f1.id, f2.id}
     assert file_store.get(f1.id) is None
     assert file_store.get(f2.id) is None
@@ -334,11 +340,13 @@ def test_delete_all_for_session_returns_only_orphaned_blobs(
 
     # Deleting the source returns solo's blob (now unreferenced) but NOT the
     # shared blob the fork still points at.
-    orphaned = file_store.delete_all_for_session(src_session)
+    orphaned: list[str] = []
+    file_store.delete_all_for_session(src_session, orphaned.extend)
     assert set(orphaned) == {solo.id}
 
     # Deleting the fork finally orphans the shared blob.
-    orphaned_after = file_store.delete_all_for_session(fork_session)
+    orphaned_after: list[str] = []
+    file_store.delete_all_for_session(fork_session, orphaned_after.extend)
     assert set(orphaned_after) == {shared.blob_key}
 
 
@@ -417,9 +425,45 @@ def test_delete_all_for_project_keeps_blobs_other_rows_share(
     file_store.create("shared.md", 8, session_id=_SID, blob_key=shared.blob_key)
     file_store.create("kept.md", 8, project_id=_OTHER_PROJECT)
 
-    assert set(file_store.delete_all_for_project(_PROJECT)) == {solo.id}
+    orphaned: list[str] = []
+    file_store.delete_all_for_project(_PROJECT, orphaned.extend)
+    assert set(orphaned) == {solo.id}
     assert file_store.list_for_project(_PROJECT).data == []
     assert [f.filename for f in file_store.list_for_project(_OTHER_PROJECT).data] == ["kept.md"]
+
+
+def test_a_failed_batch_leaves_its_rows_after_reporting_the_earlier_batches(
+    file_store: SqlAlchemyFileStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Each committed batch's orphaned blobs reach the caller before a later batch fails.
+    """
+    monkeypatch.setattr(sqlalchemy_store, "_DELETE_BATCH_SIZE", 2)
+    created = {file_store.create(f"f{index}.md", 1, project_id=_PROJECT).id for index in range(3)}
+    real_transaction = sqlalchemy_store.run_write_transaction
+    delete_batches: list[str] = []
+
+    def fail_the_second_batch(
+        session_maker: NamedManagedSessionMaker,
+        operation_name: str,
+        callback: Callable[[Session], object],
+    ) -> object:
+        if operation_name == "delete_project_files":
+            delete_batches.append(operation_name)
+            if len(delete_batches) == 2:
+                raise RuntimeError("database unavailable")
+        return real_transaction(session_maker, operation_name, callback)
+
+    monkeypatch.setattr(sqlalchemy_store, "run_write_transaction", fail_the_second_batch)
+    reported: list[str] = []
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        file_store.delete_all_for_project(_PROJECT, reported.extend)
+
+    remaining = {f.id for f in file_store.list_for_project(_PROJECT).data}
+    assert len(reported) == 2
+    assert set(reported) | remaining == created
+    assert not set(reported) & remaining
 
 
 def test_rows_without_a_blob_key_still_reference_their_blob(
@@ -435,4 +479,6 @@ def test_rows_without_a_blob_key_still_reference_their_blob(
     fetched = file_store.get(legacy.id)
     assert fetched is not None and fetched.blob_key is None
     assert file_store.is_blob_key_orphaned(legacy.id) is False
-    assert file_store.delete_all_for_session(_SID) == [legacy.id]
+    orphaned: list[str] = []
+    file_store.delete_all_for_session(_SID, orphaned.extend)
+    assert orphaned == [legacy.id]

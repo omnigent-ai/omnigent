@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Query, Request
@@ -66,12 +67,12 @@ def _delete_project_blobs(
     artifact_store: ArtifactStore, project_id: str, blob_keys: list[str]
 ) -> None:
     """
-    Delete a deleted project's file blobs after the response, best-effort.
+    Delete the blobs of a project's deleted file rows, best-effort.
 
     A failed delete leaves its blob behind and is logged, as for a deleted session.
 
     :param artifact_store: Store holding the bytes.
-    :param project_id: The deleted project, for the log.
+    :param project_id: The project the rows belonged to, for the log.
     :param blob_keys: Blobs no file row references any more.
     """
     failed = 0
@@ -81,18 +82,92 @@ def _delete_project_blobs(
         except Exception as exc:  # noqa: BLE001 - one failed blob must not stop the rest
             failed += 1
             _logger.warning(
-                "Failed to delete file blob %s of deleted project %s: %s",
+                "Failed to delete file blob %s of project %s: %s",
                 blob_key,
                 project_id,
                 type(exc).__name__,
             )
     if failed:
         _logger.warning(
-            "Project %s deleted with %d of %d file blobs left behind",
+            "Project %s file cleanup left %d of %d blobs behind",
             project_id,
             failed,
             len(blob_keys),
         )
+
+
+@dataclass(frozen=True)
+class _ProjectFileStores:
+    """
+    The stores a project delete touches when the server keeps file bytes.
+
+    :param projects: Project rows.
+    :param files: File rows.
+    :param artifacts: File bytes.
+    """
+
+    projects: ProjectStore
+    files: FileStore
+    artifacts: ArtifactStore
+
+
+async def _sweep_leftover_project_files(stores: _ProjectFileStores, project_id: str) -> None:
+    """
+    Finish a project delete that failed after its row was gone, if one did.
+
+    The files of a project nobody has any more are unreachable, so any caller may
+    clear them; a project that exists, whoever owns it, is left alone.
+
+    :param stores: The project, file and artifact stores.
+    :param project_id: A project id the caller doesn't own, e.g. one just deleted.
+    """
+    if await asyncio.to_thread(stores.projects.exists, project_id):
+        return
+    orphaned: list[str] = []
+    try:
+        await asyncio.to_thread(stores.files.delete_all_for_project, project_id, orphaned.extend)
+    finally:
+        await asyncio.to_thread(_delete_project_blobs, stores.artifacts, project_id, orphaned)
+
+
+async def _delete_project_with_files(
+    stores: _ProjectFileStores,
+    project_id: str,
+    user_id: str | None,
+    background_tasks: BackgroundTasks,
+) -> bool:
+    """
+    Delete one of the caller's projects with its file rows, then their bytes.
+
+    The rows are deleted before and after the project row: a failed sweep leaves
+    the project in place to delete again, and the second sweep catches an upload
+    that raced the delete. If that second sweep fails, deleting the gone project
+    again finishes it. The bytes go after the response, except on a failure,
+    where the batches that already committed drop theirs first.
+
+    :param stores: The project, file and artifact stores.
+    :param project_id: The project to delete.
+    :param user_id: The caller, who must own the project.
+    :param background_tasks: Runs the blob deletion after the response.
+    :returns: Whether this call deleted the project row.
+    """
+    if await asyncio.to_thread(stores.projects.get, project_id, user_id=user_id) is None:
+        await _sweep_leftover_project_files(stores, project_id)
+        return False
+    orphaned: list[str] = []
+    try:
+        await asyncio.to_thread(stores.files.delete_all_for_project, project_id, orphaned.extend)
+        deleted = await asyncio.to_thread(stores.projects.delete, project_id, user_id=user_id)
+        await asyncio.to_thread(stores.files.delete_all_for_project, project_id, orphaned.extend)
+    except Exception:
+        await asyncio.to_thread(_delete_project_blobs, stores.artifacts, project_id, orphaned)
+        raise
+    if deleted:
+        background_tasks.add_task(_delete_project_blobs, stores.artifacts, project_id, orphaned)
+    else:
+        # A concurrent delete won the row; still drop the bytes this one unlinked.
+        await asyncio.to_thread(_delete_project_blobs, stores.artifacts, project_id, orphaned)
+    return deleted
 
 
 def create_projects_router(
@@ -298,23 +373,12 @@ def create_projects_router(
         if file_store is None or artifact_store is None:
             deleted = await asyncio.to_thread(project_store.delete, project_id, user_id=user_id)
         else:
-            if await asyncio.to_thread(project_store.get, project_id, user_id=user_id) is None:
-                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-            # Files go first, so a failed sweep leaves the project in place to delete again.
-            orphaned = await asyncio.to_thread(file_store.delete_all_for_project, project_id)
-            deleted = await asyncio.to_thread(project_store.delete, project_id, user_id=user_id)
-            # An upload racing this delete committed before this second sweep, or
-            # finds the project gone and removes itself.
-            orphaned += await asyncio.to_thread(file_store.delete_all_for_project, project_id)
-            if deleted:
-                background_tasks.add_task(
-                    _delete_project_blobs, artifact_store, project_id, orphaned
-                )
-            else:
-                # A concurrent delete won the row; still drop the bytes this one unlinked.
-                await asyncio.to_thread(
-                    _delete_project_blobs, artifact_store, project_id, orphaned
-                )
+            deleted = await _delete_project_with_files(
+                _ProjectFileStores(project_store, file_store, artifact_store),
+                project_id,
+                user_id,
+                background_tasks,
+            )
         if not deleted:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         # Drop the folder from the owner's other connected clients live.

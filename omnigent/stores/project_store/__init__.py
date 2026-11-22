@@ -78,6 +78,19 @@ class ProjectStore(ABC):
         ...
 
     @abstractmethod
+    def exists(self, project_id: str) -> bool:
+        """
+        Whether a project with this id exists, whoever owns it.
+
+        For cleanup decisions that must not depend on the caller; never report
+        the answer to a caller who doesn't own the project.
+
+        :param project_id: Opaque project identifier.
+        :returns: ``True`` if any owner has a project with this id.
+        """
+        ...
+
+    @abstractmethod
     def list(self, *, user_id: str | None) -> list[Project]:
         """
         List the owner's projects ordered by ``created_at ASC, id ASC``.

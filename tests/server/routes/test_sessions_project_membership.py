@@ -19,6 +19,7 @@ edit/read access to.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,7 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_PUBLIC,
     UnifiedAuthProvider,
 )
 from omnigent.server.routes.projects import create_projects_router
@@ -568,6 +570,31 @@ def test_a_collaborator_reaches_the_project_through_a_shared_session(
     assert upload.status_code == upload_status, upload.text
 
 
+def test_a_session_shared_by_link_keeps_its_project_files_private(
+    db_uri: str, tmp_path: Path
+) -> None:
+    """
+    A public link to one project session lets others read that session, not the project's files.
+    """
+    _ensure_agent(db_uri)
+    client = TestClient(_multi_user_app(db_uri, artifact_root=tmp_path / "artifacts"))
+    project = client.post("/v1/projects", json={"name": "P"}, headers=_hdr(ALICE)).json()
+    linked = _filed_session(db_uri, client, ALICE, project["id"])
+    file_id = _upload_to_project(client, linked, ALICE, "plan.md")
+    SqlAlchemyPermissionStore(db_uri).grant(RESERVED_USER_PUBLIC, linked, LEVEL_READ)
+
+    session = client.get(f"/v1/sessions/{linked}", headers=_hdr(BOB))
+    listed = client.get(f"/v1/sessions/{linked}/resources/project-files", headers=_hdr(BOB))
+    content = client.get(
+        f"/v1/sessions/{linked}/resources/project-files/{file_id}/content", headers=_hdr(BOB)
+    )
+
+    assert session.status_code == 200, session.text
+    assert listed.status_code == 403, listed.text
+    assert content.status_code == 403, content.text
+    assert _project_file_names(client, linked, ALICE) == ["plan.md"]
+
+
 def test_a_sub_agent_uses_its_root_sessions_project(db_uri: str, tmp_path: Path) -> None:
     """A sub-agent reaches its root's project, even when filed elsewhere itself."""
     _ensure_agent(db_uri)
@@ -671,38 +698,111 @@ def test_an_upload_racing_a_project_delete_leaves_no_file(db_uri: str, tmp_path:
 
 
 class _SweepFailsOnce(SqlAlchemyFileStore):
-    """A file store whose first project file sweep fails, like a lost database connection."""
+    """
+    A file store whose first project sweep commits one batch, then fails.
+
+    Like a database connection lost between two batches: the first file's row
+    is gone and its blob key reported, and the rest of the project's files stay.
+    """
 
     def __init__(self, db_uri: str) -> None:
         super().__init__(db_uri)
         self.failures_left = 1
 
-    def delete_all_for_project(self, project_id: str) -> list[str]:
+    def delete_all_for_project(
+        self, project_id: str, on_orphaned: Callable[[list[str]], None]
+    ) -> None:
         if self.failures_left:
             self.failures_left -= 1
+            first = self.list_for_project(project_id, limit=1, order="asc").data[0]
+            self.delete(first.id, project_id=project_id)
+            on_orphaned([first.id])
             raise RuntimeError("database unavailable")
-        return super().delete_all_for_project(project_id)
+        super().delete_all_for_project(project_id, on_orphaned)
 
 
 def test_a_failed_file_sweep_keeps_the_project_for_a_retry(db_uri: str, tmp_path: Path) -> None:
-    """The files go before the project, so a failed delete can simply be retried."""
+    """
+    The files go before the project, so a delete that fails between batches can be
+    retried, and the file the committed batch removed still loses its bytes.
+    """
     _ensure_agent(db_uri)
     artifacts = tmp_path / "artifacts"
     app = _multi_user_app(db_uri, artifact_root=artifacts, file_store=_SweepFailsOnce(db_uri))
     client = TestClient(app, raise_server_exceptions=False)
     project = client.post("/v1/projects", json={"name": "P"}, headers=_hdr(ALICE)).json()
     member = _filed_session(db_uri, client, ALICE, project["id"])
-    _upload_to_project(client, member, ALICE, "plan.md")
+    uploaded = {
+        _upload_to_project(client, member, ALICE, "plan.md"),
+        _upload_to_project(client, member, ALICE, "notes.md"),
+    }
 
     failed = client.delete(f"/v1/projects/{project['id']}", headers=_hdr(ALICE))
+    remaining = {f.id for f in SqlAlchemyFileStore(db_uri).list_for_project(project["id"]).data}
+
     assert failed.status_code == 500
     assert client.get(f"/v1/projects/{project['id']}", headers=_hdr(ALICE)).status_code == 200
-    assert _project_file_names(client, member, ALICE) == ["plan.md"]
+    assert len(remaining) == 1 and remaining < uploaded
+    assert {path.name for path in artifacts.iterdir()} == remaining
 
     retried = client.delete(f"/v1/projects/{project['id']}", headers=_hdr(ALICE))
     assert retried.status_code == 200, retried.text
     assert SqlAlchemyFileStore(db_uri).list_for_project(project["id"]).data == []
     assert list(artifacts.iterdir()) == []
+
+
+class _SweepAfterTheProjectFailsOnce(SqlAlchemyFileStore):
+    """
+    A file store whose sweep after the project row fails once.
+
+    An upload that raced the delete committed its row just before that sweep.
+    """
+
+    def __init__(self, db_uri: str) -> None:
+        super().__init__(db_uri)
+        self.sweeps = 0
+
+    def delete_all_for_project(
+        self, project_id: str, on_orphaned: Callable[[list[str]], None]
+    ) -> None:
+        self.sweeps += 1
+        if self.sweeps == 2:
+            self.create("late.md", 4, project_id=project_id)
+            raise RuntimeError("database unavailable")
+        super().delete_all_for_project(project_id, on_orphaned)
+
+
+def test_deleting_a_gone_project_again_clears_what_a_failed_delete_left(
+    db_uri: str, tmp_path: Path
+) -> None:
+    """
+    When the sweep after the project row fails, deleting the project again clears the
+    files it left; another user's delete never touches a project that still exists.
+    """
+    _ensure_agent(db_uri)
+    artifacts = tmp_path / "artifacts"
+    app = _multi_user_app(
+        db_uri, artifact_root=artifacts, file_store=_SweepAfterTheProjectFailsOnce(db_uri)
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+    project = client.post("/v1/projects", json={"name": "P"}, headers=_hdr(ALICE)).json()
+    member = _filed_session(db_uri, client, ALICE, project["id"])
+    _upload_to_project(client, member, ALICE, "plan.md")
+    files = SqlAlchemyFileStore(db_uri)
+
+    outsider = client.delete(f"/v1/projects/{project['id']}", headers=_hdr(BOB))
+    assert outsider.status_code == 404
+    assert [f.filename for f in files.list_for_project(project["id"]).data] == ["plan.md"]
+
+    failed = client.delete(f"/v1/projects/{project['id']}", headers=_hdr(ALICE))
+    assert failed.status_code == 500
+    assert client.get(f"/v1/projects/{project['id']}", headers=_hdr(ALICE)).status_code == 404
+    assert [f.filename for f in files.list_for_project(project["id"]).data] == ["late.md"]
+    assert list(artifacts.iterdir()) == []
+
+    retried = client.delete(f"/v1/projects/{project['id']}", headers=_hdr(ALICE))
+    assert retried.status_code == 404
+    assert files.list_for_project(project["id"]).data == []
 
 
 @pytest.mark.parametrize("route", ["owner", "session"])

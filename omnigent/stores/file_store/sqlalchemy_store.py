@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,6 +12,7 @@ from sqlalchemy import ColumnElement, Select, and_, asc, desc, or_, select
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlFile, current_workspace_id, normalize_uuid
+from omnigent.db.keyset import keyset_after
 from omnigent.db.query_context import query_name_scope
 from omnigent.db.utils import (
     generate_file_id,
@@ -310,54 +312,66 @@ class SqlAlchemyFileStore(FileStore):
 
         return run_write_transaction(self._session_immediate, "delete_file", write)
 
-    def delete_all_for_session(self, session_id: str) -> builtins.list[str]:
+    def delete_all_for_session(
+        self, session_id: str, on_orphaned: Callable[[builtins.list[str]], None]
+    ) -> None:
         """
         Delete all file metadata for a session.
 
         Because a fork copy can share a blob (its ``blob_key`` points at
         another session's row), the deleted rows' blobs may still be
-        referenced elsewhere. This returns only the blob keys that became
-        **orphaned** — the caller deletes exactly those artifact bytes, so a
+        referenced elsewhere. Only the blob keys that became **orphaned** are
+        reported, so the caller deletes exactly those artifact bytes and a
         fork's shared blob survives its source session's deletion.
 
         :param session_id: Owning session/conversation id.
-        :returns: The now-orphaned artifact-store keys to clean up.
+        :param on_orphaned: Receives each committed batch's orphaned keys.
         """
-        return self._delete_all(
+        self._delete_all(
             SqlFile.session_id == session_id,
+            on_orphaned,
             transaction_name="delete_session_files",
             select_name="list_session_files_for_delete",
         )
 
-    def delete_all_for_project(self, project_id: str) -> builtins.list[str]:
+    def delete_all_for_project(
+        self, project_id: str, on_orphaned: Callable[[builtins.list[str]], None]
+    ) -> None:
         """
         Delete all file metadata for a project.
 
         :param project_id: Owning project id.
-        :returns: The now-orphaned artifact-store keys to clean up.
+        :param on_orphaned: Receives each committed batch's orphaned keys.
         """
-        return self._delete_all(
+        self._delete_all(
             SqlFile.project_id == normalize_uuid(project_id),
+            on_orphaned,
             transaction_name="delete_project_files",
             select_name="list_project_files_for_delete",
         )
 
     def _delete_all(
-        self, owner: ColumnElement[bool], *, transaction_name: str, select_name: str
-    ) -> builtins.list[str]:
+        self,
+        owner: ColumnElement[bool],
+        on_orphaned: Callable[[builtins.list[str]], None],
+        *,
+        transaction_name: str,
+        select_name: str,
+    ) -> None:
         """
         Delete one owner's file rows and report the blobs nothing references any more.
 
-        Runs in bounded batches, one transaction each, over the owner's index. A
-        failure leaves the remaining rows for a retry.
+        Runs in bounded batches, one transaction each, over the owner's index.
+        Each batch's orphaned keys are reported once it commits, so a failure
+        loses none of them and leaves the remaining rows for a retry.
 
         :param owner: Filter selecting the owner's rows, e.g.
             ``SqlFile.project_id == project_id``.
+        :param on_orphaned: Receives each committed batch's orphaned keys.
         :param transaction_name: Semantic name of each batch's write transaction,
             e.g. ``"delete_project_files"``.
         :param select_name: Semantic name of each batch's row lookup, e.g.
             ``"list_project_files_for_delete"``.
-        :returns: The now-orphaned artifact-store keys to clean up.
         """
 
         def delete_batch(session: Session) -> _DeletedBatch:
@@ -383,12 +397,11 @@ class SqlAlchemyFileStore(FileStore):
                     orphaned.append(blob_key)
             return _DeletedBatch(deleted=len(rows), orphaned=orphaned)
 
-        orphaned: builtins.list[str] = []
         while True:
             batch = run_write_transaction(self._session_immediate, transaction_name, delete_batch)
-            orphaned.extend(batch.orphaned)
+            on_orphaned(batch.orphaned)
             if batch.deleted < _DELETE_BATCH_SIZE:
-                return orphaned
+                return
 
 
 def _page(
@@ -414,13 +427,26 @@ def _page(
     """
     is_desc = order == "desc"
     sort_fn = desc if is_desc else asc
-    stmt: Select[tuple[SqlFile]] = select(SqlFile).where(
-        SqlFile.workspace_id == current_workspace_id(), owner
-    )
-    if after:
-        stmt = stmt.where(_beyond_cursor(after, older=is_desc))
-    if before:
-        stmt = stmt.where(_beyond_cursor(before, older=not is_desc))
+    in_workspace = SqlFile.workspace_id == current_workspace_id()
+    stmt: Select[tuple[SqlFile]] = select(SqlFile).where(in_workspace, owner)
+    dialect_name = session.get_bind().dialect.name
+    for cursor_id, older in ((after, is_desc), (before, not is_desc)):
+        if not cursor_id:
+            continue
+        cursor_at = session.execute(
+            select(SqlFile.created_at).where(in_workspace, SqlFile.id == cursor_id)
+        ).scalar_one_or_none()
+        if cursor_at is None:
+            return PagedList(data=[], first_id=None, last_id=None, has_more=False)
+        # Seek on the whole (created_at, id) key, so ties on created_at cost no extra rows.
+        stmt = stmt.where(
+            keyset_after(
+                dialect_name,
+                (SqlFile.created_at, SqlFile.id),
+                (cursor_at, cursor_id),
+                descending=older,
+            )
+        )
     stmt = stmt.order_by(sort_fn(SqlFile.created_at), sort_fn(SqlFile.id)).limit(limit + 1)
     rows = list(session.execute(stmt).scalars().all())
     has_more = len(rows) > limit
@@ -432,31 +458,4 @@ def _page(
         first_id=entities[0].id if entities else None,
         last_id=entities[-1].id if entities else None,
         has_more=has_more,
-    )
-
-
-def _beyond_cursor(cursor: str, *, older: bool) -> ColumnElement[bool]:
-    """
-    Match rows strictly older or newer than the cursor row, by ``(created_at, id)``.
-
-    The ``created_at`` bound comes first so the owner's index seeks straight to
-    the cursor; only rows tied on ``created_at`` are then filtered by ``id``.
-
-    :param cursor: The cursor file ID.
-    :param older: ``True`` for rows before the cursor, ``False`` for rows after it.
-    :returns: The filter.
-    """
-    cursor_created_at = (
-        select(SqlFile.created_at)
-        .where(SqlFile.workspace_id == current_workspace_id(), SqlFile.id == cursor)
-        .scalar_subquery()
-    )
-    if older:
-        return and_(
-            SqlFile.created_at <= cursor_created_at,
-            or_(SqlFile.created_at < cursor_created_at, SqlFile.id < cursor),
-        )
-    return and_(
-        SqlFile.created_at >= cursor_created_at,
-        or_(SqlFile.created_at > cursor_created_at, SqlFile.id > cursor),
     )

@@ -47,7 +47,10 @@ def parse_file_scope(arguments: dict[str, Any]) -> str | None:
     Return the file tools' requested scope.
 
     :param arguments: Parsed tool arguments, e.g. ``{"path": "a.md", "scope": "project"}``.
-    :returns: ``"session"`` (the default) or ``"project"``; ``None`` for any other value.
+    :returns: ``"session"`` (the default, also for an explicit ``null``) or ``"project"``;
+        ``None`` for any other value.
     """
-    scope = arguments.get("scope", "session")
+    scope = arguments.get("scope")
+    if scope is None:
+        return "session"
     return scope if scope in ("session", PROJECT_FILE_SCOPE) else None

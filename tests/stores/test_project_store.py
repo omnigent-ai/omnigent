@@ -65,6 +65,18 @@ def test_get_scoped_to_owner(store: SqlAlchemyProjectStore) -> None:
     assert store.get(_uid("p1"), user_id="bob@example.com") is None
 
 
+def test_exists_ignores_the_owner(store: SqlAlchemyProjectStore) -> None:
+    """
+    ``exists`` reports a project whoever owns it, until it's deleted.
+    """
+    store.create(_uid("p1"), "Alice Project", "alice@example.com")
+
+    assert store.exists(_uid("p1"))
+    assert not store.exists(_uid("nope"))
+    assert store.delete(_uid("p1"), user_id="alice@example.com")
+    assert not store.exists(_uid("p1"))
+
+
 # ── list ──────────────────────────────────────────────────────────────────
 
 

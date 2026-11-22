@@ -137,7 +137,7 @@ def test_file_store_names_each_application_query(db_uri: str) -> None:
 
         file_store.create("old.txt", 1, session_id="94c349190e241f85a984b3df8f129696")
         query_names.clear()
-        file_store.delete_all_for_session("94c349190e241f85a984b3df8f129696")
+        file_store.delete_all_for_session("94c349190e241f85a984b3df8f129696", lambda keys: None)
         assert query_names == [
             "omnigent.file_store.list_session_files_for_delete",
             "omnigent.file_store.delete_session_files",
@@ -153,7 +153,7 @@ def test_file_store_names_each_application_query(db_uri: str) -> None:
         assert query_names == ["omnigent.file_store.list_project_files"]
 
         query_names.clear()
-        file_store.delete_all_for_project(project_id)
+        file_store.delete_all_for_project(project_id, lambda keys: None)
         assert query_names == [
             "omnigent.file_store.list_project_files_for_delete",
             "omnigent.file_store.delete_project_files",
@@ -214,8 +214,9 @@ def test_project_file_deletion_runs_in_bounded_batches(
         file_store.create(f"f{index}.md", 1, project_id=project_id).id for index in range(5)
     }
 
+    orphaned: list[str] = []
     with _capture_application_query_names(file_store._engine) as query_names:
-        orphaned = file_store.delete_all_for_project(project_id)
+        file_store.delete_all_for_project(project_id, orphaned.extend)
 
     assert set(orphaned) == created
     assert query_names.count("omnigent.file_store.list_project_files_for_delete") == 3

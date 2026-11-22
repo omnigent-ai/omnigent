@@ -1056,14 +1056,22 @@ def create_scheduled_tasks_router(
         """Delete an unused copy with its file rows; blobs another session still uses stay."""
         try:
             if file_store is not None:
-                orphaned = await asyncio.to_thread(file_store.delete_all_for_session, session_id)
-                if artifact_store is not None:
-                    for blob_key in orphaned:
-                        try:
-                            await asyncio.to_thread(artifact_store.delete, blob_key)
-                        except Exception:
-                            # A blob that won't delete must not keep the copy.
-                            _logger.warning("could not delete blob %s", blob_key, exc_info=True)
+                orphaned: list[str] = []
+                try:
+                    await asyncio.to_thread(
+                        file_store.delete_all_for_session, session_id, orphaned.extend
+                    )
+                finally:
+                    # Also after a failed batch: rows earlier batches deleted are gone.
+                    if artifact_store is not None:
+                        for blob_key in orphaned:
+                            try:
+                                await asyncio.to_thread(artifact_store.delete, blob_key)
+                            except Exception:
+                                # A blob that won't delete must not keep the copy.
+                                _logger.warning(
+                                    "could not delete blob %s", blob_key, exc_info=True
+                                )
             await conversation_store.delete_conversation(session_id)
         except Exception:
             _logger.exception("could not delete the unused session copy %s", session_id)

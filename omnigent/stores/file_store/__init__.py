@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any
 
 from omnigent.entities import PagedList, StoredFile
@@ -188,31 +189,37 @@ class FileStore(ABC):
         ...
 
     @abstractmethod
-    def delete_all_for_session(self, session_id: str) -> builtins.list[str]:
+    def delete_all_for_session(
+        self, session_id: str, on_orphaned: Callable[[builtins.list[str]], None]
+    ) -> None:
         """
-        Delete all file metadata for a session.
+        Delete all file metadata for a session, in bounded batches.
 
-        Returns only the artifact-store keys that became **orphaned** by the
-        deletion (no surviving row references them), so the caller cleans up
-        exactly those bytes. A blob still shared by a fork in another session
-        is not returned and therefore survives.
+        After each batch commits, calls *on_orphaned* with the artifact-store
+        keys that batch left **orphaned** (no surviving row references them),
+        so the caller cleans up exactly those bytes, even when a later batch
+        fails. A blob still shared by a fork in another session is not
+        reported and therefore survives.
 
         :param session_id: Owning session/conversation id.
-        :returns: The now-orphaned artifact-store keys to clean up.
+        :param on_orphaned: Receives each committed batch's orphaned keys, e.g.
+            ``orphaned.extend``. An exception it raises stops the deletion.
         """
         ...
 
     @abstractmethod
-    def delete_all_for_project(self, project_id: str) -> builtins.list[str]:
+    def delete_all_for_project(
+        self, project_id: str, on_orphaned: Callable[[builtins.list[str]], None]
+    ) -> None:
         """
-        Delete all file metadata for a project.
+        Delete all file metadata for a project, in bounded batches.
 
-        Like :meth:`delete_all_for_session`, returns only the artifact-store
-        keys that no surviving row references, so the caller deletes exactly
-        those bytes.
+        Like :meth:`delete_all_for_session`, reports each committed batch's
+        orphaned artifact-store keys to *on_orphaned*, so the caller deletes
+        exactly those bytes.
 
         :param project_id: Owning project id, e.g.
             ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
-        :returns: The now-orphaned artifact-store keys to clean up.
+        :param on_orphaned: Receives each committed batch's orphaned keys.
         """
         ...
