@@ -78,11 +78,11 @@ import {
   terminalToSidebarRefusal,
 } from "./terminalPaneMoves";
 import { unzoomPane, useZoomedPaneKey } from "./terminalPaneZoom";
-import { usePublishMainTerminalKeys, useTerminalSplitsAllowed } from "./terminalPlacement";
+import { usePanesSplitsAllowed } from "./panesViewGate";
+import { usePublishMainTerminalKeys } from "./terminalPlacement";
 import { mainSplitTarget } from "./terminalSplitTarget";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 import { usePaneCycleHotkey } from "@/hooks/usePaneCycleHotkey";
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 
 type MainTerminalViewProps = ComponentProps<typeof MainTerminalView>;
 
@@ -103,14 +103,13 @@ export function SplitPanesMainView(props: SplitPanesMainViewProps) {
   const { terminals, listCompleteAt, isFetching } = useTerminals(conversationId);
   const agentTerminal = useMemo(() => findAgentTerminal(terminals), [terminals]);
   const agentKey = agentTerminal ? terminalTabKey(agentTerminal) : null;
-  const splitsAllowed = useTerminalSplitsAllowed(readOnly);
-  const isMobile = useIsMobileViewport();
+  const splitsAllowed = usePanesSplitsAllowed(readOnly);
   // A shell the sidebar opened takes over the view unsplit, as the Terminal view shows it.
   const shellView =
     !!initialTerminalKey &&
     initialTerminalKey !== PANEL_NO_TERMINAL_KEY &&
     initialTerminalKey !== agentKey;
-  const panes = splitsAllowed && !isMobile && !shellView && !sandboxOffline && agentKey !== null;
+  const panes = splitsAllowed && !shellView && !sandboxOffline && agentKey !== null;
   // The sidebar leaves out exactly the terminals the Terminal view reports it shows.
   const [terminalViewKeys, setTerminalViewKeys] = useState<readonly string[]>(NO_KEYS);
   usePublishMainTerminalKeys(conversationId, panes ? NO_KEYS : terminalViewKeys);

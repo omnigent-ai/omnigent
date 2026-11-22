@@ -16,6 +16,7 @@ import {
 } from "@/lib/terminalGroups";
 
 import { MissingTerminalPane } from "./MissingTerminalPane";
+import { usePanesSplitsAllowed } from "./panesViewGate";
 import { PaneCloseDialog } from "./PaneCloseDialog";
 import { applyDividerResizes } from "./paneDividerCorners";
 import { moveSplitPane } from "./paneMove";
@@ -36,11 +37,7 @@ import {
 import { readTerminalGroups, updateTerminalGroups, useTerminalGroups } from "./terminalGroupsStore";
 import { useTerminalPaneActions } from "./terminalPaneActions";
 import { unzoomPane, useZoomedPaneKey } from "./terminalPaneZoom";
-import {
-  NO_MAIN_SPLIT_MEMBERS,
-  useMainOwnedTerminalKeys,
-  useTerminalSplitsAllowed,
-} from "./terminalPlacement";
+import { NO_MAIN_SPLIT_MEMBERS, useMainOwnedTerminalKeys } from "./terminalPlacement";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 
 export interface SidebarTerminalPanesProps {
@@ -73,7 +70,7 @@ export function SidebarTerminalPanes({
   const { terminals, listCompleteAt, isFetching } = useTerminals(conversationId);
   const { setTerminalConnectionState, markTerminalActive } = useTerminalStatuses(terminals);
   // Splits are managed only by desktop owners; everyone else sees one shell per tab.
-  const splitAllowed = useTerminalSplitsAllowed(readOnly);
+  const splitAllowed = usePanesSplitsAllowed(readOnly);
   const storedGroups = useTerminalGroups(conversationId);
   const mainOwned = useMainOwnedTerminalKeys(conversationId, { splitMembers: mainSplitMembers });
   const mainKeys = [...mainOwned];
