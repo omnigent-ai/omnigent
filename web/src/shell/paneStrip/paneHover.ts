@@ -1,9 +1,6 @@
-// Whether each pane's row shows its actions on hover: the pointer is over the pane (as the page
-// sees it, or as the frame showing its content reports, since the page can't see the pointer
-// over a cross-origin frame), or the row has the keyboard. Typing doesn't hide them.
-// Hover rests on pointer moves, not enter and leave, which don't cross origins reliably: a move
-// the page sees means the pointer is over no frame, and a frame's "over" means it's in no other
-// pane. When the page drops a frame's hover it tells the frame, so its next move reports afresh.
+// Each pane row's hover, from the page's pointer moves, its frames' reports and the row's focus.
+// Moves, not enter and leave, drive it, since those don't cross origins reliably: a move the page
+// sees means no frame has the pointer, so a frame whose hover drops is told to report afresh.
 
 /** What a pane's frame says about the pointer over it; a "typing" report still means "over". */
 export type FrameHoverState = "over" | "out" | "typing";

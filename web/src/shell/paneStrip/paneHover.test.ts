@@ -1,11 +1,19 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createPaneHover, HOVER_GRACE_MS, stripShown } from "./paneHover";
+
+const created: { dispose: () => void }[] = [];
+
+afterEach(() => {
+  for (const hover of created.splice(0)) hover.dispose();
+  vi.useRealTimers();
+});
 
 function setup() {
   vi.useFakeTimers();
   const dropped: string[] = [];
   const hover = createPaneHover({ onFrameHoverDropped: (key) => dropped.push(key) });
+  created.push(hover);
   const shown = (key: string, dividerDragging = false) =>
     stripShown(hover.get(key), dividerDragging);
   return { hover, dropped, shown };
@@ -62,7 +70,7 @@ describe("createPaneHover", () => {
   it("drops a frame's hover the page has seen past, and rearms that frame", () => {
     const { hover, dropped, shown } = setup();
     hover.frameReported("a", "over");
-    // The page sees the pointer at all: it isn't over a frame.
+    // A move the page sees means the pointer is over no frame.
     hover.pointerMoved(null);
     vi.advanceTimersByTime(HOVER_GRACE_MS);
     expect(shown("a")).toBe(false);
