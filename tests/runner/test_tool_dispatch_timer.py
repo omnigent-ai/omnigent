@@ -18,18 +18,19 @@ class _TimerServer:
     ``requests`` records ``(method, path, json body or None)`` for every call,
     e.g. ``("POST", "/v1/sessions/conv_parent/timers", {"seconds": 5})``.
     ``lost_reply_path`` names a path whose requests time out after arriving, e.g.
-    ``"/v1/info"``.
+    ``"/v1/info"``. ``info`` is the ``/v1/info`` body, e.g. ``{}`` for an older server
+    that predates ``session_timers``.
     """
 
     def __init__(
         self,
         *,
-        timers_supported: bool = True,
+        info: dict[str, Any] | None = None,
         status_code: int = 201,
         reply: dict[str, Any] | None = None,
         lost_reply_path: str | None = None,
     ) -> None:
-        self.timers_supported = timers_supported
+        self.info = info if info is not None else {"session_timers": True}
         self.status_code = status_code
         self.reply = reply if reply is not None else {"timer_id": "t1", "status": "scheduled"}
         self.lost_reply_path = lost_reply_path
@@ -41,7 +42,7 @@ class _TimerServer:
         if request.url.path == self.lost_reply_path:
             raise httpx.ReadTimeout("timed out", request=request)
         if request.url.path == "/v1/info":
-            return httpx.Response(200, json={"session_timers": self.timers_supported})
+            return httpx.Response(200, json=self.info)
         return httpx.Response(self.status_code, json=self.reply)
 
 
@@ -74,8 +75,14 @@ async def test_timer_set_saves_the_timer_on_the_server() -> None:
     ]
 
 
-async def test_timer_set_refuses_a_server_without_timers() -> None:
-    server = _TimerServer(timers_supported=False)
+@pytest.mark.parametrize(
+    "info",
+    [{"session_timers": False}, {}],
+    ids=["timers-off", "older-server"],
+)
+async def test_timer_set_refuses_a_server_without_timers(info: dict[str, Any]) -> None:
+    """With timers off, or on a server that predates them, nothing is saved anywhere."""
+    server = _TimerServer(info=info)
     result = await _call(server, "sys_timer_set", {"seconds": 5})
     assert "does not run timers" in result["error"]
     assert [method for method, _path, _body in server.requests] == ["GET"]

@@ -3331,6 +3331,37 @@ def test_list_reads_only_the_requested_kinds(store: SqlAlchemyScheduledTaskStore
     }
 
 
+def test_listing_one_kind_reads_only_its_rows_through_the_kind_index(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """However many timers an owner has, the Automations list never examines them."""
+    from sqlalchemy import event
+
+    store.create(
+        scheduled_task_id=_uid("st_plan_automation"),
+        **_reminder_fields(kind="automation", rrule="FREQ=DAILY"),
+    )
+    _timer(store, "st_plan_timer", repeat=True)
+    queries = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        store.list(owner_user_id="u", kinds=("automation",))
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+    [(statement, parameters)] = queries
+    if store._engine.dialect.name != "sqlite":
+        return
+    with store._engine.connect() as connection:
+        plan = str(connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all())
+    assert "ix_scheduled_tasks_kind_scope" in plan and "SEARCH" in plan, plan
+    assert "TEMP B-TREE" not in plan, plan
+
+
 def test_inbox_failures_never_list_timers(store: SqlAlchemyScheduledTaskStore) -> None:
     automation = store.create(
         scheduled_task_id=_uid("inbox-automation"),
