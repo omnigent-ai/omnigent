@@ -7,7 +7,7 @@ import type { Plugin, ProxyOptions } from "vite";
 import { defineConfig } from "vitest/config";
 import { shikiManualChunk } from "./vite.shiki";
 import { streamdownManualChunk } from "./vite.streamdown";
-import { workerBuildOptions } from "./vite.workerExports";
+import { devServerWorkerExports, workerBuildOptions } from "./vite.workerExports";
 
 // Databricks workspace-hosted omnigent is mounted behind the api-proxy at this
 // path; a local / self-hosted server mounts at the root. Mirrors the Python
@@ -256,9 +256,16 @@ export default defineConfig(({ command }) => ({
   // `{base}/assets/...` at serve time (see `_rewrite_web_ui_index` in
   // omnigent/server/app.py). Dev (`vite serve`) stays at root.
   base: command === "build" ? "./" : "/",
-  plugins: [devProxyAuth(), safariLookbehindWorkarounds(), react(), tailwindcss()],
+  plugins: [
+    devProxyAuth(),
+    safariLookbehindWorkarounds(),
+    react(),
+    tailwindcss(),
+    ...devServerWorkerExports.plugins(),
+  ],
   // Workers have no DOM, so they take a package's worker entry over its browser one.
   worker: workerBuildOptions,
+  optimizeDeps: devServerWorkerExports.optimizeDeps,
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

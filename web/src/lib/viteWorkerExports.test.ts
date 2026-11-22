@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import { rootPackageName, workerEntryFor } from "../../vite.workerExports";
+import type { UserConfig } from "vite";
+
+import { devServerWorkerExports, rootPackageName, workerEntryFor } from "../../vite.workerExports";
 
 const ROOT = "/app/node_modules/.pnpm/pkg@1/node_modules/pkg";
 
@@ -46,5 +48,19 @@ describe("rootPackageName", () => {
     ]) {
       expect(rootPackageName(source)).toBeNull();
     }
+  });
+});
+
+describe("devServerWorkerExports", () => {
+  it("swaps entries only while serving the app, not for a build or the tests", () => {
+    const [plugin] = devServerWorkerExports.plugins();
+    const apply = plugin!.apply as (
+      config: UserConfig,
+      env: { command: "serve" | "build"; mode: string },
+    ) => boolean;
+    expect(apply({}, { command: "serve", mode: "development" })).toBe(true);
+    expect(apply({}, { command: "serve", mode: "test" })).toBe(false);
+    expect(apply({}, { command: "build", mode: "production" })).toBe(false);
+    expect(devServerWorkerExports.optimizeDeps.rolldownOptions.plugins).toHaveLength(1);
   });
 });

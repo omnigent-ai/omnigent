@@ -78,3 +78,18 @@ export const workerBuildPlugins = (): Plugin[] => [preferWorkerExports()];
 
 /** The `worker` options of every web build, the app's and the embed's. */
 export const workerBuildOptions = { plugins: workerBuildPlugins };
+
+/**
+ * What `vite serve` needs for the same: the page and its workers share each module and the
+ * dependency pre-bundle there, so both take the worker entries, which need no DOM either. Tests
+ * keep the browser entries the page builds with.
+ */
+export const devServerWorkerExports = {
+  plugins: (): Plugin[] => [
+    {
+      ...preferWorkerExports(),
+      apply: (_config, { command, mode }) => command === "serve" && mode !== "test",
+    },
+  ],
+  optimizeDeps: { rolldownOptions: { plugins: [preferWorkerExports()] } },
+};

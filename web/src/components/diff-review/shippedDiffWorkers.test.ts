@@ -2,20 +2,22 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { build, type Rollup } from "vite";
+import { build, createServer, type Rollup } from "vite";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { RICH_MARKDOWN_REQUEST, richMarkdownAnswer, startInWorkerScope } from "@/test/workerScope";
 
-// The Markdown diff worker each real web build emits, the app's and the embed's.
+// The Markdown diff worker each real web build emits, the app's and the embed's, and the one
+// `vite serve` gives a page.
 const WEB = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const CONFIGS = ["vite.config.ts", "vite.embed.config.ts"];
+const SERVED_WORKER = "/src/components/diff-review/markdownDiffWorker.ts?worker_file&type=module";
 const workers = new Map<string, string>();
 const scratch = mkdtempSync(path.join(tmpdir(), "shipped-diff-workers-"));
 const proxyLog: unknown[][] = [];
 
 // The dev proxy settings a developer's shell may carry: a token, which the app config reads
-// while serving, and a local server, so nothing here asks a workspace for one.
+// while serving, and a local server, so serving never asks a workspace for one.
 const PROXY_ENV = { OMNIGENT_AUTH_TOKEN: "test-token", OMNIGENT_URL: "http://localhost:6767" };
 
 async function emittedMarkdownWorker(configFile: string): Promise<string> {
@@ -63,4 +65,35 @@ describe.each(CONFIGS)("the Markdown diff worker %s emits", (config) => {
     expect(answer.rendered).toContain("katex");
     expect(answer.text).toContain("Price & fees");
   });
+});
+
+describe("the Markdown diff worker vite serve gives a page", () => {
+  it("loads no package entry that needs the DOM as it starts", async () => {
+    const server = await createServer({
+      configFile: path.join(WEB, "vite.config.ts"),
+      root: WEB,
+      logLevel: "silent",
+      cacheDir: path.join(scratch, "vite-cache"),
+      server: { middlewareMode: true, hmr: false, ws: false },
+    });
+    // Every module the worker imports, as the dev server serves each one.
+    const served = new Map<string, string>();
+    const visit = async (url: string): Promise<void> => {
+      if (served.has(url)) return;
+      const result = await server.transformRequest(url);
+      served.set(url, result?.code ?? "");
+      const imports = [...served.get(url)!.matchAll(/(?:from|import)\s*["'](\/[^"']+)["']/g)];
+      await Promise.all(imports.map(([, imported]) => visit(imported!)));
+    };
+    try {
+      await visit(SERVED_WORKER);
+    } finally {
+      await server.close();
+    }
+    // The browser entries of hast-util-from-html-isomorphic and decode-named-character-reference.
+    const domAtStartup = /new DOMParser\(|document\.createElement\(["']i["']\)/;
+    const needsDom = [...served].filter(([, code]) => domAtStartup.test(code)).map(([url]) => url);
+    expect(served.size).toBeGreaterThan(10);
+    expect(needsDom).toEqual([]);
+  }, 120_000);
 });
