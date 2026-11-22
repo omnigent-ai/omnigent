@@ -128,6 +128,12 @@ real data unless the person gives it to you.
   - `unique`: `collection`, `fields` (1–3 top-level fields).
   - `reference`: `collection`, `field`, `target` (a collection), `on_delete`
     `restrict`, `cascade` or `unset`.
+
+  Rules keep their state in one 30 KiB record: about 30 bytes plus the record
+  ID for each value a `unique` rule holds, and, while a write runs, that
+  write's record. So a `unique` rule's collection fits fewer records than its
+  limit when IDs are long, and one record in a ruled collection must stay well
+  under 30 KiB; past that a write fails as over capacity. Keep IDs short there.
 - `actions`: what a person can ask the gadget session for, each
   `{"name", "description", "params"}`. `name` is like `run_card`;
   `description` tells the agent what to do; `params` is an optional JSON Schema.

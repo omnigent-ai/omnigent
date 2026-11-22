@@ -21,7 +21,10 @@ broken. A rule only refuses writes that make it worse, so data that predates a
 rule stays editable.
 
 The guard record rotates every ``EPOCH_WRITES`` writes because a record holds a
-bounded number of revisions.
+bounded number of revisions. Its state, with a change in flight, must fit in
+``MAX_GUARD_BYTES``: each unique key costs its digest plus the holding record's
+ID, so how many records a ``unique`` rule allows depends on their IDs and on the
+size of the record being written, not only on the collection's record limit.
 """
 
 from __future__ import annotations

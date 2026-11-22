@@ -516,6 +516,62 @@ def test_a_unique_rule_refuses_duplicates_and_frees_a_deleted_value(gadgets: Fix
     )
 
 
+def test_rule_state_is_bounded_by_its_bytes_not_a_record_count(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The guard holds every unique key with its record's ID, plus the write in flight, in one
+    # record: what fits depends on IDs and values, so a write can be refused below max_records.
+    monkeypatch.setattr(constraints_module, "MAX_GUARD_BYTES", 2048)
+    service = gadgets.service()
+    rule = {"name": "one_title", "kind": "unique", "collection": "cards", "fields": ["title"]}
+    app = publish_ruled_board(service, [rule])
+
+    # One write whose own record is too large for the guard is refused as capacity.
+    with pytest.raises(CapacityExceeded, match="too large"):
+        rpc(
+            service,
+            app,
+            "create",
+            id="big",
+            value={"title": "x" * 2048, "column": "todo"},
+            operation_id="c-big",
+        )
+
+    created: list[dict] = []
+    with pytest.raises(CapacityExceeded):
+        for index in range(1000):
+            created.append(
+                rpc(
+                    service,
+                    app,
+                    "create",
+                    id=f"card-{index:04d}-{'i' * 24}",
+                    value={"title": f"T{index}", "column": "todo"},
+                    operation_id=f"c-{index}",
+                )
+            )
+    # Well under the store's record limit, and what was written stays readable.
+    assert 0 < len(created) < 100
+    assert len(rpc(service, app, "list", limit=100)["items"]) == len(created)
+    # Deleting a record frees its key's bytes for the next write.
+    rpc(
+        service,
+        app,
+        "delete",
+        id=created[0]["id"],
+        if_version=created[0]["version"],
+        operation_id="d-0",
+    )
+    assert rpc(
+        service,
+        app,
+        "create",
+        id="after",
+        value={"title": "Again", "column": "todo"},
+        operation_id="c-after",
+    )
+
+
 @pytest.mark.parametrize("on_delete", ["restrict", "cascade", "unset"])
 def test_a_reference_rule_checks_targets_and_applies_its_delete_rule(
     gadgets: Fixture, on_delete: str

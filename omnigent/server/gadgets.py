@@ -26,6 +26,7 @@ from starlette.responses import JSONResponse, Response
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.gadgets.access import GadgetAccess
+from omnigent.gadgets.actions import ACTION_STATES
 from omnigent.gadgets.constraints import ConstraintViolation
 from omnigent.gadgets.progress import SessionStateReader
 from omnigent.gadgets.service import GadgetError, GadgetService, GadgetViewer, canonical_bytes
@@ -55,6 +56,28 @@ MAX_RPC_BYTES = 64 * 1024
 # ``GET /gadgets/{id}/revisions/published``: revision IDs are hex, so this never names one.
 PUBLISHED_REVISION = "published"
 _NO_STORE = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+
+
+def _json_body(properties: dict[str, Any], required: Sequence[str]) -> dict[str, Any]:
+    """OpenAPI for a route that reads its JSON body itself."""
+    return {
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": properties,
+                        "required": list(required),
+                    }
+                }
+            },
+        }
+    }
+
+
+_ACTION_ENTRY_RESPONSE = {"description": "The ledger entry: `id`, `value`, `version` and times."}
+_STRING = {"type": "string"}
 # The gadget codes for the server's general error codes, so every /v1/gadgets route,
 # sharing included, answers in one vocabulary.
 _OMNIGENT_CODES = {
@@ -412,7 +435,15 @@ def create_gadgets_router(
         body = await _body(request)
         return _json(await run(request, lambda service: service.set_gadget_session(app_id, body)))
 
-    @router.get("/gadgets/{app_id}/actions")
+    @router.get(
+        "/gadgets/{app_id}/actions",
+        openapi_extra={
+            "parameters": [
+                {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 50}},
+                {"name": "cursor", "in": "query", "schema": _STRING},
+            ]
+        },
+    )
     async def list_actions(app_id: str, request: Request) -> Response:
         """A page of the action ledger: ``{"items", "next_cursor"}``."""
         limit = request.query_params.get("limit", "50")
@@ -423,7 +454,18 @@ def create_gadgets_router(
             await run(request, lambda service: service.list_actions(app_id, int(limit), cursor))
         )
 
-    @router.post("/gadgets/{app_id}/actions")
+    @router.post(
+        "/gadgets/{app_id}/actions",
+        status_code=201,
+        responses={
+            201: _ACTION_ENTRY_RESPONSE,
+            200: {"description": "Joined an open request for the same action (`merged`)."},
+        },
+        openapi_extra=_json_body(
+            {"action": _STRING, "params": {"type": "object"}, "operation_id": _STRING},
+            ["action", "operation_id"],
+        ),
+    )
     async def request_action(app_id: str, request: Request) -> Response:
         """Queue ``{"action", "params", "operation_id"}``; 201, or 200 when it joined an
         open request for the same action (``"merged": true``)."""
@@ -438,7 +480,20 @@ def create_gadgets_router(
         ids = [value for value in request.query_params.get("ids", "").split(",") if value]
         return _json(await run(request, lambda service: service.action_progress(app_id, ids)))
 
-    @router.patch("/gadgets/{app_id}/actions/{action_id}")
+    @router.patch(
+        "/gadgets/{app_id}/actions/{action_id}",
+        responses={200: _ACTION_ENTRY_RESPONSE},
+        openapi_extra=_json_body(
+            {
+                "if_version": _STRING,
+                "operation_id": _STRING,
+                "state": {"type": "string", "enum": list(ACTION_STATES)},
+                "summary": _STRING,
+                "session_id": _STRING,
+            },
+            ["if_version", "operation_id"],
+        ),
+    )
     async def update_action(app_id: str, action_id: str, request: Request) -> Response:
         """Record ``state``, ``summary`` or ``session_id`` with ``if_version`` and
         ``operation_id``."""
@@ -449,7 +504,10 @@ def create_gadgets_router(
             )
         )
 
-    @router.post("/gadgets/{app_id}/actions/{action_id}/delivery")
+    @router.post(
+        "/gadgets/{app_id}/actions/{action_id}/delivery",
+        openapi_extra=_json_body({"session_id": _STRING}, ["session_id"]),
+    )
     async def record_delivery(app_id: str, action_id: str, request: Request) -> Response:
         """Record that the web app posted the action into ``{"session_id"}``."""
         body = await _body(request, MAX_RPC_BYTES)

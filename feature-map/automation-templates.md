@@ -184,6 +184,9 @@ to customize.
   settings reveal their controls. Escape closes the active selector or folder browser
   without discarding the automation draft. The footer stays visible while the form scrolls.
   Gallery cards use two columns on desktop and one on narrow screens.
+- `prefilled-link`: `/tasks?new=1&name=…&prompt=…&schedule=<RRULE>` opens New
+  automation filled in for review (a gadget's **Make it an automation** uses it);
+  nothing is saved until the user saves, and New afterwards starts empty.
 
 ## How to get to it (user POV)
 

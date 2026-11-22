@@ -316,6 +316,16 @@ the header menu), and each place is a separate entry point.
   with its cost, including its own sub-agents; an unpriced one shows no cost.
   A Claude sub-agent shows its Claude session's transcript estimate as `~$x.xx`. The
   Agents list and graph show the same costs beside each agent.
+- `gadgets`: with the server's `gadgets` feature on, a session's side panel
+  shows the gadgets linked to it as tabs, and **New → Gadget** adds one; with it
+  off none of this appears. A tab can fill the screen, leaving only the gadget
+  and its **Open session** button. Opening a gadget from inside the app (the
+  Gadget page, its pin under **Gadget** in the sidebar, an in-app link) fills the
+  screen and leaves the sidebar as it was; loading a gadget's link fresh fills
+  the screen with the sidebar collapsed. A gadget action that needs a session
+  keeps the gadget full screen: it goes to the linked session, or opens the
+  **Create session** menu over a dimmed page, and the session created there is
+  linked to the gadget and gets the action.
 
 ## How to get to it (user POV)
 
