@@ -96,18 +96,34 @@ describe("matchSessions", () => {
     expect(matchSessions(sessions, "https://github.com/acme/app/pull/8")).toEqual([]);
   });
 
-  it("finds a pull request however its link is cased, keeping sub-page boundaries", () => {
+  it.each([
+    "https://github.com/ACME/App/pull/42",
+    "https://GITHUB.com/acme/APP/pull/42/files",
+    "https://GITHUB.COM/ACME/APP/PULL/42",
+    "https://GitHub.com/Acme/App/PuLl/42/FiLeS",
+    "HTTPS://github.com/acme/app/pull/42/",
+  ])("finds a pull request however its link is cased: %s", (link) => {
     const sessions = [withPullRequest("linked", 42), withPullRequest("longer", 420)];
-    expect(ids(matchSessions(sessions, "https://github.com/ACME/App/pull/42"))).toEqual(["linked"]);
-    expect(ids(matchSessions(sessions, "https://GITHUB.com/acme/APP/pull/42/files"))).toEqual([
-      "linked",
-    ]);
+    expect(isPullRequestLookup(link)).toBe(true);
+    expect(ids(matchSessions(sessions, link))).toEqual(["linked"]);
+  });
+
+  it("keeps a pull request's number whole, in any case", () => {
+    const sessions = [withPullRequest("linked", 42)];
+    expect(matchSessions(sessions, "https://github.com/acme/app/PULL/420/files")).toEqual([]);
+    expect(matchSessions(sessions, "https://github.com/acme/app/pull/4")).toEqual([]);
+    // Not a pull request page, so it's text to search for.
+    expect(isPullRequestLookup("https://github.com/acme/app/PULL/42x/files")).toBe(false);
+    expect(isPullRequestLookup("https://github.com/acme/app/PULLS")).toBe(false);
   });
 
   it("knows a pull request reference when it sees one", () => {
     expect(isPullRequestLookup(" #8 ")).toBe(true);
     expect(isPullRequestLookup("https://github.com/acme/app/pull/8")).toBe(true);
     expect(isPullRequestLookup("https://gitlab.example.com/acme/app/-/merge_requests/8")).toBe(
+      true,
+    );
+    expect(isPullRequestLookup("https://GitLab.example.com/Acme/App/-/Merge_Requests/8")).toBe(
       true,
     );
     expect(isPullRequestLookup("pr 8")).toBe(false);
