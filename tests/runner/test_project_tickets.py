@@ -92,6 +92,44 @@ TICKET = "c" * 32
             f"/{TICKET}",
             {"stage_id": "review", "comment": "Check the demo"},
         ),
+        (
+            "sys_ticket_stages_update",
+            {"stages": [{"id": "inbox", "name": " Inbox "}]},
+            "PUT",
+            "/stages",
+            {"stages": [{"id": "inbox", "name": "Inbox", "instructions": ""}], "moves": {}},
+        ),
+        (
+            "sys_ticket_stages_update",
+            {
+                "stages": [
+                    {"id": "inbox", "name": "Inbox", "color": None, "icon": None},
+                    {
+                        "id": "resolved",
+                        "name": "Resolved",
+                        "instructions": " Attach evidence ",
+                        "color": "green",
+                        "icon": "circle-check",
+                    },
+                ],
+                "moves": {"open": "inbox", "done": "resolved"},
+            },
+            "PUT",
+            "/stages",
+            {
+                "stages": [
+                    {"id": "inbox", "name": "Inbox", "instructions": ""},
+                    {
+                        "id": "resolved",
+                        "name": "Resolved",
+                        "instructions": "Attach evidence",
+                        "color": "green",
+                        "icon": "circle-check",
+                    },
+                ],
+                "moves": {"open": "inbox", "done": "resolved"},
+            },
+        ),
     ],
 )
 async def test_tools_use_only_the_callers_project(name, args, method, suffix, expected):
@@ -177,6 +215,44 @@ async def test_get_returns_paged_activity_outputs_and_sessions():
         ("sys_ticket_list", {"limit": 101}),
         ("sys_session_link_ticket", {"ticket_id": TICKET, "action": "remove", "involvement": ""}),
         ("sys_ticket_comment", {"ticket_id": TICKET, "text": "Hi", "notify_orchestrator": False}),
+        ("sys_ticket_stages_update", {"stages": []}),
+        (
+            "sys_ticket_stages_update",
+            {"stages": [{"id": "open", "name": "A"}, {"id": "open", "name": "B"}]},
+        ),
+        (
+            "sys_ticket_stages_update",
+            {"stages": [{"id": "open", "name": " New "}, {"id": "other", "name": "new"}]},
+        ),
+        ("sys_ticket_stages_update", {"stages": [{"id": "open", "name": " "}]}),
+        (
+            "sys_ticket_stages_update",
+            {"stages": [{"id": "../other", "name": "New"}]},
+        ),
+        (
+            "sys_ticket_stages_update",
+            {"stages": [{"id": "open", "name": "New", "is_complete": True}]},
+        ),
+        (
+            "sys_ticket_stages_update",
+            {"stages": [{"id": "open", "name": "New"}], "initial_stage_id": "open"},
+        ),
+        (
+            "sys_ticket_stages_update",
+            {"stages": [{"id": "open", "name": "New"}], "project_id": PROJECT},
+        ),
+        (
+            "sys_ticket_stages_update",
+            {"stages": [{"id": "open", "name": "New", "icon": "unknown"}]},
+        ),
+        (
+            "sys_ticket_stages_update",
+            {"stages": [{"id": "open", "name": "New"}], "moves": {"open": "open"}},
+        ),
+        (
+            "sys_ticket_stages_update",
+            {"stages": [{"id": "open", "name": "New"}], "moves": {"removed": "missing"}},
+        ),
     ],
 )
 async def test_invalid_tool_args_make_no_request(name, args):
@@ -190,7 +266,14 @@ async def test_invalid_tool_args_make_no_request(name, args):
 
 
 @pytest.mark.parametrize("status,project_id", [(200, None), (403, PROJECT)])
-async def test_source_errors_are_reported_without_writes(status, project_id):
+@pytest.mark.parametrize(
+    "name,args",
+    [
+        ("sys_ticket_create", {"title": "Work"}),
+        ("sys_ticket_stages_update", {"stages": [{"id": "open", "name": "New"}]}),
+    ],
+)
+async def test_source_errors_are_reported_without_writes(status, project_id, name, args):
     def handler(request):
         assert request.method == "GET"
         return httpx.Response(status, json={"project_id": project_id})
@@ -198,13 +281,11 @@ async def test_source_errors_are_reported_without_writes(status, project_id):
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://test"
     ) as client:
-        assert "error" in json.loads(
-            await execute_ticket_tool("sys_ticket_create", {"title": "Work"}, client, SOURCE)
-        )
+        assert "error" in json.loads(await execute_ticket_tool(name, args, client, SOURCE))
 
 
 def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
-    assert len(TICKET_TOOLS) == 7
+    assert len(TICKET_TOOLS) == 8
     for tool in TICKET_TOOLS.values():
         properties = tool().get_schema()["function"]["parameters"]["properties"]
         assert (
@@ -220,3 +301,13 @@ def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
             & properties.keys()
         )
         assert "delete" not in tool.name()
+    schema = TICKET_TOOLS["sys_ticket_stages_update"]().get_schema()["function"]["parameters"]
+    assert set(schema["properties"]) == {"stages", "moves"}
+    assert schema["required"] == ["stages"]
+    assert set(schema["$defs"]["TicketStageDefinition"]["properties"]) == {
+        "id",
+        "name",
+        "instructions",
+        "color",
+        "icon",
+    }

@@ -487,6 +487,7 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_ticket_get",
         "sys_ticket_create",
         "sys_ticket_update",
+        "sys_ticket_stages_update",
         "sys_ticket_comment",
         "sys_session_link_ticket",
         "sys_ticket_link",
@@ -511,6 +512,7 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "message",
     ]
     assert tools_by_name["sys_session_link_pr"]["parameters"]["required"] == ["url"]
+    assert tools_by_name["sys_ticket_stages_update"]["parameters"]["required"] == ["stages"]
     assert tools_by_name["ui_open_file"]["parameters"]["required"] == ["path"]
     assert tools_by_name["ui_open_file"]["parameters"]["additionalProperties"] is False
     # A url + token prove the localhost relay HTTP server actually started

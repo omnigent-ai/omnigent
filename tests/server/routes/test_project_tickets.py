@@ -292,7 +292,16 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
     assert "agent_guidance" not in (await project_client.get(base)).json()
     stages = await project_client.get(base + "/stages")
     assert stages.status_code == 200 and stages.json()["initial_stage_id"] == "open"
-    ticket = (await project_client.post(base, json={"title": "Investigate"})).json()
+    ticket = (
+        await project_client.post(
+            base,
+            json={
+                "title": "Investigate",
+                "description": "Keep context",
+                "tags": [{"key": "needs-human"}],
+            },
+        )
+    ).json()
     configuration = {
         "stages": [
             {"id": "triage", "name": "New"},
@@ -307,19 +316,43 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
         ],
         "moves": {"open": "triage"},
     }
-    response = await project_client.put(base + "/stages", json=configuration)
-    assert response.status_code == 200, response.text
-    assert response.json()["initial_stage_id"] == "triage"
-    assert [stage["is_complete"] for stage in response.json()["stages"]] == [False, False, True]
+    events_before = (await project_client.get(f"{base}/{ticket['id']}/events")).json()
+    rejected = json.loads(
+        await execute_ticket_tool(
+            "sys_ticket_stages_update",
+            {"stages": configuration["stages"]},
+            project_client,
+            source,
+        )
+    )
+    assert "HTTP 400" in rejected["error"]
+    assert "contains tickets" in rejected["detail"]
+    assert (await project_client.get(base + "/stages")).json() == stages.json()
+    assert (await project_client.get(f"{base}/{ticket['id']}")).json() == ticket
+    assert (await project_client.get(f"{base}/{ticket['id']}/events")).json() == events_before
+    configured = json.loads(
+        await execute_ticket_tool(
+            "sys_ticket_stages_update", configuration, project_client, source
+        )
+    )
+    assert configured["initial_stage_id"] == "triage"
+    assert [stage["is_complete"] for stage in configured["stages"]] == [False, False, True]
+    assert (await project_client.get(base + "/stages")).json() == configured
     assert (await project_client.get(base + "/stages", params={"include_usage": True})).json()[
         "occupied_stage_ids"
     ] == ["triage"]
     human_ticket = (await project_client.get(f"{base}/{ticket['id']}")).json()
     assert human_ticket["stage_id"] == "triage"
+    assert human_ticket["description"] == "Keep context"
+    assert human_ticket["tags"] == ticket["tags"]
     assert "agent_guidance" not in human_ticket
+    events = (await project_client.get(f"{base}/{ticket['id']}/events")).json()["data"]
+    assert events[:-1] == events_before["data"]
+    assert events[-1]["session_id"] == source
+    assert events[-1]["payload"]["reason"] == "stage_removed"
     assert (await project_client.post(base, json={"title": "Next"})).json()["stage_id"] == "triage"
     listed = json.loads(await execute_ticket_tool("sys_ticket_list", {}, project_client, source))
-    assert listed["stages"] == response.json()["stages"]
+    assert listed["stages"] == configured["stages"]
     assert listed["agent_guidance"] == PROJECT_TICKET_WORK_INSTRUCTION
     detail = json.loads(
         await execute_ticket_tool(
@@ -378,6 +411,26 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
         await project_client.patch(f"{base}/{ticket['id']}", json={"stage_id": "foreign"})
     ).status_code == 400
     assert (await project_client.get(base, params={"stage_id": "foreign"})).status_code == 400
+    reordered = json.loads(
+        await execute_ticket_tool(
+            "sys_ticket_stages_update",
+            {
+                "stages": [
+                    configuration["stages"][1],
+                    {"id": "triage", "name": "Queued"},
+                    configuration["stages"][2],
+                ]
+            },
+            project_client,
+            source,
+        )
+    )
+    assert reordered["initial_stage_id"] == "verifying"
+    assert [stage["id"] for stage in reordered["stages"]] == ["verifying", "triage", "resolved"]
+    assert reordered["stages"][1]["name"] == "Queued"
+    assert reordered["stages"][0]["color"] == "purple"
+    assert reordered["stages"][0]["icon"] == "search"
+    assert (await project_client.get(f"{base}/{ticket['id']}")).json()["stage_id"] == "resolved"
 
 
 async def test_agent_source_is_project_scoped_owned_bound_and_private(multi_user_client, db_uri):

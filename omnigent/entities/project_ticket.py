@@ -42,15 +42,14 @@ TICKET_PAGE_MAX = 100
 STAGE_EDIT_TICKET_MAX = 500
 
 
-class TicketStage(BaseModel):
+class TicketStageDefinition(BaseModel):
+    """User-editable stage fields shared by the board and agent tools."""
+
     model_config = ConfigDict(extra="forbid")
 
     id: TicketStageId
     name: str = Field(min_length=1, max_length=60)
     instructions: str = Field(default="", max_length=500)
-    is_complete: bool = Field(
-        default=False, description="Derived from the final stage's position."
-    )
     color: TicketStageColor | None = Field(
         default=None, description="Visual color only; null uses the default appearance."
     )
@@ -64,10 +63,16 @@ class TicketStage(BaseModel):
         return value.strip()
 
     @model_validator(mode="after")
-    def require_name(self) -> TicketStage:
+    def require_name(self) -> TicketStageDefinition:
         if not self.name:
             raise ValueError("stage name must not be empty")
         return self
+
+
+class TicketStage(TicketStageDefinition):
+    is_complete: bool = Field(
+        default=False, description="Derived from the final stage's position."
+    )
 
 
 class TicketStages(BaseModel):

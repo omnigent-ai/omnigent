@@ -2,7 +2,7 @@
 
 from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.entities.project_ticket import (
     CommentOnTicket,
@@ -10,8 +10,10 @@ from omnigent.entities.project_ticket import (
     LinkRelatedTicket,
     TicketEventKind,
     TicketSessionLinkOptions,
+    TicketStageDefinition,
     TicketStageId,
     UpdateTicket,
+    UpdateTicketStages,
 )
 from omnigent.tools.base import Tool
 
@@ -37,6 +39,26 @@ class GetTicket(BaseModel):
 
 class EditTicket(UpdateTicket):
     ticket_id: str
+
+
+class EditTicketStages(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    stages: list[TicketStageDefinition] = Field(
+        min_length=1,
+        max_length=20,
+        description="Complete desired stage list in column order, including unchanged fields.",
+    )
+    moves: dict[TicketStageId, TicketStageId] = Field(
+        default_factory=dict,
+        max_length=20,
+        description="Removed stage IDs mapped to surviving destinations for their tickets.",
+    )
+
+    @model_validator(mode="after")
+    def validate_configuration(self) -> "EditTicketStages":
+        UpdateTicketStages.model_validate(self.model_dump())
+        return self
 
 
 class AddTicketComment(CommentOnTicket):
@@ -129,6 +151,26 @@ class SysTicketUpdateTool(_TicketTool):
     arguments = EditTicket
 
 
+class SysTicketStagesUpdateTool(_TicketTool):
+    tool_name = "sys_ticket_stages_update"
+    help_text = (
+        "Replace this project's board columns with the complete ordered stages list. "
+        "Read current definitions with sys_ticket_list or sys_ticket_get first; keep stable "
+        "IDs and unchanged names, instructions, colors and icons. Supply a unique ID for a "
+        "new stage. The first stage starts tickets; the last means complete. Do not send "
+        "initial_stage_id or is_complete. Removing an occupied stage requires moves from "
+        "its ID to a surviving stage ID. Configuration and ticket moves commit together "
+        "or not at all; tickets, history and response routing are preserved. Returns the "
+        "saved definitions. This edits board structure; move individual tickets with "
+        "sys_ticket_update. Stage edits do not start work or grant approvals."
+    )
+    arguments = EditTicketStages
+
+    @classmethod
+    def description(cls) -> str:
+        return cls.help_text + " Scoped to this session's project."
+
+
 class SysTicketCommentTool(_TicketTool):
     tool_name = "sys_ticket_comment"
     help_text = (
@@ -165,6 +207,7 @@ TICKET_TOOL_CLASSES = (
     SysTicketGetTool,
     SysTicketCreateTool,
     SysTicketUpdateTool,
+    SysTicketStagesUpdateTool,
     SysTicketCommentTool,
     SysSessionLinkTicketTool,
     SysTicketLinkTool,

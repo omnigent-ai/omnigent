@@ -56,6 +56,15 @@ The first stage starts new tickets and the last means complete; `initial_stage_i
 and `is_complete` are derived from that order, never from names such as "Done".
 Refresh the definitions after a rejected move: stages can change while you work.
 
+To edit the board's columns, use `sys_ticket_stages_update` with the complete
+ordered `stages` list. Read the current definitions first and preserve unchanged
+`id`, `name`, `instructions`, `color` and `icon` fields; give new stages unique IDs.
+Omit the derived `initial_stage_id` and `is_complete` fields. Removing a column
+containing tickets requires `moves: {removed_stage_id: surviving_stage_id}`;
+the edit and moves commit together without deleting history. Use this for
+authorized workflow changes, not to disguise stalled work or bypass acceptance.
+Use `sys_ticket_update` for an individual ticket's progress.
+
 The defaults are **Open → Planning → Working → Review → Done**, but projects
 can rename, reorder, add or remove them. A project might instead use
 New → Investigating → Mitigating → Verifying → Resolved. Stages describe work,
