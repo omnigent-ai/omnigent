@@ -357,29 +357,48 @@ class _TurnRunner:
     def __init__(self) -> None:
         self.running: set[str] = set()
         self.held: dict[str, list[str]] = {}
-        # Cleared by a test to hold the reply to a message until it is set again.
-        self.replies = asyncio.Event()
-        self.replies.set()
         self.message_received = asyncio.Event()
+        self._next_reply_gate: asyncio.Event | None = None
+
+    def hold_next_reply(self) -> asyncio.Event:
+        """Hold the reply to the next message the runner takes until the returned event is set."""
+        self._next_reply_gate = asyncio.Event()
+        self.message_received.clear()
+        return self._next_reply_gate
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         if request.method != "POST" or not request.url.path.endswith("/events"):
             return _runner(request)
-        self.message_received.set()
-        await self.replies.wait()
         session_id = request.url.path.split("/")[3]
         if session_id in self.running:
             item_id = json.loads(request.content)["persisted_item_id"]
             self.held.setdefault(session_id, []).append(item_id)
             detail = "Message buffered; active turn will process it."
-            return httpx.Response(202, json={"status": "buffered", "detail": detail})
-        self.running.add(session_id)
-        return httpx.Response(202, json={"status": "accepted", "detail": "Turn started."})
+            reply = httpx.Response(202, json={"status": "buffered", "detail": detail})
+        else:
+            self.running.add(session_id)
+            reply = httpx.Response(202, json={"status": "accepted", "detail": "Turn started."})
+        gate, self._next_reply_gate = self._next_reply_gate, None
+        self.message_received.set()
+        if gate is not None:
+            await gate.wait()
+        return reply
 
-    async def continue_turn(self, session_id: str, store: SqlAlchemyConversationStore) -> None:
-        """Start a turn with the held messages as the turn before it ends, with no idle edge."""
+    def steer(self, session_id: str) -> None:
+        """Take the oldest held message into the running turn."""
+        self.held[session_id].pop(0)
+
+    async def continue_turn(
+        self, session_id: str, store: SqlAlchemyConversationStore, *, names_items: bool = True
+    ) -> None:
+        """Start a turn with the held messages as the turn before it ends, with no idle edge.
+
+        :param names_items: Name the held messages on the running edge; older runners do not.
+        """
         held = self.held.pop(session_id)
-        edge = {"type": "session.status", "status": "running", "input_item_ids": held}
+        edge: dict[str, Any] = {"type": "session.status", "status": "running"}
+        if names_items:
+            edge["input_item_ids"] = held
         stream = _RunnerStream([edge])
         await _relay_runner_stream_once(session_id, stream, store)  # type: ignore[arg-type]
 
@@ -398,9 +417,14 @@ async def turn_runner(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[_TurnRun
         yield turns
 
 
+@pytest.mark.parametrize("names_items", [True, False], ids=["runner_names_items", "older_runner"])
 @pytest.mark.parametrize("held_kind", ["message", "skill"])
 async def test_sdk_side_chat_leaves_out_the_messages_a_runner_held_for_its_next_turn(
-    client: httpx.AsyncClient, turn_runner: _TurnRunner, held_kind: str, db_uri: str
+    client: httpx.AsyncClient,
+    turn_runner: _TurnRunner,
+    held_kind: str,
+    names_items: bool,
+    db_uri: str,
 ) -> None:
     """Messages a runner held while a turn ran start the next turn; a side chat leaves them out."""
     session_id = await _session(client, native=False)
@@ -417,12 +441,35 @@ async def test_sdk_side_chat_leaves_out_the_messages_a_runner_held_for_its_next_
         await _post(client, session_id, {"type": "slash_command", "data": skill})
     await _send(client, session_id, "And the docs")
     await _mirror(client, session_id, "assistant", "The parser looks fine", "r2")
-    await turn_runner.continue_turn(session_id, SqlAlchemyConversationStore(db_uri))
+    store = SqlAlchemyConversationStore(db_uri)
+    await turn_runner.continue_turn(session_id, store, names_items=names_items)
     await _mirror(client, session_id, "assistant", "Checking the rest", "r3")
     await _send(client, session_id, "Then summarize")
 
     history = await _side_chat_history(client, session_id)
     assert history == [_CODENAME, _NOTED, "Review the parser", "On it"]
+
+
+async def test_sdk_side_chat_cuts_before_a_held_skill_that_follows_a_steered_message(
+    client: httpx.AsyncClient, turn_runner: _TurnRunner, db_uri: str
+) -> None:
+    """A held skill that starts the next turn after a steered message cuts before its command."""
+    session_id = await _session(client, native=False)
+    await _sdk_turn(client, session_id, lambda: _send(client, session_id, _CODENAME), _NOTED, "r1")
+    turn_runner.end_turn(session_id)
+    await _sdk_turn(
+        client, session_id, lambda: _send(client, session_id, "Review the parser"), "On it", "r2"
+    )
+    await _send(client, session_id, "Also check the lexer")
+    turn_runner.steer(session_id)
+    skill = {"kind": "skill", "name": "grill-me", "arguments": "the parser"}
+    await _post(client, session_id, {"type": "slash_command", "data": skill})
+    await _mirror(client, session_id, "assistant", "Both look fine", "r2")
+    await turn_runner.continue_turn(session_id, SqlAlchemyConversationStore(db_uri))
+    await _mirror(client, session_id, "assistant", "Grilling it", "r3")
+
+    history = await _side_chat_history(client, session_id)
+    assert history == [_CODENAME, _NOTED, "Review the parser", "On it", "Also check the lexer"]
 
 
 async def test_sdk_side_chat_keeps_a_message_a_runner_steered_into_a_finished_turn(
@@ -432,23 +479,27 @@ async def test_sdk_side_chat_keeps_a_message_a_runner_steered_into_a_finished_tu
     session_id = await _session(client, native=False)
     await _sdk_turn(client, session_id, lambda: _send(client, session_id, _CODENAME), _NOTED, "r1")
     turn_runner.end_turn(session_id)
-    await _sdk_turn(
-        client, session_id, lambda: _send(client, session_id, "Review the parser"), "On it", "r2"
-    )
+    # The runner's reply to the request comes back only after its turn has ended.
+    reply = turn_runner.hold_next_reply()
+    sending = asyncio.create_task(_send(client, session_id, "Review the parser"))
+    await asyncio.wait_for(turn_runner.message_received.wait(), timeout=30)
+    sessions_module._publish_status(session_id, "running")
+    await _mirror(client, session_id, "assistant", "On it", "r2")
     await _send(client, session_id, "Also check the lexer")
     await _mirror(client, session_id, "assistant", "Both look fine", "r2")
     turn_runner.end_turn(session_id)
+    reply.set()
+    await sending
     finished = ["Review the parser", "On it", "Also check the lexer", "Both look fine"]
 
     # Also while the next message is persisted but still on its way to the runner.
-    turn_runner.replies.clear()
-    turn_runner.message_received.clear()
+    reply = turn_runner.hold_next_reply()
     sending = asyncio.create_task(_send(client, session_id, "Now add tests"))
     await asyncio.wait_for(turn_runner.message_received.wait(), timeout=30)
     try:
         assert await _side_chat_history(client, session_id) == [_CODENAME, _NOTED, *finished]
     finally:
-        turn_runner.replies.set()
+        reply.set()
         await sending
     sessions_module._publish_status(session_id, "running")
     await _mirror(client, session_id, "assistant", "Adding", "r3")
