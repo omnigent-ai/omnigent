@@ -41,6 +41,14 @@ export async function uploadFile(sessionId: string, file: File): Promise<Uploade
   };
 }
 
+export async function deleteSessionFile(sessionId: string, fileId: string): Promise<void> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(fileId)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok) throw await apiErrorFromResponse(res);
+}
+
 /**
  * Download a session's uploaded file back into a `File`, e.g. to attach it again.
  *

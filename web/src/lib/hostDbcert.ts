@@ -1,9 +1,6 @@
 /**
- * dbcert on a session's host (Databricks-internal). Arca boxes and managed
- * Arclets hold a copy of the laptop's corp certificate, which Arca Companion
- * syncs, and a laptop host has its own; tools that call internal services
- * fail once it expires. These helpers read and renew it through the
- * session's environment shell, on any host that has one.
+ * Reads and renews the dbcert credential on a session's host, through the
+ * session's environment shell. Any host that has one can be checked.
  */
 
 import { authenticatedFetch } from "@/lib/identity";
@@ -17,9 +14,8 @@ export const DBCERT_REFRESH_CHECK_COMMAND =
   'for c in dbcert setsid flock timeout; do command -v "$c" >/dev/null || exit 1; done';
 
 /**
- * Starts `dbcert` on the host and returns at once, because its browser sign-in
- * outlasts the server's shell-proxy timeout. On Arca, dbcert opens the sign-in
- * on the laptop through Arca Companion. `flock` stops a second click from
+ * Starts `dbcert` on the host and returns at once, because its sign-in can
+ * outlast the server's shell-proxy timeout. `flock` stops a second click from
  * starting a second sign-in, and `timeout` ends an abandoned one.
  */
 export const DBCERT_REFRESH_COMMAND = `${DBCERT_REFRESH_CHECK_COMMAND}; setsid flock -n "\${TMPDIR:-/tmp}/omnigent-dbcert-refresh.lock" timeout 300 dbcert --caller-name omnigent </dev/null >/dev/null 2>&1 &`;

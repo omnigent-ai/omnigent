@@ -104,7 +104,7 @@ jobs:
           path: .venv
           # Namespaced + container-scoped to match ui-snapshot.yml (built with
           # the container's system Python, not the host interpreter).
-          key: venv-uisnapshot-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+          key: venv-uisnapshot-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}-${{ hashFiles('uv.toml') }}
 
       - name: Install project + test dependencies
         run: uv sync --extra all --group test

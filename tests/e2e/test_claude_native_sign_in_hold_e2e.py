@@ -1,6 +1,6 @@
 """A message sent while Claude's launcher waits for a Databricks sign-in is sent after it.
 
-A launcher wrapper in front of ``claude`` (Isaac's ``ucode``, for example) can stop
+A launcher wrapper in front of ``claude`` (Isaac's launcher, for example) can stop
 on a device-code sign-in before Claude Code starts. This drives a real server,
 runner and tmux pane with such a launcher: the message must wait for the sign-in,
 then reach Claude's composer once, in order with a message queued behind it,

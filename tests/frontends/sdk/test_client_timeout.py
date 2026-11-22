@@ -18,19 +18,17 @@ async def test_client_timeout_applies_to_regular_requests_and_preserves_sse_time
             return httpx.Response(200, json={"ok": True})
         return httpx.Response(200, content=b"data: [DONE]\n\n")
 
-    client = OmnigentClient("http://example.invalid", timeout=0.1)
-    original_transport = client._http._transport
-    mock_transport = httpx.MockTransport(handler)
-    client._http._transport = mock_transport
+    # A caller's transport carries both regular requests and the stream.
+    client = OmnigentClient(
+        "http://example.invalid", timeout=0.1, transport=httpx.MockTransport(handler)
+    )
     try:
         response = await client._http.get("http://example.invalid/health")
         assert response.status_code == 200
 
         events = [event async for event in client.responses.stream(model="agent", input="hello")]
     finally:
-        client._http._transport = original_transport
         await client.close()
-        await mock_transport.aclose()
 
     assert events == []
     assert captured == [

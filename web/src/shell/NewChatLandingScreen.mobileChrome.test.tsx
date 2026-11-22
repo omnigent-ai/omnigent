@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useSidebarData", () => ({
   useLoadedConversations: () => ({ data: undefined, isLoading: false }),
+  useOptionalLoadedConversations: () => undefined,
 }));
 
 vi.mock("@/hooks/useSkills", () => ({
@@ -48,8 +49,10 @@ import { NewChatLandingScreen } from "./NewChatDialog";
 import { MobileHeaderButtonGroup } from "./MobileHeaderButton";
 import { MobileHeaderControlsProvider, MobileHeaderControlsSlot } from "./MobileHeaderControlsSlot";
 
+const replaceSearchParamsMock = vi.fn();
 vi.mock("@/lib/routing", () => ({
   useLocation: () => ({ hash: "", state: null }),
+  useReplaceSearchParams: () => replaceSearchParamsMock,
   useNavigate: () => vi.fn(),
   useSearchParams: () => [new URLSearchParams(), vi.fn()],
 }));

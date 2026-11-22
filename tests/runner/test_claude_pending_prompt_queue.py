@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
+import json
 import logging
+import re
 import threading
 import uuid
 from collections.abc import Callable
@@ -18,8 +21,10 @@ from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
+from omnigent.runner._entry import _run_inactivity_monitor
 from omnigent.scheduled_context import SCHEDULED_RUN_HEADER
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests._helpers.polling import poll_until_async
 from tests.debug_log_helpers import capture_debug_rows
 from tests.runner.conftest import (
     _FakeProcessManager,
@@ -73,6 +78,28 @@ async def _until(condition: Callable[[], bool]) -> None:
     async with asyncio.timeout(5):
         while not condition():
             await asyncio.sleep(0.01)
+
+
+async def _stream_failures(
+    client: Any, sid: str, *, accepts_input_only_failures: bool
+) -> list[dict[str, Any]]:
+    """Open the session stream as the server would and return the failures it sends."""
+    runner_app._session_event_queues_ref[sid].put_nowait(None)
+    params = {"accepts_input_only_failures": "true"} if accepts_input_only_failures else None
+    response = await client.get(f"/v1/sessions/{sid}/stream", params=params)
+    assert response.status_code == 200
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: {")
+    ]
+    return [event for event in events if event.get("type") == "response.failed"]
+
+
+@pytest.fixture(autouse=True)
+def _default_human_wait_hold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear an ambient human-wait hold so the default applies."""
+    monkeypatch.delenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", raising=False)
 
 
 @pytest.fixture
@@ -445,3 +472,186 @@ async def test_buffered_turn_restores_its_own_occurrence(
             if item.get("type") == "message"
         ]
         assert texts[-2:] == ["second", "third"]
+
+
+@pytest.mark.asyncio
+async def test_unanswered_prompt_reports_queued_messages_then_releases_runner(
+    monkeypatch: pytest.MonkeyPatch, pending_prompt: dict[str, bool]
+) -> None:
+    """When the hold runs out, each queued message is reported as not sent, then the runner stops.
+
+    The runner accepted these messages but holds them only in memory, so they
+    must not vanish silently when an unanswered prompt lets it idle out.
+    """
+    monkeypatch.setenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", "0.05")
+    monkeypatch.setattr(runner_app, "_server_accepts_input_only_failures", True)
+    app, _harness = _build_app()
+    sid = uuid.uuid4().hex
+    queued = [
+        {
+            **_message(text),
+            "pending_id": f"pending_{uuid.uuid4().hex}",
+            "input_stable_id": uuid.uuid4().hex,
+        }
+        for text in ("first follow-up", "second follow-up")
+    ]
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex})
+        for body in queued:
+            buffered = await client.post(f"/v1/sessions/{sid}/events", json=body)
+            assert buffered.status_code == 202
+            assert buffered.json()["status"] == "buffered"
+        assert sid in app.state.claude_prompt_waiters
+        assert app.state.has_active_work() is True
+
+        loop = asyncio.get_running_loop()
+        shutdowns: list[str] = []
+        monitor = asyncio.create_task(
+            _run_inactivity_monitor(
+                idle_timeout_s=0.02,
+                get_last_activity=lambda: loop.time() - 1.0,
+                has_active_work=app.state.has_active_work,
+                request_shutdown=lambda: shutdowns.append("shutdown"),
+                poll_interval_s=0.005,
+            )
+        )
+        try:
+            await poll_until_async(lambda: sid not in app.state.claude_prompt_waiters, timeout_s=5)
+            assert not app.state.session_message_buffers.get(sid)
+            # No server is reading the stream: the reports hold the runner.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(monitor), timeout=0.2)
+            assert shutdowns == []
+            failures = await _stream_failures(client, sid, accepts_input_only_failures=True)
+            await asyncio.wait_for(monitor, timeout=5)
+            assert shutdowns == ["shutdown"]
+            assert [
+                (
+                    failure["pending_id"],
+                    failure["input_stable_id"],
+                    failure["error"]["code"],
+                    failure["error"]["undelivered"],
+                    failure["input_only"],
+                    failure["input_content"],
+                )
+                for failure in failures
+            ] == [
+                (
+                    body["pending_id"],
+                    body["input_stable_id"],
+                    "native_prompt_wait_expired",
+                    True,
+                    True,
+                    body["content"],
+                )
+                for body in queued
+            ]
+            # Each failure names its own response, not the parked turn's.
+            response_ids = [failure["response"]["id"] for failure in failures]
+            assert all(re.fullmatch(r"resp_[0-9a-f]{32}", rid) for rid in response_ids)
+            assert len(set(response_ids)) == len(queued)
+        finally:
+            monitor.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await monitor
+            waiter = app.state.claude_prompt_waiters.get(sid)
+            if waiter is not None:
+                waiter.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await waiter
+
+
+@pytest.mark.asyncio
+async def test_prompt_waiter_outlives_the_hold_until_the_server_takes_input_only_failures(
+    monkeypatch: pytest.MonkeyPatch, pending_prompt: dict[str, bool]
+) -> None:
+    """A server without ``accepts_input_only_failures`` keeps queued messages queued.
+
+    An older server would end the parked turn on per-message failures and could
+    not recover their content, so the runner keeps the prompt waiter and its
+    messages past the hold and sends nothing. Once the server reopens the session
+    stream advertising the capability, the expiry goes ahead.
+    """
+    monkeypatch.setenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", "0.05")
+    monkeypatch.setattr(runner_app, "_server_accepts_input_only_failures", False)
+    app, _harness = _build_app()
+    sid = uuid.uuid4().hex
+    queued = [
+        {
+            **_message(text),
+            "pending_id": f"pending_{uuid.uuid4().hex}",
+            "input_stable_id": uuid.uuid4().hex,
+        }
+        for text in ("first follow-up", "second follow-up")
+    ]
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex})
+        for body in queued:
+            buffered = await client.post(f"/v1/sessions/{sid}/events", json=body)
+            assert buffered.json()["status"] == "buffered"
+        loop = asyncio.get_running_loop()
+        shutdowns: list[str] = []
+        monitor = asyncio.create_task(
+            _run_inactivity_monitor(
+                idle_timeout_s=0.02,
+                get_last_activity=lambda: loop.time() - 1.0,
+                has_active_work=app.state.has_active_work,
+                request_shutdown=lambda: shutdowns.append("shutdown"),
+                poll_interval_s=0.005,
+            )
+        )
+        try:
+            # Well past the hold: the older server gets nothing and the runner stays up.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(monitor), timeout=0.3)
+            assert shutdowns == []
+            assert sid in app.state.claude_prompt_waiters
+            assert len(app.state.session_message_buffers[sid]) == 2
+            assert await _stream_failures(client, sid, accepts_input_only_failures=False) == []
+
+            # The server reopens the session stream and advertises the capability; the
+            # expiry goes ahead and the next stream it opens takes the reports.
+            assert await _stream_failures(client, sid, accepts_input_only_failures=True) == []
+            await poll_until_async(lambda: sid not in app.state.claude_prompt_waiters, timeout_s=5)
+            failures = await _stream_failures(client, sid, accepts_input_only_failures=True)
+            await asyncio.wait_for(monitor, timeout=5)
+            assert shutdowns == ["shutdown"]
+            assert [failure["pending_id"] for failure in failures] == [
+                body["pending_id"] for body in queued
+            ]
+        finally:
+            monitor.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await monitor
+            waiter = app.state.claude_prompt_waiters.get(sid)
+            if waiter is not None:
+                waiter.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await waiter
+
+
+def test_prompt_wait_expired_failure_carries_content_only_within_the_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure carries a message's content only when it fits the event size limit."""
+    content = [{"type": "input_text", "text": "hi"}]
+    encoded_bytes = len(json.dumps(content, separators=(",", ":")).encode())
+    body = {**_message("hi"), "content": content}
+    monkeypatch.setattr(runner_app, "MAX_SESSION_EVENT_REQUEST_BYTES", encoded_bytes)
+    assert runner_app._prompt_wait_expired_failure(body)["input_content"] == content
+    monkeypatch.setattr(runner_app, "MAX_SESSION_EVENT_REQUEST_BYTES", encoded_bytes - 1)
+    assert "input_content" not in runner_app._prompt_wait_expired_failure(body)
+    # Non-ASCII text counts as UTF-8 bytes, as the server's request limit does,
+    # not as its longer escaped form.
+    wide = [{"type": "input_text", "text": "\u6f22\u5b57" * 4}]
+    wide_bytes = len(json.dumps(wide, separators=(",", ":"), ensure_ascii=False).encode())
+    assert wide_bytes < len(json.dumps(wide, separators=(",", ":")).encode())
+    monkeypatch.setattr(runner_app, "MAX_SESSION_EVENT_REQUEST_BYTES", wide_bytes)
+    wide_body = {**body, "content": wide}
+    assert runner_app._prompt_wait_expired_failure(wide_body)["input_content"] == wide
+    monkeypatch.setattr(runner_app, "MAX_SESSION_EVENT_REQUEST_BYTES", wide_bytes - 1)
+    assert "input_content" not in runner_app._prompt_wait_expired_failure(wide_body)
+    for malformed in ("hi", [], [{"type": "input_text", "text": object()}]):
+        failure = runner_app._prompt_wait_expired_failure({**body, "content": malformed})
+        assert "input_content" not in failure
+        assert failure["input_only"] is True

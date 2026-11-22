@@ -1199,12 +1199,12 @@ async def test_create_terminal_threads_agent_parent_os_env_through(
     ``omnigent claude`` wrapper) could spawn an unsandboxed
     terminal in a session whose YAML declared an egress allow-list.
     """
-    from omnigent.inner.datamodel import AgentDef, OSEnvSandboxSpec, OSEnvSpec
-
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    agent = AgentDef(
+    agent = AgentSpec(
+        spec_version=1,
         name="hardened",
+        executor=ExecutorSpec(),
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=str(workspace),
@@ -1220,7 +1220,7 @@ async def test_create_terminal_threads_agent_parent_os_env_through(
         assert request.url.path == "/v1/sessions/conv_test"
         return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_hardened"})
 
-    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+    async def _resolver(agent_id: str, session_id: str) -> AgentSpec:
         assert agent_id == "agent_hardened"
         assert session_id == "conv_test"
         return agent
@@ -1276,13 +1276,6 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
     could spawn the YAML-declared terminal name with a completely
     different command.
     """
-    from omnigent.inner.datamodel import (
-        AgentDef,
-        OSEnvSandboxSpec,
-        OSEnvSpec,
-        TerminalEnvSpec,
-    )
-
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     declared_zsh = TerminalEnvSpec(
@@ -1291,8 +1284,10 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
         env={"OPERATOR": "set"},
         os_env="inherit",
     )
-    agent = AgentDef(
+    agent = AgentSpec(
+        spec_version=1,
         name="hardened",
+        executor=ExecutorSpec(),
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=str(workspace),
@@ -1304,7 +1299,7 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
     async def _session_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_hardened"})
 
-    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+    async def _resolver(agent_id: str, session_id: str) -> AgentSpec:
         return agent
 
     server_client = httpx.AsyncClient(
@@ -1351,7 +1346,6 @@ async def test_create_terminal_rejects_unavailable_native_shell(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A mixed-version request cannot silently substitute another shell."""
-    from omnigent.inner.datamodel import AgentDef
     from omnigent.native.native_coding_agents import (
         CLAUDE_NATIVE_AGENT_NAME,
         native_shell_terminal_specs,
@@ -1365,15 +1359,17 @@ async def test_create_terminal_rejects_unavailable_native_shell(
     monkeypatch.setattr("shutil.which", lambda _name: None)
     monkeypatch.setattr("omnigent._platform._INTERACTIVE_SHELL_DIRS", ())
 
-    agent = AgentDef(
+    agent = AgentSpec(
+        spec_version=1,
         name=CLAUDE_NATIVE_AGENT_NAME,
+        executor=ExecutorSpec(),
         terminals=native_shell_terminal_specs(["fish"]),
     )
 
     async def _session_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_native"})
 
-    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+    async def _resolver(agent_id: str, session_id: str) -> AgentSpec:
         return agent
 
     server_client = httpx.AsyncClient(
@@ -1426,13 +1422,6 @@ async def test_create_terminal_resolves_declared_placeholder_cwd_to_workspace(
     workspace must be baked into the launched spec (never via
     ``cwd_override``, which the stub asserts stays ``None``).
     """
-    from omnigent.inner.datamodel import (
-        AgentDef,
-        OSEnvSandboxSpec,
-        OSEnvSpec,
-        TerminalEnvSpec,
-    )
-
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     # Declared shell owns its os_env with the placeholder cwd — the
@@ -1445,8 +1434,10 @@ async def test_create_terminal_resolves_declared_placeholder_cwd_to_workspace(
             sandbox=OSEnvSandboxSpec(type="none"),
         ),
     )
-    agent = AgentDef(
+    agent = AgentSpec(
+        spec_version=1,
         name="polly-like",
+        executor=ExecutorSpec(),
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=".",
@@ -1458,7 +1449,7 @@ async def test_create_terminal_resolves_declared_placeholder_cwd_to_workspace(
     async def _session_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_polly"})
 
-    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+    async def _resolver(agent_id: str, session_id: str) -> AgentSpec:
         return agent
 
     server_client = httpx.AsyncClient(
@@ -1719,6 +1710,8 @@ class _WatcherCapture:
         was wired.
     :param on_tick: The per-tick callback the registry passed (drives the
         claude-native status-file poller), or ``None`` if none was wired.
+    :param idle_poll_backoff_allowed: The native idle-poll backoff gate the
+        registry passed, or ``None`` when no backoff gate was wired.
     :param idle_threshold_s: The per-watcher idle threshold the registry
         passed, or ``None`` for the module default.
     :param poll_interval_s: The per-watcher poll interval the registry
@@ -1730,6 +1723,7 @@ class _WatcherCapture:
     on_idle: Callable[[], None] | None = None
     on_exit: Callable[[], None] | None = None
     on_tick: Callable[[], None] | None = None
+    idle_poll_backoff_allowed: Callable[[], bool] | None = None
     idle_threshold_s: float | None = None
     poll_interval_s: float | None = None
     replace: bool = False
@@ -1765,6 +1759,7 @@ def _make_capturing_instance(
         on_activity: Callable[[], None] | None = None,
         on_exit: Callable[[], None] | None = None,
         on_tick: Callable[[], None] | None = None,
+        idle_poll_backoff_allowed: Callable[[], bool] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
@@ -1774,6 +1769,7 @@ def _make_capturing_instance(
         capture.on_activity = on_activity
         capture.on_exit = on_exit
         capture.on_tick = on_tick
+        capture.idle_poll_backoff_allowed = idle_poll_backoff_allowed
         capture.idle_threshold_s = idle_threshold_s
         capture.poll_interval_s = poll_interval_s
         capture.replace = replace

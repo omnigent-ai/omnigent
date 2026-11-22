@@ -27,6 +27,7 @@ from omnigent.spec.types import (
 )
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.browser_agent_tools import ADVANCED_BROWSER_TOOL_NAMES
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.manager import _UCFunctionSchemaTool
 from omnigent.tools.mcp import clear_discovery_cache
@@ -76,18 +77,39 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_agent_get",
         "sys_agent_download",
         "sys_agent_list",
+        # Project and session organizing proxy owner-gated endpoints.
+        "sys_project_list",
+        "sys_session_link_pr",
+        "sys_session_update",
+        "sys_project_update",
         # Policy tools are always auto-registered so agents can
         # browse the registry and add policies at runtime.
         "sys_add_policy",
         "sys_policy_registry",
         # Scheduled-task management tools are always auto-registered
         # so agents can create, list, update, and delete recurring
-        # runs without spec opt-in. They are runner-dispatched via
-        # the Omnigent server's REST API.
+        # runs, and set one-time reminders, without spec opt-in. They
+        # are runner-dispatched via the Omnigent server's REST API.
         "sys_scheduled_task_create",
         "sys_scheduled_task_list",
         "sys_scheduled_task_update",
         "sys_scheduled_task_delete",
+        "sys_reminder_set",
+        # The session journal's tools are always auto-registered so every
+        # agent can keep a plan, step statuses and notes, and ask about a
+        # task; runner-dispatched.
+        "sys_journal_read",
+        "sys_journal_write_note",
+        "sys_journal_write_plan",
+        "sys_journal_write_status",
+        "sys_workflow_request_input",
+        "sys_workflow_save",
+        "sys_workflow_load",
+        "sys_workflow_list",
+        # The owner-Inbox tools register on every agent too; the runner drops
+        # them unless the server offers the Inbox. Schema-only; runner-dispatched.
+        "sys_user_inbox_post",
+        "sys_user_inbox_list",
         # Embedded-browser tools are always auto-registered (framework-
         # owned) so any agent can drive the desktop app's browser without
         # the spec opting in. Schema-only; runner-dispatched.
@@ -96,7 +118,20 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "browser_click",
         "browser_type",
         "browser_screenshot",
+        # Long-term memory tools are always auto-registered unless the spec
+        # sets ``tool_groups.memory: false``. Runner-dispatched to ``/v1/memory``.
+        "memory_search",
+        "memory_get",
+        "memory_list",
+        "memory_write",
+        "memory_delete",
+        # Session file tools are always auto-registered unless the spec sets
+        # ``tool_groups.files: false``. Runner-dispatched to the session's files.
+        "sys_upload_file",
+        "sys_list_files",
+        "sys_download_file",
     }
+    | ADVANCED_BROWSER_TOOL_NAMES
 )
 
 
@@ -1452,20 +1487,44 @@ def test_unknown_builtin_logs_warning_and_skips(caplog: pytest.LogCaptureFixture
     assert "Unknown built-in tool 'definitely_missing'" in caplog.text
 
 
-def test_create_builtin_handles_web_fetch_and_upload_file() -> None:
+def test_create_builtin_handles_web_fetch() -> None:
     from omnigent.spec.types import ExecutorSpec
 
     spec = AgentSpec(spec_version=1, executor=ExecutorSpec(config={"harness": "pi"}))
     mgr = ToolManager(spec)
 
     web_fetch = mgr._create_builtin("web_fetch", None)
-    upload_file = mgr._create_builtin("upload_file", None)
 
     assert web_fetch is not None
     assert type(web_fetch).__name__ == "WebFetchTool"
     assert web_fetch._parent_spec is spec
-    assert upload_file is not None
-    assert type(upload_file).__name__ == "UploadFileTool"
+
+
+@pytest.mark.parametrize(
+    "declared", ["upload_file", "list_files", "download_file", "sys_upload_file"]
+)
+def test_file_tools_register_by_default_and_are_not_declarable_builtins(
+    declared: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    The file tools register by default under their ``sys_`` names only. A
+    ``tools.builtins`` entry naming a file tool, old or new, is skipped with a
+    warning, and no old name is registered as an alias.
+
+    :param declared: The file tool name the spec lists, e.g. ``"upload_file"``.
+    :param caplog: Captures the skipped-builtin warning.
+    """
+    spec = AgentSpec(
+        spec_version=1, tools=ToolsConfig(builtins=[BuiltinToolConfig(name=declared)])
+    )
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        mgr = ToolManager(spec)
+
+    names = set(mgr.get_tool_names())
+    assert {"sys_upload_file", "sys_list_files", "sys_download_file"} <= names
+    assert not {"upload_file", "list_files", "download_file"} & names
+    assert type(mgr.get_tool("sys_upload_file")).__name__ == "UploadFileTool"
+    assert f"Unknown built-in tool {declared!r}" in caplog.text
 
 
 def test_os_env_registration_noops_when_factory_returns_none(
@@ -1720,11 +1779,16 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
             "sys_scheduled_task_list",
             "sys_scheduled_task_update",
             "sys_scheduled_task_delete",
+            "sys_reminder_set",
         }
     ),
     "comments": frozenset({"list_comments", "update_comment"}),
     "policies": frozenset({"sys_add_policy", "sys_policy_registry"}),
     "agent_discovery": frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list"}),
+    "projects": frozenset(
+        {"sys_project_list", "sys_session_update", "sys_project_update", "sys_session_link_pr"}
+    ),
+    "files": frozenset({"sys_upload_file", "sys_list_files", "sys_download_file"}),
 }
 
 
@@ -1739,7 +1803,7 @@ def _grouped_spec(**groups: bool) -> AgentSpec:
 
 
 def test_tool_groups_default_registers_every_group() -> None:
-    """An absent ``tool_groups:`` block changes nothing: all 16 register."""
+    """An absent ``tool_groups:`` block changes nothing: all 24 register."""
     names = _tool_names(_grouped_spec())
     for group, members in _TOOL_GROUP_MEMBERS.items():
         assert members <= names, f"{group} members missing by default: {members - names}"
@@ -1757,13 +1821,13 @@ def test_tool_groups_false_drops_only_that_group(group: str) -> None:
 
 def test_tool_groups_all_false_keeps_the_load_bearing_tools() -> None:
     """
-    With every group off, the 16 gated tools are gone but the session
+    With every group off, the 24 gated tools are gone but the session
     reads, ``sys_session_rename`` and ``sys_cancel_task`` stay: multi-agent
     participation and async handles depend on them, so they have no key.
     """
     names = _tool_names(_grouped_spec(**dict.fromkeys(_TOOL_GROUP_MEMBERS, False)))
     gated = frozenset().union(*_TOOL_GROUP_MEMBERS.values())
-    assert len(gated) == 16
+    assert len(gated) == 24
     assert not (gated & names)
     assert {
         "sys_session_list",

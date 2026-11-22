@@ -99,6 +99,17 @@ def test_native_harnesses_resume_warm() -> None:
         assert caps[harness].resume is Resume.WARM_REATTACH, harness
 
 
+def test_workspace_file_mentions_cover_native_agents_and_claude_sdk() -> None:
+    # Native executors deliver files as an "[Attached: <path>]" marker their CLI
+    # reads; claude-sdk's CLI reads it from the session workspace cwd.
+    declared = {
+        harness
+        for harness, capability in harness_capabilities().items()
+        if capability.workspace_file_mentions
+    }
+    assert declared == {agent.harness for agent in native_agents()} | {"claude-sdk"}
+
+
 def test_p0_bench_harnesses_declare_interrupt_and_streaming() -> None:
     # The harness bench live-probes these four and declares them SUPPORTED for
     # interrupt + streaming; the capability declaration must match so the bench
@@ -142,6 +153,7 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
     assert capability.shell_tool_name is None
     assert capability.shell_tool_prompt is None
     assert capability.instruction_delivery is InstructionDelivery.UNKNOWN
+    assert capability.workspace_file_mentions is None
     assert capability.as_dict() == {
         "integration_mode": "sdk-in-process",
         "elicitation": "none",
@@ -160,6 +172,7 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
         "shell_tool_name": None,
         "shell_tool_prompt": None,
         "instruction_delivery": "unknown",
+        "workspace_file_mentions": None,
     }
 
 
