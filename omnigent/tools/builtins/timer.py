@@ -130,7 +130,8 @@ class SysTimerSetTool(Tool):
             "a repeating timer skips a tick while this session is busy, and ticks "
             "missed while the server was down arrive as one late firing. Times are "
             "rounded up to whole seconds and are best effort: a firing can arrive "
-            "a little late, never early. The tool returns immediately with the "
+            "a little late, never early. Sessions in a permission mode that skips "
+            "approval can't set timers. The tool returns immediately with the "
             "timer_id and the first fire_at."
         )
 

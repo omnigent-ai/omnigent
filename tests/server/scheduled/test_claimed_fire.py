@@ -2334,13 +2334,32 @@ async def test_a_cancel_after_the_commit_stops_later_ticks_but_not_this_one(stor
     assert store.get(claimed.task.id) is None
 
 
-@pytest.mark.parametrize("problem", ["deleted", "archived", "no_access"])
-async def test_a_timer_whose_session_is_gone_stops_without_waking_it(store, problem) -> None:
+@pytest.mark.parametrize(
+    ("problem", "reason"),
+    [
+        ("deleted", "no longer exists"),
+        ("archived", "archived"),
+        ("no_access", "can no longer send"),
+        # Switched after the timer was set: a timer never runs it unattended in that mode.
+        ("skips_approval", "'bypassPermissions', which skips approval"),
+    ],
+)
+async def test_a_timer_stops_without_waking_a_session_it_may_no_longer_wake(
+    store, caplog, problem, reason
+) -> None:
+    caplog.set_level(logging.INFO)
     claimed = _claim_timer(store, repeat=True)
+    labels = (
+        {"omnigent.claude_native.permission_mode": "bypassPermissions"}
+        if problem == "skips_approval"
+        else {}
+    )
     sessions = (
         _ExistingConversationStore()
         if problem == "deleted"
-        else _ExistingConversationStore(_timer_session(archived=problem == "archived"))
+        else _ExistingConversationStore(
+            _timer_session(archived=problem == "archived", labels=labels)
+        )
     )
     permissions = FakePermissionStore()
     if problem == "no_access":
@@ -2351,6 +2370,12 @@ async def test_a_timer_whose_session_is_gone_stops_without_waking_it(store, prob
         launch_dispatch=dispatch,
     ).fire(claimed.task, claimed.lease)
     dispatch.assert_not_awaited()
+    assert _startup_outcomes(caplog) == [("skipped", "timer_session_unavailable")]
+    assert any(
+        f"timer {claimed.task.id} stopped: " in record.getMessage()
+        and reason in record.getMessage()
+        for record in caplog.records
+    )
     # The timer is gone, so no later tick tries the session again.
     assert store.get(claimed.task.id) is None
     assert store.list_due_tasks(claimed.task.next_run_at + 3600) == []

@@ -2738,7 +2738,7 @@ async def _side_chat_runner(
     """Find the runner a side chat shares with its source, as a message to it would.
 
     A side chat has no host of its own: its source's runner is relaunched on the
-    source's host if needed, while the timer's owner may still edit the source.
+    source's host if needed, while a timer may still wake the source.
 
     :param deps: The fire's stores and runner registries.
     :param task: The timer waking *conv*.
@@ -2752,11 +2752,16 @@ async def _side_chat_runner(
     )
     from omnigent.server.routes.sessions import _ensure_runner_relay_ready, _get_runner_client
 
-    if _side_chat_source_id(conv) is None:
+    source_id = _side_chat_source_id(conv)
+    if source_id is None:
         return None, conv
     runner_client = await _get_runner_client(conv.id, deps.runner_router, conversation=conv)
     if runner_client is not None:
         return runner_client, conv
+    # Recovery relaunches the source's runner, so the source must be one a timer may wake.
+    source = await asyncio.to_thread(deps.conversation_store.get_conversation, source_id)
+    if await _timer_session_problem(deps, task, source) is not None:
+        return None, conv
     runner_client, conv = await _recover_side_chat_runner_via_source(
         conv,
         app_state=deps.app_state,
@@ -2780,7 +2785,8 @@ async def _wake_host_owner(
     """Relaunch an exited shared runner through the session that owns its host.
 
     A sub-agent with no host of its own can't relaunch the runner it shares; the
-    ancestor that owns the host can, while the timer's owner may still send to it.
+    ancestor that owns the host can, while a timer may still wake it: its owner may
+    send to it, and its permission mode asks for approval.
 
     :param deps: The fire's stores and runner registries.
     :param task: The timer waking *conv*.
@@ -3296,7 +3302,11 @@ def _delivered_run_outcome(
 async def _timer_session_problem(
     deps: FireDeps, task: ScheduledTask, conv: Conversation | None
 ) -> str | None:
-    """Why a timer can no longer wake *conv*, its session, or ``None`` if it can."""
+    """Why a timer can no longer wake *conv*, its session, or ``None`` if it can.
+
+    A timer selects no permission mode of its own, so, like a continued automation that
+    doesn't select one, it never wakes a session whose mode skips approval.
+    """
     if conv is None:
         return "the session no longer exists"
     if conv.archived:
@@ -3311,6 +3321,12 @@ async def _timer_session_problem(
         conversation=conv,
     ):
         return "the timer's owner can no longer send messages to the session"
+    skipping_mode = session_approval_skipping_mode(conv)
+    if skipping_mode is not None:
+        return (
+            f"the session is in permission mode {skipping_mode!r}, which skips approval, "
+            "so a timer can't wake it unattended"
+        )
     return None
 
 

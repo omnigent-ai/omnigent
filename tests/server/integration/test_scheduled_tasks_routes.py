@@ -7366,6 +7366,28 @@ async def test_timer_routes_keep_to_the_callers_own_session(
 
 
 @pytest.mark.parametrize("auth_app", [True], indirect=True)
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"labels": {"omnigent.claude_native.permission_mode": "bypassPermissions"}},
+        {"terminal_launch_args": ["--dangerously-bypass-approvals-and-sandbox"]},
+    ],
+    ids=["mode-label", "launch-flag"],
+)
+async def test_a_session_whose_mode_skips_approval_cant_set_timers(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, fields: dict
+) -> None:
+    session_id = _owned_session(db_uri, **fields)
+    refused = await auth_client.post(
+        f"/v1/sessions/{session_id}/timers", json={"seconds": 60}, headers=_headers()
+    )
+    # A timer would wake the session unattended in that mode.
+    assert refused.status_code == 400, refused.text
+    assert "which skips approval" in refused.text
+    assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
+
+
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
 async def test_a_sub_agent_timer_routes_to_the_host_its_parent_runs_on(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:

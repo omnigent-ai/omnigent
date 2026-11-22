@@ -471,10 +471,12 @@ tunnel claims its firings.
   using the midnight-anchored RRULE search, and a timer is exempt from the automation
   minimum interval.
 - **Delivery.** The built-in executor skips the automation steps (budgets, sharing,
-  run labels) for a timer. A session that was deleted or archived, or that the owner
-  can no longer send to, records `skipped` (`timer_session_unavailable`) and deletes
-  the timer without waking anything. Otherwise `begin_timer_delivery` commits the
-  firing under the task lock that deleting takes, then the prompt, a hidden
+  run labels) for a timer. A session that was deleted or archived, that the owner
+  can no longer send to, or whose permission mode skips approval (which the route
+  also refuses at creation, as a continued automation must) records `skipped`
+  (`timer_session_unavailable`) and deletes the timer without waking anything.
+  Otherwise `begin_timer_delivery` commits the firing under the task lock that
+  deleting takes, then the prompt, a hidden
   (`is_meta`) user message, goes in through the continued-session wake and dispatch.
   A sub-agent session whose runner is gone first moves to its parent's live runner,
   output relay included, before anything launches a runner of its own, as a message

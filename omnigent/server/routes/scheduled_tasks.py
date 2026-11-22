@@ -2265,8 +2265,9 @@ def create_scheduled_tasks_router(
         :returns: ``timer_id``, ``status`` ``"scheduled"``, the UTC ``fire_at`` of the
             first firing, ``interval_seconds`` for a repeating timer (else ``None``),
             and the ``seconds``, ``repeat`` and ``note`` it was set with.
-        :raises OmnigentError: 400 for bad arguments, an archived session or a server
-            without the database scheduler; 403/404 as for posting a message.
+        :raises OmnigentError: 400 for bad arguments, an archived session, a session whose
+            permission mode skips approval, or a server without the database scheduler;
+            403/404 as for posting a message.
         """
         if not getattr(request.app.state, "session_timers_enabled", False):
             raise OmnigentError(
@@ -2291,6 +2292,18 @@ def create_scheduled_tasks_router(
         if conv.agent_id is None:
             raise OmnigentError(
                 "This session has no agent for a timer to wake", code=ErrorCode.INVALID_INPUT
+            )
+        from omnigent.server.scheduled.fire import session_approval_skipping_mode
+
+        # A timer selects no permission mode, so it never runs a session unattended in one
+        # that skips approval, as a continued automation can't without choosing it.
+        skipping_mode = session_approval_skipping_mode(conv)
+        if skipping_mode is not None:
+            raise OmnigentError(
+                f"This session is in permission mode {skipping_mode!r}, which skips approval, "
+                "so a timer can't wake it unattended; switch to a mode that asks for "
+                "approval or uses the auto classifier",
+                code=ErrorCode.INVALID_INPUT,
             )
         agent_id = conv.agent_id
         routing_host = await asyncio.to_thread(routing_host_id, conv, conversation_store)

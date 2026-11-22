@@ -4362,23 +4362,34 @@ async def test_a_sub_agent_follows_its_parents_new_runner_before_its_host_launch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source_mode", ["asks", "skips-approval"])
 async def test_a_side_chat_timer_recovers_its_sources_runner_as_a_message_would(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, source_mode: str
 ) -> None:
-    """A side chat has no host: its source's runner is recovered for it, never its own."""
+    """A side chat has no host: its source's runner is recovered for it, never its own.
+
+    A source whose permission mode skips approval is never relaunched for a timer.
+    """
     from omnigent.server.routes import sessions
     from omnigent.server.routes._sessions import orchestration
 
     labels = {SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: "conv_source"}
     side_chat = _continued_session(host_id=None, runner_id="gone", labels=labels)
     rebound = _continued_session(host_id=None, runner_id="source_runner", labels=labels)
+    source = _continued_session(
+        id="conv_source",
+        labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
+        if source_mode == "skips-approval"
+        else {},
+    )
     source_runner = object()
     monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=None))
     recover = AsyncMock(return_value=(source_runner, rebound))
     monkeypatch.setattr(orchestration, "_recover_side_chat_runner_via_source", recover)
     relay = AsyncMock()
     monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", relay)
-    relaunch = AsyncMock()
+    # A hostless side chat's own wake finds no runner, as the real one would.
+    relaunch = AsyncMock(side_effect=lambda **kwargs: (None, kwargs["conv"]))
     monkeypatch.setattr(sessions, "ensure_runner_connected", relaunch)
     send = AsyncMock()
     monkeypatch.setattr(fire_mod, "_send_prompt", send)
@@ -4386,10 +4397,16 @@ async def test_a_side_chat_timer_recovers_its_sources_runner_as_a_message_would(
     dispatch = fire_mod._make_reuse_dispatch(
         _deps(
             FakeScheduledTaskStore(rows={"task_1": task}),
-            conversation_store=_ExistingConversationStore(rebound),
+            conversation_store=_ExistingConversationStore(rebound, source),
         )
     )
 
+    if source_mode == "skips-approval":
+        with pytest.raises(RuntimeError, match="no runner can be reached"):
+            await dispatch(side_chat, task)
+        recover.assert_not_awaited()
+        send.assert_not_awaited()
+        return
     await dispatch(side_chat, task)
 
     relaunch.assert_not_awaited()
@@ -4404,13 +4421,14 @@ async def test_a_side_chat_timer_recovers_its_sources_runner_as_a_message_would(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("owner_usable", [True, False], ids=["wakes-host-owner", "owner-unusable"])
+@pytest.mark.parametrize("owner", ["usable", "inaccessible", "skips-approval"])
 async def test_a_sub_agents_exited_runner_is_relaunched_through_the_session_owning_its_host(
-    monkeypatch: pytest.MonkeyPatch, owner_usable: bool
+    monkeypatch: pytest.MonkeyPatch, owner: str
 ) -> None:
     """A runner-created sub-agent has no host; its parent's host relaunches their runner.
 
-    The parent is only woken while the timer's owner may still send to it.
+    The parent is only woken while a timer may still wake it: the timer's owner may
+    send to it, and its permission mode asks for approval.
     """
     from omnigent.server.routes import sessions
 
@@ -4420,7 +4438,12 @@ async def test_a_sub_agents_exited_runner_is_relaunched_through_the_session_owni
     healed = _continued_session(
         kind="sub_agent", parent_conversation_id="conv_parent", runner_id="new", host_id=None
     )
-    parent = _continued_session(id="conv_parent")
+    parent = _continued_session(
+        id="conv_parent",
+        labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
+        if owner == "skips-approval"
+        else {},
+    )
     parent_runner = object()
     monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=None))
     # No ancestor runner is live until the parent's is relaunched.
@@ -4437,7 +4460,7 @@ async def test_a_sub_agents_exited_runner_is_relaunched_through_the_session_owni
     send = AsyncMock()
     monkeypatch.setattr(fire_mod, "_send_prompt", send)
     permissions = FakePermissionStore()
-    if not owner_usable:
+    if owner == "inaccessible":
         permissions.unowned.add("conv_parent")
     task = _continuing_task()
     dispatch = fire_mod._make_reuse_dispatch(
@@ -4449,7 +4472,7 @@ async def test_a_sub_agents_exited_runner_is_relaunched_through_the_session_owni
     )
     woken = lambda: [call.kwargs["session_id"] for call in wake.await_args_list]  # noqa: E731
 
-    if owner_usable:
+    if owner == "usable":
         await dispatch(child, task)
         assert woken() == ["conv_parent"]
         assert heal.await_count == 2
