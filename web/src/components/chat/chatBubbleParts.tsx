@@ -49,7 +49,7 @@ import {
   parseDesignRequest,
   type DesignRequest,
 } from "@/components/BrowserPane/designTools/parseDesignRequest";
-import { SessionMentionPill } from "@/components/blocks/ChatMarkdown";
+import { SessionMessageLabel } from "@/components/blocks/SessionMessageCard";
 import {
   BlockRenderer,
   FilePathAwareMessageResponse,
@@ -81,7 +81,6 @@ import {
 import { readableSentText, replaceSentMentions } from "@/lib/composerMentions";
 import { mentionPillMarkdown } from "@/lib/mentionPills";
 import { splitSessionMessageOrigin, type SessionMessageOrigin } from "@/lib/sessionMessageOrigin";
-import { useSessionLabel } from "@/hooks/useSessionLabel";
 import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
   attachmentLabel,
@@ -93,6 +92,8 @@ import {
   keyedAttachments,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
+import { isCommandListed } from "@/store/paletteCommands";
+import { forkFromResponseAvailability, userMessageLinkId } from "./messageActions";
 import { getCurrentAuthorId, getCurrentUserId } from "@/lib/identity";
 import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { QueryClientContext } from "@tanstack/react-query";
@@ -121,6 +122,8 @@ import { codexAsyncQuestionReplyText } from "@/lib/codexAsyncQuestionReply";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { usePeerSessionMessageDisplay } from "@/lib/peerSessionMessagePreferences";
 import type { BackgroundTaskInfo, PendingInput, SessionStatus } from "@/lib/types";
 import {
@@ -155,6 +158,13 @@ export function extractUserText(content: MessageContentBlock[]): string {
   return readableSentText(userMessageBody(content)).trimEnd();
 }
 
+/** What Copy puts on the clipboard for a user message: a shell command keeps its `!`. */
+export function userBubbleCopyText(bubble: Extract<Bubble, { kind: "user" }>): string {
+  return bubble.shellCommand !== undefined
+    ? `!${bubble.shellCommand}`
+    : extractUserText(bubble.content);
+}
+
 /** A user message's text for rendering: mention markers become inline pills. */
 function userMarkdownText(content: MessageContentBlock[]): string {
   return replaceSentMentions(userMessageBody(content), mentionPillMarkdown).trimEnd();
@@ -164,28 +174,18 @@ function userMarkdownText(content: MessageContentBlock[]): string {
 function SessionMessageOriginLine({
   sourceId,
   currentSessionId,
-  className,
 }: {
   sourceId: string;
   currentSessionId: string | null;
-  className?: string;
 }) {
-  const label = useSessionLabel(sourceId, currentSessionId);
   return (
-    <div
-      data-testid="message-origin"
-      className={cn("flex shrink-0 items-center gap-1 text-xs text-muted-foreground", className)}
-    >
-      <CornerDownRightIcon className="size-3 shrink-0" />
-      <span>From</span>
-      {label ? (
-        <SessionMentionPill id={sourceId} isSubagent={label.isSubagent}>
-          @{label.title}
-        </SessionMentionPill>
-      ) : (
-        <span>another session</span>
-      )}
-    </div>
+    <SessionMessageLabel
+      sessionId={sourceId}
+      currentSessionId={currentSessionId}
+      verb="From"
+      icon={CornerDownRightIcon}
+      testId="message-origin"
+    />
   );
 }
 
@@ -1092,8 +1092,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // - input_file: always render as a chip (non-image files can't be
   //   previewed inline).
   const published = usePublishedComposerCommands(sessionId);
-  const text =
-    bubble.shellCommand !== undefined ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
+  const text = userBubbleCopyText(bubble);
   // The backend classifies the raw block, before sender and context wrappers
   // are stripped for display.
   const rawText =
@@ -1124,9 +1123,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const awaitingAgent = Boolean(bubble.pending && bubble.awaitingAgent);
   const { toggleActions, visibilityClassName, visibilityToggle, actionsId } =
     useMessageActionVisibility(awaitingAgent, awaitingAgent && !text);
-  const { isLinkCopied, handleCopyLink } = useCopyMessageLink(
-    bubble.pending ? null : bubble.itemId,
-  );
+  const { isLinkCopied, handleCopyLink } = useCopyMessageLink(userMessageLinkId(bubble));
   // Collapse long prompts by default to avoid expensive Markdown parsing and
   // a large DOM for text the user hasn't asked to read yet.
   const isLong = renderedText.length > COLLAPSE_THRESHOLD;
@@ -1472,8 +1469,10 @@ function AssistantBubble({
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(bubble.responseId);
   const flashing = useChatStore((s) => s.flashItemId === bubble.responseId);
   const foldNarration = useFoldAssistantNarration();
+  const workflowsEnabled = isFeatureEnabled(useServerInfo(), "workflows");
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
+  const forkAvailability = forkFromResponseAvailability(forkDialog, bubble.lifecycle);
   const queryClient = useContext(QueryClientContext);
   const handleRetryError = useCallback(
     async (item: Extract<RenderItem, { kind: "error" }>) => {
@@ -1539,6 +1538,7 @@ function AssistantBubble({
     showsWorking,
     defaultExpanded: bubble.defaultExpanded,
     foldNarration,
+    workflowsEnabled,
   });
 
   // Elicitation cards want full chat-column width to match the composer.
@@ -1650,7 +1650,7 @@ function AssistantBubble({
                 {/* Fork from this response: clone the session with history
                     truncated after this turn. Hidden while streaming and when
                     the session can't be forked. */}
-                {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
+                {forkDialog && isCommandListed(forkAvailability) && (
                   <DisabledActionTooltip reason={forkDialog.disabledReason} label="Fork from here">
                     <MessageAction
                       tooltip={forkDialog.disabledReason ? undefined : "Fork from here"}

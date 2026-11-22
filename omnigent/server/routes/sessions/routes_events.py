@@ -206,6 +206,7 @@ from omnigent.server.routes._sessions.helpers import (
     _background_task_delivery_status,
     _build_actor,
     _build_skill_slash_command_policy_body,
+    _delete_session_tree_files,
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
     _extract_user_text_from_event,
@@ -4538,34 +4539,12 @@ def register_events_routes(
                 exclude_conversation_id=conv.id,
                 fail_if_unavailable=True,
             )
-        # Session file cleanup. delete_all_for_session returns only the blob
-        # keys that became orphaned — a blob still shared by a fork in another
-        # session is not returned, so the fork's attachment survives.
+        # The subtree delete below also removes every sub-agent, so clean their
+        # files too; a blob a fork in another session still shares survives.
         if file_store is not None and artifact_store is not None:
-            orphaned_blob_keys = await asyncio.to_thread(
-                file_store.delete_all_for_session, session_id
+            await _delete_session_tree_files(
+                conversation_store, file_store, artifact_store, session_id
             )
-            # Best-effort: a backend failure on one blob must not abort the
-            # delete after the file rows are already gone.
-            failed_blob_count = 0
-            for blob_key in orphaned_blob_keys:
-                try:
-                    await asyncio.to_thread(artifact_store.delete, blob_key)
-                except Exception as exc:
-                    failed_blob_count += 1
-                    _logger.warning(
-                        "Failed to delete attachment blob %s for session %s: %s",
-                        blob_key,
-                        session_id,
-                        type(exc).__name__,
-                    )
-            if failed_blob_count:
-                _logger.warning(
-                    "Session %s deleted with %d of %d attachment blobs left behind",
-                    session_id,
-                    failed_blob_count,
-                    len(orphaned_blob_keys),
-                )
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.pop(session_id, None)
         deleted = await conversation_store.delete_conversation(session_id)

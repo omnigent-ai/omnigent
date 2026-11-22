@@ -10055,6 +10055,8 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
     assert info["last_activity_at"] == 42
     assert info["pending_elicitations"] == []
     assert info["pending_elicitation_count"] == 0
+    # A server that predates the field reports no mode.
+    assert info["permission_mode"] is None
     assert not any(p.startswith("/v1/runners") for p in requested_paths)
 
 
@@ -10450,6 +10452,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "sub_agent_name": "researcher",
                     "llm_model": "anthropic/claude-sonnet-4-6",
                     "model_override": "claude-opus-4-8",
+                    "permission_mode": "approve-for-me",
                     "workspace": "/repo",
                     "git_branch": "feature/x",
                     "project_id": "proj_1",
@@ -10503,6 +10506,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     # default. "anthropic/claude-sonnet-4-6" here would mean the
     # override was ignored.
     assert info["model"] == "claude-opus-4-8"
+    assert info["permission_mode"] == "approve-for-me"
     # Two outstanding approval prompts surfaced from the snapshot — both
     # the prompts themselves and a count. If the projection dropped the
     # prompts (count-only), the orchestrator couldn't tell what the

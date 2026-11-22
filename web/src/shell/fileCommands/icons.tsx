@@ -7,6 +7,7 @@ import {
   ExternalLinkIcon,
   FileTextIcon,
   FolderInputIcon,
+  FolderOpenIcon,
   HistoryIcon,
   Link2Icon,
   type LucideIcon,
@@ -26,6 +27,7 @@ export const FILE_COMMAND_ICONS: Record<FileCommandId, LucideIcon> = {
   "copy-relative-path": ClipboardCopyIcon,
   "copy-previous-path": HistoryIcon,
   "copy-link": Link2Icon,
+  reveal: FolderOpenIcon,
   "open-in-vscode": SquareCodeIcon,
   "open-in-cursor": SquareCodeIcon,
 };

@@ -213,7 +213,11 @@ vi.mock("@/lib/serverOrigin", () => ({
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
 import { Sidebar } from "./Sidebar";
-import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "./sidebarNav";
+import {
+  COLLAPSED_SESSION_FAMILIES_STORAGE_KEY,
+  EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
+  MAX_STORED_COLLAPSED_SESSION_FAMILIES,
+} from "./sidebarNav";
 import { useSessionImportStore } from "@/store/sessionImport";
 import * as identity from "@/lib/identity";
 
@@ -1949,6 +1953,54 @@ describe("Sidebar failed session indicator", () => {
     expect(within(row).getByRole("img", { name: "Latest message is an error" })).toBe(badge);
   });
 
+  it("shows unread output over background work, then the background spinner once seen", () => {
+    const session = conv("conv_background", "Claude Code", {
+      status: "idle",
+      background_work_running: true,
+      updated_at: 200,
+    });
+    seedReadState([{ id: session.id, viewer_last_seen: 199 }]);
+    mockConversations([session]);
+    renderSessionSidebar();
+
+    const row = screen.getByRole("link", { name: /conv_background/ }).closest("li")!;
+    expect(within(row).getByRole("img", { name: "New messages" })).toHaveAttribute(
+      "data-state",
+      "unseen",
+    );
+
+    act(() => markConversationSeen(session.id, session.updated_at));
+
+    expect(within(row).getByRole("img", { name: "Working in the background" })).toHaveAttribute(
+      "data-state",
+      "running",
+    );
+
+    act(() => markConversationUnread(session.id, session.updated_at));
+
+    expect(within(row).getByRole("img", { name: "New messages" })).toHaveAttribute(
+      "data-state",
+      "unseen",
+    );
+  });
+
+  it("keeps the background spinner on the open session", () => {
+    const session = conv("conv_background", "Claude Code", {
+      status: "idle",
+      background_work_running: true,
+      updated_at: 200,
+    });
+    seedReadState([{ id: session.id, viewer_last_seen: 199 }]);
+    mockConversations([session]);
+    renderSessionSidebar(`/c/${session.id}`);
+
+    const row = screen.getByRole("link", { name: "conv_background" }).closest("li")!;
+    expect(within(row).getByRole("img", { name: "Working in the background" })).toHaveAttribute(
+      "data-state",
+      "running",
+    );
+  });
+
   it("keeps the error icon on the active, already-read session", () => {
     const session = conv("conv_error", "Codex", {
       status: "idle",
@@ -2602,6 +2654,45 @@ describe("Sidebar sections", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Expand session family" }));
     expect(screen.getByText("conv_nested")).toBeInTheDocument();
+  });
+
+  it("restores each family's collapsed state when the sidebar mounts again", () => {
+    const family = { id: "family", representative_id: "conv_parent", pinned: false };
+    mockConversations([
+      conv("conv_parent", "Claude Code", { updated_at: 2, family }),
+      conv("conv_nested", "Claude Code", { updated_at: 1, family }),
+    ]);
+    renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
+
+    cleanup();
+    renderSidebar();
+    expect(screen.queryByText("conv_nested")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Expand session family" }));
+
+    cleanup();
+    renderSidebar();
+    expect(screen.getByText("conv_nested")).toBeInTheDocument();
+  });
+
+  it("stores only the most recently collapsed families", () => {
+    const stale = Array.from(
+      { length: MAX_STORED_COLLAPSED_SESSION_FAMILIES },
+      (_, index) => `stale_${index}`,
+    );
+    localStorage.setItem(COLLAPSED_SESSION_FAMILIES_STORAGE_KEY, JSON.stringify(stale));
+    const family = { id: "family", representative_id: "conv_parent", pinned: false };
+    mockConversations([
+      conv("conv_parent", "Claude Code", { updated_at: 2, family }),
+      conv("conv_nested", "Claude Code", { updated_at: 1, family }),
+    ]);
+    renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
+
+    expect(JSON.parse(localStorage.getItem(COLLAPSED_SESSION_FAMILIES_STORAGE_KEY)!)).toEqual([
+      ...stale.slice(1),
+      "family",
+    ]);
   });
 });
 
@@ -3755,6 +3846,42 @@ describe("Sidebar collapsed project marker", () => {
       );
       if (unreadSibling) expect(hiddenMarker).toHaveAttribute("data-state", "unseen");
       else expect(hiddenMarker).toBeNull();
+    },
+  );
+
+  it.each([false, true])(
+    "shows a hidden background row's unread output until it is seen, seen=%s",
+    (seen) => {
+      projectsMock.push("Customer X");
+      writeProjectFolderPageSize(1);
+      seedReadState([
+        { id: "conv_read", viewer_last_seen: 300 },
+        { id: "conv_background", viewer_last_seen: seen ? 200 : 199 },
+      ]);
+      mockConversations([
+        conv("conv_read", "Codex", {
+          labels: { omni_project: "Customer X" },
+          status: "idle",
+          updated_at: 300,
+        }),
+        conv("conv_background", "Claude Code", {
+          labels: { omni_project: "Customer X" },
+          status: "idle",
+          background_work_running: true,
+          updated_at: 200,
+        }),
+      ]);
+      renderSidebar();
+      const expected = seen ? "running" : "unseen";
+      const header = screen.getByRole("button", { name: /^Customer X/ });
+      expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
+        "data-state",
+        expected,
+      );
+      fireEvent.click(header);
+      expect(
+        within(screen.getByTestId("project-show-more")).getByTestId("session-state-badge"),
+      ).toHaveAttribute("data-state", expected);
     },
   );
 

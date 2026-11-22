@@ -145,7 +145,7 @@ def test_unsupported_harness_rejected_before_spawn(spec, harness):
 @pytest.mark.parametrize(
     "name,args",
     [
-        ("upload_file", {"path": "original"}),
+        ("sys_upload_file", {"path": "original"}),
         ("sys_agent_download", {"session_id": "session"}),
         ("sys_agent_list", {}),
         ("load_skill", {"name": "example"}),
@@ -181,7 +181,7 @@ async def test_cached_cow_still_rejects_host_io_when_spec_unavailable(spec, tmp_
     monkeypatch.setattr(registry, "_create_primary_env", Mock(return_value=shared))
     registry._resolve_primary("session", spec)
     result = await execute_tool(
-        tool_name="upload_file",
+        tool_name="sys_upload_file",
         arguments='{"path":"original"}',
         agent_spec=None,
         resource_registry=registry,
@@ -195,7 +195,7 @@ async def test_tool_grant_probe_keeps_session_relative_cow_configuration(tmp_pat
     from unittest.mock import AsyncMock
 
     from omnigent.runner import tool_dispatch
-    from omnigent.spec.types import AgentSpec, BuiltinToolConfig, ExecutorSpec, ToolsConfig
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
 
     workspace = tmp_path / "workspace"
     (workspace / "dependencies").mkdir(parents=True)
@@ -211,7 +211,6 @@ async def test_tool_grant_probe_keeps_session_relative_cow_configuration(tmp_pat
     agent = AgentSpec(
         spec_version=1,
         os_env=os_spec,
-        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="upload_file")]),
         executor=ExecutorSpec(type="omnigent", config={"harness": "openai-agents"}),
     )
     execute = AsyncMock(return_value="session file")
@@ -228,7 +227,7 @@ async def test_tool_grant_probe_keeps_session_relative_cow_configuration(tmp_pat
     assert os_spec.sandbox is not None
     assert os_spec.sandbox.write_path_specs == [WritePathSpec("dependencies", True)]
     refused = await tool_dispatch.execute_tool(
-        tool_name="upload_file",
+        tool_name="sys_upload_file",
         arguments='{"path":"dependencies/original"}',
         agent_spec=agent,
         conversation_id="session",

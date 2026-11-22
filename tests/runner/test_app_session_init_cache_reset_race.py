@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from omnigent.runner import create_runner_app
@@ -206,6 +207,75 @@ async def test_lazy_metadata_policy_failure_is_structured_and_recovers(
         recovered = await client.post(f"/v1/sessions/{_SESSION_ID}/{path}", json=body)
         assert recovered.status_code == 200, recovered.text
         assert len(manager.get_client_calls) == 1
+
+
+class _MetadataReadsServerClient(NullServerClient):
+    """
+    Server stub whose session metadata reads fail until ``readable`` is set, while
+    its file store always accepts uploads and records their bytes.
+    """
+
+    def __init__(self, workspace: Path) -> None:
+        """
+        :param workspace: The session's stored workspace, e.g. ``Path("/repo")``.
+        """
+        self.readable = False
+        self.workspace = workspace
+        self.uploaded: list[bytes] = []
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        """Answer the session metadata read, failing it until it is readable."""
+        if url != f"/v1/sessions/{_SESSION_ID}":
+            return await super().get(url, **kwargs)
+        if not self.readable:
+            return httpx.Response(503)
+        body = {"id": _SESSION_ID, "agent_id": _AGENT_ID, "workspace": str(self.workspace)}
+        return httpx.Response(200, json=body)
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        """Accept a session file upload, recording its bytes."""
+        if url != f"/v1/sessions/{_SESSION_ID}/resources/files":
+            return await super().post(url, **kwargs)
+        self.uploaded.append(kwargs["files"]["file"][1])
+        return httpx.Response(201, json={"id": "file_1"})
+
+
+@pytest.mark.asyncio
+async def test_upload_refuses_while_the_session_workspace_is_unreadable(tmp_path: Path) -> None:
+    """
+    While the session's metadata can't be read, its workspace is unknown: an upload
+    is refused instead of reading the runner's workspace, though the file store
+    would accept it. Once the metadata reads, the session uploads its own file.
+    """
+    runner_root = tmp_path / "runner"
+    session_root = tmp_path / "session"
+    for root, content in ((runner_root, "runner copy"), (session_root, "session copy")):
+        root.mkdir()
+        (root / "report.md").write_text(content)
+    server = _MetadataReadsServerClient(session_root)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=AsyncMock(return_value=AgentSpec(spec_version=1, skills_filter="none")),
+        server_client=server,  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(
+            runner_workspace=runner_root, terminal_registry=None
+        ),
+        runner_workspace=runner_root,
+    )
+    call = {
+        "method": "tools/call",
+        "params": {"name": "sys_upload_file", "arguments": {"path": "report.md"}},
+    }
+    async with _runner_client(app) as client:
+        refused = await client.post(f"/v1/sessions/{_SESSION_ID}/mcp/execute", json=call)
+        uploaded_while_unreadable = list(server.uploaded)
+        server.readable = True
+        shared = await client.post(f"/v1/sessions/{_SESSION_ID}/mcp/execute", json=call)
+
+    assert "the session workspace is unknown" in refused.text, refused.text
+    assert uploaded_while_unreadable == []
+    assert "file_1" in shared.text, shared.text
+    assert server.uploaded == [b"session copy"]
 
 
 @pytest.mark.asyncio

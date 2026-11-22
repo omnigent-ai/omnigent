@@ -19,6 +19,14 @@ describe("createShellWaits", () => {
     expect(waits.since("terminal:a")).toBe(5_000);
   });
 
+  it("reads a wait only for what it waits for, so a new reason hasn't started yet", () => {
+    const waits = createShellWaits();
+    waits.track(new Map([["terminal:a", "starting"]]));
+    expect(waits.since("terminal:a", "starting")).toBe(1_000);
+    expect(waits.since("terminal:a", "shell_list")).toBeUndefined();
+    expect(waits.since("terminal:b", "shell_list")).toBeUndefined();
+  });
+
   it("forgets a shell that stops waiting, so its next wait is fresh", () => {
     const waits = createShellWaits();
     waits.track(new Map([["terminal:a", "shell_list"]]));

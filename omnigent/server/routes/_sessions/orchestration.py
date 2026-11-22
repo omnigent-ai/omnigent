@@ -1784,6 +1784,7 @@ def _build_session_response(
             conv, agent_store=agent_store, agent_cache=agent_cache, agent=agent
         )
     from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+    from omnigent.server.scheduled.harness_settings import session_permission_mode
 
     native_usage_baseline = None
     if harness in ("pi-native", "claude-native") or (
@@ -1836,6 +1837,7 @@ def _build_session_response(
         root_conversation_id=conv.root_conversation_id,
         llm_model=llm_model,
         harness=harness,
+        permission_mode=session_permission_mode(conv, harness) if harness else None,
         model_override=conv.model_override,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
@@ -12782,6 +12784,57 @@ def _created_session_title(body: SessionCreateInput, workflow: Workflow | None) 
     return workflow.name
 
 
+# Agent-spec keys with which a worker's own agent chooses its permission mode.
+_SPEC_PERMISSION_MODE_KEYS = ("permission_mode", "yolo", "exec_mode")
+
+
+def _spec_leaves_permission_mode_open(spec: AgentSpec | None) -> bool:
+    """
+    Whether *spec* was read and chooses no permission mode of its own, even its default.
+
+    A spec the server couldn't read might choose one, so it never counts as open.
+
+    :param spec: The new session's agent spec, or ``None`` when it couldn't be loaded.
+    :returns: ``True`` when the spec sets none of :data:`_SPEC_PERMISSION_MODE_KEYS`.
+    """
+    if spec is None:
+        return False
+    return not any(key in spec.executor.config for key in _SPEC_PERMISSION_MODE_KEYS)
+
+
+def _creator_permission_launch_options(
+    creator: Conversation,
+    body: SessionCreateInput,
+    *,
+    harness: str | None,
+    conversation_store: ConversationStore,
+    agent_store: AgentStore,
+    agent_cache: AgentCache | None,
+) -> tuple[list[str] | None, dict[str, str]] | None:
+    """
+    Launch options that start a session *creator* asks for in *creator*'s permission mode.
+
+    :param creator: The server-authorized session that requested the create.
+    :param body: The create request, after its placement was resolved.
+    :param harness: The new session's harness, e.g. ``"codex-native"``.
+    :param conversation_store: Store used to find the creator's host.
+    :param agent_store: Store used to resolve the creator's harness.
+    :param agent_cache: Cache used to load the creator's spec.
+    :returns: Launch args and labels, or ``None`` for the new session's agent default.
+    """
+    from omnigent.server.scheduled.harness_settings import creator_session_launch_options
+
+    creator_host_id = routing_host_id(creator, conversation_store)
+    return creator_session_launch_options(
+        creator,
+        harness=harness,
+        creator_harness=_resolve_harness(
+            creator, agent_store=agent_store, agent_cache=agent_cache
+        ),
+        on_creator_host=creator_host_id is not None and body.host_id == creator_host_id,
+    )
+
+
 async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -12835,8 +12888,8 @@ async def _create_session_from_existing_agent(
         no project is filed there, so it sits beside the session that started it.
     :param created_by_scheduled_task_id: The automation whose run is that source, if
         any. A worker whose request carries no launch args runs in its permission mode.
-    :param created_by: That source session. A worker that picks no MCP services of
-        its own starts with the source's.
+    :param created_by: That source session. A worker that picks no MCP services or
+        permission mode of its own starts with the source's.
     :param launched_by_scheduled_task_id: The automation whose run's tree that source
         is in, if any, stamped as the worker's ``SCHEDULED_TASK_LAUNCH_LABEL_KEY``.
     :returns: The newly created session snapshot, its conversation row, and
@@ -13501,6 +13554,27 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    # Inherit the creator's mode only when the request, automation and readable spec
+    # select none.
+    creator_permission_labels: dict[str, str] = {}
+    if (
+        needs_launch_args_from_spec
+        and validated_launch_args is None
+        and created_by is not None
+        and _spec_leaves_permission_mode_open(own_spec)
+    ):
+        creator_launch_options = await asyncio.to_thread(
+            _creator_permission_launch_options,
+            created_by,
+            body,
+            harness=selected_harness,
+            conversation_store=conversation_store,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+        )
+        if creator_launch_options is not None:
+            validated_launch_args, creator_permission_labels = creator_launch_options
+
     if reasoning_effort is None:
         effort_spec: AgentSpec | None = sub_spec if sub_spec is not None else own_spec
         spec_effort = effort_spec.executor.reasoning_effort if effort_spec is not None else None
@@ -13525,6 +13599,7 @@ async def _create_session_from_existing_agent(
         initial_labels[SCHEDULED_TASK_LAUNCH_LABEL_KEY] = launched_by_scheduled_task_id
     initial_labels.update(registry_labels)
     initial_labels.update(automation_permission_labels)
+    initial_labels.update(creator_permission_labels)
     initial_labels.update(inherited_mcp_labels)
     if created_worktree_path is not None:
         from omnigent.server.routes._host_worktree import (

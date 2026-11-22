@@ -37,6 +37,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { showToast } from "@/components/ui/toast";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
+import { AutomationListPaletteCommands } from "@/components/scheduled/automationListPaletteCommands";
 import { AutomationsIntro } from "@/components/scheduled/AutomationsIntro";
 import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
 import { AUTOMATION_TEMPLATES } from "@/components/scheduled/automationTemplates";
@@ -587,6 +588,27 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
           automation={sharingTask}
           open={shareOpen}
           onOpenChange={setShareOpen}
+        />
+      )}
+      {isFeatureEnabled(info, "quick_pick_palette") && (
+        <AutomationListPaletteCommands
+          view={view}
+          tasks={tasks}
+          loadFailed={isError}
+          filter={filter}
+          busyTaskId={busyId}
+          canShare={(task) => canShareAutomation(info, viewerId, task.ownerUserId)}
+          shareDisabledReason={(task) => automationShareDisabledReason(info, task)}
+          cloneAvailable={cloneAvailable}
+          handlers={{
+            newAutomation: openManual,
+            changeFilter: setFilter,
+            runNow: handleRunNow,
+            edit: handleEdit,
+            share: handleShare,
+            clone: handleClone,
+            pauseToggle: handlePauseToggle,
+          }}
         />
       )}
     </PageScroll>

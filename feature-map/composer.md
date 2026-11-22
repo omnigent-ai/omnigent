@@ -378,6 +378,15 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   transcript shows a yellow banner with the deployment's instructions. Provisioning
   continues, and the banner leaves when the launch moves on. Dismissing hides
   only that warning; a later one shows again.
+- `palette-model-effort`: with `quick_pick_palette` on (off by default), ⌘K lists
+  the open session composer's **Model** and **Reasoning Effort** (**Thinking
+  Level** for Pi) under **Composer**, each showing its current value. Enter opens
+  the menu's choices; picking one runs the menu's own handler. Model lists Smart
+  Routing first where the composer offers it, and the whole effort row is greyed
+  while Smart Routing picks the effort. A value the menu greys says why. With the
+  flag off the picker mounts none of it
+  (`web/src/components/composer/composerSectionSettings.test.tsx`,
+  `web/src/components/composer/SessionHarnessPicker.test.tsx`).
 - `custom-agent-placement`: New session and Add nested agent can launch an uploaded
   custom agent on a fresh sandbox with repositories when `session_bundle_workspaces`
   is advertised. Nested custom agents can also use new or existing worktrees on a
@@ -388,6 +397,14 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   bundle and selects it. States: import in flight (Cancel and Create locked),
   rejected bundle, imported agent missing from the refreshed list, and hidden on
   a server without agent install.
+- `palette-add-actions`: with `quick_pick_palette` on (off by default), ⌘K lists
+  the open session composer's Add menu under **Composer**: Attach files and
+  images…, Start a new side chat, Set goal… (View or update goal… once one is
+  set), and Enter or Exit Plan mode. Each reads the menu item's availability
+  and runs its handler, so a row the menu hides is absent and a greyed one says
+  why. Only the open session's composer offers them; side chats and the
+  new-session composer add none
+  (`web/src/components/composer/useComposerAddPaletteCommands.test.tsx`).
 - `mobile-labels`: on narrow screens labels collapse to icons without
   overlapping the stop button.
 
@@ -484,6 +501,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   `quick_pick_palette` on, ⌘K also lists Always steer as a setting row: type
   "always steer", press Enter, and pick On or Off
   (`web/src/shell/QuickPickCommandPalette.appCommands.test.tsx`).
+- With `quick_pick_palette` on, in an open session press Cmd/Ctrl+K, type
+  "model" or "reasoning effort", press Enter, then pick a value.
 
 **New-session composer** (landing page, or New session):
 
@@ -599,6 +618,10 @@ and opens the composer with its prompt`).
   Under picker curation (`restrict_to_agent_names`, see
   `native-harnesses.md`) this New Chat entry point is absent: a curated
   deployment offers no bundle import from New Chat.
+
+- With `quick_pick_palette` on, open a session, press Cmd/Ctrl+K and type
+  "attach", "side chat", "goal" or "plan mode", then press Enter to run the
+  Add menu's action. A row that can't run stays listed with the reason.
 
 **Fork dialog** (Fork in the session header menu, or Fork from here on a
 message, with a native target): the same model, effort, and permission mode

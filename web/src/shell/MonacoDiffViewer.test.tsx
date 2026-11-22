@@ -7,6 +7,8 @@ import { act } from "react";
 import { cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DiffOnMount } from "@monaco-editor/react";
+import type { Comment } from "@/hooks/useComments";
+import type { ActiveSelection } from "./codeViewerHelpers";
 
 const h = vi.hoisted(() => ({
   diffProps: null as {
@@ -23,7 +25,14 @@ const h = vi.hoisted(() => ({
     };
   } | null,
   onMount: null as DiffOnMount | null,
-  commentOptions: null as { editorRef: { current: unknown }; mounted: boolean } | null,
+  commentOptions: null as {
+    editorRef: { current: unknown };
+    mounted: boolean;
+    comments?: unknown[];
+    activeSelection?: unknown;
+    canComment?: boolean;
+    attachToAgent?: boolean;
+  } | null,
 }));
 vi.mock("@monaco-editor/react", () => ({
   DiffEditor: (props: {
@@ -68,6 +77,10 @@ function diffTree(props: {
   wrapLines?: boolean;
   searchOpen?: boolean;
   onSearchHandled?: () => void;
+  comments?: Comment[];
+  activeSelection?: ActiveSelection | null;
+  attachToAgent?: boolean;
+  commentable?: boolean;
 }) {
   return (
     <MonacoDiffViewer
@@ -79,9 +92,11 @@ function diffTree(props: {
       hideWhitespace={props.hideWhitespace ?? false}
       wrapLines={props.wrapLines ?? false}
       conversationId="conv_1"
-      comments={[]}
-      activeSelection={null}
+      comments={props.comments ?? []}
+      activeSelection={props.activeSelection ?? null}
       onSetActiveSelection={() => {}}
+      attachToAgent={props.attachToAgent}
+      commentable={props.commentable}
       searchOpen={props.searchOpen}
       onSearchHandled={props.onSearchHandled}
     />
@@ -204,6 +219,41 @@ describe("MonacoDiffViewer", () => {
     // before=null → new file: original must be "" so the whole file shows as added.
     expect(h.diffProps?.original).toBe("");
     expect(h.diffProps?.modified).toBe("created\n");
+  });
+
+  it("offers comments and attachments only while the after side is the working copy", () => {
+    const comments = [{ id: "c1" }] as unknown as Comment[];
+    const activeSelection = { startOffset: 0, endOffset: 1 } as unknown as ActiveSelection;
+    renderDiff({
+      before: "a",
+      after: "b",
+      layout: "split",
+      comments,
+      activeSelection,
+      attachToAgent: true,
+    });
+    expect(h.commentOptions).toMatchObject({
+      comments,
+      activeSelection,
+      canComment: true,
+      attachToAgent: true,
+    });
+    cleanup();
+    renderDiff({
+      before: "a",
+      after: "b",
+      layout: "split",
+      comments,
+      activeSelection,
+      attachToAgent: true,
+      commentable: false,
+    });
+    expect(h.commentOptions).toMatchObject({
+      comments: [],
+      activeSelection: null,
+      canComment: false,
+      attachToAgent: false,
+    });
   });
 
   it("wires getModifiedEditor() into the comment layer on mount", async () => {

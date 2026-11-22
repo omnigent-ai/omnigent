@@ -5,6 +5,9 @@ import { type ReactNode, useSyncExternalStore } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type { DiffReviewCommand } from "@/components/diff-review/diffReviewCommands";
+import type { DiffReviewToolbarProps } from "@/components/diff-review/DiffReviewToolbar";
+import { DEFAULT_DIFF_REVIEW_FILTERS } from "@/components/diff-review/diffReviewModel";
 import type * as WorkingCopyChangesModule from "@/hooks/useWorkingCopyChanges";
 import type { WorkingCopyChanges } from "@/hooks/useWorkingCopyChanges";
 import type { inMemoryCustomComparisons } from "@/lib/commitComparisons";
@@ -759,6 +762,57 @@ describe("the Commits and Changes tabs", () => {
       base: `${SHOWN_COMMIT}~1`,
       head: SHOWN_COMMIT,
     });
+  });
+
+  it("offers Wrap long lines in the Diff options of the changes' and a commit's toolbar", async () => {
+    reviewWithCommits();
+    renderReview();
+    const wrap = vi.fn();
+    const toolbarProps: DiffReviewToolbarProps = {
+      commands: [
+        {
+          id: "toggle-wrap",
+          label: "Wrap lines",
+          icon: () => null,
+          keywords: [],
+          pressed: false,
+          run: wrap,
+        } as unknown as DiffReviewCommand,
+      ],
+      fileCount: 1,
+      filters: DEFAULT_DIFF_REVIEW_FILTERS,
+      dispatchFilter: () => {},
+      languages: [],
+      testCount: 0,
+      generatedCount: 0,
+      filtersOpen: false,
+      setFiltersOpen: () => {},
+      breakdown: {
+        totals: { files: 1, additions: 1, deletions: 0 },
+        notViewed: { files: 1, additions: 1, deletions: 0 },
+        languages: [],
+      },
+      languagesOpen: false,
+      setLanguagesOpen: () => {},
+    };
+    const wrapsFrom = async (props: WorkingCopyDiffReviewBodyProps) => {
+      const toolbar = render(
+        <TooltipProvider>{props.presentation!.toolbar!(toolbarProps)}</TooltipProvider>,
+      );
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Diff options" }), { button: 0 });
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Wrap long lines" }));
+      toolbar.unmount();
+    };
+    const lastBody = () => mocks.body.mock.lastCall![0] as WorkingCopyDiffReviewBodyProps;
+    await wrapsFrom(lastBody());
+    expect(wrap).toHaveBeenCalledTimes(1);
+
+    // A commit's review has its own toolbar, which offers the same.
+    await userEvent.click(tab("Commits"));
+    await userEvent.click(await screen.findByRole("option", { name: /Fix the build/ }));
+    await vi.waitFor(() => expect(lastBody().showComparisonNotes).toBe(false));
+    await wrapsFrom(lastBody());
+    expect(wrap).toHaveBeenCalledTimes(2);
   });
 
   it("compares a root commit with the empty tree, since it has no parent", async () => {

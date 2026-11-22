@@ -29,6 +29,7 @@ import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import postcss from "postcss";
 import { defineConfig, transformWithOxc, type Plugin } from "vite";
+import { workerBuildOptions } from "./vite.workerExports";
 
 const SCOPE = ".omnigent-app";
 
@@ -317,6 +318,8 @@ export default defineConfig({
     forceMonacoBrowserPlatform(),
     inlineWorkerUrlForHost(),
   ],
+  // Workers have no DOM, so they take a package's worker entry over its browser one.
+  worker: workerBuildOptions,
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

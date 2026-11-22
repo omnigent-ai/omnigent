@@ -91,6 +91,22 @@ describe("SessionCard", () => {
     },
   );
 
+  it.each([false, true])(
+    "shows unread output over background work until it is seen, seen=%s",
+    (seen) => {
+      seedReadState([{ id: "conv_1", viewer_last_seen: seen ? 100 : 50, updated_at: 100 }]);
+      const { card } = renderCard({
+        conversation: conversation({
+          status: "idle",
+          background_work_running: true,
+          updated_at: 100,
+        }),
+      });
+      expect(card).toHaveAttribute("data-state", seen ? "running" : "unseen");
+      expect(screen.getByText(seen ? "Running" : "New messages")).toBeInTheDocument();
+    },
+  );
+
   it("falls back to idle and failed labels", () => {
     renderCard({ conversation: conversation({ status: "idle" }) });
     expect(screen.getByTestId("session-card")).toHaveAttribute("data-state", "idle");

@@ -7,7 +7,7 @@ import type { Node, NodeProps } from "@xyflow/react";
 import { FolderIcon, GitBranchIcon, GitPullRequestIcon } from "lucide-react";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import type { Conversation } from "@/hooks/useConversations";
-import { getSessionState, type SessionState } from "@/hooks/useSessionState";
+import { getSessionState, withUnreadState, type SessionState } from "@/hooks/useSessionState";
 import { stateAsOf } from "@/hooks/useSessionPullRequests";
 import { useConversationReadState } from "@/hooks/useUnseenConversations";
 import { showsUnreadFor } from "@/lib/sessionMute";
@@ -56,8 +56,7 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
   );
   // A muted session shows no unread state, matching its sidebar row.
   const unread = showsUnreadFor(conversation, readState.unseen);
-  const state: SessionState | null =
-    getSessionState(conversation) ?? (unread ? { kind: "unseen" } : null);
+  const state: SessionState | null = withUnreadState(getSessionState(conversation), unread);
   const title = conversation.title || optimisticTitle || conversationDisplayLabel(conversation);
   const titleProvisional = !conversation.title && optimisticTitle !== undefined;
   const label = stateLabel(state, conversation.status);
