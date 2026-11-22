@@ -1,7 +1,7 @@
 import type * as CapabilitiesModule from "@/lib/capabilities";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { FolderTreeIcon } from "lucide-react";
 import { useEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -13,6 +13,7 @@ import { TERMINAL_SURFACE_ATTRIBUTE } from "@/lib/paneSurfaces";
 import { usePaletteCommandsStore } from "@/store/paletteCommands";
 
 import { resetAppPanes, setAppPaneTabActions, setAppPaneTitle } from "./appPanes";
+import { ChatPaneBody } from "./ChatPaneBody";
 import { readPaneSplit, resetPaneSplitsCache, updatePaneSplit } from "./paneSplitStore";
 import { SidebarTerminalPanes } from "./SidebarTerminalPanes";
 import { SplitPanesMainView, type SplitPanesMainViewProps } from "./SplitPanesMainView";
@@ -35,11 +36,12 @@ const OTHER = `terminal:${OTHER_ID}`;
 const listed = vi.hoisted(() => ({
   terminals: [] as TerminalInfo[],
   splitsAllowed: true,
+  launch: vi.fn(),
 }));
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: () => ({ terminals: listed.terminals, listCompleteAt: 1, isFetching: false }),
-  useCreateTerminal: () => ({ launch: vi.fn(), isPending: false }),
+  useCreateTerminal: () => ({ launch: listed.launch, isPending: false }),
   useDeleteTerminal: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 vi.mock("@/hooks/useAgents", () => ({ useSessionAgent: () => ({ data: { terminals: ["zsh"] } }) }));
@@ -103,6 +105,7 @@ const paneCommandLabels = () =>
 beforeEach(() => {
   listed.terminals = TERMINALS;
   listed.splitsAllowed = true;
+  listed.launch.mockClear();
   vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
 });
 
@@ -232,6 +235,29 @@ describe("SplitPanesMainView", () => {
     expect(document.activeElement).toBe(screen.getByLabelText("Message"));
     expect(pendingTerminalFocus(conversationId, "main")).toBeNull();
   });
+
+  it.each([
+    ["⌘D", false],
+    ["⇧⌘D", true],
+  ])(
+    "splits the agent's pane with %s from the composer of a chat not split yet",
+    async (_chord, shiftKey) => {
+      const conversationId = nextConversation();
+      render(
+        <>
+          <View conversationId={conversationId} visible={false} chatShown />
+          <ChatPaneBody sessionId={conversationId} host={null} marked>
+            <textarea aria-label="composer" />
+          </ChatPaneBody>
+        </>,
+      );
+      await screen.findByTestId(`terminal-${AGENT_ID}`);
+      const composer = screen.getByLabelText("composer");
+      act(() => composer.focus());
+      fireEvent.keyDown(composer, { key: "d", code: "KeyD", metaKey: true, shiftKey });
+      expect(listed.launch).toHaveBeenCalledOnce();
+    },
+  );
 
   it("hands a focus request for the view to the split's focused pane", async () => {
     const conversationId = nextConversation();
