@@ -5695,6 +5695,35 @@ describe("Sidebar pull request filter", () => {
     expect(listed()).toEqual(everyRow);
   });
 
+  it.each(["harness", "created", "updated"])(
+    "keeps the menu and paging with %s grouping when a status filter drops every loaded row",
+    (grouping) => {
+      localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping }));
+      storeFilters({ status: "draft" });
+      mockConversations(statusRows());
+      withMorePages();
+      renderWith(true);
+      expect(screen.getByTestId("session-filter")).toBeInTheDocument();
+      expect(screen.queryByText("Working")).toBeNull();
+    },
+  );
+
+  it("shows a folder with no match under the filters as such, with Clear filters", () => {
+    projectsMock.push("Alpha");
+    storeFilters({ project: { kind: "project", id: "p_Alpha" }, status: "attention" });
+    mockConversations([
+      conv("conv_alpha_idle", "Codex", { status: "idle", labels: { omni_project: "Alpha" } }),
+    ]);
+    renderWith(true);
+    const toggle = screen.getByRole("button", { name: /^Alpha/ });
+    if (toggle.getAttribute("aria-expanded") !== "true") fireEvent.click(toggle);
+    const folder = screen.getByText("Alpha").closest("section")!;
+    expect(within(folder).getByTestId("session-filters-empty")).toBeInTheDocument();
+    expect(within(folder).queryByText(/Start a/)).toBeNull();
+    fireEvent.click(within(folder).getByRole("button", { name: "Clear filters" }));
+    expect(storedFilters()).toMatchObject({ status: "all", project: { kind: "all" } });
+  });
+
   it("applies and matches a saved view's status, harness and project filters", () => {
     vi.spyOn(identity, "getCurrentUserId").mockReturnValue(VIEWER);
     saveView(SCOPE(), "Failing Codex", {
@@ -6385,6 +6414,45 @@ describe("sidebar_grouping_ui release flag", () => {
     const sharedScopeCalls = useConvMock.mock.calls.filter((args) => args[4] === "shared");
     expect(sharedScopeCalls.some((args) => (args[2] as { enabled?: boolean }).enabled)).toBe(false);
   });
+
+  it.each([
+    ["No project", { kind: "none" }],
+    ["another project", { kind: "project", id: "p_Alpha" }],
+  ])(
+    "lists the open shared run on My sessions when %s hides the automation folder",
+    (_, project) => {
+      projectsMock.push("Alpha", "Omnigent Automation");
+      mockScopedConversations(SHARED_RUNS);
+      localStorage.setItem("omnigent:session-list-filter", JSON.stringify({ project }));
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const info: ServerInfo = {
+        ...FALLBACK_SERVER_INFO,
+        features: {
+          ...FALLBACK_SERVER_INFO.features,
+          sidebar_grouping_ui: true,
+          sidebar_saved_views: true,
+        },
+      };
+      render(
+        <QueryClientProvider client={client}>
+          <CapabilitiesProvider info={info}>
+            <SidebarDataProvider config={sidebarConfig}>
+              <TooltipProvider>
+                <MemoryRouter initialEntries={["/c/conv_shared_run"]}>
+                  <Routes>
+                    <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+                  </Routes>
+                </MemoryRouter>
+              </TooltipProvider>
+            </SidebarDataProvider>
+          </CapabilitiesProvider>
+        </QueryClientProvider>,
+      );
+      selectSessionFilter("mine");
+      expect(screen.queryByRole("button", { name: /^Omnigent Automation/ })).toBeNull();
+      expect(screen.getAllByText("conv_shared_run")).toHaveLength(1);
+    },
+  );
 
   it("keeps the open shared run in the automation folder on My sessions though the pull request filter drops it", () => {
     projectsMock.push("Alpha", "Omnigent Automation");

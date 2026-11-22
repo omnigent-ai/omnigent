@@ -1768,7 +1768,10 @@ function ProjectFolder({
   pageSize,
   filterRows = keepEveryRow,
   filterKey = "",
+  onClearFilters,
 }: {
+  /** Clears the sidebar's filters, offered when they leave this folder empty. */
+  onClearFilters?: () => void;
   /** The rows the sidebar's filters keep, and `openSessionId` whatever it is. */
   filterRows?: (rows: Conversation[], openSessionId: string | null) => Conversation[];
   /** Names the filters on, empty with none; a change restarts the folder's pages. */
@@ -2105,7 +2108,10 @@ function ProjectFolder({
         reorderGroup={reorderable ? `project:${name}` : undefined}
         emptyMessage={
           // Filtered, a later page may still hold a match.
-          loadingFirstPage || (filterKey !== "" && query.hasNextPage) ? undefined : archived ? (
+          loadingFirstPage || (filterKey !== "" && query.hasNextPage) ? undefined : filterKey !==
+              "" && onClearFilters ? (
+            <FiltersMatchNothing onClear={onClearFilters} />
+          ) : archived ? (
             "No archived sessions"
           ) : placeholder ? (
             "No sessions"
@@ -2414,12 +2420,13 @@ function ConversationList({
       (c.harness || "Unknown harness"),
     [harnessLabels],
   );
-  // Status buckets read the unread mirror and the drafts store; only a status view or
-  // filter subscribes, so other views don't re-render the list on those writes.
-  const statusView = view.grouping === "status" || listFilter.value.status !== "all";
-  const unseenTick = useUnseenTick(statusView);
-  const draftIds = useSessionDraftIds(statusView);
-  const startingId = useStartingConversationId(statusView);
+  // Status buckets read the unread mirror and the drafts store; only the Status grouping or a
+  // status filter subscribes, so other views don't re-render the list on those writes.
+  const statusView = view.grouping === "status";
+  const readsStatus = statusView || listFilter.value.status !== "all";
+  const unseenTick = useUnseenTick(readsStatus);
+  const draftIds = useSessionDraftIds(readsStatus);
+  const startingId = useStartingConversationId(readsStatus);
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   // Resolve the active conversation's top-level root once here (rows get a plain
   // `isActive` prop, not their own query). Falls back to the raw id while the
@@ -2538,7 +2545,7 @@ function ConversationList({
           : DATE_BUCKETS.map((bucket) => `${GROUPING_LABELS[view.grouping]} ${bucket}`),
     [view.grouping, allConversations, harnessLabel],
   );
-  const workingIds = useSidebarWorkingIds(allConversations, startingId, statusView);
+  const workingIds = useSidebarWorkingIds(allConversations, startingId, readsStatus);
 
   // Project folders ({ id, name }) for grouping sessions — first-class id
   // and/or the legacy omni_project label, unioned server-side.
@@ -2799,10 +2806,20 @@ function ConversationList({
     // unloaded page. We render it as a folder with a "No sessions" placeholder
     // rather than hiding it (matches the target sidebar layout).
 
+    // My sessions lists shared runs only in the automation folder. When a project filter hides
+    // it, the runs the filters keep, the open one included, list with the unfiled sessions.
+    const unfiledSharedRuns =
+      activeTab === "mine" && chosenProject.kind !== "all"
+        ? folderCandidates.filter(
+            (c) => !isOwnedByViewer(c, viewerId) && isSharedAutomationRun(c, viewerId),
+          )
+        : [];
     // The remainder — not pinned, not filed — splits into Shared (other owners')
     // and Sessions (the viewer's own).
     const allOrdered = sortConversations(
-      tabScoped.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id)),
+      [...tabScoped, ...unfiledSharedRuns].filter(
+        (c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id),
+      ),
       activeOverride,
       frozenKeys,
       sortBy,
@@ -3971,6 +3988,7 @@ function ConversationList({
                               windowConversations={group.conversations}
                               filterRows={filterRows}
                               filterKey={filterKey}
+                              onClearFilters={listFilter.clear}
                               archived={activeTab === "archived"}
                               activeConversationId={displayedActiveId}
                               expanded={expandedProjects.includes(group.name)}
