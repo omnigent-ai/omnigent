@@ -247,6 +247,8 @@ async def test_deny_on_request_phase_blocks_input(
         ("allow", None),
         ("deny", "All input is blocked by request-phase policy."),
         ("ask", "Every message needs approval."),
+        # A policy that can't be checked refuses the wake, even one that would allow it.
+        ("error", "policy evaluation error: RuntimeError"),
     ],
 )
 async def test_request_phase_policies_check_a_timers_wake(
@@ -259,8 +261,9 @@ async def test_request_phase_policies_check_a_timers_wake(
     """A timer's wake meets the session's REQUEST-phase policies before reaching a runner."""
     from omnigent.server.routes import sessions
 
-    arguments: dict[str, object] = {"action": action, "on_phases": ["request"]}
-    if reason is not None:
+    policy_action = "allow" if action == "error" else action
+    arguments: dict[str, object] = {"action": policy_action, "on_phases": ["request"]}
+    if reason is not None and action != "error":
         arguments["reason"] = reason
     agent = await create_test_agent(
         client,
@@ -286,6 +289,9 @@ async def test_request_phase_policies_check_a_timers_wake(
     monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", AsyncMock())
     monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", send)
     monkeypatch.setattr(fire_mod, "_agent_revision", AsyncMock(return_value=None))
+    if action == "error":
+        evaluation_error = AsyncMock(side_effect=RuntimeError("evaluator unavailable"))
+        monkeypatch.setattr(sessions, "_evaluate_input_policy", evaluation_error)
 
     store = SqlAlchemyScheduledTaskStore(db_uri)
     store.configure_dispatch(True)

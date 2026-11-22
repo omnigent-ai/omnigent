@@ -303,12 +303,18 @@ async def test_a_timer_the_server_wont_save_stays_in_the_runner_and_says_so(
     ids=["rejected", "gateway", "lost-reply"],
 )
 async def test_a_failed_save_is_reported_and_starts_no_runner_timer(
-    server: _TimerServer, error: str
+    server: _TimerServer, error: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from omnigent.runner import app as runner_app
+
+    registered: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(runner_app, "register_timer", lambda *args: registered.append(args))
     async with _client(server) as client:
         result = await _call(client, "sys_timer_set", {"seconds": 300})
     assert error in result["error"]
     assert ("may still have been set" in result["error"]) is (error != "server returned 400")
+    # A save that may have landed must not also start a runner timer, or it could fire twice.
+    assert registered == []
 
 
 @pytest.mark.asyncio
