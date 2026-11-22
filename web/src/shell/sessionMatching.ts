@@ -80,7 +80,7 @@ function prepareSession(session: Conversation): PreparedSession {
 
 const PULL_REQUEST_NUMBER = /^#(\d+)$/;
 // The pull request pages of the providers sessions link to, other than GitHub's.
-const OTHER_PULL_REQUEST_PATH = /\/(?:merge_requests|pullrequest|pull-requests)\/\d+(?:\/|$)/i;
+const OTHER_PULL_REQUEST_PATH = /\/(?:merge_requests|pullrequest|pull-requests)\/\d+(?:\/|$)/;
 // What a GitHub link parses with: nothing known about the session, as none is open here.
 const NO_SESSION_CONTEXT: PullRequestReferenceContext = {
   numberPrefix: "#",
@@ -88,13 +88,15 @@ const NO_SESSION_CONTEXT: PullRequestReferenceContext = {
   accountHosts: [],
 };
 
-/** Whether `link` names a pull request, rather than any other page. */
+/** Whether `link` names a pull request, rather than any other page, however it's cased. */
 function isPullRequestLink(link: string): boolean {
   if (!/^https?:\/\//i.test(link)) return false;
-  const parsed = parsePullRequestReference(link, NO_SESSION_CONTEXT);
+  // Read as the lookup compares it, so the two agree on any casing.
+  const key = pullRequestKey(link);
+  const parsed = parsePullRequestReference(key, NO_SESSION_CONTEXT);
   if (parsed?.kind === "link" && parsed.number !== null) return true;
   try {
-    return OTHER_PULL_REQUEST_PATH.test(new URL(link).pathname);
+    return OTHER_PULL_REQUEST_PATH.test(new URL(key).pathname);
   } catch {
     return false;
   }
