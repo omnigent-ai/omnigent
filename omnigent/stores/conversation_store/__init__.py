@@ -925,6 +925,20 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def list_side_chat_ids_by_parent(self, parent_ids: list[str]) -> dict[str, list[str]]:
+        """Return each parent's side-chat ids, grouped by parent, in one query.
+
+        Batched counterpart to :meth:`list_side_chat_ids` for a page of session-list
+        rows. Like it, there is no per-row access check.
+
+        :param parent_ids: Sessions whose rails list the side chats, e.g.
+            ``["conv_abc123"]``. Duplicates are tolerated.
+        :returns: Mapping from every unique input id to its side-chat ids in id
+            order; a parent without side chats maps to an empty list.
+        """
+        ...
+
+    @abstractmethod
     def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
         """
         Fetch one persisted item by id, or ``None`` when absent.

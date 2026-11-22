@@ -11406,6 +11406,19 @@
             "description": "Whether the requesting user owns this session and has granted access to another user (the public link alone doesn't count). `None` when the requester isn't the owner or permissions are disabled, so the grant list never leaks to non-owners.",
             "title": "Shared With Others"
           },
+          "side_chat_activity_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Latest `updated_at` (seconds) among the session's side chats that are not running, so the sidebar can flag a side-chat reply the viewer hasn't seen; side chats have no row of their own. Only the owner, who starts and sees the side chats, gets it. `None` without finished side chats.",
+            "title": "Side Chat Activity At"
+          },
           "status": {
             "description": "Derived session lifecycle status.",
             "enum": [

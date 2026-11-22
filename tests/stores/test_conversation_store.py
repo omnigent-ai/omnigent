@@ -460,6 +460,46 @@ def test_side_chats_page_by_parent_in_id_order(tmp_path: Path) -> None:
             assert "TEMP B-TREE" not in plan, plan
 
 
+def test_side_chat_ids_group_by_parent_in_one_query(tmp_path: Path) -> None:
+    """A page of parents gets each one's side chats, generic and Codex, from one indexed query."""
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path}/omnigent.db", f"sqlite:///{tmp_path}/conversations.db"
+    )
+    parent, other_parent, lonely = (store.create_conversation() for _ in range(3))
+    generic = [store.create_conversation(side_chat_parent_id=parent.id) for _ in range(2)]
+    codex = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, side_chat_parent_id=parent.id
+    )
+    other_side_chat = store.create_conversation(side_chat_parent_id=other_parent.id)
+    store.create_conversation(kind="sub_agent", parent_conversation_id=lonely.id)
+
+    queries = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        grouped = store.list_side_chat_ids_by_parent(
+            [parent.id, other_parent.id, lonely.id, parent.id]
+        )
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+
+    assert grouped == {
+        parent.id: sorted(side_chat.id for side_chat in [*generic, codex]),
+        other_parent.id: [other_side_chat.id],
+        lonely.id: [],
+    }
+    assert len(queries) == 1
+    with store._engine.connect() as conn:
+        statement, parameters = queries[0]
+        plan = str(conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all())
+        assert "ix_conversation_metadata_side_chat_parent_id" in plan, plan
+    assert store.list_side_chat_ids_by_parent([]) == {}
+
+
 def test_fork_lists_a_side_chat_and_marks_what_it_copied(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

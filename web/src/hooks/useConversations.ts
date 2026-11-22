@@ -313,6 +313,13 @@ export interface Conversation {
    */
   viewer_unread?: boolean;
   /**
+   * Latest `updated_at` (seconds) among this session's side chats that are not
+   * running. Side chats have no row of their own, so the parent's row flags a
+   * newer reply than the viewer last saw. Sent only to the owner; absent without
+   * finished side chats and on older servers.
+   */
+  side_chat_activity_at?: number | null;
+  /**
    * Excerpt of the chat content that matched the current `search_query`,
    * centered on the match with `…` marking elided ends. Present only on
    * search responses where the query hit a message body rather than the

@@ -133,6 +133,7 @@ export interface ReadStateSeed {
   viewer_last_seen?: number | null;
   viewer_unread?: boolean;
   updated_at?: number;
+  side_chat_activity_at?: number | null;
 }
 
 /**
@@ -157,7 +158,8 @@ export function seedReadState(conversations: readonly ReadStateSeed[]): void {
     let baseline =
       local !== undefined && server !== undefined ? Math.max(local, server) : (local ?? server);
     if (baseline === undefined && typeof conv.updated_at === "number") {
-      baseline = conv.updated_at;
+      // Side-chat replies from before the load are read as of load too.
+      baseline = Math.max(conv.updated_at, conv.side_chat_activity_at ?? 0);
     }
     if (baseline !== undefined && baseline !== local) {
       lastSeenMap[conv.id] = baseline;
@@ -409,6 +411,24 @@ export function isConversationUnseen(
   status: string | undefined,
 ): boolean {
   return isUnseenSince(lastSeenMap[conversationId], updatedAt, status);
+}
+
+/**
+ * Whether a side chat finished a reply after the user last had its parent open.
+ * Side chats are read inside the parent, so the parent's baseline applies, and
+ * the parent's own running turn doesn't hide the reply (the server already
+ * leaves out side chats that are still running).
+ */
+export function isSideChatReplyUnseen(
+  conversationId: string,
+  sideChatActivityAt: number | null | undefined,
+): boolean {
+  const baseline = lastSeenMap[conversationId];
+  return (
+    typeof sideChatActivityAt === "number" &&
+    baseline !== undefined &&
+    sideChatActivityAt > baseline
+  );
 }
 
 function isUnseenSince(

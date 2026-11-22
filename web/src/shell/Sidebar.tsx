@@ -87,6 +87,7 @@ import {
   MailOpenIcon,
   MessageCircleDashedIcon,
   MessageCirclePlusIcon,
+  MessageSquareDotIcon,
   Maximize2Icon,
   Minimize2Icon,
   MoreHorizontalIcon,
@@ -237,6 +238,7 @@ import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
   isExplicitlyUnread,
+  isSideChatReplyUnseen,
   markConversationRead,
   markConversationUnread,
   useConversationReadState,
@@ -6152,6 +6154,12 @@ function ConversationRowImpl({
   const unread = readState.unseen && (!isActive || readState.explicitlyUnread);
   const hasUnseenMessages = showsUnreadFor(conversation, unread);
   const canMarkUnread = !unread;
+  // A side-chat reply gets its own marker beside the title, so it still shows
+  // while the session's own turn holds the state slot.
+  const sideChatReplyUnseen = useReadStateSnapshot(() =>
+    isSideChatReplyUnseen(conversation.id, conversation.side_chat_activity_at),
+  );
+  const hasUnseenSideChatReply = !isActive && showsUnreadFor(conversation, sideChatReplyUnseen);
   // Approvals, turns and failures outrank the unread dot without clearing read
   // state; background work alone yields to it.
   const badgeConversations = useMemo(() => [conversation], [conversation]);
@@ -6413,6 +6421,13 @@ function ConversationRowImpl({
           {label}
           {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
         </span>
+        {hasUnseenSideChatReply && (
+          <MessageSquareDotIcon
+            role="img"
+            aria-label="Unread side chat reply"
+            className="ml-1.5 size-3.5 shrink-0 text-brand-accent"
+          />
+        )}
       </div>
       {/* Row 2: the "Show" metadata, each part omitted when it has no value. */}
       <SessionMetaLine environment={metaEnvironment} repo={metaRepo} branch={metaBranch} />
@@ -6967,6 +6982,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "nested_draft_source_id",
   "project_draft_name",
   "shared_with_others",
+  "side_chat_activity_at",
   "family",
 ];
 

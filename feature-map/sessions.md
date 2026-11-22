@@ -119,6 +119,9 @@ the header menu), and each place is a separate entry point.
   writable side chat; Reply on side-chat text quotes it in that chat. Both preserve
   interleaved comments and existing attachments; removing a quote keeps its comments.
   Live side chats accept pasted images in every reply text field.
+- `side-chat-unread`: a side-chat reply that finishes after the owner leaves the
+  parent shows a side-chat icon beside the parent's sidebar title, also while the
+  parent's own turn is running. Opening the parent clears it; muting hides it.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
   menu of an archived session. An archived session opened from ⌘K search or a
   link also gets its row on the live sidebar views while it is open, outside
@@ -1168,6 +1171,11 @@ plain `uv run pytest`, which starts a private server for the test.
   mobile side-chat drawer. Its stale-branch scenarios simulate a stopped parent
   runner and verify parent recovery before binding; the hosted lifecycle test
   above proves live-parent reuse with actual runner processes.
+- **`side-chat-unread`, parent sidebar row:**
+  `tests/e2e_ui/sessions/test_side_chat_unread.py::test_side_chat_reply_marks_parent_row_unread`
+  holds a side-chat reply until the user has switched sessions, with the parent
+  idle and with its own turn still running, then checks the marker appears and
+  clears once the parent is reopened.
 - **`side-chat-settings`, desktop panel and mobile drawer:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_sends_with_stale_branch_metadata`
   checks that a legacy harness without advertised picker capabilities hides the

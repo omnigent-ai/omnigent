@@ -3880,6 +3880,11 @@ class SessionListItem(BaseModel):
     :param viewer_unread: Whether the *requesting user* explicitly
         marked this session unread. Per-viewer; lifts the active-row
         dot suppression on the client. ``False`` by default.
+    :param side_chat_activity_at: Latest ``updated_at`` (seconds) among the
+        session's side chats that are not running, so the sidebar can flag a
+        side-chat reply the viewer hasn't seen; side chats have no row of their
+        own. Only the owner, who starts and sees the side chats, gets it.
+        ``None`` without finished side chats.
     :param search_snippet: Excerpt of the chat content that matched the
         request's ``search_query``, centered on the match with ``…``
         marking elided ends, so the search UI can show *where* a session
@@ -3922,6 +3927,7 @@ class SessionListItem(BaseModel):
     comments_updated_at: int | None = None
     viewer_last_seen: int | None = None
     viewer_unread: bool = False
+    side_chat_activity_at: int | None = None
     search_snippet: str | None = None
     parent_session_id: str | None = None
     # First-class project this session is filed under, or ``None`` when
