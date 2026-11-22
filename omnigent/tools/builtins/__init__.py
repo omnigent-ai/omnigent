@@ -36,6 +36,7 @@ from omnigent.tools.builtins.async_inbox import (
     SysCancelAsyncTool,
     SysReadInboxTool,
 )
+from omnigent.tools.builtins.gadgets import GADGET_TOOLS
 from omnigent.tools.builtins.journal import (
     SysJournalReadTool,
     SysJournalWriteNoteTool,
@@ -86,7 +87,6 @@ from omnigent.tools.builtins.spawn import (
     SysSessionSendTool,
     SysSessionShareTool,
 )
-from omnigent.tools.builtins.thingies import THINGY_TOOLS
 from omnigent.tools.builtins.timer import (
     SysTimerCancelTool,
     SysTimerSetTool,
@@ -98,8 +98,8 @@ from omnigent.tools.builtins.web_search import WebSearchTool
 
 __all__ = [
     "BUILTIN_NAMES",
+    "GADGET_TOOLS",
     "INSTANTIABLE_BUILTINS",
-    "THINGY_TOOLS",
     "ListCommentsTool",
     "LoadSkillTool",
     "MemoryDeleteTool",

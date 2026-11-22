@@ -129,7 +129,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   const [shareOpen, setShareOpen] = useState(false);
   const viewerId = useViewerId();
   const [templateId, setTemplateId] = useState<string | null>(null);
-  // A link (from a thingy, say) that opens New automation filled in.
+  // A link (from a gadget, say) that opens New automation filled in.
   const [linkedDraft, setLinkedDraft] = useState<{
     name: string;
     prompt: string;

@@ -1621,10 +1621,10 @@ def _load_agent_spec_bundle(
     """Extract and load a fresh bundle while the runner's worker lock is held."""
     from omnigent.automations_availability import (
         AUTOMATIONS_HEADER,
-        THINGIES_HEADER,
+        GADGETS_HEADER,
         USER_INBOX_HEADER,
+        without_gadget_tools,
         without_scheduled_task_tools,
-        without_thingy_tools,
         without_user_inbox_tools,
     )
     from omnigent.mcp_selection import MCP_SELECTION_HEADER, selected_mcp_spec
@@ -1669,9 +1669,9 @@ def _load_agent_spec_bundle(
         # tools need the server to turn them on.
         if resp.headers.get(USER_INBOX_HEADER) != "1":
             spec = without_user_inbox_tools(spec)
-        # Only a server with thingies on sends "1"; older ones send nothing.
-        if resp.headers.get(THINGIES_HEADER) != "1":
-            spec = without_thingy_tools(spec)
+        # Only a server with gadgets on sends "1"; older ones send nothing.
+        if resp.headers.get(GADGETS_HEADER) != "1":
+            spec = without_gadget_tools(spec)
         if resp.headers.get(MEMORY_HEADER) != "1":
             spec = without_memory_tools(spec)
         elif resp.headers.get(MEMORY_SEARCH_HEADER) != "1":

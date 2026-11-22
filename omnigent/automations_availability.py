@@ -11,8 +11,8 @@ from omnigent.spec.types import AgentSpec
 AUTOMATIONS_HEADER = "X-Omnigent-Automations"
 # Same, for the owner-Inbox tools; runners keep them only when it is "1".
 USER_INBOX_HEADER = "X-Omnigent-User-Inbox"
-# Same, for the thingy tools; runners keep them only when it is "1".
-THINGIES_HEADER = "X-Omnigent-Thingies"
+# Same, for the gadget tools; runners keep them only when it is "1".
+GADGETS_HEADER = "X-Omnigent-Gadgets"
 
 
 def without_scheduled_task_tools(spec: AgentSpec) -> AgentSpec:
@@ -33,10 +33,10 @@ def without_user_inbox_tools(spec: AgentSpec) -> AgentSpec:
     )
 
 
-def without_thingy_tools(spec: AgentSpec) -> AgentSpec:
-    """Return *spec* and its sub-agents with the thingy tool group off."""
+def without_gadget_tools(spec: AgentSpec) -> AgentSpec:
+    """Return *spec* and its sub-agents with the gadget tool group off."""
     return replace(
         spec,
-        tool_groups=replace(spec.tool_groups, thingies=False),
-        sub_agents=[without_thingy_tools(child) for child in spec.sub_agents],
+        tool_groups=replace(spec.tool_groups, gadgets=False),
+        sub_agents=[without_gadget_tools(child) for child in spec.sub_agents],
     )

@@ -96,7 +96,7 @@ function keepSelection(event: React.MouseEvent) {
 
 /**
  * The popup's buttons on their own, for a selection tracked elsewhere, such as text selected
- * inside a sandboxed thingy frame. `position` is the selection's top center in viewport
+ * inside a sandboxed gadget frame. `position` is the selection's top center in viewport
  * coordinates.
  */
 export function SelectionPopupActions({

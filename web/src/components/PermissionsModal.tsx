@@ -1,11 +1,11 @@
 /**
- * Permissions management modal for a session, an automation, a workflow or a thingy.
+ * Permissions management modal for a session, an automation, a workflow or a gadget.
  *
  * Displays current grants, allows granting/revoking access, and
  * toggling public visibility. Only accessible to users with
  * manage-level (3) permission on the session. An automation or a workflow
  * is shared by its owner at read access only, with no public or link sharing.
- * A thingy is shared by its managers at Can view, Can edit or Can manage, also
+ * A gadget is shared by its managers at Can view, Can edit or Can manage, also
  * without public or link sharing.
  */
 
@@ -66,8 +66,8 @@ import { automationSharePath } from "@/lib/automationFromSession";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 import type { Session } from "@/lib/types";
-import type { Thingy } from "@/thingies/api/thingyApi";
-import { thingyLink } from "@/thingies/ui/thingyNavigation";
+import type { Gadget } from "@/gadgets/api/gadgetApi";
+import { gadgetLink } from "@/gadgets/ui/gadgetNavigation";
 import { cn } from "@/lib/utils";
 
 const PUBLIC_USER = "__public__";
@@ -86,17 +86,17 @@ export type SharedAutomation = Pick<ScheduledTask, "id" | "name" | "sessionMode"
 /** The workflow fields its share dialog shows. */
 export type SharedWorkflow = Pick<SavedWorkflow, "id" | "name">;
 
-/** The thingy fields its share dialog shows; with its owner and viewer, it lists the owner. */
-export type SharedThingy = Pick<Thingy, "id" | "name"> &
-  Partial<Pick<Thingy, "owner_id" | "viewer_id">>;
+/** The gadget fields its share dialog shows; with its owner and viewer, it lists the owner. */
+export type SharedGadget = Pick<Gadget, "id" | "name"> &
+  Partial<Pick<Gadget, "owner_id" | "viewer_id">>;
 
-/** The levels a thingy can be shared at (read, edit, manage), as its share dialog names them. */
-const THINGY_LEVELS = [
+/** The levels a gadget can be shared at (read, edit, manage), as its share dialog names them. */
+const GADGET_LEVELS = [
   { value: 1, label: "Can view" },
   { value: 2, label: "Can edit" },
   { value: 3, label: "Can manage" },
 ] as const;
-const THINGY_LEVELS_WITH_OWNER = [...THINGY_LEVELS, { value: 4, label: "Owner" }] as const;
+const GADGET_LEVELS_WITH_OWNER = [...GADGET_LEVELS, { value: 4, label: "Owner" }] as const;
 
 type PermissionsModalProps = {
   open: boolean;
@@ -108,7 +108,7 @@ type PermissionsModalProps = {
       filePath?: string;
       automation?: undefined;
       workflow?: undefined;
-      thingy?: undefined;
+      gadget?: undefined;
     }
   | {
       automation: SharedAutomation;
@@ -116,7 +116,7 @@ type PermissionsModalProps = {
       workspace?: undefined;
       filePath?: undefined;
       workflow?: undefined;
-      thingy?: undefined;
+      gadget?: undefined;
     }
   | {
       workflow: SharedWorkflow;
@@ -124,10 +124,10 @@ type PermissionsModalProps = {
       workspace?: undefined;
       filePath?: undefined;
       automation?: undefined;
-      thingy?: undefined;
+      gadget?: undefined;
     }
   | {
-      thingy: SharedThingy;
+      gadget: SharedGadget;
       sessionId?: undefined;
       workspace?: undefined;
       filePath?: undefined;
@@ -139,7 +139,7 @@ type PermissionsModalProps = {
 function shareTarget(props: PermissionsModalProps): ShareTarget {
   if (props.automation !== undefined) return { kind: "automation", id: props.automation.id };
   if (props.workflow !== undefined) return { kind: "workflow", id: props.workflow.id };
-  if (props.thingy !== undefined) return { kind: "thingy", id: props.thingy.id };
+  if (props.gadget !== undefined) return { kind: "gadget", id: props.gadget.id };
   return { kind: "session", id: props.sessionId };
 }
 
@@ -150,11 +150,11 @@ export function PermissionsModal(props: PermissionsModalProps) {
   // read the sessions its runs create. Nor does a workflow: its grantees run it.
   const automation = props.automation ?? null;
   const workflow = props.workflow ?? null;
-  const thingy = props.thingy ?? null;
+  const gadget = props.gadget ?? null;
   // Only a session has public access, workspace files and a link.
   const readOnlyShare = target.kind !== "session";
-  // An automation or a workflow is shared at read access only; a thingy at any of its levels.
-  const fixedReadShare = readOnlyShare && thingy === null;
+  // An automation or a workflow is shared at read access only; a gadget at any of its levels.
+  const fixedReadShare = readOnlyShare && gadget === null;
   const sessionId = target.kind === "session" ? target.id : null;
   // Server sharing policy. While the boot probe is in flight we treat the
   // server as "on" (fail open) so the modal renders its full controls; the
@@ -178,8 +178,8 @@ export function PermissionsModal(props: PermissionsModalProps) {
       : 1;
   // In "off" mode never fetch the grant list — the modal short-circuits to a
   // notice below. Closing keeps the loaded list through the close animation.
-  // With sharing off, a thingy's managers still see who has access, and can take it away.
-  const revokeOnly = sharingOff && thingy !== null;
+  // With sharing off, a gadget's managers still see who has access, and can take it away.
+  const revokeOnly = sharingOff && gadget !== null;
   const {
     data: grantList,
     isLoading,
@@ -248,13 +248,13 @@ export function PermissionsModal(props: PermissionsModalProps) {
   }
 
   const userGrants = (permissions ?? []).filter((p) => p.user_id !== PUBLIC_USER);
-  // A thingy's owner is not a grant; the list names them first, fixed, for its other managers.
-  const thingyOwner =
-    thingy?.owner_id !== undefined
+  // A gadget's owner is not a grant; the list names them first, fixed, for its other managers.
+  const gadgetOwner =
+    gadget?.owner_id !== undefined
       ? {
-          user_id: thingy.owner_id,
+          user_id: gadget.owner_id,
           level: 4,
-          display_name: thingy.owner_id === thingy.viewer_id ? "You" : thingy.owner_id,
+          display_name: gadget.owner_id === gadget.viewer_id ? "You" : gadget.owner_id,
         }
       : null;
   const publicGrant = (permissions ?? []).find((p) => p.user_id === PUBLIC_USER);
@@ -303,11 +303,11 @@ export function PermissionsModal(props: PermissionsModalProps) {
         ? (await refreshPermissions({ throwOnError: true })).data?.permissions
         : undefined;
       const existingGrant = currentPermissions?.find((p) => p.user_id === trimmed);
-      // Granting a thingy grantee less than they have would quietly take access away.
-      const listed = thingy ? permissions?.find((p) => p.user_id === trimmed) : undefined;
+      // Granting a gadget grantee less than they have would quietly take access away.
+      const listed = gadget ? permissions?.find((p) => p.user_id === trimmed) : undefined;
       if (listed && listed.level > parseInt(newLevel, 10)) {
         const name = listed.display_name ?? listed.user_id;
-        const current = THINGY_LEVELS.find((level) => level.value === listed.level)?.label;
+        const current = GADGET_LEVELS.find((level) => level.value === listed.level)?.label;
         setError(`${name} already has ${current ?? "more access"}. Change it in the list above.`);
         return;
       }
@@ -322,17 +322,17 @@ export function PermissionsModal(props: PermissionsModalProps) {
     }
   }
 
-  // The viewer appears in a thingy's list only as a grantee, never as its owner.
-  const viewerId = thingy?.viewer_id;
+  // The viewer appears in a gadget's list only as a grantee, never as its owner.
+  const viewerId = gadget?.viewer_id;
   const isViewerManage = (userId: string) =>
     viewerId !== undefined &&
     userId === viewerId &&
     (permissions?.find((p) => p.user_id === userId)?.level ?? 0) >= 3;
   // Losing Can manage closes the dialog, whose list only managers may read, and refreshes the
-  // thingy, which shows the viewer's new access.
+  // gadget, which shows the viewer's new access.
   function afterSelfChange() {
     setSelfChange(null);
-    void queryClient.invalidateQueries({ queryKey: ["thingies"] });
+    void queryClient.invalidateQueries({ queryKey: ["gadgets"] });
     onOpenChange(false);
   }
 
@@ -379,11 +379,11 @@ export function PermissionsModal(props: PermissionsModalProps) {
   } else if (workflow) {
     description =
       "The people below can view this workflow, run it and make a copy. Their runs stay private.";
-  } else if (thingy && revokeOnly) {
+  } else if (gadget && revokeOnly) {
     description = `${SHARING_OFF_REASON} The people below keep their access until you remove it.`;
-  } else if (thingy) {
+  } else if (gadget) {
     description = sharingReadOnly
-      ? "This server allows read-only sharing — invite others to view this thingy."
+      ? "This server allows read-only sharing — invite others to view this gadget."
       : "Can view lets people use it; Can edit also lets them change its data and publish versions; Can manage also lets them share and delete it.";
   } else if (filePath) {
     description = "This link opens the selected file in full screen.";
@@ -392,7 +392,7 @@ export function PermissionsModal(props: PermissionsModalProps) {
   }
 
   // "off" short-circuit: sharing is disabled server-wide, so skip the whole
-  // grant UI and show a plain notice instead. Mirrors the server's 403. A thingy
+  // grant UI and show a plain notice instead. Mirrors the server's 403. A gadget
   // keeps its list, so existing grants can still be removed.
   if (sharingOff && !revokeOnly) {
     return (
@@ -421,8 +421,8 @@ export function PermissionsModal(props: PermissionsModalProps) {
               ? "Share this automation"
               : workflow
                 ? "Share this workflow"
-                : thingy
-                  ? "Share this thingy"
+                : gadget
+                  ? "Share this gadget"
                   : filePath
                     ? "Share this file"
                     : "Share this session"}
@@ -437,7 +437,7 @@ export function PermissionsModal(props: PermissionsModalProps) {
                   General access are kept.
                 </p>
               )}
-              {sharingReadOnly && !filePath && !thingy && (
+              {sharingReadOnly && !filePath && !gadget && (
                 <p>
                   Please be careful when sharing. Read access will allow for reading of all session
                   outputs.
@@ -560,7 +560,7 @@ export function PermissionsModal(props: PermissionsModalProps) {
             <p role="alert" className="text-ui text-destructive py-2">
               Couldn&apos;t load who has access: {grantsError.message}
             </p>
-          ) : userGrants.length === 0 && !thingyOwner ? (
+          ) : userGrants.length === 0 && !gadgetOwner ? (
             <p className="text-ui text-muted-foreground py-2">No grants yet.</p>
           ) : (
             <>
@@ -572,7 +572,7 @@ export function PermissionsModal(props: PermissionsModalProps) {
                 <span
                   className={cn(
                     "text-sm font-medium uppercase tracking-wide text-muted-foreground",
-                    thingy ? "w-32" : "w-28",
+                    gadget ? "w-32" : "w-28",
                   )}
                 >
                   Permission
@@ -580,15 +580,15 @@ export function PermissionsModal(props: PermissionsModalProps) {
                 <span className="size-7 shrink-0" aria-hidden="true" />
               </div>
               <div className="max-h-48 overflow-y-auto">
-                {thingyOwner && (
+                {gadgetOwner && (
                   <GrantRow
-                    permission={thingyOwner}
+                    permission={gadgetOwner}
                     onRevoke={handleRevoke}
                     onChangeLevel={handleChangeLevel}
                     busy={shareBusy}
                     levelDisabled
                     readOnly
-                    levels={THINGY_LEVELS_WITH_OWNER}
+                    levels={GADGET_LEVELS_WITH_OWNER}
                   />
                 )}
                 {userGrants.map((p) => (
@@ -599,15 +599,15 @@ export function PermissionsModal(props: PermissionsModalProps) {
                     onChangeLevel={handleChangeLevel}
                     busy={shareBusy}
                     levelDisabled={fileShareUnavailable}
-                    readOnly={revokeOnly || (sharingReadOnly && !thingy) || fixedReadShare}
+                    readOnly={revokeOnly || (sharingReadOnly && !gadget) || fixedReadShare}
                     levels={
-                      thingy
+                      gadget
                         ? sharingReadOnly
                           ? // Read-only sharing still lets a grant go down to Can view.
-                            THINGY_LEVELS.filter(
+                            GADGET_LEVELS.filter(
                               (level) => level.value === 1 || level.value === p.level,
                             )
-                          : THINGY_LEVELS
+                          : GADGET_LEVELS
                         : undefined
                     }
                     youLabel={p.user_id === viewerId ? "you" : undefined}
@@ -636,8 +636,8 @@ export function PermissionsModal(props: PermissionsModalProps) {
             <AlertDescription>
               <p>
                 {selfChange.level === 0
-                  ? "You won’t be able to open this thingy again unless someone shares it with you."
-                  : "You won’t be able to share or delete this thingy, or see who has access, unless someone gives you Can manage again."}
+                  ? "You won’t be able to open this gadget again unless someone shares it with you."
+                  : "You won’t be able to share or delete this gadget, or see who has access, unless someone gives you Can manage again."}
               </p>
               <div className="mt-2 flex gap-2">
                 <Button
@@ -690,15 +690,15 @@ export function PermissionsModal(props: PermissionsModalProps) {
                   valueHasNoPii
                 >
                   <SelectTrigger
-                    className={cn("mt-1", thingy ? "w-32" : "w-24")}
+                    className={cn("mt-1", gadget ? "w-32" : "w-24")}
                     aria-label="New user permission"
                   >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent position="popper" align="start">
-                    {thingy ? (
+                    {gadget ? (
                       // Read-only sharing caps new grants at view.
-                      THINGY_LEVELS.filter((level) => !sharingReadOnly || level.value === 1).map(
+                      GADGET_LEVELS.filter((level) => !sharingReadOnly || level.value === 1).map(
                         (level) => (
                           <SelectItem key={level.value} value={String(level.value)}>
                             {level.label}
@@ -740,7 +740,7 @@ export function PermissionsModal(props: PermissionsModalProps) {
         {/* Keep the default stacking below sm: one row of Copy link + QR +
             Done overflows a phone-width dialog and widens the whole grid. */}
         <DialogFooter className="sm:justify-between">
-          {thingy && <ThingyCopyLinkButton thingyId={thingy.id} onError={setError} />}
+          {gadget && <GadgetCopyLinkButton gadgetId={gadget.id} onError={setError} />}
           {sessionId !== null && (
             <div className="flex items-center gap-2">
               <CopyLinkButton
@@ -984,12 +984,12 @@ function getDeepLink(
   }
 }
 
-/** Copies the link that opens a thingy; only the people it is shared with can open it. */
-function ThingyCopyLinkButton({
-  thingyId,
+/** Copies the link that opens a gadget; only the people it is shared with can open it. */
+function GadgetCopyLinkButton({
+  gadgetId,
   onError,
 }: {
-  thingyId: string;
+  gadgetId: string;
   onError: (message: string | null) => void;
 }) {
   const [copied, setCopied] = useState(false);
@@ -1003,10 +1003,10 @@ function ThingyCopyLinkButton({
     <Button
       variant="ghost"
       className="gap-1.5 text-primary"
-      componentId="diagnostics.permissions.copy_thingy_link"
+      componentId="diagnostics.permissions.copy_gadget_link"
       onClick={() => {
         onError(null);
-        copyText(thingyLink(thingyId, rebasePath)).then(
+        copyText(gadgetLink(gadgetId, rebasePath)).then(
           () => setCopied(true),
           () => onError("Couldn’t copy the link."),
         );
@@ -1164,7 +1164,7 @@ function GrantRow({
   busy: boolean;
   levelDisabled: boolean;
   readOnly: boolean;
-  /** The levels the row offers, when the target names its own (a thingy). */
+  /** The levels the row offers, when the target names its own (a gadget). */
   levels?: readonly { value: number; label: string }[];
   /** Marks the viewer's own row. */
   youLabel?: string;
@@ -1177,7 +1177,7 @@ function GrantRow({
   // Read-only sharing mode: existing grants can't be re-leveled, so the level
   // shows as a fixed label (like owner/manage) — but the row stays revocable.
   const fixedLevel = isOwner || isManage || readOnly || (levels !== undefined && levels.length < 2);
-  // A thingy's levels are longer words than a session's Read and Edit.
+  // A gadget's levels are longer words than a session's Read and Edit.
   const levelWidth = levels ? "w-32" : "w-28";
   // An automation's grants carry a display name; the ID follows when it differs.
   const name = permission.display_name ?? permission.user_id;

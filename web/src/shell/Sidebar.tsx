@@ -281,7 +281,7 @@ import {
 } from "@/lib/sidebarViewPreferences";
 import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
 import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
-import { ThingySidebarNav, useFullScreenThingyId } from "@/thingies/ui/ThingySidebarNav";
+import { GadgetSidebarNav, useFullScreenGadgetId } from "@/gadgets/ui/GadgetSidebarNav";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useExtensions } from "@/extensions/ExtensionProvider";
 import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
@@ -607,7 +607,7 @@ function useActiveNavItem(): {
   isCanvasPage: boolean;
   isTasksPage: boolean;
   isWorkflowsPage: boolean;
-  isThingyPage: boolean;
+  isGadgetPage: boolean;
   isUsagePage: boolean;
   activeExtensionPageId: string | null;
   newSessionProjectName: string | null;
@@ -633,8 +633,8 @@ function useActiveNavItem(): {
   // Likewise /workflows (list) and /workflows/:workflowId (a workflow's page).
   const isWorkflowsPage =
     !isExtensionRoute && (leaf === "workflows" || segments.at(-2) === "workflows");
-  // /thingy (list), /thingy/new and /thingy/:thingyId.
-  const isThingyPage = !isExtensionRoute && (leaf === "thingy" || segments.at(-2) === "thingy");
+  // /gadget (list), /gadget/new and /gadget/:gadgetId.
+  const isGadgetPage = !isExtensionRoute && (leaf === "gadget" || segments.at(-2) === "gadget");
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
@@ -649,7 +649,7 @@ function useActiveNavItem(): {
     !isCanvasPage &&
     !isTasksPage &&
     !isWorkflowsPage &&
-    !isThingyPage &&
+    !isGadgetPage &&
     !isUsagePage &&
     !isExtensionRoute;
   const searchParams = new URLSearchParams(location.search);
@@ -667,7 +667,7 @@ function useActiveNavItem(): {
     isCanvasPage,
     isTasksPage,
     isWorkflowsPage,
-    isThingyPage,
+    isGadgetPage,
     isUsagePage,
     activeExtensionPageId,
     newSessionProjectName,
@@ -974,15 +974,15 @@ function SidebarImpl({
     isCanvasPage,
     isTasksPage,
     isWorkflowsPage,
-    isThingyPage,
+    isGadgetPage,
     isUsagePage,
     activeExtensionPageId,
     newSessionProjectName,
     projectHomeName,
   } = useActiveNavItem();
-  // A thingy filling the screen beside New session is what the sidebar marks, not New session.
-  const fullScreenThingyId = useFullScreenThingyId();
-  const isNewChatPage = isNewChatRoute && fullScreenThingyId === null;
+  // A gadget filling the screen beside New session is what the sidebar marks, not New session.
+  const fullScreenGadgetId = useFullScreenGadgetId();
+  const isNewChatPage = isNewChatRoute && fullScreenGadgetId === null;
   const navigate = useNavigate();
   const projectKanban = useProjectKanbanEnabled();
   const openProjectHome = useStableCallback((projectName: string) => {
@@ -1579,7 +1579,7 @@ function SidebarImpl({
                   )}
                 </Link>
               </Button>
-              <ThingySidebarNav active={isThingyPage} onNavigate={onNavClick} />
+              <GadgetSidebarNav active={isGadgetPage} onNavigate={onNavClick} />
               {canvasEnabled && (
                 <PrimaryNavLink
                   to={canvasDestination.pathname + canvasDestination.search}

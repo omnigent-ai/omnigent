@@ -6097,7 +6097,7 @@ describe("Composer reply quotes", () => {
     expect(ref.current?.canTakeQuote()).toBe(true);
     let taken: boolean | undefined;
     act(() => {
-      taken = ref.current?.appendReplyQuote("Quoted from a thingy");
+      taken = ref.current?.appendReplyQuote("Quoted from a gadget");
     });
     expect(taken).toBe(true);
     unmount();
@@ -6105,7 +6105,7 @@ describe("Composer reply quotes", () => {
     // A read-only composer refuses the quote, so the queue keeps it.
     render(<Composer {...composerProps({ permissionLevel: 1 })} ref={ref} />);
     act(() => {
-      taken = ref.current?.appendReplyQuote("Quoted from a thingy");
+      taken = ref.current?.appendReplyQuote("Quoted from a gadget");
     });
     expect(taken).toBe(false);
   });

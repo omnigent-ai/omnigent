@@ -22,7 +22,7 @@ const RAIL_TABS: readonly RightRailTab[] = [
   "browser",
   "sidechat",
   "content-search",
-  "thingy",
+  "gadget",
 ];
 
 export interface SessionWorkspaceState {
@@ -52,8 +52,8 @@ export interface SessionWorkspaceState {
   openSubagentTabs?: string[];
   /** The active side-chat tab (null = a file/scope/other view is active). */
   selectedSideChatId?: string | null;
-  /** The active thingy tab (`thingy:<id>`), restored once the session's thingies load. */
-  selectedThingyKey?: string | null;
+  /** The active gadget tab (`gadget:<id>`), restored once the session's gadgets load. */
+  selectedGadgetKey?: string | null;
   /** Split panes of the main terminal view; absent while unsplit. */
   terminalSplit?: TerminalSplitState;
 }
@@ -144,8 +144,8 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (record.selectedSideChatId === null || typeof record.selectedSideChatId === "string") {
     state.selectedSideChatId = record.selectedSideChatId;
   }
-  if (record.selectedThingyKey === null || typeof record.selectedThingyKey === "string") {
-    state.selectedThingyKey = record.selectedThingyKey;
+  if (record.selectedGadgetKey === null || typeof record.selectedGadgetKey === "string") {
+    state.selectedGadgetKey = record.selectedGadgetKey;
   }
   const terminalSplit = parseTerminalSplitState(record.terminalSplit);
   if (terminalSplit) state.terminalSplit = terminalSplit;
@@ -246,7 +246,7 @@ export function resetSessionWorkspaceTabSelections(): void {
     delete state.selectedTerminalKey;
     delete state.selectedBrowserId;
     delete state.selectedSideChatId;
-    delete state.selectedThingyKey;
+    delete state.selectedGadgetKey;
   }
   writeStore(store);
 }

@@ -350,6 +350,7 @@ def _build_app_with_stub_stores() -> Any:
         SqlAlchemyConversationStore,
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
     from omnigent.stores.host_store import HostStore
     from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
     from omnigent.stores.memory_store.sqlalchemy_store import SqlAlchemyMemoryStore
@@ -359,7 +360,6 @@ def _build_app_with_stub_stores() -> Any:
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
-    from omnigent.stores.thingy_store.local import LocalThingyStore
 
     # On-disk SQLite (mkdtemp ensures uniqueness so concurrent
     # invocations don't collide).
@@ -387,7 +387,7 @@ def _build_app_with_stub_stores() -> Any:
         # The release feature is off by default; the spec documents the routes anyway.
         proactive_agent=True,
         memory_store=SqlAlchemyMemoryStore(db_uri),
-        thingy_store=LocalThingyStore(str(workdir / "thingies")),
+        gadget_store=LocalGadgetStore(str(workdir / "gadgets")),
     )
 
 

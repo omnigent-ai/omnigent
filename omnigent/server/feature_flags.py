@@ -60,7 +60,7 @@ class Feature(StrEnum):
     PI_CLAUDE_PLUGINS = "pi_claude_plugins"
     MEMORY = "memory"
     QUICK_PICK_PALETTE = "quick_pick_palette"
-    THINGIES = "thingies"
+    GADGETS = "gadgets"
 
 
 @dataclass(frozen=True)
@@ -330,8 +330,8 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         frontend_visible=False,
     ),
     FeatureDefinition(
-        feature=Feature.THINGIES,
-        description="Thingies: agent-built web apps beside sessions, their routes and agent tools",
+        feature=Feature.GADGETS,
+        description="Gadgets: agent-built web apps beside sessions, their routes and agent tools",
         owner="server",
         review_by_release="0.27.0",
     ),

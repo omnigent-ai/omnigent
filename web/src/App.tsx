@@ -79,17 +79,17 @@ const WorkflowDetailPage = withPageView(
   "workflows.detail",
   lazy(() => import("@/pages/WorkflowDetailPage").then((m) => ({ default: m.WorkflowDetailPage }))),
 );
-const ThingyListPage = withPageView(
-  "thingies",
-  lazy(() => import("@/thingies/ui/ThingyListPage").then((m) => ({ default: m.ThingyListPage }))),
+const GadgetListPage = withPageView(
+  "gadgets",
+  lazy(() => import("@/gadgets/ui/GadgetListPage").then((m) => ({ default: m.GadgetListPage }))),
 );
-const ThingyStartPage = withPageView(
-  "thingies.new",
-  lazy(() => import("@/thingies/ui/ThingyStart").then((m) => ({ default: m.ThingyStartPage }))),
+const GadgetStartPage = withPageView(
+  "gadgets.new",
+  lazy(() => import("@/gadgets/ui/GadgetStart").then((m) => ({ default: m.GadgetStartPage }))),
 );
-const ThingyOpenPage = withPageView(
-  "thingies.open",
-  lazy(() => import("@/thingies/ui/ThingyOpenPage").then((m) => ({ default: m.ThingyOpenPage }))),
+const GadgetOpenPage = withPageView(
+  "gadgets.open",
+  lazy(() => import("@/gadgets/ui/GadgetOpenPage").then((m) => ({ default: m.GadgetOpenPage }))),
 );
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
@@ -292,26 +292,26 @@ function AppRoutes({ basename }: AppProps) {
             }
           />
           <Route
-            path={`${prefix}/thingy`}
+            path={`${prefix}/gadget`}
             element={
-              <FeatureGatedPage feature="thingies">
-                <ThingyListPage />
+              <FeatureGatedPage feature="gadgets">
+                <GadgetListPage />
               </FeatureGatedPage>
             }
           />
           <Route
-            path={`${prefix}/thingy/new`}
+            path={`${prefix}/gadget/new`}
             element={
-              <FeatureGatedPage feature="thingies">
-                <ThingyStartPage />
+              <FeatureGatedPage feature="gadgets">
+                <GadgetStartPage />
               </FeatureGatedPage>
             }
           />
           <Route
-            path={`${prefix}/thingy/:thingyId`}
+            path={`${prefix}/gadget/:gadgetId`}
             element={
-              <FeatureGatedPage feature="thingies">
-                <ThingyOpenPage />
+              <FeatureGatedPage feature="gadgets">
+                <GadgetOpenPage />
               </FeatureGatedPage>
             }
           />

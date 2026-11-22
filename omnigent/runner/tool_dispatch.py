@@ -68,6 +68,7 @@ from omnigent.models.model_override import (
 )
 from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.policies.builtins.safety import scheduled_task_review_error
+from omnigent.runner.gadget_tools import GADGET_TOOL_NAMES, execute_gadget_tool
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.journal_tools import (
     JOURNAL_TOOL_NAMES,
@@ -75,7 +76,6 @@ from omnigent.runner.journal_tools import (
     server_workflows_enabled,
 )
 from omnigent.runner.session_requests import remember_session_host
-from omnigent.runner.thingy_tools import THINGY_TOOL_NAMES, execute_thingy_tool
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.spec.types import MEMORY_TOOL_NAMES
 from omnigent.tools import ToolManager
@@ -486,9 +486,9 @@ _SCHEDULED_TASK_TOOLS = frozenset(
 # Priority 5l.2: The session journal — the runner proxies the server's
 # /v1/sessions/{id}/journal routes (see omnigent/runner/journal_tools.py).
 _JOURNAL_TOOLS = JOURNAL_TOOL_NAMES
-# Priority 5l.2: Thingies — the runner proxies the server's /v1/thingies routes
-# (see omnigent/runner/thingy_tools.py). Registered when the server enables thingies.
-_THINGY_TOOLS = THINGY_TOOL_NAMES
+# Priority 5l.2: Gadgets — the runner proxies the server's /v1/gadgets routes
+# (see omnigent/runner/gadget_tools.py). Registered when the server enables gadgets.
+_GADGET_TOOLS = GADGET_TOOL_NAMES
 # Priority 5l.2: Owner Inbox — the runner proxies /v1/inbox/items. Registered
 # only for agents that opt into ``tool_groups.user_inbox``.
 _USER_INBOX_TOOLS = frozenset({"sys_user_inbox_post", "sys_user_inbox_list"})
@@ -562,7 +562,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
     | _JOURNAL_TOOLS
-    | _THINGY_TOOLS
+    | _GADGET_TOOLS
     | _USER_INBOX_TOOLS
     | _MEMORY_TOOLS
     | _TERMINAL_TOOLS
@@ -1081,7 +1081,7 @@ _ALL_LOCAL_TOOLS = (
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
     | _JOURNAL_TOOLS
-    | _THINGY_TOOLS
+    | _GADGET_TOOLS
     | _USER_INBOX_TOOLS
     | _MEMORY_TOOLS
 )
@@ -8453,8 +8453,8 @@ async def execute_tool(
                 call_id=call_id,
                 publish_event=publish_event,
             )
-        elif tool_name in _THINGY_TOOLS:
-            output = await execute_thingy_tool(
+        elif tool_name in _GADGET_TOOLS:
+            output = await execute_gadget_tool(
                 tool_name,
                 arguments,
                 server_client=server_client,
@@ -10701,7 +10701,7 @@ def _execute_skill_tool(
     :param runner_workspace: The runner's workspace path for
         host-scope skill discovery.
     :param workflows_enabled: Whether the server enables workflow skills; the
-        others, such as ``thingy``, follow the spec's tool groups.
+        others, such as ``gadget``, follow the spec's tool groups.
     :returns: Tool output string.
     """
     from omnigent.spec.skill_sources import framework_skills

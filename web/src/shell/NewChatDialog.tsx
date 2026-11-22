@@ -8168,8 +8168,8 @@ function NewChatLandingContent({
                 ),
                 trailing: (
                   <>
-                    {/* Create session, in the full screen thingy's menu: starts this session
-                    as the Start button does, while the thingy stays full screen. */}
+                    {/* Create session, in the full screen gadget's menu: starts this session
+                    as the Start button does, while the gadget stays full screen. */}
                     <SessionControlPortal sessionId={null} slot="create" inPlace={false}>
                       <div className="flex flex-col gap-2">
                         {createError && (
@@ -8186,7 +8186,7 @@ function NewChatLandingContent({
                           className="w-full"
                           disabled={creating || submitDisabledReason !== null}
                           loading={creating}
-                          data-testid="thingy-create-session"
+                          data-testid="gadget-create-session"
                           onClick={() => void handleCreate()}
                         >
                           <PlusIcon className="size-4" aria-hidden />
@@ -8194,7 +8194,7 @@ function NewChatLandingContent({
                         </Button>
                       </div>
                     </SessionControlPortal>
-                    {/* The harness New session will start, on the full screen thingy's Open
+                    {/* The harness New session will start, on the full screen gadget's Open
                     session button. */}
                     {selectedAgent && (
                       <SessionControlPortal sessionId={null} slot="icon" inPlace={false}>

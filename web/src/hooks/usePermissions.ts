@@ -26,7 +26,7 @@ import {
   isOwnerLevel,
   listAutomationPermissions,
   listPermissions,
-  listThingyPermissions,
+  listGadgetPermissions,
   listWorkflowPermissions,
   revokePermission,
   revokeSharePermission,
@@ -54,7 +54,7 @@ function grantListQuery(rawTarget: ShareTarget | null, enabled: boolean) {
     queryFn: () => {
       if (target!.kind === "session") return listPermissions(target!.id);
       if (target!.kind === "workflow") return listWorkflowPermissions(target!.id);
-      if (target!.kind === "thingy") return listThingyPermissions(target!.id);
+      if (target!.kind === "gadget") return listGadgetPermissions(target!.id);
       return listAutomationPermissions(target!.id);
     },
     enabled: enabled && !!target,
@@ -109,8 +109,8 @@ function invalidateAfterShareChange(qc: QueryClient, target: ShareTarget): void 
   void qc.invalidateQueries({ queryKey: permissionsKey(target) });
   // The server shares an automation's continued session at once.
   if (target.kind === "automation") invalidateSessionGrants(qc);
-  // A change can be the viewer's own access, which every open view of the thingy shows.
-  if (target.kind === "thingy") void qc.invalidateQueries({ queryKey: ["thingies"] });
+  // A change can be the viewer's own access, which every open view of the gadget shows.
+  if (target.kind === "gadget") void qc.invalidateQueries({ queryKey: ["gadgets"] });
   void qc.invalidateQueries({ queryKey: ["conversations"] });
   void qc.invalidateQueries({ queryKey: ["project-sessions"] });
   void qc.invalidateQueries({ queryKey: PINNED_CONVERSATIONS_KEY });
@@ -119,7 +119,7 @@ function invalidateAfterShareChange(qc: QueryClient, target: ShareTarget): void 
 /**
  * Grant or update a permission. Invalidates the grants and session lists on
  * success. An automation or a workflow is shared at read access whatever `level` says;
- * a thingy at the level given.
+ * a gadget at the level given.
  */
 export function useGrantPermission(target: ShareTarget) {
   const qc = useQueryClient();
@@ -133,7 +133,7 @@ export function useGrantPermission(target: ShareTarget) {
       level: number;
       ensureMinimum?: boolean;
     }): Promise<ShareGrant> => {
-      if (target.kind === "thingy") return grantSharePermission(target, userId, level);
+      if (target.kind === "gadget") return grantSharePermission(target, userId, level);
       if (target.kind !== "session") return grantSharePermission(target, userId, LEVEL_READ);
       return ensureMinimum
         ? grantPermission(target.id, userId, level, true)

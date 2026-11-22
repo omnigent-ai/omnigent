@@ -33,8 +33,8 @@ SCHEDULED_TASK_GRANT_LEVELS: frozenset[int] = frozenset({LEVEL_READ})
 # The permission store enforces it; widening it needs no migration.
 WORKFLOW_GRANT_LEVELS: frozenset[int] = frozenset({LEVEL_READ})
 
-# Levels a thingy may grant: Can view, Can edit (records and versions) and Can manage.
-THINGY_GRANT_LEVELS: frozenset[int] = frozenset({LEVEL_READ, LEVEL_EDIT, LEVEL_MANAGE})
+# Levels a gadget may grant: Can view, Can edit (records and versions) and Can manage.
+GADGET_GRANT_LEVELS: frozenset[int] = frozenset({LEVEL_READ, LEVEL_EDIT, LEVEL_MANAGE})
 
 
 def is_reserved_grantee(user_id: str) -> bool:

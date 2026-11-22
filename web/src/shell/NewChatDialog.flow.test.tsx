@@ -58,8 +58,8 @@ import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
-import { requestThingyCreateSessionMenu, resetThingyRailRequests } from "@/lib/thingyRailTabs";
-import { ThingyOpenSessionButton } from "@/thingies/ui/ThingyOpenSessionButton";
+import { requestGadgetCreateSessionMenu, resetGadgetRailRequests } from "@/lib/gadgetRailTabs";
+import { GadgetOpenSessionButton } from "@/gadgets/ui/GadgetOpenSessionButton";
 import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
 import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "./NewChatDialog";
 import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
@@ -465,7 +465,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  resetThingyRailRequests();
+  resetGadgetRailRequests();
   cleanup();
   localStorage.clear();
 });
@@ -521,7 +521,7 @@ describe("NewChatLandingScreen in the floating panel", () => {
     expect(navigateMock).not.toHaveBeenCalled();
   });
 
-  it("starts the session from a full screen thingy's Create session menu as Start does", async () => {
+  it("starts the session from a full screen gadget's Create session menu as Start does", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
       json: async () => ({ id: "conv_new" }),
@@ -533,17 +533,17 @@ describe("NewChatLandingScreen in the floating panel", () => {
       [],
       {},
       panel,
-      <ThingyOpenSessionButton sessionId={null} onOpenSession={onOpenSession} />,
+      <GadgetOpenSessionButton sessionId={null} onOpenSession={onOpenSession} />,
     );
     await waitForWorkspaceSeed();
     typeMessage("inspect the repo");
     act(() => {
-      requestThingyCreateSessionMenu();
+      requestGadgetCreateSessionMenu();
     });
-    const create = await screen.findByTestId("thingy-create-session");
+    const create = await screen.findByTestId("gadget-create-session");
     // The menu holds New session's own controls.
     expect(
-      within(screen.getByTestId("thingy-open-session-popover")).getByTestId(
+      within(screen.getByTestId("gadget-open-session-popover")).getByTestId(
         "new-chat-landing-agent-select",
       ),
     ).toBeInTheDocument();

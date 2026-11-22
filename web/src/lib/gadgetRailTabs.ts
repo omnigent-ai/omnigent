@@ -1,0 +1,152 @@
+// Requests to show a gadget in a session's side panel, and whether the gadget beside New session
+// fills the screen. Gadget code that runs outside the panel (a gadget link, a pinned row, a quote
+// sent to the composer) asks here; the session's panel takes the request once it shows.
+import { create } from "zustand";
+
+export interface GadgetRailRequest {
+  conversationId: string;
+  /** The side panel tab, for example `gadget:<id>`. */
+  key: string;
+  maximize: boolean;
+  keepSidebar: boolean;
+}
+
+interface GadgetRailState {
+  requested: GadgetRailRequest | null;
+  /** A request to take a session's gadget tab out of full screen. */
+  exitFullScreen: { conversationId: string } | null;
+  /** Whether the gadget beside New session fills the screen. */
+  newSessionMaximized: boolean;
+  /** The gadget filling the screen now, in a session's side panel or beside New session. */
+  fullScreenGadgetId: string | null;
+  /**
+   * Whether the full screen gadget's Create session menu should open: a request from the gadget
+   * before its session exists waits there for the viewer to create one. The menu takes it when it
+   * opens, which can be after the navigation that made the request.
+   */
+  createSessionMenuRequested: boolean;
+  /**
+   * How many times a frame of each gadget has connected, and how many sessions started beside
+   * each full screen gadget failed to show it. The gadget beside New session covers the session
+   * it started until that session's own frame connects, or its start fails.
+   */
+  frameConnections: Record<string, number>;
+  failedStarts: Record<string, number>;
+}
+
+export const useGadgetRailRequest = create<GadgetRailState>(() => ({
+  requested: null,
+  exitFullScreen: null,
+  newSessionMaximized: false,
+  fullScreenGadgetId: null,
+  createSessionMenuRequested: false,
+  frameConnections: {},
+  failedStarts: {},
+}));
+
+/**
+ * The query parameter naming the gadget that fills the screen, on a session's page or New
+ * session's. It makes the view a link: reloading, sharing or going Forward to it opens the gadget
+ * full screen again.
+ */
+export const GADGET_FULL_SCREEN_PARAM = "gadget";
+
+/** `path` with `gadgetId` filling the screen, keeping its other query parameters. */
+export function withGadgetFullScreen(path: string, gadgetId: string): string {
+  const hashAt = path.indexOf("#");
+  const hash = hashAt < 0 ? "" : path.slice(hashAt);
+  const withoutHash = hashAt < 0 ? path : path.slice(0, hashAt);
+  const queryAt = withoutHash.indexOf("?");
+  const pathname = queryAt < 0 ? withoutHash : withoutHash.slice(0, queryAt);
+  const params = new URLSearchParams(queryAt < 0 ? "" : withoutHash.slice(queryAt + 1));
+  params.set(GADGET_FULL_SCREEN_PARAM, gadgetId);
+  return `${pathname}?${params.toString()}${hash}`;
+}
+
+/** Tells the sidebar which gadget fills the screen, or that none does. */
+export function setFullScreenGadget(gadgetId: string | null): void {
+  if (useGadgetRailRequest.getState().fullScreenGadgetId !== gadgetId)
+    useGadgetRailRequest.setState({ fullScreenGadgetId: gadgetId });
+}
+
+/**
+ * Shows the tab `key` in the side panel of `conversationId`, opening the panel, and in full
+ * screen with `maximize`, where the panel shows only that tab; `keepSidebar` leaves the sidebar
+ * open then. A request made before navigating to the session waits until its panel shows the tab.
+ */
+export function requestGadgetRailTab(
+  conversationId: string,
+  key: string,
+  { maximize = false, keepSidebar = false }: { maximize?: boolean; keepSidebar?: boolean } = {},
+): void {
+  useGadgetRailRequest.setState({ requested: { conversationId, key, maximize, keepSidebar } });
+}
+
+/**
+ * Takes the gadget out of full screen so the conversation shows: in the side panel of
+ * `conversationId`, or beside New session for null.
+ */
+export function exitGadgetRailFullScreen(conversationId: string | null): void {
+  if (conversationId === null) useGadgetRailRequest.setState({ newSessionMaximized: false });
+  else useGadgetRailRequest.setState({ exitFullScreen: { conversationId } });
+}
+
+/** Whether the gadget beside New session fills the screen. */
+export function setGadgetNewSessionTabMaximized(maximized: boolean): void {
+  useGadgetRailRequest.setState({ newSessionMaximized: maximized });
+}
+
+/**
+ * Whether the gadget `gadgetId` fills the screen now: in a session's side panel, or beside New
+ * session, where the full screen gadget is the only one showing.
+ */
+export function gadgetFillsScreen(gadgetId: string): boolean {
+  const state = useGadgetRailRequest.getState();
+  return state.fullScreenGadgetId === gadgetId || state.newSessionMaximized;
+}
+
+/** Opens the Create session menu beside the full screen gadget that has no session yet. */
+export function requestGadgetCreateSessionMenu(): void {
+  useGadgetRailRequest.setState({ createSessionMenuRequested: true });
+}
+
+/** Takes a request to open the Create session menu; true when there was one. */
+export function takeGadgetCreateSessionMenuRequest(): boolean {
+  if (!useGadgetRailRequest.getState().createSessionMenuRequested) return false;
+  useGadgetRailRequest.setState({ createSessionMenuRequested: false });
+  return true;
+}
+
+/** Notes that a frame of `gadgetId` connected to its gadget. */
+export function noteGadgetFrameConnected(gadgetId: string): void {
+  useGadgetRailRequest.setState((state) => ({
+    frameConnections: {
+      ...state.frameConnections,
+      [gadgetId]: (state.frameConnections[gadgetId] ?? 0) + 1,
+    },
+  }));
+}
+
+/** Notes that the session started beside `gadgetId` couldn't show it. */
+export function noteGadgetStartFailed(gadgetId: string): void {
+  useGadgetRailRequest.setState((state) => ({
+    failedStarts: { ...state.failedStarts, [gadgetId]: (state.failedStarts[gadgetId] ?? 0) + 1 },
+  }));
+}
+
+export function clearGadgetRailRequest(): void {
+  useGadgetRailRequest.setState({ requested: null });
+}
+
+/** Forgets every request; for tests. */
+export function resetGadgetRailRequests(): void {
+  useGadgetRailRequest.setState({
+    requested: null,
+    exitFullScreen: null,
+    newSessionMaximized: false,
+    fullScreenGadgetId: null,
+    createSessionMenuRequested: false,
+    frameConnections: {},
+    failedStarts: {},
+  });
+}

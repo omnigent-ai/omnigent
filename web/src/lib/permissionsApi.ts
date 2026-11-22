@@ -1,10 +1,10 @@
 /**
  * Typed client for the `/v1/sessions/{id}/permissions`,
  * `/v1/scheduled-tasks/{id}/permissions`, `/v1/workflows/{id}/permissions` and
- * `/v1/thingies/{id}/permissions` endpoints. Mirrors the handlers in
+ * `/v1/gadgets/{id}/permissions` endpoints. Mirrors the handlers in
  * `omnigent/server/routes/sessions/routes_permissions.py`,
  * `omnigent/server/routes/scheduled_task_permissions.py`,
- * `omnigent/server/routes/workflow_permissions.py` and the thingy sharing routes.
+ * `omnigent/server/routes/workflow_permissions.py` and the gadget sharing routes.
  */
 
 import type { Conversation } from "@/hooks/useConversations";
@@ -22,13 +22,13 @@ import { authenticatedFetch } from "./identity";
 /**
  * What a share dialog shares: a session, an automation whose runs' sessions follow
  * it, a saved workflow, which people it is shared with can view, run and copy, or a
- * thingy, which they can view, edit or manage.
+ * gadget, which they can view, edit or manage.
  */
 export type ShareTarget =
   | { kind: "session"; id: string }
   | { kind: "automation"; id: string }
   | { kind: "workflow"; id: string }
-  | { kind: "thingy"; id: string };
+  | { kind: "gadget"; id: string };
 
 /** Numeric read level, the only level an automation or a workflow can be shared at. */
 export const LEVEL_READ = 1;
@@ -170,9 +170,9 @@ export interface WorkflowPermission extends ShareGrant {
   display_name: string;
 }
 
-/** One grant on a thingy; each carries the grantee's display name. */
-export interface ThingyPermission extends ShareGrant {
-  thingy_id: string;
+/** One grant on a gadget; each carries the grantee's display name. */
+export interface GadgetPermission extends ShareGrant {
+  gadget_id: string;
   display_name: string;
 }
 
@@ -196,7 +196,7 @@ const PERMISSION_COLLECTIONS: Record<ShareTarget["kind"], string> = {
   session: "sessions",
   automation: "scheduled-tasks",
   workflow: "workflows",
-  thingy: "thingies",
+  gadget: "gadgets",
 };
 
 function permissionsPath(target: ShareTarget): string {
@@ -254,11 +254,11 @@ export async function listWorkflowPermissions(
   return listAllGrants<WorkflowPermission>({ kind: "workflow", id: workflowId });
 }
 
-/** Everyone a thingy is shared with, which only its managers may list. */
-export async function listThingyPermissions(
-  thingyId: string,
-): Promise<GrantList<ThingyPermission>> {
-  return listAllGrants<ThingyPermission>({ kind: "thingy", id: thingyId });
+/** Everyone a gadget is shared with, which only its managers may list. */
+export async function listGadgetPermissions(
+  gadgetId: string,
+): Promise<GrantList<GadgetPermission>> {
+  return listAllGrants<GadgetPermission>({ kind: "gadget", id: gadgetId });
 }
 
 export async function getSessionOwner(sessionId: string): Promise<string | null> {
@@ -385,9 +385,9 @@ export function workflowSharingAvailable(info: ServerInfo | "loading"): boolean 
 }
 
 /**
- * Whether the server has thingies and other users to share them with; a viewer
- * also needs manage access to the thingy.
+ * Whether the server has gadgets and other users to share them with; a viewer
+ * also needs manage access to the gadget.
  */
-export function thingySharingAvailable(info: ServerInfo | "loading"): boolean {
-  return isFeatureEnabled(info, "thingies") && !isSingleUserMode(info);
+export function gadgetSharingAvailable(info: ServerInfo | "loading"): boolean {
+  return isFeatureEnabled(info, "gadgets") && !isSingleUserMode(info);
 }

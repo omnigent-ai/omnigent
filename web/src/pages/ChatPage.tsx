@@ -226,7 +226,7 @@ import {
 } from "@/hooks/useSessionLiveness";
 import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
-import { useThingyRailRequest } from "@/lib/thingyRailTabs";
+import { useGadgetRailRequest } from "@/lib/gadgetRailTabs";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
@@ -289,7 +289,7 @@ import { canAutoWakeSandbox, useSandboxAutoWake } from "@/hooks/useSandboxAutoWa
 import { isSandboxLaunchStopped } from "@/lib/sandboxStatus";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
-import { useThingyComposerQuotes } from "@/lib/thingyComposerQuotes";
+import { useGadgetComposerQuotes } from "@/lib/gadgetComposerQuotes";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import { modelPickerKindForConv, type NativeModelPickerKind } from "@/lib/composerCapabilities";
 
@@ -510,11 +510,11 @@ export function ChatPage() {
 
   // Clear the "unseen messages" sidebar dot for the conversation the
   // user is currently viewing. Re-fires when conversations refresh
-  // (every 4 s) so messages arriving while viewing are marked seen. A thingy
+  // (every 4 s) so messages arriving while viewing are marked seen. A gadget
   // filling the screen hides the conversation, so its new messages stay new.
-  const thingyCoversChat = useThingyRailRequest((state) => state.fullScreenThingyId !== null);
+  const gadgetCoversChat = useGadgetRailRequest((state) => state.fullScreenGadgetId !== null);
   useMarkConversationSeen(
-    thingyCoversChat ? undefined : sessionConvId,
+    gadgetCoversChat ? undefined : sessionConvId,
     conversations?.find((c) => c.id === sessionConvId)?.updated_at,
   );
 
@@ -1872,9 +1872,9 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   });
 
   const composerReadOnly = isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason);
-  // A thingy's Reply and Ask in side chat land here like the transcript's own; the
+  // A gadget's Reply and Ask in side chat land here like the transcript's own; the
   // terminal view switches to chat first.
-  useThingyComposerQuotes(conversationId ?? null, (quote) => {
+  useGadgetComposerQuotes(conversationId ?? null, (quote) => {
     // While the session loads its permissions read as unknown; wait rather than drop the quote.
     if (permissionLevel === null) return false;
     if (composerReadOnly) return true;

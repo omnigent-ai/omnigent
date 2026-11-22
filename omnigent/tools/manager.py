@@ -206,7 +206,7 @@ class ToolManager:
         self._register_journal_tools()
         self._register_user_inbox_tools()
         self._register_memory_tools()
-        self._register_thingy_tools()
+        self._register_gadget_tools()
         self._register_browser_tools()
 
     def _register_policy_tools(self) -> None:
@@ -262,19 +262,19 @@ class ToolManager:
         for tool_class in JOURNAL_TOOLS:
             self._tools[tool_class.name()] = tool_class()
 
-    def _register_thingy_tools(self) -> None:
+    def _register_gadget_tools(self) -> None:
         """
-        Auto-register the ``sys_thingy_*`` tools.
+        Auto-register the ``sys_gadget_*`` tools.
 
-        ``tool_groups.thingies: false`` drops them, and the runner drops them
-        unless the server enables thingies. The runner dispatches them via the
-        server's ``/v1/thingies`` routes.
+        ``tool_groups.gadgets: false`` drops them, and the runner drops them
+        unless the server enables gadgets. The runner dispatches them via the
+        server's ``/v1/gadgets`` routes.
         """
-        if not self._spec.tool_groups.thingies:
+        if not self._spec.tool_groups.gadgets:
             return
-        from omnigent.tools.builtins.thingies import THINGY_TOOLS
+        from omnigent.tools.builtins.gadgets import GADGET_TOOLS
 
-        for tool_class in THINGY_TOOLS:
+        for tool_class in GADGET_TOOLS:
             self._tools[tool_class.name()] = tool_class()
 
     def _register_user_inbox_tools(self) -> None:

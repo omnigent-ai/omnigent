@@ -20,7 +20,7 @@ vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
   revokePermission: vi.fn(),
   listAutomationPermissions: vi.fn(),
   listWorkflowPermissions: vi.fn(),
-  listThingyPermissions: vi.fn(),
+  listGadgetPermissions: vi.fn(),
   grantSharePermission: vi.fn(),
   revokeSharePermission: vi.fn(),
 }));
@@ -67,7 +67,7 @@ const grantMock = vi.mocked(api.grantPermission);
 const revokeMock = vi.mocked(api.revokePermission);
 const listAutomationMock = vi.mocked(api.listAutomationPermissions);
 const listWorkflowMock = vi.mocked(api.listWorkflowPermissions);
-const listThingyMock = vi.mocked(api.listThingyPermissions);
+const listGadgetMock = vi.mocked(api.listGadgetPermissions);
 const grantShareMock = vi.mocked(api.grantSharePermission);
 const revokeShareMock = vi.mocked(api.revokeSharePermission);
 
@@ -2065,12 +2065,12 @@ describe("PermissionsModal", () => {
     });
   });
 
-  describe("sharing a thingy", () => {
-    const thingy = { id: "thingy-1", name: "Launch board" };
-    const thingyTarget = { kind: "thingy", id: thingy.id };
+  describe("sharing a gadget", () => {
+    const gadget = { id: "gadget-1", name: "Launch board" };
+    const gadgetTarget = { kind: "gadget", id: gadget.id };
 
     function grantee(userId: string, level: number, displayName = userId) {
-      return { user_id: userId, thingy_id: thingy.id, level, display_name: displayName };
+      return { user_id: userId, gadget_id: gadget.id, level, display_name: displayName };
     }
 
     async function chooseLevel(trigger: HTMLElement, name: string) {
@@ -2081,20 +2081,20 @@ describe("PermissionsModal", () => {
     }
 
     it("shares it at Can view, Can edit or Can manage, with no public access or link", async () => {
-      listThingyMock.mockResolvedValue(grantList([grantee("bob@example.com", 2, "Bob")]));
+      listGadgetMock.mockResolvedValue(grantList([grantee("bob@example.com", 2, "Bob")]));
       grantShareMock.mockResolvedValue(grantee("carol@example.com", 3));
       revokeShareMock.mockResolvedValue(undefined);
 
-      render(<PermissionsModal thingy={thingy} open onOpenChange={() => {}} />, {
-        wrapper: createInfoWrapper({ features: { thingies: true } }),
+      render(<PermissionsModal gadget={gadget} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ features: { gadgets: true } }),
       });
 
       expect(await screen.findByText("Bob")).toHaveAttribute("title", "bob@example.com");
-      expect(screen.getByRole("heading", { name: "Share this thingy" })).toBeInTheDocument();
-      expect(listThingyMock).toHaveBeenCalledWith(thingy.id);
+      expect(screen.getByRole("heading", { name: "Share this gadget" })).toBeInTheDocument();
+      expect(listGadgetMock).toHaveBeenCalledWith(gadget.id);
       expect(listMock).not.toHaveBeenCalled();
       expect(screen.queryByText("General access")).toBeNull();
-      // Its link opens the thingy for the people it is shared with; there is no session link.
+      // Its link opens the gadget for the people it is shared with; there is no session link.
       expect(screen.getByRole("button", { name: "Copy link" })).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "Open in mobile app" })).toBeNull();
       expect(
@@ -2110,7 +2110,7 @@ describe("PermissionsModal", () => {
       );
       fireEvent.click(screen.getByRole("button", { name: /grant/i }));
       await waitFor(() =>
-        expect(grantShareMock).toHaveBeenCalledWith(thingyTarget, "carol@example.com", 3),
+        expect(grantShareMock).toHaveBeenCalledWith(gadgetTarget, "carol@example.com", 3),
       );
 
       await chooseLevel(
@@ -2118,22 +2118,22 @@ describe("PermissionsModal", () => {
         "Can view",
       );
       await waitFor(() =>
-        expect(grantShareMock).toHaveBeenCalledWith(thingyTarget, "bob@example.com", 1),
+        expect(grantShareMock).toHaveBeenCalledWith(gadgetTarget, "bob@example.com", 1),
       );
       fireEvent.click(screen.getByRole("button", { name: "Revoke access for Bob" }));
       await waitFor(() =>
-        expect(revokeShareMock).toHaveBeenCalledWith(thingyTarget, "bob@example.com"),
+        expect(revokeShareMock).toHaveBeenCalledWith(gadgetTarget, "bob@example.com"),
       );
       expect(grantMock).not.toHaveBeenCalled();
     });
 
     it("names the owner and asks before a manager gives up their own access", async () => {
-      const managed = { ...thingy, owner_id: "alice@example.com", viewer_id: "bob@example.com" };
-      listThingyMock.mockResolvedValue(grantList([grantee("bob@example.com", 3, "Bob")]));
+      const managed = { ...gadget, owner_id: "alice@example.com", viewer_id: "bob@example.com" };
+      listGadgetMock.mockResolvedValue(grantList([grantee("bob@example.com", 3, "Bob")]));
       revokeShareMock.mockResolvedValue(undefined);
       const onOpenChange = vi.fn();
-      render(<PermissionsModal thingy={managed} open onOpenChange={onOpenChange} />, {
-        wrapper: createInfoWrapper({ features: { thingies: true } }),
+      render(<PermissionsModal gadget={managed} open onOpenChange={onOpenChange} />, {
+        wrapper: createInfoWrapper({ features: { gadgets: true } }),
       });
 
       expect(await screen.findByText("alice@example.com")).toBeInTheDocument();
@@ -2151,15 +2151,15 @@ describe("PermissionsModal", () => {
       const confirm = screen.getByRole("alertdialog", { name: "Change your own access" });
       fireEvent.click(within(confirm).getByRole("button", { name: "Remove my access" }));
       await waitFor(() =>
-        expect(revokeShareMock).toHaveBeenCalledWith(thingyTarget, "bob@example.com"),
+        expect(revokeShareMock).toHaveBeenCalledWith(gadgetTarget, "bob@example.com"),
       );
       await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
     });
 
     it("warns instead of lowering a grant from the add form", async () => {
-      listThingyMock.mockResolvedValue(grantList([grantee("bob@example.com", 3, "Bob")]));
-      render(<PermissionsModal thingy={thingy} open onOpenChange={() => {}} />, {
-        wrapper: createInfoWrapper({ features: { thingies: true } }),
+      listGadgetMock.mockResolvedValue(grantList([grantee("bob@example.com", 3, "Bob")]));
+      render(<PermissionsModal gadget={gadget} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ features: { gadgets: true } }),
       });
       await screen.findByText("Bob");
       fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
@@ -2173,23 +2173,23 @@ describe("PermissionsModal", () => {
     });
 
     it("still lists and removes grants while sharing is off", async () => {
-      listThingyMock.mockResolvedValue(grantList([grantee("bob@example.com", 2, "Bob")]));
+      listGadgetMock.mockResolvedValue(grantList([grantee("bob@example.com", 2, "Bob")]));
       revokeShareMock.mockResolvedValue(undefined);
-      render(<PermissionsModal thingy={thingy} open onOpenChange={() => {}} />, {
-        wrapper: createInfoWrapper({ features: { thingies: true }, sharing_mode: "off" }),
+      render(<PermissionsModal gadget={gadget} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ features: { gadgets: true }, sharing_mode: "off" }),
       });
       expect(await screen.findByText("Bob")).toBeInTheDocument();
       expect(screen.queryByPlaceholderText("alice@example.com")).toBeNull();
       fireEvent.click(screen.getByRole("button", { name: "Revoke access for Bob" }));
       await waitFor(() =>
-        expect(revokeShareMock).toHaveBeenCalledWith(thingyTarget, "bob@example.com"),
+        expect(revokeShareMock).toHaveBeenCalledWith(gadgetTarget, "bob@example.com"),
       );
     });
 
     it("offers only Can view where the server allows read-only sharing", async () => {
-      listThingyMock.mockResolvedValue(grantList([]));
-      render(<PermissionsModal thingy={thingy} open onOpenChange={() => {}} />, {
-        wrapper: createInfoWrapper({ features: { thingies: true }, sharing_mode: "read_only" }),
+      listGadgetMock.mockResolvedValue(grantList([]));
+      render(<PermissionsModal gadget={gadget} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ features: { gadgets: true }, sharing_mode: "read_only" }),
       });
       const trigger = await screen.findByRole("combobox", { name: "New user permission" });
       trigger.focus();

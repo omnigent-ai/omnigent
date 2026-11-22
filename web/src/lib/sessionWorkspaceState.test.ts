@@ -38,17 +38,17 @@ describe("sessionWorkspaceState", () => {
     });
   });
 
-  it("remembers a selected thingy tab", () => {
-    writeSessionWorkspaceState("conv_thingy", {
-      rightRailTab: "thingy",
-      selectedThingyKey: "thingy:board",
+  it("remembers a selected gadget tab", () => {
+    writeSessionWorkspaceState("conv_gadget", {
+      rightRailTab: "gadget",
+      selectedGadgetKey: "gadget:board",
     });
-    expect(readSessionWorkspaceState("conv_thingy")).toEqual({
-      rightRailTab: "thingy",
-      selectedThingyKey: "thingy:board",
+    expect(readSessionWorkspaceState("conv_gadget")).toEqual({
+      rightRailTab: "gadget",
+      selectedGadgetKey: "gadget:board",
     });
     resetSessionWorkspaceTabSelections();
-    expect(readSessionWorkspaceState("conv_thingy")).toEqual({});
+    expect(readSessionWorkspaceState("conv_gadget")).toEqual({});
   });
 
   it("remembers a selected GitHub tab", () => {

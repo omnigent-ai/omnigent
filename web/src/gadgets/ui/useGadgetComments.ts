@@ -1,0 +1,214 @@
+// Comments on a gadget, in the shape of the comments panel that files use. They live with the
+// gadget, so everyone it is shared with sees them; Address all sends the open ones to the session
+// that works on the gadget and moves them to Sent.
+import { useCallback, useMemo, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+
+import type { Comment } from "@/hooks/useComments";
+import { randomUUID } from "@/lib/randomUUID";
+import type { ActiveSelection, CommentsPanelProps } from "@/shell/CommentsPanel";
+import {
+  type Gadget,
+  type GadgetComment,
+  type GadgetCommentAnchor,
+  createGadgetComment,
+  deleteGadgetComment,
+  listGadgetComments,
+  updateGadgetComment,
+} from "@/gadgets/api/gadgetApi";
+import type { GadgetSelection } from "@/gadgets/host/gadgetBridge";
+import { GADGET_SKILL_INSTRUCTION } from "@/gadgets/host/gadgetBuild";
+import { GADGETS_KEY } from "./gadgetQueries";
+
+export function gadgetCommentsKey(gadgetId: string) {
+  return [...GADGETS_KEY, "comments", gadgetId] as const;
+}
+
+/** What the session reads for the comments Address all sends. */
+export function gadgetCommentsMessage(
+  gadget: Pick<Gadget, "id" | "name">,
+  comments: readonly GadgetComment[],
+): string {
+  const lines = [
+    `${GADGET_SKILL_INSTRUCTION} Address these comments on the gadget ${JSON.stringify(gadget.name)} (gadget_id ${gadget.id}). Change its page with sys_gadget_revision_create and sys_gadget_publish, or its records, as each asks. They are already marked addressed; sys_gadget_comment_list has them all.`,
+    "",
+  ];
+  comments.forEach((comment, index) => {
+    const where = [comment.anchor.label, comment.anchor.ref ? `ref ${comment.anchor.ref}` : null]
+      .filter(Boolean)
+      .join(", ");
+    lines.push(
+      `${index + 1}. On ${JSON.stringify(comment.anchor.text)}${where ? ` (${where})` : ""}, ${comment.createdBy || "someone"} wrote:`,
+      ...comment.body.split("\n").map((line) => `   ${line}`),
+    );
+  });
+  return lines.join("\n");
+}
+
+// The panel tells a comment's card from a pending selection by character range. Gadget comments
+// have none, so each gets its own position and a pending selection one no comment has.
+const PENDING_POSITION = -1;
+
+/**
+ * A gadget comment as the panel's. The viewer's own comments carry no author, which the panel
+ * reads as "You" and lets them edit or delete; in single-user mode every comment is theirs.
+ */
+function toPanelComment(
+  gadget: Pick<Gadget, "id" | "viewer_id">,
+  comment: GadgetComment,
+  position: number,
+): Comment {
+  const own = comment.createdBy === gadget.viewer_id;
+  return {
+    id: comment.id,
+    conversation_id: "",
+    path: `gadget:${gadget.id}`,
+    start_index: position,
+    end_index: position,
+    body: comment.body,
+    status: comment.status,
+    created_at: comment.createdAt,
+    updated_at: comment.updatedAt,
+    anchor_content: comment.anchor.text,
+    created_by: own ? null : comment.createdBy || null,
+  };
+}
+
+export type GadgetCommentsPanelProps = Pick<
+  CommentsPanelProps,
+  | "comments"
+  | "addressedComments"
+  | "activeSelection"
+  | "onAddComment"
+  | "onAddressAll"
+  | "onEditComment"
+  | "onDeleteComment"
+  | "onClickComment"
+  | "canAddress"
+  | "addressPending"
+  | "canEdit"
+  | "readOnlyMessage"
+>;
+
+export interface GadgetComments {
+  open: boolean;
+  setOpen: (open: boolean) => void;
+  draftCount: number;
+  canComment: boolean;
+  /** Starts a comment on a selection in the gadget and opens the panel. */
+  startComment: (selection: GadgetSelection) => void;
+  panel: GadgetCommentsPanelProps;
+  error: unknown;
+}
+
+export function useGadgetComments(
+  gadget: Gadget,
+  /** Sends the message to the session working on the gadget; absent when the viewer can't. */
+  address: ((message: string) => Promise<void>) | undefined,
+): GadgetComments {
+  const gadgetId = gadget.id;
+  const queryClient = useQueryClient();
+  const list = useQuery({
+    queryKey: gadgetCommentsKey(gadgetId),
+    queryFn: ({ signal }) => listGadgetComments(gadgetId, signal),
+  });
+  const [open, setOpen] = useState(false);
+  const [pending, setPending] = useState<GadgetCommentAnchor | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [addressing, setAddressing] = useState(false);
+  const [workError, setWorkError] = useState<unknown>(undefined);
+
+  const run = useCallback(
+    async (work: () => Promise<unknown>) => {
+      try {
+        await work();
+        setWorkError(undefined);
+      } catch (error) {
+        setWorkError(error);
+      }
+      await queryClient.invalidateQueries({ queryKey: gadgetCommentsKey(gadgetId) });
+    },
+    [queryClient, gadgetId],
+  );
+
+  const items = useMemo(() => list.data?.items ?? [], [list.data]);
+  const canComment = list.data?.canComment ?? false;
+  const drafts = useMemo(() => items.filter((item) => item.status === "draft"), [items]);
+  const positions = useMemo(
+    () => new Map(items.map((item, index) => [item.id, index + 1])),
+    [items],
+  );
+  const toPanel = (item: GadgetComment) =>
+    toPanelComment(gadget, item, positions.get(item.id) ?? 0);
+
+  const startComment = useCallback((selection: GadgetSelection) => {
+    setPending({
+      text: selection.text,
+      label: selection.label ?? null,
+      ref: selection.ref ?? null,
+      occurrence: selection.occurrence,
+    });
+    setSelectedId(null);
+    setOpen(true);
+  }, []);
+
+  const selected = items.find((item) => item.id === selectedId);
+  const activeSelection: ActiveSelection | null = useMemo(
+    () =>
+      pending
+        ? {
+            start_index: PENDING_POSITION,
+            end_index: PENDING_POSITION,
+            anchor_content: pending.text,
+          }
+        : selected
+          ? {
+              start_index: positions.get(selected.id) ?? 0,
+              end_index: positions.get(selected.id) ?? 0,
+              anchor_content: selected.anchor.text,
+              comment_id: selected.id,
+            }
+          : null,
+    [pending, positions, selected],
+  );
+
+  return {
+    open,
+    setOpen,
+    draftCount: drafts.length,
+    canComment,
+    startComment,
+    error: workError ?? (list.isError ? list.error : undefined),
+    panel: {
+      comments: drafts.map(toPanel),
+      addressedComments: items.filter((item) => item.status === "addressed").map(toPanel),
+      activeSelection,
+      onAddComment: (body) => {
+        const anchor = pending;
+        if (anchor === null) return;
+        setPending(null);
+        void run(() => createGadgetComment(gadgetId, { body, anchor, operationId: randomUUID() }));
+      },
+      onAddressAll: () => {
+        if (address === undefined || drafts.length === 0) return;
+        setAddressing(true);
+        void run(async () => {
+          await address(gadgetCommentsMessage(gadget, drafts));
+          await Promise.all(
+            drafts.map((item) => updateGadgetComment(gadgetId, item.id, { status: "addressed" })),
+          );
+        }).finally(() => setAddressing(false));
+      },
+      onEditComment: (id, body) => void run(() => updateGadgetComment(gadgetId, id, { body })),
+      onDeleteComment: (id) => void run(() => deleteGadgetComment(gadgetId, id)),
+      onClickComment: (comment) => {
+        setPending(null);
+        setSelectedId(comment.id);
+      },
+      canAddress: address !== undefined,
+      addressPending: addressing,
+      canEdit: canComment,
+      readOnlyMessage: "You can read the comments on this gadget but not add any.",
+    },
+  };
+}

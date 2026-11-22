@@ -18,7 +18,7 @@ from fastapi.responses import Response
 
 from omnigent.automations_availability import (
     AUTOMATIONS_HEADER,
-    THINGIES_HEADER,
+    GADGETS_HEADER,
     USER_INBOX_HEADER,
 )
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
@@ -320,9 +320,9 @@ def register_agent_routes(
                 )
                 inbox_on = False
             selection_headers[USER_INBOX_HEADER] = "1" if inbox_on else "0"
-        thingies_available = getattr(request.app.state, "thingies_available", None)
-        selection_headers[THINGIES_HEADER] = (
-            "1" if thingies_available is not None and thingies_available() else "0"
+        gadgets_available = getattr(request.app.state, "gadgets_available", None)
+        selection_headers[GADGETS_HEADER] = (
+            "1" if gadgets_available is not None and gadgets_available() else "0"
         )
         memory_available = getattr(request.app.state, "memory_available", None)
         selection_headers[MEMORY_HEADER] = (
@@ -639,8 +639,8 @@ def register_agent_routes(
 
         if method == "tools/call":
             from omnigent.server.mcp_identity import mcp_policy_actor
+            from omnigent.tools.builtins.gadgets import GADGET_TOOL_NAMES
             from omnigent.tools.builtins.journal import JOURNAL_TOOLS
-            from omnigent.tools.builtins.thingies import THINGY_TOOL_NAMES
 
             tool_name = params.get("name")
             if (
@@ -651,11 +651,11 @@ def register_agent_routes(
                 )
             ):
                 return _mcp_error_response(rpc_id, -32601, "Workflows are disabled on this server")
-            if isinstance(tool_name, str) and tool_name in THINGY_TOOL_NAMES:
-                thingies_available = getattr(request.app.state, "thingies_available", None)
-                if thingies_available is None or not thingies_available():
+            if isinstance(tool_name, str) and tool_name in GADGET_TOOL_NAMES:
+                gadgets_available = getattr(request.app.state, "gadgets_available", None)
+                if gadgets_available is None or not gadgets_available():
                     return _mcp_error_response(
-                        rpc_id, -32601, "Thingies are disabled on this server"
+                        rpc_id, -32601, "Gadgets are disabled on this server"
                     )
 
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)

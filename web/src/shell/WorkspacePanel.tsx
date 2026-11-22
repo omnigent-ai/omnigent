@@ -110,13 +110,13 @@ import {
 } from "./workspacePanelTabs";
 import { Button } from "../components/ui/button";
 import {
-  ThingyFullScreenSlot,
-  ThingyMobileDrawer,
-  type ThingyRailNewItem,
-  ThingyRailTabStrip,
-  useThingyRailTabState,
-} from "@/thingies/ui/ThingyRailTabs";
-import { ThingyOpenSessionButton } from "@/thingies/ui/ThingyOpenSessionButton";
+  GadgetFullScreenSlot,
+  GadgetMobileDrawer,
+  type GadgetRailNewItem,
+  GadgetRailTabStrip,
+  useGadgetRailTabState,
+} from "@/gadgets/ui/GadgetRailTabs";
+import { GadgetOpenSessionButton } from "@/gadgets/ui/GadgetOpenSessionButton";
 
 const TerminalView = lazy(() =>
   import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
@@ -199,7 +199,7 @@ function shellConnectState(liveness: SessionLiveness | undefined): ShellConnectS
   }
 }
 
-const NO_EXTRA_ITEMS: readonly ThingyRailNewItem[] = [];
+const NO_EXTRA_ITEMS: readonly GadgetRailNewItem[] = [];
 
 function NewTabMenu({
   conversationId,
@@ -226,8 +226,8 @@ function NewTabMenu({
   /** Open a new side chat (a fork of this conversation) as a rail tab. Absent
    *  when the session can't host one (e.g. Codex uses its typed `/side`). */
   onOpenSideChat?: () => void;
-  /** More tabs to open, after Side chat, such as a new thingy. */
-  extraItems?: readonly ThingyRailNewItem[];
+  /** More tabs to open, after Side chat, such as a new gadget. */
+  extraItems?: readonly GadgetRailNewItem[];
   /** Called when a shell create is initiated (before the POST resolves), so
    *  the shell can be focused as soon as its tab appears in the list. */
   onCreateStart?: () => void;
@@ -810,11 +810,11 @@ interface WorkspacePanelProps {
   maximized: boolean;
   /** Toggle the rail's maximized state. */
   onToggleMaximized: () => void;
-  /** Maximizes the rail and leaves the sidebar open, for a thingy opened from the sidebar. */
+  /** Maximizes the rail and leaves the sidebar open, for a gadget opened from the sidebar. */
   onMaximizeKeepingSidebar?: () => void;
-  /** Whether the sidebar is open, for a full screen thingy's bar. */
+  /** Whether the sidebar is open, for a full screen gadget's bar. */
   sidebarOpen?: boolean;
-  /** Opens the sidebar from a full screen thingy's bar. */
+  /** Opens the sidebar from a full screen gadget's bar. */
   onOpenSidebar?: (peek?: boolean) => void;
   /** Viewer's permission level (gates edit affordances). */
   permissionLevel: number | null;
@@ -985,11 +985,11 @@ function WorkspacePanelImpl({
   const sideChats = useSideChats(conversationId);
   const mobileViewport = useIsMobileViewport();
   const isMobile = mobileViewport && !contained;
-  // The thingies shown beside the session, as tabs after its side chats.
-  const thingyRail = useThingyRailTabState(conversationId, {
+  // The gadgets shown beside the session, as tabs after its side chats.
+  const gadgetRail = useGadgetRailTabState(conversationId, {
     readOnly: pending || !isEditorLevel(permissionLevel),
-    showing: rightRailTab === "thingy" && selectedFilePath === null && selectedTerminalKey === null,
-    onShow: () => onRightRailTabChange("thingy"),
+    showing: rightRailTab === "gadget" && selectedFilePath === null && selectedTerminalKey === null,
+    onShow: () => onRightRailTabChange("gadget"),
     onReveal,
     maximized,
     onMaximizedChange: (next, options) => {
@@ -997,7 +997,7 @@ function WorkspacePanelImpl({
       if (next && options?.keepSidebar && onMaximizeKeepingSidebar) onMaximizeKeepingSidebar();
       else onToggleMaximized();
     },
-    // Phones have no rail: a requested thingy covers the session in its own drawer.
+    // Phones have no rail: a requested gadget covers the session in its own drawer.
     mobile: isMobile,
     routed: !contained,
   });
@@ -1008,7 +1008,7 @@ function WorkspacePanelImpl({
       selectedTerminalKey,
       selectedBrowserId: browsers.selected,
       selectedSideChatId: sideChats.selected,
-      selectedThingyKey: thingyRail.selected,
+      selectedGadgetKey: gadgetRail.selected,
     },
     {
       terminalPresent: (key) => openTerminals.includes(key),
@@ -1020,11 +1020,11 @@ function WorkspacePanelImpl({
       mobile: isMobile,
     },
   );
-  const { browserSelected, sideChatSelected, thingySelected } = activeView;
+  const { browserSelected, sideChatSelected, gadgetSelected } = activeView;
   const terminalShown = activeView.terminalKey !== null;
-  // In full screen a thingy shows alone: the strip holds its controls and Open session.
-  const thingyFullScreen = maximized && thingySelected;
-  const [thingyToolbar, setThingyToolbar] = useState<HTMLElement | null>(null);
+  // In full screen a gadget shows alone: the strip holds its controls and Open session.
+  const gadgetFullScreen = maximized && gadgetSelected;
+  const [gadgetToolbar, setGadgetToolbar] = useState<HTMLElement | null>(null);
   const fullScreenLabel = maximized ? "Exit full screen" : "Full screen";
   const returnPointRef = useRef<ReturnPoint | null>(null);
   // The latest returnFrom, so a close that finishes later uses the tabs open by then.
@@ -1426,7 +1426,7 @@ function WorkspacePanelImpl({
       openFiles.length > 0 ||
       openTerminals.length > 0 ||
       sideChats.tabs.length > 0 ||
-      thingyRail.tabs.length > 0 ||
+      gadgetRail.tabs.length > 0 ||
       (showBrowserTab && browsers.tabs.length > 0));
   const newTabMenu = (menuAlign: "start" | "end") => (
     <NewTabMenu
@@ -1436,7 +1436,7 @@ function WorkspacePanelImpl({
       onOpenBrowser={showBrowserTab ? addBrowserFromMenu : undefined}
       onOpen={noteMenuOrigin}
       onOpenSideChat={onNewSideChat}
-      extraItems={thingyRail.newItems}
+      extraItems={gadgetRail.newItems}
       onOpenTerminal={openTerminalTab}
       onCreateStart={onShellCreateStart}
       onCreateError={onShellCreateFailed}
@@ -1484,8 +1484,8 @@ function WorkspacePanelImpl({
     if (
       ((rightRailTab === "browser" && browsers.selected === null) ||
         (rightRailTab === "sidechat" && sideChats.selected === null) ||
-        // A saved thingy tab waits for the session's thingies before it counts as gone.
-        (rightRailTab === "thingy" && thingyRail.selected === null && !thingyRail.loading)) &&
+        // A saved gadget tab waits for the session's gadgets before it counts as gone.
+        (rightRailTab === "gadget" && gadgetRail.selected === null && !gadgetRail.loading)) &&
       selectedFilePath === null &&
       selectedTerminalKey === null
     ) {
@@ -1495,8 +1495,8 @@ function WorkspacePanelImpl({
     rightRailTab,
     browsers.selected,
     sideChats.selected,
-    thingyRail.selected,
-    thingyRail.loading,
+    gadgetRail.selected,
+    gadgetRail.loading,
     selectedFilePath,
     selectedTerminalKey,
     browserFallbackTab,
@@ -1558,11 +1558,11 @@ function WorkspacePanelImpl({
       },
       disabled: false,
     })),
-    ...thingyRail.tabs.map((tab) => ({
-      key: `thingy:${tab.key}`,
+    ...gadgetRail.tabs.map((tab) => ({
+      key: `gadget:${tab.key}`,
       label: tab.label,
-      active: thingySelected && thingyRail.selected === tab.key,
-      select: () => thingyRail.select(tab.key),
+      active: gadgetSelected && gadgetRail.selected === tab.key,
+      select: () => gadgetRail.select(tab.key),
       disabled: false,
     })),
   ];
@@ -1630,8 +1630,8 @@ function WorkspacePanelImpl({
         handleCloseTab();
       } else if (scopeView === "sidechat" && sideChats.selected !== null) {
         void closeSideChat(sideChats.selected);
-      } else if (scopeView === "thingy" && thingyRail.selected !== null) {
-        if (thingyRail.canClose) thingyRail.close(thingyRail.selected);
+      } else if (scopeView === "gadget" && gadgetRail.selected !== null) {
+        if (gadgetRail.canClose) gadgetRail.close(gadgetRail.selected);
       } else if (scopeView === "browser" && browsers.selected !== null) {
         void closeBrowserTab(browsers.selected);
       } else if (openPanel !== undefined) {
@@ -1817,8 +1817,8 @@ function WorkspacePanelImpl({
       className={cn(
         "workspace-panel-motion @container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
         maximized ? "md:absolute md:inset-0" : "md:shrink-0",
-        // A full screen thingy meets the window's edge with the sidebar closed.
-        thingyFullScreen && !sidebarOpen && "md:border-l-0",
+        // A full screen gadget meets the window's edge with the sidebar closed.
+        gadgetFullScreen && !sidebarOpen && "md:border-l-0",
         contained &&
           "flex min-h-0 flex-col overflow-hidden border-l border-border bg-card shrink-0",
         contained && maximized && "absolute inset-0",
@@ -1859,7 +1859,7 @@ function WorkspacePanelImpl({
           tabIndex={-1}
           className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3"
         >
-          {!thingyFullScreen && visiblePermanentTabs.length > 0 && (
+          {!gadgetFullScreen && visiblePermanentTabs.length > 0 && (
             <Tabs
               className={cn("shrink-0", showOpenTabs && "@max-[400px]/rail:hidden")}
               // Soft tabs own their highlight. A vanished shell falls back to a
@@ -1870,7 +1870,7 @@ function WorkspacePanelImpl({
                   : selectedFilePath !== null ||
                       browserSelected ||
                       sideChatSelected ||
-                      thingySelected ||
+                      gadgetSelected ||
                       terminalShown
                     ? "__tab__"
                     : (rightRailTab ?? "__empty__")
@@ -1884,7 +1884,7 @@ function WorkspacePanelImpl({
             </Tabs>
           )}
           {/* The divider follows the fixed panel icons' visibility. */}
-          {!thingyFullScreen && visiblePermanentTabs.length > 0 && (
+          {!gadgetFullScreen && visiblePermanentTabs.length > 0 && (
             <div
               aria-hidden
               className={cn(
@@ -1893,7 +1893,7 @@ function WorkspacePanelImpl({
               )}
             />
           )}
-          {!thingyFullScreen && showOpenTabs && (
+          {!gadgetFullScreen && showOpenTabs && (
             <>
               {/* Open tabs fill the space before the pinned trailing controls. */}
               <WorkspaceTabsScroller>
@@ -2045,16 +2045,16 @@ function WorkspacePanelImpl({
                     </div>
                   );
                 })}
-                <ThingyRailTabStrip state={thingyRail} active={thingySelected} />
+                <GadgetRailTabStrip state={gadgetRail} active={gadgetSelected} />
               </WorkspaceTabsScroller>
             </>
           )}
           {/* With no open tabs, "+" sits right after the nav tabs. */}
-          {!pending && !thingyFullScreen && !showOpenTabs && newTabMenu("start")}
-          {/* A full screen thingy fills the bar with its own controls. */}
-          {thingyFullScreen && (
-            <ThingyFullScreenSlot
-              onToolbar={setThingyToolbar}
+          {!pending && !gadgetFullScreen && !showOpenTabs && newTabMenu("start")}
+          {/* A full screen gadget fills the bar with its own controls. */}
+          {gadgetFullScreen && (
+            <GadgetFullScreenSlot
+              onToolbar={setGadgetToolbar}
               sidebarOpen={sidebarOpen}
               onOpenSidebar={onOpenSidebar}
             />
@@ -2062,8 +2062,8 @@ function WorkspacePanelImpl({
           {/* The picker and fullscreen toggle form the trailing control group,
             pinned right outside the scrolling viewport; "+" joins it once tabs exist. */}
           <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
-            {!thingyFullScreen && showOpenTabs && newTabMenu("end")}
-            {!thingyFullScreen && panelOptions.length > 0 && (
+            {!gadgetFullScreen && showOpenTabs && newTabMenu("end")}
+            {!gadgetFullScreen && panelOptions.length > 0 && (
               <DropdownMenu
                 onOpenChange={(isOpen) => {
                   if (isOpen) markPickerKeyboard();
@@ -2115,10 +2115,10 @@ function WorkspacePanelImpl({
                 </DropdownMenuContent>
               </DropdownMenu>
             )}
-            {thingyFullScreen ? (
-              // Leaving a full screen thingy shows its session, so the button shows the session's
+            {gadgetFullScreen ? (
+              // Leaving a full screen gadget shows its session, so the button shows the session's
               // harness, with its composer controls in a popover.
-              <ThingyOpenSessionButton
+              <GadgetOpenSessionButton
                 sessionId={conversationId}
                 onOpenSession={onToggleMaximized}
                 className="text-muted-foreground hover:text-foreground"
@@ -2166,7 +2166,7 @@ function WorkspacePanelImpl({
               frontTerminalKey,
               sideChats.selected,
               browsers.viewId,
-              thingyRail.selected,
+              gadgetRail.selected,
             ])}
           >
             {/* Phones use AppShell's drawer instead; one mounted panel keeps the input state single-owner. */}
@@ -2257,10 +2257,10 @@ function WorkspacePanelImpl({
                   sort={filesPanelSort}
                 />
               </ResponsiveViewerSlot>
-            ) : scopeView === "thingy" && thingyRail.selected !== null ? (
-              thingyRail.render(thingyRail.selected, {
-                fullScreen: thingyFullScreen,
-                toolbar: thingyFullScreen ? thingyToolbar : null,
+            ) : scopeView === "gadget" && gadgetRail.selected !== null ? (
+              gadgetRail.render(gadgetRail.selected, {
+                fullScreen: gadgetFullScreen,
+                toolbar: gadgetFullScreen ? gadgetToolbar : null,
               })
             ) : scopeView === "sidechat" ? (
               // A side chat: a forked child conversation streamed here in its own
@@ -2311,7 +2311,7 @@ function WorkspacePanelImpl({
   return (
     <>
       {rail}
-      {isMobile && <ThingyMobileDrawer state={thingyRail} />}
+      {isMobile && <GadgetMobileDrawer state={gadgetRail} />}
       {/* The rail is `hidden` on phones, so the drawer renders beside it. A
         portal to the body would escape the embed's scoped styles. */}
       {isMobile && (

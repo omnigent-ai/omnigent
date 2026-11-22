@@ -109,9 +109,9 @@ export interface HtmlPreviewFrameProps {
   onLoad: () => void;
 }
 
-/** Props of a host-provided thingy frame (see `OmnigentHostConfig.thingyFrame`). */
-export interface ThingyFrameHostProps {
-  /** The thingy's document: a CSP meta tag, the SDK bootstrap script, then the thingy's HTML. */
+/** Props of a host-provided gadget frame (see `OmnigentHostConfig.gadgetFrame`). */
+export interface GadgetFrameHostProps {
+  /** The gadget's document: a CSP meta tag, the SDK bootstrap script, then the gadget's HTML. */
   htmlContent: string;
   /** The same policy as the meta tag, for hosts that also send it as a response header. */
   contentSecurityPolicy: string;
@@ -123,12 +123,12 @@ export interface ThingyFrameHostProps {
    */
   frameId: string;
   /**
-   * Call with each message the thingy document posts to its parent window. Pass only messages
+   * Call with each message the gadget document posts to its parent window. Pass only messages
    * whose source is that document's window; the SDK greets its host this way.
    */
   onMessage: (data: unknown) => void;
   /**
-   * Call with the thingy document's window once it has loaded, and again after each later load;
+   * Call with the gadget document's window once it has loaded, and again after each later load;
    * the SDK's connect message and port are posted to that window.
    */
   onLoad: (frameWindow: Window) => void;
@@ -141,11 +141,11 @@ export interface OmnigentHostConfig {
    */
   htmlPreviewFrame?: ComponentType<HtmlPreviewFrameProps>;
   /**
-   * Runs a thingy's published HTML, for hosts that serve thingies from an isolated origin.
+   * Runs a gadget's published HTML, for hosts that serve gadgets from an isolated origin.
    * Without it the web app runs the HTML in a sandboxed `srcdoc` iframe with an opaque origin.
    * Install before the app mounts and keep the component identity stable for that mount.
    */
-  thingyFrame?: ComponentType<ThingyFrameHostProps>;
+  gadgetFrame?: ComponentType<GadgetFrameHostProps>;
   /**
    * Stable server/workspace identity for browser storage and goal ownership.
    * Embedded hosts must change this when switching backends.
@@ -239,8 +239,8 @@ export function getOmnigentHtmlPreviewFrame(): OmnigentHostConfig["htmlPreviewFr
   return hostConfig.htmlPreviewFrame;
 }
 
-export function getOmnigentThingyFrame(): OmnigentHostConfig["thingyFrame"] {
-  return hostConfig.thingyFrame;
+export function getOmnigentGadgetFrame(): OmnigentHostConfig["gadgetFrame"] {
+  return hostConfig.gadgetFrame;
 }
 
 export function getOmnigentServerIdentity(): string | null {

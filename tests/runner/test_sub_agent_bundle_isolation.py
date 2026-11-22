@@ -321,7 +321,7 @@ def test_isolated_framework_bundle_carries_only_the_framework_skill(
     runner mints an EMPTY temp dir and seeds at most the framework-owned
     skills: ``build-omnigent``, which every agent gets unconditionally, and
     ``workflow`` and ``save-workflow`` for agents with the journal tools, and
-    ``thingy`` for agents with the thingy tools. It
+    ``gadget`` for agents with the gadget tools. It
     never copies from the parent — which is why those two call sites need
     no change. This fails loudly if that fallback ever starts sourcing a
     parent bundle.
@@ -338,7 +338,7 @@ def test_isolated_framework_bundle_carries_only_the_framework_skill(
 
     skills_dir = isolated / "skills"
     seeded = {p.name for p in skills_dir.iterdir()} if skills_dir.is_dir() else set()
-    assert seeded <= {"build-omnigent", "workflow", "save-workflow", "thingy"}
+    assert seeded <= {"build-omnigent", "workflow", "save-workflow", "gadget"}
     # No parent asset reached the isolated bundle by any route.
     assert not list(isolated.rglob("parent-only"))
     assert not list(isolated.rglob("config.yaml"))

@@ -56,18 +56,18 @@ class WorkflowPermission:
 
 
 @dataclasses.dataclass(frozen=True)
-class ThingyPermission:
-    """A single permission grant on a thingy.
+class GadgetPermission:
+    """A single permission grant on a gadget.
 
-    The thingy's owner holds no grant; ownership is ``Thingy.owner_id``.
+    The gadget's owner holds no grant; ownership is ``Gadget.owner_id``.
 
     :param user_id: The grantee, a user or group, e.g. ``"alice@example.com"``.
-    :param thingy_id: The thingy this grant applies to.
+    :param gadget_id: The gadget this grant applies to.
     :param level: Numeric permission level: ``1`` read, ``2`` edit, ``3`` manage.
     """
 
     user_id: str
-    thingy_id: str
+    gadget_id: str
     level: int
 
 

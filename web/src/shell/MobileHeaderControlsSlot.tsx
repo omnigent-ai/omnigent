@@ -10,7 +10,7 @@ const MobileHeaderControlsContext = createContext<{
 } | null>(null);
 
 /**
- * Where a session's composer controls can show outside the composer: the full screen thingy's
+ * Where a session's composer controls can show outside the composer: the full screen gadget's
  * Open session button (its harness icon) and the popover beside it (host, permission mode,
  * harness and model, and New session's Create session button). The controls are the composer's
  * own, so a choice made there is the composer's; New session's composer uses the session ID
@@ -100,7 +100,7 @@ function useSessionControlSlot(
 
 /**
  * Renders a composer control where it is offered: the session's `popoverSlot` while the full
- * screen thingy's popover is open, the mobile header on mobile, else in place.
+ * screen gadget's popover is open, the mobile header on mobile, else in place.
  */
 export function MobileHeaderControlPortal({
   sessionId,

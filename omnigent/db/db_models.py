@@ -2154,23 +2154,23 @@ class SqlWorkflowShare(OmnigentBase):
     )
 
 
-class SqlThingyShare(OmnigentBase):
+class SqlGadgetShare(OmnigentBase):
     """
-    SQLAlchemy model for the ``thingy_shares`` table.
+    SQLAlchemy model for the ``gadget_shares`` table.
 
-    One row per user or group a thingy is shared with, at read, edit or manage.
-    Thingies themselves live in the server's thingy store, not in this database,
-    so the application deletes these rows when it deletes the thingy. Public
+    One row per user or group a gadget is shared with, at read, edit or manage.
+    Gadgets themselves live in the server's gadget store, not in this database,
+    so the application deletes these rows when it deletes the gadget. Public
     shares (``__public__``) are never stored; the application enforces that.
 
-    :param thingy_id: The thingy this share belongs to, a UUID stored as 16 bytes.
+    :param gadget_id: The gadget this share belongs to, a UUID stored as 16 bytes.
     :param user_id: The grantee, a user or group ID, e.g. ``"alice@example.com"``.
         String(128) matches ``session_permissions.user_id``.
     :param level: The permission level granted. No CHECK constraint: the permission
         store owns the set of valid levels.
     """
 
-    __tablename__ = "thingy_shares"
+    __tablename__ = "gadget_shares"
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     # No database default; the ORM always supplies it.
@@ -2180,7 +2180,7 @@ class SqlThingyShare(OmnigentBase):
         nullable=False,
         default=current_workspace_id,
     )
-    thingy_id: Mapped[str] = mapped_column(Uuid16, primary_key=True, nullable=False)
+    gadget_id: Mapped[str] = mapped_column(Uuid16, primary_key=True, nullable=False)
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True, nullable=False)
     level: Mapped[int] = mapped_column(SmallInteger, nullable=False)
 
@@ -2188,24 +2188,24 @@ class SqlThingyShare(OmnigentBase):
         # SQLite and D1 ignore VARCHAR lengths: 128 characters at up to four bytes each.
         CheckConstraint(
             "length(CAST(user_id AS BLOB)) <= 512",
-            name="ck_thingy_shares_user_id_bytes",
+            name="ck_gadget_shares_user_id_bytes",
         ).ddl_if(callable_=_on_sqlite_family),
         # SQLite and D1 store any value in an integer column.
         CheckConstraint(
             "typeof(workspace_id) = 'integer'",
-            name="ck_thingy_shares_workspace_id_integer",
+            name="ck_gadget_shares_workspace_id_integer",
         ).ddl_if(callable_=_on_sqlite_family),
         CheckConstraint(
             "typeof(level) = 'integer'",
-            name="ck_thingy_shares_level_integer",
+            name="ck_gadget_shares_level_integer",
         ).ddl_if(callable_=_on_sqlite_family),
-        # Looks up the thingies shared with one user; the primary key already
+        # Looks up the gadgets shared with one user; the primary key already
         # covers the remaining columns.
         Index(
-            "ix_thingy_shares_user_id",
+            "ix_gadget_shares_user_id",
             "workspace_id",
             "user_id",
-            "thingy_id",
+            "gadget_id",
         ),
     )
 

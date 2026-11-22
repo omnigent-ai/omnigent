@@ -33,10 +33,10 @@ from omnigent.entities.github_connection import GithubConnection
 from omnigent.entities.inbox_item import InboxItem
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.permission import (
+    GadgetPermission,
     ResolvedAccess,
     ScheduledTaskPermission,
     SessionPermission,
-    ThingyPermission,
     WorkflowPermission,
 )
 from omnigent.entities.policy import Policy
@@ -68,6 +68,7 @@ __all__ = [
     "ErrorData",
     "FunctionCallData",
     "FunctionCallOutputData",
+    "GadgetPermission",
     "GithubConnection",
     "InboxItem",
     "ItemData",
@@ -91,7 +92,6 @@ __all__ = [
     "SlashCommandData",
     "StoredFile",
     "TerminalCommandData",
-    "ThingyPermission",
     "WorkflowPermission",
     "filter_resources_by_type",
     "get_resource_by_id",

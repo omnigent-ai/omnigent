@@ -252,7 +252,7 @@ export function CreateScheduledTaskDialog({
   /** Open on a Jira/Slack/GitHub/Linear trigger template instead of a plain prompt. */
   initialTrigger?: TriggerSource | null;
   initialTemplateId?: AutomationTemplateId;
-  /** RRULE a new automation starts from, for example from a thingy's link. */
+  /** RRULE a new automation starts from, for example from a gadget's link. */
   initialSchedule?: string;
   /** Shareable session URL the trigger prompt links back with; see `SESSION_LINK_ID_PLACEHOLDER`. */
   sessionLink?: string;
