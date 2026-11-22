@@ -664,6 +664,27 @@ _runner_status_probe_inflight: WorkspaceScopedCache[str, asyncio.Task[str | None
 _session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
+# The input each running turn began with, so a side chat forked mid-turn copies
+# only what came before it. Set as that input is persisted; the turn's end drops it.
+_session_turn_request_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+
+
+def _record_turn_request(session_id: str, item_id: str, *, starts_turn: bool) -> None:
+    """
+    Remember *item_id* as the input *session_id*'s running turn began with.
+
+    :param session_id: Session the input was persisted to, e.g. ``"conv_abc123"``.
+    :param item_id: The persisted input's item id.
+    :param starts_turn: Whether the input began a turn of its own. Any other
+        input, such as a follow-up steered into the running turn or a task
+        notification, counts only while no start is known for the turn.
+    """
+    if starts_turn:
+        _session_turn_request_cache[session_id] = item_id
+    else:
+        _session_turn_request_cache.setdefault(session_id, item_id)
+
+
 _session_background_task_count_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 
 
@@ -1296,6 +1317,7 @@ __all__ = [
     "_read_explicit_unread",
     "_read_last_seen",
     "_recent_mirrored_tool_calls",
+    "_record_turn_request",
     "_runner_relay_tasks",
     "_runner_status_probe_backoff",
     "_runner_status_probe_inflight",
@@ -1310,6 +1332,7 @@ __all__ = [
     "_session_sandbox_status_cache",
     "_session_status_cache",
     "_session_terminal_pending_cache",
+    "_session_turn_request_cache",
     "_unbound_managed_launch_tasks",
     "get_server_host_registry",
     "get_server_runner_router",

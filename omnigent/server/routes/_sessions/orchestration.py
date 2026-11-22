@@ -245,6 +245,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _policy_evaluation_locks,
     _pushed_model_options_cache,
     _recent_mirrored_tool_calls,
+    _record_turn_request,
     _RelayHandle,
     _RelayStatusSnapshot,
     _runner_relay_tasks,
@@ -260,6 +261,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
+    _session_turn_request_cache,
     _unbound_managed_launch_tasks,
     get_caps,
     get_server_runner_router,
@@ -3370,6 +3372,24 @@ def _drains_pending_inputs(item: NewConversationItem) -> bool:
     )
 
 
+def _begins_native_turn(item: NewConversationItem) -> bool:
+    """
+    Whether a mirrored item is input a native turn can begin with.
+
+    That is anything that settles a queued web message, or hidden input such as
+    a background task's notification, which Claude Code answers in a turn of its own.
+
+    :param item: The parsed external item.
+    :returns: ``True`` for a turn's possible first input.
+    """
+    return _drains_pending_inputs(item) or (
+        item.type == "message"
+        and isinstance(item.data, MessageData)
+        and item.data.role == "user"
+        and item.data.is_meta
+    )
+
+
 async def _persist_external_conversation_item(
     session_id: str,
     conv: Conversation,
@@ -3664,6 +3684,14 @@ async def _persist_external_conversation_item_unlocked(
         )
         await record_claude_subagent_return(session_id, persisted, conversation_store)
         return persisted.id
+    if _begins_native_turn(item):
+        # Before the queue entry settles, so a side chat fork that saw it pending
+        # finds the request it became.
+        _record_turn_request(
+            session_id,
+            persisted.id,
+            starts_turn=drained is not None and not drained.queued_during_turn,
+        )
     # Landed: the drained entries are settled (uncertain ones leave without a
     # record — their mirror may already have been attributed by position);
     # older messages a slash command jumped over are still on their way and
@@ -8256,6 +8284,13 @@ async def _forward_event_to_runner(
             persisted = await asyncio.to_thread(
                 conversation_store.append, session_id, [replacement]
             )
+        if not persisted[0].deduplicated:
+            # A message sent while a turn runs is steered into that turn.
+            _record_turn_request(
+                session_id,
+                persisted[0].id,
+                starts_turn=_session_status_from_cache(session_id, conv.live_status) != "running",
+            )
         return persisted
 
     # Run controls wait for routing and a fresh guard before entering replayable history.
@@ -9747,6 +9782,7 @@ def _relinquish_session_live_state(session_id: str) -> None:
     """Drop local live state for a session now owned by another replica."""
     _session_status_cache.pop(session_id, None)
     _session_active_response_cache.pop(session_id, None)
+    _session_turn_request_cache.pop(session_id, None)
     _session_blocked_on_cache.pop(session_id, None)
     session_live_state.forget_live_status(session_id)
 

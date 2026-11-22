@@ -162,6 +162,8 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_CONVERSATION_ITEM_TYPE,
     _FORK_HISTORY_NATIVE_HARNESSES,
     _logger,
+    _session_background_agents_cache,
+    _session_turn_request_cache,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -332,8 +334,22 @@ from omnigent.version import VERSION
 # Harnesses whose sessions offer ``/rewind``.
 _REWIND_HARNESSES = frozenset({"claude-sdk", "claude-native"})
 
-# Newest items a side chat fork reads to find its source's active request.
+# Newest items a side chat fork reads for its source's request when no turn start is recorded.
 _SIDE_CHAT_REQUEST_LOOKBACK = 200
+
+
+class _SideChatCutoff(NamedTuple):
+    """
+    Where a side chat forked mid-turn stops copying its source's history.
+
+    :param before_item_id: Copy only the items before this one.
+    :param up_to_response_id: Copy through this response's last item.
+    :param copy_items: ``False`` copies no items.
+    """
+
+    before_item_id: str | None = None
+    up_to_response_id: str | None = None
+    copy_items: bool = True
 
 
 class _NewestRequest(NamedTuple):
@@ -4882,11 +4898,11 @@ def register_core_routes(
 
         A side chat (``body.side_chat``) forked while the source answers a
         request, or while a message is still reaching its runner, leaves that
-        request out. It copies the history before the source's newest request
-        (a message or skill a person sent), or, while that request has not
-        reached history, the history as it stands when the fork is made. A
-        native target rebuilds its transcript from those items instead of
-        cloning the source's live one.
+        request out. It copies the history before the input the running turn
+        began with, which follow-ups sent during the turn do not change, or,
+        while that request has not reached history, the history as it stands
+        when the fork is made. A native target rebuilds its transcript from
+        those items instead of cloning the source's live one.
 
         The dialog's run-config picks (``body.model_override``,
         ``body.reasoning_effort``, ``body.terminal_launch_args`` — the
@@ -5130,20 +5146,11 @@ def register_core_routes(
         up_to_response_id = body.up_to_response_id
         copy_items = copy_history
         if side_chat_mid_turn:
-            # Checked before the read too, so a request that settles meanwhile
-            # cannot make the earlier read look like the running turn.
-            delivering = pending_inputs.has_pending_turn_start(source.id)
-            newest = await asyncio.to_thread(_newest_request, source.id)
-            delivering = delivering or pending_inputs.has_pending_turn_start(source.id)
-            if newest.item_id is not None and (
-                not newest.answered or (source_running and not delivering)
-            ):
-                before_item_id = newest.item_id
-            elif delivering or not source_running:
-                # The request has not reached history: copy only what is there now,
-                # which is nothing when no item a copy can end on exists.
-                up_to_response_id = newest.end_response_id
-                copy_items = newest.end_response_id is not None or not newest.whole_history
+            # A claude-native turn that ended with background agents running reads as running.
+            turn_in_flight = source_running and not _session_background_agents_cache.get(source.id)
+            before_item_id, up_to_response_id, copy_items = await asyncio.to_thread(
+                _side_chat_cutoff, source.id, turn_in_flight
+            )
         # A fork that keeps no history has no attachments to replay.
         if copy_items:
             await asyncio.to_thread(
@@ -6434,6 +6441,43 @@ def register_core_routes(
             if not page.has_more or page.last_id is None:
                 return False
             after = page.last_id
+
+    def _side_chat_cutoff(session_id: str, turn_in_flight: bool) -> _SideChatCutoff:
+        """
+        Find where a side chat forked from *session_id* now stops copying.
+
+        It stops before the input the running turn began with, so it never sees
+        that turn's request. Without a recorded start, e.g. after a restart, it
+        stops before the newest request, or copies nothing when none is in reach.
+
+        :param session_id: The side chat's source session, e.g. ``"conv_abc"``.
+        :param turn_in_flight: Whether the source is answering a request.
+        :returns: The copy's cutoff.
+        """
+        turn_request = _session_turn_request_cache.get(session_id)
+        if turn_request is not None:
+            return _SideChatCutoff(before_item_id=turn_request)
+        # Checked before the read too, so a request that settles meanwhile
+        # cannot make the earlier read look like the running turn.
+        delivering = pending_inputs.has_pending_turn_start(session_id)
+        newest = _newest_request(session_id)
+        # A request that lands during the read is recorded before it stops pending.
+        turn_request = _session_turn_request_cache.get(session_id)
+        delivering = delivering or pending_inputs.has_pending_turn_start(session_id)
+        if turn_request is not None:
+            return _SideChatCutoff(before_item_id=turn_request)
+        if newest.item_id is not None and (
+            not newest.answered or (turn_in_flight and not delivering)
+        ):
+            return _SideChatCutoff(before_item_id=newest.item_id)
+        if delivering or not turn_in_flight:
+            # The request has not reached history: copy only what is there now,
+            # which is nothing when no item a copy can end on exists.
+            return _SideChatCutoff(
+                up_to_response_id=newest.end_response_id,
+                copy_items=newest.end_response_id is not None or not newest.whole_history,
+            )
+        return _SideChatCutoff(copy_items=False)
 
     def _newest_request(session_id: str) -> _NewestRequest:
         """

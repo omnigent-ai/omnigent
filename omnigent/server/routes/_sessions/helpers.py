@@ -253,6 +253,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _pushed_model_options_cache,
     _read_explicit_unread,
     _read_last_seen,
+    _record_turn_request,
     _session_active_response_cache,
     _session_background_agents_cache,
     _session_background_task_count_cache,
@@ -262,6 +263,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
+    _session_turn_request_cache,
     _unbound_managed_launch_tasks,
     build_policy_engine,
     get_agent_cache,
@@ -5275,6 +5277,7 @@ def _publish_status(
         # tracked in-flight response id rather than leaving it for the
         # snapshot to reopen a streaming bubble.
         _session_active_response_cache.pop(session_id, None)
+        _session_turn_request_cache.pop(session_id, None)
         return
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
@@ -5370,6 +5373,9 @@ def _publish_status(
             _session_active_response_cache[session_id] = response_id
     else:
         _session_active_response_cache.pop(session_id, None)
+    # A ``waiting`` edge naming background agents ends a claude-native turn too.
+    if status not in ("running", "waiting") or background_agents:
+        _session_turn_request_cache.pop(session_id, None)
     # Keep the background-shell tally sticky alongside the status (see the
     # cache's declaration). A ``Stop`` hook reports an authoritative count
     # (``None`` is never sent by it): a positive count sets the tally, and
@@ -8676,6 +8682,12 @@ async def _dispatch_skill_slash_command_to_runner(
         [visible_item, meta_item],
     )
     visible = persisted_items[0]
+    if not visible.deduplicated:
+        _record_turn_request(
+            session_id,
+            visible.id,
+            starts_turn=_session_status_from_cache(session_id, conv.live_status) != "running",
+        )
 
     # Mirror the plain-message path's title seeding: a session whose FIRST
     # message is a skill invocation (web landing composer, REPL) would
