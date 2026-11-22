@@ -61,6 +61,17 @@ export interface WorkspaceSidebarTabActionsOptions {
   closeStepsFor?: (tab: WorkspaceTab) => TabCloseSteps;
   /** Releases what closing others leaves behind, such as a browser view. */
   releaseFor?: (tab: WorkspaceTab) => (() => Promise<boolean>) | undefined;
+  /**
+   * Closes the strip entry `tabId` stands for when the host shows several tabs as one, such as
+   * a split; returns false to close it as a tab. Used by Close tab, its chord and ⌘W.
+   */
+  closeEntry?: (tabId: TabId, source?: "pointer", fromSidebar?: boolean) => boolean;
+  /**
+   * Moves the strip entry `tabId` is in one entry over, with every tab it stands for, where the
+   * host shows several tabs as one; returns false to move it as a tab. Used by Move Tab Left
+   * and Right, their chords and the menu.
+   */
+  moveEntry?: (tabId: TabId, delta: -1 | 1) => boolean;
   /** The actions only some hosts offer. */
   offers?: { newTab?: () => void; searchTabs?: () => void };
   /** Offers Pin and Unpin, for a strip that shows pinned tabs; `refusalFor` says why a tab can't. */
@@ -86,6 +97,8 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
     canClose = () => true,
     closeStepsFor,
     releaseFor,
+    closeEntry,
+    moveEntry,
     offers = {},
     pinning,
     onReveal,
@@ -109,11 +122,16 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
       );
     }
   };
+  // The tab the strip shows for `tabId`: a split closes as one.
+  const closeVisibleTab = (tabId: TabId, source?: "pointer", fromSidebar?: boolean) => {
+    if (!closeEntry?.(tabId, source, fromSidebar)) closeTab(tabId, source, fromSidebar);
+  };
   // Shells stay: closing others shouldn't end every shell with a dialog each.
   const closeOtherTabs = (keepTabId: TabId) => {
     void store.closeOthers(keepTabId, releaseFor ?? (() => undefined));
   };
   const moveTab = (tabId: TabId, delta: -1 | 1) => {
+    if (moveEntry?.(tabId, delta)) return;
     const index = store.tabs().findIndex((tab) => tab.id === tabId);
     if (index !== -1) store.move(tabId, index + delta);
   };
@@ -166,7 +184,7 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
         return;
       case "close-tab":
         if (selectedTabId !== null) {
-          closeTab(selectedTabId, undefined, origin?.fromWorkspaceSidebar);
+          closeVisibleTab(selectedTabId, undefined, origin?.fromWorkspaceSidebar);
         }
         return;
       case "reopen":
@@ -296,6 +314,7 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
     facts,
     run,
     closeTab,
+    closeVisibleTab,
     closeOtherTabs,
     moveTab,
     togglePin,
