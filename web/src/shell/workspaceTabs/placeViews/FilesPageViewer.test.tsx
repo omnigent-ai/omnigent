@@ -224,6 +224,33 @@ describe("FilesPageViewer", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t open a.ts: not found");
   });
 
+  it("shows the comparison's diff for a Markdown file it deleted, where reading the file fails", () => {
+    const deleted = {
+      base: "comparison",
+      changed: true,
+      deleted: true,
+      headIsWorkingCopy: true,
+      query: {},
+    } as ReturnType<typeof useComparisonFileDiff>;
+    comparison.diff = deleted;
+    renderViewer("docs/removed.md", { isError: true, error: new Error("not found") } as never);
+    expect(screen.getByTestId("file-viewer")).toHaveTextContent("docs/removed.md");
+    expect(captured.viewer?.comparisonDiff).toBe(deleted);
+    expect(screen.queryByRole("alert")).toBeNull();
+    cleanup();
+    // A file the comparison doesn't list as deleted still says why it couldn't open.
+    comparison.diff = {
+      base: "comparison",
+      changed: false,
+      deleted: false,
+      headIsWorkingCopy: true,
+      query: {},
+    } as ReturnType<typeof useComparisonFileDiff>;
+    renderViewer("docs/removed.md", { isError: true, error: new Error("not found") } as never);
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t open docs/removed.md: not found");
+    comparison.diff = { base: "head" };
+  });
+
   it("keeps a rich file in the app's viewer when a background refresh fails", () => {
     const { rerender } = renderViewer("docs/guide.md", { data: file("docs/guide.md", "# Guide") });
     const viewer = screen.getByTestId("file-viewer");
