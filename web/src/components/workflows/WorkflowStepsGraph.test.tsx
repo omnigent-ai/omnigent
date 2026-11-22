@@ -266,6 +266,28 @@ describe("WorkflowGraphOverlay", () => {
     expectTextWrapsInside(card);
   });
 
+  it("says a stopped step started when its attempt did, not at its newest start", async () => {
+    const now = Date.now() / 1000;
+    const run = progress("stopped", "waiting");
+    const newest = {
+      ...statusEntry("explore", "started", "Pushed fix 7"),
+      created_at: now - 1_926,
+    };
+    run[0] = { ...run[0]!, status: newest, startedAt: now - 14_840 };
+    render(
+      <WorkflowGraphOverlay
+        title="Triage flaky tests"
+        steps={STEPS}
+        progress={run}
+        onClose={vi.fn()}
+      />,
+    );
+    await userEvent.hover(screen.getAllByTestId("workflow-step-node")[0]!);
+    expect(await screen.findByTestId("workflow-step-card")).toHaveTextContent(
+      "Stopped · started 4h ago",
+    );
+  });
+
   it("offers each step's action in its ⋯ menu, and an open menu takes the first Escape", async () => {
     const onTaskAction = vi.fn();
     const onClose = vi.fn();
