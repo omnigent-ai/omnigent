@@ -1178,7 +1178,7 @@ describe("Project ticket board", () => {
   });
 
   it.each(["hover", "focus"])(
-    "highlights all direct related tickets across paginated results on %s",
+    "tints the source and outlines direct related tickets across paginated results on %s",
     async (interaction) => {
       const first: ProjectTicket = {
         ...ticket,
@@ -1214,19 +1214,27 @@ describe("Project ticket board", () => {
       const source = await screen.findByRole("link", { name: "Open ticket: Ship the board" });
       const neighbor = await screen.findByRole("link", { name: "Open ticket: Done part" });
       expect(api.listRelatedTickets).not.toHaveBeenCalled();
+      expect(source).toHaveClass("hover:bg-primary/5", "focus-visible:bg-primary/5");
+      expect(source).not.toHaveAttribute("data-related-highlight");
       if (interaction === "hover") fireEvent.mouseEnter(source);
       else fireEvent.focus(source);
       await waitFor(() => expect(neighbor).toHaveAttribute("data-related-highlight", "true"));
-      expect(screen.getByRole("link", { name: "Open ticket: Plan part" })).toHaveAttribute(
-        "data-related-highlight",
-        "true",
-      );
+      for (const related of [
+        neighbor,
+        screen.getByRole("link", { name: "Open ticket: Plan part" }),
+      ]) {
+        expect(related).toHaveAttribute("data-related-highlight", "true");
+        expect(related).toHaveClass("border-muted-foreground/50", "bg-card");
+        expect(related).not.toHaveClass("bg-primary/5");
+        expect(related).not.toHaveClass("ring-2");
+      }
       expect(screen.getByRole("link", { name: "Open ticket: Other work" })).not.toHaveAttribute(
         "data-related-highlight",
       );
       if (interaction === "hover") fireEvent.mouseLeave(source);
       else fireEvent.blur(source);
       await waitFor(() => expect(neighbor).not.toHaveAttribute("data-related-highlight"));
+      expect(neighbor).not.toHaveClass("border-muted-foreground/50");
       expect(api.updateTicket).not.toHaveBeenCalled();
     },
   );

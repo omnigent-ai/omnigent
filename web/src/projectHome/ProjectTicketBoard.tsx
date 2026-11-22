@@ -283,9 +283,9 @@ function TicketCard({
         if (suppressClick()) event.preventDefault();
       }}
       className={cn(
-        "flex flex-col gap-3 rounded-xl border border-border/60 bg-card p-3.5 text-left shadow-xs outline-none transition-colors hover:border-muted-foreground/50 focus-visible:ring-2 focus-visible:ring-ring",
+        "flex flex-col gap-3 rounded-xl border border-border/60 bg-card p-3.5 text-left shadow-xs outline-none transition-colors hover:border-primary/70 hover:bg-primary/5 hover:ring-2 hover:ring-primary/20 focus-visible:bg-primary/5 focus-visible:ring-2 focus-visible:ring-ring",
+        related && "border-muted-foreground/50",
         selected && "border-primary ring-1 ring-primary/20",
-        related && "border-primary/70 bg-primary/5 ring-2 ring-primary/20",
         isDragging && "opacity-40",
       )}
     >
