@@ -1,5 +1,7 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, render, renderHook } from "@testing-library/react";
 import type { ReactNode } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { StickToBottom } from "use-stick-to-bottom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -9,7 +11,12 @@ import type { Bubble } from "@/lib/renderItems";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { type PaletteCommand, usePaletteCommandsStore } from "@/store/paletteCommands";
 
+import type { UserMessageBlock } from "@/lib/blocks";
+import { writePeerSessionMessageDisplay } from "@/lib/peerSessionMessagePreferences";
+import { useChatStore } from "@/store/chatStore";
+
 import { useStopResponsePaletteCommand } from "./stopResponse";
+import { Transcript } from "./Transcript";
 import { TranscriptPaletteCommands } from "./TranscriptPaletteCommands";
 
 const clipboard = vi.hoisted(() => ({
@@ -57,6 +64,8 @@ const command = (label: string) => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  useChatStore.setState({ blocks: [], conversationId: null });
+  writePeerSessionMessageDisplay("collapse");
   usePaletteCommandsStore.setState({ groups: {} });
 });
 
@@ -95,6 +104,74 @@ describe("TranscriptPaletteCommands", () => {
     });
     act(() => command("Fork from latest response…").run());
     expect(openForkDialog).toHaveBeenCalledWith({ upToResponseId: "r1" });
+  });
+});
+
+function userBlock(itemId: string, content: UserMessageBlock["content"]): UserMessageBlock {
+  return {
+    type: "user_message",
+    ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: itemId, itemId },
+    content,
+  };
+}
+
+describe("TranscriptPaletteCommands in the transcript", () => {
+  it("copies the latest prompt the transcript shows, not a hidden message from another session", async () => {
+    writePeerSessionMessageDisplay("hide");
+    useChatStore.setState({
+      conversationId: "c1",
+      blocks: [
+        userBlock("u1", [{ type: "input_text", text: "Fix the parser" }]),
+        userBlock("u2", [
+          { type: "input_text", text: "[Message from session peer_1]\nStatus from the peer" },
+        ]),
+      ],
+    });
+    const FlagOn = withFlag(true);
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={["/c/c1"]}>
+          <FlagOn>
+            <Transcript
+              hostId={null}
+              setConversationEl={vi.fn()}
+              containerEl={null}
+              scroller={null}
+              setScroller={vi.fn()}
+              sendScrollNonce={0}
+              hasMoreHistory={false}
+              loadingMoreHistory={false}
+              isMobileViewport={false}
+              showsWorking={false}
+              agentsError={null}
+              sandboxLaunching={false}
+              spacerMeasureRef={{ current: null }}
+            />
+          </FlagOn>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    await act(async () => command("Copy latest prompt").run());
+    expect(clipboard.text).toHaveBeenLastCalledWith("Fix the parser");
+    await act(async () => command("Copy link to latest prompt").run());
+    expect(clipboard.text).toHaveBeenLastCalledWith(expect.stringContaining("message=u1"));
+  });
+});
+
+describe("TranscriptPaletteCommands for an attachment-only prompt", () => {
+  it("greys Copy latest prompt and never empties the clipboard, but still links to it", async () => {
+    const attachmentOnly: Bubble[] = [
+      { kind: "user", itemId: "u1", content: [{ type: "input_image", image_url: "data:," }] },
+    ];
+    render(<TranscriptPaletteCommands conversationId="c1" bubbles={attachmentOnly} />, {
+      wrapper: withFlag(true),
+    });
+    const copy = command("Copy latest prompt");
+    expect(copy.availability?.available).toBe(false);
+    await act(async () => copy.run());
+    expect(clipboard.text).not.toHaveBeenCalled();
+    await act(async () => command("Copy link to latest prompt").run());
+    expect(clipboard.text).toHaveBeenLastCalledWith(expect.stringContaining("message=u1"));
   });
 });
 

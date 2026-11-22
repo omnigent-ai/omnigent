@@ -57,10 +57,13 @@ function ConversationCommands({ conversationId, bubbles }: TranscriptPaletteComm
   const fork = useForkDialog();
   const { isAtBottom, scrollToBottom } = useStickToBottomContext();
   const latest = latestMessages(bubbles);
-  const responseText = latest.response ? collectBubbleMarkdown(latest.response.items) : "";
   const commands = latestMessageCommands({
     latest,
-    responseHasText: responseText !== "",
+    // Checked without building the text, since this runs on every streamed frame.
+    responseHasText:
+      latest.response?.items.some((item) => item.kind === "text" && item.text.trim() !== "") ??
+      false,
+    promptHasText: latest.prompt ? userBubbleCopyText(latest.prompt) !== "" : false,
     fork,
   });
   // Read when run, so a command copies the message showing then, not one from a frame ago.
@@ -92,9 +95,12 @@ function ConversationCommands({ conversationId, bubbles }: TranscriptPaletteComm
             case "fork-latest-response":
               if (response) forkDialog?.openForkDialog({ upToResponseId: response.responseId });
               return;
-            case "copy-latest-prompt":
-              if (prompt) copied(copyText(userBubbleCopyText(prompt)), "Copied to clipboard");
+            case "copy-latest-prompt": {
+              // As the message's own button, never overwrite the clipboard with nothing.
+              const text = prompt ? userBubbleCopyText(prompt) : "";
+              if (text) copied(copyText(text), "Copied to clipboard");
               return;
+            }
             case "copy-latest-prompt-link": {
               const linkId = prompt ? userMessageLinkId(prompt) : null;
               if (linkId) copied(copyText(buildMessageDeepLink(linkId)), "Link copied");

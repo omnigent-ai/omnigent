@@ -7,6 +7,7 @@ import {
   type LatestMessageCommandId,
   latestMessageCommands,
   latestMessages,
+  NO_PROMPT_TEXT,
   NO_PROMPT_YET,
   NO_RESPONSE_TEXT,
   NO_RESPONSE_YET,
@@ -41,11 +42,12 @@ interface Fork {
 
 function commandsFor(
   bubbles: Bubble[],
-  { responseHasText = true, fork = { canFork: true } as Fork | null } = {},
+  { responseHasText = true, promptHasText = true, fork = { canFork: true } as Fork | null } = {},
 ) {
   const commands = latestMessageCommands({
     latest: latestMessages(bubbles),
     responseHasText,
+    promptHasText,
     fork,
   });
   const find = (id: LatestMessageCommandId) => commands.find((command) => command.id === id)!;
@@ -96,6 +98,10 @@ describe("latestMessageCommands", () => {
     expect(empty.reason("copy-latest-prompt")).toBe(NO_PROMPT_YET);
     const noText = commandsFor([response("r1")], { responseHasText: false });
     expect(noText.reason("copy-latest-response")).toBe(NO_RESPONSE_TEXT);
+    // A prompt of only attachments has nothing to copy, but its link still works.
+    const attachmentsOnly = commandsFor([prompt("u1")], { promptHasText: false });
+    expect(attachmentsOnly.reason("copy-latest-prompt")).toBe(NO_PROMPT_TEXT);
+    expect(attachmentsOnly.available("copy-latest-prompt-link")).toBe(true);
     const unsent = commandsFor([prompt("u1", { pending: true })]);
     expect(unsent.reason("copy-latest-prompt-link")).toBe(PROMPT_NOT_SENT);
   });

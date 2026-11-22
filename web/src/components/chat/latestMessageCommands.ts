@@ -19,6 +19,7 @@ type UserBubble = Extract<Bubble, { kind: "user" }>;
 export const NO_RESPONSE_YET = "No response in this conversation yet.";
 export const NO_RESPONSE_TEXT = "The latest response has no text to copy.";
 export const NO_PROMPT_YET = "No message in this conversation yet.";
+export const NO_PROMPT_TEXT = "The latest message has no text to copy.";
 export const PROMPT_NOT_SENT = "Available once the message is sent.";
 
 export type LatestMessageCommandId =
@@ -54,6 +55,8 @@ export interface LatestMessageFacts {
   latest: LatestMessages;
   /** Whether the latest response has text to copy. */
   responseHasText: boolean;
+  /** Whether the latest prompt has text to copy; one with only attachments has none. */
+  promptHasText: boolean;
   fork: Pick<ForkDialogContextValue, "canFork" | "disabledReason"> | null;
 }
 
@@ -67,6 +70,7 @@ export interface LatestMessageCommand {
 export function latestMessageCommands({
   latest: { response, prompt },
   responseHasText,
+  promptHasText,
   fork,
 }: LatestMessageFacts): LatestMessageCommand[] {
   const needsResponse = (then: CommandAvailability) =>
@@ -98,7 +102,7 @@ export function latestMessageCommands({
     {
       id: "copy-latest-prompt",
       label: "Copy latest prompt",
-      availability: needsPrompt(AVAILABLE),
+      availability: needsPrompt(promptHasText ? AVAILABLE : unavailableBecause(NO_PROMPT_TEXT)),
     },
     {
       id: "copy-latest-prompt-link",

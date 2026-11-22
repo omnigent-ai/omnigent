@@ -531,7 +531,7 @@ function TranscriptImpl({
           <ConversationScrollRefBridge onScroller={setScroller} />
           <TranscriptPaletteCommands
             conversationId={display.conversationId}
-            bubbles={display.bubbles}
+            bubbles={display.streamBubbles}
           />
           <ConversationScrollButton
             className={
