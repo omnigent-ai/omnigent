@@ -225,13 +225,16 @@ async def test_name_only_project_uses_owned_host_home_and_normal_launch(
 async def test_board_api_lifecycle_and_no_deletion(project_client):
     project = (await project_client.post("/v1/projects", json={"name": "Shipping"})).json()
     base = f"/v1/projects/{project['id']}/tickets"
-    created = await project_client.post(base, json={"title": "Ship"})
+    labels = [{"key": "source", "value": "report"}]
+    created = await project_client.post(base, json={"title": "Ship", "labels": labels})
     assert created.status_code == 201
     ticket = created.json()
     assert ticket["stage_id"] == "open" and ticket["description"] == ""
+    assert ticket["labels"] == labels and "tags" not in ticket
     path = base + f"/{ticket['id']}"
     response = await project_client.patch(
-        path, json={"tags": [{"key": "needs-human", "value": "review"}], "stage_id": "in_progress"}
+        path,
+        json={"labels": [{"key": "needs-human", "value": "review"}], "stage_id": "in_progress"},
     )
     assert response.status_code == 200
     assert (await project_client.get(base, params={"stage_id": "in_progress", "limit": 1})).json()[
@@ -260,7 +263,7 @@ async def test_board_api_lifecycle_and_no_deletion(project_client):
     )
     assert completed.status_code == 200
     assert completed.json()["comment_count"] == 2
-    assert completed.json()["tags"] == [{"key": "needs-human", "value": "review"}]
+    assert completed.json()["labels"] == [{"key": "needs-human", "value": "review"}]
     assert {"plan", "review_summary", "completion_summary"}.isdisjoint(completed.json())
     events_before = (await project_client.get(path + "/events")).json()
     rejected = await project_client.patch(
@@ -269,6 +272,21 @@ async def test_board_api_lifecycle_and_no_deletion(project_client):
     assert rejected.status_code == 422
     assert (await project_client.get(path)).json()["description"] == ""
     assert (await project_client.get(path + "/events")).json() == events_before
+    for method, url, body in (
+        ("POST", base, {"title": "Rejected", "tags": labels}),
+        ("PATCH", path, {"tags": [], "description": "Must not be applied"}),
+    ):
+        rejected = await project_client.request(method, url, json=body)
+        assert rejected.status_code == 422
+        assert any(error["loc"] == ["body", "tags"] for error in rejected.json()["detail"])
+    assert (await project_client.get(path)).json() == completed.json()
+    assert (await project_client.get(path + "/events")).json() == events_before
+    assert len((await project_client.get(base)).json()["data"]) == 1
+    schemas = (await project_client.get("/openapi.json")).json()["components"]["schemas"]
+    for name in ("CreateTicket", "UpdateTicket"):
+        assert "labels" in schemas[name]["properties"]
+        assert "tags" not in schemas[name]["properties"]
+    assert "TicketLabel" in schemas and "TicketTag" not in schemas
     assert (await project_client.delete(path)).status_code in (404, 405)
     assert (await project_client.delete(f"/v1/projects/{project['id']}")).status_code == 409
     assert (await project_client.get(path)).status_code == 200
@@ -298,7 +316,7 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
             json={
                 "title": "Investigate",
                 "description": "Keep context",
-                "tags": [{"key": "needs-human"}],
+                "labels": [{"key": "needs-human"}],
             },
         )
     ).json()
@@ -344,7 +362,7 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
     human_ticket = (await project_client.get(f"{base}/{ticket['id']}")).json()
     assert human_ticket["stage_id"] == "triage"
     assert human_ticket["description"] == "Keep context"
-    assert human_ticket["tags"] == ticket["tags"]
+    assert human_ticket["labels"] == ticket["labels"]
     assert "agent_guidance" not in human_ticket
     events = (await project_client.get(f"{base}/{ticket['id']}/events")).json()["data"]
     assert events[:-1] == events_before["data"]

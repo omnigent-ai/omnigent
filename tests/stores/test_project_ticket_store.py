@@ -1,11 +1,12 @@
 import random
+from copy import deepcopy
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import event, update
+from sqlalchemy import event, select, update
 from sqlalchemy.exc import StatementError
 
-from omnigent.db.db_models import SqlProjectTicket, workspace_scope
+from omnigent.db.db_models import SqlProjectTicket, SqlProjectTicketEvent, workspace_scope
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities.project_ticket import (
     CommentOnTicket,
@@ -38,7 +39,7 @@ def test_atomic_edits_and_append_only_outputs(board):
     tickets.update(
         project.id,
         ticket["id"],
-        UpdateTicket(title="Last", tags=[{"key": "needs-human", "value": "decision"}]),
+        UpdateTicket(title="Last", labels=[{"key": "needs-human", "value": "decision"}]),
         actor,
     )
     tickets.comment(
@@ -56,7 +57,7 @@ def test_atomic_edits_and_append_only_outputs(board):
     )
     result = tickets.get(project.id, ticket["id"], user_id="alice")
     assert result["title"] == "Last" and result["comment_count"] == 1
-    assert result["tags"] == [{"key": "needs-human", "value": "decision"}]
+    assert result["labels"] == [{"key": "needs-human", "value": "decision"}]
     events = tickets.events(project.id, ticket["id"], user_id="alice")["data"]
     assert [e["kind"] for e in events] == [
         "created",
@@ -71,6 +72,12 @@ def test_atomic_edits_and_append_only_outputs(board):
         e["session_id"] == actor.session_id and e["agent_id"] == actor.agent_id for e in events
     )
     assert events[-1]["payload"] == events[-2]["payload"]
+    assert events[0]["payload"]["labels"] == []
+    assert events[2]["payload"]["changes"]["labels"] == result["labels"]
+    assert "tags" not in events[0]["payload"]
+    assert "tags" not in events[2]["payload"]["changes"]
+    assert tickets.update(project.id, ticket["id"], UpdateTicket(labels=None), actor) == result
+    assert tickets.events(project.id, ticket["id"], user_id="alice")["data"] == events
     done = tickets.update(
         project.id,
         ticket["id"],
@@ -79,12 +86,84 @@ def test_atomic_edits_and_append_only_outputs(board):
     )
     assert not {"plan", "review_summary", "completion_summary"} & done.keys()
     reopened = tickets.update(
-        project.id, ticket["id"], UpdateTicket(stage_id="open", tags=[]), actor
+        project.id, ticket["id"], UpdateTicket(stage_id="open", labels=[]), actor
     )
-    assert reopened["tags"] == []
+    assert reopened["labels"] == []
     history = tickets.events(project.id, ticket["id"], user_id="alice")["data"]
     assert len(history) == 9
     assert history[-2]["payload"] == {"text": "Delivered and tested"}
+
+
+def test_labels_project_existing_storage_and_history_without_rewriting_it(board, db_uri):
+    tickets, _, project = board
+    actor = TicketActor("alice", uuid4().hex, uuid4().hex)
+    ticket = tickets.create(
+        project.id,
+        CreateTicket(title="Keep tags in authored text", labels=[{"key": "area"}]),
+        actor,
+    )
+    tickets.link_session(project.id, ticket["id"], actor.session_id, "attach", actor)
+    labels = [{"key": "needs-human", "value": "Keep café 🦊 tags"}, {"key": "area", "value": ""}]
+    expected = tickets.update(
+        project.id,
+        ticket["id"],
+        UpdateTicket(
+            labels=labels,
+            stage_id="planning",
+            lead_session_id=actor.session_id,
+            description="Keep `tags` in this description.",
+            comment="**Tags**\n\nKeep this authored text.",
+        ),
+        actor,
+    )
+    expected_history = tickets.events(project.id, ticket["id"], user_id="alice")["data"]
+    table = SqlProjectTicket.__table__
+    assert "tags" in table.columns and "labels" not in table.columns
+    assert SqlProjectTicket.labels.property.columns[0] is table.c.tags
+    engine = get_or_create_engine(db_uri)
+    with engine.begin() as connection:
+        connection.execute(table.update().where(table.c.id == ticket["id"]).values(tags=labels))
+        for entry in expected_history:
+            payload = deepcopy(entry["payload"])
+            if entry["kind"] == "created":
+                payload["tags"] = payload.pop("labels")
+            elif entry["kind"] == "updated" and "labels" in payload.get("changes", {}):
+                payload["changes"]["tags"] = payload["changes"].pop("labels")
+            connection.execute(
+                update(SqlProjectTicketEvent)
+                .where(SqlProjectTicketEvent.id == entry["id"])
+                .values(payload=payload)
+            )
+    with engine.connect() as connection:
+        raw_ticket = connection.exec_driver_sql("SELECT * FROM project_tickets").all()
+        raw_events = connection.exec_driver_sql(
+            "SELECT * FROM project_ticket_events ORDER BY position"
+        ).all()
+    for _ in range(2):
+        assert tickets.get(project.id, ticket["id"], user_id="alice") == expected
+        assert tickets.list(project.id, user_id="alice")["data"] == [expected]
+        assert (
+            tickets.events(project.id, ticket["id"], user_id="alice")["data"] == expected_history
+        )
+    with tickets._session("check_history_projection") as session:
+        rows = session.scalars(
+            select(SqlProjectTicketEvent)
+            .where(SqlProjectTicketEvent.ticket_id == ticket["id"])
+            .order_by(SqlProjectTicketEvent.position)
+            .limit(10)
+        ).all()
+        for row, expected_event in zip(rows, expected_history, strict=True):
+            saved_payload = deepcopy(row.payload)
+            assert project_ticket_store._event(row) == expected_event
+            assert row.payload == saved_payload
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql("SELECT * FROM project_tickets").all() == raw_ticket
+        assert (
+            connection.exec_driver_sql(
+                "SELECT * FROM project_ticket_events ORDER BY position"
+            ).all()
+            == raw_events
+        )
 
 
 def test_failed_event_write_rolls_back_ticket_and_link_changes(board, monkeypatch):
@@ -118,7 +197,7 @@ def test_storage_envelope_bound_rolls_back_the_event(board):
     ticket = tickets.create(project.id, CreateTicket(title="Original"), actor)
     # Multibyte values are poorly compressible, unlike a repeated test string.
     rng = random.Random(0)
-    tags = [
+    labels = [
         {
             "key": str(i),
             "value": "".join(chr(0x10000 + rng.randrange(0x10000)) for _ in range(256)),
@@ -126,8 +205,8 @@ def test_storage_envelope_bound_rolls_back_the_event(board):
         for i in range(20)
     ]
     with pytest.raises(StatementError):
-        tickets.update(project.id, ticket["id"], UpdateTicket(tags=tags), actor)
-    assert tickets.get(project.id, ticket["id"], user_id="alice")["tags"] == []
+        tickets.update(project.id, ticket["id"], UpdateTicket(labels=labels), actor)
+    assert tickets.get(project.id, ticket["id"], user_id="alice")["labels"] == []
     assert len(tickets.events(project.id, ticket["id"], user_id="alice")["data"]) == 1
 
 
@@ -323,7 +402,7 @@ def test_description_stages_and_feedback_change_atomically(board, monkeypatch):
         UpdateTicket(
             stage_id="review",
             comment="Tests passed; please check the layout",
-            tags=[{"key": "needs-human"}],
+            labels=[{"key": "needs-human"}],
         ),
         actor,
     )
@@ -344,7 +423,7 @@ def test_description_stages_and_feedback_change_atomically(board, monkeypatch):
                 UpdateTicket(
                     stage_id="in_progress",
                     comment="Adjust spacing",
-                    tags=[],
+                    labels=[],
                 ),
                 actor,
             )
@@ -355,12 +434,12 @@ def test_description_stages_and_feedback_change_atomically(board, monkeypatch):
         UpdateTicket(
             stage_id="in_progress",
             comment="Adjust spacing",
-            tags=[],
+            labels=[],
         ),
         actor,
     )
     assert working["description"] == planning["description"]
-    assert working["comment_count"] == 3 and working["tags"] == []
+    assert working["comment_count"] == 3 and working["labels"] == []
     events = tickets.events(project.id, ticket_id, user_id="alice")["data"]
     assert [event["payload"]["text"] for event in events if event["kind"] == "comment"] == [
         "Agreed in chat",
@@ -462,7 +541,7 @@ def test_stage_edit_reorder_start_and_removal_preserve_ticket_content_and_histor
     tickets.update(
         project.id,
         ticket["id"],
-        UpdateTicket(description="Approach", comment="Evidence", tags=[{"key": "needs-human"}]),
+        UpdateTicket(description="Approach", comment="Evidence", labels=[{"key": "needs-human"}]),
         actor,
     )
     tickets.comment(project.id, ticket["id"], CommentOnTicket(text="Keep me"), actor)
@@ -519,7 +598,7 @@ def test_stage_edit_reorder_start_and_removal_preserve_ticket_content_and_histor
     assert moved["stage_id"] == "resolved"
     assert "completion_summary" not in moved
     assert tickets.get(project.id, sibling["id"], user_id="alice")["stage_id"] == "resolved"
-    for field in ("id", "title", "description", "tags", "comment_count"):
+    for field in ("id", "title", "description", "labels", "comment_count"):
         assert moved[field] == original[field]
     assert (
         tickets.sessions(project.id, ticket["id"], user_id="alice")["data"][0]["session_id"]
@@ -552,7 +631,7 @@ def test_stage_edit_reorder_start_and_removal_preserve_ticket_content_and_histor
     assert tickets.get(project.id, ticket["id"], user_id="alice")["stage_id"] == "resolved"
 
 
-def test_stage_moves_preserve_ordinary_content_and_human_tags(board):
+def test_stage_moves_preserve_ordinary_content_and_human_labels(board):
     tickets, _, project = board
     actor = TicketActor("alice")
     configuration = UpdateTicketStages(
@@ -564,7 +643,7 @@ def test_stage_moves_preserve_ordinary_content_and_human_tags(board):
     )
     tickets.update_stages(project.id, configuration, actor)
     ticket = tickets.create(
-        project.id, CreateTicket(title="Investigate", tags=[{"key": "needs-human"}]), actor
+        project.id, CreateTicket(title="Investigate", labels=[{"key": "needs-human"}]), actor
     )
     assert ticket["stage_id"] == "done"
     tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="done"), actor)
@@ -575,19 +654,19 @@ def test_stage_moves_preserve_ordinary_content_and_human_tags(board):
     completed = tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="verified"), actor)
     assert completed["stage_id"] == "verified"
     assert "completion_summary" not in completed
-    assert completed["tags"] == ticket["tags"]
+    assert completed["labels"] == ticket["labels"]
     completed = tickets.update(
         project.id,
         ticket["id"],
         UpdateTicket(stage_id="verified", description="Evidence", comment="Recovery confirmed"),
         actor,
     )
-    assert completed["tags"] == ticket["tags"]
+    assert completed["labels"] == ticket["labels"]
     reopened = tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="done"), actor)
     assert reopened["description"] == "Evidence"
     completed = tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="verified"), actor)
     assert completed["description"] == "Evidence"
-    assert completed["tags"] == ticket["tags"]
+    assert completed["labels"] == ticket["labels"]
     assert [
         event["payload"]["text"]
         for event in tickets.events(project.id, ticket["id"], user_id="alice")["data"]

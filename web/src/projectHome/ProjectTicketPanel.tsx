@@ -42,14 +42,14 @@ import {
   type ProjectTicket,
   type TicketEvent,
   type TicketOutput,
-  type TicketTag,
+  type TicketLabel,
 } from "@/lib/projectTicketsApi";
 import { ProjectSessionPanel } from "./ProjectSessionPanel";
 import { ticketPanelSearch } from "./projectHomeNavigation";
 import { TicketAgents } from "./TicketAgents";
 import { TicketCommentBody } from "./TicketCommentBody";
 import { TicketSessionLink } from "./TicketSessionLink";
-import { TicketError, TicketStageIcon, TicketTags } from "./TicketControls";
+import { TicketError, TicketStageIcon, TicketLabels } from "./TicketControls";
 import { TicketRelatedTickets } from "./TicketRelatedTickets";
 import {
   useTicket,
@@ -454,12 +454,12 @@ function TicketDetails({
                     ))}
                   </SelectContent>
                 </Select>
-                {ticket.tags.length > 0 && <TicketTags tags={ticket.tags} />}
-                <TagEditor
-                  tags={ticket.tags}
+                {ticket.labels.length > 0 && <TicketLabels labels={ticket.labels} />}
+                <LabelEditor
+                  labels={ticket.labels}
                   disabled={update.isPending}
                   error={update.error}
-                  onChange={(tags) => update.mutate({ id: ticketId, changes: { tags } })}
+                  onChange={(labels) => update.mutate({ id: ticketId, changes: { labels } })}
                 />
               </div>
               <TicketError error={configuration.error} />
@@ -623,16 +623,16 @@ function TicketCommentComposer({
   );
 }
 
-function TagEditor({
-  tags,
+function LabelEditor({
+  labels,
   disabled,
   error,
   onChange,
 }: {
-  tags: TicketTag[];
+  labels: TicketLabel[];
   disabled: boolean;
   error: Error | null;
-  onChange: (tags: TicketTag[]) => void;
+  onChange: (labels: TicketLabel[]) => void;
 }) {
   const [key, setKey] = useState("");
   const [value, setValue] = useState("");
@@ -641,34 +641,34 @@ function TagEditor({
       <PopoverTrigger asChild>
         <Button
           variant="ghost"
-          size={tags.length ? "icon-sm" : "sm"}
+          size={labels.length ? "icon-sm" : "sm"}
           className="text-muted-foreground"
-          aria-label={tags.length ? "Edit tags" : "Add tags"}
+          aria-label={labels.length ? "Edit labels" : "Add labels"}
         >
           <TagsIcon aria-hidden />
-          {tags.length === 0 && "Tags"}
+          {labels.length === 0 && "Labels"}
         </Button>
       </PopoverTrigger>
       <PopoverContent
         align="start"
-        aria-label="Edit tags"
+        aria-label="Edit labels"
         className="max-w-[calc(100vw-2rem)] gap-3 p-3"
       >
-        <h3 className="text-sm font-medium">Tags</h3>
-        {tags.length > 0 && (
+        <h3 className="text-sm font-medium">Labels</h3>
+        {labels.length > 0 && (
           <ul className="max-h-48 space-y-1 overflow-y-auto">
-            {tags.map((tag) => (
-              <li key={tag.key} className="flex min-w-0 items-center gap-2">
+            {labels.map((label) => (
+              <li key={label.key} className="flex min-w-0 items-center gap-2">
                 <span className="min-w-0 flex-1 text-sm wrap-anywhere">
-                  {tag.key}
-                  {tag.value && <span className="text-muted-foreground">: {tag.value}</span>}
+                  {label.key}
+                  {label.value && <span className="text-muted-foreground">: {label.value}</span>}
                 </span>
                 <Button
                   variant="ghost"
                   size="icon-sm"
                   disabled={disabled}
-                  aria-label={`Remove tag ${tag.key}`}
-                  onClick={() => onChange(tags.filter((item) => item.key !== tag.key))}
+                  aria-label={`Remove label ${label.key}`}
+                  onClick={() => onChange(labels.filter((item) => item.key !== label.key))}
                 >
                   <XIcon aria-hidden />
                 </Button>
@@ -682,14 +682,14 @@ function TagEditor({
             event.preventDefault();
             if (disabled || !key.trim()) return;
             const next = { key: key.trim(), ...(value ? { value } : {}) };
-            onChange([...tags.filter((tag) => tag.key !== next.key), next]);
+            onChange([...labels.filter((label) => label.key !== next.key), next]);
           }}
         >
           <Input
-            name="tag_key"
+            name="label_key"
             className="focus-visible:ring-0"
             autoComplete="off"
-            aria-label="Tag key"
+            aria-label="Label key"
             placeholder="Key, e.g. needs-human…"
             maxLength={64}
             required
@@ -698,10 +698,10 @@ function TagEditor({
             onChange={(event) => setKey(event.target.value)}
           />
           <Input
-            name="tag_value"
+            name="label_value"
             className="focus-visible:ring-0"
             autoComplete="off"
-            aria-label="Tag value"
+            aria-label="Label value"
             placeholder="Value (optional)…"
             maxLength={256}
             disabled={disabled}
@@ -715,11 +715,11 @@ function TagEditor({
             disabled={
               disabled ||
               !key.trim() ||
-              (tags.length >= 20 && !tags.some((tag) => tag.key === key.trim()))
+              (labels.length >= 20 && !labels.some((label) => label.key === key.trim()))
             }
           >
             <PlusIcon aria-hidden />
-            Save tag
+            Save label
           </Button>
         </form>
         <TicketError error={error} />

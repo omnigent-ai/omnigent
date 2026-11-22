@@ -51,7 +51,7 @@ export const DEFAULT_TICKET_STAGES: TicketStages = {
   })),
   initial_stage_id: "open",
 };
-export interface TicketTag {
+export interface TicketLabel {
   key: string;
   value?: string | null;
 }
@@ -65,7 +65,7 @@ export interface ProjectTicket {
   title: string;
   description: string;
   stage_id: string;
-  tags: TicketTag[];
+  labels: TicketLabel[];
   lead_session_id?: string | null;
   /** Latest linked-agent activity; absent or null means unknown. */
   has_running_agents?: boolean | null;
@@ -101,7 +101,7 @@ export interface TicketSession {
   involvement?: string;
 }
 export type TicketChanges = Partial<
-  Pick<ProjectTicket, "title" | "description" | "stage_id" | "tags" | "lead_session_id">
+  Pick<ProjectTicket, "title" | "description" | "stage_id" | "labels" | "lead_session_id">
 > & { comment?: string };
 export interface TicketComment {
   text: string;
@@ -155,7 +155,7 @@ export function updateTicketStages(projectId: string, body: TicketStageChanges) 
 }
 export function createTicket(
   projectId: string,
-  body: { title: string; description?: string; tags?: TicketTag[] },
+  body: { title: string; description?: string; labels?: TicketLabel[] },
 ) {
   return request<ProjectTicket>(path(projectId), "POST", body).then(normalizeTicket);
 }

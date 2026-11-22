@@ -281,7 +281,7 @@ def test_note_migration_preserves_text_metadata_and_retries_without_duplicates(
     tickets.update(
         project.id,
         history_ticket["id"],
-        UpdateTicket(lead_session_id=actor.session_id, tags=[{"key": "needs-human"}]),
+        UpdateTicket(lead_session_id=actor.session_id, labels=[{"key": "needs-human"}]),
         actor,
     )
     tickets.link_ticket(project.id, history_ticket["id"], snapshot_ticket["id"], "attach", actor)

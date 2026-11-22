@@ -1,6 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import {
   DEFAULT_TICKET_STAGES,
+  createTicket,
   getTicket,
   getTicketStages,
   listTickets,
@@ -24,6 +25,27 @@ const event: TicketEvent = {
   payload: {},
   created_at: 1000,
 };
+
+it.each([{ labels: [] }, { labels: [{ key: "needs-human", value: "approval" }, { key: "area" }] }])(
+  "uses labels for ticket creation and replacement: %j",
+  async ({ labels }) => {
+    const ticket = { id: "ticket", stage_id: "open", labels };
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(ticket)));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await createTicket("project", { title: "Work", labels })).toEqual(ticket);
+    expect(await updateTicket("project", "ticket", { labels })).toEqual(ticket);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/v1/projects/project/tickets",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ title: "Work", labels }) }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/v1/projects/project/tickets/ticket",
+      expect.objectContaining({ method: "PATCH", body: JSON.stringify({ labels }) }),
+    );
+  },
+);
 
 it.each(["Planning the approach", ""])(
   "sends involvement, including an explicit clear (%s)",

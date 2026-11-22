@@ -20,8 +20,8 @@ export function TicketAgents({ projectId, ticket }: { projectId: string; ticket:
   const sessions = query.data?.pages.flatMap((page) => page.data) ?? [];
   const orchestratorId = project.data?.orchestrator_session_id;
   const orchestrator = sessions.find((session) => session.session_id === orchestratorId);
-  const responseTag = ticket.tags.find((tag) => tag.key === "needs-human");
-  const responseSessionId = responseTag ? ticket.lead_session_id : null;
+  const responseLabel = ticket.labels.find((label) => label.key === "needs-human");
+  const responseSessionId = responseLabel ? ticket.lead_session_id : null;
   return (
     <section aria-label="Agents" className="space-y-2">
       <h3 className="text-sm font-medium">Agents</h3>

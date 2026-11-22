@@ -30,12 +30,15 @@ header, new-session composer, session quick view and side chat, and UI primitive
   with the existing session pane; use normal session creation and messaging.
 - R17: Automatically deliver ticket updates to that session, retaining pending
   delivery across restarts and avoiding notifications for its own writes.
-- R19: Tags have a key and optional value. The presence of `needs-human` shows
+- R19: Labels have a key and optional value. The presence of `needs-human` shows
   the pink Needs response pill. A comment explains the request; removing the
-  tag resolves it. This is independent of a session's pending approval prompt.
+  label resolves it. This is independent of a session's pending approval prompt.
+  The API and ticket tools use `labels: [{key, value?}]` and reject `tags` arguments.
+  Existing values and historical events remain stored unchanged; historical field
+  names are projected as labels when read.
 - R20: Results are ordinary comments, not a dedicated completion field. A finished
   session does not finish a ticket.
-- R21: Keep New ticket and New session. No search or tag-filter UI.
+- R21: Keep New ticket and New session. No search or label-filter UI.
 - R22: Use the description and ordinary comments for approach and acceptance criteria.
   Agents investigate routine choices; ask humans only for necessary decisions
   or authority. Explicit approval gates cannot be skipped.
@@ -84,7 +87,7 @@ header, new-session composer, session quick view and side chat, and UI primitive
 - AC21: GIVEN a ticket update by someone else WHEN it commits THEN its orchestrator
   receives a durable ordinary session message, without a caller notification option.
 - AC22: GIVEN a ticket WHEN `needs-human` is toggled THEN its badge changes without
-  changing status, regardless of the tag's value.
+  changing status, regardless of the label's value.
 - AC23: GIVEN competing edits WHEN they commit THEN the last write wins; each edit
   and its event commit together, without versions or conflict handling in the UI.
 - AC24: GIVEN a same-project session WHEN it is explicitly linked THEN the ticket

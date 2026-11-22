@@ -22,14 +22,14 @@ TICKET = "c" * 32
             {"title": "Do it"},
             "POST",
             "",
-            {"title": "Do it", "description": "", "tags": []},
+            {"title": "Do it", "description": "", "labels": []},
         ),
         (
             "sys_ticket_update",
-            {"ticket_id": TICKET, "tags": [{"key": "needs-human"}]},
+            {"ticket_id": TICKET, "labels": [{"key": "needs-human"}]},
             "PATCH",
             f"/{TICKET}",
-            {"tags": [{"key": "needs-human"}]},
+            {"labels": [{"key": "needs-human"}]},
         ),
         (
             "sys_ticket_comment",
@@ -203,6 +203,12 @@ async def test_get_returns_paged_activity_outputs_and_sessions():
     "name,args",
     [
         ("sys_ticket_create", {"title": " ", "project_id": PROJECT}),
+        ("sys_ticket_create", {"title": "Work", "tags": []}),
+        ("sys_ticket_create", {"title": "Work", "tags": None}),
+        ("sys_ticket_create", {"title": "Work", "tags": [{"key": "needs-human"}]}),
+        ("sys_ticket_update", {"ticket_id": TICKET, "tags": []}),
+        ("sys_ticket_update", {"ticket_id": TICKET, "tags": None}),
+        ("sys_ticket_update", {"ticket_id": TICKET, "tags": [{"key": "needs-human"}]}),
         ("sys_ticket_update", {"ticket_id": TICKET, "stage_id": "../other"}),
         ("sys_ticket_update", {"ticket_id": TICKET, "stage_id": "x" * 65}),
         ("sys_ticket_update", {"ticket_id": TICKET, "plan": "Old approach"}),
@@ -297,10 +303,15 @@ def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
                 "review_summary",
                 "completion_summary",
                 "review_action",
+                "tags",
             }
             & properties.keys()
         )
         assert "delete" not in tool.name()
+        if tool.name() in ("sys_ticket_create", "sys_ticket_update"):
+            assert "labels" in properties
+            schema = tool().get_schema()["function"]["parameters"]
+            assert "TicketLabel" in schema["$defs"] and "TicketTag" not in schema["$defs"]
     schema = TICKET_TOOLS["sys_ticket_stages_update"]().get_schema()["function"]["parameters"]
     assert set(schema["properties"]) == {"stages", "moves"}
     assert schema["required"] == ["stages"]

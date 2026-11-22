@@ -145,8 +145,9 @@ class SysTicketUpdateTool(_TicketTool):
         "results as ordinary comments. "
         "Set lead_session_id to an already "
         "linked session (null clears it). Optional comment is appended atomically. "
-        "Tags replace the whole list: use needs-human plus a comment when a person must act, "
-        "in any stage, and remove that tag only when its request is resolved."
+        "Labels replace the whole key/value list: use labels with key needs-human plus a comment "
+        "when a person must act, in any stage, and remove that label only when its request is "
+        "resolved."
     )
     arguments = EditTicket
 

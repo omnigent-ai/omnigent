@@ -15,18 +15,50 @@ from omnigent.entities.project_ticket import (
 )
 
 
-def test_title_only_and_key_value_tags():
+def test_title_only_and_key_value_labels():
     assert CreateTicket(title="  Ship it  ").model_dump() == {
         "title": "Ship it",
         "description": "",
-        "tags": [],
+        "labels": [],
     }
-    ticket = CreateTicket(title="Review", tags=[{"key": "needs-human", "value": "approval"}])
-    assert ticket.tags[0].key == "needs-human"
+    ticket = CreateTicket(title="Review", labels=[{"key": "needs-human", "value": "approval"}])
+    assert ticket.labels[0].key == "needs-human"
+    assert UpdateTicket(labels=None).model_dump(exclude_none=True) == {}
+    assert UpdateTicket(labels=[]).model_dump(exclude_none=True) == {"labels": []}
     with pytest.raises(ValidationError):
         CreateTicket(title=" ")
     with pytest.raises(ValidationError):
-        CreateTicket(title="Review", tags=[{"key": "team"}, {"key": " team "}])
+        CreateTicket(title="Review", labels=[{"key": "team"}, {"key": " team "}])
+
+
+@pytest.mark.parametrize("model,required", [(CreateTicket, {"title": "Work"}), (UpdateTicket, {})])
+@pytest.mark.parametrize("value", [None, [], [{"key": "needs-human"}]])
+def test_old_tags_arguments_are_rejected(model, required, value):
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        model.model_validate({**required, "tags": value, "labels": []})
+    schema = model.model_json_schema()
+    assert "labels" in schema["properties"] and "tags" not in schema["properties"]
+    assert set(schema["$defs"]["TicketLabel"]["properties"]) == {"key", "value"}
+
+
+@pytest.mark.parametrize("model,required", [(CreateTicket, {"title": "Work"}), (UpdateTicket, {})])
+@pytest.mark.parametrize(
+    "labels",
+    [
+        [{"key": " "}],
+        [{"key": "x" * 65}],
+        [{"key": "area", "value": "x" * 257}],
+        [{"key": "area"}, {"key": " area "}],
+        [{"key": str(index)} for index in range(21)],
+        [{"key": "area", "other": "unknown"}],
+    ],
+)
+def test_labels_retain_bounded_unique_key_value_validation(model, required, labels):
+    with pytest.raises(ValidationError):
+        model.model_validate({**required, "labels": labels})
+    valid = [{"key": str(index), "value": "x" * 256} for index in range(19)]
+    valid.append({"key": "x" * 64, "value": None})
+    assert len(model.model_validate({**required, "labels": valid}).labels) == 20
 
 
 def test_stage_ids_are_dynamic_and_comments_have_no_notification_option():

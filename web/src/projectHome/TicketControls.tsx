@@ -2,33 +2,39 @@ import { useId } from "react";
 import { Badge } from "@/components/ui/badge";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { NeedsResponseBadge } from "@/components/NeedsResponseBadge";
-import type { TicketTag } from "@/lib/projectTicketsApi";
+import type { TicketLabel } from "@/lib/projectTicketsApi";
 import { cn } from "@/lib/utils";
 
 export { TicketStageIcon } from "./TicketStageAppearance";
 
-export function TicketTags({ tags, compact = false }: { tags: TicketTag[]; compact?: boolean }) {
+export function TicketLabels({
+  labels,
+  compact = false,
+}: {
+  labels: TicketLabel[];
+  compact?: boolean;
+}) {
   const ordered = compact
     ? [
-        ...tags.filter((tag) => tag.key === "needs-human"),
-        ...tags.filter((tag) => tag.key !== "needs-human"),
+        ...labels.filter((label) => label.key === "needs-human"),
+        ...labels.filter((label) => label.key !== "needs-human"),
       ]
-    : tags;
+    : labels;
   const visible = compact ? ordered.slice(0, 2) : ordered;
-  const hiddenCount = tags.length - visible.length;
+  const hiddenCount = labels.length - visible.length;
   return (
     <div className={cn("flex min-w-0 gap-1.5", compact ? "items-center" : "flex-wrap")}>
-      {visible.map((tag) =>
-        tag.key === "needs-human" ? (
-          <NeedsResponseBadge key={tag.key} title={tag.value || undefined} />
+      {visible.map((label) =>
+        label.key === "needs-human" ? (
+          <NeedsResponseBadge key={label.key} title={label.value || undefined} />
         ) : (
-          <TicketTagBadge key={tag.key} tag={tag} compact={compact} />
+          <TicketLabelBadge key={label.key} label={label} compact={compact} />
         ),
       )}
       {hiddenCount > 0 && (
         <span
           className="shrink-0 text-xs text-muted-foreground tabular-nums"
-          aria-label={`${hiddenCount} more ${hiddenCount === 1 ? "tag" : "tags"}`}
+          aria-label={`${hiddenCount} more ${hiddenCount === 1 ? "label" : "labels"}`}
         >
           +{hiddenCount}
         </span>
@@ -37,13 +43,13 @@ export function TicketTags({ tags, compact = false }: { tags: TicketTag[]; compa
   );
 }
 
-function TicketTagBadge({ tag, compact }: { tag: TicketTag; compact: boolean }) {
+function TicketLabelBadge({ label, compact }: { label: TicketLabel; compact: boolean }) {
   const descriptionId = useId();
-  const label = `${tag.key}${tag.value ? `: ${tag.value}` : ""}`;
+  const labelText = `${label.key}${label.value ? `: ${label.value}` : ""}`;
   const badge = (
     <Badge
       variant="secondary"
-      title={compact ? undefined : tag.value || undefined}
+      title={compact ? undefined : label.value || undefined}
       tabIndex={compact ? 0 : undefined}
       aria-describedby={compact ? descriptionId : undefined}
       className={
@@ -52,7 +58,7 @@ function TicketTagBadge({ tag, compact }: { tag: TicketTag; compact: boolean }) 
           : "h-auto min-h-5 max-w-full whitespace-normal text-left wrap-anywhere"
       }
     >
-      <span className={compact ? "truncate" : undefined}>{label}</span>
+      <span className={compact ? "truncate" : undefined}>{labelText}</span>
     </Badge>
   );
   if (!compact) return badge;
@@ -70,7 +76,7 @@ function TicketTagBadge({ tag, compact }: { tag: TicketTag; compact: boolean }) 
         onMouseDown={(event) => event.stopPropagation()}
         onTouchStart={(event) => event.stopPropagation()}
       >
-        {label}
+        {labelText}
       </HoverCardContent>
     </HoverCard>
   );

@@ -119,7 +119,7 @@ beforeEach(() => {
     title: "Ship the board",
     description: "",
     stage_id: "open",
-    tags: [{ key: "needs-human", value: "approval" }],
+    labels: [{ key: "needs-human", value: "approval" }],
     latest_update: "Created the ticket",
     comment_count: 0,
     created_at: 1000,
@@ -255,7 +255,7 @@ describe("Ticket comment previews", () => {
 });
 
 describe("Project ticket board", () => {
-  it("shows five phases and human-input tags, without filter controls", async () => {
+  it("shows five phases and human-input labels, without filter controls", async () => {
     renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
     await screen.findByRole("region", { name: "Open" });
     const board = screen.getByRole("region", { name: "Shipping ticket board" });
@@ -279,9 +279,9 @@ describe("Project ticket board", () => {
   });
 
   it.each([false, true])(
-    "reveals compact card tags on hover and focus and keeps detail tags complete (needs response=%s)",
+    "reveals compact card labels on hover and focus and keeps detail labels complete (needs response=%s)",
     async (needsResponse) => {
-      ticket.tags = [
+      ticket.labels = [
         { key: "source", value: "ISSUE-123" },
         { key: "status", value: "Waiting for the investigation to finish" },
         { key: "assignee", value: "Unassigned" },
@@ -300,7 +300,7 @@ describe("Project ticket board", () => {
       expect(badge).toHaveClass("text-xs", "rounded-md", "shrink");
       expect(badge.parentElement).not.toHaveClass("flex-wrap");
       expect(
-        within(card).getByLabelText(needsResponse ? "2 more tags" : "1 more tag"),
+        within(card).getByLabelText(needsResponse ? "2 more labels" : "1 more label"),
       ).toHaveTextContent(needsResponse ? "+2" : "+1");
       expect(within(card).queryByText("assignee: Unassigned")).toBeNull();
       if (needsResponse) {
@@ -349,7 +349,7 @@ describe("Project ticket board", () => {
       expect(screen.getByText("status: Waiting for the investigation to finish")).not.toHaveClass(
         "truncate",
       );
-      expect(screen.queryByLabelText(/more tags?/)).toBeNull();
+      expect(screen.queryByLabelText(/more labels?/)).toBeNull();
       expect(api.updateTicket).not.toHaveBeenCalled();
     },
   );
@@ -542,7 +542,7 @@ describe("Project ticket board", () => {
       }),
     );
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    expect(ticket.tags).toEqual([{ key: "needs-human", value: "approval" }]);
+    expect(ticket.labels).toEqual([{ key: "needs-human", value: "approval" }]);
     expect(ticket.description).toBe("Gather recovery evidence.");
     expect(screen.getByText("Gather recovery evidence.")).toBeInTheDocument();
     expect(screen.getByText("Needs response")).toBeInTheDocument();
@@ -710,7 +710,7 @@ describe("Project ticket board", () => {
     },
   );
 
-  it("edits key/value tags without changing ticket status", async () => {
+  it("edits key/value labels without changing ticket status", async () => {
     renderBoard(
       <ProjectTicketPanel
         projectName="Shipping"
@@ -720,16 +720,18 @@ describe("Project ticket board", () => {
       />,
     );
     expect(await screen.findByText("Needs response")).toHaveAttribute("title", "approval");
-    fireEvent.click(screen.getByRole("button", { name: "Edit tags" }));
-    fireEvent.click(screen.getByRole("button", { name: "Remove tag needs-human" }));
+    expect(screen.queryByRole("button", { name: /tags/i })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Edit labels" }));
+    expect(screen.getByRole("heading", { name: "Labels" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Remove label needs-human" }));
     await waitFor(() => expect(screen.queryByText("Needs response")).toBeNull());
-    expect(api.updateTicket).toHaveBeenCalledWith("project", "ticket", { tags: [] });
-    fireEvent.change(screen.getByLabelText("Tag key"), { target: { value: "area" } });
-    fireEvent.change(screen.getByLabelText("Tag value"), { target: { value: "board" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save tag" }));
+    expect(api.updateTicket).toHaveBeenCalledWith("project", "ticket", { labels: [] });
+    fireEvent.change(screen.getByLabelText("Label key"), { target: { value: "area" } });
+    fireEvent.change(screen.getByLabelText("Label value"), { target: { value: "board" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save label" }));
     await waitFor(() =>
       expect(api.updateTicket).toHaveBeenLastCalledWith("project", "ticket", {
-        tags: [{ key: "area", value: "board" }],
+        labels: [{ key: "area", value: "board" }],
       }),
     );
     expect(ticket.stage_id).toBe("open");
@@ -737,7 +739,7 @@ describe("Project ticket board", () => {
 
   it("renders ticket prose as Markdown and hides empty optional sections", async () => {
     ticket.description = "## Acceptance\n\n- **Readable** descriptions\n- Keep `status` simple";
-    ticket.tags = [];
+    ticket.labels = [];
     vi.mocked(api.listTicketEvents).mockImplementation(async (_project, _ticket, _after, kind) => ({
       data: kind
         ? []
@@ -788,8 +790,8 @@ describe("Project ticket board", () => {
     expect(screen.getByText("status")).toHaveProperty("tagName", "CODE");
     expect(screen.getByText("You")).toBeInTheDocument();
     expect(screen.getByText("System")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Add tags" })).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Tags" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Add labels" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Labels" })).toBeNull();
     expect(screen.queryByRole("heading", { name: "Pull requests" })).toBeNull();
     expect(screen.queryByRole("heading", { name: "Links" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
@@ -973,7 +975,7 @@ describe("Project ticket board", () => {
       expect(api.updateTicket).toHaveBeenLastCalledWith("project", "ticket", { stage_id: "done" }),
     );
     expect(screen.queryByRole("dialog")).toBeNull();
-    expect(ticket.tags).toEqual([{ key: "needs-human", value: "approval" }]);
+    expect(ticket.labels).toEqual([{ key: "needs-human", value: "approval" }]);
   });
 
   it("keeps earlier activity when loading another page", async () => {
@@ -1084,7 +1086,7 @@ describe("Project ticket board", () => {
     expect(api.updateTicket).not.toHaveBeenCalled();
     expect(ticket.stage_id).toBe("review");
     expect(ticket.description).toBe("Inspect the existing evidence.");
-    expect(ticket.tags).toEqual([{ key: "needs-human", value: "approval" }]);
+    expect(ticket.labels).toEqual([{ key: "needs-human", value: "approval" }]);
   });
 
   it("keeps a description draft through fullscreen changes and save failure", async () => {

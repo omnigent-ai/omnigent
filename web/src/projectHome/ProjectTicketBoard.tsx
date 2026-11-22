@@ -18,7 +18,7 @@ import { Link } from "@/lib/routing";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import type { ProjectTicket, TicketStage } from "@/lib/projectTicketsApi";
 import { cn } from "@/lib/utils";
-import { TicketError, TicketTags } from "./TicketControls";
+import { TicketError, TicketLabels } from "./TicketControls";
 import { TicketStageBadge } from "./TicketStageAppearance";
 import {
   useRelatedTickets,
@@ -308,7 +308,7 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
           </span>
         )}
       </div>
-      {ticket.tags.length > 0 && <TicketTags tags={ticket.tags} compact />}
+      {ticket.labels.length > 0 && <TicketLabels labels={ticket.labels} compact />}
       {ticket.latest_update &&
         (ticket.latest_update !== "Created the ticket" || ticket.comment_count > 0) && (
           <p className="line-clamp-2 text-sm leading-relaxed text-muted-foreground wrap-anywhere">

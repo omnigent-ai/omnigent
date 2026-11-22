@@ -120,7 +120,7 @@ def default_ticket_stages() -> TicketStages:
     )
 
 
-class TicketTag(BaseModel):
+class TicketLabel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     key: str = Field(min_length=1, max_length=64)
@@ -130,7 +130,7 @@ class TicketTag(BaseModel):
     @classmethod
     def trim_key(cls, value: str) -> str:
         if not value.strip():
-            raise ValueError("tag key must not be empty")
+            raise ValueError("label key must not be empty")
         return value.strip()
 
 
@@ -163,7 +163,7 @@ class CreateTicket(BaseModel):
 
     title: str = Field(min_length=1, max_length=160)
     description: str = Field(default="", max_length=3000)
-    tags: list[TicketTag] = Field(default_factory=list, max_length=20)
+    labels: list[TicketLabel] = Field(default_factory=list, max_length=20)
 
     @field_validator("title")
     @classmethod
@@ -172,12 +172,12 @@ class CreateTicket(BaseModel):
             raise ValueError("title must not be empty")
         return value.strip()
 
-    @field_validator("tags")
+    @field_validator("labels")
     @classmethod
-    def unique_keys(cls, tags: list[TicketTag]) -> list[TicketTag]:
-        if len({tag.key for tag in tags}) != len(tags):
-            raise ValueError("tag keys must be unique")
-        return tags
+    def unique_keys(cls, labels: list[TicketLabel]) -> list[TicketLabel]:
+        if len({label.key for label in labels}) != len(labels):
+            raise ValueError("label keys must be unique")
+        return labels
 
 
 class UpdateTicket(BaseModel):
@@ -189,7 +189,7 @@ class UpdateTicket(BaseModel):
         default=None,
         description="A stage ID from this project's ticket list or stage definitions.",
     )
-    tags: list[TicketTag] | None = Field(default=None, max_length=20)
+    labels: list[TicketLabel] | None = Field(default=None, max_length=20)
     lead_session_id: str | None = Field(
         default=None, description="An already linked session to contact; null clears the lead."
     )
@@ -202,10 +202,10 @@ class UpdateTicket(BaseModel):
             raise ValueError("text must not be empty")
         return value.strip() if value is not None else None
 
-    @field_validator("tags")
+    @field_validator("labels")
     @classmethod
-    def unique_keys(cls, tags: list[TicketTag] | None) -> list[TicketTag] | None:
-        return None if tags is None else CreateTicket.unique_keys(tags)
+    def unique_keys(cls, labels: list[TicketLabel] | None) -> list[TicketLabel] | None:
+        return None if labels is None else CreateTicket.unique_keys(labels)
 
 
 class CommentOnTicket(BaseModel):

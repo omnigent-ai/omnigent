@@ -95,7 +95,7 @@ def _ticket(row: SqlProjectTicket) -> dict[str, Any]:
         "title": row.title,
         "description": row.description,
         "stage_id": _stage_id(row),
-        "tags": row.tags,
+        "labels": row.labels,
         "lead_session_id": row.lead_session_id,
         "latest_update": row.latest_update,
         "comment_count": row.comment_count,
@@ -105,8 +105,15 @@ def _ticket(row: SqlProjectTicket) -> dict[str, Any]:
 
 
 def _event(row: SqlProjectTicketEvent) -> dict[str, Any]:
-    payload = row.payload
+    payload = dict(row.payload)
+    # Project historical field names without changing the stored event.
+    if row.kind == EVENT_CODES["created"] and "tags" in payload:
+        payload["labels"] = payload.pop("tags")
     changes = payload.get("changes")
+    if row.kind == EVENT_CODES["updated"] and isinstance(changes, dict) and "tags" in changes:
+        changes = dict(changes)
+        changes["labels"] = changes.pop("tags")
+        payload["changes"] = changes
     if isinstance(changes, dict) and "text" not in payload:
         notes = legacy_ticket_notes(changes)
         if notes:
@@ -211,7 +218,7 @@ class ProjectTicketStore:
                 description=body.description,
                 status=LEGACY_STATUS_CODES.get(stage.id, 0),
                 stage_id=stage.id,
-                tags=[tag.model_dump(exclude_none=True) for tag in body.tags],
+                labels=[label.model_dump(exclude_none=True) for label in body.labels],
                 latest_update="Created the ticket",
                 comment_count=0,
                 next_event_position=0,

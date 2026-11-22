@@ -159,7 +159,9 @@ describe("project ticket sources", () => {
     });
     expect(props?.initialPrompt).toContain("sys_ticket_comment");
     expect(props?.initialPrompt).toContain("canonical source URL");
-    expect(props?.initialPrompt).toContain("preserve its current stage, tags, and human decisions");
+    expect(props?.initialPrompt).toContain(
+      "preserve its current stage, labels, and human decisions",
+    );
     expect(props?.initialPrompt?.length).toBeLessThan(LEGACY_MAX_INSTRUCTIONS_CHARS);
     expect(vi.mocked(authenticatedFetch).mock.calls).toEqual([["/v1/scheduled-tasks"]]);
   });

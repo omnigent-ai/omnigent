@@ -68,8 +68,10 @@ Use `sys_ticket_update` for an individual ticket's progress.
 The defaults are **Open → Planning → Working → Review → Done**, but projects
 can rename, reorder, add or remove them. A project might instead use
 New → Investigating → Mitigating → Verifying → Resolved. Stages describe work,
-not whether a session is running. `needs-human` is an independent tag, meaningful
+not whether a session is running. `needs-human` is an independent label, meaningful
 in any stage, including a completed one. A stage change never clears it.
+Ticket `labels` is a list of `{key, value?}` entries; updates replace the whole
+list, so preserve existing labels when adding or resolving a human request.
 If the advertised tools/schema do not yet support a field below, explain the
 upgrade limitation; don't invent tool arguments or claim unpersisted transitions.
 Record unavailable metadata in comments while using supported fields.
@@ -256,7 +258,7 @@ updates and worker reports promptly between checks.
   or a worker asking for a go-ahead is not enough. When a human really must act,
   add `needs-human`, set `lead_session_id` to the responsible worker, and comment
   with the exact question and worker chat; notify here in ordinary text. Preserve
-  other tags. Clear `needs-human` only after checking that no other human request
+  other labels. Clear `needs-human` only after checking that no other human request
   remains; if the blocker changes, update the question/contact without hiding the
   remaining decision. Continue independent work. Missing tools or required isolation
   are blockers to explain, not reasons to silently take over implementation.

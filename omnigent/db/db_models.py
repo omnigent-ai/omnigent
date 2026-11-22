@@ -958,7 +958,9 @@ class SqlProjectTicket(OmnigentBase):
     status: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     # NULL retains the original numeric status until a stage-aware writer moves the ticket.
     stage_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    tags: Mapped[list[dict[str, str]]] = mapped_column(EnvelopedJSON(4096), nullable=False)
+    labels: Mapped[list[dict[str, str]]] = mapped_column(
+        "tags", EnvelopedJSON(4096), nullable=False
+    )
     completion_summary: Mapped[str | None] = mapped_column(EnvelopedText(8192), nullable=True)
     plan: Mapped[str | None] = mapped_column(EnvelopedText(16383), nullable=True)
     review_summary: Mapped[str | None] = mapped_column(EnvelopedText(8192), nullable=True)
