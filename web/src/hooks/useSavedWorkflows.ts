@@ -53,27 +53,36 @@ const NO_WORKFLOWS: readonly SavedWorkflow[] = [];
 const SAVED_WORKFLOWS_KEY = ["saved-workflows"];
 const SHARED_WORKFLOWS_KEY = ["shared-workflows"];
 
-/** What a reload found: the workflows loaded so far, and whether more pages remain. */
+/**
+ * What a reload found: the workflows loaded so far, whether more pages remain, and
+ * whether it failed, which leaves the workflows the list held before.
+ */
 export interface ReloadedWorkflows {
   workflows: readonly SavedWorkflow[];
   hasMore: boolean;
+  failed: boolean;
 }
 
-const NOTHING_RELOADED: ReloadedWorkflows = { workflows: NO_WORKFLOWS, hasMore: false };
+const NOTHING_RELOADED: ReloadedWorkflows = {
+  workflows: NO_WORKFLOWS,
+  hasMore: false,
+  failed: false,
+};
 
 const nextSharedPage = (last: SharedWorkflowPage) => last.next_cursor ?? undefined;
 const nextSavedPage = (last: WorkflowPage) =>
   last.has_more ? (last.next_cursor ?? last.last_id ?? undefined) : undefined;
 
-/** Reloaded pages as one list, with more to load when the last page names a next one. */
+/** A refetch's pages as one list, with more to load when the last page names a next one. */
 function reloadedWorkflows<Page extends { data: SavedWorkflow[] }>(
-  data: InfiniteData<Page> | undefined,
+  result: { data?: InfiniteData<Page>; isError: boolean },
   nextPage: (last: Page) => string | undefined,
 ): ReloadedWorkflows {
-  const last = data?.pages.at(-1);
+  const last = result.data?.pages.at(-1);
   return {
-    workflows: data?.pages.flatMap((page) => page.data) ?? NO_WORKFLOWS,
+    workflows: result.data?.pages.flatMap((page) => page.data) ?? NO_WORKFLOWS,
     hasMore: last !== undefined && nextPage(last) !== undefined,
+    failed: result.isError,
   };
 }
 
@@ -119,9 +128,7 @@ export function useSharedWorkflows({ enabled = true }: { enabled?: boolean } = {
   // refetch() ignores `enabled`, so a server that doesn't share workflows is never asked.
   const reload = useCallback(
     async () =>
-      enabled && supported
-        ? reloadedWorkflows((await refetch()).data, nextSharedPage)
-        : NOTHING_RELOADED,
+      enabled && supported ? reloadedWorkflows(await refetch(), nextSharedPage) : NOTHING_RELOADED,
     [enabled, supported, refetch],
   );
   const refresh = useCallback(() => void reload(), [reload]);
@@ -195,13 +202,14 @@ export function useSavedWorkflows({
   const reload = useCallback(async (): Promise<ReloadedWorkflows> => {
     const [ownReload, sharedReload] = await Promise.all([
       enabled && supported
-        ? refetch().then((result) => reloadedWorkflows(result.data, nextSavedPage))
+        ? refetch().then((result) => reloadedWorkflows(result, nextSavedPage))
         : NOTHING_RELOADED,
       includeShared ? reloadShared() : NOTHING_RELOADED,
     ]);
     return {
       workflows: [...ownReload.workflows, ...sharedReload.workflows],
       hasMore: ownReload.hasMore || sharedReload.hasMore,
+      failed: ownReload.failed || sharedReload.failed,
     };
   }, [enabled, supported, refetch, includeShared, reloadShared]);
   const refresh = useCallback(() => void reload(), [reload]);

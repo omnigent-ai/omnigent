@@ -1,4 +1,5 @@
-import { type ReactNode, useRef, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
 
 import { offersSavedWorkflows, WorkflowPicker } from "@/components/composer/WorkflowPicker";
 import {
@@ -9,14 +10,8 @@ import {
 import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 
 /**
- * Run a workflow from outside the composer, e.g. the Tasks tab's empty state.
- * Like the "+" menu's Run a workflow, the button lists the user's saved workflows
- * to run or a new one to describe, and goes straight to describing one when none
- * can run.
- *
- * @param onStart - Opens the workflow dialog: with no arguments to describe one,
- *   with the search text for New workflow, or with the saved workflow picked. A
- *   choice from the menu runs once the menu has closed, so the dialog keeps focus.
+ * The "+" menu's Run a workflow for other surfaces, e.g. the Tasks tab. A choice
+ * from the menu runs once the menu has closed, so the dialog it opens keeps focus.
  */
 export function RunWorkflowMenu({
   className,
@@ -25,6 +20,7 @@ export function RunWorkflowMenu({
 }: {
   className?: string;
   children: ReactNode;
+  /** Opens the workflow dialog, to describe one from `description` or to run `savedWorkflow`. */
   onStart: (description?: string, savedWorkflow?: SavedWorkflow) => void;
 }) {
   const { workflows, pagination, refresh, reload } = useSavedWorkflows({ includeShared: true });
@@ -37,6 +33,14 @@ export function RunWorkflowMenu({
     setOpen(true);
   }
   const checkingRef = useRef(false);
+  // A reload that ends after the button has gone, e.g. once another session shows, opens nothing.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
   const pendingActionRef = useRef<(() => void) | null>(null);
   const show = async () => {
     if (listed) {
@@ -51,8 +55,13 @@ export function RunWorkflowMenu({
     checkingRef.current = true;
     try {
       const latest = await reload();
-      if (offersSavedWorkflows(latest.workflows, latest)) setOpenWhenListed(true);
-      else onStart();
+      if (!mountedRef.current) return;
+      if (offersSavedWorkflows(latest.workflows, latest)) {
+        setOpenWhenListed(true);
+        return;
+      }
+      if (latest.failed) toast.error("Couldn't load your saved workflows.");
+      onStart();
     } finally {
       checkingRef.current = false;
     }

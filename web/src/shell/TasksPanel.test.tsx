@@ -10,7 +10,11 @@ import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
-import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
+import {
+  type ReloadedWorkflows,
+  type SavedWorkflow,
+  useSavedWorkflows,
+} from "@/hooks/useSavedWorkflows";
 import { type SessionJournalView, useSessionJournal } from "@/hooks/useSessionJournal";
 import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -161,7 +165,7 @@ beforeEach(() => {
     isLoading: false,
     isError: false,
     refresh: vi.fn(),
-    reload: vi.fn().mockResolvedValue({ workflows: [], hasMore: false }),
+    reload: vi.fn().mockResolvedValue({ workflows: [], hasMore: false, failed: false }),
     pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
   });
   conversationRegistry
@@ -251,32 +255,57 @@ describe("TasksPanel", () => {
     }
   });
 
-  it("goes straight to describing a workflow when no saved one can run", async () => {
-    showJournal([]);
-    const drafts = [{ id: "b".repeat(32), name: "Unfinished", description: "", is_draft: true }];
-    const reload = vi.fn().mockResolvedValue({ workflows: drafts, hasMore: false });
-    vi.mocked(useSavedWorkflows).mockReturnValue({
-      workflows: drafts,
-      isLoading: false,
-      isError: false,
-      refresh: vi.fn(),
-      reload,
-      pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
-    });
-    const start = vi.fn();
-    const withdraw = registerStartWorkflow("conv", start);
-    try {
-      renderPanel();
-      const link = screen.getByRole("button", { name: "run a workflow" });
-      expect(link).toHaveAttribute("aria-haspopup", "dialog");
-      fireEvent.pointerDown(link, { button: 0 });
-      await waitFor(() => expect(start).toHaveBeenCalledWith());
-      expect(reload).toHaveBeenCalledOnce();
-      expect(screen.queryByTestId("composer-workflow-picker")).toBeNull();
-    } finally {
-      act(withdraw);
-    }
-  });
+  it.each([
+    ["no workflow to run", []],
+    ["a workflow to run", [{ id: "a".repeat(32), name: "Triage flaky tests", description: "" }]],
+  ])(
+    "opens nothing in the next session when a check that finds %s ends after a switch",
+    async (_label, found) => {
+      showJournal([]);
+      let finishReload: (result: ReloadedWorkflows) => void = () => undefined;
+      const savedWorkflows = (workflows: SavedWorkflow[]) => ({
+        workflows,
+        isLoading: false,
+        isError: false,
+        refresh: vi.fn(),
+        reload: () =>
+          new Promise<ReloadedWorkflows>((resolve) => {
+            finishReload = resolve;
+          }),
+        pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
+      });
+      vi.mocked(useSavedWorkflows).mockReturnValue(savedWorkflows([]));
+      const startHere = vi.fn();
+      const startNext = vi.fn();
+      const withdrawHere = registerStartWorkflow("conv", startHere);
+      const withdrawNext = registerStartWorkflow("next", startNext);
+      const panel = (conversationId: string) => (
+        <MemoryRouter>
+          <TasksPanel conversationId={conversationId} active />
+        </MemoryRouter>
+      );
+      try {
+        const { rerender } = render(panel("conv"));
+        fireEvent.pointerDown(screen.getByRole("button", { name: "run a workflow" }), {
+          button: 0,
+        });
+        rerender(panel("next"));
+
+        // The check ends in the next session, with the list then holding what it found.
+        vi.mocked(useSavedWorkflows).mockReturnValue(savedWorkflows(found));
+        await act(async () => finishReload({ workflows: found, hasMore: false, failed: false }));
+        rerender(panel("next"));
+
+        expect(screen.queryByTestId("composer-workflow-picker")).toBeNull();
+        expect(startHere).not.toHaveBeenCalled();
+        expect(startNext).not.toHaveBeenCalled();
+        expect(screen.getByRole("button", { name: "run a workflow" })).toBeInTheDocument();
+      } finally {
+        act(withdrawHere);
+        act(withdrawNext);
+      }
+    },
+  );
 
   it("shows the agent's own task list when the session has no plan", () => {
     showJournal([]);

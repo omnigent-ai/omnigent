@@ -1356,6 +1356,8 @@ export function TasksPanel({
                   {" "}
                   or you{" "}
                   <RunWorkflowMenu
+                    // A new one for each session, so a pending check opens nothing in the next.
+                    key={conversationId}
                     className="cursor-pointer font-medium text-link hover:underline focus-visible:underline focus-visible:outline-none data-[state=open]:underline"
                     onStart={(...choice) => {
                       onStartWorkflow?.();

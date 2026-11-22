@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
@@ -17,22 +18,34 @@ const triage: SavedWorkflow = {
   name: "Triage flaky tests",
   description: "Finds and fixes flaky tests.",
 };
+const draft: SavedWorkflow = {
+  id: "b".repeat(32),
+  name: "Unfinished workflow",
+  description: "Still planning.",
+  is_draft: true,
+};
 
-/** Answers each request for the user's workflows with the next list, then repeats the last. */
-function listWorkflows(...lists: SavedWorkflow[][]): () => number {
+/**
+ * Answers each request for the user's workflows with the next list, or a server
+ * error for `"error"`, then repeats the last answer.
+ */
+function listWorkflows(...answers: (SavedWorkflow[] | "error")[]): () => number {
   let requests = 0;
   vi.mocked(authenticatedFetch).mockImplementation(async () => {
-    const data = lists[Math.min(requests, lists.length - 1)];
+    const answer = answers[Math.min(requests, answers.length - 1)];
     requests += 1;
-    return Response.json({ data, has_more: false, last_id: null });
+    return answer === "error"
+      ? new Response(null, { status: 503, statusText: "Service Unavailable" })
+      : Response.json({ data: answer, has_more: false, last_id: null });
   });
   return () => requests;
 }
 
 function renderMenu() {
   const onStart = vi.fn();
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
-    <QueryClientProvider client={new QueryClient()}>
+    <QueryClientProvider client={client}>
       <RunWorkflowMenu onStart={onStart}>run a workflow</RunWorkflowMenu>
     </QueryClientProvider>,
   );
@@ -66,15 +79,32 @@ describe("RunWorkflowMenu", () => {
     expect(onStart).not.toHaveBeenCalled();
   });
 
-  it("describes a new workflow when the reloaded list is still empty", async () => {
-    const requests = listWorkflows([]);
+  it("describes a new workflow when the reloaded list has none that can run", async () => {
+    const requests = listWorkflows([draft]);
     const { onStart, link } = renderMenu();
     await waitFor(() => expect(requests()).toBe(1));
+    expect(link).toHaveAttribute("aria-haspopup", "dialog");
 
     fireEvent.pointerDown(link, { button: 0 });
     await waitFor(() => expect(onStart).toHaveBeenCalledWith());
     expect(requests()).toBe(2);
     expect(screen.queryByTestId("composer-workflow-picker")).toBeNull();
+  });
+
+  it("says the saved workflows couldn't load, then describes a new workflow", async () => {
+    const error = vi.spyOn(toast, "error");
+    try {
+      const requests = listWorkflows([], "error");
+      const { onStart, link } = renderMenu();
+      await waitFor(() => expect(requests()).toBe(1));
+
+      fireEvent.pointerDown(link, { button: 0 });
+      await waitFor(() => expect(onStart).toHaveBeenCalledWith());
+      expect(error).toHaveBeenCalledWith("Couldn't load your saved workflows.");
+      expect(requests()).toBe(2);
+    } finally {
+      error.mockRestore();
+    }
   });
 
   it("keeps the same focused button while the list loads", async () => {
