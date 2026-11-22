@@ -107,18 +107,20 @@ async def test_a_covering_turn_end_refresh_leaves_the_listed_refresh() -> None:
     assert calls.calls == ["full", "listed"]
 
 
-class _Refresher:
-    """Captures the refreshes the routes bind and the reads that cover a turn."""
+class _Refresher(server_prs.PullRequestRefresher):
+    """The real refresher, exposing the refreshes the routes bind and the reads it is told of."""
 
     def __init__(self) -> None:
+        super().__init__(turn_end_delay_s=0)
         self.noted: list[float] = []
 
     def bind(self, refresh: Any, listed: Any = None) -> None:
+        super().bind(refresh, listed)
         self.full, self.listed = refresh, listed
 
     def note_read(self, session_id: str, requested_at: float) -> None:
-        del session_id
         self.noted.append(requested_at)
+        super().note_read(session_id, requested_at)
 
 
 class _Router:
@@ -157,7 +159,7 @@ class Routes:
             APIRouter(),
             conversation_store=conversations,
             agent_store=SqlAlchemyAgentStore(f"sqlite:///{tmp}/omnigent.db"),
-            pull_request_refresher=self.refresher,  # type: ignore[arg-type]
+            pull_request_refresher=self.refresher,
         )
 
     def _respond(self, request: httpx.Request) -> httpx.Response:
@@ -182,8 +184,8 @@ class Routes:
             },
         )
 
-    async def sync(self, *urls: str) -> None:
-        """Have a full read report ``urls`` as the session's complete PR list."""
+    def report(self, *urls: str) -> None:
+        """Have full reads report ``urls`` as the session's complete PR list."""
         self.prs = [
             {
                 "url": url,
@@ -196,6 +198,10 @@ class Routes:
             }
             for url in urls
         ]
+
+    async def sync(self, *urls: str) -> None:
+        """Store ``urls`` as the session's complete PR list through a full read."""
+        self.report(*urls)
         await self.refresher.full(self.session_id)
         self.params.clear()
         self.refresher.noted.clear()
@@ -205,6 +211,7 @@ class Routes:
 async def routes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Routes]:
     routes = Routes(tmp_path, monkeypatch)
     yield routes
+    await routes.refresher.aclose()
     await routes.runner.aclose()
 
 
@@ -226,10 +233,28 @@ async def test_a_listed_session_with_synced_prs_asks_for_a_summary(routes: Route
     assert [(pr.url, pr.state, pr.title) for pr in stored.entries] == [(URL, "MERGED", "Renamed")]
 
 
-async def test_a_listed_session_not_yet_synced_gets_the_full_read(routes: Routes) -> None:
-    await routes.refresher.listed(routes.session_id)
-    assert len(routes.params) == 1
-    assert "summary" not in routes.params[0]
+async def test_a_listed_session_gets_full_reads_until_it_is_synced_and_discovered(
+    routes: Routes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Listed refreshes alone, with no turn ending: discovery that failed is still retried.
+    monkeypatch.setattr(server_prs, "FRESHNESS_S", 0.0)
+    routes.report(URL)
+    routes.full_extra = {"discovery_incomplete": True}
+    modes: list[str | None] = []
+
+    async def listed_refresh() -> None:
+        routes.refresher.request(routes.session_id)
+        await _settle(routes.refresher)
+        [params] = routes.params
+        routes.params.clear()
+        modes.append(params.get("summary"))
+
+    await listed_refresh()  # Not synced yet: a full read, whose discovery fails.
+    await listed_refresh()  # Synced, but discovery did not finish: a full read again.
+    routes.full_extra = {}
+    await listed_refresh()  # Discovery finishes.
+    await listed_refresh()
+    assert modes == [None, None, None, "true"]
 
 
 async def test_a_listed_session_synced_without_prs_gets_the_full_read(routes: Routes) -> None:

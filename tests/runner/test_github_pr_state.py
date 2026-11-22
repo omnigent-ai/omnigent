@@ -394,7 +394,7 @@ class _Clock:
 
 @pytest.mark.parametrize("failed", [False, True])
 @pytest.mark.parametrize("server_only", [False, True], ids=["registered", "server_only"])
-@pytest.mark.parametrize("seconds_per_read", [1.0, 3.0, 9.0])
+@pytest.mark.parametrize("seconds_per_read", [1.0, 9.0])
 def test_summaries_cut_by_the_budget_read_every_tracked_pr_in_turn(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

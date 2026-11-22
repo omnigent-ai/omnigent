@@ -16,7 +16,7 @@ import pytest
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
-from omnigent.runner import create_runner_app, pr_resource
+from omnigent.runner import create_runner_app, github_pr_state, pr_resource
 from omnigent.runner import github_resource as github
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from omnigent.runner.slow_io import run_slow_io
@@ -837,21 +837,32 @@ async def test_runner_serves_a_pr_the_server_vouches_for(
 ) -> None:
     """A fresh host never recorded the session's PR; the server's vouching is enough."""
     monkeypatch.setattr(github, "_gh", lambda *_a, **_kw: (0, '{"number": 42}', ""))
+    monkeypatch.setattr(
+        github_pr_state,
+        "reference_state",
+        lambda _root, reference: {"number": 7, "url": reference.url, "state": "OPEN"},
+    )
     app = create_runner_app(
         runner_workspace=Path(tracked),
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
     path = "/v1/sessions/fresh/resources/github"
+    vouched = {"pr_url": A, "server_tracked": "1"}
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://runner"
     ) as client:
         refused = await client.get(path, params={"pr_url": A})
-        served = await client.get(path, params={"pr_url": A, "server_tracked": "1"})
+        served = await client.get(path, params=vouched)
         default = await client.get(path, params={"default_pr_url": A, "server_tracked": "1"})
-    assert refused.status_code == 400
+        summary = await client.get(path, params={**vouched, "summary": "true"})
+        refused_summary = await client.get(path, params={"pr_url": A, "summary": "true"})
+    assert refused.status_code == refused_summary.status_code == 400
     assert served.status_code == 200, served.text
     assert served.json()["pr"]["number"] == 42
+    assert "pr_states" not in served.json()
     assert default.json()["selected_pr_url"] == A
+    assert summary.status_code == 200, summary.text
+    assert (summary.json()["pr"]["number"], summary.json()["pr_states"]) == (7, [])
     assert SessionPrRegistry("fresh").list() == []
 
 

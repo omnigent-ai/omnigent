@@ -385,8 +385,8 @@ class PullRequestRefresher:
         self._delay_s = turn_end_delay_s
         # Sessions with a turn no read has covered yet, by when that turn ended.
         self._turn_ended: dict[tuple[int, str], float] = {}
-        # Sessions whose turn-end refresh did not cover the turn, by when it ended; their
-        # next listed refresh is a full read, so it still finds PRs the turn opened.
+        # Sessions whose next listed refresh must be a full read, by when the need arose: a
+        # turn-end refresh did not cover the turn, or a full read's discovery did not finish.
         self._uncovered: dict[tuple[int, str], float] = {}
         # When each listed session was last refreshed, on the monotonic clock.
         self._attempted: dict[tuple[int, str], float] = {}
@@ -425,6 +425,18 @@ class PullRequestRefresher:
         uncovered = self._uncovered.get(key)
         if uncovered is not None and requested_at >= uncovered:
             del self._uncovered[key]
+
+    def note_incomplete_read(self, session_id: str, requested_at: float) -> None:
+        """Keep listed refreshes full reads, which retry discovery, until one finishes it.
+
+        :param requested_at: Epoch seconds the incomplete read was sent; a later read clears it.
+        """
+        self._mark_uncovered((current_workspace_id(), session_id), requested_at)
+
+    def _mark_uncovered(self, key: tuple[int, str], since: float) -> None:
+        if key not in self._uncovered and len(self._uncovered) >= _ATTEMPTS_MAX:
+            del self._uncovered[next(iter(self._uncovered))]
+        self._uncovered[key] = max(since, self._uncovered.get(key, since))
 
     def request(self, session_id: str) -> None:
         """Refresh a listed session that needs it, at most once per :data:`FRESHNESS_S`."""
@@ -466,9 +478,7 @@ class PullRequestRefresher:
                 # ending meanwhile replaces it and keeps the loop going.
                 if self._turn_ended.get(key) == ended:
                     del self._turn_ended[key]
-                    if len(self._uncovered) >= _ATTEMPTS_MAX:
-                        del self._uncovered[next(iter(self._uncovered))]
-                    self._uncovered[key] = ended
+                    self._mark_uncovered(key, ended)
         finally:
             self._running.pop(key, None)
 

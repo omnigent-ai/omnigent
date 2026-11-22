@@ -3576,8 +3576,12 @@ def register_resources_routes(
             return info
         # A read whose discovery failed or is still running may miss PRs the turn opened.
         discovered = info.get("discovery_incomplete") is not True
-        if pull_request_refresher is not None and covers_turn and discovered:
-            pull_request_refresher.note_read(session_id, requested_at)
+        if pull_request_refresher is not None and covers_turn:
+            if discovered:
+                pull_request_refresher.note_read(session_id, requested_at)
+            else:
+                # Listed refreshes stay full reads, which retry discovery, until one finishes.
+                pull_request_refresher.note_incomplete_read(session_id, requested_at)
         return server_prs.answer(info, stored)
 
     async def _record_attached(session_id: str, info: dict[str, Any]) -> None:
