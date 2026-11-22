@@ -9,7 +9,11 @@ import type { AgentBrowserTabRequest } from "@/components/BrowserPane/agentTools
 import { readBrowserTabsState } from "@/hooks/useBrowserTabs";
 import { onBrowserActionSettled } from "@/lib/browserActionBus";
 
-import { claimFileAction, useFileActionStore } from "./fileCommands/fileActionStore";
+import {
+  claimFileAction,
+  nextFileActionRequest,
+  useFileActionStore,
+} from "./fileCommands/fileActionStore";
 import type { ShowAllPullRequestsCommandProps } from "./workspaceCommands/useShowAllPullRequestsCommand";
 import type * as WorkspaceTabsSessions from "./workspaceTabs/workspaceTabsSessions";
 
@@ -48,11 +52,11 @@ export function loadFileActionHost(
 }
 
 /**
- * Loads the host again for each request that arrives, which stays waiting meanwhile, so the
- * host runs it once loaded; a request the load fails for says so and is dropped.
+ * Loads the host again for the next request, which waits in the queue with any made meanwhile,
+ * so the host runs them all once loaded; a request the load fails for says so and is dropped.
  */
 function FileActionHostRetry({ load }: { load: () => Promise<FileActionHostModule> }) {
-  const request = useFileActionStore((state) => state.request);
+  const request = useFileActionStore(nextFileActionRequest);
   const [host, setHost] = useState<ComponentType | null>(null);
   const retriedFor = useRef<number | null>(null);
   useEffect(() => {

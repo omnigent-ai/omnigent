@@ -22,10 +22,15 @@ export interface FileActionRequest {
 }
 
 interface FileActionState {
-  request: FileActionRequest | null;
+  /** Requests not yet taken, oldest first, so one made before the last runs still runs. */
+  pending: readonly FileActionRequest[];
 }
 
-export const useFileActionStore = create<FileActionState>(() => ({ request: null }));
+export const useFileActionStore = create<FileActionState>(() => ({ pending: [] }));
+
+/** The request to run next, if any. */
+export const nextFileActionRequest = (state: FileActionState): FileActionRequest | null =>
+  state.pending[0] ?? null;
 
 let nextKey = 0;
 
@@ -39,15 +44,17 @@ export function requestFileAction(
   { linkState = "" }: { linkState?: string } = {},
 ): void {
   nextKey += 1;
-  useFileActionStore.setState({ request: { target, command, linkState, key: nextKey } });
+  const request = { target, command, linkState, key: nextKey };
+  useFileActionStore.setState(({ pending }) => ({ pending: [...pending, request] }));
 }
 
 /**
  * Take `request` to run it. Only the first claim wins, so an effect that runs again
- * can't run it twice; a newer request is left alone.
+ * can't run it twice; the other requests stay queued.
  */
 export function claimFileAction(request: FileActionRequest): boolean {
-  if (useFileActionStore.getState().request?.key !== request.key) return false;
-  useFileActionStore.setState({ request: null });
+  const { pending } = useFileActionStore.getState();
+  if (!pending.some((queued) => queued.key === request.key)) return false;
+  useFileActionStore.setState({ pending: pending.filter((queued) => queued.key !== request.key) });
   return true;
 }

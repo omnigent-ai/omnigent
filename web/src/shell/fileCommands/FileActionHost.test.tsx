@@ -62,7 +62,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
-  useFileActionStore.setState({ request: null });
+  useFileActionStore.setState({ pending: [] });
   useFocusedFileStore.setState({ target: null, element: null });
 });
 
@@ -143,6 +143,15 @@ describe("FileActionHost", () => {
     expect(copied.slice(2)).toEqual(["/repo-a/src/a.ts", "/repo-b/lib/b.ts"]);
   });
 
+  it("runs two requests made at once, in order", () => {
+    act(() => {
+      requestFileAction(target("src/a.ts"), "copy-path");
+      requestFileAction(target("src/b.ts"), "copy-relative-path");
+    });
+    expect(copyText.mock.calls.map(([text]) => text)).toEqual(["/repo/src/a.ts", "src/b.ts"]);
+    expect(useFileActionStore.getState().pending).toEqual([]);
+  });
+
   it("shows this machine's files in the file manager", () => {
     act(() => requestFileAction(target("src/main.ts"), "reveal"));
     expect(revealInFileManager).toHaveBeenCalledWith({
@@ -221,7 +230,7 @@ describe("FileActionHost", () => {
     expect(launchEditorLink).not.toHaveBeenCalled();
     expect(copyText).not.toHaveBeenCalled();
     expect(toast.success).not.toHaveBeenCalled();
-    expect(useFileActionStore.getState().request).toBeNull();
+    expect(useFileActionStore.getState().pending).toEqual([]);
   });
 
   it("builds links under the deployment's base path, keeping the surface's link state", () => {

@@ -14,6 +14,7 @@ import {
   claimFileAction,
   type FileActionRequest,
   type HostedFileCommandId,
+  nextFileActionRequest,
   useFileActionStore,
 } from "./fileActionStore";
 import { useFocusedFile } from "./focusedFile";
@@ -49,7 +50,7 @@ function useFocusedFilePaletteCommands() {
 /** Runs each requested action, and offers the focused Files row's actions in ⌘K. */
 export function FileActionHost() {
   useFocusedFilePaletteCommands();
-  const request = useFileActionStore((state) => state.request);
+  const request = useFileActionStore(nextFileActionRequest);
   return request ? <FileActionRunner key={request.key} request={request} /> : null;
 }
 
