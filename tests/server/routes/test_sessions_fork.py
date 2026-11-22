@@ -915,10 +915,10 @@ def test_side_chat_fork_keeps_the_exchange_before_a_request_that_settles() -> No
     assert [item["response_id"] for item in response.json()["items"]] == ["resp_001", "resp_002"]
 
 
-def test_side_chat_fork_keeps_history_when_the_request_is_out_of_reach(
+def test_side_chat_fork_copies_no_history_when_the_running_request_is_out_of_reach(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A request beyond the bounded lookup leaves the history whole, never guessed."""
+    """With no known start for the running turn, a side chat copies nothing rather than guess."""
     monkeypatch.setattr(routes_core, "_SIDE_CHAT_REQUEST_LOOKBACK", 2)
     source = _make_conversation()
     source.live_status = "running"
@@ -929,8 +929,7 @@ def test_side_chat_fork_keeps_history_when_the_request_is_out_of_reach(
     response = client.post(f"/v1/sessions/{source.id}/fork", json={"side_chat": True})
 
     assert response.status_code == 201, response.text
-    assert store.fork_calls[-1]["before_item_id"] is None
-    assert store.fork_calls[-1]["up_to_response_id"] is None
+    assert response.json()["items"] == []
 
 
 async def _side_chat_ids(client: httpx.AsyncClient, parent_id: str, **kwargs: Any) -> set[str]:
