@@ -2788,9 +2788,13 @@ def create_app(
         app.state.memory_available() and memory_store is not None and memory_store.supports_search
     )
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
-    # Agent timers are scheduled tasks only the database scheduler fires.
+    # Agent timers are scheduled tasks only the database scheduler fires. Creating them
+    # waits for the release feature, until every server on the database reads them.
     app.state.session_timers_enabled = (
-        automations_enabled and automations_v2_enabled and scheduled_task_store is not None
+        automations_enabled
+        and automations_v2_enabled
+        and scheduled_task_store is not None
+        and resolved_feature_flags.enabled(Feature.SESSION_TIMERS)
     )
     # Separate from dispatch: schedulers accept one-time rules from this release on,
     # and creating them waits until every scheduler on the database does.

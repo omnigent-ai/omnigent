@@ -53,6 +53,8 @@ _REPLY = "Noted the timer."
 # timer's ticks for up to ten minutes, so these tests stop runners between turns, with
 # at least this long before the next tick.
 _STOP_MARGIN_S = 4.0
+# Timers are off until a server enables their release feature.
+_TIMERS_FEATURE = {"OMNIGENT_FEATURES": "session_timers"}
 
 
 @contextmanager
@@ -65,7 +67,9 @@ def _timer_stack(
         ``{"OMNIGENT_RUNNER_TUNNEL_TOKEN": None}`` to admit any token-bound runner.
     """
     with (
-        server_runner(tmp_path / "stack", server_env=server_env) as stack,
+        server_runner(
+            tmp_path / "stack", server_env={**_TIMERS_FEATURE, **(server_env or {})}
+        ) as stack,
         httpx.Client(
             base_url=stack.base_url,
             trust_env=False,
@@ -83,7 +87,8 @@ def _host_stack(tmp_path: Path) -> Iterator[tuple[ServerRunner, httpx.Client]]:
     with (
         # Host-launched runners bind their own tunnel tokens.
         server_runner(
-            tmp_path / "stack", server_env={"OMNIGENT_RUNNER_TUNNEL_TOKEN": None}
+            tmp_path / "stack",
+            server_env={**_TIMERS_FEATURE, "OMNIGENT_RUNNER_TUNNEL_TOKEN": None},
         ) as stack,
         httpx.Client(
             base_url=stack.base_url,
@@ -431,9 +436,10 @@ def test_a_sub_agent_timer_wakes_its_child_after_the_parent_moves_runners(
             lambda: client.get(f"/v1/runners/{new_runner_id}/status").json().get("online"),
             timeout_s=120,
         )
-        bind_session_runner(client.patch, "", parent_id, new_runner_id)
+        # Until the parent names its new runner, no tick can move the child to it.
         assert client.get(f"/v1/sessions/{child_id}").json()["runner_id"] == stack.runner_id
         replies_before = _replies(client, child_id)
+        bind_session_runner(client.patch, "", parent_id, new_runner_id)
 
         # A later tick finds the parent's new runner and wakes the child's agent there.
         poll_until(

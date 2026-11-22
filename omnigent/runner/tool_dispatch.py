@@ -4864,7 +4864,8 @@ async def _timer_support_error(server_client: httpx.AsyncClient) -> str | None:
     if supported:
         return None
     return (
-        "sys_timer_set: this Omnigent server does not run timers; it needs the database scheduler"
+        "sys_timer_set: this Omnigent server does not run timers; they need its database "
+        "scheduler and the session_timers feature"
     )
 
 

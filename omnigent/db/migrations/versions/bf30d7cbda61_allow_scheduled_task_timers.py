@@ -5,8 +5,17 @@ Revises: 5ab01aaca219
 
 ``kind`` 3 marks a timer an agent set with ``sys_timer_set``: a one-shot or
 repeating hidden wake into its own session, which clients never list as an
-automation. Deploy before any writer creates timers: an older binary cannot
-read the new code. Downgrade refuses while a timer exists; cancel timers first.
+automation.
+
+Deployment order: run this migration first. Older binaries keep working, since
+they never write kind 3 and the wider check accepts what they write. Then deploy
+a release that reads timers to every server sharing the database, and only then
+enable its ``session_timers`` release feature: an older binary can't decode a
+timer row.
+
+Rollback: before moving a server to a release that can't read timers, turn
+``session_timers`` off and drain the timers until no ``kind = 3`` row remains.
+The downgrade refuses while one does.
 """
 
 from __future__ import annotations

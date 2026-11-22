@@ -2266,12 +2266,14 @@ def create_scheduled_tasks_router(
             first firing, ``interval_seconds`` for a repeating timer (else ``None``),
             and the ``seconds``, ``repeat`` and ``note`` it was set with.
         :raises OmnigentError: 400 for bad arguments, an archived session, a session whose
-            permission mode skips approval, or a server without the database scheduler;
-            403/404 as for posting a message.
+            permission mode skips approval, or a server with timers off (no database
+            scheduler, or the ``session_timers`` feature off); 403/404 as for posting a
+            message.
         """
         if not getattr(request.app.state, "session_timers_enabled", False):
             raise OmnigentError(
-                "Timers need the database scheduler, which this server does not run",
+                "Timers are off on this server: they need the database scheduler and the "
+                "session_timers feature",
                 code=ErrorCode.INVALID_INPUT,
             )
         unknown = sorted(set(body) - {"seconds", "repeat", "note"})

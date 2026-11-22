@@ -458,7 +458,10 @@ deployment:
 `DELETE /v1/sessions/{id}/timers/{timer_id}`. Both authorize the caller as posting a
 message would; cancelling also needs the same session and owner. The task ID is the
 `timer_id`. The automations gate does not hide these routes, but they need the
-database scheduler (`session_timers` in `/v1/info`). The task's host is the one
+database scheduler and the default-off `session_timers` release feature (both
+reflected in `session_timers` in `/v1/info`). Enable it only once every server on
+the database reads timer rows. Turning it off stops new timers, while existing ones
+keep firing and can still be cancelled. The task's host is the one
 serving the session's runner tunnel (`routing_host_id`): a sub-agent or side chat
 with no host of its own takes its parent's or source's, so the replica holding that
 tunnel claims its firings.

@@ -109,6 +109,7 @@ def _build_app(
     *,
     persistent: bool = False,
     one_time: bool = False,
+    timers: bool = False,
     local_single_user: bool = False,
     projects: bool = True,
     automations: bool | Callable[[], bool] | None = None,
@@ -140,6 +141,7 @@ def _build_app(
                     ("automations_v2" if persistent else "-automations_v2")
                     + ("" if automations_feature else ",-automations")
                     + (",one_time_automations" if one_time else "")
+                    + (",session_timers" if timers else "")
                     + (",workflows" if workflows else "")
                 )
             }
@@ -157,15 +159,16 @@ def _build_app(
 def auth_app(
     runtime_init: None, db_uri: str, tmp_path: Path, request: pytest.FixtureRequest
 ) -> FastAPI:
-    # ``True`` turns on the database scheduler; ``"one_time"`` also enables
-    # one-time automations on it; ``"one_time_without_dispatch"`` enables only
-    # the release feature, which needs the database scheduler to take effect.
+    # ``True`` turns on the database scheduler, with timers; ``"one_time"`` also
+    # enables one-time automations on it; ``"one_time_without_dispatch"`` enables
+    # only that release feature, which needs the database scheduler to take effect.
     param = getattr(request, "param", False)
     app = _build_app(
         db_uri,
         tmp_path,
         persistent=param in (True, "one_time"),
         one_time=param in ("one_time", "one_time_without_dispatch"),
+        timers=param in (True, "one_time"),
     )
     _make_user(db_uri)
     _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
@@ -7429,24 +7432,60 @@ async def test_timer_requests_are_checked_like_the_tools_arguments(
     assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
 
 
-async def test_timers_need_the_database_scheduler(
-    auth_client: httpx.AsyncClient, db_uri: str
+@pytest.mark.parametrize(
+    ("persistent", "timers"),
+    [(False, True), (True, False)],
+    ids=["no-database-scheduler", "feature-off"],
+)
+async def test_timers_need_the_database_scheduler_and_their_feature(
+    db_uri: str,
+    tmp_path: Path,
+    mock_llm: ControllableMockClient,
+    runtime_init: None,
+    persistent: bool,
+    timers: bool,
 ) -> None:
+    app = _build_app(db_uri, tmp_path, persistent=persistent, timers=timers)
+    _make_user(db_uri)
     session_id = _owned_session(db_uri)
-    info = (await auth_client.get("/v1/info", headers=_headers())).json()
-    assert info["session_timers"] is False
-    resp = await auth_client.post(
-        f"/v1/sessions/{session_id}/timers", json={"seconds": 60}, headers=_headers()
-    )
+    async with _serve(app, mock_llm, tmp_path) as client:
+        info = (await client.get("/v1/info", headers=_headers())).json()
+        assert info["session_timers"] is False
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/timers", json={"seconds": 60}, headers=_headers()
+        )
     assert resp.status_code == 400, resp.text
-    assert "database scheduler" in resp.text
+    assert "database scheduler and the session_timers feature" in resp.text
     assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
+
+
+async def test_turning_timers_off_stops_new_ones_but_still_cancels_existing_ones(
+    db_uri: str, tmp_path: Path, mock_llm: ControllableMockClient, runtime_init: None
+) -> None:
+    """A rollback drains existing timers with the feature off, so it must cancel them."""
+    _make_user(db_uri)
+    session_id = _owned_session(db_uri)
+    timers_url = f"/v1/sessions/{session_id}/timers"
+    on = _build_app(db_uri, tmp_path, persistent=True, timers=True)
+    async with _serve(on, mock_llm, tmp_path) as client:
+        created = await client.post(timers_url, json={"seconds": 600}, headers=_headers())
+    assert created.status_code == 201, created.text
+    timer_id = created.json()["timer_id"]
+    off = _build_app(db_uri, tmp_path, persistent=True, timers=False)
+    async with _serve(off, mock_llm, tmp_path) as client:
+        refused = await client.post(timers_url, json={"seconds": 600}, headers=_headers())
+        cancelled = await client.delete(f"{timers_url}/{timer_id}", headers=_headers())
+    assert refused.status_code == 400, refused.text
+    assert cancelled.status_code == 200, cancelled.text
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+    assert tasks.list_due_tasks(int(time.time()) + 3600) == []
+    assert [task.id for task in tasks.list(kinds=("timer",))] == []
 
 
 async def test_the_automations_gate_does_not_hide_timers(
     db_uri: str, tmp_path: Path, mock_llm: ControllableMockClient, runtime_init: None
 ) -> None:
-    app = _build_app(db_uri, tmp_path, persistent=True, automations=lambda: False)
+    app = _build_app(db_uri, tmp_path, persistent=True, timers=True, automations=lambda: False)
     _make_user(db_uri)
     session_id = _owned_session(db_uri)
     async with _serve(app, mock_llm, tmp_path) as client:
