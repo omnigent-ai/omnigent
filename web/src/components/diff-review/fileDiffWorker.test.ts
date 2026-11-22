@@ -1,10 +1,14 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { runInNewContext } from "node:vm";
 import { build, type Rollup } from "vite";
 import { beforeAll, describe, expect, it } from "vitest";
 
-// Each diff worker as the app ships it: one bundle, loaded where there is no document.
+import { RICH_MARKDOWN_REQUEST, richMarkdownAnswer, startInWorkerScope } from "@/test/workerScope";
+
+import { workerBuildPlugins } from "../../../vite.workerExports";
+
+// Each diff worker as the app ships it: one bundle built with the app's worker plugins,
+// loaded where there is no document.
 const WORKERS = ["fileDiffWorker.ts", "markdownDiffWorker.ts"];
 const chunks = new Map<string, Rollup.OutputChunk>();
 
@@ -13,6 +17,7 @@ async function bundle(worker: string): Promise<Rollup.OutputChunk> {
   const result = await build({
     configFile: false,
     logLevel: "silent",
+    plugins: workerBuildPlugins(),
     resolve: { alias: { "@": path.resolve(here, "../..") } },
     build: {
       write: false,
@@ -42,24 +47,26 @@ describe.each(WORKERS)("%s", (worker) => {
     expect(moduleIds().filter((id) => react.test(id) || id.endsWith(".tsx"))).toEqual([]);
   });
 
-  // The Markdown worker's bundle here reaches a browser-only parser this scope lacks.
-  it.runIf(worker === "fileDiffWorker.ts")("starts in a worker scope without a document", () => {
-    const scope: { onmessage: unknown; postMessage: () => void } = {
-      onmessage: null,
-      postMessage: () => {},
-    };
-    // What a worker scope has that the diff relies on; no document or window.
-    const { TextDecoder, TextEncoder, URL, queueMicrotask, setTimeout, clearTimeout } = globalThis;
-    runInNewContext(chunks.get(worker)!.code, {
-      self: scope,
-      console,
-      TextDecoder,
-      TextEncoder,
-      URL,
-      queueMicrotask,
-      setTimeout,
-      clearTimeout,
-    });
-    expect(typeof scope.onmessage).toBe("function");
+  it("starts in a worker scope without a document", () => {
+    expect(() => startInWorkerScope(chunks.get(worker)!.code)).not.toThrow();
+  });
+
+  it.runIf(worker === "fileDiffWorker.ts")("answers a file diff request", async () => {
+    const started = startInWorkerScope(chunks.get(worker)!.code);
+    const request = { path: "src/app.ts", before: "a\n", after: "a\nb\n", ignoreWhitespace: false };
+    const [answer] = (await started.send({ id: 7, request: { ...request, revision: "r1" } })) as [
+      { id: number; fileDiff?: { name: string; type: string }; error?: string },
+    ];
+    expect(answer.error).toBeUndefined();
+    expect(answer.id).toBe(7);
+    expect(answer.fileDiff).toMatchObject({ name: "src/app.ts", type: "change" });
+  });
+
+  it.runIf(worker === "markdownDiffWorker.ts")("answers a rich Markdown request", async () => {
+    const started = startInWorkerScope(chunks.get(worker)!.code);
+    const answer = richMarkdownAnswer(await started.send(RICH_MARKDOWN_REQUEST));
+    expect([answer.id, answer.status]).toEqual([1, "ready"]);
+    expect(answer.rendered).toContain("katex");
+    expect(answer.text).toContain("Price & fees");
   });
 });
