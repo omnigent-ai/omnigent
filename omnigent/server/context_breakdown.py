@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from pathlib import PurePath
 from typing import Any
 
 from omnigent.entities import ConversationItem
@@ -26,7 +27,7 @@ from omnigent.entities.file import StoredFile
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness, is_native_harness
 from omnigent.harness_capabilities import InstructionDelivery
-from omnigent.inner.native_attachments import uses_filesystem_delivery
+from omnigent.inner.native_attachments import decode_data_uri, uses_filesystem_delivery
 from omnigent.llms.errors import APPROX_BYTES_PER_TOKEN
 from omnigent.mcp_selection import selected_mcp_spec
 from omnigent.runtime.context_breakdown import (
@@ -136,7 +137,8 @@ class _AttachmentRef:
     filename: str | None
     is_image: bool
     inline_bytes: int | None
-    has_data_uri: bool = False
+    # The inline payload when it is a data URI, which a native harness decodes to a file.
+    data_uri: str | None = None
     # A compaction snapshot replaced the payload with a marker.
     omitted: bool = False
     # A provider-shaped block a checkpoint replays to the model as-is.
@@ -177,7 +179,7 @@ def _attachment_ref(block: dict[str, Any]) -> _AttachmentRef:
         filename=filename if isinstance(filename, str) else None,
         is_image=block.get("type") == "input_image",
         inline_bytes=inline_payload_bytes(block),
-        has_data_uri=isinstance(payload, str) and payload.startswith("data:"),
+        data_uri=payload if isinstance(payload, str) and payload.startswith("data:") else None,
         omitted=is_omitted_binary_payload(payload),
     )
 
@@ -387,6 +389,14 @@ def scan_history(
     return history, attachments
 
 
+def _materializes(ref: _AttachmentRef) -> bool:
+    """Whether a native harness can write this inline attachment to a file."""
+    if ref.data_uri is None or decode_data_uri(ref.data_uri) is None:
+        return False
+    # The harness refuses a name that resolves to the parent directory.
+    return ref.filename is None or PurePath(ref.filename).name != ".."
+
+
 def resolve_attachment(
     ref: _AttachmentRef,
     lookup_file: Callable[[str], StoredFile | None],
@@ -415,12 +425,14 @@ def resolve_attachment(
                 estimated_tokens=IMAGE_TOKEN_ESTIMATE if ref.is_image else None,
             )
         if native:
-            # Only a data URI materializes; a remote URL or bare base64 reaches
-            # the CLI as a "could not be loaded" marker.
+            # Only a decodable data URI materializes; anything else reaches the
+            # CLI as a "could not be loaded" marker.
+            if not _materializes(ref):
+                return ContextBreakdownAttachment(
+                    filename=ref.filename, bytes=size or None, delivery="missing"
+                )
             return ContextBreakdownAttachment(
-                filename=ref.filename,
-                bytes=size,
-                delivery="workspace" if ref.has_data_uri else "missing",
+                filename=ref.filename, bytes=size, delivery="workspace"
             )
         return ContextBreakdownAttachment(
             filename=ref.filename,

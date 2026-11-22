@@ -781,6 +781,37 @@ def test_breakdown_reflects_native_harness_prompt_and_attachment_paths() -> None
             },
             {"type": "input_image", "filename": "remote.png", "image_url": "https://x.test/a.png"},
             {"type": "input_file", "filename": "bare.txt", "file_data": "QUJDRA=="},
+            {
+                "type": "input_image",
+                "filename": "broken.png",
+                "image_url": "data:image/png;base64,A",
+            },
+            {
+                "type": "input_image",
+                "filename": "empty.png",
+                "image_url": "data:image/png;base64,",
+            },
+            {
+                "type": "input_image",
+                "filename": "nopad.png",
+                "image_url": "data:image/png;base64,QUJDRA",
+            },
+            {
+                "type": "input_file",
+                "filename": "report.pdf",
+                "file_data": "data:application/pdf;base64,QUJDRA==",
+            },
+            {
+                "type": "input_file",
+                "filename": "broken.pdf",
+                "file_data": "data:application/pdf;base64,A",
+            },
+            {"type": "input_file", "filename": "plain.txt", "file_data": "data:text/plain,"},
+            {
+                "type": "input_image",
+                "filename": "..",
+                "image_url": "data:image/png;base64,QUJDRA==",
+            },
         )
     ]
 
@@ -807,6 +838,15 @@ def test_breakdown_reflects_native_harness_prompt_and_attachment_paths() -> None
         # Only data URIs materialize, so these reach the CLI as "could not be loaded".
         ("remote.png", "missing", None, None),
         ("bare.txt", "missing", 4, None),
+        # A data URI the native decoder rejects never becomes a file.
+        ("broken.png", "missing", None, None),
+        ("empty.png", "missing", None, None),
+        ("nopad.png", "missing", 4, None),
+        ("report.pdf", "workspace", 4, None),
+        ("broken.pdf", "missing", None, None),
+        ("plain.txt", "missing", None, None),
+        # The harness refuses a name that resolves to the parent directory.
+        ("..", "missing", 4, None),
     ]
 
 

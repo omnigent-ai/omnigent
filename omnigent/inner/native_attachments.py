@@ -94,6 +94,21 @@ def parse_data_uri(uri: str) -> DataUri:
     return DataUri(mime_type=mime_part, base64_payload=payload)
 
 
+def decode_data_uri(uri: str) -> tuple[bytes, str] | None:
+    """
+    Decode a ``data:`` URI's payload, as materializing an attachment does.
+
+    :param uri: Data URI string, e.g. ``"data:image/png;base64,iVBOR..."``.
+    :returns: ``(raw_bytes, mime_type)``, or ``None`` when the URI has no
+        payload or the payload is not valid base64.
+    """
+    try:
+        parsed = parse_data_uri(uri)
+        return base64.b64decode(parsed.base64_payload), parsed.mime_type
+    except (ValueError, binascii.Error):
+        return None
+
+
 # Upload limits for files that the harness opens with filesystem tools.
 # The server enforces these per session, including copies between sessions.
 MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES: int = 50 * 1024 * 1024
@@ -366,14 +381,13 @@ def _decode_attachment_block(block: Mapping[str, object]) -> tuple[bytes, str] |
             )
         return None
 
-    try:
-        parsed = parse_data_uri(data_uri)
-        raw_bytes = base64.b64decode(parsed.base64_payload)
-    except (ValueError, binascii.Error):
-        _logger.warning("Failed to decode data URI for attachment", exc_info=True)
+    decoded = decode_data_uri(data_uri)
+    if decoded is None:
+        _logger.warning("Failed to decode data URI for attachment")
         return None
+    raw_bytes, mime_type = decoded
 
-    ext = MIME_TO_EXT.get(parsed.mime_type, "")
+    ext = MIME_TO_EXT.get(mime_type, "")
     filename = block.get("filename")
     if not isinstance(filename, str) or not filename:
         filename = f"attachment_{uuid.uuid4().hex[:8]}{ext}"
