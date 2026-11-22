@@ -26,7 +26,11 @@ function row(id: string, updated: number, overrides: Partial<Conversation> = {})
 
 afterEach(() => {
   navigate.mockClear();
-  useSidebarSessionOrderStore.setState({ orderedSessionIds: [], activeSessionId: null });
+  useSidebarSessionOrderStore.setState({
+    orderedSessionIds: [],
+    activeSessionId: null,
+    pendingSessionId: null,
+  });
 });
 
 const command = (commands: ReturnType<typeof useSessionNavigationCommands>, id: string) =>
@@ -45,8 +49,9 @@ describe("useSessionNavigationCommands", () => {
     );
     command(result.current, "next-session").run();
     expect(navigate).toHaveBeenLastCalledWith("/c/c");
+    // Before the route renders c, a step back starts from it.
     command(result.current, "previous-session").run();
-    expect(navigate).toHaveBeenLastCalledWith("/c/a");
+    expect(navigate).toHaveBeenLastCalledWith("/c/b");
   });
 
   it("offers no steps while no sidebar lists sessions", () => {

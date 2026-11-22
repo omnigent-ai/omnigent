@@ -106,6 +106,7 @@ beforeEach(() => {
   useSidebarSessionOrderStore.setState({
     orderedSessionIds: ["a", "b", "c"],
     activeSessionId: "b",
+    pendingSessionId: null,
   });
 });
 afterEach(() => {
@@ -121,7 +122,7 @@ describe("QuickPickShortcutHost", () => {
     render(<QuickPickShortcutHost />);
     press(NEXT);
     press(PREVIOUS);
-    expect(navigate.mock.calls).toEqual([["/c/c"], ["/c/a"]]);
+    expect(navigate.mock.calls).toEqual([["/c/c"], ["/c/b"]]);
   });
 
   it("leaves the key alone when no sidebar lists sessions, or a dialog has focus", () => {
@@ -168,7 +169,7 @@ describe("QuickPickShortcutHost", () => {
     render(<QuickPickShortcutHost />);
     expect(press(CTRL_TAB)).toBe(false);
     expect(press(CTRL_SHIFT_TAB)).toBe(false);
-    expect(navigate.mock.calls).toEqual([["/c/c"], ["/c/a"]]);
+    expect(navigate.mock.calls).toEqual([["/c/c"], ["/c/b"]]);
     expect(document.querySelector('[role="dialog"]')).toBeNull();
   });
 
@@ -203,7 +204,7 @@ describe("QuickPickShortcutHost", () => {
     forwarded({ shiftKey: true });
     forwarded({ repeat: true });
     forwarded({ type: "keyup", key: "Control" });
-    expect(navigate.mock.calls).toEqual([["/c/c"], ["/c/a"]]);
+    expect(navigate.mock.calls).toEqual([["/c/c"], ["/c/b"]]);
     expect(bridge.cancelled).toBe(3);
     unmount();
     expect(bridge.supported).toEqual([true, false]);

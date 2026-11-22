@@ -1,0 +1,99 @@
+import { act, render, renderHook } from "@testing-library/react";
+import { MemoryRouter, useNavigate } from "react-router-dom";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import {
+  currentSidebarSessionId,
+  stepSidebarSession,
+  steppedSessionId,
+  usePublishSidebarSessionOrder,
+  useSidebarSessionOrderStore,
+} from "./useSidebarSessionOrder";
+
+afterEach(() =>
+  useSidebarSessionOrderStore.setState({
+    orderedSessionIds: [],
+    activeSessionId: null,
+    pendingSessionId: null,
+  }),
+);
+
+describe("steppedSessionId", () => {
+  const rows = ["a", "b", "c"];
+
+  it("steps down and up from the open row, wrapping at the ends", () => {
+    expect(steppedSessionId(rows, "a", 1)).toBe("b");
+    expect(steppedSessionId(rows, "c", 1)).toBe("a");
+    expect(steppedSessionId(rows, "a", -1)).toBe("c");
+  });
+
+  it("enters at the top going down and at the bottom going up from off the list", () => {
+    expect(steppedSessionId(rows, null, 1)).toBe("a");
+    expect(steppedSessionId(rows, "elsewhere", -1)).toBe("c");
+  });
+
+  it("has nowhere to go with nothing listed", () => {
+    expect(steppedSessionId([], "a", 1)).toBeUndefined();
+  });
+});
+
+describe("usePublishSidebarSessionOrder", () => {
+  it("publishes the sidebar's rows while mounted and clears them once it unmounts", () => {
+    const view = renderHook(() => usePublishSidebarSessionOrder(["a", "b"], "b"), {
+      wrapper: MemoryRouter,
+    });
+    expect(useSidebarSessionOrderStore.getState()).toEqual({
+      orderedSessionIds: ["a", "b"],
+      activeSessionId: "b",
+      pendingSessionId: null,
+    });
+    view.unmount();
+    expect(useSidebarSessionOrderStore.getState()).toEqual({
+      orderedSessionIds: [],
+      activeSessionId: null,
+      pendingSessionId: null,
+    });
+  });
+});
+
+describe("stepSidebarSession", () => {
+  it("steps again from the session it opened before the route renders it", () => {
+    useSidebarSessionOrderStore.setState({
+      orderedSessionIds: ["a", "b", "c"],
+      activeSessionId: "a",
+    });
+    const navigate = vi.fn();
+    expect(stepSidebarSession(1, navigate)).toBe(true);
+    expect(stepSidebarSession(1, navigate)).toBe(true);
+    expect(stepSidebarSession(-1, navigate)).toBe(true);
+    expect(navigate.mock.calls).toEqual([["/c/b"], ["/c/c"], ["/c/b"]]);
+  });
+
+  it("starts from the rendered session again once a navigation commits", () => {
+    const navigate = vi.fn();
+    function Publisher() {
+      usePublishSidebarSessionOrder(["a", "b", "c"], "a");
+      const go = useNavigate();
+      return (
+        <button type="button" onClick={() => go("/elsewhere")}>
+          go
+        </button>
+      );
+    }
+    const view = render(
+      <MemoryRouter>
+        <Publisher />
+      </MemoryRouter>,
+    );
+    stepSidebarSession(1, navigate);
+    expect(currentSidebarSessionId()).toBe("b");
+    act(() => view.getByRole("button").click());
+    expect(currentSidebarSessionId()).toBe("a");
+  });
+
+  it("has nowhere to go with nothing listed", () => {
+    const navigate = vi.fn();
+    expect(stepSidebarSession(1, navigate)).toBe(false);
+    expect(navigate).not.toHaveBeenCalled();
+  });
+});

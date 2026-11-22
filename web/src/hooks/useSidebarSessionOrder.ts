@@ -5,11 +5,18 @@
 import { useEffect } from "react";
 import { create } from "zustand";
 
+import { useLocation } from "@/lib/routing";
+
 interface SidebarSessionOrderState {
   /** Visible rows in render order, without duplicates; empty while no sidebar lists any. */
   orderedSessionIds: readonly string[];
   /** The open session's row, or null off-list (a new session, the inbox). */
   activeSessionId: string | null;
+  /**
+   * A session a step opened that the route hasn't rendered yet. Navigations render in a
+   * transition that waits for the session to load, so a quick next step starts from here.
+   */
+  pendingSessionId: string | null;
 }
 
 const NO_SESSIONS: readonly string[] = [];
@@ -17,6 +24,7 @@ const NO_SESSIONS: readonly string[] = [];
 export const useSidebarSessionOrderStore = create<SidebarSessionOrderState>(() => ({
   orderedSessionIds: NO_SESSIONS,
   activeSessionId: null,
+  pendingSessionId: null,
 }));
 
 /** Publishes the sidebar's rows while it's mounted, and clears them once it unmounts. */
@@ -24,6 +32,11 @@ export function usePublishSidebarSessionOrder(
   orderedSessionIds: readonly string[],
   activeSessionId: string | null,
 ): void {
+  // Any committed navigation, including one that replaced a step's, makes the route current.
+  const { key: locationKey } = useLocation();
+  useEffect(() => {
+    useSidebarSessionOrderStore.setState({ pendingSessionId: null });
+  }, [locationKey]);
   useEffect(() => {
     useSidebarSessionOrderStore.setState({ orderedSessionIds, activeSessionId });
   }, [orderedSessionIds, activeSessionId]);
@@ -32,6 +45,7 @@ export function usePublishSidebarSessionOrder(
       useSidebarSessionOrderStore.setState({
         orderedSessionIds: NO_SESSIONS,
         activeSessionId: null,
+        pendingSessionId: null,
       }),
     [],
   );
@@ -54,4 +68,29 @@ export function steppedSessionId(
   const current = activeSessionId ? orderedSessionIds.indexOf(activeSessionId) : -1;
   if (current === -1) return orderedSessionIds[direction === 1 ? 0 : count - 1];
   return orderedSessionIds[(current + direction + count) % count];
+}
+
+/** The session a step starts from: the one a step last opened, else the rendered one. */
+export function currentSidebarSessionId(): string | null {
+  const { pendingSessionId, activeSessionId } = useSidebarSessionOrderStore.getState();
+  return pendingSessionId ?? activeSessionId;
+}
+
+/**
+ * Opens the listed row one step from the current session, reading the list when it runs.
+ * Returns false when there is nowhere to go.
+ */
+export function stepSidebarSession(
+  direction: SessionStepDirection,
+  navigate: (path: string) => void,
+): boolean {
+  const { orderedSessionIds } = useSidebarSessionOrderStore.getState();
+  const current = currentSidebarSessionId();
+  const target = steppedSessionId(orderedSessionIds, current, direction);
+  if (!target) return false;
+  if (target !== current) {
+    navigate(`/c/${target}`);
+    useSidebarSessionOrderStore.setState({ pendingSessionId: target });
+  }
+  return true;
 }
