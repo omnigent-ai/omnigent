@@ -295,12 +295,24 @@ describe("browserViewRegistry — app chords a page hands to the shell", () => {
     registry.releaseForwardedChords(true);
     assert.equal(commandK(), false);
 
-    // A list the new renderer sends replaces the held one.
-    registry.setForwardedChords([COMMAND_K]);
+    // An update during a navigation waits: it applies if the old renderer stays...
+    registry.holdForwardedChords();
+    assert.deepEqual(registry.setForwardedChords([COMMAND_K]), { ok: true, count: 1 });
+    assert.equal(commandK(), false);
+    registry.releaseForwardedChords(true);
+    assert.equal(commandK(), true);
     registry.holdForwardedChords();
     registry.setForwardedChords([]);
     registry.releaseForwardedChords(true);
     assert.equal(commandK(), false);
+
+    // ...and goes with it when a new document replaces it.
+    registry.holdForwardedChords();
+    registry.setForwardedChords([COMMAND_K]);
+    registry.releaseForwardedChords(false);
+    assert.equal(commandK(), false);
+    registry.setForwardedChords([COMMAND_K]);
+    assert.equal(commandK(), true);
   });
 });
 

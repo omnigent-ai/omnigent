@@ -3604,7 +3604,32 @@ describe("browser view detach on main-frame navigation (src/main.js)", () => {
 
   const HOST_URL = "https://host.example/ml/omnigents";
   const reload = (h) => h.emit("did-start-navigation", HOST_URL, false, true);
+  const COMMAND_K = { key: "k", metaKey: true, ctrlKey: false, altKey: false, shiftKey: false };
+  // The outgoing renderer can still send its list while the window loads the next document.
+  const updateMidReload = (h, registry) => (reload(h), registry.setForwardedChords([COMMAND_K]));
   for (const [scenario, navigate, pageKeepsKeys] of [
+    [
+      "an update mid-reload, then a new document",
+      (h, registry) => (updateMidReload(h, registry), h.emit("did-navigate")),
+      true,
+    ],
+    [
+      "an update mid-reload, then an error page",
+      (h, registry) => (
+        updateMidReload(h, registry),
+        h.emit("did-fail-load", -105, "", HOST_URL, true)
+      ),
+      true,
+    ],
+    [
+      "an update mid-reload, then a cancelled reload",
+      (h, registry) => (
+        updateMidReload(h, registry),
+        h.emit("did-fail-load", -3, "", HOST_URL, true),
+        h.emit("did-stop-loading")
+      ),
+      false,
+    ],
     ["a reload into a bundle that never asks", (h) => (reload(h), h.emit("did-navigate")), true],
     [
       "an error page replacing the shell",
@@ -3669,11 +3694,9 @@ describe("browser view detach on main-frame navigation (src/main.js)", () => {
           return { prevented, forwarded: forwarded.length };
         };
 
-        registry.setForwardedChords([
-          { key: "k", metaKey: true, ctrlKey: false, altKey: false, shiftKey: false },
-        ]);
+        registry.setForwardedChords([COMMAND_K]);
         assert.deepEqual(pressCommandK(), { prevented: true, forwarded: 1 });
-        navigate(h);
+        navigate(h, registry);
         // A finished load that follows never hands back keys a new document didn't ask for.
         h.emit("did-stop-loading");
         assert.deepEqual(

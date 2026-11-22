@@ -407,14 +407,17 @@ function createBrowserViewRegistry({
     return { ok: true };
   }
 
+  // During a host navigation an update waits with the held list: the old renderer that sent it
+  // may stay, and a replacement document asks for its own keys.
   function setForwardedChords(chords) {
-    forwardedChords = normalizeForwardedChords(chords);
-    heldForwardedChords = null;
-    return { ok: true, count: forwardedChords.length };
+    const chordList = normalizeForwardedChords(chords);
+    if (heldForwardedChords !== null) heldForwardedChords = chordList;
+    else forwardedChords = chordList;
+    return { ok: true, count: chordList.length };
   }
 
   // A navigation may replace the renderer with a bundle that never asks, so pages keep their
-  // keys until it ends; the first held list survives a navigation that supersedes another.
+  // keys until it ends; a navigation that supersedes another keeps the list already held.
   function holdForwardedChords() {
     if (heldForwardedChords === null) heldForwardedChords = forwardedChords;
     forwardedChords = [];
