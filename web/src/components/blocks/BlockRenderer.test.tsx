@@ -1911,7 +1911,62 @@ describe("BlockRenderer dispatch", () => {
             "false",
           ),
         );
-        expect(screen.getAllByTestId("task-activity")).toEqual([started, done]);
+        const [startedAfter, doneAfter] = screen.getAllByTestId("task-activity");
+        expect(startedAfter).toBe(started);
+        expect(doneAfter).toBe(done);
+      });
+
+      it("keeps a sub-agent's notice between the markers it landed between", () => {
+        const returned: RenderItem = {
+          kind: "subagent_activity",
+          itemId: "notice_returned",
+          data: {
+            type: "resource_event",
+            event_type: "session.subagent.returned",
+            resource_type: "session",
+            resource_id: "conv_child",
+            resource: { title: "Peirce" },
+          },
+        };
+        const follows = (earlier: Node, later: Node) =>
+          (earlier.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+        // No work between the markers: the notice stays in view instead of joining
+        // the fold before "Started".
+        const view = render(
+          turn(
+            [
+              tool(1, "Agent"),
+              marker("e1", "started", "Say hello", 4),
+              returned,
+              marker("e2", "done", "Say hello", 7),
+              text("m1", "Said hello."),
+            ],
+            { workedForS: 9 },
+          ),
+        );
+        const [started, done] = screen.getAllByTestId("task-activity");
+        const notice = screen.getByTestId("subagent-activity");
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+        expect(follows(started!, notice) && follows(notice, done!)).toBe(true);
+        view.unmount();
+
+        // Nor does it join the work after a marker when none came before it.
+        render(
+          turn(
+            [
+              text("m0", "Checking in with Peirce."),
+              returned,
+              marker("e1", "started", "Say hello", 4),
+              tool(1, "Agent"),
+              text("m1", "Said hello."),
+            ],
+            { workedForS: 9 },
+          ),
+        );
+        expect(
+          follows(screen.getByTestId("subagent-activity"), screen.getByTestId("task-activity")),
+        ).toBe(true);
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
       });
     });
 

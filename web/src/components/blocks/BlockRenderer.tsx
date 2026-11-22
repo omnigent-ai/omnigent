@@ -255,9 +255,9 @@ export function BlockRenderer({
     showsWorking,
   });
 
+  const workflowsEnabled = isFeatureEnabled(useServerInfo(), "workflows");
   // Keep each message visible even when a later tool call follows it,
   // unless the user opted into folding narration.
-  const workflowsEnabled = isFeatureEnabled(useServerInfo(), "workflows");
   const partition = partitionTurn(
     items,
     foldsNarration({ items, turnLifecycle, foldNarration }),
@@ -607,17 +607,26 @@ function isNoticeOrUncommitted(item: RenderItem): boolean {
 }
 
 /**
- * A run of only notices folds with the nearest work, earlier first. With no
- * work in the turn there is no row to fold into, so the notices stay visible.
+ * A run of only notices folds with the nearest work between the same task
+ * markers, earlier first. With no work there to fold into, the notices stay
+ * visible where they landed.
  */
 function foldNoticeRuns(segments: TurnSegment[]): TurnSegment[] {
   const isNoticeRun = (segment: TurnSegment): boolean =>
     segment.kind === "work" && segment.items.every((item) => item.kind === "subagent_activity");
-  const workRuns = segments.filter((segment) => segment.kind === "work" && !isNoticeRun(segment));
+  let markersSoFar = 0;
+  const stretchOf = segments.map((segment) => {
+    if (segment.kind === "marker") markersSoFar += 1;
+    return markersSoFar;
+  });
+  const workRuns = segments.flatMap((segment, index) =>
+    segment.kind === "work" && !isNoticeRun(segment) ? [{ segment, index }] : [],
+  );
   return segments.flatMap((segment, index): TurnSegment[] => {
     if (segment.kind !== "work" || !isNoticeRun(segment)) return [segment];
-    const earlier = workRuns.findLast((run) => segments.indexOf(run) < index);
-    const target = earlier ?? workRuns[0];
+    const sameStretch = workRuns.filter((run) => stretchOf[run.index] === stretchOf[index]);
+    const earlier = sameStretch.findLast((run) => run.index < index)?.segment;
+    const target = earlier ?? sameStretch[0]?.segment;
     if (target?.kind !== "work") {
       return segment.items.map((item, k) => ({
         kind: "exempt",

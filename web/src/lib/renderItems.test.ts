@@ -451,12 +451,28 @@ describe("sub-agent timeline events", () => {
         at(answer, { timestamp: 160 }),
       ]),
     ).toEqual([36.5]);
+    // A marker recorded just before the call it marks counts from the turn's start.
+    expect(
+      markerElapsed([
+        at(taskMarker, { createdAtS: 95 }),
+        at(work, { createdAtS: 100 }),
+        at(answer, { createdAtS: 250 }),
+      ]),
+    ).toEqual([0]);
     // Clocks that differ (a page loaded mid-turn) can't place the marker.
     expect(
       markerElapsed([
         at(work, { createdAtS: 100 }),
         at(taskMarker, { timestamp: 46.5 }),
         at(answer, { timestamp: 160 }),
+      ]),
+    ).toEqual([undefined]);
+    // Only the clock that spans the turn places a marker, even when another one could.
+    expect(
+      markerElapsed([
+        at(work, { timestamp: 10, createdAtS: 100 }),
+        at(taskMarker, { createdAtS: 136 }),
+        at(answer, { timestamp: 160, createdAtS: 250 }),
       ]),
     ).toEqual([undefined]);
     // A sub-agent's notice doesn't split the turn's time.
