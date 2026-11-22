@@ -14,9 +14,12 @@ only for rows written before ``blob_key`` existed): a lookup instead of a scan
 of the workspace's files.
 
 Additive and unused by earlier releases, so this schema deploys before the
-application code that reads it, and that code can be rolled back while it
-stays. Downgrade drops both indexes and the column, and with it every project
-file's membership, so only downgrade before project files are in use.
+application code that reads it. Earlier releases treat a file with no session
+as global, which is what a project file looks like to them: once project files
+exist, roll the application back only to a release that recognises
+``project_id``, or delete the project files first. Downgrade drops both indexes
+and the column, and with it every project file's membership, so only downgrade
+before project files are in use.
 """
 
 from __future__ import annotations
