@@ -107,7 +107,8 @@ class WorkspaceService(Protocol):
 
     async def list_branch_commits(self, request: ListBranchCommitsRequest, ctx: RequestContext[ListBranchCommitsRequest, ListBranchCommitsResponse], /) -> ListBranchCommitsResponse:
         """
-        Lists the commits HEAD has beyond its merge base with a base, newest first.
+        Lists the commits a head (HEAD by default) has beyond its merge base with a
+        base, newest first.
         """
         raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
 
@@ -951,7 +952,8 @@ class WorkspaceServiceClient(ConnectClient):
         use_get: bool = False,
     ) -> ListBranchCommitsResponse:
         """
-        Lists the commits HEAD has beyond its merge base with a base, newest first.
+        Lists the commits a head (HEAD by default) has beyond its merge base with a
+        base, newest first.
         """
         return await self.execute_unary(
             request=request,
@@ -1571,7 +1573,8 @@ class WorkspaceServiceSync(Protocol):
 
     def list_branch_commits(self, request: ListBranchCommitsRequest, ctx: RequestContext[ListBranchCommitsRequest, ListBranchCommitsResponse], /) -> ListBranchCommitsResponse:
         """
-        Lists the commits HEAD has beyond its merge base with a base, newest first.
+        Lists the commits a head (HEAD by default) has beyond its merge base with a
+        base, newest first.
         """
         raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
 
@@ -2413,7 +2416,8 @@ class WorkspaceServiceClientSync(ConnectClientSync):
         use_get: bool = False,
     ) -> ListBranchCommitsResponse:
         """
-        Lists the commits HEAD has beyond its merge base with a base, newest first.
+        Lists the commits a head (HEAD by default) has beyond its merge base with a
+        base, newest first.
         """
         return self.execute_unary(
             request=request,

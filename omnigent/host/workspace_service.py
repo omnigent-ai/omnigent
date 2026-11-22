@@ -149,7 +149,7 @@ _SERVED: dict[str, _Served] = {
     "ListWorkingCopyChanges": _Served(tool="git"),
     "ReadBaseFile": _Served(tool="git"),
     "ListRepositoryRefs": _Served(tool="git"),
-    "ListBranchCommits": _Served(features=("branch_commits",), tool="git"),
+    "ListBranchCommits": _Served(features=("branch_commits", "branch_commits.head"), tool="git"),
     "ResolveRepositoryContext": _Served(tool="git"),
     # Served only over the tunnel, for a call the server sent with its session.
     **{name: _Served(tool="gh") for name in PULL_REQUEST_OPS},

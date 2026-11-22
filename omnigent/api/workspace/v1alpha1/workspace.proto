@@ -73,7 +73,8 @@ service WorkspaceService {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
 
-  // Lists the commits HEAD has beyond its merge base with a base, newest first.
+  // Lists the commits a head (HEAD by default) has beyond its merge base with a
+  // base, newest first.
   rpc ListBranchCommits(ListBranchCommitsRequest) returns (ListBranchCommitsResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
@@ -709,6 +710,10 @@ message ListBranchCommitsRequest {
   // Any revision Git resolves to a commit; empty means the default branch,
   // else HEAD.
   string base_revision = 1;
+
+  // The commit whose commits are listed; empty means HEAD. Feature
+  // "branch_commits.head": a server without it lists HEAD's commits.
+  string head_revision = 2;
 }
 
 message BranchCommit {
