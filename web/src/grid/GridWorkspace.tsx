@@ -63,6 +63,7 @@ import { gridPanes, gridSessionIds, type SessionGrid } from "./gridLayout";
 import { GridSessionPane, type GridWorkspacePanelProps } from "./GridSessionPane";
 import { GridDropOverlay, type GridDropTarget } from "./GridDropTargets";
 import { gridTitle, useGridSessions } from "./GridSessionsContext";
+import { useGridPaletteCommands } from "./useGridPaletteCommands";
 
 export function GridSidebar({ onNavigate }: { onNavigate?: MouseEventHandler<HTMLAnchorElement> }) {
   const grids = useGridSessions();
@@ -109,6 +110,13 @@ function GridSidebarRow({
   const grids = useGridSessions()!;
   const [editing, setEditing] = useState(false);
   const active = grids.activeGrid?.id === grid.id;
+  useGridPaletteCommands({
+    gridId: grid.id,
+    title,
+    open: active,
+    rename: () => setEditing(true),
+    remove: () => grids.deleteGrid(grid.id),
+  });
   if (editing)
     return (
       <li>
