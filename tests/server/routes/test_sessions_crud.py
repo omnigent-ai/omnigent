@@ -566,6 +566,39 @@ async def test_delete_session_keeps_cleaning_files_after_a_sub_agent_failure(
     assert "RuntimeError" in caplog.text
 
 
+async def test_delete_session_keeps_the_session_when_its_file_rows_cannot_be_deleted(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """A store failure on the session's own file rows fails the delete, keeping it to retry."""
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("notes.txt", b"notes", "text/plain")},
+    )
+    assert resp.status_code == 201, resp.text
+    file_id = resp.json()["id"]
+
+    def failing_batch(
+        self: SqlAlchemyFileStore, owner_id: str, *, limit: int
+    ) -> tuple[int, list[str]]:
+        del self, owner_id, limit
+        raise RuntimeError("database unavailable")
+
+    with (
+        patch.object(SqlAlchemyFileStore, "delete_session_files_batch", failing_batch),
+        pytest.raises(RuntimeError, match="database unavailable"),
+    ):
+        await client.delete(f"/v1/sessions/{session_id}")
+
+    assert (await client.get(f"/v1/sessions/{session_id}")).status_code == 200
+    assert [f.id for f in SqlAlchemyFileStore(db_uri).list(session_id).data] == [file_id]
+    assert (tmp_path / "artifacts" / file_id).exists()
+
+
 async def test_delete_session_not_found(client: httpx.AsyncClient) -> None:
     """Deleting a nonexistent session returns 404."""
     resp = await client.delete("/v1/sessions/4fe12335002377c209e501c3fe3bcffc")

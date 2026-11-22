@@ -1590,6 +1590,48 @@ async def _collect_descendant_conversation_ids_paged(
     return descendant_ids
 
 
+async def _delete_one_session_files(
+    file_store: FileStore,
+    artifact_store: ArtifactStore,
+    owner_id: str,
+    *,
+    deleting_session_id: str,
+) -> tuple[int, int]:
+    """
+    Delete one session's file rows in bounded batches, with each batch's orphaned blobs.
+
+    A row-deletion failure propagates; a blob that won't delete is logged and skipped.
+
+    :param file_store: Store of the session's file rows.
+    :param artifact_store: Store of the file bytes.
+    :param owner_id: The session whose files go, e.g. ``"conv_abc123"``.
+    :param deleting_session_id: The session being deleted, for log lines.
+    :returns: How many orphaned blobs were attempted, and how many failed.
+    """
+    attempted_blob_count = 0
+    failed_blob_count = 0
+    while True:
+        deleted, orphaned_blob_keys = await asyncio.to_thread(
+            file_store.delete_session_files_batch,
+            owner_id,
+            limit=_SESSION_FILE_DELETE_BATCH_SIZE,
+        )
+        for blob_key in orphaned_blob_keys:
+            attempted_blob_count += 1
+            try:
+                await asyncio.to_thread(artifact_store.delete, blob_key)
+            except Exception as exc:  # noqa: BLE001
+                failed_blob_count += 1
+                _logger.warning(
+                    "Failed to delete attachment blob %s for session %s: %s",
+                    blob_key,
+                    deleting_session_id,
+                    type(exc).__name__,
+                )
+        if deleted < _SESSION_FILE_DELETE_BATCH_SIZE:
+            return attempted_blob_count, failed_blob_count
+
+
 async def _delete_session_tree_files(
     conversation_store: ConversationStore,
     file_store: FileStore,
@@ -1602,17 +1644,18 @@ async def _delete_session_tree_files(
 
     Rows go in bounded batches, and each batch's orphaned blobs are deleted
     before the next, so a blob another session still shares survives. A
-    failure on one session or blob is logged and cleanup moves on.
+    failure deleting the session's own rows propagates, so the caller keeps
+    the session for a retry; a sub-agent's failure, or a blob's, is logged.
 
     :param conversation_store: Store for the sub-agent lookup.
     :param file_store: Store of the sessions' file rows.
     :param artifact_store: Store of the file bytes.
     :param session_id: The session being deleted, e.g. ``"conv_abc123"``.
+    :raises Exception: Whatever the file store raised for the session's own rows.
     """
-    owner_ids = [session_id]
     try:
-        owner_ids.extend(
-            await _collect_descendant_conversation_ids_paged(conversation_store, session_id)
+        descendant_ids = await _collect_descendant_conversation_ids_paged(
+            conversation_store, session_id
         )
     except Exception as exc:  # noqa: BLE001
         _logger.warning(
@@ -1620,38 +1663,25 @@ async def _delete_session_tree_files(
             session_id,
             type(exc).__name__,
         )
-    attempted_blob_count = 0
-    failed_blob_count = 0
-    for owner_id in owner_ids:
-        while True:
-            try:
-                deleted, orphaned_blob_keys = await asyncio.to_thread(
-                    file_store.delete_session_files_batch,
-                    owner_id,
-                    limit=_SESSION_FILE_DELETE_BATCH_SIZE,
-                )
-            except Exception as exc:  # noqa: BLE001
-                _logger.warning(
-                    "Failed to delete the file rows of session %s while deleting %s: %s",
-                    owner_id,
-                    session_id,
-                    type(exc).__name__,
-                )
-                break
-            for blob_key in orphaned_blob_keys:
-                attempted_blob_count += 1
-                try:
-                    await asyncio.to_thread(artifact_store.delete, blob_key)
-                except Exception as exc:  # noqa: BLE001
-                    failed_blob_count += 1
-                    _logger.warning(
-                        "Failed to delete attachment blob %s for session %s: %s",
-                        blob_key,
-                        session_id,
-                        type(exc).__name__,
-                    )
-            if deleted < _SESSION_FILE_DELETE_BATCH_SIZE:
-                break
+        descendant_ids = []
+    attempted_blob_count, failed_blob_count = await _delete_one_session_files(
+        file_store, artifact_store, session_id, deleting_session_id=session_id
+    )
+    for owner_id in descendant_ids:
+        try:
+            attempted, failed = await _delete_one_session_files(
+                file_store, artifact_store, owner_id, deleting_session_id=session_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "Failed to delete the file rows of session %s while deleting %s: %s",
+                owner_id,
+                session_id,
+                type(exc).__name__,
+            )
+            continue
+        attempted_blob_count += attempted
+        failed_blob_count += failed
     if failed_blob_count:
         _logger.warning(
             "Session %s deleted with %d of %d attachment blobs left behind",

@@ -509,6 +509,56 @@ async def test_force_import_deletes_the_replaced_sessions_files(
     assert [key for key in uploaded if (tmp_path / "artifacts" / key).exists()] == []
 
 
+async def test_force_import_keeps_the_replaced_session_when_its_file_rows_cannot_be_deleted(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-import whose file cleanup fails is refused before the earlier import is touched."""
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    _seed_claude_agent(db_uri)
+    payload: dict[str, Any] = {
+        "source": "claude",
+        "external_session_id": "claude-files-cleanup-failure",
+        "items": [
+            {
+                "type": "message",
+                "response_id": "claude:turn-1",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            }
+        ],
+    }
+    created = await client.post("/v1/imports", json=payload)
+    assert created.status_code == 201, created.text
+    imported_id = created.json()["session_id"]
+    upload = await client.post(
+        f"/v1/sessions/{imported_id}/resources/files",
+        files={"file": ("notes.txt", b"notes", "text/plain")},
+    )
+    assert upload.status_code == 201, upload.text
+    file_id = upload.json()["id"]
+
+    def failing_batch(
+        self: SqlAlchemyFileStore, owner_id: str, *, limit: int
+    ) -> tuple[int, list[str]]:
+        del self, owner_id, limit
+        raise RuntimeError("database unavailable")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(SqlAlchemyFileStore, "delete_session_files_batch", failing_batch)
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await client.post("/v1/imports", json={**payload, "force": True})
+
+    items = await client.get(f"/v1/sessions/{imported_id}/items")
+    assert items.status_code == 200, items.text
+    messages = [item for item in items.json()["data"] if item["type"] == "message"]
+    assert [item["content"][0]["text"] for item in messages] == ["hi"]
+    assert [f.id for f in SqlAlchemyFileStore(db_uri).list(imported_id).data] == [file_id]
+    assert (tmp_path / "artifacts" / file_id).exists()
+
+
 @pytest.mark.parametrize("host_owner,expected_status", [(None, 404), ("bob@example.com", 403)])
 async def test_rejected_force_import_preserves_existing_session(
     db_uri: str, host_owner: str | None, expected_status: int
