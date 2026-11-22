@@ -9,7 +9,7 @@ and skips).
 Tool categories:
 - _OS_ENV_TOOLS: execute through a runner-local OSEnvironment (sys_os_*)
 - _REST_TOOLS: call server REST APIs (sys_call_async, sys_cancel_async)
-- _FILE_TOOLS: call server file APIs (sys_upload/download/list_files)
+- _FILE_TOOLS: call server file APIs (sys_upload_file, sys_list_files, sys_download_file)
 - _TERMINAL_TOOLS: runner-local TerminalRegistry
 - MCP tools: spec-defined; dispatched via RunnerMcpManager passed
   in by proxy_stream (designs/RUNNER_MCP.md). Not in the static
@@ -92,6 +92,7 @@ from omnigent.tools.builtins.async_inbox import (
 from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
 from omnigent.tools.builtins.download_file import DownloadFileTool
 from omnigent.tools.builtins.list_comments import ListCommentsTool
+from omnigent.tools.builtins.list_files import ListFilesTool
 from omnigent.tools.builtins.os_env import (
     OS_ENV_TOOL_TYPES,
     SysOsEditTool,
@@ -168,6 +169,13 @@ class _UnsetLocalToolWorkdir:
 
 
 _UNSET_LOCAL_TOOL_WORKDIR = _UnsetLocalToolWorkdir()
+
+
+class UnknownSessionWorkspace:
+    """Sentinel for a session whose workspace could not be read from the server."""
+
+
+UNKNOWN_SESSION_WORKSPACE = UnknownSessionWorkspace()
 
 
 class _DynamicCallable(Protocol):
@@ -297,14 +305,8 @@ _OS_ENV_TOOLS = frozenset(tool_cls.name() for tool_cls in OS_ENV_TOOL_TYPES)
 # (sys_call_async / sys_cancel_async moved to _ASYNC_INBOX_TOOLS)
 _REST_TOOLS: frozenset[str] = frozenset()
 
-# Priority 5c: File tools — runner calls server file APIs.
-_FILE_TOOLS = frozenset(
-    {
-        UploadFileTool.name(),
-        DownloadFileTool.name(),
-        "list_files",  # from builtins registry; no standalone class
-    }
-)
+# Priority 5c: File tools — runner calls the server's session file APIs.
+_FILE_TOOLS = frozenset({UploadFileTool.name(), ListFilesTool.name(), DownloadFileTool.name()})
 
 # Priority 5d: Terminal tools — runner-local TerminalRegistry.
 _TERMINAL_TOOLS = frozenset(
@@ -534,7 +536,7 @@ _BROWSER_TIMEOUT_ERROR = (
 # ignore the harness ``tools`` list, so the relay is their ONLY tool
 # surface; this set is the runner-/server-proxied builtin surface that
 # rides through the Omnigent ``/mcp`` endpoint (comment, session read/write,
-# async inbox, task lifecycle, agent-discovery, and terminal families —
+# async inbox, task lifecycle, agent-discovery, file, and terminal families —
 # the same dispatch posture non-native harnesses get via
 # ``request.tools``). ``sys_terminal_*`` inherits the spec gate for
 # free: the relay only advertises names that ``ToolManager(spec)``
@@ -576,6 +578,9 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # what discovers host-scope skills (``.agents/skills`` and friends), and a
     # native session's only tool surface is this relay.
     | _SKILL_TOOLS
+    # Session file tools reach only this session's file store, and uploads
+    # only read files inside the session workspace.
+    | _FILE_TOOLS
 )
 
 
@@ -624,7 +629,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     Returns the same tool set the claude-native / codex-native relay advertises
     and that pi-native registers via ``pi.registerTool``: the spec-gated builtin
     surface (``_NATIVE_RELAY_BUILTIN_TOOLS`` — comment, session read/write,
-    agent-discovery, policy, and terminal families). It never includes
+    agent-discovery, policy, file, and terminal families). It never includes
     ``sys_os_*``: native harnesses use their own shell and file tools.
 
     Each entry is a flat ``{"name", "description", "parameters"}`` dict (the
@@ -703,6 +708,9 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysAgentDownloadTool,
             SysAddPolicyTool,
             SysPolicyRegistryTool,
+            UploadFileTool,
+            ListFilesTool,
+            DownloadFileTool,
         ):
             if _cls is SysSessionMessageTool and not peer_session_messaging_enabled():
                 continue
@@ -6298,7 +6306,7 @@ async def _session_get_info_via_rest(
     caller's own ``conversation_id`` when omitted), fetches the session
     snapshot, and projects the metadata fields — status, title, agent
     binding, runner binding, host and its reported harness readiness,
-    reasoning effort, effective model,
+    reasoning effort, effective model, the server-resolved permission mode,
     parent linkage, workspace / git branch, project, persisted last-activity
     time, and the outstanding approval prompts (the prompts themselves plus a
     count). Runner connectivity
@@ -6378,6 +6386,10 @@ async def _session_get_info_via_rest(
             # Effective model: a per-session override wins over the
             # agent spec's default; both may be None when unset.
             "model": snap.get("model_override") or snap.get("llm_model"),
+            # Mode names are the ones sys_session_create's permission_mode takes;
+            # None when the harness has none, the mode is unknown, or the server
+            # predates the field.
+            "permission_mode": _optional_string(snap.get("permission_mode")),
             "workspace": snap.get("workspace"),
             "git_branch": snap.get("git_branch"),
             "project_id": snap.get("project_id"),
@@ -8156,6 +8168,7 @@ async def execute_tool(
     wake_on_async_result: AsyncResultWake | None = None,
     call_id: str | None = None,
     caller_user_id: str | None = None,
+    session_workspace: Path | UnknownSessionWorkspace | None = None,
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -8188,6 +8201,11 @@ async def execute_tool(
         runner can wake a session that is no longer in a turn.
     :param call_id: The harness's tool call ID, when the caller has one; the
         journal tools key their writes on it.
+    :param session_workspace: The session's own server-stored workspace, e.g.
+        ``Path("/repo")``; ``None`` when it has none, or
+        :data:`UNKNOWN_SESSION_WORKSPACE` when it could not be read. Bounds
+        ``sys_upload_file`` reads; unlike ``runner_workspace`` it never falls
+        back to the runner's.
     :returns: Tool output string.
     """
     if not arguments.strip():
@@ -8261,6 +8279,8 @@ async def execute_tool(
                 conversation_id=conversation_id,
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
+                session_workspace=session_workspace,
+                resource_registry=resource_registry,
             )
         elif tool_name in _TERMINAL_TOOLS:
             output = await _execute_terminal_tool(
@@ -8297,6 +8317,7 @@ async def execute_tool(
                 filesystem_registry=filesystem_registry,
                 effective_harness=effective_harness,
                 wake_on_async_result=wake_on_async_result,
+                session_workspace=session_workspace,
             )
         elif tool_name in _SUBAGENT_TOOLS:
             output = await _execute_subagent_tool(
@@ -9234,6 +9255,79 @@ async def _execute_rest_tool(
 # ── File tools (Phase 1) ──────────────────────────────────
 
 
+def _session_upload_roots(
+    agent_spec: AgentSpec | None,
+    conversation_id: str,
+    *,
+    runner_workspace: Path | None,
+    session_workspace: Path | UnknownSessionWorkspace | None,
+    resource_registry: SessionResourceRegistry | None,
+) -> list[Path]:
+    """
+    Return the directories ``sys_upload_file`` may read from, searched in order.
+
+    The session's own workspace wins: its native terminal and tools run there.
+    Otherwise use the session's default environment root, the one its filesystem
+    routes serve; a runner that isolates sessions gives each session its own
+    subdirectory there, never the shared runner workspace. When neither the
+    session nor the runner has a workspace, the agent's tools use a separate
+    per-session directory, so it is searched first.
+
+    :param agent_spec: The session's agent spec, or ``None`` when unresolved.
+    :param conversation_id: The session id, e.g. ``"conv_abc123"``.
+    :param runner_workspace: The runtime cwd: the session's workspace, else the
+        runner's, e.g. ``Path("/repo")``; ``None`` when neither has one.
+    :param session_workspace: The session's server-stored workspace, e.g.
+        ``Path("/repo")``; ``None`` when it has none, or
+        :data:`UNKNOWN_SESSION_WORKSPACE` when it could not be read, which no
+        fallback root may stand in for.
+    :param resource_registry: The runner's session resource registry.
+    :returns: The upload roots; empty when no boundary can be established.
+    """
+    if isinstance(session_workspace, UnknownSessionWorkspace):
+        return []
+    if session_workspace is not None:
+        return [session_workspace]
+    roots: list[Path] = []
+    if runner_workspace is None:
+        tools_cwd = _effective_runner_os_env_spec(agent_spec, conversation_id).cwd
+        assert tools_cwd is not None
+        roots.append(Path(tools_cwd))
+    if resource_registry is not None:
+        # Without an os_env the registry reports no filesystem; use its spec-less default.
+        spec = agent_spec if getattr(agent_spec, "os_env", None) is not None else None
+        default_root = resource_registry.compute_default_env_root(conversation_id, spec)
+        if default_root is not None and Path(default_root) not in roots:
+            roots.append(Path(default_root))
+    return roots
+
+
+def _resolve_upload_path(path: str, roots: list[Path]) -> Path:
+    """
+    Resolve *path* within the first upload root that holds it as a file.
+
+    :param path: The agent-supplied path, e.g. ``"out/report.md"``.
+    :param roots: Upload roots from :func:`_session_upload_roots`, non-empty.
+    :returns: The file to read; when no root holds it, the first in-bounds
+        candidate, so reading it reports the missing file.
+    :raises ValueError: If *path* escapes every root.
+    """
+    candidates: list[Path] = []
+    first_escape: ValueError | None = None
+    for root in roots:
+        try:
+            candidates.append(safe_resolve(path, root))
+        except ValueError as exc:
+            first_escape = first_escape or exc
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    if candidates:
+        return candidates[0]
+    assert first_escape is not None
+    raise first_escape
+
+
 async def _execute_file_tool(
     tool_name: str,
     args: _JsonObject,
@@ -9242,23 +9336,24 @@ async def _execute_file_tool(
     conversation_id: str | None,
     agent_spec: AgentSpec | None = None,
     runner_workspace: Path | None = None,
+    session_workspace: Path | UnknownSessionWorkspace | None = None,
+    resource_registry: SessionResourceRegistry | None = None,
 ) -> str:
     """
     Execute a file tool by calling session-scoped server file APIs.
 
-    :param tool_name: File tool name, e.g. ``"upload_file"``.
+    :param tool_name: File tool name, e.g. ``"sys_upload_file"``.
     :param args: Parsed tool arguments.
     :param server_client: HTTP client for the Omnigent server.
     :param conversation_id: Owning session/conversation id,
         e.g. ``"conv_abc123"``.
-    :param agent_spec: Agent spec resolved for the current turn, used
-        (with ``runner_workspace``) to derive the workspace root that
-        an ``upload_file`` path is resolved against. ``None`` falls back
-        to the per-conversation default workspace.
-    :param runner_workspace: Authoritative runtime cwd for the runner,
-        sourced from ``OMNIGENT_RUNNER_WORKSPACE``. Combined with
-        ``agent_spec`` to compute the workspace containment boundary
-        for ``upload_file``.
+    :param agent_spec: Agent spec resolved for the current turn.
+    :param runner_workspace: The runtime cwd, e.g. ``Path("/repo")``, or ``None``.
+    :param session_workspace: The session's server-stored workspace, e.g.
+        ``Path("/repo")``, ``None`` or :data:`UNKNOWN_SESSION_WORKSPACE`. See
+        :func:`_session_upload_roots`.
+    :param resource_registry: The runner's session resource registry, which
+        knows the session's default environment root.
     :returns: Tool result string.
     """
     if server_client is None:
@@ -9271,18 +9366,19 @@ async def _execute_file_tool(
         path = args.get("path")
         if not isinstance(path, str) or not path:
             return "Error: sys_upload_file failed: empty path"
-        # Resolve the agent-supplied path against the session workspace
-        # (the same cwd the sys_os_* tools operate in) and reject any
-        # path that escapes it. The read happens in the un-sandboxed
-        # runner process, so without this containment an agent could
-        # exfiltrate arbitrary host files. Mirrors the
-        # builtin UploadFileTool's safe_resolve / sys_agent_download
-        # containment checks.
-        os_spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
-        assert os_spec.cwd is not None
-        workspace = Path(os_spec.cwd)
+        # The read runs in the un-sandboxed runner, so the path must stay inside this
+        # session's workspace, or an agent could upload host or sibling-session files.
+        roots = _session_upload_roots(
+            agent_spec,
+            conversation_id,
+            runner_workspace=runner_workspace,
+            session_workspace=session_workspace,
+            resource_registry=resource_registry,
+        )
+        if not roots:
+            return "Error: sys_upload_file failed: the session workspace is unknown"
         try:
-            resolved = safe_resolve(path, workspace)
+            resolved = _resolve_upload_path(path, roots)
         except ValueError as exc:
             return f"Error: sys_upload_file failed: {exc}"
         filename = resolved.name
@@ -9314,14 +9410,14 @@ async def _execute_file_tool(
         except Exception as exc:  # noqa: BLE001
             return f"Error: {DownloadFileTool.name()} failed: {exc}"
 
-    if tool_name == "list_files":
+    if tool_name == ListFilesTool.name():
         try:
             resp = await server_client.get(files_path, timeout=30.0)
             if resp.status_code == 200:
                 return json.dumps(resp.json())
-            return f"Error: list_files returned {resp.status_code}"
+            return f"Error: {tool_name} returned {resp.status_code}"
         except Exception as exc:  # noqa: BLE001
-            return f"Error: list_files failed: {exc}"
+            return f"Error: {tool_name} failed: {exc}"
 
     return f"Error: {tool_name} not implemented in file dispatch"
 
@@ -9639,6 +9735,7 @@ async def _execute_async_inbox_tool(
     harness_client: httpx.AsyncClient | None = None,
     effective_harness: str | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
+    session_workspace: Path | UnknownSessionWorkspace | None = None,
 ) -> str:
     """
     Runner-local dispatch for async inbox tools.
@@ -9662,6 +9759,8 @@ async def _execute_async_inbox_tool(
         ``_spawn_async_tool`` so the target is judged against the surface the
         session was advertised.
     :param wake_on_async_result: Forwarded to ``_spawn_async_tool``.
+    :param session_workspace: The session's own workspace, forwarded to
+        ``_spawn_async_tool`` for file tools.
     :returns: Tool output string.
     """
     del harness_client
@@ -9691,6 +9790,7 @@ async def _execute_async_inbox_tool(
             filesystem_registry=filesystem_registry,
             effective_harness=effective_harness,
             wake_on_async_result=wake_on_async_result,
+            session_workspace=session_workspace,
         )
 
     if tool_name == SysCancelAsyncTool.name():
@@ -10203,6 +10303,7 @@ def _spawn_async_tool(
     local_tool_workdir: Path | _UnsetLocalToolWorkdir | None = _UNSET_LOCAL_TOOL_WORKDIR,
     effective_harness: str | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
+    session_workspace: Path | UnknownSessionWorkspace | None = None,
 ) -> str:
     """
     Spawn a tool as a background asyncio.Task.
@@ -10225,6 +10326,8 @@ def _spawn_async_tool(
     :param wake_on_async_result: Called with ``(session_id, handle_id,
         tool_name, status)`` after a completed or failed result is queued.
         Cancelled results are not reported: whoever cancelled is not waiting.
+    :param session_workspace: The session's own workspace, forwarded to
+        ``execute_tool`` for file tools.
     :returns: JSON handle string with canonical ``handle_id``,
         plus compatibility ``task_id`` (identical value; remove in 0.8.0),
         ``tool_name``, ``status``, and ``message``. Prefer
@@ -10306,6 +10409,7 @@ def _spawn_async_tool(
                 session_inbox=session_inbox if target_tool in _TERMINAL_TOOLS else None,
                 filesystem_registry=filesystem_registry,
                 effective_harness=effective_harness,
+                session_workspace=session_workspace,
             )
             execution_task = asyncio.create_task(exec_coro)
             cancellation_task = asyncio.create_task(cancel_event.wait())

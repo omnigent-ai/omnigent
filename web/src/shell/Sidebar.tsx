@@ -231,7 +231,7 @@ import { SidebarEditRow } from "./SidebarEditRow";
 import { isInClosedSidebar, registerSidebarRename } from "./sidebarRename";
 import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
-import type { SessionState } from "@/hooks/useSessionState";
+import { withUnreadState, type SessionState } from "@/hooks/useSessionState";
 import { useSessionBadgeStates } from "@/hooks/useSessionBadgeStates";
 import { useChatStore } from "@/store/chatStore";
 import {
@@ -293,12 +293,14 @@ import { SettingsSidebar } from "./settingsSearch/SettingsSidebar";
 import {
   type ActiveChatOverride,
   clearLegacyPinnedConversationIds,
+  COLLAPSED_SESSION_FAMILIES_STORAGE_KEY,
   COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY,
   computeNextActiveOverride,
   conversationDisplayLabel,
   dedupeConversationsById,
   EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
   groupConversations,
+  MAX_STORED_COLLAPSED_SESSION_FAMILIES,
   moveCustomOrder,
   orderByPinnedTimestamp,
   appendPinWrites,
@@ -1643,7 +1645,7 @@ function SidebarImpl({
                     : "[scrollbar-color:transparent_transparent] [&::-webkit-scrollbar-thumb]:bg-transparent",
                 )}
               >
-                <GridSidebar onNavigate={onNavClick} />
+                <GridSidebar onNavigate={onNavClick} onOpenSidebar={open ? undefined : onOpen} />
                 {sidebarData.identityReady ? (
                   <ConversationList
                     conversationsQuery={displayQuery}
@@ -2273,7 +2275,15 @@ function ConversationList({
   const grids = useGridSessions();
   const nestedDrafts = useNestedSessionDrafts();
   const draftQueryClient = useQueryClient();
-  const [collapsedFamilies, setCollapsedFamilies] = useState<Set<string>>(() => new Set());
+  const [collapsedFamilies, setCollapsedFamilies] = useState<Set<string>>(
+    () => new Set(readStoredStringList(COLLAPSED_SESSION_FAMILIES_STORAGE_KEY)),
+  );
+  useEffect(() => {
+    writeStoredStringList(
+      COLLAPSED_SESSION_FAMILIES_STORAGE_KEY,
+      [...collapsedFamilies].slice(-MAX_STORED_COLLAPSED_SESSION_FAMILIES),
+    );
+  }, [collapsedFamilies]);
   const toggleFamily = useCallback((familyId: string) => {
     setCollapsedFamilies((previous) => {
       const next = new Set(previous);
@@ -2307,6 +2317,7 @@ function ConversationList({
     customOrder,
     loadedRows,
     sharedActive,
+    splitShared,
   } = useSidebarData();
   const updateView = useStableCallback((patch: Partial<SidebarViewPreferences>) => {
     // Regrouping swaps which sections (and selection scopes) exist, so leave
@@ -2694,7 +2705,6 @@ function ConversationList({
     };
     // Grouped views fold Shared into the groups too, so the first group takes
     // the Projects header's place.
-    const splitShared = groupingUi && !grouped;
     const shared = splitShared ? allOrdered.filter((c) => !isOwnedByViewer(c, viewerId)) : [];
     const ordered = splitShared
       ? allOrdered.filter((c) => isOwnedByViewer(c, viewerId))
@@ -2768,7 +2778,7 @@ function ConversationList({
     includeSharedRuns,
     mineSharedRuns,
     viewerId,
-    groupingUi,
+    splitShared,
     grouped,
     groupOrder,
     harnessLabel,
@@ -4081,7 +4091,10 @@ function projectMarkerState(
   let disconnected = false;
   let unseen = false;
   for (const [i, c] of conversations.entries()) {
-    const state = states[i];
+    const state = withUnreadState(
+      states[i],
+      showsUnreadFor(c, isConversationUnseen(c.id, c.updated_at, c.status)),
+    );
     if (state?.kind === "awaiting") {
       awaiting += state.count;
       terminalReason ??= state.terminalReason;
@@ -4093,7 +4106,7 @@ function projectMarkerState(
       error = true;
     } else if (state?.kind === "disconnected") {
       disconnected = true;
-    } else if (showsUnreadFor(c, isConversationUnseen(c.id, c.updated_at, c.status))) {
+    } else if (state?.kind === "unseen") {
       unseen = true;
     }
   }
@@ -6139,9 +6152,11 @@ function ConversationRowImpl({
   const unread = readState.unseen && (!isActive || readState.explicitlyUnread);
   const hasUnseenMessages = showsUnreadFor(conversation, unread);
   const canMarkUnread = !unread;
-  // Approvals and failures outrank the unread dot without clearing read state.
+  // Approvals, turns and failures outrank the unread dot without clearing read
+  // state; background work alone yields to it.
   const badgeConversations = useMemo(() => [conversation], [conversation]);
   const [derivedState] = useSessionBadgeStates(badgeConversations);
+  const badgeState = withUnreadState(derivedState, hasUnseenMessages);
   // The bound session's launch/relaunch window: a send is in flight (local
   // status "streaming") or the runner is auto-creating the PTY
   // (`terminalPending`), but the server hasn't confirmed `running` yet — a
@@ -6153,11 +6168,11 @@ function ConversationRowImpl({
     (s) => s.conversationId === conversation.id && (s.status === "streaming" || s.terminalPending),
   );
   const sessionState =
-    derivedState?.kind === "awaiting" || derivedState?.kind === "running"
-      ? derivedState
+    badgeState?.kind === "awaiting" || badgeState?.kind === "running"
+      ? badgeState
       : isStartingUp
         ? { kind: "starting" as const }
-        : (derivedState ?? (hasUnseenMessages ? { kind: "unseen" as const } : null));
+        : badgeState;
   // Drafts share the row's trailing indicator slot, but the active session's
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.
@@ -8357,40 +8372,30 @@ export function isMobileViewport(): boolean {
 // starts expanded. Archived no longer lives in the sidebar (it's on the
 // Settings page). Once the user toggles any header, the stored array (even an
 // empty one) becomes the preference and persists across reloads.
-const DEFAULT_COLLAPSED_SIDEBAR_SECTIONS: string[] = [];
-
 function readCollapsedSidebarSections(): string[] {
-  if (typeof window === "undefined") return DEFAULT_COLLAPSED_SIDEBAR_SECTIONS;
-  try {
-    const raw = window.localStorage.getItem(COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY);
-    if (!raw) return DEFAULT_COLLAPSED_SIDEBAR_SECTIONS;
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return DEFAULT_COLLAPSED_SIDEBAR_SECTIONS;
-    return parsed.filter((value): value is string => typeof value === "string");
-  } catch {
-    // Same contract as pins: corrupt storage means "back to defaults",
-    // never a broken sidebar.
-    return DEFAULT_COLLAPSED_SIDEBAR_SECTIONS;
-  }
+  return readStoredStringList(COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY);
 }
 
 function writeCollapsedSidebarSections(titles: string[]) {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY, JSON.stringify(titles));
-  } catch {
-    // Collapse state is a local navigation preference; losing it is fine.
-  }
+  writeStoredStringList(COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY, titles);
 }
 
 // Project folders default to collapsed, so the persisted set is the EXPANDED
 // names (empty by default = every project starts collapsed).
 function readExpandedProjectSections(): string[] {
+  return readStoredStringList(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY);
+}
+
+function writeExpandedProjectSections(names: string[]) {
+  writeStoredStringList(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, names);
+}
+
+// Same contract as pins: corrupt storage means "back to defaults", never a
+// broken sidebar.
+function readStoredStringList(storageKey: string): string[] {
   if (typeof window === "undefined") return [];
   try {
-    const raw = window.localStorage.getItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed: unknown = JSON.parse(raw);
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(storageKey) ?? "null");
     if (!Array.isArray(parsed)) return [];
     return parsed.filter((value): value is string => typeof value === "string");
   } catch {
@@ -8398,11 +8403,11 @@ function readExpandedProjectSections(): string[] {
   }
 }
 
-function writeExpandedProjectSections(names: string[]) {
+function writeStoredStringList(storageKey: string, values: readonly string[]) {
   if (typeof window === "undefined") return;
   try {
-    window.localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(names));
+    window.localStorage.setItem(storageKey, JSON.stringify(values));
   } catch {
-    // Same as collapse state — a lost local preference is harmless.
+    // Collapse state is a local navigation preference; losing it is fine.
   }
 }

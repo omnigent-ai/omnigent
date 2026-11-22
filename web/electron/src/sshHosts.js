@@ -18,8 +18,9 @@ function recordFor(servers, serverTarget) {
 
 /**
  * @param {() => string} filePath Where the record lives, e.g. in `userData`.
+ * @param {{ onChange?: (serverTarget: string, hostId: string) => void }} options
  */
-function createSshHostStore(filePath) {
+function createSshHostStore(filePath, { onChange = () => {} } = {}) {
   let hosts = null;
 
   function load() {
@@ -58,6 +59,7 @@ function createSshHostStore(filePath) {
       }
       // Update the cache only after a successful write, so a failed record is never served.
       hosts = next;
+      if (forServer[key] !== destination) onChange(serverTarget, key);
     },
 
     /** The recorded destination for `hostId` on `serverTarget`, or null. */

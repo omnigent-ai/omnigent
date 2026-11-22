@@ -111,7 +111,18 @@ generate-theme-palettes: _ensure-web
 # --- Electron desktop app ---
 
 _ensure-electron:
-    cd web/electron && test -d node_modules || pnpm install
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd web/electron
+    test -d node_modules || pnpm install
+    # A macOS package is built for both CPUs and each needs its own native
+    # Keychain binding, but a plain install fetches only this machine's.
+    if [ "$(uname)" = "Darwin" ] && ! node -e '
+        const fromKeyring = require("node:module").createRequire(require.resolve("@napi-rs/keyring"));
+        for (const cpu of ["x64", "arm64"]) fromKeyring.resolve(`@napi-rs/keyring-darwin-${cpu}`);
+    ' 2>/dev/null; then
+        (cd ../.. && pnpm install --filter ./web --filter ./web/electron --cpu x64 --cpu arm64)
+    fi
 
 [group('electron')]
 electron-dev: _ensure-web _ensure-electron

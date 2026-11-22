@@ -574,6 +574,8 @@ describe("MessageResponse table fullscreen", () => {
     fireEvent.click(await screen.findByRole("button", { name: "View fullscreen" }));
 
     const dialog = within(embedRoot).getByRole("dialog", { name: "View fullscreen" });
+    // Marks a full-window view, which clears the window's top inset (index.css).
+    expect(dialog).toHaveAttribute("data-fullscreen-overlay");
     expect(within(dialog).getByRole("cell", { name: "Alpha" })).toBeInTheDocument();
 
     fireEvent.click(within(dialog).getByRole("button", { name: "Exit fullscreen" }));

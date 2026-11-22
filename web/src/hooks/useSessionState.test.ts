@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { getSessionState, isSessionWorking } from "./useSessionState";
+import { getSessionState, isSessionWorking, withUnreadState } from "./useSessionState";
 import type { Conversation } from "@/hooks/useConversations";
+import type { LatestSessionError } from "@/lib/sessionError";
 
 type SessionFields = Pick<
   Conversation,
@@ -135,6 +136,40 @@ describe("getSessionState — priority composition", () => {
   it("returns null when conversation status is undefined", () => {
     // Older sessions whose server payload predates the `status` field.
     expect(getSessionState(conv({}))).toBeNull();
+  });
+});
+
+describe("withUnreadState — the unread dot against derived states", () => {
+  function badge(fields: SessionFields, unread: boolean, error: LatestSessionError | null = null) {
+    return withUnreadState(getSessionState(conv(fields), error), unread);
+  }
+
+  it("shows an ended turn's unread output even while background work runs", () => {
+    expect(badge({ status: "idle" }, true)).toEqual({ kind: "unseen" });
+    expect(badge({ status: "idle", background_work_running: true }, true)).toEqual({
+      kind: "unseen",
+    });
+  });
+
+  it("returns to the background spinner once the output is seen", () => {
+    expect(badge({ status: "idle", background_work_running: true }, false)).toEqual({
+      kind: "running",
+      background: true,
+    });
+    expect(badge({ status: "idle" }, false)).toBeNull();
+  });
+
+  it("keeps running turns, prompts, disconnects and errors ahead of unread output", () => {
+    const shells = { background_work_running: true };
+    expect(badge({ ...shells, status: "running" }, true)).toEqual({ kind: "running" });
+    expect(badge({ ...shells, pending_elicitations_count: 1 }, true)).toEqual({
+      kind: "awaiting",
+      count: 1,
+    });
+    expect(badge({ ...shells, status: "idle" }, true, "disconnected")).toEqual({
+      kind: "disconnected",
+    });
+    expect(badge({ ...shells, status: "idle" }, true, "error")).toEqual({ kind: "error" });
   });
 });
 

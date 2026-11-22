@@ -132,6 +132,8 @@ describe("customTheme", () => {
         const alpha = /, ([\d.]+)\)$/.exec(palette.tokens[mode].selectionBackground)?.[1] ?? "0.12";
         expect(variants[mode].selectionBackground).toBe(`rgba(${r}, ${g}, ${b}, ${alpha})`);
         expect(variants[mode].selectionForeground).toBe(variants[mode].foreground);
+        const codeAlpha = /, ([\d.]+)\)$/.exec(palette.tokens[mode].codeSelection)?.[1];
+        expect(variants[mode].codeSelection).toBe(`rgba(${r}, ${g}, ${b}, ${codeAlpha})`);
       }
     }
   });

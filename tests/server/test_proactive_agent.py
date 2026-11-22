@@ -19,6 +19,7 @@ from fastapi.routing import APIRoute
 
 from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.utils import builtin_agent_id
+from omnigent.runner.policy import RunnerToolPolicyGate
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import proactive_agent
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
@@ -84,7 +85,28 @@ def test_bundle_opts_into_the_inbox_tools_only() -> None:
     groups = dataclasses.asdict(spec.tool_groups)
     # A new framework group defaults to on, so the bundle must turn it off explicitly.
     assert groups.pop("user_inbox") is True
+    # Older runners reject `files: false`; test_bundle_denies_the_session_file_tools.
+    assert groups.pop("files") is True
     assert not any(groups.values()), groups
+
+
+@pytest.mark.parametrize(
+    ("tool", "action"),
+    [
+        ("sys_upload_file", "deny"),
+        ("sys_list_files", "deny"),
+        ("sys_download_file", "deny"),
+        ("sys_session_list", "allow"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_bundle_denies_the_session_file_tools(tool: str, action: str) -> None:
+    """The bundle's policies refuse the session file tools and nothing else here."""
+    gate = RunnerToolPolicyGate.from_spec(load(_BUNDLE))
+
+    verdict = await gate.evaluate_tool_call(tool, {})
+
+    assert verdict.action == action, verdict
 
 
 def test_seeded_outside_the_seeded_agents_allowlist(

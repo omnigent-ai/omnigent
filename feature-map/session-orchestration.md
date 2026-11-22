@@ -18,8 +18,21 @@ MCP independent creation.
   the prefix. The title comes from sessions the sidebar, the viewed session's
   subagents or the session cache already hold, else one lookup; an unreadable
   sender reads "From another session". The prefix is a label, not proof of origin.
+- `recipient-attribution`: the sender's Chat shows each `sys_session_message`, and the first
+  task of a same-host, host or managed `sys_session_create`, as a collapsed "To @<destination>"
+  row in place of its tool row. The row never folds into the turn's steps; it expands to the
+  sent text, and the pill opens the destination. It appears once the server accepts the send
+  (a boolean `queued`), which is not proof of delivery or reading. "Not sent" needs a proven
+  refusal: a policy denial or the runner's `delivery: "refused"`. Any other error, or a turn
+  that ends mid-send, reads "Could not confirm send".
 - `read-results`: the manager reads history/status; replies are not forwarded.
   Existing owner-authorized reads remain allowed when a session is shared.
+  `sys_session_get_info` reports the session's `permission_mode` in its
+  harness's vocabulary, as `sys_session_create` takes it, including a switch
+  made while it runs to a mode that keeps approval. A mode that skips approval
+  shows only when the session launched in it, since anyone who can edit the
+  session can write the reported mode; `null` when the harness has no
+  permission modes or the mode is unknown. Coverage: `tests/e2e/test_session_info_permission_mode_e2e.py`.
 - `created-by`: independent workers record their creating session. The worker's
   Chat/Terminal header rechecks access when opened, hides attribution during the
   lookup, and links to the creator when accessible; otherwise it says "Created by
@@ -51,6 +64,13 @@ MCP independent creation.
   An optional `permission_mode` starts the session in a mode of its harness;
   modes that skip approval are refused, and on a server that doesn't advertise
   `session_create_permission_modes` the tool refuses the call before creating anything.
+  Without one, an independent session that runs its creator's harness, Claude
+  Code or Codex, starts in the mode the creator is in, so a workflow run's
+  nested agents work as unattended as the run; a mode that skips approval comes
+  only from the creator's launch settings and carries over only onto its own
+  host. An automation that sets a mode gives it to its run's workers first (see
+  `scheduled`), and a worker whose agent sets a mode keeps it. Coverage:
+  `tests/e2e/test_nested_agent_permission_mode_e2e.py`.
   An optional `workflow_id` (agent_id only) starts the session as a run of one
   of the owner's saved workflows, with that workflow's plan already in its
   journal. With workflows disabled, or on a server that doesn't advertise
@@ -154,7 +174,8 @@ MCP independent creation.
   messaging, or `/settings/sharing`, and toggle **Message other sessions**.
 - In an SDK session's Chat, ask the agent to send a task using
   `sys_session_message`, then inspect the destination's history. Its new user
-  bubble shows "From @<sender>"; click the pill to open the sender.
+  bubble shows "From @<sender>"; click the pill to open the sender. The sender's
+  Chat shows the send as "To @<destination>"; click the row to read the text.
 - In a native session's Chat or agent terminal, ask for the same operation;
   the native MCP relay supplies the tools.
 - In a session with creation tools enabled, ask for a worker with

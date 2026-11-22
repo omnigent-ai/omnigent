@@ -1434,7 +1434,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
       <CreateScheduledTaskDialog
         open
         onOpenChange={vi.fn()}
-        editingTask={scheduledTask({ rrule: "FREQ=DAILY;BYHOUR=9,17;BYMINUTE=0" })}
+        editingTask={scheduledTask({ rrule: "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=1" })}
       />,
       { collapseAdvanced: true },
     );
@@ -1454,7 +1454,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
         <CreateScheduledTaskDialog
           open
           onOpenChange={vi.fn()}
-          editingTask={scheduledTask({ rrule: "FREQ=DAILY;BYHOUR=9,17;BYMINUTE=0" })}
+          editingTask={scheduledTask({ rrule: "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=1" })}
         />,
       );
       expect(screen.getByRole("alert")).toHaveTextContent("This schedule can't be edited");
@@ -1482,6 +1482,45 @@ describe("CreateScheduledTaskDialog edit mode", () => {
       expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe(expectedRules[frequency]);
     },
   );
+});
+
+describe("CreateScheduledTaskDialog edit mode for agent-written rules", () => {
+  it("opens a lower-case rule with COUNT first under Ends and keeps it on save", async () => {
+    const rrule = "rrule:count=3;freq=daily;byhour=9;byminute=0";
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ rrule })}
+      />,
+    );
+    expect(screen.getByTestId("task-ending-trigger")).toHaveTextContent("After 3 occurrences");
+    fireEvent.change(screen.getByLabelText("Automation title"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe(rrule);
+  });
+
+  it("opens a rule the visual controls can't show as RRULE text and keeps it on save", async () => {
+    // Reordered, lower-case and zero-padded, so a rebuilt rule would differ byte for byte.
+    const rrule = "byminute=00;FREQ=WEEKLY;BYHOUR=09,10,11,12,13,14,15,16,17;byday=MO,TU,WE,TH,FR";
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ rrule })}
+      />,
+    );
+    expect(screen.queryByText(/can't be edited/)).not.toBeInTheDocument();
+    openAutomationSection("Schedule");
+    expect(screen.getByRole("tab", { name: "RRULE" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByLabelText("RRULE string")).toHaveValue(rrule.toUpperCase());
+    expect(screen.queryByTestId("schedule-error")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Automation title"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe(rrule);
+  });
 });
 
 describe("CreateScheduledTaskDialog sandbox mode", () => {
@@ -2167,6 +2206,60 @@ describe("CreateScheduledTaskDialog submit", () => {
       "Monthly",
       "Yearly",
     ]);
+  });
+
+  it("saves a schedule written as RRULE text", async () => {
+    renderDialog();
+    fireEvent.change(screen.getByLabelText("Automation title"), { target: { value: "T" } });
+    fireEvent.change(screen.getByLabelText("Instructions"), { target: { value: "P" } });
+    openAutomationSection("Schedule");
+    await userEvent.click(screen.getByRole("tab", { name: "RRULE" }));
+    const rule = screen.getByLabelText("RRULE string");
+    expect(rule).toHaveValue("FREQ=DAILY;BYHOUR=9;BYMINUTE=0");
+    fireEvent.change(rule, { target: { value: "FREQ=DAILY;BYHOUR=9;COUNT=2" } });
+    expect(screen.getByTestId("schedule-error")).toHaveTextContent("under Ends");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    fireEvent.change(rule, { target: { value: "freq=daily;byhour=9;byminute=30" } });
+    expect(screen.getByTestId("schedule-rule-summary")).toHaveTextContent("Every day at 9:30 AM");
+    fireEvent.change(rule, {
+      target: { value: "rrule:freq=weekly;byday=mo,tu,we,th,fr;byhour=9,10,11,12,13,14,15,16,17" },
+    });
+    expect(screen.queryByTestId("schedule-error")).not.toBeInTheDocument();
+    // No phrase states several hours, so the hint replaces a summary that would skip some.
+    expect(screen.getByTestId("schedule-rule-summary")).toHaveTextContent("RFC 5545 RRULE");
+    expect(screen.getByLabelText("Timezone")).toBeVisible();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].rrule).toBe(
+      "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17",
+    );
+  });
+
+  it("returns to the matching visual schedule when leaving RRULE text", async () => {
+    renderDialog();
+    selectSchedulePreset("Every hour");
+    await userEvent.click(screen.getByRole("tab", { name: "RRULE" }));
+    const rule = screen.getByLabelText("RRULE string");
+    expect(rule).toHaveValue("FREQ=HOURLY;BYMINUTE=0");
+    fireEvent.change(rule, {
+      target: { value: " rrule:freq=weekly;byday=fr,mo;byhour=8;byminute=30 " },
+    });
+    await userEvent.click(screen.getByRole("tab", { name: "Visual" }));
+    expect(screen.getByRole("radio", { name: "Every week" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByRole("button", { name: "Days of the week" })).toHaveTextContent("Mon, Fri");
+    await userEvent.click(screen.getByRole("tab", { name: "RRULE" }));
+    fireEvent.change(screen.getByLabelText("RRULE string"), {
+      target: { value: "FREQ=MONTHLY;BYDAY=1MO;BYHOUR=9;BYMINUTE=0" },
+    });
+    await userEvent.click(screen.getByRole("tab", { name: "Visual" }));
+    // No visual control names "the first Monday", so the previous visual schedule returns.
+    expect(screen.getByRole("radio", { name: "Every week" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
   });
 
   it("applies custom weekdays, validates intervals and submits the selected timezone and end count", async () => {
@@ -6039,6 +6132,9 @@ describe("scheduler capabilities", () => {
           .getAllByRole("radio")
           .map((option) => option.textContent),
       ).toEqual(["Every hour", "Every day", "Every weekday", "Every week"]);
+      expect(screen.getByRole("tab", { name: "RRULE" })).toBeDisabled();
+      await userEvent.click(screen.getByRole("tab", { name: "RRULE" }));
+      expect(screen.queryByLabelText("RRULE string")).not.toBeInTheDocument();
       selectSchedulePreset("Every hour");
       openTopLevelPopover("task-ending-trigger");
       expect(

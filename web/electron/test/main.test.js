@@ -20,10 +20,25 @@ const assert = require("node:assert/strict");
 const { readFileSync } = require("node:fs");
 const fs = require("node:fs");
 const os = require("node:os");
-const { createRequire } = require("node:module");
+const moduleLoader = require("node:module");
 const path = require("node:path");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
+
+const { createRequire } = moduleLoader;
+const electronStub = {
+  shell: {
+    openExternal: async () => {
+      throw new Error("unexpected system-browser launch");
+    },
+  },
+  safeStorage: { isEncryptionAvailable: () => false },
+};
+const originalLoad = moduleLoader["_load"];
+moduleLoader["_load"] = function (request, ...rest) {
+  if (request === "electron") return electronStub;
+  return originalLoad.call(this, request, ...rest);
+};
 
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
 const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
@@ -48,7 +63,7 @@ const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/
 
 /** A fake workspace behind the real databricks-session module: `verdict` answers session-create. */
 function createWorkspaceNetwork(origin, { oauth: oauthOverrides, account = {} } = {}) {
-  const network = { verdict: "allow", sessionCreates: 0, browserSignIns: 0 };
+  const network = { verdict: "allow", sessionCreates: 0, browserSignIns: 0, sessionChecks: [] };
   let jar = [];
   const cookies = Object.assign(new EventEmitter(), { get: async () => jar });
   // Chromium removes the old cookie before inserting its replacement.
@@ -159,6 +174,7 @@ function loadNavigationHarness({
   cliPath = null,
   hostConnectResult = { ok: true },
   sshConnectResult = { ok: true, shownInConsole: true },
+  sshPreviewVerification = null,
   serverAuthResult = { ok: true },
   managedServerNames = {},
   // A createWorkspaceNetwork() to run the real session module against.
@@ -615,6 +631,17 @@ function loadNavigationHarness({
     },
     "./databricks-auth": {
       ...require("../src/databricks-auth"),
+      createDatabricksAuth(options) {
+        const auth = require("../src/databricks-auth").createDatabricksAuth(options);
+        return {
+          ...auth,
+          checkSession(...args) {
+            const pending = auth.checkSession(...args);
+            network?.sessionChecks?.push(pending);
+            return pending;
+          },
+        };
+      },
       readDatabricksAuthMode: () => databricksMode,
     },
     // The bounce's behavior is unit-tested in workspace-root-bounce.test.js;
@@ -707,6 +734,12 @@ function loadNavigationHarness({
       startLocalServer: async () => ({ ok: false }),
     },
   };
+
+  if (sshPreviewVerification) {
+    localRequires["./sshPreviewIdentity"] = {
+      verifySshPreviewIdentity: sshPreviewVerification,
+    };
+  }
 
   if (arcaConsentResult !== undefined) {
     localRequires["./arca_connect_window"] = {
@@ -854,6 +887,7 @@ describe("Arca extend IPC", () => {
         arcaPreviewRecovery: true,
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
+        sshLocalhostPreview: true,
         floatingComposer: true,
         floatingComposerShortcut: true,
       },
@@ -4439,9 +4473,12 @@ describe("HTTP error status fallback (src/main.js)", () => {
     assert.ok(h.calls.auth.every((call) => call[2].interactive === false));
   });
 
-  it("keeps the plain fallback for a Databricks 404 and other servers' 503", async (t) => {
+  it("keeps the plain fallback for a Databricks 404, a 403 without a session, and other servers' 503", async (t) => {
     const notFound = workspaceHarness(t, [20]);
     notFound.emit("did-navigate", page, 404, "Not Found");
+    // No renewable session is attached to this window, so there is nothing to check.
+    const forbidden = workspaceHarness(t, [20]);
+    forbidden.emit("did-navigate", page, 403, "Forbidden");
     const other = loadNavigationHarness();
     t.after(other.cleanup);
     other.api.setReconnectDelaysMs([20]);
@@ -4449,6 +4486,7 @@ describe("HTTP error status fallback (src/main.js)", () => {
     await wait(60);
     for (const [h, error] of [
       [notFound, "404 Not Found"],
+      [forbidden, "403 Forbidden"],
       [other, "503 Service Unavailable"],
     ]) {
       assert.equal(h.calls.loadFile.length, 1);
@@ -4898,6 +4936,7 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
   for (const [trigger, drop] of [
     ["the session cookie is removed", (_h, network) => network.removeCookie()],
     ["the workspace redirects to login", loginRedirect],
+    ["a reload is refused", (h) => h.emit("did-navigate", `${workspace}/c/456`, 403, "Forbidden")],
   ]) {
     it(`reconnects by itself when the VPN returns after ${trigger} off the VPN`, async (t) => {
       const { h, network } = await connected(t, Array(6).fill(40));
@@ -4930,6 +4969,42 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       assert.equal(h.calls.loadURL.length, 2);
       assert.ok(h.calls.auth.every((call) => call[2].interactive === false));
       assert.equal(network.browserSignIns, 0);
+    });
+  }
+
+  it("shows a reload's 403 on the setup page when the session still renews", async (t) => {
+    const { h, network } = await connected(t, [20]);
+    const sessionCreates = network.sessionCreates;
+    h.emit("did-navigate", `${workspace}/c/456`, 403, "Forbidden");
+    await until(() => h.calls.loadFile.length === 1, "the setup page");
+    assert.deepEqual(shown(h), { error: "403 Forbidden", url: workspace });
+    assert.equal(network.sessionCreates, sessionCreates + 1);
+    assert.deepEqual(h.overlay.shows, []);
+    await wait(60);
+    assert.equal(network.sessionCreates, sessionCreates + 1);
+    assert.equal(h.calls.loadURL.length, 1);
+    assert.equal(network.browserSignIns, 0);
+  });
+
+  for (const verdict of ["allow", "blocked", "forbidden"]) {
+    it(`leaves a newer page load alone when a reload's session check ends in ${verdict}`, async (t) => {
+      const { h, network } = await connected(t, [20]);
+      const sessionCreates = network.sessionCreates;
+      const checksBefore = network.sessionChecks.length;
+      network.verdict = verdict;
+      h.emit("did-navigate", `${workspace}/c/456`, 403, "Forbidden");
+      const newerPage = `${workspace}/c/789`;
+      h.setUrl(newerPage);
+      h.emit("did-navigate", newerPage, 200, "OK");
+      const loadsBefore = structuredClone(h.calls.loadURL);
+      await until(() => network.sessionCreates === sessionCreates + 1, "the session check");
+      assert.equal(network.sessionChecks.length, checksBefore + 1);
+      await network.sessionChecks.at(-1);
+      assert.deepEqual(h.calls.loadFile, []);
+      assert.deepEqual(h.calls.loadURL, loadsBefore);
+      assert.equal(h.webContents.getURL(), newerPage);
+      assert.deepEqual(h.overlay.shows, []);
+      assert.equal(h.api.windows.get(h.win).origin, origin);
     });
   }
 
@@ -5159,6 +5234,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         arcaPreviewRecovery: true,
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
+        sshLocalhostPreview: true,
         floatingComposer: true,
         floatingComposerShortcut: true,
       },
@@ -5353,6 +5429,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
 
   it("returns immediately and shares one consent prompt across agent retries", async (t) => {
     const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const resolvedOrigin = "https://accounts.cloud.databricks.com";
     const hostId = "a".repeat(32);
     let settleConsent;
     const consent = new Promise((resolve) => {
@@ -5360,18 +5437,38 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     });
     const h = loadNavigationHarness({
       serverUrl,
+      databricksMode: "browser",
+      ensureSession: async () => resolvedOrigin,
       internalFeatures: true,
       arcaPath: "/usr/local/bin/arca",
       arcaConsentResult: () => consent,
     });
     t.after(h.cleanup);
     h.api.registerIpc();
+    const resolvedUrl = await h.api.loadServerUrl(h.win, serverUrl);
+    assert.equal(resolvedUrl, `${resolvedOrigin}/omnigent`);
+    assert.notEqual(resolvedUrl, serverUrl);
     const deps = h.browserIpcDeps();
     const recover = deps.recoverAgentNavigationForEvent;
     const hint = deps.getAgentNavigationHintForEvent;
-    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+    const event = { sender: h.webContents, senderFrame: { url: resolvedUrl } };
+    let previewPrompts = 0;
+    h.electron.dialog.showMessageBox = async () => {
+      previewPrompts++;
+      return { response: 0 };
+    };
 
     assert.equal(await recover(event, "http://localhost:5173", hostId, hostId), false);
+    assert.equal(
+      await deps.requestPreviewHostForEvent(event, "http://localhost:5173", {
+        sourceHostId: hostId,
+        sourceSshTarget: "devbox",
+        sessionHostProtocol: 1,
+        sshPreviewProtocol: 1,
+      }),
+      false,
+    );
+    assert.equal(previewPrompts, 0, "pending reconnect consent must not start another prompt");
     assert.equal(h.calls.arcaConsentRuns.length, 1);
     assert.equal(h.calls.arcaConsentRuns[0].serverUrl, serverUrl);
     assert.equal(h.calls.arcaConsentRuns[0].options.reason, "preview-reconnect");
@@ -6819,6 +6916,178 @@ describe("SSH connect IPC", () => {
       [...h.ipc.keys()].filter((channel) => /ssh/i.test(channel)),
       ["omnigent:ssh-connect"],
     );
+  });
+});
+
+describe("localhost previews for hosts reached over SSH", () => {
+  const server = "https://host.example/ml/omnigents";
+  const hostId = "0123456789abcdef0123456789abcdef";
+  const preview = "http://127.0.0.1:8787/";
+
+  /** A window on `server` whose SSH connect reaches `hostId`, answering previews with `answer()`. */
+  function previewHarness(t, answer) {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      sshConnectResult: { ok: true, shownInConsole: true, identity: { hostId } },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.api.createBrowserRegistryForWindow(h.win);
+    const questions = [];
+    h.electron.dialog.showMessageBox = async (win, options) => {
+      assert.equal(win, h.win);
+      questions.push(options.message);
+      return { response: answer() };
+    };
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const deps = h.browserIpcDeps();
+    return {
+      h,
+      event,
+      deps,
+      questions,
+      context: () =>
+        deps.getAgentContextForEvent(event, {
+          sourceHostId: hostId,
+          sessionHostProtocol: 1,
+          sshPreviewProtocol: 1,
+        }),
+      eligible: h.browserRegistryDeps().allowsLocalhost,
+      connect: () => h.ipc.get("omnigent:ssh-connect")(event, "devbox"),
+    };
+  }
+
+  it("asks once about a host connected over SSH, then lets its sessions open localhost pages", async (t) => {
+    const { h, event, deps, questions, context, eligible, connect } = previewHarness(t, () => 1);
+    const request = (url, source = hostId, from = event) =>
+      deps.requestPreviewHostForEvent(from, url, {
+        sourceHostId: source,
+        sessionHostProtocol: 1,
+        sshPreviewProtocol: 1,
+      });
+    const elsewhere = { sender: h.webContents, senderFrame: { url: "https://elsewhere.example/" } };
+
+    assert.equal(await request(preview), false, "nothing is recorded for the host yet");
+    assert.equal((await connect()).ok, true);
+    assert.equal(eligible(context()), false);
+    assert.equal(await request("https://example.com/"), false);
+    assert.equal(await request(preview, "b".repeat(32)), false);
+    assert.equal(await request(preview, hostId, elsewhere), false);
+    assert.deepEqual(questions, []);
+
+    assert.equal(await request(preview), true);
+    assert.deepEqual(questions, ['Let sessions on "devbox" open localhost pages?']);
+    assert.equal(eligible(context()), true);
+    assert.equal(context().hostIsSshPreview, true);
+    assert.equal(context().hostIsThisMachine, false);
+    assert.equal(eligible({ ...context(), sourceHostId: "b".repeat(32) }), false);
+    assert.equal(eligible(deps.getAgentContextForEvent(event, { sourceHostId: hostId })), false);
+    assert.equal(
+      eligible(
+        deps.getAgentContextForEvent(event, { sourceHostId: hostId, sessionHostProtocol: 1 }),
+      ),
+      false,
+      "an older renderer cannot reuse another renderer's SSH preview grant",
+    );
+    assert.equal(await request(preview), false, "an allowed host needs no retry");
+    assert.equal(questions.length, 1);
+  });
+
+  it("keeps a verified preview destination separate from SSH file access", async (t) => {
+    const proofs = [];
+    let questions = 0;
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      sshPreviewVerification: async (...args) => {
+        proofs.push(args);
+        return true;
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.api.createBrowserRegistryForWindow(h.win);
+    const approve = async () => {
+      questions++;
+      return { response: 1 };
+    };
+    h.electron.dialog.showMessageBox = approve;
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const deps = h.browserIpcDeps();
+    const opts = {
+      sourceHostId: hostId,
+      sourceSshTarget: "devbox",
+      sessionHostProtocol: 1,
+      sshPreviewProtocol: 1,
+    };
+    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), true);
+    assert.deepEqual(proofs, [[server, hostId, "devbox"]]);
+    assert.equal(h.sshHosts.destination(server, hostId), null);
+    const savedProof = require("../src/sshHosts").createSshHostStore(() =>
+      path.join(path.dirname(h.settingsPath), "ssh-preview-hosts.json"),
+    );
+    assert.equal(savedProof.destination(server, hostId), "devbox");
+    const context = deps.getAgentContextForEvent(event, opts);
+    assert.equal(h.browserRegistryDeps().allowsLocalhost(context), true);
+    h.sshHosts.record(server, hostId, "devbox");
+    assert.equal(h.browserRegistryDeps().allowsLocalhost(context), true);
+    h.sshHosts.record(server, hostId, "replacement");
+    h.sshHosts.record(server, hostId, "devbox");
+    assert.equal(h.browserRegistryDeps().allowsLocalhost(context), false);
+
+    const consent = Promise.withResolvers();
+    h.electron.dialog.showMessageBox = () => {
+      questions++;
+      return consent.promise;
+    };
+    const pending = deps.requestPreviewHostForEvent(event, preview, opts);
+    await until(() => questions === 2, "fresh consent for the restored destination");
+    h.sshHosts.record(server, hostId, "replacement");
+    h.sshHosts.record(server, hostId, "devbox");
+    consent.resolve({ response: 1 });
+    assert.equal(await pending, false, "intermediate writes must invalidate pending consent too");
+    assert.equal(h.browserRegistryDeps().allowsLocalhost(context), false);
+
+    h.electron.dialog.showMessageBox = approve;
+    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), true);
+    assert.equal(questions, 3);
+    assert.equal(proofs.length, 1, "the file-access route is already proven");
+    h.sshHosts.record(server, hostId, "replacement");
+    assert.equal(h.browserRegistryDeps().allowsLocalhost(context), false);
+  });
+
+  it("keeps a declined host blocked until restart and tells the agent why", async (t) => {
+    const { event, deps, questions, context, eligible, connect } = previewHarness(t, () => 0);
+    assert.equal((await connect()).ok, true);
+    assert.equal(deps.getAgentNavigationHintForEvent(event, preview, hostId), null);
+
+    const opts = { sourceHostId: hostId, sessionHostProtocol: 1, sshPreviewProtocol: 1 };
+    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
+    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
+    assert.equal(questions.length, 1);
+    assert.equal(eligible(context()), false);
+    assert.match(
+      deps.getAgentNavigationHintForEvent(event, preview, hostId),
+      /"devbox" were declined/,
+    );
+    assert.equal(deps.getAgentNavigationHintForEvent(event, "https://example.com/", hostId), null);
+  });
+
+  it("does not ask an older renderer even for a recorded destination or supplied hint", async (t) => {
+    const { event, deps, questions, eligible, connect } = previewHarness(t, () => 1);
+    assert.equal((await connect()).ok, true);
+    await Promise.all(
+      [undefined, 0, 2].map(async (sshPreviewProtocol) => {
+        const opts = {
+          sourceHostId: hostId,
+          sessionHostProtocol: 1,
+          sshPreviewProtocol,
+          sourceSshTarget: "devbox",
+        };
+        assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
+        assert.equal(eligible(deps.getAgentContextForEvent(event, opts)), false);
+      }),
+    );
+    assert.deepEqual(questions, []);
   });
 });
 

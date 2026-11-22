@@ -27,6 +27,8 @@ import { isDatabricksWorkspace } from "@/lib/host";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { useChatStore } from "@/store/chatStore";
 import {
+  canDownloadImage,
+  downloadImage,
   downloadWorkspaceFile,
   FILE_CONTENT_FAILING_POLL_MS,
   FILE_CONTENT_POLL_MAX_BYTES,
@@ -340,6 +342,117 @@ describe("downloadWorkspaceFile", () => {
     } as Response);
 
     await expect(downloadWorkspaceFile("sess_x", "missing.txt")).rejects.toThrow("404");
+  });
+});
+
+describe("canDownloadImage", () => {
+  it.each([
+    ["an in-memory blob source in any case", "BLOB:http://app/1", {}, true],
+    ["a data source", "data:image/png;base64,AA==", {}, true],
+    [
+      "a data source of a type it can name, in any case",
+      "DATA:IMAGE/SVG+XML,%3Csvg%2F%3E",
+      {},
+      true,
+    ],
+    ["a data source of a type it can't name", "data:image/x-unknown;base64,AA==", {}, false],
+    ["a data source with no type", "data:;base64,AA==", {}, false],
+    ["held bytes for any source", "https://example.com/a.png", { blob: new Blob(["x"]) }, true],
+    [
+      "an app API path",
+      "/base/v1/x",
+      { apiPath: "/v1/sessions/s/resources/files/f/content" },
+      true,
+    ],
+    ["an empty API path", "/v1/x", { apiPath: "" }, false],
+    ["a remote URL as the API path", "/v1/x", { apiPath: "https://example.com/a.png" }, false],
+    ["a remote source with nothing else", "https://example.com/a.png", {}, false],
+  ])("decides %s (%s)", (_label, src, source, expected) => {
+    expect(canDownloadImage(src, source)).toBe(expected);
+  });
+
+  it("accepts nothing before the source resolves", () => {
+    expect(canDownloadImage(undefined, { blob: new Blob(["x"]) })).toBe(false);
+  });
+
+  it("types an extensionless name from the bytes the Android shell fetches", async () => {
+    vi.mocked(isAndroidShell).mockReturnValueOnce(true);
+    const image = new Blob(["png"], { type: "image/png" });
+    fetchMock.mockResolvedValueOnce(blobResponse(image));
+    const clicked = captureDownloadClicks();
+    vi.stubGlobal("URL", {
+      createObjectURL: vi.fn(() => "blob:fetched"),
+      revokeObjectURL: vi.fn(),
+    });
+
+    await downloadImage("/v1/x", "file_123", {
+      apiPath: "/v1/sessions/s/resources/files/file_123/content",
+    });
+
+    expect(clicked).toEqual([["blob:fetched", "file_123.png"]]);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("refuses to fetch a source it can't save, without a request", async () => {
+    await expect(downloadImage("https://example.com/a.png", "a.png")).rejects.toThrow();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a page name on SVG bytes", "invoice.html", "image/svg+xml", "invoice.html.svg"],
+    ["a last dot that isn't an extension", "Figure 1.2", "image/png", "Figure 1.2.png"],
+    ["another image type's extension", "chart.svg", "image/png", "chart.svg.png"],
+    ["a matching extension in any case", "photo.JPEG", "image/jpeg", "photo.JPEG"],
+    ["a type it can't name", "notes", "application/octet-stream", "notes"],
+  ])("names held bytes for their type: %s", async (_label, name, type, saved) => {
+    const clicked = captureDownloadClicks();
+    vi.stubGlobal("URL", { createObjectURL: vi.fn(() => "blob:held"), revokeObjectURL: vi.fn() });
+
+    await downloadImage("blob:shown", name, { blob: new Blob(["x"], { type }) });
+
+    expect(clicked).toEqual([["blob:held", saved]]);
+  });
+
+  it("names a data image for the type it declares", async () => {
+    const clicked = captureDownloadClicks();
+    const src = "data:image/svg+xml;base64,PHN2Zy8+";
+
+    await downloadImage(src, "invoice.html");
+
+    expect(clicked).toEqual([[src, "invoice.html.svg"]]);
+  });
+
+  it("won't save a data image of a type it can't name", async () => {
+    const clicked = captureDownloadClicks();
+
+    await expect(
+      downloadImage("data:image/x-unknown;base64,AA==", "invoice.html"),
+    ).rejects.toThrow();
+
+    expect(clicked).toEqual([]);
+  });
+
+  describe("in the iOS shell, whose web view can't save a download", () => {
+    afterEach(() => {
+      vi.mocked(isIOSShell).mockReturnValue(false);
+    });
+
+    it.each([
+      ["a blob source", "blob:shown", {}],
+      ["a data source", "data:image/png;base64,AA==", {}],
+      ["held bytes", "blob:shown", { blob: new Blob(["x"], { type: "image/png" }) }],
+      ["an app API path", "/v1/x", { apiPath: "/v1/sessions/s/resources/files/f/content" }],
+    ])("offers no save for %s", async (_label, src, source) => {
+      vi.mocked(isIOSShell).mockReturnValue(true);
+      const clicked = captureDownloadClicks();
+
+      expect(canDownloadImage(src, source)).toBe(false);
+      await expect(downloadImage(src, "shot.png", source)).rejects.toThrow();
+
+      expect(clicked).toEqual([]);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
   });
 });
 

@@ -122,10 +122,10 @@ export function useAppCommands({
 }
 
 /** The commands whose label or a keyword contains `query`, ignoring case; all of them for a blank query. */
-export function filterAppCommands(
-  commands: readonly ActionCommand[],
+export function filterAppCommands<Command extends { label: string; keywords: readonly string[] }>(
+  commands: readonly Command[],
   query: string,
-): readonly ActionCommand[] {
+): readonly Command[] {
   const q = query.trim().toLowerCase();
   if (q === "") return commands;
   return commands.filter(

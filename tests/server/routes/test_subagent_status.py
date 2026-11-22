@@ -382,16 +382,28 @@ async def test_subagent_idle_validates_optional_response_id(
 
 
 @pytest.mark.parametrize(
-    ("status", "turn_outcome"),
-    [("idle", None), ("running", None), ("failed", None), ("idle", "cancelled")],
+    ("status", "turn_outcome", "output_kind"),
+    [
+        ("idle", None, "plain"),
+        ("idle", None, "structured"),
+        ("running", None, "plain"),
+        ("running", None, "structured"),
+        ("failed", None, "plain"),
+        ("failed", None, "structured"),
+        ("idle", "cancelled", "plain"),
+        ("idle", "cancelled", "structured"),
+        ("failed", None, "output-limit"),
+    ],
 )
-@pytest.mark.parametrize("structured", [False, True])
 async def test_external_session_status_still_forwards_to_runner(
-    status_route: _StatusRoute, status: str, turn_outcome: str | None, structured: bool
+    status_route: _StatusRoute, status: str, turn_outcome: str | None, output_kind: str
 ) -> None:
     route = status_route
     sid = route.child_id
+    structured = output_kind == "structured"
     data = {"status": status, "output": "authoritative result"}
+    if output_kind == "output-limit":
+        data["output"] = "Claude Code ended the turn with an API error (max_output_tokens)."
     if structured:
         data["output"] = json.dumps(
             {
@@ -433,6 +445,8 @@ async def test_external_session_status_still_forwards_to_runner(
         [failure] = [r for r in rows if r["event_name"] == "session_turn_failed"]
         assert failure["session_id"] == sid
         assert failure["attributes"]["origin"] == "external_session_status"
+        if output_kind == "output-limit":
+            assert failure["attributes"]["code"] == "output_limit_exceeded"
         if structured:
             assert failure["attributes"]["provider_error_param"] == "input[3].content"
     assert body["data"] == expected_data
