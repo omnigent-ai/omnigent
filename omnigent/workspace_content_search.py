@@ -176,6 +176,30 @@ def content_search_script(
         raise ContentSearchError("Enter a single-line search query of 1–4096 characters.")
     if not 1 <= limit <= MAX_MATCHES:
         raise ContentSearchError("Search limit must be between 1 and 500.")
+    glob_args = content_search_globs(include, exclude)
+    parameters = (
+        f"query = {query!r}\ncase_sensitive = {case_sensitive!r}\n"
+        f"regex = {regex!r}\nlimit = {limit!r}\nglob_args = {glob_args!r}\n"
+        f"extra_args = {list(extra_args)!r}\nsearch_paths = {list(search_paths)!r}\n"
+    )
+    return parameters + _SEARCH_SCRIPT
+
+
+# Backslash-escaped, so ripgrep matches a name literally; a space too, since
+# ripgrep reads globs as ignore lines, which drop a trailing one.
+_GLOB_METACHARACTERS = frozenset("\\*?[]{}! ")
+
+
+def literal_glob(path: str) -> str:
+    """``path`` as a ripgrep glob that matches only itself."""
+    return "".join(f"\\{c}" if c in _GLOB_METACHARACTERS else c for c in path)
+
+
+def content_search_globs(include: str, exclude: str) -> list[str]:
+    """The ripgrep ``--glob`` options for the user's comma-separated filters.
+
+    :raises ContentSearchError: When the filters are invalid.
+    """
     glob_args = []
     for raw, prefix in ((include, ""), (exclude, "!")):
         if len(raw) > MAX_QUERY_LENGTH or any(c in raw for c in "\x00\r\n"):
@@ -188,12 +212,7 @@ def content_search_script(
             if pattern.endswith("/"):
                 pattern += "**"
             glob_args.append(f"--glob={prefix}{pattern}")
-    parameters = (
-        f"query = {query!r}\ncase_sensitive = {case_sensitive!r}\n"
-        f"regex = {regex!r}\nlimit = {limit!r}\nglob_args = {glob_args!r}\n"
-        f"extra_args = {list(extra_args)!r}\nsearch_paths = {list(search_paths)!r}\n"
-    )
-    return parameters + _SEARCH_SCRIPT
+    return glob_args
 
 
 def parse_record(line: str | bytes) -> dict[str, Any]:

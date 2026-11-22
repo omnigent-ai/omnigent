@@ -72,6 +72,7 @@ from omnigent.workspace_content_search import (
     SCRIPT_TIMEOUT_S,
     ContentSearchError,
     content_search_script,
+    literal_glob,
     parse_record,
 )
 from omnigent.workspace_file_search import walk_search
@@ -84,9 +85,6 @@ _MAX_FILE_RESULTS = 10_000
 _FILE_SEARCH_DEADLINE_S = 20.0
 # Matching lines per SearchText message.
 _TEXT_MATCH_BATCH = 100
-# Backslash-escaped in an exclude, so ripgrep matches the directory's name literally;
-# a space too, since ripgrep reads globs as ignore lines, which drop a trailing one.
-_GLOB_METACHARACTERS = frozenset("\\*?[]{}! ")
 # Ranked paths beyond the limit, standing in for ones deleted since Git listed them.
 _SPARE_RANKED = 32
 # Fuzzy mode's file lists, reused while Git's listing is unchanged.
@@ -480,10 +478,6 @@ async def _search_fuzzy(search: _FuzzySearch) -> SearchFilesResponse:
     )
 
 
-def _literal_glob(path: str) -> str:
-    return "".join(f"\\{c}" if c in _GLOB_METACHARACTERS else c for c in path)
-
-
 def text_search_arguments(
     root: Path, request: SearchTextRequest
 ) -> tuple[list[str], list[str]] | None:
@@ -518,7 +512,7 @@ def text_search_arguments(
     if request.include_git_ignored:
         options.append("--no-ignore-vcs")
     for directory in excluded:
-        literal = _literal_glob(directory)
+        literal = literal_glob(directory)
         options += [f"--glob=!/{literal}", f"--glob=!/{literal}/**"]
     return options, [f"./{d}" for d in present] or ["."]
 
