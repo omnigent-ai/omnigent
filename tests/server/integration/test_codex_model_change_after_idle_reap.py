@@ -457,16 +457,24 @@ async def test_codex_settings_wait_for_reaping_uses_the_readiness_budget(
     session.assert_applied(response, model=_LATEST_MODEL)
 
 
+@pytest.mark.parametrize("strict", [False, True])
 async def test_goal_read_after_idle_reap_does_not_wake_codex(
-    client: httpx.AsyncClient, native_session: _NativeSession
+    client: httpx.AsyncClient, native_session: _NativeSession, strict: bool
 ) -> None:
     session = native_session
     await session.reap(clear_bridge=False)
 
-    response = await client.get(f"/v1/sessions/{session.session_id}/codex_goal")
+    response = await client.get(
+        f"/v1/sessions/{session.session_id}/codex_goal",
+        headers={"X-Omnigent-Codex-Goal-Read": "strict"} if strict else {},
+    )
 
-    assert response.status_code == 200, response.text
-    assert response.json() == {"goal": None}
+    if strict:
+        assert response.status_code == 503, response.text
+        assert response.json()["error"] == "codex_native_goal_failed"
+    else:
+        assert response.status_code == 200, response.text
+        assert response.json() == {"goal": None, "available": False}
     assert session.codex.launches == 1
     assert session.codex.requests == []
     assert session.terminals.get(session.session_id, "codex", "main") is None
@@ -480,7 +488,7 @@ async def test_goal_read_forwards_to_a_live_codex_backend(
     response = await client.get(f"/v1/sessions/{session.session_id}/codex_goal")
 
     assert response.status_code == 200, response.text
-    assert response.json() == {"goal": None}
+    assert response.json() == {"goal": None, "available": True}
     assert ("thread/goal/get", {"threadId": session.codex.thread_id}) in session.codex.requests
     assert session.codex.launches == 1
 

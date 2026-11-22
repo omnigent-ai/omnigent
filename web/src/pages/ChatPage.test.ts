@@ -15,6 +15,7 @@ import {
   buildPendingBubbles,
   buildSlashCommandMap,
   composerOffersClear,
+  composerOffersRewind,
   buildSlashCommandWithArgsSet,
   collectBubbleMarkdown,
   collectPendingElicitations,
@@ -41,7 +42,6 @@ import {
   updateWarmTerminalSurfaces,
   type WarmTerminalEntry,
   isBackgroundTasksOnly,
-  splitSlashCommand,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
   unboundSessionResumableInApp,
@@ -129,21 +129,22 @@ describe("Composer structural read-only reasons", () => {
     ).toBe("Claude Code sub-agents are read-only");
   });
 
-  it("gives a sealed codex /side child its own reason, not the generic one", () => {
-    // Server seals a dead side chat with omnigent.closed; the "Side chat"
-    // nickname distinguishes it from an ordinary closed codex sub-agent.
-    expect(
-      readOnlyReasonForSessionLabels(
-        {
-          labels: {
-            "omnigent.closed": "true",
-            "omnigent.wrapper": "codex-native-ui-subagent",
-            "omnigent.codex_native.agent_nickname": "Side chat",
-          },
-        },
-        null,
-      ),
-    ).toBe("This side chat has ended and can't receive new messages");
+  it.each(
+    [undefined, "false", "true"].flatMap((support) =>
+      [true, false].map((live) => ({ support, live })),
+    ),
+  )("gates closed codex /side recovery (live: $live, support: $support)", ({ live, support }) => {
+    const session = {
+      labels: {
+        "omnigent.closed": "true",
+        "omnigent.wrapper": "codex-native-ui-subagent",
+        "omnigent.codex_native.agent_nickname": "Side chat",
+        ...(support === undefined ? {} : { "omnigent.codex_native.side_chat_resume": support }),
+      },
+    };
+    expect(readOnlyReasonForSessionLabels(live ? session : null, live ? null : session)).toBe(
+      support === "true" ? null : "This sub-agent session is closed",
+    );
   });
 
   it("keeps the generic closed reason for a non-side-chat codex sub-agent", () => {
@@ -1464,7 +1465,7 @@ describe("collectBubbleMarkdown", () => {
 
 // ── Slash command map (skills + built-ins) ────────────────────────────
 
-describe("composer /clear gating", () => {
+describe("composer /clear and /rewind gating", () => {
   const info = (overrides: Partial<ServerInfo>) => ({ ...FALLBACK_SERVER_INFO, ...overrides });
 
   it.each([
@@ -1489,10 +1490,21 @@ describe("composer /clear gating", () => {
     // An older server lists "clear" for native sessions only.
     expect(composerOffersClear("claude-sdk", info({ session_event_types: ["clear"] }))).toBe(false);
   });
+
+  it.each([
+    ["claude-sdk", true],
+    ["claude-native", true],
+    ["codex-native", false],
+    ["openai-agents", false],
+  ] as const)("offers /rewind for %s when the server has the endpoint", (harness, offered) => {
+    expect(composerOffersRewind(harness, info({ session_rewind: true }))).toBe(offered);
+    expect(composerOffersRewind(harness, info({}))).toBe(false);
+    expect(composerOffersRewind(harness, "loading")).toBe(false);
+  });
 });
 
 describe("buildSlashCommandMap", () => {
-  const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions"];
+  const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions", "/rewind", "/goal"];
 
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
@@ -1529,6 +1541,32 @@ describe("buildSlashCommandMap", () => {
     expect(
       buildSlashCommandMap([], true, true, true, false, false, "/", false, false, true)["/clear"],
     ).toBe(BUILTIN_SLASH_COMMANDS["/clear"]);
+  });
+
+  it("includes /rewind only when showRewind is true", () => {
+    expect(buildSlashCommandMap([], true, true)["/rewind"]).toBeUndefined();
+    expect(
+      buildSlashCommandMap(
+        [],
+        true,
+        true,
+        true,
+        false,
+        false,
+        "/",
+        false,
+        false,
+        false,
+        false,
+        true,
+      )["/rewind"],
+    ).toBe(BUILTIN_SLASH_COMMANDS["/rewind"]);
+    // The /permissions slot right before it doesn't turn on /rewind.
+    expect(
+      buildSlashCommandMap([], true, true, true, false, false, "/", false, false, false, true)[
+        "/rewind"
+      ],
+    ).toBeUndefined();
   });
 
   it("includes /btw only when showBtw is true (claude-native)", () => {
@@ -1876,68 +1914,6 @@ describe("isSlashCommandText", () => {
     ["empty string", ""],
   ] as const)("does not treat %s as a slash command", (_label, text) => {
     expect(isSlashCommandText(text)).toBe(false);
-  });
-});
-
-describe("splitSlashCommand", () => {
-  // The composer overlay tints only `token`; `before`/`after` stay default,
-  // so the whole draft no longer goes blue once args are typed.
-  it("splits the command token from its args", () => {
-    expect(splitSlashCommand("/cross-review fix the bug")).toEqual({
-      before: "",
-      token: "/cross-review",
-      after: " fix the bug",
-    });
-  });
-
-  it("returns an empty `after` for a bare command", () => {
-    expect(splitSlashCommand("/oncall")).toEqual({
-      before: "",
-      token: "/oncall",
-      after: "",
-    });
-  });
-
-  it("preserves leading whitespace in `before`", () => {
-    expect(splitSlashCommand("  /compact")).toEqual({
-      before: "  ",
-      token: "/compact",
-      after: "",
-    });
-  });
-
-  it("keeps a plugin-namespaced skill name whole", () => {
-    expect(splitSlashCommand("/dev-productivity:simplify now")).toEqual({
-      before: "",
-      token: "/dev-productivity:simplify",
-      after: " now",
-    });
-  });
-
-  it("treats a known skill name with spaces as one token", () => {
-    const name = "/Simplified Technical English (ASD-STE100)";
-    expect(splitSlashCommand(`${name} rewrite this`, ["/compact", name])).toEqual({
-      before: "",
-      token: name,
-      after: " rewrite this",
-    });
-    // Without a catalog match only the first word reads as the command.
-    expect(splitSlashCommand(`${name} rewrite this`, ["/compact"])?.token).toBe("/Simplified");
-  });
-
-  it("matches a known skill whose first word is not command-shaped", () => {
-    const name = "/Node.js Best Practices";
-    expect(splitSlashCommand(`${name} here`, [name])).toEqual({
-      before: "",
-      token: name,
-      after: " here",
-    });
-    // Not command-shaped and not in the catalog: nothing to tint.
-    expect(splitSlashCommand(`${name} here`)).toBeNull();
-  });
-
-  it("returns null when the text isn't a command", () => {
-    expect(splitSlashCommand("just prose")).toBeNull();
   });
 });
 

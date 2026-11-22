@@ -1,5 +1,11 @@
+import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DEFAULT_ALWAYS_STEER, readAlwaysSteer, writeAlwaysSteer } from "./alwaysSteerPreferences";
+import {
+  DEFAULT_ALWAYS_STEER,
+  readAlwaysSteer,
+  useAlwaysSteer,
+  writeAlwaysSteer,
+} from "./alwaysSteerPreferences";
 
 afterEach(() => {
   localStorage.clear();
@@ -47,5 +53,20 @@ describe("alwaysSteerPreferences", () => {
     });
     expect(() => writeAlwaysSteer(false)).not.toThrow();
     expect(readAlwaysSteer()).toBe(DEFAULT_ALWAYS_STEER);
+  });
+
+  it("updates a mounted reader on a write here and on a change from another window", () => {
+    const { result } = renderHook(() => useAlwaysSteer());
+    expect(result.current).toBe(true);
+    act(() => writeAlwaysSteer(false));
+    expect(result.current).toBe(false);
+    // Another window's write reaches this one only as a storage event.
+    act(() => {
+      localStorage.setItem("omnigent:always-steer", "true");
+      window.dispatchEvent(
+        new StorageEvent("storage", { key: "omnigent:always-steer", storageArea: localStorage }),
+      );
+    });
+    expect(result.current).toBe(true);
   });
 });

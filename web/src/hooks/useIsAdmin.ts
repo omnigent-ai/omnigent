@@ -1,5 +1,8 @@
-import { useQuery } from "@tanstack/react-query";
-import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import { useEffect } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { getCurrentIsAdmin, resolveIdentity, subscribeIdentity } from "@/lib/identity";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 
 // Mode-agnostic admin gate, sourced from the `/v1/me` identity probe
 // (the shared `users.is_admin` column). Unlike `useMe`, which reads the
@@ -16,8 +19,12 @@ const QUERY_KEY = ["identity-is-admin"];
  * flag on every admin route regardless — this is chrome only.
  */
 export function useIsAdmin(): boolean {
+  const info = useServerInfo();
+  const enabled = info !== "loading" && !isBootFallbackInfo(info);
+  const queryClient = useQueryClient();
   const { data } = useQuery<boolean>({
     queryKey: QUERY_KEY,
+    enabled,
     queryFn: async () => {
       await resolveIdentity();
       return getCurrentIsAdmin();
@@ -29,5 +36,9 @@ export function useIsAdmin(): boolean {
     // A false seed may mean the startup identity probe is still pending.
     initialDataUpdatedAt: 0,
   });
+  useEffect(() => {
+    if (!enabled) return;
+    return subscribeIdentity(() => queryClient.setQueryData(QUERY_KEY, getCurrentIsAdmin()));
+  }, [enabled, queryClient]);
   return data;
 }

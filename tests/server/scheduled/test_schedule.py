@@ -8,9 +8,11 @@ import pytest
 from omnigent.entities import ScheduledTask
 from omnigent.server.scheduled.rrule import RRuleSearchError
 from omnigent.server.scheduled.schedule import (
+    continued_sandbox_host_id,
     is_trigger_automation,
     next_scheduled_time,
     occurrence_host_id,
+    sandbox_host_id,
 )
 
 
@@ -39,6 +41,35 @@ def test_sandbox_identity_is_stable_per_tenant_task_and_trigger(task) -> None:
     assert host != occurrence_host_id(task, "manual:100")
     pinned = replace(task, execution_target="connected_host", host_id=uuid.uuid4().hex)
     assert occurrence_host_id(pinned, "schedule:100") == pinned.host_id
+
+
+@pytest.mark.parametrize(
+    "task_id,occurrence_host,continued_host",
+    [
+        # Values from before non-UUID IDs, so running sandboxes keep their host IDs.
+        (
+            "6f1c0a3e9b2d4c5e8f7a1b2c3d4e5f60",
+            "e140df56908451ec8c9e48a16e1a9784",
+            "f3570dd74571508eb915bedac22a76e1",
+        ),
+        # An ID a deployment allocates in another form.
+        (
+            "4611686018427387904",
+            "1a9741b70fec58859e0afd6205d2721e",
+            "e2a4b899204a553e8046228f5fce6286",
+        ),
+    ],
+    ids=["uuid", "decimal"],
+)
+def test_sandbox_identity_is_pinned_for_any_task_id_form(
+    task_id: str, occurrence_host: str, continued_host: str
+) -> None:
+    assert sandbox_host_id(task_id, 1, "schedule:100") == occurrence_host
+    assert continued_sandbox_host_id(task_id, 1) == continued_host
+    # Another ID of the same form gets other hosts.
+    other = task_id[:-1] + ("2" if task_id.endswith("1") else "1")
+    assert sandbox_host_id(other, 1, "schedule:100") != occurrence_host
+    assert continued_sandbox_host_id(other, 1) != continued_host
 
 
 @pytest.mark.parametrize("source", ["Jira", "Slack", "GitHub", "Linear", "PagerDuty"])

@@ -169,6 +169,7 @@ def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
             return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="")
         raise AssertionError(f"unexpected subprocess during readiness tests: {argv!r}")
 
+    monkeypatch.setattr(hi, "run_isolated", _stub_run)
     monkeypatch.setattr(hi.subprocess, "run", _stub_run)
     # Auth-aware native harnesses (now including Cursor native) check login state
     # in the picker map. Treat them as logged in when the test just needs
@@ -296,7 +297,7 @@ def test_pi_readiness_uses_selected_executable(
         assert argv == ["/test/selected/pi", "--version"]
         return subprocess.CompletedProcess(argv, 0, stdout=selected_version or "", stderr="")
 
-    monkeypatch.setattr(hi.subprocess, "run", version_probe)
+    monkeypatch.setattr(hi, "run_isolated", version_probe)
     assert _binary_availability_reason("pi") == expected
     assert hi.harness_cli_version_satisfies("pi") is (expected is True)
     version, _range = hi.harness_cli_version("pi")
@@ -305,6 +306,34 @@ def test_pi_readiness_uses_selected_executable(
         assert harness_is_configured(harness) is (expected is True)
     for harness in ("pi", "pi-native"):
         assert (hi.missing_harness_cli(harness) is None) is (expected is True)
+
+
+@pytest.mark.parametrize(
+    "skip_env,binary,expected",
+    [
+        (None, "/usr/bin/opencode", HARNESS_VERSION_TOO_LOW),
+        ("1", "/usr/bin/opencode", True),
+        ("1", None, HARNESS_BINARY_MISSING),
+    ],
+)
+def test_opencode_skip_version_check_admits_newer_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    skip_env: str | None,
+    binary: str | None,
+    expected: bool | str,
+) -> None:
+    """The skip env var only waives the range; a missing CLI is still missing."""
+    if skip_env is None:
+        monkeypatch.delenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", skip_env)
+    monkeypatch.setattr(hi.shutil, "which", lambda name: binary)
+
+    def version_probe(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 0, stdout="opencode v2.3.0\n", stderr="")
+
+    monkeypatch.setattr(hi, "run_isolated", version_probe)
+    assert _binary_availability_reason(hi.OPENCODE_KEY) == expected
 
 
 def test_unanswered_pi_version_probe_is_not_reported_as_outdated(
@@ -975,14 +1004,14 @@ def test_timed_out_version_probe_reports_cli_unresponsive_and_passes_launch_gate
 ) -> None:
     """A resolved CLI whose ``--version`` times out is neither outdated nor missing."""
     _all_clis_installed(monkeypatch)
-    answered_run = hi.subprocess.run
+    answered_run = hi.run_isolated
 
     def _hanging_version(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         if argv[1:] == ["--version"]:
             raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
         return answered_run(argv, **kwargs)
 
-    monkeypatch.setattr(hi.subprocess, "run", _hanging_version)
+    monkeypatch.setattr(hi, "run_isolated", _hanging_version)
     result = configured_harness_map()
     for harness in (
         "pi",
@@ -1023,14 +1052,14 @@ def test_unanswered_version_probe_still_requires_antigravity_credential(
     import omnigent.onboarding.gemini_auth as _ga
 
     _all_clis_installed(monkeypatch)
-    answered_run = hi.subprocess.run
+    answered_run = hi.run_isolated
 
     def _hanging_version(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         if argv[1:] == ["--version"]:
             raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
         return answered_run(argv, **kwargs)
 
-    monkeypatch.setattr(hi.subprocess, "run", _hanging_version)
+    monkeypatch.setattr(hi, "run_isolated", _hanging_version)
     monkeypatch.setattr(_ga, "gemini_login_detected", lambda: False)
     assert configured_harness_map()["antigravity-native"] is False
     assert harness_is_configured("antigravity-native") is False

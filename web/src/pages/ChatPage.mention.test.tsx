@@ -5,6 +5,7 @@ import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
+import type * as UseSessionLiveMcpServersModule from "@/hooks/useSessionLiveMcpServers";
 import type * as UseAgentsModule from "@/hooks/useAgents";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UseSidebarDataModule from "@/hooks/useSidebarData";
@@ -31,6 +32,8 @@ const ws = vi.hoisted(() => ({
   dirLoading: false,
   searchFiles: [] as unknown[],
 }));
+// Harness ids the server declares ``workspace_file_mentions`` for.
+const declaredMentions = vi.hoisted(() => ({ harnesses: new Set<string>() }));
 const ROOT_ENTRIES: WorkspaceFile[] = [
   { path: "src", name: "src", type: "directory", bytes: null, modified_at: null },
   { path: "readme.md", name: "readme.md", type: "file", bytes: 10, modified_at: null },
@@ -95,6 +98,10 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 
 // ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
 // (default: no PR) so bare Composer renders don't need a QueryClientProvider.
+// Run a workflow lists saved workflows from a TanStack query; none here.
+vi.mock("@/hooks/useSavedWorkflows", () => ({
+  useSavedWorkflows: () => ({ workflows: [], refresh: () => {} }),
+}));
 vi.mock("@/hooks/usePullRequests", () => ({
   usePullRequestInfo: () => ({ data: undefined }),
 }));
@@ -107,6 +114,16 @@ vi.mock("@/hooks/useSkills", () => ({
 vi.mock("@/hooks/useHarnessInventory", async (importOriginal) => ({
   ...(await importOriginal<typeof UseHarnessInventoryModule>()),
   useHostMcpServers: () => ({ data: [], isLoading: false, isError: false }),
+}));
+vi.mock("@/hooks/useSessionLiveMcpServers", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseSessionLiveMcpServersModule>()),
+  useSessionLiveMcpServers: () => ({ data: undefined, isError: false }),
+  useReconnectLiveMcpServer: () => ({
+    reconnect: () => {},
+    reconnectingName: null,
+    error: null,
+    clearError: () => {},
+  }),
 }));
 // /mcp reads the session's agent via a TanStack query; stub it (no agent loaded)
 // so bare Composer renders don't need a QueryClientProvider.
@@ -143,10 +160,17 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     antigravity: "Antigravity",
     copilot: "Copilot",
   }),
+  useFileMentionHarnesses: () => declaredMentions.harnesses,
 }));
 
 import { Composer, detectMentionAt, mentionMarkerFor } from "./ChatPage";
 import { SESSION_MENTION_CAP, SESSION_MENTION_HINT } from "@/lib/composerMentions";
+import * as CodeMirrorModule from "@/components/composer/engine/CodeMirrorComposerInput";
+import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
+import { composerTargetOf } from "@/components/composer/engine/composerInput";
+import { insertComposerText } from "@/lib/composerText";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 
 function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) {
   return {
@@ -283,6 +307,7 @@ describe("Composer @-file-mention browser (native sessions)", () => {
   let convSeq = 0;
   beforeEach(() => {
     resetWorkspaceMock();
+    declaredMentions.harnesses = new Set();
     localStorage.clear();
     useChatStore.setState({
       conversationId: `conv_test_${++convSeq}`,
@@ -404,11 +429,24 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     );
   });
 
-  it("does NOT show the mention menu on non-native (in-process SDK) harnesses", () => {
+  it("does NOT show the mention menu on a non-native harness the server doesn't declare", () => {
     useChatStore.setState({ sessionHarness: "claude-sdk" });
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@src");
     expect(screen.queryByTitle("Open src")).not.toBeInTheDocument();
+  });
+
+  it("delivers mentions on a non-native harness the server declares", () => {
+    declaredMentions.harnesses = new Set(["claude-sdk"]);
+    useChatStore.setState({ sessionHarness: "claude-sdk" });
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("check @src");
+    fireEvent.click(screen.getByTitle("Open src"));
+    fireEvent.click(screen.getByTitle("Attach server.ts"));
+    append("now");
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend).toHaveBeenCalledWith("check [Attached: src/server.ts] now", undefined);
   });
 
   it("opens the menu on an aliased native harness (native-pi → pi-native)", () => {
@@ -993,5 +1031,48 @@ describe("Composer @-session mentions", () => {
     type("@src/");
     expect(screen.queryAllByTestId(/^session-mention-item-/)).toHaveLength(0);
     expect(screen.getByTitle("Attach server.ts")).toBeInTheDocument();
+  });
+});
+
+describe("Composer @-file mentions with the CodeMirror composer", () => {
+  const codeMirrorInfo = { ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: true } };
+  beforeEach(() => {
+    resetWorkspaceMock();
+    declaredMentions.harnesses = new Set();
+    localStorage.clear();
+    useChatStore.setState({
+      conversationId: "conv_codemirror_mention",
+      sessionHarness: "claude-native",
+      pendingComposerAttachments: [],
+    });
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+  });
+  afterEach(() => {
+    cleanup();
+    resetCodeMirrorComposerLoadForTests();
+    vi.restoreAllMocks();
+  });
+
+  it("shows an attached file as a pill inside the editor", async () => {
+    renderWithTooltips(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...composerProps()} />
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    const editor = screen.getByLabelText("Message the agent");
+
+    act(() => insertComposerText(composerTargetOf(editor)!, "@"));
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+
+    expect(editor.closest('[data-composer-engine="codemirror"]')).not.toBeNull();
+    expect(
+      Array.from(
+        editor.querySelectorAll('[data-testid="composer-mention-token"]'),
+        (token) => token.textContent,
+      ),
+    ).toEqual(["@readme.md"]);
   });
 });

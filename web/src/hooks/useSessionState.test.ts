@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { getSessionState, isSessionWorking } from "./useSessionState";
+import { getSessionState, isSessionWorking, withUnreadState } from "./useSessionState";
 import type { Conversation } from "@/hooks/useConversations";
+import type { LatestSessionError } from "@/lib/sessionError";
 
 type SessionFields = Pick<
   Conversation,
@@ -76,7 +77,6 @@ describe("getSessionState — priority composition", () => {
     expect(getSessionState(conv({ ...shells, status: "idle" }), "disconnected")).toEqual({
       kind: "disconnected",
     });
-    expect(getSessionState(conv({ ...shells, status: "failed" }))).toEqual({ kind: "error" });
     expect(getSessionState(conv({ ...shells, status: "idle" }), "error")).toEqual({
       kind: "error",
     });
@@ -93,7 +93,7 @@ describe("getSessionState — priority composition", () => {
     ).toEqual({ kind: "awaiting", count: 1 });
   });
 
-  it("returns error from the existing failed session status", () => {
+  it("flags status-only failures without a latest-activity label", () => {
     expect(getSessionState(conv({ status: "failed" }))).toEqual({ kind: "error" });
   });
 
@@ -104,13 +104,13 @@ describe("getSessionState — priority composition", () => {
     expect(getSessionState(conv({ status: "failed" }), "recovered_disconnect")).toBeNull();
   });
 
-  it("follows status updates without retaining an old error", () => {
-    const conversation = conv({ status: "failed" });
-    expect(getSessionState(conversation)).toEqual({ kind: "error" });
+  it("follows status updates while the labelled error is kept", () => {
+    const conversation = conv({ status: "idle" });
+    expect(getSessionState(conversation, "error")).toEqual({ kind: "error" });
     conversation.status = "running";
-    expect(getSessionState(conversation)).toEqual({ kind: "running" });
+    expect(getSessionState(conversation, "error")).toEqual({ kind: "running" });
     conversation.status = "idle";
-    expect(getSessionState(conversation)).toBeNull();
+    expect(getSessionState(conversation, null)).toBeNull();
   });
 
   it("treats failed + pending elicitation as awaiting (the actionable signal)", () => {
@@ -136,6 +136,40 @@ describe("getSessionState — priority composition", () => {
   it("returns null when conversation status is undefined", () => {
     // Older sessions whose server payload predates the `status` field.
     expect(getSessionState(conv({}))).toBeNull();
+  });
+});
+
+describe("withUnreadState — the unread dot against derived states", () => {
+  function badge(fields: SessionFields, unread: boolean, error: LatestSessionError | null = null) {
+    return withUnreadState(getSessionState(conv(fields), error), unread);
+  }
+
+  it("shows an ended turn's unread output even while background work runs", () => {
+    expect(badge({ status: "idle" }, true)).toEqual({ kind: "unseen" });
+    expect(badge({ status: "idle", background_work_running: true }, true)).toEqual({
+      kind: "unseen",
+    });
+  });
+
+  it("returns to the background spinner once the output is seen", () => {
+    expect(badge({ status: "idle", background_work_running: true }, false)).toEqual({
+      kind: "running",
+      background: true,
+    });
+    expect(badge({ status: "idle" }, false)).toBeNull();
+  });
+
+  it("keeps running turns, prompts, disconnects and errors ahead of unread output", () => {
+    const shells = { background_work_running: true };
+    expect(badge({ ...shells, status: "running" }, true)).toEqual({ kind: "running" });
+    expect(badge({ ...shells, pending_elicitations_count: 1 }, true)).toEqual({
+      kind: "awaiting",
+      count: 1,
+    });
+    expect(badge({ ...shells, status: "idle" }, true, "disconnected")).toEqual({
+      kind: "disconnected",
+    });
+    expect(badge({ ...shells, status: "idle" }, true, "error")).toEqual({ kind: "error" });
   });
 });
 
