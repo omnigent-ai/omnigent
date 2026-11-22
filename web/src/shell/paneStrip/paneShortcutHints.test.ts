@@ -1,29 +1,17 @@
 import { describe, expect, it } from "vitest";
 
-import { ARIA_MOD_KEY } from "@/components/KeyboardShortcut";
-import { chordKeyLabel } from "@/lib/shortcuts/chord";
-import { activeShortcutChords, shortcutKeys } from "@/lib/shortcuts/registry";
-
+import { paneKeyAria, paneKeyCaps } from "../paneShortcuts";
 import { paneShortcutAria, paneShortcutKeys } from "./paneShortcutHints";
 
 describe("paneShortcutHints", () => {
-  it("shows the registry's chord for the split commands", () => {
-    expect(paneShortcutKeys("terminal.splitRight")).toEqual(shortcutKeys("terminal.splitRight"));
-    expect(paneShortcutKeys("terminal.splitDown")).toEqual(shortcutKeys("terminal.splitDown"));
+  it("shows the pane key a command has here, as caps and for assistive technology", () => {
+    expect(paneShortcutKeys("terminal.toggleZoom")).toEqual(paneKeyCaps("terminal.toggleZoom"));
+    expect(paneShortcutAria("terminal.toggleZoom")).toBe(paneKeyAria("terminal.toggleZoom"));
   });
 
-  it("names the same chord for assistive technology", () => {
-    const [chord] = activeShortcutChords("terminal.splitRight");
-    expect(paneShortcutAria("terminal.splitRight")).toBe(
-      `${ARIA_MOD_KEY}+Alt+Shift+${chordKeyLabel(chord!)}`,
-    );
-    expect(paneShortcutAria("terminal.splitDown")).toBe(
-      `${ARIA_MOD_KEY}+Alt+${chordKeyLabel(activeShortcutChords("terminal.splitDown")[0]!)}`,
-    );
-  });
-
-  it("shows no hint for a pane command without a chord", () => {
-    for (const command of ["terminal.toggleZoom", "close", "terminal.swapLeft", undefined]) {
+  it("shows no hint for a command without a key here", () => {
+    // jsdom isn't a Mac, where the split keys are the shell's.
+    for (const command of ["terminal.splitRight", "close", "terminal.swapLeft", undefined]) {
       expect(paneShortcutKeys(command)).toBeUndefined();
       expect(paneShortcutAria(command)).toBeUndefined();
     }

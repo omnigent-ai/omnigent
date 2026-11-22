@@ -10,8 +10,12 @@ export const TERMINAL_SURFACE = `[${TERMINAL_SURFACE_ATTRIBUTE}]`;
 /** A pane's tile in a split; its `data-terminal-pane` value is the pane's key. */
 export const TERMINAL_PANE = "[data-terminal-pane]";
 
-/** The web chat as a pane of the session's split: where it renders, in or out of the split. */
+/**
+ * The web chat as a pane of the session's split: where it renders, in or out of the split. Its
+ * `data-chat-pane-body` value is the session's id, since a grid shows several sessions' chats.
+ */
 export const CHAT_PANE_BODY = "[data-chat-pane-body]";
+export const CHAT_PANE_BODY_ATTRIBUTE = "data-chat-pane-body";
 
 /** Marks an app pane's body, where its tab renders; its value is the tab's id. */
 export const APP_PANE_HOST_ATTRIBUTE = "data-app-pane-host";

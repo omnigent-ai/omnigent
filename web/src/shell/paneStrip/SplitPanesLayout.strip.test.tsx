@@ -352,9 +352,9 @@ describe("SplitPanesLayout: every pane's strip row", () => {
       const labels = ["Split Right", "Split Down", PANE_ZOOM_LABELS.maximize, "Close Pane"];
       const items = menuItems();
       expect(items).toHaveLength(labels.length);
-      // Each label, then the shortcut ⌘K shows for it.
+      // Each label, then the pane key ⌘K shows for it: Maximize has one on every platform.
       labels.forEach((label, index) => expect(items[index]?.startsWith(label)).toBe(true));
-      expect(items[0]).not.toBe("Split Right");
+      expect(items[2]).not.toBe(PANE_ZOOM_LABELS.maximize);
       expect(inside(menu).getByRole("separator")).toBeInTheDocument();
       fireEvent.click(screen.getByRole("menuitem", { name: /^Split Down/ }));
       expect(commands.get("b")!.splitDown).toHaveBeenCalledTimes(1);
