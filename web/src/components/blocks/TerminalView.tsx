@@ -37,6 +37,7 @@ import {
   type TerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
+import { noteTerminalAttachClosed } from "@/lib/terminalEndings";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 import { ShellCommandDraftContext } from "@/shell/ShellCommandContext";
 import {
@@ -722,6 +723,11 @@ export function TerminalView({
     setConnectAttempt((attempt) => attempt + 1);
   }, [launchMode, closedByOwnLaunch, disposeActiveSession]);
   const refusedDuringLaunch = launchMode === "attach" && closedByOwnLaunch;
+  // A runner that reports exit outcomes names the shell's end in its 4404 close reason.
+  const endedReason = state.kind === "closed" && state.code === 4404 ? state.reason : null;
+  useEffect(() => {
+    if (endedReason !== null) noteTerminalAttachClosed(sessionId, terminalId, endedReason, null);
+  }, [sessionId, terminalId, endedReason]);
   const previousResumeGeneration = useRef(resumeGeneration);
   useEffect(() => {
     if (previousResumeGeneration.current === resumeGeneration) return;

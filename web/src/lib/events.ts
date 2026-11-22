@@ -900,6 +900,8 @@ export interface SessionResourceDeletedEvent {
   resourceId: string;
   resourceType: string;
   sessionId: string;
+  /** How a shell ended, from a runner that reports it (see terminalEndings); else absent. */
+  exit?: unknown;
 }
 
 /**

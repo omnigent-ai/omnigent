@@ -1,3 +1,4 @@
+import type * as TerminalEndingsModule from "@/lib/terminalEndings";
 // Vitest cases for the chat store.
 //
 // `switchTo` opens the session SSE stream and hydrates session
@@ -52,6 +53,7 @@ import {
   SESSION_HISTORY_PAGE_SIZE,
 } from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
+import { readTerminalEnding, recordTerminalEnding } from "@/lib/terminalEndings";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { continuePlanMessage, stopPlanMessage } from "@/lib/workflow";
 import { trackPlanStop, usePlanStops } from "@/store/planStops";
@@ -160,6 +162,12 @@ const realSend = useChatStore.getState().send;
 // don't pick up ambient identity. A `vi.fn` (not the real impl) so
 // per-test `mockReturnValue` works; reset in afterEach so a stubbed
 // identity never leaks across tests.
+// The endings store is its own suite's; here, only what the deletion hands it.
+const endingNotes = vi.hoisted(() => [] as unknown[][]);
+vi.mock("@/lib/terminalEndings", async (importOriginal) => ({
+  ...(await importOriginal<typeof TerminalEndingsModule>()),
+  noteTerminalDeleted: (...args: unknown[]) => void endingNotes.push(args),
+}));
 vi.mock("@/lib/identity", async (importOriginal) => {
   const actual = await importOriginal<typeof IdentityModule>();
   return {
@@ -11848,6 +11856,16 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       }
     });
 
+    it("forgets how the last shell with that id ended, as one started again under it", () => {
+      client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_abc"), []);
+      recordTerminalEnding("conv_abc", "terminal_bash_s1", { kind: "exited", code: 3 }, null);
+      handleSessionEvent({
+        type: "session_resource_created",
+        resource: makeTerminalResource("terminal_bash_s1") as never,
+      });
+      expect(readTerminalEnding("conv_abc", "terminal_bash_s1")).toBeUndefined();
+    });
+
     it("is idempotent for duplicate resource ids", () => {
       client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_abc"), [
         { id: "terminal_bash_s1", name: "bash", session: "s1", running: true },
@@ -11910,6 +11928,27 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       expect(cached).toEqual([
         { id: "terminal_python_s2", name: "python", session: "s2", running: true },
       ]);
+    });
+
+    it("hands a shell's exit and its row to the endings store before the row goes", () => {
+      const row: TerminalInfo = {
+        id: "terminal_bash_s1",
+        name: "bash",
+        session: "s1",
+        running: true,
+      };
+      client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_abc"), [row]);
+      endingNotes.length = 0;
+      const exit = { status: 3, signal: null };
+      handleSessionEvent({
+        type: "session_resource_deleted",
+        resourceId: "terminal_bash_s1",
+        resourceType: "terminal",
+        sessionId: "conv_abc",
+        exit,
+      });
+      expect(endingNotes).toEqual([["conv_abc", "terminal_bash_s1", exit, row]]);
+      expect(client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_abc"))).toEqual([]);
     });
 
     it("is a no-op for an unknown resource id", () => {

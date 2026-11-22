@@ -390,6 +390,33 @@ describe("session.resource.deleted (FLAT envelope)", () => {
     expect(ev.sessionId).toBe("conv_abc");
   });
 
+  it("carries a reporting runner's exit, and adds nothing to an event without one", () => {
+    const base = {
+      type: "session.resource.deleted",
+      resource_id: "terminal_bash_s1",
+      resource_type: "terminal",
+      session_id: "conv_abc",
+    };
+    expect(parse("session.resource.deleted", base)).toEqual([
+      {
+        type: "session_resource_deleted",
+        resourceId: "terminal_bash_s1",
+        resourceType: "terminal",
+        sessionId: "conv_abc",
+      },
+    ]);
+    const exit = { status: 3, signal: null };
+    expect(parse("session.resource.deleted", { ...base, exit })).toEqual([
+      {
+        type: "session_resource_deleted",
+        resourceId: "terminal_bash_s1",
+        resourceType: "terminal",
+        sessionId: "conv_abc",
+        exit,
+      },
+    ]);
+  });
+
   it("rejects missing resource_id", () => {
     const out = parse("session.resource.deleted", {
       type: "session.resource.deleted",

@@ -1,3 +1,4 @@
+import type * as TerminalEndingsModule from "@/lib/terminalEndings";
 // Unit tests for the WebSocket attach path builder and the closed
 // bridge overlay.
 //
@@ -88,6 +89,11 @@ const terminalSessionMock = vi.hoisted(() => ({
   }[],
 }));
 
+const attachEnds = vi.hoisted(() => [] as unknown[][]);
+vi.mock("@/lib/terminalEndings", async (importOriginal) => ({
+  ...(await importOriginal<typeof TerminalEndingsModule>()),
+  noteTerminalAttachClosed: (...args: unknown[]) => void attachEnds.push(args),
+}));
 vi.mock("./TerminalSession", async (importOriginal) => ({
   // Keep the real module (isUnexpectedTerminalClose and friends) —
   // only the session class itself is replaced.
@@ -1618,6 +1624,26 @@ describe("closed bridge overlay", () => {
     expect(terminalSessionMock.instances).toHaveLength(1);
     rerender(<TerminalView {...props} resumeGeneration={1} />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+  });
+
+  it("hands a 4404 close's reason to the endings store, and no other close's", async () => {
+    attachEnds.length = 0;
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_u-1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    act(() => {
+      terminalSessionMock.instances[0].onState({ kind: "closed", reason: "detached", code: 4405 });
+    });
+    expect(attachEnds).toEqual([]);
+    act(() => {
+      terminalSessionMock.instances[0].onState({
+        kind: "closed",
+        reason: "terminal session ended; exit=status:3",
+        code: 4404,
+      });
+    });
+    expect(attachEnds).toEqual([
+      ["conv_abc", "terminal_bash_u-1", "terminal session ended; exit=status:3", null],
+    ]);
   });
 
   it("renders a resume button beside the closed message and invokes the callback", async () => {

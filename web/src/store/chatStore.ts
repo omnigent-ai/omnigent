@@ -164,6 +164,7 @@ import {
   terminalsQueryKey,
   type TerminalInfo,
 } from "@/lib/terminals";
+import { forgetTerminalEnding, noteTerminalDeleted } from "@/lib/terminalEndings";
 import type {
   BackgroundTaskInfo,
   ContentBlock,
@@ -9884,7 +9885,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       return;
     case "session_resource_deleted":
       if (event.resourceType === "terminal") {
-        applyTerminalDeleted(event.sessionId, event.resourceId);
+        applyTerminalDeleted(event.sessionId, event.resourceId, event.exit);
       }
       return;
     case "session_child_session_updated":
@@ -10057,6 +10058,8 @@ function applyTerminalCreated(resource: Record<string, unknown>): void {
   const key = terminalsQueryKey(sessionId);
   // The user closed this shell before its create returned; its launch deletes it.
   if (isClosedDuringLaunch(info.id)) return;
+  // Ids repeat: a shell started again under its id hasn't ended, whatever the last one did.
+  forgetTerminalEnding(sessionId, info.id);
   const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
   if (current.some((t) => t.id === info.id)) return;
   queryClient.setQueryData<TerminalInfo[]>(key, [...current, info]);
@@ -10067,10 +10070,17 @@ function applyTerminalCreated(resource: Record<string, unknown>): void {
  *
  * Idempotent: a delete for an unknown id is a no-op.
  */
-function applyTerminalDeleted(sessionId: string, resourceId: string): void {
+function applyTerminalDeleted(sessionId: string, resourceId: string, exit?: unknown): void {
   if (queryClient === null) return;
   const key = terminalsQueryKey(sessionId);
   const current = queryClient.getQueryData<TerminalInfo[]>(key);
+  // Read before the row goes, so a view keeping a shell that didn't exit cleanly has its row.
+  noteTerminalDeleted(
+    sessionId,
+    resourceId,
+    exit,
+    current?.find((t) => t.id === resourceId) ?? null,
+  );
   if (current === undefined) return;
   const next = current.filter((t) => t.id !== resourceId);
   if (next.length === current.length) return;

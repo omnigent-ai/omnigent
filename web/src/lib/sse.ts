@@ -948,6 +948,8 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       resourceId,
       resourceType,
       sessionId,
+      // Only a runner that reports exit outcomes sends it; without it the event is as before.
+      ...("exit" in data ? { exit: data.exit } : {}),
     } satisfies SessionResourceDeletedEvent;
   }
   if (eventType === "session.child_session.updated") {
