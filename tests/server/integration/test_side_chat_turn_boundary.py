@@ -175,6 +175,25 @@ async def test_side_chat_leaves_out_the_turn_a_follow_up_was_steered_into(
     assert await _side_chat_history(client, native_session) == [_CODENAME, _NOTED]
 
 
+async def test_side_chat_leaves_out_a_turn_whose_follow_up_was_sent_before_it_ran(
+    client: httpx.AsyncClient, native_session: str
+) -> None:
+    """A follow-up sent before the turn is seen running does not become the turn's start."""
+    await _exchange(client, native_session)
+    await _send(client, native_session, "Run the long command")
+    await _send(client, native_session, "Also check the parser")
+    await _status(client, native_session, "running")
+    for role, text in (
+        ("user", "Run the long command"),
+        ("assistant", "Running it now"),
+        ("user", "Also check the parser"),
+        ("assistant", "Checking the parser too"),
+    ):
+        await _mirror(client, native_session, role, text, "claude_turn_2")
+
+    assert await _side_chat_history(client, native_session) == [_CODENAME, _NOTED]
+
+
 @pytest.mark.parametrize("turn_end", ["idle", "waiting_on_background_agents"])
 async def test_side_chat_keeps_the_exchange_before_a_task_notification_turn(
     client: httpx.AsyncClient, native_session: str, turn_end: str
@@ -276,5 +295,20 @@ async def test_sdk_side_chat_leaves_out_the_turn_a_follow_up_was_steered_into(
     await _sdk_turn(client, session_id, send_request, "Reviewing it", "r2")
     await _send(client, session_id, "Also check the lexer")
     await _mirror(client, session_id, "assistant", "Checking the lexer too", "r2")
+
+    assert await _side_chat_history(client, session_id) == [_CODENAME, _NOTED]
+
+
+async def test_sdk_side_chat_leaves_out_a_turn_whose_follow_up_was_sent_before_it_ran(
+    client: httpx.AsyncClient, runner: None
+) -> None:
+    """An SDK follow-up sent before the runner reports the turn running is not its start."""
+    session_id = await _session(client, native=False)
+    await _sdk_turn(client, session_id, lambda: _send(client, session_id, _CODENAME), _NOTED, "r1")
+    sessions_module._publish_status(session_id, "idle")
+    await _send(client, session_id, "Review the parser")
+    await _send(client, session_id, "Also check the lexer")
+    sessions_module._publish_status(session_id, "running")
+    await _mirror(client, session_id, "assistant", "Reviewing both", "r2")
 
     assert await _side_chat_history(client, session_id) == [_CODENAME, _NOTED]
