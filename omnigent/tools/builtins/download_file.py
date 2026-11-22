@@ -97,9 +97,11 @@ class DownloadFileTool(Tool):
         if record is None:
             return json.dumps({"error": f"File {file_id!r} not found."})
 
-        # Reject session-scoped files that belong to a different
-        # conversation (ownership, not just existence).
-        if record.session_id is not None and record.session_id != ctx.conversation_id:
+        # Reject another conversation's files and project files, which are not
+        # global even though they have no session.
+        if record.project_id is not None or (
+            record.session_id is not None and record.session_id != ctx.conversation_id
+        ):
             return json.dumps({"error": f"File {file_id!r} not found."})
 
         try:

@@ -40,6 +40,7 @@ def _to_entity(row: SqlFile) -> StoredFile:
         source_metadata=(
             json.loads(row.source_metadata) if row.source_metadata is not None else None
         ),
+        project_id=row.project_id,
     )
 
 
@@ -186,33 +187,28 @@ class SqlAlchemyFileStore(FileStore):
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
-        include_unscoped: bool = False,
     ) -> PagedList[StoredFile]:
         """
-        List a session's files with cursor-based pagination.
+        List a session's own files with cursor-based pagination.
 
         Always scoped to ``session_id`` — the query filters on it, so
-        it is served by ``ix_files_session_id_created_at``.
+        it is served by ``ix_files_session_id_created_at``. Global files,
+        which belong to no session, aren't any session's.
 
         :param session_id: Owning session whose files to list.
         :param limit: Maximum number of files to return.
         :param after: Cursor file ID for forward pagination.
         :param before: Cursor file ID for backward pagination.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param include_unscoped: When ``True``, also return global
-            files (``session_id IS NULL``).
         :returns: A :class:`PagedList` of :class:`StoredFile`.
         """
         with self._session("list_files") as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
-            stmt = select(SqlFile).where(SqlFile.workspace_id == current_workspace_id())
-            if include_unscoped:
-                stmt = stmt.where(
-                    or_(SqlFile.session_id == session_id, SqlFile.session_id.is_(None))
-                )
-            else:
-                stmt = stmt.where(SqlFile.session_id == session_id)
+            stmt = select(SqlFile).where(
+                SqlFile.workspace_id == current_workspace_id(),
+                SqlFile.session_id == session_id,
+            )
             if after:
                 sub = (
                     select(SqlFile.created_at)

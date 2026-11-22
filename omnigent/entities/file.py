@@ -31,6 +31,10 @@ class StoredFile:
         giving the pre-downscale pixel size — used to tell the model it is
         viewing a reduced-resolution version. New file types may add their
         own keys without a schema change.
+    :param project_id: Owning project when the file is project-scoped,
+        e.g. ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``. Every session filed in
+        that project can read it. ``None`` for session files, which carry
+        ``session_id`` instead.
     """
 
     id: str
@@ -41,3 +45,4 @@ class StoredFile:
     session_id: str | None = None
     blob_key: str | None = None
     source_metadata: dict[str, Any] | None = None
+    project_id: str | None = None

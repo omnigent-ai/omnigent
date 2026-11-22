@@ -726,7 +726,8 @@ def extract_text_attachments(
             continue
         if file_meta is None:
             continue
-        if (
+        # A project file has no session but isn't global; messages don't reference it.
+        if file_meta.project_id is not None or (
             file_meta.session_id is not None
             and session_id is not None
             and file_meta.session_id != session_id
@@ -936,8 +937,11 @@ def _resolve_file_id_block(
     file_id = block["file_id"]
     owner_session_id = session_id or _session_id_from_block(block)
     file_meta = file_store.get(file_id)
-    if file_meta is None or (
-        file_meta.session_id is not None and file_meta.session_id != owner_session_id
+    # A project file has no session but isn't global; messages don't reference it.
+    if (
+        file_meta is None
+        or file_meta.project_id is not None
+        or (file_meta.session_id is not None and file_meta.session_id != owner_session_id)
     ):
         raise ValueError(
             f"Referenced file '{file_id}' no longer exists — "
