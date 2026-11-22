@@ -629,6 +629,8 @@ async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: 
         "ReadLinkText",
         "SearchFiles",
         "search_files.substring",
+        "search_files.fuzzy",
+        "search_files.browse",
         "SearchText",
         "ResolveWorkingCopyBase",
         "revision_comparison",
@@ -653,10 +655,23 @@ async def test_capabilities_leave_out_methods_whose_tool_is_missing(
     assert set(response.capabilities) == {"ListDirectory", "ReadFile", "StatPath", "ReadLinkText"}
 
 
+async def test_capabilities_leave_out_fuzzy_search_where_paths_cant_be_ranked(
+    tmp_path: Path, client_for: ClientFor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("omnigent.host.workspace_fuzzy._frizbee", lambda: None)
+    client = client_for(tmp_path)
+
+    response = await client.get_capabilities(GetCapabilitiesRequest())
+
+    assert "search_files.substring" in response.capabilities
+    assert not {"search_files.fuzzy", "search_files.browse"} & set(response.capabilities)
+
+
 async def test_a_search_mode_not_served_answers_unimplemented(
-    tmp_path: Path, client_for: ClientFor
+    tmp_path: Path, client_for: ClientFor, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A client that skips GetCapabilities still gets a code it can fall back on."""
+    monkeypatch.setattr("omnigent.host.workspace_fuzzy._frizbee", lambda: None)
     client = client_for(tmp_path)
 
     with pytest.raises(ConnectError) as fuzzy:

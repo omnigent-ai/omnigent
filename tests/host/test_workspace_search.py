@@ -23,11 +23,13 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     ENTRY_TYPE_FILE,
     FILE_SEARCH_MODE_FUZZY,
     FILE_SEARCH_MODE_SUBSTRING,
+    FILE_SEARCH_MODE_UNSPECIFIED,
     SearchFilesRequest,
     SearchFilesResponse,
     SearchTextRequest,
     SearchTextResponse,
 )
+from omnigent.host import workspace_fuzzy, workspace_search
 from omnigent.host.workspace_git import files as files_module
 from omnigent.host.workspace_search import DirectoryScope, search_files, search_text
 from tests.host.test_workspace_git_runner import _alive, _fake_git, _git, _repository
@@ -39,14 +41,20 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(autouse=True)
 def _fresh_listers() -> Iterator[None]:
-    # Each test's repository gets its own untracked list.
+    # Each test's repository gets its own listings and ranked file lists.
     files_module._by_root.clear()
+    workspace_search._corpora = workspace_fuzzy.CorpusCache()
     yield
     files_module._by_root.clear()
 
 
 async def _search(root: Path, query: str, **fields: object) -> SearchFilesResponse:
     request = SearchFilesRequest(query=query, mode=FILE_SEARCH_MODE_SUBSTRING, **fields)  # type: ignore[arg-type]
+    return await search_files(root, request)
+
+
+async def _fuzzy(root: Path, query: str, **fields: object) -> SearchFilesResponse:
+    request = SearchFilesRequest(query=query, mode=FILE_SEARCH_MODE_FUZZY, **fields)  # type: ignore[arg-type]
     return await search_files(root, request)
 
 
@@ -181,11 +189,147 @@ async def test_outside_git_the_walk_finds_everything(tmp_path: Path) -> None:
     assert response.indexed_paths == 0
 
 
-async def test_blank_queries_find_nothing_and_fuzzy_mode_is_unimplemented(tmp_path: Path) -> None:
+async def test_blank_substring_queries_find_nothing(tmp_path: Path) -> None:
     assert _paths(await _search(tmp_path, "   ")) == []
+
+
+@pytest.mark.parametrize("mode", [FILE_SEARCH_MODE_FUZZY, FILE_SEARCH_MODE_UNSPECIFIED])
+async def test_fuzzy_mode_is_unimplemented_where_paths_cant_be_ranked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int
+) -> None:
+    monkeypatch.setattr(workspace_fuzzy, "_frizbee", lambda: None)
+
     with pytest.raises(ConnectError) as fuzzy:
-        await search_files(tmp_path, SearchFilesRequest(query="x", mode=FILE_SEARCH_MODE_FUZZY))
+        await search_files(tmp_path, SearchFilesRequest(query="x", mode=mode))  # type: ignore[arg-type]
+
     assert fuzzy.value.code == Code.UNIMPLEMENTED
+
+
+def _project(root: Path) -> Path:
+    _repository(root)
+    (root / "web" / "electron").mkdir(parents=True)
+    (root / "web" / "electron" / "workspaceFastTrack.ts").write_text("x")
+    (root / "web" / "fast").mkdir()
+    (root / "web" / "fast" / "tracks.ts").write_text("x")
+    (root / "docs").mkdir()
+    (root / "docs" / "workspace.md").write_text("x")
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "project")
+    (root / "web" / "electron" / "workspaceFastTrack.test.ts").write_text("x")  # untracked
+    return root
+
+
+async def test_fuzzy_queries_rank_files_best_first_with_highlights(tmp_path: Path) -> None:
+    root = _project(tmp_path / "repo")
+
+    response = await _fuzzy(root, "wsft")
+
+    assert _paths(response)[:2] == [
+        "web/electron/workspaceFastTrack.ts",
+        "web/electron/workspaceFastTrack.test.ts",
+    ]
+    best = response.results[0]
+    assert best.score >= response.results[-1].score > 0
+    path = best.entry.path
+    assert "".join(path[index] for index in best.matched_indices).lower() == "wsft"
+    assert all(result.entry.type == ENTRY_TYPE_FILE for result in response.results)
+    assert response.indexed_paths == 5 and not response.truncated
+
+
+async def test_a_blank_fuzzy_query_lists_files_in_path_order(tmp_path: Path) -> None:
+    root = _project(tmp_path / "repo")
+
+    every = await _fuzzy(root, "  ")
+    capped = await _fuzzy(root, "", maximum_results=2)
+
+    assert _paths(every) == [
+        "a.txt",
+        "docs/workspace.md",
+        "web/electron/workspaceFastTrack.test.ts",
+        "web/electron/workspaceFastTrack.ts",
+        "web/fast/tracks.ts",
+    ]
+    assert all(result.score == 0 and not result.matched_indices for result in every.results)
+    assert not every.truncated
+    assert _paths(capped) == ["a.txt", "docs/workspace.md"] and capped.truncated
+
+
+async def test_fuzzy_results_keep_to_the_path_scopes_and_globs(tmp_path: Path) -> None:
+    root = _project(tmp_path / "repo")
+
+    beneath = await _fuzzy(root, "ts", path="web")
+    scoped = await _fuzzy(root, "", include_directories=["web"], exclude_directories=["web/fast"])
+    globbed = await _fuzzy(root, "", include=["*.md"])
+
+    assert set(_paths(beneath)) == {
+        "electron/workspaceFastTrack.ts",
+        "electron/workspaceFastTrack.test.ts",
+        "fast/tracks.ts",
+    }
+    assert _paths(scoped) == [
+        "web/electron/workspaceFastTrack.test.ts",
+        "web/electron/workspaceFastTrack.ts",
+    ]
+    assert _paths(globbed) == ["docs/workspace.md"]
+
+
+@pytest.mark.parametrize(
+    ("include_git_ignored", "expected"),
+    [
+        (False, ["src/main.py", "src/new_main.py"]),
+        (True, ["src/build/main.o", "src/main.py", "src/new_main.py"]),
+    ],
+)
+async def test_fuzzy_mode_ranks_ignored_files_only_when_asked(
+    tmp_path: Path, include_git_ignored: bool, expected: list[str]
+) -> None:
+    root = _ignoring_repository(tmp_path / "repo")
+
+    response = await _fuzzy(root, "main", include_git_ignored=include_git_ignored)
+
+    assert sorted(_paths(response)) == expected
+
+
+async def test_outside_git_fuzzy_mode_ranks_the_walked_files(tmp_path: Path) -> None:
+    (tmp_path / "notes").mkdir()
+    (tmp_path / "notes" / "todo.md").write_text("x")
+    (tmp_path / "readme.md").write_text("x")
+
+    response = await _fuzzy(tmp_path, "todo")
+
+    assert _paths(response) == ["notes/todo.md"]
+    assert response.indexed_paths == 0
+
+
+async def test_fuzzy_mode_skips_deleted_files_and_never_describes_outside_links(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path / "repo")
+    (tmp_path / "secret.txt").write_text("secret bytes")
+    (root / "gone.txt").write_text("x")
+    (root / "link_out.txt").symlink_to(tmp_path / "secret.txt")
+    (root / "sub").mkdir()
+    (root / "sub" / "x.txt").write_text("x")
+    (root / "linked_dir").symlink_to("sub")
+    _git(root, "add", "gone.txt", "link_out.txt", "linked_dir", "sub/x.txt")
+    (root / "gone.txt").unlink()
+
+    response = await _fuzzy(root, "")
+
+    described = {r.entry.path: (r.entry.size, r.entry.is_symlink) for r in response.results}
+    # The deleted file and the link to a directory are left out.
+    assert described == {"a.txt": (2, False), "link_out.txt": (0, True), "sub/x.txt": (1, False)}
+    assert not response.results[1].entry.HasField("size")
+
+
+async def test_a_new_commit_is_ranked_on_the_next_query(tmp_path: Path) -> None:
+    root = _project(tmp_path / "repo")
+    assert "lib/ranking.py" not in _paths(await _fuzzy(root, "rank"))
+    (root / "lib").mkdir()
+    (root / "lib" / "ranking.py").write_text("x")
+    _git(root, "add", "lib/ranking.py")
+
+    assert _paths(await _fuzzy(root, "rank")) == ["lib/ranking.py"]
 
 
 async def test_globs_arrive_as_lists_without_comma_splitting(tmp_path: Path) -> None:
@@ -560,3 +704,64 @@ async def test_an_excluded_directory_ending_in_a_space_is_the_one_excluded(
     responses = await _search_text(tmp_path, "needle", exclude_directories=["build "])
 
     assert _lines(responses) == ["build/hit.txt:1"]
+
+
+async def test_files_staged_since_the_untracked_list_are_listed_and_ranked_once(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path / "repo")
+    for index in range(40):
+        (root / f"note{index:02}.md").write_text("x")
+    await _fuzzy(root, "")  # remembers the 40 untracked notes
+    _git(root, "add", ".")  # now tracked too, while the untracked list is reused
+
+    listed = await _fuzzy(root, "", maximum_results=81)
+    ranked = await _fuzzy(root, "note", maximum_results=40)
+
+    assert len(_paths(listed)) == len(set(_paths(listed))) == 41  # a.txt and the notes
+    assert len(set(_paths(ranked))) == 40
+
+
+async def test_tracked_and_untracked_files_beneath_a_folder_are_compared_by_full_path(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path / "repo")  # tracks a.txt
+    (root / "src").mkdir()
+    (root / "src" / "a.txt").write_text("x")
+    (root / "src" / "b.txt").write_text("x")
+    await _fuzzy(root, "", path="src")  # remembers both as untracked
+    _git(root, "add", "src/b.txt")  # now tracked too, while the untracked list is reused
+
+    ranked = await _fuzzy(root, "a", path="src")
+    listed = await _fuzzy(root, "", path="src")
+
+    assert _paths(ranked) == ["a.txt"]  # not hidden by the tracked a.txt above src
+    assert _paths(listed) == ["a.txt", "b.txt"]  # b.txt once
+
+
+async def test_fuzzy_mode_keeps_ranking_past_many_deleted_files(tmp_path: Path) -> None:
+    root = _repository(tmp_path / "repo")
+    for index in range(40):
+        (root / f"report{index:02}.md").write_text("x")
+    (root / "docs").mkdir()
+    (root / "docs" / "quarterly_report_draft.md").write_text("x")
+    _git(root, "add", ".")
+    for index in range(40):
+        (root / f"report{index:02}.md").unlink()  # still in the index, gone from disk
+
+    response = await _fuzzy(root, "report", maximum_results=5)
+
+    assert _paths(response) == ["docs/quarterly_report_draft.md"]
+    assert not response.truncated
+
+
+async def test_a_walk_that_runs_out_of_budget_says_the_list_is_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workspace_search, "_SEARCH_SCAN_BUDGET", 10)
+    for index in range(30):
+        (tmp_path / f"file{index:02}.txt").write_text("x")
+
+    response = await _fuzzy(tmp_path, "")
+
+    assert response.index_incomplete
