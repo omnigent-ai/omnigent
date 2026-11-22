@@ -12,7 +12,7 @@ import { isImeCompositionKeyEvent } from "@/lib/ime";
  */
 export function offersSavedWorkflows(
   workflows: readonly SavedWorkflow[],
-  pagination?: WorkflowPagination,
+  pagination?: Pick<WorkflowPagination, "hasMore">,
 ): boolean {
   // A list whose loaded pages show nothing yet can still have more to load.
   return workflows.some((workflow) => !workflow.is_draft) || pagination?.hasMore === true;

@@ -161,6 +161,7 @@ beforeEach(() => {
     isLoading: false,
     isError: false,
     refresh: vi.fn(),
+    reload: vi.fn().mockResolvedValue({ workflows: [], hasMore: false }),
     pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
   });
   conversationRegistry
@@ -174,7 +175,7 @@ afterEach(() => {
 });
 
 describe("TasksPanel", () => {
-  it("says where tasks come from, and links to starting a workflow when the composer can", () => {
+  it("says where tasks come from, and links to starting a workflow when the composer can", async () => {
     showJournal([]);
     renderPanel();
     expect(screen.getByText("No tasks yet")).toBeTruthy();
@@ -190,9 +191,9 @@ describe("TasksPanel", () => {
       expect(screen.getByText(/to-do list or you/).textContent).toBe(
         "Tasks show up here when the agent makes a to-do list or you run a workflow.",
       );
-      fireEvent.click(screen.getByRole("button", { name: "run a workflow" }));
+      fireEvent.pointerDown(screen.getByRole("button", { name: "run a workflow" }), { button: 0 });
+      await waitFor(() => expect(start).toHaveBeenCalled());
       expect(closeDrawer).toHaveBeenCalled();
-      expect(start).toHaveBeenCalled();
     } finally {
       act(withdraw);
     }
@@ -217,10 +218,13 @@ describe("TasksPanel", () => {
       isLoading: false,
       isError: false,
       refresh,
+      reload: vi.fn(),
       pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
     });
-    const start = vi.fn();
-    const closeDrawer = vi.fn();
+    // The phone's drawer closes before the dialog opens over the chat.
+    const calls: string[] = [];
+    const start = vi.fn(() => void calls.push("start"));
+    const closeDrawer = vi.fn(() => void calls.push("close drawer"));
     const withdraw = registerStartWorkflow("conv", start);
     try {
       renderPanel(closeDrawer);
@@ -241,19 +245,22 @@ describe("TasksPanel", () => {
       });
       fireEvent.click(screen.getByTestId("composer-describe-workflow"));
       await waitFor(() => expect(start).toHaveBeenLastCalledWith("Bump deps"));
-      expect(closeDrawer).toHaveBeenCalledTimes(2);
+      expect(calls).toEqual(["close drawer", "start", "close drawer", "start"]);
     } finally {
       act(withdraw);
     }
   });
 
-  it("goes straight to describing a workflow when no saved one can run", () => {
+  it("goes straight to describing a workflow when no saved one can run", async () => {
     showJournal([]);
+    const drafts = [{ id: "b".repeat(32), name: "Unfinished", description: "", is_draft: true }];
+    const reload = vi.fn().mockResolvedValue({ workflows: drafts, hasMore: false });
     vi.mocked(useSavedWorkflows).mockReturnValue({
-      workflows: [{ id: "b".repeat(32), name: "Unfinished", description: "", is_draft: true }],
+      workflows: drafts,
       isLoading: false,
       isError: false,
       refresh: vi.fn(),
+      reload,
       pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
     });
     const start = vi.fn();
@@ -261,9 +268,10 @@ describe("TasksPanel", () => {
     try {
       renderPanel();
       const link = screen.getByRole("button", { name: "run a workflow" });
-      expect(link).not.toHaveAttribute("aria-haspopup");
-      fireEvent.click(link);
-      expect(start).toHaveBeenCalledWith();
+      expect(link).toHaveAttribute("aria-haspopup", "dialog");
+      fireEvent.pointerDown(link, { button: 0 });
+      await waitFor(() => expect(start).toHaveBeenCalledWith());
+      expect(reload).toHaveBeenCalledOnce();
       expect(screen.queryByTestId("composer-workflow-picker")).toBeNull();
     } finally {
       act(withdraw);
@@ -428,6 +436,7 @@ describe("TasksPanel", () => {
       isLoading: false,
       isError: false,
       refresh: vi.fn(),
+      reload: vi.fn(),
       pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
     });
     showJournal([{ ...journalPlan(0, ["explore"]), workflow_id: workflowId }]);
@@ -466,6 +475,7 @@ describe("TasksPanel", () => {
       isLoading: false,
       isError: false,
       refresh: vi.fn(),
+      reload: vi.fn(),
       pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
     });
     const renderWorkflowRuns = vi.fn((id: string) => <p data-testid="workflow-runs-slot">{id}</p>);

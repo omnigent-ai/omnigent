@@ -201,6 +201,27 @@ describe("workflows shared with the user", () => {
     },
   );
 
+  it("resolves a reload with what both lists hold then, the user's own first", async () => {
+    vi.mocked(useServerInfo).mockReturnValue(SHARING);
+    let sharedCalls = 0;
+    vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
+      if (!String(url).startsWith("/v1/workflows/shared")) return respond(String(url));
+      sharedCalls += 1;
+      return Response.json({ data: sharedCalls === 1 ? [] : [shared], next_cursor: null });
+    });
+    const { result } = renderWithClient(() => useSavedWorkflows({ includeShared: true }));
+    await waitFor(() => expect(sharedCalls).toBe(1));
+    await waitFor(() => expect(result.current.workflows).toEqual([own]));
+
+    // Shared since the list loaded: the reload resolves with it.
+    let reloaded: unknown;
+    await act(async () => {
+      reloaded = await result.current.reload();
+    });
+    expect(reloaded).toEqual({ workflows: [own, shared], hasMore: false });
+    expect(sharedCalls).toBe(2);
+  });
+
   it.each([
     ["a server that doesn't share workflows", { ...SHARING, workflow_sharing: false }],
     ["a single-user server", { ...SHARING, single_user: true }],

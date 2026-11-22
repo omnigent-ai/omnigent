@@ -1,4 +1,4 @@
-import { type ReactNode, useRef } from "react";
+import { type ReactNode, useRef, useState } from "react";
 
 import { offersSavedWorkflows, WorkflowPicker } from "@/components/composer/WorkflowPicker";
 import {
@@ -27,24 +27,47 @@ export function RunWorkflowMenu({
   children: ReactNode;
   onStart: (description?: string, savedWorkflow?: SavedWorkflow) => void;
 }) {
-  const { workflows, pagination, refresh } = useSavedWorkflows({ includeShared: true });
-  const pendingActionRef = useRef<(() => void) | null>(null);
-  if (!offersSavedWorkflows(workflows, pagination)) {
-    return (
-      <button type="button" className={className} onClick={() => onStart()}>
-        {children}
-      </button>
-    );
+  const { workflows, pagination, refresh, reload } = useSavedWorkflows({ includeShared: true });
+  const listed = offersSavedWorkflows(workflows, pagination);
+  const [open, setOpen] = useState(false);
+  // Set when a reload finds workflows to run: the menu opens once the list shows them.
+  const [openWhenListed, setOpenWhenListed] = useState(false);
+  if (openWhenListed && listed) {
+    setOpenWhenListed(false);
+    setOpen(true);
   }
+  const checkingRef = useRef(false);
+  const pendingActionRef = useRef<(() => void) | null>(null);
+  const show = async () => {
+    if (listed) {
+      // A workflow saved since the list last loaded shows up.
+      refresh();
+      setOpen(true);
+      return;
+    }
+    // An empty list may be out of date or still loading, e.g. after a workflow was
+    // saved elsewhere, so reload it before going straight to describing one.
+    if (checkingRef.current) return;
+    checkingRef.current = true;
+    try {
+      const latest = await reload();
+      if (offersSavedWorkflows(latest.workflows, latest)) setOpenWhenListed(true);
+      else onStart();
+    } finally {
+      checkingRef.current = false;
+    }
+  };
   return (
     <DropdownMenu
-      onOpenChange={(open) => {
-        // A workflow saved since the list last loaded shows up.
-        if (open) refresh();
+      open={open}
+      onOpenChange={(next) => {
+        if (next) void show();
+        else setOpen(false);
       }}
     >
       <DropdownMenuTrigger asChild>
-        <button type="button" className={className}>
+        {/* One button whether or not there's a list, so it keeps focus as the list loads. */}
+        <button type="button" className={className} aria-haspopup={listed ? "menu" : "dialog"}>
           {children}
         </button>
       </DropdownMenuTrigger>
