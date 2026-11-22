@@ -1,5 +1,11 @@
-import { type CSSProperties, useEffect, useRef, useState } from "react";
-import { ChevronRightIcon, FolderOpenIcon, PlusIcon, SmilePlusIcon } from "lucide-react";
+import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ChevronRightIcon,
+  FolderOpenIcon,
+  FolderPlusIcon,
+  PlusIcon,
+  SmilePlusIcon,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -38,6 +44,9 @@ import { deriveRepoName, sandboxRepoProblem } from "@/lib/sandboxRepositories";
 import { SandboxRepositoryPicker } from "./SandboxRepositoryPicker";
 import { joinPath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
+import type { PaletteCommand } from "@/store/paletteCommands";
+
+import { useQuickPickPaletteCommands } from "./screenCommands/useQuickPickPaletteCommands";
 
 interface WorkspaceSelection {
   hostId: string;
@@ -140,6 +149,8 @@ function friendlyCloneError(error: unknown): string {
   return "The repository couldn’t be cloned. Check the details and try again.";
 }
 
+const NO_COMMANDS: PaletteCommand[] = [];
+
 /**
  * "New project" control in the Projects group header. Opens a dialog that
  * creates an EMPTY first-class project (`POST /v1/projects`) — the capability
@@ -156,11 +167,14 @@ export function NewProjectButton({
   hostId,
   hosts,
   hostsLoading,
+  inPalette = false,
 }: {
   onCreated: (name: string) => void;
   hostId: string | null;
   hosts: Host[];
   hostsLoading: boolean;
+  /** Offer New project… in the QuickPick ⌘K palette; one mounted button does. */
+  inPalette?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
@@ -384,6 +398,50 @@ export function NewProjectButton({
       },
     );
   };
+
+  // A fresh dialog each time, from the button or ⌘K.
+  const openDialog = () => {
+    submissionGeneration.current += 1;
+    setName("");
+    setIcon(undefined);
+    setRunOn(hostId);
+    runOnPicked.current = false;
+    setSourceMode("folder");
+    setWorkspace(null);
+    setCreatedWorkspace(null);
+    setWorkspacePickerOpen(false);
+    setCreateWorkspaceFolder(false);
+    setRepositories([]);
+    setPendingRepoUrl("");
+    setPendingRepoBranch("");
+    setCloneParent("~");
+    setDestinationOverride(null);
+    setParentPickerOpen(false);
+    setCheckout(null);
+    setRepositorySubmitting(false);
+    setSubmitError(null);
+    setOpen(true);
+  };
+  const openDialogRef = useRef(openDialog);
+  openDialogRef.current = openDialog;
+  const paletteCommands = useMemo<PaletteCommand[]>(
+    () =>
+      inPalette
+        ? [
+            {
+              id: "project.new",
+              label: "New project…",
+              icon: FolderPlusIcon,
+              keywords: ["project", "folder", "create", "add"],
+              // The dialog takes focus once the palette has closed.
+              movesFocus: true,
+              run: () => openDialogRef.current(),
+            },
+          ]
+        : NO_COMMANDS,
+    [inPalette],
+  );
+  useQuickPickPaletteCommands("new-project", "Project", paletteCommands);
 
   const dialog = (
     <Dialog
@@ -781,26 +839,7 @@ export function NewProjectButton({
             className="text-muted-foreground mobile-touch-target"
             onClick={(e) => {
               e.stopPropagation();
-              submissionGeneration.current += 1;
-              setName("");
-              setIcon(undefined);
-              setRunOn(hostId);
-              runOnPicked.current = false;
-              setSourceMode("folder");
-              setWorkspace(null);
-              setCreatedWorkspace(null);
-              setWorkspacePickerOpen(false);
-              setCreateWorkspaceFolder(false);
-              setRepositories([]);
-              setPendingRepoUrl("");
-              setPendingRepoBranch("");
-              setCloneParent("~");
-              setDestinationOverride(null);
-              setParentPickerOpen(false);
-              setCheckout(null);
-              setRepositorySubmitting(false);
-              setSubmitError(null);
-              setOpen(true);
+              openDialog();
             }}
           >
             <PlusIcon className="size-3.5" />

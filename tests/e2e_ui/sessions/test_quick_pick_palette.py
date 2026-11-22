@@ -392,6 +392,27 @@ def test_quick_pick_renames_the_open_sessions_project(
     poll_until(lambda: renamed in _project_names(base_url), timeout_s=15.0)
 
 
+def test_quick_pick_creates_a_project(
+    request: pytest.FixtureRequest, seeded_session: tuple[str, str]
+) -> None:
+    """⌘K New project… opens the Projects header's dialog and files a new folder."""
+    base_url, session_id = seeded_session
+    page: Page = request.getfixturevalue("page")
+    enable_quick_pick_palette(page)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible(timeout=30_000)
+
+    run_palette_command(page, "new project", "New project…")
+    name_input = page.get_by_placeholder("Project name…")
+    expect(name_input).to_be_visible(timeout=10_000)
+    name = f"Wren {uuid.uuid4().hex[:6]}"
+    name_input.fill(name)
+    page.get_by_test_id("new-project-confirm").click()
+    expect(page.get_by_test_id("new-project-confirm")).to_have_count(0)
+    expect(_project_folder(page, name)).to_be_visible()
+    poll_until(lambda: name in _project_names(base_url), timeout_s=15.0)
+
+
 def test_quick_pick_deletes_the_project_a_new_session_starts_in(
     request: pytest.FixtureRequest, seeded_session: tuple[str, str]
 ) -> None:
