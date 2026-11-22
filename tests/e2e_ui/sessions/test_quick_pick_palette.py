@@ -468,6 +468,12 @@ def test_quick_pick_ctrl_tab_steps_through_the_sidebar(
     expect(page.locator(f'li[data-sidebar-session-id="{other_id}"]')).to_be_visible(timeout=30_000)
     rows = _rendered_row_ids(page)
     below = rows[(rows.index(open_id) + 1) % len(rows)]
+    # The chords wait for quick_pick_palette, which ⌘K opening the QuickPick palette shows.
+    page.keyboard.press("ControlOrMeta+k")
+    palette_input = page.get_by_role("combobox", name="Command palette")
+    expect(palette_input).to_be_focused(timeout=10_000)
+    page.keyboard.press("Escape")
+    expect(palette_input).to_have_count(0)
 
     page.keyboard.press("Control+Tab")
     expect(page).to_have_url(re.compile(rf"/c/{below}$"), timeout=10_000)
