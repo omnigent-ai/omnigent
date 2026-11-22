@@ -4,7 +4,12 @@
 import type { RefObject } from "react";
 
 import { isFocusInDialogOrMenu, isTextEntry } from "@/lib/hotkeys";
-import { CHAT_PANE_BODY, TERMINAL_PANE, TERMINAL_SURFACE } from "@/lib/paneSurfaces";
+import {
+  CHAT_PANE_BODY,
+  CHAT_PANE_BODY_ATTRIBUTE,
+  TERMINAL_PANE,
+  TERMINAL_SURFACE,
+} from "@/lib/paneSurfaces";
 import { domCellSizing, type PaneSizing } from "./paneSizing";
 import { focusSplitPane } from "./splitTargetActions";
 import type { SplitTarget } from "./terminalSplitTarget";
@@ -33,9 +38,10 @@ export interface PaneFocus {
   subscribe: (listener: PaneFocusListener) => () => void;
 }
 
-/** Whether the keyboard is in the session's web chat. */
-export function focusInChatPane(): boolean {
-  return !!document.activeElement?.closest(CHAT_PANE_BODY);
+/** Whether the keyboard is in session ``conversationId``'s web chat, not another session's. */
+export function focusInChatPane(conversationId: string): boolean {
+  const body = document.activeElement?.closest(CHAT_PANE_BODY);
+  return body?.getAttribute(CHAT_PANE_BODY_ATTRIBUTE) === conversationId;
 }
 
 /** Whether the keyboard is on the page itself, not in a field, terminal, dialog or menu. */
