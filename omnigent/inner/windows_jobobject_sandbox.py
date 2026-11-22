@@ -176,6 +176,17 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
 
     type_name = "windows_jobobject"
 
+    def launch_fingerprint(
+        self,
+        argv: list[str],
+        policy: SandboxPolicy,
+        cwd: Path,
+        chdir: Path | None = None,
+    ) -> object:
+        """Job containment derives no launch-time masks from the filesystem."""
+        del argv, policy, cwd, chdir
+        return ()
+
     def resolve(self, spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
         """
         Build a :class:`SandboxPolicy` for the Job Object backend.

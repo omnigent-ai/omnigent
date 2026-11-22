@@ -2,26 +2,47 @@ import { AlertTriangleIcon, Loader2Icon, WifiOffIcon, XIcon } from "lucide-react
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
+import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { SANDBOX_STAGE_LABELS } from "@/lib/sandboxStatus";
 import type { SandboxStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
-import { useChatStore } from "@/store/chatStore";
+import { type ConversationState, useChatStore } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
+
+/** What a launch in `action_required` asks the user to do, or null. */
+function launchActionDetails(state: Pick<ConversationState, "sandboxStatus">): string | null {
+  return state.sandboxStatus?.stage === "action_required" && state.sandboxStatus.details
+    ? state.sandboxStatus.details
+    : null;
+}
 
 /**
  * Shows what a launch in `action_required` needs the user to do. Only a
  * warning: the launch keeps going, and the banner leaves when it moves on.
  */
-export function SandboxActionBanner() {
-  const asking = useChatStore((s) =>
-    s.sandboxStatus?.stage === "action_required" && s.sandboxStatus.details
-      ? s.sandboxStatus.details
-      : null,
-  );
-  const dismissed = useChatStore((s) => s.sandboxActionDismissed);
-  const dismiss = useChatStore((s) => s.dismissSandboxAction);
+export function SandboxActionBanner({
+  conversationId,
+  className,
+}: {
+  /** A pane showing another session names it; defaults to the open session. */
+  conversationId?: string;
+  className?: string;
+}) {
+  const openSessionAsking = useChatStore(launchActionDetails);
+  const openSessionDismissed = useChatStore((s) => s.sandboxActionDismissed);
+  const dismissOpenSession = useChatStore((s) => s.dismissSandboxAction);
+  const paneId = conversationId ?? null;
+  const paneAsking = useConversationEntryValue(paneId, launchActionDetails);
+  const paneDismissed = useConversationEntryValue(paneId, (s) => s.sandboxActionDismissed);
+  const asking = paneId === null ? openSessionAsking : paneAsking;
+  const dismissed = paneId === null ? openSessionDismissed : paneDismissed;
+  const dismiss = (details: string) => {
+    if (paneId === null) dismissOpenSession(details);
+    else conversationRegistry.peek(paneId)?.setState({ sandboxActionDismissed: details });
+  };
   if (asking === null || dismissed === asking) return null;
   return (
     <div
@@ -33,6 +54,7 @@ export function SandboxActionBanner() {
         "border border-amber-300 bg-amber-100 text-amber-900",
         "dark:border-amber-700/60 dark:bg-amber-950 dark:text-amber-100",
         "animate-in fade-in-0 slide-in-from-top-1 duration-200",
+        className,
       )}
     >
       <AlertTriangleIcon className="size-4 shrink-0" aria-hidden="true" />
@@ -175,8 +197,16 @@ export function ConnectionIndicator({
  * renders that bubble immediately, so the empty state never shows
  * there).
  */
-export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }) {
-  const sandboxStatus = useChatStore((s) => s.sandboxStatus);
+export function RunnerStartingIndicator({
+  variant,
+  status,
+}: {
+  variant: "hero" | "row";
+  /** A pane showing another session passes that session's launch; defaults to the open session's. */
+  status?: SandboxStatus | null;
+}) {
+  const openSessionStatus = useChatStore((s) => s.sandboxStatus);
+  const sandboxStatus = status === undefined ? openSessionStatus : status;
   if (sandboxStatus?.stage === "failed") {
     return <SandboxFailedIndicator status={sandboxStatus} />;
   }

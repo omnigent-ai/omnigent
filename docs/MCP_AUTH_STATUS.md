@@ -5,6 +5,11 @@ host owns (Claude Code, Codex and Cursor configs, including an organization's
 `managed-mcp.json`), Omnigent has no way to know that state: whatever manages those
 sign-ins does. This file is how that manager tells Omnigent.
 
+While a `managed-mcp.json` exists, Claude Code loads only the servers it lists, so the
+host reports only those for Claude. That file also needs Omnigent's relay entry for
+Claude sessions to keep Omnigent's tools; see
+[CLAUDE_MANAGED_MCP.md](CLAUDE_MANAGED_MCP.md).
+
 ## Where it lives
 
 `~/.omnigent/mcp-auth-status.json`, or the absolute path in

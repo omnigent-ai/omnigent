@@ -35,6 +35,7 @@ when the credentials file is absent — see ``ambient._claude_login_detected``.)
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -57,8 +58,11 @@ from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
 from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
     OPENCODE_MIN_VERSION,
+    OPENCODE_SKIP_VERSION_CHECK_ENV,
+    opencode_version_check_skipped,
 )
 from omnigent.inner import _proc
+from omnigent.inner._proc import run_isolated
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 _logger = logging.getLogger(__name__)
@@ -919,6 +923,9 @@ def _harness_cli_version_satisfies(
     version = _harness_cli_version_string(spec, binary, timeout, raise_on_timeout=raise_on_timeout)
     if version is None:
         return False
+    if spec == _HARNESS_INSTALL[OPENCODE_KEY] and opencode_version_check_skipped():
+        _warn_opencode_version_check_skipped(version, _version_range_str(spec))
+        return True
     try:
         parsed = Version(version)
     except InvalidVersion:
@@ -945,6 +952,17 @@ def _harness_cli_version_satisfies(
         except InvalidVersion:
             return False
     return True
+
+
+@functools.cache
+def _warn_opencode_version_check_skipped(version: str, supported: str | None) -> None:
+    """Warn once per installed version; readiness probes run this repeatedly."""
+    _logger.warning(
+        "%s set; treating OpenCode %s as installed (supported %s)",
+        OPENCODE_SKIP_VERSION_CHECK_ENV,
+        version,
+        supported,
+    )
 
 
 def harness_install_spec(key: str) -> HarnessInstallSpec | None:
@@ -1096,13 +1114,12 @@ def _harness_cli_version_string(
         if cached is not None and time.monotonic() < cached[1]:
             return cached[0]
     try:
-        completed = subprocess.run(
+        completed = run_isolated(
             [binary, "--version"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout,
-            check=False,
             cwd=probe_cwd,
         )
     except subprocess.TimeoutExpired:
@@ -1440,9 +1457,8 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
         if time.monotonic() < _LOGIN_PROBE_CACHE.get(cache_key, 0.0):
             return True
     try:
-        result = subprocess.run(
+        result = run_isolated(
             [binary, *spec.status_args],
-            check=False,
             timeout=timeout,
             # Concurrent probes must not change or restore a shared terminal's input mode.
             stdin=subprocess.DEVNULL,

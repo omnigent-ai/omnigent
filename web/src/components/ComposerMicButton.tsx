@@ -1,6 +1,7 @@
 "use client";
 
 import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
+import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
 import { Button } from "@/components/ui/button";
 import { showToast } from "@/components/ui/toast";
 import { useVoiceDictationHotkey, VOICE_DICTATION_KEYS } from "@/hooks/useVoiceDictationHotkey";
@@ -106,7 +107,7 @@ export interface ComposerMicButtonProps {
   /** The composer's text box. macOS Dictation types into the focused field, so
    *  the desktop app's macOS fallback focuses this first; without it there is no
    *  fallback. */
-  inputRef?: RefObject<HTMLTextAreaElement | null>;
+  inputRef?: RefObject<ComposerTextTarget | null>;
 }
 
 /** getUserMedia permission failures, distinct from transport failures. */

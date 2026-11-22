@@ -136,6 +136,35 @@ executor:
     api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
 ```
 
+### Codex tool switches
+
+With `harness: codex`, `web_search: false` turns off Codex's built-in web
+search and `disable_native_tools: true` turns off its native shell tools, so
+shell commands use Omnigent tools and policies. For a directory bundle using
+`config.yaml`, place them in `executor.config`:
+
+```yaml
+spec_version: 1
+name: codex-worker
+executor:
+  type: omnigent
+  config:
+    harness: codex
+    web_search: false
+    disable_native_tools: true
+```
+
+The switches accept YAML booleans; omitting either switch or setting it to YAML
+`null` leaves it unset and preserves operator restrictions. Boolean settings
+apply on every Codex route, including ChatGPT login, API-key providers and brokered
+gateways. They only restrict tools: `web_search: true` and
+`disable_native_tools: false` do not re-enable tools that the runner's operator
+turned off. Locked profiles still require `web_search: false` and
+`disable_native_tools: true`, and `broker_gateway` rejects `null`.
+
+Upgrade runners before relying on these restrictions on ordinary routes. Older
+runners ignore the spec's tool switches on those routes.
+
 ### Pi context files
 
 With `harness: pi` or `pi-native`, Pi automatically appends context files such
@@ -486,6 +515,92 @@ os_env:
     allow_network: true
 ```
 
+For `harness: claude-sdk`, an active sandbox contains the entire Claude CLI
+and its descendants, including inline skill shell expansion (``!`command` ``),
+hooks, and plugin subprocesses. Both system-installed and SDK-bundled CLIs use
+the same launcher. A sandbox resolution or launch failure stops startup;
+`OMNIGENT_CLAUDE_SDK_NO_SANDBOX` cannot bypass a requested sandbox. Bash is
+available in the contained CLI so skills can execute their shell commands.
+Native Bash calls pass an Omnigent `PreToolUse` policy gate even when Claude's
+permission mode approves tools automatically; Claude's own permission rules
+remain in force.
+Claude's own Bash sandbox is separate from this outer process boundary.
+Containment requires `linux_bwrap` or `darwin_seatbelt`. Windows
+`windows_jobobject` provides process containment without filesystem or network
+isolation and is rejected for sandboxed Claude SDK launches and callbacks.
+Omitting `os_env` or selecting `sandbox.type: none` does not request this
+boundary; skills, hooks, and local MCP commands can then run uncontained.
+On Linux, the optional default CLI wrapper still checks the installed Python
+runtime for mutable hard-link aliases. An integrity failure can stop startup
+even when `os_env` is omitted. Reinstall a `uv tool` environment with
+`uv tool upgrade --reinstall --link-mode copy omnigent` if this occurs.
+Setting `OMNIGENT_CLAUDE_SDK_NO_SANDBOX` while requesting a sandbox raises a
+startup error; use an explicit `sandbox.type: none` to opt out.
+
+Model access is automatic; no model egress rule is needed:
+
+```yaml
+executor:
+  harness: claude-sdk
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: auto
+    write_paths: ["."]
+    allow_network: false
+```
+
+The trusted parent derives the model host and gateway prefix from the selected
+provider. It signs only HTTPS `POST` requests to that provider's
+`/v1/messages` and `/v1/messages/count_tokens` routes, optionally with exactly
+`?beta=true`. Requests must have matching CONNECT, TLS SNI, and Host authorities,
+a session placeholder, and a bounded JSON body. The relay reconstructs upstream
+headers before attaching the provider credential. Broader `egress_rules` cannot
+expand this signing authority. Redirects, account APIs, and arbitrary model-host
+paths receive no credential. Gateway thinking compatibility is preserved.
+
+The CLI, sandboxed session terminals, and `sys_os_*` shell environments get this
+model relay automatically, including when `allow_network: false`. They can make
+inference requests using the placeholder; skills therefore have the session's inference
+capability. Real model tokens and auth commands stay in the trusted parent. The
+CLI, sandboxed session terminals, and `sys_os_*` shell environments use private
+HOME/config/scratch directories. Home-relative Git, package-manager, and shell
+configuration may therefore be unavailable in all three. Host Claude state and
+credential files are excluded; conflicting filesystem grants stop startup. macOS
+also denies Keychain service access. Bundled skills remain available; host Claude
+state and plugins are not imported into the private home. Only bundled skills
+and their supporting files are copied into a separate plugin directory. Keep
+the original agent bundle, including its credential-bearing `config.yaml` and
+MCP configuration, outside the sandbox workspace and read/write grants;
+conflicting layouts fail before execution. Omnigent's Python runtime and
+framework installation must also remain outside sandbox-writable paths.
+
+Direct networking is disabled for these contained launches, including policies
+that previously enabled it with `allow_network: true`. Additional ordinary
+HTTP(S) access requires `egress_rules`; those requests do not receive the model
+credential. API-key providers, explicit Anthropic bearer/OAuth tokens, and host
+Claude OAuth credentials are supported. Host OAuth credentials are reread from
+the credentials file or macOS Keychain; expired credentials require signing in
+again. Databricks profile credentials refresh in the trusted parent. Arbitrary shell auth helpers, HTTP/nonstandard-port model endpoints,
+and Bedrock/Vertex/Foundry transports fail closed. This automatic integration is
+specific to `claude-sdk`; it does not change `claude-native` launches or other
+harnesses' model-authentication policy.
+
+Profile authentication requires the trusted Python profile-token helper on the parent's `PATH`; a profile
+configured only through the Databricks CLI cannot start a sandboxed Claude worker.
+The helper requires an absolute Python interpreter shebang, and its interpreter
+and installed modules must stay outside sandbox write grants.
+The parent retains any `DATABRICKS_CONFIG_FILE` selection. Managed Claude policy
+remains in force, but managed configuration containing model credentials or
+`apiKeyHelper` is rejected before it becomes readable by the CLI. Store model
+credentials in the parent provider configuration instead. Validation includes
+settings-only directories, settings drop-ins, and macOS device and per-user MDM
+preference plists.
+
+See [Claude sandbox CLI verification](CLAUDE_SANDBOX_TESTING.md) for the real CLI
+test matrix, worker prerequisites, and reproducible commands.
+
 On Linux, the `openai-agents` harness supports disposable copy-on-write mounts:
 
 ```yaml
@@ -618,7 +733,7 @@ not pass secrets through the environment unless the tool genuinely needs them.
 
 You usually don't need to choose a `sandbox.type` — omit it and Omnigent picks
 the platform default (`linux_bwrap` on Linux, `darwin_seatbelt` on macOS, or
-`windows_jobobject` on Windows), so the same YAML works across platforms. Use
+`windows_jobobject` on Windows). Use
 `type: auto` to explicitly request the platform-default sandbox backend:
 
 ```yaml
@@ -635,15 +750,105 @@ to share one policy across `sys_os_*` and terminals, and how to set up network
 egress rules, see the `sandbox:` examples below and the sandbox source under
 `omnigent/inner/`.
 
+Runner-local `sys_os_read`, `sys_os_write` and `sys_os_edit` calls reuse a helper
+within a session when the environment spec, sandbox mounts and inherited
+environment values remain unchanged.
+Calls configured with `sandbox.credential_proxy` use a disposable environment for
+each runner-local tool invocation. Credential sources resolve at helper startup;
+snapshot and change-tracking reads share that helper with the requested operation.
+A safe retry can start a replacement and resolve the sources again. The next tool
+invocation starts a fresh helper, so these calls retain helper startup cost.
+A `sys_os_shell` call retires that tool helper before returning, including on
+success: shell descendants may outlive the command. The next tool call starts a
+fresh helper. Shell calls therefore still incur helper startup cost; warm shell
+reuse needs a complete per-request process lifetime boundary. This tool lease
+policy does not change shared copy-on-write environments or forked environments.
+
+Inner harness adapters reject `windows_jobobject`, including the Windows
+default, because it cannot enforce the requested filesystem and network
+boundaries. Confined harness processes require a supported Linux or macOS
+backend. Codex checks these capabilities during session initialization, before
+starting its worker. Claude SDK containment also requires a system-installed or SDK-bundled CLI;
+`OMNIGENT_CLAUDE_SDK_NO_SANDBOX` cannot bypass a requested sandbox.
+
+The Copilot, Cursor, Hermes, and Antigravity inner adapters cannot install
+process confinement and reject requests for it. Supplying `os_env` without a
+sandbox type selects the platform default, which these adapters also reject.
+Choose a sandbox-capable harness for confinement. Use an explicit
+`sandbox.type: none` only when unrestricted execution is intended.
+
+The framework-created `web_fetch` researcher inherits its parent's harness and
+requests the platform-default sandbox when the parent has no `os_env`.
+On Copilot, Cursor, Hermes, and Antigravity, that researcher therefore refuses to start.
+Use a sandbox-capable harness for this confined research path.
+
+ACP, Claude SDK, Codex, Goose, Kimi, Pi, and Qwen worker containment supports
+`os_env.type: caller_process` and rejects `fork`, `start_in_scratch`, and
+`sandbox.git_ssh`. Worker `egress_rules` are supported by Codex and Claude SDK.
+Worker `credential_proxy` requires Codex's supported brokered gateway
+configuration or Claude SDK's owned worker environment and credential broker.
+When a later turn supplies a changed OS policy, the runtime replaces its retained
+worker before running that turn so the new policy reaches a fresh process.
+Launch-policy overrides such as `enforce_sandbox` are reapplied before deriving
+the spawn environment, including after an agent revision changes.
+Whole-process `allow_network: false` denies direct external network connections
+from the worker. Supported brokered inference, including Claude SDK's owned
+model broker, can remain available without granting direct provider connections.
+
+Claude SDK routes supported HTTP egress and credential injection through an
+owned broker outside its confined worker. Direct CLI preparation without an
+owned worker environment rejects these settings. `sys_os_shell` shares the
+agent's primary `os_env`; it cannot substitute for worker containment.
+
+- For HTTP egress on the primary worker policy, use Claude SDK's owned broker
+  or Codex's supported egress configuration. Credentialed Codex operations
+  require the [brokered Codex gateway configuration](#secretless-credential-proxy)
+  below, including `broker_gateway: true` and its required gateway binding.
+  Nonbrokered or signer-backed Codex is not a substitute for that configuration.
+- For terminal-only HTTP or TCP egress without credentials, put `egress_rules`
+  or `tcp_egress` in the terminal's own `os_env`. Terminal launches ignore
+  `credential_proxy` and do not inject its credentials. Keep the primary
+  worker's required confinement; terminal-local rules do not replace a worker
+  egress boundary.
+
+Inner workers cannot enforce `tcp_egress`. If that restriction must cover the
+worker itself, there is no supported inner-harness migration yet. Retain the
+restriction and treat the configuration as unsupported.
+
+Relative `os_env.cwd` does not override a workspace selected by the runner.
+Claude SDK additionally resolves a named relative directory such as `./project`
+against the runner base when that base is still the selected workspace; `.`
+continues to use the selected workspace. Other adapters retain the selected
+workspace rather than applying that Claude-specific directory selection.
+Claude's CLI-preparation callbacks already resolve named relative directories;
+the SDK uses that prepared cwd for settings, credentials, execution, and transcript
+lookup so the process runs in the directory its sandbox protects.
+An absolute `os_env.cwd` must contain the selected session workspace; conflicting
+absolute boundaries refuse launch. Codex skips optional provider discovery when
+the worker policy blocks its loopback transport; configured providers still apply.
+
+Sandbox launchers also grant read access to the installed `omnigent` Python
+package. With an editable installation, this includes that package's source
+directory even when it is outside the executable's installation roots. Existing
+private scratch and vendor runtime-state write grants also remain.
+
 ### Secretless credential proxy
 
-`sandbox.credential_proxy` lets sandboxed tools authenticate to external hosts
-without the real secret ever entering the sandbox: the mandatory L7 egress proxy
-attaches the credential on the way out. It requires `egress_rules` and a
+The credential-proxy machinery lets sandboxed framework tools authenticate to
+external hosts without the real secret ever entering the sandbox: the mandatory
+L7 egress proxy attaches the credential on the way out. It requires `egress_rules` and a
 network-isolating backend (`linux_bwrap` or `darwin_seatbelt`). See
 `designs/SANDBOX_CREDENTIAL_PROXY.md` for the full type table.
 
-The `databricks_cli` type proxies the Databricks CLI. List the profiles to
+Inner workers accept `sandbox.credential_proxy` with Codex's supported brokered
+gateway configuration or Claude SDK's owned worker environment and credential
+broker. Direct Claude CLI preparation without an owned worker environment,
+nonbrokered Codex, and other inner adapters reject these policies. The general
+proxy types described below do not imply support for launching an inner worker
+with them.
+
+The `databricks_cli` type is for framework tools, not inner workers. It proxies
+the Databricks CLI. List the profiles to
 proxy; only those are materialized into the sandbox (with placeholder tokens)
 and swapped by the proxy. As with every other credential-proxy type, you must
 list each workspace host in `egress_rules` yourself — the proxy does not widen
@@ -668,6 +873,155 @@ os_env:
 
 Inside the sandbox, `databricks --profile dbc-87654321-dcba current-user me`
 works; the sandbox holds only `oa_cred_*` placeholders, never a live token.
+
+A sandboxed `codex` executor can use an HTTPS gateway through the same proxy.
+Bind the gateway host with `https_bearer`, set `env` to
+`OMNIGENT_CODEX_GATEWAY_TOKEN`, and allow the gateway's exact Responses route.
+The runner replaces the provider's auth command with a fixed command that
+prints only the placeholder. The trusted parent reads the protected source and
+renews its token; Codex receives a private home without host auth or provider
+configuration. A locked profile requires an explicit `broker_gateway: true`;
+missing or mismatched bindings prevent launch. Nonbrokered gateway profiles
+retain their existing authentication only when `credential_proxy` is absent;
+configuring it on a nonbrokered Codex worker prevents launch.
+
+```yaml
+executor:
+  model: gpt-daybreak-blue-latest
+  auth:
+    type: provider
+    name: locked-model
+  config:
+    harness: codex
+    broker_gateway: true
+    web_search: false
+    disable_native_tools: true
+os_env:
+  type: caller_process
+  sandbox:
+    type: darwin_seatbelt # or linux_bwrap
+    egress_rules:
+      - "POST model.example.com/cyber/v1/responses"
+    credential_proxy:
+      - type: https_bearer
+        target: model.example.com
+        env: OMNIGENT_CODEX_GATEWAY_TOKEN
+        source:
+          unix_socket: /private/model-token.sock
+          refresh_interval_seconds: 300
+```
+
+Configure this provider in the host's `~/.omnigent/config.yaml`:
+
+```yaml
+providers:
+  locked-model:
+    kind: gateway
+    openai:
+      base_url: https://model.example.com/cyber/v1
+      wire_api: responses
+      auth_command: "false" # required by the provider schema; locked mode replaces it
+      models:
+        default: gpt-daybreak-blue-latest
+```
+
+Before a release includes gateway broker support, the minimum runner build is
+[8ee1f8558f](https://github.com/omnigent-ai/omnigent/commit/8ee1f8558fc8f5e86244e8ac9bbcb1189eb6e375)
+or a later build containing that implementation. Upgrade every runner that can
+launch the profile before enabling it. Older runners
+ignore `broker_gateway` and retain legacy authentication behavior. Keep the
+provider's `auth_command: "false"` exactly as shown: an older runner then fails
+authentication instead of running a real token command. The setting alone
+does not protect an older runner. Verify a real turn and a resumed turn on
+the upgraded runner before rollout.
+
+The locked profile replaces `false` with the brokered placeholder command
+before Codex starts. Other uses of this provider run `false` and fail
+authentication.
+
+The reserved gateway binding requires a placeholder-bearing HTTPS request on
+port 443 in both the Codex relay and the Omnigent OS-tool proxy. A bare request
+or plaintext HTTP request receives no bearer.
+
+The socket path must be absolute and outside sandbox read/write grants. A
+separate trusted issuer must serve `GET /token` and refresh the bearer; Omnigent
+does not start that issuer. Keep its code, dependencies, configuration, and
+credential storage outside sandbox write grants. Locked Codex profiles must set
+`web_search: false` and `disable_native_tools: true` so their shell and file
+operations use Omnigent tools and policies. Missing or unsafe settings prevent
+launch.
+
+### Named TCP egress from a sandbox
+
+For runnable CLI checks on macOS and Linux, see the
+[local Python HTTP listener and public SSH examples](../examples/tcp-egress/README.md).
+
+`sandbox.tcp_egress` permits a sandbox to open an opaque TCP stream to one
+named, exact host and port without giving it general network access. The
+parent resolves DNS on each connection, checks **every** returned address
+against the route's policy, and dials a pinned address. The sandbox cannot
+choose the dialed IP or port. This setting supplies **no credentials** and
+does not verify the server's identity: configure TLS or host-key verification
+in the client.
+
+```yaml
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: auto # linux_bwrap or darwin_seatbelt
+    allow_network: false
+    tcp_egress:
+      - name: analytics_db
+        host: db.internal.example
+        port: 5432
+        allowed_cidrs: [10.42.0.0/16]
+      - name: git_host
+        host: github.com
+        port: 22
+terminals:
+  shell:
+    command: bash
+    os_env: inherit
+```
+
+Upgrade the server, host, and session runner to builds with TCP egress support
+before using this field. The server requires both connected runtimes to advertise
+the `tcp_egress` capability and rejects older builds before launch or initialization,
+including routes in sub-agents and terminal environments. Updating only the server
+is insufficient. Keep `allow_network: false` explicit so an older server and runner
+that ignore `tcp_egress` still deny direct networking.
+
+The parent resolves DNS on every connection. A public DNS name that resolves
+to a private address is **denied by default**; permit the smallest relevant
+private CIDR explicitly with `allowed_cidrs`. **Every** A/AAAA answer must
+match the CIDRs when specified; a mixed public/private answer is denied unless
+every address is explicitly allowed. The chosen IP is pinned for the dial,
+so a later DNS change cannot redirect an established connection.
+Loopback, link-local, metadata, cloud control addresses, and mixed
+allowed/blocked DNS answers remain denied. The broker permits up to eight
+concurrent streams per sandbox. Each stream has a 30-minute lifetime, a
+five-minute idle limit, and a 2 GiB total-transfer limit; the connector exits
+nonzero if the broker closes it early. A peer that stops reading for ten
+seconds also closes the stream, even if the idle limit has not elapsed.
+A sandbox cannot configure
+`tcp_egress` and HTTP `egress_rules` together: even a different DNS name
+could lead to the same HTTP endpoint and bypass method/path restrictions.
+Opaque routes on ports 80/443 are also rejected. Clients
+that support a stdin/stdout proxy can run
+`omnigent-egress-connect analytics_db` from `sys_os_shell` or an inherited
+sandboxed terminal. For example, OpenSSH can use
+`ssh -o 'ProxyCommand=omnigent-egress-connect git_host' git@github.com`
+with the `git_host` route above, a separately available SSH credential, and
+its own pinned host key. A
+plain `psql -h db.internal.example` cannot use this connector directly;
+PostgreSQL client wiring and secretless credentials require the separate
+PostgreSQL capability. Native Codex workers and sandbox backends other than
+`linux_bwrap` and `darwin_seatbelt` reject `tcp_egress` rather than silently
+discarding the route. Native launchers that have not started a TCP broker
+also fail at spawn rather than retaining direct network access. Git SSH
+bindings can coexist with named TCP routes;
+HTTP `egress_rules` cannot coexist until an explicit overlap policy exists.
 
 ### Git over SSH from a sandbox
 
@@ -780,6 +1134,14 @@ absolute/escaping working directories. This includes terminals and nested
 agents. These restrictions apply on multi-user servers and, starting in 0.19.0,
 on local single-user servers too, including bundles uploaded by `omnigent run`.
 Loopback requests can originate from agents as well as the operator.
+
+Uploaded bundles also cannot declare absolute, `~`, or `..` entries in
+`os_env.sandbox` `read_paths`, `write_paths`, or `write_files`. A host that
+needs to expose paths outside the workspace lists absolute paths under
+`runner.sandbox_grants.read_paths` / `write_paths` in its own `config.yaml`
+(`$OMNIGENT_CONFIG_HOME/config.yaml`, default `~/.omnigent/config.yaml`). The
+runner adds them to every agent, terminal, and nested agent with an
+`os_env.sandbox` block that the host runs.
 
 Invalid uploads return HTTP 400 before tools or policy handlers are imported.
 Existing uploaded agents using these features also fail bundle validation when
@@ -990,17 +1352,56 @@ byte-bounded provider counts every advertised tool against its limit.
 ```yaml
 tool_groups:
   browser: false          # browser_navigate / _snapshot / _click / _type / _screenshot
-  scheduled_tasks: false  # sys_scheduled_task_create / _list / _update / _delete
+  scheduled_tasks: false  # sys_scheduled_task_create / _list / _update / _delete, sys_reminder_set
   comments: false         # list_comments / update_comment
   policies: false         # sys_add_policy / sys_policy_registry
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
+  journal: false          # sys_journal_read / _write_plan / _write_status / _write_note, sys_workflow_request_input / _save / _load / _list
+  projects: false         # sys_project_* / sys_session_update
+  user_inbox: false       # sys_user_inbox_post / sys_user_inbox_list
+  memory: false           # memory_search / _get / _list / _write / _delete
+  files: false            # sys_upload_file / sys_list_files / sys_download_file
 ```
 
 Every group defaults to `true`, so omitting the block changes nothing. Values
 must be booleans and group names must match exactly; a typo fails the load
-rather than silently leaving the group registered. Disabling `browser` also
-drops the embedded-browser guidance from the composed system prompt. The block
-is read the same way from a `config.yaml` bundle and a single-file agent YAML.
+rather than silently leaving the group registered. The `journal` group also
+requires the server's `workflows` feature flag, which defaults off; enable it
+with `OMNIGENT_FEATURES=workflows` on the server. The `user_inbox` group, which
+posts to and reads the session owner's Inbox, requires the server's `user_inbox`
+feature flag, which defaults on; turn it off with `OMNIGENT_FEATURES=-user_inbox`.
+Disabling `browser` also
+drops the embedded-browser guidance from the composed system prompt, and
+disabling `journal` also drops the `/workflow` and `/save-workflow` skills (see
+[Session journal](session-journal.md)). The block is read the same way from a
+`config.yaml` bundle and a single-file agent YAML.
+
+The `memory` group is the long-term memory tools. It applies only when the server
+has memory turned on (`OMNIGENT_FEATURES=memory`); otherwise no agent gets them,
+whatever the spec says. The tools persist across sessions, harnesses, models and
+forks, and belong to the signed-in user: the server decides whose memory it is,
+never the agent. They are refused in a session shared with anyone who can add
+input. Two kinds of spec get `memory: false` by default, and setting `memory: true`
+on them is an error:
+
+- Specs that still declare the deprecated `hindsight_*` builtins, with a warning.
+  Configure Hindsight as the server's memory backend instead with
+  `omnigent server --memory-backend hindsight`.
+- Specs with their own local tool or MCP server named like a memory tool, which
+  keep that tool. See [MEMORY.md](MEMORY.md).
+
+The `files` group shares files through the current session's file resources
+(`/v1/sessions/{id}/resources/files`). `sys_upload_file` stores a file from
+inside the session workspace, `sys_list_files` lists the session's files, and
+`sys_download_file` returns a stored file's content as text, so it suits text
+files rather than binary ones. These tools cannot be listed under
+`tools.builtins`. They don't need `os_env` either: an agent without one can
+still upload from its session workspace, so turn them off with
+`tool_groups.files: false`. A spec that still lists the removed `upload_file`,
+`list_files` or `download_file` builtins gets none of the three, with a
+warning, because a policy written for the old names would not match the new
+ones. Remove those entries and rename such policy selectors to the `sys_`
+names; `files: true` alongside a removed name is an error.
 
 `agent_discovery: false` is rejected while `spawn: true` or the
 `scheduled_tasks` group is on: `sys_session_create` and

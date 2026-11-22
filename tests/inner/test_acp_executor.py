@@ -15,6 +15,8 @@ Two layers:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
 import os
 import shlex
@@ -51,6 +53,7 @@ from omnigent.inner.executor import (
     TurnComplete,
     describe_exception,
 )
+from omnigent.inner.sandbox import HarnessSandboxValidationError
 
 # ---------------------------------------------------------------------------
 # Construction / argv
@@ -2401,6 +2404,60 @@ def test_spawn_env_still_excludes_undeclared_secret() -> None:
 
 
 @pytest.mark.asyncio
+async def test_operator_passthrough_reaches_spawned_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.host.connect import _build_runner_env
+    from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
+    from omnigent.runtime.harnesses.process_manager import _build_harness_spawn_env
+
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+    runner_env = _build_runner_env(
+        {
+            "OMNIGENT_RUNNER_ENV_PASSTHROUGH": ",".join(
+                ["XAI_API_KEY", *sorted(RUNNER_AUTH_SECRET_ENV_VARS)]
+            ),
+            "XAI_API_KEY": "canary-xai",
+            "UNRELATED_API_KEY": "canary-unlisted",
+        },
+        server_url="http://server",
+        runner_id="runner_test",
+        binding_token="canary-binding",
+        initial_auth_token="canary-auth",
+        workspace=str(tmp_path),
+        parent_pid=os.getpid(),
+    )
+    monkeypatch.setattr("os.environ", runner_env)
+    worker_env = _build_harness_spawn_env(None)
+    monkeypatch.setattr("os.environ", worker_env)
+    captured = tmp_path / "agent-env.json"
+    command = shlex.join(
+        [
+            sys.executable,
+            "-c",
+            "import json, os, pathlib, sys; "
+            "observed = {'XAI_API_KEY': os.environ.get('XAI_API_KEY'), "
+            "'unrelated_present': 'UNRELATED_API_KEY' in os.environ, "
+            "'runner_auth_present': any(name in os.environ "
+            f"for name in {sorted(RUNNER_AUTH_SECRET_ENV_VARS)!r})}}; "
+            "pathlib.Path(sys.argv[1]).write_text(json.dumps(observed))",
+            str(captured),
+        ]
+    )
+    executor = AcpExecutor(AcpAgentConfig(command=command))
+    try:
+        await executor._start_process()
+        assert executor._proc is not None
+        assert await asyncio.wait_for(executor._proc.wait(), timeout=10) == 0
+        observed = json.loads(captured.read_text())
+        assert observed["XAI_API_KEY"] == "canary-xai"
+        assert not observed["unrelated_present"]
+        assert not observed["runner_auth_present"]
+    finally:
+        await executor.close()
+
+
+@pytest.mark.asyncio
 async def test_handshake_timeout_reports_a_non_blank_error(tmp_path: Path) -> None:
     """An agent that never answers ``session/new`` yields a named error.
 
@@ -2597,6 +2654,9 @@ def test_spawn_env_env_unset_strips_declared_names(monkeypatch: pytest.MonkeyPat
     env = ex._build_spawn_env()
     assert env.get("DEEPSEEK_API_KEY") == "ds-secret"
     assert "XAI_API_KEY" not in env
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "XAI_API_KEY")
+    assert "XAI_API_KEY" not in ex._build_spawn_env()
 
 
 def test_spawn_env_env_unset_empty_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2868,64 +2928,118 @@ def test_resolve_cwd_deleted_process_cwd_readlink_failure_still_raises() -> None
                 _resolve_cwd(None)
 
 
-def test_acp_executor_init_raises_on_deleted_explicit_cwd(tmp_path: Path) -> None:
-    """AcpExecutor.__init__ raises RuntimeError when an explicit cwd is missing."""
+_CWD_POLICY_CASES = [
+    pytest.param(None, False, id="no-policy"),
+    pytest.param(OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none")), False, id="explicit-none"),
+    pytest.param(OSEnvSpec(), True, id="default-sandbox"),
+    pytest.param(
+        OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")), True, id="requested-sandbox"
+    ),
+]
+
+
+@pytest.mark.parametrize(("os_env", "sandbox_requested"), _CWD_POLICY_CASES)
+def test_acp_executor_init_raises_on_deleted_explicit_cwd(
+    tmp_path: Path, os_env: OSEnvSpec | None, sandbox_requested: bool
+) -> None:
+    """Missing cwd diagnostics are preserved as a cause when sandboxing is requested."""
     missing = str(tmp_path / "workspace")
-    with pytest.raises(RuntimeError, match="workspace"):
-        AcpExecutor(AcpAgentConfig(command="agent"), cwd=missing)
+    expected_error = HarnessSandboxValidationError if sandbox_requested else RuntimeError
+    with pytest.raises(expected_error, match="workspace") as failure:
+        AcpExecutor(AcpAgentConfig(command="agent"), cwd=missing, os_env=os_env)
+    diagnostic = failure.value.__cause__ if sandbox_requested else failure.value
+    assert type(diagnostic) is RuntimeError
+    assert str(diagnostic) == f"ACP executor working directory does not exist: {missing!r}"
+    if not sandbox_requested:
+        assert failure.value.__cause__ is None
+    else:
+        assert missing not in failure.value.client_message
+        assert failure.value.client_message == (
+            "The working directory is unavailable. Choose an existing workspace and retry."
+        )
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("os_env", "sandbox_requested"), _CWD_POLICY_CASES)
 async def test_start_process_guard_raises_clear_error_on_deleted_cwd(
-    tmp_path: Path,
+    tmp_path: Path, os_env: OSEnvSpec | None, sandbox_requested: bool
 ) -> None:
-    """Deleting the cwd after __init__ yields an ExecutorError naming the path.
-
-    Without the guard at the top of _start_process(), the error would be the raw
-    ``asyncio.create_subprocess_exec`` OS error ("[Errno 2] No such file or directory:
-    '/path'"), which lacks ACP-specific context. With the guard, the message says
-    "ACP executor working directory does not exist".
-    """
+    """Unconfined sessions retain ordinary workspace errors."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    ex = AcpExecutor(AcpAgentConfig(command="agent --acp"), cwd=str(workspace))
+    ex = AcpExecutor(AcpAgentConfig(command="agent --acp"), cwd=str(workspace), os_env=os_env)
     assert ex._cwd == str(workspace)
 
     # Simulate the workspace being deleted after the executor was constructed.
     workspace.rmdir()
 
     events = []
-    async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
-        events.append(ev)
-    await ex.close()
+    try:
+        with (
+            pytest.raises(HarnessSandboxValidationError)
+            if sandbox_requested
+            else contextlib.nullcontext()
+        ) as failure:
+            async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                events.append(ev)
+    finally:
+        await ex.close()
 
-    assert events, "expected at least one ExecutorError event"
     error_events = [e for e in events if isinstance(e, ExecutorError)]
-    assert error_events, f"expected ExecutorError, got: {[type(e).__name__ for e in events]}"
-    msg = error_events[0].message
+    if failure is not None:
+        assert type(failure.value.__cause__) is RuntimeError
+        assert not error_events
+        assert str(workspace) not in failure.value.client_message
+        assert failure.value.client_message == (
+            "The working directory is unavailable. Choose an existing workspace and retry."
+        )
+        msg = str(failure.value.__cause__)
+    else:
+        assert error_events, f"expected ExecutorError, got: {[type(e).__name__ for e in events]}"
+        msg = error_events[0].message
     assert "working directory" in msg, f"expected 'working directory' in: {msg!r}"
     assert str(workspace) in msg, f"expected path in: {msg!r}"
 
 
 @pytest.mark.asyncio
-async def test_start_process_guard_deleted_process_cwd_relative_cwd() -> None:
-    """Relative cwd with deleted process cwd yields a clear 'Runner working directory' error."""
-    ex = AcpExecutor(AcpAgentConfig(command="agent --acp"), cwd=".")
+@pytest.mark.parametrize(("os_env", "sandbox_requested"), _CWD_POLICY_CASES)
+async def test_start_process_guard_deleted_process_cwd_relative_cwd(
+    os_env: OSEnvSpec | None,
+    sandbox_requested: bool,
+) -> None:
+    """An inherited deleted cwd preserves its diagnostic outside client error events."""
+    ex = AcpExecutor(AcpAgentConfig(command="agent --acp"), cwd=".", os_env=os_env)
 
     fnfe = FileNotFoundError(2, "No such file or directory")
-    with patch("omnigent.inner.acp_executor.os.getcwd", side_effect=fnfe):
-        with patch(
-            "omnigent.inner.acp_executor.os.readlink",
-            return_value="/workspace/project (deleted)",
-        ):
-            events = []
-            async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
-                events.append(ev)
-    await ex.close()
+    events = []
+    try:
+        with patch("omnigent.inner.acp_executor.os.getcwd", side_effect=fnfe):
+            with patch(
+                "omnigent.inner.acp_executor.os.readlink",
+                return_value="/workspace/project (deleted)",
+            ):
+                with (
+                    pytest.raises(HarnessSandboxValidationError)
+                    if sandbox_requested
+                    else contextlib.nullcontext()
+                ) as failure:
+                    async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                        events.append(ev)
+    finally:
+        await ex.close()
 
     error_events = [e for e in events if isinstance(e, ExecutorError)]
-    assert error_events
-    msg = error_events[0].message
+    if failure is not None:
+        assert type(failure.value.__cause__) is RuntimeError
+        assert not error_events
+        assert "/workspace/project" not in failure.value.client_message
+        assert failure.value.client_message == (
+            "The working directory is unavailable. Choose an existing workspace and retry."
+        )
+        msg = str(failure.value.__cause__)
+    else:
+        assert error_events
+        msg = error_events[0].message
     assert "deleted" in msg, f"expected 'deleted' in: {msg!r}"
     assert "/workspace/project" in msg, f"expected path in: {msg!r}"
 

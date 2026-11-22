@@ -11,6 +11,7 @@ import { ChevronDownIcon, ChevronUpIcon, SearchIcon, XIcon } from "lucide-react"
 import type { Editor } from "@tiptap/react";
 import type { Transaction } from "@tiptap/pm/state";
 import type { ReactElement, RefObject } from "react";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import {
   findMatches,
   searchDecorationKey,
@@ -122,6 +123,8 @@ export function MarkdownSearchBar({
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         onKeyDown={(e) => {
+          // IME composition keys (CJK input) confirm text, not find.
+          if (isImeCompositionKeyEvent(e)) return;
           if (e.key === "Enter") {
             e.preventDefault();
             if (e.shiftKey) goPrev();

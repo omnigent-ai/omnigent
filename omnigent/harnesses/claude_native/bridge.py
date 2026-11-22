@@ -15,9 +15,9 @@ This module owns the small filesystem rendezvous directory plus two
 helper surfaces:
 
 - An MCP stdio server (``serve-mcp`` subcommand) that Claude Code
-  launches as a child process. It advertises Omnigent tools to
-  Claude (workspace ``sys_os_*`` tools outside an active turn,
-  active-turn Omnigent tools via a per-turn relay).
+  launches as a child process. It advertises the Omnigent tools the
+  runner's tool relay serves; Claude's own Bash, Read, Write and Edit
+  cover workspace file and shell access.
 - A tmux send-keys path. Web UI messages are delivered to Claude by
   typing them into the same tmux pane the user is attached to;
   Claude treats them as ordinary user input. The runner advertises
@@ -39,6 +39,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -102,8 +103,6 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 if TYPE_CHECKING:
     import httpx
 
-    from omnigent.inner.datamodel import OSEnvSandboxSpec
-    from omnigent.inner.os_env import OSEnvironment
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.llms.context_window import ModelPricing
 
@@ -116,10 +115,10 @@ from omnigent.inner.terminal_lifecycle import (
     TERMINAL_LAUNCH_SESSION_ID_ENV,
 )
 from omnigent.native import native_bridge_common, policy_allow_cache
-from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
+CLAUDE_STARTUP_CONTEXT_FILE = "startup_context.txt"
 
 _logger = logging.getLogger(__name__)
 _INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
@@ -208,6 +207,22 @@ BRIDGE_PORT_POOL_ENV_VAR = "OMNIGENT_BRIDGE_PORT_POOL"
 # ingress plus one tool relay per session), hence a pool rather than one port.
 DEFAULT_BRIDGE_PORT_POOL: tuple[int, ...] = tuple(range(28700, 28716))
 
+
+def _pinned_temp_parent() -> Path | None:
+    """A pinned ``TMPDIR`` this process may only read, to validate bridges under it.
+
+    Helpers launched for the runner get its ``TMPDIR`` pinned (see
+    :func:`build_mcp_config`), but Python skips a ``TMPDIR`` it can't write, as in a
+    sandboxed relay. New bridges are still allocated under ``tempfile``'s choice; this
+    root only lets the helper recognise the bridge the runner prepared under it.
+    """
+    pinned = os.environ.get("TMPDIR")
+    if not (pinned and os.path.isabs(pinned) and os.path.isdir(pinned)):
+        return None
+    root = _absolute_syntactic_path(Path(pinned))
+    return None if root == _absolute_syntactic_path(_TRUSTED_PARENT) else root
+
+
 # Root for the per-process Claude bridge tree. Namespaced by uid so
 # other Unix users on the same host cannot read the bearer token or
 # pre-create the parent as a symlink to redirect the bridge tree. The
@@ -266,15 +281,34 @@ _EXPECTED_CLOSE_FILE = "expected_close"
 _OMNIGENT_KILL_FILE = "omnigent_kill"
 _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
+# The cost a cold resume seeded into the next Claude process; see ResumeCostBaseline.
+_RESUME_COST_BASELINE_FILE = "resume_cost_baseline.json"
 _USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 _MCP_SERVER_NAME = "omnigent"
+# Read by the static relay entry in an enterprise managed-mcp.json; see
+# docs/CLAUDE_MANAGED_MCP.md.
+MANAGED_MCP_RELAY_PYTHON_ENV = "OMNIGENT_MCP_RELAY_PYTHON"
+MANAGED_MCP_RELAY_BRIDGE_DIR_ENV = "OMNIGENT_MCP_RELAY_BRIDGE_DIR"
+MANAGED_MCP_RELAY_TMPDIR_ENV = "OMNIGENT_MCP_RELAY_TMPDIR"
+# A private directory for serve-mcp's control socket; empty keeps the shared default.
+MANAGED_MCP_RELAY_SOCKET_DIR_ENV = "OMNIGENT_MCP_RELAY_SOCKET_DIR"
+MANAGED_MCP_RELAY_ENV_NAMES = (
+    MANAGED_MCP_RELAY_PYTHON_ENV,
+    MANAGED_MCP_RELAY_BRIDGE_DIR_ENV,
+    MANAGED_MCP_RELAY_TMPDIR_ENV,
+    MANAGED_MCP_RELAY_SOCKET_DIR_ENV,
+)
+MANAGED_MCP_RELAY_MISSING_WARNING = (
+    "Claude Code has an enterprise managed-mcp.json without Omnigent's relay entry; "
+    "starting without Omnigent's MCP tools (see docs/CLAUDE_MANAGED_MCP.md)."
+)
 _MCP_PROTOCOL_VERSION = "2024-11-05"
 # Tools-changed: harness POSTs to the bridge MCP server's localhost
 # control endpoint, which emits ``notifications/tools/list_changed``
 # on its MCP stdout. Standard MCP notification — unrelated to the
 # experimental Claude Channels feature that this module no longer
 # uses.
-_TOOLS_CHANGED_READY_TIMEOUT_S = 30.0
+TOOLS_CHANGED_READY_TIMEOUT_S = 30.0
 _TOOLS_CHANGED_POST_TIMEOUT_S = 10.0
 # The control POST carries an empty JSON object; anything larger is not ours.
 _TOOLS_CHANGED_BODY_MAX_BYTES = 4096
@@ -464,6 +498,8 @@ _OCCUPIED_INPUT_DISMISS_TIMEOUT_S = 3.0
 _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 1.5
 # What :func:`_occupying_surface` reports when no input box is drawn.
 _OVERLAY_SURFACE = "an overlay"
+_DETAILED_TRANSCRIPT_SURFACE = "the detailed transcript view"
+_DETAILED_TRANSCRIPT_FOOTER = "showingdetailedtranscript·ctrl+ototoggle·?forshortcuts"
 # What :func:`_occupying_surface` reports when the box is in ``!`` shell mode.
 _SHELL_MODE_SURFACE = "shell mode"
 # What :func:`_occupying_surface` reports when a draft taller than the pane
@@ -475,11 +511,13 @@ _SCROLLED_DRAFT_SURFACE = "a draft taller than the terminal"
 _ESCAPE_DISMISS_HINT = re.compile(r"\b(?:\w+/)*Esc(?:/\w+)*\s+to\s+\w", re.IGNORECASE)
 # Headlines of startup dialogs whose "Esc to cancel" quits Claude Code rather
 # than closing the dialog (2.1.299: the settings error exits 1, the folder-trust
-# question exits 0). Only the person may answer them.
+# question exits 0; 2.1.326: the --add-dir trust question exits 1). Only the
+# person may answer them.
 _ESCAPE_QUITS_DIALOG_HEADLINES = (
     "Settings Error",
     "Accessing workspace",
     "Do you trust the files in this folder",
+    "Adding a new directory",
 )
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
@@ -917,6 +955,12 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     if target.is_relative_to(router_root):
         return _absolute_syntactic_path(router_root.parent.parent)
 
+    # A sandboxed helper may only read the TMPDIR the runner pinned for it, and the
+    # bridge the runner prepared sits in that root's uid-scoped tree.
+    pinned = _pinned_temp_parent()
+    if pinned is not None and target.is_relative_to(pinned / f"omnigent-{stable_user_id()}"):
+        return pinned
+
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
         f"({claude_root!s}, {codex_root!s}, {pi_root!s}, {cursor_root!s}, "
@@ -1101,6 +1145,8 @@ class ClaudeHookRecord:
         payload's ``error_details`` field, e.g.
         ``"prompt is too long: 120000 tokens (limit 100000)"``. ``None`` when absent.
     :param failure_context: Structured evidence supplied by this hook record.
+    :param completion_output: Authoritative ``Stop`` reply, including an empty
+        reply. ``None`` when absent or malformed; never truncated here.
     """
 
     event_cursor: int
@@ -1125,6 +1171,7 @@ class ClaudeHookRecord:
     failure_category: str | None = None
     failure_message: str | None = None
     failure_context: FailureContext | None = None
+    completion_output: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1613,7 +1660,7 @@ def acp_mcp_bridge_root() -> Path:
 
 
 def prepare_acp_mcp_bridge_dir() -> Path:
-    """Create a fresh, secure per-relay bridge dir for an ACP harness.
+    """Create a fresh, secure per-relay bridge dir for an ACP harness or claude-sdk.
 
     Returns a unique owner-only directory under :func:`acp_mcp_bridge_root` with
     a minimal token-only ``bridge.json`` — so the shared ``serve-mcp`` serves
@@ -1734,9 +1781,6 @@ def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -
     """
     Whether a permission hook is parked on this session's verdict right now.
 
-    Scans every hook's marker for the session; a stale one (a hook killed
-    mid-wait) is removed on the way so they never accumulate.
-
     :param session_id: Omnigent session id to check, e.g.
         ``"conv_abc123"``.
     :param bridge_dir: Derive the marker root from this bridge, matching the hook writer.
@@ -1744,20 +1788,38 @@ def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -
         :data:`APPROVAL_WAIT_MARKER_TTL_S`; ``False`` when none exists, all
         are stale, or the root is unreadable.
     """
+    return bool(fresh_approval_wait_markers(session_id, bridge_dir=bridge_dir))
+
+
+def fresh_approval_wait_markers(session_id: str, *, bridge_dir: Path | None = None) -> list[str]:
+    """
+    Name each permission hook parked on this session's verdict right now.
+
+    Scans every hook's marker for the session; a stale one (a hook killed
+    mid-wait) is removed on the way so they never accumulate. Each hook
+    process owns one marker, so a name identifies one wait.
+
+    :param session_id: Omnigent session id to check, e.g.
+        ``"conv_abc123"``.
+    :param bridge_dir: Derive the marker root from this bridge, matching the hook writer.
+    :returns: File names of markers touched within
+        :data:`APPROVAL_WAIT_MARKER_TTL_S`, e.g. ``["<digest>.4242.wait"]``;
+        empty when none exists, all are stale, or the root is unreadable.
+    """
     root = bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME if bridge_dir else _APPROVAL_WAIT_ROOT
     try:
         markers = list(root.glob(f"{_approval_wait_digest(session_id)}.*.wait"))
     except OSError:
-        return False
+        return []
     now = time.time()
-    fresh = False
+    fresh: list[str] = []
     for marker in markers:
         try:
             touched_at = marker.stat().st_mtime
         except OSError:
             continue
         if now - touched_at < APPROVAL_WAIT_MARKER_TTL_S:
-            fresh = True
+            fresh.append(marker.name)
         else:
             clear_approval_wait_marker(marker)
     return fresh
@@ -1821,15 +1883,6 @@ def build_claude_native_spawn_env(
     }
 
 
-def _bridge_sandbox_payload(sandbox: OSEnvSandboxSpec) -> dict[str, Any]:
-    """Persist sandbox settings without parent-only credential sources."""
-    from omnigent.inner.os_env_serialization import encode_sandbox_spec
-
-    payload = encode_sandbox_spec(sandbox)
-    payload.pop("credential_proxy", None)
-    return payload
-
-
 def prepare_bridge_dir(
     conversation_id: str,
     *,
@@ -1838,7 +1891,6 @@ def prepare_bridge_dir(
     launch_model: str | None = None,
     launch_env: Mapping[str, str] | None = None,
     picker_values: Sequence[str] | None = None,
-    sandbox: OSEnvSandboxSpec | None = None,
 ) -> Path:
     """
     Create or refresh the bridge directory for a native Claude session.
@@ -1850,7 +1902,7 @@ def prepare_bridge_dir(
         ``"conv_abc123"``.
     :param bridge_id: Opaque bridge id, e.g. ``"bridge_abc123"``.
         ``None`` normalizes old sessions by using *conversation_id*.
-    :param workspace: Runner workspace/cwd used for local OS tools.
+    :param workspace: Runner workspace/cwd of the Claude session.
     :param launch_model: Gateway model name that Claude was launched
         with, e.g. ``"databricks-claude-opus-4-7"``.  Persisted so the
         forwarder can re-inject it when Claude Code's ``/model``
@@ -1865,14 +1917,6 @@ def prepare_bridge_dir(
         offers, e.g. ``["system.ai.glm-5-3"]``. Persisted for the same
         translation: a gateway-managed picker names rows by served id, and
         no pin spells those.
-    :param sandbox: Resolved ``os_env.sandbox`` for this session (the
-        agent spec's declared sandbox, already overridden by any
-        ``enforce_sandbox``/``force_sandbox`` policy verdict). Persisted
-        so :func:`_build_tools` can build the bridge's own
-        ``sys_os_*`` tools against it instead of always running
-        unsandboxed. ``None`` preserves the prior unsandboxed default.
-        Its ``credential_proxy`` is never written — see
-        :func:`_bridge_sandbox_payload`.
     :returns: Bridge directory path.
     """
     resolved_bridge_id = bridge_id or conversation_id
@@ -1908,8 +1952,6 @@ def prepare_bridge_dir(
             payload["model_env"] = model_env
         if picker_values is not None:
             payload["model_picker_values"] = list(picker_values)
-        if sandbox is not None:
-            payload["sandbox"] = _bridge_sandbox_payload(sandbox)
         _write_json_file(bridge_dir / _CONFIG_FILE, payload)
         if previous_session_id != conversation_id:
             # A window opened for another session must not answer this one's hooks.
@@ -2023,7 +2065,12 @@ def _account_home_dir() -> Path:
         return Path.home()
 
 
-def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | None = None) -> None:
+def ensure_claude_workspace_trusted(
+    workspace: Path,
+    env: Mapping[str, str] | None = None,
+    *,
+    added_dirs: Sequence[Path] = (),
+) -> None:
     """
     Pre-accept Claude Code's first-run trust, onboarding, and mode prompts.
 
@@ -2032,15 +2079,16 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
     top-level ``hasCompletedOnboarding`` key in its global config
     (:func:`claude_global_config_path`, usually ``~/.claude.json``), a
     per-directory "Do you trust the files in this folder?" dialog gated
-    by ``projects["<abs cwd>"].hasTrustDialogAccepted``, and a "Make auto
-    mode your default permission mode?" question gated by
-    ``hasSeenAutoDefaultNudge``. None fires a
+    by ``projects["<abs cwd>"].hasTrustDialogAccepted``, an "Adding a new
+    directory" question (2.1.326+) for each ``--add-dir`` gated by the same
+    key, and a "Make auto mode your default permission mode?" question gated
+    by ``hasSeenAutoDefaultNudge``. None fires a
     ``PermissionRequest`` hook, so on a host-spawned (web-UI-driven)
     session there is nobody at the terminal to answer them: Claude hangs
     and the web UI shows nothing. This is acute with
     per-session git worktrees, which hand Claude a brand-new —
-    therefore untrusted — directory on every session, and for sessions
-    rooted at the home directory, whose interactively accepted trust
+    therefore untrusted — directory on every session, and for the home
+    directory and added directories, whose interactively accepted trust
     Claude keeps for that session only.
 
     Seed the gating keys idempotently so the launch never blocks. Only
@@ -2065,6 +2113,8 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
     :param env: Environment the Claude terminal is launched with, used to
         find the config file Claude will load. ``None`` uses this process's
         environment.
+    :param added_dirs: Omnigent-owned directories passed to ``--add-dir``
+        to trust as well, e.g. the portable-skill overlay.
     :returns: None.
     :raises ValueError: If the existing global config is not a regular
         file or is a broken or looping symlink, or it (or its ``projects`` map /
@@ -2107,18 +2157,20 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
 
     # Per-directory trust gate. Claude keys its ``projects`` map by the
     # resolved absolute path, so match that exactly.
-    project_key = str(workspace.resolve())
     projects = data.setdefault("projects", {})
     if not isinstance(projects, dict):
         raise ValueError(f"{config_path} 'projects' is not a JSON object; refusing to overwrite.")
-    project = projects.setdefault(project_key, {})
-    if not isinstance(project, dict):
-        raise ValueError(
-            f"{config_path} projects[{project_key!r}] is not a JSON object; refusing to overwrite."
-        )
-    if project.get("hasTrustDialogAccepted") is not True:
-        project["hasTrustDialogAccepted"] = True
-        changed = True
+    for directory in (workspace, *added_dirs):
+        project_key = str(directory.resolve())
+        project = projects.setdefault(project_key, {})
+        if not isinstance(project, dict):
+            raise ValueError(
+                f"{config_path} projects[{project_key!r}] is not a JSON object; "
+                "refusing to overwrite."
+            )
+        if project.get("hasTrustDialogAccepted") is not True:
+            project["hasTrustDialogAccepted"] = True
+            changed = True
 
     if not changed:
         return
@@ -2390,29 +2442,163 @@ def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) 
         :data:`sys.executable`.
     :returns: JSON-serializable Claude MCP config.
     """
-    python = python_executable or sys.executable
     return {
         "mcpServers": {
-            _MCP_SERVER_NAME: {
-                "command": python,
-                "args": [
-                    "-I",
-                    "-m",
-                    "omnigent.harnesses.claude_native.bridge",
-                    "serve-mcp",
-                    "--bridge-dir",
-                    str(bridge_dir),
-                ],
-                "env": {
-                    "PYTHONUNBUFFERED": "1",
-                    # The bridge root is derived from tempfile at import time.
-                    # Keep it aligned with the runner when Claude inherits a
-                    # different TMPDIR from the user's shell.
-                    "TMPDIR": str(_TRUSTED_PARENT),
-                },
-            }
+            _MCP_SERVER_NAME: _serve_mcp_entry(
+                python_executable or sys.executable, str(bridge_dir), str(_TRUSTED_PARENT)
+            )
         }
     }
+
+
+def _serve_mcp_entry(
+    python: str, bridge_dir: str, tmpdir: str, *, socket_dir: str | None = None
+) -> _JsonObject:
+    """One Claude Code MCP server entry that runs ``serve-mcp`` for a bridge directory.
+
+    :param socket_dir: Directory for its control socket, or ``None`` for the shared
+        harness socket root.
+    """
+    from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
+
+    env = {
+        "PYTHONUNBUFFERED": "1",
+        # The bridge root is derived from tempfile at import time. Keep it
+        # aligned with the runner when Claude inherits a different TMPDIR.
+        "TMPDIR": tmpdir,
+    }
+    if socket_dir is not None:
+        env[HARNESS_TMP_PARENT_ENV_VAR] = socket_dir
+    return {
+        "command": python,
+        "args": [
+            "-I",
+            "-m",
+            "omnigent.harnesses.claude_native.bridge",
+            "serve-mcp",
+            "--bridge-dir",
+            bridge_dir,
+        ],
+        "env": env,
+    }
+
+
+def managed_mcp_relay_entry() -> _JsonObject:
+    """The static ``omnigent`` entry an operator adds to Claude Code's ``managed-mcp.json``.
+
+    Claude Code refuses ``--mcp-config`` while that file exists, so this entry stands in
+    for :func:`build_mcp_config`; Claude Code expands each session's values from the
+    environment :func:`managed_mcp_relay_env` sets.
+    """
+    return _serve_mcp_entry(
+        f"${{{MANAGED_MCP_RELAY_PYTHON_ENV}}}",
+        f"${{{MANAGED_MCP_RELAY_BRIDGE_DIR_ENV}}}",
+        f"${{{MANAGED_MCP_RELAY_TMPDIR_ENV}}}",
+        # Empty when unset, which leaves serve-mcp on the shared default socket root.
+        socket_dir=f"${{{MANAGED_MCP_RELAY_SOCKET_DIR_ENV}:-}}",
+    )
+
+
+def managed_mcp_relay_env(
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+    socket_dir: Path | None = None,
+) -> dict[str, str]:
+    """Environment that points :func:`managed_mcp_relay_entry` at one session's bridge.
+
+    :param bridge_dir: Bridge directory ``serve-mcp`` serves.
+    :param python_executable: Python with Omnigent installed; ``None`` uses this one.
+    :param socket_dir: Control-socket directory: a private one a sandbox grants, or
+        the configured harness socket root; ``None`` leaves serve-mcp on the default root.
+    :returns: Claude Code environment, e.g. ``{"OMNIGENT_MCP_RELAY_BRIDGE_DIR": "/tmp/x", ...}``.
+    """
+    return {
+        MANAGED_MCP_RELAY_PYTHON_ENV: python_executable or sys.executable,
+        MANAGED_MCP_RELAY_BRIDGE_DIR_ENV: str(bridge_dir),
+        MANAGED_MCP_RELAY_TMPDIR_ENV: str(_TRUSTED_PARENT),
+        # Set even when empty, so an inherited value can't pick another session's.
+        MANAGED_MCP_RELAY_SOCKET_DIR_ENV: str(socket_dir) if socket_dir is not None else "",
+    }
+
+
+def prepare_relay_socket_dir() -> Path:
+    """Create a short, private control-socket directory for one relay.
+
+    It sits under the harness socket root, kept short because a Unix socket path is
+    capped at 104 bytes on macOS, so a sandbox can grant this one directory rather
+    than the root that holds other sessions' sockets.
+
+    :returns: The new directory, e.g. ``/tmp/omnigent-501/r-1a2b3c4d``.
+    """
+    from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
+
+    root = resolve_harness_tmp_parent()
+    root.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(root, os.getuid())
+    socket_dir = root / f"r-{secrets.token_hex(4)}"
+    _ensure_private_dir(socket_dir, os.getuid())
+    return socket_dir
+
+
+def claude_terminal_relay_env(
+    bridge_dir: Path, *, python_executable: str | None = None
+) -> dict[str, str]:
+    """Relay environment for a Claude Code terminal, needed only under ``managed-mcp.json``.
+
+    Without that file :func:`augment_claude_args` passes the relay as ``--mcp-config``.
+    The entry sets serve-mcp's socket root from this environment, so it carries the
+    launching environment's root, as serve-mcp would inherit it from ``--mcp-config``.
+    """
+    from omnigent.onboarding.ambient import claude_code_managed_mcp_present
+    from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
+
+    if not claude_code_managed_mcp_present():
+        return {}
+    return managed_mcp_relay_env(
+        bridge_dir,
+        python_executable=python_executable,
+        socket_dir=resolve_harness_tmp_parent(),
+    )
+
+
+def managed_mcp_relay_configured() -> bool:
+    """Whether the ``managed-mcp.json`` Claude Code applies has a usable relay entry.
+
+    Both Claude harnesses use this one check, so they agree on whether a session
+    gets Omnigent's tools or the missing-entry warning.
+    """
+    from omnigent.host.mcp_inventory import managed_claude_mcp_config
+
+    _present, servers = managed_claude_mcp_config()
+    return _launches_session_relay(servers.get(_MCP_SERVER_NAME))
+
+
+# ``${VAR}`` or ``${VAR:-default}``, as Claude Code expands managed entries.
+_RELAY_BRIDGE_DIR_REFERENCE = re.compile(
+    r"\$\{" + MANAGED_MCP_RELAY_BRIDGE_DIR_ENV + r"(?::-[^}]*)?\}"
+)
+
+
+def _launches_session_relay(entry: object) -> bool:
+    """Whether a stdio entry runs ``serve-mcp`` for the bridge directory Omnigent sets.
+
+    A wrapper may precede the relay, but ``serve-mcp`` and the bridge directory must
+    appear in its command or arguments; an environment value launches nothing.
+    """
+    if not isinstance(entry, Mapping) or entry.get("type", "stdio") != "stdio":
+        return False
+    command, args, env = entry.get("command"), entry.get("args", []), entry.get("env", {})
+    if not (isinstance(command, str) and command.strip()):
+        return False
+    if not (isinstance(args, list) and all(isinstance(arg, str) for arg in args)):
+        return False
+    if not (isinstance(env, Mapping) and all(isinstance(value, str) for value in env.values())):
+        return False
+    launch = [command, *args]
+    return any("serve-mcp" in part for part in launch) and any(
+        _RELAY_BRIDGE_DIR_REFERENCE.search(part) for part in launch
+    )
 
 
 def _pin_runner_tmpdir(command: str) -> str:
@@ -2479,7 +2665,9 @@ def build_hook_settings(
     server (``enableAllProjectMcpServers``): the "New MCP server found"
     dialog is another unhookable startup gate that a host-spawned terminal
     can never answer. It also turns off auto mode's post-turn
-    environment-setup offer (``skillOverrides``) for the same reason.
+    environment-setup offer (``skillOverrides``) for the same reason, and keeps
+    automatic compaction on (``autoCompactEnabled``) so a full context compacts
+    instead of refusing every turn until someone types ``/compact``.
 
     :param bridge_dir: Bridge directory path.
     :param python_executable: Python executable to run, e.g.
@@ -2552,24 +2740,29 @@ def build_hook_settings(
     # far. Python's start-up keeps that message ahead of the Stop record; a
     # curl hook can beat it, and a native sub-agent's parent gets no output.
     turn_end_hook = {"type": "command", "command": python_command}
-    framework_context_parts = [
-        python,
-        "-I",
-        "-m",
-        "omnigent.harnesses.claude_native.hook",
-        "framework-context",
-        "--bridge-dir",
-        str(bridge_dir),
-    ]
-    # Most prompts carry no framework context, so the shell answers those.
-    framework_context_file = shlex.quote(str(bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE))
-    framework_context_hook = {
-        "type": "command",
-        "command": (
-            f"if [ ! -e {framework_context_file} ]; then cat >/dev/null; exit 0; fi; "
-            f"{_python_hook_command(framework_context_parts)} 2>> {observer_stderr}"
-        ),
-    }
+    context_hooks = {}
+    for subcommand, filename in (
+        ("framework-context", CLAUDE_FRAMEWORK_CONTEXT_FILE),
+        ("startup-context", CLAUDE_STARTUP_CONTEXT_FILE),
+    ):
+        context_parts = [
+            python,
+            "-I",
+            "-m",
+            "omnigent.harnesses.claude_native.hook",
+            subcommand,
+            "--bridge-dir",
+            str(bridge_dir),
+        ]
+        # Read context inside the terminal sandbox; absent files need no Python.
+        context_file = shlex.quote(str(bridge_dir / filename))
+        context_hooks[subcommand] = {
+            "type": "command",
+            "command": (
+                f"if [ ! -e {context_file} ]; then cat >/dev/null; exit 0; fi; "
+                f"{_python_hook_command(context_parts)} 2>> {observer_stderr}"
+            ),
+        }
     session_start_hook = {
         "type": "command",
         "command": command,
@@ -2589,7 +2782,7 @@ def build_hook_settings(
         ),
     }
     hooks: dict[str, list[_JsonObject]] = {
-        "SessionStart": [{"hooks": [session_start_hook]}],
+        "SessionStart": [{"hooks": [session_start_hook, context_hooks["startup-context"]]}],
         "SessionEnd": [{"hooks": [hook]}],
         "Stop": [{"hooks": [turn_end_hook]}],
         "StopFailure": [{"hooks": [turn_end_hook]}],
@@ -2598,7 +2791,7 @@ def build_hook_settings(
         # (web-UI message via tmux send-keys, or direct keystrokes
         # into the embedded terminal). The transcript forwarder
         # translates it into ``session.status: running``.
-        "UserPromptSubmit": [{"hooks": [hook, framework_context_hook]}],
+        "UserPromptSubmit": [{"hooks": [hook, context_hooks["framework-context"]]}],
         # ``TaskCreated`` fires when Claude creates a new native task
         # (shown with ``□`` in the TUI). The payload carries ``task_id``
         # and ``task_subject``; the forwarder converts all current tasks
@@ -2739,6 +2932,9 @@ def build_hook_settings(
         # a catch-all policy evaluation entry so TOOL_RESULT policies
         # fire for all tools, not just the forwarder-specific ones.
         hooks["PostToolUse"].append({"hooks": [evaluate_policy_hook]})
+        # A failed tool call (e.g. Bash exiting non-zero) fires
+        # PostToolUseFailure instead of PostToolUse.
+        hooks["PostToolUseFailure"] = [{"hooks": [evaluate_policy_hook]}]
         # UserPromptSubmit already carries the transcript forwarder's
         # status hook (running). Append the policy hook so REQUEST-phase
         # policies gate native prompts — for native sessions this is the
@@ -2789,8 +2985,16 @@ def build_hook_settings(
     # Pasted attachments are cached outside the workspace, so Claude would ask
     # before reading them. Deny/ask rules and Omnigent policy hooks still apply.
     attachment_read_rule = _claude_read_rule(attachment_cache_dir(bridge_dir))
-    if attachment_read_rule is not None:
-        permissions["allow"] = [attachment_read_rule]
+    allow_rules = [attachment_read_rule] if attachment_read_rule is not None else []
+    # Omnigent reviews the full change and requires human approval server-side.
+    # Don't let a second native prompt or classifier prevent that review.
+    allow_rules.extend(
+        (
+            "mcp__omnigent__sys_scheduled_task_create",
+            "mcp__omnigent__sys_scheduled_task_update",
+        )
+    )
+    permissions["allow"] = allow_rules
     if permissions:
         settings["permissions"] = permissions
     if launch_bypass_permissions:
@@ -2809,6 +3013,10 @@ def build_hook_settings(
     # only the terminal can answer it, so web-UI messages stall behind it. This
     # Claude Code switch turns off that offer and its /auto-mode-setup wizard.
     settings["skillOverrides"] = {"auto-mode-setup": "off"}
+    # With auto-compaction off, a full context refuses every turn until someone
+    # types /compact, which an unattended run never does. This outranks the
+    # user's setting; DISABLE_AUTO_COMPACT and managed policy still win.
+    settings["autoCompactEnabled"] = True
     if launch_effort and launch_effort in CLAUDE_EFFORTS:
         settings["effortLevel"] = launch_effort
     if api_key_helper:
@@ -2977,10 +3185,9 @@ def augment_claude_args(
         / ``"none"`` / list of skill names), mapped to
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
-    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
-        (author-supplied, not framework-composed) to append through Claude
-        Code's native ``--append-system-prompt`` flag, placed before a
-        caller-supplied inline prompt instead of replacing it.
+    :param append_system_prompt: Optional startup instructions, placed before
+        a caller-supplied inline prompt. With a caller prompt file, delivered
+        through SessionStart context so Claude reads the file in its sandbox.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param subagent_router_dir: Directory advertising the runner's
@@ -3019,16 +3226,15 @@ def augment_claude_args(
     from omnigent.onboarding.ambient import claude_code_managed_mcp_present
 
     if claude_code_managed_mcp_present():
-        # Claude Code exits at startup on --mcp-config while an enterprise MCP config exists.
-        _logger.warning(
-            "Claude Code has an enterprise managed-mcp.json; launching without "
-            "Omnigent's MCP tools."
-        )
+        # Claude Code exits at startup on --mcp-config while an enterprise MCP config
+        # exists; its relay entry reads the bridge from claude_terminal_relay_env.
+        if not managed_mcp_relay_configured():
+            _logger.warning(MANAGED_MCP_RELAY_MISSING_WARNING)
     else:
         mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
         args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])
     args.extend(["--settings", str(settings_path)])
-    args = _merge_append_system_prompt(args, append_system_prompt)
+    args = _merge_append_system_prompt(args, append_system_prompt, bridge_dir=bridge_dir)
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
     from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
 
@@ -3116,32 +3322,46 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
     return args
 
 
-def _merge_append_system_prompt(args: list[str], extra: str | None) -> list[str]:
+def _merge_append_system_prompt(
+    args: list[str], extra: str | None, *, bridge_dir: Path
+) -> list[str]:
     """Put ``extra`` before the caller's ``--append-system-prompt`` value.
 
     Claude Code keeps only the last value of the flag, so ``extra`` joins that
     value in place, or a new flag carries it. The scan stops at a bare ``--``.
-    Other caller tokens, including an ``--append-system-prompt-file``, are left
-    as they are. Claude Code 2.1.295+ applies such a file before the inline
-    prompt; 2.1.161 and 2.1.278 refuse to start with both.
+    Caller prompt files stay in Claude's sandbox. With a file flag, deliver only
+    ``extra`` through SessionStart so older CLIs do not receive a second flag.
 
     :param args: Claude CLI argument list to mutate-and-return.
     :param extra: Instructions Omnigent appends, e.g. the agent's instructions.
-    :returns: ``args`` whose last prompt value carries both prompts.
+    :param bridge_dir: Owner-only directory for generated startup context.
+    :returns: ``args`` with inline instructions merged, or caller file flags intact.
     """
+    startup_context = bridge_dir / CLAUDE_STARTUP_CONTEXT_FILE
     if not extra:
+        startup_context.unlink(missing_ok=True)
         return args
     flag = "--append-system-prompt"
-    joined_prefix = f"{flag}="
+    file_flag = f"{flag}-file"
     location: tuple[int, int] | None = None
+    has_prompt_file = False
     idx = 0
     while idx < len(args) and args[idx] != "--":
-        if args[idx].startswith(joined_prefix):
-            location = (idx, len(joined_prefix))
+        if args[idx] == file_flag:
+            has_prompt_file = True
+            idx += 1
+        elif args[idx].startswith(f"{file_flag}="):
+            has_prompt_file = True
+        elif args[idx].startswith(f"{flag}="):
+            location = (idx, len(flag) + 1)
         elif args[idx] == flag and idx + 1 < len(args):
             location = (idx + 1, 0)
             idx += 1
         idx += 1
+    if has_prompt_file:
+        _write_private_file(startup_context, extra)
+        return args
+    startup_context.unlink(missing_ok=True)
     if location is None:
         args.extend([flag, extra])
         return args
@@ -3229,6 +3449,10 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
                 seen = read_seen_claude_session_ids(bridge_dir)
                 seen.add(claude_session_id)
                 state["seen_claude_session_ids"] = sorted(seen)
+            if event_name == "Stop":
+                state["background_agents_after_turn"] = _background_agent_hold(payload)
+            elif event_name in {"UserPromptSubmit", "StopFailure", "SessionStart"}:
+                state["background_agents_after_turn"] = None
         else:
             _logger.debug(
                 "Ignoring identity fields from side-channel hook event; "
@@ -3279,6 +3503,88 @@ def read_claude_session_id(bridge_dir: Path) -> str | None:
     if not isinstance(raw, str) or not raw:
         return None
     return raw
+
+
+class BackgroundAgentsAfterTurnReader:
+    """
+    Read whether the main session's last turn ended with a background agent running.
+
+    Claude keeps reporting itself busy for as long as such an agent runs,
+    although its prompt is free, so the session reports ``waiting`` instead.
+    Set by the main session's ``Stop`` hook and cleared by its next
+    ``UserPromptSubmit``, ``StopFailure`` or ``SessionStart``.
+    A blocking ``Stop`` hook resumes the same turn with no new prompt, so a main
+    conversation entry after that turn's last reply also ends it, as does a
+    transcript cut short of that reply. Each read parses only the complete
+    transcript lines appended since the previous one.
+
+    :param bridge_dir: Bridge directory path.
+    """
+
+    def __init__(self, bridge_dir: Path) -> None:
+        self._bridge_dir = bridge_dir
+        self._hold: tuple[str, int] | None = None
+        self._transcript_identity: tuple[int, int] | None = None
+        self._scanned_to = 0
+        self._released = False
+        self._agents: list[_JsonObject] = []
+
+    @property
+    def agents(self) -> list[_JsonObject]:
+        """Display fields of the agents the last ``Stop`` left running.
+
+        Read alongside :meth:`read`; meaningful only while it returns ``True``.
+        An entry has ``id`` / ``type`` / ``status`` / ``description`` when Claude
+        sent them, e.g. ``{"id": "a1", "type": "subagent", "description": "Audit"}``.
+        """
+        return list(self._agents)
+
+    def read(self) -> bool:
+        """
+        Return whether the last ``Stop`` still holds the session waiting on its agents.
+
+        :returns: ``True`` between that ``Stop`` and the next main-session turn.
+        """
+        state = _read_json_file(self._bridge_dir / _STATE_FILE)
+        raw = state.get("background_agents_after_turn") if isinstance(state, dict) else None
+        transcript_path = raw.get("transcript_path") if isinstance(raw, dict) else None
+        offset = raw.get("transcript_offset") if isinstance(raw, dict) else None
+        if not isinstance(transcript_path, str) or not isinstance(offset, int):
+            self._hold = None
+            self._agents = []
+            return False
+        if self._hold != (transcript_path, offset):
+            self._hold = (transcript_path, offset)
+            self._transcript_identity = None
+            self._released = False
+            raw_agents = raw.get("agents") if isinstance(raw, dict) else None
+            self._agents = (
+                [agent for agent in raw_agents if isinstance(agent, dict)]
+                if isinstance(raw_agents, list)
+                else []
+            )
+        if self._released:
+            return False
+        try:
+            with open(transcript_path, "rb") as handle:
+                status = os.fstat(handle.fileno())
+                if status.st_size < offset:
+                    self._released = True
+                    return False
+                identity = (status.st_dev, status.st_ino)
+                if identity != self._transcript_identity or status.st_size < self._scanned_to:
+                    self._transcript_identity, self._scanned_to = identity, offset
+                handle.seek(self._scanned_to)
+                for line in handle:
+                    if not line.endswith(b"\n"):
+                        break
+                    self._scanned_to += len(line)
+                    if _main_conversation_entry_type(line) in {"user", "assistant"}:
+                        self._released = True
+                        return False
+        except OSError:
+            return False
+        return True
 
 
 def read_seen_claude_session_ids(bridge_dir: Path) -> set[str]:
@@ -4189,6 +4495,7 @@ _BACKGROUND_TASK_FORWARD_LIMIT = 100
 _BACKGROUND_TASK_FIELD_MAX_CHARS = 512
 _BACKGROUND_TASK_FIELDS: tuple[str, ...] = ("id", "type", "status", "description", "command")
 _BACKGROUND_AGENT_TASK_TYPES: frozenset[str] = frozenset({"agent", "local_agent", "subagent"})
+_TURN_END_SCAN_BYTES = 256 * 1024
 
 
 def _is_background_shell(raw: object) -> bool:
@@ -4196,6 +4503,68 @@ def _is_background_shell(raw: object) -> bool:
     if not isinstance(raw, dict):
         return True
     return raw.get("type") not in _BACKGROUND_AGENT_TASK_TYPES
+
+
+def _background_agent_hold(payload: _JsonObject) -> _JsonObject | None:
+    """Where the turn's last reply ends at a ``Stop`` that left an agent running, if one did.
+
+    The hold also keeps the running agents' display fields, so the session can
+    say what it is still waiting on.
+    """
+    raw_tasks = payload.get("background_tasks")
+    transcript_path = payload.get("transcript_path")
+    if not isinstance(raw_tasks, list) or not isinstance(transcript_path, str):
+        return None
+    running = [
+        task
+        for task in raw_tasks
+        if isinstance(task, dict)
+        and task.get("type") in _BACKGROUND_AGENT_TASK_TYPES
+        and task.get("status") not in _TERMINAL_BACKGROUND_TASK_STATUSES
+    ]
+    if not running:
+        return None
+    offset = _offset_after_last_main_reply(transcript_path)
+    if offset is None:
+        return None
+    agents = [
+        detail
+        for task in running[:_BACKGROUND_TASK_FORWARD_LIMIT]
+        if (detail := _normalize_background_task(task)) is not None
+    ]
+    return {"transcript_path": transcript_path, "transcript_offset": offset, "agents": agents}
+
+
+def _offset_after_last_main_reply(transcript_path: str) -> int | None:
+    """Byte offset just past the transcript's last main ``assistant`` entry, if near the end.
+
+    Claude runs ``Stop`` hooks in parallel and may already have appended a blocking
+    hook's feedback, so the file size at ``Stop`` is not the turn's end.
+    """
+    try:
+        with open(transcript_path, "rb") as handle:
+            start = max(0, handle.seek(0, os.SEEK_END) - _TURN_END_SCAN_BYTES)
+            handle.seek(start)
+            tail = handle.read()
+    except OSError:
+        return None
+    position, found = start, None
+    for line in tail.splitlines(keepends=True):
+        position += len(line)
+        if line.endswith(b"\n") and _main_conversation_entry_type(line) == "assistant":
+            found = position
+    return found
+
+
+def _main_conversation_entry_type(line: bytes) -> str | None:
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(entry, dict) or entry.get("isSidechain"):
+        return None
+    entry_type = entry.get("type")
+    return entry_type if isinstance(entry_type, str) else None
 
 
 def _normalize_background_task(raw: object) -> _JsonObject | None:
@@ -4327,6 +4696,11 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     failure_category: str | None = None
     failure_message: str | None = None
     failure_context: FailureContext | None = None
+    completion_output: str | None = None
+    if event_name == "Stop" and isinstance(payload, dict):
+        raw_output = payload.get("last_assistant_message")
+        if isinstance(raw_output, str):
+            completion_output = raw_output
     if event_name == "StopFailure" and isinstance(payload, dict):
         failure_category = _bounded_hook_text(payload.get("error"), _FAILURE_CATEGORY_MAX_CHARS)
         # ``error_details`` is the purpose-built API error field; ``last_assistant_message``
@@ -4387,6 +4761,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         failure_category=failure_category,
         failure_message=failure_message,
         failure_context=failure_context,
+        completion_output=completion_output,
     )
 
 
@@ -4548,10 +4923,12 @@ def inject_user_message(
     temp file) + ``paste-buffer -p`` so interior newlines ride as raw CR
     inside the paste markers and Claude Code's TUI keeps multi-line
     input as data rather than submitting on each newline
-    (anthropics/claude-code#52126). A trailing newline inside the paste
-    absorbs any trailing backslash — otherwise ``\`` + the submit
+    (anthropics/claude-code#52126). A message ending in ``\`` gets a
+    trailing newline inside the paste — otherwise ``\`` + the submit
     ``Enter`` reads as a line-continuation and the message sits unsent.
-    ``Enter`` is a separate tmux call. The file-based buffer
+    No other message gets one: Claude Code collapses a paste holding
+    three or more line breaks into a ``[Pasted text #N +X lines]``
+    placeholder. ``Enter`` is a separate tmux call. The file-based buffer
     path (not ``send-keys`` argv) matters: tmux caps a single
     client→server command at ~16KB, so a large message — e.g. a PR diff
     in a sub-agent dispatch — failed with "command too long".
@@ -4708,6 +5085,18 @@ def _paste_and_submit(
             "Answer the pending Claude question or permission request before sending a message.",
             nothing_typed=True,
         )
+    delivery_diagnostics.set_stage("encoding")
+    # Trailing line breaks add nothing before the submit Enter, and a third CR
+    # collapses the paste into a placeholder.
+    payload = _paste_payload_bytes(text).rstrip(b"\r")
+    if not payload:
+        raise RuntimeError(
+            "The message has no text to paste into Claude Code (only line breaks or "
+            "control characters). The message was not delivered."
+        )
+    if payload.endswith(b"\\"):
+        # Append a CR only when a trailing backslash would consume the submit Enter.
+        payload += b"\r"
     tail_needle = _submit_tail_needle(text) if needle else ""
     delivery_diagnostics.set_stage("pasting")
     # Clear stale text first, or the paste lands inside the person's draft and
@@ -4715,7 +5104,12 @@ def _paste_and_submit(
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
     transcript_before_paste = _capture_pane(socket_path, tmux_target)
     draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
-        bridge_dir, socket_path, tmux_target, text=text, needle=needle, tail_needle=tail_needle
+        bridge_dir,
+        socket_path,
+        tmux_target,
+        payload=payload,
+        needle=needle,
+        tail_needle=tail_needle,
     )
     box = _composer_box(pane)
     # A TUI that submits the paste itself leaves an empty box and a new transcript line.
@@ -4739,7 +5133,12 @@ def _paste_and_submit(
         )
         _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
         draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
-            bridge_dir, socket_path, tmux_target, text=text, needle=needle, tail_needle=tail_needle
+            bridge_dir,
+            socket_path,
+            tmux_target,
+            payload=payload,
+            needle=needle,
+            tail_needle=tail_needle,
         )
     delivery_diagnostics.record_draft(
         pane=pane,
@@ -4809,37 +5208,32 @@ def _paste_and_await_draft(
     socket_path: str,
     tmux_target: str,
     *,
-    text: str,
+    payload: bytes,
     needle: str,
     tail_needle: str = "",
 ) -> tuple[bool, str, int, int, float]:
     """
-    Paste *text* into the composer, then poll until its draft shows or the paste budget ends.
+    Paste *payload* into the composer, then poll until its draft shows or the paste budget ends.
 
     :param bridge_dir: Bridge directory whose temp paste file is written here.
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string.
-    :param text: Exact text to paste.
+    :param payload: Encoded paste bytes, including any backslash-protecting CR.
     :param needle: Draft marker from :func:`_submit_needle`.
     :param tail_needle: End-of-draft marker from :func:`_submit_tail_needle`.
     :returns: ``(draft_seen, last_pane, polls, empty_captures, wait_started)``.
     :raises RuntimeError: If a ``tmux`` invocation fails.
     """
-    # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
-    # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
-    # client→server command at ~16KB, so per-byte hex argv blew up with
-    # "command too long" on large payloads (a PR diff in a sub-agent
-    # dispatch). ``load-buffer`` streams the file without that cap, and
-    # ``paste-buffer -p`` wraps it in the same bracketed-paste markers so
-    # interior newlines (mapped to CR below) stay data instead of becoming
-    # per-line submits. See anthropics/claude-code#52126.
+    # Use a tmux buffer, not ``send-keys`` argv: tmux caps a client→server
+    # command at ~16KB. ``load-buffer`` avoids the cap; ``paste-buffer -p``
+    # keeps interior CRs as data, not submits (anthropics/claude-code#52126).
     paste_path: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
             dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
         ) as paste_file:
             paste_path = paste_file.name
-            paste_file.write(_paste_payload_bytes(text + "\n"))
+            paste_file.write(payload)
         _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
         _run_tmux(
             socket_path,
@@ -5934,10 +6328,14 @@ def display_cost_approval_popup(
     )
 
 
+class ClaudeBridgeNotReady(RuntimeError):
+    """The MCP control endpoint has not published its connection details yet."""
+
+
 def post_tools_changed(
     bridge_dir: Path,
     *,
-    timeout_s: float = _TOOLS_CHANGED_READY_TIMEOUT_S,
+    timeout_s: float = TOOLS_CHANGED_READY_TIMEOUT_S,
     cancelled: threading.Event | None = None,
 ) -> None:
     """
@@ -5950,7 +6348,7 @@ def post_tools_changed(
 
     :param bridge_dir: Bridge directory path.
     :param timeout_s: Seconds to wait for the bridge control endpoint
-        to publish itself, e.g. ``30.0``.
+        to publish itself, e.g. ``30.0``; ``0`` probes once without waiting.
     :param cancelled: Stops waiting when the notifying task is cancelled.
     :returns: None.
     :raises RuntimeError: If the bridge server is not ready, cannot
@@ -6395,7 +6793,9 @@ def claude_pane_input_box_shown(pane: str) -> bool:
     :param pane: Captured pane text, e.g. the watcher's last capture.
     :returns: ``False`` when a dialog or picker replaces the input box.
     """
-    return _composer_box(pane) is not None or _history_search_overlay_shown(pane)
+    return not _detailed_transcript_view_shown(pane) and (
+        _composer_box(pane) is not None or _history_search_overlay_shown(pane)
+    )
 
 
 def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
@@ -6417,8 +6817,8 @@ def _user_prompt_visible(pane: str) -> bool:
     lines = [line for line in pane.splitlines() if line.strip()]
     rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
     region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
-    # Narrow panes wrap the decision footer across captured lines.
-    footer = " ".join(region.split())
+    # Narrow panes can wrap inside the decision footer's words.
+    footer = "".join(region.split())
     # A short pane can clip the plan decision's footer entirely.
     plan_region = "\n".join(lines[rules[-1] + 1 :]) if rules else ""
     plan_exit = re.search(
@@ -6434,8 +6834,8 @@ def _user_prompt_visible(pane: str) -> bool:
         or "Do you want to " in region
         or "Yes, and don't ask again" in region
         or (
-            any(hint in footer for hint in ("Enter to select", "Enter to submit"))
-            and "Esc to cancel" in footer
+            any(hint in footer for hint in ("Entertoselect", "Entertosubmit"))
+            and "Esctocancel" in footer
         )
     )
 
@@ -6700,6 +7100,9 @@ def _restore_occupied_input(
     the pane, which scrolls the box's glyph row out of view
     (:func:`_scrolled_draft_rows`).
 
+    The detailed transcript view uses Ctrl+O instead of Escape. Toggle it
+    once after two matching captures; repeating it could reopen the view.
+
     Questions and permission prompts are protected by their hook wait markers
     and visible decision controls; they require an explicit answer. So are the
     startup dialogs whose Escape quits Claude Code instead of closing them
@@ -6709,7 +7112,7 @@ def _restore_occupied_input(
     it once with Ctrl+L before any edit keys can erase its identifying prefix,
     then check the actual composer and pending prompts again.
 
-    Escape is only sent while the surface is verifiably on screen —
+    Dismissal keys are only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
     in-flight turn. A screen with no input box counts only when it
     advertises Escape as its dismissal; before Claude Code draws its input
@@ -6743,6 +7146,8 @@ def _restore_occupied_input(
     confirmed = False
     unclearable_seen = False
     notice_redrawn = False
+    transcript_view_seen = False
+    transcript_toggled = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         _raise_if_user_prompt_pending(
@@ -6758,6 +7163,9 @@ def _restore_occupied_input(
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
             return None
         surface = _occupying_surface(pane)
+        if transcript_toggled and not pane.strip():
+            # A torn capture cannot confirm that the toggled view closed.
+            surface = _DETAILED_TRANSCRIPT_SURFACE
         delivery_diagnostics.record_restore_observation(pane=pane, surface=surface)
         box = _composer_box(pane)
         if (
@@ -6792,6 +7200,13 @@ def _restore_occupied_input(
             # can misreport during a repaint. A real surface is still there a
             # poll later; a repaint artifact is not.
             confirmed = True
+        elif surface == _DETAILED_TRANSCRIPT_SURFACE:
+            if transcript_view_seen and not transcript_toggled:
+                _logger.info("claude-native: leaving the detailed transcript view")
+                delivery_diagnostics.record_restore_action("transcript_toggle")
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-o")
+                # Repeating a toggle against a stale capture would reopen the view.
+                transcript_toggled = True
         elif unclearable:
             # Give it up only on two consecutive hint-less sightings, so a
             # torn frame mid-redraw of a dismissible surface does not hand a
@@ -6817,6 +7232,7 @@ def _restore_occupied_input(
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
             last_escape = now
         unclearable_seen = unclearable
+        transcript_view_seen = surface == _DETAILED_TRANSCRIPT_SURFACE
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
@@ -6860,6 +7276,8 @@ def _occupying_surface(pane: str) -> str | None:
     """
     if not pane.strip():
         return None
+    if _detailed_transcript_view_shown(pane):
+        return _DETAILED_TRANSCRIPT_SURFACE
     if _history_search_footer_shown(pane):
         return "the prompt-history search"
     row = _composer_row(pane)
@@ -7178,7 +7596,17 @@ def _claude_prompt_rendered(pane: str) -> bool:
     row = _composer_row(pane)
     if row is None or not row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
         return False
-    return not _history_search_footer_shown(pane)
+    return not _history_search_footer_shown(pane) and not _detailed_transcript_view_shown(pane)
+
+
+def _detailed_transcript_view_shown(pane: str) -> bool:
+    """Match the view's complete footer below its last rule, including wrapped text."""
+    lines = pane.splitlines()
+    last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
+    if last_rule is None:
+        return False
+    footer = "".join("".join(lines[last_rule + 1 :]).split()).lower()
+    return footer in {_DETAILED_TRANSCRIPT_FOOTER, _DETAILED_TRANSCRIPT_FOOTER + "verbose"}
 
 
 def _history_search_footer_shown(pane: str) -> bool:
@@ -7620,11 +8048,17 @@ def _wait_for_claude_prompt_ready(
         if _claude_prompt_rendered(pane):
             return
         remaining = hard_deadline - time.monotonic()
+        occupying_surface = _occupying_surface(pane)
         if (
             bridge_dir is not None
             and remaining > 0
-            and _occupying_surface(pane) == _OVERLAY_SURFACE
-            and (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
+            and (
+                occupying_surface == _DETAILED_TRANSCRIPT_SURFACE
+                or (
+                    occupying_surface == _OVERLAY_SURFACE
+                    and (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
+                )
+            )
             and _terminal_dialog_headline(pane) is None
             and not _escape_quits_claude(pane)
         ):
@@ -7922,6 +8356,22 @@ def _paste_payload_bytes(text: str) -> bytes:
     return bytes(body)
 
 
+def read_tmux_target(bridge_dir: Path) -> dict[str, str] | None:
+    """
+    Read the ``tmux.json`` advertisement once.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: ``{"socket_path": ..., "tmux_target": ...}``, or ``None`` when
+        the file is absent or lacks valid fields.
+    """
+    payload = _read_json_file(bridge_dir / _TMUX_FILE)
+    socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
+    tmux_target = payload.get("tmux_target") if isinstance(payload, dict) else None
+    if isinstance(socket_path, str) and isinstance(tmux_target, str):
+        return {"socket_path": socket_path, "tmux_target": tmux_target}
+    return None
+
+
 def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]:
     """
     Wait for the runner to write ``tmux.json``.
@@ -7933,14 +8383,11 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
         ``socket_path`` and ``tmux_target`` fields.
     """
     deadline = time.monotonic() + timeout_s
-    path = bridge_dir / _TMUX_FILE
     while time.monotonic() < deadline:
         _check_injection_cancelled()
-        payload = _read_json_file(path)
-        socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
-        tmux_target = payload.get("tmux_target") if isinstance(payload, dict) else None
-        if isinstance(socket_path, str) and isinstance(tmux_target, str):
-            return {"socket_path": socket_path, "tmux_target": tmux_target}
+        info = read_tmux_target(bridge_dir)
+        if info is not None:
+            return info
         time.sleep(0.05)
     raise TmuxSessionNotAdvertised(
         "Claude terminal tmux target is not advertised yet. Wait for the "
@@ -8095,7 +8542,6 @@ def _serve_mcp(bridge_dir: Path) -> None:
     notification_queue: queue.Queue[_JsonObject | None] = queue.Queue()
     stdout_lock = threading.Lock()
     httpd = _start_http_ingress(bridge_dir, token, notification_queue)
-    tools, close_tools = _build_tools(config)
     writer = threading.Thread(
         target=_notification_writer,
         args=(notification_queue, stdout_lock),
@@ -8104,12 +8550,11 @@ def _serve_mcp(bridge_dir: Path) -> None:
     )
     writer.start()
     try:
-        _stdio_jsonrpc_loop(tools, stdout_lock, bridge_dir)
+        _stdio_jsonrpc_loop(stdout_lock, bridge_dir)
     finally:
         notification_queue.put(None)
         httpd.shutdown()
         httpd.server_close()
-        close_tools()
 
 
 def _start_http_ingress(
@@ -8806,14 +9251,12 @@ def _notification_writer(
 
 
 def _stdio_jsonrpc_loop(
-    tools: dict[str, Tool],
     stdout_lock: threading.Lock,
     bridge_dir: Path,
 ) -> None:
     """
     Run the minimal MCP JSON-RPC stdio loop.
 
-    :param tools: Omnigent tools exposed over MCP.
     :param stdout_lock: Lock protecting JSON-RPC writes to stdout.
     :param bridge_dir: Bridge directory path used to read the
         active tool relay.
@@ -8830,7 +9273,7 @@ def _stdio_jsonrpc_loop(
         token = _MCP_CALL_CANCEL_EVENT.set(cancelled)
         try:
             _handle_and_write_mcp_request(
-                request_id, method, params, tools, bridge_dir, stdout_lock, framed, request_slots
+                request_id, method, params, bridge_dir, stdout_lock, framed, request_slots
             )
         finally:
             _MCP_CALL_CANCEL_EVENT.reset(token)
@@ -9039,7 +9482,6 @@ def _handle_and_write_mcp_request(
     request_id: object,
     method: str,
     params: object,
-    tools: dict[str, Tool],
     bridge_dir: Path,
     stdout_lock: threading.Lock,
     framed: bool,
@@ -9051,7 +9493,6 @@ def _handle_and_write_mcp_request(
     :param request_id: JSON-RPC request identifier returned to the client.
     :param method: JSON-RPC method name.
     :param params: Method parameters from the request.
-    :param tools: Omnigent tools exposed over MCP.
     :param bridge_dir: Bridge directory used to resolve the active relay.
     :param stdout_lock: Lock serializing responses and notifications.
     :param framed: Whether to emit a Content-Length framed response.
@@ -9059,7 +9500,6 @@ def _handle_and_write_mcp_request(
     :returns: None after the response is written.
     """
     # Heartbeat relay calls only: execution and approval waits are bounded.
-    # A hung local tool must stay killable by the client's static timeout.
     progress_token = (
         _extract_progress_token(params)
         if method == "tools/call" and _is_relay_tool_call(params, bridge_dir)
@@ -9068,7 +9508,7 @@ def _handle_and_write_mcp_request(
     heartbeat = _McpProgressHeartbeat(progress_token, stdout_lock, framed=framed)
     try:
         with heartbeat:
-            result = _handle_mcp_request(method, params, tools, bridge_dir)
+            result = _handle_mcp_request(method, params, bridge_dir)
         response: _JsonObject = {
             "jsonrpc": "2.0",
             "id": request_id,
@@ -9089,7 +9529,6 @@ def _handle_and_write_mcp_request(
 def _handle_mcp_request(
     method: str,
     params: object,
-    tools: dict[str, Tool],
     bridge_dir: Path,
 ) -> _JsonObject:
     """
@@ -9097,7 +9536,6 @@ def _handle_mcp_request(
 
     :param method: JSON-RPC method name, e.g. ``"initialize"``.
     :param params: Request params object.
-    :param tools: Omnigent tools exposed over MCP.
     :param bridge_dir: Bridge directory path used to read the
         active tool relay.
     :returns: MCP result object.
@@ -9114,57 +9552,31 @@ def _handle_mcp_request(
             },
             "instructions": (
                 "Omnigent tools are available as MCP tools when the "
-                "active Omnigent turn advertises them; local sys_os_* "
-                "tools are available outside an active turn for "
-                "workspace file and shell access."
+                "active Omnigent turn advertises them."
             ),
         }
     if method == "tools/list":
-        return {"tools": _combined_mcp_tool_schemas(tools, bridge_dir)}
+        return {"tools": _relay_mcp_tool_schemas(bridge_dir)}
     if method == "tools/call":
-        return _call_mcp_tool(params, tools, bridge_dir)
+        return _call_mcp_tool(params, bridge_dir)
     if method == "ping":
         return {}
     return {}
 
 
-def _mcp_tool_schema(tool: Tool) -> _JsonObject:
+def _relay_mcp_tool_schemas(bridge_dir: Path) -> list[_JsonObject]:
     """
-    Convert an Omnigent tool schema into MCP tool-list shape.
+    Return the active relay tools in MCP list shape.
 
-    :param tool: Tool instance, e.g. ``SysOsReadTool``.
-    :returns: MCP tool descriptor.
-    """
-    schema = tool.get_schema()["function"]
-    return {
-        "name": schema["name"],
-        "description": schema.get("description", ""),
-        "inputSchema": schema.get("parameters", {"type": "object", "properties": {}}),
-    }
-
-
-def _combined_mcp_tool_schemas(
-    local_tools: dict[str, Tool],
-    bridge_dir: Path,
-) -> list[_JsonObject]:
-    """
-    Return local and active-turn relay tools in MCP list shape.
-
-    :param local_tools: Tools the bridge can run directly, e.g.
-        ``{"sys_os_read": SysOsReadTool(...)}``.
     :param bridge_dir: Bridge directory path used to read
         ``tool_relay.json``.
-    :returns: MCP tool descriptors. Active relay tools override
-        local tools with the same name so calls flow through Omnigent and
-        appear in the Omnigent event stream during web turns.
+    :returns: MCP tool descriptors, one per named relay tool.
     """
-    schemas = {name: _mcp_tool_schema(tool) for name, tool in local_tools.items()}
-    for tool_spec in _read_relay_tool_specs(bridge_dir):
-        name = tool_spec.get("name")
-        if not isinstance(name, str) or not name:
-            continue
-        schemas[name] = _mcp_tool_schema_from_spec(tool_spec)
-    return list(schemas.values())
+    return [
+        _mcp_tool_schema_from_spec(tool_spec)
+        for tool_spec in _read_relay_tool_specs(bridge_dir)
+        if isinstance(tool_spec.get("name"), str) and tool_spec.get("name")
+    ]
 
 
 def _mcp_tool_schema_from_spec(tool_spec: _JsonObject) -> _JsonObject:
@@ -9187,15 +9599,13 @@ def _mcp_tool_schema_from_spec(tool_spec: _JsonObject) -> _JsonObject:
 
 def _call_mcp_tool(
     params: object,
-    tools: dict[str, Tool],
     bridge_dir: Path,
 ) -> _JsonObject:
     """
-    Execute one MCP tool call.
+    Execute one MCP tool call through the active relay.
 
     :param params: MCP tool-call params, e.g.
-        ``{"name": "sys_os_read", "arguments": {"path": "README.md"}}``.
-    :param tools: Omnigent tools exposed over MCP.
+        ``{"name": "list_comments", "arguments": {}}``.
     :param bridge_dir: Bridge directory path used to read the
         active tool relay.
     :returns: MCP tool-call result.
@@ -9204,48 +9614,11 @@ def _call_mcp_tool(
         return _mcp_error("tool call params must be an object")
     name = params.get("name")
     arguments = params.get("arguments")
-    if not isinstance(name, str):
+    if not isinstance(name, str) or name not in _read_relay_tool_names(bridge_dir):
         return _mcp_error(f"unknown tool: {name!r}")
     if not isinstance(arguments, dict):
         arguments = {}
-    if name in _read_relay_tool_names(bridge_dir):
-        return _call_relay_tool(bridge_dir, name, arguments)
-    if name not in tools:
-        return _mcp_error(f"unknown tool: {name!r}")
-    bridge_config = _read_json_file(bridge_dir / _CONFIG_FILE)
-    workspace_raw = bridge_config.get("workspace") if isinstance(bridge_config, dict) else None
-    workspace = Path(workspace_raw) if isinstance(workspace_raw, str) and workspace_raw else None
-    ctx = ToolContext(
-        task_id="claude-native",
-        agent_id="claude-native-ui",
-        workspace=workspace,
-        conversation_id=read_active_session_id(bridge_dir),
-    )
-    result = tools[name].invoke(json.dumps(arguments), ctx)
-    response: _JsonObject = {"content": [{"type": "text", "text": result}]}
-    if _local_result_is_error(result):
-        response["isError"] = True
-    return response
-
-
-def _local_result_is_error(result: object) -> bool:
-    """Whether a bridge-local tool's JSON result reports an error.
-
-    Relay-routed calls get ``isError`` from
-    :func:`omnigent.runtime.mcp_tool_result.mcp_response_from_tool_result`;
-    the local ``sys_os_*`` tools served outside an active turn return the same
-    ``{"error": ...}`` / ``{"blocked": true}`` shapes and must flag them the
-    same way, or the model reads a failure as a result.
-    """
-    if not isinstance(result, str):
-        return False
-    try:
-        payload = json.loads(result)
-    except ValueError:
-        return False
-    if not isinstance(payload, dict):
-        return False
-    return payload.get("blocked") is True or bool(payload.get("error"))
+    return _call_relay_tool(bridge_dir, name, arguments)
 
 
 def _read_relay_tool_names(bridge_dir: Path) -> set[str]:
@@ -9402,57 +9775,6 @@ def _empty_object_schema() -> _JsonObject:
     :returns: ``{"type": "object", "properties": {}}``.
     """
     return {"type": "object", "properties": {}}
-
-
-def _build_tools(config: _JsonObject) -> tuple[dict[str, Tool], Callable[[], None]]:
-    """
-    Build Omnigent MCP tools served by the bridge.
-
-    :param config: Bridge config JSON object. An optional ``"sandbox"``
-        key, written by :func:`prepare_bridge_dir` from the session's
-        resolved ``os_env.sandbox`` (policy overrides included), is
-        applied to the ``sys_os_*`` tools built here. Its absence
-        (older bridge configs, or sessions with no sandbox to carry)
-        falls back to the prior unsandboxed default. ``credential_proxy``
-        is never present (see :func:`_bridge_sandbox_payload`), so the
-        rebuilt spec always has it unset here.
-    :returns: ``(tools, close_tools)`` where ``close_tools``
-        releases any helper processes.
-    """
-    # Imported here, not at module top: this drags the tools/spec/pydantic
-    # graph (~300 ms of interpreter startup), and this module is on the
-    # import path of every per-chunk/per-tool-call Claude hook subprocess.
-    # Only the bridge MCP server (launch path) ever builds these tools.
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-    from omnigent.inner.os_env import create_os_environment
-    from omnigent.inner.os_env_serialization import decode_sandbox_spec
-    from omnigent.tools.builtins.os_env import build_os_env_tools
-
-    workspace_raw = config.get("workspace")
-    workspace = Path(workspace_raw) if isinstance(workspace_raw, str) and workspace_raw else None
-    os_env: OSEnvironment | None = None
-    if workspace is not None:
-        sandbox_payload = config.get("sandbox")
-        sandbox = (
-            decode_sandbox_spec(sandbox_payload)
-            if isinstance(sandbox_payload, dict)
-            else OSEnvSandboxSpec(type="none")
-        )
-        spec = OSEnvSpec(
-            type="caller_process",
-            cwd=str(workspace),
-            sandbox=sandbox,
-            fork=False,
-        )
-        os_env = create_os_environment(spec)
-    tools = {tool.name(): tool for tool in build_os_env_tools(os_env)} if os_env else {}
-
-    def _close_tools() -> None:
-        """Close helper resources owned by this bridge server."""
-        if os_env is not None:
-            os_env.close()
-
-    return tools, _close_tools
 
 
 def _write_jsonrpc(
@@ -9690,6 +10012,110 @@ def read_claude_status_model(bridge_dir: Path) -> str | None:
         return None
     model = parsed.get("model")
     return model if isinstance(model, str) and model else None
+
+
+@dataclass(frozen=True)
+class ResumeCostBaseline:
+    """
+    The session cost a cold resume seeded into a resumed Claude process.
+
+    :param claude_session_id: Claude session id the process resumed, e.g.
+        ``"02857840-6362-408f-b41f-309e396ed7c6"``. The baseline applies only
+        while the forwarded transcript belongs to that session.
+    :param cost_usd: Cost written into the transcript's ``cost-state`` record,
+        e.g. ``1.25``.
+    :param restored: Whether the process reported that cost back, or ``None``
+        until its first non-zero statusLine cost is seen.
+    """
+
+    claude_session_id: str
+    cost_usd: float
+    restored: bool | None = None
+
+
+def record_resume_cost_baseline(
+    bridge_dir: Path, *, claude_session_id: str, cost_usd: float
+) -> None:
+    """
+    Record the cost a cold resume seeds into the next Claude process.
+
+    Also removes the previous process's statusLine snapshot, so the first
+    cost the forwarder reads comes from the resumed process.
+
+    :param bridge_dir: Bridge directory shared with the forwarder.
+    :param claude_session_id: Claude session id passed to ``--resume``, e.g.
+        ``"02857840-6362-408f-b41f-309e396ed7c6"``.
+    :param cost_usd: Cost written into the ``cost-state`` record, e.g.
+        ``1.25``.
+    :raises OSError: When the snapshot can't be removed or the record written.
+    :raises RuntimeError: When the bridge dir fails its ownership check.
+    """
+    for name in (_CONTEXT_FILE, CONTEXT_RAW_FILE):
+        with contextlib.suppress(FileNotFoundError):
+            (bridge_dir / name).unlink()
+    write_resume_cost_baseline(
+        bridge_dir,
+        ResumeCostBaseline(claude_session_id=claude_session_id, cost_usd=cost_usd),
+    )
+
+
+def write_resume_cost_baseline(bridge_dir: Path, baseline: ResumeCostBaseline) -> None:
+    """
+    Persist *baseline*, so a restarted forwarder keeps its restore decision.
+
+    :param bridge_dir: Bridge directory shared with the forwarder.
+    :param baseline: Baseline to store.
+    :raises OSError: When the record can't be written.
+    :raises RuntimeError: When the bridge dir fails its ownership check.
+    """
+    _write_json_file(
+        bridge_dir / _RESUME_COST_BASELINE_FILE,
+        {
+            "claude_session_id": baseline.claude_session_id,
+            "cost_usd": baseline.cost_usd,
+            "restored": baseline.restored,
+        },
+    )
+
+
+def clear_resume_cost_baseline(bridge_dir: Path) -> None:
+    """
+    Forget any seeded cost, e.g. before a launch that seeds none.
+
+    :param bridge_dir: Bridge directory shared with the forwarder.
+    :raises OSError: When an existing record can't be removed.
+    """
+    with contextlib.suppress(FileNotFoundError):
+        (bridge_dir / _RESUME_COST_BASELINE_FILE).unlink()
+
+
+def read_resume_cost_baseline(bridge_dir: Path) -> ResumeCostBaseline | None:
+    """
+    Read the cost the last cold resume seeded into Claude.
+
+    :param bridge_dir: Bridge directory shared with the forwarder.
+    :returns: The baseline, or ``None`` when absent or malformed.
+    :raises OSError: When an existing record can't be read.
+    """
+    payload = _read_json_file(bridge_dir / _RESUME_COST_BASELINE_FILE)
+    claude_session_id = payload.get("claude_session_id")
+    cost_usd = payload.get("cost_usd")
+    restored = payload.get("restored")
+    if not isinstance(claude_session_id, str) or not claude_session_id:
+        return None
+    if isinstance(cost_usd, bool) or not isinstance(cost_usd, (int, float)):
+        return None
+    try:
+        cost = float(cost_usd)
+    except OverflowError:  # an integer too large for a float
+        return None
+    if not math.isfinite(cost) or cost <= 0:
+        return None
+    if restored is not None and not isinstance(restored, bool):
+        return None
+    return ResumeCostBaseline(
+        claude_session_id=claude_session_id, cost_usd=cost, restored=restored
+    )
 
 
 def read_user_status_line_command() -> str | None:
@@ -10180,7 +10606,7 @@ _CLI_SCAFFOLDING_MARKERS: tuple[str, ...] = (
 #   web message that opens one would never be confirmed delivered.
 # - SURFACED — commands that change the next turn's behavior or the
 #   conversation state (``/effort high``, ``/clear``, ``/compact``,
-#   ``/model``, ``/ultrareview``). A web observer needs to see these,
+#   ``/goal``, ``/model``, ``/ultrareview``). A web observer needs to see these,
 #   otherwise the next assistant turn appears to shift unprompted.
 #
 # Unknown names fall through to the Skill branch — a safer default
@@ -10231,6 +10657,7 @@ _CLAUDE_CLI_SURFACED_COMMANDS: frozenset[str] = frozenset(
         "clear",
         "compact",
         "effort",
+        "goal",
         "model",
         "ultrareview",
     }
@@ -11137,6 +11564,22 @@ _CONTEXT_OVERFLOW_REPLACEMENT = (
     "space, or /clear to start a new conversation."
 )
 
+# Claude Code's record for a response that ended with stop_reason "max_tokens";
+# its remedy (CLAUDE_CODE_MAX_OUTPUT_TOKENS on the CLI process) is a dead end in
+# the web chat. Loose on count, apostrophe and prefix so a CLI wording bump matches.
+_OUTPUT_TOKEN_LIMIT_RE = re.compile(
+    r"^(?:API Error: )?Claude['’]s response exceeded the [\d,]+ output token maximum\.",
+    re.IGNORECASE,
+)
+
+# ``classify_native_turn_error`` keys on "exceeded the model’s maximum output length";
+# keep that phrase if the wording changes.
+_OUTPUT_TOKEN_LIMIT_REPLACEMENT = (
+    "Output limit reached — the response exceeded the model’s maximum "
+    "output length and was cut off. Ask for a shorter answer, or break "
+    "the request into smaller pieces and continue step by step."
+)
+
 # Claude Code points its auth failures at ``/login`` — a dead end in the
 # web chat, where ``/login`` is a dropped command: it is escaped into
 # plain text and answered by the same expired session with the same
@@ -11272,8 +11715,8 @@ def _assistant_message_item(
     :param text: Assistant text block.
     :param is_api_error: Whether Claude Code flagged the record as its
         own API error (see :func:`_is_api_error_entry`). Gates the
-        ``/login`` guidance append, which is safe only on CLI-authored
-        text.
+        output-limit rewrite and the ``/login`` guidance append, which
+        are safe only on CLI-authored text.
     :param failure_context: Original error fields before display-text rewriting.
     :returns: Parsed transcript item.
     """
@@ -11298,12 +11741,15 @@ def _display_text(text: str, *, is_api_error: bool) -> str:
 
     :param text: Assistant or CLI error text, e.g. ``"Prompt is too long"``.
     :param is_api_error: Whether Claude Code authored the text as its own
-        error; gates the ``/login`` guidance append.
+        error; gates the output-limit rewrite and the ``/login`` guidance
+        append.
     :returns: The text to show, e.g. the context-overflow guidance.
     """
     stripped = text.strip()
     if _CONTEXT_OVERFLOW_RE.match(stripped):
         return _CONTEXT_OVERFLOW_REPLACEMENT
+    if is_api_error and _OUTPUT_TOKEN_LIMIT_RE.match(stripped):
+        return _OUTPUT_TOKEN_LIMIT_REPLACEMENT
     if is_api_error and _LOGIN_COMMAND_RE.search(stripped):
         return f"{text.rstrip()}\n\n{_login_guidance()}"
     return text
@@ -11521,7 +11967,7 @@ def _wait_for_server_info(
     """
     deadline = time.monotonic() + timeout_s
     path = bridge_dir / _SERVER_FILE
-    while time.monotonic() < deadline:
+    while True:
         if cancelled is not None and cancelled.is_set():
             raise RuntimeError("Claude native bridge notification was cancelled")
         payload = _read_json_file(path)
@@ -11531,11 +11977,13 @@ def _wait_for_server_info(
             and (payload.get("socket") or payload.get("url"))
         ):
             return payload
+        if time.monotonic() >= deadline:
+            break
         if cancelled is None:
             time.sleep(0.05)
         else:
             cancelled.wait(0.05)
-    raise RuntimeError(
+    raise ClaudeBridgeNotReady(
         "Claude native bridge is not ready yet. Wait for Claude Code "
         "startup to finish before notifying tool list changes."
     )

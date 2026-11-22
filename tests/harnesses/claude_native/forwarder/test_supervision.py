@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -22,10 +23,12 @@ from tests.harnesses.claude_native.forwarder._support import (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("slow_observer_stderr", [False, True])
 async def test_forwarder_survives_unhandled_loop_exceptions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    slow_observer_stderr: bool,
 ) -> None:
     """
     A non-HTTP loop exception is logged and the next poll continues.
@@ -84,6 +87,22 @@ async def test_forwarder_survives_unhandled_loop_exceptions(
     )
     caplog.set_level(logging.ERROR, logger="omnigent.harnesses.claude_native.forwarder")
 
+    observer_entered = asyncio.Event()
+    release_observer = threading.Event()
+    observer_finished = threading.Event()
+    original_stat = Path.stat
+    loop = asyncio.get_running_loop()
+
+    def slow_stat(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == bridge_dir / forwarder.OBSERVER_HOOK_STDERR_FILE:
+            if slow_observer_stderr and not observer_finished.is_set():
+                loop.call_soon_threadsafe(observer_entered.set)
+                release_observer.wait(timeout=5.0)
+                observer_finished.set()
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", slow_stat)
+
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
         forwarder.forward_claude_transcript_to_session(
@@ -97,8 +116,13 @@ async def test_forwarder_survives_unhandled_loop_exceptions(
         )
     )
     try:
+        if slow_observer_stderr:
+            await asyncio.wait_for(observer_entered.wait(), timeout=10.0)
+            assert not observer_finished.is_set(), "observer file I/O blocked the event loop"
+            release_observer.set()
         request = await _get_recorded_item_request(server)
     finally:
+        release_observer.set()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -559,9 +583,16 @@ def test_subagent_delivery_not_confirmed_503_exhausts_after_budget() -> None:
     assert tracker.record_failure("k", exc, session_id="conv_retry").exhausted is True
 
 
-def test_generic_503_without_not_confirmed_body_never_exhausts() -> None:
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"error": "internal_error"},
+        {"error": {"code": "runner_unavailable", "message": "Could not reach runner"}},
+    ],
+)
+def test_generic_503_without_not_confirmed_body_never_exhausts(body: object) -> None:
     tracker = forwarder._PostRetryTracker(max_not_confirmed_attempts=3)
-    exc = _http_status_error(503, {"error": "internal_error"})
+    exc = _http_status_error(503, body)
     for _ in range(10):
         assert tracker.record_failure("k", exc, session_id="conv_retry").exhausted is False
 
@@ -601,9 +632,18 @@ def test_is_subagent_delivery_not_confirmed_classifier() -> None:
     yes = _http_status_error(503, {"error": "subagent_delivery_not_confirmed"})
     no_status = _http_status_error(500, {"error": "subagent_delivery_not_confirmed"})
     no_body = _http_status_error(503, {"error": "something_else"})
+    relayed_error = {
+        "code": "runner_unavailable",
+        "message": "Runner rejected external_session_status 'idle' with status 503: "
+        '{"error":"subagent_delivery_not_confirmed","reason":"missing_parent_inbox"}',
+    }
+    relayed = _http_status_error(503, {"error": relayed_error})
+    other_code = _http_status_error(503, {"error": {**relayed_error, "code": "internal_error"}})
     assert forwarder._is_subagent_delivery_not_confirmed(yes) is True
+    assert forwarder._is_subagent_delivery_not_confirmed(relayed) is True
     assert forwarder._is_subagent_delivery_not_confirmed(no_status) is False
     assert forwarder._is_subagent_delivery_not_confirmed(no_body) is False
+    assert forwarder._is_subagent_delivery_not_confirmed(other_code) is False
     assert forwarder._is_subagent_delivery_not_confirmed(httpx.ConnectError("boom")) is False
 
 

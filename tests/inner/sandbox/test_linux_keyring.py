@@ -69,6 +69,12 @@ def desktop_keyring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator
         assert daemon.stdin is not None
         daemon.stdin.write(b"disposable-test-password")
         daemon.stdin.close()
+        # Any Secret Service call before the daemon creates the login keyring keeps it
+        # from ever exposing that keyring, so wait for the file instead of polling D-Bus.
+        login_keyring = tmp_path / "data" / "keyrings" / "login.keyring"
+        while not login_keyring.exists():
+            assert daemon.poll() is None and time.monotonic() < deadline, "keyring not created"
+            time.sleep(0.05)
         probe = (
             "from keyring.backends.SecretService import Keyring; "
             "Keyring().set_password('omnigent', 'desktop-test', 'test-only-credential')"

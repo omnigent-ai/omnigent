@@ -197,6 +197,24 @@ describe("CommentsPanel read-only collaborator gating", () => {
     expect(screen.getByRole("button", { name: "Add Comment" })).toBeInTheDocument();
   });
 
+  it("does not add the comment on the Enter that confirms an IME candidate", () => {
+    const onAddComment = vi.fn();
+    renderGated({ canEdit: true, activeSelection: FRESH_SELECTION, handlers: { onAddComment } });
+    const box = screen.getByPlaceholderText("Add a comment…");
+    fireEvent.change(box, { target: { value: "漢字" } });
+
+    // Chrome flags the confirming Enter with keyCode 229; Safari sends a plain
+    // Enter before compositionend, so only the tracked composition catches it.
+    fireEvent.keyDown(box, { key: "Enter", keyCode: 229 });
+    fireEvent.compositionStart(box);
+    fireEvent.keyDown(box, { key: "Enter" });
+    fireEvent.compositionEnd(box);
+    expect(onAddComment).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(onAddComment).toHaveBeenCalledWith("漢字");
+  });
+
   it("hides per-comment Edit and Delete actions when read-only", () => {
     renderGated({ canEdit: false, comments: [makeComment("c1")] });
     expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
@@ -408,30 +426,38 @@ describe("CommentsPanel show more / less", () => {
 //
 // The panel is resizable on desktop via a left-edge drag handle, and stacks
 // full-width (no inline width, no handle) on a narrow/mobile viewport. Desktop
-// vs mobile is decided from window.innerWidth (jsdom defaults to 1024 ≥ md).
+// vs mobile is decided from window.innerWidth (jsdom's default 1024 is below md).
 
 describe("CommentsPanel resize affordance", () => {
-  it("renders a resize handle and applies an inline width on desktop", () => {
-    renderPanel([makeComment("c1")], []);
+  function withInnerWidth(width: number, run: () => void) {
+    const orig = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    try {
+      run();
+    } finally {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: orig });
+    }
+  }
 
-    // The separator is the drag handle; its parent is the panel root, which
-    // gets an explicit pixel width (default 240px) so it can be dragged wider.
-    const handle = screen.getByRole("separator", { name: "Resize comments panel" });
-    expect((handle.parentElement as HTMLElement).style.width).toBe("240px");
+  it("renders a resize handle and applies an inline width on desktop", () => {
+    withInnerWidth(1280, () => {
+      renderPanel([makeComment("c1")], []);
+
+      // The separator is the drag handle; its parent is the panel root, which
+      // gets an explicit pixel width (default 240px) so it can be dragged wider.
+      const handle = screen.getByRole("separator", { name: "Resize comments panel" });
+      expect((handle.parentElement as HTMLElement).style.width).toBe("240px");
+    });
   });
 
   it("omits the handle and inline width on a narrow (mobile) viewport", () => {
-    const orig = window.innerWidth;
-    Object.defineProperty(window, "innerWidth", { configurable: true, value: 500 });
-    try {
+    withInnerWidth(500, () => {
       renderPanel([makeComment("c1")], []);
       // No drag handle, and the panel falls back to the w-full class (no inline width).
       expect(screen.queryByRole("separator", { name: "Resize comments panel" })).toBeNull();
       const panel = screen.getByText("Comments").closest("div")?.parentElement as HTMLElement;
       expect(panel.style.width).toBe("");
-    } finally {
-      Object.defineProperty(window, "innerWidth", { configurable: true, value: orig });
-    }
+    });
   });
 });
 

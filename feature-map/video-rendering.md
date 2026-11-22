@@ -8,7 +8,7 @@ Recordings linked in chat and opened from Files render in an inline player with 
 - `recording-remote`: Direct HTTP links ending in a video extension show a player, including URLs with signed query strings.
 - `recording-files`: Video files open in the file viewer rather than the editor or binary placeholder.
 - `recording-playback`: Play, pause, seek, and fullscreen use the browser's media controls without automatic playback on mount.
-- `recording-failure`: Failed workspace reads and unsupported codecs show a download fallback and Retry; remote recordings offer Open video in new tab.
+- `recording-failure`: Failed workspace reads and unsupported codecs show a download fallback and Retry. When the player downloads a workspace recording through the authenticated API (the host offers no direct media URL), a recording over 200 MB explains the limit and offers only Download, without Retry; direct host media URLs are not bounded by this limit. Remote recordings offer Open video in new tab.
 - `recording-lifecycle`: Workspace bytes load only on Play; closing the file panel or switching files stops playback, cancels pending reads, and releases loaded media without dropping unsaved editor protection. The same viewer moves between desktop and mobile layouts.
 - `recording-actions`: Optional WebVTT chapters open in the file side panel, seek to agent actions, and highlight the current step during playback.
 - `recording-actions-scroll`: Long action lists scroll within a bounded panel instead of stretching the video card.

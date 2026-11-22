@@ -215,7 +215,9 @@ async def native_session(
     previous_model = "claude-opus-4-6" if is_claude else "gpt-5.4"
     requested_model = "claude-opus-4-7" if is_claude else "gpt-6-sol"
     wrapper = "claude-code-native-ui" if is_claude else "codex-native-ui"
-    agent = await create_test_agent(client)
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": harness}}
+    )
     created = await client.post(
         "/v1/sessions",
         json={

@@ -543,4 +543,109 @@ describe("/mcp panel connection state", () => {
       "/settings/mcp",
     );
   });
+
+  it("shows what the session's harness holds and reconnects only troubled rows", () => {
+    const onMcpReconnect = vi.fn();
+    const rows: McpServerRow[] = [
+      { name: "docs", live: { status: "connected" }, liveName: "docs" },
+      {
+        name: "search",
+        connection: "connected",
+        live: { status: "failed", error: "token expired" },
+        liveName: "plugin:tools:search",
+      },
+      { name: "wiki", live: { status: "needs-auth" }, liveName: "wiki" },
+      { name: "calendar", live: { status: "pending" }, liveName: "calendar" },
+      { name: "local-files" },
+      { name: "mail", connection: "connected", live: { status: "not-loaded" } },
+      {
+        name: "notes",
+        connection: "sign-in-required",
+        signIn: { kind: "url", url: "https://example.com/sign-in" },
+        live: { status: "needs-auth" },
+        liveName: "notes",
+      },
+    ];
+    const panel = (extra: Partial<Parameters<typeof SlashCommandMenu>[0]> = {}) => (
+      <MemoryRouter>
+        <SlashCommandMenu
+          {...menuProps}
+          showMcpServers
+          mcpServers={rows}
+          onMcpReconnect={onMcpReconnect}
+          {...extra}
+        />
+      </MemoryRouter>
+    );
+    const { rerender } = render(panel());
+    expect(screen.getByTestId("mcp-live-status-docs")).toHaveTextContent(
+      "In this session: Connected",
+    );
+    expect(screen.getByTestId("mcp-live-status-search")).toHaveTextContent(
+      "In this session: Failed: token expired",
+    );
+    // A registry account state and the harness's own state are told apart.
+    expect(screen.getByTestId("mcp-server-row-search")).toHaveTextContent("Account: Connected");
+    expect(screen.getByTestId("mcp-live-status-wiki")).toHaveTextContent("Needs sign-in");
+    expect(screen.getByTestId("mcp-live-status-calendar")).toHaveTextContent("Connecting…");
+    expect(screen.queryByTestId("mcp-live-status-local-files")).toBeNull();
+    // A signed-in account the session never loaded is not shown as simply connected.
+    expect(screen.getByTestId("mcp-server-row-mail")).toHaveTextContent("Account: Connected");
+    expect(screen.getByTestId("mcp-live-status-mail")).toHaveTextContent(
+      "In this session: Not loaded",
+    );
+    // A row that still needs its account signed in offers that, not a Reconnect too.
+    expect(
+      within(screen.getByTestId("mcp-server-row-notes")).getByRole("link", { name: /Sign in/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getAllByRole("button", { name: "Reconnect" }).map((b) => b.dataset.testid),
+    ).toEqual(["mcp-reconnect-search", "mcp-reconnect-wiki"]);
+
+    fireEvent.click(screen.getByTestId("mcp-reconnect-search"));
+    expect(onMcpReconnect).toHaveBeenCalledWith("plugin:tools:search");
+
+    rerender(panel({ mcpReconnectingName: "plugin:tools:search" }));
+    expect(screen.getByRole("button", { name: "Reconnecting…" })).toBeDisabled();
+    // The harness takes one control request at a time.
+    expect(screen.getByTestId("mcp-reconnect-wiki")).toBeDisabled();
+
+    rerender(
+      panel({ mcpReconnectError: { name: "plugin:tools:search", message: "token expired" } }),
+    );
+    expect(
+      within(screen.getByTestId("mcp-server-row-search")).getByRole("alert"),
+    ).toHaveTextContent("Reconnect failed: token expired");
+    expect(within(screen.getByTestId("mcp-server-row-wiki")).queryByRole("alert")).toBeNull();
+
+    // Once the row recovers, the old failure is no longer shown.
+    const recovered = rows.map((row) =>
+      row.liveName === "plugin:tools:search" ? { ...row, live: { status: "connected" } } : row,
+    );
+    rerender(
+      panel({
+        mcpServers: recovered,
+        mcpReconnectError: { name: "plugin:tools:search", message: "token expired" },
+      }),
+    );
+    expect(within(screen.getByTestId("mcp-server-row-search")).queryByRole("alert")).toBeNull();
+    expect(screen.queryByTestId("mcp-reconnect-error")).toBeNull();
+
+    // With live status unavailable no row carries the name, so the panel shows the refusal.
+    rerender(
+      panel({
+        mcpServers: rows.map((row) => ({ ...row, live: undefined, liveName: undefined })),
+        mcpReconnectError: { name: "plugin:tools:search", message: "token expired" },
+      }),
+    );
+    expect(screen.getByTestId("mcp-reconnect-error")).toHaveTextContent(
+      "Reconnecting plugin:tools:search failed: token expired",
+    );
+  });
+
+  it("offers no Reconnect to a read-only viewer", () => {
+    renderPanel({ mcpServers: [{ name: "wiki", live: { status: "failed" }, liveName: "wiki" }] });
+    expect(screen.getByTestId("mcp-live-status-wiki")).toHaveTextContent("Failed");
+    expect(screen.queryByRole("button", { name: "Reconnect" })).toBeNull();
+  });
 });

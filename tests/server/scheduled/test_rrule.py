@@ -17,6 +17,7 @@ from omnigent.server.scheduled.rrule import (
     MIN_INTERVAL_SECONDS,
     RRuleValidationError,
     get_next_fire_time,
+    is_one_time_rule,
     validate_rrule,
 )
 
@@ -151,6 +152,50 @@ def test_validate_rejects_fires_only_once() -> None:
     # COUNT=1 -> a single occurrence, so no interval and no recurrence.
     with pytest.raises(RRuleValidationError):
         validate_rrule("FREQ=DAILY;COUNT=1")
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "FREQ=DAILY;COUNT=1",
+        "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=23;BYMINUTE=0;BYSECOND=0;COUNT=1",
+        "RRULE:freq=yearly;bymonth=2;bymonthday=29;count=01",
+    ],
+)
+def test_validate_accepts_explicit_one_time_rule_when_allowed(rule: str) -> None:
+    assert validate_rrule(rule, allow_single_fire=True).rule == rule
+    # Without the opt-in the legacy "fires only once" check still applies.
+    with pytest.raises(RRuleValidationError, match="fires only once"):
+        validate_rrule(rule)
+
+
+@pytest.mark.parametrize(
+    "rule,message",
+    [
+        # Fires once only because UNTIL is tight: a misconfigured recurrence.
+        ("FREQ=DAILY;UNTIL=20160101T120000Z", "fires only once"),
+        # COUNT=1 does not rescue a rule with no occurrence at all.
+        ("FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30;COUNT=1", "never fires"),
+    ],
+)
+def test_single_fire_opt_in_still_rejects_accidental_rules(rule: str, message: str) -> None:
+    with pytest.raises(RRuleValidationError, match=message):
+        validate_rrule(rule, allow_single_fire=True)
+
+
+@pytest.mark.parametrize(
+    "rule,expected",
+    [
+        ("FREQ=DAILY;COUNT=1", True),
+        ("COUNT=1;FREQ=DAILY", True),
+        ("rrule:FREQ=DAILY; COUNT=001", True),
+        ("FREQ=DAILY;COUNT=10", False),
+        ("FREQ=DAILY;COUNT=2", False),
+        ("FREQ=DAILY", False),
+    ],
+)
+def test_is_one_time_rule(rule: str, expected: bool) -> None:
+    assert is_one_time_rule(rule) is expected
 
 
 def test_validate_rejects_never_fires() -> None:

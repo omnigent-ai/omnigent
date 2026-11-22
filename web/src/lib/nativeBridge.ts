@@ -27,12 +27,26 @@
  */
 export type SidebarDragPhase = "begin" | "move" | "open" | "close";
 
-// Mirrors SESSION_HOST_PROTOCOL in electron/src/hostIdentity.js.
+// Mirrors the protocol versions in electron/src/hostIdentity.js.
 export const SESSION_HOST_PROTOCOL = 1;
+export const SSH_PREVIEW_PROTOCOL = 1;
 
 export interface BrowserHostOptions {
   sourceHostId?: string | null;
   sessionHostProtocol?: number;
+  sshPreviewProtocol?: number;
+  navigationRetryToken?: string;
+  sourceSshTarget?: string;
+}
+
+export interface BrowserNavigationResult {
+  ok: boolean;
+  created?: boolean;
+  hostIsThisMachine?: boolean;
+  sshPreviewHost?: boolean;
+  retryWithFreshHost?: boolean;
+  navigationRetryToken?: string;
+  error?: string;
 }
 
 export function navigationHostOptions(hostId: string | null): BrowserHostOptions {
@@ -223,6 +237,8 @@ interface ElectronDesktopApi extends NativeShellApi {
   connectArcaHost?: () => Promise<ArcaConnectResult>;
   /** Connect a machine the user reaches over SSH; absent on Windows and older shells. */
   connectSshHost?: (destination: string) => Promise<ArcaConnectResult>;
+  /** A workspace API call on a session host's local socket; absent on Windows and older shells. */
+  workspaceSocketRequest?: (request: WorkspaceSocketRequest) => Promise<WorkspaceSocketResponse>;
   /** Extend this machine's running Arca instance with an approved mode. */
   extendArca?: (mode: ArcaExtendMode) => Promise<ArcaExtendResult>;
   /** Renew this machine's dbcert. */
@@ -249,7 +265,7 @@ interface ElectronDesktopApi extends NativeShellApi {
       rememberedArcaHostId?: string;
       sourceIsArcaHost?: boolean;
     },
-  ) => Promise<{ ok: boolean; created?: boolean; hostIsThisMachine?: boolean; error?: string }>;
+  ) => Promise<BrowserNavigationResult>;
   /**
    * Hide/show the active embedded browser view while a DOM overlay is open.
    * The native view paints above the renderer, so this is how overlays
@@ -269,14 +285,16 @@ interface ElectronDesktopApi extends NativeShellApi {
   browserCancelRecentSessionSwitch?: () => Promise<{ ok: boolean; error?: string }>;
   /**
    * Inspect the local Google Chrome profiles for cookies in the site tree the
-   * conversation's view is on. Metadata only (profile + per-scope counts): no
-   * Keychain access and no cookie values. Absent on shells predating the feature.
+   * conversation's view is on, and across every website. Metadata only (profile
+   * + counts): no Keychain access and no cookie values. Absent on shells
+   * predating the feature.
    */
   browserChromeCookiePreview?: (conversationId: string) => Promise<ChromeCookiePreviewResult>;
   /**
-   * Copy that site's cookies out of one Chrome profile into the conversation's
-   * own in-memory browser session. Decrypts via the Keychain (system prompt on
-   * the first import); `expectedHost` must still match the view's current site.
+   * Copy one Chrome profile's cookies into the conversation's own in-memory
+   * browser session: every website's for {@link CHROME_COOKIE_ALL_SITES_SCOPE},
+   * else one site tree, for which `expectedHost` must still match the view's
+   * current site. Decrypts via the Keychain (system prompt on the first import).
    */
   browserChromeCookieImport?: (
     conversationId: string,
@@ -302,15 +320,40 @@ interface ElectronDesktopApi extends NativeShellApi {
    * macOS shells expose it. Resolves whether the shell started it.
    */
   startSystemDictation?: () => Promise<boolean>;
-  /** The "Show Omnigent from anywhere" shortcut; absent on shells predating it. */
-  getGlobalShortcut?: () => Promise<GlobalShortcutStatus | null>;
+  /**
+   * A system-wide shortcut, "show" when no id is given; absent on shells predating it. Only
+   * shells reporting `floatingComposerShortcut` know an id other than "show".
+   */
+  getGlobalShortcut?: (id?: GlobalShortcutId) => Promise<GlobalShortcutStatus | null>;
   /** Saves the shortcut; resolves `{ ok: false, error }` when the shell refuses the chord. */
-  setGlobalShortcut?: (change: GlobalShortcutChange) => Promise<GlobalShortcutSaveResult>;
+  setGlobalShortcut?: (
+    change: GlobalShortcutChange,
+    id?: GlobalShortcutId,
+  ) => Promise<GlobalShortcutSaveResult>;
   /** Takes the next chord ahead of the page's shortcuts and the menu; null when cancelled. */
-  recordGlobalShortcut?: () => Promise<string | null>;
+  recordGlobalShortcut?: (id?: GlobalShortcutId) => Promise<string | null>;
   cancelGlobalShortcutRecording?: () => Promise<boolean>;
   /** The attached browser page's view id if it has keyboard focus; absent on older shells. */
   browserFocusedView?: () => Promise<string | null>;
+  /** The floating New Agent panel; absent on shells predating it. */
+  floatingComposer?: FloatingComposerBridge;
+}
+
+/** Why the shell didn't open a path from the floating panel in a main window. */
+export type FloatingComposerOpenError = "not-composer" | "bad-path" | "window-loading";
+
+/** The desktop shell's floating New Agent panel. */
+export interface FloatingComposerBridge {
+  /** From a main window: this document can render the panel (version 1) for its server. */
+  announceSupport: (version: number) => void;
+  /** From the panel: hide it, keeping its draft. */
+  dismiss: () => void;
+  /** From the panel: show `/c/<id>` or an app page in a main window, then hide. */
+  openInMainWindow: (
+    path: string,
+  ) => Promise<{ ok: true } | { ok: false; error: FloatingComposerOpenError }>;
+  /** From the panel: its native file picker opened or closed. */
+  filePicker: (state: "open" | "closed") => void;
 }
 
 /** Native menu commands the desktop shell hands to the page (see lib/desktopCommands). */
@@ -385,6 +428,16 @@ export interface ChromeCookieProfile {
   scopes?: ChromeCookieScopeCount[];
 }
 
+/** The import scope for every website in a Chrome profile, not one site tree. */
+export const CHROME_COOKIE_ALL_SITES_SCOPE = "*";
+
+/** One local Chrome profile and how many cookies it holds across every website. */
+export interface ChromeCookieAllSitesProfile {
+  id: string;
+  name: string;
+  cookieCount: number;
+}
+
 export interface ChromeCookiePreviewResult {
   ok: boolean;
   /** Host whose page asked for the import (main-derived from the real URL). */
@@ -394,6 +447,9 @@ export interface ChromeCookiePreviewResult {
   scopes?: string[];
   /** Profiles with at least one cookie for any scope; empty when none match. */
   profiles?: ChromeCookieProfile[];
+  /** Profiles with at least one cookie for any website. Absent on shells that
+   *  can only import one site. */
+  allSitesProfiles?: ChromeCookieAllSitesProfile[];
   error?: string;
 }
 
@@ -402,7 +458,7 @@ export interface ChromeCookieImportResult {
   /** The user declined the shell's own confirmation; nothing was read. */
   cancelled?: boolean;
   host?: string;
-  /** The site tree actually copied (the page's host unless the user widened it). */
+  /** The site tree actually copied, or {@link CHROME_COOKIE_ALL_SITES_SCOPE}. */
   scope?: string;
   profileId?: string;
   profileName?: string;
@@ -450,6 +506,37 @@ export interface ArcaConnectResult extends HostActionResult {
   shownInConsole?: boolean;
 }
 
+/** One workspace API call for the desktop shell to send to a host's local socket. */
+export interface WorkspaceSocketRequest {
+  /** The session's host; the shell reaches it over SSH when this desktop connected it that way. */
+  hostId: string;
+  /** An SSH alias the shell may verify and record for `hostId` when it has none. */
+  sshTarget?: string;
+  /** The socket the server named for the session's host, on the host's machine. */
+  socketPath: string;
+  /** The call's path, e.g. `/omnigent.api.workspace.v1alpha1.WorkspaceService/ReadFile`. */
+  path: string;
+  headers: Record<string, string>;
+  body: Uint8Array;
+}
+
+/** The host's whole HTTP response to a {@link WorkspaceSocketRequest}. */
+export interface WorkspaceSocketResponse {
+  status: number;
+  headers: Record<string, string>;
+  body: Uint8Array;
+}
+
+/**
+ * The desktop shell's way to call a host's local workspace socket, or null
+ * outside the shell, on Windows, and in shells too old to offer it.
+ */
+export function workspaceSocketBridge():
+  ((request: WorkspaceSocketRequest) => Promise<WorkspaceSocketResponse>) | null {
+  const electron = electronApi();
+  return electron?.workspaceSocketRequest ? electron.workspaceSocketRequest.bind(electron) : null;
+}
+
 /**
  * Desktop-shell feature gates the server can't know about. All fields
  * optional: an older shell reports fewer.
@@ -469,6 +556,12 @@ export interface DesktopFeatures {
   arcaPreviewRecovery?: boolean;
   /** This shell can import the current site's cookies from local Google Chrome. */
   chromeCookieImport?: boolean;
+  /** Shell can ask to verify a remote host over SSH before allowing localhost previews. */
+  sshLocalhostPreview?: boolean;
+  /** This shell can show the floating New Agent panel (macOS). */
+  floatingComposer?: boolean;
+  /** This shell's shortcut calls take the "floatingComposer" id (macOS). */
+  floatingComposerShortcut?: boolean;
 }
 
 /** Status of the local `omni` CLI, from the desktop shell. */
@@ -510,7 +603,10 @@ export interface HostActionResult {
   authError?: boolean;
 }
 
-/** The "Show Omnigent from anywhere" shortcut; `accelerator` is an Electron accelerator. */
+/** "Show Omnigent from anywhere", or the floating New Agent panel's shortcut. */
+export type GlobalShortcutId = "show" | "floatingComposer";
+
+/** A system-wide shortcut's setting; `accelerator` is an Electron accelerator. */
 export interface GlobalShortcutSetting {
   enabled: boolean;
   accelerator: string;
@@ -719,6 +815,11 @@ export function updateBridge(): ElectronUpdateBridge | undefined {
   return electronApi()?.updates;
 }
 
+/** The floating New Agent panel bridge, or undefined outside Electron / older shells. */
+export function floatingComposerBridge(): FloatingComposerBridge | undefined {
+  return electronApi()?.floatingComposer;
+}
+
 /**
  * True when the desktop shell is new enough to host the embedded browser pane.
  * Older installed builds expose `omnigentDesktop` but predate the `browser*`
@@ -867,12 +968,19 @@ export function supportsGlobalShortcut(): boolean {
   );
 }
 
-/** The saved "Show Omnigent from anywhere" shortcut; `null` outside the shell or on failure. */
-export async function getGlobalShortcut(): Promise<GlobalShortcutStatus | null> {
+/** The id to pass the shell: none for "show", so that call is the one every shell takes. */
+function shortcutIdArgs(id: GlobalShortcutId): [] | [GlobalShortcutId] {
+  return id === "show" ? [] : [id];
+}
+
+/** The saved shortcut; `null` outside the shell or on failure. */
+export async function getGlobalShortcut(
+  id: GlobalShortcutId = "show",
+): Promise<GlobalShortcutStatus | null> {
   const electron = electronApi();
   if (!electron?.getGlobalShortcut) return null;
   try {
-    return await electron.getGlobalShortcut();
+    return await electron.getGlobalShortcut(...shortcutIdArgs(id));
   } catch (err) {
     console.warn("[nativeBridge] electron getGlobalShortcut failed:", err);
     return null;
@@ -885,11 +993,12 @@ export async function getGlobalShortcut(): Promise<GlobalShortcutStatus | null> 
  */
 export async function setGlobalShortcut(
   change: GlobalShortcutChange,
+  id: GlobalShortcutId = "show",
 ): Promise<GlobalShortcutSaveResult> {
   const electron = electronApi();
   if (!electron?.setGlobalShortcut) return { ok: false, error: "Couldn't save the shortcut." };
   try {
-    return await electron.setGlobalShortcut(change);
+    return await electron.setGlobalShortcut(change, ...shortcutIdArgs(id));
   } catch (err) {
     console.warn("[nativeBridge] electron setGlobalShortcut failed:", err);
     return { ok: false, error: "Couldn't save the shortcut." };
@@ -902,9 +1011,9 @@ export function shellRecordsGlobalShortcut(): boolean {
 }
 
 /** The next chord, taken by the shell; null when recording was cancelled or failed. */
-export async function recordGlobalShortcut(): Promise<string | null> {
+export async function recordGlobalShortcut(id: GlobalShortcutId = "show"): Promise<string | null> {
   try {
-    return (await electronApi()?.recordGlobalShortcut?.()) ?? null;
+    return (await electronApi()?.recordGlobalShortcut?.(...shortcutIdArgs(id))) ?? null;
   } catch (err) {
     console.warn("[nativeBridge] electron recordGlobalShortcut failed:", err);
     return null;

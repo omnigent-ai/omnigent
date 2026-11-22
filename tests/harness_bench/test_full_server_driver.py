@@ -83,7 +83,7 @@ def _driver(
 
 def test_poll_session_collects_terminal_snapshot_once(monkeypatch) -> None:
     monkeypatch.setattr("tests.harness_bench.full_server_driver.time.sleep", lambda _: None)
-    call = {"type": "function_call", "data": {"call_id": "c1", "name": "list_files"}}
+    call = {"type": "function_call", "data": {"call_id": "c1", "name": "sys_list_files"}}
     output = {"type": "function_call_output", "data": {"output": "ok"}}
     driver = _driver(
         [
@@ -99,7 +99,7 @@ def test_poll_session_collects_terminal_snapshot_once(monkeypatch) -> None:
 
     assert result.completed
     assert result.text == "done"
-    assert result.tool_calls == [{"call_id": "c1", "name": "list_files", "arguments": None}]
+    assert result.tool_calls == [{"call_id": "c1", "name": "sys_list_files", "arguments": None}]
     assert result.tool_call_allowed
 
 

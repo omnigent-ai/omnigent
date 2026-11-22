@@ -3527,9 +3527,11 @@ def test_gateway_provider_max_output_tokens_validation_rejects_negative() -> Non
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("catalog_unavailable", [False, True])
 def test_cli_config_pi_provider_uses_live_discovery_over_catalog_default(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    catalog_unavailable: bool,
 ) -> None:
     """cli-config Databricks path: live discovery wins over the catalog default.
 
@@ -3542,13 +3544,20 @@ def test_cli_config_pi_provider_uses_live_discovery_over_catalog_default(
     used ``model or catalog_default``, ignoring ``_default_claude_model_from``
     even when a live Claude list was successfully fetched.
     """
+    from omnigent.models.model_resolver import ModelResolutionError
     from omnigent.runtime.credentials.databricks import WorkspaceCreds
 
-    # Stub catalog default to an unserved id (the bug: this must NOT win).
+    # Stub catalog default to an unserved id (the bug: this must NOT win). An
+    # unreachable catalog must not drop the provider either.
     UNSERVED_DEFAULT = "databricks-claude-fable-5"
+
+    def _resolve_catalog_model(provider_name: str, *, family: str, **kwargs: object) -> object:
+        if catalog_unavailable:
+            raise ModelResolutionError("no compatible catalog model")
+        return SimpleNamespace(model_id=UNSERVED_DEFAULT)
+
     monkeypatch.setattr(
-        "omnigent.models.model_catalog.resolve_catalog_model",
-        lambda provider_name, *, family, **kwargs: SimpleNamespace(model_id=UNSERVED_DEFAULT),
+        "omnigent.models.model_catalog.resolve_catalog_model", _resolve_catalog_model
     )
 
     # Stub workspace credentials and live model discovery.
@@ -3592,6 +3601,21 @@ def test_cli_config_pi_provider_uses_live_discovery_over_catalog_default(
     assert provider.model != UNSERVED_DEFAULT, (
         f"selected model must not be the unserved catalog default {UNSERVED_DEFAULT!r}"
     )
+
+
+def test_select_databricks_claude_model_needs_catalog_or_served_claude(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a catalog default or a served Claude model, selection still fails."""
+    from omnigent.models.model_resolver import ModelResolutionError
+
+    def _unavailable(provider_name: str, *, family: str, **kwargs: object) -> object:
+        raise ModelResolutionError("no compatible catalog model")
+
+    monkeypatch.setattr("omnigent.models.model_catalog.resolve_catalog_model", _unavailable)
+
+    with pytest.raises(ModelResolutionError):
+        creds._select_databricks_claude_model(None, [])
 
 
 def test_cli_config_pi_provider_explicit_override_wins_over_discovery(

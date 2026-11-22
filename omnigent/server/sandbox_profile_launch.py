@@ -21,7 +21,7 @@ async def prepare_profile(
     user_id: str | None = None,
     inherited_session_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Resolve a selection, or inherit from an already-authorized session."""
+    """Resolve a selection, inherit an already-authorized session's, or use the default."""
     catalog = getattr(request.app.state, "sandbox_profiles", None)
     if body.sandbox_profile_id is not None:
         if catalog is None:
@@ -64,7 +64,13 @@ async def prepare_profile(
                 code=ErrorCode.INVALID_INPUT,
             )
     elif body.host_type == "managed":
-        await asyncio.to_thread(catalog.require_selection, body.sandbox_provider, user_id=user_id)
+        snapshot = await asyncio.to_thread(
+            catalog.default_selection, body.sandbox_provider, user_id=user_id
+        )
+        if snapshot is None:
+            await asyncio.to_thread(
+                catalog.require_selection, body.sandbox_provider, user_id=user_id
+            )
     return snapshot
 
 
@@ -88,14 +94,66 @@ async def record_profile(
 
 
 async def saved_profile(
-    catalog: Any, session_id: str, *, user_id: str | None, host_id: str | None = None
+    catalog: Any,
+    session_id: str,
+    *,
+    user_id: str | None,
+    host_id: str | None = None,
+    bind_host: bool = True,
 ) -> dict[str, Any] | None:
     """Recheck authorization without replacing the accepted provider reference."""
     if catalog is None:
         return None
+    host_snapshot = None
     if host_id is not None:
-        await asyncio.to_thread(catalog.require_session_host, session_id, host_id, user_id=user_id)
+        host_snapshot = await asyncio.to_thread(
+            catalog.require_session_host,
+            session_id,
+            host_id,
+            user_id=user_id,
+            bind=bind_host,
+        )
     snapshot = await asyncio.to_thread(catalog.get_session_snapshot, session_id)
+    if snapshot is None and not bind_host:
+        # A reset automation adopts the host's profile when provisioning binds its workspace.
+        snapshot = host_snapshot
     if snapshot is not None:
         await asyncio.to_thread(catalog.validate_snapshot, snapshot, user_id=user_id)
     return snapshot
+
+
+async def default_profile_for_unrecorded_host(
+    catalog: Any,
+    session_id: str,
+    host_id: str,
+    provider: str | None,
+    *,
+    user_id: str | None,
+) -> dict[str, Any] | None:
+    """Give a scheduled reset session the default profile when its host's profile is unknown.
+
+    A host's profile is recorded only on the sessions bound to it. Once a continue
+    task's sessions are deleted, a provider that cannot report a sandbox's profile
+    leaves the host with no record, and the relaunch would wait for a selection no
+    one can make. Automations always launch on the default, so it is what the host
+    was built with unless an admin changed the default since.
+
+    :returns: The default, now accepted for *session_id*, or ``None`` when the
+        session or host already has a profile or the provider has no default.
+    """
+    if catalog is None:
+        return None
+    if await asyncio.to_thread(catalog.get_session_snapshot, session_id) is not None:
+        return None
+    if (
+        await asyncio.to_thread(
+            catalog.get_host_snapshot, host_id, reference_session_id=session_id
+        )
+        is not None
+    ):
+        return None
+    default = await asyncio.to_thread(catalog.default_selection, provider, user_id=user_id)
+    if default is None:
+        return None
+    await asyncio.to_thread(catalog.bind_session, session_id, default)
+    return default

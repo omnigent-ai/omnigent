@@ -160,8 +160,17 @@ async def _drive(rig: ManagedReplicas) -> None:
                         .get_by_text("Research the API", exact=True)
                         .bounding_box()
                     )
+                    representative_box, sibling_box = [
+                        await page.locator(
+                            f'li[data-sidebar-session-id="{row_id}"]'
+                        ).bounding_box()
+                        for row_id in (source_id, sibling_id)
+                    ]
                     assert representative_label and sibling_label
-                    assert sibling_label["x"] >= representative_label["x"] + 16
+                    assert representative_box and sibling_box
+                    # The nested row steps in; its title lines up with the representative's.
+                    assert sibling_box["x"] >= representative_box["x"] + 16
+                    assert sibling_label["x"] == representative_label["x"]
                     await page.screenshot(path=str(evidence / "siblings-two-sandboxes.png"))
                     representative = page.locator(f'li[data-sidebar-session-id="{source_id}"]')
                     await page.mouse.move(1200, 900)
@@ -292,20 +301,15 @@ async def _drive(rig: ManagedReplicas) -> None:
                         await row.hover()
                         await row.get_by_test_id("conversation-actions").click()
 
-                    # Individual pins remain shortcuts; a representative pin moves the family.
+                    # Only the representative offers pin actions.
                     await menu(fresh_id)
-                    await expect(page.get_by_test_id("move-to-project")).to_have_count(0)
+                    await expect(page.get_by_test_id("move-to-project")).to_be_visible()
+                    await expect(page.get_by_test_id("pin-conversation")).to_have_count(0)
                     await page.keyboard.press("Escape")
-                    await (
-                        page.locator(f'li[data-sidebar-session-id="{fresh_id}"]')
-                        .first.get_by_test_id("quick-pin-conversation")
-                        .click()
-                    )
-                    await _poll(
-                        client,
-                        f"{rig.a}/v1/sessions/{fresh_id}",
-                        lambda row: bool(row.get("labels", {}).get("omnigent.pinned")),
-                    )
+                    member_row = page.locator(f'li[data-sidebar-session-id="{fresh_id}"]')
+                    await expect(
+                        member_row.get_by_test_id("quick-pin-conversation")
+                    ).to_have_count(0)
                     await page.locator(f'li[data-sidebar-session-id="{sibling_id}"]').first.hover()
                     await (
                         page.locator(f'li[data-sidebar-session-id="{sibling_id}"]')
@@ -318,18 +322,10 @@ async def _drive(rig: ManagedReplicas) -> None:
                         lambda row: row.get("family", {}).get("pinned") is True,
                     )
                     await page.screenshot(path=str(evidence / "family-pinned.png"))
-                    member_row = page.locator(f'li[data-sidebar-session-id="{fresh_id}"]')
-                    await member_row.hover()
-                    await member_row.get_by_role("button", name="Unpin conversation").click()
-                    await _poll(
-                        client,
-                        f"{rig.a}/v1/sessions/{fresh_id}",
-                        lambda row: (
-                            not row.get("labels", {}).get("omnigent.pinned")
-                            and row.get("family", {}).get("pinned") is True
-                        ),
-                    )
-                    await page.screenshot(path=str(evidence / "individual-unpinned.png"))
+                    await expect(member_row).to_have_attribute("data-sibling-session", "true")
+                    await expect(
+                        member_row.get_by_test_id("quick-pin-conversation")
+                    ).to_have_count(0)
                     await page.locator(f'li[data-sidebar-session-id="{sibling_id}"]').first.hover()
                     await (
                         page.locator(f'li[data-sidebar-session-id="{sibling_id}"]')
@@ -344,6 +340,7 @@ async def _drive(rig: ManagedReplicas) -> None:
                     # Project moves are family-wide.
                     await menu(sibling_id)
                     await page.get_by_test_id("move-to-project").hover()
+                    await page.get_by_role("menuitem", name="Projects", exact=True).hover()
                     await page.get_by_placeholder("Search or create project").fill("Sibling demo")
                     await page.get_by_role(
                         "menuitem", name=re.compile("Create.*Sibling demo")
@@ -360,21 +357,14 @@ async def _drive(rig: ManagedReplicas) -> None:
                     # Pinning an expanded folder's family removes every row from that folder.
                     project_header = page.get_by_role("button", name="Sibling demo", exact=True)
                     if await project_header.get_attribute("aria-expanded") == "false":
-                        await project_header.click()
+                        await project_header.locator("[data-section-toggle]").first.click()
                     project_section = project_header.locator("xpath=ancestor::section[1]")
                     member_selector = f'li[data-sidebar-session-id="{fresh_id}"]'
                     member_row = project_section.locator(member_selector)
-                    await member_row.hover()
-                    await member_row.get_by_role("button", name="Pin conversation").click()
-                    await expect(page.locator(member_selector)).to_have_count(1)
-                    await expect(member_row).to_have_count(0)
-                    pinned_row = page.locator(member_selector)
-                    await expect(pinned_row).not_to_have_attribute("data-sibling-session", "true")
-                    await page.screenshot(path=str(evidence / "project-personal-pin.png"))
-                    await pinned_row.hover()
-                    await pinned_row.get_by_role("button", name="Unpin conversation").click()
-                    await expect(page.locator(member_selector)).to_have_count(1)
                     await expect(member_row).to_have_attribute("data-sibling-session", "true")
+                    await expect(
+                        member_row.get_by_test_id("quick-pin-conversation")
+                    ).to_have_count(0)
                     for pinned in (True, False):
                         representative = page.locator(
                             f'li[data-sidebar-session-id="{sibling_id}"]'
@@ -467,7 +457,7 @@ async def _drive(rig: ManagedReplicas) -> None:
                         await phone.get_by_role("button", name="Open sidebar", exact=True).click()
                         project = phone.get_by_role("button", name="Sibling demo", exact=True)
                         if await project.get_attribute("aria-expanded") == "false":
-                            await project.click()
+                            await project.locator("[data-section-toggle]").first.click()
                         row = phone.locator(f'li[data-sidebar-session-id="{fresh_id}"]').first
                         await row.scroll_into_view_if_needed()
                         box = await row.bounding_box()
