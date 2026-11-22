@@ -390,17 +390,22 @@ def test_list_for_project_paginates(
     monkeypatch.setattr(
         "omnigent.stores.file_store.sqlalchemy_store.now_epoch", lambda: next(created_at)
     )
-    for index in range(5):
-        file_store.create(f"f{index}.txt", index, project_id=_PROJECT)
-    newest_first = [f.id for f in file_store.list_for_project(_PROJECT, limit=10).data]
+    created = [
+        file_store.create(f"f{index}.txt", index, project_id=_PROJECT) for index in range(5)
+    ]
+    # The expected order, from the records themselves: newest first, ties broken by id.
+    newest_first = [
+        f.id for f in sorted(created, key=lambda f: (f.created_at, f.id), reverse=True)
+    ]
 
+    listed = file_store.list_for_project(_PROJECT, limit=10)
     first = file_store.list_for_project(_PROJECT, limit=2)
     second = file_store.list_for_project(_PROJECT, limit=2, after=first.last_id)
     third = file_store.list_for_project(_PROJECT, limit=2, after=second.last_id)
     newer = file_store.list_for_project(_PROJECT, limit=2, before=newest_first[2])
     ascending = file_store.list_for_project(_PROJECT, limit=2, order="asc", after=newest_first[3])
 
-    assert len(newest_first) == 5
+    assert [f.id for f in listed.data] == newest_first
     assert [f.id for f in first.data + second.data + third.data] == newest_first
     assert [first.has_more, second.has_more, third.has_more] == [True, True, False]
     assert [f.id for f in newer.data] == newest_first[:2]

@@ -903,6 +903,7 @@ def test_deleting_a_project_removes_its_files(tmp_path: Path) -> None:
             stored_before = {path.name for path in stack.artifact_location.iterdir()}
 
             deleted = client.delete(f"/v1/projects/{project_id}")
+            assert deleted.status_code == 200, deleted.text
             owner_after = client.get(f"/v1/projects/{project_id}/resources/files")
             agent_after = _mcp_tool_call(
                 client, session_id, "sys_list_files", {"scope": "project"}
@@ -922,7 +923,6 @@ def test_deleting_a_project_removes_its_files(tmp_path: Path) -> None:
 
     assert read_brief == "the brief"
     assert {brief_id, plan_id} <= stored_before
-    assert deleted.status_code == 200, deleted.text
     assert owner_after.status_code == 404, owner_after.text
     assert agent_after.startswith("Error: sys_list_files returned 404"), agent_after
     assert not {brief_id, plan_id} & stored_after
