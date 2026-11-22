@@ -27,6 +27,9 @@ describe("SaveSidebarViewDialog", () => {
         show: [],
         sessionFilter: "all",
         pullRequestFilter: "all",
+        statusFilter: "all",
+        harnessFilter: null,
+        projectFilter: { kind: "all" },
       },
     });
     expect(saveButton()).toBeDisabled();

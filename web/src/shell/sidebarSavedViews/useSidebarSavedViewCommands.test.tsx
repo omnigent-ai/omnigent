@@ -17,6 +17,9 @@ const SETTINGS = {
   show: [],
   sessionFilter: "all",
   pullRequestFilter: "open",
+  statusFilter: "all",
+  harnessFilter: null,
+  projectFilter: { kind: "all" },
 } as const;
 
 function savedView(name: string): SidebarSavedView {
