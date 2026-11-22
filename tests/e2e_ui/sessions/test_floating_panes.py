@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import io
 import os
+import re
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from PIL import Image
 from playwright.sync_api import Locator, Page, Route, expect
@@ -398,3 +400,79 @@ def test_the_workspace_sidebar_resizes_from_the_gutter_beside_the_chat(
     assert _cursor_at(page, inside, y) != "col-resize"
     _drag(page, inside, y, -_DRAG_PX)
     assert abs(_workspace_width(page) - narrowed) <= 1
+
+
+def _open_terminal_first(page: Page, base_url: str, session_id: str, **open_args: Any) -> None:
+    """Open the session as ``omnigent claude`` sessions are: terminal-first, with the agent's
+    terminal listed (no live PTY is needed to place the switch)."""
+    httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.ui": "terminal"}},
+        timeout=10.0,
+    ).raise_for_status()
+    terminals = {
+        "object": "list",
+        "data": [
+            {
+                "id": "terminal_tui_main",
+                "type": "terminal",
+                "session_id": session_id,
+                "name": "tui:main",
+                "metadata": {"terminal_name": "tui", "session_key": "main", "running": True},
+            }
+        ],
+        "first_id": "terminal_tui_main",
+        "last_id": "terminal_tui_main",
+        "has_more": False,
+    }
+    page.route(
+        re.compile(rf"/v1/sessions/{re.escape(session_id)}/resources/terminals\?.*"),
+        lambda route: route.fulfill(json=terminals),
+    )
+    _open(page, base_url, session_id, **open_args)
+
+
+@pytest.mark.parametrize("tabs_sidebar", [True, False], ids=["tabs", "classic"])
+@pytest.mark.parametrize("floating", [True, False], ids=["floating", "edge-to-edge"])
+def test_a_terminal_first_chat_switches_views_from_its_own_row(
+    page: Page, seeded_session: tuple[str, str], tabs_sidebar: bool, floating: bool
+) -> None:
+    """With floating panes the Chat/Terminal switch sits in a row at the top of the chat's card,
+    over both views; with ``-floating_panes`` it stays in the header. The classic layout's cases
+    run dark, so the switch's track is seen in both themes."""
+    base_url, session_id = seeded_session
+    scheme = "light" if tabs_sidebar else "dark"
+    name = f"terminal-first-{'strip' if floating else 'header'}-{scheme}"
+    _open_terminal_first(
+        page, base_url, session_id, scheme=scheme, floating=floating, tabs_sidebar=tabs_sidebar
+    )
+    header = page.locator("header.chat-header")
+    strip = page.get_by_role("group", name="Chat pane")
+    switch_home = strip if floating else header
+    view_switch = switch_home.get_by_role("group", name="Switch between chat and terminal")
+    expect(view_switch).to_be_visible()
+    if floating:
+        expect(header.get_by_role("group", name="Switch between chat and terminal")).to_have_count(
+            0
+        )
+    else:
+        expect(strip).to_have_count(0)
+    _capture(page, name)
+
+    view_switch.get_by_role("button", name=re.compile("^Terminal ")).click()
+    terminal_view = page.get_by_test_id("main-terminal-view")
+    expect(terminal_view).to_be_visible()
+    expect(message_composer(page)).to_have_count(0)
+    if floating:
+        # The row stays over the terminal, which starts below it.
+        expect(strip).to_be_visible()
+        strip_box, terminal_box = strip.bounding_box(), terminal_view.bounding_box()
+        assert strip_box is not None and terminal_box is not None
+        content_top = terminal_box["y"] + float(
+            terminal_view.evaluate("(el) => parseFloat(getComputedStyle(el).paddingTop)")
+        )
+        assert content_top >= strip_box["y"] + strip_box["height"] - 0.5, (strip_box, content_top)
+    _capture(page, f"{name}-terminal")
+
+    view_switch.get_by_role("button", name="Chat view").click()
+    expect(message_composer(page)).to_be_visible()
