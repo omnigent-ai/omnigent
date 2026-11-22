@@ -2692,6 +2692,8 @@ def _make_reuse_dispatch(deps: FireDeps) -> LaunchDispatch:
             if conv.kind == "sub_agent":
                 runner_client, conv = await _sub_agent_runner(deps, task, conv)
             if runner_client is None:
+                runner_client, conv = await _side_chat_runner(deps, task, conv)
+            if runner_client is None:
                 runner_client, conv = await ensure_runner_connected(
                     session_id=conv.id,
                     conv=conv,
@@ -2728,6 +2730,48 @@ async def _sub_agent_runner(
     if runner_client is not None:
         return runner_client, conv
     return await _wake_host_owner(deps, task, conv)
+
+
+async def _side_chat_runner(
+    deps: FireDeps, task: ScheduledTask, conv: Conversation
+) -> tuple[httpx.AsyncClient | None, Conversation]:
+    """Find the runner a side chat shares with its source, as a message to it would.
+
+    A side chat has no host of its own: its source's runner is relaunched on the
+    source's host if needed, while the timer's owner may still edit the source.
+
+    :param deps: The fire's stores and runner registries.
+    :param task: The timer waking *conv*.
+    :param conv: The session, e.g. a side chat whose source's runner idled out.
+    :returns: The runner's client and the side chat as last read, or ``None`` and
+        *conv* when it is not a side chat or its source's runner can't be recovered.
+    """
+    from omnigent.server.routes._sessions.orchestration import (
+        _recover_side_chat_runner_via_source,
+        _side_chat_source_id,
+    )
+    from omnigent.server.routes.sessions import _ensure_runner_relay_ready, _get_runner_client
+
+    if _side_chat_source_id(conv) is None:
+        return None, conv
+    runner_client = await _get_runner_client(conv.id, deps.runner_router, conversation=conv)
+    if runner_client is not None:
+        return runner_client, conv
+    runner_client, conv = await _recover_side_chat_runner_via_source(
+        conv,
+        app_state=deps.app_state,
+        conversation_store=deps.conversation_store,
+        runner_router=deps.runner_router,
+        user_id=task.user_id or RESERVED_USER_LOCAL,
+        permission_store=deps.permission_store,
+    )
+    if runner_client is None:
+        return None, conv
+    # The side chat's output relay still follows the stopped runner.
+    await _ensure_runner_relay_ready(
+        conv.id, conv.runner_id, runner_client, deps.conversation_store, conversation=conv
+    )
+    return runner_client, conv
 
 
 async def _wake_host_owner(

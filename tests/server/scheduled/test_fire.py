@@ -73,6 +73,8 @@ from omnigent.stores.conversation_store import (
     FORK_SOURCE_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
     SessionActivity,
 )
 from omnigent.stores.permission_store import PermissionStore
@@ -4357,6 +4359,48 @@ async def test_a_sub_agent_follows_its_parents_new_runner_before_its_host_launch
     assert relay.await_args.args[:3] == ("conv_prev", "runner_parent", parent_runner)
     send.assert_awaited_once()
     assert send.await_args.args[1:] == (healed, parent_runner, task)
+
+
+@pytest.mark.asyncio
+async def test_a_side_chat_timer_recovers_its_sources_runner_as_a_message_would(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A side chat has no host: its source's runner is recovered for it, never its own."""
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes._sessions import orchestration
+
+    labels = {SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: "conv_source"}
+    side_chat = _continued_session(host_id=None, runner_id="gone", labels=labels)
+    rebound = _continued_session(host_id=None, runner_id="source_runner", labels=labels)
+    source_runner = object()
+    monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=None))
+    recover = AsyncMock(return_value=(source_runner, rebound))
+    monkeypatch.setattr(orchestration, "_recover_side_chat_runner_via_source", recover)
+    relay = AsyncMock()
+    monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", relay)
+    relaunch = AsyncMock()
+    monkeypatch.setattr(sessions, "ensure_runner_connected", relaunch)
+    send = AsyncMock()
+    monkeypatch.setattr(fire_mod, "_send_prompt", send)
+    task = _continuing_task(user_id="alice@example.com")
+    dispatch = fire_mod._make_reuse_dispatch(
+        _deps(
+            FakeScheduledTaskStore(rows={"task_1": task}),
+            conversation_store=_ExistingConversationStore(rebound),
+        )
+    )
+
+    await dispatch(side_chat, task)
+
+    relaunch.assert_not_awaited()
+    recover.assert_awaited_once()
+    # The source is recovered as the timer's owner, who must still be able to edit it.
+    assert recover.await_args.args[0] is side_chat
+    assert recover.await_args.kwargs["user_id"] == "alice@example.com"
+    relay.assert_awaited_once()
+    assert relay.await_args.args[:3] == ("conv_prev", "source_runner", source_runner)
+    send.assert_awaited_once()
+    assert send.await_args.args[1:] == (rebound, source_runner, task)
 
 
 @pytest.mark.asyncio

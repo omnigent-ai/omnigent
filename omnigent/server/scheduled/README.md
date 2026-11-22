@@ -479,7 +479,9 @@ tunnel claims its firings.
   A sub-agent session whose runner is gone first moves to its parent's live runner,
   output relay included, before anything launches a runner of its own, as a message
   to it would. If no ancestor runner is live, the session owning their host (while
-  the timer's owner may still send to it) is woken and the sub-agent follows it.
+  the timer's owner may still send to it) is woken and the sub-agent follows it. A
+  side chat recovers its source's runner through the message path's
+  `_recover_side_chat_runner_via_source`.
   The run records `succeeded`, or `failed` (`launch_failed`) when no runner can be
   reached or woken or the runner declines the wake; a firing is never retried.
 - **Cancelling.** A cancel that commits before a claimed firing does suppresses it:
