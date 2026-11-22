@@ -23,6 +23,8 @@ import { Button } from "@/components/ui/button";
 import { TabsContent } from "@/components/ui/tabs";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useComments } from "@/hooks/useComments";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import type { usePullRequestReviewThreads } from "@/hooks/usePullRequestReviewThreads";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
@@ -31,12 +33,17 @@ import {
   type NormalizedPullRequestInfo,
   type PullRequest,
   type PullRequestChangedFile,
+  type PullRequestChangedFilesResult,
   type usePullRequestChangedFiles,
+  usePullRequestCommitDiff,
+  usePullRequestCommits,
+  usePullRequestCommitsUnsupported,
   type usePullRequestDiff,
 } from "@/hooks/usePullRequests";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { gitProviderCopy } from "@/lib/gitProviders";
 import { hasCommandModifier } from "@/lib/hotkeys";
+import { consumeLocalReviewNavigation, useLocalReviewNavigation } from "@/lib/localReviewContext";
 import { PULL_REQUEST_DIFF_THEME, type ReviewThread } from "@/lib/pullRequestReviewThreads";
 import { patchFileHashes, useViewedFiles, type PullRequestIdentity } from "@/lib/pullRequestViewed";
 import { cn } from "@/lib/utils";
@@ -48,13 +55,19 @@ import {
   type DiffOptions,
   type FindHighlight,
 } from "./PullRequestFileSection";
+import { PullRequestCommitBar } from "./PullRequestCommitBar";
+import { PullRequestCommitsList } from "./PullRequestCommitsList";
+import { PullRequestChangesModeSwitch } from "./PullRequestChangesModeSwitch";
+import { PullRequestChangesSince } from "./PullRequestChangesSince";
 import { PullRequestFileActions } from "./PullRequestFileActions";
 import { PullRequestFindBar } from "./PullRequestFindBar";
 import { PullRequestPathFilter } from "./PullRequestPathFilter";
 import { PullRequestReviewThread, type ReviewThreadContext } from "./PullRequestReviewThread";
 import { PullRequestViewedProgress, PullRequestViewedToggle } from "./PullRequestViewedControls";
+import { LocalReviewComment } from "./LocalReviewComment";
 import {
   buildSearchCorpus,
+  changedFilesFromPatch,
   filterChangedPaths,
   findMatches,
   firstMatchAtOrBelow,
@@ -63,9 +76,11 @@ import {
   pullRequestRepoUrl,
   refreshedMatchIndex,
   selectVisibleFiles,
+  unquoteGitPath,
   type Match,
 } from "./pullRequestReview";
 import { useChangesViewState, type FindState } from "./useChangesViewState";
+import { useCommitViewState } from "./useCommitViewState";
 
 /** Index of the match a step moves to; with none active, the first or last by direction. */
 function stepTarget(activeIndex: number, direction: 1 | -1, length: number): number {
@@ -264,6 +279,7 @@ function ChangesToolbar({
   onToggleAll,
   navigation,
   progress,
+  modeSwitch,
 }: {
   showFileControls: boolean;
   sidebarCollapsed: boolean;
@@ -280,10 +296,14 @@ function ChangesToolbar({
   onToggleAll: () => void;
   navigation?: React.ReactNode;
   progress?: React.ReactNode;
+  /** The Changes | Commits control, shown only where the provider lists commits. */
+  modeSwitch?: React.ReactNode;
 }) {
   return (
-    <div className="flex w-full shrink-0 items-center justify-between gap-2 border-b border-border px-2 py-1">
-      <div className="flex min-w-0 flex-1 items-center gap-0.5">
+    // Wraps when the mode switch, file controls and progress together outgrow a narrow rail.
+    <div className="flex w-full shrink-0 flex-wrap items-center justify-between gap-x-2 gap-y-1 border-b border-border px-2 py-1">
+      <div className="flex min-w-0 flex-auto items-center gap-0.5">
+        {modeSwitch}
         {showFileControls && (
           <IconButton
             label={sidebarCollapsed ? "Show file list" : "Hide file list"}
@@ -411,6 +431,43 @@ function openUnavailableReason(
 
 const NO_HIDDEN_PATHS: ReadonlySet<string> = new Set();
 
+/** The message a failed read shows; a runner that went offline gets its own wording. */
+function readErrorText(error: Error): string {
+  return error instanceof RunnerOfflineError ? "Runner offline." : error.message;
+}
+
+/** What an empty file list says: an unreadable commit, a commit without changes, or a PR without any. */
+function emptyChangesText(
+  commitView: boolean,
+  sinceView: boolean,
+  commitUnavailable: boolean,
+): string {
+  if (commitUnavailable) return "This commit's diff can't be read here.";
+  if (sinceView) return "No changes since that commit.";
+  if (commitView) return "This commit has no file changes.";
+  return "No changes vs base.";
+}
+
+const PR_PARSE_ERROR = "Couldn’t read the PR diff. Refresh or open the PR on its provider.";
+const COMMIT_PARSE_ERROR = "Couldn’t read this commit’s diff. Refresh or open it on its provider.";
+
+/** A unified patch split into per-file diffs keyed by path, or `parseError` when it can't be parsed. */
+function parsePatchByPath(
+  patch: string | undefined,
+  parseError: string,
+): { filesByPath: Map<string, FileDiffMetadata>; parseError: string | undefined } {
+  const filesByPath = new Map<string, FileDiffMetadata>();
+  if (!patch) return { filesByPath, parseError: undefined };
+  try {
+    for (const parsed of parsePatchFiles(patch)) {
+      for (const file of parsed.files) filesByPath.set(unquoteGitPath(file.name), file);
+    }
+  } catch {
+    return { filesByPath, parseError };
+  }
+  return { filesByPath, parseError: undefined };
+}
+
 /**
  * The Changes tab content. Mounted beside the other tabs' content (it renders its
  * own TabsContent) so collapse and scroll-spy state survive tab switches.
@@ -445,14 +502,188 @@ export function PullRequestChangesTab({
   const headSha = pr.head_sha;
   const baseSha = pr.base_sha;
   const mobile = useIsMobileViewport();
+  const serverInfo = useServerInfo();
+  const sessionComments = useComments(selected ? conversationId : undefined);
+  const selectedPrUrl = data.selected_pr_url ?? pr.url;
+  const localComments = useMemo(
+    () =>
+      (sessionComments.data ?? []).filter(
+        (comment) => comment.anchor_metadata?.pr_url === selectedPrUrl,
+      ),
+    [sessionComments.data, selectedPrUrl],
+  );
+  const earlierLocalCommentIds = useMemo(
+    () =>
+      new Set(
+        localComments
+          .filter(
+            (comment) =>
+              comment.anchor_metadata?.head_sha !== prDiff.data?.head_sha ||
+              comment.anchor_metadata?.base_sha !== prDiff.data?.base_sha,
+          )
+          .map((comment) => comment.id),
+      ),
+    [localComments, prDiff.data?.head_sha, prDiff.data?.base_sha],
+  );
   const view = useChangesViewState(conversationId, data.selected_pr_url ?? pr.url);
-  const { revealedPaths, reveal, clearReveal, find } = view;
+  const {
+    revealedPaths,
+    reveal,
+    clearReveal,
+    find,
+    setPathFilter,
+    setHideViewed,
+    setMode,
+    setSinceSha,
+    shownEarlierCommentPaths,
+    setEarlierCommentsShown,
+  } = view;
+  const shownLocalComments = localComments.filter(
+    (comment) =>
+      !earlierLocalCommentIds.has(comment.id) || shownEarlierCommentPaths.has(comment.path),
+  );
+  const navigationTarget = useLocalReviewNavigation(conversationId);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const commentHighlight = useRef<Animation | null>(null);
+  useEffect(
+    () => () => commentHighlight.current?.cancel(),
+    [conversationId, selectedPrUrl, selected],
+  );
+  useEffect(() => {
+    if (
+      !selected ||
+      !navigationTarget ||
+      changes.isLoading ||
+      changes.isFetching ||
+      prDiff.isLoading ||
+      prDiff.isFetching ||
+      sessionComments.isFetching ||
+      !sessionComments.isSuccess ||
+      navigationTarget.anchor_metadata?.pr_url !== selectedPrUrl
+    )
+      return;
+    if (view.mode !== "changes" || view.sinceSha) {
+      setMode("changes");
+      setSinceSha(null);
+      return;
+    }
+    if (!localComments.some((comment) => comment.id === navigationTarget.id)) {
+      toast.error("This review comment is no longer available.");
+      consumeLocalReviewNavigation(conversationId);
+      return;
+    }
+    setPathFilter("");
+    setHideViewed(false);
+    if (earlierLocalCommentIds.has(navigationTarget.id)) {
+      setEarlierCommentsShown(navigationTarget.path, true);
+    }
+    reveal(navigationTarget.path);
+    // Tabs can mount their content after this effect; diff slots also settle asynchronously.
+    let frame = 0;
+    const focusComment = () => {
+      const element = scrollRef.current?.querySelector<HTMLElement>(
+        `[data-local-review-comment="${CSS.escape(navigationTarget.id)}"]`,
+      );
+      if (element?.getClientRects().length) {
+        element.focus({ preventScroll: true });
+        if ((element.getRootNode() as Document | ShadowRoot).activeElement === element) {
+          element.scrollIntoView({ block: "center" });
+          commentHighlight.current?.cancel();
+          const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+          commentHighlight.current =
+            element.animate?.(
+              [
+                { borderColor: "var(--ring)", offset: 0 },
+                { borderColor: "var(--ring)", offset: reducedMotion ? 1 : 0.8 },
+              ],
+              { duration: 3000, easing: "ease-out" },
+            ) ?? null;
+          consumeLocalReviewNavigation(conversationId);
+          return;
+        }
+      }
+      frame = requestAnimationFrame(focusComment);
+    };
+    frame = requestAnimationFrame(focusComment);
+    return () => cancelAnimationFrame(frame);
+  }, [
+    changes.isLoading,
+    changes.isFetching,
+    prDiff.isLoading,
+    prDiff.isFetching,
+    conversationId,
+    navigationTarget,
+    reveal,
+    selected,
+    selectedPrUrl,
+    setHideViewed,
+    setPathFilter,
+    setMode,
+    setSinceSha,
+    view.mode,
+    view.sinceSha,
+    localComments,
+    sessionComments.isSuccess,
+    sessionComments.isFetching,
+    earlierLocalCommentIds,
+    setEarlierCommentsShown,
+  ]);
   // The filter input shows in the sidebar; while the sidebar is collapsed it opens inline.
   const [filterOpen, setFilterOpen] = useState(false);
   // The revision the displayed list reports. Open uses only this pinned revision, so a newer
   // poll never changes the link, and a list without one leaves Open disabled.
   const renderedHeadSha = changes.data?.head_sha ?? null;
   const renderedBaseSha = changes.data?.base_sha ?? null;
+  // Commits need the host's capability, a pinned head, and a server that has the routes.
+  const commitsUnsupported = usePullRequestCommitsUnsupported(conversationId, prUrl);
+  const commitsSupported =
+    !!data.capabilities.commit_history && !!prUrl && !!renderedHeadSha && !commitsUnsupported;
+  const mode = commitsSupported ? view.mode : "changes";
+  const commitsView = mode === "commits";
+  const commitView = mode === "commit";
+  // In Changes, a picked PR commit narrows the view to the changes after it, up to the head.
+  const sinceSha = mode === "changes" && commitsSupported ? view.sinceSha : null;
+  const sinceView = !!sinceSha;
+  // An open commit's patch, or the changes since a commit, stand in for the PR patch.
+  const patchView = commitView || sinceView;
+  // The Changes since picker loads the commit list once it is first opened.
+  const [commitsWanted, setCommitsWanted] = useState(false);
+  const commits = usePullRequestCommits(
+    conversationId,
+    prUrl,
+    renderedHeadSha,
+    commitsSupported && (mode !== "changes" || commitsWanted || sinceView),
+  );
+  const commitDiff = usePullRequestCommitDiff(
+    conversationId,
+    prUrl,
+    commitView ? view.commitSha : sinceSha,
+    sinceView ? renderedHeadSha : null,
+  );
+  const shownDiff = patchView ? commitDiff : prDiff;
+  // The list is oldest first, so the previous commit is the older one and the next is newer.
+  const commitList = useMemo(() => commits.data?.data ?? [], [commits.data]);
+  const commitIndex = commitList.findIndex((commit) => commit.sha === view.commitSha);
+  const selectedCommit = commitIndex >= 0 ? commitList[commitIndex] : undefined;
+  const previousCommit = commitIndex > 0 ? commitList[commitIndex - 1] : null;
+  const nextCommit =
+    commitIndex >= 0 && commitIndex < commitList.length - 1 ? commitList[commitIndex + 1] : null;
+  // The open commit left the loaded list (the head moved), so there is nothing to step from.
+  useEffect(() => {
+    if (commitView && commits.data && commitIndex < 0) setMode("commits");
+  }, [commitView, commits.data, commitIndex, setMode]);
+  // A picked start that left the loaded list (the head moved) falls back to the PR base.
+  useEffect(() => {
+    if (sinceSha && commits.data && !commitList.some((commit) => commit.sha === sinceSha)) {
+      setSinceSha(null);
+    }
+  }, [sinceSha, commits.data, commitList, setSinceSha]);
+  // A server without the commit routes leaves Changes as the only view, so a saved commit view ends.
+  useEffect(() => {
+    if (!commitsUnsupported || view.mode === "changes") return;
+    setMode("changes");
+    toast("Commits need an updated Omnigent server.", { id: "pr-commits-unsupported" });
+  }, [commitsUnsupported, view.mode, setMode]);
   const baseRepoUrl = pullRequestRepoUrl(data.provider, pr.url);
   const providerLabel = gitProviderCopy(data.provider, undefined, data.provider_display).label;
   const findInputRef = useRef<HTMLInputElement>(null);
@@ -460,30 +691,22 @@ export function PullRequestChangesTab({
   const [pendingReveal, setPendingReveal] = useState<{ path: string } | null>(null);
   // The match the reader navigated to. Null until seeded when the bar opens or its query changes.
   const [findTarget, setFindTarget] = useState<Match | null>(null);
+  // A match or a pending jump belongs to the patch it was made in, so it ends with a mode or commit change.
+  useEffect(() => {
+    setFindTarget(null);
+    setPendingReveal(null);
+  }, [mode, view.commitSha, sinceSha]);
   // The head the shown patch was fetched for. Viewed state needs both the list and the diff
   // pinned to the same head; unpinned providers (GitLab, Azure) can't prove it, so marks are withheld.
   const pinnedHead = changes.data?.head_sha ?? null;
   const renderedHead = pinnedHead && prDiff.data?.head_sha === pinnedHead ? pinnedHead : null;
   // Parse the one whole-PR patch into per-file diffs, keyed by path.
-  const { filesByPath, parseError } = useMemo(() => {
-    const map = new Map<string, FileDiffMetadata>();
-    const patch = prDiff.data?.patch;
-    if (patch) {
-      try {
-        for (const parsed of parsePatchFiles(patch)) {
-          for (const f of parsed.files) map.set(f.name, f);
-        }
-      } catch {
-        return {
-          filesByPath: map,
-          parseError: "Couldn’t read the PR diff. Refresh or open the PR on its provider.",
-        };
-      }
-    }
-    return { filesByPath: map, parseError: undefined };
-  }, [prDiff.data]);
-  // Hashed from this parse, before the expand-context loader edits these files.
-  const patchHashes = useMemo(() => patchFileHashes(filesByPath), [filesByPath]);
+  const prParse = useMemo(
+    () => parsePatchByPath(prDiff.data?.patch, PR_PARSE_ERROR),
+    [prDiff.data],
+  );
+  // Viewed marks always hash the whole-PR patch, before the expand-context loader edits these files.
+  const patchHashes = useMemo(() => patchFileHashes(prParse.filesByPath), [prParse]);
   const viewedFiles = useViewedFiles(identity, renderedHead, patchHashes);
 
   const themeType = useResolvedThemeMode();
@@ -500,9 +723,37 @@ export function PullRequestChangesTab({
     });
   }, []);
 
-  const files = useMemo<PullRequestChangedFile[]>(() => changes.data?.data ?? [], [changes.data]);
+  // The shown patch: the whole PR's parse in Changes, or one commit's.
+  const { filesByPath, parseError } = useMemo(
+    () => (patchView ? parsePatchByPath(shownDiff.data?.patch, COMMIT_PARSE_ERROR) : prParse),
+    [patchView, shownDiff.data, prParse],
+  );
+  // A commit's list is the files its patch changes; the PR's list is the provider's.
+  const commitFiles = useMemo(
+    () => (patchView ? changedFilesFromPatch(filesByPath) : []),
+    [patchView, filesByPath],
+  );
+  const listing = useMemo<{
+    data?: PullRequestChangedFilesResult;
+    isLoading: boolean;
+    error: Error | null;
+  }>(
+    () =>
+      patchView
+        ? {
+            data: { available: true, data: commitFiles, has_more: false },
+            isLoading: commitDiff.isLoading,
+            error: commitDiff.error,
+          }
+        : changes,
+    [patchView, commitFiles, commitDiff.isLoading, commitDiff.error, changes],
+  );
+  const files = useMemo<PullRequestChangedFile[]>(() => listing.data?.data ?? [], [listing.data]);
+  // Review features (threads, drafts, viewed controls, marks and progress) belong to the whole
+  // PR diff, so they apply only in Changes from the PR base.
+  const reviewing = mode === "changes" && !sinceView;
   // One filtered list drives the tree, sections, threads and collapse all so they never disagree.
-  const hiddenPaths = view.hideViewed ? viewedFiles.viewed : NO_HIDDEN_PATHS;
+  const hiddenPaths = view.hideViewed && reviewing ? viewedFiles.viewed : NO_HIDDEN_PATHS;
   const visibleFiles = useMemo(
     () => selectVisibleFiles(files, { pathFilter: view.pathFilter, hiddenPaths }),
     [files, view.pathFilter, hiddenPaths],
@@ -512,21 +763,45 @@ export function PullRequestChangesTab({
   const changedListed = files.some((file) => viewedFiles.changed.has(file.path));
   // Hide viewed has emptied every file the path filter still matches.
   const matchingCount = filterChangedPaths(files, view.pathFilter).length;
-  const allViewed = view.hideViewed && visibleFiles.length === 0 && matchingCount > 0;
+  const allViewed = view.hideViewed && reviewing && visibleFiles.length === 0 && matchingCount > 0;
   // The sidebar groups the flat file list into a compacted folder tree (the
   // diff scroll below stays linear, in file order).
   const fileTree = useMemo(() => buildSidebarTree(visibleFiles), [visibleFiles]);
   const visiblePaths = useMemo(() => visibleFiles.map((file) => file.path), [visibleFiles]);
   // The toolbar, and with it the find bar, renders only when there is something to show.
   const toolbarShown =
-    files.length > 0 || reviews.isFetching || (reviews.page?.data ?? []).some((t) => !t.resolved);
+    files.length > 0 ||
+    commitsSupported ||
+    reviews.isFetching ||
+    (reviews.page?.data ?? []).some((t) => !t.resolved);
 
   // Per-file collapse is lifted here so the toolbar's "expand/collapse all" can
   // drive every section; a path in the set is collapsed unless it is revealed.
   const [collapsedPaths, setCollapsedPaths] = useState<ReadonlySet<string>>(() => new Set());
+  // Each view reads and writes only its own collapse and reveal state. A commit's is created
+  // fresh for that commit, so nothing a commit does reaches the PR's Changes view.
+  const commitState = useCommitViewState(
+    commitView ? view.commitSha : sinceSha ? `since:${sinceSha}` : null,
+  );
+  const changesState = useMemo(
+    () => ({
+      collapsedPaths,
+      revealedPaths,
+      setCollapsedPaths,
+      reveal,
+      clearReveal,
+    }),
+    [collapsedPaths, revealedPaths, reveal, clearReveal],
+  );
+  const pane = patchView ? commitState : changesState;
+  const {
+    setCollapsedPaths: setPaneCollapsed,
+    clearReveal: clearPaneReveal,
+    reveal: revealPane,
+  } = pane;
   const isCollapsed = useCallback(
-    (path: string) => collapsedPaths.has(path) && !revealedPaths.has(path),
-    [collapsedPaths, revealedPaths],
+    (path: string) => pane.collapsedPaths.has(path) && !pane.revealedPaths.has(path),
+    [pane.collapsedPaths, pane.revealedPaths],
   );
   // Viewed files start collapsed once per rendered head. A collapse that marks introduced
   // expands again on a new head, since its mark was reset; the reader's own collapses stay.
@@ -553,20 +828,57 @@ export function PullRequestChangesTab({
       return { ...prev, owned };
     });
   }, []);
-  // Marking a file collapses it; unmarking leaves its current state alone.
-  const toggleViewed = useCallback(
+  // A file marked viewed collapses; the collapse belongs to the mark until the reader toggles it.
+  const collapseMarked = useCallback(
     (path: string) => {
-      const markViewed = !viewedFiles.viewed.has(path);
-      viewedFiles.setMany([path], markViewed);
-      if (!markViewed) return;
       if (!collapsedPaths.has(path)) {
         setSeed((prev) => ({ ...prev, owned: new Set(prev.owned).add(path) }));
       }
       clearReveal(path);
       setCollapsedPaths((prev) => (prev.has(path) ? prev : new Set(prev).add(path)));
     },
-    [viewedFiles, clearReveal, collapsedPaths],
+    [clearReveal, collapsedPaths],
   );
+  // Hide viewed can remove the file just marked, and with it the focused box. Focus then moves to
+  // the next shown file's Viewed box, or to Hide viewed when no file follows.
+  const viewedRowRef = useRef<HTMLDivElement>(null);
+  const [focusAfterHide, setFocusAfterHide] = useState<{ nextPath: string | null } | null>(null);
+  useEffect(() => {
+    if (!focusAfterHide) return;
+    const nextBox = focusAfterHide.nextPath
+      ? scrollRef.current?.querySelector<HTMLElement>(
+          `[role="checkbox"][aria-label="${CSS.escape(`Viewed ${focusAfterHide.nextPath}`)}"]`,
+        )
+      : null;
+    (nextBox ?? viewedRowRef.current?.querySelector<HTMLElement>('[role="checkbox"]'))?.focus();
+  }, [focusAfterHide]);
+  // Unmarking leaves the file's current state alone.
+  const toggleViewed = useCallback(
+    (path: string) => {
+      const markViewed = !viewedFiles.viewed.has(path);
+      viewedFiles.setMany([path], markViewed);
+      if (!markViewed) return;
+      if (view.hideViewed && reviewing) {
+        const index = visibleFiles.findIndex((file) => file.path === path);
+        setFocusAfterHide({ nextPath: visibleFiles[index + 1]?.path ?? null });
+      }
+      collapseMarked(path);
+    },
+    [viewedFiles, collapseMarked, view.hideViewed, reviewing, visibleFiles],
+  );
+  // Marks another tab stores arrive as storage events. A file that becomes viewed on the same head
+  // collapses here. A head change or an unavailable snapshot resets the baseline instead.
+  const previousViewed = useRef<{ head: string | null; viewed: ReadonlySet<string> } | null>(null);
+  useEffect(() => {
+    const previous = previousViewed.current;
+    previousViewed.current = viewedFiles.available
+      ? { head: renderedHead, viewed: viewedFiles.viewed }
+      : null;
+    if (!previous || !viewedFiles.available || previous.head !== renderedHead) return;
+    for (const path of viewedFiles.viewed) {
+      if (!previous.viewed.has(path)) collapseMarked(path);
+    }
+  }, [viewedFiles.available, viewedFiles.viewed, renderedHead, collapseMarked]);
 
   // Fixed id keeps repeated failures from stacking toasts.
   useEffect(() => {
@@ -608,9 +920,10 @@ export function PullRequestChangesTab({
   const toggleOne = useCallback(
     (path: string) => {
       const collapse = !isCollapsed(path);
-      clearReveal(path);
-      releaseMarkCollapse([path]);
-      setCollapsedPaths((prev) => {
+      clearPaneReveal(path);
+      // Mark ownership belongs to the PR's Changes view; a commit's toggles leave it alone.
+      if (reviewing) releaseMarkCollapse([path]);
+      setPaneCollapsed((prev) => {
         if (prev.has(path) === collapse) return prev;
         const next = new Set(prev);
         if (collapse) next.add(path);
@@ -618,14 +931,14 @@ export function PullRequestChangesTab({
         return next;
       });
     },
-    [isCollapsed, clearReveal, releaseMarkCollapse],
+    [isCollapsed, clearPaneReveal, setPaneCollapsed, reviewing, releaseMarkCollapse],
   );
 
   const allCollapsed = visibleFiles.length > 0 && visibleFiles.every((f) => isCollapsed(f.path));
   const toggleAll = useCallback(() => {
-    for (const file of visibleFiles) clearReveal(file.path);
-    releaseMarkCollapse(visibleFiles.map((file) => file.path));
-    setCollapsedPaths((prev) => {
+    for (const file of visibleFiles) clearPaneReveal(file.path);
+    if (reviewing) releaseMarkCollapse(visibleFiles.map((file) => file.path));
+    setPaneCollapsed((prev) => {
       const next = new Set(prev);
       for (const file of visibleFiles) {
         if (allCollapsed) next.delete(file.path);
@@ -633,20 +946,30 @@ export function PullRequestChangesTab({
       }
       return next;
     });
-  }, [visibleFiles, allCollapsed, clearReveal, releaseMarkCollapse]);
+  }, [
+    visibleFiles,
+    allCollapsed,
+    clearPaneReveal,
+    setPaneCollapsed,
+    reviewing,
+    releaseMarkCollapse,
+  ]);
 
   // Expand-context loader: fetch a file's full old/new content on demand when
   // the reader expands unchanged regions.
   const loadDiffFiles = useCallback(
     async (fd: FileDiffMetadata) => {
+      // The parser keeps git's quoting; the provider reads files by repository path.
+      const path = unquoteGitPath(fd.name);
+      const previousPath = fd.prevName ? unquoteGitPath(fd.prevName) : undefined;
       const { before, after } = prUrl
-        ? await fetchPullRequestFileContents(conversationId, fd.name, baseRef, {
+        ? await fetchPullRequestFileContents(conversationId, path, baseRef, {
             pr_url: prUrl,
-            previous_path: fd.prevName,
+            previous_path: previousPath,
             head_sha: headSha,
             base_sha: baseSha,
           })
-        : await fetchPullRequestFileContents(conversationId, fd.name, baseRef);
+        : await fetchPullRequestFileContents(conversationId, path, baseRef);
       return {
         oldFile: { name: fd.prevName ?? fd.name, contents: before ?? "" },
         newFile: { name: fd.name, contents: after ?? "" },
@@ -677,14 +1000,14 @@ export function PullRequestChangesTab({
       // unchanged lines aren't in the patch, so expansion (and the exact
       // trailing-region count) is served by loadDiffFiles on demand.
       expansionLineCount: 10,
-      loadDiffFiles,
+      // A commit's unchanged lines need its parent revision, so its context can't expand.
+      loadDiffFiles: patchView ? undefined : loadDiffFiles,
     }),
-    [themeType, diffStyle, loadDiffFiles],
+    [themeType, diffStyle, loadDiffFiles, patchView],
   );
 
   // The stacked diff scrolls as one; the sidebar highlights the file at the top
   // of the viewport and jumps to a file on click.
-  const scrollRef = useRef<HTMLDivElement>(null);
   const sectionEls = useRef<Map<string, HTMLElement>>(new Map());
   const [activePath, setActivePath] = useState<string | null>(null);
 
@@ -722,10 +1045,10 @@ export function PullRequestChangesTab({
   const jumpTo = useCallback(
     (path: string) => {
       setActivePath(path);
-      reveal(path);
+      revealPane(path);
       setPendingReveal({ path });
     },
-    [reveal],
+    [revealPane],
   );
 
   // A filtered-out target is visible only after the filter clears. With no filter left to
@@ -751,21 +1074,23 @@ export function PullRequestChangesTab({
   // Find searches the visible files; the hidden count searches the rest, and no filter changes.
   // Corpora are built only while the bar is open.
   const { matchCase, regex } = find;
-  const query = find.open ? find.query : "";
+  // The commit list has no find bar, so find stays idle there.
+  const findOpen = find.open && !commitsView;
+  const query = findOpen ? find.query : "";
   // Matches follow the query one render later, so typing stays responsive on large patches.
   const deferredQuery = useDeferredValue(query);
   const searchCorpus = useMemo(
-    () => (find.open ? buildSearchCorpus(filesByPath, visibleFiles) : []),
-    [find.open, filesByPath, visibleFiles],
+    () => (findOpen ? buildSearchCorpus(filesByPath, visibleFiles) : []),
+    [findOpen, filesByPath, visibleFiles],
   );
   const hiddenCorpus = useMemo(() => {
-    if (!find.open) return [];
+    if (!findOpen) return [];
     const shown = new Set(visiblePaths);
     return buildSearchCorpus(
       filesByPath,
       files.filter((file) => !shown.has(file.path)),
     );
-  }, [find.open, filesByPath, files, visiblePaths]);
+  }, [findOpen, filesByPath, files, visiblePaths]);
   const search = useMemo(
     () => findMatches(searchCorpus, deferredQuery, { matchCase, regex, limit: MATCH_LIMIT }),
     [searchCorpus, deferredQuery, matchCase, regex],
@@ -814,16 +1139,16 @@ export function PullRequestChangesTab({
   // Seed the match when the bar opens or its query changes: the first at or below the
   // viewport top. A path match also scrolls its header, as stepping to it does.
   useEffect(() => {
-    if (!find.open || findTarget || !matches.length || deferredQuery !== query) return;
+    if (!findOpen || findTarget || !matches.length || deferredQuery !== query) return;
     const seeded = matches[firstMatchAtOrBelow(matches, visiblePaths, activePath)];
     setFindTarget(seeded);
     if (seeded.target.kind === "path") setPendingReveal({ path: seeded.target.path });
-  }, [find.open, findTarget, matches, visiblePaths, activePath, deferredQuery, query]);
+  }, [findOpen, findTarget, matches, visiblePaths, activePath, deferredQuery, query]);
 
   // The active match's file opens even if the reader collapsed it earlier.
   useEffect(() => {
-    if (activeFilePath) reveal(activeFilePath);
-  }, [activeFilePath, findTarget, reveal]);
+    if (activeFilePath && !commitsView) revealPane(activeFilePath);
+  }, [activeFilePath, findTarget, revealPane, commitsView]);
 
   const stepMatch = (direction: 1 | -1) => {
     // Matches for a query still being searched would navigate the previous results.
@@ -845,13 +1170,16 @@ export function PullRequestChangesTab({
   };
   const showHidden = () => {
     view.setPathFilter("");
-    view.setHideViewed(false);
+    // Hide viewed belongs to the whole-PR view, so a commit view leaves it as it is.
+    if (reviewing) view.setHideViewed(false);
   };
   const onTabKeyDown = (event: React.KeyboardEvent) => {
     // The platform's command modifier only: Ctrl+F stays the caret-forward key on macOS.
     // IME composition keys confirm text, not find.
+    // The commit list has no find bar, so the shortcut stays with the browser there.
     if (
       !toolbarShown ||
+      commitsView ||
       event.nativeEvent.isComposing ||
       event.keyCode === 229 ||
       !hasCommandModifier(event) ||
@@ -869,14 +1197,24 @@ export function PullRequestChangesTab({
   const patchFileCount = files.filter((file) => filesByPath.has(file.path)).length;
   const withoutText = files.length - patchFileCount;
   // Counts are meaningless until the patch has loaded and parsed.
-  const patchReady = !!prDiff.data?.patch && !parseError && !prDiff.isLoading;
+  const patchReady = !!shownDiff.data?.patch && !parseError && !shownDiff.isLoading;
+  // A disabled commit query has no data, which is not a commit without changes.
+  const commitUnavailable =
+    patchView && !commitDiff.data && !commitDiff.isLoading && !commitDiff.error;
+  const emptyChangesMessage = emptyChangesText(commitView, sinceView, commitUnavailable);
   const coverageNote =
-    find.open && patchReady && (changes.data?.has_more || withoutText > 0)
-      ? `Search covers the fetched patch: ${patchFileCount} of ${changes.data?.total_count ?? files.length} files${withoutText > 0 ? `, ${withoutText} without text` : ""}`
+    findOpen && patchReady && (listing.data?.has_more || withoutText > 0)
+      ? `Search covers the fetched patch: ${patchFileCount} of ${listing.data?.total_count ?? files.length} files${withoutText > 0 ? `, ${withoutText} without text` : ""}`
       : null;
 
+  const earlierCommentsControl = (path: string) => ({
+    shown: shownEarlierCommentPaths.has(path),
+    onToggle: () => setEarlierCommentsShown(path, !shownEarlierCommentPaths.has(path)),
+  });
+
   // Header actions for one file. Deleted files open at the base revision; others
-  // at the rendered head, so a newer polled head never changes the link.
+  // at the rendered head, so a newer polled head never changes the link. A commit's
+  // files open at that commit, and a file the commit deletes has no page to open.
   const fileActions = (file: PullRequestChangedFile) => {
     const previous = file.previous_path ?? filesByPath.get(file.path)?.prevName ?? null;
     const renamedFrom = previous && previous !== file.path ? previous : null;
@@ -885,8 +1223,8 @@ export function PullRequestChangesTab({
       provider: data.provider,
       headRepoUrl: pr.head_repository_url,
       baseRepoUrl,
-      headSha: renderedHeadSha,
-      baseSha: renderedBaseSha,
+      headSha: commitView ? view.commitSha : renderedHeadSha,
+      baseSha: patchView ? null : renderedBaseSha,
       path: file.path,
       previousPath: renamedFrom,
       status: file.status,
@@ -897,7 +1235,22 @@ export function PullRequestChangesTab({
         previousPath={renamedFrom}
         openLabel={`Open in ${providerLabel}`}
         openUrl={openUrl}
-        openUnavailableReason={openUnavailableReason(providerLabel, !!baseRepoUrl, sourceRepoUrl)}
+        earlierComments={
+          reviewing &&
+          (threadsByFile.get(file.path)?.some((thread) => thread.outdated) ||
+            localComments.some(
+              (comment) => comment.path === file.path && earlierLocalCommentIds.has(comment.id),
+            ))
+            ? earlierCommentsControl(file.path)
+            : undefined
+        }
+        openUnavailableReason={
+          patchView && file.status === "deleted"
+            ? commitView
+              ? "Deleted in this commit"
+              : "Deleted since that commit"
+            : openUnavailableReason(providerLabel, !!baseRepoUrl, sourceRepoUrl)
+        }
       />
     );
   };
@@ -936,23 +1289,24 @@ export function PullRequestChangesTab({
       pr.base_sha === prDiff.data?.base_sha &&
       reviews.page
     ),
-    headSha: pr.head_sha,
-    baseSha: pr.base_sha,
+    headSha: prDiff.data?.head_sha,
+    baseSha: prDiff.data?.base_sha,
     loadComments: reviews.loadComments,
     loadingComments: reviews.loadingComments,
   };
-  const threads = reviews.page?.data ?? [];
+  // Review conversations belong to the PR's head, so a commit's patch shows none.
+  const threads = reviewing ? (reviews.page?.data ?? []) : [];
   const matchingRevision =
     !!reviews.page &&
     reviews.page.head_sha === prDiff.data?.head_sha &&
     reviews.page.base_sha === prDiff.data?.base_sha;
   const canShowFiles =
-    !changes.error &&
-    !prDiff.error &&
+    !listing.error &&
+    !shownDiff.error &&
     !parseError &&
-    !prDiff.data?.unavailable_reason &&
+    !shownDiff.data?.unavailable_reason &&
     files.length > 0 &&
-    !prDiff.isLoading;
+    !shownDiff.isLoading;
   const threadsByFile = new Map<string, ReviewThread[]>();
   const earlierThreads: ReviewThread[] = [];
   for (const thread of threads) {
@@ -967,6 +1321,22 @@ export function PullRequestChangesTab({
     else if (visibleFiles.includes(file))
       threadsByFile.set(file.path, [...(threadsByFile.get(file.path) ?? []), thread]);
   }
+  const localReviewReady =
+    reviewing &&
+    !listing.isLoading &&
+    !shownDiff.isLoading &&
+    !listing.error &&
+    !shownDiff.error &&
+    !parseError;
+  const unavailableLocalComments = localReviewReady
+    ? localComments.filter(
+        (comment) => !canShowFiles || !files.some((file) => file.path === comment.path),
+      )
+    : [];
+  const unavailableCommentPaths = new Set([
+    ...earlierThreads.map((thread) => thread.path),
+    ...unavailableLocalComments.map((comment) => comment.path),
+  ]);
   const unresolved = threads.filter((thread) => !thread.resolved);
   const navigateThread = (direction: number) => {
     const index = unresolved.findIndex((thread) => thread.id === focusedThread?.id);
@@ -976,6 +1346,7 @@ export function PullRequestChangesTab({
     const file = files.find(
       (entry) => entry.path === next.path || filesByPath.get(entry.path)?.prevName === next.path,
     );
+    if (next.outdated) setEarlierCommentsShown(file?.path ?? next.path, true);
     if (file) {
       // A thread on a file a filter hides has no mounted section, so clear that filter first.
       // The path filter goes only when it hides the file; hide-viewed goes only for a viewed one.
@@ -994,7 +1365,8 @@ export function PullRequestChangesTab({
   // A controls row, then the sidebar (jump-to-file) + one scroll of all files' diffs.
   return (
     <TabsContent value="changes" className="flex min-h-0 flex-1 flex-col" onKeyDown={onTabKeyDown}>
-      {data.capabilities.review_threads &&
+      {reviewing &&
+        data.capabilities.review_threads &&
         (reviews.page?.has_more ||
           reviews.historyStale ||
           reviews.page?.warning ||
@@ -1025,12 +1397,12 @@ export function PullRequestChangesTab({
             )}
           </div>
         )}
-      {(changes.data?.has_more || changes.data?.warning) && (
+      {!commitsView && (listing.data?.has_more || listing.data?.warning) && (
         <p
           role="status"
           className="shrink-0 border-b border-border p-2 text-ui text-muted-foreground"
         >
-          {changes.data.warning || "The changed-file list is incomplete."}
+          {listing.data.warning || "The changed-file list is incomplete."}
         </p>
       )}
       {coverageNote && (
@@ -1038,7 +1410,7 @@ export function PullRequestChangesTab({
           {coverageNote}
         </p>
       )}
-      {changedListed && view.dismissedResetHead !== renderedHead && (
+      {reviewing && changedListed && view.dismissedResetHead !== renderedHead && (
         <div
           role="status"
           className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-3 py-1 text-ui text-muted-foreground"
@@ -1055,40 +1427,69 @@ export function PullRequestChangesTab({
       )}
       {toolbarShown && (
         <ChangesToolbar
-          showFileControls={files.length > 0}
+          showFileControls={files.length > 0 && !commitsView}
           sidebarCollapsed={sidebarCollapsed}
           onToggleSidebar={() => setSidebarCollapsed((v) => !v)}
           filterOpen={filterOpen}
-          onToggleFilter={files.length > 0 && sidebarCollapsed ? toggleInlineFilter : undefined}
+          onToggleFilter={
+            files.length > 0 && sidebarCollapsed && !commitsView ? toggleInlineFilter : undefined
+          }
           canNavigateThreads={unresolved.length > 0}
           onNavigateThread={navigateThread}
-          loadingThreads={reviews.isFetching}
+          loadingThreads={reviewing && reviews.isFetching}
           diffStyle={diffStyle}
           onToggleDiffStyle={toggleDiffStyle}
           allCollapsed={allCollapsed}
           onToggleAll={toggleAll}
+          modeSwitch={
+            commitsSupported ? (
+              <>
+                <PullRequestChangesModeSwitch
+                  value={commitsView || commitView ? "commits" : "changes"}
+                  onChange={view.setMode}
+                />
+                {mode === "changes" && (
+                  <PullRequestChangesSince
+                    commits={commitList}
+                    headSha={renderedHeadSha}
+                    hasMore={!!commits.data?.has_more}
+                    loading={commits.isLoading}
+                    errorMessage={commits.error ? readErrorText(commits.error) : null}
+                    sinceSha={sinceSha}
+                    onChange={setSinceSha}
+                    onOpen={() => {
+                      setCommitsWanted(true);
+                      if (commits.error) void commits.refetch();
+                    }}
+                  />
+                )}
+              </>
+            ) : undefined
+          }
           navigation={
-            <PullRequestFindBar
-              find={find}
-              inputRef={findInputRef}
-              position={activeIndex + 1}
-              total={matches.length}
-              truncated={search.truncated}
-              invalid={search.invalid}
-              hiddenCount={hiddenSearch.matches.length}
-              hiddenTruncated={hiddenSearch.truncated}
-              onOpen={() => view.setFind({ open: true })}
-              onClose={closeFind}
-              onQueryChange={(next) => changeFind({ query: next })}
-              onToggleOption={(option) =>
-                changeFind(option === "matchCase" ? { matchCase: !matchCase } : { regex: !regex })
-              }
-              onStep={stepMatch}
-              onShowHidden={showHidden}
-            />
+            commitsView ? undefined : (
+              <PullRequestFindBar
+                find={find}
+                inputRef={findInputRef}
+                position={activeIndex + 1}
+                total={matches.length}
+                truncated={search.truncated}
+                invalid={search.invalid}
+                hiddenCount={hiddenSearch.matches.length}
+                hiddenTruncated={hiddenSearch.truncated}
+                onOpen={() => view.setFind({ open: true })}
+                onClose={closeFind}
+                onQueryChange={(next) => changeFind({ query: next })}
+                onToggleOption={(option) =>
+                  changeFind(option === "matchCase" ? { matchCase: !matchCase } : { regex: !regex })
+                }
+                onStep={stepMatch}
+                onShowHidden={showHidden}
+              />
+            )
           }
           progress={
-            files.length > 0 && viewedFiles.available ? (
+            files.length > 0 && viewedFiles.available && reviewing ? (
               <PullRequestViewedProgress
                 viewedCount={viewedCount}
                 totalCount={files.length}
@@ -1096,19 +1497,30 @@ export function PullRequestChangesTab({
                 mobile={mobile}
                 hideViewed={view.hideViewed}
                 onHideViewedChange={view.setHideViewed}
+                rowRef={viewedRowRef}
               />
             ) : undefined
           }
         />
       )}
       {/* With the sidebar collapsed (narrow screens), the filter opens above the list. */}
-      {sidebarCollapsed && files.length > 0 && filterOpen && (
+      {sidebarCollapsed && files.length > 0 && filterOpen && !commitsView && (
         <div className="shrink-0 border-b border-border p-2">
           <PullRequestPathFilter value={view.pathFilter} onChange={view.setPathFilter} />
         </div>
       )}
+      {commitView && (
+        <PullRequestCommitBar
+          sha={view.commitSha ?? ""}
+          title={selectedCommit?.title ?? null}
+          previous={previousCommit}
+          next={nextCommit}
+          onBack={() => view.setMode("commits")}
+          onOpen={view.openCommit}
+        />
+      )}
       <div ref={bodyRef as React.RefObject<HTMLDivElement>} className="flex min-h-0 flex-1">
-        {!sidebarCollapsed && (
+        {!sidebarCollapsed && !commitsView && (
           <ChangesSidebar
             width={sidebarWidth}
             handleProps={sidebarHandleProps}
@@ -1120,23 +1532,21 @@ export function PullRequestChangesTab({
               )
             }
           >
-            {changes.isLoading ? (
+            {listing.isLoading ? (
               <div className="flex items-center justify-center p-4 text-muted-foreground">
                 <Loader2Icon className="size-4 animate-spin" />
               </div>
-            ) : changes.error ? (
+            ) : listing.error ? (
               <p className="px-2 py-1 text-ui text-muted-foreground">
-                {changes.error instanceof RunnerOfflineError
-                  ? "Runner offline."
-                  : (changes.error as Error).message}
+                {readErrorText(listing.error)}
               </p>
             ) : files.length === 0 ? (
               <p className="px-2 py-1 text-ui text-muted-foreground">
-                {changes.data?.available === false ||
-                changes.data?.has_more ||
-                changes.data?.warning
+                {listing.data?.available === false ||
+                listing.data?.has_more ||
+                listing.data?.warning
                   ? "Changed files are unavailable."
-                  : "No changes vs base."}
+                  : emptyChangesMessage}
               </p>
             ) : (
               fileTree.map((node) => (
@@ -1148,7 +1558,7 @@ export function PullRequestChangesTab({
                   onSelectFile={jumpTo}
                   collapsedDirs={collapsedDirs}
                   onToggleDir={toggleDir}
-                  viewedPaths={viewedFiles.viewed}
+                  viewedPaths={reviewing ? viewedFiles.viewed : NO_HIDDEN_PATHS}
                 />
               ))
             )}
@@ -1159,30 +1569,44 @@ export function PullRequestChangesTab({
           onScroll={onScroll}
           className="github-diff-stack min-w-0 flex-1 overflow-y-auto"
         >
-          {changes.error || prDiff.error || parseError ? (
+          {commitsView ? (
+            <PullRequestCommitsList
+              commits={commitList}
+              hasMore={!!commits.data?.has_more}
+              loading={commits.isLoading}
+              // A disabled query has no data, and that is not the same as an empty history.
+              unavailable={commits.data === undefined && !commits.isLoading && !commits.error}
+              errorMessage={commits.error ? readErrorText(commits.error) : null}
+              query={view.commitQuery}
+              onQueryChange={view.setCommitQuery}
+              onSelect={view.openCommit}
+            />
+          ) : listing.error || shownDiff.error || parseError ? (
             <PanelMessage>
-              <p role="alert">{parseError || ((changes.error || prDiff.error) as Error).message}</p>
+              <p role="alert">
+                {parseError || readErrorText((listing.error || shownDiff.error) as Error)}
+              </p>
             </PanelMessage>
-          ) : prDiff.data?.unavailable_reason ? (
+          ) : shownDiff.data?.unavailable_reason ? (
             <PanelMessage>
-              {prDiff.data.message ||
-                (prDiff.data.unavailable_reason === "pr_outside_workspace"
+              {shownDiff.data.message ||
+                (shownDiff.data.unavailable_reason === "pr_outside_workspace"
                   ? "Diff unavailable for a PR outside this workspace's repository"
                   : "Diff unavailable. Refresh or open the request on its provider.")}
             </PanelMessage>
-          ) : files.length === 0 || prDiff.isLoading ? (
+          ) : files.length === 0 || shownDiff.isLoading ? (
             <PanelMessage>
-              {changes.isLoading || prDiff.isLoading ? (
+              {listing.isLoading || shownDiff.isLoading ? (
                 <>
                   <Loader2Icon className="size-5 animate-spin" />
                   Loading changes…
                 </>
-              ) : changes.data?.available === false ||
-                changes.data?.has_more ||
-                changes.data?.warning ? (
+              ) : listing.data?.available === false ||
+                listing.data?.has_more ||
+                listing.data?.warning ? (
                 "Changed files are unavailable."
               ) : (
-                "No changes vs base."
+                emptyChangesMessage
               )}
             </PanelMessage>
           ) : allViewed ? (
@@ -1207,44 +1631,117 @@ export function PullRequestChangesTab({
                 fileDiff={filesByPath.get(file.path)}
                 options={diffOptions}
                 registerRef={registerRef}
-                collapsed={collapsedPaths.has(file.path)}
-                forceExpanded={revealedPaths.has(file.path)}
-                forceMount={pendingReveal?.path === file.path || activeFilePath === file.path}
+                collapsed={pane.collapsedPaths.has(file.path)}
+                forceExpanded={pane.revealedPaths.has(file.path)}
+                forceMount={
+                  pendingReveal?.path === file.path ||
+                  activeFilePath === file.path ||
+                  navigationTarget?.path === file.path
+                }
                 bypassLargeDiffGate={!!highlight && activeFilePath === file.path}
                 highlight={activeFilePath === file.path ? highlight : null}
                 onToggleCollapsed={() => toggleOne(file.path)}
-                headerActions={
-                  <>
-                    {fileActions(file)}
-                    {viewedFiles.available && (
-                      <PullRequestViewedToggle
-                        path={file.path}
-                        viewed={viewedFiles.viewed.has(file.path)}
-                        changed={viewedFiles.changed.has(file.path)}
-                        onToggle={() => toggleViewed(file.path)}
-                      />
-                    )}
-                  </>
+                headerActions={fileActions(file)}
+                reviewable={reviewing}
+                reviewActions={
+                  viewedFiles.available ? (
+                    <PullRequestViewedToggle
+                      path={file.path}
+                      viewed={viewedFiles.viewed.has(file.path)}
+                      changed={viewedFiles.changed.has(file.path)}
+                      onToggle={() => toggleViewed(file.path)}
+                    />
+                  ) : undefined
                 }
-                threads={threadsByFile.get(file.path) ?? []}
+                threads={(threadsByFile.get(file.path) ?? []).filter(
+                  (thread) => !thread.outdated || shownEarlierCommentPaths.has(file.path),
+                )}
                 threadContext={threadContext}
                 matchingRevision={matchingRevision}
+                localComments={
+                  localReviewReady
+                    ? shownLocalComments.filter((comment) => comment.path === file.path)
+                    : []
+                }
+                canCommentLocally={
+                  serverInfo !== "loading" &&
+                  serverInfo.comment_anchor_metadata === true &&
+                  !!(canEdit && prDiff.data?.head_sha && prDiff.data?.base_sha)
+                }
               />
             ))
           )}
-          {earlierThreads.length > 0 && (
+          {unavailableCommentPaths.size > 0 && (
             <div className="p-3">
               <p className="text-ui font-medium">Earlier conversations and unavailable diffs</p>
-              {earlierThreads.map((thread) => (
-                <div key={thread.id}>
-                  <p className="mt-3 break-all text-xs text-muted-foreground">{thread.path}</p>
-                  <PullRequestReviewThread thread={thread} context={threadContext} showContext />
+              {[...unavailableCommentPaths].map((path) => (
+                <div key={path}>
+                  <div className="mt-3 flex items-center justify-between gap-2">
+                    <p className="break-all text-xs text-muted-foreground">{path}</p>
+                    <PullRequestFileActions
+                      path={path}
+                      previousPath={null}
+                      openLabel={`Open in ${providerLabel}`}
+                      openUrl={null}
+                      openUnavailableReason="Diff unavailable"
+                      earlierComments={
+                        earlierThreads.some((thread) => thread.path === path && thread.outdated) ||
+                        unavailableLocalComments.some(
+                          (comment) =>
+                            comment.path === path && earlierLocalCommentIds.has(comment.id),
+                        )
+                          ? earlierCommentsControl(path)
+                          : undefined
+                      }
+                    />
+                  </div>
+                  {earlierThreads
+                    .filter(
+                      (thread) =>
+                        thread.path === path &&
+                        (!thread.outdated || shownEarlierCommentPaths.has(path)),
+                    )
+                    .map((thread) => (
+                      <PullRequestReviewThread
+                        key={thread.id}
+                        thread={thread}
+                        context={threadContext}
+                        showContext
+                      />
+                    ))}
+                  {unavailableLocalComments
+                    .filter(
+                      (comment) =>
+                        comment.path === path &&
+                        (!earlierLocalCommentIds.has(comment.id) ||
+                          shownEarlierCommentPaths.has(path)),
+                    )
+                    .map((comment) => (
+                      <LocalReviewComment
+                        key={comment.id}
+                        comment={comment}
+                        canEdit={canEdit}
+                        outdated={earlierLocalCommentIds.has(comment.id)}
+                      />
+                    ))}
                 </div>
               ))}
             </div>
           )}
         </div>
       </div>
+      {sessionComments.isError && (
+        <p role="alert" className="p-3 text-ui">
+          Local comments could not be loaded.{" "}
+          <button
+            type="button"
+            className="underline"
+            onClick={() => void sessionComments.refetch()}
+          >
+            Retry
+          </button>
+        </p>
+      )}
     </TabsContent>
   );
 }

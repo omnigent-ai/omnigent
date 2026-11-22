@@ -14,32 +14,18 @@
 // Vite dev proxy keep working. Identity rides the ingress/dev proxy on the
 // handshake, as with those sockets.
 
-import { getOmnigentHostConfig, resolveWebSocketUrl } from "@/lib/host";
-import { modalHostId } from "@/lib/sessionHost";
+import { resolveWebSocketUrl } from "@/lib/host";
 
 /**
  * Build the `ws(s)://` URL for the dictation stream.
  *
- * When a host fetcher is installed, append `?omnigent_slice_key=<modal host>` —
- * the same query-param seam the session-updates and terminal-attach sockets use
- * (a browser WS handshake can't set request headers). Dictation is NOT
- * host-scoped — any replica transcribes a take equally, so correctness is
- * unaffected either way. It's a LOAD-BALANCING lever: without a key, the default
- * route hashes a whole tenant onto one replica, so a busy tenant's mic takes all
- * pile onto a single replica — bad for a CPU-bound engine with a per-replica
- * concurrent-take cap ({@link DictationBusyError} / `OMNIGENT_DICTATION_MAX_STREAMS`).
- * {@link modalHostId} is per-user (the host backing most of THIS user's
- * sessions), so keying by it spreads a tenant's takes across many replicas —
- * finer-grained than per-tenant. Omitted on an unsharded server and until the
- * modal host resolves (→ no key → default route).
+ * Dictation is not host-scoped: any replica transcribes a take. The client's
+ * own slice key, added by {@link resolveWebSocketUrl}, spreads takes across
+ * replicas instead of piling a tenant onto one replica's concurrent-take cap
+ * ({@link DictationBusyError} / `OMNIGENT_DICTATION_MAX_STREAMS`).
  */
 function buildDictationUrl(): string {
-  const path = "/v1/dictation/stream";
-  if (!getOmnigentHostConfig().fetcher) return resolveWebSocketUrl(path);
-  const sliceKey = modalHostId();
-  return resolveWebSocketUrl(
-    sliceKey ? `${path}?omnigent_slice_key=${encodeURIComponent(sliceKey)}` : path,
-  );
+  return resolveWebSocketUrl("/v1/dictation/stream");
 }
 
 /** A transcript event pushed by the server over the dictation stream. */

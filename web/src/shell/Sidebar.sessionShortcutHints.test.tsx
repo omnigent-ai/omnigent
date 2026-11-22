@@ -16,7 +16,8 @@ const mocks = vi.hoisted(() => ({
   mobile: false,
 }));
 
-vi.mock("@/hooks/useIsMobileViewport", () => ({
+vi.mock(import("@/hooks/useIsMobileViewport"), async (importOriginal) => ({
+  ...(await importOriginal()),
   useIsMobileViewport: () => mocks.mobile,
 }));
 
@@ -197,7 +198,7 @@ describe("Sidebar numbered-row shortcut hints", () => {
     releaseCommand();
   });
 
-  it("shows the New session chord while the command key is held", async () => {
+  it("shows the New session chord while the command key is held, and while Shift joins", async () => {
     renderSidebar();
     const chord = screen
       .getByTestId("new-chat-button")
@@ -206,11 +207,15 @@ describe("Sidebar numbered-row shortcut hints", () => {
 
     pressCommand();
     await waitFor(() => expect(chord).toHaveClass("opacity-100"));
+    fireEvent.keyDown(window, { key: "Shift", ...COMMAND_MODIFIER, shiftKey: true });
+    expect(hints()).toHaveLength(5);
+    expect(chord).toHaveClass("opacity-100");
     releaseCommand();
     expect(chord).not.toHaveClass("opacity-100");
+    expect(hints()).toHaveLength(0);
   });
 
-  it("shows no hints on touch layouts", async () => {
+  it("shows no hints on the mobile layout", async () => {
     mocks.mobile = true;
     renderSidebar();
     expect(rowOf("conv_a")).toBeTruthy();

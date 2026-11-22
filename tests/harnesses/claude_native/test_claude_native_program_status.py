@@ -14,12 +14,13 @@ from pathlib import Path
 import pytest
 
 from omnigent.debug_logging import record_to_row
+from omnigent.harnesses.claude_native.program_status import (
+    ERROR_HOOK_GRACE_S as _GRACE_S,
+)
 from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller
 from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
 from omnigent.terminals.program_status import ProgramStatusReader
 
-# The production grace period, from ERROR_HOOK_GRACE_S.
-_GRACE_S = 5.0
 _ERROR_REPORT = {"state": "error", "app": "claude-code", "message": "API Error: 499"}
 # What Claude reports after a turn fails authentication, until the user signs in.
 _AUTH_BLOCKED_REPORT = {
@@ -53,6 +54,7 @@ def _poller(
     turn_activity_epoch: Callable[[], int] | None = None,
     failures: list[str] | None = None,
     clock: Callable[[], float] = time.monotonic,
+    background_agents_after_turn: Callable[[], bool] | None = None,
 ) -> ClaudeProgramStatusPoller:
     def on_status(status: str, _reason: str | None) -> None:
         published.append(status)
@@ -70,7 +72,99 @@ def _poller(
         turn_activity_epoch=turn_activity_epoch,
         on_failure=failures.append if failures is not None else None,
         clock=clock,
+        background_agents_after_turn=background_agents_after_turn,
     )
+
+
+def test_working_report_reads_waiting_while_a_settled_turn_runs_a_background_agent(
+    tmp_path: Path,
+) -> None:
+    """Claude reports working for a background agent that outlives its turn."""
+    path = tmp_path / "program-status.json"
+    _write_report(path, {"state": "working", "app": "claude-code"})
+    agent_after_turn = [False]
+    published: list[str] = []
+    poller = _poller(
+        tmp_path, path, published, background_agents_after_turn=lambda: agent_after_turn[0]
+    )
+    poller.tick()
+    assert published == ["running"]
+
+    agent_after_turn[0] = True
+    poller.tick()
+    poller.tick()
+    assert published == ["running", "waiting"]
+    assert poller.holding_background_agents is True
+
+    _write_report(path, {"state": "blocked", "kind": "permission", "message": "allow?"})
+    poller.tick()
+    assert published == ["running", "waiting", "running"]
+    assert poller.holding_background_agents is False
+    assert poller.blocked_on == "allow?"
+
+    _write_report(path, {"state": "working", "app": "claude-code"})
+    poller.tick()
+    agent_after_turn[0] = False
+    poller.tick()
+    assert published == ["running", "waiting", "running", "waiting", "running"]
+    assert poller.holding_background_agents is False
+
+    agent_after_turn[0] = True
+    poller.tick()
+    _write_report(path, {"state": "idle", "app": "claude-code"})
+    poller.tick()
+    assert published[-2:] == ["waiting", "idle"]
+    assert poller.holding_background_agents is False
+
+
+def test_file_fallback_keeps_a_background_agent_hold_after_osc_reports_stop(
+    tmp_path: Path,
+) -> None:
+    """Once OSC reports stop, the busy file still reads waiting until the hold clears."""
+    path = tmp_path / "program-status.json"
+    _write_report(path, {"state": "working", "app": "claude-code"})
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "1.json").write_text(
+        json.dumps({"pid": 1, "sessionId": "s", "kind": "interactive", "status": "busy"})
+    )
+    agent_after_turn = [True]
+    published: list[str] = []
+
+    def on_status(status: str, _reason: str | None) -> None:
+        published.append(status)
+
+    poller = ClaudeProgramStatusPoller(
+        ProgramStatusReader(path),
+        SessionStatusPoller(
+            on_status=on_status,
+            pane_pid_getter=lambda: 1,
+            session_id_getter=lambda: "s",
+            config_dir=tmp_path,
+            background_agents_after_turn=lambda: agent_after_turn[0],
+        ),
+        on_status,
+        background_agents_after_turn=lambda: agent_after_turn[0],
+    )
+    poller.tick()
+    assert published == ["waiting"]
+    assert poller.holding_background_agents is True
+
+    path.unlink()
+    poller.tick()
+    assert published == ["waiting", "waiting"]
+    assert poller.holding_background_agents is True
+
+    agent_after_turn[0] = False
+    poller.tick()
+    assert published == ["waiting", "waiting", "running"]
+    assert poller.holding_background_agents is False
+
+    agent_after_turn[0] = True
+    poller.tick()
+    assert poller.holding_background_agents is True
+    poller.retire()
+    assert poller.holding_background_agents is False
 
 
 @pytest.mark.parametrize("report", [_ERROR_REPORT, _AUTH_BLOCKED_REPORT])
@@ -107,12 +201,52 @@ def test_error_fallback_preserves_available_detail(tmp_path: Path, message: str 
     )
     poller.tick()
     assert published == failures == []
-    clock.now = _GRACE_S
+    clock.now = 10.0
     poller.tick()
     poller.resync()
     poller.tick()
     assert failures == ([message] if message and message.strip() else [])
     assert published == ([] if failures else ["failed"])
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        _ERROR_REPORT,
+        {**_ERROR_REPORT, "message": None},
+        _AUTH_BLOCKED_REPORT,
+        {**_AUTH_BLOCKED_REPORT, "message": None},
+    ],
+)
+def test_delayed_failure_hook_can_settle_before_fallback(
+    tmp_path: Path, report: dict[str, object]
+) -> None:
+    """A delayed detailed hook must not be preceded by a synthetic failure."""
+    path = tmp_path / "program-status.json"
+    _write_report(path, report)
+    clock = _FakeClock()
+    published: list[str] = []
+    failures: list[str] = []
+    turn_active = True
+    poller = _poller(
+        tmp_path,
+        path,
+        published,
+        turn_is_active=lambda: turn_active,
+        failures=failures,
+        clock=clock,
+    )
+
+    poller.tick()
+    clock.now = 7.5
+    poller.resync()
+    poller.tick()
+    assert published == failures == []
+
+    turn_active = False
+    clock.now = 30.0
+    poller.tick()
+    assert published == failures == []
 
 
 def test_auth_block_is_a_failed_turn_while_a_prompt_block_is_work(tmp_path: Path) -> None:
@@ -143,6 +277,19 @@ def test_auth_block_is_a_failed_turn_while_a_prompt_block_is_work(tmp_path: Path
     _write_report(path, {"state": "idle", "app": "claude-code"})
     poller.tick()
     assert reasons == [("running", "permission prompt"), ("idle", None)]
+
+
+def test_reports_idle_follows_the_osc_report(tmp_path: Path) -> None:
+    """Pane polling may back off only while OSC reads idle, never once retired."""
+    path = tmp_path / "program-status.json"
+    poller = _poller(tmp_path, path, [])
+    # No OSC report and no status file read yet: unknown is not idle.
+    assert poller.reports_idle is False
+    for state, idle in [("working", False), ("blocked", False), ("done", True), ("idle", True)]:
+        _write_report(path, {"state": state, "app": "claude-code"})
+        assert poller.reports_idle is idle, state
+    poller.retire()
+    assert poller.reports_idle is False
 
 
 def test_osc_owns_status_while_the_file_reports_background_shells(tmp_path: Path) -> None:

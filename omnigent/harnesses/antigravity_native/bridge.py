@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -388,12 +389,15 @@ _AGY_ENABLED_TOOLS = [
     "sys_os_shell",
     "sys_os_write",
     "sys_policy_registry",
+    "sys_project_list",
+    "sys_project_update",
     "sys_session_close",
     "sys_session_create",
     "sys_session_get_history",
     "sys_session_get_info",
     "sys_session_list",
     "sys_session_send",
+    "sys_session_update",
     "sys_terminal_close",
     "sys_terminal_launch",
     "sys_terminal_list",
@@ -474,6 +478,19 @@ def agy_gemini_dir(bridge_dir: Path) -> Path:
         config/state and the Omnigent MCP config.
     """
     return agy_home_dir(bridge_dir) / ".gemini"
+
+
+def agy_conversation_db(bridge_dir: Path, cascade_id: str) -> Path:
+    """Return the conversation db agy writes for *cascade_id* under this session's Gemini dir.
+
+    Its existence proves the cascade was created by this session's own agy; a
+    foreign agy writes into its own ``--gemini_dir``.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :param cascade_id: agy cascade/conversation id.
+    :returns: Path of that conversation's sqlite db (may not exist yet).
+    """
+    return agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations" / f"{cascade_id}.db"
 
 
 def build_mcp_config(
@@ -984,6 +1001,12 @@ def _seed_isolated_agy_workspace_trust(iso_gemini: Path, workspace: Path) -> Non
     os.replace(tmp, settings_path)
 
 
+# Serializes bridge-state writes in this process, so a guarded conversation-id update
+# (cold-start, reader recovery) is atomic against other writes and a terminal's
+# clear/reseed. Reentrant because update_conversation_id writes while holding it.
+_STATE_UPDATE_LOCK = threading.RLock()
+
+
 def write_bridge_state(bridge_dir: Path, state: AntigravityNativeBridgeState) -> None:
     """
     Persist shared native Antigravity state atomically.
@@ -992,25 +1015,26 @@ def write_bridge_state(bridge_dir: Path, state: AntigravityNativeBridgeState) ->
     :param state: State payload to persist.
     :returns: None.
     """
-    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = bridge_dir / _STATE_FILE
-    fd, tmp_name = tempfile.mkstemp(prefix=f"{_STATE_FILE}.", dir=str(bridge_dir))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "session_id": state.session_id,
-                    "conversation_id": state.conversation_id,
-                    "active_turn_id": state.active_turn_id,
-                },
-                handle,
-                sort_keys=True,
-            )
-            handle.write("\n")
-        os.replace(tmp_name, path)
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+    with _STATE_UPDATE_LOCK:
+        bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = bridge_dir / _STATE_FILE
+        fd, tmp_name = tempfile.mkstemp(prefix=f"{_STATE_FILE}.", dir=str(bridge_dir))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "session_id": state.session_id,
+                        "conversation_id": state.conversation_id,
+                        "active_turn_id": state.active_turn_id,
+                    },
+                    handle,
+                    sort_keys=True,
+                )
+                handle.write("\n")
+            os.replace(tmp_name, path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
 
 
 def clear_bridge_state(bridge_dir: Path) -> None:
@@ -1030,9 +1054,10 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     :param bridge_dir: Native Antigravity bridge directory.
     :returns: None.
     """
-    for runtime_file in (_STATE_FILE, _TMUX_FILE):
-        with contextlib.suppress(FileNotFoundError):
-            (bridge_dir / runtime_file).unlink()
+    with _STATE_UPDATE_LOCK:
+        for runtime_file in (_STATE_FILE, _TMUX_FILE):
+            with contextlib.suppress(FileNotFoundError):
+                (bridge_dir / runtime_file).unlink()
 
 
 def read_bridge_state(bridge_dir: Path) -> AntigravityNativeBridgeState | None:
@@ -1081,6 +1106,9 @@ def update_conversation_id(
     bridge_dir: Path,
     conversation_id: str,
     active_turn_id: str | None = None,
+    *,
+    expect_placeholder: bool = False,
+    expected_state: AntigravityNativeBridgeState | None = None,
 ) -> bool:
     """
     Update the agy conversation id in bridge state.
@@ -1095,31 +1123,63 @@ def update_conversation_id(
     forever, surfaced only as a generic "conversation not ready". The caller
     decides how to react (it stays best-effort; this never raises).
 
+    The guards are checked under one process-wide lock, so racing writers cannot
+    clobber each other's binding.
+
     :param bridge_dir: Native Antigravity bridge directory.
     :param conversation_id: New agy conversation id, e.g.
         ``"agy_conv_abc123"``.
     :param active_turn_id: Active turn id for the new conversation, e.g.
         ``"turn_abc123"``, or ``None`` when no turn is running yet.
+    :param expect_placeholder: When ``True``, only replace an ``agy_conv_*``
+        placeholder; a real id already in state is kept and ``False`` returned.
+    :param expected_state: When set, only write if bridge state still names this
+        session and conversation, e.g. the placeholder a recovery scan started
+        from; a recreated terminal's new placeholder is kept and ``False`` returned.
     :returns: ``True`` when the new id was written, ``False`` when there was no
-        existing state to update (the id was dropped; a WARNING was logged).
+        existing state to update (the id was dropped; a WARNING was logged) or a
+        guard kept the current state.
     """
-    state = read_bridge_state(bridge_dir)
-    if state is None:
-        _logger.warning(
-            "Antigravity bridge: no existing state at %s to update; dropping "
-            "conversation_id=%s (the reader will stay on the placeholder id)",
+    with _STATE_UPDATE_LOCK:
+        state = read_bridge_state(bridge_dir)
+        if state is None:
+            _logger.warning(
+                "Antigravity bridge: no existing state at %s to update; dropping "
+                "conversation_id=%s (the reader will stay on the placeholder id)",
+                bridge_dir,
+                conversation_id,
+            )
+            return False
+        if expect_placeholder and not is_placeholder_conversation_id(state.conversation_id):
+            _logger.info(
+                "Antigravity bridge: state at %s already binds conversation %s; keeping it "
+                "instead of replacing it with %s",
+                bridge_dir,
+                state.conversation_id,
+                conversation_id,
+            )
+            return False
+        if expected_state is not None and (state.session_id, state.conversation_id) != (
+            expected_state.session_id,
+            expected_state.conversation_id,
+        ):
+            _logger.info(
+                "Antigravity bridge: state at %s changed from conversation %s to %s; "
+                "not replacing it with %s",
+                bridge_dir,
+                expected_state.conversation_id,
+                state.conversation_id,
+                conversation_id,
+            )
+            return False
+        write_bridge_state(
             bridge_dir,
-            conversation_id,
+            AntigravityNativeBridgeState(
+                session_id=state.session_id,
+                conversation_id=conversation_id,
+                active_turn_id=active_turn_id,
+            ),
         )
-        return False
-    write_bridge_state(
-        bridge_dir,
-        AntigravityNativeBridgeState(
-            session_id=state.session_id,
-            conversation_id=conversation_id,
-            active_turn_id=active_turn_id,
-        ),
-    )
     return True
 
 
@@ -1169,6 +1229,7 @@ _AGY_ACTIVE_MARKER = "esc to cancel"
 # so both the render gate and the submit verification key off the placeholder
 # appearing and then leaving the composer.
 _AGY_PASTE_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+[^\]]*\]")
+_AGY_SCROLL_INDICATOR_RE = re.compile(r"^[> ]*[↑↓]\s*\d+\s+more\s+lines", re.IGNORECASE)
 # agy's notice when a turn is submitted before its startup account-eligibility
 # check settles. The composer footer mounts ~3s after launch but eligibility is
 # not settled for ~7-9s, and a turn landing in that window is CONSUMED (the draft
@@ -1400,6 +1461,21 @@ def _paste_payload_bytes(text: str) -> bytes:
     return bytes(body)
 
 
+def _submit_needles(content: str) -> list[str]:
+    """Sample both ends of the draft so a scrolled composer can confirm a paste."""
+    lines = [line.strip() for line in content.splitlines() if len(line.strip()) >= 4]
+    if not lines:
+        stripped = content.strip()
+        return [stripped[:24]] if len(stripped) >= 4 else []
+    needles: list[str] = []
+    for line in (lines[0], lines[-1]):
+        for sample in (line[:24], line[-24:]):
+            sample = sample.strip()
+            if len(sample) >= 4 and sample not in needles:
+                needles.append(sample)
+    return needles
+
+
 def _submit_needle(content: str) -> str:
     """
     A stable single-line substring used to confirm the paste rendered in the pane.
@@ -1409,12 +1485,8 @@ def _submit_needle(content: str) -> str:
         or ``""`` when no such line exists (the caller then skips the
         paste-commit poll and submits after the settle pause).
     """
-    for line in content.splitlines():
-        stripped = line.strip()
-        if len(stripped) >= 4:
-            return stripped[:24]
-    stripped = content.strip()
-    return stripped[:24] if len(stripped) >= 4 else ""
+    needles = _submit_needles(content)
+    return needles[0] if needles else ""
 
 
 def _redact_pane_secrets(text: str) -> str:
@@ -1451,12 +1523,22 @@ def _agy_input_region(pane: str) -> str:
     agy renders the editable composer between horizontal separator lines. After
     a successful submit, the submitted prompt remains in transcript history
     above a fresh empty composer, so checking the full pane would falsely think
-    the draft is still present. The last separator pair scopes matching to the
-    currently editable input box, mirroring Kiro's input-region guard.
+    the draft is still present. Scans candidate separator sections from the bottom
+    up looking for the active prompt box (> ...), properly skipping any background
+    task or subagent status widgets below it.
     """
     lines = pane.splitlines()
     separator_indexes = [index for index, line in enumerate(lines) if _agy_separator_line(line)]
     if len(separator_indexes) >= 2:
+        for index in range(len(separator_indexes) - 2, -1, -1):
+            start = separator_indexes[index] + 1
+            end = separator_indexes[index + 1]
+            candidate = lines[start:end]
+            if any(
+                line.strip().startswith(">") or _AGY_PASTE_PLACEHOLDER_RE.search(line)
+                for line in candidate
+            ):
+                return "\n".join(candidate)
         start = separator_indexes[-2] + 1
         end = separator_indexes[-1]
         return "\n".join(lines[start:end])
@@ -1477,36 +1559,52 @@ def _agy_separator_line(line: str) -> bool:
     return all(char in _AGY_BOX_GLYPHS for char in stripped if not char.isspace())
 
 
-def _draft_in_input_region(pane: str, needle: str, baseline_region: str) -> bool:
+def _collapse_ws(text: str) -> str:
+    """Collapse all whitespace runs to single spaces for wrap-tolerant compares."""
+    return " ".join(text.split())
+
+
+def _needle_matches_candidates(needle: str, candidates: list[str]) -> bool:
+    """Match one needle against composer lines, tolerating terminal word-wrap."""
+    collapsed = _collapse_ws(needle)
+    if not collapsed:
+        return False
+    for line in candidates:
+        if needle in line or collapsed in _collapse_ws(line):
+            return True
+    joined_space = _collapse_ws(" ".join(candidates))
+    joined_bare = _collapse_ws("".join(candidates))
+    return bool(joined_space and collapsed in joined_space) or bool(
+        joined_bare and collapsed in joined_bare
+    )
+
+
+def _draft_in_input_region(
+    pane: str,
+    needle: str,
+    baseline_region: str,
+    extra_needles: tuple[str, ...] = (),
+) -> bool:
     """
     Return whether the pasted draft is still visible in agy's composer.
 
     The baseline region prevents matching the empty prompt or stale text that was
     already present before this paste. Candidate lines are normalized by removing
     agy's leading ``>`` prompt glyph.
-
-    When *needle* is empty (a message too short for a stable needle, e.g.
-    ``"ok"``), any draft-like content in a composer that differs from the
-    pre-paste baseline counts as present — so short messages are still render- and
-    submit-verified by composer state instead of being submitted blind.
     """
     region = _agy_input_region(pane)
     if region == baseline_region:
         return False
     candidates = _agy_draft_candidate_lines(region)
-    # A collapsed paste hides the text behind a placeholder, so no needle can
-    # match; the placeholder itself IS the draft (see _AGY_PASTE_PLACEHOLDER_RE).
     if any(_AGY_PASTE_PLACEHOLDER_RE.search(line) for line in candidates):
         return True
-    normalized_needle = needle.strip() if needle else ""
-    if not normalized_needle:
+    if any(_AGY_SCROLL_INDICATOR_RE.search(line) for line in candidates):
+        return True
+    needles = [needle.strip() if needle else "", *(n.strip() for n in extra_needles)]
+    needles = [n for n in needles if n]
+    if not needles:
         return bool(candidates)
-    return any(
-        line == normalized_needle
-        or line.startswith(normalized_needle)
-        or normalized_needle in line
-        for line in candidates
-    )
+    return any(_needle_matches_candidates(n, candidates) for n in needles)
 
 
 def _agy_draft_candidate_lines(region: str) -> list[str]:
@@ -1570,6 +1668,7 @@ def _submit_and_verify(
     needle: str = "",
     baseline_region: str = "",
     draft_seen: bool = False,
+    extra_needles: tuple[str, ...] = (),
 ) -> None:
     """
     Press Enter to submit the pasted draft, verifying by composer state.
@@ -1631,10 +1730,14 @@ def _submit_and_verify(
                 )
             pane = _capture_pane(socket_path, tmux_target)
             last_pane = pane or last_pane
-            if pane and not _draft_in_input_region(pane, needle, baseline_region):
+            if pane and not _draft_in_input_region(
+                pane, needle, baseline_region, extra_needles=extra_needles
+            ):
                 return
             time.sleep(_TMUX_POLL_INTERVAL_S)
-    draft_visible = _draft_in_input_region(last_pane, needle, baseline_region)
+    draft_visible = _draft_in_input_region(
+        last_pane, needle, baseline_region, extra_needles=extra_needles
+    )
     raise RuntimeError(
         "agy did not accept the submitted message; the draft is still visible "
         "in the input box; "
@@ -1728,7 +1831,9 @@ def _paste_and_submit(
     # runs for EVERY message — including short ones with no stable needle — so a
     # paste that never lands in the composer is caught rather than submitted blind
     # (``_draft_in_input_region`` keys off composer change when the needle is "").
-    needle = _submit_needle(content)
+    needles = _submit_needles(content)
+    needle = needles[0] if needles else ""
+    extra_needles = tuple(needles[1:]) if len(needles) > 1 else ()
     # A mid-turn steer (agy already running a turn) is delivered best-effort: agy
     # queues it as the next turn and may not surface the draft in the composer the
     # same way an idle turn does, so a non-render is NOT a swallowed message here.
@@ -1742,7 +1847,7 @@ def _paste_and_submit(
     while time.monotonic() < commit_deadline:
         pane = _capture_pane(socket_path, tmux_target)
         last_commit_pane = pane or last_commit_pane
-        if _draft_in_input_region(pane, needle, baseline_region):
+        if _draft_in_input_region(pane, needle, baseline_region, extra_needles=extra_needles):
             draft_seen = True
             break
         time.sleep(_TMUX_POLL_INTERVAL_S)
@@ -1758,6 +1863,7 @@ def _paste_and_submit(
         needle=needle,
         baseline_region=baseline_region,
         draft_seen=draft_seen,
+        extra_needles=extra_needles,
     )
 
 
@@ -1849,20 +1955,12 @@ def send_interaction_keys_via_tui(
     """
     Send raw key arguments to the agy TUI pane to answer its in-process prompt.
 
-    The companion to :func:`inject_user_message_via_tui` for the OTHER thing the
-    attended agy TUI maintains in parallel with the RPC step state: its
-    **in-process permission / question prompt**. When agy runs attended (the
-    web/mobile path types every turn into the TUI), an approval surfaces in the
-    Omnigent web UI AND as agy's own numbered TUI prompt ("Do you want to
-    proceed?", 1.Yes … 4.No). Delivering the verdict over
-    :func:`omnigent.harnesses.antigravity_native.rpc.handle_user_interaction` flips the
-    backend trajectory step to DONE and the command runs, but the **TUI prompt
-    for that interaction can stay open** — and the next typed turn then lands in
-    that stale prompt's filter/amend buffer instead of starting a fresh turn
-    (live-verified; see ``docs/claude/antigravity-rpc-spike-notes.md`` §"attended
-    TUI"). So the bridge ALSO types the selection into the pane to dismiss the
-    prompt, mirroring cursor-native's
-    :func:`omnigent.harnesses.cursor_native.bridge.send_cursor_pane_keys`.
+    RPC and terminal prompt state can diverge. Callers must confirm the same
+    interaction is still waiting before sending post-RPC dismissal keys: a
+    closed prompt would accept those keys as a new chat message. Clients whose
+    trajectory is already DONE while their terminal prompt remains open need
+    manual dismissal; the RPC state cannot safely distinguish that stale menu
+    from an active composer.
 
     Each argument is a tmux ``send-keys`` key argument — a bare ``"1"`` / ``"4"``
     selects a numbered option, ``"Enter"`` confirms, ``"Escape"`` cancels — sent

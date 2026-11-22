@@ -940,3 +940,56 @@ describe("itemsToBlocks — edge cases", () => {
     expect(texts.some((t) => t.includes("continued from a previous conversation"))).toBe(false);
   });
 });
+
+describe("task markers", () => {
+  it("become chat notices, placed and folded like sub-agent markers", () => {
+    const marker = {
+      id: "item_marker",
+      type: "resource_event",
+      response_id: "journal_abc",
+      event_type: "session.journal.task",
+      resource_type: "journal",
+      resource_id: "deploy",
+      resource: {
+        name: "Deploy the swap",
+        status: "started",
+        text: null,
+        entry_id: "e1",
+        native: false,
+      },
+    } as unknown as ConversationItem;
+    expect(itemsToBlocks([marker])).toMatchObject([
+      { type: "native_tool", toolType: "subagent_activity", data: { resource_id: "deploy" } },
+    ]);
+  });
+});
+
+describe("itemsToBlocks — Claude sub-agent handback", () => {
+  it("shows the handed-back report as the answer and hides the delivery receipt", () => {
+    const items: ConversationItem[] = [
+      userMessage("resp_1", "Audit the tests"),
+      functionCall("resp_1", "c1", "Bash", { command: "ls" }),
+      functionCallOutput("resp_1", "c1", "tests"),
+      functionCall("resp_1", "c2", "SubagentHandback", { message: "**Audit** done." }, "fc_c2"),
+      functionCallOutput("resp_1", "c2", '{"success":true,"message":"Report delivered."}'),
+    ];
+    const blocks = itemsToBlocks(items);
+    expect(blocks.map((b) => b.type)).toEqual([
+      "user_message",
+      "tool_group",
+      "tool_result",
+      "text_done",
+    ]);
+    const answer = blocks[3] as TextDone;
+    expect(answer.fullText).toBe("**Audit** done.");
+    expect(answer.ctx.itemId).toBe("fc_c2");
+  });
+
+  it("keeps a handback with no report as an ordinary tool row", () => {
+    const items: ConversationItem[] = [
+      functionCall("resp_1", "c1", "SubagentHandback", { message: "  " }),
+      functionCallOutput("resp_1", "c1", "ok"),
+    ];
+    expect(itemsToBlocks(items).map((b) => b.type)).toEqual(["tool_group", "tool_result"]);
+  });
+});

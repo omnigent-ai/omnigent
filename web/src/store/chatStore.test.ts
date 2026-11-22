@@ -18,10 +18,19 @@
 import type * as IdentityModule from "@/lib/identity";
 import { sideChatSettingsMutationKey } from "@/lib/sideChat";
 
-import { type InfiniteData, QueryClient, QueryObserver } from "@tanstack/react-query";
+import {
+  type InfiniteData,
+  QueryClient,
+  QueryClientProvider,
+  QueryObserver,
+} from "@tanstack/react-query";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { toast } from "sonner";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import { useSetConversationMuted } from "@/hooks/useConversations";
+import { clearSessionMuteState, MUTED_LABEL_KEY } from "@/lib/sessionMute";
 import type {
   AnyBlock,
   ElicitationBlock,
@@ -36,9 +45,16 @@ import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { latestActivityErrorState } from "@/lib/sessionError";
 import { RECONNECT_BASE_MS } from "@/lib/reconnectBackoff";
 import { buildBubbles } from "@/lib/renderItems";
-import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
+import {
+  getSessionSlim,
+  INITIAL_WINDOW_ITEMS,
+  OLDER_HISTORY_PAGE_ITEMS,
+  SESSION_HISTORY_PAGE_SIZE,
+} from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
+import { continuePlanMessage, stopPlanMessage } from "@/lib/workflow";
+import { trackPlanStop, usePlanStops } from "@/store/planStops";
 import {
   clearUnsentSends,
   peekQueuedSends,
@@ -410,6 +426,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
           subagent_routing_override?: "on" | "off" | null;
           collaboration_mode?: string;
           approval_mode?: string;
+          permission_mode?: string;
         })
       : {};
     const labels = { ...(sessionLabels.get(sessionId) ?? {}) };
@@ -435,6 +452,10 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
     }
     if ("approval_mode" in body && typeof body.approval_mode === "string") {
       labels["omnigent.codex_native.approval_mode"] = body.approval_mode;
+      sessionLabels.set(sessionId, labels);
+    }
+    if ("permission_mode" in body && typeof body.permission_mode === "string") {
+      labels["omnigent.claude_native.permission_mode"] = body.permission_mode;
       sessionLabels.set(sessionId, labels);
     }
     return mockResponse({
@@ -789,10 +810,13 @@ describe("chatStore — lazy subtree usage", () => {
     expect(useChatStore.getState().blocks).toHaveLength(1);
     expect(useChatStore.getState().sessionCostUsd).toBeNull();
     expect(useChatStore.getState().sessionUsageByModel).toBeNull();
+    // Unknown while the read runs is loading, not unavailable.
+    expect(useChatStore.getState().sessionUsageLoading).toBe(true);
 
     finishUsage(usage("conv_usage", 3.5));
     await tick();
 
+    expect(useChatStore.getState().sessionUsageLoading).toBe(false);
     expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
     expect(useChatStore.getState().sessionUsageByModel).toEqual({
       "model-a": {
@@ -861,6 +885,7 @@ describe("chatStore — lazy subtree usage", () => {
     expect(useChatStore.getState().conversationLoadError).toBeNull();
     expect(useChatStore.getState().sessionCostUsd).toBeNull();
     expect(useChatStore.getState().sessionUsageByModel).toBeNull();
+    expect(useChatStore.getState().sessionUsageLoading).toBe(false);
     expect(readUsage).toHaveBeenCalledOnce();
   });
 
@@ -1017,6 +1042,119 @@ describe("chatStore — lazy subtree usage", () => {
     expect(useChatStore.getState().sessionCostUsd).toBe(8);
   });
 
+  it("clears a cached cost once the server hides it, keeping token usage", async () => {
+    const readUsage = vi.fn(() => usage("conv_usage", 3.5));
+    routeUsage("conv_usage", readUsage);
+    await useChatStore.getState().switchTo("conv_usage");
+    await tick();
+    expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
+
+    await useChatStore.getState().switchTo("conv_other");
+    readUsage.mockImplementation(() =>
+      mockResponse({
+        id: "conv_usage",
+        cost_hidden: true,
+        usage_by_model: { "model-a": { input_tokens: 200 } },
+      }),
+    );
+    await useChatStore.getState().switchTo("conv_usage");
+    await tick();
+
+    expect(useChatStore.getState().sessionCostUsd).toBeNull();
+    expect(useChatStore.getState().sessionUsageByModel?.["model-a"]?.inputTokens).toBe(200);
+
+    handleSessionEvent({ type: "session_usage", conversationId: "conv_usage", totalCostUsd: 8 });
+    expect(useChatStore.getState().sessionCostUsd).toBe(8);
+    handleSessionEvent({
+      type: "session_usage",
+      conversationId: "conv_usage",
+      costHidden: true,
+      usageByModel: {
+        "model-a": {
+          inputTokens: 300,
+          outputTokens: null,
+          totalTokens: null,
+          cacheReadInputTokens: null,
+          cacheCreationInputTokens: null,
+          totalCostUsd: null,
+        },
+      },
+    });
+
+    expect(useChatStore.getState().sessionCostUsd).toBeNull();
+    expect(useChatStore.getState().sessionUsageByModel?.["model-a"]?.inputTokens).toBe(300);
+
+    await useChatStore.getState().switchTo("conv_other");
+    let finishUsage!: (response: Response) => void;
+    const pending = new Promise<Response>((resolve) => {
+      finishUsage = resolve;
+    });
+    const readHiddenUsage = vi.fn(() => pending);
+    routeUsage("conv_usage", readHiddenUsage, snapshot("conv_usage", { cost_hidden: true }));
+    client.setQueryData(["agent_costs", "conv_usage"], new Map([["child", { costUsd: 0.4 }]]));
+    client.setQueryData(["agent_costs", "conv_unsupported"], null);
+
+    await useChatStore.getState().switchTo("conv_usage");
+    await tick();
+
+    expect(readHiddenUsage).toHaveBeenCalledOnce();
+    expect(client.getQueryData(["agent_costs", "conv_usage"])).toEqual(new Map());
+    expect(client.getQueryData(["agent_costs", "conv_unsupported"])).toBeNull();
+    finishUsage(
+      mockResponse({
+        id: "conv_usage",
+        cost_hidden: true,
+        usage_by_model: { "model-a": { input_tokens: 400 } },
+      }),
+    );
+    await tick();
+
+    expect(useChatStore.getState().sessionCostUsd).toBeNull();
+    expect(useChatStore.getState().sessionUsageByModel?.["model-a"]).toMatchObject({
+      inputTokens: 400,
+      totalCostUsd: null,
+    });
+  });
+
+  it("clears cached per-model costs from hidden metadata when the usage read fails", async () => {
+    routeUsage("conv_usage", () => usage("conv_usage", 3.5));
+    await useChatStore.getState().switchTo("conv_usage");
+    await tick();
+    expect(useChatStore.getState().sessionUsageByModel?.["model-a"]?.totalCostUsd).toBe(3.5);
+
+    await useChatStore.getState().switchTo("conv_other");
+    routeUsage(
+      "conv_usage",
+      () => Promise.reject(new Error("usage unavailable")),
+      snapshot("conv_usage", { cost_hidden: true }),
+    );
+    await useChatStore.getState().switchTo("conv_usage");
+    await tick();
+
+    expect(useChatStore.getState().sessionCostUsd).toBeNull();
+    expect(useChatStore.getState().sessionUsageByModel?.["model-a"]).toMatchObject({
+      inputTokens: 100,
+      totalCostUsd: null,
+    });
+  });
+
+  it("clears cached per-model costs on a hiding-only usage event", async () => {
+    routeUsage("conv_usage", () => usage("conv_usage", 3.5));
+    await useChatStore.getState().switchTo("conv_usage");
+    await tick();
+    expect(useChatStore.getState().sessionUsageByModel?.["model-a"]?.totalCostUsd).toBe(3.5);
+    client.setQueryData(["agent_costs", "conv_usage"], new Map([["child", { costUsd: 0.4 }]]));
+
+    handleSessionEvent({ type: "session_usage", conversationId: "conv_usage", costHidden: true });
+
+    expect(client.getQueryData(["agent_costs", "conv_usage"])).toEqual(new Map());
+    expect(useChatStore.getState().sessionCostUsd).toBeNull();
+    expect(useChatStore.getState().sessionUsageByModel?.["model-a"]).toMatchObject({
+      inputTokens: 100,
+      totalCostUsd: null,
+    });
+  });
+
   describe("periodic usage reconciliation", () => {
     beforeEach(() => {
       vi.useFakeTimers();
@@ -1063,12 +1201,20 @@ describe("chatStore — lazy subtree usage", () => {
       await useChatStore.getState().switchTo("conv_usage");
       await drainAsync();
       expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
+      await vi.advanceTimersByTimeAsync(2_000);
+      client.setQueryData(["agent_costs", "conv_usage"], new Map());
+      client.setQueryData(["agent_costs", "conv_unsupported"], null);
 
       await advanceReconcileInterval();
+      await vi.advanceTimersByTimeAsync(2_000);
 
       expect(streamOpenCount()).toBe(1);
       expect(readUsage).toHaveBeenCalledTimes(2);
       expect(useChatStore.getState().sessionCostUsd).toBe(8);
+      // A total recovered outside the live stream still refreshes per-agent costs,
+      // except from a server that has no breakdown.
+      expect(client.getQueryState(["agent_costs", "conv_usage"])?.isInvalidated).toBe(true);
+      expect(client.getQueryState(["agent_costs", "conv_unsupported"])?.isInvalidated).toBe(false);
       expect(useChatStore.getState().sessionUsageByModel?.["model-a"]).toMatchObject({
         inputTokens: 500,
         totalCostUsd: 8,
@@ -1091,6 +1237,8 @@ describe("chatStore — lazy subtree usage", () => {
 
       await advanceReconcileInterval();
       expect(readUsage).toHaveBeenCalledTimes(2);
+      // A background re-read keeps the settled answer instead of loading again.
+      expect(useChatStore.getState().sessionUsageLoading).toBe(false);
       handleSessionEvent({
         type: "session_status",
         conversationId: "conv_usage",
@@ -1258,6 +1406,22 @@ describe("chatStore — switchTo", () => {
     expect(useChatStore.getState().blocks).toHaveLength(1);
   });
 
+  it("stamps a background session's runner launch without touching the open conversation", async () => {
+    seedSession("conv_cell", []);
+    seedSession("conv_open", []);
+    await useChatStore.getState().switchTo("conv_cell");
+    await useChatStore.getState().switchTo("conv_open");
+
+    useChatStore.getState().markRunnerLaunched("conv_cell");
+
+    expect(conversationRegistry.peek("conv_cell")!.getState().runnerLaunchedAt).toEqual(
+      expect.any(Number),
+    );
+    expect(conversationRegistry.peek("conv_open")!.getState().runnerLaunchedAt).toBeNull();
+    expect(useChatStore.getState().conversationId).toBe("conv_open");
+    expect(useChatStore.getState().runnerLaunchedAt).toBeNull();
+  });
+
   it("scopes the background-task pill state to the active conversation", async () => {
     seedSession("conv_with_task", []);
     seedSession("conv_empty", []);
@@ -1278,6 +1442,36 @@ describe("chatStore — switchTo", () => {
     await useChatStore.getState().switchTo("conv_with_task");
     expect(useChatStore.getState().backgroundTaskCount).toBe(1);
     expect(useChatStore.getState().backgroundTasks).toEqual([{ description: "Wait for CI" }]);
+  });
+
+  it("restores the background agents a waiting snapshot names", async () => {
+    seedSession("conv_waiting_agent", []);
+    const routed = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (
+        String(input).split("?")[0] === "/v1/sessions/conv_waiting_agent" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        return mockResponse({
+          id: "conv_waiting_agent",
+          agent_id: "agent_xyz",
+          // The server's wire shape for the hold: collapsed status plus the agents.
+          status: "running",
+          background_agents: [{ id: "a1", type: "subagent", description: "Audit" }],
+          created_at: 0,
+          items: [],
+        });
+      }
+      return routed(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_waiting_agent");
+
+    const state = useChatStore.getState();
+    expect(state.sessionStatus).toBe("waiting");
+    expect(state.backgroundAgents).toEqual([{ id: "a1", type: "subagent", description: "Audit" }]);
+    // The turn is over, so the composer sends rather than queueing.
+    expect(state.status).toBe("idle");
   });
 
   it("revalidates a retained live conversation on revisit, recovering items its stream never delivered", async () => {
@@ -1584,9 +1778,14 @@ describe("chatStore — switchTo", () => {
 
     const state = useChatStore.getState();
     // Keyed by the server pending id so a later consumed event drops it
-    // by id, and content is replayed verbatim so the bubble renders.
+    // by id, and content is replayed verbatim so the bubble renders. Marked
+    // replayed: the session accepted it, so it counts as the latest request.
     expect(state.pendingUserMessages).toEqual([
-      { tempId: "pending_srv1", content: [{ type: "input_text", text: "queued msg" }] },
+      {
+        tempId: "pending_srv1",
+        content: [{ type: "input_text", text: "queued msg" }],
+        replayed: true,
+      },
     ]);
   });
 
@@ -1638,7 +1837,11 @@ describe("chatStore — switchTo", () => {
     // Only the not-yet-committed entry survives; the one already in
     // history is dropped so the message renders exactly once.
     expect(useChatStore.getState().pendingUserMessages).toEqual([
-      { tempId: "pending_live", content: [{ type: "input_text", text: "a genuinely queued msg" }] },
+      {
+        tempId: "pending_live",
+        content: [{ type: "input_text", text: "a genuinely queued msg" }],
+        replayed: true,
+      },
     ]);
   });
 
@@ -1678,6 +1881,7 @@ describe("chatStore — switchTo", () => {
       {
         tempId: "pending_img",
         content: [{ type: "input_image", file_id: "file_xyz", filename: "a.png" }],
+        replayed: true,
       },
     ]);
   });
@@ -2028,7 +2232,7 @@ describe("chatStore — switchTo", () => {
 
   it("hydrates only the initial window and flags that older history remains", async () => {
     // Longer than the initial window so the loaded window is a strict subset.
-    const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE + 5;
+    const total = INITIAL_WINDOW_ITEMS + OLDER_HISTORY_PAGE_ITEMS + 5;
     const fullItems = Array.from({ length: total }, (_, idx) =>
       userMessage(`resp_${idx.toString().padStart(4, "0")}`, `message ${idx}`),
     );
@@ -2063,7 +2267,7 @@ describe("chatStore — switchTo", () => {
   it.each([false, true])(
     "loadMoreHistory prepends the correct page (scoped pane: %s)",
     async (scoped) => {
-      const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE + 5;
+      const total = INITIAL_WINDOW_ITEMS + OLDER_HISTORY_PAGE_ITEMS + 5;
       const fullItems = Array.from({ length: total }, (_, idx) =>
         userMessage(`resp_${idx.toString().padStart(4, "0")}`, `message ${idx}`),
       );
@@ -2082,14 +2286,14 @@ describe("chatStore — switchTo", () => {
       // Window + one older page. A wrong older-page cursor — e.g. the pre-fix
       // bug that fetched the convo head — would yield the wrong count or
       // duplicate blocks.
-      expect(state.blocks).toHaveLength(INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE);
+      expect(state.blocks).toHaveLength(INITIAL_WINDOW_ITEMS + OLDER_HISTORY_PAGE_ITEMS);
       // The older page sits before the original, oldest item first. Its first
       // block is index `total - WINDOW - PAGE` (= 5): proves the prepend order
       // and the descending+after cursor math are correct.
       expect(state.blocks[0]).toMatchObject({
         type: "user_message",
         ctx: {
-          itemId: `msg_resp_${(total - INITIAL_WINDOW_ITEMS - SESSION_HISTORY_PAGE_SIZE)
+          itemId: `msg_resp_${(total - INITIAL_WINDOW_ITEMS - OLDER_HISTORY_PAGE_ITEMS)
             .toString()
             .padStart(4, "0")}_user`,
         },
@@ -2105,7 +2309,7 @@ describe("chatStore — switchTo", () => {
     // relative to a window that no longer existed. The conversation now keeps its
     // window across navigation, so the page is still valid when it lands and must
     // be applied rather than discarded.
-    const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE;
+    const total = INITIAL_WINDOW_ITEMS + OLDER_HISTORY_PAGE_ITEMS;
     const itemsA = Array.from({ length: total }, (_, idx) =>
       userMessage(`a_${idx.toString().padStart(4, "0")}`, `a ${idx}`),
     );
@@ -2137,7 +2341,7 @@ describe("chatStore — switchTo", () => {
     const state = useChatStore.getState();
     // Prepended onto the window it was fetched against, which is still current.
     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([
-      ...itemsA.slice(0, SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      ...itemsA.slice(0, OLDER_HISTORY_PAGE_ITEMS).map((item) => item.id),
       ...windowIds,
     ]);
     expect(state.oldestItemId).toBe(itemsA[0]!.id);
@@ -2146,7 +2350,7 @@ describe("chatStore — switchTo", () => {
   });
 
   it("loadMoreHistory dedupes a page overlapping blocks kept across a rebind", async () => {
-    const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE * 2;
+    const total = INITIAL_WINDOW_ITEMS + OLDER_HISTORY_PAGE_ITEMS * 2;
     const items = Array.from({ length: total }, (_, idx) =>
       userMessage(`r_${idx.toString().padStart(4, "0")}`, `r ${idx}`),
     );
@@ -2155,7 +2359,7 @@ describe("chatStore — switchTo", () => {
     await useChatStore.getState().switchTo("conv_re");
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks).toHaveLength(
-      INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE,
+      INITIAL_WINDOW_ITEMS + OLDER_HISTORY_PAGE_ITEMS,
     );
 
     // The stream died (idle disconnect): the send-triggered rebind
@@ -2169,7 +2373,7 @@ describe("chatStore — switchTo", () => {
     // kept across the rebind — without itemId dedupe each would render twice.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      items.slice(SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      items.slice(OLDER_HISTORY_PAGE_ITEMS).map((item) => item.id),
     );
 
     // The cursor advanced through the overlap, so the oldest page loads next.
@@ -2180,7 +2384,7 @@ describe("chatStore — switchTo", () => {
   });
 
   it("clears loadingMoreHistory when a rebind hydration voids the in-flight page", async () => {
-    const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE;
+    const total = INITIAL_WINDOW_ITEMS + OLDER_HISTORY_PAGE_ITEMS;
     const items = Array.from({ length: total }, (_, idx) =>
       userMessage(`lh_${idx.toString().padStart(4, "0")}`, `lh ${idx}`),
     );
@@ -2219,7 +2423,7 @@ describe("chatStore — switchTo", () => {
     // Scroll-up still works: the older page actually fetches and prepends.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
-      ...items.slice(0, SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      ...items.slice(0, OLDER_HISTORY_PAGE_ITEMS).map((item) => item.id),
       ...windowIds,
     ]);
   });
@@ -2401,7 +2605,7 @@ describe("chatStore — switchTo", () => {
     // future scroll-up: dead history until a page refresh.
     // One full window plus one page, so there is genuinely more to scroll to.
     const items: ConversationItem[] = Array.from(
-      { length: INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE },
+      { length: INITIAL_WINDOW_ITEMS + OLDER_HISTORY_PAGE_ITEMS },
       (_, idx) => userMessage(`bh_${idx.toString().padStart(4, "0")}`, `bh ${idx}`),
     );
     seedSession("conv_scroll", items);
@@ -2433,7 +2637,7 @@ describe("chatStore — switchTo", () => {
     expect(scrolled.loadingMoreHistory).toBe(false);
     // ...and the page landed on the conversation it belongs to, in order.
     expect(scrolled.blocks.map((b) => b.ctx.itemId)).toEqual([
-      ...items.slice(0, SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      ...items.slice(0, OLDER_HISTORY_PAGE_ITEMS).map((item) => item.id),
       ...windowIds,
     ]);
     // The visible conversation gained nothing.
@@ -3557,6 +3761,96 @@ describe("chatStore — send (first-send ordering)", () => {
     // The bubble pushed before the POST is removed on failure — no server
     // idle will fire to reconcile it.
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+  });
+
+  it("ends a plan's Stop in progress once the session takes another message", async () => {
+    onTestFinished(() => usePlanStops.setState({ requests: {}, settledStops: {} }));
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+    });
+    await trackPlanStop("conv_existing", async () => ({}));
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse({ error: "boom" }, { ok: false, status: 500 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    // A message the session never took leaves the run stopping.
+    await useChatStore.getState().send("Keep the logs", "agent_xyz");
+    expect(usePlanStops.getState().requests.conv_existing).toMatchObject({ sent: true });
+
+    fetchMock.mockImplementation(defaultFetchHandler);
+    await useChatStore.getState().send(continuePlanMessage(null), "agent_xyz");
+    expect(usePlanStops.getState().requests.conv_existing).toBeUndefined();
+  });
+
+  it("places a native Stop's message once the session's receipt names its item", async () => {
+    onTestFinished(() => usePlanStops.setState({ requests: {}, settledStops: {} }));
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+    });
+    await trackPlanStop("conv_existing", async () => ({ pendingId: "pending_stop" }));
+    expect(usePlanStops.getState().requests.conv_existing).not.toHaveProperty("itemId");
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "item_stop",
+      itemType: "message",
+      clearedPendingId: "pending_stop",
+      data: { role: "user", content: [{ type: "input_text", text: stopPlanMessage(null) }] },
+    });
+    expect(usePlanStops.getState().requests.conv_existing).toMatchObject({
+      sent: true,
+      itemId: "item_stop",
+    });
+
+    // A background session's stream places only that session's Stop.
+    await trackPlanStop("conv_background", async () => ({ pendingId: "pending_background" }));
+    await trackPlanStop("conv_existing", async () => ({ pendingId: "pending_background" }));
+    handleSessionEvent(
+      {
+        type: "session_input_consumed",
+        itemId: "item_background",
+        itemType: "message",
+        clearedPendingId: "pending_background",
+        data: { role: "user", content: [{ type: "input_text", text: stopPlanMessage(null) }] },
+      },
+      "conv_background",
+    );
+    expect(usePlanStops.getState().requests.conv_background).toMatchObject({
+      itemId: "item_background",
+    });
+    expect(usePlanStops.getState().requests.conv_existing).not.toHaveProperty("itemId");
+  });
+
+  it("keeps a plan's Stop when a message sent before it lands after it", async () => {
+    onTestFinished(() => usePlanStops.setState({ requests: {}, settledStops: {} }));
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+    });
+    let landMessage: (() => void) | undefined;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+        return new Promise<Response>((resolve) => {
+          landMessage = () => resolve(defaultFetchHandler(input, init));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const sending = useChatStore.getState().send("Keep the logs", "agent_xyz");
+    await vi.waitFor(() => expect(landMessage).toBeDefined());
+    await trackPlanStop("conv_existing", async () => ({}));
+    landMessage!();
+    await sending;
+    expect(usePlanStops.getState().requests.conv_existing).toMatchObject({ sent: true });
   });
 
   it("surfaces a visible error block with friendly copy when the runner is unavailable (503)", async () => {
@@ -5469,6 +5763,27 @@ describe("chatStore — sendSlashCommand", () => {
     expect(lastEventBody().data).toEqual({ kind: "skill", name: "deslop", arguments: "" });
   });
 
+  it("ends a plan's Stop in progress once the session takes the command, not when it refuses it", async () => {
+    onTestFinished(() => usePlanStops.setState({ requests: {}, settledStops: {} }));
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    await trackPlanStop("conv_existing", async () => ({}));
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse({ error: "boom" }, { ok: false, status: 500 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().sendSlashCommand("workflow", "Fix the tests", "agent_xyz");
+    expect(usePlanStops.getState().requests.conv_existing).toMatchObject({ sent: true });
+
+    fetchMock.mockImplementation(defaultFetchHandler);
+    await useChatStore.getState().sendSlashCommand("workflow", "Fix the tests", "agent_xyz");
+    expect(usePlanStops.getState().requests.conv_existing).toBeUndefined();
+  });
+
   it("sets streaming status and pushes an optimistic echo of the typed command", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",
@@ -5941,6 +6256,30 @@ describe("chatStore — send while streaming (queueing)", () => {
     expect(errorBlocks[0]).toMatchObject({ code: "executor_error", message: "boom" });
   });
 
+  it.each(["session_recovery_failed", "executor_error"])(
+    "supersedes the disconnect only for automatic resume exhaustion, received %s",
+    (code) => {
+      useChatStore.setState({
+        conversationId: "conv_abc",
+        sessionStatus: "running",
+        blocks: [],
+      });
+      for (const errorCode of ["runner_disconnected", code]) {
+        handleSessionEvent({
+          type: "session_status",
+          conversationId: "conv_abc",
+          status: "failed",
+          responseId: "resp_interrupted",
+          error: { code: errorCode, message: errorCode },
+        });
+      }
+      const errors = useChatStore.getState().blocks.filter((block) => block.type === "error");
+      expect(errors.map((block) => block.code)).toEqual(
+        code === "session_recovery_failed" ? [code] : ["runner_disconnected", code],
+      );
+    },
+  );
+
   it("stops reporting a status-only relaunch failure as the latest error after a resume", () => {
     // A failed resume, then a successful one that adds no items.
     useChatStore.setState({
@@ -6123,6 +6462,27 @@ describe("chatStore — background-shell tally (claude-native)", () => {
     const state = useChatStore.getState();
     expect(state.sessionStatus).toBe("idle");
     expect(state.backgroundTaskCount).toBe(0);
+  });
+
+  it("keeps a waiting edge's background agents until the next edge", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "idle",
+      backgroundAgents: [],
+      activeResponse: null,
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "waiting",
+      backgroundAgents: [{ id: "a1", description: "Audit" }],
+    });
+    expect(useChatStore.getState().sessionStatus).toBe("waiting");
+    expect(useChatStore.getState().backgroundAgents).toEqual([{ id: "a1", description: "Audit" }]);
+
+    // The agent finished, so Claude went idle.
+    handleSessionEvent({ type: "session_status", conversationId: "conv_abc", status: "idle" });
+    expect(useChatStore.getState().backgroundAgents).toEqual([]);
   });
 
   it("adopts the per-shell detail alongside an authoritative count", () => {
@@ -6778,6 +7138,229 @@ describe("chatStore — send (file attachments)", () => {
     failPost = false;
     await useChatStore.getState().send("look at this", "agent_xyz", [file]);
     expect(uploads).toBe(1);
+  });
+
+  it.each(["foreground", "background"])(
+    "releases a failed %s upload batch's quota and reuploads its files on retry",
+    async (path) => {
+      seedConversationsCache([conv("conv_active", "running"), conv("conv_existing", "idle")]);
+      useChatStore.setState({
+        conversationId: path === "foreground" ? "conv_existing" : "conv_active",
+        abortController: new AbortController(),
+      });
+      const stored = new Set<string>();
+      const deleted: string[] = [];
+      const posted: unknown[] = [];
+      let uploads = 0;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/v1/sessions/conv_existing/resources/files") && init?.method === "POST") {
+          uploads += 1;
+          if (stored.size === 2) {
+            return mockResponse({ detail: "Attachment quota reached" }, { ok: false, status: 413 });
+          }
+          const id = `file_${uploads}`;
+          stored.add(id);
+          return mockResponse({ id });
+        }
+        if (url.includes("/resources/files/") && init?.method === "DELETE") {
+          const id = url.split("/").at(-1)!;
+          deleted.push(id);
+          stored.delete(id);
+          return mockResponse({ deleted: true });
+        }
+        if (url.endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+          posted.push(JSON.parse(init.body as string).data.content);
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const files = ["first.zip", "second.zip", "third.zip"].map(
+        (name) => new File(["content"], name, { type: "application/zip" }),
+      );
+      const submit = async (batch: File[]) => {
+        if (path === "foreground") {
+          await useChatStore.getState().send("read these", "agent_xyz", batch);
+        } else {
+          initChatStore(client);
+          useChatStore.setState({
+            queuedMessages: [
+              {
+                queueId: "q_batch",
+                conversationId: "conv_existing",
+                text: "read these",
+                files: batch,
+              },
+            ],
+          });
+          useChatStore.getState().flushBackgroundQueues();
+          await tick();
+          await tick();
+        }
+      };
+
+      await submit(files);
+
+      expect(uploads).toBe(3);
+      expect(deleted.sort()).toEqual(["file_1", "file_2"]);
+      expect(stored.size).toBe(0);
+      expect(posted).toEqual([]);
+      if (path === "foreground") {
+        expect(useChatStore.getState().failedSendDraft?.files).toEqual(files);
+      } else {
+        expect(useChatStore.getState().queuedMessages[0]?.files).toEqual(files);
+      }
+
+      await submit([files[0]!]);
+      await submit([files[1]!]);
+
+      expect(uploads).toBe(5);
+      expect([...stored]).toEqual(["file_4", "file_5"]);
+      expect(posted).toEqual([
+        [
+          { type: "input_file", file_id: "file_4", filename: "first.zip" },
+          { type: "input_text", text: "read these" },
+        ],
+        [
+          { type: "input_file", file_id: "file_5", filename: "second.zip" },
+          { type: "input_text", text: "read these" },
+        ],
+      ]);
+    },
+  );
+
+  it("keeps previously posted attachments when a later upload batch fails", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    const uploaded: string[] = [];
+    const deleted: string[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/resources/files") && init?.method === "POST") {
+        const name = ((init.body as FormData).get("file") as File).name;
+        uploaded.push(name);
+        if (name === "rejected.zip") {
+          return mockResponse({ detail: "Attachment quota reached" }, { ok: false, status: 413 });
+        }
+        return mockResponse({ id: `file_${uploaded.length}` });
+      }
+      if (url.includes("/resources/files/") && init?.method === "DELETE") {
+        deleted.push(url.split("/").at(-1)!);
+        return mockResponse({ deleted: true });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const files = ["posted.zip", "new.zip", "rejected.zip"].map(
+      (name) => new File(["content"], name, { type: "application/zip" }),
+    );
+
+    await useChatStore.getState().send("first", "agent_xyz", [files[0]!]);
+    await useChatStore.getState().send("second", "agent_xyz", files);
+    await useChatStore.getState().send("reuse posted", "agent_xyz", [files[0]!]);
+
+    expect(uploaded).toEqual(["posted.zip", "new.zip", "rejected.zip"]);
+    expect(deleted).toEqual(["file_2"]);
+    expect(useChatStore.getState().pendingUserMessages.at(-1)?.content).toContainEqual({
+      type: "input_file",
+      file_id: "file_1",
+      filename: "posted.zip",
+    });
+  });
+
+  it("keeps an overlapping send's attachment when an earlier upload batch fails", async () => {
+    vi.useFakeTimers();
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    const deleted: string[] = [];
+    const posted: unknown[] = [];
+    let uploads = 0;
+    let rejectUpload!: () => void;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/resources/files") && init?.method === "POST") {
+        if (((init.body as FormData).get("file") as File).name === "rejected.zip") {
+          return new Promise<Response>((resolve) => {
+            rejectUpload = () =>
+              resolve(
+                mockResponse({ detail: "Attachment quota reached" }, { ok: false, status: 413 }),
+              );
+          });
+        }
+        uploads += 1;
+        return mockResponse({ id: `file_${uploads}` });
+      }
+      if (url.includes("/resources/files/") && init?.method === "DELETE") {
+        deleted.push(url.split("/").at(-1)!);
+        return mockResponse({ deleted: true });
+      }
+      if (url.endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        posted.push(JSON.parse(init.body as string).data.content);
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const shared = new File(["content"], "shared.zip", { type: "application/zip" });
+    const rejected = new File(["content"], "rejected.zip", { type: "application/zip" });
+
+    const firstSend = useChatStore.getState().send("first", "agent_xyz", [shared, rejected]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(rejectUpload).toBeDefined();
+    expect(uploads).toBe(1);
+
+    const secondSend = useChatStore.getState().send("second", "agent_xyz", [shared]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(posted).toEqual([]);
+    await vi.advanceTimersByTimeAsync(180_000);
+    await secondSend;
+
+    expect(uploads).toBe(2);
+    expect(posted).toEqual([
+      [
+        { type: "input_file", file_id: "file_2", filename: "shared.zip" },
+        { type: "input_text", text: "second" },
+      ],
+    ]);
+    rejectUpload();
+    await firstSend;
+
+    expect(deleted).toEqual(["file_1"]);
+  });
+
+  it("continues failed-batch cleanup after a deletion fails and preserves the upload error", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    const deleted: string[] = [];
+    let uploads = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/resources/files") && init?.method === "POST") {
+        uploads += 1;
+        return uploads === 3
+          ? mockResponse({ detail: "Attachment quota reached" }, { ok: false, status: 413 })
+          : mockResponse({ id: `file_${uploads}` });
+      }
+      if (url.includes("/resources/files/") && init?.method === "DELETE") {
+        const id = url.split("/").at(-1)!;
+        deleted.push(id);
+        return id === "file_1"
+          ? mockResponse({ detail: "Cleanup unavailable" }, { ok: false, status: 503 })
+          : mockResponse({ deleted: true });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const files = ["first.zip", "second.zip", "third.zip"].map(
+      (name) => new File(["content"], name, { type: "application/zip" }),
+    );
+    const onError = vi.fn();
+
+    await useChatStore.getState().send("read these", "agent_xyz", files, { onError });
+
+    expect(deleted.sort()).toEqual(["file_1", "file_2"]);
+    expect(onError).toHaveBeenCalledWith("Attachment quota reached");
   });
 
   it("hands the message back for retry when the upload is rejected", async () => {
@@ -7694,6 +8277,194 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
 
       await useChatStore.getState().clearContext();
 
+      expect(useChatStore.getState().redirectToConversationId).toBeNull();
+    });
+  });
+
+  describe("rewindToPrompt", () => {
+    function answerRewind(response: Response): () => RequestInit | undefined {
+      let sent: RequestInit | undefined;
+      const base = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith("/v1/sessions/conv_old/rewind")) {
+          sent = init;
+          return Promise.resolve(response.clone());
+        }
+        return base(input, init);
+      });
+      return () => sent;
+    }
+
+    it.each([false, true])(
+      "restores the rewound prompt and warns if incomplete: %s",
+      async (incomplete) => {
+        onTestFinished(() => clearSessionDrafts());
+        useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+        const sent = answerRewind(
+          Response.json({
+            session_id: "conv_new",
+            prompt: "Add parser tests",
+            attachments_incomplete: incomplete,
+          }),
+        );
+        const warning = vi.spyOn(toast, "warning");
+        onTestFinished(() => warning.mockRestore());
+
+        await useChatStore.getState().rewindToPrompt("msg_second");
+
+        if (incomplete) {
+          expect(warning).toHaveBeenCalledExactlyOnceWith(
+            "Some attachments couldn't be restored. Attach them again before sending.",
+          );
+        } else {
+          expect(warning).not.toHaveBeenCalled();
+        }
+        expect(JSON.parse(String(sent()?.body))).toEqual({ item_id: "msg_second" });
+        expect(getSessionDraft("conv_new")?.text).toBe("Add parser tests");
+        expect(useChatStore.getState().redirectToConversationId).toBe("conv_new");
+        expect(useChatStore.getState().rewindPrefill).toEqual({
+          conversationId: "conv_new",
+          text: "Add parser tests",
+          files: [],
+        });
+      },
+    );
+
+    it("stays put when the user switched away before the rewind was acknowledged", async () => {
+      onTestFinished(() => {
+        clearSessionDrafts();
+        useChatStore.setState({ rewindPrefill: null });
+      });
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      let acknowledge = () => {};
+      const answered = new Promise<void>((resolve) => {
+        acknowledge = resolve;
+      });
+      const base = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith("/v1/sessions/conv_old/rewind")) {
+          await answered;
+          return Response.json({ session_id: "conv_new", prompt: "Add parser tests" });
+        }
+        return base(input, init);
+      });
+
+      const rewinding = useChatStore.getState().rewindToPrompt("msg_second");
+      useChatStore.setState({ conversationId: "conv_other" });
+      acknowledge();
+      await rewinding;
+
+      expect(useChatStore.getState().redirectToConversationId).toBeNull();
+      // The new session still opens with the prompt when the user goes there.
+      expect(getSessionDraft("conv_new")?.text).toBe("Add parser tests");
+    });
+
+    it("restores the prompt's attachments as the new session's own files", async () => {
+      onTestFinished(() => {
+        clearSessionDrafts();
+        useChatStore.setState({ rewindPrefill: null });
+      });
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      answerRewind(
+        Response.json({
+          session_id: "conv_new",
+          prompt: "",
+          attachments: [
+            { type: "input_image", file_id: "file_fork_png", filename: "diagram.png" },
+            // Carried inline (e.g. imported), with no stored file to copy.
+            {
+              type: "input_image",
+              file_id: null,
+              image_url: "data:image/png;base64,cGFzdGVk",
+              filename: "pasted.png",
+            },
+            {
+              type: "input_file",
+              file_id: null,
+              file_data: "data:application/pdf;base64,JVBERi0=",
+              filename: "spec.pdf",
+            },
+            {
+              type: "input_file",
+              file_id: null,
+              file_data: "data:text/plain;charset=utf-8;base64,aW5saW5l",
+              filename: "inline.txt",
+            },
+            { type: "input_file", file_id: "file_fork_gone", filename: "gone.txt" },
+            { type: "input_file", file_id: "file_fork_txt", filename: "notes.txt" },
+          ],
+        }),
+      );
+      const contents: Record<string, Response> = {
+        file_fork_png: new Response("png", { headers: { "Content-Type": "image/png" } }),
+        file_fork_gone: Response.json({ error: { code: "not_found" } }, { status: 404 }),
+        file_fork_txt: new Response("notes", { headers: { "Content-Type": "text/plain" } }),
+      };
+      const uploads: string[] = [];
+      const posted: unknown[] = [];
+      const rewindFetch = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const fileId = url.match(
+          /\/v1\/sessions\/conv_new\/resources\/files\/(\w+)\/content$/,
+        )?.[1];
+        if (fileId) return Promise.resolve(contents[fileId]!);
+        if (url.endsWith("/resources/files")) {
+          uploads.push(url);
+          return mockResponse({
+            id: `file_uploaded_${uploads.length}`,
+            name: "inline",
+            metadata: { filename: "inline", bytes: 6, created_at: 0 },
+          });
+        }
+        if (url.endsWith("/v1/sessions/conv_new/events") && init?.method === "POST")
+          posted.push(JSON.parse(String(init.body)));
+        return rewindFetch(input, init);
+      });
+
+      const warning = vi.spyOn(toast, "warning");
+      onTestFinished(() => warning.mockRestore());
+
+      await useChatStore.getState().rewindToPrompt("msg_second");
+
+      expect(warning).toHaveBeenCalledExactlyOnceWith(
+        "Couldn't restore gone.txt to the composer. Attach again to send.",
+      );
+      const files = getSessionDraft("conv_new")?.files ?? [];
+      expect(files.map((file) => [file.name, file.type])).toEqual([
+        ["diagram.png", "image/png"],
+        ["pasted.png", "image/png"],
+        ["spec.pdf", "application/pdf"],
+        ["inline.txt", "text/plain"],
+        ["notes.txt", "text/plain"],
+      ]);
+      expect(await files[1]!.text()).toBe("pasted");
+      expect(await files[2]!.text()).toBe("%PDF-");
+      expect(await files[3]!.text()).toBe("inline");
+      expect(await files[4]!.text()).toBe("notes");
+      expect(useChatStore.getState().rewindPrefill?.files).toEqual(files);
+
+      // Sending them reuses the new session's copies instead of uploading
+      // again; only the inline image and documents, which had no copy, are uploaded.
+      useChatStore.setState({ conversationId: "conv_new", abortController: new AbortController() });
+      await useChatStore.getState().send("", "agent_xyz", files);
+      expect(uploads).toEqual(Array(3).fill("/v1/sessions/conv_new/resources/files"));
+      expect(JSON.stringify(posted)).toContain('"file_id":"file_fork_png"');
+      for (const uploaded of ["file_uploaded_1", "file_uploaded_2", "file_uploaded_3"])
+        expect(JSON.stringify(posted)).toContain(`"file_id":"${uploaded}"`);
+      expect(JSON.stringify(posted)).toContain('"file_id":"file_fork_txt"');
+    });
+
+    it("leaves the view in place when the server refuses", async () => {
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      answerRewind(
+        Response.json(
+          { error: { code: "invalid_input", message: "Stop the current turn first." } },
+          { status: 400 },
+        ),
+      );
+
+      await expect(useChatStore.getState().rewindToPrompt("msg_second")).rejects.toThrow();
       expect(useChatStore.getState().redirectToConversationId).toBeNull();
     });
   });
@@ -9953,33 +10724,37 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(after.pendingUserMessages).toEqual([]);
     });
 
-    it("ignores meta input events without consuming pending user messages", () => {
-      const existingBlocks: AnyBlock[] = [];
-      useChatStore.setState({
-        blocks: existingBlocks,
-        pendingUserMessages: [
+    it.each([undefined, false, true])(
+      "ignores meta input (user_authored=%s) without consuming pending user messages",
+      (userAuthored) => {
+        const existingBlocks: AnyBlock[] = [];
+        useChatStore.setState({
+          blocks: existingBlocks,
+          pendingUserMessages: [
+            { tempId: "pend_1", content: [{ type: "input_text", text: "visible pending" }] },
+          ],
+        });
+
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: "msg_meta",
+          itemType: "message",
+          isMeta: true,
+          data: {
+            role: "user",
+            is_meta: true,
+            content: [{ type: "input_text", text: "<skill>hidden</skill>" }],
+            ...(userAuthored === undefined ? {} : { user_authored: userAuthored }),
+          },
+        });
+
+        const after = useChatStore.getState();
+        expect(after.blocks).toBe(existingBlocks);
+        expect(after.pendingUserMessages).toEqual([
           { tempId: "pend_1", content: [{ type: "input_text", text: "visible pending" }] },
-        ],
-      });
-
-      handleSessionEvent({
-        type: "session_input_consumed",
-        itemId: "msg_meta",
-        itemType: "message",
-        isMeta: true,
-        data: {
-          role: "user",
-          is_meta: true,
-          content: [{ type: "input_text", text: "<skill>hidden</skill>" }],
-        },
-      });
-
-      const after = useChatStore.getState();
-      expect(after.blocks).toBe(existingBlocks);
-      expect(after.pendingUserMessages).toEqual([
-        { tempId: "pend_1", content: [{ type: "input_text", text: "visible pending" }] },
-      ]);
-    });
+        ]);
+      },
+    );
 
     it("renders a meta background-task wake as a system marker without consuming pending", () => {
       // Claude Code resumes on a finished background task with no human
@@ -12104,6 +12879,100 @@ describe("chatStore — session configuration scope", () => {
     },
   ];
 
+  // Both events and cache states, each mute direction and outcome once.
+  it.each([
+    { event: "session_agent_changed", muted: true, success: true, cached: false },
+    { event: "session_agent_changed", muted: false, success: false, cached: true },
+    { event: "session_model_options", muted: false, success: true, cached: false },
+    { event: "session_model_options", muted: true, success: false, cached: true },
+  ])(
+    "applies $event after mute=$muted settles with success=$success, cached=$cached",
+    async ({ event, muted, success, cached }) => {
+      const id = "conv_mute_refresh";
+      seedSession(id);
+      sessionLabels.set(id, muted ? {} : { [MUTED_LABEL_KEY]: "1" });
+      await useChatStore.getState().switchTo(id);
+      client.setQueryData(["conversation-backfill", id], {
+        id,
+        object: "conversation",
+        title: "Mute refresh",
+        created_at: 0,
+        updated_at: 0,
+        permission_level: null,
+        labels: sessionLabels.get(id) ?? {},
+      } satisfies Conversation);
+      if (!cached) client.removeQueries({ queryKey: ["session", id], exact: true });
+      expect(useChatStore.getState().codexModelOptions).toEqual([]);
+      expect(useChatStore.getState().isNativeTerminalSession).toBe(false);
+      let resolveSnapshot!: (response: Response) => void;
+      const snapshotRead = vi.fn(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveSnapshot = resolve;
+          }),
+      );
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).split("?")[0] === `/v1/sessions/${id}`) {
+          if (init?.method === "PATCH")
+            return mockResponse(
+              { labels: muted ? { [MUTED_LABEL_KEY]: "1" } : {} },
+              { ok: success, status: success ? 200 : 500 },
+            );
+          return snapshotRead();
+        }
+        return defaultFetchHandler(input, init);
+      });
+      handleSessionEvent(
+        event === "session_agent_changed"
+          ? {
+              type: "session_agent_changed",
+              conversationId: id,
+              agentId: "ag_updated",
+              agentName: "Updated agent",
+            }
+          : { type: "session_model_options", conversationId: id },
+      );
+      await vi.waitFor(() => expect(snapshotRead).toHaveBeenCalledOnce());
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client }, children);
+      const { result, unmount } = renderHook(() => useSetConversationMuted(), { wrapper });
+      onTestFinished(() => {
+        unmount();
+        clearSessionMuteState();
+        client.clear();
+      });
+      await act(async () => {
+        await result.current.mutateAsync({ id, muted }).catch(() => {});
+      });
+      await waitFor(() => expect(result.current.status).toBe(success ? "success" : "error"));
+      expect(snapshotRead).toHaveBeenCalledOnce();
+      expect(client.getQueryState(["session", id])?.fetchStatus).toBe("fetching");
+      resolveSnapshot(
+        mockResponse({
+          id,
+          agent_id: "ag_updated",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: { ...sessionLabels.get(id), "omnigent.wrapper": "claude-code-native-ui" },
+          model_options: CLAUDE_MODEL_OPTIONS,
+        }),
+      );
+      await vi.waitFor(() =>
+        expect(useChatStore.getState().codexModelOptions).toEqual(CLAUDE_MODEL_OPTIONS),
+      );
+      if (event === "session_agent_changed") {
+        expect(useChatStore.getState().isNativeTerminalSession).toBe(true);
+        expect(useChatStore.getState().boundAgentId).toBe("ag_updated");
+      }
+      expect(
+        !!client.getQueryData<{ labels: Record<string, string> }>(["session", id])?.labels[
+          MUTED_LABEL_KEY
+        ],
+      ).toBe(success ? muted : !muted);
+    },
+  );
+
   interface SnapshotOverrides {
     labels?: Record<string, string>;
     reasoning_effort?: string | null;
@@ -13161,6 +14030,114 @@ describe("chatStore — session configuration scope", () => {
     expect(sessionLabels.get("conv_approval_failure")).not.toHaveProperty(
       "omnigent.codex_native.approval_mode",
     );
+  });
+
+  it.each([
+    {
+      wrapper: "codex-native-ui",
+      setter: "setCodexApprovalMode",
+      field: "codexApprovalMode",
+      key: "approval_mode",
+      mode: "approve-for-me",
+    },
+    {
+      wrapper: "claude-code-native-ui",
+      setter: "setClaudePermissionMode",
+      field: "claudePermissionMode",
+      key: "permission_mode",
+      mode: "auto",
+    },
+  ] as const)(
+    "switches a background session's $field without touching the active one",
+    async ({ wrapper, setter, field, key, mode }) => {
+      const cellId = `conv_${key}_cell`;
+      const activeId = `conv_${key}_active`;
+      for (const id of [cellId, activeId]) {
+        seedSession(id, []);
+        withSnapshot(id, { labels: { "omnigent.wrapper": wrapper } });
+      }
+      await useChatStore.getState().switchTo(cellId);
+      await useChatStore.getState().switchTo(activeId);
+      const cell = () => conversationRegistry.peek(cellId)!.getState();
+      fetchMock.mockClear();
+
+      await useChatStore.getState()[setter](mode, cellId);
+
+      expect(patchCallsFor(cellId)).toEqual([{ [key]: mode }]);
+      expect(patchCallsFor(activeId)).toEqual([]);
+      expect(cell()[field]).toBe(mode);
+      expect(useChatStore.getState()[field]).toBe("");
+
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = (typeof input === "string" ? input : input.toString()).split("?")[0]!;
+        if (path === `/v1/sessions/${cellId}` && init?.method === "PATCH")
+          return mockResponse(
+            { error: { code: "runner_unavailable" } },
+            { ok: false, status: 503 },
+          );
+        return defaultFetchHandler(input, init);
+      });
+      await expect(useChatStore.getState()[setter]("default", cellId)).rejects.toThrow();
+
+      // The rejected switch rolls back only the targeted session.
+      expect(cell()[field]).toBe(mode);
+      expect(useChatStore.getState()[field]).toBe("");
+    },
+  );
+
+  it("changes a background session's model, effort and routing, leaving the active one", async () => {
+    const cellId = "conv_settings_cell";
+    const activeId = "conv_settings_active";
+    for (const id of [cellId, activeId]) {
+      seedSession(id, []);
+      sessionLabels.set(id, { "omnigent.wrapper": "claude-code-native-ui" });
+    }
+    // Echo a model pick like the real server ("default" clears it), so turning
+    // routing on must clear the pinned model.
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const response = defaultFetchHandler(input, init);
+      const patch: Record<string, unknown> =
+        init?.method === "PATCH" ? JSON.parse(String(init.body)) : {};
+      if (!("model_override" in patch)) return response;
+      const model = patch.model_override === "default" ? null : patch.model_override;
+      return mockResponse({ ...(await response.json()), model_override: model });
+    });
+    await useChatStore.getState().switchTo(cellId);
+    await useChatStore.getState().switchTo(activeId);
+    useChatStore.setState({ sessionModelOverride: null, sessionReasoningEffort: "low" });
+    const cell = () => conversationRegistry.peek(cellId)!.getState();
+    fetchMock.mockClear();
+
+    await useChatStore.getState().setModel("sonnet", { sessionId: cellId });
+    expect(cell().sessionModelOverride).toBe("sonnet");
+    await useChatStore.getState().setEffort("high", cellId);
+    await useChatStore.getState().setCostControlMode("on", cellId);
+
+    expect(patchCallsFor(cellId)).toEqual([
+      { model_override: "sonnet" },
+      { reasoning_effort: "high" },
+      { cost_control_mode_override: "on", model_override: "default" },
+    ]);
+    expect(patchCallsFor(activeId)).toEqual([]);
+    expect(cell()).toMatchObject({
+      sessionModelOverride: null,
+      sessionReasoningEffort: "high",
+      costControlModeOverride: "on",
+    });
+    expect(useChatStore.getState()).toMatchObject({
+      conversationId: activeId,
+      sessionModelOverride: null,
+      sessionReasoningEffort: "low",
+      costControlModeOverride: null,
+    });
+  });
+
+  it("leaves a session that isn't loaded alone", async () => {
+    const store = useChatStore.getState();
+    await store.setModel("sonnet", { sessionId: "conv_not_loaded" });
+    await store.setEffort("high", "conv_not_loaded");
+    await store.setCostControlMode("on", "conv_not_loaded");
+    expect(patchCallsFor("conv_not_loaded")).toEqual([]);
   });
 
   it("hydrates server-side model and effort without PATCHing", async () => {
@@ -17081,6 +18058,76 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("keeps one row per tool call when a backfill re-reads calls the stream showed", async () => {
+    // The stream names tool items by provisional ids; the saved items carry their own.
+    const before = userMessage("resp_tool_gap_pre", "brief the worker");
+    seedSession("conv_tool_gap", [before]);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_tool_gap",
+      abortController: controller,
+      blocks: itemsToBlocks([before]),
+    });
+
+    const loop = startStreamPump("conv_tool_gap", controller, setState, getState);
+    await drainAsync();
+    const name = "sys_session_message";
+    const args = '{"session_id":"s_worker","message":"Reproduce the bug."}';
+    const live = sinks[0]!;
+    live.push(sse("response.created", { id: "resp_tool_gap", status: "in_progress", output: [] }));
+    live.push(
+      sse("response.output_item.done", {
+        item: { id: "fc_live", type: "function_call", call_id: "call_send", name, arguments: args },
+      }),
+    );
+    live.push(
+      sse("response.output_item.done", {
+        item: {
+          id: "fco_live",
+          type: "function_call_output",
+          response_id: "resp_tool_gap",
+          call_id: "call_send",
+          output: '{"queued": true}',
+        },
+      }),
+    );
+    live.push(sse("response.completed", { id: "resp_tool_gap", status: "completed", output: [] }));
+    await drainAsync();
+
+    const savedCall: ConversationItem = {
+      id: "item_call",
+      response_id: "resp_tool_gap",
+      type: "function_call",
+      status: "completed",
+      name,
+      arguments: args,
+      call_id: "call_send",
+    };
+    const savedOutput: ConversationItem = {
+      id: "item_output",
+      response_id: "resp_tool_gap",
+      type: "function_call_output",
+      status: "completed",
+      call_id: "call_send",
+      output: '{"queued": true}',
+    };
+    seedSessionItems("conv_tool_gap", [before, savedCall, savedOutput]);
+    live.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    const blocks = useChatStore.getState().blocks;
+    expect(blocks.filter((b) => b.type === "tool_group")).toHaveLength(1);
+    expect(blocks.filter((b) => b.type === "tool_result")).toHaveLength(1);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
   it("re-hydrates the window when the gap outruns the backfill page cap", async () => {
     const preGap = Array.from({ length: 30 }, (_, i) => gapUser("pre", i));
     const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
@@ -17123,7 +18170,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // Scroll-up still pages from the window's top, one page at a time.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      [...preGap.slice(-SESSION_HISTORY_PAGE_SIZE), ...gap].map((item) => item.id),
+      [...preGap.slice(-OLDER_HISTORY_PAGE_ITEMS), ...gap].map((item) => item.id),
     );
 
     const last = sinks[1]!;
@@ -17795,6 +18842,13 @@ describe("chatStore — startStreamPump reconnect loop", () => {
      * snapshot; `pendingFirstOpenFor` parks that session's first open pre-headers,
      * and `failFirstOpenFor` answers it with a 503.
      */
+    // A hostless open carries the client's own random key.
+    const CLIENT_KEY_RE = /^[0-9a-f]{32}$/;
+    function routeLabel(key: string | null): string {
+      if (key === null) return "none";
+      return CLIENT_KEY_RE.test(key) ? "client" : key;
+    }
+
     function routeKeyedStreamOpens(
       opts: {
         snapshotExtras?: Map<string, Record<string, unknown>>;
@@ -17814,7 +18868,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         if (streamMatch) {
           const open: StreamOpen = { headers: new Headers(init?.headers), aborted: false };
           opens.push(open);
-          log.push(`open:${open.headers.get(SLICE_KEY) ?? "none"}`);
+          log.push(`open:${routeLabel(open.headers.get(SLICE_KEY))}`);
           if (opts.failFirstOpenFor === streamMatch[1] && !firstOpenFailed) {
             firstOpenFailed = true;
             return mockResponse({}, { ok: false, status: 503 });
@@ -17882,8 +18936,8 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await loop;
     }
 
-    // `isDatabricksWorkspace()` gates slice-key routing. The standalone build
-    // never keys a request, so there the rebind has nothing to correct.
+    // Keyed routing is only enabled in workspace mode. Elsewhere no request is
+    // keyed, so the rebind has nothing to correct.
     function workspaceMode(): void {
       vi.stubEnv("VITE_DATABRICKS_WORKSPACE", "true");
     }
@@ -17904,8 +18958,8 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       const loop = startStreamPump(id, controller, setState, getState);
       await drainAsync();
       expect(route.opens).toHaveLength(1);
-      // Opened before the host was known: keyless, to the default replica.
-      expect(route.opens[0]!.headers.has(SLICE_KEY)).toBe(false);
+      // Opened before the host was known: on the client key.
+      expect(route.opens[0]!.headers.get(SLICE_KEY)).toMatch(CLIENT_KEY_RE);
 
       // Bytes are flowing, so no stale or stall path could explain a recycle.
       route.sinks[0]!.push(sse("session.heartbeat", {}));
@@ -17952,7 +19006,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
       const loop = startStreamPump(id, controller, setState, getState);
       await drainAsync();
-      expect(route.log).toEqual(["open:none"]);
+      expect(route.log).toEqual(["open:client"]);
 
       // The message was dispatched on the owning replica while this stream sat
       // on the wrong one: its commit and the reply never arrived here.
@@ -17964,7 +19018,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await drainAsync(50);
 
       expect(route.log.filter((entry) => entry.startsWith("open:"))).toEqual([
-        "open:none",
+        "open:client",
         "open:host_b",
       ]);
       const reopenedAt = route.log.indexOf("open:host_b");
@@ -17996,7 +19050,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       const loop = startStreamPump(id, controller, setState, getState);
       await drainAsync();
       // The keyless open's headers never arrive: nothing has connected yet.
-      expect(route.log).toEqual(["open:none"]);
+      expect(route.log).toEqual(["open:client"]);
       expect(route.sinks).toHaveLength(0);
 
       const committed = userMessage("pend_gap", "only once");
@@ -18041,7 +19095,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       const loop = startStreamPump(id, controller, setState, getState);
       await drainAsync();
       // The keyless open failed; the first backoff (125-250 ms) is pending.
-      expect(route.log).toEqual(["open:none"]);
+      expect(route.log).toEqual(["open:client"]);
 
       const committed = userMessage("backoff_gap", "only once");
       const reply = assistantMessage("backoff_gap", "the reply");
@@ -18052,7 +19106,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await drainAsync(50);
 
       expect(route.log.filter((entry) => entry.startsWith("open:"))).toEqual([
-        "open:none",
+        "open:client",
         "open:host_b",
       ]);
       // No attempt was live to recycle, but the host still changed after the
@@ -18084,7 +19138,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       const loop = startStreamPump(child, controller, setState, getState);
       await drainAsync();
       expect(route.opens).toHaveLength(1);
-      expect(route.opens[0]!.headers.has(SLICE_KEY)).toBe(false);
+      expect(route.opens[0]!.headers.get(SLICE_KEY)).toMatch(CLIENT_KEY_RE);
 
       // The child keys by its nearest host-bound ancestor.
       setSessionHost(parent, "host_p");
@@ -18117,7 +19171,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await drainAsync();
       expect(route.opens).toHaveLength(1);
       // No parent link yet, so the child resolves no host of its own.
-      expect(route.opens[0]!.headers.has(SLICE_KEY)).toBe(false);
+      expect(route.opens[0]!.headers.get(SLICE_KEY)).toMatch(CLIENT_KEY_RE);
 
       // A cold /c/<child> open learns the parent from the child's own snapshot
       // after the parent's host is already on the map.
@@ -18217,7 +19271,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       setSessionHost(id, null);
     });
 
-    it("stays inert outside a Databricks workspace", async () => {
+    it("stays inert outside workspace mode", async () => {
       const id = "conv_rekey_standalone";
       seedSession(id, []);
       const route = routeKeyedStreamOpens();
@@ -19353,6 +20407,22 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
     });
   }
 
+  function codexCommandReqFrame(id: string, command: string, prefix: string[]): string {
+    return sse("response.elicitation_request", {
+      elicitation_id: id,
+      params: {
+        mode: "form",
+        message: `Codex wants to run ${command}`,
+        phase: "codex_command_approval",
+        policy_name: "codex_native_command_approval",
+        content_preview: "",
+        command,
+        execpolicy_amendment: prefix,
+        approval_request_fingerprint: command,
+      },
+    });
+  }
+
   function elicitationCards(): ElicitationBlock[] {
     return useChatStore
       .getState()
@@ -19679,6 +20749,37 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
 
     await abortLoop(sinks, controller, loop);
   });
+
+  it.each(["pending", "auto_resolved", "responded"] as const)(
+    "replaces a reused Codex command card with the current request (%s)",
+    async (priorStatus) => {
+      seedSession("conv_codex_reuse", []);
+      const { sinks, controller, loop } = await openLoop("conv_codex_reuse");
+
+      sinks[0]!.push(codexCommandReqFrame("elic_reused", "python -m pytest", ["python", "-m"]));
+      await drainAsync();
+      if (priorStatus === "auto_resolved") {
+        sinks[0]!.push(sse("response.elicitation_resolved", { elicitation_id: "elic_reused" }));
+        await drainAsync();
+      } else if (priorStatus === "responded") {
+        await useChatStore.getState().submitApproval("elic_reused", "accept");
+      }
+
+      sinks[0]!.push(codexCommandReqFrame("elic_reused", "sh -c new-command", ["sh", "-c"]));
+      await drainAsync();
+
+      const cards = elicitationCards();
+      expect(cards).toHaveLength(1);
+      expect(cards[0]!.status).toBe("pending");
+      expect(cards[0]!.codexCommand).toMatchObject({
+        command: "sh -c new-command",
+        execPolicyAmendment: ["sh", "-c"],
+        requestFingerprint: "sh -c new-command",
+      });
+
+      await abortLoop(sinks, controller, loop);
+    },
+  );
 
   it("does not clobber an in-flight user verdict with a re-publish", async () => {
     seedSession("conv_verdict", []);

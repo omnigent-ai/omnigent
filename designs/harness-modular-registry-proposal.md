@@ -128,7 +128,7 @@ each paired with a `_build_<x>_native_bundle()` that imports
 ### 6. The web mirror — `web/src/lib/`
 
 `nativeCodingAgents.ts` duplicates all 11 rows + aliases; `forkHarness.ts`,
-`AgentCard.tsx` (icon switch), and `sessionStop.ts` / `sessionCapabilities.ts` /
+`agentIcon.ts` (icon switch), and `sessionStop.ts` / `sessionCapabilities.ts` /
 `codexPlanMode.ts` hardcode wrapper-label literals. Truly community-contributable
 native harnesses need the web driven by `GET /v1/harnesses`, not literals.
 
@@ -343,7 +343,7 @@ Only starts once Phase 1 has every built-in running *through* the seam.
 |---|---|---|---|---|---|
 | **2.1 Validator flip** | Replace the hard reject in `_validate_community_contribution` with positive validation: every `native_agent.key` has a matching `native_provider.key`; provider import paths start with `COMMUNITY_MODULE_PREFIX`; identity values don't collide (`_native_agent_identity_values` already checks this); `run_native` + `auto_create_terminal` are non-empty. | `harness_plugins.py` | 1.1 | Low–Med | 1d |
 | **2.2 `/v1/harnesses` native rows** | Extend `harness_catalog()` to emit native-agent rows + capabilities (`agent_name`, `wrapper_label`, `fork_history`, icon/label field), so the web has a server source of truth. | `harness_plugins.py`, `server/routes/harnesses.py` | 1.8 | Low | 2d |
-| **2.3 Web off the endpoint** | Delete the `nativeCodingAgents.ts` literals + `HARNESS_ALIASES`, the `forkHarness.ts` sets (`NATIVE_REBUILD_HARNESSES` / `PREAMBLE_FORK_HARNESSES` now come from `fork_history`), the `AgentCard` icon switch, and the wrapper-label literals in `sessionStop.ts` / `sessionCapabilities.ts` / `codexPlanMode.ts` — all driven by `/v1/harnesses`. Needs a **demo (screenshots/recording)** per CLAUDE.md; likely splits into 2.3a fork/capabilities data-plumb and 2.3b icon/label rendering. | `web/src/lib/*`, `web/src/components/AgentCard.tsx` | 2.2 | Med–High (largest FE) | 4–6d |
+| **2.3 Web off the endpoint** | Delete the `nativeCodingAgents.ts` literals + `HARNESS_ALIASES`, the `forkHarness.ts` sets (`NATIVE_REBUILD_HARNESSES` / `PREAMBLE_FORK_HARNESSES` now come from `fork_history`), the `iconForAgent` icon switch, and the wrapper-label literals in `sessionStop.ts` / `sessionCapabilities.ts` / `codexPlanMode.ts` — all driven by `/v1/harnesses`. Needs a **demo (screenshots/recording)** per CLAUDE.md; likely splits into 2.3a fork/capabilities data-plumb and 2.3b icon/label rendering. | `web/src/lib/*`, `web/src/components/agentIcon.ts` | 2.2 | Med–High (largest FE) | 4–6d |
 | **2.4 Docs + example plugin** | Extend `designs/harness-plugin-interface.md` § "Native TUI Harnesses" with the native checklist, and ship an example native plugin (`examples/` or a sibling `omnigent-foo-native`) proving the contract end to end. **Acceptance criterion: the example plugin is benchable** — `python -m tests.harness_bench --harness <plugin> --live` runs green (selection + native-tui driver + provisioning), which is the honest end-to-end proof the contract holds. | `designs/harness-plugin-interface.md`, `examples/` | 2.1, 2.2 | Low–Med | 2–3d |
 
 **Phase 2 subtotal: ~9–12 engineer-days.**

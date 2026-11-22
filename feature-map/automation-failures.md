@@ -8,6 +8,8 @@ session, while session-linked failures keep their existing session Inbox entry.
 
 - `card-warning`: latest failed runs show a red warning with “Last run failed”.
 - `paused-warning`: pausing a failed automation preserves its warning.
+- `source-session-missing`: an automation created from a session whose copy is gone fails
+  its run with `source_session_missing` and pauses itself.
 - `inbox-failure`: Inbox All and Unread show the automation name, time and failure reason.
 - `session-deduplication`: a failure linked to a session creates no automation Inbox item,
   even when the session is already read or outside the loaded session pages.
@@ -22,7 +24,9 @@ session, while session-linked failures keep their existing session Inbox entry.
   cards show the warning. With the detail page enabled, open the card for run history.
 - **Inbox:** open Inbox from the sidebar or visit `/inbox`. Expand an Automation
   failed item, then choose Open automation or Mark as read. These items appear in
-  All and Unread, and do not appear in Awaiting response.
+  All and Unread, and do not appear in Awaiting response or, where the server
+  offers Omni Advisor, in its Omni Advisor filter, which lists only that agent's
+  suggestions.
 - **Command palette:** open Search or press Cmd+K (Mac) / Ctrl+K (Linux/Windows),
   then choose Go to Inbox or Go to Automations.
 - **Narrow screens / embedded UI:** the same Automations and Inbox pages are
@@ -66,6 +70,9 @@ no connected host so Run now fails naturally without touching a real host.
   Inbox badge counts unread failures in loaded pages and adds a “+” while older
   automations remain unchecked (just “+” when none are loaded). Use Check more
   automations to inspect older jobs; an empty page can still have a continuation.
+  Where Omni Advisor is on, the badge also counts its unread suggestions from
+  the server's total; that total stops at 100, and the badge then shows “100+”
+  and describes itself as at least that many.
 - Opening Inbox refreshes the feed. The app-wide summary refreshes every five
   minutes while mounted; the Automations list retains its existing polling.
 - Read state is browser-local and scoped to server, mount path and user. It keeps

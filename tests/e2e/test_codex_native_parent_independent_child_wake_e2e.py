@@ -34,6 +34,7 @@ from tests._helpers.server_runner import server_runner
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
+    get_mock_requests,
     upload_agent,
 )
 
@@ -49,6 +50,9 @@ _WAKE_NOTICE_SIGNATURE = "waiting in inbox"
 _CHILD_MARKER = "CODEX_CHILD_DONE_8842"
 # Reachable only via the auto-wake continuation turn (the third parent reply).
 _CONTINUATION_MARKER = "PARENT_CONTINUATION_8842"
+_DISPATCH_PROMPT = "Dispatch the worker and wait."
+_TOOLS_PROBE = "MCP tools probe"
+_OMNIGENT_TOOLS = "mcp__omnigent"
 
 
 @pytest.fixture
@@ -133,6 +137,17 @@ def _items_blob(client: httpx.Client, session_id: str) -> str:
     return json.dumps(_snapshot(client, session_id).get("items", []))
 
 
+def _send(client: httpx.Client, session_id: str, text: str) -> None:
+    response = client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+        },
+    )
+    response.raise_for_status()
+
+
 def _wait_for(probe: Callable[[], Any], *, description: str, deadline: float) -> Any:
     """Share one deadline across the journey so failures leave time for cleanup."""
     while time.monotonic() < deadline:
@@ -189,6 +204,9 @@ def test_codex_native_parent_woken_by_independent_child(
     # Codex's auxiliary title/summary requests must not drain the scripted turns.
     for marker in ("<session>", "<user_message>", "Generate a concise, single-line task title"):
         configure_mock_llm(mock_url, [{"text": "Working."}], match=marker)
+    # Codex can answer before its omnigent MCP tools are listed, so probe turns get their
+    # own replies and the dispatch replies need a request that advertises those tools.
+    configure_mock_llm(mock_url, [{"text": "Ready."}] * 20, match=_TOOLS_PROBE)
     configure_mock_llm(
         mock_url,
         [
@@ -215,6 +233,8 @@ def test_codex_native_parent_woken_by_independent_child(
             {"text": f"{_CONTINUATION_MARKER}: the worker returned {_CHILD_MARKER}"},
         ],
         key=_PARENT_MODEL,
+        match=_DISPATCH_PROMPT,
+        required_tools=[_OMNIGENT_TOOLS],
     )
     configure_mock_llm(
         mock_url,
@@ -225,17 +245,25 @@ def test_codex_native_parent_woken_by_independent_child(
     agent_name = upload_agent(client, bundle)
     parent_id = create_runner_bound_session(client, agent_name=agent_name, runner_id=runner_id)
     try:
-        send = client.post(
-            f"/v1/sessions/{parent_id}/events",
-            json={
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "Dispatch the worker and wait."}],
-                },
-            },
+        _send(client, parent_id, _TOOLS_PROBE)
+        probes_seen = 0
+
+        def omnigent_tools_ready() -> bool:
+            nonlocal probes_seen
+            if _snapshot(client, parent_id).get("status") != "idle":
+                return False
+            probes = [r for r in get_mock_requests(mock_url) if _TOOLS_PROBE in json.dumps(r)]
+            if any(t.get("name") == _OMNIGENT_TOOLS for r in probes for t in r.get("tools", [])):
+                return True
+            if len(probes) > probes_seen:
+                probes_seen = len(probes)
+                _send(client, parent_id, _TOOLS_PROBE)
+            return False
+
+        _wait_for(
+            omnigent_tools_ready, description="Codex listing its omnigent tools", deadline=deadline
         )
-        send.raise_for_status()
+        _send(client, parent_id, _DISPATCH_PROMPT)
 
         def find_child() -> str | None:
             rows = client.get(f"/v1/sessions/{parent_id}/child_sessions").json()["data"]

@@ -1,18 +1,24 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ComponentProps, ReactNode } from "react";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import type { Conversation } from "@/hooks/useConversations";
+import { type ComponentProps, type ReactNode, useState } from "react";
 
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import * as commandPaletteModule from "./CommandPalette";
 import { CommandPalette } from "./CommandPalette";
+import type { WorkspaceHistoryFacts } from "./workspaceCommands/model";
+import { useWorkspaceHistoryCommands } from "./workspaceCommands/useWorkspaceHistoryCommands";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({
   useNavigate: () => navigate,
+  useLocation: () => ({ pathname: "/", search: "", hash: "", state: null, key: "default" }),
 }));
 
 const useConversations = vi.fn();
 const useSessionSearch = vi.fn();
+const useProjects = vi.fn();
 const serverInfo = vi.fn();
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => serverInfo(),
@@ -20,6 +26,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
   useSessionSearch: (...args: unknown[]) => useSessionSearch(...args),
+  useProjects: (...args: unknown[]) => useProjects(...args),
 }));
 
 function conv(
@@ -31,7 +38,10 @@ function conv(
   return { id, title, agent_name, archived: false, search_snippet };
 }
 
-function setSessions(sessions: ReturnType<typeof conv>[], isFetching = false) {
+function setSessions(
+  sessions: (ReturnType<typeof conv> & Partial<Conversation>)[],
+  isFetching = false,
+) {
   useConversations.mockReturnValue({ data: { pages: [{ data: sessions }] }, isFetching });
 }
 
@@ -54,7 +64,7 @@ function setSearchGroups({
   }));
 }
 
-function searchPages(...pages: ReturnType<typeof conv>[][]) {
+function searchPages(...pages: (ReturnType<typeof conv> & Partial<Conversation>)[][]) {
   return { data: { pages: pages.map((data) => ({ data })) } };
 }
 
@@ -91,11 +101,24 @@ beforeEach(() => {
   navigate.mockClear();
   useConversations.mockReset();
   useSessionSearch.mockReset();
+  useProjects.mockReturnValue({ data: [] });
   serverInfo.mockReturnValue({ session_search_scope: true });
   setSessions([]);
   setSearchGroups({});
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  // QuickPick records accepted commands under Recent; a later case starts without them.
+  localStorage.clear();
+});
+
+/** Every non-empty live region's text, so both palettes' status messages read the same. */
+const announced = () =>
+  screen
+    .getAllByRole("status")
+    .map((region) => region.textContent)
+    .filter(Boolean)
+    .join(" ");
 
 describe("CommandPalette — sessions", () => {
   it.each([false, true])(
@@ -115,6 +138,93 @@ describe("CommandPalette — sessions", () => {
       expect(screen.queryByText("Archived session")).toBeNull();
     },
   );
+
+  it.each([false, true])(
+    "shows project and parent context without needing the parent in results (sessionsOnly=%s)",
+    (sessionsOnly) => {
+      useProjects.mockReturnValue({ data: [{ id: "project", name: "App redesign" }] });
+      setSessions([
+        {
+          ...conv("nested", "Implement search"),
+          project_id: "project",
+          labels: {},
+          family: {
+            id: "family",
+            representative_id: "parent",
+            representative_title: "Search experience",
+            pinned: false,
+          },
+        },
+        { ...conv("standalone", "Standalone task"), labels: {} },
+      ]);
+      const { onOpenChange } = renderPalette({ sessionsOnly });
+      expect(
+        screen.getByRole("option", {
+          name: /Implement search.*Project:\s*App redesign.*Nested under:\s*Search experience/,
+        }),
+      ).toBeTruthy();
+      expect(
+        labelRow("Standalone task").closest('[role="option"]')!.querySelector("[title]"),
+      ).toBeNull();
+      fireEvent.click(labelRow("Implement search"));
+      expect(navigate).toHaveBeenCalledWith("/c/nested");
+      expect(onOpenChange).toHaveBeenCalledWith(false);
+    },
+  );
+
+  it.each(["recent", "title", "content"])(
+    "uses a parent loaded in %s against older servers without title metadata",
+    (parentSource) => {
+      const parent = conv("parent", "Planning");
+      const nested = {
+        ...conv("nested", "Follow-up"),
+        family: { id: "family", representative_id: "parent", pinned: false },
+      };
+      if (parentSource === "recent") {
+        setSessions([parent, nested]);
+      } else {
+        setSearchGroups({
+          title: searchPages(parentSource === "title" ? [parent] : [nested]),
+          content: searchPages(parentSource === "content" ? [parent] : [nested]),
+        });
+      }
+      renderPalette();
+      if (parentSource !== "recent") {
+        vi.useFakeTimers();
+        try {
+          fireEvent.change(screen.getByTestId("command-palette-input"), {
+            target: { value: "Follow-up" },
+          });
+          act(() => vi.advanceTimersByTime(300));
+        } finally {
+          vi.useRealTimers();
+        }
+      }
+      expect(
+        screen.getByRole("option", { name: /Follow-up.*Nested under:\s*Planning/ }),
+      ).toBeTruthy();
+    },
+  );
+
+  it("uses legacy project labels and omits the parent breadcrumb on the representative", () => {
+    setSessions([
+      {
+        ...conv("parent", "Planning"),
+        labels: { omni_project: "Legacy project" },
+        family: {
+          id: "family",
+          representative_id: "parent",
+          representative_title: "Planning",
+          pinned: false,
+        },
+      },
+    ]);
+    renderPalette();
+    expect(
+      screen.getByRole("option", { name: /Planning.*Project:\s*Legacy project/ }),
+    ).toBeTruthy();
+    expect(screen.queryByText(/Nested under/)).toBeNull();
+  });
 
   it("fuzzy-matches session names without showing unrelated actions", () => {
     setSessions([
@@ -177,7 +287,7 @@ describe("CommandPalette — sessions", () => {
     });
     renderPalette({ sessionsOnly: true });
     expect(fetchNextPage).not.toHaveBeenCalled();
-    expect(screen.getByRole("status").textContent).toContain("Couldn't load");
+    expect(announced()).toContain("Couldn't load");
     expect(screen.queryByText("No results found")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(fetchNextPage).toHaveBeenCalledOnce();
@@ -189,7 +299,7 @@ describe("CommandPalette — sessions", () => {
       const refetch = vi.fn();
       useConversations.mockReturnValue({ isError: true, isFetching: false, refetch });
       renderPalette({ sessionsOnly });
-      expect(screen.getByRole("status").textContent).toContain("Couldn't load sessions.");
+      expect(announced()).toContain("Couldn't load sessions.");
       expect(screen.queryByText("No results found")).toBeNull();
       fireEvent.click(screen.getByRole("button", { name: "Retry" }));
       expect(refetch).toHaveBeenCalledOnce();
@@ -199,7 +309,7 @@ describe("CommandPalette — sessions", () => {
   it("shows only one loading message during the initial session fetch", () => {
     setSessions([], true);
     renderPalette({ sessionsOnly: true });
-    expect(screen.getByRole("status").textContent).toBe("Loading sessions…");
+    expect(announced()).toBe("Loading sessions…");
     expect(screen.queryByText("Searching…")).toBeNull();
     expect(screen.queryByText("No results found")).toBeNull();
   });
@@ -221,11 +331,37 @@ describe("CommandPalette — sessions", () => {
     expect(fetchNextPage).toHaveBeenCalledOnce();
   });
 
+  it("keeps the match cap visible beside a load error", () => {
+    useConversations.mockReturnValue({
+      data: {
+        pages: [{ data: Array.from({ length: 60 }, (_, i) => conv(`c${i}`, `Session ${i}`)) }],
+      },
+      isFetching: false,
+      hasNextPage: true,
+      isFetchNextPageError: true,
+      fetchNextPage: vi.fn(),
+    });
+    renderPalette({ sessionsOnly: true });
+    expect(screen.getByText("Couldn't load more sessions.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(screen.getByText(/Showing 50 of 60 matches\./)).toBeTruthy();
+  });
+
+  it("keeps the match cap visible while sessions reload", () => {
+    setSessions(
+      Array.from({ length: 60 }, (_, i) => conv(`c${i}`, `Session ${i}`)),
+      true,
+    );
+    renderPalette({ sessionsOnly: true });
+    expect(screen.getByText("Loading sessions…")).toBeTruthy();
+    expect(screen.getByText(/Showing 50 of 60 matches\./)).toBeTruthy();
+  });
+
   it("bounds rendered rows while searching every loaded session", () => {
     setSessions(Array.from({ length: 100 }, (_, i) => conv(`c${i}`, `Session ${i}`)));
     renderPalette({ sessionsOnly: true });
     expect(screen.getAllByRole("option")).toHaveLength(50);
-    expect(screen.getByRole("status").textContent).toContain("Showing 50 of 100 matches.");
+    expect(announced()).toContain("Showing 50 of 100 matches.");
     fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "Session" } });
     expect(screen.getAllByRole("option")).toHaveLength(50);
     expect(document.querySelector("mark")?.textContent).toBe("Session");
@@ -241,7 +377,7 @@ describe("CommandPalette — sessions", () => {
       Array.from(
         screen
           .getByText(label)
-          .closest("[cmdk-item]")!
+          .closest('[role="option"]')!
           .querySelectorAll<HTMLElement>('[data-slot="kbd"]'),
       ).map((key) => key.textContent);
     renderPalette();
@@ -379,16 +515,20 @@ describe("CommandPalette — sessions", () => {
     expect(screen.getByText("Two")).toBeTruthy();
   });
 
-  it("indents session rows so their label aligns with the icon-prefixed actions", () => {
-    setSessions([conv("c1", "Fix the parser")]);
-    renderPalette();
+  // The QuickPick palette aligns them with a blank icon slot; its own test covers that.
+  it.skipIf("QUICK_PICK_PALETTE" in commandPaletteModule)(
+    "indents session rows so their label aligns with the icon-prefixed actions",
+    () => {
+      setSessions([conv("c1", "Fix the parser")]);
+      renderPalette();
 
-    // Session items carry no leading icon, so they're padded to line up with
-    // the Action rows' icon + gap. Assert the class so the alignment can't
-    // silently regress.
-    const item = screen.getByText("Fix the parser").closest("[data-slot=command-item]");
-    expect(item?.className).toContain("pl-6");
-  });
+      // Session items carry no leading icon, so they're padded to line up with
+      // the Action rows' icon + gap. Assert the class so the alignment can't
+      // silently regress.
+      const item = screen.getByText("Fix the parser").closest("[data-slot=command-item]");
+      expect(item?.className).toContain("pl-6");
+    },
+  );
 });
 
 describe("CommandPalette — match preview", () => {
@@ -402,6 +542,34 @@ describe("CommandPalette — match preview", () => {
 
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
+
+  it("keeps parent and project context alongside archived content matches", () => {
+    useProjects.mockReturnValue({ data: [{ id: "project", name: "Search project" }] });
+    setSearchGroups({
+      content: searchPages([
+        {
+          ...conv("content", "Investigation", "codex", "The matcher uses a shared index"),
+          project_id: "project",
+          archived: true,
+          family: {
+            id: "family",
+            representative_id: "parent",
+            representative_title: "Search planning",
+            pinned: false,
+          },
+        },
+      ]),
+    });
+    renderPalette();
+    search("matcher");
+    expect(
+      screen.getByRole("option", {
+        name: /Investigation.*Project:\s*Search project.*Nested under:\s*Search planning/,
+      }),
+    ).toBeTruthy();
+    expect(screen.getByText("Archived")).toBeTruthy();
+    expect(labelRow("The matcher uses a shared index")).toBeTruthy();
+  });
 
   it("shows the content snippet as a second line when the match is in the body", () => {
     setSearchGroups({
@@ -449,7 +617,7 @@ describe("CommandPalette — input", () => {
 });
 
 describe("CommandPalette — mobile full-screen sheet", () => {
-  // useIsMobileViewport reads window.matchMedia("(max-width: 767.98px)").matches.
+  // useIsMobileViewport reads window.matchMedia("(max-width: 1180.98px)").matches.
   // The global test-setup stubs matchMedia to always report false (desktop);
   // flip it here so the palette renders its keyboard-safe mobile layout.
   function setMobile(isMobile: boolean) {
@@ -482,6 +650,21 @@ describe("CommandPalette — mobile full-screen sheet", () => {
     expect(content?.className).not.toContain("top-1/4");
     // …and offers an explicit close affordance (no ⌘K/Esc hint on touch).
     expect(screen.getByLabelText("Close search")).toBeTruthy();
+  });
+
+  it("pins the mobile sheet to the top of the visible viewport in the iOS app", () => {
+    // The iOS app's dialogs center on the keyboard-aware viewport inline; the sheet must not.
+    vi.stubGlobal("omnigentNative", { kind: "ios" });
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    setMobile(true);
+    renderPalette();
+
+    const style = (dialogContent() as HTMLElement | null)?.style;
+    expect(style?.top).toBe("0px");
+    expect(style?.height).toBe("var(--omnigent-viewport-height, 100dvh)");
+    expect(style?.maxHeight).toBe("var(--omnigent-viewport-height, 100dvh)");
   });
 
   it("keeps the centered dialog and shows no close button on desktop", () => {
@@ -743,6 +926,49 @@ describe("CommandPalette — title and content groups", () => {
     expect(navigate).toHaveBeenCalledWith("/c/c3");
   });
 
+  it("offers no Show more for a group whose matches all appear under Sessions", () => {
+    setSearchGroups({
+      title: searchPages([conv("same", "Deploy plan")]),
+      content: {
+        ...searchPages([conv("same", "Deploy plan", null, "deploy on Friday")]),
+        hasNextPage: true,
+        fetchNextPage: vi.fn(),
+      },
+    });
+    renderPalette();
+    search("deploy");
+    expect(screen.queryByText("In messages")).toBeNull();
+    expect(screen.queryByText("Show more")).toBeNull();
+    expect(screen.getAllByRole("option")).toHaveLength(1);
+  });
+
+  it("starts from the top row again after Show more and a reopen", () => {
+    setSessions([conv("recent", "Recent session"), conv("parked", "Deploy plan")]);
+    setSearchGroups({
+      title: {
+        ...searchPages([conv("parked", "Deploy plan")]),
+        hasNextPage: true,
+        fetchNextPage: vi.fn(),
+      },
+    });
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />, { wrapper: withQueryClient() });
+    search("deploy");
+    fireEvent.click(screen.getByText("Show more"));
+    rerender(<CommandPalette {...props} open={false} />);
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+    rerender(<CommandPalette {...props} />);
+    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/recent");
+  });
+
   it("holds the search until server info loads, then sends only the grouped requests", () => {
     serverInfo.mockReturnValue("loading");
     const props = {
@@ -878,7 +1104,7 @@ describe("CommandPalette — title and content groups", () => {
     renderPalette();
     search("deploy");
 
-    expect(screen.getByRole("status").textContent).toContain("Couldn't load more sessions.");
+    expect(announced()).toContain("Couldn't load more sessions.");
     // A slow content request doesn't block retrying the failed title page.
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(fetchTitlePage).toHaveBeenCalledOnce();
@@ -895,7 +1121,7 @@ describe("CommandPalette — title and content groups", () => {
     renderPalette();
     search("deploy");
 
-    expect(screen.getByRole("status").textContent).toContain("Couldn't load sessions.");
+    expect(announced()).toContain("Couldn't load sessions.");
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(refetchContent).toHaveBeenCalledOnce();
     expect(refetchTitle).not.toHaveBeenCalled();
@@ -942,8 +1168,8 @@ describe("CommandPalette — actions", () => {
       target: { value: "settings" },
     });
 
-    expect(screen.getByText("Go to Settings")).toBeTruthy();
-    expect(screen.queryByText("New chat")).toBeNull();
+    expect(screen.getByRole("option", { name: /Go to Settings/ })).toBeTruthy();
+    expect(screen.queryByRole("option", { name: /New chat/ })).toBeNull();
   });
 });
 
@@ -959,4 +1185,132 @@ describe("CommandPalette — empty state", () => {
 
     expect(screen.getByText("No results found")).toBeTruthy();
   });
+});
+
+describe("CommandPalette — commands a mounted feature offers", () => {
+  const BACK_ONLY: WorkspaceHistoryFacts = {
+    back: { target: "Files", waitingForPage: false },
+    forward: { target: null, waitingForPage: false },
+  };
+
+  const FORWARD_ONLY: WorkspaceHistoryFacts = {
+    back: { target: null, waitingForPage: false },
+    forward: { target: "Files", waitingForPage: false },
+  };
+
+  /** The tabs sidebar's Back and Forward, registered as its host registers them. */
+  function WorkspaceHistory({ go, facts }: { go: () => void; facts: WorkspaceHistoryFacts }) {
+    useWorkspaceHistoryCommands({ conversationId: "conv_a", facts, go }, true);
+    return null;
+  }
+
+  /** A palette opened from a button. */
+  function OpenedPalette({
+    go,
+    facts = BACK_ONLY,
+  }: {
+    go: () => void;
+    facts?: WorkspaceHistoryFacts;
+  }) {
+    const [open, setOpen] = useState(false);
+    return (
+      <>
+        <button type="button" onClick={() => setOpen(true)}>
+          Open palette
+        </button>
+        <button type="button">Where the command moves focus</button>
+        <WorkspaceHistory go={go} facts={facts} />
+        <CommandPalette
+          open={open}
+          onOpenChange={setOpen}
+          onToggleLeftSidebar={vi.fn()}
+          onToggleRightSidebar={vi.fn()}
+        />
+      </>
+    );
+  }
+
+  const withSidebarFlag = (enabled: boolean) =>
+    serverInfo.mockReturnValue({
+      session_search_scope: true,
+      features: { workspace_sidebar_v2: enabled },
+    });
+
+  function openPalette(go: () => void, facts?: WorkspaceHistoryFacts) {
+    render(<OpenedPalette go={go} facts={facts} />, { wrapper: withQueryClient() });
+    const opener = screen.getByRole("button", { name: "Open palette" });
+    opener.focus();
+    fireEvent.click(opener);
+    return opener;
+  }
+
+  it("lists them with their chords, and one that can't run says why", async () => {
+    withSidebarFlag(true);
+    openPalette(vi.fn());
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "in the workspace" },
+    });
+
+    const back = await screen.findByRole("option", { name: /Go back in the workspace/ });
+    expect(back.textContent).toContain("←");
+    const forward = screen.getByRole("option", { name: /Go forward in the workspace/ });
+    expect(forward).toHaveAttribute("aria-disabled", "true");
+    expect(forward.textContent).toContain("There's nothing to go forward to in the workspace.");
+  });
+
+  it("highlights the first one that can run, so Enter runs it past one that can't", async () => {
+    withSidebarFlag(true);
+    const go = vi.fn();
+    openPalette(go, FORWARD_ONLY);
+    const input = screen.getByTestId("command-palette-input");
+    fireEvent.change(input, { target: { value: "in the workspace" } });
+
+    const forward = await screen.findByRole("option", { name: /Go forward in the workspace/ });
+    expect(screen.getByRole("option", { name: /Go back in the workspace/ })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    // Once the rows have settled, before anyone moves the selection.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 300);
+    });
+    expect(forward).toHaveAttribute("aria-selected", "true");
+    fireEvent.keyDown(input, { key: "Enter" });
+    await vi.waitFor(() => expect(go).toHaveBeenCalledWith("forward"));
+  });
+
+  it("runs one that moves focus once the palette has closed, so the focus stays", async () => {
+    withSidebarFlag(true);
+    let dialogAtRun: Element | null = null;
+    const go = vi.fn(() => {
+      dialogAtRun = screen.queryByRole("dialog");
+      screen.getByText("Where the command moves focus").focus();
+    });
+    openPalette(go);
+
+    fireEvent.click(await screen.findByRole("option", { name: /Go back in the workspace/ }));
+    expect(go).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(go).toHaveBeenCalledOnce());
+    expect(dialogAtRun).toBeNull();
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
+    // The dialog's own focus return, to the opener, came first and didn't undo it.
+    expect(document.activeElement).toBe(screen.getByText("Where the command moves focus"));
+  });
+
+  // The QuickPick palette lists them under its own flag; its own test covers that.
+  it.skipIf("QUICK_PICK_PALETTE" in commandPaletteModule)(
+    "lists none without the workspace_sidebar_v2 flag",
+    async () => {
+      withSidebarFlag(false);
+      openPalette(vi.fn());
+      fireEvent.change(screen.getByTestId("command-palette-input"), {
+        target: { value: "in the workspace" },
+      });
+
+      await screen.findByText("No results found");
+      expect(screen.queryByRole("option", { name: /Go back in the workspace/ })).toBeNull();
+    },
+  );
 });

@@ -50,6 +50,7 @@ from omnigent.cli import (
     cli as cli_group,
 )
 from omnigent.host.local_server import LocalServerStartup
+from omnigent.telemetry.request_headers import client_user_agent
 
 
 @pytest.fixture(autouse=True)
@@ -1003,7 +1004,7 @@ def _server_record(target: str = "http://127.0.0.1:59999") -> cli._HostDaemonRec
 
 
 def _patch_registration_wait(
-    monkeypatch: pytest.MonkeyPatch, probe_result: cli._HostHttpResult
+    monkeypatch: pytest.MonkeyPatch, probe_result: cli._HostHttpResult | None
 ) -> None:
     """Pin the registration wait to one probe outcome with zero grace.
 
@@ -1029,7 +1030,7 @@ def test_registration_wait_names_server_while_waiting(
     )
 
     with pytest.raises(click.ClickException):
-        cli._confirm_background_host_registered(_server_record())
+        cli._confirm_background_host_registered(_server_record(), stop_command="omnigent stop")
 
     captured = capsys.readouterr()
     assert "Waiting for the host daemon to register with http://127.0.0.1:59999" in captured.err
@@ -1046,7 +1047,7 @@ def test_registration_wait_prints_nothing_when_immediately_online(
         monkeypatch, cli._HostHttpResult(status_code=200, body={"status": "online"})
     )
 
-    cli._confirm_background_host_registered(_server_record())
+    cli._confirm_background_host_registered(_server_record(), stop_command="omnigent stop")
 
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -1073,7 +1074,7 @@ def test_registration_timeout_names_unreachable_server_and_skips_stale_host_hint
     )
 
     with pytest.raises(click.ClickException) as excinfo:
-        cli._confirm_background_host_registered(_server_record())
+        cli._confirm_background_host_registered(_server_record(), stop_command="omnigent stop")
 
     message = str(excinfo.value)
     assert "127.0.0.1:59999" in message
@@ -1081,28 +1082,38 @@ def test_registration_timeout_names_unreachable_server_and_skips_stale_host_hint
     assert suppresses_recovery_hint(excinfo.value) is True
 
 
-def test_registration_diagnostics_never_expose_url_credentials(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """A configured server URL carrying userinfo is redacted in diagnostics.
-
-    Server configuration and daemon URL normalization both preserve URL
-    userinfo (``http://user:token@host``), so the waiting line and the
-    timeout error would otherwise echo credentials into the terminal and
-    persistent CLI diagnostics.
-    """
-    _patch_registration_wait(
-        monkeypatch,
+@pytest.mark.parametrize(
+    "probe_result",
+    [
         cli._HostHttpResult(
             status_code=0,
             body="ConnectError: [Errno 111] Connection refused",
             unreachable=True,
         ),
-    )
-    record = _server_record("http://synthetic-user:synthetic-secret@127.0.0.1:59999")
+        cli._HostHttpResult(status_code=200, body={"status": "offline"}),
+    ],
+    ids=["server-unreachable", "server-answers"],
+)
+def test_registration_diagnostics_never_expose_url_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    probe_result: cli._HostHttpResult,
+) -> None:
+    """A configured server URL carrying userinfo is redacted in diagnostics.
+
+    Server configuration and daemon URL normalization both preserve URL
+    userinfo (``http://user:token@host``), so the waiting line, the timeout
+    error, and the stop command it names would otherwise echo credentials
+    into the terminal and persistent CLI diagnostics.
+    """
+    _patch_registration_wait(monkeypatch, probe_result)
+    server = "http://synthetic-user:synthetic-secret@127.0.0.1:59999"
+    record = _server_record(server)
 
     with pytest.raises(click.ClickException) as excinfo:
-        cli._confirm_background_host_registered(record)
+        cli._confirm_background_host_registered(
+            record, stop_command=f"omnigent host stop --server {server}"
+        )
 
     message = str(excinfo.value)
     captured = capsys.readouterr()
@@ -1112,6 +1123,9 @@ def test_registration_diagnostics_never_expose_url_credentials(
     # The server is still identified, just without its userinfo.
     assert "http://127.0.0.1:59999" in message
     assert "Waiting for the host daemon to register with http://127.0.0.1:59999" in captured.err
+    if not probe_result.unreachable:
+        assert "host stop --server http://[REDACTED]@127.0.0.1:59999" in message
+        assert "Replace [REDACTED] with your configured server credentials" in message
 
 
 def test_registration_target_display_preserves_ipv6_brackets() -> None:
@@ -1151,11 +1165,12 @@ def test_registration_timeout_keeps_hint_when_server_answered_then_dropped(
     )
 
     with pytest.raises(click.ClickException) as excinfo:
-        cli._confirm_background_host_registered(_server_record())
+        cli._confirm_background_host_registered(_server_record(), stop_command="omnigent stop")
 
     message = str(excinfo.value)
     assert "did not register with the server at http://127.0.0.1:59999" in message
     assert suppresses_recovery_hint(excinfo.value) is False
+    assert isinstance(excinfo.value, cli._HostRegistrationPending)
 
 
 def test_registration_timeout_keeps_stale_host_hint_when_server_answers(
@@ -1174,11 +1189,49 @@ def test_registration_timeout_keeps_stale_host_hint_when_server_answers(
     )
 
     with pytest.raises(click.ClickException) as excinfo:
-        cli._confirm_background_host_registered(_server_record())
+        cli._confirm_background_host_registered(_server_record(), stop_command="omnigent stop")
 
     message = str(excinfo.value)
     assert "did not register with the server at http://127.0.0.1:59999" in message
     assert suppresses_recovery_hint(excinfo.value) is False
+    assert isinstance(excinfo.value, cli._HostRegistrationPending)
+    assert "still running (pid 4242)" in message
+    assert "`omnigent stop`" in message
+    assert "host status`" in message
+    assert "Replace [REDACTED]" not in message
+
+
+def test_registration_timeout_reports_daemon_that_exits_before_deadline_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A daemon that dies as the wait expires is reported as exited, not as still running."""
+    alive = iter([True])
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: next(alive, False))
+    monkeypatch.setattr(cli, "_BACKGROUND_HOST_REGISTRATION_GRACE_S", 0.0)
+    monkeypatch.setattr(
+        cli,
+        "_daemon_host_status_probe",
+        lambda record, **_kw: cli._HostHttpResult(status_code=200, body={"status": "offline"}),
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli._confirm_background_host_registered(_server_record(), stop_command="omnigent stop")
+
+    assert not isinstance(excinfo.value, cli._HostRegistrationPending)
+    assert "exited before registering" in str(excinfo.value)
+
+
+def test_registration_timeout_without_any_probe_is_not_reported_as_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wait that never could probe the server does not claim the daemon may still register."""
+    _patch_registration_wait(monkeypatch, None)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli._confirm_background_host_registered(_server_record(), stop_command="omnigent stop")
+
+    assert not isinstance(excinfo.value, cli._HostRegistrationPending)
+    assert "did not register with the server at http://127.0.0.1:59999" in str(excinfo.value)
 
 
 # Every proxy variable httpx consults, so the cases below see exactly the
@@ -3487,7 +3540,10 @@ def test_databricks_preflight_silent_sdk_refresh_skips_login(
 
     cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
 
-    assert requests[1]["headers"] == {"Authorization": "Bearer fresh-token"}
+    assert requests[1]["headers"] == {
+        "Authorization": "Bearer fresh-token",
+        "User-Agent": client_user_agent(),
+    }
     assert requests[1]["params"] == {"o": "123"}
     assert stored == [(_HOST_DATABRICKS_SERVER, "https://example.databricks.com", "123")]
 
@@ -3510,7 +3566,7 @@ def test_databricks_preflight_uses_cli_workspace_id_for_workspace_mount(
         "auth_type = databricks-cli\n"
         "[fresh]\n"
         "host = https://example.databricks.com\n"
-        "workspace_id = 1965859176160743\n"
+        "workspace_id = 4242424242424242\n"
         "auth_type = databricks-cli\n"
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
@@ -3556,9 +3612,12 @@ def test_databricks_preflight_uses_cli_workspace_id_for_workspace_mount(
 
     cli._ensure_databricks_server_auth(server, non_interactive=True)
 
-    assert requests[1]["headers"] == {"Authorization": "Bearer fresh-token"}
-    assert requests[1]["params"] == {"o": "1965859176160743"}
-    assert stored == [(server, "https://example.databricks.com", "1965859176160743")]
+    assert requests[1]["headers"] == {
+        "Authorization": "Bearer fresh-token",
+        "User-Agent": client_user_agent(),
+    }
+    assert requests[1]["params"] == {"o": "4242424242424242"}
+    assert stored == [(server, "https://example.databricks.com", "4242424242424242")]
 
 
 def test_databricks_preflight_refresh_handles_duplicate_workspace_profiles(
@@ -3868,7 +3927,7 @@ def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
     monkeypatch.setattr(httpx, "get", _get)
     monkeypatch.setattr(
         "omnigent.cli_auth.load_databricks_workspace_host",
-        lambda server: "https://example.databricks.com",
+        lambda server: "https://workspace.example.test",
     )
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
     from omnigent.inner.databricks_executor import _databrickscfg_fingerprint
@@ -3878,6 +3937,7 @@ def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
         current_token=lambda: "fresh-token",
         profile_name=None,
         resolved_config_file=_databrickscfg_fingerprint(),
+        resolved_workspace_host="https://workspace.example.test",
     )
     monkeypatch.setattr(
         cli,
@@ -3899,7 +3959,7 @@ def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
 
     cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
 
-    assert stored == [(_HOST_DATABRICKS_SERVER, "https://example.databricks.com")]
+    assert stored == [(_HOST_DATABRICKS_SERVER, "https://workspace.example.test")]
     shared = chat._shared_token_source(_HOST_DATABRICKS_SERVER)
     assert shared is not refused, (
         "clients built after the refused probe would reuse the refused credential"
@@ -4233,7 +4293,7 @@ def test_resolve_host_server_defaults_scheme_and_accepts_omnigent(
 ) -> None:
     """``host`` subcommands accept a schemeless ``/omnigent`` workspace URL.
 
-    The internal user guide's web URL omits the scheme and ends in
+    The user guide's web URL omits the scheme and ends in
     ``/omnigent``; host must default it to https before expansion, just
     like ``omnigent login``.
     """

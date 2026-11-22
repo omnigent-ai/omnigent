@@ -81,10 +81,12 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   terminal_launch_failed: "The agent's terminal couldn't be started on the host.",
   runner_error: "Something went wrong setting up the turn on the host.",
   runner_disconnected: "The connection to the host dropped unexpectedly.",
+  session_recovery_failed: "Automatic resume failed. Please send a new message to continue.",
   runner_unavailable: "The session's runner isn't connected to the server.",
   connection_error:
     "The connection to the agent dropped mid-turn; retrying usually continues the turn.",
   context_length_exceeded: "The conversation grew past the model's context window.",
+  output_limit_exceeded: "The model's response hit its maximum output length and was cut off.",
   executor_error: "The agent runtime hit an error while running the turn.",
   workspace_missing: "The session workspace no longer exists on the host.",
   session_agent_missing:
@@ -109,6 +111,8 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
     "Codex couldn't get a token from the model provider's sign-in command on the host.",
   client_update_required:
     "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
+  content_policy_refusal:
+    "The model's safeguards refused this message. Start a new session and rephrase it without the flagged content.",
   host_disk_full: "The host's disk is full, so the agent can't save the conversation.",
   harness_not_configured: "The harness isn't set up on the host, so this session can't start.",
 };
