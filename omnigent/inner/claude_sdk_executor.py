@@ -2678,7 +2678,7 @@ class ClaudeSDKExecutor(Executor):
         # Session keys whose Claude harness process crashed and must not be reused.
         self._crashed_sessions: dict[str, str] = {}
         # Per session: prior messages its client was launched without (trimmed
-        # replay), and how many messages the history had at that launch.
+        # replay), and how many messages the history had on its latest turn.
         self._omitted_history: dict[str, tuple[int, int]] = {}
         # Force-close tasks for clients evicted on turn cancellation, kept
         # referenced so they are not GC'd mid-close.
@@ -4079,10 +4079,15 @@ class ClaudeSDKExecutor(Executor):
             return
         await self._evict_terminated_client(session_key)
         resume_session = session_key in self._clients
-        if resume_session and len(messages) < self._omitted_history.get(session_key, (0, 0))[1]:
-            # The history was rebuilt shorter (a compaction), so the messages the
-            # launch left out are no longer at its head.
-            self._omitted_history.pop(session_key, None)
+        if resume_session and session_key in self._omitted_history:
+            omitted_at_launch, last_seen = self._omitted_history[session_key]
+            if len(messages) < last_seen:
+                # The history was rebuilt shorter than at the last turn's start (a
+                # compaction), so the messages the launch left out are no longer
+                # at its head.
+                del self._omitted_history[session_key]
+            else:
+                self._omitted_history[session_key] = (omitted_at_launch, len(messages))
         prompt = (
             self._build_prompt(
                 messages,
@@ -4516,6 +4521,7 @@ class ClaudeSDKExecutor(Executor):
                 )
                 return None
 
+            self._retire_omitted_history_after_compaction(session_key)
             return CompactionComplete(
                 summary="[Claude Code compaction — context was automatically compacted]",
                 token_count=compaction_tokens,
@@ -5124,6 +5130,19 @@ class ClaudeSDKExecutor(Executor):
 
     def omitted_history_messages(self, session_key: str) -> int:
         return self._omitted_history.get(session_key, (0, 0))[0]
+
+    def _retire_omitted_history_after_compaction(self, session_key: str) -> None:
+        """Drop the session's omitted count from its next turn on.
+
+        The compacted context replaces the history the launch trimmed, but the
+        turn that compacted was still sent the trimmed history, so its own
+        breakdown keeps the count.
+        """
+        if session_key in self._omitted_history:
+            self._omitted_history[session_key] = (
+                self._omitted_history[session_key][0],
+                sys.maxsize,
+            )
 
     async def _fresh_session_prompt(
         self, messages: list[Message], cfg: ExecutorConfig, session_key: str

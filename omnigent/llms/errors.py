@@ -135,6 +135,9 @@ _SPECIFIC_OVERFLOW_PHRASES = (
     "context_length_exceeded",
     "maximum context length",
     "prompt is too long",
+    "exceeds the context window",
+    "exceed context limit",
+    "ran out of room in the model's context window",
 )
 # Also said about other things, e.g. in diagnostics a crash report embeds.
 _GENERIC_OVERFLOW_PHRASES = ("context window",)

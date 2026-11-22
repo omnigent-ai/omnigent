@@ -248,3 +248,38 @@ def test_content_length_phrase_without_sizes_is_not_overflow() -> None:
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_a_loose_overflow_match_drops_the_attempted_breakdown() -> None:
+    """Text that only mentions a context window still recovers, but claims no attempt."""
+    from omnigent.server.context_breakdown import failed_turn_updates
+
+    crash = {
+        "code": "RuntimeError",
+        "message": "inner executor error: CLI crashed while resizing its context window buffer",
+        "context_breakdown": {"history_tokens": 4800},
+    }
+    harness = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_test"}}),
+            _sse(
+                {
+                    "type": "response.failed",
+                    "response": {"id": "resp_test", "status": "failed", "error": crash},
+                    "error": crash,
+                }
+            ),
+        ]
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    error = await _assert_failure_on_both_streams(app, source="llm")
+
+    # The runner's own overflow handling is unchanged.
+    assert error["code"] == "context_length_exceeded"
+    assert "context_breakdown" not in error
+    assert failed_turn_updates(error) == {}

@@ -1076,3 +1076,21 @@ def test_breakdown_lists_what_a_rejected_request_attempted() -> None:
 )
 def test_failed_turn_updates_need_an_overflow_with_a_valid_breakdown(error: object) -> None:
     assert failed_turn_updates(error) == {}
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Prompt is too long",
+        "This model's maximum context length is 200000 tokens",
+        "Your input exceeds the context window of this model",
+        "input length and `max_tokens` exceed context limit: 210000 + 8000 > 200000",
+        "Codex ran out of room in the model's context window",
+    ],
+)
+def test_provider_overflow_wordings_keep_their_attempt(message: str) -> None:
+    updates = failed_turn_updates(
+        {"code": "RuntimeError", "message": message, "context_breakdown": {"history_tokens": 9}}
+    )
+
+    assert updates == {"failed_attempt": {"history_tokens": 9}}

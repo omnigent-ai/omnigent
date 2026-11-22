@@ -2612,6 +2612,12 @@ async def _persist_external_session_usage(
     label_updates: dict[str, str] = {}
     if raw_tokens is not None:
         label_updates[_LAST_CONTEXT_TOKENS_LABEL_KEY] = str(raw_tokens)
+        # A terminal harness reports its own usage and the runner sees none of
+        # its requests, so a document left by an earlier in-process harness
+        # (its report, or a failed attempt) must not resurface after it.
+        await _relay_merge_context_breakdown(
+            conversation_store, session_id, completed_turn_updates({})
+        )
     if raw_window is not None:
         label_updates[_LAST_CONTEXT_WINDOW_LABEL_KEY] = str(raw_window)
     await asyncio.to_thread(

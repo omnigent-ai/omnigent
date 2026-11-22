@@ -76,7 +76,11 @@ from omnigent.harness_plugins import (
     spawn_env_builders,
 )
 from omnigent.inner.executor import NativeTurnAcceptance
-from omnigent.llms.errors import detect_request_size_overflow, is_context_overflow_message
+from omnigent.llms.errors import (
+    CONTEXT_EXCEEDED_CODES,
+    detect_request_size_overflow,
+    is_context_overflow_message,
+)
 from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
 from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native.native_coding_agents import (
@@ -1033,17 +1037,32 @@ def _is_context_overflow_error(
 
 def _failed_event_context_breakdown(event: _JsonObject) -> _JsonObject | None:
     """
-    The attempted-request breakdown a ``response.failed`` event carries, if any.
+    The attempted-request breakdown an overflow ``response.failed`` event carries.
+
+    The overflow check also matches text that merely mentions a context
+    window (kept for its recovery behaviour), so the breakdown is passed on
+    only when the failure's code or message names an overflow outright.
 
     :param event: The parsed SSE event dict.
     :returns: The ``error.context_breakdown`` object, or ``None``.
     """
     response = event.get("response")
-    for error in (
-        response.get("error") if isinstance(response, dict) else None,
-        event.get("error"),
+    errors = [
+        error
+        for error in (
+            response.get("error") if isinstance(response, dict) else None,
+            event.get("error"),
+        )
+        if isinstance(error, dict)
+    ]
+    if not any(
+        error.get("code") in CONTEXT_EXCEEDED_CODES
+        or is_context_overflow_message(str(error.get("message", "")), specific_only=True)
+        for error in errors
     ):
-        if isinstance(error, dict) and isinstance(error.get("context_breakdown"), dict):
+        return None
+    for error in errors:
+        if isinstance(error.get("context_breakdown"), dict):
             return cast(_JsonObject, error["context_breakdown"])
     return None
 
