@@ -669,20 +669,18 @@ _session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScoped
 _session_turn_request_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
-def _record_turn_request(session_id: str, item_id: str, *, starts_turn: bool) -> None:
+def _record_turn_request(session_id: str, item_id: str) -> None:
     """
-    Remember *item_id* as the input *session_id*'s running turn began with.
+    Record *item_id* as the input *session_id*'s turn began with, unless one is recorded.
+
+    The first input persisted since the last turn ended is the turn's start. A
+    follow-up sent before the turn is seen running, or steered into it, never
+    replaces it, whatever its status said when it was sent.
 
     :param session_id: Session the input was persisted to, e.g. ``"conv_abc123"``.
     :param item_id: The persisted input's item id.
-    :param starts_turn: Whether the input began a turn of its own. Any other
-        input, such as a follow-up steered into the running turn or a task
-        notification, counts only while no start is known for the turn.
     """
-    if starts_turn:
-        _session_turn_request_cache[session_id] = item_id
-    else:
-        _session_turn_request_cache.setdefault(session_id, item_id)
+    _session_turn_request_cache.setdefault(session_id, item_id)
 
 
 _session_background_task_count_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()

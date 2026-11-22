@@ -3687,11 +3687,7 @@ async def _persist_external_conversation_item_unlocked(
     if _begins_native_turn(item):
         # Before the queue entry settles, so a side chat fork that saw it pending
         # finds the request it became.
-        _record_turn_request(
-            session_id,
-            persisted.id,
-            starts_turn=drained is not None and not drained.queued_during_turn,
-        )
+        _record_turn_request(session_id, persisted.id)
     # Landed: the drained entries are settled (uncertain ones leave without a
     # record — their mirror may already have been attributed by position);
     # older messages a slash command jumped over are still on their way and
@@ -8285,12 +8281,7 @@ async def _forward_event_to_runner(
                 conversation_store.append, session_id, [replacement]
             )
         if not persisted[0].deduplicated:
-            # A message sent while a turn runs is steered into that turn.
-            _record_turn_request(
-                session_id,
-                persisted[0].id,
-                starts_turn=_session_status_from_cache(session_id, conv.live_status) != "running",
-            )
+            _record_turn_request(session_id, persisted[0].id)
         return persisted
 
     # Run controls wait for routing and a fresh guard before entering replayable history.

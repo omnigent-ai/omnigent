@@ -6448,7 +6448,8 @@ def register_core_routes(
 
         It stops before the input the running turn began with, so it never sees
         that turn's request. Without a recorded start, e.g. after a restart, it
-        stops before the newest request, or copies nothing when none is in reach.
+        stops before the newest request, which still copies the turn's request
+        once a follow-up has been steered in, or copies nothing when none is in reach.
 
         :param session_id: The side chat's source session, e.g. ``"conv_abc"``.
         :param turn_in_flight: Whether the source is answering a request.

@@ -8683,11 +8683,7 @@ async def _dispatch_skill_slash_command_to_runner(
     )
     visible = persisted_items[0]
     if not visible.deduplicated:
-        _record_turn_request(
-            session_id,
-            visible.id,
-            starts_turn=_session_status_from_cache(session_id, conv.live_status) != "running",
-        )
+        _record_turn_request(session_id, visible.id)
 
     # Mirror the plain-message path's title seeding: a session whose FIRST
     # message is a skill invocation (web landing composer, REPL) would
