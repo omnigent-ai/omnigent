@@ -7722,6 +7722,40 @@ describe("Composer workflow entry point", () => {
     expect(onSendSlashCommand).not.toHaveBeenCalled();
   });
 
+  it("opens the Tasks tab's choice in the dialog: a new workflow's text, or a saved workflow", async () => {
+    setComposerState({
+      conversationId: "conv_test",
+      sessionHarness: "openai-agents",
+      skills: workflowSkills,
+    });
+    const onSendSlashCommand = vi.fn();
+    renderWithWorkflows(<Composer {...composerProps({ onSendSlashCommand })} />);
+    const startWorkflow = useSessionTasksActions.getState().startWorkflow.conv_test;
+
+    act(() => startWorkflow?.("Bump deps"));
+    expect(await screen.findByTestId("workflow-dialog-description")).toHaveValue("Bump deps");
+    fireEvent.keyDown(screen.getByTestId("workflow-dialog-description"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("workflow-dialog")).toBeNull());
+
+    const workflow = {
+      id: "a".repeat(32),
+      name: "Triage flaky tests",
+      description: "Finds and fixes flaky tests.",
+    };
+    act(() => startWorkflow?.("", workflow));
+    expect(
+      await screen.findByRole("heading", { name: "Run Triage flaky tests" }),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("workflow-dialog-description"), {
+      target: { value: "The upload tests" },
+    });
+    fireEvent.click(screen.getByTestId("workflow-dialog-run"));
+    expect(onSendSlashCommand).toHaveBeenCalledWith(
+      "workflow",
+      `Run the saved workflow "Triage flaky tests" (ID ${workflow.id}).\n\nThe upload tests`,
+    );
+  });
+
   it("runs or continues a task for the Tasks tab, or says why it can't", () => {
     setComposerState({ conversationId: "conv_test", sessionHarness: "openai-agents", skills: [] });
     const onSend = vi.fn();
