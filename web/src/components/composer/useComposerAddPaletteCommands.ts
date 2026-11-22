@@ -36,6 +36,9 @@ export type ComposerAddHandlers = Partial<Record<ComposerAddActionId, () => void
 
 const NO_COMMANDS: PaletteCommand[] = [];
 
+/** The heading the composer's ⌘K rows share. */
+export const COMPOSER_PALETTE_HEADING = "Composer";
+
 /** Offers `actions` under `source` while the menu is mounted; no source offers none. */
 export function useComposerAddPaletteCommands(
   source: string | undefined,
@@ -61,5 +64,5 @@ export function useComposerAddPaletteCommands(
     // eslint-disable-next-line react-hooks/exhaustive-deps -- the signature covers `actions`.
     [source, signature],
   );
-  useQuickPickPaletteCommands(source ?? "composer", "Composer", commands);
+  useQuickPickPaletteCommands(source ?? "composer", COMPOSER_PALETTE_HEADING, commands);
 }

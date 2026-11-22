@@ -4856,6 +4856,12 @@ function ComposerImpl(
                     setBusy={setConfigBusy}
                     openNonce={pickerOpenNonce}
                     modelPickerShortcutEnabled={modelPickerHotkeyEnabled}
+                    paletteSettingsSource={
+                      composerSessionId &&
+                      isFeatureEnabled(composerServerInfo, "quick_pick_palette")
+                        ? `composer:${composerSessionId}`
+                        : undefined
+                    }
                     {...sessionHarnessPicker}
                   />
                 </div>
