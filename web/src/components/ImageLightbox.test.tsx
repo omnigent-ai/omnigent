@@ -188,6 +188,103 @@ describe("dismissing the lightbox by clicking outside the image", () => {
   });
 });
 
+describe("pinch-to-zoom", () => {
+  interface Finger {
+    clientX: number;
+    clientY: number;
+  }
+  const finger = (clientX: number, clientY = 0): Finger => ({ clientX, clientY });
+  // The dialog's scroll lock reads `changedTouches` from every touch event.
+  const fingers = (touches: Finger[], changedTouches = touches) => ({ touches, changedTouches });
+
+  function openPreview() {
+    renderWithProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Zoom image: diagram" }));
+    const previewImg = screen.getAllByRole("img", { name: "diagram" }).at(-1)!;
+    Object.defineProperties(previewImg, {
+      offsetWidth: { value: 400 },
+      offsetHeight: { value: 300 },
+    });
+    const stage = previewImg.parentElement!;
+    stage.setPointerCapture = vi.fn();
+    return { previewImg, stage };
+  }
+
+  function pinch(target: Element, from: [Finger, Finger], to: [Finger, Finger]) {
+    fireEvent.touchStart(target, fingers(from));
+    fireEvent.touchMove(target, fingers(to));
+    fireEvent.touchEnd(target, fingers([], to));
+  }
+
+  afterEach(() => isIOSShell.mockReset().mockReturnValue(false));
+
+  it("zooms with the fingers' spread and back out to fit", () => {
+    const { previewImg, stage } = openPreview();
+
+    pinch(stage, [finger(-50), finger(50)], [finger(-100), finger(100)]);
+    expect(screen.getByRole("button", { name: "Reset zoom" })).toHaveTextContent("200%");
+    expect(previewImg).toHaveStyle({ transform: "translate(0px, 0px) scale(2)" });
+
+    pinch(stage, [finger(-100), finger(100)], [finger(-20), finger(20)]);
+    expect(screen.getByRole("button", { name: "Reset zoom" })).toHaveTextContent("100%");
+    expect(previewImg).toHaveStyle({ transform: "translate(0px, 0px) scale(1)" });
+  });
+
+  it("keeps the point between the fingers in place", () => {
+    // jsdom lays the stage out at 0x0, so its center is the origin.
+    const { previewImg, stage } = openPreview();
+
+    pinch(stage, [finger(100, 50), finger(140, 50)], [finger(80, 50), finger(160, 50)]);
+
+    expect(previewImg).toHaveStyle({ transform: "translate(-120px, -50px) scale(2)" });
+  });
+
+  it("holds the image's nearest edge when the fingers start beside it", () => {
+    const { previewImg, stage } = openPreview();
+
+    pinch(stage, [finger(280, 50), finger(320, 50)], [finger(260, 50), finger(340, 50)]);
+
+    expect(previewImg).toHaveStyle({ transform: "translate(-100px, -50px) scale(2)" });
+  });
+
+  it("stops a one-finger pan when a second finger lands", () => {
+    const { previewImg, stage } = openPreview();
+    fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
+
+    fireEvent.pointerDown(stage, { pointerId: 1, clientX: 0, clientY: 0 });
+    fireEvent.pointerDown(stage, { pointerId: 2, clientX: 100, clientY: 0 });
+    fireEvent.touchStart(stage, fingers([finger(0), finger(100)]));
+    fireEvent.pointerMove(stage, { pointerId: 2, clientX: 100, clientY: 80 });
+
+    expect(previewImg).toHaveStyle({ transform: "translate(0px, 0px) scale(1.5)" });
+  });
+
+  it("opens a chat image's preview from a pinch in the iOS shell and keeps zooming", () => {
+    isIOSShell.mockReturnValue(true);
+    renderWithProvider();
+    const thumbnail = screen.getByRole("button", { name: "Zoom image: diagram" });
+
+    fireEvent.touchStart(thumbnail, fingers([finger(-10), finger(10)]));
+    fireEvent.touchMove(thumbnail, fingers([finger(-15), finger(15)]));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reset zoom" })).toHaveTextContent("100%");
+
+    fireEvent.touchMove(thumbnail, fingers([finger(-30), finger(30)]));
+    expect(screen.getByRole("button", { name: "Reset zoom" })).toHaveTextContent("200%");
+  });
+
+  it("leaves a pinch on a chat image to the page outside the native shells", () => {
+    renderWithProvider();
+    const thumbnail = screen.getByRole("button", { name: "Zoom image: diagram" });
+
+    fireEvent.touchStart(thumbnail, fingers([finger(-10), finger(10)]));
+    const move = fireEvent.touchMove(thumbnail, fingers([finger(-30), finger(30)]));
+
+    expect(move).toBe(true);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+});
+
 describe("downloading from the lightbox", () => {
   function openImage(props: {
     src: string;
