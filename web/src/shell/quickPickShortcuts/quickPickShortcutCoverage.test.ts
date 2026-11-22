@@ -21,6 +21,12 @@ const HANDLED_ELSEWHERE: Record<string, string> = {
   "message.next": "The transcript's own ⌘⌥↓ listener; the binding gives its ⌘K row the keys.",
 };
 
+/** Flagged bindings with their own listener, whose chords nothing else may take. */
+const OWN_LISTENER: Record<string, string> = {
+  "session.recent": "useRecentSessionHotkey, which opens and steps the hold-to-switch switcher.",
+  "session.recentReverse": "useRecentSessionHotkey, which steps the held switcher back.",
+};
+
 /** Flagged bindings that take over another's chord, whose own handler stands down with the flag on. */
 const TAKES_OVER: Record<string, readonly string[]> = {
   // AppShellOverlays turns the recent switcher off with quick_pick_palette on.
@@ -60,7 +66,7 @@ describe("shortcuts that wait for quick_pick_palette", () => {
       ...Object.keys(HOSTED_SHORTCUT_COMMANDS),
       ...Object.keys(OPEN_SESSION_SHORTCUT_COMMANDS),
     ];
-    const elsewhere = Object.keys(HANDLED_ELSEWHERE);
+    const elsewhere = [...Object.keys(HANDLED_ELSEWHERE), ...Object.keys(OWN_LISTENER)];
     expect(hosted.filter((id) => elsewhere.includes(id))).toEqual([]);
     expect([...hosted, ...elsewhere].toSorted()).toEqual(
       QUICK_PICK_SHORTCUT_BINDINGS.map((binding) => binding.id).toSorted(),

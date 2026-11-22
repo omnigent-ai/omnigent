@@ -51,6 +51,10 @@ beforeEach(() => {
     loaded.add("ProjectActionHost");
     return { ProjectActionHost: () => <div data-testid="project-action-host" /> };
   });
+  vi.doMock("./quickPickShortcuts/RecentSessionSwitchHost", () => {
+    loaded.add("RecentSessionSwitchHost");
+    return { RecentSessionSwitchHost: () => <div data-testid="recent-session-switch-host" /> };
+  });
   vi.doMock("./quickPickShortcuts/QuickPickShortcutHost", () => {
     loaded.add("QuickPickShortcutHost");
     return { QuickPickShortcutHost: () => <div data-testid="quick-pick-shortcut-host" /> };
@@ -135,10 +139,12 @@ describe("AppShellOverlays palette flag", () => {
       expect(await findByTestId("session-action-host")).toBeTruthy();
       expect(await findByTestId("project-action-host")).toBeTruthy();
       expect(await findByTestId("quick-pick-shortcut-host")).toBeTruthy();
+      expect(await findByTestId("recent-session-switch-host")).toBeTruthy();
       expect([...loaded].sort()).toEqual([
         "ProjectActionHost",
         "QuickPickCommandPalette",
         "QuickPickShortcutHost",
+        "RecentSessionSwitchHost",
         "SessionActionHost",
         "ThemePicker",
       ]);

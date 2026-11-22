@@ -30,6 +30,11 @@ const SessionActionHost = lazy(() =>
     default: module.SessionActionHost,
   })),
 );
+const RecentSessionSwitchHost = lazy(() =>
+  import("./quickPickShortcuts/RecentSessionSwitchHost").then((module) => ({
+    default: module.RecentSessionSwitchHost,
+  })),
+);
 const ProjectActionHost = lazy(() =>
   import("./projectCommands/ProjectActionHost").then((module) => ({
     default: module.ProjectActionHost,
@@ -119,6 +124,7 @@ export function AppShellOverlays({
         <Suspense fallback={null}>
           <SessionActionHost />
           <ProjectActionHost />
+          <RecentSessionSwitchHost />
           <QuickPickShortcutHost />
         </Suspense>
       )}

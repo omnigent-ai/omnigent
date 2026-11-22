@@ -477,6 +477,66 @@ def test_quick_pick_ctrl_tab_steps_through_the_sidebar(
     expect(page.get_by_role("dialog")).to_have_count(0)
 
 
+# The recent-session chord is macOS-only; the page reads the platform from navigator.
+_AS_MAC = """
+Object.defineProperty(Navigator.prototype, "platform", { get: () => "MacIntel" });
+Object.defineProperty(Navigator.prototype, "userAgentData", { get: () => undefined });
+"""
+
+
+def _open_one_then_the_other(page: Page, base_url: str, first: str, second: str) -> None:
+    """Open *first*, then *second* from its sidebar row, so *first* is the previous visit."""
+    page.goto(f"{base_url}/c/{first}")
+    expect(page.locator(f'li[data-sidebar-session-id="{second}"]').first).to_be_visible(
+        timeout=30_000
+    )
+    page.locator(f'li[data-sidebar-session-id="{second}"] a').first.click()
+    expect(page).to_have_url(re.compile(rf"/c/{second}$"), timeout=10_000)
+    expect(page).to_have_title(re.compile("Kestrel"), timeout=10_000)
+
+
+def test_quick_pick_recent_switcher_opens_the_last_visit_on_release(
+    request: pytest.FixtureRequest, seeded_session_pair: tuple[str, str, str]
+) -> None:
+    """Holding Control, ] opens the switcher on the previous visit; releasing Control opens it."""
+    base_url, first, second = seeded_session_pair
+    patch_session(base_url, first, title="Heron notes")
+    patch_session(base_url, second, title="Kestrel notes")
+    page: Page = request.getfixturevalue("page")
+    page.add_init_script(_AS_MAC)
+    enable_quick_pick_palette(page)
+    _open_one_then_the_other(page, base_url, first, second)
+
+    page.keyboard.down("Control")
+    page.keyboard.press("BracketRight")
+    switcher = page.get_by_role("dialog", name="Switch to recent session")
+    expect(switcher).to_be_visible(timeout=10_000)
+    expect(switcher.get_by_role("option", selected=True)).to_contain_text("Heron notes")
+    page.keyboard.up("Control")
+    expect(page).to_have_url(re.compile(rf"/c/{first}$"), timeout=10_000)
+    expect(switcher).to_have_count(0)
+
+
+def test_quick_pick_switch_to_recent_session_from_the_palette(
+    request: pytest.FixtureRequest, seeded_session_pair: tuple[str, str, str]
+) -> None:
+    """⌘K's Switch to recent session opens the switcher, which waits for Enter."""
+    base_url, first, second = seeded_session_pair
+    patch_session(base_url, first, title="Heron notes")
+    patch_session(base_url, second, title="Kestrel notes")
+    page: Page = request.getfixturevalue("page")
+    enable_quick_pick_palette(page)
+    _open_one_then_the_other(page, base_url, first, second)
+
+    run_palette_command(page, "switch to recent session", "Switch to recent session")
+    switcher = page.get_by_role("dialog", name="Switch to recent session")
+    expect(switcher).to_be_visible(timeout=10_000)
+    expect(switcher.get_by_role("option", selected=True)).to_contain_text("Heron notes")
+    page.keyboard.press("Enter")
+    expect(page).to_have_url(re.compile(rf"/c/{first}$"), timeout=10_000)
+    expect(switcher).to_have_count(0)
+
+
 def _viewer_unread(base_url: str, session_id: str) -> bool:
     """Read the server's ``viewer_unread`` for one session from ``GET /v1/sessions``."""
     response = httpx.get(f"{base_url}/v1/sessions", params={"visibility": "all"}, timeout=10.0)

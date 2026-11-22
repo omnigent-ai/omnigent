@@ -4,6 +4,10 @@
 import { useEffect, useRef } from "react";
 
 import { useIsEmbedded } from "@/lib/embedded";
+import {
+  cancelRecentSessionSwitcher,
+  isRecentSessionSwitcherOpen,
+} from "@/hooks/useRecentSessionSwitch";
 import { getEmbedRoot } from "@/lib/host";
 import {
   cancelBrowserRecentSessionSwitch,
@@ -90,14 +94,20 @@ export function QuickPickShortcutHost() {
       const tabStep = event.key === "Tab";
       const focused = document.activeElement;
       const owningSurfaces = tabStep ? DIALOG_SURFACES : KEY_OWNING_SURFACES;
-      if (focused instanceof Element && focused.closest(owningSurfaces)) return;
+      // Over a held recent-session switcher, Ctrl+Tab drops the recency switch and steps.
+      const overRecentSwitcher = tabStep && isRecentSessionSwitcherOpen();
+      if (!overRecentSwitcher && focused instanceof Element && focused.closest(owningSurfaces)) {
+        return;
+      }
       const command = commandFor(shortcut);
       if (!command || !isCommandAvailable(command.availability)) return;
       // A held Ctrl+Tab steps once; its repeats are consumed so a terminal never sees Tabs.
       if (event.repeat && !tabStep) return;
       event.preventDefault();
       event.stopPropagation();
-      if (!event.repeat) command.run();
+      if (event.repeat) return;
+      if (overRecentSwitcher) cancelRecentSessionSwitcher();
+      command.run();
     };
     // An embedded Browser page is its own WebContents, so the shell forwards its Ctrl+Tab.
     const unsubscribeBrowserInput = onBrowserRecentSessionInput((input) => {

@@ -278,6 +278,15 @@ the header menu), and each place is a separate entry point.
   desktop app's Browser panes, but not from a dialog; a held chord steps once
   (`web/src/shell/quickPickShortcuts/QuickPickShortcutHost.test.tsx`,
   `tests/e2e_ui/sessions/test_quick_pick_palette.py::test_quick_pick_ctrl_tab_steps_through_the_sidebar`).
+  On macOS, Control+] opens a compact switcher one visit back through the sessions
+  opened most recently (remembered per device), whatever the sidebar's filter or
+  folders hide. More presses of ] or [ while Control is held walk the list, releasing
+  Control opens the selection, and Escape or leaving the window cancels. Control+Tab
+  while it's held drops it and steps by position instead. ⌘K's **Switch to recent
+  session** opens the same switcher on every platform; there it waits for Enter
+  (`web/src/hooks/useRecentSessionSwitch.test.tsx`,
+  `web/src/shell/RecentSessionSwitcher.test.tsx`,
+  `tests/e2e_ui/sessions/test_quick_pick_palette.py::test_quick_pick_recent_switcher_opens_the_last_visit_on_release`).
 - `browser-storage`: browser soft tabs, including one opened by the agent, share
   cookies within a session; different sessions stay isolated. Navigation stays
   per-tab. On macOS the browser toolbar can also import cookies from a local
@@ -842,6 +851,8 @@ recent sessions. Continue pressing Tab (or Shift+Tab) to cycle, release Control
 to switch, or press Escape to cancel.
 With `quick_pick_palette` on, Control+Tab opens the next sidebar session instead,
 and Control+Shift+Tab the previous one.
+On macOS, hold Control and press ] to open your previous session, or keep
+pressing ] or [ to choose another before you let go.
 
 ## Driving it with the repro environment
 
