@@ -5498,15 +5498,21 @@ describe("Sidebar pull request filter", () => {
     }),
     conv("conv_none", "Codex", { pull_request: null, pull_requests_synced: true }),
   ];
-  const renderWith = (savedViews: boolean | undefined) =>
-    renderSidebar(true, "/", undefined, {
-      ...FALLBACK_SERVER_INFO,
-      features: {
-        ...FALLBACK_SERVER_INFO.features,
-        sidebar_grouping_ui: true,
-        ...(savedViews === undefined ? {} : { sidebar_saved_views: savedViews }),
-      },
-    });
+  const infoWith = (savedViews: boolean | undefined, grouping = true): ServerInfo => ({
+    ...FALLBACK_SERVER_INFO,
+    features: {
+      ...FALLBACK_SERVER_INFO.features,
+      sidebar_grouping_ui: grouping,
+      ...(savedViews === undefined ? {} : { sidebar_saved_views: savedViews }),
+    },
+  });
+  const renderWith = (savedViews: boolean | undefined, grouping = true) =>
+    renderSidebar(true, "/", undefined, infoWith(savedViews, grouping));
+  /** The list reports another server page, as while Load more is offered. */
+  const withMorePages = () => {
+    const base = useConvMock.getMockImplementation()!;
+    useConvMock.mockImplementation((...args) => ({ ...base(...args), hasNextPage: true }));
+  };
   const listed = () =>
     within(screen.getByTestId("sidebar-conversation-list"))
       .getAllByRole("link", { name: /^conv_/ })
@@ -5556,6 +5562,70 @@ describe("Sidebar pull request filter", () => {
     mockConversations(rows());
     renderWith(true);
     expect(listed()).toEqual(["conv_none"]);
+  });
+
+  it("narrows an expanded project folder's own fetched sessions too", () => {
+    localStorage.setItem("omnigent:session-pull-request-filter", "open");
+    projectsMock.push("Customer X");
+    mockConversations([conv("conv_unfiled", "Codex")]);
+    const filed = { labels: { omni_project: "Customer X" }, pull_requests_synced: true };
+    projectSessionsMock.current["Customer X"] = [
+      conv("conv_far_open", "Codex", { ...filed, pull_request: pullRequest("OPEN") }),
+      conv("conv_far_merged", "Codex", { ...filed, pull_request: pullRequest("MERGED") }),
+    ];
+    renderWith(true);
+    fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+    const folder = screen.getByText("Customer X").closest("section")!;
+    expect(within(folder).getByText("conv_far_open")).toBeInTheDocument();
+    expect(within(folder).queryByText("conv_far_merged")).toBeNull();
+  });
+
+  it("keeps the session open in the route listed before its snapshot loads", () => {
+    localStorage.setItem("omnigent:session-pull-request-filter", "open");
+    mockConversations(rows());
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <CapabilitiesProvider info={infoWith(true)}>
+          <SidebarDataProvider config={sidebarConfig}>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={["/c/conv_merged"]}>
+                <Routes>
+                  <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+                </Routes>
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </CapabilitiesProvider>
+      </QueryClientProvider>,
+    );
+    expect(listed()).toEqual(["conv_merged", "conv_open"]);
+  });
+
+  it("holds No sessions while more pages may hold a match, and says it once they're read", () => {
+    localStorage.setItem("omnigent:session-pull-request-filter", "draft");
+    mockConversations(rows());
+    withMorePages();
+    const first = renderWith(true);
+    expect(screen.queryByText("No sessions")).toBeNull();
+    first.unmount();
+    mockConversations(rows());
+    renderWith(true);
+    expect(screen.getByText("No sessions")).toBeInTheDocument();
+  });
+
+  it("still says No sessions beside more pages with the flag off", () => {
+    mockConversations([]);
+    withMorePages();
+    renderWith(false);
+    expect(screen.getByText("No sessions")).toBeInTheDocument();
+  });
+
+  it("applies no stored choice without the grouping menu that offers it", () => {
+    localStorage.setItem("omnigent:session-pull-request-filter", "open");
+    mockConversations(rows());
+    renderWith(true, false);
+    expect(listed()).toEqual(["conv_merged", "conv_none", "conv_open"]);
   });
 });
 
