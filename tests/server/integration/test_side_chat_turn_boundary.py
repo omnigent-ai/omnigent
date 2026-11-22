@@ -289,6 +289,8 @@ async def test_sdk_side_chat_leaves_out_a_turn_with_a_follow_up(
         await _post(client, session_id, {"type": "slash_command", "data": skill})
     if follow_up == "sent_before_it_ran":
         await _send(client, session_id, "Also check the lexer")
+    # The runner took the request but its running edge has not reached the server yet.
+    assert await _side_chat_history(client, session_id) == [_CODENAME, _NOTED]
     sessions_module._publish_status(session_id, "running")
     await _mirror(client, session_id, "assistant", "Reviewing it", "r2")
     if follow_up == "steered_in":
@@ -508,9 +510,32 @@ async def test_sdk_side_chat_cuts_before_each_held_message_a_runner_takes_up_alo
     # A /compact queued between them makes the runner take each up alone, with no idle edge.
     await turn_runner.continue_turn(session_id, store, take=1)
     await _mirror(client, session_id, "assistant", "The lexer looks fine", "r3")
+    finished = [_CODENAME, _NOTED, "Review the parser", "On it", "Also check the lexer"]
     await turn_runner.continue_turn(session_id, store, take=0)
+    # The compaction turn answers no request: only the skill still held stays out.
+    assert await _side_chat_history(client, session_id) == finished
     await turn_runner.continue_turn(session_id, store, take=1)
     await _mirror(client, session_id, "assistant", "Grilling it", "r4")
 
-    history = await _side_chat_history(client, session_id)
-    assert history == [_CODENAME, _NOTED, "Review the parser", "On it", "Also check the lexer"]
+    assert await _side_chat_history(client, session_id) == finished
+
+
+async def test_sdk_side_chat_keeps_the_exchange_before_a_compaction_turn(
+    client: httpx.AsyncClient, turn_runner: _TurnRunner, db_uri: str
+) -> None:
+    """A turn that takes up no stored request, e.g. a buffered /compact, answers none."""
+    session_id = await _session(client, native=False)
+    await _sdk_turn(client, session_id, lambda: _send(client, session_id, _CODENAME), _NOTED, "r1")
+    turn_runner.end_turn(session_id)
+    await _sdk_turn(
+        client, session_id, lambda: _send(client, session_id, "Review the parser"), "On it", "r2"
+    )
+    await _mirror(client, session_id, "assistant", "The parser looks fine", "r2")
+    store = SqlAlchemyConversationStore(db_uri)
+    await turn_runner.continue_turn(session_id, store, take=0)
+    finished = [_CODENAME, _NOTED, "Review the parser", "On it", "The parser looks fine"]
+
+    assert await _side_chat_history(client, session_id) == finished
+    # A message sent during it waits for a later turn, so it stays out.
+    await _send(client, session_id, "Then add tests")
+    assert await _side_chat_history(client, session_id) == finished
