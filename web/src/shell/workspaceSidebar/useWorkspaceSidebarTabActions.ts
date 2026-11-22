@@ -63,13 +63,13 @@ export interface WorkspaceSidebarTabActionsOptions {
   releaseFor?: (tab: WorkspaceTab) => (() => Promise<boolean>) | undefined;
   /**
    * Closes the strip entry `tabId` stands for when the host shows several tabs as one, such as
-   * a split; returns false to close it as a tab. Used by Close tab, its chord and ⌘W.
+   * a split, returning the close; null to close it as a tab. Used by Close tab, its chord and ⌘W.
    */
-  closeEntry?: (tabId: TabId, source?: "pointer", fromSidebar?: boolean) => boolean;
+  closeEntry?: (tabId: TabId, source?: "pointer") => Promise<{ ok: boolean }> | null;
   /**
    * Moves the strip entry `tabId` is in one entry over, with every tab it stands for, where the
-   * host shows several tabs as one; returns false to move it as a tab. Used by Move Tab Left
-   * and Right, their chords and the menu.
+   * host shows several tabs as one; true once handled, even with no entry to move past, and
+   * false to move it as a tab. Used by Move Tab Left and Right, their chords and the menu.
    */
   moveEntry?: (tabId: TabId, delta: -1 | 1) => boolean;
   /** The actions only some hosts offer. */
@@ -113,18 +113,27 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
     const tab = store.findTab(tabId);
     if (tab && !canClose(tab)) return;
     const closing = store.close(tabId, tab && closeStepsFor ? closeStepsFor(tab) : {});
-    // A pointer close keeps the strip still under the pointer, so only a keyboard close moves focus.
-    if (source !== "pointer") {
-      void keepSidebarFocusAfterClose(
-        closing,
-        () => store.snapshot().selectedTabId,
-        fromSidebar ?? isFocusInWorkspaceSidebar(),
-      );
-    }
+    keepFocusAfterKeyboardClose(closing, source, fromSidebar);
   };
-  // The tab the strip shows for `tabId`: a split closes as one.
+  // A pointer close keeps the strip still under the pointer, so only a keyboard close moves focus.
+  const keepFocusAfterKeyboardClose = (
+    closing: Promise<{ ok: boolean }>,
+    source: "pointer" | undefined,
+    fromSidebar: boolean | undefined,
+  ) => {
+    if (source === "pointer") return;
+    void keepSidebarFocusAfterClose(
+      closing,
+      () => store.snapshot().selectedTabId,
+      fromSidebar ?? isFocusInWorkspaceSidebar(),
+    );
+  };
+  // The tab the strip shows for `tabId`: a split closes as one, keeping focus as a tab's close does.
   const closeVisibleTab = (tabId: TabId, source?: "pointer", fromSidebar?: boolean) => {
-    if (!closeEntry?.(tabId, source, fromSidebar)) closeTab(tabId, source, fromSidebar);
+    const inSidebar = fromSidebar ?? isFocusInWorkspaceSidebar();
+    const closing = closeEntry?.(tabId, source) ?? null;
+    if (closing === null) closeTab(tabId, source, inSidebar);
+    else keepFocusAfterKeyboardClose(closing, source, inSidebar);
   };
   // Shells stay: closing others shouldn't end every shell with a dialog each.
   const closeOtherTabs = (keepTabId: TabId) => {
@@ -151,8 +160,8 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
     if (store.reopenClosed() !== null) onReveal?.();
   };
 
-  const selectedIndex =
-    selectedTabId === null ? -1 : tabs.findIndex((tab) => tab.id === selectedTabId);
+  // Moves and Close Others go by the strip's entries, a split being one.
+  const selectedIndex = selectedEntryId === null ? -1 : entryIds.indexOf(selectedEntryId);
   const selectedTab = selectedTabId === null ? undefined : store.findTab(selectedTabId);
   const facts: WorkspaceTabListFacts = {
     canReopen,
@@ -160,7 +169,7 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
     selectedPinned: selectedTab !== undefined && isPinnedTab(selectedTab),
     selectedPinRefusal: selectedTabId === null ? undefined : pinning?.refusalFor?.(selectedTabId),
     selectedIndex,
-    tabCount: tabs.length,
+    tabCount: entryIds.length,
     sidebarOpen,
     selectedCloseRefusal: selectedTabId === null ? undefined : closeRefusalFor?.(selectedTabId),
     selectedIsOnlyEmptyNewTab: selectedTabId !== null && isOnlyEmptyNewTab(tabs, selectedTabId),

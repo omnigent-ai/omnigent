@@ -57,7 +57,15 @@ function makeStore(): WorkspaceTabsStore {
 }
 
 /** A minimal host: no session, no chat store, no shells. */
-function Host({ store, pinsStayPut }: { store: WorkspaceTabsStore; pinsStayPut?: boolean }) {
+function Host({
+  store,
+  pinsStayPut,
+  closeEntry,
+}: {
+  store: WorkspaceTabsStore;
+  pinsStayPut?: boolean;
+  closeEntry?: (tabId: string) => Promise<{ ok: boolean }> | null;
+}) {
   const { tabs, selectedTabId, canReopen } = useSyncExternalStore(store.subscribe, store.snapshot);
   const stripWidth = useTabStripWidth(tabs.length, 0);
   const label = (id: string) => {
@@ -74,6 +82,7 @@ function Host({ store, pinsStayPut }: { store: WorkspaceTabsStore; pinsStayPut?:
     entryIds: tabs.map((tab) => tab.id),
     selectedEntryId: selectedTabId,
     selectedLabel: selectedTabId ? `#${label(selectedTabId)}` : undefined,
+    closeEntry,
   });
   return (
     <TooltipProvider>
@@ -162,6 +171,24 @@ describe("a workspace sidebar without a session", () => {
   it("closes the selected tab from ⌘K and keeps keyboard focus on the tab selected next", async () => {
     const store = makeStore();
     render(<Host store={store} />);
+    await act(() => store.open({ place: pull(1) }, { opener: "link" }));
+    await act(() => store.open({ place: pull(2) }, { opener: "link" }));
+    stripTab(2).focus();
+    act(() => command("Close workspace tab").run());
+    await waitFor(() => expect(screen.queryByRole("tab", { name: /#2/ })).toBeNull());
+    await waitFor(() => expect(stripTab(1)).toHaveFocus());
+  });
+
+  it("keeps keyboard focus in the strip as an entry the host closes itself goes", async () => {
+    const store = makeStore();
+    // The host closes tab 2 as its own entry, such as a split of several tabs, after a moment.
+    const closeEntry = (tabId: string) =>
+      tabId === "t2"
+        ? new Promise<{ ok: boolean }>((resolve) => {
+            setTimeout(() => void store.close(tabId).then(resolve), 0);
+          })
+        : null;
+    render(<Host store={store} closeEntry={closeEntry} />);
     await act(() => store.open({ place: pull(1) }, { opener: "link" }));
     await act(() => store.open({ place: pull(2) }, { opener: "link" }));
     stripTab(2).focus();

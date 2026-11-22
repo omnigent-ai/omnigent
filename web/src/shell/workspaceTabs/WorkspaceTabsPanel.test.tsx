@@ -9,6 +9,9 @@ import {
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { toast } from "sonner";
+
+import { isPinnedTab } from "./pinnedTabs";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -27,7 +30,11 @@ import { MOUNTED_SHELL_TAB_LIMIT } from "./shellTabBudget";
 import { LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ } from "@/lib/permissionsApi";
 import { terminalsQueryKey } from "@/lib/terminals";
 import { LOCAL_RECONNECT_DESCRIPTION, LOCAL_RECONNECT_TITLE } from "@/shell/ReconnectSessionDialog";
-import { isCommandListed, usePaletteCommandsStore } from "@/store/paletteCommands";
+import {
+  isCommandAvailable,
+  isCommandListed,
+  usePaletteCommandsStore,
+} from "@/store/paletteCommands";
 import { usePullRequestListCounts } from "@/store/pullRequestListCounts";
 import { registeredPaletteCommands } from "@/test/paletteCommands";
 
@@ -120,6 +127,7 @@ function panel(overrides: PanelOverrides) {
       terminalKeys={[]}
       openTerminalTab={vi.fn()}
       confirmCloseShell={vi.fn(async () => true)}
+      confirmCloseShells={vi.fn(async () => true)}
       endShell={vi.fn(async () => true)}
       maximized={false}
       onToggleMaximized={vi.fn()}
@@ -875,6 +883,291 @@ describe("a shell's tab", () => {
       expect(store.history.state.visits).toEqual(visits);
     },
   );
+
+  describe("a sidebar split's strip entry", () => {
+    /** Shells a, b and c with a and b split, a focused and selected. */
+    async function splitAB(conversationId: string, overrides: Partial<PanelOverrides> = {}) {
+      panesGate.shown = true;
+      const opened = await openShells(conversationId, ["term_a", "term_b", "term_c"], {
+        permissionLevel: LEVEL_OWNER,
+        ...overrides,
+      });
+      act(() =>
+        updateTerminalGroups(conversationId, () => [
+          {
+            id: "g_ab",
+            split: {
+              layout: {
+                axis: "columns",
+                ratio: 0.5,
+                children: ["terminal:term_a", "terminal:term_b"],
+              },
+              focusedKey: "terminal:term_a",
+            },
+          },
+        ]),
+      );
+      opened.select("term_a");
+      return opened;
+    }
+    const stripNames = () => screen.getAllByRole("tab").map((tab) => tab.textContent);
+
+    it("shows the split once, named for its focused shell, and follows focus", async () => {
+      await splitAB("s-group-entry");
+      await waitFor(() => expect(stripNames()).toEqual(["term_a:s +1", "term_c:s"]));
+      const entry = screen.getByRole("tab", { name: /term_a:s \+1/ });
+      expect(entry).toHaveAttribute("aria-selected", "true");
+      await waitFor(() => expect(stubOf("term_b")).not.toBeNull());
+      fireEvent.focusIn(stubOf("term_b")!);
+      await waitFor(() => expect(stripNames()).toEqual(["term_b:s +1", "term_c:s"]));
+      expect(screen.getByRole("tab", { name: /term_b:s \+1/ })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+    });
+
+    it("keeps each shell's own tab where splits aren't allowed", async () => {
+      await splitAB("s-group-editor", { permissionLevel: LEVEL_EDIT });
+      await waitFor(() => expect(stripNames()).toEqual(["term_a:s", "term_b:s", "term_c:s"]));
+    });
+
+    it("closes the split whole from its ×, asking once, and keeps it on Cancel", async () => {
+      const confirmCloseShells = vi.fn(async () => false);
+      const endShell = vi.fn(async () => true);
+      const { store } = await splitAB("s-group-close", { confirmCloseShells, endShell });
+      const close = await screen.findByRole("button", { name: "Close term_a:s +1" });
+      await userEvent.click(close);
+      await waitFor(() =>
+        expect(confirmCloseShells).toHaveBeenCalledExactlyOnceWith([
+          "terminal:term_a",
+          "terminal:term_b",
+        ]),
+      );
+      expect(endShell).not.toHaveBeenCalled();
+      expect(store.tabs()).toHaveLength(3);
+
+      confirmCloseShells.mockResolvedValue(true);
+      await userEvent.click(screen.getByRole("button", { name: "Close term_a:s +1" }));
+      await waitFor(() => expect(store.tabs()).toHaveLength(1));
+      expect(endShell.mock.calls).toEqual([["terminal:term_a"], ["terminal:term_b"]]);
+      expect(confirmCloseShells).toHaveBeenCalledTimes(2);
+    });
+
+    it("closes the split whole from Close tab's chord and from its menu", async () => {
+      const confirmCloseShells = vi.fn(async () => true);
+      const confirmCloseShell = vi.fn(async () => true);
+      const endShell = vi.fn(async () => true);
+      const { store } = await splitAB("s-group-chord", {
+        confirmCloseShells,
+        confirmCloseShell,
+        endShell,
+      });
+      await screen.findByRole("tab", { name: /term_a:s \+1/ });
+      act(pressCloseTab);
+      await waitFor(() => expect(store.tabs()).toHaveLength(1));
+      expect(confirmCloseShells).toHaveBeenCalledOnce();
+      expect(confirmCloseShell).not.toHaveBeenCalled();
+
+      cleanup();
+      const second = await splitAB("s-group-menu", { confirmCloseShells, endShell });
+      const entry = await screen.findByRole("tab", { name: /term_a:s \+1/ });
+      fireEvent.contextMenu(entry.closest("[data-tab-strip-entry]")!);
+      expect(screen.queryByRole("menuitem", { name: /^Pin tab/ })).toBeNull();
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Close split" }));
+      await waitFor(() => expect(second.store.tabs()).toHaveLength(1));
+    });
+
+    it("keeps a shell that won't end in a consistent strip, and says which", async () => {
+      const failed = vi.spyOn(toast, "error").mockImplementation(() => "");
+      const endShell = vi.fn(async (key: string) => key !== "terminal:term_b");
+      const { store } = await splitAB("s-group-partial", { endShell });
+      await userEvent.click(await screen.findByRole("button", { name: "Close term_a:s +1" }));
+      await waitFor(() =>
+        expect(failed).toHaveBeenCalledWith("Couldn't close term_b:s. Try again."),
+      );
+      // a's tab went; b's and c's stay, with the selection on one of them and history agreeing.
+      const remaining = store.tabs().map((tab) => ("binding" in tab ? tab.binding : undefined));
+      expect(remaining).toEqual([
+        { kind: "terminal", key: "terminal:term_b" },
+        { kind: "terminal", key: "terminal:term_c" },
+      ]);
+      const selected = store.selectedTabId();
+      expect(store.tabs().some((tab) => tab.id === selected)).toBe(true);
+      expect(store.history.state.visits[store.history.state.cursor]?.tabId).toBe(selected);
+      failed.mockRestore();
+    });
+
+    it("ends every shell the split names, though a member has no tab", async () => {
+      const endShell = vi.fn(async () => true);
+      const { store } = await splitAB("s-group-tabless", { endShell });
+      const tabB = store
+        .tabs()
+        .find(
+          (tab) =>
+            "binding" in tab &&
+            tab.binding?.kind === "terminal" &&
+            tab.binding.key === "terminal:term_b",
+        )!.id;
+      // A restored split whose second shell's tab is gone; closing that tab ends nothing.
+      await act(async () => void (await store.close(tabB)));
+      await userEvent.click(await screen.findByRole("button", { name: "Close term_a:s +1" }));
+      await waitFor(() => expect(endShell).toHaveBeenCalledTimes(2));
+      expect(endShell.mock.calls).toEqual([["terminal:term_a"], ["terminal:term_b"]]);
+    });
+
+    it("ends nothing when the split changes while its close is asking", async () => {
+      let answer!: (confirmed: boolean) => void;
+      const confirmCloseShells = vi.fn(
+        () =>
+          new Promise<boolean>((resolve) => {
+            answer = resolve;
+          }),
+      );
+      const endShell = vi.fn(async () => true);
+      const { store } = await splitAB("s-group-changed", { confirmCloseShells, endShell });
+      await userEvent.click(await screen.findByRole("button", { name: "Close term_a:s +1" }));
+      await waitFor(() => expect(confirmCloseShells).toHaveBeenCalledOnce());
+      act(() =>
+        updateTerminalGroups("s-group-changed", () => [
+          {
+            id: "g_ab",
+            split: {
+              layout: {
+                axis: "columns",
+                ratio: 0.5,
+                children: ["terminal:term_a", "terminal:term_c"],
+              },
+              focusedKey: "terminal:term_a",
+            },
+          },
+        ]),
+      );
+      await act(async () => answer(true));
+      await act(async () => {});
+      expect(endShell).not.toHaveBeenCalled();
+      expect(store.tabs()).toHaveLength(3);
+    });
+
+    it("moves a split's tabs together with ⌥⇧→, and a tab past them whole", async () => {
+      const { store } = await splitAB("s-group-move");
+      await waitFor(() => expect(stripNames()).toEqual(["term_a:s +1", "term_c:s"]));
+      fireEvent.keyDown(screen.getByRole("tab", { name: /term_a:s \+1/ }), {
+        key: "ArrowRight",
+        altKey: true,
+        shiftKey: true,
+      });
+      expect(stripNames()).toEqual(["term_c:s", "term_a:s +1"]);
+      const keys = () =>
+        store
+          .tabs()
+          .map((tab) =>
+            "binding" in tab && tab.binding?.kind === "terminal" ? tab.binding.key : "",
+          );
+      expect(keys()).toEqual(["terminal:term_c", "terminal:term_a", "terminal:term_b"]);
+      // c moving right past the split lands after it, not between its tabs.
+      fireEvent.keyDown(screen.getByRole("tab", { name: "term_c:s" }), {
+        key: "ArrowRight",
+        altKey: true,
+        shiftKey: true,
+      });
+      expect(stripNames()).toEqual(["term_a:s +1", "term_c:s"]);
+      expect(keys()).toEqual(["terminal:term_a", "terminal:term_b", "terminal:term_c"]);
+    });
+
+    it("keeps a split at the strip's end where it is, its tabs in their order", async () => {
+      const { store, select } = await splitAB("s-group-edge");
+      // b, the split's second tab, has its focus, so the split goes by b's tab.
+      fireEvent.focusIn((await waitFor(() => stubOf("term_b")))!);
+      select("term_b");
+      await waitFor(() => expect(stripNames()).toEqual(["term_b:s +1", "term_c:s"]));
+      // ⌘K goes by the strip's entries: the split is the first, though b is the second tab.
+      const moveLeft = registeredPaletteCommands().find(
+        (command) => command.label === "Move workspace tab left",
+      );
+      expect(isCommandAvailable(moveLeft?.availability)).toBe(false);
+      const keys = () =>
+        store
+          .tabs()
+          .map((tab) =>
+            "binding" in tab && tab.binding?.kind === "terminal" ? tab.binding.key : "",
+          );
+      fireEvent.keyDown(screen.getByRole("tab", { name: /term_b:s \+1/ }), {
+        key: "ArrowLeft",
+        altKey: true,
+        shiftKey: true,
+      });
+      expect(stripNames()).toEqual(["term_b:s +1", "term_c:s"]);
+      expect(keys()).toEqual(["terminal:term_a", "terminal:term_b", "terminal:term_c"]);
+    });
+
+    it("moves a tab past a whole entry when the split's tabs aren't side by side", async () => {
+      panesGate.shown = true;
+      const { store, select } = await openShells(
+        "s-group-scattered",
+        ["term_a", "term_b", "term_c", "term_d"],
+        { permissionLevel: LEVEL_OWNER },
+      );
+      // a and c split, with b between their tabs: the strip shows the split, b, then d.
+      act(() =>
+        updateTerminalGroups("s-group-scattered", () => [
+          {
+            id: "g_ac",
+            split: {
+              layout: {
+                axis: "columns",
+                ratio: 0.5,
+                children: ["terminal:term_a", "terminal:term_c"],
+              },
+              focusedKey: "terminal:term_a",
+            },
+          },
+        ]),
+      );
+      select("term_b");
+      await waitFor(() => expect(stripNames()).toEqual(["term_a:s +1", "term_b:s", "term_d:s"]));
+      fireEvent.keyDown(screen.getByRole("tab", { name: "term_b:s" }), {
+        key: "ArrowRight",
+        altKey: true,
+        shiftKey: true,
+      });
+      expect(stripNames()).toEqual(["term_a:s +1", "term_d:s", "term_b:s"]);
+      expect(store.tabs()).toHaveLength(4);
+    });
+
+    it("unpins a pinned shell as it joins a split", async () => {
+      const { store } = await openShells("s-group-pin", ["term_a", "term_b", "term_c"], {
+        permissionLevel: LEVEL_OWNER,
+      });
+      const tabOf = (key: string) =>
+        store
+          .tabs()
+          .find(
+            (tab) =>
+              "binding" in tab && tab.binding?.kind === "terminal" && tab.binding.key === key,
+          )!.id;
+      act(() => store.setPinned([tabOf("terminal:term_b")], true));
+      expect(isPinnedTab(store.findTab(tabOf("terminal:term_b"))!)).toBe(true);
+      panesGate.shown = true;
+      act(() =>
+        updateTerminalGroups("s-group-pin", () => [
+          {
+            id: "g_bc",
+            split: {
+              layout: {
+                axis: "columns",
+                ratio: 0.5,
+                children: ["terminal:term_b", "terminal:term_c"],
+              },
+              focusedKey: "terminal:term_b",
+            },
+          },
+        ]),
+      );
+      await waitFor(() =>
+        expect(isPinnedTab(store.findTab(tabOf("terminal:term_b"))!)).toBe(false),
+      );
+    });
+  });
 
   it("keeps only the selected shell attached while the sidebar is closed", async () => {
     const { view, panels, select } = await openShells("s-closed", ["term_a", "term_b"]);
