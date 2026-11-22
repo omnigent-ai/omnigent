@@ -48,6 +48,8 @@ _SQLITE_UNSAFE_OPS = frozenset(
 
 _VERSIONS_DIR = Path(omnigent.db.__file__).parent / "migrations" / "versions"
 
+_SQLITE_FAMILY_DIALECT_NAMES = frozenset({"sqlite", "cloudflare_d1"})
+
 
 def _raw_unsafe_op_calls(source: str) -> list[tuple[str, int]]:
     """Return ``(op_name, lineno)`` for raw ``op.<unsafe>(...)`` calls in *source*.
@@ -106,6 +108,53 @@ def test_no_migration_uses_sqlite_unsafe_raw_ddl() -> None:
         "will crash on SQLite (e.g. `ALTER TABLE ... DROP COLUMN` is rejected "
         "pre-3.35). Wrap each in `with op.batch_alter_table(<table>) as "
         f"batch_op:` and use `batch_op.<op>(...)`. Offenders: {offenders}"
+    )
+
+
+def _literal_sqlite_dialect_checks(source: str) -> list[int]:
+    """Return lines that compare against, or list, a SQLite-family dialect name."""
+    offenders: list[int] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Compare):
+            operands = [node.left, *node.comparators]
+        elif isinstance(node, (ast.List, ast.Set, ast.Tuple)):
+            operands = node.elts
+        else:
+            continue
+        if any(
+            isinstance(operand, ast.Constant) and operand.value in _SQLITE_FAMILY_DIALECT_NAMES
+            for operand in operands
+        ):
+            offenders.append(node.lineno)
+    return offenders
+
+
+def test_literal_sqlite_dialect_checks_are_detected() -> None:
+    source = (
+        'a = op.get_bind().dialect.name == "sqlite"\n'
+        'b = dialect in ("sqlite", "cloudflare_d1")\n'
+        'c = frozenset({"cloudflare_d1"})\n'
+        'd = sa.JSON().with_variant(sa.Text(), "sqlite")\n'
+        'e = dialect == "mysql"\n'
+    )
+    assert _literal_sqlite_dialect_checks(source) == [1, 2, 3]
+
+
+def test_no_migration_checks_a_literal_sqlite_dialect_name() -> None:
+    """Migrations detect SQLite through ``is_sqlite_family``.
+
+    Cloudflare D1 serves SQLite under the ``cloudflare_d1`` dialect name, so a
+    literal ``== "sqlite"`` check sends it down another dialect's path.
+    """
+    offenders = {
+        path.name: lines
+        for path in sorted(_VERSIONS_DIR.glob("*.py"))
+        if (lines := _literal_sqlite_dialect_checks(path.read_text()))
+    }
+    assert offenders == {}, (
+        "These migrations compare against or list a literal SQLite dialect name; "
+        "use omnigent.db.utils.is_sqlite_family (or is_cloudflare_d1) instead. "
+        f"Offenders: {offenders}"
     )
 
 

@@ -11,14 +11,14 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
-from sqlalchemy import Engine, create_engine, event, inspect, text
+from sqlalchemy import Engine, LargeBinary, bindparam, create_engine, event, inspect, text
 from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.exc import DBAPIError, NoSuchModuleError
 
@@ -226,6 +226,34 @@ def is_cockroachdb(dialect_name: str) -> bool:
 def is_postgresql_family(dialect_name: str) -> bool:
     """Return whether a dialect accepts PostgreSQL-family DML."""
     return dialect_name in {"postgresql", "cockroachdb"}
+
+
+def is_sqlite_family(dialect_name: str) -> bool:
+    """Return whether a dialect runs SQLite, including Cloudflare D1 over HTTP."""
+    return dialect_name in {"sqlite", "cloudflare_d1"}
+
+
+def is_cloudflare_d1(dialect_name: str) -> bool:
+    """Return whether a dialect is Cloudflare D1, which rejects SQL transaction control."""
+    return dialect_name == "cloudflare_d1"
+
+
+def encode_d1_text_as_binary(connection: Connection, table: str, columns: Iterable[str]) -> None:
+    """Rewrite text left in columns retyped to binary on D1 as its UTF-8 bytes.
+
+    Native SQLite's batch ``CAST`` yields those bytes. D1 stores binary values as
+    base64 TEXT, so plain text must be re-bound through the binary type.
+    """
+    for column in columns:
+        rows = connection.execute(
+            text(f'SELECT rowid, "{column}" FROM "{table}" WHERE "{column}" IS NOT NULL')
+        ).fetchall()
+        update = text(f'UPDATE "{table}" SET "{column}" = :value WHERE rowid = :rowid')
+        for rowid, value in rows:
+            connection.execute(
+                update.bindparams(bindparam("value", type_=LargeBinary())),
+                {"value": value.encode("utf-8"), "rowid": rowid},
+            )
 
 
 def _env_int(name: str, default: int, *, minimum: int) -> int:
@@ -1451,13 +1479,6 @@ _CREATE_FTS = text(
     "item_id UNINDEXED, conversation_id UNINDEXED, search_text)"
 )
 
-# Dialects that support SQLite's FTS5 extension. Cloudflare D1 is SQLite
-# served over HTTP, so it gets full-text search too — gate FTS on the dialect
-# *family*, not the literal name "sqlite". (The engine-level WAL/PRAGMA path in
-# ``_create_engine`` stays sqlite-only: those are local-file concerns that D1
-# neither needs nor supports over the wire.)
-_FTS5_DIALECTS = frozenset({"sqlite", "cloudflare_d1"})
-
 
 def _supports_fts5(dialect_name: str) -> bool:
     """
@@ -1468,7 +1489,7 @@ def _supports_fts5(dialect_name: str) -> bool:
     :returns: ``True`` for SQLite and SQLite-over-the-wire dialects (D1),
         ``False`` otherwise.
     """
-    return dialect_name in _FTS5_DIALECTS
+    return is_sqlite_family(dialect_name)
 
 
 def ensure_fts_table(engine: Engine) -> None:

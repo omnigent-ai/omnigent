@@ -36,6 +36,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
+from omnigent.db.utils import is_sqlite_family
+
 revision: str = "c7cd88f24c1c"
 down_revision: str | None = "e5b2c8d4f1a7"
 branch_labels: str | Sequence[str] | None = None
@@ -45,13 +47,11 @@ _TABLE = "omnigent_conversation_metadata"
 _BLOCKED_ON_CHECK = "ck_conversation_metadata_blocked_on_bytes"
 _RUNNING_CHECK = "ck_conversation_metadata_running_boolean"
 _REPORTED_AT_CHECK = "ck_conversation_metadata_reported_at_integer"
-# Dialects that store a value of any type in any column.
-_SQLITE_FAMILY = frozenset({"sqlite", "cloudflare_d1"})
 
 
 def upgrade() -> None:
     """Add ``background_work_running``, ``background_work_reported_at`` and ``blocked_on``."""
-    if op.get_bind().dialect.name in _SQLITE_FAMILY:
+    if is_sqlite_family(op.get_bind().dialect.name):
         op.execute(
             f"ALTER TABLE {_TABLE} ADD COLUMN background_work_running BOOLEAN "
             f"CONSTRAINT {_RUNNING_CHECK} "
@@ -79,7 +79,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     """Remove ``background_work_running``, ``background_work_reported_at`` and ``blocked_on``."""
     with op.batch_alter_table(_TABLE) as batch_op:
-        if op.get_bind().dialect.name in _SQLITE_FAMILY:
+        if is_sqlite_family(op.get_bind().dialect.name):
             # The rebuilt table would otherwise keep CHECKs on the dropped columns.
             batch_op.drop_constraint(_BLOCKED_ON_CHECK, type_="check")
             batch_op.drop_constraint(_REPORTED_AT_CHECK, type_="check")

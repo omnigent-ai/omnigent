@@ -59,6 +59,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
+from omnigent.db.utils import is_sqlite_family
+
 # A bare 32-char lowercase-hex uuid — the form every id reduces to after
 # stripping dashes and any prefix. A value matching this is decoded directly;
 # anything else is a non-uuid and falls back to md5 (see the module docstring).
@@ -98,7 +100,6 @@ _BINARY_ID_COLUMNS: dict[str, list[str]] = {
 }
 
 _FTS_TABLE = "conversation_items_fts"
-_FTS_DIALECTS = frozenset({"sqlite", "cloudflare_d1"})
 
 
 def _id_to_bytes(value: object) -> bytes:
@@ -165,7 +166,7 @@ def upgrade() -> None:
 
     _rewrite_embedded_session_id()
 
-    if dialect in _FTS_DIALECTS and _fts_present(bind):
+    if is_sqlite_family(dialect) and _fts_present(bind):
         op.execute(
             sa.text(
                 f"UPDATE {_FTS_TABLE} SET "

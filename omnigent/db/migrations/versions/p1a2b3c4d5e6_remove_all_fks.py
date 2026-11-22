@@ -24,6 +24,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
+from omnigent.db.utils import is_sqlite_family
+
 revision: str = "p1a2b3c4d5e6"
 down_revision: str | None = "o1a2b3c4d5e6"
 branch_labels: str | Sequence[str] | None = None
@@ -37,7 +39,7 @@ _NAMING_CONVENTION = {
 
 
 def _is_sqlite() -> bool:
-    return op.get_bind().dialect.name == "sqlite"
+    return is_sqlite_family(op.get_bind().dialect.name)
 
 
 def _drop_all_fks_on_table(table_name: str, sqlite: bool) -> None:

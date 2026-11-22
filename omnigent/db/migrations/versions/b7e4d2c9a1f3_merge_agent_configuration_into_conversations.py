@@ -60,6 +60,8 @@ _OVERRIDE_KEYS = (
     "harness_override",
 )
 _BACKFILL_BATCH = 1000
+# Decodes D1's base64 binary text; drivers returning native bytes are unaffected.
+_ID_TYPES = {"conversation_id": sa.LargeBinary(), "agent_id": sa.LargeBinary()}
 
 
 def _as_uuid_bytes(value: object) -> bytes | None:
@@ -111,7 +113,7 @@ def _backfill_binding_and_overrides() -> None:
                     " model_override, cost_control_mode_override, harness_override"
                     " FROM agent_configuration"
                     " ORDER BY workspace_id, conversation_id LIMIT :lim"
-                ),
+                ).columns(**_ID_TYPES),
                 {"lim": _BACKFILL_BATCH},
             ).fetchall()
         else:
@@ -123,7 +125,7 @@ def _backfill_binding_and_overrides() -> None:
                     " WHERE workspace_id > :ws"
                     "    OR (workspace_id = :ws AND conversation_id > :id)"
                     " ORDER BY workspace_id, conversation_id LIMIT :lim"
-                ),
+                ).columns(**_ID_TYPES),
                 {"ws": last_ws, "id": last_id, "lim": _BACKFILL_BATCH},
             ).fetchall()
         if not rows:

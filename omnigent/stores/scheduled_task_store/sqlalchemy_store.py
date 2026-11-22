@@ -45,6 +45,7 @@ from omnigent.db.keyset import keyset_after
 from omnigent.db.preference_rows import upsert_preference_row
 from omnigent.db.utils import (
     get_or_create_engine,
+    is_cloudflare_d1,
     make_named_managed_session_maker,
     now_epoch,
     run_write_transaction,
@@ -1422,7 +1423,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
     def check_dispatch_support(self) -> None:
         """D1's REST driver auto-commits each statement and cannot roll back a claim."""
-        if self._engine.dialect.name == "cloudflare_d1":
+        if is_cloudflare_d1(self._engine.dialect.name):
             raise NotImplementedError(
                 "The persistent scheduler cannot use Cloudflare D1: its REST driver does not "
                 "support the multi-statement transactions needed to create a run and advance "

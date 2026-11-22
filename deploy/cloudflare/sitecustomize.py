@@ -18,7 +18,7 @@ the dialect package (just change its base class); until it ships, sitecustomize
 re-registers a corrected dialect here. Python imports ``sitecustomize`` at
 interpreter startup, so it runs before Omnigent builds an engine.
 
-Two small adaptations remain, both expressing facts about D1 rather than SQLite
+A few small adaptations remain, all expressing facts about D1 rather than SQLite
 shortcomings:
 
   * **Alembic.** Its DDL-impl registry (``alembic.ddl.impl._impls``) is keyed by
@@ -29,16 +29,27 @@ shortcomings:
     ``temp`` schema (``SQLITE_AUTH``). SQLite's reflection probes ``temp``
     (``PRAGMA temp.*``, ``sqlite_temp_master``, ``PRAGMA database_list``); the
     three touchpoints are overridden to read only ``main``.
+  * **Binary values travel as base64 TEXT.** That is how the dialect's binary
+    type writes them, so untyped ``bytes`` parameters are encoded the same way,
+    and Alembic batch type changes skip SQLite's ``CAST(... AS BLOB)``.
 """
 
+import base64
 import sys
 
 # ── Alembic: register a DDL impl for the cloudflare_d1 name ──────────────
 try:
     from alembic.ddl.sqlite import SQLiteImpl
+    from sqlalchemy.sql.sqltypes import _Binary
 
     class CloudflareD1Impl(SQLiteImpl):  # auto-registers via __dialect__
         __dialect__ = "cloudflare_d1"
+
+        def cast_for_batch_migrate(self, existing, existing_transfer, new_type):
+            # D1 keeps binary values as the base64 TEXT its transport sends; a BLOB
+            # cast of that text would never equal a bound binary value again.
+            if not issubclass(new_type._type_affinity, _Binary):
+                super().cast_for_batch_migrate(existing, existing_transfer, new_type)
 except Exception as exc:  # noqa: BLE001 -- defensive: never block server startup
     print(f"[d1-shim] could not register Alembic impl: {exc}", file=sys.stderr)
 
@@ -76,6 +87,25 @@ try:
             return _UpstreamD1.import_dbapi()
 
         create_connect_args = _UpstreamD1.create_connect_args
+
+        # JSON cannot carry raw bytes; send untyped binary parameters base64-encoded
+        # like the dialect's binary type does.
+        @staticmethod
+        def _encode_binary_parameters(parameters):
+            return [
+                base64.b64encode(value).decode("ascii")
+                if isinstance(value, (bytes, bytearray, memoryview))
+                else value
+                for value in parameters
+            ]
+
+        def do_execute(self, cursor, statement, parameters, context=None):
+            parameters = self._encode_binary_parameters(parameters or ())
+            super().do_execute(cursor, statement, parameters, context)
+
+        def do_executemany(self, cursor, statement, parameters, context=None):
+            parameters = [self._encode_binary_parameters(row) for row in parameters]
+            super().do_executemany(cursor, statement, parameters, context)
 
         # D1 has no isolation levels — keep these no-ops so SQLite's
         # PRAGMA read_uncommitted machinery never runs over the REST API.

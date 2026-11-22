@@ -21,6 +21,8 @@ import zstandard
 from alembic import op
 from sqlalchemy.dialects.mysql import VARBINARY
 
+from omnigent.db.utils import is_sqlite_family
+
 revision: str = "f7c2d8a4b901"
 down_revision: str | None = "e9b6a17c20d4"
 branch_labels: tuple[str, ...] | None = None
@@ -147,7 +149,7 @@ def _convert_description(*, to_binary: bool) -> None:
     with op.batch_alter_table("workflows") as batch:
         batch.alter_column(temporary, existing_type=target_type, nullable=False)
     _publish_cockroach_schema(connection)
-    sqlite = connection.dialect.name in ("sqlite", "cloudflare_d1")
+    sqlite = is_sqlite_family(connection.dialect.name)
     with op.batch_alter_table(
         "workflows",
         recreate="always" if sqlite else "auto",

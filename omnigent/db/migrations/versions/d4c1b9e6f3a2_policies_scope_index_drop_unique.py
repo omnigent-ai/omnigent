@@ -38,6 +38,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
+from omnigent.db.utils import is_sqlite_family
+
 revision: str = "d4c1b9e6f3a2"
 down_revision: str | None = "a7f3c1b9e2d4"
 branch_labels: str | Sequence[str] | None = None
@@ -45,7 +47,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def _is_sqlite() -> bool:
-    return op.get_bind().dialect.name == "sqlite"
+    return is_sqlite_family(op.get_bind().dialect.name)
 
 
 def upgrade() -> None:

@@ -17,6 +17,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.mysql import MEDIUMBLOB
 
+from omnigent.db.utils import is_sqlite_family
+
 revision: str = "kk1a2b3c4d5e"
 down_revision: str | None = "jj1a2b3c4d5e"
 branch_labels: str | Sequence[str] | None = None
@@ -31,7 +33,7 @@ def upgrade() -> None:
     # SQLite may still contain legacy TEXT; count UTF-8 bytes, not characters.
     size = (
         sa.func.length(sa.cast(value, sa.LargeBinary()))
-        if dialect == "sqlite"
+        if is_sqlite_family(dialect)
         else sa.func.octet_length(value)
     )
     # This table has only stored project ordering, so values above the BLOB limit

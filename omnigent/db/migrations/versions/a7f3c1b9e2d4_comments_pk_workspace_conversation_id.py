@@ -41,6 +41,8 @@ from collections.abc import Iterator, Sequence
 import sqlalchemy as sa
 from alembic import op
 
+from omnigent.db.utils import is_sqlite_family
+
 revision: str = "a7f3c1b9e2d4"
 down_revision: str | None = "c3e8f1a9d2b7"
 branch_labels: str | Sequence[str] | None = None
@@ -79,7 +81,7 @@ def _quiet_pk_override() -> Iterator[None]:
 def _rebuild_pk(new_pk: list[str]) -> None:
     """Drop the current ``comments`` PK and install ``new_pk``."""
     dialect = op.get_bind().dialect.name
-    sqlite = dialect == "sqlite"
+    sqlite = is_sqlite_family(dialect)
 
     if sqlite:
         op.execute(sa.text("PRAGMA foreign_keys = OFF"))

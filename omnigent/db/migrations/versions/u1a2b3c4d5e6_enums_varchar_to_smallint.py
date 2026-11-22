@@ -35,6 +35,8 @@ from typing import Literal
 import sqlalchemy as sa
 from alembic import op
 
+from omnigent.db.utils import is_sqlite_family
+
 revision: str = "u1a2b3c4d5e6"
 down_revision: str | None = "t1a2b3c4d5e6"
 branch_labels: tuple[str, ...] | None = None
@@ -42,7 +44,7 @@ depends_on: tuple[str, ...] | None = None
 
 
 def _is_sqlite() -> bool:
-    return op.get_bind().dialect.name == "sqlite"
+    return is_sqlite_family(op.get_bind().dialect.name)
 
 
 # Name → int code, mirroring omnigent.db.enum_codecs. Duplicated here on

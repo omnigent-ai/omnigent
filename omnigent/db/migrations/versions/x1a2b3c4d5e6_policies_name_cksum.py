@@ -37,6 +37,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 
+from omnigent.db.utils import is_sqlite_family
+
 revision: str = "x1a2b3c4d5e6"
 down_revision: str | None = "w1a2b3c4d5e6"
 branch_labels: str | Sequence[str] | None = None
@@ -47,7 +49,7 @@ _CKSUM32 = sa.LargeBinary(length=32).with_variant(MySQLBinary(32), "mysql")
 
 
 def _is_sqlite() -> bool:
-    return op.get_bind().dialect.name == "sqlite"
+    return is_sqlite_family(op.get_bind().dialect.name)
 
 
 def _name_cksum(name: str) -> bytes:
