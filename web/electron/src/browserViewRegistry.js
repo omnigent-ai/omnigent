@@ -166,6 +166,8 @@ function createBrowserViewRegistry({
   let recentSessionSwitchSupported = false;
   // The app chords the renderer handles itself; none until a renderer that handles them asks.
   let forwardedChords = [];
+  // The list a started host navigation set aside, until a new document commits or the old one stays.
+  let heldForwardedChords = null;
   // Set by an SPA that opens `browser-open-tab` requests as new tabs; an older
   // SPA would drop them, so modifier-clicks navigate in place until declared.
   let openTabSupported = false;
@@ -407,7 +409,22 @@ function createBrowserViewRegistry({
 
   function setForwardedChords(chords) {
     forwardedChords = normalizeForwardedChords(chords);
+    heldForwardedChords = null;
     return { ok: true, count: forwardedChords.length };
+  }
+
+  // A navigation may replace the renderer with a bundle that never asks, so pages keep their
+  // keys until it ends; the first held list survives a navigation that supersedes another.
+  function holdForwardedChords() {
+    if (heldForwardedChords === null) heldForwardedChords = forwardedChords;
+    forwardedChords = [];
+  }
+
+  // The navigation ended: `restore` when the old renderer stayed, so its keys work again.
+  function releaseForwardedChords(restore) {
+    if (heldForwardedChords === null) return;
+    if (restore) forwardedChords = heldForwardedChords;
+    heldForwardedChords = null;
   }
 
   // Hand the renderer's app chords to it, focused, so ⌘K acts as if the page weren't there.
@@ -833,6 +850,8 @@ function createBrowserViewRegistry({
     cancelRecentSessionSwitch,
     setRecentSessionSwitchSupported,
     setForwardedChords,
+    holdForwardedChords,
+    releaseForwardedChords,
     setOpenTabSupported,
     close,
     closeAll,

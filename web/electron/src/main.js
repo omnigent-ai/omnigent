@@ -4819,10 +4819,17 @@ function createBrowserRegistryForWindow(win) {
   win.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
     if (isMainFrame && !isInPlace) {
       registry.setRecentSessionSwitchSupported(false);
-      registry.setForwardedChords([]);
+      registry.holdForwardedChords();
       registry.setOpenTabSupported(false);
     }
   });
+  // A new document, or an error page, asks for its own keys. A navigation that stopped
+  // without one, such as a cancelled reload, left the old renderer, which keeps them.
+  win.webContents.on("did-navigate", () => registry.releaseForwardedChords(false));
+  win.webContents.on("did-fail-load", (_event, errorCode, _description, _url, isMainFrame) => {
+    if (isMainFrame && errorCode !== ERR_ABORTED) registry.releaseForwardedChords(false);
+  });
+  win.webContents.on("did-stop-loading", () => registry.releaseForwardedChords(true));
   // A crashed renderer can't take the keys it asked for.
   win.webContents.on("render-process-gone", () => registry.setForwardedChords([]));
   return registry;

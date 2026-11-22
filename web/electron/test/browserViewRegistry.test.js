@@ -271,6 +271,37 @@ describe("browserViewRegistry — app chords a page hands to the shell", () => {
     assert.equal(press(listeners, { key: "k", code: "KeyK", meta: true }), false);
     assert.equal(forwarded().length, 1);
   });
+
+  it("holds the list through a navigation, restoring it only when the old renderer stays", () => {
+    const { registry, listeners } = makeRecentSessionInputRegistry({
+      supportsRecentSessionSwitch: false,
+      focusHost: () => {},
+    });
+    const commandK = () => press(listeners, { key: "k", code: "KeyK", meta: true });
+    registry.setForwardedChords([COMMAND_K]);
+
+    // A navigation superseded by another still restores the first list.
+    registry.holdForwardedChords();
+    registry.holdForwardedChords();
+    assert.equal(commandK(), false);
+    registry.releaseForwardedChords(true);
+    assert.equal(commandK(), true);
+    registry.releaseForwardedChords(true);
+    assert.equal(commandK(), true);
+
+    // A new document drops the held list, and a later stop doesn't bring it back.
+    registry.holdForwardedChords();
+    registry.releaseForwardedChords(false);
+    registry.releaseForwardedChords(true);
+    assert.equal(commandK(), false);
+
+    // A list the new renderer sends replaces the held one.
+    registry.setForwardedChords([COMMAND_K]);
+    registry.holdForwardedChords();
+    registry.setForwardedChords([]);
+    registry.releaseForwardedChords(true);
+    assert.equal(commandK(), false);
+  });
 });
 
 describe("browserViewRegistry — recent-session input forwarding", () => {

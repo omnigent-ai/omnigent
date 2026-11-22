@@ -274,12 +274,7 @@ function loadNavigationHarness({
   const bannerCalls = { show: [], hide: 0 };
   // The reconnect overlay's behavior is unit-tested in reconnect_overlay.test.js.
   const overlay = { hint: null, shows: [], hides: 0, raises: 0, cancel: null };
-  const browserRegistryCalls = {
-    setActive: [],
-    closeAll: [],
-    setOpenTabSupported: [],
-    setForwardedChords: [],
-  };
+  const browserRegistryCalls = { setActive: [], closeAll: [], setOpenTabSupported: [] };
   let browserRegistryDeps;
   let browserIpcDeps;
   const permissionPromptCalls = { show: [], dismiss: [] };
@@ -696,7 +691,9 @@ function loadNavigationHarness({
               setRecentSessionSwitchSupported: () => {},
               setOpenTabSupported: (supported) =>
                 browserRegistryCalls.setOpenTabSupported.push(supported),
-              setForwardedChords: (chords) => browserRegistryCalls.setForwardedChords.push(chords),
+              setForwardedChords: () => {},
+              holdForwardedChords: () => {},
+              releaseForwardedChords: () => {},
               activeConversationId: () => null,
             };
           },
@@ -3605,32 +3602,40 @@ describe("browser view detach on main-frame navigation (src/main.js)", () => {
     harness.cleanup();
   });
 
-  it("hands page keys back when the shell starts a new document or its renderer goes away", () => {
-    const harness = loadNavigationHarness({ registerFallbacks: false });
-    harness.api.createWindow("https://host.example/ml/omnigents");
-
-    harness.emit("did-start-navigation", "https://host.example/ml/omnigents#c/1", true, true);
-    harness.emit("did-start-navigation", "https://frame.example/", false, false);
-    assert.deepEqual(harness.browserRegistryCalls.setForwardedChords, []);
-
-    // main runs in its own context, so compare each cleared list's length.
-    const cleared = () =>
-      harness.browserRegistryCalls.setForwardedChords.map((list) => list.length);
-    harness.emit("did-start-navigation", "https://host.example/ml/omnigents", false, true);
-    assert.deepEqual(cleared(), [0]);
-    harness.emit("render-process-gone", {}, { reason: "crashed" });
-    assert.deepEqual(cleared(), [0, 0]);
-    harness.cleanup();
-  });
-
-  for (const [replacement, replace] of [
+  const HOST_URL = "https://host.example/ml/omnigents";
+  const reload = (h) => h.emit("did-start-navigation", HOST_URL, false, true);
+  for (const [scenario, navigate, pageKeepsKeys] of [
+    ["a reload into a bundle that never asks", (h) => (reload(h), h.emit("did-navigate")), true],
     [
-      "a reload into a bundle that never asks",
-      (h) => h.emit("did-start-navigation", "https://host.example/ml/omnigents", false, true),
+      "an error page replacing the shell",
+      (h) => (reload(h), h.emit("did-fail-load", -105, "", HOST_URL, true)),
+      true,
     ],
-    ["a crashed renderer", (h) => h.emit("render-process-gone", {}, { reason: "crashed" })],
+    ["a crashed renderer", (h) => h.emit("render-process-gone", {}, { reason: "crashed" }), true],
+    [
+      "a cancelled reload",
+      (h) => (
+        reload(h),
+        h.emit("did-fail-load", -3, "", HOST_URL, true),
+        h.emit("did-stop-loading")
+      ),
+      false,
+    ],
+    [
+      "a reload that stopped without a new document",
+      (h) => (reload(h), h.emit("did-stop-loading")),
+      false,
+    ],
+    [
+      "an in-page or subframe navigation",
+      (h) => (
+        h.emit("did-start-navigation", `${HOST_URL}#c/1`, true, true),
+        h.emit("did-start-navigation", "https://frame.example/", false, false)
+      ),
+      false,
+    ],
   ]) {
-    it(`leaves a page its keys after ${replacement}`, () => {
+    it(`${pageKeepsKeys ? "leaves a page its keys" : "keeps forwarding keys"} after ${scenario}`, () => {
       const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
       try {
         Object.assign(h.webContents, { focus() {} });
@@ -3668,8 +3673,13 @@ describe("browser view detach on main-frame navigation (src/main.js)", () => {
           { key: "k", metaKey: true, ctrlKey: false, altKey: false, shiftKey: false },
         ]);
         assert.deepEqual(pressCommandK(), { prevented: true, forwarded: 1 });
-        replace(h);
-        assert.deepEqual(pressCommandK(), { prevented: false, forwarded: 0 });
+        navigate(h);
+        // A finished load that follows never hands back keys a new document didn't ask for.
+        h.emit("did-stop-loading");
+        assert.deepEqual(
+          pressCommandK(),
+          pageKeepsKeys ? { prevented: false, forwarded: 0 } : { prevented: true, forwarded: 1 },
+        );
       } finally {
         h.cleanup();
       }
