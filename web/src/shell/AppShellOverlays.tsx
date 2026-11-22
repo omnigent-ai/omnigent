@@ -122,10 +122,11 @@ export function AppShellOverlays({
           <QuickPickShortcutHost />
         </Suspense>
       )}
+      {/* With quick_pick_palette on, Ctrl+Tab steps through the sidebar instead. */}
       <RecentSessionsSwitcher
         conversations={allConversations}
         activeSessionId={serverConversationId ?? null}
-        enabled={isElectronShell()}
+        enabled={isElectronShell() && !quickPick}
       />
       {/* Transient toasts (e.g. "session archived"). Mounted once here so
           any surface can fire one via showToast(). */}

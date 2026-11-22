@@ -280,6 +280,7 @@ const PAGE_CONTEXT: ShortcutPageContext = {
   splitTerminal: true,
   siblingSessions: true,
   desktopCommands: true,
+  quickPick: false,
 };
 
 const SHOWN: SettingsAvailability = {

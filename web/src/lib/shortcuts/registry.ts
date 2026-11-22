@@ -92,6 +92,16 @@ interface ShortcutBindingDefinition {
   flag?: "quick_pick_palette";
 }
 
+/** A session step's Ctrl+Tab chord and its Ctrl+Alt+Shift arrow, the one a browser tab reaches. */
+function sessionStepChords(
+  environment: ShortcutEnvironment,
+  tab: Chord,
+  arrow: "ArrowDown" | "ArrowUp",
+): Chord[] {
+  const arrowChord: Chord = { ctrl: true, alt: true, shift: true, key: arrow, exactKey: true };
+  return environment.native ? [tab, arrowChord] : [arrowChord, tab];
+}
+
 /** Sidebar slots in order: ⌘1–⌘9 pick the first nine and ⌘0 the tenth, as browser tabs do. */
 export const SESSION_NUMBER_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"] as const;
 
@@ -175,6 +185,7 @@ const APP_BINDINGS = {
     label: "Go forward",
     chords: () => [{ mod: true, code: "BracketRight", matchesAltGraph: true }],
   },
+  // With quick_pick_palette on, Ctrl+Tab is Next session instead.
   "sessions.recent": {
     group: "navigation",
     paletteExempt: "Switches while Control is held.",
@@ -314,19 +325,26 @@ const APP_BINDINGS = {
     label: "Split terminal down",
     chords: () => [{ mod: true, alt: true, code: "Minus" }],
   },
-  // With quick_pick_palette on, each runs its ⌘K command; Ctrl+Tab stays the recent switcher.
+  // With quick_pick_palette on, each runs its ⌘K command, and Ctrl+Tab steps instead of
+  // opening the recent switcher. A browser keeps Ctrl+Tab, so the desktop app lists it first.
   "session.next": {
     group: "navigation",
     paletteCommand: "next-session",
     label: "Next session",
-    chords: () => [{ ctrl: true, alt: true, shift: true, key: "ArrowDown", exactKey: true }],
+    chords: (environment) =>
+      sessionStepChords(environment, { ctrl: true, key: "Tab", exactKey: true }, "ArrowDown"),
     flag: "quick_pick_palette",
   },
   "session.previous": {
     group: "navigation",
     paletteCommand: "previous-session",
     label: "Previous session",
-    chords: () => [{ ctrl: true, alt: true, shift: true, key: "ArrowUp", exactKey: true }],
+    chords: (environment) =>
+      sessionStepChords(
+        environment,
+        { ctrl: true, shift: true, key: "Tab", exactKey: true },
+        "ArrowUp",
+      ),
     flag: "quick_pick_palette",
   },
   // The transcript has always handled these chords itself; listed here for their ⌘K rows.

@@ -1,4 +1,4 @@
-// Golden Keyboard shortcuts rows for macOS and other platforms across all 1,024 runtime contexts,
+// Golden Keyboard shortcuts rows for macOS and other platforms across all 2,048 runtime contexts,
 // pinning the page's output independently of the registry that builds it.
 
 /** A recorded row: keys as space-separated caps on macOS, then on other platforms. */
@@ -30,7 +30,7 @@ function row(
 export const GOLDEN_GROUP_FLAGS = {
   General: ["native", "siblingSessions", "desktopCommands"],
   "In chats": ["submitWithModEnter", "preventsKeyboardSubmit"],
-  Navigation: ["electron", "native"],
+  Navigation: ["electron", "native", "quickPick"],
   View: ["native", "browser", "contentSearch", "desktopCommands", "preventsKeyboardSubmit"],
   Panes: ["grids", "splitTerminal"],
   "Slash commands": [],
@@ -102,6 +102,10 @@ export const GOLDEN_ROWS: readonly GoldenRow[] = [
   /* 61 */ row("Focus the browser address bar", "⌘ L", "Ctrl L"),
   /* 62 */ row("Mark current session unread or read", "⌘ ⌥ U", "Ctrl Alt U"),
   /* 63 */ row("Exit full screen from a file", "Esc", "Esc"),
+  /* 64 */ row("Next session", "⌃ Tab", "Ctrl Tab"),
+  /* 65 */ row("Previous session", "⌃ ⇧ Tab", "Ctrl ⇧ Tab"),
+  /* 66 */ row("Next session", "⌃ ⌥ ⇧ ↓", "Ctrl Alt ⇧ ↓"),
+  /* 67 */ row("Previous session", "⌃ ⌥ ⇧ ↑", "Ctrl Alt ⇧ ↑"),
 ];
 
 /**
@@ -149,6 +153,10 @@ export const GOLDEN_GROUPS: Record<string, GoldenGroup | null> = {
   "Navigation: native": { title: "Navigation", rows: [33] },
   "Navigation: electron": { title: "Navigation", rows: [36, 37, 38, 23] },
   "Navigation: electron+native": { title: "Navigation", rows: [36, 37, 38, 33] },
+  "Navigation: quickPick": { title: "Navigation", rows: [23] },
+  "Navigation: native+quickPick": { title: "Navigation", rows: [33] },
+  "Navigation: electron+quickPick": { title: "Navigation", rows: [66, 67, 37, 38, 23] },
+  "Navigation: electron+native+quickPick": { title: "Navigation", rows: [64, 65, 37, 38, 33] },
   "View: -": { title: "View", rows: [24, 25, 26, 27, 28, 63] },
   "View: native": { title: "View", rows: [24, 34, 35, 27, 28, 63] },
   "View: browser": { title: "View", rows: [24, 25, 26, 27, 28, 63] },

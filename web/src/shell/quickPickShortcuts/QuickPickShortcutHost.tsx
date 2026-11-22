@@ -5,6 +5,11 @@ import { useEffect, useRef } from "react";
 
 import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
+import {
+  cancelBrowserRecentSessionSwitch,
+  onBrowserRecentSessionInput,
+  setBrowserRecentSessionSwitchSupported,
+} from "@/lib/nativeBridge";
 import { matchesShortcut, type ShortcutId } from "@/lib/shortcuts/registry";
 import {
   isCommandAvailable,
@@ -48,6 +53,10 @@ function registeredCommand(id: string): PaletteCommand | undefined {
 // Surfaces that own their keystrokes, as for the current session's other chords.
 const KEY_OWNING_SURFACES =
   '.xterm, .monaco-editor, [role="dialog"], [role="alertdialog"], [role="menu"]';
+// Ctrl+Tab passes over terminals and editors, but a dialog or menu keeps it.
+const DIALOG_SURFACES = '[role="dialog"], [role="alertdialog"], [role="menu"]';
+
+const SESSION_STEP_IDS = ["session.next", "session.previous"] as const;
 
 /** Mount once with quick_pick_palette on, beside the palette. */
 export function QuickPickShortcutHost() {
@@ -72,23 +81,43 @@ export function QuickPickShortcutHost() {
         .find((command) => command !== undefined);
     };
     const handler = (event: globalThis.KeyboardEvent): void => {
-      if (event.defaultPrevented || event.repeat || event.isComposing) return;
+      if (event.defaultPrevented || event.isComposing) return;
       const shortcut = HOSTED_SHORTCUT_IDS.find((id) => matchesShortcut(event, id));
       if (!shortcut) return;
       const embedRoot = getEmbedRoot();
       if (isEmbedded && (!embedRoot || !event.composedPath().includes(embedRoot))) return;
+      // Ctrl+Tab steps from a terminal or editor too, as the recent switcher it replaces did.
+      const tabStep = event.key === "Tab";
       const focused = document.activeElement;
-      if (focused instanceof Element && focused.closest(KEY_OWNING_SURFACES)) return;
+      const owningSurfaces = tabStep ? DIALOG_SURFACES : KEY_OWNING_SURFACES;
+      if (focused instanceof Element && focused.closest(owningSurfaces)) return;
       const command = commandFor(shortcut);
       if (!command || !isCommandAvailable(command.availability)) return;
+      // A held Ctrl+Tab steps once; its repeats are consumed so a terminal never sees Tabs.
+      if (event.repeat && !tabStep) return;
       event.preventDefault();
       event.stopPropagation();
-      command.run();
+      if (!event.repeat) command.run();
     };
+    // An embedded Browser page is its own WebContents, so the shell forwards its Ctrl+Tab.
+    const unsubscribeBrowserInput = onBrowserRecentSessionInput((input) => {
+      if (input.type !== "keydown" || input.key !== "Tab") return;
+      const shortcut = SESSION_STEP_IDS.find((id) => matchesShortcut(input, id));
+      if (!shortcut) return;
+      // Older shells latch for a release-to-switch; clear it so the page keeps its Escape.
+      void cancelBrowserRecentSessionSwitch();
+      const command = commandFor(shortcut);
+      if (!input.repeat && command && isCommandAvailable(command.availability)) command.run();
+    });
+    void setBrowserRecentSessionSwitchSupported(true);
     // Capture, so a chord that another page listener also reads, such as the transcript's
     // message steps with Shift held, is this host's alone.
     window.addEventListener("keydown", handler, true);
-    return () => window.removeEventListener("keydown", handler, true);
+    return () => {
+      window.removeEventListener("keydown", handler, true);
+      unsubscribeBrowserInput();
+      void setBrowserRecentSessionSwitchSupported(false);
+    };
   }, [isEmbedded]);
   return null;
 }

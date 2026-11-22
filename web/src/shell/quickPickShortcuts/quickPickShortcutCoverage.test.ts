@@ -21,6 +21,13 @@ const HANDLED_ELSEWHERE: Record<string, string> = {
   "message.next": "The transcript's own ⌘⌥↓ listener; the binding gives its ⌘K row the keys.",
 };
 
+/** Flagged bindings that take over another's chord, whose own handler stands down with the flag on. */
+const TAKES_OVER: Record<string, readonly string[]> = {
+  // AppShellOverlays turns the recent switcher off with quick_pick_palette on.
+  "session.next": ["sessions.recent"],
+  "session.previous": ["sessions.recent"],
+};
+
 const ENVIRONMENTS: ShortcutEnvironment[] = [true, false].flatMap((mac) =>
   [true, false].flatMap((native) =>
     [true, false].map((desktopMenu) => ({ mac, native, desktopMenu })),
@@ -72,8 +79,9 @@ describe("shortcuts that wait for quick_pick_palette", () => {
               .chords(environment)
               .some((otherChord) => chordMatches(otherChord, press, environment.mac)),
           );
+          const replaced = TAKES_OVER[binding.id] ?? [];
           expect(
-            taken.map((other) => other.id),
+            taken.map((other) => other.id).filter((id) => !replaced.includes(id)),
             `${binding.id} ${JSON.stringify(environment)}`,
           ).toEqual([]);
         }
