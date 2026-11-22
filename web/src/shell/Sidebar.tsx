@@ -2088,7 +2088,9 @@ function ProjectFolder({
         onProjectAssigned={onProjectAssigned}
         reorderGroup={reorderable ? `project:${name}` : undefined}
         emptyMessage={
-          loadingFirstPage ? undefined : archived ? (
+          // Filtered, a later page may still hold a match.
+          loadingFirstPage ||
+          (pullRequestFilter !== "all" && query.hasNextPage) ? undefined : archived ? (
             "No archived sessions"
           ) : placeholder ? (
             "No sessions"
@@ -3451,6 +3453,8 @@ function ConversationList({
     ...(sharedListOnly ? [] : (sessionGroups?.map((g) => g.title) ?? ["Chats"])),
   ];
   const emptyMessage = searchQuery ? "No matching conversations" : "No sessions";
+  // Filtered by pull request, a later page may still hold a match: no list says it has none.
+  const morePagesMayMatch = pullRequestFilter.value !== "all" && !!conversationsQuery.hasNextPage;
 
   // List header controls and row props, shared by the Shared, single "Sessions"
   // and grouped sections; the controls sit on the first of the viewer's lists.
@@ -3902,7 +3906,9 @@ function ConversationList({
                       title="Shared with me"
                       conversations={sections.shared}
                       emptyMessage={
-                        sharedListOnly && !sessionStatus ? SIDEBAR_FILTER_EMPTY.shared : undefined
+                        sharedListOnly && !sessionStatus && !morePagesMayMatch
+                          ? SIDEBAR_FILTER_EMPTY.shared
+                          : undefined
                       }
                       footer={sharedListOnly ? sessionStatus : undefined}
                       collapsed={effectiveCollapsedSections.includes("Shared")}
@@ -3943,7 +3949,7 @@ function ConversationList({
                               }
                               conversations={group.conversations}
                               emptyMessage={
-                                group.title === "Working" && !sessionStatus
+                                group.title === "Working" && !sessionStatus && !morePagesMayMatch
                                   ? emptyMessage
                                   : undefined
                               }
@@ -3966,8 +3972,7 @@ function ConversationList({
                           title="Sessions"
                           conversations={sections.sessions}
                           emptyMessage={
-                            sessionStatus ||
-                            (pullRequestFilter.value !== "all" && conversationsQuery.hasNextPage)
+                            sessionStatus || morePagesMayMatch
                               ? undefined
                               : SIDEBAR_FILTER_EMPTY[activeTab]
                           }

@@ -5614,6 +5614,51 @@ describe("Sidebar pull request filter", () => {
     expect(screen.getByText("No sessions")).toBeInTheDocument();
   });
 
+  it.each([
+    ["Shared with me", "shared", undefined],
+    ["Working", "mine", "status"],
+  ])("holds %s's No sessions while more pages may hold a match", (_, sessionFilter, grouping) => {
+    localStorage.setItem("omnigent:session-filter", sessionFilter);
+    if (grouping) localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping }));
+    localStorage.setItem("omnigent:session-pull-request-filter", "draft");
+    const shared = { owner: "other@example.com" };
+    const sessions = () =>
+      rows().map((row) => (sessionFilter === "shared" ? { ...row, ...shared } : row));
+    mockConversations(sessions());
+    withMorePages();
+    const first = renderWith(true);
+    expect(screen.queryByText("No sessions")).toBeNull();
+    first.unmount();
+    mockConversations(sessions());
+    renderWith(true);
+    expect(screen.getByText("No sessions")).toBeInTheDocument();
+  });
+
+  it("holds an expanded folder's No sessions while its own pages may hold a match", () => {
+    localStorage.setItem("omnigent:session-pull-request-filter", "draft");
+    projectsMock.push("Customer X");
+    mockConversations([conv("conv_unfiled", "Codex", { pull_request: pullRequest("OPEN") })]);
+    const filed = { labels: { omni_project: "Customer X" }, pull_requests_synced: true };
+    projectSessionsMock.current["Customer X"] = [
+      conv("conv_far_merged", "Codex", { ...filed, pull_request: pullRequest("MERGED") }),
+    ];
+    projectSessionsNextPage.current["Customer X"] = vi.fn();
+    const first = renderWith(true);
+    const folder = () => screen.getByText("Customer X").closest("section")!;
+    const expand = () => {
+      const toggle = screen.getByRole("button", { name: /^Customer X/ });
+      if (toggle.getAttribute("aria-expanded") !== "true") fireEvent.click(toggle);
+    };
+    expand();
+    expect(within(folder()).getByText("Customer X")).toBeInTheDocument();
+    expect(within(folder()).queryByText(/No sessions/)).toBeNull();
+    first.unmount();
+    delete projectSessionsNextPage.current["Customer X"];
+    renderWith(true);
+    expand();
+    expect(within(folder()).getByText(/No sessions/)).toBeInTheDocument();
+  });
+
   it("still says No sessions beside more pages with the flag off", () => {
     mockConversations([]);
     withMorePages();
