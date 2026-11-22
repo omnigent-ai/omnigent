@@ -160,6 +160,9 @@ export function usePaletteSessionSearch({
   const searching = !sessionsOnly && debouncedQuery !== "" && !pullRequestLookup;
   // Loaded sessions match at once, without waiting for the debounce or the server.
   const matchingLoaded = matchLoaded && query.trim() !== "";
+  // Server matches answer the debounced query. Next to loaded matches, which follow every
+  // keystroke, they show only once it has caught up, and never for a cleared query.
+  const showingServerMatches = searching && (!matchLoaded || debouncedQuery === query);
   // Wait briefly for server info so a supporting server never gets the mixed
   // request; if it stalls, fall back to that request rather than never searching.
   const serverInfoLoading = serverInfo === "loading";
@@ -219,7 +222,7 @@ export function usePaletteSessionSearch({
     [data, titleSearch.data, contentSearch.data],
   );
   const sessions = useMemo(() => {
-    const serverMatches = searching
+    const serverMatches = showingServerMatches
       ? paletteSessions(titleSearch.data?.pages ?? [], {
           includeArchived: true,
           projects,
@@ -242,12 +245,10 @@ export function usePaletteSessionSearch({
         matches.map((match) => match.session),
         { projects, parentTitles },
       ).map((session) => ({ ...session, labelRanges: rangesById.get(session.id) }));
-      // The server's matches answer the debounced query; until it catches up they're stale.
-      if (debouncedQuery !== query) return local;
       const listed = new Set(local.map((session) => session.id));
       return [...local, ...serverMatches.filter((session) => !listed.has(session.id))];
     }
-    if (searching) return serverMatches;
+    if (showingServerMatches) return serverMatches;
     // Rows archived after they loaded are still cached here, so drop them.
     const out = paletteSessions(data?.pages ?? [], { newestFirst: true, projects, parentTitles });
     if (sessionsOnly) {
@@ -264,8 +265,7 @@ export function usePaletteSessionSearch({
     sidebarRows,
     titleSearch.data,
     query,
-    debouncedQuery,
-    searching,
+    showingServerMatches,
     matchingLoaded,
     sessionsOnly,
     projects,
@@ -275,7 +275,7 @@ export function usePaletteSessionSearch({
   // two groups' requests: list rows need unique ids.
   const contentSessions = useMemo(
     () =>
-      searching
+      showingServerMatches
         ? paletteSessions(contentSearch.data?.pages ?? [], {
             includeArchived: true,
             projects,
@@ -283,7 +283,7 @@ export function usePaletteSessionSearch({
             excludeIds: new Set(sessions.map((s) => s.id)),
           })
         : [],
-    [contentSearch.data, searching, sessions, projects, parentTitles],
+    [contentSearch.data, showingServerMatches, sessions, projects, parentTitles],
   );
   const visibleSessions = sessionsOnly ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT) : sessions;
   const searchGroups = [titleSearch, contentSearch];
@@ -325,6 +325,8 @@ export function usePaletteSessionSearch({
     setQuery,
     debouncedQuery,
     searching,
+    /** Whether the server's matches answer the query shown, so they and their paging list. */
+    showingServerMatches,
     sessions,
     visibleSessions,
     contentSessions,
