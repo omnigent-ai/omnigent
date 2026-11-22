@@ -24,6 +24,7 @@ import {
   sessionInSidebarFolder,
   sessionInSidebarFolderWithKey,
   sidebarFolderKey,
+  sidebarScopeFolders,
   sessionsListAcceptsDrop,
   sortConversations,
   startCustomOrder,
@@ -1130,6 +1131,27 @@ describe("automation runs shared with the viewer", () => {
     expect(inFolder(run, "name:Omnigent Automation")).toBe(true);
     expect(inFolder(run, "name:Omnigent Automation", false)).toBe(false);
     expect(sessionInAnySidebarFolder(run, folders, viewer, true)).toBe(true);
+  });
+
+  it("lists a scope's folders, with the automation folder only for an unpinned shared run", () => {
+    const projects = [{ id: "p_a", name: "Alpha" }];
+    const run = session({ [LAUNCH]: "st_1" });
+    const scope = (overrides: Partial<Parameters<typeof sidebarScopeFolders>[1]>) =>
+      sidebarScopeFolders(projects, {
+        scope: "archived",
+        candidates: [run],
+        pinnedIds: new Set(),
+        viewerId: "bob@example.com",
+        includeSharedRuns: true,
+        manualOrder: false,
+        ...overrides,
+      }).map((folder) => folder.name);
+    expect(scope({})).toEqual(["Alpha", "Omnigent Automation"]);
+    expect(scope({ scope: "mine" })).toEqual(["Alpha", "Omnigent Automation"]);
+    expect(scope({ scope: "shared" })).toEqual([]);
+    expect(scope({ candidates: [] })).toEqual(["Alpha"]);
+    expect(scope({ pinnedIds: new Set([run.id]) })).toEqual(["Alpha"]);
+    expect(scope({ includeSharedRuns: false })).toEqual(["Alpha"]);
   });
 
   it("places the default automation folder where a new project would go", () => {

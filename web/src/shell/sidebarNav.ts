@@ -273,6 +273,37 @@ export function sessionInAnySidebarFolder(
   );
 }
 
+/**
+ * The project folders the sidebar lists for a scope, before any project filter: the viewer's
+ * projects, plus the default automation folder when an unpinned shared run among `candidates`
+ * (the scope's rows: live ones, or archived ones on Archived) is there to file. None on Shared,
+ * where filing doesn't apply. The folder list and the project filter both read this set.
+ */
+export function sidebarScopeFolders<Project extends { id: string | null; name: string }>(
+  projects: Project[],
+  {
+    scope,
+    candidates,
+    pinnedIds,
+    viewerId,
+    includeSharedRuns,
+    manualOrder,
+  }: {
+    scope: "all" | "mine" | "shared" | "archived";
+    candidates: readonly Conversation[];
+    pinnedIds: ReadonlySet<string>;
+    viewerId: string | null;
+    includeSharedRuns: boolean;
+    manualOrder: boolean;
+  },
+): (Project | PlaceholderProjectFolder)[] {
+  if (scope === "shared") return [];
+  const sharedRunsToFile =
+    includeSharedRuns &&
+    candidates.some((c) => isSharedAutomationRun(c, viewerId) && !pinnedIds.has(c.id));
+  return withAutomationFolder(projects, sharedRunsToFile, manualOrder);
+}
+
 /** A folder the sidebar shows for shared automation runs before the viewer has that project. */
 export interface PlaceholderProjectFolder {
   id: null;

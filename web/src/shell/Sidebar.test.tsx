@@ -6463,6 +6463,58 @@ describe("sidebar_grouping_ui release flag", () => {
     expect(sharedScopeCalls.some((args) => (args[2] as { enabled?: boolean }).enabled)).toBe(false);
   });
 
+  it("offers as projects exactly the folders each scope shows", () => {
+    projectRowsRef.current = [
+      { id: "p_Alpha", name: "Alpha" },
+      { id: null, name: "Legacy" },
+    ];
+    mockScopedConversations([
+      conv("conv_own_alpha", "Codex", { project_id: "p_Alpha" }),
+      conv("conv_own_legacy_archived", "Codex", {
+        archived: true,
+        labels: { omni_project: "Legacy" },
+      }),
+      // Only an archived shared run, and no Omnigent Automation project of the viewer's own.
+      { ...SHARED_RUNS[0]!, archived: true },
+    ]);
+    renderSidebar(true, "/", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: {
+        ...FALLBACK_SERVER_INFO.features,
+        sidebar_grouping_ui: true,
+        sidebar_saved_views: true,
+      },
+    });
+    const foldersShown = () =>
+      screen
+        .queryAllByRole("button", { name: /^(Alpha|Legacy|Omnigent Automation)/ })
+        .map((button) => /^(Alpha|Legacy|Omnigent Automation)/.exec(button.textContent ?? "")![1]);
+    const projectChoices = () => {
+      fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+        button: 0,
+        ctrlKey: false,
+        pointerType: "mouse",
+      });
+      fireEvent.keyDown(screen.getByTestId("session-list-filter-menu"), { key: "ArrowRight" });
+      const choices = screen
+        .queryAllByTestId("session-project-filter")
+        .map((item) => item.textContent);
+      fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+      return choices;
+    };
+    const expected: Record<string, string[]> = {
+      mine: ["Alpha", "Legacy"],
+      shared: [],
+      archived: ["Alpha", "Legacy", "Omnigent Automation"],
+    };
+    for (const scope of ["mine", "shared", "archived"] as const) {
+      if (scope === "shared") showSharedTab();
+      else selectSessionFilter(scope);
+      expect([scope, foldersShown()]).toEqual([scope, expected[scope]]);
+      expect([scope, projectChoices()]).toEqual([scope, expected[scope]]);
+    }
+  });
+
   it("offers the automation folder shared runs show in before the viewer has that project", () => {
     projectsMock.push("Alpha");
     mockScopedConversations(SHARED_RUNS);

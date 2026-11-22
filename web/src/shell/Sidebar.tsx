@@ -350,7 +350,7 @@ import {
   sessionInSidebarFolderWithKey,
   sessionsListAcceptsDrop,
   sidebarFolderKey,
-  withAutomationFolder,
+  sidebarScopeFolders,
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { isRowFullyVisible } from "./sidebarRowVisibility";
@@ -2662,53 +2662,6 @@ function ConversationList({
   // Other users' automation runs join the default automation folder. My sessions
   // takes them from the shared rows already loaded, so none show when those aren't.
   const includeSharedRuns = activeTab !== "mine" || sharedActive;
-  // A session's status as the Status grouping gives it, starting and working sessions included.
-  // `unseenTick` and `draftIds` version the stores it reads.
-  const liveStatusOf = useCallback(
-    (c: Conversation): StatusBucket => {
-      const unseen = showsUnreadFor(c, isConversationUnseen(c.id, c.updated_at, c.status));
-      const bucket = statusBucket(c, unseen, hasSessionDraft(c.id));
-      return bucket !== "Needs attention" && (c.id === startingId || workingIds.has(c.id))
-        ? "Working"
-        : bucket;
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [startingId, workingIds, unseenTick, draftIds],
-  );
-  // The folders the project filter offers and reads: the ones the sidebar shows, label-only
-  // projects and the automation folder that shared runs show in before the viewer has it included.
-  const sharedRunsShown =
-    includeSharedRuns && loadedRows.some((c) => isSharedAutomationRun(c, viewerId));
-  const filterFolders = useMemo(
-    () =>
-      withAutomationFolder(projects, sharedRunsShown, projectOrder.data?.sort_mode === "manual"),
-    [projects, sharedRunsShown, projectOrder.data?.sort_mode],
-  );
-  const filterProjects = useMemo(
-    () => filterFolders.map((folder) => ({ id: sidebarFolderKey(folder), name: folder.name })),
-    [filterFolders],
-  );
-  const filterContext = useMemo<SessionListFilterContext>(
-    () => ({
-      statusOf: liveStatusOf,
-      harnessOf: sessionHarnessKey,
-      // Each folder's own membership, owner check included, so a filter shows what folders show.
-      inProject: (c, folderKey) =>
-        sessionInSidebarFolderWithKey(c, filterFolders, folderKey, viewerId, includeSharedRuns),
-      inAnyProject: (c) => sessionInAnySidebarFolder(c, filterFolders, viewerId, includeSharedRuns),
-    }),
-    [liveStatusOf, filterFolders, viewerId, includeSharedRuns],
-  );
-  const filterRows = useCallback(
-    (rows: Conversation[], openSessionId: string | null) =>
-      applySessionListFilter(rows, listFilter.value, filterContext, openSessionId),
-    [listFilter.value, filterContext],
-  );
-  const filterKey = listFilter.count > 0 ? JSON.stringify(listFilter.value) : "";
-  const harnessChoices = useMemo(
-    () => sessionHarnessChoices(allConversations, listFilter.value.harness, harnessLabels),
-    [allConversations, listFilter.value.harness, harnessLabels],
-  );
   const mineSharedRuns = useMemo(
     () =>
       activeTab === "mine" && includeSharedRuns
@@ -2722,6 +2675,71 @@ function ConversationList({
   // sessions render in their own group at the bottom (below "Shared with
   // me"); a pinned-then-archived session shows under Archived, not Pinned.
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
+  // The project folders this scope lists, from its rows before any filter. The folder list and
+  // the project filter's choices and membership all read this one set, so they can't diverge.
+  const scopeFolders = useMemo(() => {
+    const rows = dedupeConversationsById([...allConversations, ...pinnedConversations]);
+    const live = rows.filter((c) => c.archived !== true);
+    return sidebarScopeFolders(projects, {
+      scope: activeTab,
+      candidates:
+        activeTab === "archived"
+          ? rows.filter((c) => c.archived === true)
+          : dedupeConversationsById([...live, ...mineSharedRuns]),
+      pinnedIds: new Set(live.filter((c) => isSessionPinned(c, pinnedSet)).map((c) => c.id)),
+      viewerId,
+      includeSharedRuns,
+      manualOrder: projectOrder.data?.sort_mode === "manual",
+    });
+  }, [
+    allConversations,
+    pinnedConversations,
+    projects,
+    activeTab,
+    mineSharedRuns,
+    pinnedSet,
+    viewerId,
+    includeSharedRuns,
+    projectOrder.data?.sort_mode,
+  ]);
+  // A session's status as the Status grouping gives it, starting and working sessions included.
+  // `unseenTick` and `draftIds` version the stores it reads.
+  const liveStatusOf = useCallback(
+    (c: Conversation): StatusBucket => {
+      const unseen = showsUnreadFor(c, isConversationUnseen(c.id, c.updated_at, c.status));
+      const bucket = statusBucket(c, unseen, hasSessionDraft(c.id));
+      return bucket !== "Needs attention" && (c.id === startingId || workingIds.has(c.id))
+        ? "Working"
+        : bucket;
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [startingId, workingIds, unseenTick, draftIds],
+  );
+  const filterProjects = useMemo(
+    () => scopeFolders.map((folder) => ({ id: sidebarFolderKey(folder), name: folder.name })),
+    [scopeFolders],
+  );
+  const filterContext = useMemo<SessionListFilterContext>(
+    () => ({
+      statusOf: liveStatusOf,
+      harnessOf: sessionHarnessKey,
+      // Each folder's own membership, owner check included, so a filter shows what folders show.
+      inProject: (c, folderKey) =>
+        sessionInSidebarFolderWithKey(c, scopeFolders, folderKey, viewerId, includeSharedRuns),
+      inAnyProject: (c) => sessionInAnySidebarFolder(c, scopeFolders, viewerId, includeSharedRuns),
+    }),
+    [liveStatusOf, scopeFolders, viewerId, includeSharedRuns],
+  );
+  const filterRows = useCallback(
+    (rows: Conversation[], openSessionId: string | null) =>
+      applySessionListFilter(rows, listFilter.value, filterContext, openSessionId),
+    [listFilter.value, filterContext],
+  );
+  const filterKey = listFilter.count > 0 ? JSON.stringify(listFilter.value) : "";
+  const harnessChoices = useMemo(
+    () => sessionHarnessChoices(allConversations, listFilter.value.harness, harnessLabels),
+    [allConversations, listFilter.value.harness, harnessLabels],
+  );
   const loadedSections = useMemo(() => {
     // Merge the server pinned set in, so a pinned session outside the loaded
     // paginated window still renders. Dedupe by id: a pinned session is usually
@@ -2771,19 +2789,12 @@ function ConversationList({
             ...notArchived,
             ...filterRows(mineSharedRuns, resolvedActiveId),
           ]);
-    const sharedRunsToFile =
-      includeSharedRuns &&
-      folderCandidates.some((c) => isSharedAutomationRun(c, viewerId) && !pinnedIdSet.has(c.id));
     // A project filter shows that project's folder alone, and No project shows none.
     const chosenProject = listFilter.value.project;
     const folders =
-      grouped || activeTab === "shared" || chosenProject.kind === "none"
+      grouped || chosenProject.kind === "none"
         ? []
-        : withAutomationFolder(
-            projects,
-            sharedRunsToFile,
-            projectOrder.data?.sort_mode === "manual",
-          ).filter(
+        : scopeFolders.filter(
             (folder) =>
               chosenProject.kind === "all" || sidebarFolderKey(folder) === chosenProject.id,
           );
@@ -2915,13 +2926,12 @@ function ConversationList({
     activeOverride,
     frozenKeys,
     frozenStatus,
-    projects,
-    projectOrder.data?.sort_mode,
     activeTab,
     includeSharedRuns,
     mineSharedRuns,
     filterRows,
     listFilter.value.project,
+    scopeFolders,
     resolvedActiveId,
     viewerId,
     splitShared,
