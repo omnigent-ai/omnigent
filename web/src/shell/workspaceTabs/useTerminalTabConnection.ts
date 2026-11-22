@@ -176,7 +176,18 @@ export function useTerminalTabConnections(
   }
   useEffect(() => {
     if (nextDeadline === null) return;
-    const timer = window.setTimeout(() => setNow(Date.now()), nextDeadline - Date.now());
+    const deadline = nextDeadline;
+    let timer = 0;
+    const wake = () => {
+      // A timer that fires early, or a system clock set back during the wait, leaves time to go.
+      const remaining = deadline - Date.now();
+      if (remaining > 0) {
+        timer = window.setTimeout(wake, remaining);
+        return;
+      }
+      setNow(Date.now());
+    };
+    timer = window.setTimeout(wake, deadline - Date.now());
     return () => window.clearTimeout(timer);
   }, [nextDeadline]);
 

@@ -322,6 +322,35 @@ describe("a shell tab whose wait changes", () => {
       vi.useRealTimers();
     }
   });
+
+  it("still reaches the limit when the system clock is set back during the wait", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    try {
+      vi.setSystemTime(1_000);
+      const client = new QueryClient();
+      const shell = { key: "terminal:t1", inventory: "unknown" } as const;
+      const shellWaits = createShellWaits();
+      const { result } = renderHook(
+        () =>
+          useTerminalTabConnections("s-clock", shellWaits, {
+            liveness: "online",
+            listFailed: false,
+            shells: [shell],
+          }),
+        { wrapper: ({ children }) => createElement(QueryClientProvider, { client }, children) },
+      );
+      // The clock moves back a second, so the timer fires a second short of the wall deadline.
+      vi.setSystemTime(0);
+      await act(async () => vi.advanceTimersByTime(SHELL_LIST_LIMIT_MS));
+      expect(result.current.connectionOf(shell).kind).toBe("connecting");
+
+      await act(async () => vi.advanceTimersByTime(1_000));
+      expect(result.current.connectionOf(shell).kind).toBe("unreachable");
+      client.clear();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("Try Again from a shell tab", () => {
