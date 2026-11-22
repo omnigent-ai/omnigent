@@ -4,7 +4,10 @@ import { runInNewContext } from "node:vm";
 import { build, type Rollup } from "vite";
 import { beforeAll, describe, expect, it } from "vitest";
 
-// Each diff worker as the app ships it: one bundle, loaded where there is no document.
+import { workerBuildPlugins } from "../../../vite.workerExports";
+
+// Each diff worker as the app ships it: one bundle built with the app's worker plugins,
+// loaded where there is no document.
 const WORKERS = ["fileDiffWorker.ts", "markdownDiffWorker.ts"];
 const chunks = new Map<string, Rollup.OutputChunk>();
 
@@ -13,6 +16,7 @@ async function bundle(worker: string): Promise<Rollup.OutputChunk> {
   const result = await build({
     configFile: false,
     logLevel: "silent",
+    plugins: workerBuildPlugins(),
     resolve: { alias: { "@": path.resolve(here, "../..") } },
     build: {
       write: false,
@@ -42,13 +46,16 @@ describe.each(WORKERS)("%s", (worker) => {
     expect(moduleIds().filter((id) => react.test(id) || id.endsWith(".tsx"))).toEqual([]);
   });
 
-  // The Markdown worker's bundle here reaches a browser-only parser this scope lacks.
-  it.runIf(worker === "fileDiffWorker.ts")("starts in a worker scope without a document", () => {
-    const scope: { onmessage: unknown; postMessage: () => void } = {
+  it("starts in a worker scope without a document, and answers a request", async () => {
+    const answers: unknown[] = [];
+    const scope: {
+      onmessage: ((event: { data: unknown }) => void) | null;
+      postMessage: (message: unknown) => void;
+    } = {
       onmessage: null,
-      postMessage: () => {},
+      postMessage: (message) => answers.push(message),
     };
-    // What a worker scope has that the diff relies on; no document or window.
+    // What a worker scope has that the diff relies on; no document, window or DOMParser.
     const { TextDecoder, TextEncoder, URL, queueMicrotask, setTimeout, clearTimeout } = globalThis;
     runInNewContext(chunks.get(worker)!.code, {
       self: scope,
@@ -61,5 +68,13 @@ describe.each(WORKERS)("%s", (worker) => {
       clearTimeout,
     });
     expect(typeof scope.onmessage).toBe("function");
+    if (worker !== "markdownDiffWorker.ts") return;
+    // Entities and math reach the parts whose browser builds need the DOM.
+    const before = "# Notes\n\nPrice &amp; tax\n\nInline $x^2$\n";
+    scope.onmessage!({ data: { id: 1, request: { before, after: before.replace("x^2", "y^3") } } });
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(answers).toEqual([{ id: 1, result: expect.objectContaining({ status: "ready" }) }]);
   });
 });
