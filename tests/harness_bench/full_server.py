@@ -53,7 +53,7 @@ _POLL_INTERVAL_S = 0.2
 # The system tool the tool/policy probes drive: read-only, zero setup, registered
 # on every agent, server-dispatched, and gated at the tool_call phase. Its denial
 # output carries _DENY_REASON so a blocked call is unambiguous.
-_TOOL_NAME = "sys_list_files"
+_TOOL_NAME = "sys_files_list"
 _DENY_REASON = "bench-policy-deny"
 
 

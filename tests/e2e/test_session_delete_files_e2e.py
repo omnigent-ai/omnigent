@@ -131,7 +131,7 @@ def _create(client: httpx.Client, **body: Any) -> str:
 
 
 def _upload(client: httpx.Client, session_id: str, name: str, content: bytes) -> str:
-    """Upload a file as the web composer and the runner's ``sys_upload_file`` do."""
+    """Upload a file as the web composer and the runner's ``sys_files_upload`` do."""
     response = client.post(
         f"/v1/sessions/{session_id}/resources/files",
         files={"file": (name, content, "text/plain")},
@@ -196,7 +196,7 @@ def test_deleting_a_parent_removes_its_sub_agents_files(
             mock,
             [
                 _tool_call("write", "sys_os_write", {"path": "report.md", "content": "report"}),
-                _tool_call("parent_upload", "sys_upload_file", {"path": "report.md"}),
+                _tool_call("parent_upload", "sys_files_upload", {"path": "report.md"}),
                 _tool_call(
                     "dispatch",
                     "sys_session_send",
@@ -216,7 +216,7 @@ def test_deleting_a_parent_removes_its_sub_agents_files(
             mock,
             [
                 _tool_call("notes", "sys_os_write", {"path": "notes.md", "content": "notes"}),
-                _tool_call("child_upload", "sys_upload_file", {"path": "notes.md"}),
+                _tool_call("child_upload", "sys_files_upload", {"path": "notes.md"}),
                 {"text": "Uploaded."},
             ],
             key=f"mock-delete-child-{uid}",

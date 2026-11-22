@@ -2,8 +2,8 @@
 
 The server, runner, harness subprocesses, native CLIs, host, MCP proxy and the
 session file store are real. Only the model endpoint is scripted, so each
-journey's tool calls are deterministic. An agent turns ``sys_upload_file``,
-``sys_list_files`` and ``sys_download_file`` on with ``tool_groups.files:
+journey's tool calls are deterministic. An agent turns ``sys_files_upload``,
+``sys_files_list`` and ``sys_files_download`` on with ``tool_groups.files:
 true``; an agent that doesn't is offered none of them.
 
 Run: uv run --no-sync pytest tests/e2e/test_session_file_tools_e2e.py -v
@@ -41,7 +41,7 @@ from tests.e2e.conftest import (
 from tests.e2e.routing._helpers import wait_for
 
 _REPO = Path(__file__).resolve().parents[2]
-_FILE_TOOLS = {"sys_upload_file", "sys_list_files", "sys_download_file"}
+_FILE_TOOLS = {"sys_files_upload", "sys_files_list", "sys_files_download"}
 _OLD_NAMES = {"upload_file", "list_files", "download_file"}
 _FILES_ON = {"files": True}
 _OS_ENV = {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}}
@@ -89,7 +89,7 @@ def _mcp_tool_call(
 
     :param client: Client for the server.
     :param session_id: Calling session, e.g. ``"conv_abc123"``.
-    :param name: Tool name, e.g. ``"sys_upload_file"``.
+    :param name: Tool name, e.g. ``"sys_files_upload"``.
     :param arguments: Tool arguments, e.g. ``{"path": "notes.txt"}``.
     :returns: The tool's text result, or the JSON-RPC error message.
     """
@@ -114,7 +114,7 @@ def _tool_call(call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, 
     Script one mock model response that calls a single tool.
 
     :param call_id: The call's id, e.g. ``"upload"``.
-    :param name: Tool name, e.g. ``"sys_upload_file"``.
+    :param name: Tool name, e.g. ``"sys_files_upload"``.
     :param arguments: Tool arguments, e.g. ``{"path": "report.md"}``.
     :returns: A mock response entry for :func:`configure_mock_llm`.
     """
@@ -211,14 +211,14 @@ def test_model_turn_shares_and_reads_session_files_with_the_file_tools_on(
             _tool_call(
                 "write", "sys_os_write", {"path": "out/report.md", "content": "agent report"}
             ),
-            _tool_call("upload_report", "sys_upload_file", {"path": "out/report.md"}),
-            _tool_call("upload_notes", "sys_upload_file", {"path": "notes.txt"}),
-            _tool_call("list", "sys_list_files", {}),
-            _tool_call("download", "sys_download_file", {"file_id": brief_id}),
+            _tool_call("upload_report", "sys_files_upload", {"path": "out/report.md"}),
+            _tool_call("upload_notes", "sys_files_upload", {"path": "notes.txt"}),
+            _tool_call("list", "sys_files_list", {}),
+            _tool_call("download", "sys_files_download", {"file_id": brief_id}),
             {"text": "Shared your files."},
         ],
         key=model,
-        required_tools=["sys_upload_file"],
+        required_tools=["sys_files_upload"],
     )
     response_id = send_user_message_to_session(
         http_client, session_id=session_id, content="Share the report and the notes."
@@ -305,7 +305,7 @@ def _omnigent_tool_names(requests: list[dict[str, Any]]) -> set[str]:
     ``mcp__omnigent`` namespace.
 
     :param requests: Captured model requests.
-    :returns: Bare tool names, e.g. ``{"sys_upload_file"}``.
+    :returns: Bare tool names, e.g. ``{"sys_files_upload"}``.
     """
     names: set[str] = set()
     for request in requests:
@@ -331,7 +331,7 @@ def test_native_cli_uploads_a_workspace_file_through_the_omnigent_relay(
     """
     A real Claude Code or Codex CLI, launched by a real host for an agent that
     sets ``tool_groups.files: true``, is offered the three tools by Omnigent's
-    relay and uploads a file from its workspace with ``sys_upload_file``.
+    relay and uploads a file from its workspace with ``sys_files_upload``.
     """
     for binary in (harness, "tmux"):
         if shutil.which(binary) is None:
@@ -472,7 +472,7 @@ def test_native_cli_uploads_a_workspace_file_through_the_omnigent_relay(
             assert not snapshot.get("last_task_error"), snapshot["last_task_error"]
             requests = [r for r in get_mock_requests(mock_url) if probe in json.dumps(r)]
             offered = _omnigent_tool_names(requests)
-            if "sys_upload_file" in offered:
+            if "sys_files_upload" in offered:
                 return offered
             if snapshot["status"] == "idle" and len(requests) >= sent_probes:
                 sent_probes += 1
@@ -490,7 +490,9 @@ def test_native_cli_uploads_a_workspace_file_through_the_omnigent_relay(
 
         upload_call: dict[str, Any] = {
             "call_id": "share_report",
-            "name": "mcp__omnigent__sys_upload_file" if harness == "claude" else "sys_upload_file",
+            "name": "mcp__omnigent__sys_files_upload"
+            if harness == "claude"
+            else "sys_files_upload",
             **({"namespace": "mcp__omnigent"} if harness == "codex" else {}),
             "arguments": json.dumps({"path": "report.md"}),
         }
@@ -501,7 +503,7 @@ def test_native_cli_uploads_a_workspace_file_through_the_omnigent_relay(
             match=upload_prompt,
             # Codex's approval review quotes the prompt but advertises no relay tools.
             required_tools=[
-                "mcp__omnigent__sys_upload_file" if harness == "claude" else "mcp__omnigent"
+                "mcp__omnigent__sys_files_upload" if harness == "claude" else "mcp__omnigent"
             ],
         )
         send(upload_prompt)
@@ -510,7 +512,7 @@ def test_native_cli_uploads_a_workspace_file_through_the_omnigent_relay(
             snapshot = client.get(f"/v1/sessions/{session_id}").json()
             assert not snapshot.get("last_task_error"), snapshot["last_task_error"]
             for elicitation in snapshot.get("pending_elicitations", []):
-                assert elicitation["params"].get("tool_name", "").endswith("sys_upload_file"), (
+                assert elicitation["params"].get("tool_name", "").endswith("sys_files_upload"), (
                     elicitation
                 )
                 client.post(
@@ -576,9 +578,9 @@ def test_isolating_runner_keeps_uploads_inside_each_session(tmp_path: Path) -> N
             secret = stack.workspace / sibling_id / "secret.txt"
             assert secret.read_text() == "SIBLING SECRET", "sibling's file is not where expected"
 
-            own = _mcp_tool_call(client, own_id, "sys_upload_file", {"path": "own.txt"})
+            own = _mcp_tool_call(client, own_id, "sys_files_upload", {"path": "own.txt"})
             refused = {
-                path: _mcp_tool_call(client, own_id, "sys_upload_file", {"path": path})
+                path: _mcp_tool_call(client, own_id, "sys_files_upload", {"path": path})
                 for path in (
                     f"{sibling_id}/secret.txt",
                     f"../{sibling_id}/secret.txt",
@@ -589,7 +591,7 @@ def test_isolating_runner_keeps_uploads_inside_each_session(tmp_path: Path) -> N
 
     assert json.loads(own).get("filename") == "own.txt", own
     for path, result in refused.items():
-        assert result.startswith("Error: sys_upload_file failed:"), (path, result)
+        assert result.startswith("Error: sys_files_upload failed:"), (path, result)
     assert set(stored) == {"own.txt"}, stored
 
 
@@ -598,7 +600,7 @@ def test_model_turn_uploads_only_from_the_session_workspace(
     tmp_path: Path, mock_llm_server_url: str, isolating: bool
 ) -> None:
     """
-    A model turn's ``sys_upload_file`` reads the session's own workspace: it shares
+    A model turn's ``sys_files_upload`` reads the session's own workspace: it shares
     the report ``sys_os_write`` just wrote there and refuses a file outside it.
     ``omnigent chat`` and ``omnigent run`` isolate sessions and use the launch
     directory as both workspaces; a shared runner may serve a session elsewhere.
@@ -614,12 +616,12 @@ def test_model_turn_uploads_only_from_the_session_workspace(
         mock_llm_server_url,
         [
             _tool_call("write", "sys_os_write", {"path": "report.md", "content": "cli report"}),
-            _tool_call("upload", "sys_upload_file", {"path": "report.md"}),
-            _tool_call("outside", "sys_upload_file", {"path": str(outside)}),
+            _tool_call("upload", "sys_files_upload", {"path": "report.md"}),
+            _tool_call("outside", "sys_files_upload", {"path": str(outside)}),
             {"text": "Shared report.md."},
         ],
         key=model,
-        required_tools=["sys_upload_file"],
+        required_tools=["sys_files_upload"],
     )
     with server_runner(
         tmp_path, base_env=_stack_base_env(), workspace=runner_workspace, poll_interval=0.2
@@ -653,12 +655,12 @@ def test_model_turn_uploads_only_from_the_session_workspace(
             )
 
     advertised = advertised_tool_names(get_mock_requests(mock_llm_server_url, key=model))
-    assert "sys_upload_file" in advertised, sorted(advertised)
+    assert "sys_files_upload" in advertised, sorted(advertised)
     assert body["status"] == "completed", (body.get("status"), body.get("error"))
     assert (session_workspace / "report.md").read_text() == "cli report"
     outputs = _outputs_by_call_id(body)
     assert not outputs["upload"].startswith("Error:"), outputs["upload"]
     assert json.loads(outputs["upload"])["filename"] == "report.md", outputs["upload"]
-    assert outputs["outside"].startswith("Error: sys_upload_file failed:"), outputs["outside"]
+    assert outputs["outside"].startswith("Error: sys_files_upload failed:"), outputs["outside"]
     assert set(stored) == {"report.md"}, stored
     assert shared == b"cli report"

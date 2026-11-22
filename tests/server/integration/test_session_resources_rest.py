@@ -147,7 +147,7 @@ async def _file_tool(
     :param client: The test HTTP client, standing in for the runner's server client.
     :param session_id: The calling session, e.g. ``"conv_abc123"``.
     :param workspace: The session's own workspace, where its native terminal runs.
-    :param name: File tool name, e.g. ``"sys_upload_file"``.
+    :param name: File tool name, e.g. ``"sys_files_upload"``.
     :param args: Tool arguments, e.g. ``path="out/report.txt"``.
     :returns: The tool's output string.
     """
@@ -184,17 +184,17 @@ async def test_file_tools_round_trip_through_the_real_server(
     (workspace / "out" / "report.txt").write_text("quarterly report\n")
 
     uploaded = json.loads(
-        await _file_tool(client, session_id, workspace, "sys_upload_file", path="out/report.txt")
+        await _file_tool(client, session_id, workspace, "sys_files_upload", path="out/report.txt")
     )
-    listed = json.loads(await _file_tool(client, session_id, workspace, "sys_list_files"))
+    listed = json.loads(await _file_tool(client, session_id, workspace, "sys_files_list"))
     downloaded = await _file_tool(
-        client, session_id, workspace, "sys_download_file", file_id=uploaded["file_id"]
+        client, session_id, workspace, "sys_files_download", file_id=uploaded["file_id"]
     )
     other_listed = json.loads(
-        await _file_tool(client, other_session_id, workspace, "sys_list_files")
+        await _file_tool(client, other_session_id, workspace, "sys_files_list")
     )
     other_downloaded = await _file_tool(
-        client, other_session_id, workspace, "sys_download_file", file_id=uploaded["file_id"]
+        client, other_session_id, workspace, "sys_files_download", file_id=uploaded["file_id"]
     )
 
     assert uploaded["filename"] == "report.txt"

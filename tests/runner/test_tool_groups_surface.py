@@ -24,7 +24,7 @@ _ALL_OFF = ToolGroupsConfig(
     files=False,
 )
 _ALL_ON = ToolGroupsConfig(files=True)
-_FILE_TOOL_NAMES = frozenset({"sys_upload_file", "sys_list_files", "sys_download_file"})
+_FILE_TOOL_NAMES = frozenset({"sys_files_upload", "sys_files_list", "sys_files_download"})
 
 
 def _spec(groups: ToolGroupsConfig) -> AgentSpec:

@@ -910,7 +910,7 @@ class ToolGroupsConfig:
         which write to and read the owner's Inbox. The runner also drops them
         unless the server offers the Inbox to the session's owner.
     :param memory: The ``memory_*`` long-term memory tools (5).
-    :param files: ``sys_upload_file``, ``sys_list_files`` and ``sys_download_file``,
+    :param files: ``sys_files_upload``, ``sys_files_list`` and ``sys_files_download``,
         which share workspace files through the session's file store. Off by
         default.
     """

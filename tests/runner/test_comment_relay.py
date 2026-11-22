@@ -489,9 +489,9 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_agent_download",
         "sys_add_policy",
         "sys_policy_registry",
-        "sys_upload_file",
-        "sys_list_files",
-        "sys_download_file",
+        "sys_files_upload",
+        "sys_files_list",
+        "sys_files_download",
     }
     # Parameters must be the real schemas from the tool classes — proving
     # get_schema() flowed through rather than an empty placeholder. "status"

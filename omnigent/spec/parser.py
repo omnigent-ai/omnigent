@@ -658,7 +658,7 @@ def resolve_file_tool_group(
     Keep the file tools off for an agent that still declares their removed names.
 
     ``upload_file``, ``list_files`` and ``download_file`` became the opt-in
-    ``sys_upload_file``, ``sys_list_files`` and ``sys_download_file``. A policy
+    ``sys_files_upload``, ``sys_files_list`` and ``sys_files_download``. A policy
     written for an old name does not match the new one, so an agent that still
     lists an old name cannot turn the file tools on until those entries are
     removed.

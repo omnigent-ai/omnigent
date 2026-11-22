@@ -9,7 +9,7 @@ and skips).
 Tool categories:
 - _OS_ENV_TOOLS: execute through a runner-local OSEnvironment (sys_os_*)
 - _REST_TOOLS: call server REST APIs (sys_call_async, sys_cancel_async)
-- _FILE_TOOLS: call server file APIs (sys_upload_file, sys_list_files, sys_download_file)
+- _FILE_TOOLS: call server file APIs (sys_files_upload, sys_files_list, sys_files_download)
 - _TERMINAL_TOOLS: runner-local TerminalRegistry
 - MCP tools: spec-defined; dispatched via RunnerMcpManager passed
   in by proxy_stream (designs/RUNNER_MCP.md). Not in the static
@@ -8204,7 +8204,7 @@ async def execute_tool(
     :param session_workspace: The session's own server-stored workspace, e.g.
         ``Path("/repo")``; ``None`` when it has none, or
         :data:`UNKNOWN_SESSION_WORKSPACE` when it could not be read. Bounds
-        ``sys_upload_file`` reads; unlike ``runner_workspace`` it never falls
+        ``sys_files_upload`` reads; unlike ``runner_workspace`` it never falls
         back to the runner's.
     :returns: Tool output string.
     """
@@ -9264,7 +9264,7 @@ def _session_upload_roots(
     resource_registry: SessionResourceRegistry | None,
 ) -> list[Path]:
     """
-    Return the directories ``sys_upload_file`` may read from, searched in order.
+    Return the directories ``sys_files_upload`` may read from, searched in order.
 
     The session's own workspace wins: its native terminal and tools run there.
     Otherwise use the session's default environment root, the one its filesystem
@@ -9342,7 +9342,7 @@ async def _execute_file_tool(
     """
     Execute a file tool by calling session-scoped server file APIs.
 
-    :param tool_name: File tool name, e.g. ``"sys_upload_file"``.
+    :param tool_name: File tool name, e.g. ``"sys_files_upload"``.
     :param args: Parsed tool arguments.
     :param server_client: HTTP client for the Omnigent server.
     :param conversation_id: Owning session/conversation id,
@@ -9365,7 +9365,7 @@ async def _execute_file_tool(
     if tool_name == UploadFileTool.name():
         path = args.get("path")
         if not isinstance(path, str) or not path:
-            return "Error: sys_upload_file failed: empty path"
+            return "Error: sys_files_upload failed: empty path"
         # The read runs in the un-sandboxed runner, so the path must stay inside this
         # session's workspace, or an agent could upload host or sibling-session files.
         roots = _session_upload_roots(
@@ -9376,11 +9376,11 @@ async def _execute_file_tool(
             resource_registry=resource_registry,
         )
         if not roots:
-            return "Error: sys_upload_file failed: the session workspace is unknown"
+            return "Error: sys_files_upload failed: the session workspace is unknown"
         try:
             resolved = _resolve_upload_path(path, roots)
         except ValueError as exc:
-            return f"Error: sys_upload_file failed: {exc}"
+            return f"Error: sys_files_upload failed: {exc}"
         filename = resolved.name
         try:
             with open(resolved, "rb") as f:
@@ -9395,7 +9395,7 @@ async def _execute_file_tool(
                 return json.dumps({"file_id": data.get("id"), "filename": filename})
             return f"Error: upload returned {resp.status_code}"
         except Exception as exc:  # noqa: BLE001
-            return f"Error: sys_upload_file failed: {exc}"
+            return f"Error: sys_files_upload failed: {exc}"
 
     if tool_name == DownloadFileTool.name():
         file_id = args.get("file_id", "")

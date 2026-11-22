@@ -268,7 +268,7 @@ async def test_upload_refuses_while_the_session_workspace_is_unreadable(tmp_path
     )
     call = {
         "method": "tools/call",
-        "params": {"name": "sys_upload_file", "arguments": {"path": "report.md"}},
+        "params": {"name": "sys_files_upload", "arguments": {"path": "report.md"}},
     }
     async with _runner_client(app) as client:
         refused = await client.post(f"/v1/sessions/{_SESSION_ID}/mcp/execute", json=call)

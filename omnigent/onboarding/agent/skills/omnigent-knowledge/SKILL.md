@@ -190,7 +190,7 @@ list — new tools may be added at any time.
 - "I want an agent that can access external APIs" → consider MCP servers (see below)
 
 An agent that shares files with the user sets `tool_groups.files: true` to get
-`sys_upload_file`, `sys_list_files` and `sys_download_file`; they are off by
+`sys_files_upload`, `sys_files_list` and `sys_files_download`; they are off by
 default and need no `tools.builtins` entry.
 
 ### MCP servers (external tool integrations)

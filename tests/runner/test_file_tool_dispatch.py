@@ -1,4 +1,4 @@
-"""Unit tests for the runner-side ``sys_upload_file`` dispatch containment.
+"""Unit tests for the runner-side ``sys_files_upload`` dispatch containment.
 
 These cover the upload-containment fix: the runner's ``_execute_file_tool``
 upload branch must resolve the agent-supplied ``path`` against the
@@ -78,7 +78,7 @@ async def test_upload_rejects_paths_outside_workspace(
     tmp_path: Path,
 ) -> None:
     """
-    A ``sys_upload_file`` path that escapes the workspace is rejected and
+    A ``sys_files_upload`` path that escapes the workspace is rejected and
     no upload POST is made.
 
     :param evil_path: An agent-supplied path that resolves outside the
@@ -97,7 +97,7 @@ async def test_upload_rejects_paths_outside_workspace(
     client = _recording_client(captured)
     try:
         result = await _execute_file_tool(
-            "sys_upload_file",
+            "sys_files_upload",
             {"path": evil_path},
             client,
             conversation_id=_CONVERSATION_ID,
@@ -110,7 +110,7 @@ async def test_upload_rejects_paths_outside_workspace(
     # Rejection surfaces as an error string from safe_resolve's
     # ValueError. If this were a success JSON ({"file_id": ...}) the
     # containment check failed open and the file was exfiltrated.
-    assert result.startswith("Error: sys_upload_file failed:"), (
+    assert result.startswith("Error: sys_files_upload failed:"), (
         f"Expected a containment rejection for {evil_path!r}, got: {result!r}"
     )
     assert "escapes" in result, (
@@ -120,7 +120,7 @@ async def test_upload_rejects_paths_outside_workspace(
     # file was never read into the session store. A non-empty list here
     # means the runner read and uploaded an out-of-workspace file.
     assert captured == [], (
-        f"sys_upload_file POSTed despite an out-of-workspace path {evil_path!r}; "
+        f"sys_files_upload POSTed despite an out-of-workspace path {evil_path!r}; "
         f"the host file would have been exfiltrated"
     )
 
@@ -148,7 +148,7 @@ async def test_upload_rejects_symlink_escaping_workspace(tmp_path: Path) -> None
     client = _recording_client(captured)
     try:
         result = await _execute_file_tool(
-            "sys_upload_file",
+            "sys_files_upload",
             {"path": "looks_innocent.txt"},
             client,
             conversation_id=_CONVERSATION_ID,
@@ -161,13 +161,13 @@ async def test_upload_rejects_symlink_escaping_workspace(tmp_path: Path) -> None
     # The resolved symlink target escapes the workspace, so the upload
     # is rejected before any read. A success envelope here would mean
     # the host secret was followed and exfiltrated via the symlink.
-    assert result.startswith("Error: sys_upload_file failed:"), (
+    assert result.startswith("Error: sys_files_upload failed:"), (
         f"Expected a containment rejection for the escaping symlink, got: {result!r}"
     )
     assert "escapes" in result, f"Expected a workspace-escape reason, got: {result!r}"
     # Decisive: nothing POSTed, so the symlinked host file was never read.
     assert captured == [], (
-        "sys_upload_file POSTed despite a symlink whose target escapes the "
+        "sys_files_upload POSTed despite a symlink whose target escapes the "
         "workspace; the host secret would have been exfiltrated"
     )
 
@@ -175,7 +175,7 @@ async def test_upload_rejects_symlink_escaping_workspace(tmp_path: Path) -> None
 @pytest.mark.asyncio
 async def test_upload_in_workspace_succeeds(tmp_path: Path) -> None:
     """
-    A ``sys_upload_file`` path inside the workspace uploads the file's raw
+    A ``sys_files_upload`` path inside the workspace uploads the file's raw
     bytes and returns the store-issued ``file_id``.
 
     :param tmp_path: Pytest-provided workspace root for the session.
@@ -193,7 +193,7 @@ async def test_upload_in_workspace_succeeds(tmp_path: Path) -> None:
     client = _recording_client(captured)
     try:
         result = await _execute_file_tool(
-            "sys_upload_file",
+            "sys_files_upload",
             {"path": "output/chart.png"},
             client,
             conversation_id=_CONVERSATION_ID,
@@ -228,7 +228,7 @@ async def test_native_relay_upload_keeps_workspace_containment(
     tmp_path: Path,
 ) -> None:
     """
-    A native harness's relayed ``sys_upload_file`` is granted to a spec that
+    A native harness's relayed ``sys_files_upload`` is granted to a spec that
     turns the file tools on, yet a path outside the session workspace is still
     rejected unread.
 
@@ -250,7 +250,7 @@ async def test_native_relay_upload_keeps_workspace_containment(
     client = _recording_client(captured)
     try:
         result = await execute_tool(
-            tool_name="sys_upload_file",
+            tool_name="sys_files_upload",
             arguments=json.dumps({"path": "../secrets.txt"}),
             server_client=client,
             agent_spec=spec,
@@ -264,7 +264,7 @@ async def test_native_relay_upload_keeps_workspace_containment(
 
     # The containment error (not a grant refusal) proves the opted-in surface
     # admitted the call and the workspace check still ran.
-    assert result.startswith("Error: sys_upload_file failed:"), result
+    assert result.startswith("Error: sys_files_upload failed:"), result
     assert "escapes" in result, result
     assert captured == [], "a relayed upload read and posted a file outside the workspace"
 
@@ -288,9 +288,9 @@ async def _upload(
     runner_workspace: Path | None = None,
     session_workspace: Path | UnknownSessionWorkspace | None = None,
 ) -> str:
-    """Call ``sys_upload_file`` the way the runner's ``/mcp/execute`` route does."""
+    """Call ``sys_files_upload`` the way the runner's ``/mcp/execute`` route does."""
     return await execute_tool(
-        tool_name="sys_upload_file",
+        tool_name="sys_files_upload",
         arguments=json.dumps({"path": path}),
         server_client=client,
         resource_registry=resource_registry,
@@ -480,7 +480,7 @@ async def test_upload_on_an_isolating_runner_refuses_a_sibling_session_file(
     finally:
         await client.aclose()
 
-    assert refused.startswith("Error: sys_upload_file failed:"), refused
+    assert refused.startswith("Error: sys_files_upload failed:"), refused
     assert posted_before_own_upload == [], "the sibling session's file was uploaded"
     assert json.loads(own)["filename"] == "own.txt", own
     assert len(captured) == 1
@@ -559,7 +559,7 @@ async def test_upload_without_a_known_workspace_is_refused(
     finally:
         await client.aclose()
 
-    assert result == "Error: sys_upload_file failed: the session workspace is unknown"
+    assert result == "Error: sys_files_upload failed: the session workspace is unknown"
     assert captured == []
 
 
@@ -588,7 +588,7 @@ async def test_async_upload_keeps_the_session_workspace(tmp_path: Path) -> None:
         handle = await execute_tool(
             tool_name="sys_call_async",
             arguments=json.dumps(
-                {"tool": "sys_upload_file", "args": json.dumps({"path": "report.txt"})}
+                {"tool": "sys_files_upload", "args": json.dumps({"path": "report.txt"})}
             ),
             server_client=client,
             agent_spec=AgentSpec(spec_version=1, skills_filter="none", tool_groups=_FILE_TOOLS_ON),

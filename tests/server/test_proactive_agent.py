@@ -91,9 +91,9 @@ def test_bundle_opts_into_the_inbox_tools_only() -> None:
 @pytest.mark.parametrize(
     ("tool", "action"),
     [
-        ("sys_upload_file", "deny"),
-        ("sys_list_files", "deny"),
-        ("sys_download_file", "deny"),
+        ("sys_files_upload", "deny"),
+        ("sys_files_list", "deny"),
+        ("sys_files_download", "deny"),
         ("sys_session_list", "allow"),
     ],
 )

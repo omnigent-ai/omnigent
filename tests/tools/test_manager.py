@@ -1496,7 +1496,7 @@ def test_create_builtin_handles_web_fetch() -> None:
 
 
 @pytest.mark.parametrize(
-    "declared", ["upload_file", "list_files", "download_file", "sys_upload_file"]
+    "declared", ["upload_file", "list_files", "download_file", "sys_files_upload"]
 )
 def test_file_tools_register_with_files_on_and_are_not_declarable_builtins(
     declared: str, caplog: pytest.LogCaptureFixture
@@ -1518,9 +1518,9 @@ def test_file_tools_register_with_files_on_and_are_not_declarable_builtins(
         mgr = ToolManager(spec)
 
     names = set(mgr.get_tool_names())
-    assert {"sys_upload_file", "sys_list_files", "sys_download_file"} <= names
+    assert {"sys_files_upload", "sys_files_list", "sys_files_download"} <= names
     assert not {"upload_file", "list_files", "download_file"} & names
-    assert type(mgr.get_tool("sys_upload_file")).__name__ == "UploadFileTool"
+    assert type(mgr.get_tool("sys_files_upload")).__name__ == "UploadFileTool"
     assert f"Unknown built-in tool {declared!r}" in caplog.text
 
 
@@ -1785,7 +1785,7 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
     "projects": frozenset(
         {"sys_project_list", "sys_session_update", "sys_project_update", "sys_session_link_pr"}
     ),
-    "files": frozenset({"sys_upload_file", "sys_list_files", "sys_download_file"}),
+    "files": frozenset({"sys_files_upload", "sys_files_list", "sys_files_download"}),
 }
 
 

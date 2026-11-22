@@ -1361,7 +1361,7 @@ tool_groups:
   projects: false         # sys_project_* / sys_session_update
   user_inbox: false       # sys_user_inbox_post / sys_user_inbox_list
   memory: false           # memory_search / _get / _list / _write / _delete
-  files: true             # sys_upload_file / sys_list_files / sys_download_file (off by default)
+  files: true             # sys_files_upload / sys_files_list / sys_files_download (off by default)
 ```
 
 Every group except `files` defaults to `true`, so omitting the block changes
@@ -1394,9 +1394,9 @@ on them is an error:
   keep that tool. See [MEMORY.md](MEMORY.md).
 
 The `files` group shares files through the current session's file resources
-(`/v1/sessions/{id}/resources/files`). `sys_upload_file` stores a file from
-inside the session workspace, `sys_list_files` lists the session's files, and
-`sys_download_file` returns a stored file's content as text, so it suits text
+(`/v1/sessions/{id}/resources/files`). `sys_files_upload` stores a file from
+inside the session workspace, `sys_files_list` lists the session's files, and
+`sys_files_download` returns a stored file's content as text, so it suits text
 files rather than binary ones. The group is off by default: an agent turns the
 tools on with `tool_groups.files: true`, and they cannot be listed under
 `tools.builtins`. They don't need `os_env`: an agent without one can still
