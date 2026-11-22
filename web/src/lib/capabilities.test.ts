@@ -300,6 +300,7 @@ describe.each([
   "proactive_agent_available",
   "session_create_workflow_id",
   "workflow_sharing",
+  "gadget_sharing",
 ] as const)("resolveServerInfo %s", (capability) => {
   it.each([
     [true, true],

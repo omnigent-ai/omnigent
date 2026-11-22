@@ -207,6 +207,7 @@ import {
   setPendingInitialPrompt,
 } from "@/store/chatStore";
 import { markSessionCreated } from "@/store/interactionTelemetry";
+import { noteSessionCreatedHere } from "@/lib/sessionCreations";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { DesktopWindowContext, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { MODEL_PICKER_KEYS, useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
@@ -6638,6 +6639,7 @@ function NewChatLandingContent({
         // otherwise both sandbox and computer bundled creates emit nothing. Split
         // by the picked host; interactionTelemetry completes/settles the span.
         markSessionCreated(data.id, sandboxSelected ? "sandbox" : "computer");
+        noteSessionCreatedHere(data.id, initialPrompt);
         if (!siblingSourceId && !sandboxSelected && selectedHostId && workspaceTrimmed) {
           await launchRunner(selectedHostId, data.id, workspaceTrimmed, bundledGitOptions);
         }
@@ -6864,6 +6866,7 @@ function NewChatLandingContent({
         // New Chat is the only create path that can produce a managed sandbox;
         // interactionTelemetry completes/settles the span once the session runs.
         markSessionCreated(created.id, sandboxSelected ? "sandbox" : "computer");
+        noteSessionCreatedHere(created.id, initialPrompt);
         if (sandboxSelected) {
           const launchedRow = sandboxCatalog?.find((row) => row.id === normalizedModelOverride);
           markSandboxLaunch(created.id, {

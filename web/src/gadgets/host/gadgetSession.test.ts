@@ -1,3 +1,4 @@
+import { waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type * as IdentityModule from "@/lib/identity";
@@ -380,10 +381,10 @@ describe("gadget session", () => {
       ),
     ).toBe(true);
 
-    expect(await adoptStartedGadgetSession("app-1", "temp:123")).toBe(false);
+    expect(await adoptStartedGadgetSession("app-1", "temp:123", prompt)).toBe(false);
     const linked = waitForRequest("put", `${API}/app-1/sessions/s_new`);
     const delivered = waitForRequest("post", `${API}/app-1/actions/act1/delivery`);
-    expect(await adoptStartedGadgetSession("app-1", "s_new")).toBe(true);
+    expect(await adoptStartedGadgetSession("app-1", "s_new", prompt)).toBe(true);
     // Shown beside the started session, which also makes it the viewer's gadget session.
     expect(await (await linked).json()).toEqual({ linked: true });
     // The action rode in the started session's first message, so it was delivered there.
@@ -491,7 +492,8 @@ describe("gadget session", () => {
       // Create session: the session that starts is linked to the gadget and gets the action.
       const linked = waitForRequest("put", `${API}/app-1/sessions/s_new`);
       const delivered = waitForRequest("post", `${API}/app-1/actions/act1/delivery`);
-      expect(await adoptStartedGadgetSession("app-1", "s_new")).toBe(true);
+      const firstMessage = opened.searchParams.get("prompt");
+      expect(await adoptStartedGadgetSession("app-1", "s_new", firstMessage)).toBe(true);
       expect(await (await linked).json()).toEqual({ linked: true });
       expect(await (await delivered).json()).toEqual({ session_id: "s_new" });
       expect(exitGadgetRailFullScreen).not.toHaveBeenCalled();
@@ -525,9 +527,49 @@ describe("gadget session", () => {
     expect(prompt.match(/Load the gadget skill/g)).toHaveLength(1);
     const first = waitForRequest("post", `${API}/app-1/actions/act1/delivery`);
     const other = waitForRequest("post", `${API}/app-1/actions/act2/delivery`);
-    expect(await adoptStartedGadgetSession("app-1", "s_new")).toBe(true);
+    expect(await adoptStartedGadgetSession("app-1", "s_new", prompt)).toBe(true);
     expect(await (await first).json()).toEqual({ session_id: "s_new" });
     expect(await (await other).json()).toEqual({ session_id: "s_new" });
+  });
+
+  it("acknowledges only the requests the session's first message carried", async () => {
+    const second = { ...ENTRY, id: "act2", value: { ...ENTRY.value, params: { cardId: "c2" } } };
+    let next = ENTRY;
+    const deliveries: string[] = [];
+    server.use(
+      rest.post(`${API}/app-1/actions`, (_req, res, ctx) => res(ctx.status(201), ctx.json(next))),
+      rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
+        res(ctx.json({ session_id: null, version: null })),
+      ),
+      rest.put(`${API}/app-1/sessions/:sessionId`, (_req, res, ctx) =>
+        res(ctx.json({ items: [] })),
+      ),
+      rest.post(`${API}/app-1/actions/:actionId/delivery`, (req, res, ctx) => {
+        deliveries.push((req as { path: string }).path.split("/actions/")[1].split("/")[0]);
+        return res(ctx.json({ items: [] }));
+      }),
+    );
+    await requestGadgetAction(EDITOR, { action: "run_card", params: { cardId: "c1" } }, navigate);
+    next = second;
+    await requestGadgetAction(EDITOR, { action: "run_card", params: { cardId: "c2" } }, navigate);
+    const prompt = parse(navigate.mock.calls[1][0]).searchParams.get("prompt") ?? "";
+
+    // The viewer deleted the second request from New session's prompt before sending it.
+    const edited = prompt.slice(0, prompt.indexOf('Gadget action\n{"action_id":"act2"'));
+    const linked = waitForRequest("put", `${API}/app-1/sessions/s_new`);
+    expect(await adoptStartedGadgetSession("app-1", "s_new", edited)).toBe(true);
+    await linked;
+    await waitFor(() => expect(deliveries).toEqual(["act1"]));
+
+    // A session created without a known first message acknowledges nothing.
+    deliveries.length = 0;
+    next = ENTRY;
+    await requestGadgetAction(EDITOR, { action: "run_card", params: { cardId: "c1" } }, navigate);
+    expect(await adoptStartedGadgetSession("app-1", "s_other", null)).toBe(true);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20);
+    });
+    expect(deliveries).toEqual([]);
   });
 
   it("sends actions and quotes to the session the gadget is shown beside", async () => {

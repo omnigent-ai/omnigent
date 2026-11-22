@@ -152,4 +152,14 @@ describe("Share and the ⋯ menu", () => {
     });
     expect(screen.queryByRole("button", { name: "Share gadget" })).toBeNull();
   });
+
+  it("offers no Share on a multi-user server whose store keeps no gadget grants", async () => {
+    renderWithGadgets(<GadgetActions gadget={BOARD} onDeleted={vi.fn()} shareInMenu={false} />, {
+      info: { ...GADGETS_INFO, gadget_sharing: false },
+    });
+    expect(screen.queryByRole("button", { name: "Share gadget" })).toBeNull();
+    openMenu();
+    expect(await screen.findByRole("menuitem", { name: "Delete gadget" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Share" })).toBeNull();
+  });
 });

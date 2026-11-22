@@ -426,9 +426,14 @@ export function workflowSharingAvailable(info: ServerInfo | "loading"): boolean 
 }
 
 /**
- * Whether the server has gadgets and other users to share them with; a viewer
- * also needs manage access to the gadget.
+ * Whether the server has gadgets, keeps their grants and has other users to share
+ * them with; a viewer also needs manage access to the gadget.
  */
 export function gadgetSharingAvailable(info: ServerInfo | "loading"): boolean {
-  return isFeatureEnabled(info, "gadgets") && !isSingleUserMode(info);
+  return (
+    isFeatureEnabled(info, "gadgets") &&
+    info !== "loading" &&
+    info.gadget_sharing === true &&
+    !isSingleUserMode(info)
+  );
 }

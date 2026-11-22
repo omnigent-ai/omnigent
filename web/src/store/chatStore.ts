@@ -200,6 +200,7 @@ import {
   onResponseEnd,
   onResponseStart,
 } from "./interactionTelemetry";
+import { noteSessionCreatedHere } from "@/lib/sessionCreations";
 import { getSessionHost, subscribeSessionHostChanges } from "@/lib/sessionHost";
 import {
   isClaudeAgentMessageContent,
@@ -3049,7 +3050,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // `rekey` runs INSIDE the call, the moment `createSession` returns and
       // before the new id is published — a send issued during the bind would
       // otherwise resolve that id, find an empty chain, and overtake this POST.
-      const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
+      const sessionId = await ensureBoundSession(
+        agentId,
+        get,
+        opts,
+        submitConversationId,
+        rekey,
+        text,
+      );
       postedSessionId = sessionId;
       // Until this send settles, the server may hold the message without persisting
       // it, so keep its text where a reload can find it (see `unsentSendToRestore`).
@@ -4930,6 +4938,7 @@ async function ensureBoundSession(
   opts?: SendOptions,
   pinnedConversationId?: string | null,
   onSessionResolved?: (sessionId: string) => void,
+  firstMessage?: string,
 ): Promise<string> {
   // Use the session pinned at submit time so a queued send still targets
   // where it was composed, not wherever the user switched to meanwhile.
@@ -4950,6 +4959,7 @@ async function ensureBoundSession(
     // session — managed sandboxes are created by the New Chat dialog, which
     // registers itself.
     markSessionCreated(sessionId, "computer");
+    noteSessionCreatedHere(sessionId, firstMessage ?? null);
     // Claim the send chain for this id NOW, while it is still private to this
     // call. Everything below publishes it (the store write, the navigate
     // callback, the sidebar invalidation) and awaits network work, so a send

@@ -152,13 +152,13 @@ export function GadgetView({
   const navigate = useGadgetNavigate();
   const queryClient = useQueryClient();
   const address = useCallback(
-    async (message: string) => {
-      await openGadgetSession(gadget, message, navigate, {
+    (message: string, onDelivered: (sessionId: string) => void) =>
+      openGadgetSession(gadget, message, navigate, {
         deliver: true,
         reveal: false,
         railSessionId: sessionId,
-      });
-    },
+        onDelivered,
+      }),
     [navigate, sessionId, gadget],
   );
   const comments = useGadgetComments(gadget, gadget.permissions.publish ? address : undefined);

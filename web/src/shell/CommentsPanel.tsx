@@ -38,7 +38,11 @@ export interface CommentsPanelProps {
   comments: Comment[];
   addressedComments: Comment[];
   activeSelection: ActiveSelection | null;
-  onAddComment: (body: string) => void;
+  /**
+   * Adds a comment on the active selection. One that returns a promise keeps the typed text
+   * until it resolves `true`, so a failed save can be tried again.
+   */
+  onAddComment: (body: string) => void | Promise<boolean>;
   onAddressAll: () => void;
   onEditComment: (id: string, body: string) => void;
   onDeleteComment: (id: string) => void;
@@ -124,6 +128,21 @@ export function CommentsPanel({
     setBody("");
     if (pendingBodyRef) pendingBodyRef.current = "";
   }, [activeSelectionStart, activeSelectionEnd, activeCommentId, pendingBodyRef]);
+
+  const submitComment = () => {
+    const clear = () => {
+      setBody("");
+      if (pendingBodyRef) pendingBodyRef.current = "";
+    };
+    const outcome = onAddComment(body.trim());
+    if (outcome instanceof Promise) {
+      void outcome.then((saved) => {
+        if (saved) clear();
+      });
+    } else {
+      clear();
+    }
+  };
 
   // Auto-focus the textarea when a new pending selection appears (no existing
   // comment at that range) so the user can start typing immediately.
@@ -300,9 +319,7 @@ export function CommentsPanel({
                   if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
                   if (e.key === "Enter" && !e.shiftKey && body.trim()) {
                     e.preventDefault();
-                    onAddComment(body.trim());
-                    setBody("");
-                    if (pendingBodyRef) pendingBodyRef.current = "";
+                    submitComment();
                   }
                 }}
               />
@@ -311,11 +328,7 @@ export function CommentsPanel({
                 size="xs"
                 className="w-full"
                 disabled={!body.trim()}
-                onClick={() => {
-                  onAddComment(body.trim());
-                  setBody("");
-                  if (pendingBodyRef) pendingBodyRef.current = "";
-                }}
+                onClick={submitComment}
               >
                 Add Comment
               </Button>

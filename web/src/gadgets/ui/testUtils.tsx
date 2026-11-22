@@ -28,6 +28,8 @@ export function gadgetFixture(overrides: Partial<Gadget> = {}): Gadget {
 export const GADGETS_INFO: ServerInfo = {
   ...SERVER_INFO_OFFLINE_FALLBACK,
   features: { gadgets: true },
+  // A server whose store keeps gadget grants; tests of one without them override it.
+  gadget_sharing: true,
 };
 
 /** Shows the router's current location, for asserting where a click navigated. */

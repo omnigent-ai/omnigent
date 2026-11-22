@@ -36,7 +36,15 @@ const PENDING_TTL_MS = 30 * 60 * 1000;
 // Gadgets whose gadget session this page opened New session for, when, and the actions its
 // prompt carries. In memory: the pane reaches the created session without a reload, and after one
 // the next request starts again.
-const pendingStarts = new Map<string, { at: number; actionIds: string[]; messages: string[] }>();
+const pendingStarts = new Map<
+  string,
+  {
+    at: number;
+    actionIds: string[];
+    messages: string[];
+    onDelivered: { message: string; callback: (sessionId: string) => void }[];
+  }
+>();
 const SESSION_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
 type GadgetInfo = Pick<Gadget, "id" | "name" | "permissions">;
@@ -162,6 +170,7 @@ function markPending(appId: string, actionId?: string, message?: string): void {
     at: Date.now(),
     actionIds: actionId ? [actionId] : [],
     messages: message ? [message] : [],
+    onDelivered: [],
   });
 }
 
@@ -169,15 +178,22 @@ function markPending(appId: string, actionId?: string, message?: string): void {
  * Adds a request to the session the viewer is about to start for the gadget, so requests made
  * before it starts all go in its first message; returns that message's requests.
  */
-function addPendingRequest(appId: string, message: string, actionId?: string): string[] {
+function addPendingRequest(
+  appId: string,
+  message: string,
+  actionId?: string,
+  onDelivered?: (sessionId: string) => void,
+): string[] {
   const current = pendingStarts.get(appId);
   const fresh = current !== undefined && Date.now() - current.at <= PENDING_TTL_MS;
   const actionIds = fresh ? current.actionIds : [];
   const messages = fresh ? current.messages : [];
+  const delivered = fresh ? current.onDelivered : [];
   pendingStarts.set(appId, {
     at: Date.now(),
     actionIds: actionId && !actionIds.includes(actionId) ? [...actionIds, actionId] : actionIds,
     messages: messages.includes(message) ? messages : [...messages, message],
+    onDelivered: onDelivered ? [...delivered, { message, callback: onDelivered }] : delivered,
   });
   return pendingStarts.get(appId)?.messages ?? [message];
 }
@@ -204,12 +220,14 @@ async function recordDelivery(appId: string, actionId: string, sessionId: string
 
 /**
  * Called when a session started from the gadget exists: shows the gadget in that session's side
- * panel, which also makes it the viewer's gadget session, and records the actions its prompt
- * carried as delivered there.
+ * panel, which also makes it the viewer's gadget session, and records as delivered there the
+ * actions whose requests its first message carried. The viewer may have edited New session's
+ * prompt, so an action whose request isn't in `firstMessage` stays undelivered.
  */
 export async function adoptStartedGadgetSession(
   appId: string,
   sessionId: string,
+  firstMessage: string | null,
 ): Promise<boolean> {
   if (!isStartedSessionId(sessionId)) {
     return false; // A temporary ID while the session is created.
@@ -218,9 +236,17 @@ export async function adoptStartedGadgetSession(
   const started = pendingStarts.get(appId);
   if (started !== undefined && Date.now() - started.at <= PENDING_TTL_MS) {
     pendingStarts.delete(appId);
-    await Promise.all(
-      started.actionIds.map((actionId) => recordDelivery(appId, actionId, sessionId)),
+    const carried = (message: string) => firstMessage !== null && firstMessage.includes(message);
+    const sent = started.actionIds.filter((actionId) =>
+      started.messages.some(
+        (message) =>
+          message.includes(`"action_id":${JSON.stringify(actionId)}`) && carried(message),
+      ),
     );
+    await Promise.all(sent.map((actionId) => recordDelivery(appId, actionId, sessionId)));
+    for (const { message, callback } of started.onDelivered) {
+      if (carried(message)) callback(sessionId);
+    }
   }
   return true;
 }
@@ -250,7 +276,19 @@ export async function openGadgetSession(
     actionId,
     reveal = true,
     railSessionId,
-  }: { deliver: boolean; actionId?: string; reveal?: boolean; railSessionId?: string },
+    onDelivered,
+  }: {
+    deliver: boolean;
+    actionId?: string;
+    reveal?: boolean;
+    railSessionId?: string;
+    /**
+     * For a request left in New session (`"starting"`): called once the session started there
+     * got it in its first message. Never called when New session is left, or its prompt sent
+     * without the request.
+     */
+    onDelivered?: (sessionId: string) => void;
+  },
 ): Promise<"sent" | "starting"> {
   if (railSessionId !== undefined) {
     if (deliver) {
@@ -284,7 +322,7 @@ export async function openGadgetSession(
       }
     }
   }
-  const requests = addPendingRequest(app.id, message, actionId);
+  const requests = addPendingRequest(app.id, message, actionId, onDelivered);
   const prompt = [composeGadgetSessionPrompt(app), ...requests].join("\n\n");
   if (gadgetFillsScreen(app.id)) {
     // The gadget stays full screen: New session's composer holds the requests, and the Create

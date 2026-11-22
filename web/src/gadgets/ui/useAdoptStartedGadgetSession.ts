@@ -1,6 +1,7 @@
 // New session opened from a gadget carries the gadget's ID in its URL (`gadget_start`). New
-// session creates the session at its usual path; once that path has the real session ID, the
-// gadget is linked to the session and shown in its side panel. A host whose navigation keeps the
+// session creates the session at its usual path; once that path has the real ID of the session
+// this tab created, the gadget is linked to the session and shown in its side panel. Opening an
+// existing session instead leaves the gadget unlinked, as leaving New session does. A host whose navigation keeps the
 // query brings `gadget_start` along to the session's page; it is adopted there and dropped from
 // the URL, so a reload does not adopt it again.
 //
@@ -19,6 +20,7 @@ import {
   isStartedSessionId,
   gadgetRailKey,
 } from "@/gadgets/host/gadgetSession";
+import { sessionCreatedHere } from "@/lib/sessionCreations";
 import { invalidateGadgets, useGadgetsEnabled } from "./gadgetQueries";
 
 // The gadget whose New session this tab is on, until it starts a session or goes elsewhere.
@@ -105,10 +107,17 @@ export function useAdoptStartedGadgetSession(): void {
       params.delete(GADGET_START_PARAM);
       replaceSearchParams(params);
     }
+    // Only the session New session created here: an existing session the viewer opened
+    // instead never got the gadget's requests.
+    const creation = sessionCreatedHere(sessionId);
+    if (creation === undefined) {
+      leaveGadgetStart(gadgetId, queryClient);
+      return;
+    }
     starting = null;
     unbuilt.delete(gadgetId);
     const fullScreen = fullScreenStarts.delete(gadgetId);
-    adoptStartedGadgetSession(gadgetId, sessionId)
+    adoptStartedGadgetSession(gadgetId, sessionId, creation.firstMessage)
       .then(() => {
         const key = gadgetRailKey(gadgetId);
         // Started beside a full screen gadget: it stays full screen, the sidebar as it was.

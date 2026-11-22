@@ -2,6 +2,7 @@ import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  createGadgetComment,
   getGadget,
   getGadgetContent,
   getGadgetGadgetSessionStatus,
@@ -19,6 +20,7 @@ vi.mock("@/gadgets/api/gadgetApi", async (importOriginal) => ({
   getGadgetContent: vi.fn(),
   getGadgetGadgetSessionStatus: vi.fn(),
   listGadgetComments: vi.fn(),
+  createGadgetComment: vi.fn(),
 }));
 let frameProps: GadgetFrameProps | null = null;
 vi.mock("@/gadgets/host/GadgetFrame", () => ({
@@ -91,6 +93,42 @@ describe("a gadget beside a session", () => {
       "true",
     );
     expect(screen.getByPlaceholderText("Add a comment…")).toBeInTheDocument();
+  });
+
+  it("keeps a comment whose save failed in the panel, with its selection, to try again", async () => {
+    vi.mocked(createGadgetComment).mockRejectedValueOnce(new Error("The server is unreachable"));
+    renderView();
+    await waitFor(() => expect(frameProps?.onAddComment).toBeDefined());
+    act(() =>
+      frameProps?.onAddComment?.({
+        text: "Ship it",
+        occurrence: 1,
+        rect: { x: 0, y: 0, width: 1, height: 1 },
+      }),
+    );
+    const field = screen.getByPlaceholderText("Add a comment…");
+    fireEvent.change(field, { target: { value: "Move it to Done" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add Comment" }));
+
+    await waitFor(() => expect(createGadgetComment).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByText(/The server is unreachable/)).toBeInTheDocument());
+    // The text and the selection it was on are still there.
+    expect(screen.getByPlaceholderText("Add a comment…")).toHaveValue("Move it to Done");
+    expect(screen.getByText("Ship it")).toBeInTheDocument();
+
+    vi.mocked(createGadgetComment).mockResolvedValueOnce({
+      id: "c1",
+      body: "Move it to Done",
+      status: "draft",
+      anchor: { text: "Ship it", label: null, ref: null, occurrence: 1 },
+      createdBy: BOARD.viewer_id,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add Comment" }));
+    await waitFor(() => expect(createGadgetComment).toHaveBeenCalledTimes(2));
+    const [first, retry] = vi.mocked(createGadgetComment).mock.calls;
+    expect(retry).toEqual(first);
   });
 
   it("explains a page written for a newer SDK", async () => {

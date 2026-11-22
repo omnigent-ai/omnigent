@@ -15,6 +15,7 @@ import {
   resetGadgetStarts,
   useAdoptStartedGadgetSession,
 } from "./useAdoptStartedGadgetSession";
+import { noteSessionCreatedHere, resetSessionCreations } from "@/lib/sessionCreations";
 import { GADGETS_INFO, gadgetFixture } from "./testUtils";
 import type * as GadgetApiModule from "@/gadgets/api/gadgetApi";
 import type * as GadgetSessionModule from "@/gadgets/host/gadgetSession";
@@ -49,11 +50,16 @@ function Shell() {
       <button type="button" onClick={() => navigate("/tasks")}>
         Elsewhere
       </button>
+      <button type="button" onClick={() => navigate("/c/conv_old")}>
+        Existing session
+      </button>
     </>
   );
 }
 
 function renderShell(info: ServerInfo = GADGETS_INFO) {
+  // New session creates conv_9 in these tests; conv_old is a session the viewer already had.
+  noteSessionCreatedHere("conv_9", "Build");
   render(
     <QueryClientProvider client={new QueryClient()}>
       <CapabilitiesProvider info={info}>
@@ -68,6 +74,7 @@ function renderShell(info: ServerInfo = GADGETS_INFO) {
 afterEach(() => {
   resetGadgetRailRequests();
   resetGadgetStarts();
+  resetSessionCreations();
   vi.clearAllMocks();
 });
 
@@ -78,7 +85,7 @@ describe("a session started beside a gadget", () => {
     expect(adoptStartedGadgetSession).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "Created" }));
-    expect(adoptStartedGadgetSession).toHaveBeenCalledWith("board", "conv_9");
+    expect(adoptStartedGadgetSession).toHaveBeenCalledWith("board", "conv_9", "Build");
     await waitFor(() =>
       expect(useGadgetRailRequest.getState().requested).toMatchObject({
         conversationId: "conv_9",
@@ -127,12 +134,30 @@ describe("a session started beside a gadget", () => {
     );
     expect(screen.getByLabelText("location").textContent).toBe("/c/conv_9?o=1");
     expect(adoptStartedGadgetSession).toHaveBeenCalledTimes(1);
-    expect(adoptStartedGadgetSession).toHaveBeenCalledWith("board", "conv_9");
+    expect(adoptStartedGadgetSession).toHaveBeenCalledWith("board", "conv_9", "Build");
   });
 
   it("forgets the gadget when New session is left without starting it", () => {
     renderShell();
     fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
+    fireEvent.click(screen.getByRole("button", { name: "Created" }));
+    expect(adoptStartedGadgetSession).not.toHaveBeenCalled();
+  });
+
+  it("doesn't take an existing session the viewer opens instead for the gadget's", async () => {
+    vi.mocked(getGadget).mockResolvedValue(
+      gadgetFixture({ id: "board", published_revision: null }),
+    );
+    vi.mocked(getGadgetGadgetSession).mockResolvedValue(null);
+    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    rememberUnbuiltGadget("board");
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Existing session" }));
+    // Not linked, its requests not acknowledged, and Build's unbuilt gadget goes as if New
+    // session were left.
+    expect(adoptStartedGadgetSession).not.toHaveBeenCalled();
+    await waitFor(() => expect(deleteGadget).toHaveBeenCalledWith("board"));
+    // A session created later from a plain New session isn't the gadget's either.
     fireEvent.click(screen.getByRole("button", { name: "Created" }));
     expect(adoptStartedGadgetSession).not.toHaveBeenCalled();
   });

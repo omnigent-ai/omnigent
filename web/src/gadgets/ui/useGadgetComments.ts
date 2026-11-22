@@ -1,6 +1,6 @@
 // Comments on a gadget, in the shape of the comments panel that files use. They live with the
 // gadget, so everyone it is shared with sees them; Address all sends the open ones to the session
-// that works on the gadget and moves them to Sent.
+// that works on the gadget and moves them to Sent once that session has them.
 import { useCallback, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -30,7 +30,7 @@ export function gadgetCommentsMessage(
   comments: readonly GadgetComment[],
 ): string {
   const lines = [
-    `${GADGET_SKILL_INSTRUCTION} Address these comments on the gadget ${JSON.stringify(gadget.name)} (gadget_id ${gadget.id}). Change its page with sys_gadget_revision_create and sys_gadget_publish, or its records, as each asks. They are already marked addressed; sys_gadget_comment_list has them all.`,
+    `${GADGET_SKILL_INSTRUCTION} Address these comments on the gadget ${JSON.stringify(gadget.name)} (gadget_id ${gadget.id}). Change its page with sys_gadget_revision_create and sys_gadget_publish, or its records, as each asks. They are marked addressed as you get them; sys_gadget_comment_list has them all.`,
     "",
   ];
   comments.forEach((comment, index) => {
@@ -79,7 +79,6 @@ export type GadgetCommentsPanelProps = Pick<
   | "comments"
   | "addressedComments"
   | "activeSelection"
-  | "onAddComment"
   | "onAddressAll"
   | "onEditComment"
   | "onDeleteComment"
@@ -88,7 +87,10 @@ export type GadgetCommentsPanelProps = Pick<
   | "addressPending"
   | "canEdit"
   | "readOnlyMessage"
->;
+> & {
+  /** Resolves whether the comment was saved; until then the panel keeps its text. */
+  onAddComment: (body: string) => Promise<boolean>;
+};
 
 export interface GadgetComments {
   open: boolean;
@@ -101,10 +103,20 @@ export interface GadgetComments {
   error: unknown;
 }
 
+/**
+ * Sends the message to the session working on the gadget: `"sent"` once it has it, or
+ * `"starting"` when it waits in New session, which calls `onDelivered` if the session started
+ * there gets it.
+ */
+export type AddressGadgetComments = (
+  message: string,
+  onDelivered: (sessionId: string) => void,
+) => Promise<"sent" | "starting">;
+
 export function useGadgetComments(
   gadget: Gadget,
-  /** Sends the message to the session working on the gadget; absent when the viewer can't. */
-  address: ((message: string) => Promise<void>) | undefined,
+  /** Absent when the viewer can't address comments. */
+  address: AddressGadgetComments | undefined,
 ): GadgetComments {
   const gadgetId = gadget.id;
   const queryClient = useQueryClient();
@@ -114,6 +126,8 @@ export function useGadgetComments(
   });
   const [open, setOpen] = useState(false);
   const [pending, setPending] = useState<GadgetCommentAnchor | null>(null);
+  // One per selection, so retrying a create whose outcome is unknown can't add it twice.
+  const [pendingOperationId, setPendingOperationId] = useState<string>(() => randomUUID());
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [addressing, setAddressing] = useState(false);
   const [workError, setWorkError] = useState<unknown>(undefined);
@@ -148,6 +162,7 @@ export function useGadgetComments(
       ref: selection.ref ?? null,
       occurrence: selection.occurrence,
     });
+    setPendingOperationId(randomUUID());
     setSelectedId(null);
     setOpen(true);
   }, []);
@@ -183,20 +198,31 @@ export function useGadgetComments(
       comments: drafts.map(toPanel),
       addressedComments: items.filter((item) => item.status === "addressed").map(toPanel),
       activeSelection,
-      onAddComment: (body) => {
+      // Keeps the selection, the typed text and the operation ID until the comment is saved,
+      // so a failed request can be sent again as it was.
+      onAddComment: async (body) => {
         const anchor = pending;
-        if (anchor === null) return;
-        setPending(null);
-        void run(() => createGadgetComment(gadgetId, { body, anchor, operationId: randomUUID() }));
+        if (anchor === null) return false;
+        let saved = false;
+        await run(async () => {
+          await createGadgetComment(gadgetId, { body, anchor, operationId: pendingOperationId });
+          saved = true;
+          setPending(null);
+        });
+        return saved;
       },
       onAddressAll: () => {
         if (address === undefined || drafts.length === 0) return;
+        const ids = drafts.map((item) => item.id);
+        const markAddressed = () =>
+          Promise.all(ids.map((id) => updateGadgetComment(gadgetId, id, { status: "addressed" })));
         setAddressing(true);
         void run(async () => {
-          await address(gadgetCommentsMessage(gadget, drafts));
-          await Promise.all(
-            drafts.map((item) => updateGadgetComment(gadgetId, item.id, { status: "addressed" })),
-          );
+          const delivery = await address(gadgetCommentsMessage(gadget, drafts), () => {
+            // The session started in New session got them; until then they stay open.
+            void run(markAddressed);
+          });
+          if (delivery === "sent") await markAddressed();
         }).finally(() => setAddressing(false));
       },
       onEditComment: (id, body) => void run(() => updateGadgetComment(gadgetId, id, { body })),

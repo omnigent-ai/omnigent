@@ -30,6 +30,7 @@ import {
   revokePermission,
   revokeSharePermission,
   sharedAutomationsListed,
+  gadgetSharingAvailable,
   workflowSharingAvailable,
   workspaceSharingBlocked,
 } from "./permissionsApi";
@@ -469,6 +470,20 @@ describe("workflowSharingAvailable", () => {
     ["a server still loading", "loading" as const, false],
   ])("answers for %s", (_label, info, expected) => {
     expect(workflowSharingAvailable(info)).toBe(expected);
+  });
+});
+
+describe("gadgetSharingAvailable", () => {
+  const sharing = { ...FALLBACK_SERVER_INFO, features: { gadgets: true }, gadget_sharing: true };
+  it.each([
+    ["a multi-user server that keeps gadget grants", sharing, true],
+    ["a server that says it keeps no gadget grants", { ...sharing, gadget_sharing: false }, false],
+    ["a server that doesn't say", { ...sharing, gadget_sharing: undefined }, false],
+    ["a single-user server", { ...sharing, single_user: true }, false],
+    ["a server without gadgets", { ...sharing, features: {} }, false],
+    ["a server still loading", "loading" as const, false],
+  ])("answers for %s", (_label, info, expected) => {
+    expect(gadgetSharingAvailable(info)).toBe(expected);
   });
 });
 
