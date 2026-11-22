@@ -12,7 +12,10 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import { useCodeMirrorComposerLoad } from "@/components/composer/engine/composerEnginePolicy";
+import {
+  COMPOSER_LOAD_RETRY_INTERVAL_MS,
+  useCodeMirrorComposerLoad,
+} from "@/components/composer/engine/composerEnginePolicy";
 import {
   COMPOSER_INPUT_ID_ATTRIBUTE,
   COMPOSER_TAIL_INPUT_ID,
@@ -27,6 +30,7 @@ import type {
   PastedTextLedger,
   PastedTextSnapshot,
 } from "@/components/composer/engine/pastedTextLedger";
+import type * as LedgerModuleExports from "@/components/composer/engine/pastedTextLedger";
 import { insertComposerText } from "@/lib/composerText";
 
 export type { PastedTextChip } from "@/components/composer/engine/pastedTextLedger";
@@ -75,13 +79,18 @@ export function pastedTextEnvironment(): PastedTextEnvironment {
   };
 }
 
+type LedgerModule = typeof LedgerModuleExports;
+const importLedgerModule = (): Promise<LedgerModule> =>
+  import("@/components/composer/engine/pastedTextLedger");
+
 // The ledger's module, shared by every owner once loaded; a failed load is tried again later.
 let loadedFactory: LedgerFactory | null = null;
 let pendingFactory: Promise<LedgerFactory> | null = null;
+let importLedger = importLedgerModule;
 
 /** Load the ledger's module ahead of a paste; owners also load it once the editor has. */
 export function loadPastedTextLedger(): Promise<LedgerFactory> {
-  pendingFactory ??= import("@/components/composer/engine/pastedTextLedger").then(
+  pendingFactory ??= importLedger().then(
     (module) => {
       loadedFactory = () => module.createPastedTextLedger(pastedTextEnvironment());
       return loadedFactory;
@@ -98,21 +107,32 @@ export function loadPastedTextLedger(): Promise<LedgerFactory> {
 function useLedgerFactory(): LedgerFactory | null {
   const editorReady = useCodeMirrorComposerLoad().status === "ready";
   const [factory, setFactory] = useState<LedgerFactory | null>(() => loadedFactory);
+  const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     if (!editorReady || factory) return;
     let live = true;
+    let retryOnFocus: (() => void) | null = null;
     loadPastedTextLedger().then(
       (loaded) => {
         if (live) setFactory(() => loaded);
       },
       (error: unknown) => {
-        console.warn("The large-paste ledger couldn't load; pastes stay inline.", error);
+        console.warn("The large-paste ledger couldn't load; pastes stay inline for now.", error);
+        if (!live) return;
+        // Tried again as the editor's own chunk is: on window focus, at most once a minute.
+        const failedAt = Date.now();
+        retryOnFocus = () => {
+          if (Date.now() - failedAt >= COMPOSER_LOAD_RETRY_INTERVAL_MS)
+            setAttempt((count) => count + 1);
+        };
+        window.addEventListener("focus", retryOnFocus);
       },
     );
     return () => {
       live = false;
+      if (retryOnFocus) window.removeEventListener("focus", retryOnFocus);
     };
-  }, [editorReady, factory]);
+  }, [editorReady, factory, attempt]);
   return editorReady ? factory : null;
 }
 
@@ -167,7 +187,10 @@ export function usePastedTextAttachments({
 }
 
 /** Forget the loaded ledger module, so a test can load it again from scratch. */
-export function resetPastedTextLedgerForTests(): void {
+export function resetPastedTextLedgerForTests(
+  importModule: () => Promise<LedgerModule> = importLedgerModule,
+): void {
   loadedFactory = null;
   pendingFactory = null;
+  importLedger = importModule;
 }

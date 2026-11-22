@@ -47,7 +47,78 @@ function liveOwner(initial: string) {
   return { surface, ledger, owner, context, paste };
 }
 
+/** A ledger over a tail and a reply quote, each a live input the owner can hide. */
+function twoInputOwner(tail: string, quote: string) {
+  const inputs = { tail: createFakeComposerSurface(tail), quote: createFakeComposerSurface(quote) };
+  surfaces.push(inputs.tail, inputs.quote);
+  const shown = new Set<string>(["tail", "quote"]);
+  const written: Record<string, string> = {};
+  const ledger = createPastedTextLedger({
+    tailInputId: "tail",
+    inputIdOf: (target) => (target === inputs.quote ? "quote" : "tail"),
+    insertText: (target, text, start, end) => insertComposerText(target, text, start, end),
+  });
+  const owner = { files: [] as File[] };
+  const valueOf = (inputId: string) =>
+    written[inputId] ??
+    (inputId === "tail" || inputId === "quote" ? inputs[inputId].value : undefined);
+  const context = (): PastedTextContext => ({
+    files: owner.files,
+    valueOf,
+    attach: (file) => {
+      owner.files = [...owner.files, file];
+      return true;
+    },
+    removeFile: (file) => {
+      owner.files = owner.files.filter((each) => each !== file);
+    },
+    targetOf: (inputId) =>
+      shown.has(inputId) && (inputId === "tail" || inputId === "quote") ? inputs[inputId] : null,
+    writeInput: (inputId, value) => {
+      written[inputId] = value;
+    },
+    revealInput: () => {},
+    locked: false,
+  });
+  const paste = (inputId: "tail" | "quote", text: string, at: number) => {
+    inputs[inputId].setSelectionRange(at, at);
+    ledger.offerPaste(inputs[inputId], clipboard(text), context());
+    return owner.files.at(-1)!;
+  };
+  return { inputs, shown, ledger, owner, context, paste, valueOf };
+}
+
 describe("createPastedTextLedger", () => {
+  it("keeps another input's edit counted once across a restore elsewhere", () => {
+    const { inputs, ledger, context, paste, valueOf } = twoInputOwner("abcdef", "xyz");
+    const quoted = paste("quote", FIRST, 1);
+    const tailPaste = paste("tail", SECOND, 3);
+    // The quote changes before the owner syncs, then a tail paste is restored.
+    insertComposerText(inputs.quote, "QQ", 0, 0);
+
+    expect(ledger.insertAsText(tailPaste, context())).toBe(true);
+    ledger.sync(context());
+    expect(ledger.insertAsText(quoted, context())).toBe(true);
+
+    expect(valueOf("quote")).toBe(`QQx${FIRST}yz`);
+  });
+
+  it("refuses a second restore while one waits for its input, then finishes the first", () => {
+    const { shown, ledger, owner, context, paste, valueOf } = twoInputOwner("tail", "");
+    const quoted = paste("quote", FIRST, 0);
+    const tailPaste = paste("tail", SECOND, 4);
+    shown.delete("quote");
+
+    expect(ledger.insertAsText(quoted, context())).toBe(true);
+    expect(ledger.insertAsText(tailPaste, context())).toBe(false);
+    ledger.completePendingRestore(context());
+
+    expect(valueOf("quote")).toBe(FIRST);
+    expect(owner.files).toEqual([tailPaste]);
+    expect(ledger.insertAsText(tailPaste, context())).toBe(true);
+    expect(owner.files).toEqual([]);
+  });
+
   it("shifts a later paste once past a restore, when the owner reads the input live", () => {
     const { surface, ledger, owner, context, paste } = liveOwner("abcdef");
     paste(FIRST, 1);

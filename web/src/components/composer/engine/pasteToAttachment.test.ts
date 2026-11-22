@@ -55,8 +55,9 @@ describe("following a remembered offset through edits", () => {
     ["deleting across it", "ab|cdef", "aef", 1],
     ["replacing the whole draft", "abc|def", "", 0],
   ])("keeps its place when %s", (_name, marked, after, expected) => {
+    // Each case marks the offset with exactly one "|".
     const offset = marked.indexOf("|");
-    const before = marked.replace("|", "");
+    const before = marked.slice(0, offset) + marked.slice(offset + 1);
     expect(mapOffsetThroughEdit(offset, before, after)).toBe(expected);
   });
 

@@ -145,6 +145,8 @@ export function createPastedTextLedger(environment: PastedTextEnvironment): Past
     const current = mapped(context);
     const paste = current.find((each) => each.file === file);
     if (!paste || isGone(file, context) || context.locked) return false;
+    // One restore waits for its input at a time; another runs once it has finished.
+    if (pendingRestore !== null && pendingRestore !== file) return false;
     // A reply quote removed since the paste sends the text to the end of the tail.
     const inPlace = context.valueOf(paste.inputId);
     const inputId = inPlace === undefined ? environment.tailInputId : paste.inputId;
@@ -177,6 +179,10 @@ export function createPastedTextLedger(environment: PastedTextEnvironment): Past
         const moves = each.offset > offset || (each.offset === offset && later);
         return moves ? { ...each, offset: each.offset + paste.text.length } : each;
       });
+    // Every offset now counts each input's edits so far, so each input's text is remembered.
+    for (const each of pastes) {
+      if (each.inputId !== inputId) remember(each.inputId, context.valueOf(each.inputId));
+    }
     remember(inputId, insertAtOffset(value, offset, paste.text));
     undoable = false;
     context.removeFile(file);

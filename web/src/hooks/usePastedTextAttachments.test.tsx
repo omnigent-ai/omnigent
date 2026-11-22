@@ -1,6 +1,8 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { useCallback, useState } from "react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as PastedTextLedgerModule from "@/components/composer/engine/pastedTextLedger";
+import { COMPOSER_LOAD_RETRY_INTERVAL_MS } from "@/components/composer/engine/composerEnginePolicy";
 import * as CodeMirrorModule from "@/components/composer/engine/codeMirrorComposerModule";
 import {
   codeMirrorComposerLoad,
@@ -137,6 +139,30 @@ describe("usePastedTextAttachments", () => {
       expect(owner.result.current.pasted.offerPaste(target, clipboard(LARGE))).toBe(true),
     );
     expect(owner.result.current.files).toHaveLength(1);
+  });
+
+  it("tries a failed ledger load again on window focus, at most once a minute", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    const importModule = vi
+      .fn<() => Promise<typeof PastedTextLedgerModule>>()
+      .mockRejectedValueOnce(new Error("chunk failed"))
+      .mockResolvedValue(PastedTextLedgerModule);
+    resetPastedTextLedgerForTests(importModule);
+    const owner = renderOwner();
+    const target = owner.input(COMPOSER_TAIL_INPUT_ID);
+    await waitFor(() => expect(console.warn).toHaveBeenCalledOnce());
+
+    act(() => void window.dispatchEvent(new Event("focus")));
+    expect(importModule).toHaveBeenCalledOnce();
+
+    now.mockReturnValue(1_000_000 + COMPOSER_LOAD_RETRY_INTERVAL_MS);
+    act(() => void window.dispatchEvent(new Event("focus")));
+    await waitFor(() =>
+      expect(owner.result.current.pasted.offerPaste(target, clipboard(LARGE))).toBe(true),
+    );
+    expect(importModule).toHaveBeenCalledTimes(2);
+    vi.restoreAllMocks();
   });
 
   it("attaches a large paste in place of the selection, and ⌘Z types it back undoably", async () => {
