@@ -30,6 +30,12 @@ const ROWS: Record<string, Row> = {
   unfetched: { id: "unfetched", pull_request: pullRequest(null), pull_requests_synced: true },
   none: { id: "none", pull_request: null, pull_requests_synced: true },
   notImported: { id: "notImported", pull_request: null, pull_requests_synced: false },
+  // A pull request linked to the session before the server imported the rest of them.
+  knownNotImported: {
+    id: "knownNotImported",
+    pull_request: pullRequest("OPEN"),
+    pull_requests_synced: false,
+  },
   olderServer: { id: "olderServer" },
 };
 
@@ -44,7 +50,7 @@ describe("matchesSessionPullRequestFilter", () => {
   });
 
   it("keeps open pull requests, drafts included, under Open", () => {
-    expect(kept("open")).toEqual(["open", "draft"]);
+    expect(kept("open")).toEqual(["open", "draft", "knownNotImported"]);
   });
 
   it("keeps only open drafts under Draft", () => {

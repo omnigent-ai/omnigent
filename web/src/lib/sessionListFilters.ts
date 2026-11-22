@@ -30,9 +30,10 @@ export const SESSION_PULL_REQUEST_FILTER_LABELS: Record<SessionPullRequestFilter
 type PullRequestFields = Pick<Conversation, "pull_request" | "pull_requests_synced">;
 
 /**
- * Whether `row` stays under `filter`. Open includes drafts. A session whose pull request
- * state isn't fetched yet, or whose pull requests aren't imported yet, matches only All:
- * it isn't known to have, or to lack, a pull request in that state.
+ * Whether `row` stays under `filter`. Open includes drafts. A pull request the session list
+ * names counts by its state, even before the server has imported all of the session's pull
+ * requests: a known one is known. A state not fetched yet matches only All, and so does a
+ * session with none named until the import says it has none.
  */
 export function matchesSessionPullRequestFilter(
   row: PullRequestFields,

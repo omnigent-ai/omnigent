@@ -24,9 +24,13 @@ export function useSessionPullRequestFilter(enabled: boolean): SessionPullReques
     () => (!enabled ? "all" : (chosen ?? readSessionPullRequestFilter())),
     [enabled, chosen],
   );
-  const choose = useCallback((next: SessionPullRequestFilter) => {
-    setChosen(next);
-    writeSessionPullRequestFilter(next);
-  }, []);
+  const choose = useCallback(
+    (next: SessionPullRequestFilter) => {
+      if (!enabled) return;
+      setChosen(next);
+      writeSessionPullRequestFilter(next);
+    },
+    [enabled],
+  );
   return { enabled, value, choose };
 }

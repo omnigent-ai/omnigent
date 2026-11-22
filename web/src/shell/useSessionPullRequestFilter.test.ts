@@ -14,9 +14,14 @@ describe("useSessionPullRequestFilter", () => {
   it("keeps every session with the flag off, never touching the stored choice", () => {
     localStorage.setItem(STORAGE_KEY, "open");
     const getItem = vi.spyOn(Storage.prototype, "getItem");
+    const setItem = vi.spyOn(Storage.prototype, "setItem");
     const { result } = renderHook(() => useSessionPullRequestFilter(false));
     expect(result.current).toMatchObject({ enabled: false, value: "all" });
+    act(() => result.current.choose("none"));
+    expect(result.current.value).toBe("all");
     expect(getItem).not.toHaveBeenCalledWith(STORAGE_KEY);
+    expect(setItem).not.toHaveBeenCalledWith(STORAGE_KEY, expect.anything());
+    expect(localStorage.getItem(STORAGE_KEY)).toBe("open");
   });
 
   it("starts from the stored choice with the flag on, and stores a new one", () => {
