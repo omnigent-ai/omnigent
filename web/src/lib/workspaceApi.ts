@@ -10,6 +10,7 @@ import {
   ContentEncoding,
   EntryType,
   FileSearchMode,
+  SearchOrder,
   WorkspaceService,
   type ComparisonSchema,
   type Entry,
@@ -646,6 +647,13 @@ export function rankFilesViaWorkspaceApi(
   );
 }
 
+export interface TextSearchPriority {
+  /** Workspace-relative files searched first, the most important first; 16 at most are used. */
+  focusedPaths: string[];
+  /** What changed folders are measured against; the last commit by default. */
+  changedAgainst?: ComparisonKind;
+}
+
 export interface TextSearchOptions {
   caseSensitive: boolean;
   /** Read the query as a ripgrep regular expression. */
@@ -653,6 +661,11 @@ export interface TextSearchOptions {
   /** Comma-separated globs; an include also searches files ignore rules skip. */
   include: string;
   exclude: string;
+  /**
+   * Search these first, then the folders with the most changes, then the rest.
+   * A host without "text_search_priority" ignores it and returns matches in walk order.
+   */
+  priority?: TextSearchPriority;
 }
 
 /**
@@ -667,7 +680,7 @@ export interface TextSearchOptions {
 export function searchTextViaWorkspaceApi(
   sessionId: string,
   query: string,
-  { caseSensitive, regex, include, exclude }: TextSearchOptions,
+  { caseSensitive, regex, include, exclude, priority }: TextSearchOptions,
   signal?: AbortSignal,
 ): Promise<ContentSearchResult | null> {
   const info = getCachedServerInfo() ?? "loading";
@@ -680,7 +693,18 @@ export function searchTextViaWorkspaceApi(
       const result: ContentSearchResult = { matches: [], truncated: false, warning: null };
       let done = false;
       const stream = client.searchText(
-        { query, caseSensitive, regularExpression: regex, include, exclude },
+        {
+          query,
+          caseSensitive,
+          regularExpression: regex,
+          include,
+          exclude,
+          ...(priority && {
+            order: SearchOrder.PRIORITY,
+            focusedPaths: priority.focusedPaths,
+            changedAgainst: priority.changedAgainst,
+          }),
+        },
         { signal },
       );
       for await (const message of stream) {

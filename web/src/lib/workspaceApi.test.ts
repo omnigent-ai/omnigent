@@ -14,6 +14,7 @@ import {
   SearchTextResponseSchema,
   ComparisonKind,
   FileSearchMode,
+  SearchOrder,
   ListWorkingCopyChangesRequestSchema,
   ListWorkingCopyChangesResponseSchema,
   ReadBaseFileResponseSchema,
@@ -1015,6 +1016,43 @@ describe("searchTextViaWorkspaceApi", () => {
       truncated: true,
       warning: "Search stopped.",
     });
+  });
+
+  it.each([
+    [
+      "sends the priority order when asked",
+      { focusedPaths: ["src/a.ts"], changedAgainst: ComparisonKind.BRANCH_POINT },
+    ],
+    ["keeps walk order otherwise", undefined],
+  ])("%s", async (_case, priority) => {
+    enable("workspace_api_server_access", "workspace_content_search");
+    const requests: object[] = [];
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("SearchText", "text_search_priority"), {
+          headers: PROTO_HEADERS,
+        }),
+      SearchText: (body) => {
+        requests.push(fromBinary(SearchTextRequestSchema, envelopePayload(body)));
+        return new Response(textMatches({ matches: [match(1)], done: true }), {
+          headers: CONNECT_HEADERS,
+        });
+      },
+    });
+
+    const sessionId = priority ? "s-text-priority" : "s-text-walk";
+    await searchTextViaWorkspaceApi(sessionId, "needle", { ...TEXT_OPTIONS, priority });
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject(
+      priority
+        ? {
+            order: SearchOrder.PRIORITY,
+            focusedPaths: ["src/a.ts"],
+            changedAgainst: ComparisonKind.BRANCH_POINT,
+          }
+        : { order: SearchOrder.UNSPECIFIED, focusedPaths: [] },
+    );
   });
 
   it("leaves a stream that ends without its last message to REST, then stops asking", async () => {
