@@ -57,3 +57,8 @@ a running instance from the verify-omnigent skill and an agent with `os_env`.
   `-c'SELECT 1'` isn't read, and only `psql` reads bundles such as `-tAc`. A flag
   a rule doesn't list in `value_flags` can shift positional words.
 - Only the first query in a chained command is reported for a call.
+- On `claude-sdk` (and any SDK harness that reports its own MCP servers' tools
+  as `mcp__server__tool`), a tool of a server the harness owns, such as one from
+  Claude Code's MCP config or a claude.ai connector, is recorded under its bare
+  name. Only a rule without `server` matches it. Servers the spec declares are
+  recorded as `server__tool` and match with or without `server`.

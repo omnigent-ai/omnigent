@@ -1444,9 +1444,15 @@ data_queries:
 
 Each rule has a unique `name` and exactly one matcher:
 
-- `mcp:` matches a tool by `server` and/or `tool`. Claude's
-  `mcp__server__tool` and the SDK harnesses' `server__tool` names both match;
-  without `server`, an unprefixed tool of that name matches too.
+- `mcp:` matches a tool by `server` and/or `tool`. A recorded
+  `mcp__server__tool` name and the SDK harnesses' `server__tool` name both
+  match; without `server`, an unprefixed tool of that name matches too. An MCP
+  server the spec declares runs through Omnigent on the SDK harnesses and is
+  recorded as `server__tool`. A server the harness owns instead (on
+  `claude-sdk`, one from Claude Code's own MCP config or a claude.ai
+  connector) is recorded there under the bare tool name, with the server
+  dropped: match it with `tool` alone, because a rule that names `server`
+  never matches it.
 - `shell:` matches a shell tool call (`sys_os_shell`, `Bash`, Codex `shell`
   and the other harnesses' shell tools) whose command starts with this argv
   prefix, as a string or a list of words. The first word matches a binary's

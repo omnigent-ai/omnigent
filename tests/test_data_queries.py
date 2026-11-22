@@ -335,6 +335,16 @@ def test_mcp_rule_needs_its_sql_and_its_server() -> None:
     assert fallback is not None and fallback.source == "42"
 
 
+def test_claude_sdk_host_config_mcp_tool_matches_only_a_rule_without_server() -> None:
+    """claude-sdk stores a Claude-owned server's tool bare; a rule naming the server misses it."""
+    tool_only_rule = {**_WAREHOUSE_RULE, "mcp": {"tool": "execute_sql"}}
+    arguments = {"statement": "SELECT 1", "warehouse_id": 42}
+    matched = classify_tool_call("execute_sql", arguments, spec=_spec(tool_only_rule))
+    assert matched is not None
+    assert (matched.matcher, matched.sql, matched.source) == ("mcp", "SELECT 1", "42")
+    assert classify_tool_call("execute_sql", arguments, spec=_spec(_WAREHOUSE_RULE)) is None
+
+
 def test_source_only_rules_mark_data_source_reads() -> None:
     """A rule with only a source locator marks every matching call as a source read."""
     spec = _spec(
