@@ -10,7 +10,7 @@ import {
 
 import { usePaneDividerPointer } from "./usePaneDividerPointer";
 
-// A divider rendered on its own, as in a test, has no drag session to tell.
+// Defaults for a divider used without a layout's drag session.
 const ignoreStart = () => {};
 const ignoreAbort = () => {};
 
@@ -78,8 +78,8 @@ export function PaneSplitDivider({
       aria-orientation={columns ? "vertical" : "horizontal"}
       aria-label="Resize terminal panes"
       // A long row's split can sit past the resize limits; the range includes it.
-      aria-valuemin={Math.min(MIN_SPLIT_RATIO * 100, percent)}
-      aria-valuemax={Math.max(MAX_SPLIT_RATIO * 100, percent)}
+      aria-valuemin={Math.min(Math.round(MIN_SPLIT_RATIO * 100), percent)}
+      aria-valuemax={Math.max(Math.round(MAX_SPLIT_RATIO * 100), percent)}
       aria-valuenow={percent}
       tabIndex={0}
       data-testid="terminal-split-divider"

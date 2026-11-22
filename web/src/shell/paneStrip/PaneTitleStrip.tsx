@@ -1,10 +1,6 @@
-// A pane's strip row: the row every pane keeps above its terminal, with the pane's icon and title
-// always, and on the active or hovered pane its Split Right, Split Down, Maximize and Close, which
-// give way as the row narrows (the row's right-click menu and ⌘K keep them). A maximized pane
-// shows Restore and Close. Every button runs the pane's existing command;
-// none of them takes the keyboard from the terminal on a click, and a click on the row's blank
-// space gives the pane's terminal the keyboard. ⌘K's Show Pane Toolbar moves the keyboard into the
-// row, where the arrows move between its buttons and Escape gives it back to the pane.
+// A pane's strip row: its icon and title, and on the active or hovered pane the actions that fit,
+// with the rest in its menu and ⌘K. A click runs the pane's own command and leaves the keyboard in
+// its terminal; ⌘K's Show Pane Toolbar moves the keyboard into the row.
 
 import {
   type MouseEvent as ReactMouseEvent,
@@ -42,6 +38,7 @@ import { cn } from "@/lib/utils";
 import { PANE_ZOOM_LABELS, paneCommandLabel } from "../paneCommandTable";
 import { MOVE_PANE_LABEL, NO_ROOM_TO_MOVE_REASON } from "../paneMove";
 import type { PaneMenuChoice } from "./paneMenu";
+import { PANE_STRIP_CONTROL } from "./usePaneMoveDrag";
 import { paneShortcutAria, paneShortcutKeys } from "./paneShortcutHints";
 import { type PaneStripLayout, type PaneStripParts, STRIP_BUTTON_WIDTH } from "./paneStripLayout";
 import {
@@ -379,9 +376,7 @@ export function PaneTitleStrip({
 
 /** Whether a row event happened on one of its controls, not its own space. */
 const onAControl = (event: ReactMouseEvent) =>
-  (event.target as Element).closest(
-    "button, input, textarea, [data-pane-strip-view-toggle-host]",
-  ) !== null;
+  (event.target as Element).closest(PANE_STRIP_CONTROL) !== null;
 
 /** A row menu item, with the shortcut of the pane command it runs when it has one. */
 function PaneMenuItem({
@@ -436,7 +431,18 @@ function PaneStripMenu({
   const swaps = commands?.swaps ?? [];
   const moveOptions = commands?.moveOptions;
   const rearranges = swaps.length > 0 || moveOptions !== undefined;
-  if (!commands || (actions.length === 0 && !restore && !rearranges)) return children;
+  // With no commands the row keeps the same parents, its menu disabled, so commands appearing
+  // (a shell finishing its start) never remount it or what it measures.
+  if (!commands || (actions.length === 0 && !restore && !rearranges)) {
+    return (
+      <ContextMenu modal={false}>
+        <ContextMenuTrigger asChild disabled>
+          {children}
+        </ContextMenuTrigger>
+        {null}
+      </ContextMenu>
+    );
+  }
   const zoom = () => {
     keyboardAfterClose.current = pane.focus;
     commands.toggleZoom?.();

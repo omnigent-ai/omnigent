@@ -1,9 +1,5 @@
-// Dragging a split's pane by its strip row onto another pane's side. A press on the row's blank
-// space becomes a drag past a few pixels, so a plain click still focuses the pane. While it
-// drags, frames stop taking the pointer (as for a divider) and the half the pane would take
-// shows; a drop there moves it, once, as the drop's own gesture. Escape, a cancelled or lost
-// pointer, a hidden or inactive window, a drop anywhere else, the pane going away or the view
-// unmounting end it unchanged, from the press on.
+// Dragging a split's pane by its strip row onto another pane's side, past a few pixels so a click
+// still focuses the pane. Any ending but a drop on an offered spot leaves the layout unchanged.
 
 import {
   type PointerEvent as ReactPointerEvent,
@@ -19,10 +15,13 @@ import { terminalLayoutKeys } from "@/lib/paneSplitLayout";
 import { type PaneDividerDrag, paneDividerDrag } from "@/shell/paneDividerDrag";
 import {
   isPaneMoveDestination,
+  type PaneDragOutside,
   type PaneMoveDestination,
   placedPaneArea,
   paneDropSpot,
 } from "@/shell/paneMove";
+
+export type { PaneDragOutside } from "@/shell/paneMove";
 
 /** How far the pointer goes, in CSS pixels, before a press on the row is a drag. */
 export const PANE_DRAG_THRESHOLD_PX = 4;
@@ -59,20 +58,25 @@ export interface PaneMoveDragOptions {
   outside?: PaneDragOutside;
 }
 
-/** A place off the split a dragged pane may be dropped on. */
-export interface PaneDragOutside {
-  /** The pointer is at `point`, off every pane spot, or null once it's on one or the drag ends. */
-  over: (key: string, point: { x: number; y: number } | null) => void;
-  /** Dropped at `point` off every pane spot: true when it went there. */
-  drop: (key: string, point: { x: number; y: number }) => boolean;
-}
-
 /** A press this soon and this near after a click is a double-click's second press. */
 const DOUBLE_CLICK_MS = 500;
 const DOUBLE_CLICK_SLOP_PX = 8;
 
-/** A row's blank space: not its controls. */
-const ON_A_CONTROL = "button, input, textarea, [data-pane-strip-view-toggle-host]";
+/** A row's controls: a press or click on one is the control's, never the row's. */
+export const PANE_STRIP_CONTROL = "button, input, textarea, [data-pane-strip-view-toggle-host]";
+
+/** Whether two drops show the same preview: the same spot, and the same area it would take. */
+function sameDrop(a: PaneDrop | null, b: PaneDrop | null): boolean {
+  if (a === null || b === null) return a === b;
+  return (
+    a.targetKey === b.targetKey &&
+    a.side === b.side &&
+    a.area.left === b.area.left &&
+    a.area.top === b.area.top &&
+    a.area.width === b.area.width &&
+    a.area.height === b.area.height
+  );
+}
 
 interface Gesture {
   key: string;
@@ -104,12 +108,15 @@ export function usePaneMoveDrag({
   const [heldKey, setHeldKey] = useState<string | null>(null);
   const [drop, setDrop] = useState<PaneDrop | null>(null);
   const gesture = useRef<Gesture | null>(null);
-  const lastClick = useRef<{ at: number; x: number; y: number } | null>(null);
+  const lastClick = useRef<{ key: string; at: number; x: number; y: number } | null>(null);
   const latest = useRef({ layout, destinations, onMove, refocus, panesRef, dividerDrag, outside });
   latest.current = { layout, destinations, onMove, refocus, panesRef, dividerDrag, outside };
 
-  /** Ends the gesture; `moved` says whether it ended in a move. */
-  const end = useCallback((moved: boolean) => {
+  /**
+   * Ends the gesture; `moved` says whether it ended in a move. A teardown (the pane gone or
+   * hidden, the view unmounting) gives no pane the keyboard back.
+   */
+  const end = useCallback((moved: boolean, teardown = false) => {
     const current = gesture.current;
     if (!current) return;
     gesture.current = null;
@@ -121,7 +128,7 @@ export function usePaneMoveDrag({
     setDraggingKey(null);
     setHeldKey(null);
     setDrop(null);
-    if (current.dragging && !moved) latest.current.refocus?.(current.key);
+    if (current.dragging && !moved && !teardown) latest.current.refocus?.(current.key);
   }, []);
 
   /** The spot under the pointer for the dragged pane, if it's one offered. */
@@ -150,12 +157,13 @@ export function usePaneMoveDrag({
   const begin = (key: string, event: ReactPointerEvent<HTMLElement>) => {
     // A Ctrl-click is the Mac's right-click: it opens the row's menu, never a drag.
     if (event.button !== 0 || event.ctrlKey || gesture.current) return;
-    if ((event.target as Element).closest(ON_A_CONTROL)) return;
-    // A double-click maximizes; its second press never drags, however much the hand moves.
+    if ((event.target as Element).closest(PANE_STRIP_CONTROL)) return;
+    // A double-click maximizes; its second press on the same row never drags, however much the
+    // hand moves. A press on another pane's row, however near, is its own.
     const click = lastClick.current;
     lastClick.current = null;
     if (
-      click &&
+      click?.key === key &&
       performance.now() - click.at < DOUBLE_CLICK_MS &&
       Math.hypot(event.clientX - click.x, event.clientY - click.y) <= DOUBLE_CLICK_SLOP_PX
     )
@@ -175,8 +183,10 @@ export function usePaneMoveDrag({
         setDraggingKey(current.key);
       }
       const spot = dropAt(current, move.clientX, move.clientY);
+      const unchanged = sameDrop(spot, current.shown);
       current.shown = spot;
-      setDrop(spot);
+      // Only a new preview re-renders the panes; a move that shows the same one doesn't.
+      if (!unchanged) setDrop(spot);
       latest.current.outside?.over(current.key, spot ? null : { x: move.clientX, y: move.clientY });
     };
     const onPointerUp = (up: PointerEvent) => {
@@ -184,7 +194,7 @@ export function usePaneMoveDrag({
       if (!current || up.pointerId !== current.pointerId) return;
       lastClick.current = current.dragging
         ? null
-        : { at: performance.now(), x: current.startX, y: current.startY };
+        : { key: current.key, at: performance.now(), x: current.startX, y: current.startY };
       const landed = current.dragging ? dropAt(current, up.clientX, up.clientY) : null;
       // Still offered for the split as it is now, which the move checks again.
       const still =
@@ -267,9 +277,9 @@ export function usePaneMoveDrag({
   const keys = layout === null ? null : terminalLayoutKeys(layout).join("\n");
   useEffect(() => {
     const current = gesture.current;
-    if (current && (keys === null || !keys.split("\n").includes(current.key))) end(false);
+    if (current && (keys === null || !keys.split("\n").includes(current.key))) end(false, true);
   }, [keys, end]);
-  useEffect(() => () => end(false), [end]);
+  useEffect(() => () => end(false, true), [end]);
 
   return {
     draggingKey,

@@ -1,7 +1,5 @@
-// Every pane's strip row as session panes get it: identity always, actions on the active and the
-// hovered pane, the buttons run the pane's own commands, Maximized docks in the row, a
-// split's panes are square tiles with a divider between them and an accent line on the focused
-// pane's toolbar, and nothing here ever remounts the terminal under it.
+// Every pane's strip row: its name always, actions on the active and hovered pane, its menu and
+// keyboard, and no remount of the terminal under it.
 
 import {
   act,
@@ -155,6 +153,8 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.restoreAllMocks();
+  // A title bar a failed case left would put every later case's rows under it.
+  for (const strip of document.querySelectorAll(".electron-drag-strip")) strip.remove();
 });
 
 describe("SplitPanesLayout: every pane's strip row", () => {
@@ -450,10 +450,7 @@ describe("SplitPanesLayout: every pane's strip row", () => {
 
     it("hands the keyboard back to the terminal when the menu closes without a command", async () => {
       setup();
-      const input = document.querySelector<HTMLElement>(
-        "[data-terminal-pane='a'] textarea, [data-terminal-pane='a'] input",
-      );
-      const terminal = input ?? document.body.appendChild(document.createElement("textarea"));
+      const terminal = screen.getByTestId("input-a");
       terminal.focus();
       openMenu("a");
       expect(document.activeElement).not.toBe(terminal);
@@ -641,7 +638,7 @@ describe("SplitPanesLayout: every pane's strip row", () => {
     );
   });
 
-  it("lays out a split pane's row at its tile's width, with no card around it", () => {
+  it("lays out a split's panes as square tiles side by side, each row at its tile's width", () => {
     // Two 202 px tiles fit all four actions, as a lone 202 px pane does.
     viewWidth(404);
     setup();
@@ -651,6 +648,15 @@ describe("SplitPanesLayout: every pane's strip row", () => {
       "pane-strip-maximize",
       "pane-strip-close",
     ]);
+    // No card around a tile or its row; only the divider between them.
+    for (const key of ["a", "b"]) {
+      const tile = document.querySelector<HTMLElement>(`[data-terminal-pane="${key}"]`)!;
+      const surface = row(key).parentElement!;
+      for (const element of [tile, surface]) {
+        expect(element.className).not.toMatch(/\brounded|\bp-0\.5\b|\bborder\b/);
+      }
+    }
+    expect(document.querySelectorAll("[data-testid=terminal-split-divider]")).toHaveLength(1);
   });
 
   it("keeps only Restore below the row's floor, the name left for screen readers", () => {
@@ -698,18 +704,6 @@ describe("SplitPanesLayout: every pane's strip row", () => {
     expect(document.querySelector("[data-pane-card]")).toBeNull();
   });
 
-  it("draws a split's panes square, side by side, with only the divider between them", () => {
-    setup();
-    for (const key of ["a", "b"]) {
-      const tile = document.querySelector<HTMLElement>(`[data-terminal-pane="${key}"]`)!;
-      const surface = row(key).parentElement!;
-      for (const element of [tile, surface]) {
-        expect(element.className).not.toMatch(/\brounded|\bp-0\.5\b|\bborder\b/);
-      }
-    }
-    expect(document.querySelectorAll("[data-testid=terminal-split-divider]")).toHaveLength(1);
-  });
-
   it("marks the focused pane of a split with an accent line on its toolbar, and a lone pane not", () => {
     const { rerender } = setup();
     expect(row("a").hasAttribute("data-pane-strip-focused")).toBe(true);
@@ -740,10 +734,29 @@ describe("SplitPanesLayout: every pane's strip row", () => {
       );
       rerender({ split: SPLIT, alsoMounted: ["b"] });
       expect(input().value).toBe("typed in b");
+      // Another pane maximized hides b; restoring shows it again.
+      rerender({ split: SPLIT, zoomedKey: "a" });
+      rerender({ split: { ...SPLIT, focusedKey: "b" } });
+      expect(input().value).toBe("typed in b");
       expect(mounts.get("a")).toBe(1);
       expect(mounts.get("b")).toBe(1);
     },
   );
+
+  it("keeps a row mounted, and what it measures, as its pane's commands appear", () => {
+    let ready = false;
+    const commands: PaneStripCommands = { splitRight: vi.fn(), toggleZoom: vi.fn() };
+    const { rerender } = setup({
+      single: true,
+      paneOf: () => ({ name: "zsh", commands: ready ? commands : null }),
+    });
+    const before = row("a");
+    // The shell finishes starting, and its commands appear.
+    ready = true;
+    rerender({});
+    expect(row("a")).toBe(before);
+    expect(buttonsOf("a")).toContain("pane-strip-split-right");
+  });
 
   it("shows only the name of a pane with no commands", () => {
     setup({ single: true, paneOf: () => ({ name: "read-only", commands: null }) });

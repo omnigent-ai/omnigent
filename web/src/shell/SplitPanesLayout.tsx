@@ -1,9 +1,5 @@
-// Panes laid out by a split, shared by the main panes view and the sidebar's
-// terminal tabs. Panes are flat siblings keyed by session and
-// terminal, so splitting, unsplitting or switching what's shown never remounts
-// a live terminal; shells mounted but not shown stay hidden at full size. Every
-// shown pane keeps a strip row above its terminal (see paneStrip/), the same for
-// every pane kind, and a split's panes are cards with a gap between them.
+// A split's panes as flat keyed siblings, so splitting, unsplitting or hiding a pane never remounts
+// its content; each shown pane keeps a strip row above it (see paneStrip/).
 
 import {
   Fragment,
@@ -132,7 +128,12 @@ export function SplitPanesLayout({
   // saved layout only while it lives, and only its release saves them.
   const [session, setSession] = useState<DividerDragSession | null>(null);
   // A layout saved meanwhile, as from another window, restarts the drag's sizes from it.
-  useEffect(() => setSession((current) => current && { ...current, resizes: null }), [split]);
+  // The drag's sizes as its last pointer move left them, which may not have rendered yet.
+  const latestResizes = useRef<readonly DividerResize[] | null>(null);
+  useEffect(() => {
+    latestResizes.current = null;
+    setSession((current) => current && { ...current, resizes: null });
+  }, [split]);
   // Maximizing, unsplitting, or closing a pane so another split takes a held divider's place ends
   // the drag, dropping its sizes.
   const maximized =
@@ -153,13 +154,25 @@ export function SplitPanesLayout({
     !split || keeps(split.layout, resizeTerminalSplit(split.layout, path, ratio));
   const draft = liveSession?.resizes ?? null;
   const layout = split && draft ? applyDividerResizes(split.layout, draft) : split?.layout;
-  const moveDrag = (resizes: readonly DividerResize[]) =>
-    setSession((current) => current && { ...current, resizes });
-  const commitDrag = () => {
-    setSession(null);
-    if (draft) onResize(draft);
+  const startDrag = (taken: Parameters<typeof dividerDragSession>[0], from: TerminalLayout) => {
+    latestResizes.current = null;
+    setSession(dividerDragSession(taken, from));
   };
-  const abortDrag = () => setSession(null);
+  const moveDrag = (resizes: readonly DividerResize[]) => {
+    latestResizes.current = resizes;
+    setSession((current) => current && { ...current, resizes });
+  };
+  // Saves the last move's sizes, even one a release follows before it renders.
+  const commitDrag = () => {
+    const resizes = latestResizes.current;
+    latestResizes.current = null;
+    setSession(null);
+    if (resizes && liveSession) onResize(resizes);
+  };
+  const abortDrag = () => {
+    latestResizes.current = null;
+    setSession(null);
+  };
   const shownLayout = layout ?? singlePaneKey;
   const geometry =
     shownLayout === null ? { panes: [], dividers: [] } : terminalLayoutGeometry(shownLayout);
@@ -269,8 +282,8 @@ export function SplitPanesLayout({
         const area = isZoomed ? { left: 0, top: 0, width: 100, height: 100 } : pane;
         const paneStrip = stripOf(pane.key);
         const content = renderPane(pane.key, focused, !zoomedAway);
-        // A split's panes are square tiles that meet at the divider; the focused one's toolbar
-        // carries the accent line. A lone or maximized pane has no focus to show.
+        // Only a split's focused, unmaximized pane shows focus: its card's border, or its row's
+        // accent line. A lone or maximized pane has none to show.
         const focusShown = rowed && splitShown && !isZoomed && focused;
         // Held by its row, to move: the pane lifts from the press until the drag ends.
         const held = paneDrag.heldKey === pane.key;
@@ -371,7 +384,7 @@ export function SplitPanesLayout({
               liveSession.corner === null &&
               liveSession.held[0].path.join(".") === divider.path.join(".")
             }
-            onStart={(taken) => setSession(dividerDragSession(taken, split.layout))}
+            onStart={(taken) => startDrag(taken, split.layout)}
             onResize={(path, ratio, final) => {
               if (!roomFor(path, ratio)) return;
               if (final) onResize([{ path, ratio }]);
@@ -391,7 +404,7 @@ export function SplitPanesLayout({
             containerRef={panesRef}
             inGap={carded}
             dragging={heldCorner !== null && heldCorner.key === corner.key}
-            onStart={(taken) => setSession(dividerDragSession(taken, split.layout))}
+            onStart={(taken) => startDrag(taken, split.layout)}
             // Each way moves from where the drag has it, so one stopped at a minimum stays put.
             onDrag={(dragged, point) => moveDrag(cornerDragResizes(layout, dragged, point, keeps))}
             onCommit={commitDrag}

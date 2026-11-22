@@ -1,7 +1,7 @@
 // Where a split's vertical and horizontal dividers meet, a corner handle drags both at once,
 // stops each way at the minimum on its own, and leaves the dividers' keyboard and ARIA alone.
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { useRef } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -70,8 +70,8 @@ function setup({
 const corners = () => screen.queryAllByTestId("terminal-split-corner");
 const pane = (key: string) => document.querySelector<HTMLElement>(`[data-terminal-pane="${key}"]`)!;
 
-/** Presses the corner, or one of its regions, and moves the pointer to (x, y) in a 1000 × 500 px view. */
-function dragCorner(corner: HTMLElement, x: number, y: number, pressed: HTMLElement = corner) {
+/** Presses a corner or divider, or a corner's region, and moves the pointer to (x, y) in a 1000 × 500 px view. */
+function dragHandle(corner: HTMLElement, x: number, y: number, pressed: HTMLElement = corner) {
   vi.spyOn(corner.parentElement!, "getBoundingClientRect").mockReturnValue({
     left: 0,
     top: 0,
@@ -99,7 +99,7 @@ describe("a split's divider corner", () => {
     expect(corners()).toHaveLength(1);
     expect(corner).toHaveStyle({ left: "calc(40% - 6px)", top: "calc(50% - 6px)" });
 
-    dragCorner(corner, 600, 350);
+    dragHandle(corner, 600, 350);
     // Both ways follow the pointer while it moves; nothing is saved until release.
     expect(pane("b")).toHaveStyle({ left: "60%", width: "40%", height: "70%" });
     expect(pane("a")).toHaveStyle({ width: "60%" });
@@ -132,7 +132,7 @@ describe("a split's divider corner", () => {
       const region = regions.find((candidate) => candidate.dataset.quadrant === quadrant)!;
       expect(region).toHaveStyle({ cursor });
 
-      dragCorner(corner, x, y, region);
+      dragHandle(corner, x, y, region);
       // The pressed diagonal holds for the whole drag, over every region.
       for (const other of regions) expect(other).toHaveStyle({ cursor });
       expect(corner).toHaveStyle({ cursor });
@@ -159,7 +159,7 @@ describe("a split's divider corner", () => {
     });
     const { onResize } = setup({ sizing });
     const [corner] = corners();
-    dragCorner(corner, 100, 350);
+    dragHandle(corner, 100, 350);
     expect(pane("a")).toHaveStyle({ width: "40%" });
     expect(pane("b")).toHaveStyle({ height: "70%" });
     fireEvent.pointerUp(corner, { pointerId: 1 });
@@ -210,7 +210,7 @@ describe("a split's divider corner", () => {
       "bottom-right nwse-resize",
     ]);
     // Up to 30%: a1 and a2 would be 15% tall, so the left side stops; the right side follows.
-    dragCorner(corner, 600, 150);
+    dragHandle(corner, 600, 150);
     expect(pane("c")).toHaveStyle({ height: "30%" });
     expect(pane("b")).toHaveStyle({ top: "50%" });
     expect(corner.isConnected).toBe(true);
@@ -235,10 +235,28 @@ describe("a split's divider corner", () => {
     expect(corners().length).toBeGreaterThan(1);
   });
 
+  it("saves where the pointer last was, though the release comes before that move renders", () => {
+    const first = setup();
+    dragHandle(corners()[0], 700, 400);
+    fireEvent.pointerUp(corners()[0], { pointerId: 1 });
+    const [[settled]] = first.onResize.mock.calls;
+    cleanup();
+
+    const { onResize } = setup();
+    const [corner] = corners();
+    dragHandle(corner, 600, 350);
+    // The last move and the release in one batch: nothing renders between them.
+    act(() => {
+      fireEvent.pointerMove(corner, { pointerId: 1, clientX: 700, clientY: 400 });
+      fireEvent.pointerUp(corner, { pointerId: 1 });
+    });
+    expect(onResize).toHaveBeenCalledExactlyOnceWith(settled);
+  });
+
   it("discards the drag's sizes when the pointer is cancelled", () => {
     const { onResize } = setup();
     const [corner] = corners();
-    dragCorner(corner, 600, 350);
+    dragHandle(corner, 600, 350);
     expect(pane("a")).toHaveStyle({ width: "60%" });
     fireEvent.pointerCancel(corner, { pointerId: 1 });
     expect(pane("a")).toHaveStyle({ width: "40%" });
@@ -251,7 +269,7 @@ describe("a split's divider corner", () => {
   it("drops a drag that maximizing cut off, so restoring shows the saved sizes", () => {
     const { onResize, rerender } = setup();
     const [corner] = corners();
-    dragCorner(corner, 600, 350);
+    dragHandle(corner, 600, 350);
     expect(pane("a")).toHaveStyle({ width: "60%" });
     // Maximizing keeps the same split; the zoom lives apart from it.
     rerender(T_SPLIT, "b");
@@ -264,7 +282,7 @@ describe("a split's divider corner", () => {
     expect(onResize).not.toHaveBeenCalled();
     // A new drag starts clean.
     const [again] = corners();
-    dragCorner(again, 500, 250);
+    dragHandle(again, 500, 250);
     fireEvent.pointerUp(again, { pointerId: 1 });
     expect(onResize).toHaveBeenCalledTimes(1);
   });
@@ -282,7 +300,7 @@ describe("a split's divider corner", () => {
       split: cross({ axis: "rows", ratio: 0.3, children: ["c", "d"] }),
     });
     const [held] = corners();
-    dragCorner(held, 500, 150);
+    dragHandle(held, 500, 150);
     // d closes mid-drag: the right side's divider the drag held is gone.
     rerender(cross("c"));
     expect(paneDividerDrag.dragging()).toBe(false);
@@ -302,7 +320,7 @@ describe("a split's divider corner", () => {
     };
     const { onResize } = setup({ split: pastLimit });
     const [divider] = screen.getAllByTestId("terminal-split-divider");
-    dragCorner(divider, 950, 250);
+    dragHandle(divider, 950, 250);
     expect(pane("a")).toHaveStyle({ width: "90%" });
     fireEvent.pointerMove(divider, { pointerId: 1, clientX: 880, clientY: 250 });
     expect(pane("a")).toHaveStyle({ width: "88%" });
@@ -321,7 +339,7 @@ describe("a split's divider corner", () => {
     };
     const { onResize, rerender } = setup({ split: nested });
     const [root] = screen.getAllByTestId("terminal-split-divider");
-    dragCorner(root, 400, 250);
+    dragHandle(root, 400, 250);
     expect(pane("a")).toHaveStyle({ width: "40%" });
     // a closes mid-drag: b | c moves up to the root, its divider at the same path the same way.
     const promoted: TerminalSplitState = {

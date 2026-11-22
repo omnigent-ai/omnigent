@@ -101,44 +101,32 @@ beforeEach(() => {
 afterEach(() => {
   resetAppPanes();
   cleanup();
+  // A title bar a failed case left would shift every later case's rows.
+  for (const strip of document.querySelectorAll(".electron-drag-strip")) strip.remove();
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
 describe("SplitPanesLayout: dragging a pane by its row", () => {
-  it("marks a split's rows movable, and not a lone or maximized pane's, nor without a mover", () => {
+  it("marks a split's rows movable with a drag handle, and not a lone or maximized pane's, nor without a mover", () => {
+    const handle = (key: string) => row(key).querySelector("[data-pane-strip-drag-handle]");
     setup();
-    expect(row("a").hasAttribute("data-pane-strip-movable")).toBe(true);
+    for (const key of ["a", "b"]) {
+      expect(row(key).hasAttribute("data-pane-strip-movable")).toBe(true);
+      expect(handle(key)).not.toBeNull();
+    }
+    // Only a hint: presses go through it to the row.
+    expect(handle("a")!.className).toMatch(/pointer-events-none/);
     // Movable, it looks and points as any row: no grip dots, no grab cursor.
     expect(row("a").querySelector("[data-pane-strip-grip]")).toBeNull();
     expect(row("a").className).not.toMatch(/cursor-grab/);
-    cleanup();
-    setup({ single: true });
-    expect(row("a").hasAttribute("data-pane-strip-movable")).toBe(false);
-    cleanup();
-    setup({ zoomedKey: "a" });
-    expect(row("a").hasAttribute("data-pane-strip-movable")).toBe(false);
-    cleanup();
-    // A shell that can't move panes: no drag, the row as it was.
-    setup({ movable: false });
-    expect(row("a").hasAttribute("data-pane-strip-movable")).toBe(false);
-  });
-
-  it("shows a drag handle on a row that can move, and none on one that can't", () => {
-    const handle = (key: string) => row(key).querySelector("[data-pane-strip-drag-handle]");
-    setup();
-    for (const key of ["a", "b"]) expect(handle(key)).not.toBeNull();
-    // Only a hint: presses go through it to the row.
-    expect(handle("a")!.className).toMatch(/pointer-events-none/);
-    cleanup();
-    setup({ single: true });
-    expect(handle("a")).toBeNull();
-    cleanup();
-    setup({ zoomedKey: "a" });
-    expect(handle("a")).toBeNull();
-    cleanup();
-    setup({ movable: false });
-    expect(handle("a")).toBeNull();
+    // A lone pane, a maximized one, and a shell that can't move panes: the row as it was.
+    for (const options of [{ single: true }, { zoomedKey: "a" }, { movable: false }]) {
+      cleanup();
+      setup(options);
+      expect(row("a").hasAttribute("data-pane-strip-movable")).toBe(false);
+      expect(handle("a")).toBeNull();
+    }
   });
 
   it("shows the drag handle only while the pointer is over the row", () => {
@@ -236,6 +224,20 @@ describe("SplitPanesLayout: dragging a pane by its row", () => {
     expect(dropShown()).toBe("b:right");
     release(780, 300);
     expect(onMovePane).toHaveBeenCalledTimes(1);
+  });
+
+  it("drags from a press on another pane's row right after a click on this one's, however near", () => {
+    const now = vi.spyOn(performance, "now").mockReturnValue(1000);
+    const { onMovePane } = setup();
+    // A click just left of the divider, then a press just right of it, on b's row.
+    press("a", 398);
+    release(398, 10);
+    now.mockReturnValue(1100);
+    press("b", 402);
+    moveTo(20, 300);
+    expect(dropShown()).toBe("a:left");
+    release(20, 300);
+    expect(onMovePane).toHaveBeenCalledExactlyOnceWith({ key: "b", targetKey: "a", side: "left" });
   });
 
   it("starts a drag from a press on the drag handle", () => {
@@ -365,7 +367,7 @@ describe("SplitPanesLayout: dragging a pane by its row", () => {
     expect(drop.style.width).toBe("50%");
     expect(drop.className).toContain("border-l-2");
     expect(drop.className).toContain("bg-primary/15");
-    // A slow drag still drops: main pairs the drop with its own mouse-up.
+    // A slow drag still drops on release.
     act(() => void vi.advanceTimersByTime(2_000));
     release(780, 300);
     expect(onMovePane).toHaveBeenCalledTimes(1);
@@ -499,23 +501,37 @@ describe("SplitPanesLayout: dragging a pane by its row", () => {
     expect(onMovePane).toHaveBeenCalledTimes(1);
   });
 
-  it("ends when the dragged pane goes, or the split stops being movable", () => {
-    const { onMovePane, rerender } = setup();
+  it.each([
+    ["another pane is maximized", { split: SPLIT, zoomedKey: "b" }],
+    ["the split goes", { split: undefined }],
+    [
+      "the dragged pane goes",
+      {
+        split: {
+          layout: { axis: "columns", ratio: 0.5, children: ["c", "b"] },
+          focusedKey: "b",
+        } satisfies TerminalSplitState,
+      },
+    ],
+  ])("ends when %s, giving no pane the keyboard back", (_case, next) => {
+    const { onMovePane, refocusPane, rerender } = setup();
     press("a", 100);
     moveTo(780, 300);
-    rerender({ split: SPLIT, zoomedKey: "b" });
+    rerender(next);
     expect(dividerDrag.dragging()).toBe(false);
     release(780, 300);
     expect(onMovePane).not.toHaveBeenCalled();
+    expect(refocusPane).not.toHaveBeenCalled();
   });
 
-  it("ends as the view unmounts, giving the frames the pointer back", () => {
-    setup();
+  it("ends as the view unmounts, giving the frames the pointer back and no pane the keyboard", () => {
+    const { refocusPane } = setup();
     press("a", 100);
     moveTo(780, 300);
     expect(dividerDrag.dragging()).toBe(true);
     cleanup();
     expect(dividerDrag.dragging()).toBe(false);
+    expect(refocusPane).not.toHaveBeenCalled();
   });
 });
 
@@ -550,6 +566,33 @@ describe("SplitPanesLayout: off the split", () => {
     moveTo(900, 300);
     release(900, 300);
     expect(refocusPane).toHaveBeenCalledWith("a");
+  });
+
+  it("shows the area the pane would take as the split changes under the drag, as it lands", () => {
+    const columnOverRows = (ratio: number): TerminalSplitState => ({
+      layout: {
+        axis: "columns",
+        ratio: 0.5,
+        children: ["a", { axis: "rows", ratio, children: ["b", "c"] }],
+      },
+      focusedKey: "a",
+    });
+    const { onMovePane, rerender } = setup();
+    rerender({ split: columnOverRows(0.5) });
+    press("a", 100);
+    moveTo(120, 10);
+    // b is the right column's top half: its right side is the right quarter of that half.
+    moveTo(780, 100);
+    const preview = () => document.querySelector<HTMLElement>("[data-pane-drop]")!;
+    expect(dropShown()).toBe("b:right");
+    expect(preview().style.height).toBe("50%");
+    // The saved split changes to 70/30, and the pointer moves on within b's right.
+    rerender({ split: columnOverRows(0.7) });
+    moveTo(785, 105);
+    expect(dropShown()).toBe("b:right");
+    expect(preview().style.height).toBe("70%");
+    release(785, 105);
+    expect(onMovePane).toHaveBeenCalledExactlyOnceWith({ key: "a", targetKey: "b", side: "right" });
   });
 
   it("offers Bottom below a tall pane's middle, and keeps it near the diagonal as it lands", () => {

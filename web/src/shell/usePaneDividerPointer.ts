@@ -47,10 +47,16 @@ export function usePaneDividerPointer({
       pointer.element.releasePointerCapture?.(pointer.pointerId);
     }
   }, [dragging]);
-  const end = (outcome: () => void) => () => {
-    finishDrag();
-    outcome();
-  };
+  // Only the handle holding the pointer ends a drag: a release's later lostpointercapture, or
+  // another finger's events, find none held and do nothing.
+  const end =
+    (outcome: () => void) =>
+    (event: PointerEvent<HTMLElement>): void => {
+      const pointer = held.current;
+      if (pointer === null || pointer.pointerId !== event.pointerId) return;
+      finishDrag();
+      outcome();
+    };
   return {
     onPointerDown: (event: PointerEvent<HTMLElement>) => {
       event.preventDefault();
@@ -70,7 +76,6 @@ export function usePaneDividerPointer({
       });
     },
     onPointerUp: end(onCommit),
-    // After a release the drag is already over, so these drop nothing more.
     onPointerCancel: end(onAbort),
     onLostPointerCapture: end(onAbort),
   };
