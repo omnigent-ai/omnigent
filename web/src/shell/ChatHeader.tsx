@@ -25,6 +25,12 @@ import {
 } from "lucide-react";
 import { useCanvasWorkspace } from "@/canvas/CanvasWorkspace";
 import {
+  BACK_TO_CANVAS_LABEL,
+  CLOSE_CONVERSATION_PANE_LABEL,
+  FOCUS_CONVERSATION_LABEL,
+  SHOW_CANVAS_LABEL,
+} from "@/canvas/canvasHeaderActions";
+import {
   rightSidebarToggleAriaShortcut,
   rightSidebarToggleShortcutKeys,
 } from "@/components/KeyboardShortcut";
@@ -634,7 +640,7 @@ export function ChatHeader({
             variant="ghost"
             size="sm"
             onClick={canvas.closeConversation}
-            aria-label="Back to canvas"
+            aria-label={BACK_TO_CANVAS_LABEL}
             className="shrink-0 gap-1 px-1.5 text-ui"
           >
             <ArrowLeftIcon className="size-4" />
@@ -898,7 +904,7 @@ export function ChatHeader({
             <Button
               variant="ghost"
               size="icon-xs"
-              aria-label={canvas.focused ? "Show canvas beside conversation" : "Focus conversation"}
+              aria-label={canvas.focused ? SHOW_CANVAS_LABEL : FOCUS_CONVERSATION_LABEL}
               title={canvas.focused ? "Show canvas" : "Focus conversation"}
               onClick={canvas.toggleFocus}
               className="shrink-0 text-muted-foreground"
@@ -912,8 +918,8 @@ export function ChatHeader({
             <Button
               variant="ghost"
               size="icon-xs"
-              aria-label="Close conversation pane"
-              title="Close conversation pane"
+              aria-label={CLOSE_CONVERSATION_PANE_LABEL}
+              title={CLOSE_CONVERSATION_PANE_LABEL}
               onClick={canvas.closeConversation}
               className="shrink-0 text-muted-foreground"
             >

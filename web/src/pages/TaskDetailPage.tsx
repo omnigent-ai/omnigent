@@ -39,6 +39,11 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { RunPullRequests } from "@/components/scheduled/RunPullRequests";
 import {
+  type AutomationDetailActionId,
+  automationDetailActionAvailable,
+  automationDetailActions,
+} from "@/components/scheduled/automationDetailActions";
+import {
   automationOwnerName,
   isSharedWithViewer,
   OWNER_ONLY_REASONS,
@@ -376,6 +381,18 @@ function TaskDetail({ taskId }: { taskId: string }) {
   // A single per-task busy flag: the header actions disable while any of this
   // task's mutations are in flight.
   const busy = updateMutation.isPending || deleteMutation.isPending || runNowMutation.isPending;
+  // The header buttons' states, shared with ⌘K's automation commands.
+  const actions = automationDetailActions({
+    readOnly,
+    busy,
+    triggerMode,
+    runStarting: awaitingRunRow,
+    paused,
+    canShare,
+    shareDisabledReason,
+  });
+  const actionAvailable = (id: AutomationDetailActionId) =>
+    automationDetailActionAvailable(actions, id);
 
   function handlePauseToggle() {
     updateMutation.mutate({
@@ -533,7 +550,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
               size="icon-sm"
               aria-label="Edit automation"
               data-testid="task-detail-edit"
-              disabled={busy || readOnly}
+              disabled={!actionAvailable("edit")}
               onClick={() => setEditOpen(true)}
             >
               <PencilIcon className="size-4" />
@@ -549,7 +566,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
               size="icon-sm"
               aria-label="Delete automation"
               data-testid="task-detail-delete"
-              disabled={busy || readOnly}
+              disabled={!actionAvailable("delete")}
               onClick={handleDelete}
             >
               <Trash2Icon className="size-4" />
@@ -559,7 +576,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
             <OwnerOnly readOnly={readOnly} label="Run now" reason={OWNER_ONLY_REASONS.runNow}>
               <Button
                 data-testid="task-detail-run-now"
-                disabled={busy || awaitingRunRow || readOnly}
+                disabled={!actionAvailable("run-now")}
                 onClick={handleRunNow}
               >
                 {runNowMutation.isPending || awaitingRunRow ? (
@@ -592,7 +609,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
             aria-label={paused ? "Resume automation" : "Pause automation"}
             data-testid="task-detail-pause-toggle"
             checked={!paused}
-            disabled={busy || readOnly}
+            disabled={!actionAvailable(paused ? "resume" : "pause")}
             onCheckedChange={handlePauseToggle}
           />
         </OwnerOnly>

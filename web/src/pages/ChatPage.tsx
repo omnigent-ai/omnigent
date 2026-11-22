@@ -334,6 +334,7 @@ import {
 } from "@/components/composer/useSessionHarnessPickerProps";
 import { nextTranscriptBottomPin, type TranscriptBottomPin } from "./transcriptBottomPin";
 import { Transcript } from "@/components/chat/Transcript";
+import { canStopResponse } from "@/components/chat/stopResponse";
 
 /**
  * Whether the deployment has smart routing at all. `"loading"` (the `/v1/info`
@@ -4350,7 +4351,7 @@ function ComposerImpl(
     // Esc cancels an in-flight turn. When idle it's a no-op — clearing on
     // Esc destroys typed prompts with no undo (common muscle memory after
     // dismissing autocomplete suggestions).
-    if (e.key === "Escape" && isWorking && !isReadOnly) {
+    if (e.key === "Escape" && canStopResponse({ working: isWorking, readOnly: isReadOnly })) {
       e.preventDefault();
       onStop();
       return;
