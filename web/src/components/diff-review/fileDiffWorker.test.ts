@@ -1,8 +1,9 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { runInNewContext } from "node:vm";
 import { build, type Rollup } from "vite";
 import { beforeAll, describe, expect, it } from "vitest";
+
+import { RICH_MARKDOWN_REQUEST, startInWorkerScope } from "@/test/workerScope";
 
 import { workerBuildPlugins } from "../../../vite.workerExports";
 
@@ -47,34 +48,10 @@ describe.each(WORKERS)("%s", (worker) => {
   });
 
   it("starts in a worker scope without a document, and answers a request", async () => {
-    const answers: unknown[] = [];
-    const scope: {
-      onmessage: ((event: { data: unknown }) => void) | null;
-      postMessage: (message: unknown) => void;
-    } = {
-      onmessage: null,
-      postMessage: (message) => answers.push(message),
-    };
-    // What a worker scope has that the diff relies on; no document, window or DOMParser.
-    const { TextDecoder, TextEncoder, URL, queueMicrotask, setTimeout, clearTimeout } = globalThis;
-    runInNewContext(chunks.get(worker)!.code, {
-      self: scope,
-      console,
-      TextDecoder,
-      TextEncoder,
-      URL,
-      queueMicrotask,
-      setTimeout,
-      clearTimeout,
-    });
-    expect(typeof scope.onmessage).toBe("function");
+    const started = startInWorkerScope(chunks.get(worker)!.code);
     if (worker !== "markdownDiffWorker.ts") return;
-    // Entities and math reach the parts whose browser builds need the DOM.
-    const before = "# Notes\n\nPrice &amp; tax\n\nInline $x^2$\n";
-    scope.onmessage!({ data: { id: 1, request: { before, after: before.replace("x^2", "y^3") } } });
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, 0);
-    });
-    expect(answers).toEqual([{ id: 1, result: expect.objectContaining({ status: "ready" }) }]);
+    expect(await started.send(RICH_MARKDOWN_REQUEST)).toEqual([
+      { id: 1, result: expect.objectContaining({ status: "ready" }) },
+    ]);
   });
 });

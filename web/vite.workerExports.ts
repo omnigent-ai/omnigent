@@ -75,3 +75,6 @@ export function preferWorkerExports(): Plugin {
 
 /** The plugins every worker bundle is built with, by the app and by the worker tests. */
 export const workerBuildPlugins = (): Plugin[] => [preferWorkerExports()];
+
+/** The `worker` options of every web build, the app's and the embed's. */
+export const workerBuildOptions = { plugins: workerBuildPlugins };
