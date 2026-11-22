@@ -11,7 +11,7 @@ import builtins
 import json
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -201,9 +201,12 @@ class ScheduledTaskStore(ABC):
             act as the owner when the task fires; never a credential.
         :param first_run_at: Epoch seconds the first run must fall at, checked
             against the schedule computed from the task's recorded creation timestamp, in
-            the same write. ``None`` skips the check.
-        :param kind: ``"automation"`` (default), or ``"reminder"`` for a one-time
-            (``COUNT=1``) task that continues ``session_id``.
+            the same write. ``None`` skips the check. A timer requires it and saves it as
+            its next run as given.
+        :param kind: ``"automation"`` (default), ``"reminder"`` for a one-time
+            (``COUNT=1``) task that continues ``session_id``, or ``"timer"`` for a
+            ``sys_timer_set`` wake into ``session_id`` (see
+            :func:`omnigent.server.scheduled.schedule.timer_rule`).
         :param schedule_anchor: Epoch seconds recorded as the task's creation
             timestamp, which anchors its interval phase and ``COUNT``; ``None`` uses
             now. A copy passes its original's so it runs on the same occurrences.
@@ -212,7 +215,8 @@ class ScheduledTaskStore(ABC):
         :raises ScheduledTaskFirstRunMismatchError: If ``first_run_at`` is set and
             the first run differs; nothing is saved.
         :raises ValueError: If ``state`` or ``kind`` is not a recognized value, or a
-            reminder's rule, session mode or session doesn't fit one.
+            reminder's rule, session mode or session doesn't fit one, or a timer has no
+            session or first run time.
         """
         ...
 
@@ -244,12 +248,15 @@ class ScheduledTaskStore(ABC):
         *,
         owner_user_id: str | None = None,
         exclude_agent_ids: frozenset[str] = frozenset(),
+        kinds: Collection[str] | None = None,
     ) -> list[ScheduledTask]:
         """
         List non-deleted scheduled tasks ordered by ``created_at ASC, id ASC``.
 
         :param owner_user_id: When given, return only tasks owned by this user.
         :param exclude_agent_ids: Leave out tasks bound to these agents.
+        :param kinds: When given, return only tasks of these kinds, e.g.
+            ``("automation",)``; ``None`` returns every kind.
         :returns: List of :class:`ScheduledTask` instances.
         """
         ...

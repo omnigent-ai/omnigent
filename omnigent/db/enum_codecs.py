@@ -123,6 +123,7 @@ SCHEDULED_TASK_EXECUTION_TARGET: dict[str, int] = {
 SCHEDULED_TASK_KIND: dict[str, int] = {
     "automation": 1,
     "reminder": 2,
+    "timer": 3,
 }
 
 SCHEDULED_TASK_SESSION_MODE: dict[str, int] = {

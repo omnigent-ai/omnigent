@@ -11616,7 +11616,7 @@ async def _evaluate_tool_call_policy(
 
 
 async def _evaluate_input_policy(
-    request: Request,
+    request: Request | None,
     session_id: str,
     conv: Conversation,
     body: SessionEventInput,
@@ -11644,7 +11644,8 @@ async def _evaluate_input_policy(
 
     :param request: The active FastAPI request, threaded to
         :func:`_hold_native_ask_gate` for upstream-disconnect detection
-        while parked on an ASK.
+        while parked on an ASK. ``None`` when no one waits on this input,
+        such as a timer's wake: an ASK then denies, as no one can approve it.
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param conv: The session's :class:`Conversation` entity.
@@ -11744,6 +11745,11 @@ async def _evaluate_input_policy(
     # deciding policy's writes only on accept (POLICIES.md §7.2). Accept ->
     # ALLOW (fall through to forward the message); decline / timeout ->
     # DENY (fail-closed).
+    if request is None:
+        return {
+            "verdict": "deny",
+            "reason": f"{result.reason or 'Approval required'} (no one can approve this wake)",
+        }
     try:
         approved = await _hold_native_ask_gate(
             request,
