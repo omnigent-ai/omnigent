@@ -30,6 +30,7 @@ import {
   FOCUS_CONVERSATION_LABEL,
   SHOW_CANVAS_LABEL,
 } from "@/canvas/canvasHeaderActions";
+import { useCanvasHeaderPaletteCommands } from "@/canvas/useCanvasHeaderPaletteCommands";
 import {
   rightSidebarToggleAriaShortcut,
   rightSidebarToggleShortcutKeys,
@@ -393,6 +394,7 @@ export function ChatHeader({
 }: ChatHeaderProps) {
   const isMobile = useIsMobileViewport();
   const canvas = useCanvasWorkspace();
+  useCanvasHeaderPaletteCommands(canvas);
   const { trackClick } = useOmnigentAnalytics();
   const hasPageTitle = !conversationId && pageTitle !== undefined;
   // Workspace-rail entries (Files · Changes · Agents · Shells · Logs), each
