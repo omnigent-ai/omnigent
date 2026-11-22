@@ -30,6 +30,7 @@ import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
+from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests._helpers.host import Host, isolated_host
 from tests._helpers.live_server import terminate_process
 
@@ -1157,7 +1158,6 @@ def test_scheduled_task_trigger_template_creates_polling_manager_task(
     automation_projects = [p for p in projects if p["name"] == "Omnigent Automation"]
     assert len(automation_projects) == 1
     assert created["project_id"] == automation_projects[0]["id"]
-    assert created["rrule"] is None, created
     expect(_row_by_name(page, name)).to_contain_text("Runs when new items match")
     expect(_row_by_name(page, name).get_by_test_id("task-next-run")).to_have_count(0)
     # The prompt's details are covered by the dialog and renderer tests.
@@ -1227,6 +1227,54 @@ def test_scheduled_task_trigger_template_creates_polling_manager_task(
     expect(page.get_by_test_id("task-trigger-preview")).to_have_count(0)
     expect(page.get_by_test_id("task-trigger-edit-as-prompt")).to_have_count(0)
     page.get_by_role("button", name="Cancel", exact=True).click()
+
+
+@pytest.mark.min_server_version("0.24.0")
+@pytest.mark.usefixtures("automations_v2_host")
+def test_editing_a_trigger_keeps_its_withheld_rule(
+    page: Page,
+    automations_v2_server: str,
+    automations_v2_server_dir: Path,
+) -> None:
+    """Saving a trigger's edits leaves the rule the API withholds as it was saved."""
+    live_server = automations_v2_server
+    name = f"Weekday trigger {uuid.uuid4().hex[:8]}"
+    page.set_viewport_size({"width": 390, "height": 900})
+    _open_automations_page(page, live_server)
+    page.get_by_test_id("suggestion-trigger-jira").click()
+    page.get_by_role("button", name="Advanced settings (optional)", exact=True).click()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
+    page.get_by_test_id("task-name-input").fill(name)
+    page.get_by_test_id("task-trigger-scope").fill("ES")
+    page.get_by_role("tab", name="Instructions", exact=True).click()
+    page.get_by_test_id("task-trigger-instructions").fill("Triage the ticket.")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).not_to_be_visible()
+    expect(_row_by_name(page, name)).to_be_visible(timeout=30_000)
+    tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
+    task = next(t for t in tasks if t["name"] == name)
+    assert task["rrule"] is None, task
+    url = f"{live_server}/v1/scheduled-tasks/{task['id']}"
+    # A weekday rule an agent might save for the trigger, which the form never builds.
+    weekday_rule = "FREQ=MINUTELY;INTERVAL=10;BYDAY=MO,TU,WE,TH,FR"
+    httpx.patch(url, json={"rrule": weekday_rule}, timeout=10).raise_for_status()
+    try:
+        _row_by_name(page, name).get_by_test_id("task-row-menu").click()
+        page.get_by_test_id("task-edit").click()
+        page.get_by_role("button", name="Advanced settings (optional)", exact=True).click()
+        expect(page.get_by_test_id("task-trigger-schedule-replacement")).to_have_count(0)
+        page.get_by_role("tab", name="Instructions", exact=True).click()
+        page.get_by_test_id("task-trigger-instructions").fill("Investigate the ticket.")
+        page.get_by_test_id("create-scheduled-task-submit").click()
+        expect(page.get_by_role("dialog")).to_have_count(0)
+
+        saved = httpx.get(url, timeout=10).json()
+        assert "Investigate the ticket." in saved["prompt"], saved
+        assert saved["rrule"] is None, saved
+        stored = SqlAlchemyScheduledTaskStore(f"sqlite:///{automations_v2_server_dir / 'chat.db'}")
+        assert stored.get(task["id"]).rrule == weekday_rule
+    finally:
+        httpx.delete(url, timeout=10)
 
 
 def test_ten_minute_host_schedule_round_trip(
