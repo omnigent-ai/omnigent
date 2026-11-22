@@ -205,7 +205,10 @@ export function sizeOrderComparator(files: readonly OrderedFile[]): FileTreeSort
     const segments = file.path.split("/");
     for (let depth = 0; depth < segments.length - 1; depth++) {
       const folder = `${segments.slice(0, depth + 1).join("/")}/`;
-      weights.set(folder, (weights.get(folder) ?? 0) + (lines ?? 0));
+      // A folder of only uncounted files weighs like one, below a counted empty change.
+      const previous = weights.get(folder);
+      if (lines === null) weights.set(folder, previous ?? -1);
+      else weights.set(folder, Math.max(previous ?? 0, 0) + lines);
     }
     weights.set(segments.join("/"), lines ?? -1);
   }

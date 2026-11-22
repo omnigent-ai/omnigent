@@ -112,11 +112,19 @@ describe("treeOrderedFiles by size", () => {
     expect(
       bySize([sized("image.png", null, null), sized("empty.txt", 0), sized("big.ts", 9)]),
     ).toEqual(["big.ts", "empty.txt", "image.png"]);
-    // A folder of uncounted files weighs nothing, so counted rows still come first.
+    // A folder of only uncounted files goes after counted rows, even an empty change.
     expect(bySize([sized("assets/logo.png", null, null), sized("a.ts", 1)])).toEqual([
       "a.ts",
       "assets/logo.png",
     ]);
+    expect(bySize([sized("assets/image.png", null, null), sized("empty.txt", 0)])).toEqual([
+      "empty.txt",
+      "assets/image.png",
+    ]);
+    // Once one of its files has counts, the folder weighs what they changed.
+    expect(
+      bySize([sized("assets/image.png", null, null), sized("assets/a.svg", 2), sized("b.ts", 1)]),
+    ).toEqual(["assets/a.svg", "assets/image.png", "b.ts"]);
   });
 
   it("keeps the path order unless asked for size", () => {
