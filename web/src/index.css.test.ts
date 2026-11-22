@@ -1722,3 +1722,27 @@ function extractInsetRule(css: string): { selectors: string; body: string } | nu
   if (bodyStart === -1 || bodyEnd === -1) return null;
   return { selectors, body: css.slice(bodyStart + 1, bodyEnd) };
 }
+
+// The lights are painted outside the page, so the corner pane row's room for them is pinned here.
+describe("index.css pane strip window-corner inset", () => {
+  const blocks = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).map((block) =>
+    block.replace(/\/\*[\s\S]*?\*\//g, "").trim(),
+  );
+  const ruleFor = (selector: string) =>
+    blocks.find((block) => block.slice(0, block.indexOf("{")).trim().endsWith(selector));
+
+  it("is hidden by default and shown on the Mac with the sidebar closed, clearing the header's room", () => {
+    expect(ruleFor(".pane-strip-window-inset")).toContain("display: none");
+    const shown = ruleFor(
+      "html[data-electron-mac] .app-shell:not([data-sidebar-open]) .pane-strip-window-inset",
+    );
+    expect(shown).toContain("display: block");
+    expect(shown).toContain("width: var(--mac-header-actions-clearance)");
+  });
+
+  it("makes a row under the title bar as tall as the title bar", () => {
+    expect(
+      ruleFor("html[data-electron-mac] [data-pane-strip][data-pane-strip-window-top]"),
+    ).toContain("height: var(--mac-titlebar-height)");
+  });
+});
