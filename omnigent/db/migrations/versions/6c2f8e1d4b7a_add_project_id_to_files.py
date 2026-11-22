@@ -9,13 +9,14 @@ can read and write it. ``ix_files_project_id_created_at`` serves listing a
 project's files, as ``ix_files_session_id_created_at`` does for a session's.
 
 ``ix_files_blob_key`` serves the blob reference check made before deleting
-bytes. That check now matches ``blob_key`` directly (falling back to ``id``
-only for rows written before ``blob_key`` existed), so with this index it is a
-lookup instead of a scan of the workspace's files.
+bytes, once that check matches ``blob_key`` directly (falling back to ``id``
+only for rows written before ``blob_key`` existed): a lookup instead of a scan
+of the workspace's files.
 
-Additive and unused by earlier releases, so this schema can ship before the
-application code that reads it. Downgrade drops both indexes and the column,
-and with it every project file's membership.
+Additive and unused by earlier releases, so this schema deploys before the
+application code that reads it, and that code can be rolled back while it
+stays. Downgrade drops both indexes and the column, and with it every project
+file's membership, so only downgrade before project files are in use.
 """
 
 from __future__ import annotations
