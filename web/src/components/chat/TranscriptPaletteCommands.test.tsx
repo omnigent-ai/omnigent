@@ -134,6 +134,16 @@ describe("TranscriptPaletteCommands", () => {
     expect(command("Copy latest response")).toBe(listed);
     await act(async () => listed.run());
     expect(clipboard.markdown).toHaveBeenLastCalledWith("Done, and tested.");
+
+    // A newer response with the same availability keeps the link row, which links it then.
+    const listedLink = command("Copy link to latest response");
+    const newer = edited.map((bubble) =>
+      bubble.kind === "assistant" ? { ...bubble, responseId: "r2" } : bubble,
+    );
+    rerender(<TranscriptPaletteCommands conversationId="c1" bubbles={newer} />);
+    expect(command("Copy link to latest response")).toBe(listedLink);
+    await act(async () => listedLink.run());
+    expect(clipboard.text).toHaveBeenLastCalledWith(expect.stringContaining("r2"));
   });
 
   it("scrolls to the newest message as the transcript's arrow does, greyed once there", () => {

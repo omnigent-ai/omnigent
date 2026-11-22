@@ -95,9 +95,10 @@ runs' sessions in their own Omnigent Automation folder.
 - `palette-automation-actions`: with `quick_pick_palette` on (off by default),
   an automation's page lists its header actions in ⌘K: Run automation now
   (absent for trigger automations), Edit automation…, Share automation…, and
-  Pause or Resume automation. Each runs the header button's handler and is greyed
-  while a change is saving. A viewer of a shared automation sees them greyed
-  with the owner-only reason, as the header's buttons are; the owner sees Share
+  Pause or Resume automation. Each runs the header button's handler. Run now,
+  Edit, Pause and Resume are greyed while a change is saving; Share stays
+  available then, as its button does. A viewer of a shared automation sees them
+  greyed with the owner-only reason, as the header's buttons are; the owner sees Share
   only where sharing applies. Delete stays on its button, which deletes without
   asking (`web/src/components/scheduled/AutomationPaletteCommands.test.tsx`,
   `tests/e2e_ui/scheduled/test_quick_pick_automation_commands.py`).
