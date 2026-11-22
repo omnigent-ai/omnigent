@@ -26,6 +26,7 @@ from omnigent.entities import (
     ConversationItem,
     MessageData,
     PagedList,
+    ResourceEventData,
     SlashCommandData,
     StoredFile,
 )
@@ -836,10 +837,30 @@ def test_side_chat_forked_mid_turn_leaves_out_the_running_request(
     assert store.fork_calls[-1]["resume_source_native_session"] is clones_native
 
 
+def _resource_events_only() -> list[ConversationItem]:
+    """A history holding only a resource event, with nothing a copy can end on."""
+    return [
+        ConversationItem(
+            id="evt_file",
+            type="resource_event",
+            status="completed",
+            response_id="e9f8f58523cec9a57d3bdf93be543e8c",
+            created_at=1,
+            data=ResourceEventData(
+                event_type="file.created", resource_id="file_1", resource_type="file"
+            ),
+        )
+    ]
+
+
 @pytest.mark.parametrize(
     ("history", "copied"),
-    [(_side_chat_fork_history, ["resp_001", "resp_002"]), (list, [])],
-    ids=["after_an_exchange", "empty"],
+    [
+        (_side_chat_fork_history, ["resp_001", "resp_002"]),
+        (list, []),
+        (_resource_events_only, []),
+    ],
+    ids=["after_an_exchange", "empty", "resource_events_only"],
 )
 def test_side_chat_fork_ignores_a_request_that_lands_while_it_is_prepared(
     history: Any, copied: list[str]
