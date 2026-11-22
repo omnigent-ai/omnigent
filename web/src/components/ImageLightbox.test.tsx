@@ -216,7 +216,10 @@ describe("pinch-to-zoom", () => {
     fireEvent.touchEnd(target, fingers([], to));
   }
 
-  afterEach(() => isIOSShell.mockReset().mockReturnValue(false));
+  afterEach(() => {
+    isAndroidShell.mockReset().mockReturnValue(false);
+    isIOSShell.mockReset().mockReturnValue(false);
+  });
 
   it("zooms with the fingers' spread and back out to fit", () => {
     const { previewImg, stage } = openPreview();
@@ -247,6 +250,26 @@ describe("pinch-to-zoom", () => {
     expect(previewImg).toHaveStyle({ transform: "translate(-100px, -50px) scale(2)" });
   });
 
+  it("stops zooming in at 800%", () => {
+    const { previewImg, stage } = openPreview();
+
+    pinch(stage, [finger(-10), finger(10)], [finger(-200), finger(200)]);
+
+    expect(screen.getByRole("button", { name: "Reset zoom" })).toHaveTextContent("800%");
+    expect(previewImg).toHaveStyle({ transform: "translate(0px, 0px) scale(8)" });
+  });
+
+  it("anchors a new pinch on the zoomed image after a cancelled one", () => {
+    const { previewImg, stage } = openPreview();
+    fireEvent.touchStart(stage, fingers([finger(-50), finger(50)]));
+    fireEvent.touchMove(stage, fingers([finger(-100), finger(100)]));
+    fireEvent.touchCancel(stage, fingers([], [finger(-100), finger(100)]));
+
+    pinch(stage, [finger(100, 50), finger(140, 50)], [finger(60, 50), finger(180, 50)]);
+
+    expect(previewImg).toHaveStyle({ transform: "translate(-240px, -100px) scale(6)" });
+  });
+
   it("stops a one-finger pan when a second finger lands", () => {
     const { previewImg, stage } = openPreview();
     fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
@@ -259,19 +282,28 @@ describe("pinch-to-zoom", () => {
     expect(previewImg).toHaveStyle({ transform: "translate(0px, 0px) scale(1.5)" });
   });
 
-  it("opens a chat image's preview from a pinch in the iOS shell and keeps zooming", () => {
-    isIOSShell.mockReturnValue(true);
-    renderWithProvider();
-    const thumbnail = screen.getByRole("button", { name: "Zoom image: diagram" });
+  it.each([
+    ["iOS", isIOSShell],
+    ["Android", isAndroidShell],
+  ])(
+    "opens a chat image's preview once two fingers spread a fifth wider in the %s shell",
+    (_, shell) => {
+      shell.mockReturnValue(true);
+      renderWithProvider();
+      const thumbnail = screen.getByRole("button", { name: "Zoom image: diagram" });
 
-    fireEvent.touchStart(thumbnail, fingers([finger(-10), finger(10)]));
-    fireEvent.touchMove(thumbnail, fingers([finger(-15), finger(15)]));
-    expect(screen.getByRole("dialog")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Reset zoom" })).toHaveTextContent("100%");
+      fireEvent.touchStart(thumbnail, fingers([finger(-10), finger(10)]));
+      expect(fireEvent.touchMove(thumbnail, fingers([finger(-11.9), finger(11.9)]))).toBe(false);
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 
-    fireEvent.touchMove(thumbnail, fingers([finger(-30), finger(30)]));
-    expect(screen.getByRole("button", { name: "Reset zoom" })).toHaveTextContent("200%");
-  });
+      expect(fireEvent.touchMove(thumbnail, fingers([finger(-12), finger(12)]))).toBe(false);
+      expect(screen.getByRole("dialog")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Reset zoom" })).toHaveTextContent("100%");
+
+      fireEvent.touchMove(thumbnail, fingers([finger(-24), finger(24)]));
+      expect(screen.getByRole("button", { name: "Reset zoom" })).toHaveTextContent("200%");
+    },
+  );
 
   it("leaves a pinch on a chat image to the page outside the native shells", () => {
     renderWithProvider();
