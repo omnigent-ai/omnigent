@@ -27,10 +27,21 @@ afterEach(() => vi.mocked(fetchBranchCommits).mockClear());
 function renderCommits(initialCustom: RevisionSpec | null) {
   const client = new QueryClient();
   return renderHook(
-    ({ custom }: { custom: RevisionSpec | null }) =>
-      useBranchCommits("s1", WORKSPACE, custom, { enabled: true, shown: true }),
+    ({
+      custom,
+      sessionId = "s1",
+      workspace = WORKSPACE,
+    }: {
+      custom: RevisionSpec | null;
+      sessionId?: string;
+      workspace?: typeof WORKSPACE;
+    }) => useBranchCommits(sessionId, workspace, custom, { enabled: true, shown: true }),
     {
-      initialProps: { custom: initialCustom },
+      initialProps: { custom: initialCustom } as {
+        custom: RevisionSpec | null;
+        sessionId?: string;
+        workspace?: typeof WORKSPACE;
+      },
       wrapper: ({ children }: { children: ReactNode }) =>
         createElement(QueryClientProvider, { client }, children),
     },
@@ -49,6 +60,18 @@ describe("useBranchCommits", () => {
     expect(ranges()).toEqual([TYPED]);
 
     rerender({ custom: null });
+    await waitFor(() => expect(ranges()).toEqual([TYPED, BRANCH_RANGE]));
+  });
+
+  it.each([
+    ["session", { sessionId: "s2" }],
+    ["workspace", { workspace: { hostId: "host_2", root: "/other" } }],
+  ])("lists the branch, not the last range, for one commit in another %s", async (_name, next) => {
+    const { rerender } = renderCommits(TYPED);
+    await waitFor(() => expect(ranges()).toEqual([TYPED]));
+
+    rerender({ custom: commitRevisions("a".repeat(40)), ...next });
+
     await waitFor(() => expect(ranges()).toEqual([TYPED, BRANCH_RANGE]));
   });
 });

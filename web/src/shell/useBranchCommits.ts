@@ -29,12 +29,15 @@ export function useBranchCommits(
   custom: RevisionSpec | null,
   { enabled, shown }: { enabled: boolean; shown: boolean },
 ): { view: BranchCommitsView; retry: () => void } {
-  // The last range listed, which a commit shown on its own keeps.
-  const lastRange = useRef<RevisionSpec>(BRANCH_RANGE);
-  const range = commitsRange(custom, lastRange.current);
+  // The last range listed, which a commit shown on its own keeps within the same session and
+  // workspace; in another one it starts from the branch.
+  const owner = `${sessionId}\0${workspace?.hostId ?? ""}\0${workspace?.root ?? ""}`;
+  const lastRange = useRef<{ owner: string; range: RevisionSpec }>({ owner, range: BRANCH_RANGE });
+  const previous = lastRange.current.owner === owner ? lastRange.current.range : BRANCH_RANGE;
+  const range = commitsRange(custom, previous);
   useEffect(() => {
-    lastRange.current = range;
-  }, [range]);
+    lastRange.current = { owner, range };
+  }, [owner, range]);
   const query = useQuery({
     queryKey: [
       BRANCH_COMMITS_KEY,
