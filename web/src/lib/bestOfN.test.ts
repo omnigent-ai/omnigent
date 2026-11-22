@@ -9,9 +9,9 @@ import {
   bestOfNAttemptIds,
   bestOfNBranchName,
   bestOfNRepository,
+  keepableRun,
   launchBestOfN,
   otherBestOfNAttemptIds,
-  verifiedOtherAttempts,
 } from "./bestOfN";
 
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
@@ -79,7 +79,15 @@ describe("launchBestOfN", () => {
       repository: "/repo",
       baseBranch: "  main ",
       prompt: "Fix the flaky test",
-      agents: [claude, codex, claude],
+      attempts: [
+        { agent: claude },
+        {
+          agent: codex,
+          modelOverride: "gpt-5",
+          labels: { team: "infra", [BEST_OF_N_GROUP_LABEL]: "forged" },
+        },
+        { agent: claude },
+      ],
     });
 
     expect(result.sessionIds).toEqual(["conv_1", "conv_2", "conv_3"]);
@@ -87,7 +95,9 @@ describe("launchBestOfN", () => {
     expect(result.groupId).toMatch(/^[0-9a-f]{8}$/);
     const calls = vi.mocked(createSession).mock.calls;
     expect(calls.map(([agentId]) => agentId)).toEqual(["ag_claude", "ag_codex", "ag_claude"]);
+    // An attempt's own launch options ride along; its labels can't rename the run.
     expect(calls[1][2]).toEqual({
+      modelOverride: "gpt-5",
       siblingSourceId: "conv_source",
       hostId: "host_1",
       workspace: "/repo",
@@ -95,6 +105,7 @@ describe("launchBestOfN", () => {
       title: "Attempt 2 · Codex",
       labels: {
         "omnigent.ui": "terminal",
+        team: "infra",
         "omnigent.wrapper": "codex-native-ui",
         [BEST_OF_N_GROUP_LABEL]: result.groupId,
       },
@@ -138,7 +149,7 @@ describe("launchBestOfN", () => {
       hostId: "host_1",
       repository: "/repo",
       prompt: "Task",
-      agents: [claude, codex, polly, cursor],
+      attempts: [claude, codex, polly, cursor].map((agent) => ({ agent })),
     });
 
     // A denied attempt stays in the run; nothing retries around the policy.
@@ -192,7 +203,7 @@ describe("launchBestOfN ordering", () => {
       hostId: "host_1",
       repository: "/repo",
       prompt: "Task",
-      agents: [claude, codex, polly],
+      attempts: [claude, codex, polly].map((agent) => ({ agent })),
     });
 
     expect(maxInFlight).toBe(1);
@@ -200,104 +211,82 @@ describe("launchBestOfN ordering", () => {
   });
 });
 
-describe("verifiedOtherAttempts", () => {
+describe("keepableRun", () => {
   const GROUP = "1a2b3c4d";
   const run = (attempts: string, group = GROUP) => ({
     [BEST_OF_N_GROUP_LABEL]: group,
     [BEST_OF_N_ATTEMPTS_LABEL]: attempts,
   });
-  const family = (id: string) => ({ id, representative_id: null, pinned: false });
-  // Server-recorded evidence: the worktree branch from creation and the family.
   const session = (id: string, overrides: Partial<Session> = {}) =>
     ({
       id,
       title: `Title ${id}`,
-      labels: run("conv_a,conv_b,conv_c,conv_d,conv_e,conv_f,conv_i,conv_j"),
-      gitBranch: `best-of-n-${GROUP}-1-codex`,
-      family: family("fam_run"),
+      labels: run("conv_a,conv_b,conv_c,conv_d,conv_e,conv_f,conv_g,conv_h"),
       permissionLevel: null,
       archived: false,
       ...overrides,
     }) as Session;
 
-  it("keeps only owned, active members whose own labels name the same run", async () => {
+  it("keeps the owned, active sessions that carry the kept attempt's run label", async () => {
     const fetchSession = vi.fn(async (id: string) => {
-      if (id === "conv_c") return session(id, { labels: run("conv_a,conv_c", "other") });
-      if (id === "conv_d") return session(id, { labels: run("conv_d,conv_e") });
+      // Listed by the kept attempt, but the server never put them in its run.
+      if (id === "conv_c") return session(id, { labels: run("conv_a,conv_c", "0f0f0f0f") });
+      if (id === "conv_d") return session(id, { labels: {} });
       if (id === "conv_e") return session(id, { permissionLevel: 2 });
       if (id === "conv_f") return session(id, { archived: true });
       if (id === "conv_g") throw new ApiError("Not found", 404, null);
       if (id === "conv_h") throw new ApiError("Forbidden", 403, null);
-      // Unrelated sessions an editor gave matching, reciprocal labels: their
-      // server-recorded branch or family gives them away.
-      if (id === "conv_i") return session(id, { gitBranch: "feature/login" });
-      if (id === "conv_j") return session(id, { family: family("fam_other") });
-      return session(id, { title: id === "conv_b" ? null : `Title ${id}` });
+      // An attempt needn't list the kept one back: its run label is the proof.
+      if (id === "conv_b") return session(id, { title: null, labels: { ...run(""), x: "1" } });
+      return session(id);
     });
 
-    const verified = await verifiedOtherAttempts(
-      "conv_a",
-      run("conv_a,conv_b,conv_c,conv_d,conv_e,conv_f,conv_g,conv_h,conv_i,conv_j"),
-      fetchSession,
-    );
-
-    // Missing and forbidden sessions are confirmed exclusions, not unresolved.
-    expect(verified).toEqual({ attempts: [{ id: "conv_b", title: "conv_b" }], unresolved: [] });
-  });
-
-  it("trusts no attempt list on a kept session the server doesn't place in the run", async () => {
-    const forgedKept = vi.fn(async (id: string) =>
-      session(id, id === "conv_a" ? { gitBranch: "main" } : {}),
-    );
-    expect(await verifiedOtherAttempts("conv_a", run("conv_a,conv_b"), forgedKept)).toEqual({
-      attempts: [],
-      unresolved: [],
+    expect(await keepableRun("conv_a", fetchSession)).toEqual({
+      groupId: GROUP,
+      keptArchived: false,
+      others: [{ id: "conv_b", title: "conv_b" }],
     });
-    const familyless = vi.fn(async (id: string) => session(id, { family: null }));
-    expect(
-      (await verifiedOtherAttempts("conv_a", run("conv_a,conv_b"), familyless)).attempts,
-    ).toEqual([]);
-    // A group that isn't a launched run's id isn't looked up at all.
-    const fetchSession = vi.fn(async (id: string) => session(id));
-    expect(
-      await verifiedOtherAttempts("conv_a", run("conv_a,conv_b", "feature"), fetchSession),
-    ).toEqual({ attempts: [], unresolved: [] });
-    expect(fetchSession).not.toHaveBeenCalled();
   });
 
-  it("reports a failed lookup as unresolved until a retry confirms it", async () => {
+  it("reads the run from the server, and reports a kept attempt that is archived", async () => {
+    const fetchSession = vi.fn(async (id: string) =>
+      session(id, { labels: run("conv_a,conv_b"), archived: id === "conv_a" }),
+    );
+    expect(await keepableRun("conv_a", fetchSession)).toEqual({
+      groupId: GROUP,
+      keptArchived: true,
+      others: [{ id: "conv_b", title: "Title conv_b" }],
+    });
+  });
+
+  it("rejects on a failed lookup rather than return part of the run", async () => {
     let failing = true;
     const fetchSession = vi.fn(async (id: string) => {
       if (id === "conv_c" && failing) throw new ApiError("Internal Server Error", 500, null);
       return session(id, { labels: run("conv_a,conv_b,conv_c") });
     });
-    const labels = run("conv_a,conv_b,conv_c");
-
-    expect(await verifiedOtherAttempts("conv_a", labels, fetchSession)).toEqual({
-      attempts: [{ id: "conv_b", title: "Title conv_b" }],
-      unresolved: ["conv_c"],
-    });
+    await expect(keepableRun("conv_a", fetchSession)).rejects.toThrow("Internal Server Error");
     failing = false;
-    expect(await verifiedOtherAttempts("conv_a", labels, fetchSession)).toEqual({
-      attempts: [
-        { id: "conv_b", title: "Title conv_b" },
-        { id: "conv_c", title: "Title conv_c" },
-      ],
-      unresolved: [],
-    });
-    // A network failure is no proof either; failing on the kept attempt leaves the whole run unchecked.
-    fetchSession.mockRejectedValueOnce(new TypeError("Failed to fetch"));
-    expect((await verifiedOtherAttempts("conv_a", labels, fetchSession)).unresolved).toEqual([
+    expect((await keepableRun("conv_a", fetchSession))?.others.map(({ id }) => id)).toEqual([
       "conv_b",
       "conv_c",
     ]);
+    // A network failure on the kept attempt is no proof it left the run either.
+    fetchSession.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    await expect(keepableRun("conv_a", fetchSession)).rejects.toThrow("Failed to fetch");
   });
 
-  it("checks nothing for a session that isn't an attempt", async () => {
-    const fetchSession = vi.fn();
-    const none = { attempts: [], unresolved: [] };
-    expect(await verifiedOtherAttempts("conv_a", {}, fetchSession)).toEqual(none);
-    expect(await verifiedOtherAttempts("conv_z", run("conv_a,conv_b"), fetchSession)).toEqual(none);
-    expect(fetchSession).not.toHaveBeenCalled();
+  it("finds no run for a session that isn't a readable attempt", async () => {
+    const unlabelled = vi.fn(async (id: string) => session(id, { labels: {} }));
+    expect(await keepableRun("conv_a", unlabelled)).toBeNull();
+    expect(unlabelled).toHaveBeenCalledTimes(1);
+    const missing = vi.fn(async () => {
+      throw new ApiError("Not found", 404, null);
+    });
+    expect(await keepableRun("conv_a", missing)).toBeNull();
+    // An attempt no list names has nothing to look up.
+    const unlisted = vi.fn(async (id: string) => session(id, { labels: run("conv_b,conv_c") }));
+    expect((await keepableRun("conv_a", unlisted))?.others).toEqual([]);
+    expect(unlisted).toHaveBeenCalledTimes(1);
   });
 });

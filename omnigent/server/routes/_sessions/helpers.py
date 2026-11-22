@@ -11398,8 +11398,15 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
         )
 
 
+# A best-of-N run id, as the web app mints it.
+_BEST_OF_N_GROUP_ID = re.compile(r"[0-9a-f]{8}")
+
+
 def _reject_server_reserved_label_seed(
-    labels: dict[str, str] | None, *, at_creation: bool = False
+    labels: dict[str, str] | None,
+    *,
+    at_creation: bool = False,
+    creating_nested_session: bool = False,
 ) -> None:
     """
     Reject a client-supplied label map that touches server-internal keys.
@@ -11412,6 +11419,9 @@ def _reject_server_reserved_label_seed(
     :param at_creation: Whether a session is being created, when a continuation
         (a native ``/clear`` replacement) may carry its predecessor's browser-tool
         label.
+    :param creating_nested_session: Whether the session is being created as a
+        nested session of a source its creator owns, when it may join a
+        best-of-N run.
     :raises OmnigentError: 400 when any reserved key is present.
     """
     if not labels:
@@ -11500,6 +11510,22 @@ def _reject_server_reserved_label_seed(
             " and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
+    # Keeping one attempt archives the others of its run, so the run a session
+    # belongs to is fixed when its owner creates it and never edited afterwards.
+    from omnigent.stores.conversation_store import BEST_OF_N_GROUP_LABEL_KEY
+
+    if BEST_OF_N_GROUP_LABEL_KEY in labels:
+        if not creating_nested_session:
+            raise OmnigentError(
+                f"label {BEST_OF_N_GROUP_LABEL_KEY!r} is set only when a nested session"
+                " is created and cannot be changed",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if not _BEST_OF_N_GROUP_ID.fullmatch(labels[BEST_OF_N_GROUP_LABEL_KEY]):
+            raise OmnigentError(
+                f"label {BEST_OF_N_GROUP_LABEL_KEY!r} must be 8 lowercase hex characters",
+                code=ErrorCode.INVALID_INPUT,
+            )
     # The archive timestamp is stamped by the server on the archive transition
     # only; a client write would forge the retention clock, including on shared
     # sessions the caller does not own.

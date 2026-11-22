@@ -5,7 +5,10 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent.entities.conversation import USER_SESSION_TITLE_MAX_CHARS
+from omnigent.entities.conversation import (
+    BEST_OF_N_GROUP_LABEL_KEY,
+    USER_SESSION_TITLE_MAX_CHARS,
+)
 from omnigent.native._native_supersession import (
     clear_replacement_create_body,
     unfiled_clear_replacement_body,
@@ -28,6 +31,15 @@ def test_clear_replacement_title_fits_the_create_limit(
     assert body.get("title") == expected_title
     assert "project_id" not in body
     assert "workspace" not in body
+
+
+def test_clear_replacement_leaves_the_best_of_n_run() -> None:
+    labels = {BEST_OF_N_GROUP_LABEL_KEY: "1a2b3c4d", "omnigent.ui": "terminal"}
+
+    body = clear_replacement_create_body({}, agent_id="ag", labels=labels)
+
+    # The server refuses the run label on a session not created as an attempt.
+    assert body["labels"] == {"omnigent.ui": "terminal"}
 
 
 @pytest.mark.parametrize(

@@ -15,6 +15,7 @@ from omnigent.entities import (
     NewConversationItem,
     PagedList,
 )
+from omnigent.entities.conversation import BEST_OF_N_GROUP_LABEL_KEY
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 from omnigent.session_recovery import SessionRecovery
 from omnigent.stores.conversation_store.activity_error import (
@@ -293,6 +294,8 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
     # Nor is a fork of a session a run launched; the automation doesn't share it.
     SCHEDULED_TASK_LAUNCH_LABEL_KEY,
+    # A fork of an attempt is a session of its own, not another attempt of the run.
+    BEST_OF_N_GROUP_LABEL_KEY,
     # Closing seals only that child (a stopped side chat, a closed sub-agent);
     # forking it is how the user continues it as a session of its own.
     CLOSED_LABEL_KEY,

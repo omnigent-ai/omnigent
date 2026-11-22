@@ -1990,7 +1990,11 @@ def register_core_routes(
             host_type=parsed_metadata.host_type,
         )
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
-        _reject_server_reserved_label_seed(parsed_metadata.labels, at_creation=True)
+        _reject_server_reserved_label_seed(
+            parsed_metadata.labels,
+            at_creation=True,
+            creating_nested_session=parsed_metadata.sibling_source_id is not None,
+        )
         from omnigent.tools.browser_agent_tools import apply_browser_agent_tools_creation_labels
 
         apply_browser_agent_tools_creation_labels(parsed_metadata.labels, request.headers)

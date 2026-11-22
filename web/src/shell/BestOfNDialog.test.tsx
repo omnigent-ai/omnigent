@@ -157,7 +157,7 @@ describe("BestOfNDialog", () => {
       repository: "/Users/a/proj",
       baseBranch: "main",
       prompt: "Fix the login redirect",
-      agents: [codex, claude, polly],
+      attempts: [{ agent: codex }, { agent: claude }, { agent: polly }],
     });
     expect(toast.error).toHaveBeenCalledWith("Polly: The task wasn't sent: offline");
     expect(onOpenChange).toHaveBeenCalledWith(false);
@@ -237,8 +237,6 @@ describe("KeepAttemptDialog", () => {
       id,
       title: `Title ${id}`,
       labels: run("conv_a,conv_b,conv_c"),
-      gitBranch: `best-of-n-${GROUP}-1-codex`,
-      family: { id: "fam_run", representative_id: null, pinned: false },
       permissionLevel: null,
       archived: false,
       ...overrides,
@@ -250,7 +248,6 @@ describe("KeepAttemptDialog", () => {
         <KeepAttemptDialog
           sessionId="conv_a"
           title="Attempt 1 · Codex"
-          labels={run("conv_a,conv_b,conv_c")}
           open
           onOpenChange={vi.fn()}
         />,
@@ -282,11 +279,11 @@ describe("KeepAttemptDialog", () => {
     expect(deleteRunGrids).toHaveBeenCalledExactlyOnceWith(GROUP);
   });
 
-  it("archives only sessions whose own labels place them in the run", async () => {
+  it("archives only sessions the server placed in the run", async () => {
     vi.mocked(getSessionSlim).mockImplementation(async (id) => {
       if (id === "conv_a") return attempt(id);
-      // Matching, reciprocal labels an editor forged on an unrelated session.
-      if (id === "conv_b") return attempt(id, { gitBranch: "feature/login" });
+      // Listed by an editor of the kept attempt, but never created as its attempts.
+      if (id === "conv_b") return attempt(id, { labels: {} });
       if (id === "conv_c") return attempt(id, { labels: run("conv_a,conv_c", "0f0f0f0f") });
       throw new ApiError("Not found", 404, null);
     });
@@ -305,8 +302,10 @@ describe("KeepAttemptDialog", () => {
     });
     renderKeep();
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't check 1 other attempt.");
-    expect(screen.getByTestId("keep-attempt-others")).toHaveTextContent(/^Title conv_b$/);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Couldn't check the other attempts.",
+    );
+    expect(screen.queryByTestId("keep-attempt-others")).toBeNull();
     expect(screen.getByTestId("keep-attempt-confirm")).toBeDisabled();
 
     failing = false;
@@ -325,6 +324,18 @@ describe("KeepAttemptDialog", () => {
     expect(mutateAsync.mock.invocationCallOrder[0]).toBeLessThan(
       deleteRunGrids.mock.invocationCallOrder[0],
     );
+  });
+
+  it("won't keep an attempt that was archived since, e.g. from another tab", async () => {
+    vi.mocked(getSessionSlim).mockImplementation(async (id) =>
+      attempt(id, { archived: id === "conv_a" }),
+    );
+    renderKeep();
+    expect(
+      await screen.findByText("This attempt is archived, so it can't be kept. Unarchive it first."),
+    ).toBeVisible();
+    expect(screen.queryByTestId("keep-attempt-others")).toBeNull();
+    expect(screen.getByTestId("keep-attempt-confirm")).toBeDisabled();
   });
 
   it("stays on the grid when archiving fails", async () => {

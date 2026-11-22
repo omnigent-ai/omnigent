@@ -1,4 +1,8 @@
-"""Best-of-N launch, grid comparison and keep, against explicit browser contracts."""
+"""Best-of-N launch, grid comparison and keep, as the user sees them.
+
+The requests behind them are pinned in ``web/src/lib/bestOfN.test.ts``, and the
+server's side in ``tests/server/integration/test_session_orchestration.py``.
+"""
 
 from __future__ import annotations
 
@@ -21,7 +25,6 @@ from tests.browser_ui.chat.session_contract import (
 from tests.browser_ui.conftest import BrowserContract
 
 _GROUP = "omnigent.best_of_n.group"
-_ATTEMPTS = "omnigent.best_of_n.attempts"
 _AGENTS = [
     {
         "id": "ag_claude",
@@ -44,8 +47,8 @@ def _screenshot(page: Page, artifacts: Path, name: str) -> None:
     page.screenshot(path=str(artifacts / f"{name}.png"))
 
 
-def _record_patches(handle: ChatSessionContract, patches: list[dict[str, Any]]) -> None:
-    """Merge label patches like the server does, so attempts keep their group label."""
+def _apply_patches(handle: ChatSessionContract) -> None:
+    """Merge label patches and archive like the server does."""
     api = re.compile(rf"^{re.escape(handle.base_url)}/v1/sessions/{handle.session_id}(?:\?.*)?$")
 
     def patch(route: Route) -> None:
@@ -53,7 +56,6 @@ def _record_patches(handle: ChatSessionContract, patches: list[dict[str, Any]]) 
             route.fallback()
             return
         body = json.loads(route.request.post_data or "{}")
-        patches.append({"id": handle.session_id, **body})
         snapshot = handle.session_snapshot()
         if "labels" in body:
             handle.update_session(labels={**snapshot["labels"], **body["labels"]})
@@ -92,7 +94,6 @@ def test_best_of_n_starts_attempts_in_a_grid_and_keeps_one(
             ]
         )
         created: list[dict[str, Any]] = []
-        patches: list[dict[str, Any]] = []
         for attempt in attempts:
             attempt.set_items(
                 [
@@ -104,7 +105,7 @@ def test_best_of_n_starts_attempts_in_a_grid_and_keeps_one(
                     )
                 ]
             )
-            _record_patches(attempt, patches)
+            _apply_patches(attempt)
 
         def sessions(route: Route) -> None:
             if route.request.method == "POST":
@@ -115,7 +116,6 @@ def test_best_of_n_starts_attempts_in_a_grid_and_keeps_one(
                     title=body["title"],
                     agent_id=body["agent_id"],
                     labels={_GROUP: body["labels"][_GROUP]},
-                    git_branch=body["git"]["branch_name"],
                     family={
                         "id": "bon-source",
                         "representative_id": "bon-source",
@@ -181,20 +181,9 @@ def test_best_of_n_starts_attempts_in_a_grid_and_keeps_one(
         for attempt in attempts:
             expect(page.locator(f'[data-grid-session="{attempt.session_id}"]')).to_be_visible()
 
-        group = created[0]["labels"][_GROUP]
-        assert [body["agent_id"] for body in created] == ["ag_codex", "ag_claude", "ag_claude"]
-        for index, body in enumerate(created):
-            assert body["sibling_source_id"] == "bon-source"
-            assert body["host_id"] == source.host_id
-            assert body["workspace"] == "/repo"
-            assert body["git"]["branch_name"].startswith(f"best-of-n-{group}-{index + 1}-")
-            assert body["labels"]["omnigent.ui"] == "terminal"
-        assert len({body["git"]["branch_name"] for body in created}) == 3
-        linked = {p["id"]: p["labels"][_ATTEMPTS] for p in patches if "labels" in p}
-        assert linked == {a.session_id: "bon-1,bon-2,bon-3" for a in attempts}
-        for attempt in attempts:
-            sent = [post["body"]["data"]["content"] for post in attempt.event_posts]
-            assert sent == [[{"type": "input_text", "text": "Make the login test pass reliably"}]]
+            expect(
+                page.locator(f'aside [data-sidebar-session-id="{attempt.session_id}"]')
+            ).to_be_visible()
         _screenshot(page, artifacts, "2-best-of-n-grid")
 
         kept = page.locator('[data-grid-session="bon-2"]')
@@ -210,6 +199,8 @@ def test_best_of_n_starts_attempts_in_a_grid_and_keeps_one(
         expect(
             page.get_by_text("Kept Attempt 2 · Claude Code. Archived 2 other attempts.")
         ).to_be_visible()
-        archived = sorted(p["id"] for p in patches if p.get("archived") is True)
-        assert archived == ["bon-1", "bon-3"]
+        # The kept attempt stays in the sidebar; the others leave it.
+        expect(page.locator('aside [data-sidebar-session-id="bon-2"]')).to_be_visible()
+        for archived in ("bon-1", "bon-3"):
+            expect(page.locator(f'aside [data-sidebar-session-id="{archived}"]')).to_have_count(0)
         _screenshot(page, artifacts, "4-kept-attempt")

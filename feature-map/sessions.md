@@ -39,7 +39,7 @@ the header menu), and each place is a separate entry point.
   attempts open together in a new grid; otherwise the first attempt opens.
   **Keep this attempt** lists and archives the other attempts (optionally deleting
   their worktrees; branches are kept), then drops the run's saved grid. It archives
-  only sessions you own whose own labels place them in the same run.
+  only sessions you own that the server recorded as attempts of the same run.
 - `pin`: standalone sessions and family representatives move to Pinned and back;
   pinning a representative moves its whole family.
 - `pin-undo`: unpinning shows an Undo toast that re-pins the session into its
@@ -830,12 +830,17 @@ plain `uv run pytest`, which starts a private server for the test.
 
 - **`best-of-n` (browser contract):**
   `tests/browser_ui/chat/test_best_of_n.py` starts three attempts from the
-  sidebar row menu, checks each create, link and first message, opens the grid,
-  and keeps one attempt from its cell. Attempt creation, partial failures,
-  defaults, the flag and ownership gates, and both menus have component coverage
-  in `web/src/lib/bestOfN.test.ts`, `web/src/shell/BestOfNDialog.test.tsx`,
+  sidebar row menu, sees them open in a grid, keeps one from its cell and sees
+  the others leave the sidebar. Each create, link and first message, partial
+  failures, defaults, the flag and ownership gates, and both menus have
+  component coverage in `web/src/lib/bestOfN.test.ts`,
+  `web/src/shell/BestOfNDialog.test.tsx`,
   `web/src/shell/HeaderConversationMenu.test.tsx` and
-  `web/src/grid/GridSessionPane.test.tsx`. For a real-server drive, enable
+  `web/src/grid/GridSessionPane.test.tsx`. The server's side (a nested create
+  with a worktree and the run label, and that label being refused anywhere
+  else) is in
+  `tests/server/integration/test_session_orchestration.py::test_best_of_n_attempt_keeps_the_run_it_was_created_in`.
+  For a real-server drive, enable
   `best_of_n,grid_sessions_display_ui` on the isolated server and start from a
   session in a git repository; expect one `best-of-n-<group>-<n>-<agent>` worktree per attempt.
 - **`pin`:**
@@ -1469,6 +1474,15 @@ its discoverability.
   Attempts are created one after another. A blank base branch uses the
   repository's current HEAD, and uncommitted changes in the source stay there.
   Archived attempts keep their branches even when their worktrees are deleted.
+- A best-of-N run's members are the owner's sessions carrying its
+  `omnigent.best_of_n.group` label. The sessions API accepts that label only when
+  a nested session is created and refuses every later change, and forks and
+  native `/clear` replacements drop it, so a collaborator with edit access can't
+  add a session to a run. (An agent's own policies can still write labels.) The
+  `omnigent.best_of_n.attempts` label stays editable: it only names the ids
+  **Keep** looks up, so an attempt removed from it is left running, never archived.
+  **Keep** re-reads every listed attempt, refuses while one can't be read, and
+  refuses to keep an attempt that is already archived.
 
 - Family membership is owner-only navigation context, not a sharing grant.
   Siblings start private even if the source has readers. Edit-shared sources

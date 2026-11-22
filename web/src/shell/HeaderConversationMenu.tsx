@@ -639,7 +639,6 @@ export function HeaderConversationMenu({
         <KeepAttemptDialog
           sessionId={conversation.id}
           title={label}
-          labels={conversation.labels}
           open
           onOpenChange={setKeepAttemptOpen}
         />

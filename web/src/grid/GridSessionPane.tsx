@@ -718,7 +718,6 @@ export function GridSessionPane({
           <KeepAttemptDialog
             sessionId={sessionId}
             title={title}
-            labels={session?.labels}
             open
             onOpenChange={setKeepAttemptOpen}
           />

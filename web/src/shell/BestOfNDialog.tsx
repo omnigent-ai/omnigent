@@ -28,14 +28,12 @@ import { useGridSessions } from "@/grid/GridSessionsContext";
 import { partitionPickerEntries, selectableSessionAgents } from "@/lib/agentGrouping";
 import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import {
-  BEST_OF_N_GROUP_LABEL,
   BEST_OF_N_MAX_ATTEMPTS,
   BEST_OF_N_MIN_ATTEMPTS,
   bestOfNRepository,
+  keepableRun,
   launchBestOfN,
-  otherBestOfNAttemptIds,
-  verifiedOtherAttempts,
-  type VerifiedAttempts,
+  type KeepableRun,
 } from "@/lib/bestOfN";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, pickerCuration, type ServerInfo } from "@/lib/capabilities";
@@ -211,7 +209,7 @@ export function BestOfNDialog({
         repository,
         baseBranch,
         prompt: prompt.trim(),
-        agents: chosenAgents,
+        attempts: chosenAgents.map((agent) => ({ agent })),
       });
       if (result.sessionIds.length === 0) {
         setError(result.failures[0]?.message ?? "No attempt could be started.");
@@ -358,20 +356,17 @@ export function BestOfNDialog({
 
 /**
  * Confirm keeping one best-of-N attempt: archive the other attempts, and
- * optionally remove their worktrees (their branches stay). Only attempts that
- * verify as owned members of the same run are listed and archived.
+ * optionally remove their worktrees (their branches stay). Only owned sessions
+ * the server reports as attempts of the same run are listed and archived.
  */
 export function KeepAttemptDialog({
   sessionId,
   title,
-  labels,
   open,
   onOpenChange,
 }: {
   sessionId: string;
   title: string;
-  /** The kept attempt's labels, naming its run. */
-  labels: Record<string, string> | null | undefined;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -382,37 +377,30 @@ export function KeepAttemptDialog({
   const checkboxId = useId();
   const cleanupSupported = info !== "loading" && info.archive_worktree_cleanup === true;
   const [removeWorktrees, setRemoveWorktrees] = useState(false);
-  const [verified, setVerified] = useState<VerifiedAttempts | null>(null);
+  // "checking" until the run is read; "failed" when an attempt couldn't be looked up.
+  const [check, setCheck] = useState<KeepableRun | null | "checking" | "failed">("checking");
   const [checks, setChecks] = useState(0);
   const [archiving, setArchiving] = useState(false);
-  const labelKey = JSON.stringify(labels ?? {});
 
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
-    const keptLabels = JSON.parse(labelKey) as Record<string, string>;
-    setVerified(null);
-    verifiedOtherAttempts(sessionId, keptLabels, (id) => getSessionSlim(id))
-      .then((result) => !cancelled && setVerified(result))
-      .catch(
-        () =>
-          !cancelled &&
-          setVerified({
-            attempts: [],
-            unresolved: otherBestOfNAttemptIds(sessionId, keptLabels),
-          }),
-      );
+    setCheck("checking");
+    keepableRun(sessionId, (id) => getSessionSlim(id))
+      .then((result) => !cancelled && setCheck(result))
+      // A partial list would leave unchecked attempts running after "Kept".
+      .catch(() => !cancelled && setCheck("failed"));
     return () => {
       cancelled = true;
     };
-  }, [open, sessionId, labelKey, checks]);
+  }, [open, sessionId, checks]);
 
-  const others = verified?.attempts ?? null;
-  const unresolved = verified?.unresolved.length ?? 0;
-  const count = others?.length ?? 0;
+  const run = check === "checking" || check === "failed" ? null : check;
+  // An attempt archived since, e.g. by keeping another one elsewhere, can't be kept.
+  const others = run === null || run.keptArchived ? [] : run.others;
+  const count = others.length;
   const keep = async () => {
-    // A partial list would leave unchecked attempts running after "Kept".
-    if (others === null || count === 0 || unresolved > 0) return;
+    if (run === null || count === 0) return;
     const ids = others.map((attempt) => attempt.id);
     setArchiving(true);
     try {
@@ -429,8 +417,7 @@ export function KeepAttemptDialog({
     onOpenChange(false);
     toast.success(`Kept ${title}. Archived ${count} other attempt${count === 1 ? "" : "s"}.`);
     // Drop the grid this run opened (never one the user built), then open the kept attempt.
-    const run = labels?.[BEST_OF_N_GROUP_LABEL];
-    if (run) grids?.deleteRunGrids(run);
+    grids?.deleteRunGrids(run.groupId);
     navigate(`/c/${sessionId}`);
   };
 
@@ -440,25 +427,27 @@ export function KeepAttemptDialog({
         <DialogHeader>
           <DialogTitle>Keep this attempt?</DialogTitle>
           <DialogDescription>
-            {others === null
+            {check === "checking"
               ? "Checking the other attempts…"
-              : unresolved > 0
+              : check === "failed"
                 ? "Every other attempt of this run must be checked before keeping this one."
-                : count === 0
-                  ? "No other attempts of this run can be archived."
-                  : `${title} stays. ${count === 1 ? "This attempt is" : `These ${count} attempts are`} archived; you can unarchive ${count === 1 ? "it" : "them"} later.`}
+                : run?.keptArchived
+                  ? "This attempt is archived, so it can't be kept. Unarchive it first."
+                  : count === 0
+                    ? "No other attempts of this run can be archived."
+                    : `${title} stays. ${count === 1 ? "This attempt is" : `These ${count} attempts are`} archived; you can unarchive ${count === 1 ? "it" : "them"} later.`}
           </DialogDescription>
         </DialogHeader>
         {count > 0 && (
           <ul className="list-disc pl-5 text-sm" data-testid="keep-attempt-others">
-            {others!.map((attempt) => (
+            {others.map((attempt) => (
               <li key={attempt.id}>{attempt.title}</li>
             ))}
           </ul>
         )}
-        {unresolved > 0 && (
+        {check === "failed" && (
           <div role="alert" className="flex items-center gap-2 text-sm text-destructive">
-            Couldn't check {unresolved === 1 ? "1 other attempt" : `${unresolved} other attempts`}.
+            Couldn't check the other attempts.
             <Button
               type="button"
               variant="ghost"
@@ -471,7 +460,7 @@ export function KeepAttemptDialog({
             </Button>
           </div>
         )}
-        {cleanupSupported && count > 0 && unresolved === 0 && (
+        {cleanupSupported && count > 0 && (
           <div className="flex items-center gap-2">
             <Checkbox
               id={checkboxId}
@@ -497,7 +486,7 @@ export function KeepAttemptDialog({
           </Button>
           <Button
             type="button"
-            disabled={count === 0 || unresolved > 0 || archiving}
+            disabled={count === 0 || archiving}
             onClick={() => void keep()}
             data-testid="keep-attempt-confirm"
             componentId="best_of_n.keep.confirm"

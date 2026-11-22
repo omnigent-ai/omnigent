@@ -6984,7 +6984,6 @@ function ConversationRowImpl({
         <KeepAttemptDialog
           sessionId={conversation.id}
           title={conversationDisplayLabel(conversation)}
-          labels={conversation.labels}
           open
           onOpenChange={setKeepAttemptOpen}
         />

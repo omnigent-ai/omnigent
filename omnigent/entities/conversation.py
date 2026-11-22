@@ -86,6 +86,11 @@ def humanize_mention_markers(text: str) -> str:
 DEFAULT_GENERATED_TITLE_MAX_CHARS = 100
 USER_SESSION_TITLE_MAX_CHARS = 200
 
+# Marks an attempt of one best-of-N run; the value is the run's id. The sessions
+# API accepts it only when a nested session is created, so it names sessions
+# their owner put in the run.
+BEST_OF_N_GROUP_LABEL_KEY = "omnigent.best_of_n.group"
+
 # ── Conversation ──────────────────────────────────────
 
 

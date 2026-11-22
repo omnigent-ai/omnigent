@@ -3,9 +3,11 @@
  * worktree, then keep one attempt and archive the rest.
  *
  * Attempts are ordinary sessions created as nested agents of the session the
- * run started from, so the sidebar groups them with it. Two labels tie the
- * attempts together: the group id, and the full list of attempt ids that
- * "Keep this attempt" archives from.
+ * run started from, so the sidebar groups them with it. The group label decides
+ * which sessions are attempts of a run: the server accepts it only when a nested
+ * session is created and never lets it change. The attempts label lists the
+ * ids "Keep this attempt" looks up; anyone with edit access can rewrite it, so
+ * it is only a hint.
  */
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { nativeDisplayNameForAgent, nativeWrapperLabelsForAgent } from "@/lib/nativeCodingAgents";
@@ -70,6 +72,18 @@ export function otherBestOfNAttemptIds(
   return ids.includes(sessionId) ? ids.filter((id) => id !== sessionId) : [];
 }
 
+/** One attempt to start: its agent, and any launch options of its own. */
+export interface BestOfNAttemptInput {
+  agent: AvailableAgent;
+  /** Model to pin, e.g. "claude-opus-4-7". */
+  modelOverride?: string;
+  /** Effort to pin, e.g. "high". */
+  reasoningEffort?: string;
+  /** Native CLI flags, e.g. a permission mode. */
+  terminalLaunchArgs?: string[];
+  labels?: Record<string, string>;
+}
+
 export interface BestOfNLaunchInput {
   /** The owned session the run starts from; attempts join its family. */
   sourceSessionId: string;
@@ -79,8 +93,8 @@ export interface BestOfNLaunchInput {
   /** Ref every worktree branches from; blank uses the repository's current HEAD. */
   baseBranch?: string;
   prompt: string;
-  /** One agent per attempt; the same agent may appear more than once. */
-  agents: readonly AvailableAgent[];
+  /** One entry per attempt; the same agent may appear more than once. */
+  attempts: readonly BestOfNAttemptInput[];
 }
 
 export interface BestOfNAttemptFailure {
@@ -90,7 +104,7 @@ export interface BestOfNAttemptFailure {
 
 export interface BestOfNLaunchResult {
   groupId: string;
-  /** Created attempts, in the order the agents were given. */
+  /** Created attempts, in the order they were given. */
   sessionIds: string[];
   /** Attempts that were not created, or whose task was not delivered. */
   failures: BestOfNAttemptFailure[];
@@ -101,27 +115,34 @@ function errorMessage(error: unknown): string {
 }
 
 /**
- * Create one worktree session per agent, link them as one run, and send each
+ * Create one worktree session per attempt, link them as one run, and send each
  * the same task. Attempts are independent: one failing doesn't stop the rest.
  */
 export async function launchBestOfN(input: BestOfNLaunchInput): Promise<BestOfNLaunchResult> {
   const groupId = randomUUID().replace(/-/g, "").slice(0, 8);
   const baseBranch = input.baseBranch?.trim() || undefined;
-  const names = input.agents.map((agent) => agent.display_name || nativeDisplayNameForAgent(agent));
+  const names = input.attempts.map(
+    ({ agent }) => agent.display_name || nativeDisplayNameForAgent(agent),
+  );
   const failures: BestOfNAttemptFailure[] = [];
   const attempts: { id: string; agentName: string }[] = [];
   // One at a time: concurrent `git worktree add` runs in one repository can
   // race on its config lock.
   /* oxlint-disable no-await-in-loop */
-  for (const [index, agent] of input.agents.entries()) {
+  for (const [index, { agent, labels, ...launchOptions }] of input.attempts.entries()) {
     try {
       const session = await createSession(agent.id, [], {
+        ...launchOptions,
         siblingSourceId: input.sourceSessionId,
         hostId: input.hostId,
         workspace: input.repository,
         git: { branchName: bestOfNBranchName(groupId, index, names[index]), baseBranch },
         title: `Attempt ${index + 1} · ${names[index]}`,
-        labels: { ...nativeWrapperLabelsForAgent(agent), [BEST_OF_N_GROUP_LABEL]: groupId },
+        labels: {
+          ...labels,
+          ...nativeWrapperLabelsForAgent(agent),
+          [BEST_OF_N_GROUP_LABEL]: groupId,
+        },
       });
       attempts.push({ id: session.id, agentName: names[index] });
     } catch (error) {
@@ -168,11 +189,13 @@ export interface VerifiedAttempt {
   title: string;
 }
 
-export interface VerifiedAttempts {
+export interface KeepableRun {
+  /** The run's id, from the kept attempt's group label. */
+  groupId: string;
+  /** The kept attempt is itself archived, e.g. another tab kept a different one. */
+  keptArchived: boolean;
   /** Owned, active attempts of the same run, safe to archive. */
-  attempts: VerifiedAttempt[];
-  /** Listed attempts whose lookup failed for another reason than missing or forbidden. */
-  unresolved: string[];
+  others: VerifiedAttempt[];
 }
 
 /** A lookup that proves the session is gone or not the viewer's, not a passing failure. */
@@ -180,59 +203,46 @@ function confirmsExclusion(error: unknown): boolean {
   return error instanceof ApiError && (error.status === 403 || error.status === 404);
 }
 
-/** A run's group id, as `launchBestOfN` mints it. */
-const RUN_GROUP = /^[0-9a-f]{8}$/;
-
 /**
- * The other attempts "Keep this attempt" may archive: owned, active sessions of
- * the kept attempt's run. Labels are editable by anyone with edit access, so
- * membership also needs evidence editors can't change: the worktree branch the
- * server recorded when the session was created (`best-of-n-<group>-…`) and the
- * server-assigned family, both matching the kept attempt's. Lookups that fail
- * for another reason than missing or forbidden are reported as unresolved, so
+ * The run "Keep this attempt" acts on: the other owned, active sessions that
+ * carry the kept attempt's group label, read from the server. The attempts
+ * label only names the ids to look up, so every one is checked for that label.
+ * A lookup that fails for another reason than missing or forbidden rejects, so
  * a caller never treats a partial list as the whole run.
  *
  * @param keptId - The attempt being kept.
- * @param keptLabels - Its labels, naming the run's group and attempts.
  * @param fetchSession - Reads one session, e.g. `getSessionSlim`.
+ * @returns The run, or null when the session is not an attempt the viewer can read.
  */
-export async function verifiedOtherAttempts(
+export async function keepableRun(
   keptId: string,
-  keptLabels: Record<string, string> | null | undefined,
   fetchSession: (id: string) => Promise<Session>,
-): Promise<VerifiedAttempts> {
-  const group = keptLabels?.[BEST_OF_N_GROUP_LABEL];
-  const ids = otherBestOfNAttemptIds(keptId, keptLabels);
-  const verified: VerifiedAttempts = { attempts: [], unresolved: [] };
-  if (!group || !RUN_GROUP.test(group) || ids.length === 0) return verified;
-  const [keptResult, ...sessions] = await Promise.allSettled([
-    fetchSession(keptId),
-    ...ids.map((id) => fetchSession(id)),
-  ]);
-  if (keptResult.status === "rejected") {
-    if (!confirmsExclusion(keptResult.reason)) verified.unresolved.push(...ids);
-    return verified;
+): Promise<KeepableRun | null> {
+  let kept: Session;
+  try {
+    kept = await fetchSession(keptId);
+  } catch (error) {
+    if (confirmsExclusion(error)) return null;
+    throw error;
   }
-  const family = keptResult.value.family?.id;
-  const branchPrefix = `best-of-n-${group}-`;
-  const inRun = (session: Session) =>
-    !!family &&
-    session.family?.id === family &&
-    session.gitBranch?.startsWith(branchPrefix) === true &&
-    session.labels?.[BEST_OF_N_GROUP_LABEL] === group;
-  if (keptResult.value.id !== keptId || !inRun(keptResult.value)) return verified;
-  sessions.forEach((result, index) => {
-    if (result.status === "rejected") {
-      if (!confirmsExclusion(result.reason)) verified.unresolved.push(ids[index]);
-      return;
+  const groupId = kept.labels?.[BEST_OF_N_GROUP_LABEL];
+  if (kept.id !== keptId || !groupId) return null;
+  const ids = otherBestOfNAttemptIds(keptId, kept.labels);
+  const lookups = await Promise.allSettled(ids.map((id) => fetchSession(id)));
+  const others: VerifiedAttempt[] = [];
+  lookups.forEach((lookup, index) => {
+    if (lookup.status === "rejected") {
+      if (confirmsExclusion(lookup.reason)) return;
+      throw lookup.reason;
     }
-    const session = result.value;
-    const sameRun =
+    const session = lookup.value;
+    if (
       session.id === ids[index] &&
-      inRun(session) &&
-      bestOfNAttemptIds(session.labels).includes(keptId);
-    if (sameRun && session.archived !== true && isOwnerLevel(session.permissionLevel ?? null))
-      verified.attempts.push({ id: session.id, title: session.title || session.id });
+      session.labels?.[BEST_OF_N_GROUP_LABEL] === groupId &&
+      session.archived !== true &&
+      isOwnerLevel(session.permissionLevel ?? null)
+    )
+      others.push({ id: session.id, title: session.title || session.id });
   });
-  return verified;
+  return { groupId, keptArchived: kept.archived === true, others };
 }

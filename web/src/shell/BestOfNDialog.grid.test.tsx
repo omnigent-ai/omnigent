@@ -138,8 +138,6 @@ it("keeps the user's own grid and removes the run's grid only after archiving", 
         id,
         title: `Title ${id}`,
         labels,
-        gitBranch: `best-of-n-1a2b3c4d-1-${id}`,
-        family: { id: "fam_run", representative_id: null, pinned: false },
         permissionLevel: null,
         archived: id === "conv_b",
       }) as unknown as Session,
@@ -148,13 +146,7 @@ it("keeps the user's own grid and removes the run's grid only after archiving", 
   mutateAsync.mockReturnValue(archived.promise);
   renderAt(
     "/grid/run",
-    <KeepAttemptDialog
-      sessionId="conv_a"
-      title="Attempt 1"
-      labels={labels}
-      open
-      onOpenChange={vi.fn()}
-    />,
+    <KeepAttemptDialog sessionId="conv_a" title="Attempt 1" open onOpenChange={vi.fn()} />,
   );
 
   expect(await screen.findByTestId("keep-attempt-others")).toHaveTextContent("Title conv_c");
