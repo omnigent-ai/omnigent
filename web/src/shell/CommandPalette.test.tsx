@@ -688,6 +688,53 @@ describe("CommandPalette — match preview", () => {
   });
 });
 
+describe("CommandPalette — focus as it closes", () => {
+  /** A palette ⌘K opens from a terminal's input, with no trigger button, as the app does. */
+  function ShortcutOpenedPalette() {
+    const [open, setOpen] = useState(false);
+    return (
+      <>
+        <textarea
+          aria-label="Terminal input"
+          onKeyDown={(event) => {
+            if (event.metaKey && event.key === "k") setOpen(true);
+          }}
+        />
+        <CommandPalette
+          open={open}
+          onOpenChange={setOpen}
+          onToggleLeftSidebar={vi.fn()}
+          onToggleRightSidebar={vi.fn()}
+        />
+      </>
+    );
+  }
+
+  async function openFromTerminal() {
+    render(<ShortcutOpenedPalette />, { wrapper: withQueryClient() });
+    const terminal = screen.getByRole("textbox", { name: "Terminal input" });
+    terminal.focus();
+    fireEvent.keyDown(terminal, { key: "k", metaKey: true });
+    const input = await screen.findByTestId("command-palette-input");
+    await vi.waitFor(() => expect(input).toHaveFocus());
+    return { terminal, input };
+  }
+
+  it("gives the keyboard back to the field it opened from on Escape", async () => {
+    const { terminal, input } = await openFromTerminal();
+    fireEvent.keyDown(input, { key: "Escape" });
+    await vi.waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await vi.waitFor(() => expect(terminal).toHaveFocus());
+  });
+
+  it("gives it back after running a command that leaves focus alone", async () => {
+    const { terminal } = await openFromTerminal();
+    fireEvent.click(await screen.findByRole("option", { name: /Toggle conversations sidebar/ }));
+    await vi.waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await vi.waitFor(() => expect(terminal).toHaveFocus());
+  });
+});
+
 describe("CommandPalette — input", () => {
   it("uses the sessions-first placeholder", () => {
     renderPalette();
