@@ -66,7 +66,6 @@ export interface ProjectTicket {
   description: string;
   stage_id: string;
   labels: TicketLabel[];
-  lead_session_id?: string | null;
   /** Latest linked-agent activity; absent or null means unknown. */
   has_running_agents?: boolean | null;
   latest_update: string;
@@ -101,7 +100,7 @@ export interface TicketSession {
   involvement?: string;
 }
 export type TicketChanges = Partial<
-  Pick<ProjectTicket, "title" | "description" | "stage_id" | "labels" | "lead_session_id">
+  Pick<ProjectTicket, "title" | "description" | "stage_id" | "labels">
 > & { comment?: string };
 export interface TicketComment {
   text: string;

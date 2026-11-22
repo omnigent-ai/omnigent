@@ -82,14 +82,12 @@ def test_stage_codes_and_generic_content_are_independent():
         UpdateTicket(stage_id="verifying", comment="Verify the attached demo").stage_id
         == "verifying"
     )
-    assert "lead_session_id" not in UpdateTicket(title="Keep lead").model_fields_set
-    assert "lead_session_id" in UpdateTicket(lead_session_id=None).model_fields_set
     with pytest.raises(ValidationError):
         UpdateTicket(comment=" ")
 
 
 @pytest.mark.parametrize(
-    "field", ["plan", "review_summary", "completion_summary", "review_action"]
+    "field", ["plan", "review_summary", "completion_summary", "review_action", "lead_session_id"]
 )
 @pytest.mark.parametrize("value", [None, "", "Saved text"])
 def test_removed_ticket_fields_are_rejected_not_translated(field, value):

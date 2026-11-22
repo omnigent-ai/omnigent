@@ -24,7 +24,8 @@ header, new-session composer, session quick view and side chat, and UI primitive
   require a surviving destination; moves and configuration commit together.
 - R6: Append attributed comments, changes, execution summaries and output events.
   PRs are `{type: "pull_request", url}` outputs, deduplicated for display.
-- R7: No ticket, comment or history deletion, including through project deletion.
+- R7: No ticket, comment or history deletion API, including through project deletion.
+  The one-time internal-field cleanup in R26 preserves authored content.
 - R11: The project owner and their same-project agents can work on the board.
 - R16: Create one ordinary orchestrator session when creating a project. Open it
   with the existing session pane; use normal session creation and messaging.
@@ -34,7 +35,7 @@ header, new-session composer, session quick view and side chat, and UI primitive
   the pink Needs response pill. A comment explains the request; removing the
   label resolves it. This is independent of a session's pending approval prompt.
   The API and ticket tools use `labels: [{key, value?}]` and reject `tags` arguments.
-  Existing values and historical events remain stored unchanged; historical field
+  Existing label values and historical label data remain unchanged; historical field
   names are projected as labels when read.
 - R20: Results are ordinary comments, not a dedicated completion field. A finished
   session does not finish a ticket.
@@ -45,11 +46,13 @@ header, new-session composer, session quick view and side chat, and UI primitive
 - R23: Record feedback, evidence, limitations and human checks as ordinary comments.
   Project stages define the workflow; tickets impose no built-in plan or review gate.
 - R24: Explicit approvals stay in the responsible agent's chat. Ticket comments
-  and stage moves do not answer prompts, imply approval or clear response routing.
+  and stage moves do not answer prompts, imply approval or clear outstanding elicitations.
 - R25: Persist symmetric, untyped related-ticket links. Link/unlink is idempotent,
   same-project, and recorded on both tickets; no self-links or implied dependencies.
-- R26: An optional `lead_session_id` identifies the linked same-project session
-  to contact, including while idle. Handoffs preserve prior session links/history.
+- R26: Remove `lead_session_id` from API/tool contracts and physical ticket storage.
+  Remove its structured history keys and delete only updates containing nothing else.
+  Reject old arguments, including null, without a compatibility alias. Preserve ordinary
+  session links, involvement, authored text, other history, labels and stage ownership.
 - R27: Show one Agents section near the top: the project orchestrator and linked
   sessions, with names, brief involvement, activity and explicit chat links.
   Reuse existing chat with Back to ticket and retained drafts. No phase-dependent
@@ -61,10 +64,9 @@ header, new-session composer, session quick view and side chat, and UI primitive
   related visible tickets across lanes, without changing selection or phase.
 - R30: Store an optional short involvement description on each ticket/session
   link. Updating it retains attributed history; do not infer roles from phase.
-- R31: When response is needed, explain how to respond near the top and show
-  a named Respond action for the saved contact, even when idle, as well as agents
-  with pending prompts. If no contact is recorded, say so and offer orchestrator
-  routing rather than inferring an owner. Open the exact session; comments and
+- R31: Show Respond for agents with actual pending prompts, otherwise Open chat.
+  A needs-human label alone does not select or highlight an agent; comments explain
+  the question and link to the relevant chat. Open the exact session; comments and
   stage moves do not resolve an elicitation or authorize auto-approval.
 - R32: The orchestrator must never initiate human elicitations or synchronously
   wait for a worker's human answer. Workers own prompts. The orchestrator records
@@ -109,11 +111,11 @@ header, new-session composer, session quick view and side chat, and UI primitive
 - AC31: GIVEN two same-project tickets WHEN linked from either side THEN each
   lists the other once; unlinking retains both histories and changes neither phase.
 - AC32: GIVEN unrelated ownership, projects or tenants WHEN linking tickets or
-  assigning a lead THEN access is rejected without partial writes.
-- AC33: GIVEN a linked lead WHEN its chat is opened and closed THEN the correct
+  sessions THEN access is rejected without partial writes.
+- AC33: GIVEN a linked agent WHEN its chat is opened and closed THEN the correct
   existing conversation and Back to ticket are available and ticket drafts survive.
-- AC34: GIVEN a handoff WHEN another linked session becomes lead THEN prior links
-  survive; the orchestrator remains accessible without launching work.
+- AC34: GIVEN a handoff WHEN linked-session involvement changes THEN prior links
+  and attributed history survive; the orchestrator remains accessible without launching work.
 - AC35: GIVEN planning or review WHEN workers follow the skill THEN they respect
   approval gates, record decisions/evidence and do not equate session exit with Done.
 - AC36: GIVEN related tickets on the board WHEN one is hovered or focused THEN
@@ -122,14 +124,16 @@ header, new-session composer, session quick view and side chat, and UI primitive
   the orchestrator once plus paginated linked sessions and their saved involvement.
 - AC38: GIVEN an existing link WHEN involvement changes or is cleared THEN the
   update is attributed and transactional; omitted involvement preserves it.
-- AC39: GIVEN needs-human or an agent awaiting input WHEN opening a ticket THEN
-  the pink Needs response treatment and an explicit route to the relevant chat
-  make the response path clear, without resolving prompts through ticket comments.
+- AC39: GIVEN needs-human and an agent awaiting input WHEN opening a ticket THEN
+  the label shows Needs response and the agent shows Respond with its own chat link,
+  without resolving prompts through ticket comments.
 - AC40: GIVEN a designated orchestrator WHEN composing native or SDK instructions
   THEN the non-blocking rule is included; ordinary workers do not inherit it.
-- AC41: GIVEN needs-human and a saved contact WHEN that agent is idle THEN the
-  ticket still names it as the response destination and highlights its row without
-  claiming a native prompt is pending; unknown contacts are explicit.
+- AC41: GIVEN needs-human and an idle agent without pending prompts WHEN opening
+  the ticket THEN the agent remains Idle with Open chat and no manual response highlight.
+- AC42: GIVEN existing response-field values and structured history WHEN upgrading
+  THEN the column and keys are absent, unrelated bytes and counters are preserved,
+  and interruption/retry does not duplicate or discard meaningful events.
 
 ## Constraints
 
@@ -147,12 +151,18 @@ answers/dismissal of existing human prompts are also out of scope.
 
 ## Plan
 
-Use project-defined stages, description and ordinary comments, with nullable
-`lead_session_id` and canonical-pair related tickets. Preserve retired notes in
+Use project-defined stages, description and ordinary comments, with
+canonical-pair related tickets. Preserve retired notes in
 readable historical activity; import missing snapshots with stable IDs, truthful
 System attribution and skipped notifications. Keep source columns inert, with no
-legacy API/tool inputs. Update may append a comment atomically. Leads must already
-be linked; unlinking a lead clears its reference.
+legacy API/tool inputs. Update may append a comment atomically.
+
+Remove the response field from readers and writers before its data migration.
+Stop old ticket writers, scrub only its root and changes keys in bounded primary-key
+event pages, delete emptied internal-only updates, then drop the column. Preserve
+event positions, counters, metadata and authored content; retries are idempotent.
+Downgrade restores an empty nullable column, not deleted data. Existing native tool
+schemas can remain cached; stale field arguments are rejected, not silently accepted.
 
 Add paginated related-ticket reads and `sys_ticket_link` attach/remove; include
 related tickets in `sys_ticket_get`. Reuse existing permissions, output events
@@ -162,10 +172,9 @@ the lifecycle and include the same contract in worker briefs. Verify with focuse
 entity/store/migration/route/tool and non-browser component tests.
 
 Add bounded nullable involvement to ticket/session links and the existing link
-API/tool. Replace the lead card and Sessions section with one named Agents list;
-retain lead metadata for compatibility, not as a separate UI role. Reuse the
+API/tool. Use one named Agents list without separate response-contact metadata. Reuse the
 existing session badge and chat surfaces, with pink response pills, Running for
-session activity, and explicit Respond/Open chat actions. Strengthen the shared
+session activity, and Respond only for live pending prompts, otherwise Open chat. Strengthen the shared
 orchestrator role instruction and canonical skill; preserve mandatory tool approvals.
 
 ## Tasks

@@ -964,7 +964,6 @@ class SqlProjectTicket(OmnigentBase):
     completion_summary: Mapped[str | None] = mapped_column(EnvelopedText(8192), nullable=True)
     plan: Mapped[str | None] = mapped_column(EnvelopedText(16383), nullable=True)
     review_summary: Mapped[str | None] = mapped_column(EnvelopedText(8192), nullable=True)
-    lead_session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     latest_update: Mapped[str] = mapped_column(EnvelopedText(2048), nullable=False)
     comment_count: Mapped[int] = mapped_column(Integer, nullable=False)
     next_event_position: Mapped[int] = mapped_column(Integer, nullable=False)

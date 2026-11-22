@@ -104,9 +104,7 @@ def create_project_tickets_router(
         if notifications is not None:
             notifications.wake()
 
-    async def check_session(
-        who: TicketActor, project_id: str, session_id: str, *, require_active: bool = False
-    ) -> str:
+    async def check_session(who: TicketActor, project_id: str, session_id: str) -> str:
         try:
             session_id = uuid_to_bytes(session_id).hex()
         except InvalidUuidError as exc:
@@ -117,10 +115,6 @@ def create_project_tickets_router(
             raise OmnigentError(
                 "Ticket and session must belong to the same project",
                 code=ErrorCode.INVALID_INPUT,
-            )
-        if require_active and target.archived:
-            raise OmnigentError(
-                "Archived sessions cannot lead a ticket", code=ErrorCode.INVALID_INPUT
             )
         return session_id
 
@@ -221,9 +215,6 @@ def create_project_tickets_router(
         request: Request, project_id: str, ticket_id: str, body: UpdateTicket
     ) -> dict[str, Any]:
         who = await actor(request, project_id)
-        if body.lead_session_id is not None:
-            await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
-            await check_session(who, project_id, body.lead_session_id, require_active=True)
         with _storage_errors():
             ticket = await asyncio.to_thread(store.update, project_id, ticket_id, body, who)
         wake(request)

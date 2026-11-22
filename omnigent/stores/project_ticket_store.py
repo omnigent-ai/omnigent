@@ -96,7 +96,6 @@ def _ticket(row: SqlProjectTicket) -> dict[str, Any]:
         "description": row.description,
         "stage_id": _stage_id(row),
         "labels": row.labels,
-        "lead_session_id": row.lead_session_id,
         "latest_update": row.latest_update,
         "comment_count": row.comment_count,
         "created_at": row.created_at,
@@ -438,27 +437,11 @@ class ProjectTicketStore:
         self, project_id: str, ticket_id: str, body: UpdateTicket, actor: TicketActor
     ) -> dict[str, Any]:
         changes = body.model_dump(exclude_none=True, exclude={"comment"})
-        if "lead_session_id" in body.model_fields_set:
-            changes["lead_session_id"] = (
-                _identifier(body.lead_session_id) if body.lead_session_id is not None else None
-            )
 
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)
             row = self._row(session, project_id, ticket_id, write=True)
             target = _stage(_stages(project), body.stage_id) if body.stage_id is not None else None
-            lead = changes.get("lead_session_id")
-            if (
-                lead is not None
-                and session.get(
-                    SqlProjectTicketSession, (project.workspace_id, project.id, row.id, lead)
-                )
-                is None
-            ):
-                raise OmnigentError(
-                    "Link the session to this ticket before making it the lead",
-                    code=ErrorCode.INVALID_INPUT,
-                )
             for key, value in changes.items():
                 setattr(row, key, value)
             if target is not None:
@@ -573,9 +556,6 @@ class ProjectTicketStore:
                 payload["involvement"] = involvement
                 if link is not None and action == "attach":
                     payload["action"] = "updated"
-            if action == "remove" and ticket.lead_session_id == key[3]:
-                ticket.lead_session_id = None
-                payload["changes"] = {"lead_session_id": None}
             self._append(
                 session,
                 project,

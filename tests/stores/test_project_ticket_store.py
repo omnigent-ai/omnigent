@@ -110,7 +110,6 @@ def test_labels_project_existing_storage_and_history_without_rewriting_it(board,
         UpdateTicket(
             labels=labels,
             stage_id="planning",
-            lead_session_id=actor.session_id,
             description="Keep `tags` in this description.",
             comment="**Tags**\n\nKeep this authored text.",
         ),
@@ -506,32 +505,30 @@ def test_related_link_boundaries_and_failed_activity_roll_back(board, monkeypatc
         assert len(tickets.events(project.id, ticket["id"], user_id="alice")["data"]) == 1
 
 
-def test_lead_handoff_requires_links_and_unlink_clears_only_the_lead(board, db_uri):
+def test_session_links_remain_independent_of_ticket_edits(board, db_uri):
     tickets, _, project = board
     actor = TicketActor("alice")
     ticket = tickets.create(project.id, CreateTicket(title="Plan"), actor)
     conversations = SqlAlchemyConversationStore(db_uri)
     first, second = [conversations.create_conversation(project_id=project.id) for _ in range(2)]
-    with pytest.raises(OmnigentError, match="Link the session"):
-        tickets.update(project.id, ticket["id"], UpdateTicket(lead_session_id=first.id), actor)
     for worker in (first, second):
-        tickets.link_session(project.id, ticket["id"], worker.id, "attach", actor)
-        tickets.update(project.id, ticket["id"], UpdateTicket(lead_session_id=worker.id), actor)
+        tickets.link_session(
+            project.id, ticket["id"], worker.id, "attach", actor, involvement="Verify the work"
+        )
     kept = tickets.update(project.id, ticket["id"], UpdateTicket(title="Work"), actor)
-    assert kept["lead_session_id"] == second.id
+    assert "lead_session_id" not in kept
     assert len(tickets.sessions(project.id, ticket["id"], user_id="alice")["data"]) == 2
-    cleared = tickets.update(project.id, ticket["id"], UpdateTicket(lead_session_id=None), actor)
-    assert cleared["lead_session_id"] is None
-    tickets.update(project.id, ticket["id"], UpdateTicket(lead_session_id=second.id), actor)
     result = tickets.link_session(project.id, ticket["id"], second.id, "remove", actor)
-    assert result["lead_session_id"] is None
-    assert (
-        tickets.sessions(project.id, ticket["id"], user_id="alice")["data"][0]["session_id"]
-        == first.id
-    )
-    assert tickets.events(project.id, ticket["id"], user_id="alice")["data"][-1]["payload"][
-        "changes"
-    ] == {"lead_session_id": None}
+    assert "lead_session_id" not in result
+    assert result["title"] == "Work"
+    remaining = tickets.sessions(project.id, ticket["id"], user_id="alice")["data"]
+    assert len(remaining) == 1
+    assert remaining[0]["session_id"] == first.id
+    assert remaining[0]["involvement"] == "Verify the work"
+    assert tickets.events(project.id, ticket["id"], user_id="alice")["data"][-1]["payload"] == {
+        "session_id": second.id,
+        "action": "remove",
+    }
 
 
 def test_stage_edit_reorder_start_and_removal_preserve_ticket_content_and_history(board):

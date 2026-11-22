@@ -570,7 +570,7 @@ describe("Project ticket board", () => {
               agent_id: null,
               created_at: 1000,
               payload: {
-                changes: { stage_id: "removed", lead_session_id: "worker" },
+                changes: { stage_id: "removed" },
                 stage: {
                   id: "removed",
                   name: "Investigating",
@@ -858,28 +858,12 @@ describe("Project ticket board", () => {
                 },
                 {
                   ...event,
-                  id: "assigned",
+                  id: "labeled",
                   position: 2,
                   kind: "updated",
                   payload: {
-                    changes: { lead_session_id: "worker", labels: [{ key: "research" }] },
+                    changes: { labels: [{ key: "research" }] },
                   },
-                },
-                {
-                  ...event,
-                  id: "unassigned",
-                  position: 3,
-                  kind: "updated",
-                  payload: {
-                    changes: { lead_session_id: null },
-                  },
-                },
-                {
-                  ...event,
-                  id: "lead-only",
-                  position: 4,
-                  kind: "updated",
-                  payload: { changes: { lead_session_id: "worker" } },
                 },
                 {
                   ...event,
@@ -889,7 +873,6 @@ describe("Project ticket board", () => {
                   payload: {
                     action: "remove",
                     session_id: "worker",
-                    changes: { lead_session_id: null },
                   },
                 },
               ],
@@ -1030,23 +1013,23 @@ describe("Project ticket board", () => {
   });
 
   it.each([false, true])(
-    "keeps earlier activity when loading another page (hidden first page=%s)",
-    async (hiddenFirstPage) => {
-      const hiddenEvent: TicketEvent = {
-        id: "lead-only",
+    "keeps earlier activity when loading another page (empty first page=%s)",
+    async (emptyFirstPage) => {
+      const event: TicketEvent = {
+        id: "comment",
         ticket_id: ticket.id,
         position: 0,
-        kind: "updated",
+        kind: "comment",
         user_id: "local",
         session_id: null,
         agent_id: null,
-        payload: { changes: { lead_session_id: "worker" } },
+        payload: { text: "First update" },
         created_at: 1000,
       };
-      let failNextPage = hiddenFirstPage;
+      let failNextPage = emptyFirstPage;
       vi.mocked(api.listTicketEvents).mockImplementation(async (_project, _ticket, after, kind) => {
         const position = (after ?? -1) + 1;
-        const firstCommentPosition = hiddenFirstPage ? 1 : 0;
+        const firstCommentPosition = emptyFirstPage ? 1 : 0;
         if (!kind && position === 1 && failNextPage) {
           failNextPage = false;
           throw new Error("Activity unavailable");
@@ -1054,11 +1037,11 @@ describe("Project ticket board", () => {
         return {
           data: kind
             ? []
-            : hiddenFirstPage && position === 0
-              ? [hiddenEvent]
+            : emptyFirstPage && position === 0
+              ? []
               : [
                   {
-                    ...hiddenEvent,
+                    ...event,
                     id: `comment-${position}`,
                     position,
                     kind: "comment",
@@ -1079,7 +1062,7 @@ describe("Project ticket board", () => {
           onCreated={vi.fn()}
         />,
       );
-      if (hiddenFirstPage) {
+      if (emptyFirstPage) {
         const activity = await screen.findByRole("region", { name: "Ticket activity" });
         expect(within(activity).queryAllByRole("listitem")).toHaveLength(0);
         fireEvent.click(await within(activity).findByRole("button", { name: "More activity" }));
@@ -1094,10 +1077,10 @@ describe("Project ticket board", () => {
       expect(screen.getByText("First update")).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "More activity" })).toBeNull();
       expect(screen.queryByRole("alert")).toBeNull();
-      if (hiddenFirstPage) {
+      if (emptyFirstPage) {
         act(() =>
           client.setQueryData(["project-tickets", "project", "ticket", "events", undefined], {
-            pages: [{ data: [hiddenEvent], has_more: false, last_position: 0 }],
+            pages: [{ data: [], has_more: false, last_position: -1 }],
             pageParams: [-1],
           }),
         );
@@ -1154,7 +1137,7 @@ describe("Project ticket board", () => {
     });
   });
 
-  it("records feedback as an ordinary comment independently of stages and response routing", async () => {
+  it("records feedback as an ordinary comment independently of stages and agent activity", async () => {
     ticket.stage_id = "review";
     ticket.description = "Inspect the existing evidence.";
     renderBoard(
@@ -1276,7 +1259,6 @@ describe("Project ticket board", () => {
     async (mobile) => {
       vi.mocked(useIsMobileViewport).mockReturnValue(mobile);
       ticket.stage_id = "planning";
-      ticket.lead_session_id = "planner";
       vi.mocked(fetchConversationById).mockImplementation(async (id) =>
         conversation(id, {
           title: id === "planner" ? "Design the board" : "Shipping orchestrator",
@@ -1300,12 +1282,13 @@ describe("Project ticket board", () => {
       const { rerender } = renderBoard(<ProjectTicketPanel {...props} />);
       const agents = await screen.findByRole("list", { name: "Involved agents" });
       const chat = await within(agents).findByRole("link", {
-        name: "Respond to: Design the board",
+        name: "Open chat with: Design the board",
       });
       expect(screen.queryByText("Your response is needed")).toBeNull();
       expect(screen.queryByRole("region", { name: "Response needed" })).toBeNull();
       expect(screen.getAllByText("Needs response")).toHaveLength(1);
-      expect(chat).toHaveClass("bg-tag-pink");
+      expect(chat).not.toHaveClass("bg-tag-pink");
+      expect(within(agents).queryByRole("link", { name: /^Respond to:/ })).toBeNull();
       expect(chat).not.toHaveTextContent("Needs response");
       expect(chat).toHaveTextContent("Idle");
       expect(within(chat).queryByRole("img", { name: /approval prompt/ })).toBeNull();
@@ -1337,7 +1320,6 @@ describe("Project ticket board", () => {
 
   it("lists paginated agents with read-only involvement and keeps chat routing intact", async () => {
     ticket.stage_id = "planning";
-    ticket.lead_session_id = "reviewer";
     vi.mocked(api.listTicketSessions).mockImplementation(async (_project, _ticket, after) => ({
       data: after
         ? [
@@ -1374,7 +1356,7 @@ describe("Project ticket board", () => {
     fireEvent.click(screen.getByRole("button", { name: "More agents" }));
     expect(
       await within(agents).findByRole("link", {
-        name: "Respond to: Verify the result",
+        name: "Open chat with: Verify the result",
       }),
     ).toHaveAttribute("href", "/?ticket=ticket&session=reviewer");
     expect(await within(agents).findByText("Verifying the result")).toBeInTheDocument();

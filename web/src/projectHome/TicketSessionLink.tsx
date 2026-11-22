@@ -30,13 +30,11 @@ export function TicketSessionLink({
   showStatus = false,
   ticketId,
   involvement,
-  responseRequested = false,
 }: {
   sessionId: string;
   showStatus?: boolean;
   ticketId?: string;
   involvement?: string;
-  responseRequested?: boolean;
 }) {
   const mobile = useIsMobileViewport();
   const { query, title } = useTicketSessionMetadata(sessionId, showStatus);
@@ -44,7 +42,6 @@ export function TicketSessionLink({
   const [state] = useSessionBadgeStates(session ? [session] : []);
   const unavailable = query.isError || session === null;
   const awaiting = !unavailable && !session?.archived && state?.kind === "awaiting";
-  const needsResponse = awaiting || responseRequested;
   const status = unavailable
     ? "Unavailable"
     : !session
@@ -67,11 +64,10 @@ export function TicketSessionLink({
         showStatus
           ? "flex min-w-0 flex-1 items-start gap-3 rounded-lg p-3 transition-colors hover:bg-muted/40 focus-visible:ring-inset"
           : "inline-block max-w-full align-bottom wrap-anywhere hover:underline",
-        showStatus && responseRequested && "bg-tag-pink hover:bg-brand-accent/10",
       )}
       title={`${title} (${sessionId})`}
       aria-label={
-        showStatus ? `${needsResponse ? "Respond to" : "Open chat with"}: ${title}` : undefined
+        showStatus ? `${awaiting ? "Respond to" : "Open chat with"}: ${title}` : undefined
       }
       to={
         ticketId
@@ -88,8 +84,7 @@ export function TicketSessionLink({
         <span className={showStatus ? "block font-medium wrap-anywhere" : undefined}>{title}</span>
         {showStatus && (
           <span className="block text-muted-foreground wrap-anywhere">
-            {involvement ||
-              (responseRequested ? "Your contact for this response" : "Linked to this ticket")}
+            {involvement || "Linked to this ticket"}
           </span>
         )}
         {showStatus && (
@@ -103,10 +98,10 @@ export function TicketSessionLink({
             <span
               className={cn(
                 "inline-flex items-center gap-1 font-medium",
-                needsResponse && "text-brand-accent",
+                awaiting && "text-brand-accent",
               )}
             >
-              {needsResponse ? "Respond" : "Open chat"}
+              {awaiting ? "Respond" : "Open chat"}
               <ChevronRightIcon aria-hidden className="size-3.5" />
             </span>
           </span>

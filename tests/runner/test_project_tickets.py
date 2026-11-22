@@ -68,22 +68,14 @@ TICKET = "c" * 32
         ),
         (
             "sys_ticket_update",
-            {"ticket_id": TICKET, "lead_session_id": None},
-            "PATCH",
-            f"/{TICKET}",
-            {"lead_session_id": None},
-        ),
-        (
-            "sys_ticket_update",
             {
                 "ticket_id": TICKET,
                 "stage_id": "planning",
                 "description": "Agreed scope",
-                "lead_session_id": SOURCE,
             },
             "PATCH",
             f"/{TICKET}",
-            {"stage_id": "planning", "description": "Agreed scope", "lead_session_id": SOURCE},
+            {"stage_id": "planning", "description": "Agreed scope"},
         ),
         (
             "sys_ticket_update",
@@ -215,6 +207,8 @@ async def test_get_returns_paged_activity_outputs_and_sessions():
         ("sys_ticket_update", {"ticket_id": TICKET, "review_summary": "Old review"}),
         ("sys_ticket_update", {"ticket_id": TICKET, "completion_summary": "Old result"}),
         ("sys_ticket_update", {"ticket_id": TICKET, "review_action": "approve"}),
+        ("sys_ticket_update", {"ticket_id": TICKET, "lead_session_id": SOURCE}),
+        ("sys_ticket_update", {"ticket_id": TICKET, "lead_session_id": None}),
         ("sys_ticket_link", {"ticket_id": TICKET, "related_ticket_id": "../../other"}),
         ("sys_ticket_get", {"ticket_id": TICKET, "related_after": "../other"}),
         ("sys_ticket_get", {"ticket_id": "../../other"}),
@@ -303,11 +297,14 @@ def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
                 "review_summary",
                 "completion_summary",
                 "review_action",
+                "lead_session_id",
                 "tags",
             }
             & properties.keys()
         )
         assert "delete" not in tool.name()
+        assert "lead_session_id" not in tool.description()
+        assert "response contact" not in tool.description()
         if tool.name() in ("sys_ticket_create", "sys_ticket_update"):
             assert "labels" in properties
             schema = tool().get_schema()["function"]["parameters"]

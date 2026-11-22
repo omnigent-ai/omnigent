@@ -26,10 +26,9 @@ Do not enter a native planning mode that requires blocking this session for appr
 
 - Delegate the question to the linked agent doing that planning, implementation
   or verification. Link it to the ticket, record the exact ask and where to
-  respond, and set `lead_session_id` to that worker together with `needs-human`
-  (rendered as Needs response). This is the response contact even when idle or
-  asking in ordinary chat, not a role inferred from phase. Keep its involvement
-  description current. Reuse an appropriate worker rather than starting a
+  respond with a link to that worker's chat, and add the `needs-human` label
+  (rendered as Needs response), including for questions in ordinary chat. Keep its
+  involvement description current. Reuse an appropriate worker rather than starting a
   separate agent just to relay an answer.
 - Do not synchronously wait for the worker's human answer. Stay available for
   incoming ticket comments, user messages, other workers and independent work.
@@ -168,7 +167,7 @@ Link the returned session with `sys_session_link_ticket`, including a short
 the phase). Reattach with updated involvement as responsibilities change; retain
 prior participants and describe their completed contribution. Name one worker as
 the ticket's stage owner in its brief and involvement; helpers report phase changes
-to that owner. This does not change `lead_session_id`'s human-response routing role.
+to that owner.
 The owner checks stage fit at substantive progress updates, before changing the
 kind of work, requesting input, or handing off. Use fresh definitions and combine
 a stage change with its progress rationale in one `sys_ticket_update` call.
@@ -235,7 +234,7 @@ updates and worker reports promptly between checks.
   Stay quiet when nothing changed; don't post heartbeat comments. Before declaring
   "waiting on you" or cancelling checks, reconcile every remaining ticket: it must
   be complete, explicitly paused by the user, or have a substantiated human blocker
-  with its exact question and response contact recorded. A planning-only assignment
+  with its exact question and worker chat link recorded. A planning-only assignment
   is a scope limit, not permission to implement; record that boundary clearly.
   If any authorized next action or external wait remains, act and re-arm the check.
   Cancel it only when work is done, the human pauses/stops, or this reconciliation
@@ -256,11 +255,11 @@ updates and worker reports promptly between checks.
   recovery, and the required information, access, consequential decision or explicit
   approval that cannot be supplied within the existing scope. Routine uncertainty
   or a worker asking for a go-ahead is not enough. When a human really must act,
-  add `needs-human`, set `lead_session_id` to the responsible worker, and comment
-  with the exact question and worker chat; notify here in ordinary text. Preserve
-  other labels. Clear `needs-human` only after checking that no other human request
-  remains; if the blocker changes, update the question/contact without hiding the
-  remaining decision. Continue independent work. Missing tools or required isolation
+  add `needs-human` and comment with the exact question and worker chat link; notify
+  here in ordinary text. Preserve other labels. Clear `needs-human` only after checking
+  that no other human request remains; if the blocker changes, update the question
+  and chat link without hiding the remaining decision. Continue independent work.
+  Missing tools or required isolation
   are blockers to explain, not reasons to silently take over implementation.
 - Updates automatically reach you; your own writes do not wake you. Avoid
   acknowledgement-only comments and notification loops. Never delete tickets

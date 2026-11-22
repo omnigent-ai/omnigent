@@ -20,8 +20,6 @@ export function TicketAgents({ projectId, ticket }: { projectId: string; ticket:
   const sessions = query.data?.pages.flatMap((page) => page.data) ?? [];
   const orchestratorId = project.data?.orchestrator_session_id;
   const orchestrator = sessions.find((session) => session.session_id === orchestratorId);
-  const responseLabel = ticket.labels.find((label) => label.key === "needs-human");
-  const responseSessionId = responseLabel ? ticket.lead_session_id : null;
   return (
     <section aria-label="Agents" className="space-y-2">
       <h3 className="text-sm font-medium">Agents</h3>
@@ -37,7 +35,6 @@ export function TicketAgents({ projectId, ticket }: { projectId: string; ticket:
               ticketId={ticket.id}
               showStatus
               involvement={orchestrator?.involvement || "Coordinates work and handles questions"}
-              responseRequested={orchestratorId === responseSessionId}
             />
           ) : (
             <Link
@@ -68,7 +65,6 @@ export function TicketAgents({ projectId, ticket }: { projectId: string; ticket:
                 ticketId={ticket.id}
                 showStatus
                 involvement={session.involvement}
-                responseRequested={session.session_id === responseSessionId}
               />
             </li>
           ))}

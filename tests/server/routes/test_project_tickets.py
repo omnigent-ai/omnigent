@@ -230,7 +230,7 @@ async def test_board_api_lifecycle_and_no_deletion(project_client):
     assert created.status_code == 201
     ticket = created.json()
     assert ticket["stage_id"] == "open" and ticket["description"] == ""
-    assert ticket["labels"] == labels and "tags" not in ticket
+    assert ticket["labels"] == labels and not {"tags", "lead_session_id"} & ticket.keys()
     path = base + f"/{ticket['id']}"
     response = await project_client.patch(
         path,
@@ -272,20 +272,28 @@ async def test_board_api_lifecycle_and_no_deletion(project_client):
     assert rejected.status_code == 422
     assert (await project_client.get(path)).json()["description"] == ""
     assert (await project_client.get(path + "/events")).json() == events_before
-    for method, url, body in (
-        ("POST", base, {"title": "Rejected", "tags": labels}),
-        ("PATCH", path, {"tags": [], "description": "Must not be applied"}),
+    for method, url, body, field in (
+        ("POST", base, {"title": "Rejected", "tags": labels}, "tags"),
+        ("PATCH", path, {"tags": [], "description": "Must not be applied"}, "tags"),
+        ("POST", base, {"title": "Rejected", "lead_session_id": None}, "lead_session_id"),
+        ("PATCH", path, {"lead_session_id": uuid4().hex}, "lead_session_id"),
+        (
+            "PATCH",
+            path,
+            {"lead_session_id": None, "description": "Must not be applied"},
+            "lead_session_id",
+        ),
     ):
         rejected = await project_client.request(method, url, json=body)
         assert rejected.status_code == 422
-        assert any(error["loc"] == ["body", "tags"] for error in rejected.json()["detail"])
+        assert any(error["loc"] == ["body", field] for error in rejected.json()["detail"])
     assert (await project_client.get(path)).json() == completed.json()
     assert (await project_client.get(path + "/events")).json() == events_before
     assert len((await project_client.get(base)).json()["data"]) == 1
     schemas = (await project_client.get("/openapi.json")).json()["components"]["schemas"]
     for name in ("CreateTicket", "UpdateTicket"):
         assert "labels" in schemas[name]["properties"]
-        assert "tags" not in schemas[name]["properties"]
+        assert not {"tags", "lead_session_id"} & schemas[name]["properties"].keys()
     assert "TicketLabel" in schemas and "TicketTag" not in schemas
     assert (await project_client.delete(path)).status_code in (404, 405)
     assert (await project_client.delete(f"/v1/projects/{project['id']}")).status_code == 409
@@ -643,7 +651,7 @@ async def test_ticket_running_projection_batches_links_and_respects_access(
     assert (await client.get(base, headers=_as_user(BOB))).status_code == 404
 
 
-async def test_lifecycle_related_links_and_lead_api(project_client, db_uri):
+async def test_lifecycle_related_and_session_links_api(project_client, db_uri):
     project = (await project_client.post("/v1/projects", json={"name": "Lifecycle"})).json()
     base = f"/v1/projects/{project['id']}/tickets"
     ticket = (await project_client.post(base, json={"title": "Feature"})).json()
@@ -684,19 +692,15 @@ async def test_lifecycle_related_links_and_lead_api(project_client, db_uri):
     ).status_code == 404
     session = SqlAlchemyConversationStore(db_uri).create_conversation(project_id=project["id"])
     assert (
-        await project_client.patch(path, json={"lead_session_id": session.id})
-    ).status_code == 400
-    await project_client.post(path + "/sessions", json={"session_id": session.id})
-    assert (await project_client.patch(path, json={"lead_session_id": session.id})).json()[
-        "lead_session_id"
+        await project_client.post(path + "/sessions", json={"session_id": session.id})
+    ).status_code == 200
+    assert (await project_client.get(path + "/sessions")).json()["data"][0][
+        "session_id"
     ] == session.id
-    assert (await project_client.patch(path, json={"lead_session_id": None})).json()[
-        "lead_session_id"
-    ] is None
     SqlAlchemyConversationStore(db_uri).update_conversation(session.id, archived=True)
     assert (
-        await project_client.patch(path, json={"lead_session_id": session.id})
-    ).status_code == 400
+        await project_client.post(path + "/sessions", json={"session_id": session.id})
+    ).status_code == 200
     assert (
         await project_client.post(
             path + "/sessions", json={"session_id": session.id, "action": "remove"}
@@ -711,7 +715,7 @@ async def test_lifecycle_related_links_and_lead_api(project_client, db_uri):
     assert len((await project_client.get(other_path + "/events")).json()["data"]) == 3
 
 
-async def test_related_and_lead_changes_respect_user_and_project_permissions(
+async def test_related_and_session_links_respect_user_and_project_permissions(
     multi_user_client, db_uri
 ):
     client = multi_user_client
@@ -731,16 +735,18 @@ async def test_related_and_lead_changes_respect_user_and_project_permissions(
     store = SqlAlchemyConversationStore(db_uri)
     foreign = store.create_conversation(project_id=project["id"])
     SqlAlchemyPermissionStore(db_uri).grant(BOB, foreign.id, LEVEL_OWNER)
-    response = await client.patch(
-        path, json={"lead_session_id": foreign.id}, headers=_as_user(ALICE)
+    response = await client.post(
+        path + "/sessions", json={"session_id": foreign.id}, headers=_as_user(ALICE)
     )
     assert response.status_code in (403, 404)
     outside = store.create_conversation()
     SqlAlchemyPermissionStore(db_uri).grant(ALICE, outside.id, LEVEL_OWNER)
     assert (
-        await client.patch(path, json={"lead_session_id": outside.id}, headers=_as_user(ALICE))
+        await client.post(
+            path + "/sessions", json={"session_id": outside.id}, headers=_as_user(ALICE)
+        )
     ).status_code == 400
-    assert (await client.get(path, headers=_as_user(ALICE))).json()["lead_session_id"] is None
+    assert (await client.get(path + "/sessions", headers=_as_user(ALICE))).json()["data"] == []
 
 
 async def test_notification_enqueue_survives_crash_without_duplicate_message(

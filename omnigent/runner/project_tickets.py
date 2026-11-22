@@ -23,15 +23,13 @@ async def execute_ticket_tool(
         )
     try:
         body = TICKET_TOOLS[name].arguments.model_validate(args).model_dump(exclude_none=True)
-        if name == "sys_ticket_update" and "lead_session_id" in args:
-            body["lead_session_id"] = args["lead_session_id"]
         source_id = uuid_to_bytes(source_id).hex()
         ticket_id = uuid_to_bytes(body.pop("ticket_id")).hex() if "ticket_id" in body else None
         if "after" in body and isinstance(body["after"], str):
             body["after"] = uuid_to_bytes(body["after"]).hex()
         if name == "sys_session_link_ticket":
             body["session_id"] = uuid_to_bytes(body.get("session_id", source_id)).hex()
-        for key in ("lead_session_id", "related_ticket_id", "sessions_after", "related_after"):
+        for key in ("related_ticket_id", "sessions_after", "related_after"):
             if body.get(key) is not None:
                 body[key] = uuid_to_bytes(body[key]).hex()
         headers = {ORCHESTRATION_SOURCE_HEADER: source_id}

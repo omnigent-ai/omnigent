@@ -848,10 +848,7 @@ function ActivityChange({ event }: { event: TicketEvent }) {
   const changes = event.payload.changes as Partial<ProjectTicket> | undefined;
   const stage = ticketEventStage(event);
   const fields = Object.keys(changes ?? {})
-    .filter(
-      (field) =>
-        field !== "lead_session_id" && (!stage || (field !== "stage_id" && field !== "status")),
-    )
+    .filter((field) => !stage || (field !== "stage_id" && field !== "status"))
     .map((field) => field.replaceAll("_", " "));
   return (
     <>
@@ -875,17 +872,7 @@ function TicketActivity({ projectId, ticketId }: { projectId: string; ticketId: 
   const query = useTicketEvents(projectId, ticketId);
   const now = useNow();
   const viewerId = useViewerId();
-  const events = (query.data?.pages.flatMap((page) => page.data) ?? []).filter((event) => {
-    const changes = event.payload.changes;
-    return !(
-      event.kind === "updated" &&
-      Object.keys(event.payload).length === 1 &&
-      typeof changes === "object" &&
-      changes !== null &&
-      Object.keys(changes).length === 1 &&
-      "lead_session_id" in changes
-    );
-  });
+  const events = query.data?.pages.flatMap((page) => page.data) ?? [];
   if (!query.isPending && !query.error && !query.hasNextPage && events.length === 0) return null;
   return (
     <section aria-label="Ticket activity" className="space-y-4 border-t border-border/60 pt-5">

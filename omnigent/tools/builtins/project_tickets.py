@@ -116,7 +116,7 @@ class SysTicketListTool(_TicketTool):
 class SysTicketGetTool(_TicketTool):
     tool_name = "sys_ticket_get"
     help_text = (
-        "Read a ticket, its description/response contact, and pages of activity, sessions "
+        "Read a ticket, its description, and pages of activity, sessions "
         "and related tickets, plus the project's current stage definitions. "
         "Compare the stage's meaning with actual work and the next step at progress and "
         "handoff checkpoints. "
@@ -143,11 +143,10 @@ class SysTicketUpdateTool(_TicketTool):
         "instructions never grant approval or bypass human/permission prompts. "
         "Keep the goal and current context in description; append approaches, feedback and "
         "results as ordinary comments. "
-        "Set lead_session_id to an already "
-        "linked session (null clears it). Optional comment is appended atomically. "
+        "Optional comment is appended atomically. "
         "Labels replace the whole key/value list: use labels with key needs-human plus a comment "
-        "when a person must act, in any stage, and remove that label only when its request is "
-        "resolved."
+        "with the exact ask and a link to the responsible worker's chat when a person must act, "
+        "in any stage, and remove that label only when its request is resolved."
     )
     arguments = EditTicket
 
@@ -161,7 +160,7 @@ class SysTicketStagesUpdateTool(_TicketTool):
         "new stage. The first stage starts tickets; the last means complete. Do not send "
         "initial_stage_id or is_complete. Removing an occupied stage requires moves from "
         "its ID to a surviving stage ID. Configuration and ticket moves commit together "
-        "or not at all; tickets, history and response routing are preserved. Returns the "
+        "or not at all; tickets, history and session links are preserved. Returns the "
         "saved definitions. This edits board structure; move individual tickets with "
         "sys_ticket_update. Stage edits do not start work or grant approvals."
     )

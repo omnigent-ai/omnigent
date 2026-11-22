@@ -190,9 +190,6 @@ class UpdateTicket(BaseModel):
         description="A stage ID from this project's ticket list or stage definitions.",
     )
     labels: list[TicketLabel] | None = Field(default=None, max_length=20)
-    lead_session_id: str | None = Field(
-        default=None, description="An already linked session to contact; null clears the lead."
-    )
     comment: str | None = Field(default=None, min_length=1, max_length=2000)
 
     @field_validator("title", "comment")
