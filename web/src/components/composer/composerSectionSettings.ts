@@ -48,16 +48,18 @@ function choiceAvailability(
 
 /**
  * `section` as a ⌘K setting of the composer `owner`: every choice the menu can select,
- * plus the checked one when the menu only shows it. None without a selectable choice.
+ * plus the checked one when the menu only shows it. None without a selectable choice, unless
+ * the caller adds one, as Smart Routing does for models.
  */
 export function composerSectionSetting(
   section: ComposerConfigSection | undefined,
   owner: string,
   kind: SectionSettingKind,
+  { addsChoice = false }: { addsChoice?: boolean } = {},
 ): PaletteSetting | null {
   if (!section) return null;
   const listed = section.choices.filter((choice) => choice.onSelect || choice.checked);
-  if (!listed.some((choice) => choice.onSelect)) return null;
+  if (!addsChoice && !listed.some((choice) => choice.onSelect)) return null;
   return {
     id: kind.id,
     owner,
@@ -111,14 +113,20 @@ export function modelSetting(
   owner: string,
   routing?: ModelRouting,
 ): PaletteSetting | null {
-  const setting = composerSectionSetting(section, owner, {
-    id: "composer-model",
-    label: "Model",
-    icon: BoxIcon,
-    keywords: ["model", "llm", "switch model"],
-    busyReason: MODEL_BUSY_REASON,
-    titleIs: "description",
-  });
+  // Smart Routing stays choosable when no fixed model is, as the menu's row does.
+  const setting = composerSectionSetting(
+    section,
+    owner,
+    {
+      id: "composer-model",
+      label: "Model",
+      icon: BoxIcon,
+      keywords: ["model", "llm", "switch model"],
+      busyReason: MODEL_BUSY_REASON,
+      titleIs: "description",
+    },
+    { addsChoice: routing !== undefined },
+  );
   if (!setting || !routing) return setting;
   return {
     ...setting,

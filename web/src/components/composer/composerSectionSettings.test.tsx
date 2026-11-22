@@ -137,6 +137,17 @@ describe("modelSetting with Smart Routing", () => {
     ],
   });
 
+  it("keeps Smart Routing when no fixed model can be chosen, as the menu does", async () => {
+    const select = vi.fn();
+    const empty: ComposerConfigSection = { testId: "models", header: "Models", choices: [] };
+    const setting = modelSetting(empty, "composer-1", { active: false, select });
+    expect(setting?.choices.map((choice) => choice.label)).toEqual(["Smart Routing"]);
+    await chooseSettingValue(setting!, "Smart Routing");
+    expect(select).toHaveBeenCalledOnce();
+    // Without routing there's nothing to choose, so no setting.
+    expect(modelSetting(empty, "composer-1")).toBeNull();
+  });
+
   it("lists Smart Routing first, current while it routes, choosing it as the menu's row does", () => {
     const select = vi.fn();
     const setting = modelSetting(models(), "composer-1", { active: true, select })!;
