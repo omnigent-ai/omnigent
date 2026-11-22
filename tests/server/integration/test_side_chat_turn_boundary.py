@@ -8,6 +8,8 @@ are stand-ins, since no agent runs here.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -20,6 +22,7 @@ import pytest_asyncio
 from omnigent.runtime import pending_inputs
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._sessions.helpers import _NativeTerminalEnsureOutcome
+from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
 from omnigent.server.routes.sessions import routes_core
 from omnigent.server.schemas import BackgroundTaskInfo
 from omnigent.spec.types import SkillSpec
@@ -41,9 +44,11 @@ def _runner(request: httpx.Request) -> httpx.Response:
     return httpx.Response(202, json={"queued": True})
 
 
-@pytest_asyncio.fixture
-async def runner(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[None]:
-    """Route every session to a runner and native terminal that take everything."""
+@contextlib.asynccontextmanager
+async def _routed_runner(
+    monkeypatch: pytest.MonkeyPatch, handler: Callable[[httpx.Request], httpx.Response]
+) -> AsyncIterator[None]:
+    """Route every session to *handler* as its runner, with a native terminal that is ready."""
     monkeypatch.setattr(
         sessions_module,
         "_ensure_native_terminal_ready",
@@ -53,13 +58,20 @@ async def runner(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[None]:
         sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
     )
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_runner), base_url="http://runner"
+        transport=httpx.MockTransport(handler), base_url="http://runner"
     ) as client:
         monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=client))
         monkeypatch.setattr(
             "omnigent.server.routes._sessions.orchestration._get_runner_client",
             AsyncMock(return_value=client),
         )
+        yield
+
+
+@pytest_asyncio.fixture
+async def runner(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[None]:
+    """Route every session to a runner and native terminal that take everything."""
+    async with _routed_runner(monkeypatch, _runner):
         yield
 
 
@@ -314,29 +326,61 @@ async def test_sdk_side_chat_leaves_out_a_turn_whose_follow_up_was_sent_before_i
     assert await _side_chat_history(client, session_id) == [_CODENAME, _NOTED]
 
 
+class _RunnerStream:
+    """One runner event stream: the ready heartbeat, then *events*, then its end."""
+
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        self._events = events
+
+    def stream(self, method: str, path: str, *, timeout: Any) -> _RunnerStream:
+        return self
+
+    async def __aenter__(self) -> _RunnerStream:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        return None
+
+    async def aiter_text(self) -> AsyncIterator[str]:
+        yield 'data: {"type": "session.heartbeat"}\n\n'
+        for event in self._events:
+            yield f"data: {json.dumps(event)}\n\n"
+        yield "data: [DONE]\n\n"
+
+
 class _TurnRunner:
     """A runner that answers a message the way the real one does: it starts a turn or waits."""
 
     def __init__(self) -> None:
         self.running: set[str] = set()
+        self.held: dict[str, list[str]] = {}
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         if request.method != "POST" or not request.url.path.endswith("/events"):
             return _runner(request)
         session_id = request.url.path.split("/")[3]
         if session_id in self.running:
+            item_id = json.loads(request.content)["persisted_item_id"]
+            self.held.setdefault(session_id, []).append(item_id)
             detail = "Message buffered; active turn will process it."
             return httpx.Response(202, json={"status": "buffered", "detail": detail})
         self.running.add(session_id)
         return httpx.Response(202, json={"status": "accepted", "detail": "Turn started."})
 
-    def start_turn(self, session_id: str) -> None:
-        """Start the turn the runner owes the messages it held."""
-        self.running.add(session_id)
-        sessions_module._publish_status(session_id, "running")
+    async def continue_turn(self, session_id: str, store: SqlAlchemyConversationStore) -> None:
+        """Start a turn with the held messages as the turn before it ends, with no idle edge."""
+        held = self.held.pop(session_id)
+        edge = {"type": "session.status", "status": "running", "input_item_ids": held}
+        stream = _RunnerStream([edge])
+        await _relay_runner_stream_once(session_id, stream, store)  # type: ignore[arg-type]
 
     def end_turn(self, session_id: str) -> None:
+        """End the running turn, which took up every message held for it."""
         self.running.discard(session_id)
+        self.held.pop(session_id, None)
         sessions_module._publish_status(session_id, "idle")
 
 
@@ -344,23 +388,13 @@ class _TurnRunner:
 async def turn_runner(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[_TurnRunner]:
     """Route every session to a runner that starts turns and holds messages like the real one."""
     turns = _TurnRunner()
-    monkeypatch.setattr(
-        sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
-    )
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(turns), base_url="http://runner"
-    ) as client:
-        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=client))
-        monkeypatch.setattr(
-            "omnigent.server.routes._sessions.orchestration._get_runner_client",
-            AsyncMock(return_value=client),
-        )
+    async with _routed_runner(monkeypatch, turns):
         yield turns
 
 
 @pytest.mark.parametrize("held_kind", ["message", "skill"])
 async def test_sdk_side_chat_leaves_out_the_messages_a_runner_held_for_its_next_turn(
-    client: httpx.AsyncClient, turn_runner: _TurnRunner, held_kind: str
+    client: httpx.AsyncClient, turn_runner: _TurnRunner, held_kind: str, db_uri: str
 ) -> None:
     """Messages a runner held while a turn ran start the next turn; a side chat leaves them out."""
     session_id = await _session(client, native=False)
@@ -377,8 +411,7 @@ async def test_sdk_side_chat_leaves_out_the_messages_a_runner_held_for_its_next_
         await _post(client, session_id, {"type": "slash_command", "data": skill})
     await _send(client, session_id, "And the docs")
     await _mirror(client, session_id, "assistant", "The parser looks fine", "r2")
-    turn_runner.end_turn(session_id)
-    turn_runner.start_turn(session_id)
+    await turn_runner.continue_turn(session_id, SqlAlchemyConversationStore(db_uri))
     await _mirror(client, session_id, "assistant", "Checking the rest", "r3")
     await _send(client, session_id, "Then summarize")
 
