@@ -3,7 +3,6 @@
 // against the target's current facts, then runs it.
 
 import { useEffect } from "react";
-import { toast } from "sonner";
 import { CODE_EDITORS, launchEditorLink } from "@/lib/editorLinks";
 import { useRebasePath } from "@/lib/routing";
 import { revealInFileManager } from "../RevealInFileManager";
@@ -64,15 +63,9 @@ function FileActionRunner({ request }: { request: FileActionRequest }) {
     if (!claimFileAction(request)) return;
     // An action that stopped applying since the request was made does nothing.
     const facts = fileCommandFacts(target, environment);
-    const { availability } = fileCommandsById(facts)[command];
-    if (!isCommandAvailable(availability)) {
-      // A greyed-out action says why; one that no longer applies does nothing.
-      if (availability.available === false && availability.reason) toast(availability.reason);
-      return;
-    }
+    if (!isCommandAvailable(fileCommandsById(facts)[command].availability)) return;
     runFileAction(command);
-    // Each request is handled once, against the facts when it arrives.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- runs once per request
   }, []);
 
   function runFileAction(id: HostedFileCommandId) {

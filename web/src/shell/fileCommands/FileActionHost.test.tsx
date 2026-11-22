@@ -117,6 +117,32 @@ describe("FileActionHost", () => {
     expect(link.searchParams.get("file")).toBe("docs/a b.md");
   });
 
+  it("runs each session's action once, with that session's path and link", () => {
+    const first = target("src/a.ts", {
+      root: "/repo-a",
+      hostId: "this-mac",
+      conversationId: "conv_a",
+    });
+    const second = target("lib/b.ts", {
+      root: "/repo-b",
+      hostId: "this-mac",
+      conversationId: "conv_b",
+    });
+    act(() => requestFileAction(first, "copy-link"));
+    act(() => requestFileAction(second, "copy-link"));
+    act(() => requestFileAction(first, "copy-path"));
+    act(() => requestFileAction(second, "copy-path"));
+
+    const copied = copyText.mock.calls.map(([text]) => text);
+    expect(copied).toHaveLength(4);
+    const links = copied.slice(0, 2).map((text) => new URL(text));
+    expect(links.map((link) => [link.pathname, link.searchParams.get("file")])).toEqual([
+      ["/c/conv_a", "src/a.ts"],
+      ["/c/conv_b", "lib/b.ts"],
+    ]);
+    expect(copied.slice(2)).toEqual(["/repo-a/src/a.ts", "/repo-b/lib/b.ts"]);
+  });
+
   it("shows this machine's files in the file manager", () => {
     act(() => requestFileAction(target("src/main.ts"), "reveal"));
     expect(revealInFileManager).toHaveBeenCalledWith({
