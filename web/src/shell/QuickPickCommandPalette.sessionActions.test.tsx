@@ -2,6 +2,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type * as ConversationsModule from "@/hooks/useConversations";
@@ -56,16 +57,26 @@ function listSessions(...rows: Conversation[]) {
   useConversations.mockReturnValue({ data: { pages: [{ data: rows }] }, isFetching: false });
 }
 
-function renderPalette(queryClient = new QueryClient()) {
+/** With `closes`, it closes on `onOpenChange(false)` as the shell does; else it stays open. */
+function renderPalette(queryClient = new QueryClient(), { closes = false } = {}) {
   const onOpenChange = vi.fn();
-  render(
-    <QueryClientProvider client={queryClient}>
+  function Palette() {
+    const [open, setOpen] = useState(true);
+    return (
       <QuickPickCommandPalette
-        open
-        onOpenChange={onOpenChange}
+        open={open}
+        onOpenChange={(next) => {
+          onOpenChange(next);
+          if (closes) setOpen(next);
+        }}
         onToggleLeftSidebar={vi.fn()}
         onToggleRightSidebar={vi.fn()}
       />
+    );
+  }
+  render(
+    <QueryClientProvider client={queryClient}>
+      <Palette />
     </QueryClientProvider>,
   );
   return { onOpenChange, input: screen.getByTestId("command-palette-input") };
@@ -146,14 +157,19 @@ describe("QuickPick ⌘K session actions", () => {
   });
 
   it("hands an action that opens a dialog to the host only once the palette has closed", async () => {
-    const { input, onOpenChange } = renderPalette();
+    const { input, onOpenChange } = renderPalette(undefined, { closes: true });
     openActions(input);
     await waitFor(() => expect(heading()).not.toBeNull());
     fireEvent.change(input, { target: { value: "rename" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onOpenChange).toHaveBeenCalledWith(false);
-    // The palette is still open in this test, so its close hasn't finished yet.
+    // The dialog is still closing, so the host hasn't been asked yet.
     expect(latestSessionActionRequest()).toBeNull();
+    await waitFor(() => expect(useSessionActionStore.getState().requests).toHaveLength(1));
+    expect(latestSessionActionRequest()).toMatchObject({
+      command: "rename",
+      conversation: { id: "c1" },
+    });
   });
 
   it("keeps the page on a greyed action, asking nothing of the host", async () => {
