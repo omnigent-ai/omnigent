@@ -168,3 +168,20 @@ class FileStore(ABC):
         :returns: The now-orphaned artifact-store keys to clean up.
         """
         ...
+
+    @abstractmethod
+    def delete_session_files_batch(
+        self, session_id: str, *, limit: int
+    ) -> tuple[int, builtins.list[str]]:
+        """
+        Delete up to *limit* of a session's file rows, oldest first, in one transaction.
+
+        Like :meth:`delete_all_for_session`, returns only the keys that became
+        orphaned, so a blob a fork still shares survives. Call again until
+        fewer than *limit* rows are deleted.
+
+        :param session_id: Owning session/conversation id.
+        :param limit: Most rows to delete, e.g. ``100``.
+        :returns: The number of rows deleted and the now-orphaned keys.
+        """
+        ...

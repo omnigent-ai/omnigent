@@ -28,7 +28,7 @@ from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._session_create_validation import resolve_project_session_create
-from omnigent.server.routes._sessions.helpers import _collect_descendant_conversation_ids
+from omnigent.server.routes._sessions.helpers import _delete_session_tree_files
 from omnigent.server.schemas import SessionCreateRequest
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
@@ -371,20 +371,10 @@ def create_imports_router(
 
     async def _delete_replaced_session(session_id: str, **delete_options: Any) -> None:
         """Delete a replaced session and its sub-agents with their unshared files."""
-        if file_store is not None:
-            descendant_ids = await _collect_descendant_conversation_ids(
-                conversation_store, session_id
+        if file_store is not None and artifact_store is not None:
+            await _delete_session_tree_files(
+                conversation_store, file_store, artifact_store, session_id
             )
-            for owner_id in (session_id, *descendant_ids):
-                orphaned = await asyncio.to_thread(file_store.delete_all_for_session, owner_id)
-                if artifact_store is None:
-                    continue
-                for blob_key in orphaned:
-                    try:
-                        await asyncio.to_thread(artifact_store.delete, blob_key)
-                    except Exception:
-                        # A blob that won't delete must not fail the import.
-                        _logger.warning("could not delete blob %s", blob_key, exc_info=True)
         await conversation_store.delete_conversation(session_id, **delete_options)
 
     async def _persist_import(

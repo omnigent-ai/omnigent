@@ -459,25 +459,33 @@ async def test_delete_session_removes_sub_agent_files(
     session_id: str,
     db_uri: str,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Deleting a parent removes the files of every sub-agent deleted with it.
 
-    Covers a child's upload, the child's copy of a parent file (what
+    Covers two children's uploads, a child's copy of a parent file (what
     ``sys_session_send`` with ``file_ids`` makes) and a grandchild's upload,
     while a blob another session still shares, as a fork's row does, stays.
+    One-row batches and one-child pages make the cleanup cross both bounds.
     """
+    from omnigent.server.routes._sessions import helpers as session_helpers
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 
+    monkeypatch.setattr(session_helpers, "_SESSION_FILE_DELETE_BATCH_SIZE", 1)
+    monkeypatch.setattr(session_helpers, "_DESCENDANT_PAGE_SIZE", 1)
     conv_store = SqlAlchemyConversationStore(db_uri)
     file_store = SqlAlchemyFileStore(db_uri)
     child = conv_store.create_conversation(
         kind="sub_agent", title="worker:notes", parent_conversation_id=session_id
     )
+    sibling = conv_store.create_conversation(
+        kind="sub_agent", title="worker:review", parent_conversation_id=session_id
+    )
     grandchild = conv_store.create_conversation(
         kind="sub_agent", title="worker:deep", parent_conversation_id=child.id
     )
     uploaded: dict[str, str] = {}
-    for owner in (session_id, child.id, grandchild.id):
+    for owner in (session_id, child.id, sibling.id, grandchild.id):
         resp = await client.post(
             f"/v1/sessions/{owner}/resources/files",
             files={"file": ("notes.txt", owner.encode(), "text/plain")},
@@ -499,11 +507,63 @@ async def test_delete_session_removes_sub_agent_files(
     resp = await client.delete(f"/v1/sessions/{session_id}")
 
     assert resp.status_code == 200, resp.text
-    owners = (session_id, child.id, grandchild.id)
+    owners = (session_id, child.id, sibling.id, grandchild.id)
     assert [owner for owner in owners if file_store.list(owner).data] == []
-    blob_keys = (uploaded[child.id], uploaded[grandchild.id], copy_id)
+    blob_keys = (uploaded[child.id], uploaded[sibling.id], uploaded[grandchild.id], copy_id)
     assert [key for key in blob_keys if (artifacts / key).exists()] == []
     assert (artifacts / uploaded[session_id]).exists()
+
+
+async def test_delete_session_keeps_cleaning_files_after_a_sub_agent_failure(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A store failure on one sub-agent's files is logged; the rest are still cleaned."""
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    file_store = SqlAlchemyFileStore(db_uri)
+    failing = conv_store.create_conversation(
+        kind="sub_agent", title="worker:a", parent_conversation_id=session_id
+    )
+    healthy = conv_store.create_conversation(
+        kind="sub_agent", title="worker:b", parent_conversation_id=session_id
+    )
+    uploaded: dict[str, str] = {}
+    for owner in (session_id, failing.id, healthy.id):
+        resp = await client.post(
+            f"/v1/sessions/{owner}/resources/files",
+            files={"file": ("notes.txt", owner.encode(), "text/plain")},
+        )
+        assert resp.status_code == 201, resp.text
+        uploaded[owner] = resp.json()["id"]
+    original_batch = SqlAlchemyFileStore.delete_session_files_batch
+
+    def batch_failing_for_one_session(
+        self: SqlAlchemyFileStore, owner_id: str, *, limit: int
+    ) -> tuple[int, list[str]]:
+        if owner_id == failing.id:
+            raise RuntimeError("database unavailable")
+        return original_batch(self, owner_id, limit=limit)
+
+    with (
+        patch.object(
+            SqlAlchemyFileStore, "delete_session_files_batch", batch_failing_for_one_session
+        ),
+        caplog.at_level(logging.WARNING),
+    ):
+        resp = await client.delete(f"/v1/sessions/{session_id}")
+
+    assert resp.status_code == 200, resp.text
+    assert [owner for owner in (session_id, healthy.id) if file_store.list(owner).data] == []
+    artifacts = tmp_path / "artifacts"
+    assert not (artifacts / uploaded[session_id]).exists()
+    assert not (artifacts / uploaded[healthy.id]).exists()
+    assert f"Failed to delete the file rows of session {failing.id}" in caplog.text
+    assert "RuntimeError" in caplog.text
 
 
 async def test_delete_session_not_found(client: httpx.AsyncClient) -> None:

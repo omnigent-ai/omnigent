@@ -1547,6 +1547,120 @@ async def _collect_descendant_conversation_ids(
     return descendant_ids
 
 
+_DESCENDANT_PAGE_SIZE = 128
+_SESSION_FILE_DELETE_BATCH_SIZE = 100
+
+
+async def _collect_descendant_conversation_ids_paged(
+    conversation_store: ConversationStore,
+    root_id: str,
+) -> list[str]:
+    """
+    Return every sub-agent descendant of ``root_id``, reading each parent's
+    children in bounded pages.
+
+    :param conversation_store: Store for child-id lookup.
+    :param root_id: Root session/conversation identifier.
+    :returns: Descendant ids in breadth-first order.
+    """
+    descendant_ids: list[str] = []
+    seen = {root_id}
+    frontier = [root_id]
+    while frontier:
+        next_frontier: list[str] = []
+        for parent_id in frontier:
+            after: tuple[int, str] | None = None
+            while True:
+                page = await asyncio.to_thread(
+                    conversation_store.list_child_conversation_ids_page,
+                    parent_id,
+                    after=after,
+                    limit=_DESCENDANT_PAGE_SIZE,
+                )
+                for child_id, _created_at in page:
+                    if child_id not in seen:
+                        seen.add(child_id)
+                        descendant_ids.append(child_id)
+                        next_frontier.append(child_id)
+                if len(page) < _DESCENDANT_PAGE_SIZE:
+                    break
+                last_id, last_created_at = page[-1]
+                after = (last_created_at, last_id)
+        frontier = next_frontier
+    return descendant_ids
+
+
+async def _delete_session_tree_files(
+    conversation_store: ConversationStore,
+    file_store: FileStore,
+    artifact_store: ArtifactStore,
+    session_id: str,
+) -> None:
+    """
+    Delete the files of *session_id* and every sub-agent under it, before the
+    subtree itself is deleted.
+
+    Rows go in bounded batches, and each batch's orphaned blobs are deleted
+    before the next, so a blob another session still shares survives. A
+    failure on one session or blob is logged and cleanup moves on.
+
+    :param conversation_store: Store for the sub-agent lookup.
+    :param file_store: Store of the sessions' file rows.
+    :param artifact_store: Store of the file bytes.
+    :param session_id: The session being deleted, e.g. ``"conv_abc123"``.
+    """
+    owner_ids = [session_id]
+    try:
+        owner_ids.extend(
+            await _collect_descendant_conversation_ids_paged(conversation_store, session_id)
+        )
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning(
+            "Failed to list the sub-agents of session %s for file cleanup: %s",
+            session_id,
+            type(exc).__name__,
+        )
+    attempted_blob_count = 0
+    failed_blob_count = 0
+    for owner_id in owner_ids:
+        while True:
+            try:
+                deleted, orphaned_blob_keys = await asyncio.to_thread(
+                    file_store.delete_session_files_batch,
+                    owner_id,
+                    limit=_SESSION_FILE_DELETE_BATCH_SIZE,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _logger.warning(
+                    "Failed to delete the file rows of session %s while deleting %s: %s",
+                    owner_id,
+                    session_id,
+                    type(exc).__name__,
+                )
+                break
+            for blob_key in orphaned_blob_keys:
+                attempted_blob_count += 1
+                try:
+                    await asyncio.to_thread(artifact_store.delete, blob_key)
+                except Exception as exc:  # noqa: BLE001
+                    failed_blob_count += 1
+                    _logger.warning(
+                        "Failed to delete attachment blob %s for session %s: %s",
+                        blob_key,
+                        session_id,
+                        type(exc).__name__,
+                    )
+            if deleted < _SESSION_FILE_DELETE_BATCH_SIZE:
+                break
+    if failed_blob_count:
+        _logger.warning(
+            "Session %s deleted with %d of %d attachment blobs left behind",
+            session_id,
+            failed_blob_count,
+            attempted_blob_count,
+        )
+
+
 @dataclass(frozen=True)
 class SessionLiveness:
     """
@@ -13129,11 +13243,13 @@ __all__ = [
     "_codex_subagent_labels_from_body",
     "_coerce_cumulative_field",
     "_collect_descendant_conversation_ids",
+    "_collect_descendant_conversation_ids_paged",
     "_consume_pre_resolved_harness_elicitation",
     "_create_and_publish_antigravity_child",
     "_create_and_publish_codex_child",
     "_create_and_publish_devin_child",
     "_create_session_worktree",
+    "_delete_session_tree_files",
     "_delete_stored_session_bundle_after_failure",
     "_derive_terminal_launch_args_from_spec",
     "_devin_subagent_display_tool",
