@@ -274,6 +274,7 @@ import {
 import {
   applySessionPullRequestFilter,
   SESSION_PULL_REQUEST_FILTER_LABELS,
+  type SessionPullRequestFilter,
 } from "@/lib/sessionListFilters";
 import { SessionPullRequestFilterItems } from "@/shell/SessionPullRequestFilterItems";
 import {
@@ -1748,7 +1749,10 @@ function ProjectFolder({
   ordering,
   scrollRoot,
   pageSize,
+  pullRequestFilter = "all",
 }: {
+  /** Which sessions the sidebar's pull request filter keeps; the open one always stays. */
+  pullRequestFilter?: SessionPullRequestFilter;
   /** The sidebar's scroll container, the root for unpaginated auto-loading. */
   scrollRoot: RefObject<HTMLElement | null>;
   /** Rows listed before, and added by, each Show more; undefined lists them all. */
@@ -1843,7 +1847,11 @@ function ProjectFolder({
     // Pins take precedence over live folders.
     return orderSessionFamilies(
       sortConversations(
-        [...byId.values()].filter(
+        applySessionPullRequestFilter(
+          [...byId.values()],
+          pullRequestFilter,
+          activeConversationId,
+        ).filter(
           (c) =>
             (c.archived === true) === archived &&
             sessionInSidebarFolder(c, { id: projectId, name }, viewerId, includeSharedRuns) &&
@@ -1869,10 +1877,12 @@ function ProjectFolder({
     name,
     viewerId,
     includeSharedRuns,
+    pullRequestFilter,
+    activeConversationId,
   ]);
   // Each expansion, archive switch or re-sort restarts the page count and auto-load
   // budget; when paginated, the open session is never left hidden.
-  const listScope = JSON.stringify([expanded, archived, sortBy]);
+  const listScope = JSON.stringify([expanded, archived, sortBy, pullRequestFilter]);
   const display = useSidebarDisplayPagination(
     conversations,
     listScope,
@@ -2319,8 +2329,9 @@ function ConversationList({
   // persisted per-device preference. With the release flag off the sidebar
   // keeps its default layout and ignores any stored choice.
   const groupingUi = isFeatureEnabled(serverInfo, "sidebar_grouping_ui");
+  // Only the grouping menu offers the filter, so without it none applies.
   const pullRequestFilter = useSessionPullRequestFilter(
-    isFeatureEnabled(serverInfo, "sidebar_saved_views"),
+    groupingUi && isFeatureEnabled(serverInfo, "sidebar_saved_views"),
   );
   const {
     view,
@@ -2612,7 +2623,7 @@ function ConversationList({
     const allWithPinned = applySessionPullRequestFilter(
       dedupeConversationsById([...allConversations, ...pinnedConversations]),
       pullRequestFilter.value,
-      activeRootSessionId,
+      resolvedActiveId,
     );
     const notArchived = allWithPinned.filter((c) => c.archived !== true);
     // An archived open session lists on the live views too, wherever its row
@@ -2797,6 +2808,7 @@ function ConversationList({
     includeSharedRuns,
     mineSharedRuns,
     pullRequestFilter.value,
+    resolvedActiveId,
     viewerId,
     splitShared,
     grouped,
@@ -3846,6 +3858,7 @@ function ConversationList({
                               projectId={group.id}
                               icon={group.icon}
                               windowConversations={group.conversations}
+                              pullRequestFilter={pullRequestFilter.value}
                               archived={activeTab === "archived"}
                               activeConversationId={displayedActiveId}
                               expanded={expandedProjects.includes(group.name)}
@@ -3952,7 +3965,12 @@ function ConversationList({
                         <ConversationSection
                           title="Sessions"
                           conversations={sections.sessions}
-                          emptyMessage={sessionStatus ? undefined : SIDEBAR_FILTER_EMPTY[activeTab]}
+                          emptyMessage={
+                            sessionStatus ||
+                            (pullRequestFilter.value !== "all" && conversationsQuery.hasNextPage)
+                              ? undefined
+                              : SIDEBAR_FILTER_EMPTY[activeTab]
+                          }
                           footer={sessionStatus}
                           collapsed={effectiveCollapsedSections.includes("Chats")}
                           onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
