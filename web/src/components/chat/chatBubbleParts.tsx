@@ -120,6 +120,8 @@ import { codexAsyncQuestionReplyText } from "@/lib/codexAsyncQuestionReply";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { usePeerSessionMessageDisplay } from "@/lib/peerSessionMessagePreferences";
 import type { BackgroundTaskInfo, PendingInput, SessionStatus } from "@/lib/types";
 import {
@@ -1461,6 +1463,7 @@ function AssistantBubble({
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(bubble.responseId);
   const flashing = useChatStore((s) => s.flashItemId === bubble.responseId);
   const foldNarration = useFoldAssistantNarration();
+  const workflowsEnabled = isFeatureEnabled(useServerInfo(), "workflows");
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
   const queryClient = useContext(QueryClientContext);
@@ -1528,6 +1531,7 @@ function AssistantBubble({
     showsWorking,
     defaultExpanded: bubble.defaultExpanded,
     foldNarration,
+    workflowsEnabled,
   });
 
   // Elicitation cards want full chat-column width to match the composer.

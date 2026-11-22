@@ -37,7 +37,7 @@ import {
 } from "./routingDecision";
 import type { AssistantMessagePhase } from "./conversationItems";
 import { isSystemUserContent } from "./systemMessage";
-import { repeatsTaskMarker } from "./taskActivity";
+import { readTaskActivity, repeatsTaskMarker } from "./taskActivity";
 import type { AgyPermission, CodexPersistMode, FileEditRequest, RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
@@ -104,7 +104,17 @@ export type RenderItem =
       label: string;
       data: Record<string, unknown>;
     }
-  | { kind: "subagent_activity"; itemId: string | null; data: Record<string, unknown> }
+  | {
+      kind: "subagent_activity";
+      itemId: string | null;
+      data: Record<string, unknown>;
+      /**
+       * Seconds into the turn's work when this task marker landed, on the clock
+       * `Bubble.workedForS` spans, so the marker can split that duration. Only task
+       * markers carry it, and only when the turn's first work shares their clock.
+       */
+      turnElapsedS?: number;
+    }
   | {
       kind: "slash_command";
       itemId: string | null;
@@ -1179,6 +1189,7 @@ function walkBubbles(
         lifecycle,
         crossBubbleResults,
         liveTurnId !== null && groupResponseId === liveTurnId,
+        workBlocks[0],
       ),
       ...(workedForS !== undefined ? { workedForS } : {}),
       ...(lastActivityAtS !== undefined ? { lastActivityAtS } : {}),
@@ -1483,6 +1494,11 @@ function turnWorkedForS(groupBlocks: AnyBlock[]): number | undefined {
   const first = groupBlocks[0];
   const last = groupBlocks[groupBlocks.length - 1];
   if (first === undefined || last === undefined || first === last) return undefined;
+  return secondsBetween(first, last);
+}
+
+/** Seconds from `first` to a block no earlier, on the clock `turnWorkedForS` describes. */
+function secondsBetween(first: AnyBlock, last: AnyBlock): number | undefined {
   if (first.ctx.timestamp > 0 && last.ctx.timestamp >= first.ctx.timestamp) {
     return last.ctx.timestamp - first.ctx.timestamp;
   }
@@ -1492,6 +1508,22 @@ function turnWorkedForS(groupBlocks: AnyBlock[]): number | undefined {
     return lastCreated - firstCreated;
   }
   return undefined;
+}
+
+/**
+ * How far into the turn's work a task marker landed. The server can record a
+ * journal write's marker just before the call it marks, so a marker ahead of the
+ * turn's first work counts from its start.
+ */
+function taskMarkerElapsedS(
+  turnStart: AnyBlock | undefined,
+  marker: NativeToolBlock,
+): number | undefined {
+  if (turnStart === undefined || readTaskActivity(marker.data) === null) return undefined;
+  return (
+    secondsBetween(turnStart, marker) ??
+    (secondsBetween(marker, turnStart) === undefined ? undefined : 0)
+  );
 }
 
 function isSubagentActivityBlock(
@@ -1624,13 +1656,15 @@ function groupHasInterruptedText(blocks: AnyBlock[]): boolean {
  * this bubble's own results and delayed cross-turn outputs alike,
  * while a reused callId can never adopt another turn's output —
  * and tool-state derivation from bubble lifecycle plus the trailing
- * live tool phase.
+ * live tool phase. `turnStart` is the block the turn's duration starts
+ * at, which task markers measure their place in the turn from.
  */
 function buildAssistantItems(
   groupBlocks: AnyBlock[],
   lifecycle: ActiveResponse["state"],
   crossBubbleResults: Map<string, ToolResultBlock>,
   sessionLive = false,
+  turnStart?: AnyBlock,
 ): RenderItem[] {
   // Results render only by folding into a call's card — strip them so
   // an absorbed out-of-band result can't split a text/reasoning run.
@@ -1715,7 +1749,13 @@ function buildAssistantItems(
     }
 
     if (isSubagentActivityBlock(b)) {
-      items.push({ kind: "subagent_activity", itemId: b.ctx.itemId, data: b.data });
+      const turnElapsedS = taskMarkerElapsedS(turnStart, b);
+      items.push({
+        kind: "subagent_activity",
+        itemId: b.ctx.itemId,
+        data: b.data,
+        ...(turnElapsedS !== undefined ? { turnElapsedS } : {}),
+      });
       i += 1;
       continue;
     }
