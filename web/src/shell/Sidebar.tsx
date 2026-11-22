@@ -234,6 +234,7 @@ import {
   useSessionSelectionPaletteCommands,
 } from "./sessionCommands/useBulkSessionPaletteCommands";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
+import { useProjectActionStore } from "./projectCommands/projectActionStore";
 import { ProjectRowIcon } from "./ProjectPicker";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
@@ -2974,6 +2975,11 @@ function ConversationList({
       return next;
     });
   }, []);
+  // A rename from ⌘K carries the expansion over too.
+  const hostRename = useProjectActionStore((state) => state.lastRename);
+  useEffect(() => {
+    if (hostRename) renameExpandedProject(hostRename.oldName, hostRename.newName);
+  }, [hostRename, renameExpandedProject]);
 
   const revealedDrafts = useRef(new Set<string>());
   useEffect(() => {
