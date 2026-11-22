@@ -28,13 +28,20 @@ def session_archived(base_url: str, session_id: str) -> bool:
     return response.json()["archived"] is True
 
 
-def enable_grouping_ui(page: Page, enabled: bool = True) -> None:
-    """Advertise the ``sidebar_grouping_ui`` release flag on the live server's info."""
+def enable_grouping_ui(page: Page, enabled: bool = True, *, saved_views: bool = False) -> None:
+    """Advertise the ``sidebar_grouping_ui`` release flag on the live server's info.
+
+    :param saved_views: Also advertise ``sidebar_saved_views``, for its filters and views.
+    """
 
     def serve_info(route: Route) -> None:
         response = route.fetch()
         info = response.json()
-        info["features"] = {**info.get("features", {}), "sidebar_grouping_ui": enabled}
+        flags = {
+            "sidebar_grouping_ui": enabled,
+            **({"sidebar_saved_views": True} if saved_views else {}),
+        }
+        info["features"] = {**info.get("features", {}), **flags}
         route.fulfill(response=response, json=info)
 
     page.route("**/v1/info", serve_info)

@@ -5502,6 +5502,9 @@ describe("Sidebar pull request filter", () => {
     show: [],
     sessionFilter: "all",
     pullRequestFilter: "open",
+    statusFilter: "all",
+    harnessFilter: null,
+    projectFilter: { kind: "all" },
   } as const;
   const viewCommands = () =>
     registeredPaletteCommands()
@@ -5543,6 +5546,12 @@ describe("Sidebar pull request filter", () => {
       ctrlKey: false,
       pointerType: "mouse",
     });
+  const storedFilters = () =>
+    JSON.parse(localStorage.getItem("omnigent:session-list-filter") ?? "null");
+  const filterCommands = () =>
+    registeredPaletteCommands()
+      .map((command) => command.label)
+      .filter((label) => label === "Clear sidebar filters");
 
   it.each([
     ["off", false],
@@ -5552,6 +5561,7 @@ describe("Sidebar pull request filter", () => {
     (_, flag) => {
       vi.spyOn(identity, "getCurrentUserId").mockReturnValue(VIEWER);
       localStorage.setItem("omnigent:session-pull-request-filter", "open");
+      localStorage.setItem("omnigent:session-list-filter", JSON.stringify({ status: "done" }));
       saveView(SCOPE(), "Review", REVIEW);
       const getItem = vi.spyOn(Storage.prototype, "getItem");
       const setItem = vi.spyOn(Storage.prototype, "setItem");
@@ -5560,13 +5570,15 @@ describe("Sidebar pull request filter", () => {
       expect(listed()).toEqual(["conv_merged", "conv_none", "conv_open"]);
       openMenu();
       expect(screen.getByTestId("session-display-menu")).toBeInTheDocument();
-      expect(screen.queryByTestId("session-pull-request-filter-menu")).toBeNull();
+      expect(screen.queryByTestId("session-list-filter-menu")).toBeNull();
       expect(screen.queryByTestId("session-saved-views-menu")).toBeNull();
       expect(viewCommands()).toEqual([]);
+      expect(filterCommands()).toEqual([]);
       const touched = (spy: typeof getItem | typeof setItem) =>
         spy.mock.calls.some(
           ([key]) =>
             key === "omnigent:session-pull-request-filter" ||
+            key === "omnigent:session-list-filter" ||
             key === "omnigent:sidebar-saved-views",
         );
       expect(touched(getItem)).toBe(false);
@@ -5578,13 +5590,126 @@ describe("Sidebar pull request filter", () => {
     mockConversations(rows());
     renderWith(true);
     openMenu();
-    const menu = screen.getByTestId("session-pull-request-filter-menu");
-    expect(menu).toHaveTextContent("Pull request");
-    expect(menu).toHaveTextContent("All sessions");
+    const menu = screen.getByTestId("session-list-filter-menu");
+    expect(menu).toHaveTextContent(/^Filter$/);
     fireEvent.keyDown(menu, { key: "ArrowRight" });
     fireEvent.click(screen.getByTestId("session-pull-request-filter-open"));
     expect(listed()).toEqual(["conv_open"]);
-    expect(localStorage.getItem("omnigent:session-pull-request-filter")).toBe("open");
+    expect(storedFilters()).toMatchObject({ pullRequest: "open" });
+    openMenu();
+    expect(screen.getByTestId("session-list-filter-menu")).toHaveTextContent("Filter1 on");
+  });
+
+  const storeFilters = (filters: object) =>
+    localStorage.setItem("omnigent:session-list-filter", JSON.stringify(filters));
+  const openFilterMenu = () => {
+    openMenu();
+    fireEvent.keyDown(screen.getByTestId("session-list-filter-menu"), { key: "ArrowRight" });
+  };
+  const statusRows = () => [
+    conv("conv_failed_codex", "Codex", { status: "failed", harness: "codex" }),
+    conv("conv_running_codex", "Codex", { status: "running", harness: "codex" }),
+    conv("conv_failed_claude", "Claude Code", { status: "failed", harness: "claude-native" }),
+  ];
+
+  it("narrows by status and harness together, and counts the filters on", () => {
+    storeFilters({ status: "attention" });
+    mockConversations(statusRows());
+    const view = renderWith(true);
+    expect(listed()).toEqual(["conv_failed_claude", "conv_failed_codex"]);
+    openFilterMenu();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Codex" }));
+    expect(listed()).toEqual(["conv_failed_codex"]);
+    expect(storedFilters()).toMatchObject({ status: "attention", harness: "codex" });
+    view.refresh();
+    openMenu();
+    expect(screen.getByTestId("session-list-filter-menu")).toHaveTextContent("Filter2 on");
+  });
+
+  it("shows a chosen project's folder alone, and No project shows no folder", () => {
+    projectsMock.push("Alpha", "Beta");
+    const rowsByProject = () => [
+      conv("conv_alpha", "Codex", { labels: { omni_project: "Alpha" } }),
+      conv("conv_beta", "Codex", { labels: { omni_project: "Beta" } }),
+      conv("conv_unfiled", "Codex"),
+    ];
+    storeFilters({ project: { kind: "project", id: "p_Alpha" } });
+    mockConversations(rowsByProject());
+    const first = renderWith(true);
+    expect(screen.getByRole("button", { name: /^Alpha/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Beta/ })).toBeNull();
+    expect(screen.queryByText("conv_unfiled")).toBeNull();
+    // The folder holds the matches, so the unfiled list says nothing.
+    expect(screen.queryByTestId("session-filters-empty")).toBeNull();
+    first.unmount();
+
+    storeFilters({ project: { kind: "none" } });
+    mockConversations(rowsByProject());
+    renderWith(true);
+    expect(screen.queryByRole("button", { name: /^(Alpha|Beta)/ })).toBeNull();
+    expect(listed()).toEqual(["conv_unfiled"]);
+  });
+
+  it("shows a project that's gone as Missing project, and says nothing matches", () => {
+    projectsMock.push("Alpha");
+    storeFilters({ project: { kind: "project", id: "p_Gone" } });
+    mockConversations([conv("conv_alpha", "Codex", { labels: { omni_project: "Alpha" } })]);
+    renderWith(true);
+    expect(screen.queryByRole("button", { name: /^Alpha/ })).toBeNull();
+    expect(screen.getByTestId("session-filters-empty")).toBeInTheDocument();
+    openFilterMenu();
+    expect(screen.getByRole("menuitemradio", { name: "Missing project" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+  });
+
+  it("clears the filters from the empty list, the menu and ⌘K", () => {
+    const everyRow = ["conv_failed_claude", "conv_failed_codex", "conv_running_codex"];
+    storeFilters({ status: "draft" });
+    mockConversations(statusRows());
+    renderWith(true);
+    expect(filterCommands()).toEqual(["Clear sidebar filters"]);
+    fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+    expect(listed()).toEqual(everyRow);
+    expect(storedFilters()).toEqual({
+      pullRequest: "all",
+      status: "all",
+      harness: null,
+      project: { kind: "all" },
+    });
+    expect(filterCommands()).toEqual([]);
+
+    openFilterMenu();
+    expect(screen.queryByTestId("session-filters-clear")).toBeNull();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Working" }));
+    expect(listed()).toEqual(["conv_running_codex"]);
+    openFilterMenu();
+    fireEvent.click(screen.getByTestId("session-filters-clear"));
+    expect(listed()).toEqual(everyRow);
+
+    openFilterMenu();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Needs attention" }));
+    expect(listed()).toEqual(["conv_failed_claude", "conv_failed_codex"]);
+    act(() => commandRow("Clear sidebar filters").run());
+    expect(listed()).toEqual(everyRow);
+  });
+
+  it("applies and matches a saved view's status, harness and project filters", () => {
+    vi.spyOn(identity, "getCurrentUserId").mockReturnValue(VIEWER);
+    saveView(SCOPE(), "Failing Codex", {
+      ...REVIEW,
+      pullRequestFilter: "all",
+      statusFilter: "attention",
+      harnessFilter: "codex",
+    });
+    mockConversations(statusRows());
+    renderWith(true);
+    act(() => commandRow("Sidebar view: Failing Codex").run());
+    expect(listed()).toEqual(["conv_failed_codex"]);
+    expect(storedFilters()).toMatchObject({ status: "attention", harness: "codex" });
+    openMenu();
+    expect(screen.getByTestId("session-saved-views-menu")).toHaveTextContent("Failing Codex");
   });
 
   it("starts from the stored choice", () => {
@@ -5637,11 +5762,13 @@ describe("Sidebar pull request filter", () => {
     mockConversations(rows());
     withMorePages();
     const first = renderWith(true);
-    expect(screen.queryByText("No sessions")).toBeNull();
+    expect(screen.queryByTestId("session-filters-empty")).toBeNull();
     first.unmount();
     mockConversations(rows());
     renderWith(true);
-    expect(screen.getByText("No sessions")).toBeInTheDocument();
+    expect(screen.getByTestId("session-filters-empty")).toHaveTextContent(
+      "No sessions match the filters. Clear filters",
+    );
   });
 
   it.each([
@@ -5657,11 +5784,11 @@ describe("Sidebar pull request filter", () => {
     mockConversations(sessions());
     withMorePages();
     const first = renderWith(true);
-    expect(screen.queryByText("No sessions")).toBeNull();
+    expect(screen.queryByTestId("session-filters-empty")).toBeNull();
     first.unmount();
     mockConversations(sessions());
     renderWith(true);
-    expect(screen.getByText("No sessions")).toBeInTheDocument();
+    expect(screen.getByTestId("session-filters-empty")).toBeInTheDocument();
   });
 
   it("holds an expanded folder's No sessions while its own pages may hold a match", () => {
@@ -5714,7 +5841,7 @@ describe("Sidebar pull request filter", () => {
       ordering: "created",
     });
     expect(localStorage.getItem("omnigent:session-filter")).toBe("all");
-    expect(localStorage.getItem("omnigent:session-pull-request-filter")).toBe("open");
+    expect(storedFilters()).toMatchObject({ pullRequest: "open" });
     expect(listed()).toEqual(["conv_open"]);
     openMenu();
     expect(screen.getByTestId("session-saved-views-menu")).toHaveTextContent("Review");

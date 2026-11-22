@@ -1334,6 +1334,9 @@ describe("CommandPalette — commands a mounted feature offers", () => {
       show: [],
       sessionFilter: "mine",
       pullRequestFilter: "all",
+      statusFilter: "all",
+      harnessFilter: null,
+      projectFilter: { kind: "all" },
     };
     function SavedViews() {
       useSidebarSavedViewCommands({

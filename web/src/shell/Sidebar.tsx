@@ -274,17 +274,19 @@ import {
   writeSessionFilter,
 } from "@/lib/sessionFilterPreferences";
 import {
-  applySessionPullRequestFilter,
-  SESSION_PULL_REQUEST_FILTER_LABELS,
-  type SessionPullRequestFilter,
+  applySessionListFilter,
+  type SessionListFilterContext,
+  sessionHarnessChoices,
+  sessionHarnessKey,
+  sessionProjectId,
 } from "@/lib/sessionListFilters";
-import { SessionPullRequestFilterItems } from "@/shell/SessionPullRequestFilterItems";
-import {
-  type SessionPullRequestFilterState,
-  useSessionPullRequestFilter,
-} from "@/shell/useSessionPullRequestFilter";
+import { SessionFilterSections, sessionListFilterSummary } from "@/shell/SessionFilterSections";
+import { useClearSidebarFiltersCommand } from "@/shell/useClearSidebarFiltersCommand";
+import { type SessionListFilterState, useSessionListFilter } from "@/shell/useSessionListFilter";
 import {
   matchingSavedView,
+  savedViewFilterFields,
+  savedViewListFilter,
   saveView as saveSidebarView,
   type SavedViewSettings,
   type SidebarSavedView,
@@ -1764,10 +1766,13 @@ function ProjectFolder({
   ordering,
   scrollRoot,
   pageSize,
-  pullRequestFilter = "all",
+  filterRows = keepEveryRow,
+  filterKey = "",
 }: {
-  /** Which sessions the sidebar's pull request filter keeps; the open one always stays. */
-  pullRequestFilter?: SessionPullRequestFilter;
+  /** The rows the sidebar's filters keep, and `openSessionId` whatever it is. */
+  filterRows?: (rows: Conversation[], openSessionId: string | null) => Conversation[];
+  /** Names the filters on, empty with none; a change restarts the folder's pages. */
+  filterKey?: string;
   /** The sidebar's scroll container, the root for unpaginated auto-loading. */
   scrollRoot: RefObject<HTMLElement | null>;
   /** Rows listed before, and added by, each Show more; undefined lists them all. */
@@ -1862,11 +1867,7 @@ function ProjectFolder({
     // Pins take precedence over live folders.
     return orderSessionFamilies(
       sortConversations(
-        applySessionPullRequestFilter(
-          [...byId.values()],
-          pullRequestFilter,
-          activeConversationId,
-        ).filter(
+        filterRows([...byId.values()], activeConversationId).filter(
           (c) =>
             (c.archived === true) === archived &&
             sessionInSidebarFolder(c, { id: projectId, name }, viewerId, includeSharedRuns) &&
@@ -1892,12 +1893,12 @@ function ProjectFolder({
     name,
     viewerId,
     includeSharedRuns,
-    pullRequestFilter,
+    filterRows,
     activeConversationId,
   ]);
   // Each expansion, archive switch or re-sort restarts the page count and auto-load
   // budget; when paginated, the open session is never left hidden.
-  const listScope = JSON.stringify([expanded, archived, sortBy, pullRequestFilter]);
+  const listScope = JSON.stringify([expanded, archived, sortBy, filterKey]);
   const display = useSidebarDisplayPagination(
     conversations,
     listScope,
@@ -2104,8 +2105,7 @@ function ProjectFolder({
         reorderGroup={reorderable ? `project:${name}` : undefined}
         emptyMessage={
           // Filtered, a later page may still hold a match.
-          loadingFirstPage ||
-          (pullRequestFilter !== "all" && query.hasNextPage) ? undefined : archived ? (
+          loadingFirstPage || (filterKey !== "" && query.hasNextPage) ? undefined : archived ? (
             "No archived sessions"
           ) : placeholder ? (
             "No sessions"
@@ -2347,7 +2347,7 @@ function ConversationList({
   // keeps its default layout and ignores any stored choice.
   const groupingUi = isFeatureEnabled(serverInfo, "sidebar_grouping_ui");
   // Only the grouping menu offers the filter, so without it none applies.
-  const pullRequestFilter = useSessionPullRequestFilter(sidebarSavedViewsEnabled(serverInfo));
+  const listFilter = useSessionListFilter(sidebarSavedViewsEnabled(serverInfo));
   const {
     view,
     updateView: saveView,
@@ -2370,8 +2370,8 @@ function ConversationList({
         : undefined;
     saveView(custom ? { ...patch, custom } : patch);
   });
-  // Saved views, with the pull request filter they apply: off, none is read, offered or applied.
-  const savedViewsOn = pullRequestFilter.enabled;
+  // Saved views, with the filters they apply: off, none is read, offered or applied.
+  const savedViewsOn = listFilter.enabled;
   const viewerScope = useSavedViewScope();
   const savedViewScope = savedViewsOn ? viewerScope : null;
   const savedViews = useSidebarSavedViews(savedViewScope);
@@ -2381,7 +2381,7 @@ function ConversationList({
     ordering: view.ordering === "custom" ? (view.custom?.base ?? "updated") : view.ordering,
     show: view.show,
     sessionFilter: activeTab,
-    pullRequestFilter: pullRequestFilter.value,
+    ...savedViewFilterFields(listFilter.value),
   };
   const matchedSavedView = matchingSavedView(
     { ...savedViewSettings, ordering: view.ordering },
@@ -2394,7 +2394,7 @@ function ConversationList({
     onActiveTabChange(
       saved.sessionFilter === "shared" && !multiUser ? DEFAULT_SESSION_FILTER : saved.sessionFilter,
     );
-    pullRequestFilter.choose(saved.pullRequestFilter);
+    listFilter.choose(savedViewListFilter(saved));
   });
   const openSaveView = useCallback(() => setSaveViewOpen(true), []);
   useSidebarSavedViewCommands({
@@ -2403,8 +2403,10 @@ function ConversationList({
     apply: applySavedView,
     openSave: openSaveView,
   });
+  useClearSidebarFiltersCommand({ filtersOn: listFilter.count > 0, clear: listFilter.clear });
   const grouped = view.grouping !== "default";
-  const harnessLabels = useHarnessLabels(view.grouping === "harness");
+  // The Harness filter names its choices as the Harness grouping does.
+  const harnessLabels = useHarnessLabels(view.grouping === "harness" || savedViewsOn);
   const harnessLabel = useCallback(
     (c: Conversation) =>
       nativeCodingAgentForSession(c)?.displayName ??
@@ -2412,9 +2414,9 @@ function ConversationList({
       (c.harness || "Unknown harness"),
     [harnessLabels],
   );
-  // Status buckets read the unread mirror and the drafts store; only a status
-  // view subscribes, so other views don't re-render the list on those writes.
-  const statusView = view.grouping === "status";
+  // Status buckets read the unread mirror and the drafts store; only a status view or
+  // filter subscribes, so other views don't re-render the list on those writes.
+  const statusView = view.grouping === "status" || listFilter.value.status !== "all";
   const unseenTick = useUnseenTick(statusView);
   const draftIds = useSessionDraftIds(statusView);
   const startingId = useStartingConversationId(statusView);
@@ -2541,6 +2543,42 @@ function ConversationList({
   // Project folders ({ id, name }) for grouping sessions — first-class id
   // and/or the legacy omni_project label, unioned server-side.
   const { data: projects = [] } = useProjects();
+  // A session's status as the Status grouping gives it, starting and working sessions included.
+  // `unseenTick` and `draftIds` version the stores it reads.
+  const liveStatusOf = useCallback(
+    (c: Conversation): StatusBucket => {
+      const unseen = showsUnreadFor(c, isConversationUnseen(c.id, c.updated_at, c.status));
+      const bucket = statusBucket(c, unseen, hasSessionDraft(c.id));
+      return bucket !== "Needs attention" && (c.id === startingId || workingIds.has(c.id))
+        ? "Working"
+        : bucket;
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [startingId, workingIds, unseenTick, draftIds],
+  );
+  // The projects a filter can choose: those with an id, as the filter keeps it.
+  const filterProjects = useMemo(
+    () => projects.flatMap((p) => (p.id === null ? [] : [{ id: p.id, name: p.name }])),
+    [projects],
+  );
+  const filterContext = useMemo<SessionListFilterContext>(
+    () => ({
+      statusOf: liveStatusOf,
+      harnessOf: sessionHarnessKey,
+      projectOf: (c) => sessionProjectId(c, filterProjects),
+    }),
+    [liveStatusOf, filterProjects],
+  );
+  const filterRows = useCallback(
+    (rows: Conversation[], openSessionId: string | null) =>
+      applySessionListFilter(rows, listFilter.value, filterContext, openSessionId),
+    [listFilter.value, filterContext],
+  );
+  const filterKey = listFilter.count > 0 ? JSON.stringify(listFilter.value) : "";
+  const harnessChoices = useMemo(
+    () => sessionHarnessChoices(allConversations, listFilter.value.harness, harnessLabels),
+    [allConversations, listFilter.value.harness, harnessLabels],
+  );
   const projectOrder = useProjectOrder();
   const saveOrder = useSaveProjectOrder();
   const [draggedProject, setDraggedProject] = useState<string | null>(null);
@@ -2668,9 +2706,8 @@ function ConversationList({
     // Merge the server pinned set in, so a pinned session outside the loaded
     // paginated window still renders. Dedupe by id: a pinned session is usually
     // also present in the paginated list, and merging both would render it twice.
-    const allWithPinned = applySessionPullRequestFilter(
+    const allWithPinned = filterRows(
       dedupeConversationsById([...allConversations, ...pinnedConversations]),
-      pullRequestFilter.value,
       resolvedActiveId,
     );
     const notArchived = allWithPinned.filter((c) => c.archived !== true);
@@ -2712,23 +2749,21 @@ function ConversationList({
         ? tabScoped
         : dedupeConversationsById([
             ...notArchived,
-            ...applySessionPullRequestFilter(
-              mineSharedRuns,
-              pullRequestFilter.value,
-              resolvedActiveId,
-            ),
+            ...filterRows(mineSharedRuns, resolvedActiveId),
           ]);
     const sharedRunsToFile =
       includeSharedRuns &&
       folderCandidates.some((c) => isSharedAutomationRun(c, viewerId) && !pinnedIdSet.has(c.id));
+    // A project filter shows that project's folder alone, and No project shows none.
+    const chosenProject = listFilter.value.project;
     const folders =
-      grouped || activeTab === "shared"
+      grouped || activeTab === "shared" || chosenProject.kind === "none"
         ? []
         : withAutomationFolder(
             projects,
             sharedRunsToFile,
             projectOrder.data?.sort_mode === "manual",
-          );
+          ).filter((folder) => chosenProject.kind === "all" || folder.id === chosenProject.id);
     const filedIds = new Set<string>();
     const projectGroups: {
       id: string | null;
@@ -2776,12 +2811,7 @@ function ConversationList({
     const statusOf = (c: Conversation): StatusBucket => {
       const frozen = frozenStatus?.get(c.id);
       if (frozen) return frozen;
-      const unseen = showsUnreadFor(c, isConversationUnseen(c.id, c.updated_at, c.status));
-      const bucket = statusBucket(c, unseen, hasSessionDraft(c.id));
-      const live =
-        bucket !== "Needs attention" && (c.id === startingId || workingIds.has(c.id))
-          ? "Working"
-          : bucket;
+      const live = liveStatusOf(c);
       frozenStatus?.set(c.id, live);
       return live;
     };
@@ -2844,8 +2874,6 @@ function ConversationList({
       (g) => orderSessionFamilies(g.conversations),
     );
     return { pinned, shared, sessions, projectGroups, groupTitles };
-    // `unseenTick` / `draftIds` aren't read here: they version the stores status buckets read.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     allConversations,
     activeRootSessionId,
@@ -2859,7 +2887,8 @@ function ConversationList({
     activeTab,
     includeSharedRuns,
     mineSharedRuns,
-    pullRequestFilter.value,
+    filterRows,
+    listFilter.value.project,
     resolvedActiveId,
     viewerId,
     splitShared,
@@ -2869,10 +2898,7 @@ function ConversationList({
     view.grouping,
     sortBy,
     customOrder,
-    unseenTick,
-    draftIds,
-    startingId,
-    workingIds,
+    liveStatusOf,
   ]);
 
   const config = useContext(SidebarConfigContext);
@@ -2887,7 +2913,7 @@ function ConversationList({
   );
   const displayPagination = useSidebarDisplayPagination(
     listRows,
-    JSON.stringify([activeTab, searchQuery, view.grouping, sortBy, pullRequestFilter.value]),
+    JSON.stringify([activeTab, searchQuery, view.grouping, sortBy, filterKey]),
     activeTab === "shared"
       ? (config.sharedDisplayPageSize ?? config.displayPageSize)
       : config.displayPageSize,
@@ -3503,8 +3529,20 @@ function ConversationList({
     ...(sharedListOnly ? [] : (sessionGroups?.map((g) => g.title) ?? ["Chats"])),
   ];
   const emptyMessage = searchQuery ? "No matching conversations" : "No sessions";
-  // Filtered by pull request, a later page may still hold a match: no list says it has none.
-  const morePagesMayMatch = pullRequestFilter.value !== "all" && !!conversationsQuery.hasNextPage;
+  // Filtered, a later page may still hold a match: no list says it has none.
+  const morePagesMayMatch = listFilter.count > 0 && !!conversationsQuery.hasNextPage;
+  // With filters on, an empty list says so and offers to clear them. A chosen project's sessions
+  // show in its folder, so the unfiled list stays quiet while that folder is there.
+  const chosenProject = listFilter.value.project;
+  const chosenFolderShown =
+    chosenProject.kind === "project" &&
+    sections.projectGroups.some((group) => group.id === chosenProject.id);
+  const filtersMatchNothing =
+    listFilter.count === 0 ? null : chosenFolderShown ? (
+      ""
+    ) : (
+      <FiltersMatchNothing onClear={listFilter.clear} />
+    );
 
   // List header controls and row props, shared by the Shared, single "Sessions"
   // and grouped sections; the controls sit on the first of the viewer's lists.
@@ -3594,7 +3632,15 @@ function ConversationList({
       multiUser={multiUser}
       view={groupingUi ? view : null}
       onViewChange={updateView}
-      pullRequestFilter={pullRequestFilter.enabled ? pullRequestFilter : null}
+      listFilter={
+        listFilter.enabled
+          ? {
+              state: listFilter,
+              harnesses: harnessChoices,
+              projects: filterProjects,
+            }
+          : null
+      }
       savedViews={
         savedViewScope
           ? {
@@ -3923,7 +3969,8 @@ function ConversationList({
                               projectId={group.id}
                               icon={group.icon}
                               windowConversations={group.conversations}
-                              pullRequestFilter={pullRequestFilter.value}
+                              filterRows={filterRows}
+                              filterKey={filterKey}
                               archived={activeTab === "archived"}
                               activeConversationId={displayedActiveId}
                               expanded={expandedProjects.includes(group.name)}
@@ -3968,7 +4015,7 @@ function ConversationList({
                       conversations={sections.shared}
                       emptyMessage={
                         sharedListOnly && !sessionStatus && !morePagesMayMatch
-                          ? SIDEBAR_FILTER_EMPTY.shared
+                          ? (filtersMatchNothing ?? SIDEBAR_FILTER_EMPTY.shared)
                           : undefined
                       }
                       footer={sharedListOnly ? sessionStatus : undefined}
@@ -4011,7 +4058,7 @@ function ConversationList({
                               conversations={group.conversations}
                               emptyMessage={
                                 group.title === "Working" && !sessionStatus && !morePagesMayMatch
-                                  ? emptyMessage
+                                  ? (filtersMatchNothing ?? emptyMessage)
                                   : undefined
                               }
                               footer={
@@ -4035,7 +4082,7 @@ function ConversationList({
                           emptyMessage={
                             sessionStatus || morePagesMayMatch
                               ? undefined
-                              : SIDEBAR_FILTER_EMPTY[activeTab]
+                              : (filtersMatchNothing ?? SIDEBAR_FILTER_EMPTY[activeTab])
                           }
                           footer={sessionStatus}
                           collapsed={effectiveCollapsedSections.includes("Chats")}
@@ -4469,6 +4516,27 @@ const FILTER_MENU_OPTIONS_CLASS =
   "[&_[role=menuitemradio]]:text-ui [&_[role=menuitemcheckbox]]:text-ui";
 
 // A filter-menu submenu whose trigger shows the current pick at its right edge.
+/** The rows as given, for a folder the sidebar's filters don't narrow. */
+const keepEveryRow = (rows: Conversation[]) => rows;
+
+/** An empty list under the sidebar's filters: says so, and clears them. */
+function FiltersMatchNothing({ onClear }: { onClear: () => void }) {
+  return (
+    <span data-testid="session-filters-empty">
+      No sessions match the filters.{" "}
+      <Button
+        type="button"
+        variant="link"
+        size="sm"
+        className="h-auto p-0 text-ui"
+        onClick={onClear}
+      >
+        Clear filters
+      </Button>
+    </span>
+  );
+}
+
 function FilterMenuSub({
   label,
   value,
@@ -4542,7 +4610,7 @@ function SessionFilterMenu({
   multiUser,
   view,
   onViewChange,
-  pullRequestFilter = null,
+  listFilter = null,
   savedViews = null,
 }: {
   value: SidebarTab;
@@ -4551,8 +4619,12 @@ function SessionFilterMenu({
   /** Null while the sidebar_grouping_ui release flag is off: only Display is offered. */
   view: SidebarViewPreferences | null;
   onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
-  /** Null while the sidebar_saved_views release flag is off: no Pull request filter. */
-  pullRequestFilter?: SessionPullRequestFilterState | null;
+  /** Null while the sidebar_saved_views release flag is off: no Filter. */
+  listFilter?: {
+    state: SessionListFilterState;
+    harnesses: readonly { key: string; name: string }[];
+    projects: readonly { id: string; name: string }[];
+  } | null;
   /** Null while the sidebar_saved_views release flag is off: no Views. */
   savedViews?: ComponentProps<typeof SidebarSavedViewItems> | null;
 }) {
@@ -4657,16 +4729,19 @@ function SessionFilterMenu({
           >
             {displayOptions}
           </FilterMenuSub>
-          {pullRequestFilter && (
+          {listFilter && (
             <FilterMenuSub
-              label="Pull request"
-              value={SESSION_PULL_REQUEST_FILTER_LABELS[pullRequestFilter.value]}
-              testId="session-pull-request-filter-menu"
+              label="Filter"
+              value={sessionListFilterSummary(listFilter.state.value) ?? undefined}
+              testId="session-list-filter-menu"
               pages={pages}
             >
-              <SessionPullRequestFilterItems
-                value={pullRequestFilter.value}
-                onChange={pullRequestFilter.choose}
+              <SessionFilterSections
+                value={listFilter.state.value}
+                onChange={listFilter.state.choose}
+                onClear={listFilter.state.clear}
+                harnesses={listFilter.harnesses}
+                projects={listFilter.projects}
               />
             </FilterMenuSub>
           )}

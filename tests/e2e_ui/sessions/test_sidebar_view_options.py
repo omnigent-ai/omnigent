@@ -380,3 +380,31 @@ def test_created_ordering_persists_and_flag_off_uses_updated(
     expect(page.get_by_role("tooltip")).to_have_text("Filter sessions")
     filter_button.click()
     expect(page.get_by_test_id("session-ordering-menu")).to_have_count(0)
+
+
+def test_status_filter_narrows_the_list_and_clears(
+    page: Page, request: pytest.FixtureRequest
+) -> None:
+    """With saved views on, a Status filter keeps its sessions across a reload, then clears."""
+    base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
+    enable_grouping_ui(page, saved_views=True)
+    page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
+    page.route("**/v1/sessions?*", _serve_sessions)
+    page.goto(base_url)
+    sessions = page.locator("section").filter(has=_section_header(page, "Sessions"))
+    every_row = ["Running session", "Awaiting session", "Idle session"]
+    expect(sessions.locator('a[href^="/c/"]')).to_have_text(every_row, timeout=30_000)
+
+    _open_view_submenu(page, "session-list-filter-menu")
+    page.get_by_role("menuitemradio", name="Needs attention", exact=True).click()
+    page.keyboard.press("Escape")
+    expect(sessions.locator('a[href^="/c/"]')).to_have_text(["Awaiting session"])
+    expect(page.get_by_test_id("session-list-filter-menu")).to_have_count(0)
+
+    page.reload()
+    expect(sessions.locator('a[href^="/c/"]')).to_have_text(["Awaiting session"], timeout=30_000)
+    page.get_by_test_id("session-filter").press("ArrowDown")
+    expect(page.get_by_test_id("session-list-filter-menu")).to_contain_text("1 on")
+    page.get_by_test_id("session-list-filter-menu").click()
+    page.get_by_test_id("session-filters-clear").click()
+    expect(sessions.locator('a[href^="/c/"]')).to_have_text(every_row)
