@@ -4262,7 +4262,8 @@ async def test_delete_for_session_cleans_up_all_files(
 
     # Use the injected file_store fixture directly — no closure
     # introspection needed.
-    deleted_ids = file_store.delete_all_for_session("79b22ebd2309e48fdeb450c65611d51b")
+    deleted_ids: list[str] = []
+    file_store.delete_all_for_session("79b22ebd2309e48fdeb450c65611d51b", deleted_ids.extend)
     assert len(deleted_ids) == 3
 
     list_after = await file_client.get(
@@ -5351,7 +5352,8 @@ async def test_session_file_cleanup_on_delete(
     file_id = upload.json()["id"]
     assert artifact_store.get(file_id) is not None
 
-    deleted_ids = file_store.delete_all_for_session("79b22ebd2309e48fdeb450c65611d51b")
+    deleted_ids: list[str] = []
+    file_store.delete_all_for_session("79b22ebd2309e48fdeb450c65611d51b", deleted_ids.extend)
     assert file_id in deleted_ids
     for fid in deleted_ids:
         artifact_store.delete(fid)

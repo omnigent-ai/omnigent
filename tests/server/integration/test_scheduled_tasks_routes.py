@@ -4430,7 +4430,7 @@ async def test_a_failed_create_deletes_the_copy_with_its_file_rows(
     def _failing_create(*args: Any, **kwargs: Any) -> None:
         if source_drops_its_file:
             # The copy then holds the blob's last row, and the blob won't delete.
-            files.delete_all_for_session(source_id)
+            files.delete_all_for_session(source_id, lambda keys: None)
         raise OmnigentError("store unavailable", code=ErrorCode.INVALID_INPUT)
 
     def _failing_blob_delete(self: Any, key: str) -> None:

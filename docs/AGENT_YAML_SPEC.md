@@ -1403,6 +1403,17 @@ warning, because a policy written for the old names would not match the new
 ones. Remove those entries and rename such policy selectors to the `sys_`
 names; `files: true` alongside a removed name is an error.
 
+All three tools take `scope`: `session` (the default) uses the session's own
+files; `project` uses the files of the project the session is filed in, which
+every session in that project shares (a sub-agent uses its root session's
+project). The server resolves the project from the calling session on each
+call, so an agent can only reach its own session's project, and a session
+outside any project gets an error. Anyone who can work in a project session,
+including a collaborator it's shared with, can read the project's files through
+the agent, and write them with edit access. The project's owner can also manage
+them over `/v1/projects/{id}/resources/files`. Deleting a project deletes its
+files.
+
 `agent_discovery: false` is rejected while `spawn: true` or the
 `scheduled_tasks` group is on: `sys_session_create` and
 `sys_scheduled_task_create` take an `agent_id` the model looks up with

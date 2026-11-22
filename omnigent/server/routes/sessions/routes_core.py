@@ -734,11 +734,17 @@ def register_core_routes(
     async def _delete_unreturned_session(session_id: str) -> None:
         """Delete a session whose creating request failed, with its unshared files."""
         if file_store is not None:
-            blob_keys = await asyncio.to_thread(file_store.delete_all_for_session, session_id)
-            if artifact_store is not None:
-                for blob_key in blob_keys:
-                    with contextlib.suppress(Exception):
-                        await asyncio.to_thread(artifact_store.delete, blob_key)
+            blob_keys: list[str] = []
+            try:
+                await asyncio.to_thread(
+                    file_store.delete_all_for_session, session_id, blob_keys.extend
+                )
+            finally:
+                # Also after a failed batch: rows earlier batches deleted are gone.
+                if artifact_store is not None:
+                    for blob_key in blob_keys:
+                        with contextlib.suppress(Exception):
+                            await asyncio.to_thread(artifact_store.delete, blob_key)
         await conversation_store.delete_conversation(session_id)
 
     async def _unreturned_fork_agent_copy(

@@ -967,6 +967,7 @@ def create_sessions_router(
         host_registry=host_registry,
         register_initial_file_upload=register_initial_file_upload,
         pull_request_refresher=pull_request_refresher,
+        project_store=project_store,
     )
 
     register_ui_routes(

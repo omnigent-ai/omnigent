@@ -137,10 +137,28 @@ def test_file_store_names_each_application_query(db_uri: str) -> None:
 
         file_store.create("old.txt", 1, session_id="94c349190e241f85a984b3df8f129696")
         query_names.clear()
-        file_store.delete_all_for_session("94c349190e241f85a984b3df8f129696")
+        file_store.delete_all_for_session("94c349190e241f85a984b3df8f129696", lambda keys: None)
         assert query_names == [
             "omnigent.file_store.list_session_files_for_delete",
             "omnigent.file_store.delete_session_files",
+            # The blob_key lookup, then the primary-key lookup for a pre-blob_key row.
+            "omnigent.file_store.count_blob_key_refs",
+            "omnigent.file_store.count_blob_key_refs",
+        ]
+
+        project_id = "7d3b1f4e2a9c4b6d8e0f1a2b3c4d5e6f"
+        file_store.create("plan.md", 1, project_id=project_id)
+        query_names.clear()
+        file_store.list_for_project(project_id)
+        assert query_names == ["omnigent.file_store.list_project_files"]
+
+        query_names.clear()
+        file_store.delete_all_for_project(project_id, lambda keys: None)
+        assert query_names == [
+            "omnigent.file_store.list_project_files_for_delete",
+            "omnigent.file_store.delete_project_files",
+            # The blob_key lookup, then the primary-key lookup for a pre-blob_key row.
+            "omnigent.file_store.count_blob_key_refs",
             "omnigent.file_store.count_blob_key_refs",
         ]
 
@@ -183,3 +201,24 @@ def test_conversation_store_names_create_and_get_queries(
             "omnigent.conversation_store.select_conversation_metadata_by_id",
             "omnigent.conversation_store.select_conversation_labels",
         ]
+
+
+def test_project_file_deletion_runs_in_bounded_batches(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deleting a project's files takes one bounded transaction per batch, not one for all."""
+    monkeypatch.setattr("omnigent.stores.file_store.sqlalchemy_store._DELETE_BATCH_SIZE", 2)
+    file_store = SqlAlchemyFileStore(db_uri)
+    project_id = "7d3b1f4e2a9c4b6d8e0f1a2b3c4d5e6f"
+    created = {
+        file_store.create(f"f{index}.md", 1, project_id=project_id).id for index in range(5)
+    }
+
+    orphaned: list[str] = []
+    with _capture_application_query_names(file_store._engine) as query_names:
+        file_store.delete_all_for_project(project_id, orphaned.extend)
+
+    assert set(orphaned) == created
+    assert query_names.count("omnigent.file_store.list_project_files_for_delete") == 3
+    assert query_names.count("omnigent.file_store.delete_project_files") == 3
+    assert file_store.list_for_project(project_id).data == []

@@ -7,7 +7,12 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.tools.base import Tool, ToolContext
-from omnigent.tools.builtins._arguments import parse_json_object_arguments
+from omnigent.tools.builtins._arguments import (
+    FILE_SCOPE_PARAMETER,
+    PROJECT_FILE_SCOPE,
+    parse_file_scope,
+    parse_json_object_arguments,
+)
 from omnigent.tools.builtins.upload_file import safe_resolve
 
 
@@ -35,7 +40,8 @@ class DownloadFileTool(Tool):
         return (
             "Read a stored session file by its file_id and return its content as "
             "text. Use it for text files: binary content is not returned intact. "
-            "Use sys_list_files to find available file IDs."
+            "Use sys_list_files to find available file IDs. Pass scope 'project' "
+            "for a file from this session's project."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -56,6 +62,7 @@ class DownloadFileTool(Tool):
                             "type": "string",
                             "description": ('The file ID to download, e.g. "file_abc123".'),
                         },
+                        "scope": FILE_SCOPE_PARAMETER,
                     },
                     "required": ["file_id"],
                     "additionalProperties": False,
@@ -75,10 +82,15 @@ class DownloadFileTool(Tool):
             return json.dumps({"error": error})
         assert args is not None
 
-        unsupported = sorted(set(args) - {"file_id"})
+        unsupported = sorted(set(args) - {"file_id", "scope"})
         if unsupported:
             names = ", ".join(repr(name) for name in unsupported)
             return json.dumps({"error": f"unsupported argument(s): {names}"})
+        scope = parse_file_scope(args)
+        if scope is None:
+            return json.dumps({"error": "'scope' must be 'session' or 'project'"})
+        if scope == PROJECT_FILE_SCOPE:
+            return json.dumps({"error": "project files are only available in agent sessions"})
 
         file_id = args.get("file_id")
         if file_id is None or file_id == "":
@@ -97,9 +109,11 @@ class DownloadFileTool(Tool):
         if record is None:
             return json.dumps({"error": f"File {file_id!r} not found."})
 
-        # Reject session-scoped files that belong to a different
-        # conversation (ownership, not just existence).
-        if record.session_id is not None and record.session_id != ctx.conversation_id:
+        # Reject another conversation's files and project files, which are not
+        # global even though they have no session.
+        if record.project_id is not None or (
+            record.session_id is not None and record.session_id != ctx.conversation_id
+        ):
             return json.dumps({"error": f"File {file_id!r} not found."})
 
         try:

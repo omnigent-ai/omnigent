@@ -918,6 +918,33 @@ def _stored_file_to_resource(
     }
 
 
+def _stored_project_file_to_resource(
+    project_id: str,
+    stored: StoredFile,
+) -> dict[str, Any]:
+    """Convert a :class:`StoredFile` to a project file resource dict.
+
+    The same shape as a session file resource, keyed by ``project_id``.
+
+    :param project_id: Owning project id, e.g. ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
+    :param stored: The stored file entity.
+    :returns: JSON-serializable resource dict.
+    """
+    return {
+        "id": stored.id,
+        "object": "project.resource",
+        "type": "file",
+        "project_id": project_id,
+        "name": stored.filename,
+        "metadata": {
+            "filename": stored.filename,
+            "bytes": stored.bytes,
+            "created_at": stored.created_at,
+            "source_metadata": stored.source_metadata,
+        },
+    }
+
+
 def _publish_and_persist_resource_event(
     session_id: str,
     event_type: str,

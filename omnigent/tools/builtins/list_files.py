@@ -6,7 +6,20 @@ import json
 from typing import Any
 
 from omnigent.tools.base import Tool, ToolContext
-from omnigent.tools.builtins._arguments import parse_json_object_arguments
+from omnigent.tools.builtins._arguments import (
+    FILE_SCOPE_PARAMETER,
+    PROJECT_FILE_SCOPE,
+    parse_file_scope,
+    parse_json_object_arguments,
+)
+
+_DESCRIPTION = (
+    "List files that have been uploaded or created. "
+    "Returns file metadata: ID, filename, size, and "
+    "creation time. Use the file_id to download content "
+    "with sys_download_file. With scope 'project', lists the files "
+    "shared by this session's project instead."
+)
 
 
 def _parse_limit(value: Any) -> tuple[int | None, str | None]:
@@ -45,12 +58,7 @@ class ListFilesTool(Tool):
         """
         :returns: Human-readable description of the tool.
         """
-        return (
-            "List files that have been uploaded or created. "
-            "Returns file metadata: ID, filename, size, and "
-            "creation time. Use the file_id to download content "
-            "with sys_download_file."
-        )
+        return _DESCRIPTION
 
     def get_schema(self) -> dict[str, Any]:
         """
@@ -62,12 +70,7 @@ class ListFilesTool(Tool):
             "type": "function",
             "function": {
                 "name": "sys_list_files",
-                "description": (
-                    "List files that have been uploaded or created. "
-                    "Returns file metadata: ID, filename, size, and "
-                    "creation time. Use the file_id to download content "
-                    "with sys_download_file."
-                ),
+                "description": _DESCRIPTION,
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -83,6 +86,7 @@ class ListFilesTool(Tool):
                                 "Cursor for pagination. Return files after this file ID."
                             ),
                         },
+                        "scope": FILE_SCOPE_PARAMETER,
                     },
                     "required": [],
                 },
@@ -112,6 +116,12 @@ class ListFilesTool(Tool):
         if after is not None and not isinstance(after, str):
             return json.dumps({"error": "'after' must be a string"})
 
+        scope = parse_file_scope(args)
+        if scope is None:
+            return json.dumps({"error": "'scope' must be 'session' or 'project'"})
+        if scope == PROJECT_FILE_SCOPE:
+            return json.dumps({"error": "project files are only available in agent sessions"})
+
         conversation_id = ctx.conversation_id
         if conversation_id is None:
             return json.dumps({"error": "sys_list_files requires a conversation_id"})
@@ -122,15 +132,13 @@ class ListFilesTool(Tool):
         if file_store is None:
             return json.dumps({"error": "File store not configured."})
 
-        # Scope to the current session + global (unscoped) files so
-        # agents see their own files but not other users'.
+        # Only the current session's own files, so agents never see other users'.
         page = file_store.list(
             limit=limit,
             after=after,
             before=None,
             order="desc",
             session_id=conversation_id,
-            include_unscoped=True,
         )
 
         files = [

@@ -244,6 +244,16 @@ class SqlAlchemyProjectStore(ProjectStore):
                 return None
             return _to_entity(row)
 
+    def exists(self, project_id: str) -> bool:
+        """
+        Whether a project with this id exists, whoever owns it.
+
+        :param project_id: Opaque project identifier.
+        :returns: ``True`` if any owner has a project with this id.
+        """
+        with self._session("select_project_exists") as session:
+            return session.get(SqlProject, (current_workspace_id(), project_id)) is not None
+
     def list(self, *, user_id: str | None) -> list[Project]:
         """List the owner's projects ordered by ``created_at ASC, id ASC``."""
         with self._session("list_projects") as session:

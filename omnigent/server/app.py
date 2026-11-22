@@ -362,6 +362,9 @@ class ServerInfoResponse(BaseModel):
     session_create_permission_modes: bool = True
     # Session creates accept ``workflow_id``; older servers ignore it.
     session_create_workflow_id: bool = True
+    # Sessions filed in a project share files through ``/resources/project-files``;
+    # older servers have no such routes.
+    project_files: bool = True
     scripted_sessions: bool = False
     # Scheduled tasks accept explicit modes that skip approval; servers that omit
     # this may reject them, so clients hide those modes.
@@ -4618,6 +4621,8 @@ def create_app(
                 auth_provider=auth_provider,
                 conversation_store=conversation_store,
                 permission_store=permission_store,
+                file_store=file_store,
+                artifact_store=artifact_store,
             ),
             prefix="/v1",
             tags=["projects"],

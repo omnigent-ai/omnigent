@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
-import pytest
+from collections.abc import Callable
 
+import pytest
+import sqlalchemy
+from sqlalchemy.orm import Session
+
+from omnigent.db.utils import NamedManagedSessionMaker
+from omnigent.stores.file_store import sqlalchemy_store
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 
 # Files are always listed per session, so pagination/ordering tests
 # scope their fixtures to a single session id.
 _SID = "94c349190e241f85a984b3df8f129696"
+_PROJECT = "7d3b1f4e2a9c4b6d8e0f1a2b3c4d5e6f"
+_OTHER_PROJECT = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
 
 
 @pytest.fixture()
@@ -190,7 +198,8 @@ def test_delete_all_for_session(
     file_store.create("c.txt", 3, session_id="aef8aa8b6e9cf6eda406cb88cf33708c")
     global_f = file_store.create("global.txt", 4)
 
-    deleted_ids = file_store.delete_all_for_session("4e92b5a0c0ee6db3f874f9c4a3f855a5")
+    deleted_ids: list[str] = []
+    file_store.delete_all_for_session("4e92b5a0c0ee6db3f874f9c4a3f855a5", deleted_ids.extend)
     assert set(deleted_ids) == {f1.id, f2.id}
     assert file_store.get(f1.id) is None
     assert file_store.get(f2.id) is None
@@ -202,32 +211,33 @@ def test_delete_all_for_session(
     assert file_store.get(global_f.id) is not None
 
 
-# ── include_unscoped ──────────────────────────────────────────────
+# ── session listing ───────────────────────────────────────────────
 
 
-def test_list_include_unscoped_returns_session_and_global_files(
+def test_list_returns_only_the_sessions_own_files(
     file_store: SqlAlchemyFileStore,
 ) -> None:
-    """list with include_unscoped=True includes global (session_id=NULL) files."""
+    """
+    A session's listing leaves out other sessions', project and global files.
+    """
     file_store.create("session.txt", 10, session_id="8af356d908005a65f872c246158c6293")
     file_store.create("global.txt", 20)
+    file_store.create("plan.md", 25, project_id=_PROJECT)
     file_store.create("other.txt", 30, session_id="1dacb16c401901ed250049177f59e84e")
 
-    page = file_store.list(session_id="8af356d908005a65f872c246158c6293", include_unscoped=True)
-    filenames = {f.filename for f in page.data}
-    assert "session.txt" in filenames
-    assert "global.txt" in filenames
-    assert "other.txt" not in filenames
+    page = file_store.list(session_id="8af356d908005a65f872c246158c6293")
+
+    assert [f.filename for f in page.data] == ["session.txt"]
 
 
-def test_list_include_unscoped_false_excludes_global_files(
+def test_list_excludes_global_files(
     file_store: SqlAlchemyFileStore,
 ) -> None:
-    """list with include_unscoped=False (default) excludes global files."""
+    """list excludes global files, which belong to no session."""
     file_store.create("session.txt", 10, session_id="8af356d908005a65f872c246158c6293")
     file_store.create("global.txt", 20)
 
-    page = file_store.list(session_id="8af356d908005a65f872c246158c6293", include_unscoped=False)
+    page = file_store.list(session_id="8af356d908005a65f872c246158c6293")
     filenames = {f.filename for f in page.data}
     assert "session.txt" in filenames
     assert "global.txt" not in filenames
@@ -331,12 +341,143 @@ def test_delete_all_for_session_returns_only_orphaned_blobs(
 
     # Deleting the source returns solo's blob (now unreferenced) but NOT the
     # shared blob the fork still points at.
-    orphaned = file_store.delete_all_for_session(src_session)
+    orphaned: list[str] = []
+    file_store.delete_all_for_session(src_session, orphaned.extend)
     assert set(orphaned) == {solo.id}
 
     # Deleting the fork finally orphans the shared blob.
-    orphaned_after = file_store.delete_all_for_session(fork_session)
+    orphaned_after: list[str] = []
+    file_store.delete_all_for_session(fork_session, orphaned_after.extend)
     assert set(orphaned_after) == {shared.blob_key}
+
+
+# ── project files ────────────────────────────────────────────────
+
+
+def test_project_files_are_reachable_only_through_their_project(
+    file_store: SqlAlchemyFileStore,
+) -> None:
+    """A project file is listed, fetched and deleted only through its own project."""
+    mine = file_store.create("plan.md", 5, project_id=_PROJECT)
+    file_store.create("other.md", 6, project_id=_OTHER_PROJECT)
+    file_store.create("notes.md", 7, session_id=_SID)
+
+    assert (mine.project_id, mine.session_id) == (_PROJECT, None)
+    assert [f.filename for f in file_store.list_for_project(_PROJECT).data] == ["plan.md"]
+    assert file_store.get(mine.id, project_id=_PROJECT) is not None
+    assert file_store.get(mine.id, project_id=_OTHER_PROJECT) is None
+    assert file_store.get(mine.id, session_id=_SID) is None
+    assert file_store.delete(mine.id, project_id=_OTHER_PROJECT) is False
+    assert file_store.delete(mine.id, project_id=_PROJECT) is True
+    assert file_store.list_for_project(_PROJECT).data == []
+
+
+def test_create_refuses_a_file_owned_by_a_session_and_a_project(
+    file_store: SqlAlchemyFileStore,
+) -> None:
+    with pytest.raises(ValueError, match="a session or a project"):
+        file_store.create("plan.md", 1, session_id=_SID, project_id=_PROJECT)
+
+
+def test_list_for_project_paginates(
+    file_store: SqlAlchemyFileStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Cursor pages follow ``(created_at, id)`` order across distinct and tied creation times.
+    """
+    # Fixed creation times: three files tie at 200, between one older and one newer file.
+    created_at = iter([100, 200, 200, 200, 300])
+    monkeypatch.setattr(
+        "omnigent.stores.file_store.sqlalchemy_store.now_epoch", lambda: next(created_at)
+    )
+    created = [
+        file_store.create(f"f{index}.txt", index, project_id=_PROJECT) for index in range(5)
+    ]
+    # The expected order, from the records themselves: newest first, ties broken by id.
+    newest_first = [
+        f.id for f in sorted(created, key=lambda f: (f.created_at, f.id), reverse=True)
+    ]
+
+    listed = file_store.list_for_project(_PROJECT, limit=10)
+    first = file_store.list_for_project(_PROJECT, limit=2)
+    second = file_store.list_for_project(_PROJECT, limit=2, after=first.last_id)
+    third = file_store.list_for_project(_PROJECT, limit=2, after=second.last_id)
+    newer = file_store.list_for_project(_PROJECT, limit=2, before=newest_first[2])
+    ascending = file_store.list_for_project(_PROJECT, limit=2, order="asc", after=newest_first[3])
+
+    assert [f.id for f in listed.data] == newest_first
+    assert [f.id for f in first.data + second.data + third.data] == newest_first
+    assert [first.has_more, second.has_more, third.has_more] == [True, True, False]
+    assert [f.id for f in newer.data] == newest_first[:2]
+    assert [f.id for f in ascending.data] == [newest_first[2], newest_first[1]]
+
+
+def test_delete_all_for_project_keeps_blobs_other_rows_share(
+    file_store: SqlAlchemyFileStore,
+) -> None:
+    """Deleting a project returns only the blobs no surviving row references."""
+    shared = file_store.create("shared.md", 8, project_id=_PROJECT)
+    solo = file_store.create("solo.md", 8, project_id=_PROJECT)
+    file_store.create("shared.md", 8, session_id=_SID, blob_key=shared.blob_key)
+    file_store.create("kept.md", 8, project_id=_OTHER_PROJECT)
+
+    orphaned: list[str] = []
+    file_store.delete_all_for_project(_PROJECT, orphaned.extend)
+    assert set(orphaned) == {solo.id}
+    assert file_store.list_for_project(_PROJECT).data == []
+    assert [f.filename for f in file_store.list_for_project(_OTHER_PROJECT).data] == ["kept.md"]
+
+
+def test_a_failed_batch_leaves_its_rows_after_reporting_the_earlier_batches(
+    file_store: SqlAlchemyFileStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Each committed batch's orphaned blobs reach the caller before a later batch fails.
+    """
+    monkeypatch.setattr(sqlalchemy_store, "_DELETE_BATCH_SIZE", 2)
+    created = {file_store.create(f"f{index}.md", 1, project_id=_PROJECT).id for index in range(3)}
+    real_transaction = sqlalchemy_store.run_write_transaction
+    delete_batches: list[str] = []
+
+    def fail_the_second_batch(
+        session_maker: NamedManagedSessionMaker,
+        operation_name: str,
+        callback: Callable[[Session], object],
+    ) -> object:
+        if operation_name == "delete_project_files":
+            delete_batches.append(operation_name)
+            if len(delete_batches) == 2:
+                raise RuntimeError("database unavailable")
+        return real_transaction(session_maker, operation_name, callback)
+
+    monkeypatch.setattr(sqlalchemy_store, "run_write_transaction", fail_the_second_batch)
+    reported: list[str] = []
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        file_store.delete_all_for_project(_PROJECT, reported.extend)
+
+    remaining = {f.id for f in file_store.list_for_project(_PROJECT).data}
+    assert len(reported) == 2
+    assert set(reported) | remaining == created
+    assert not set(reported) & remaining
+
+
+def test_rows_without_a_blob_key_still_reference_their_blob(
+    db_uri: str, file_store: SqlAlchemyFileStore
+) -> None:
+    """Rows written before ``blob_key`` existed keep their bytes under ``id`` and still count."""
+    legacy = file_store.create("old.png", 8, session_id=_SID)
+    engine = sqlalchemy.create_engine(db_uri)
+    with engine.begin() as connection:
+        connection.execute(sqlalchemy.text("UPDATE files SET blob_key = NULL"))
+    engine.dispose()
+
+    fetched = file_store.get(legacy.id)
+    assert fetched is not None and fetched.blob_key is None
+    assert file_store.is_blob_key_orphaned(legacy.id) is False
+    orphaned: list[str] = []
+    file_store.delete_all_for_session(_SID, orphaned.extend)
+    assert orphaned == [legacy.id]
 
 
 def test_delete_session_files_batch_bounds_each_transaction(

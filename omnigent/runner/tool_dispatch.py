@@ -9340,7 +9340,11 @@ async def _execute_file_tool(
     resource_registry: SessionResourceRegistry | None = None,
 ) -> str:
     """
-    Execute a file tool by calling session-scoped server file APIs.
+    Execute a file tool by calling the server's session or project file APIs.
+
+    ``scope: "project"`` uses the files of the project the session is filed in,
+    through ``/v1/sessions/{id}/resources/project-files``; the server resolves
+    and authorizes the project, so the agent can't name another one.
 
     :param tool_name: File tool name, e.g. ``"sys_upload_file"``.
     :param args: Parsed tool arguments.
@@ -9360,7 +9364,18 @@ async def _execute_file_tool(
         return f"Error: {tool_name} requires server access"
     if conversation_id is None:
         return f"Error: {tool_name} requires a session id"
-    files_path = f"{_session_url(conversation_id)}/resources/files"
+    from omnigent.tools.builtins._arguments import PROJECT_FILE_SCOPE, parse_file_scope
+
+    scope = parse_file_scope(args)
+    if scope is None:
+        return f"Error: {tool_name} failed: scope must be 'session' or 'project'"
+    if scope == PROJECT_FILE_SCOPE and not await _server_has_project_files(server_client):
+        return (
+            f"Error: {tool_name} failed: this Omnigent server doesn't support project "
+            "files; use the default session scope"
+        )
+    resource = "project-files" if scope == PROJECT_FILE_SCOPE else "files"
+    files_path = f"{_session_url(conversation_id)}/resources/{resource}"
 
     if tool_name == UploadFileTool.name():
         path = args.get("path")
@@ -9393,7 +9408,7 @@ async def _execute_file_tool(
             if resp.status_code in (200, 201):
                 data = resp.json()
                 return json.dumps({"file_id": data.get("id"), "filename": filename})
-            return f"Error: upload returned {resp.status_code}"
+            return f"Error: upload returned {resp.status_code}{_file_error_detail(resp)}"
         except Exception as exc:  # noqa: BLE001
             return f"Error: sys_upload_file failed: {exc}"
 
@@ -9406,20 +9421,63 @@ async def _execute_file_tool(
             )
             if resp.status_code == 200:
                 return resp.text
-            return f"Error: download returned {resp.status_code}"
+            return f"Error: download returned {resp.status_code}{_file_error_detail(resp)}"
         except Exception as exc:  # noqa: BLE001
             return f"Error: {DownloadFileTool.name()} failed: {exc}"
 
     if tool_name == ListFilesTool.name():
+        # Pass the advertised page arguments on, so a returned cursor reaches older files.
+        page: dict[str, int | str] = {}
+        limit, after = args.get("limit"), args.get("after")
+        if isinstance(limit, int) and not isinstance(limit, bool):
+            page["limit"] = limit
+        elif limit is not None:
+            return f"Error: {tool_name} failed: 'limit' must be an integer"
+        if isinstance(after, str):
+            page["after"] = after
+        elif after is not None:
+            return f"Error: {tool_name} failed: 'after' must be a string"
         try:
-            resp = await server_client.get(files_path, timeout=30.0)
+            resp = await server_client.get(files_path, params=page, timeout=30.0)
             if resp.status_code == 200:
                 return json.dumps(resp.json())
-            return f"Error: {tool_name} returned {resp.status_code}"
+            return f"Error: {tool_name} returned {resp.status_code}{_file_error_detail(resp)}"
         except Exception as exc:  # noqa: BLE001
             return f"Error: {tool_name} failed: {exc}"
 
     return f"Error: {tool_name} not implemented in file dispatch"
+
+
+async def _server_has_project_files(server_client: httpx.AsyncClient) -> bool:
+    """
+    Whether the server advertises project files in ``/v1/info``; older servers don't.
+
+    :param server_client: HTTP client for the Omnigent server.
+    :returns: ``True`` only when ``/v1/info`` reports ``project_files: true``.
+    """
+    try:
+        info = await server_client.get("/v1/info", timeout=30.0)
+        return info.status_code == 200 and info.json().get("project_files") is True
+    except (httpx.HTTPError, ValueError):
+        return False
+
+
+def _file_error_detail(resp: httpx.Response) -> str:
+    """
+    The server's reason for a failed file call, e.g. ``": This session is not in a project"``.
+
+    :param resp: The failed response.
+    :returns: ``": <message>"``, or ``""`` when the body carries none.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return ""
+    error = body.get("error") if isinstance(body, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    if message is None and isinstance(body, dict):
+        message = body.get("detail")
+    return f": {message}" if isinstance(message, str) and message else ""
 
 
 # ── Terminal tools (Phase 2) ──────────────────────────────
