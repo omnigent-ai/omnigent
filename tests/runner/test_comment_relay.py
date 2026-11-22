@@ -463,9 +463,10 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
     # sys_policy_registry) — claude-native ignores the harness tool
     # schemas, so this relay is the only surface that reaches Claude Code.
     # All are routed through the AP server's /mcp endpoint for policy
-    # enforcement. This fixture's session has no resolvable spec, so the
-    # opt-in spawn writes (sys_session_send/close/create) and session file
-    # tools (sys_files_*) are absent: the fallback can't check their gates. The
+    # enforcement. The opt-in spawn writes (sys_session_send/close/create)
+    # are absent here because this fixture's session has no resolvable
+    # spec — the fallback can't evaluate the (tools.agents | spawn) gate;
+    # specs that opt in get them via the ToolManager-derived branch. The
     # OS tools (sys_os_*) are absent too: native harnesses use their own
     # shell and file tools.
     # No more, no less: a missing entry means the schema loop dropped a class;
