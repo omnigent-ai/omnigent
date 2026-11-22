@@ -1,5 +1,5 @@
-import { render } from "@testing-library/react";
-import { createElement } from "react";
+import { act, render, waitFor } from "@testing-library/react";
+import { createElement, useEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const SESSIONS = "./workspaceTabs/workspaceTabsSessions";
@@ -180,6 +180,70 @@ describe("loadFileActionHost", () => {
     });
     expect(render(createElement(failed.default)).container).toBeEmptyDOMElement();
     expect(console.error).toHaveBeenCalled();
+  });
+
+  /** A host that runs each request it claims by recording its command. */
+  async function recordingHost(ran: string[]) {
+    const { claimFileAction, useFileActionStore } = await import("./fileCommands/fileActionStore");
+    return function FileActionHost() {
+      const request = useFileActionStore((state) => state.request);
+      useEffect(() => {
+        if (request && claimFileAction(request)) ran.push(request.command);
+      }, [request]);
+      return null;
+    };
+  }
+
+  async function requestCopyPath() {
+    const { requestFileAction } = await import("./fileCommands/fileActionStore");
+    const { resolveFileCommandTarget } = await import("./fileCommands/target");
+    const target = resolveFileCommandTarget("src/main.ts", {
+      root: "/repo",
+      hostId: "this-mac",
+      conversationId: "conv_1",
+    });
+    act(() => requestFileAction(target, "copy-path"));
+  }
+
+  it("loads the host again on the next request after its code failed to load, and runs it", async () => {
+    const { loadFileActionHost } = await routing();
+    const ran: string[] = [];
+    const FileActionHost = await recordingHost(ran);
+    const load = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Failed to fetch dynamically imported module"))
+      .mockResolvedValue({ FileActionHost });
+    const failed = await loadFileActionHost(load);
+    render(createElement(failed.default));
+    expect(load).toHaveBeenCalledTimes(1);
+
+    await requestCopyPath();
+    await waitFor(() => expect(ran).toEqual(["copy-path"]));
+    expect(load).toHaveBeenCalledTimes(2);
+    expect(toastError).not.toHaveBeenCalled();
+    // Once loaded, the host runs later requests itself.
+    await requestCopyPath();
+    await waitFor(() => expect(ran).toEqual(["copy-path", "copy-path"]));
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+
+  it("says each request it can't run while the code still won't load, then drops it", async () => {
+    const { FILE_ACTION_LOAD_FAILED, loadFileActionHost } = await routing();
+    const { useFileActionStore } = await import("./fileCommands/fileActionStore");
+    const load = vi.fn(async () => {
+      throw new Error("Failed to fetch dynamically imported module");
+    });
+    const failed = await loadFileActionHost(load);
+    render(createElement(failed.default));
+
+    await requestCopyPath();
+    await waitFor(() => expect(toastError).toHaveBeenCalledTimes(1));
+    expect(toastError).toHaveBeenCalledWith(FILE_ACTION_LOAD_FAILED);
+    expect(useFileActionStore.getState().request).toBeNull();
+    await requestCopyPath();
+    await waitFor(() => expect(toastError).toHaveBeenCalledTimes(2));
+    // One load at startup, then one per request; nothing retries in a loop.
+    expect(load).toHaveBeenCalledTimes(3);
   });
 });
 
