@@ -43,6 +43,7 @@ from omnigent.entities.session_resources import (
 )
 from omnigent.inner.async_utils import run_sync_cleanup
 from omnigent.inner.sandbox import contained_realpath, containment_prefix, resolve_sandbox
+from omnigent.inner.terminal_exit_outcome import TerminalExitOutcome
 from omnigent.inner.terminal_lifecycle import lifecycle_log_attributes
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.native.native_dispatch import resolve_hook_for_key
@@ -226,6 +227,8 @@ class TerminalExitEvent:
         ``tmux kill-session`` or ``killall tmux`` run on the host.
     :param terminal_instance_id: Identity of the observed terminal instance.
     :param lifecycle_context: Content-free evidence captured before exit cleanup.
+    :param exit_outcome: The end tmux reported for a terminal that keeps its dead
+        pane, captured before eviction; ``None`` when the terminal can't report one.
     """
 
     session_id: str
@@ -244,6 +247,7 @@ class TerminalExitEvent:
     closed_outside_omnigent: bool = False
     terminal_instance_id: str | None = None
     lifecycle_context: dict[str, str] = field(default_factory=dict)
+    exit_outcome: TerminalExitOutcome | None = None
 
 
 @dataclass(eq=False)
@@ -1663,6 +1667,34 @@ class SessionResourceRegistry:
             resource_role=resource_role,
         )
 
+    async def launch_user_shell(
+        self,
+        session_id: str,
+        terminal_name: str,
+        session_key: str,
+        spec: TerminalEnvSpec,
+        *,
+        cwd_override: str | None = None,
+        sandbox_override: str | None = None,
+        parent_os_env: OSEnvSpec | None = None,
+    ) -> SessionResourceView:
+        """Launch a shell the user opened, as an auxiliary terminal.
+
+        While exit outcomes are reported, the shell keeps its dead pane so its exit
+        status survives for the exit event and the attach close.
+        """
+        if self._feature_flags.enabled(Feature.TERMINAL_REPORT_EXIT_OUTCOME):
+            spec = replace(spec, keep_alive_after_exit=True, report_exit_outcome=True)
+        return await self.launch_auxiliary_terminal(
+            session_id=session_id,
+            terminal_name=terminal_name,
+            session_key=session_key,
+            spec=spec,
+            cwd_override=cwd_override,
+            sandbox_override=sandbox_override,
+            parent_os_env=parent_os_env,
+        )
+
     async def _launch_terminal_with_lifecycle(
         self,
         lifecycle: TerminalLifecycle,
@@ -2456,6 +2488,12 @@ class SessionResourceRegistry:
         ).lower()
         lifecycle_context["session_activity_epoch"] = str(self.session_activity_epoch(session_id))
         command, args_count, cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
+        # Read from the instance's memo before eviction tears its tmux server down.
+        exit_outcome = (
+            TerminalExitOutcome(status=exit_status, signal=instance.last_exit_signal())
+            if instance is not None and instance.report_exit_outcome
+            else None
+        )
         expected_close = (
             instance is not None
             and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
@@ -2588,6 +2626,7 @@ class SessionResourceRegistry:
                     closed_outside_omnigent=closed_outside_omnigent,
                     terminal_instance_id=instance.diagnostic_id if instance is not None else None,
                     lifecycle_context=lifecycle_context,
+                    exit_outcome=exit_outcome,
                 )
             )
 

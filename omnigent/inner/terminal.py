@@ -34,6 +34,7 @@ from omnigent._platform import IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
 from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.inner.terminal_exit_outcome import TerminalExitOutcome
 from omnigent.native import owner_claim
 from omnigent.process_logging import redact_log_text
 from omnigent.runner.identity import strip_runner_auth_secrets
@@ -1229,6 +1230,8 @@ class TerminalInstance:
     # Enabled for the claude-native agent terminal so a single inner-CLI exit no
     # longer reaps the server and cascades into ``no server running`` (#540).
     keep_alive_after_exit: bool = False
+    # With keep-alive, report how the command ended (see TerminalEnvSpec).
+    report_exit_outcome: bool = False
     running: bool = False
     launch_cwd: str | None = None
     # Runtime-owned observation; never part of the portable terminal spec.
@@ -1633,6 +1636,15 @@ class TerminalInstance:
         """Return tmux's observed signal, without attributing who sent it."""
         return self._last_exit_signal
 
+    async def read_exit_outcome(self) -> TerminalExitOutcome:
+        """Read a dead pane's end, waiting the usual short grace for tmux to reap it.
+
+        Call only once the pane is known dead. A status still pending after the
+        grace, as when PTY EOF beat SIGCHLD, stays unknown rather than clean.
+        """
+        await self._refresh_exit_status()
+        return TerminalExitOutcome(status=self._last_exit_status, signal=self._last_exit_signal)
+
     def session_killed_by_tmux(self) -> bool:
         """Whether tmux reported this terminal's session, or its whole server, gone.
 
@@ -1955,8 +1967,15 @@ class TerminalInstance:
         # keeps the pane alive after the inner process exits. We need to set
         # it AFTER new-session (not before) because window scope requires an
         # existing window, and global scope (-g) does not fire for pane-died.
+        # ``-s`` detaches every client of the session, so attaches end as the pane dies;
+        # ``-a`` is the hook terminals that don't report their exit have always had.
+        pane_died_detach = (
+            f"detach-client -s {self.tmux_target}"
+            if self.report_exit_outcome
+            else "detach-client -a"
+        )
         pane_died_hook: list[list[str]] = (
-            [["set-hook", "-w", "pane-died", "detach-client -a"]]
+            [["set-hook", "-w", "pane-died", pane_died_detach]]
             if self.keep_alive_after_exit
             else []
         )
@@ -3348,6 +3367,7 @@ def create_terminal_instance(
             tmux_allow_passthrough=spec.tmux_allow_passthrough,
             tmux_start_on_attach=spec.tmux_start_on_attach,
             keep_alive_after_exit=spec.keep_alive_after_exit,
+            report_exit_outcome=spec.report_exit_outcome,
         )
         instance._clipboard_bridge = TerminalClipboardBridge(private_dir, socket_path)
 

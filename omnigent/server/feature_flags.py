@@ -62,6 +62,7 @@ class Feature(StrEnum):
     FLOATING_COMPOSER = "floating_composer"
     WORKSPACE_SIDEBAR_V2 = "workspace_sidebar_v2"
     SIDEBAR_SAVED_VIEWS = "sidebar_saved_views"
+    TERMINAL_REPORT_EXIT_OUTCOME = "terminal_report_exit_outcome"
 
 
 @dataclass(frozen=True)
@@ -173,6 +174,13 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         owner="server",
         review_by_release="0.24.0",
         frontend_visible=False,
+        default_enabled=False,
+    ),
+    FeatureDefinition(
+        feature=Feature.TERMINAL_REPORT_EXIT_OUTCOME,
+        description="Report how a user shell ended (exit status or signal) to clients",
+        owner="web",
+        review_by_release="0.24.0",
         default_enabled=False,
     ),
     FeatureDefinition(

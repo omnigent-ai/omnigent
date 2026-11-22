@@ -51,13 +51,14 @@ import logging
 import os
 import re
 import shutil
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Final
 
 from fastapi import WebSocket, WebSocketDisconnect
 
 from omnigent.inner.terminal_clipboard import MAX_CLIPBOARD_BYTES
+from omnigent.inner.terminal_exit_outcome import TERMINAL_ENDED_REASON, TerminalExitOutcome
 from omnigent.terminals.query_replies import tmux_answered_queries
 from omnigent.terminals.ws_common import (
     WS_CLOSE_INTERNAL_ERROR,
@@ -131,6 +132,8 @@ _WS_CLOSE_EXPECTED_ERRORS: Final = (RuntimeError, WebSocketDisconnect)
 # sentinel-terminated backlog before teardown cancels it. Bounds teardown so a
 # stuck-slow client can't hang the close; a normal drain completes well within.
 _FORWARD_DRAIN_TIMEOUT_S: Final[float] = 5.0
+# Reading a dead pane's status waits at most tmux's short reap grace; never stall the close.
+_EXIT_OUTCOME_TIMEOUT_S: Final[float] = 0.5
 
 # tmux emits this control notification after copy-mode stores a selection in a
 # paste buffer. Only default-style, shell-safe names are accepted; copy-mode's
@@ -625,6 +628,15 @@ def _cursor_restore_escape(meta: _PaneMetadata | None) -> bytes:
     return cup + visibility
 
 
+async def _exit_close_reason(exit_outcome: Callable[[], Awaitable[TerminalExitOutcome]]) -> str:
+    """The 4404 reason for a dead pane: its exit when known, else the plain reason."""
+    try:
+        outcome = await asyncio.wait_for(exit_outcome(), timeout=_EXIT_OUTCOME_TIMEOUT_S)
+    except Exception:  # noqa: BLE001 - an unreadable status leaves the end unknown.
+        return TERMINAL_ENDED_REASON
+    return outcome.close_reason()
+
+
 async def bridge_tmux_control_to_websocket(
     websocket: WebSocket,
     *,
@@ -632,6 +644,7 @@ async def bridge_tmux_control_to_websocket(
     tmux_target: str,
     read_only: bool,
     on_client_interaction: Callable[[], None] | None = None,
+    exit_outcome: Callable[[], Awaitable[TerminalExitOutcome]] | None = None,
     reader_done: asyncio.Event | None = None,
     forward_done: asyncio.Event | None = None,
 ) -> None:
@@ -649,6 +662,8 @@ async def bridge_tmux_control_to_websocket(
     :param on_client_interaction: Optional callback fired on every client
         interaction (connect, disconnect, each input/resize frame) so the
         idle watcher can discount client-driven repaints.
+    :param exit_outcome: Optional reader of a dead pane's exit, for terminals that
+        keep the pane on exit. Its answer goes in the 4404 close reason.
     :param reader_done: Optional test-only event set once the reader has queued
         the full backlog and the ``None`` EOF sentinel, letting a test await the
         reader draining tmux instead of sleeping. Inert (never awaited) when
@@ -1023,10 +1038,10 @@ async def bridge_tmux_control_to_websocket(
                 if pane_dead is True or (
                     pane_dead is None and not await _tmux_session_alive(socket_path, tmux_target)
                 ):
-                    await websocket.close(
-                        code=WS_CLOSE_TERMINAL_NOT_FOUND,
-                        reason="terminal session ended",
-                    )
+                    reason = TERMINAL_ENDED_REASON
+                    if pane_dead is True and exit_outcome is not None:
+                        reason = await _exit_close_reason(exit_outcome)
+                    await websocket.close(code=WS_CLOSE_TERMINAL_NOT_FOUND, reason=reason)
                 else:
                     await websocket.close(
                         code=WS_CLOSE_TERMINAL_DETACHED,

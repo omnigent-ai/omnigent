@@ -916,6 +916,10 @@ class TerminalEnvSpec:
         into ``no server running``. Opt-in because it changes the
         ``has-session``-means-alive contract; enabled for runner-owned Claude
         and Codex terminals, whose liveness is decided by ``#{pane_dead}``.
+    :param report_exit_outcome: With ``keep_alive_after_exit``, report how the
+        command ended: every attach ends as the pane dies, with the exit in its
+        close reason, and the exit event carries it too. Set for user shells
+        while the ``terminal_report_exit_outcome`` feature is on.
     """
 
     command: str | None = None
@@ -932,6 +936,7 @@ class TerminalEnvSpec:
     tmux_allow_passthrough: bool = False
     tmux_start_on_attach: bool = False
     keep_alive_after_exit: bool = False
+    report_exit_outcome: bool = False
 
 
 # ---------------------------------------------------------------------------

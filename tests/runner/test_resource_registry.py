@@ -26,6 +26,7 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
+from omnigent.inner.terminal_exit_outcome import TerminalExitOutcome
 from omnigent.runner.resource_registry import (
     _TERMINAL_EXIT_OUTPUT_MAX_CHARS,
     _TERMINAL_EXIT_OUTPUT_MAX_LINES,
@@ -755,6 +756,125 @@ async def test_terminal_resource_role_moves_on_transfer(
     assert moved is not None
     assert registry.terminal_resource_role("conv_old", view.id) is None
     assert registry.terminal_resource_role("conv_new", view.id) == CODEX_NATIVE_TERMINAL_ROLE
+
+
+async def _exit_event_for(
+    instance: TerminalInstance, registry: SessionResourceRegistry
+) -> TerminalExitEvent:
+    """Observe *instance* as an auxiliary shell, fire its exit and return the event."""
+    exits: list[TerminalExitEvent] = []
+    published = asyncio.Event()
+    callbacks: dict[str, object] = {}
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+        published.set()
+
+    def _capture_watcher(*_args: object, on_exit: object | None = None, **_kwargs: object) -> None:
+        callbacks["on_exit"] = on_exit
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    registry.set_terminal_exit_publisher(_publish_exit)
+    await registry.observe_auxiliary_terminal("conv_shell", instance.name, "u-1", instance)
+    on_exit = callbacks["on_exit"]
+    assert callable(on_exit)
+    on_exit()
+    await asyncio.wait_for(published.wait(), timeout=1.0)
+    return exits[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pane_row", "expected"),
+    [
+        ("1|0|", TerminalExitOutcome(status=0, signal=None)),
+        ("1|3|", TerminalExitOutcome(status=3, signal=None)),
+        ("1||9", TerminalExitOutcome(status=None, signal="SIGKILL")),
+        # Still unreaped when the grace ran out: neither is known.
+        ("1||", TerminalExitOutcome(status=None, signal=None)),
+    ],
+)
+async def test_kept_shell_exit_carries_its_outcome_past_eviction(
+    tmp_path: Path, pane_row: str, expected: TerminalExitOutcome
+) -> None:
+    """A shell that keeps its dead pane reports how it ended, read before eviction."""
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("zsh", "u-1", tmp_path)
+    instance.keep_alive_after_exit = True
+    instance.report_exit_outcome = True
+    instance._exit_status_is_pending(pane_row)
+    terminal_registry._by_conversation.setdefault("conv_shell", {})[("zsh", "u-1")] = instance
+
+    event = await _exit_event_for(instance, registry)
+
+    assert event.exit_outcome == expected
+    assert terminal_registry.get("conv_shell", "zsh", "u-1") is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_without_kept_pane_reports_no_outcome(tmp_path: Path) -> None:
+    """A terminal whose tmux server dies with it can't say how it ended."""
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("zsh", "u-1", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_shell", {})[("zsh", "u-1")] = instance
+
+    event = await _exit_event_for(instance, registry)
+
+    assert event.exit_outcome is None
+
+
+@pytest.mark.asyncio
+async def test_kept_pane_that_does_not_report_its_exit_reports_no_outcome(tmp_path: Path) -> None:
+    """A keep-alive terminal that isn't a reporting user shell, as an agent's, says nothing."""
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("zsh", "u-1", tmp_path)
+    instance.keep_alive_after_exit = True
+    instance._exit_status_is_pending("1|0|")
+    terminal_registry._by_conversation.setdefault("conv_shell", {})[("zsh", "u-1")] = instance
+
+    event = await _exit_event_for(instance, registry)
+
+    assert event.exit_outcome is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("features", "kept"), [("terminal_report_exit_outcome", True), ("", False)]
+)
+async def test_user_shell_keeps_its_dead_pane_only_while_exit_outcomes_are_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, features: str, kept: bool
+) -> None:
+    """User shells keep their exit status only with the flag on; off, the spec is untouched."""
+    monkeypatch.setenv("OMNIGENT_FEATURES", features)
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("zsh", "u-1", tmp_path)
+    instance.start_idle_watcher_thread = lambda *_a, **_k: None  # type: ignore[method-assign]
+    launched: list[TerminalEnvSpec] = []
+
+    async def _fake_launch(
+        conversation_id: str,
+        terminal_name: str,
+        session_key: str,
+        spec: TerminalEnvSpec,
+        **kwargs: object,
+    ) -> TerminalInstance:
+        del kwargs
+        launched.append(spec)
+        terminal_registry._by_conversation.setdefault(conversation_id, {})[
+            (terminal_name, session_key)
+        ] = instance
+        return instance
+
+    monkeypatch.setattr(terminal_registry, "launch", _fake_launch)
+
+    await registry.launch_user_shell("conv_shell", "zsh", "u-1", TerminalEnvSpec(command="zsh"))
+
+    assert [spec.keep_alive_after_exit for spec in launched] == [kept]
+    assert [spec.report_exit_outcome for spec in launched] == [kept]
 
 
 @pytest.mark.asyncio

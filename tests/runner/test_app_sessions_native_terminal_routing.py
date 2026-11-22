@@ -13,6 +13,7 @@ import pytest
 
 from omnigent.entities.session_resources import SessionResourceView, terminal_resource_id
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.inner.datamodel import TerminalEnvSpec
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.process_logging import display_log_path
 from omnigent.runner import create_runner_app
@@ -200,6 +201,52 @@ async def test_create_session_terminal_ensure_routes_claude_native(
     assert (launch_calls == ["claude:main"]) == case.expect_launch, (
         f"{case.case_id}: launch_calls={launch_calls}, expected_launch={case.expect_launch}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("features", "reports"), [("terminal_report_exit_outcome", True), ("", False)]
+)
+async def test_create_session_terminal_launches_a_user_shell_that_keeps_its_exit(
+    monkeypatch: pytest.MonkeyPatch, features: str, reports: bool
+) -> None:
+    """A route-opened shell keeps its dead pane's exit status only while outcomes are reported."""
+    monkeypatch.setenv("OMNIGENT_FEATURES", features)
+    sid = "4d7b8f5e2a7c4f00a1b2c3d4e5f60718"
+    specs: list[TerminalEnvSpec] = []
+
+    async def _stub_launch_auxiliary_terminal(
+        self: object, *, session_id: str, terminal_name: str, session_key: str, **kwargs: object
+    ) -> SessionResourceView:
+        del self
+        spec = kwargs["spec"]
+        assert isinstance(spec, TerminalEnvSpec)
+        specs.append(spec)
+        return SessionResourceView(
+            id=terminal_resource_id(terminal_name, session_key),
+            type="terminal",
+            session_id=session_id,
+            name=terminal_name,
+        )
+
+    monkeypatch.setattr(
+        SessionResourceRegistry, "launch_auxiliary_terminal", _stub_launch_auxiliary_terminal
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{sid}/resources/terminals",
+            json={"terminal": "bash", "session_key": "u-1", "spec": {"command": "bash"}},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert [spec.keep_alive_after_exit for spec in specs] == [reports]
+    assert [spec.report_exit_outcome for spec in specs] == [reports]
 
 
 @pytest.mark.asyncio

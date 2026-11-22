@@ -29,6 +29,7 @@ from fastapi import WebSocketDisconnect
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import create_terminal_instance
+from omnigent.inner.terminal_exit_outcome import TerminalExitOutcome
 from omnigent.terminals.control_bridge import (
     _SEND_KEYS_HEX_BYTES_PER_CALL,
     _clipboard_buffer_name,
@@ -1291,3 +1292,88 @@ async def test_control_attach_pins_client_term_over_inherited_dumb(
         )
     finally:
         await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "reason"),
+    [
+        ("exit 0", "terminal session ended; exit=status:0"),
+        ("exit 3", "terminal session ended; exit=status:3"),
+        ("kill -KILL $$", "terminal session ended; exit=signal:SIGKILL"),
+    ],
+)
+async def test_kept_shell_exit_closes_the_attach_at_once_naming_its_end(
+    tmp_path: Path, command: str, reason: str
+) -> None:
+    """A shell that keeps its dead pane ends its attach as it dies, saying how."""
+    created = create_terminal_instance(
+        name="exit-test",
+        session_key="main",
+        spec=TerminalEnvSpec(
+            command="bash",
+            args=["--noprofile", "--norc"],
+            keep_alive_after_exit=True,
+            report_exit_outcome=True,
+            os_env=OSEnvSpec(
+                type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+            ),
+        ),
+    )
+    instance = created.instance
+    ws = _FakeWebSocket(inbound=[])
+    task: asyncio.Task[None] | None = None
+    try:
+        await instance.launch(cwd=created.cwd)
+        task = asyncio.create_task(
+            bridge_tmux_control_to_websocket(
+                ws,
+                socket_path=str(instance.socket_path),
+                tmux_target=instance.tmux_target,
+                read_only=False,
+                exit_outcome=instance.read_exit_outcome,
+            )
+        )
+        await poll_until_async(lambda: bool(ws.sent), timeout_s=10)
+        await instance.send(text=command)
+        # No idle watcher runs here: only the pane-died hook can end the attach.
+        await asyncio.wait_for(task, timeout=5.0)
+        assert (ws.close_code, ws.close_reason) == (4404, reason)
+    finally:
+        if task is not None and not task.done():
+            await _kill_and_join(instance.socket_path, task)
+        await instance.close()
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_unreadable_exit_outcome_leaves_the_plain_ended_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead pane whose status can't be read closes as an end of unknown kind."""
+    sock, target = await _new_private_tmux("exit 0")
+    asked: list[bool] = []
+
+    async def _pane_dead(_socket: str, _target: str) -> bool:
+        return True
+
+    async def _failing_outcome() -> TerminalExitOutcome:
+        asked.append(True)
+        raise RuntimeError("tmux gone")
+
+    monkeypatch.setattr(
+        "omnigent.terminals.control_bridge._check_pane_dead_definitive", _pane_dead
+    )
+
+    ws = _FakeWebSocket(inbound=[])
+    await bridge_tmux_control_to_websocket(
+        ws,
+        socket_path=str(sock),
+        tmux_target=target,
+        read_only=False,
+        exit_outcome=_failing_outcome,
+    )
+    assert asked == [True]
+    assert ws.close_code == 4404
+    assert ws.close_reason == "terminal session ended"

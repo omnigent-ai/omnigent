@@ -4627,6 +4627,65 @@ async def test_terminal_exit_release_preserves_a_replacement(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reports", [True, False])
+async def test_kept_user_shell_exit_publishes_its_outcome_with_the_deletion(
+    tmp_path: Path, reports: bool
+) -> None:
+    """A reporting shell tells clients how it ended as it goes; any other sends today's event."""
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = uuid.uuid4().hex
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("zsh", "u-1", tmp_path)
+    instance.keep_alive_after_exit = True
+    instance.report_exit_outcome = reports
+    instance._exit_status_is_pending("1|0|")
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("zsh", "u-1")] = instance
+    callbacks: dict[str, Any] = {}
+
+    def _capture_watcher(*_args: object, on_exit: object | None = None, **_kwargs: object) -> None:
+        callbacks["on_exit"] = on_exit
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    resource_registry = app.state.session_resource_registry
+
+    async def _deleted_event() -> dict[str, Any]:
+        while True:
+            queue = _session_event_queues_ref.get(conv_id)
+            while queue is not None and not queue.empty():
+                item = queue.get_nowait()
+                if isinstance(item, dict) and item.get("type") == "session.resource.deleted":
+                    return item
+            await asyncio.sleep(0)
+
+    try:
+        await resource_registry.observe_auxiliary_terminal(conv_id, "zsh", "u-1", instance)
+        on_exit = callbacks.get("on_exit")
+        assert callable(on_exit)
+        instance.running = False
+        on_exit()
+        deleted = await asyncio.wait_for(_deleted_event(), timeout=budget(1.0))
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+
+    expected: dict[str, Any] = {
+        "type": "session.resource.deleted",
+        "resource_id": "terminal_zsh_u-1",
+        "resource_type": "terminal",
+        "session_id": conv_id,
+    }
+    if reports:
+        expected["exit"] = {"status": 0, "signal": None}
+    assert deleted == expected
+
+
+@pytest.mark.asyncio
 async def test_required_terminal_exit_publishes_deleted_and_failed(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

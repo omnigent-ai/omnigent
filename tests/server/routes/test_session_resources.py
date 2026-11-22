@@ -4311,6 +4311,39 @@ def test_resource_lifecycle_event_schemas_in_union() -> None:
     assert deleted.resource_id == "terminal_bash_s1"
 
 
+@pytest.mark.parametrize(
+    ("runner_exit", "wire_exit"),
+    [
+        # An older runner, or a shell that doesn't report, sends no ``exit``; nor does the stream.
+        ("absent", "absent"),
+        ({"status": 0, "signal": None}, {"status": 0, "signal": None}),
+        ({"status": None, "signal": "SIGKILL"}, {"status": None, "signal": "SIGKILL"}),
+        ({"status": None, "signal": None}, {"status": None, "signal": None}),
+    ],
+)
+def test_terminal_deletion_reaches_the_stream_with_its_exit_shape(
+    runner_exit: object, wire_exit: object
+) -> None:
+    """Pin what clients get for a runner deletion, as the session stream serializes it."""
+    from omnigent.server.routes._sessions.common import _SERVER_STREAM_EVENT_ADAPTER
+
+    event: dict[str, object] = {
+        "type": "session.resource.deleted",
+        "resource_id": "terminal_zsh_u-1",
+        "resource_type": "terminal",
+        "session_id": "8e32600337d08f59ad381caf96a90659",
+    }
+    if runner_exit != "absent":
+        event["exit"] = runner_exit
+
+    wire = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event).model_dump()
+
+    expected: dict[str, object] = {**event, "sequence_number": None}
+    if wire_exit != "absent":
+        expected["exit"] = wire_exit
+    assert wire == expected
+
+
 # ── Server filesystem proxy tests ────────────────────────────────
 
 

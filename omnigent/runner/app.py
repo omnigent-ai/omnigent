@@ -2498,15 +2498,17 @@ def create_runner_app(
         _background_tasks.add(task)
 
     def _publish_terminal_exit(event: TerminalExitEvent) -> None:
-        _publish_event(
-            event.session_id,
-            {
-                "type": "session.resource.deleted",
-                "resource_id": event.terminal_id,
-                "resource_type": "terminal",
-                "session_id": event.session_id,
-            },
-        )
+        deleted: dict[str, Any] = {
+            "type": "session.resource.deleted",
+            "resource_id": event.terminal_id,
+            "resource_type": "terminal",
+            "session_id": event.session_id,
+        }
+        # Only a terminal that kept its dead pane can say how it ended; clients
+        # read a missing ``exit`` as a runner that can't tell.
+        if event.exit_outcome is not None:
+            deleted["exit"] = event.exit_outcome.event_payload()
+        _publish_event(event.session_id, deleted)
         # Auxiliary terminals do not own the session control plane. In
         # particular, losing Codex's streamable TUI must not cancel an active
         # app-server turn; the native-terminal ensure path can recreate it.

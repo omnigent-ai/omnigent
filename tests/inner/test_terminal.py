@@ -2247,6 +2247,84 @@ async def test_launch_preserves_prompt_and_following_args_real_tmux(
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.parametrize("program_status_app", [None, "claude-code"])
+@pytest.mark.asyncio
+async def test_kept_pane_detaches_its_clients_as_it_dies_real_tmux(
+    tmp_path: Path, short_tmp_parent: Path, program_status_app: str | None
+) -> None:
+    """A keep-alive pane that reports its exit ends every attach as it dies.
+
+    The pane itself stays, so its exit status and last screen can still be read.
+    """
+    exit_signal = tmp_path / "exit-signal"
+    instance = TerminalInstance(
+        name="agent",
+        session_key="s1",
+        socket_path=short_tmp_parent / "tmux.sock",
+        private_dir=tmp_path,
+        command="sh",
+        args=["-c", 'while [ ! -e "$1" ]; do sleep 0.02; done; exit 0', "sh", str(exit_signal)],
+        keep_alive_after_exit=True,
+        report_exit_outcome=True,
+        program_status_app=program_status_app,
+    )
+    client: asyncio.subprocess.Process | None = None
+    try:
+        await instance.launch(cwd=tmp_path)
+        client = await asyncio.create_subprocess_exec(
+            *instance._tmux_base_cmd(),
+            "-C",
+            "attach",
+            "-t",
+            instance.tmux_target,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        for _ in range(250):
+            if "1" in await instance._tmux_output("list-clients", "-F", "1"):
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("the control client never attached")
+
+        exit_signal.touch()
+
+        # No watcher runs here: only the pane-died hook can end the client this soon.
+        await asyncio.wait_for(client.wait(), timeout=2.0)
+        assert (await instance.read_exit_outcome()).status == 0
+    finally:
+        if client is not None and client.returncode is None:
+            client.kill()
+        await instance.close()
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.parametrize(("report_exit_outcome", "detach"), [(True, "-s"), (False, "-a")])
+@pytest.mark.asyncio
+async def test_kept_pane_died_hook_detaches_as_it_always_has_unless_it_reports_real_tmux(
+    tmp_path: Path, short_tmp_parent: Path, report_exit_outcome: bool, detach: str
+) -> None:
+    """Only a reporting pane's hook changes; other keep-alive panes keep ``detach-client -a``."""
+    instance = TerminalInstance(
+        name="agent",
+        session_key="s1",
+        socket_path=short_tmp_parent / "tmux.sock",
+        private_dir=tmp_path,
+        command="sh",
+        args=["-c", "sleep 30"],
+        keep_alive_after_exit=True,
+        report_exit_outcome=report_exit_outcome,
+    )
+    try:
+        await instance.launch(cwd=tmp_path)
+        hooks = await instance._tmux_output("show-hooks", "-w", "-t", instance.tmux_target)
+        assert f"detach-client {detach}" in hooks
+    finally:
+        await instance.close()
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
 @pytest.mark.parametrize("exit_status", [0, 255, -15, -9])
 @pytest.mark.parametrize(
     ("program_status_app", "close_stdio"),

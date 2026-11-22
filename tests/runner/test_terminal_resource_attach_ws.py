@@ -75,8 +75,9 @@ def _patch_control_attach(
         tmux_target: str,
         read_only: bool,
         on_client_interaction: object = None,
+        exit_outcome: object = None,
     ) -> None:
-        del websocket, on_client_interaction
+        del websocket, on_client_interaction, exit_outcome
         on_attach(socket_path, tmux_target, read_only)
         raise RuntimeError("bridge stopped")
 
@@ -131,6 +132,49 @@ def test_runner_resource_attach_passes_read_only_to_control_bridge(
             pass
 
     assert calls == [(str(tmp_path / "bash-s1.sock"), "main", True)]
+
+
+@pytest.mark.parametrize(
+    ("keep_alive", "reports", "passed"),
+    [(True, True, True), (True, False, False), (False, False, False)],
+)
+def test_runner_resource_attach_reads_the_exit_only_of_a_reporting_shell(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    keep_alive: bool,
+    reports: bool,
+    passed: bool,
+) -> None:
+    """Only a shell that reports its exit gives the bridge a reader; others close as today."""
+    registry = TerminalRegistry()
+    instance = _make_running_instance("bash", "s1", tmp_path)
+    instance.keep_alive_after_exit = keep_alive
+    instance.report_exit_outcome = reports
+    _seed_registry(registry, "conv_abc", instance)
+    app = create_runner_app(
+        terminal_registry=registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    readers: list[object] = []
+
+    async def fake_control(
+        websocket: object, *, exit_outcome: object = None, **_kwargs: object
+    ) -> None:
+        del websocket
+        readers.append(exit_outcome)
+        raise RuntimeError("bridge stopped")
+
+    monkeypatch.setattr(
+        "omnigent.runner.resource_routes.bridge_tmux_control_to_websocket", fake_control
+    )
+
+    with pytest.raises(RuntimeError, match="bridge stopped"):
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach"
+        ):
+            pass
+
+    assert [reader is not None for reader in readers] == [passed]
 
 
 def test_runner_resource_attach_unknown_terminal_closes_4404(tmp_path: Path) -> None:

@@ -12557,6 +12557,33 @@
       "SessionResourceDeletedEvent": {
         "description": "A session resource was deleted.\n\nEmitted when a terminal is closed, a file is deleted, or\nany other resource is removed from a session.",
         "properties": {
+          "exit": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "format": "int64",
+                      "type": "integer"
+                    },
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "For a terminal that kept its dead pane, how its command ended: `{\"status\": 0, \"signal\": None}`; `None` for both when unknown. Left out of the serialized event when the runner sent none, as older runners and shells that don't report their exit don't, so clients see the event as before.",
+            "title": "Exit"
+          },
           "resource_id": {
             "description": "Opaque id of the deleted resource.",
             "title": "Resource Id",

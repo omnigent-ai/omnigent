@@ -58,6 +58,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "project_repository_creation": True,
         "quick_pick_palette": False,
         "workspace_sidebar_v2": False,
+        "terminal_report_exit_outcome": False,
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,
@@ -348,6 +349,14 @@ def test_mcp_harness_feature_mapping_is_complete():
     from omnigent.server.feature_flags import MCP_DISABLED_SERVERS_HARNESS_FEATURES
 
     assert MCP_DISABLED_SERVERS_HARNESS_FEATURES.keys() == HARNESS_EXECUTORS.keys()
+
+
+def test_terminal_report_exit_outcome_is_an_opt_in_frontend_feature() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.TERMINAL_REPORT_EXIT_OUTCOME)
+    assert resolve_feature_flags({}).frontend_dict()["terminal_report_exit_outcome"] is False
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "terminal_report_exit_outcome"})
+    assert flags.enabled(Feature.TERMINAL_REPORT_EXIT_OUTCOME)
+    assert flags.frontend_dict()["terminal_report_exit_outcome"] is True
 
 
 def test_memory_is_opt_in_and_backend_only() -> None:

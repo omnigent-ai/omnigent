@@ -258,6 +258,27 @@ class _CapturingResourceRegistry:
             resource_role=resource_role,
         )
 
+    async def launch_user_shell(
+        self,
+        session_id: str,
+        terminal_name: str,
+        session_key: str,
+        spec: TerminalEnvSpec,
+        cwd_override: str | None = None,
+        sandbox_override: str | None = None,
+        parent_os_env: Any | None = None,
+    ) -> SessionResourceView:
+        """Capture a user shell launch, which is an auxiliary terminal."""
+        return await self.launch_auxiliary_terminal(
+            session_id=session_id,
+            terminal_name=terminal_name,
+            session_key=session_key,
+            spec=spec,
+            cwd_override=cwd_override,
+            sandbox_override=sandbox_override,
+            parent_os_env=parent_os_env,
+        )
+
     async def _launch(
         self,
         lifecycle: str,

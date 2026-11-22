@@ -5973,12 +5973,25 @@ class SessionResourceDeletedEvent(_SSEEventBase):
     :param resource_type: Type of the deleted resource,
         e.g. ``"terminal"``, ``"file"``.
     :param session_id: Owning session/conversation id.
+    :param exit: For a terminal that kept its dead pane, how its command ended:
+        ``{"status": 0, "signal": None}``; ``None`` for both when unknown. Left out
+        of the serialized event when the runner sent none, as older runners and
+        shells that don't report their exit don't, so clients see the event as before.
     """
 
     type: Literal["session.resource.deleted"]
     resource_id: str
     resource_type: str
     session_id: str
+    exit: dict[str, int | str | None] | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_unsent_exit(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Drop ``exit`` when the producer didn't send it, keeping the event as it was."""
+        data = handler(self)
+        if "exit" not in self.model_fields_set:
+            data.pop("exit", None)
+        return data
 
 
 class SessionChildSessionUpdatedEvent(_SSEEventBase):

@@ -628,21 +628,27 @@ def register_resource_routes(
                 launched_relay = relay_after.relay
 
         try:
-            launch_method = (
-                resource_registry.launch_required_terminal
-                if bridge_inject
-                else resource_registry.launch_auxiliary_terminal
-            )
-            resource_view = await launch_method(
-                session_id=session_id,
-                terminal_name=terminal_name,
-                session_key=session_key,
-                spec=env_spec,
-                cwd_override=cwd_override,
-                sandbox_override=sandbox_override,
-                parent_os_env=agent_os_env,
-                resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
-            )
+            if bridge_inject:
+                resource_view = await resource_registry.launch_required_terminal(
+                    session_id=session_id,
+                    terminal_name=terminal_name,
+                    session_key=session_key,
+                    spec=env_spec,
+                    cwd_override=cwd_override,
+                    sandbox_override=sandbox_override,
+                    parent_os_env=agent_os_env,
+                    resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
+                )
+            else:
+                resource_view = await resource_registry.launch_user_shell(
+                    session_id=session_id,
+                    terminal_name=terminal_name,
+                    session_key=session_key,
+                    spec=env_spec,
+                    cwd_override=cwd_override,
+                    sandbox_override=sandbox_override,
+                    parent_os_env=agent_os_env,
+                )
         except RuntimeError as exc:
             if launched_relay is not None:
                 _discard_comment_relay(session_id, launched_relay)
@@ -1078,6 +1084,9 @@ def register_resource_routes(
             tmux_target=entry.instance.tmux_target,
             read_only=read_only,
             on_client_interaction=entry.instance.note_client_interaction,
+            exit_outcome=(
+                entry.instance.read_exit_outcome if entry.instance.report_exit_outcome else None
+            ),
         )
 
     # Reused by the loopback direct-attach listener (see

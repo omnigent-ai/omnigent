@@ -888,8 +888,9 @@ async def test_attach_terminal_local_fallback_uses_control_mode(
         socket_path: str,
         tmux_target: str,
         read_only: bool,
+        exit_outcome: object = None,
     ) -> None:
-        del websocket
+        del websocket, exit_outcome
         calls.append((socket_path, tmux_target, read_only))
 
     monkeypatch.setattr(
