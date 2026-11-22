@@ -12,7 +12,7 @@ import { conversation } from "@/test/sidebarMockHelpers";
 import type { ProjectTicket, TicketChanges, TicketEvent } from "@/lib/projectTicketsApi";
 import * as api from "@/lib/projectTicketsApi";
 import * as projectsApi from "@/lib/projectsApi";
-import { Link } from "@/lib/routing";
+import { Link, useLocation } from "@/lib/routing";
 
 const capabilities = vi.hoisted(() => ({ lifecycle: true, involvement: true, stages: true }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -75,6 +75,10 @@ vi.mock("@/lib/projectsApi", () => ({
 
 let ticket: ProjectTicket;
 const clients: QueryClient[] = [];
+function LocationProbe() {
+  return <output aria-label="Current location">{useLocation().search}</output>;
+}
+
 function renderBoard(element: React.ReactNode) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -174,7 +178,7 @@ describe("Project ticket board", () => {
   });
 
   it.each([false, true])(
-    "keeps card tags compact and detail tags complete (needs response=%s)",
+    "reveals compact card tags on hover and focus and keeps detail tags complete (needs response=%s)",
     async (needsResponse) => {
       ticket.tags = [
         { key: "source", value: "ISSUE-123" },
@@ -183,11 +187,14 @@ describe("Project ticket board", () => {
         ...(needsResponse ? [{ key: "needs-human", value: "approval" }] : []),
       ];
       const { rerender } = renderBoard(
-        <ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />,
+        <>
+          <ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />
+          <LocationProbe />
+        </>,
       );
       const card = await screen.findByRole("link", { name: "Open ticket: Ship the board" });
       const source = within(card).getByText("source: ISSUE-123");
-      const badge = source.closest('[data-slot="badge"]')!;
+      const badge = source.closest('[data-slot="hover-card-trigger"]')!;
       expect(source).toHaveClass("truncate");
       expect(badge).toHaveClass("text-xs", "rounded-md", "shrink");
       expect(badge.parentElement).not.toHaveClass("flex-wrap");
@@ -202,6 +209,31 @@ describe("Project ticket board", () => {
       } else {
         expect(within(card).getByText(/status:/)).toHaveClass("truncate");
       }
+
+      const triggers = card.querySelectorAll('[data-slot="hover-card-trigger"]');
+      expect(triggers).toHaveLength(needsResponse ? 1 : 2);
+      const trigger = triggers[needsResponse ? 0 : 1];
+      const label = trigger.textContent!;
+      const contentSelector = { selector: '[data-slot="hover-card-content"]' };
+      expect(trigger).toHaveAttribute("tabindex", "0");
+      expect(trigger).not.toHaveAttribute("title");
+      expect(trigger.closest("a")).toBe(card);
+      expect(screen.queryByText(label, contentSelector)).toBeNull();
+      fireEvent.pointerEnter(trigger, { pointerType: "mouse" });
+      const content = await screen.findByText(label, contentSelector);
+      expect(content).toHaveClass("bg-popover", "shadow-menu", "wrap-anywhere");
+      expect(content).toHaveAttribute("id", trigger.getAttribute("aria-describedby"));
+      expect(card).not.toContainElement(content);
+      fireEvent.click(content);
+      expect(screen.getByLabelText("Current location")).toBeEmptyDOMElement();
+      fireEvent.pointerLeave(trigger, { pointerType: "mouse" });
+      await waitFor(() => expect(screen.queryByText(label, contentSelector)).toBeNull());
+      fireEvent.focus(trigger);
+      expect(await screen.findByText(label, contentSelector)).toBeInTheDocument();
+      fireEvent.blur(trigger);
+      await waitFor(() => expect(screen.queryByText(label, contentSelector)).toBeNull());
+      fireEvent.click(source);
+      expect(screen.getByLabelText("Current location")).toHaveTextContent("?ticket=ticket");
 
       rerender(
         <ProjectTicketPanel
