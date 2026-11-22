@@ -5478,6 +5478,87 @@ describe("Sidebar view options", () => {
   });
 });
 
+describe("Sidebar pull request filter", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+  const pullRequest = (state: string, isDraft = false) => ({
+    url: "https://example.com/org/repo/pull/1",
+    provider: "github",
+    repository: "org/repo",
+    number: 1,
+    state,
+    is_draft: isDraft,
+  });
+  const rows = () => [
+    conv("conv_open", "Codex", { pull_request: pullRequest("OPEN"), pull_requests_synced: true }),
+    conv("conv_merged", "Codex", {
+      pull_request: pullRequest("MERGED"),
+      pull_requests_synced: true,
+    }),
+    conv("conv_none", "Codex", { pull_request: null, pull_requests_synced: true }),
+  ];
+  const renderWith = (savedViews: boolean | undefined) =>
+    renderSidebar(true, "/", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: {
+        ...FALLBACK_SERVER_INFO.features,
+        sidebar_grouping_ui: true,
+        ...(savedViews === undefined ? {} : { sidebar_saved_views: savedViews }),
+      },
+    });
+  const listed = () =>
+    within(screen.getByTestId("sidebar-conversation-list"))
+      .getAllByRole("link", { name: /^conv_/ })
+      .map((link) => link.textContent)
+      .sort();
+  const openMenu = () =>
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+
+  it.each([
+    ["off", false],
+    ["absent, as on an older server", undefined],
+  ])("is inert with the flag %s: no menu entry, no stored filter read or written", (_, flag) => {
+    localStorage.setItem("omnigent:session-pull-request-filter", "open");
+    const getItem = vi.spyOn(Storage.prototype, "getItem");
+    const setItem = vi.spyOn(Storage.prototype, "setItem");
+    mockConversations(rows());
+    renderWith(flag);
+    expect(listed()).toEqual(["conv_merged", "conv_none", "conv_open"]);
+    openMenu();
+    expect(screen.getByTestId("session-display-menu")).toBeInTheDocument();
+    expect(screen.queryByTestId("session-pull-request-filter-menu")).toBeNull();
+    const touched = (spy: typeof getItem | typeof setItem) =>
+      spy.mock.calls.some(([key]) => key === "omnigent:session-pull-request-filter");
+    expect(touched(getItem)).toBe(false);
+    expect(touched(setItem)).toBe(false);
+  });
+
+  it("narrows the list to the chosen pull requests, and keeps the choice", () => {
+    mockConversations(rows());
+    renderWith(true);
+    openMenu();
+    const menu = screen.getByTestId("session-pull-request-filter-menu");
+    expect(menu).toHaveTextContent("Pull request");
+    expect(menu).toHaveTextContent("All sessions");
+    fireEvent.keyDown(menu, { key: "ArrowRight" });
+    fireEvent.click(screen.getByTestId("session-pull-request-filter-open"));
+    expect(listed()).toEqual(["conv_open"]);
+    expect(localStorage.getItem("omnigent:session-pull-request-filter")).toBe("open");
+  });
+
+  it("starts from the stored choice", () => {
+    localStorage.setItem("omnigent:session-pull-request-filter", "none");
+    mockConversations(rows());
+    renderWith(true);
+    expect(listed()).toEqual(["conv_none"]);
+  });
+});
+
 describe("sidebar_grouping_ui release flag", () => {
   const SHARED_AND_OWNED = [
     conv("conv_mine", "Claude Code", {
