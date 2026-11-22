@@ -482,25 +482,6 @@ describe("pull request tab", () => {
     expect(onNavigate).not.toHaveBeenCalled();
   });
 
-  it("opens a link's file in Changes, and says it can't reach the line", async () => {
-    const { onNavigate } = renderView({
-      kind: "pull",
-      url: PR,
-      view: "changes",
-      path: "src/a.ts",
-      line: { start: 4 },
-    });
-    expect(captured.page?.target).toEqual({ path: "src/a.ts" });
-    expect(screen.getByRole("status")).toHaveTextContent(
-      "This link points at line 4, which this tab can't open yet. It shows src/a.ts in the pull request's changes instead.",
-    );
-    await userEvent.click(screen.getByRole("button", { name: "Show what's here" }));
-    expect(onNavigate).toHaveBeenCalledWith(
-      { kind: "pull", url: PR, view: "changes", path: "src/a.ts" },
-      { replace: true },
-    );
-  });
-
   it("hands the tab's landing to the page, so each Back or Forward onto it shows its target", () => {
     const landing = { settled: false, choices: 0 };
     renderView({ kind: "pull", url: PR, view: "commits", commit: "abcdef1" }, { landing });
@@ -518,7 +499,7 @@ describe("pull request tab", () => {
     const { onNavigate } = renderView({
       kind: "pull",
       url: PR,
-      view: "summary",
+      view: "changes",
       path: "src/a.ts",
       line: { start: 4 },
     });
@@ -528,7 +509,7 @@ describe("pull request tab", () => {
     );
     await userEvent.click(screen.getByRole("button", { name: "Show what's here" }));
     expect(onNavigate).toHaveBeenCalledWith(
-      { kind: "pull", url: PR, view: "summary" },
+      { kind: "pull", url: PR, view: "changes" },
       { replace: true },
     );
   });

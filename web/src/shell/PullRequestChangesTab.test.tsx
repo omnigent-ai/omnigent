@@ -284,21 +284,6 @@ function renderTab({
   };
 }
 
-/** The changed-file tree's row for `path`. */
-const treeButton = (path: string) =>
-  screen.getAllByTitle(path).find((element) => element.tagName === "BUTTON")!;
-
-/** Resolves once `count` animation frames have run. */
-function afterFrames(count: number): Promise<void> {
-  return new Promise((resolve) => {
-    const step = (left: number) => {
-      if (left === 0) resolve();
-      else requestAnimationFrame(() => step(left - 1));
-    };
-    step(count);
-  });
-}
-
 const findInput = () => screen.getByRole("textbox", { name: "Find in changes" });
 function openFind(query: string) {
   fireEvent.click(screen.getByRole("button", { name: "Find in changes" }));
@@ -843,82 +828,6 @@ describe("PullRequestChangesTab", () => {
     expect(screen.getByText("Search covers the fetched patch: 2 of 5 files")).toBeInTheDocument();
   });
 
-  it("opens a link's file in the pull request's own changes, clearing filters and the since view", async () => {
-    const conversationId = "link-file";
-    const store = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
-    act(() => {
-      store.result.current.setPathFilter("a.ts");
-      store.result.current.setHideViewed(true);
-      store.result.current.setSinceSha("c1");
-    });
-    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
-
-    renderTab({ conversationId, target: { path: "b.ts" } });
-
-    await waitFor(() =>
-      expect(scroll.mock.contexts).toContain(document.querySelector('[data-github-file="b.ts"]')),
-    );
-    expect(store.result.current).toMatchObject({
-      pathFilter: "",
-      hideViewed: false,
-      sinceSha: null,
-    });
-    expect(store.result.current.mode).toBe("changes");
-  });
-
-  it("scrolls to a link's file on a fresh mount with the files already read", async () => {
-    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
-    renderTab({ conversationId: "link-file-mount", target: { path: "c.ts" } });
-    await waitFor(() =>
-      expect(scroll.mock.contexts).toContain(document.querySelector('[data-github-file="c.ts"]')),
-    );
-  });
-
-  it("keeps a link's file waiting while the patch reads, and scrolls once it arrives", async () => {
-    const conversationId = "link-file-late-patch";
-    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
-    const tab = renderTab({ conversationId, target: { path: "b.ts" }, patch: "", loading: true });
-    // Longer than a reveal waits for a section to mount.
-    await act(() => afterFrames(40));
-    expect(scroll).not.toHaveBeenCalled();
-
-    tab.rerender(PATCH);
-
-    await waitFor(() =>
-      expect(scroll.mock.contexts).toContain(document.querySelector('[data-github-file="b.ts"]')),
-    );
-  });
-
-  it("lets the reader's own pick win over a link's file still waiting for its frame", async () => {
-    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
-    const tab = renderTab({ conversationId: "link-file-picked-frame", target: { path: "b.ts" } });
-
-    fireEvent.click(treeButton("c.ts"));
-    await act(() => afterFrames(3));
-
-    const header = (path: string) => document.querySelector(`[data-github-file="${path}"]`);
-    expect(scroll.mock.contexts).toContain(header("c.ts"));
-    expect(scroll.mock.contexts).not.toContain(header("b.ts"));
-    expect(tab.landing()?.settled).toBe(true);
-  });
-
-  it("lets the reader's own pick win over a link's file still waiting for its patch", async () => {
-    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
-    const tab = renderTab({
-      conversationId: "link-file-picked-patch",
-      target: { path: "b.ts" },
-      patch: "",
-      loading: true,
-    });
-    fireEvent.click(treeButton("c.ts"));
-
-    tab.rerender(PATCH);
-    await act(() => afterFrames(3));
-
-    expect(scroll.mock.contexts).not.toContain(document.querySelector('[data-github-file="b.ts"]'));
-    expect(tab.landing()?.settled).toBe(true);
-  });
-
   it("says a link's commit can't open where the pull request's commits don't show", () => {
     const conversationId = "link-commit-unsupported";
     const store = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
@@ -928,26 +837,6 @@ describe("PullRequestChangesTab", () => {
       id: "pr-commit-target-unavailable",
     });
     expect(store.result.current).toMatchObject({ mode: "changes", commitSha: null });
-  });
-
-  it("shows a link's file again on each landing, as Forward back onto it does", async () => {
-    const conversationId = "link-file-forward";
-    const store = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
-    const tab = renderTab({ conversationId, target: { path: "b.ts" } });
-    await waitFor(() => expect(tab.landing()?.settled).toBe(true));
-    act(() => store.result.current.setPathFilter("a.ts"));
-    // Shown again without a landing, as after a click on its tab, it keeps the reader's view.
-    tab.rerender(PATCH);
-    expect(store.result.current.pathFilter).toBe("a.ts");
-
-    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
-    const landing = tab.land();
-
-    await waitFor(() =>
-      expect(scroll.mock.contexts).toContain(document.querySelector('[data-github-file="b.ts"]')),
-    );
-    expect(store.result.current.pathFilter).toBe("");
-    expect(landing?.settled).toBe(true);
   });
 
   it("leaves the view as it is without a target or a landing", () => {
@@ -962,19 +851,6 @@ describe("PullRequestChangesTab", () => {
     const landing = tab.land();
     expect(landing?.settled).toBe(false);
     expect(store.result.current).toMatchObject({ pathFilter: "a.ts", mode: "changes" });
-  });
-
-  it("shows nothing for a target without a landing, as a restored tab after a reload", async () => {
-    const conversationId = "link-reload";
-    const store = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
-    act(() => store.result.current.setPathFilter("a.ts"));
-    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
-
-    renderTab({ conversationId, target: { path: "b.ts" }, landed: false });
-    await act(() => afterFrames(1));
-
-    expect(store.result.current.pathFilter).toBe("a.ts");
-    expect(scroll).not.toHaveBeenCalled();
   });
 
   it("scrolls to a file header when the first match is a path match", () => {
@@ -2063,43 +1939,18 @@ describe("PullRequestChangesTab commits", () => {
     expect(store.result.current).toMatchObject({ mode: "commit", commitSha: SHA_B });
   });
 
-  it("leaves an open commit for a link's file, and still scrolls to it", async () => {
-    const conversationId = "link-file-from-commit";
+  it("leaves a restored tab's view as it is, with a target but no landing", () => {
+    const conversationId = "link-reload";
     const store = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
-    act(() => store.result.current.openCommit(SHA_A));
-    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
-
     renderTab({
       conversationId,
       commitHistory: true,
       listing: { head_sha: "head" },
-      target: { path: "c.ts" },
+      target: { commit: SHA_B },
+      landed: false,
     });
 
-    await waitFor(() =>
-      expect(scroll.mock.contexts).toContain(document.querySelector('[data-github-file="c.ts"]')),
-    );
     expect(store.result.current).toMatchObject({ mode: "changes", commitSha: null });
-  });
-
-  it("leaves a commit the reader opens while a link's file waits for its patch", async () => {
-    const conversationId = "link-file-reader-commit";
-    const store = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
-    const tab = renderTab({
-      conversationId,
-      commitHistory: true,
-      listing: { head_sha: "head" },
-      target: { path: "c.ts" },
-      patch: "",
-      loading: true,
-    });
-    act(() => store.result.current.openCommit(SHA_A));
-
-    tab.rerender(PATCH);
-    await act(() => afterFrames(3));
-
-    expect(store.result.current).toMatchObject({ mode: "commit", commitSha: SHA_A });
-    expect(tab.landing()?.settled).toBe(true);
   });
 
   it("shows the commit list for a link to a commit the pull request doesn't have", () => {

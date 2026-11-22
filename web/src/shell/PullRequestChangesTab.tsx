@@ -79,7 +79,7 @@ import {
   unquoteGitPath,
   type Match,
 } from "./pullRequestReview";
-import { type ChangesViewState, useChangesViewState, type FindState } from "./useChangesViewState";
+import { useChangesViewState, type FindState } from "./useChangesViewState";
 import { useCommitViewState } from "./useCommitViewState";
 
 /** Index of the match a step moves to; with none active, the first or last by direction. */
@@ -468,10 +468,12 @@ function parsePatchByPath(
   return { filesByPath, parseError: undefined };
 }
 
-/** A place in the pull request a link names: one of its commits, or one of its changed files. */
-export type PullRequestChangesTarget = { commit: string } | { path: string };
+/** A place in the pull request a link names: one of its commits. */
+export interface PullRequestChangesTarget {
+  commit: string;
+}
 
-/** A tab's landing on its place; the Changes tab marks it settled once it shows the target. */
+/** A tab's landing on its place; the Changes tab marks it settled once it handles the target. */
 export interface PullRequestChangesLanding {
   settled: boolean;
 }
@@ -482,96 +484,29 @@ export function commitTargetUnavailable(commit: string): string {
 }
 
 /**
- * Shows a link's commit or file once per landing. A commit opens once its list can say whether
- * commits show here, and says so when they don't. A file shows in the PR's own changes,
- * unfiltered, once its patch is read; its jump waits a frame, so the tab's reset of a jump on
- * a view change, which runs after this, can't cancel it. While it waits, any jump or view
- * change of the reader's own wins, and the landing ends without its jump.
+ * Opens a link's commit once per landing, once the list can say whether commits show here,
+ * and says so when they don't.
  */
 function ShowChangesTarget({
   target,
   landing,
   listed,
-  patchRead,
   commitsSupported,
-  view,
-  readerJumps,
-  revealFile,
+  openCommit,
 }: {
   target: PullRequestChangesTarget;
   landing: PullRequestChangesLanding;
   /** The tab is selected and its changed files are read. */
   listed: boolean;
-  /** The PR's patch is read, so the file's section can mount. */
-  patchRead: boolean;
   commitsSupported: boolean;
-  view: ChangesViewState;
-  /** Counts the reader's own jumps; one since the landing began supersedes it. */
-  readerJumps: React.RefObject<number>;
-  revealFile: (path: string) => void;
+  openCommit: (commitSha: string) => void;
 }) {
-  const { mode, sinceSha, openCommit, setMode, setSinceSha, setPathFilter, setHideViewed } = view;
-  // What this landing saw as it began: the reader's jump count, and the view it expects.
-  const begun = useRef<{
-    landing: PullRequestChangesLanding;
-    jumps: number;
-    view: string | null;
-  }>(null);
-  const shownView = `${commitsSupported ? mode : "changes"}:${sinceSha ?? ""}`;
   useEffect(() => {
-    if (landing.settled) return;
-    if (begun.current?.landing !== landing) {
-      begun.current = { landing, jumps: readerJumps.current, view: null };
-    }
-    const started = begun.current;
-    const superseded = () => readerJumps.current !== started.jumps;
-    if (superseded()) {
-      landing.settled = true;
-      return;
-    }
-    // The view is known once the list is read; one this landing didn't ask for is the reader's.
-    if (!listed) return;
-    started.view ??= shownView;
-    if (shownView !== started.view) {
-      landing.settled = true;
-      return;
-    }
-    if ("commit" in target) {
-      landing.settled = true;
-      if (commitsSupported) openCommit(target.commit);
-      else toast(commitTargetUnavailable(target.commit), { id: "pr-commit-target-unavailable" });
-      return;
-    }
-    if (shownView !== "changes:") {
-      started.view = "changes:";
-      setMode("changes");
-      setSinceSha(null);
-      return;
-    }
-    if (!patchRead) return;
-    const frame = requestAnimationFrame(() => {
-      landing.settled = true;
-      if (superseded()) return;
-      setPathFilter("");
-      setHideViewed(false);
-      revealFile(target.path);
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [
-    target,
-    landing,
-    listed,
-    patchRead,
-    commitsSupported,
-    shownView,
-    openCommit,
-    setMode,
-    setSinceSha,
-    setPathFilter,
-    setHideViewed,
-    readerJumps,
-    revealFile,
-  ]);
+    if (landing.settled || !listed) return;
+    landing.settled = true;
+    if (commitsSupported) openCommit(target.commit);
+    else toast(commitTargetUnavailable(target.commit), { id: "pr-commit-target-unavailable" });
+  }, [target, landing, listed, commitsSupported, openCommit]);
   return null;
 }
 
@@ -606,7 +541,7 @@ export function PullRequestChangesTab({
   reviews: ReturnType<typeof usePullRequestReviewThreads>;
   /** The PR's server identity, for the viewed-file key; null when unknown. */
   identity: PullRequestIdentity | null;
-  /** A commit or file a link opened this tab at, shown once for each landing on it. */
+  /** A commit a link opened this tab at, opened once for each landing on it. */
   target?: PullRequestChangesTarget;
   /** The tab's latest landing on its place, by an open or a Back or Forward step. */
   landing?: PullRequestChangesLanding;
@@ -1155,22 +1090,13 @@ export function PullRequestChangesTab({
   }, [visibleFiles]);
 
   // Jumping to a collapsed file also expands it, so the click lands on its diff.
-  const revealFile = useCallback(
+  const jumpTo = useCallback(
     (path: string) => {
       setActivePath(path);
       revealPane(path);
       setPendingReveal({ path });
     },
     [revealPane],
-  );
-  // The reader's own jumps, by file, conversation or find; a link's jump still waiting yields to one.
-  const readerJumps = useRef(0);
-  const jumpTo = useCallback(
-    (path: string) => {
-      readerJumps.current += 1;
-      revealFile(path);
-    },
-    [revealFile],
   );
 
   // A filtered-out target is visible only after the filter clears. With no filter left to
@@ -1263,7 +1189,6 @@ export function PullRequestChangesTab({
   useEffect(() => {
     if (!findOpen || findTarget || !matches.length || deferredQuery !== query) return;
     const seeded = matches[firstMatchAtOrBelow(matches, visiblePaths, activePath)];
-    readerJumps.current += 1;
     setFindTarget(seeded);
     if (seeded.target.kind === "path") setPendingReveal({ path: seeded.target.path });
   }, [findOpen, findTarget, matches, visiblePaths, activePath, deferredQuery, query]);
@@ -1279,7 +1204,6 @@ export function PullRequestChangesTab({
     // With no active match yet, the first step lands on the first or last match by direction.
     const next = matches[stepTarget(activeIndex, direction, matches.length)];
     // A fresh object, so stepping to the sole match again is a new reveal request.
-    readerJumps.current += 1;
     setFindTarget({ ...next });
     if (next.target.kind === "path") setPendingReveal({ path: next.target.path });
   };
@@ -1494,11 +1418,8 @@ export function PullRequestChangesTab({
           target={target}
           landing={landing}
           listed={selected && !!changes.data}
-          patchRead={!!prDiff.data && !prDiff.isLoading}
           commitsSupported={commitsSupported}
-          view={view}
-          readerJumps={readerJumps}
-          revealFile={revealFile}
+          openCommit={view.openCommit}
         />
       )}
       {reviewing &&

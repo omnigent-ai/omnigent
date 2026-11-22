@@ -168,24 +168,21 @@ describe("pull request parts the tab can't show yet", () => {
     expect(shownPullRequestPlace(place)).toEqual({ kind: "pull", url: PR, view: place.view });
   });
 
-  it("opens one commit in Commits, or one file in Changes, and names only a line it can't reach", () => {
+  it("opens one commit in Commits, and names a file in Changes, which it doesn't open", () => {
     const commit = { kind: "pull", url: PR, view: "commits", commit: "abcdef123" } as const;
     expect(pullRequestPageTarget(commit)).toEqual({ commit: "abcdef123" });
     expect(unshownPullRequestParts(commit)).toBeNull();
     expect(shownPullRequestPlace(commit)).toEqual(commit);
 
     const file = { kind: "pull", url: PR, view: "changes", path: "a.ts" } as const;
-    expect(pullRequestPageTarget(file)).toEqual({ path: "a.ts" });
-    expect(unshownPullRequestParts(file)).toBeNull();
-
-    const line = { ...file, line: { start: 4 } };
-    expect(unshownPullRequestParts(line)).toBe(
-      "This link points at line 4, which this tab can't open yet. It shows a.ts in the pull request's changes instead.",
+    expect(pullRequestPageTarget(file)).toBeNull();
+    expect(unshownPullRequestParts(file)).toBe(
+      "This link points at a.ts, which this tab can't open yet. It shows all of the pull request's changes instead.",
     );
-    expect(shownPullRequestPlace(line)).toEqual(file);
+    expect(shownPullRequestPlace(file)).toEqual({ kind: "pull", url: PR, view: "changes" });
   });
 
-  it("opens nothing for a file beside a commit, or a file or commit outside its section", () => {
+  it("opens nothing for a file, or a commit outside Commits", () => {
     for (const place of [
       { kind: "pull", url: PR, view: "changes", path: "a.ts", commit: "abcdef123" },
       { kind: "pull", url: PR, view: "summary", path: "a.ts" },

@@ -162,30 +162,23 @@ export function pullRequestSectionChosen(
 
 const SECTION_NAMES = { summary: "summary", comments: "comments" } as const;
 
-/**
- * What a pull request place opens in its page: one commit in Commits, or one file of the
- * pull request's own changes. A file named beside a commit is neither.
- */
+/** What a pull request place opens in its page: one commit in Commits. */
 export function pullRequestPageTarget(place: PullRequestPlace): PullRequestChangesTarget | null {
   if (place.kind !== "pull") return null;
   if (place.view === "commits" && place.commit !== undefined) return { commit: place.commit };
-  if (place.view === "changes" && place.path !== undefined && place.commit === undefined) {
-    return { path: place.path };
-  }
   return null;
 }
 
 /**
- * Parts of a pull request place its page can't show: a line, a file or commit it doesn't
- * open, or the checks. The tab names them and what it shows instead, rather than quietly
- * showing something else.
+ * Parts of a pull request place its page can't show: a file or line in its changes, a commit
+ * it doesn't open, or the checks. The tab names them and what it shows instead, rather than
+ * quietly showing something else.
  */
 export function unshownPullRequestParts(place: PullRequestPlace): string | null {
   if (place.kind !== "pull") return null;
   const target = pullRequestPageTarget(place);
-  const opensFile = target !== null && "path" in target;
   const parts: string[] = [];
-  if (place.path !== undefined && !opensFile) {
+  if (place.path !== undefined) {
     parts.push(place.line ? `${place.path} line ${place.line.start}` : place.path);
   } else if (place.line) {
     parts.push(`line ${place.line.start}`);
@@ -197,14 +190,11 @@ export function unshownPullRequestParts(place: PullRequestPlace): string | null 
   if (parts.length === 0) return null;
   const named =
     parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`;
-  const shown =
-    target && "path" in target
-      ? `${target.path} in the pull request's changes`
-      : target
-        ? `commit ${target.commit.slice(0, 7)}`
-        : place.view === "changes" || place.view === "commits"
-          ? "all of the pull request's changes"
-          : `the pull request's ${SECTION_NAMES[place.view]}`;
+  const shown = target
+    ? `commit ${target.commit.slice(0, 7)}`
+    : place.view === "changes" || place.view === "commits"
+      ? "all of the pull request's changes"
+      : `the pull request's ${SECTION_NAMES[place.view]}`;
   return `This link points at ${named}, which this tab can't open yet. It shows ${shown} instead.`;
 }
 
