@@ -7,8 +7,10 @@ shape using minimal real-type stubs — no MagicMock.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import uuid
+from collections.abc import Iterator
 from typing import Any, Literal
 
 import httpx
@@ -24,6 +26,7 @@ from omnigent.entities import (
     ConversationItem,
     MessageData,
     PagedList,
+    SlashCommandData,
     StoredFile,
 )
 from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, OmnigentError
@@ -45,6 +48,7 @@ from omnigent.server.managed_hosts import (
     resolve_managed_agent_label,
 )
 from omnigent.server.routes import _session_create_validation as create_validation
+from omnigent.server.routes._sessions.orchestration import _mark_dispatch_in_flight
 from omnigent.server.routes.sessions import create_sessions_router, routes_core
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
@@ -563,6 +567,7 @@ def _make_item(
     response_id: str = "resp_001",
     role: Literal["user", "assistant"] = "user",
     is_meta: bool = False,
+    user_authored: bool = False,
 ) -> ConversationItem:
     """
     Build a minimal ConversationItem for testing.
@@ -573,6 +578,8 @@ def _make_item(
     :param role: Message role, ``"user"`` or ``"assistant"``.
     :param is_meta: Whether the message is an internal record, such as a task
         notification, rather than something a person sent.
+    :param user_authored: Whether a person wrote an ``is_meta`` message, such as
+        the prompt of a skill they ran.
     :returns: A ConversationItem.
     """
     return ConversationItem(
@@ -588,6 +595,7 @@ def _make_item(
             ],
             agent="test-agent" if role == "assistant" else None,
             is_meta=is_meta,
+            user_authored=user_authored,
         ),
     )
 
@@ -696,65 +704,170 @@ def test_normal_fork_does_not_copy_side_chat_routing_source() -> None:
     assert response.json()["side_chat_parent_id"] is None
 
 
+def _side_chat_fork_history(*later: str) -> list[ConversationItem]:
+    """
+    Build a finished exchange followed by items of a later turn.
+
+    :param later: Item kinds to append, in order: ``"request"``, ``"skill"``,
+        ``"skill_prompt"``, ``"progress"`` or ``"notice"``.
+    :returns: The source session's items.
+    """
+    items = [
+        _make_item("msg_earlier", "Remember the codename", response_id="resp_001"),
+        _make_item("msg_reply", "Noted", response_id="resp_002", role="assistant"),
+    ]
+    for kind in later:
+        if kind == "request":
+            items.append(_make_item("msg_running", "Run the long command", response_id="resp_003"))
+        elif kind == "skill":
+            items.append(
+                ConversationItem(
+                    id="msg_skill",
+                    type="slash_command",
+                    status="completed",
+                    response_id="resp_003",
+                    created_at=1,
+                    data=SlashCommandData(agent="test-agent", name="review", arguments=""),
+                )
+            )
+        elif kind == "skill_prompt":
+            items.append(
+                _make_item(
+                    "msg_skill_prompt",
+                    "Review the parser",
+                    response_id="resp_003",
+                    is_meta=True,
+                    user_authored=True,
+                )
+            )
+        elif kind == "progress":
+            items.append(
+                _make_item(
+                    "msg_progress", "Running it now", response_id="resp_004", role="assistant"
+                )
+            )
+        else:
+            items.append(
+                _make_item(
+                    "msg_notice", "Background task done", response_id="resp_005", is_meta=True
+                )
+            )
+    return items
+
+
+@contextlib.contextmanager
+def _delivering(conversation_id: str, delivery: str | None) -> Iterator[None]:
+    """
+    Hold a message on its way to *conversation_id*'s runner.
+
+    :param conversation_id: Source session id.
+    :param delivery: ``"dispatch"`` (before a runner takes it), ``"turn_start"``
+        or ``"follow_up"`` (a pending native input), or ``None``.
+    """
+    if delivery == "dispatch":
+        with _mark_dispatch_in_flight(conversation_id):
+            yield
+        return
+    message = [{"type": "input_text", "text": "Next message"}]
+    pending_id = None
+    if delivery == "turn_start":
+        pending_id = pending_inputs.record(conversation_id, message)
+    elif delivery == "follow_up":
+        pending_id = pending_inputs.record(conversation_id, message, queued_during_turn=True)
+    try:
+        yield
+    finally:
+        if pending_id is not None:
+            pending_inputs.resolve(conversation_id, pending_id)
+
+
 @pytest.mark.parametrize(
-    ("side_chat", "live_status", "history", "pending", "cutoff", "clones_native"),
+    ("side_chat", "live_status", "turn", "delivery", "cutoff", "pinned_to", "clones_native"),
     [
-        (True, "running", "running", None, "msg_running", False),
-        (True, "waiting", "running", None, "msg_running", False),
-        # A task notification during the turn is not a new request.
-        (True, "running", "notified", None, "msg_running", False),
-        # A follow-up still on its way leaves the running request in history.
-        (True, "running", "running", "follow_up", "msg_running", False),
-        # The message starting the turn is still on its way, so not in history.
-        (True, "running", "answered", "turn_start", None, False),
-        (True, "idle", "answered", "turn_start", None, False),
-        (True, "idle", "answered", None, None, True),
-        (True, "failed", "answered", None, None, True),
-        (False, "running", "running", None, None, True),
+        # The running turn's request, and everything after it, is left out.
+        (True, "running", ("request", "progress"), None, "msg_running", None, False),
+        (True, "waiting", ("request", "progress"), None, "msg_running", None, False),
+        (True, "running", ("request", "progress", "notice"), None, "msg_running", None, False),
+        (True, "running", ("skill", "progress"), None, "msg_skill", None, False),
+        (True, "running", ("skill_prompt", "progress"), None, "msg_skill_prompt", None, False),
+        (True, "running", ("request", "progress"), "follow_up", "msg_running", None, False),
+        (True, "idle", ("request",), "dispatch", "msg_running", None, False),
+        # The request is not in history yet, so the copy stops at what is.
+        (True, "running", (), "turn_start", None, "resp_002", False),
+        (True, "idle", (), "turn_start", None, "resp_002", False),
+        (True, "idle", (), "dispatch", None, "resp_002", False),
+        # Nothing is in flight, or this is a regular fork.
+        (True, "idle", (), None, None, None, True),
+        (True, "failed", (), None, None, None, True),
+        (False, "running", ("request", "progress"), None, None, None, True),
     ],
 )
 def test_side_chat_forked_mid_turn_leaves_out_the_running_request(
     side_chat: bool,
     live_status: str,
-    history: str,
-    pending: str | None,
+    turn: tuple[str, ...],
+    delivery: str | None,
     cutoff: str | None,
+    pinned_to: str | None,
     clones_native: bool,
 ) -> None:
-    """Only a side chat skips the request its source is still answering."""
+    """Only a side chat leaves out a request its source is answering or about to answer."""
     source = _make_conversation()
     source.live_status = live_status
-    items = [
-        _make_item("msg_earlier", "Remember the codename", response_id="resp_001"),
-        _make_item("msg_reply", "Noted", response_id="resp_002", role="assistant"),
-    ]
-    if history != "answered":
-        items += [
-            _make_item("msg_running", "Run the long command", response_id="resp_003"),
-            _make_item("msg_progress", "Running it now", response_id="resp_004", role="assistant"),
-        ]
-    if history == "notified":
-        items.append(
-            _make_item("msg_notice", "Background task done", response_id="resp_005", is_meta=True)
-        )
-    store = _ConversationStore({source.id: source}, items_by_conv={source.id: items})
+    store = _ConversationStore(
+        {source.id: source}, items_by_conv={source.id: _side_chat_fork_history(*turn)}
+    )
     client = TestClient(_build_app(store))
-    message = [{"type": "input_text", "text": "Next message"}]
-    pending_id = None
-    if pending == "turn_start":
-        pending_id = pending_inputs.record(source.id, message)
-    elif pending == "follow_up":
-        pending_id = pending_inputs.record(source.id, message, queued_during_turn=True)
-    try:
+
+    with _delivering(source.id, delivery):
         response = client.post(f"/v1/sessions/{source.id}/fork", json={"side_chat": side_chat})
-    finally:
-        if pending_id is not None:
-            pending_inputs.resolve(source.id, pending_id)
 
     assert response.status_code == 201, response.text
     assert store.fork_calls[-1]["before_item_id"] == cutoff
+    assert store.fork_calls[-1]["up_to_response_id"] == pinned_to
     # A running source's native transcript holds the request the side chat leaves out.
     assert store.fork_calls[-1]["resume_source_native_session"] is clones_native
+
+
+def test_side_chat_fork_ignores_a_request_that_lands_while_it_is_prepared() -> None:
+    """The history a side chat copies is fixed before the parent's request lands."""
+    source = _make_conversation()
+    source.live_status = "running"
+    store = _ConversationStore(
+        {source.id: source}, items_by_conv={source.id: _side_chat_fork_history()}
+    )
+    fork = store.fork_conversation
+
+    def mirror_then_fork(*args: Any, **kwargs: Any) -> Conversation:
+        store._items[source.id] += _side_chat_fork_history("request")[2:]
+        return fork(*args, **kwargs)
+
+    store.fork_conversation = mirror_then_fork  # type: ignore[method-assign]
+    client = TestClient(_build_app(store))
+
+    with _delivering(source.id, "turn_start"):
+        response = client.post(f"/v1/sessions/{source.id}/fork", json={"side_chat": True})
+
+    assert response.status_code == 201, response.text
+    assert [item["response_id"] for item in response.json()["items"]] == ["resp_001", "resp_002"]
+
+
+def test_side_chat_fork_keeps_history_when_the_request_is_out_of_reach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request beyond the bounded lookup leaves the history whole, never guessed."""
+    monkeypatch.setattr(routes_core, "_SIDE_CHAT_REQUEST_LOOKBACK", 2)
+    source = _make_conversation()
+    source.live_status = "running"
+    items = _side_chat_fork_history("request", "progress", "notice")
+    store = _ConversationStore({source.id: source}, items_by_conv={source.id: items})
+    client = TestClient(_build_app(store))
+
+    response = client.post(f"/v1/sessions/{source.id}/fork", json={"side_chat": True})
+
+    assert response.status_code == 201, response.text
+    assert store.fork_calls[-1]["before_item_id"] is None
+    assert store.fork_calls[-1]["up_to_response_id"] is None
 
 
 async def _side_chat_ids(client: httpx.AsyncClient, parent_id: str, **kwargs: Any) -> set[str]:
