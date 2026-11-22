@@ -339,6 +339,7 @@ function StageRow({
       <div className="grid min-w-0 flex-1 gap-2">
         <Input
           aria-label={`Stage name ${index + 1}`}
+          className="focus-visible:ring-0"
           required
           maxLength={60}
           value={stage.name}
@@ -348,6 +349,7 @@ function StageRow({
         />
         <Input
           aria-label={`Instructions for ${stage.name || `stage ${index + 1}`}`}
+          className="focus-visible:ring-0"
           value={stage.instructions}
           maxLength={500}
           disabled={pending}

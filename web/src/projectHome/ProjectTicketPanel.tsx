@@ -307,6 +307,7 @@ function TicketEditor({
         <Input
           autoFocus={!mobile}
           name="title"
+          className="focus-visible:ring-0"
           autoComplete="off"
           required
           maxLength={160}
@@ -322,6 +323,7 @@ function TicketEditor({
         </span>
         <Textarea
           name="description"
+          className="focus-visible:ring-0"
           rows={6}
           maxLength={3000}
           value={description}
@@ -773,6 +775,7 @@ function TicketPlan({ projectId, ticket }: { projectId: string; ticket: ProjectT
         >
           <Textarea
             aria-label="Plan"
+            className="focus-visible:ring-0"
             rows={7}
             maxLength={3000}
             value={plan}
@@ -844,7 +847,7 @@ function TicketCommentComposer({
         );
       }}
     >
-      <div className="rounded-xl border border-input bg-background focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/30">
+      <div className="rounded-xl border border-input bg-background focus-within:border-ring">
         <Textarea
           name="comment"
           aria-label="Add a comment"
@@ -879,7 +882,7 @@ function TicketCommentComposer({
               autoComplete="off"
               spellCheck={false}
               maxLength={2048}
-              className="min-w-36 flex-1"
+              className="min-w-36 flex-1 focus-visible:ring-0"
               value={outputUrl}
               disabled={comment.isPending}
               onChange={(event) => setOutputUrl(event.target.value)}
@@ -991,6 +994,7 @@ function TagEditor({
         >
           <Input
             name="tag_key"
+            className="focus-visible:ring-0"
             autoComplete="off"
             aria-label="Tag key"
             placeholder="Key, e.g. needs-human…"
@@ -1002,6 +1006,7 @@ function TagEditor({
           />
           <Input
             name="tag_value"
+            className="focus-visible:ring-0"
             autoComplete="off"
             aria-label="Tag value"
             placeholder="Value (optional)…"

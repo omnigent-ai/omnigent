@@ -175,6 +175,7 @@ function TicketTextDialog({
             {label}
             <Textarea
               autoFocus
+              className="focus-visible:ring-0"
               required={required}
               maxLength={maxLength}
               value={summary}
