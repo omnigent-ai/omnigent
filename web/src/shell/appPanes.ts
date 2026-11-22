@@ -295,8 +295,10 @@ export function dropPaneInSplit(
 ): boolean {
   const target = mainSplitTarget(conversationId);
   if (isInMainSplit(conversationId, newKey)) return false;
+  // The panes may have changed since the preview: a maximized pane offers no spot, as the preview
+  // doesn't, and the room is checked again.
+  if (zoomedPaneKey(target) !== null) return false;
   const { axis, placement } = splitOfSide(drop.side);
-  // The panes may have changed since the preview: the drop checks the room again.
   if (!roomToSplit(target, drop.targetKey, axis, placement, agentKey)) return false;
   let inserted = false;
   target.update((current) => {

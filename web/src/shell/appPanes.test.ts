@@ -20,7 +20,7 @@ import {
   useAppPaneHosts,
   useAppPaneTitles,
 } from "./appPanes";
-import { toggleZoomedPane } from "./terminalPaneZoom";
+import { toggleZoomedPane, zoomedPaneKey } from "./terminalPaneZoom";
 import { mainSplitTarget } from "./terminalSplitTarget";
 import { terminalLayoutGeometry } from "@/lib/paneSplitLayout";
 
@@ -241,6 +241,23 @@ describe("dropping a sidebar tab on the panes", () => {
     }));
     toggleZoomedPane(mainSplitTarget(conversationId));
     expect(appPaneDropAt(conversationId, { x: 900, y: 250 }, AGENT)).toBeNull();
+  });
+
+  it("refuses a drop placed before a pane was maximized, changing nothing", () => {
+    const conversationId = nextConversation();
+    placePanes(conversationId);
+    updatePaneSplit(conversationId, () => ({
+      layout: { axis: "columns", ratio: 0.5, children: [AGENT, SHELL] },
+      focusedKey: SHELL,
+    }));
+    const drop = appPaneDropAt(conversationId, { x: 980, y: 250 }, AGENT);
+    expect(drop).not.toBeNull();
+    const target = mainSplitTarget(conversationId);
+    toggleZoomedPane(target);
+    const before = readPaneSplit(conversationId);
+    expect(dropTabAsPane(conversationId, "files", drop!, AGENT)).toBe(false);
+    expect(readPaneSplit(conversationId)).toEqual(before);
+    expect(zoomedPaneKey(target)).toBe(SHELL);
   });
 
   it("opens the tab on the side it met, taking focus, once", () => {
