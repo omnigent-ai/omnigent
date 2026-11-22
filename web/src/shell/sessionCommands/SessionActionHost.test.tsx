@@ -79,6 +79,13 @@ describe("SessionActionHost", () => {
     expect(writes.pin).toHaveBeenCalledWith({ id: "c1", pinned: true });
   });
 
+  it("reads a family pinned through its leader as pinned, as its row does", () => {
+    renderHost();
+    const family = { id: "f1", representative_id: "c1", pinned: true };
+    act(() => requestSessionAction({ ...SESSION, family }, "pin"));
+    expect(writes.pin).not.toHaveBeenCalled();
+  });
+
   it("marks the session unread as its row does", () => {
     renderHost();
     act(() => requestSessionAction(SESSION, "mark-unread"));
