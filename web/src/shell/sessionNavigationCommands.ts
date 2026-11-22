@@ -8,7 +8,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import { SidebarDataContext } from "@/hooks/useSidebarData";
 import {
   type SessionStepDirection,
-  steppedSessionId,
+  stepSidebarSession,
   useSidebarSessionOrderStore,
 } from "@/hooks/useSidebarSessionOrder";
 import { useNavigate } from "@/lib/routing";
@@ -39,9 +39,7 @@ export function useSessionNavigationCommands(): PaletteCommand[] {
   return useMemo<PaletteCommand[]>(() => {
     // Read when run, so a step taken after the list changed lands on the row shown now.
     const step = (direction: SessionStepDirection) => () => {
-      const { orderedSessionIds, activeSessionId } = useSidebarSessionOrderStore.getState();
-      const target = steppedSessionId(orderedSessionIds, activeSessionId, direction);
-      if (target && target !== activeSessionId) navigate(`/c/${target}`);
+      stepSidebarSession(direction, navigate);
     };
     return [
       {
