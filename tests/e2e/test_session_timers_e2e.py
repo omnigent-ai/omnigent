@@ -3,8 +3,8 @@
 A ``sys_timer_set`` timer of 2 minutes or more in a top-level session is one
 ``kind="timer"`` scheduled task on the server, whose scheduler delivers each firing
 into the same session as a hidden ``[System: timer <id> fired]`` message, across
-runner and server restarts. A shorter timer, or one in a sub-agent's session,
-stays in the runner's memory, and the tool's result says so. A mock model calls
+runner and server restarts. A shorter timer stays in the runner's memory, and
+the tool's result says so. A mock model calls
 the real tools; the server, runner, scheduler and tunnel are real processes,
 restarted mid-flight, and the server keeps its default 15 s poll.
 
@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -55,18 +55,10 @@ _TIMERS_FEATURE = {"OMNIGENT_FEATURES": "session_timers"}
 
 
 @contextmanager
-def _timer_stack(
-    tmp_path: Path, server_env: Mapping[str, str | None] | None = None
-) -> Iterator[tuple[ServerRunner, httpx.Client]]:
-    """A server and runner with a client that keeps background titles off the mock.
-
-    :param server_env: Server environment overrides, e.g.
-        ``{"OMNIGENT_RUNNER_TUNNEL_TOKEN": None}`` to admit any token-bound runner.
-    """
+def _timer_stack(tmp_path: Path) -> Iterator[tuple[ServerRunner, httpx.Client]]:
+    """A server and runner with a client that keeps background titles off the mock."""
     with (
-        server_runner(
-            tmp_path / "stack", server_env={**_TIMERS_FEATURE, **(server_env or {})}
-        ) as stack,
+        server_runner(tmp_path / "stack", server_env=_TIMERS_FEATURE) as stack,
         httpx.Client(
             base_url=stack.base_url,
             trust_env=False,
@@ -78,19 +70,8 @@ def _timer_stack(
         yield stack, client
 
 
-def _timer_session(
-    client: httpx.Client,
-    stack: ServerRunner,
-    mock_url: str,
-    model: str,
-    *,
-    on_host: bool = False,
-) -> str:
-    """Create a session whose agent has the timer tools.
-
-    :param on_host: Bind it to the stack's host, which launches its runner, instead of
-        to the stack's own runner.
-    """
+def _timer_session(client: httpx.Client, stack: ServerRunner, mock_url: str, model: str) -> str:
+    """Create a session whose agent has the timer tools, bound to the stack's runner."""
     spec = {
         "name": f"timer-agent-{model}",
         "prompt": "You set timers with sys_timer_set and cancel them with sys_timer_cancel.",
@@ -105,14 +86,10 @@ def _timer_session(
         client.post,
         "/v1/sessions",
         bundle_files({f"timer-agent-{model}.yaml": yaml.safe_dump(spec).encode()}),
-        metadata={"host_id": stack.host_id, "workspace": str(stack.workspace)}
-        if on_host
-        else None,
     )
     created.raise_for_status()
     session_id = str(created.json()["session_id"])
-    if not on_host:
-        bind_session_runner(client.patch, "", session_id, stack.runner_id)
+    bind_session_runner(client.patch, "", session_id, stack.runner_id)
     return session_id
 
 
@@ -240,6 +217,7 @@ def test_one_shot_timer_fires_once_after_runner_and_server_restarts(
         listed = client.get("/v1/scheduled-tasks").json()["scheduled_tasks"]
         assert timer_id not in {listed_task["id"] for listed_task in listed}
 
+        _wait_until_idle_before(client, session_id, fire_at)
         _restart_runner(stack, client)
         stack.restart_server()
         assert time.time() < fire_at, "the restarts outlasted the timer; lengthen it"

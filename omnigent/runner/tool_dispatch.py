@@ -4857,9 +4857,8 @@ def _has_subagent(
 
 
 # ── Timer dispatch ─────────────────────────────────────────────
-# A timer of DURABLE_TIMER_MIN_SECONDS or more in a top-level session is saved and fired by
-# the server, so it survives runner restarts. Others stay in this runner's memory. Both
-# check arguments with the same ``validate_timer_set_args``.
+# Long top-level timers are saved by the server, so they survive runner restarts; others
+# stay in this runner's memory. Both check arguments with ``validate_timer_set_args``.
 
 
 def _runner_timer_warning(reason: str) -> str:
