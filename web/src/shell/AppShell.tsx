@@ -3368,9 +3368,9 @@ function AppShellImpl() {
                 )}
                 style={
                   {
-                    "--workspace-panel-offset": workspacePanelVisible
-                      ? `${inlinePanelWidth}px`
-                      : "0px",
+                    // Only an inline rail takes room beside the header; below md it's a drawer.
+                    "--workspace-panel-offset":
+                      workspacePanelVisible && !mobileViewport ? `${inlinePanelWidth}px` : "0px",
                     "--omnigent-header-height": headerClearanceHidden ? "0px" : undefined,
                   } as CSSProperties
                 }
