@@ -450,6 +450,14 @@ conflicts = [
     [{ group = "lint" }, { extra = "antigravity" }],
 ]
 
+# wcmatch 10.1 has CVE-2026-132276 (GHSA-53pm-wgxf-c6qf), fixed in 11.2. e2b
+# 2.26 caps wcmatch below 11, and every e2b release that lifts the cap needs
+# connectrpc<0.13, which the `databricks` and `workspace-api` extras and the
+# test group cannot use. e2b only calls wcmatch's glob when building a
+# template, which omnigent never does, and that path behaves the same on 11.2.
+# Drop this once an e2b release accepts connectrpc 0.13.
+override-dependencies = ["wcmatch>=11.2,<12"]
+
 # Share the repository lockfile with standalone automation packages.
 [tool.uv.workspace]
 members = [".github/triage_v2"]
