@@ -50,6 +50,8 @@ export interface ShortcutPageContext {
   siblingSessions: boolean;
   /** The shell's menus hand desktop commands (Close, Pin, Quit) to the page. */
   desktopCommands: boolean;
+  /** quick_pick_palette is on, so Ctrl+Tab steps to the next session instead of switching. */
+  quickPick: boolean;
 }
 
 /** The registry's title and note for page group `id`. */
@@ -149,7 +151,9 @@ export function shortcutPageGroups(
       items: [
         // A browser tab keeps its own Back and Forward.
         ...when(context.electron, [
-          bound("sessions.recent"),
+          ...(context.quickPick
+            ? [bound("session.next"), bound("session.previous")]
+            : [bound("sessions.recent")]),
           bound("history.back"),
           bound("history.forward"),
         ]),

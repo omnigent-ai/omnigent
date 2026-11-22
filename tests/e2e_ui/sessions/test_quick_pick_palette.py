@@ -449,6 +449,34 @@ def test_quick_pick_deletes_the_project_a_new_session_starts_in(
     assert name not in _project_names(base_url)
 
 
+def _rendered_row_ids(page: Page) -> list[str]:
+    """Sidebar session row ids in render order, the first listing of each."""
+    ids = page.locator("li[data-sidebar-session-id]").evaluate_all(
+        "rows => rows.map(row => row.dataset.sidebarSessionId)"
+    )
+    return list(dict.fromkeys(ids))
+
+
+def test_quick_pick_ctrl_tab_steps_through_the_sidebar(
+    request: pytest.FixtureRequest, seeded_session_pair: tuple[str, str, str]
+) -> None:
+    """Ctrl+Tab opens the row below the open one and Ctrl+Shift+Tab returns, with no switcher."""
+    base_url, open_id, other_id = seeded_session_pair
+    page: Page = request.getfixturevalue("page")
+    enable_quick_pick_palette(page)
+    page.goto(f"{base_url}/c/{open_id}")
+    expect(page.locator(f'li[data-sidebar-session-id="{other_id}"]')).to_be_visible(timeout=30_000)
+    rows = _rendered_row_ids(page)
+    below = rows[(rows.index(open_id) + 1) % len(rows)]
+
+    page.keyboard.press("Control+Tab")
+    expect(page).to_have_url(re.compile(rf"/c/{below}$"), timeout=10_000)
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    page.keyboard.press("Control+Shift+Tab")
+    expect(page).to_have_url(re.compile(rf"/c/{open_id}$"), timeout=10_000)
+    expect(page.get_by_role("dialog")).to_have_count(0)
+
+
 def _viewer_unread(base_url: str, session_id: str) -> bool:
     """Read the server's ``viewer_unread`` for one session from ``GET /v1/sessions``."""
     response = httpx.get(f"{base_url}/v1/sessions", params={"visibility": "all"}, timeout=10.0)

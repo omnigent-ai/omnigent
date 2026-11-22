@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useSidebarSessionOrderStore } from "@/hooks/useSidebarSessionOrder";
 import type * as HotkeysModule from "@/lib/hotkeys";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
+import type { BrowserRecentSessionInput } from "@/lib/nativeBridge";
 import { AVAILABLE, type PaletteCommand, usePaletteCommandsStore } from "@/store/paletteCommands";
 
 import { QuickPickShortcutHost } from "./QuickPickShortcutHost";
@@ -19,9 +20,26 @@ vi.mock("@/lib/hotkeys", async (importOriginal) => ({
   ...(await importOriginal<typeof HotkeysModule>()),
   isMacPlatform: () => shell.mac,
 }));
+const bridge = vi.hoisted(() => ({
+  forward: null as ((input: BrowserRecentSessionInput) => void) | null,
+  supported: [] as boolean[],
+  cancelled: 0,
+}));
 vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   ...(await importOriginal<typeof NativeBridgeModule>()),
   supportsDesktopCommands: () => shell.menu,
+  onBrowserRecentSessionInput: (callback: (input: BrowserRecentSessionInput) => void) => {
+    bridge.forward = callback;
+    return () => {
+      bridge.forward = null;
+    };
+  },
+  setBrowserRecentSessionSwitchSupported: async (supported: boolean) => {
+    bridge.supported.push(supported);
+  },
+  cancelBrowserRecentSessionSwitch: async () => {
+    bridge.cancelled += 1;
+  },
 }));
 
 /** Register the open session's header row `id`, as its header does. */
@@ -53,6 +71,36 @@ const ARCHIVE = { key: "A", code: "KeyA", metaKey: true, shiftKey: true };
 const NEXT = { key: "ArrowDown", code: "ArrowDown", ctrlKey: true, altKey: true, shiftKey: true };
 const PREVIOUS = { key: "ArrowUp", code: "ArrowUp", ctrlKey: true, altKey: true, shiftKey: true };
 const press = (init: KeyboardEventInit) => fireEvent.keyDown(window, init);
+const CTRL_TAB = { key: "Tab", code: "Tab", ctrlKey: true };
+const CTRL_SHIFT_TAB = { ...CTRL_TAB, shiftKey: true };
+
+/** Focus a field inside a new element matching `markup`, such as a terminal. */
+function focusInside(attributes: Record<string, string>): () => void {
+  const surface = document.createElement("div");
+  for (const [name, value] of Object.entries(attributes)) surface.setAttribute(name, value);
+  const field = document.createElement("textarea");
+  surface.append(field);
+  document.body.append(surface);
+  act(() => field.focus());
+  return () => surface.remove();
+}
+
+/** A key the desktop shell forwards from an embedded Browser page. */
+function forwarded(input: Partial<BrowserRecentSessionInput>): void {
+  act(() =>
+    bridge.forward?.({
+      type: "keydown",
+      key: "Tab",
+      code: "Tab",
+      ctrlKey: true,
+      shiftKey: false,
+      altKey: false,
+      metaKey: false,
+      repeat: false,
+      ...input,
+    }),
+  );
+}
 
 beforeEach(() => {
   useSidebarSessionOrderStore.setState({
@@ -65,6 +113,7 @@ afterEach(() => {
   navigate.mockClear();
   usePaletteCommandsStore.setState({ groups: {} });
   Object.assign(shell, { openSession: null, mac: true, menu: false });
+  Object.assign(bridge, { forward: null, supported: [], cancelled: 0 });
 });
 
 describe("QuickPickShortcutHost", () => {
@@ -126,6 +175,52 @@ describe("QuickPickShortcutHost", () => {
     unmount();
     press(NEXT);
     expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("steps with Ctrl+Tab and Ctrl+Shift+Tab, with no switcher", () => {
+    render(<QuickPickShortcutHost />);
+    expect(press(CTRL_TAB)).toBe(false);
+    expect(press(CTRL_SHIFT_TAB)).toBe(false);
+    expect(navigate.mock.calls).toEqual([["/c/c"], ["/c/a"]]);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("takes Ctrl+Tab from a terminal, but leaves it to a dialog", () => {
+    render(<QuickPickShortcutHost />);
+    const removeTerminal = focusInside({ class: "xterm" });
+    press(NEXT);
+    expect(navigate).not.toHaveBeenCalled();
+    press(CTRL_TAB);
+    expect(navigate).toHaveBeenCalledWith("/c/c");
+    removeTerminal();
+
+    navigate.mockClear();
+    const removeDialog = focusInside({ role: "dialog" });
+    expect(press(CTRL_TAB)).toBe(true);
+    expect(navigate).not.toHaveBeenCalled();
+    removeDialog();
+  });
+
+  it("steps once for a held Ctrl+Tab and swallows its repeats", () => {
+    render(<QuickPickShortcutHost />);
+    press(CTRL_TAB);
+    expect(press({ ...CTRL_TAB, repeat: true })).toBe(false);
+    expect(press({ ...CTRL_TAB, repeat: true })).toBe(false);
+    expect(navigate).toHaveBeenCalledTimes(1);
+  });
+
+  it("steps for Ctrl+Tab forwarded from a Browser page and clears the shell's latch", () => {
+    const { unmount } = render(<QuickPickShortcutHost />);
+    expect(bridge.supported).toEqual([true]);
+    forwarded({});
+    forwarded({ shiftKey: true });
+    forwarded({ repeat: true });
+    forwarded({ type: "keyup", key: "Control" });
+    expect(navigate.mock.calls).toEqual([["/c/c"], ["/c/a"]]);
+    expect(bridge.cancelled).toBe(3);
+    unmount();
+    expect(bridge.supported).toEqual([true, false]);
+    expect(bridge.forward).toBeNull();
   });
 
   it("runs the open session's header rows from the menu's keys, in their current state", () => {

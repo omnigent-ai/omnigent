@@ -13,7 +13,16 @@ vi.mock("./CommandPalette", () => ({
 }));
 vi.mock("@/components/KeyboardShortcutsDialog", () => ({ KeyboardShortcutsDialog: () => null }));
 vi.mock("@/components/onboarding/HostImportReview", () => ({ ImportReviewGate: () => null }));
-vi.mock("./RecentSessionsSwitcher", () => ({ RecentSessionsSwitcher: () => null }));
+vi.mock("./RecentSessionsSwitcher", () => ({
+  RecentSessionsSwitcher: ({ enabled }: { enabled: boolean }) => (
+    <div data-testid="recent-sessions-switcher" data-enabled={String(enabled)} />
+  ),
+}));
+// The desktop shell, where the recent switcher takes Ctrl+Tab.
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  isElectronShell: () => true,
+}));
 
 afterEach(cleanup);
 // Which flagged modules this case imported. Each case loads the shell and these mocks afresh,
@@ -75,6 +84,19 @@ async function renderOverlays(
     </QueryClientProvider>,
   );
 }
+
+describe("AppShellOverlays recent sessions switcher", () => {
+  it.each([
+    ["off", { quick_pick_palette: false }, "true"],
+    ["on", { quick_pick_palette: true }, "false"],
+  ] as const)(
+    "takes Ctrl+Tab in the desktop app only with quick_pick_palette %s",
+    async (_state, features, enabled) => {
+      const { getByTestId } = await renderOverlays(features);
+      expect(getByTestId("recent-sessions-switcher").dataset.enabled).toBe(enabled);
+    },
+  );
+});
 
 describe("AppShellOverlays palette flag", () => {
   const notOn = [

@@ -273,6 +273,12 @@ the header menu), and each place is a separate entry point.
   uses the latest summary, retained context and subsequent turns.
 - `recent-switcher`: the desktop app opens the five most recent sessions with
   Control+Tab; Tab and Shift+Tab cycle, releasing Control switches, and Escape cancels.
+  With `quick_pick_palette` on, Control+Tab and Control+Shift+Tab instead open the
+  next or previous sidebar session at once, as ⌘K's Next session and Previous session
+  do, with no switcher. They step from a focused terminal or editor and from the
+  desktop app's Browser panes, but not from a dialog; a held chord steps once
+  (`web/src/shell/quickPickShortcuts/QuickPickShortcutHost.test.tsx`,
+  `tests/e2e_ui/sessions/test_quick_pick_palette.py::test_quick_pick_ctrl_tab_steps_through_the_sidebar`).
 - `browser-storage`: browser soft tabs, including one opened by the agent, share
   cookies within a session; different sessions stay isolated. Navigation stays
   per-tab. On macOS the browser toolbar can also import cookies from a local
@@ -873,6 +879,8 @@ create or select a closable Browser soft tab automatically.
 **Desktop recent sessions:** hold Control and press Tab to open the five most
 recent sessions. Continue pressing Tab (or Shift+Tab) to cycle, release Control
 to switch, or press Escape to cancel.
+With `quick_pick_palette` on, Control+Tab opens the next sidebar session instead,
+and Control+Shift+Tab the previous one.
 
 ## Driving it with the repro environment
 
