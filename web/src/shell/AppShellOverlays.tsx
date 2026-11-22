@@ -119,14 +119,21 @@ export function AppShellOverlays({
           <ThemePicker />
         </Suspense>
       )}
-      {/* Carries out a session's action picked from ⌘↵ on its ⌘K row, and the project in view's. */}
+      {/* Carry out a session's action picked from ⌘↵ on its ⌘K row, and the project in view's.
+          The key hosts get their own boundaries, so their chords work without waiting for these. */}
       {quickPick && (
-        <Suspense fallback={null}>
-          <SessionActionHost />
-          <ProjectActionHost />
-          <RecentSessionSwitchHost />
-          <QuickPickShortcutHost />
-        </Suspense>
+        <>
+          <Suspense fallback={null}>
+            <SessionActionHost />
+            <ProjectActionHost />
+          </Suspense>
+          <Suspense fallback={null}>
+            <QuickPickShortcutHost />
+          </Suspense>
+          <Suspense fallback={null}>
+            <RecentSessionSwitchHost />
+          </Suspense>
+        </>
       )}
       {/* With quick_pick_palette on, Ctrl+Tab steps through the sidebar instead. */}
       <RecentSessionsSwitcher
