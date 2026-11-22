@@ -1556,8 +1556,11 @@ async def _collect_descendant_conversation_ids_paged(
     root_id: str,
 ) -> list[str]:
     """
-    Return every sub-agent descendant of ``root_id``, reading each parent's
-    children in bounded pages.
+    Return every sub-agent descendant of ``root_id`` that can be listed,
+    reading each parent's children in bounded pages.
+
+    A parent whose children can't be listed is logged and skipped; the
+    descendants already found and the rest of the tree are kept.
 
     :param conversation_store: Store for child-id lookup.
     :param root_id: Root session/conversation identifier.
@@ -1571,12 +1574,20 @@ async def _collect_descendant_conversation_ids_paged(
         for parent_id in frontier:
             after: tuple[int, str] | None = None
             while True:
-                page = await asyncio.to_thread(
-                    conversation_store.list_child_conversation_ids_page,
-                    parent_id,
-                    after=after,
-                    limit=_DESCENDANT_PAGE_SIZE,
-                )
+                try:
+                    page = await asyncio.to_thread(
+                        conversation_store.list_child_conversation_ids_page,
+                        parent_id,
+                        after=after,
+                        limit=_DESCENDANT_PAGE_SIZE,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _logger.warning(
+                        "Failed to list the sub-agents of session %s for file cleanup: %s",
+                        parent_id,
+                        type(exc).__name__,
+                    )
+                    break
                 for child_id, _created_at in page:
                     if child_id not in seen:
                         seen.add(child_id)
@@ -1598,9 +1609,12 @@ async def _delete_one_session_files(
     deleting_session_id: str,
 ) -> tuple[int, int]:
     """
-    Delete one session's file rows in bounded batches, with each batch's orphaned blobs.
+    Delete one session's file rows in bounded batches, then its unshared blobs.
 
-    A row-deletion failure propagates; a blob that won't delete is logged and skipped.
+    Blobs are checked only once the session's rows are gone, so no check
+    scans them. A row-deletion failure propagates after the blobs of the rows
+    already deleted are handled; a blob that can't be checked or deleted is
+    logged and skipped.
 
     :param file_store: Store of the session's file rows.
     :param artifact_store: Store of the file bytes.
@@ -1608,28 +1622,49 @@ async def _delete_one_session_files(
     :param deleting_session_id: The session being deleted, for log lines.
     :returns: How many orphaned blobs were attempted, and how many failed.
     """
+    blob_keys: set[str] = set()
+    failure: Exception | None = None
+    try:
+        while True:
+            deleted, batch_blob_keys = await asyncio.to_thread(
+                file_store.delete_session_files_batch,
+                owner_id,
+                limit=_SESSION_FILE_DELETE_BATCH_SIZE,
+            )
+            blob_keys.update(batch_blob_keys)
+            if deleted < _SESSION_FILE_DELETE_BATCH_SIZE:
+                break
+    except Exception as exc:  # noqa: BLE001
+        failure = exc
     attempted_blob_count = 0
     failed_blob_count = 0
-    while True:
-        deleted, orphaned_blob_keys = await asyncio.to_thread(
-            file_store.delete_session_files_batch,
-            owner_id,
-            limit=_SESSION_FILE_DELETE_BATCH_SIZE,
-        )
-        for blob_key in orphaned_blob_keys:
-            attempted_blob_count += 1
-            try:
-                await asyncio.to_thread(artifact_store.delete, blob_key)
-            except Exception as exc:  # noqa: BLE001
-                failed_blob_count += 1
-                _logger.warning(
-                    "Failed to delete attachment blob %s for session %s: %s",
-                    blob_key,
-                    deleting_session_id,
-                    type(exc).__name__,
-                )
-        if deleted < _SESSION_FILE_DELETE_BATCH_SIZE:
-            return attempted_blob_count, failed_blob_count
+    for blob_key in sorted(blob_keys):
+        try:
+            orphaned = await asyncio.to_thread(file_store.is_blob_key_orphaned, blob_key)
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "Failed to check attachment blob %s for session %s: %s",
+                blob_key,
+                deleting_session_id,
+                type(exc).__name__,
+            )
+            continue
+        if not orphaned:
+            continue
+        attempted_blob_count += 1
+        try:
+            await asyncio.to_thread(artifact_store.delete, blob_key)
+        except Exception as exc:  # noqa: BLE001
+            failed_blob_count += 1
+            _logger.warning(
+                "Failed to delete attachment blob %s for session %s: %s",
+                blob_key,
+                deleting_session_id,
+                type(exc).__name__,
+            )
+    if failure is not None:
+        raise failure
+    return attempted_blob_count, failed_blob_count
 
 
 async def _delete_session_tree_files(
@@ -1642,10 +1677,10 @@ async def _delete_session_tree_files(
     Delete the files of *session_id* and every sub-agent under it, before the
     subtree itself is deleted.
 
-    Rows go in bounded batches, and each batch's orphaned blobs are deleted
-    before the next, so a blob another session still shares survives. A
-    failure deleting the session's own rows propagates, so the caller keeps
-    the session for a retry; a sub-agent's failure, or a blob's, is logged.
+    Each session's rows go in bounded batches, then its blobs no other row
+    still uses, so a blob a fork shares survives. A failure deleting the
+    session's own rows propagates, so the caller keeps the session for a
+    retry; a sub-agent's failure, or a blob's, is logged.
 
     :param conversation_store: Store for the sub-agent lookup.
     :param file_store: Store of the sessions' file rows.
@@ -1653,17 +1688,9 @@ async def _delete_session_tree_files(
     :param session_id: The session being deleted, e.g. ``"conv_abc123"``.
     :raises Exception: Whatever the file store raised for the session's own rows.
     """
-    try:
-        descendant_ids = await _collect_descendant_conversation_ids_paged(
-            conversation_store, session_id
-        )
-    except Exception as exc:  # noqa: BLE001
-        _logger.warning(
-            "Failed to list the sub-agents of session %s for file cleanup: %s",
-            session_id,
-            type(exc).__name__,
-        )
-        descendant_ids = []
+    descendant_ids = await _collect_descendant_conversation_ids_paged(
+        conversation_store, session_id
+    )
     attempted_blob_count, failed_blob_count = await _delete_one_session_files(
         file_store, artifact_store, session_id, deleting_session_id=session_id
     )

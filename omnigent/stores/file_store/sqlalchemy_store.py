@@ -342,7 +342,7 @@ class SqlAlchemyFileStore(FileStore):
 
         :param session_id: Owning session/conversation id.
         :param limit: Most rows to delete, e.g. ``100``.
-        :returns: The number of rows deleted and the now-orphaned keys.
+        :returns: The number of rows deleted and their blob keys.
         """
         if limit <= 0:
             raise ValueError("limit must be positive")
@@ -359,6 +359,9 @@ class SqlAlchemyFileStore(FileStore):
             )
             with query_name_scope("omnigent.file_store.list_session_files_batch_for_delete"):
                 rows = list(session.execute(stmt).scalars().all())
-            return len(rows), _delete_rows_returning_orphans(session, rows)
+            blob_keys = sorted({_effective_blob_key(row) for row in rows})
+            for row in rows:
+                session.delete(row)
+            return len(rows), blob_keys
 
         return run_write_transaction(self._session_immediate, "delete_session_files_batch", write)
