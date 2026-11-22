@@ -284,6 +284,10 @@ function renderTab({
   };
 }
 
+/** The changed-file tree's row for `path`. */
+const treeButton = (path: string) =>
+  screen.getAllByTitle(path).find((element) => element.tagName === "BUTTON")!;
+
 /** Resolves once `count` animation frames have run. */
 function afterFrames(count: number): Promise<void> {
   return new Promise((resolve) => {
@@ -883,6 +887,36 @@ describe("PullRequestChangesTab", () => {
     await waitFor(() =>
       expect(scroll.mock.contexts).toContain(document.querySelector('[data-github-file="b.ts"]')),
     );
+  });
+
+  it("lets the reader's own pick win over a link's file still waiting for its frame", async () => {
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    const tab = renderTab({ conversationId: "link-file-picked-frame", target: { path: "b.ts" } });
+
+    fireEvent.click(treeButton("c.ts"));
+    await act(() => afterFrames(3));
+
+    const header = (path: string) => document.querySelector(`[data-github-file="${path}"]`);
+    expect(scroll.mock.contexts).toContain(header("c.ts"));
+    expect(scroll.mock.contexts).not.toContain(header("b.ts"));
+    expect(tab.landing()?.settled).toBe(true);
+  });
+
+  it("lets the reader's own pick win over a link's file still waiting for its patch", async () => {
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    const tab = renderTab({
+      conversationId: "link-file-picked-patch",
+      target: { path: "b.ts" },
+      patch: "",
+      loading: true,
+    });
+    fireEvent.click(treeButton("c.ts"));
+
+    tab.rerender(PATCH);
+    await act(() => afterFrames(3));
+
+    expect(scroll.mock.contexts).not.toContain(document.querySelector('[data-github-file="b.ts"]'));
+    expect(tab.landing()?.settled).toBe(true);
   });
 
   it("says a link's commit can't open where the pull request's commits don't show", () => {
@@ -2046,6 +2080,26 @@ describe("PullRequestChangesTab commits", () => {
       expect(scroll.mock.contexts).toContain(document.querySelector('[data-github-file="c.ts"]')),
     );
     expect(store.result.current).toMatchObject({ mode: "changes", commitSha: null });
+  });
+
+  it("leaves a commit the reader opens while a link's file waits for its patch", async () => {
+    const conversationId = "link-file-reader-commit";
+    const store = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
+    const tab = renderTab({
+      conversationId,
+      commitHistory: true,
+      listing: { head_sha: "head" },
+      target: { path: "c.ts" },
+      patch: "",
+      loading: true,
+    });
+    act(() => store.result.current.openCommit(SHA_A));
+
+    tab.rerender(PATCH);
+    await act(() => afterFrames(3));
+
+    expect(store.result.current).toMatchObject({ mode: "commit", commitSha: SHA_A });
+    expect(tab.landing()?.settled).toBe(true);
   });
 
   it("shows the commit list for a link to a commit the pull request doesn't have", () => {

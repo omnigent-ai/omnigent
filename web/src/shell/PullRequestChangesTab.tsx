@@ -485,7 +485,8 @@ export function commitTargetUnavailable(commit: string): string {
  * Shows a link's commit or file once per landing. A commit opens once its list can say whether
  * commits show here, and says so when they don't. A file shows in the PR's own changes,
  * unfiltered, once its patch is read; its jump waits a frame, so the tab's reset of a jump on
- * a view change, which runs after this, can't cancel it.
+ * a view change, which runs after this, can't cancel it. While it waits, any jump or view
+ * change of the reader's own wins, and the landing ends without its jump.
  */
 function ShowChangesTarget({
   target,
@@ -494,7 +495,8 @@ function ShowChangesTarget({
   patchRead,
   commitsSupported,
   view,
-  jumpTo,
+  readerJumps,
+  revealFile,
 }: {
   target: PullRequestChangesTarget;
   landing: PullRequestChangesLanding;
@@ -504,18 +506,44 @@ function ShowChangesTarget({
   patchRead: boolean;
   commitsSupported: boolean;
   view: ChangesViewState;
-  jumpTo: (path: string) => void;
+  /** Counts the reader's own jumps; one since the landing began supersedes it. */
+  readerJumps: React.RefObject<number>;
+  revealFile: (path: string) => void;
 }) {
   const { mode, sinceSha, openCommit, setMode, setSinceSha, setPathFilter, setHideViewed } = view;
+  // What this landing saw as it began: the reader's jump count, and the view it expects.
+  const begun = useRef<{
+    landing: PullRequestChangesLanding;
+    jumps: number;
+    view: string | null;
+  }>(null);
+  const shownView = `${commitsSupported ? mode : "changes"}:${sinceSha ?? ""}`;
   useEffect(() => {
-    if (landing.settled || !listed) return;
+    if (landing.settled) return;
+    if (begun.current?.landing !== landing) {
+      begun.current = { landing, jumps: readerJumps.current, view: null };
+    }
+    const started = begun.current;
+    const superseded = () => readerJumps.current !== started.jumps;
+    if (superseded()) {
+      landing.settled = true;
+      return;
+    }
+    // The view is known once the list is read; one this landing didn't ask for is the reader's.
+    if (!listed) return;
+    started.view ??= shownView;
+    if (shownView !== started.view) {
+      landing.settled = true;
+      return;
+    }
     if ("commit" in target) {
       landing.settled = true;
       if (commitsSupported) openCommit(target.commit);
       else toast(commitTargetUnavailable(target.commit), { id: "pr-commit-target-unavailable" });
       return;
     }
-    if ((commitsSupported && mode !== "changes") || sinceSha) {
+    if (shownView !== "changes:") {
+      started.view = "changes:";
       setMode("changes");
       setSinceSha(null);
       return;
@@ -523,9 +551,10 @@ function ShowChangesTarget({
     if (!patchRead) return;
     const frame = requestAnimationFrame(() => {
       landing.settled = true;
+      if (superseded()) return;
       setPathFilter("");
       setHideViewed(false);
-      jumpTo(target.path);
+      revealFile(target.path);
     });
     return () => cancelAnimationFrame(frame);
   }, [
@@ -534,14 +563,14 @@ function ShowChangesTarget({
     listed,
     patchRead,
     commitsSupported,
-    mode,
-    sinceSha,
+    shownView,
     openCommit,
     setMode,
     setSinceSha,
     setPathFilter,
     setHideViewed,
-    jumpTo,
+    readerJumps,
+    revealFile,
   ]);
   return null;
 }
@@ -1126,13 +1155,22 @@ export function PullRequestChangesTab({
   }, [visibleFiles]);
 
   // Jumping to a collapsed file also expands it, so the click lands on its diff.
-  const jumpTo = useCallback(
+  const revealFile = useCallback(
     (path: string) => {
       setActivePath(path);
       revealPane(path);
       setPendingReveal({ path });
     },
     [revealPane],
+  );
+  // The reader's own jumps, by file, conversation or find; a link's jump still waiting yields to one.
+  const readerJumps = useRef(0);
+  const jumpTo = useCallback(
+    (path: string) => {
+      readerJumps.current += 1;
+      revealFile(path);
+    },
+    [revealFile],
   );
 
   // A filtered-out target is visible only after the filter clears. With no filter left to
@@ -1225,6 +1263,7 @@ export function PullRequestChangesTab({
   useEffect(() => {
     if (!findOpen || findTarget || !matches.length || deferredQuery !== query) return;
     const seeded = matches[firstMatchAtOrBelow(matches, visiblePaths, activePath)];
+    readerJumps.current += 1;
     setFindTarget(seeded);
     if (seeded.target.kind === "path") setPendingReveal({ path: seeded.target.path });
   }, [findOpen, findTarget, matches, visiblePaths, activePath, deferredQuery, query]);
@@ -1240,6 +1279,7 @@ export function PullRequestChangesTab({
     // With no active match yet, the first step lands on the first or last match by direction.
     const next = matches[stepTarget(activeIndex, direction, matches.length)];
     // A fresh object, so stepping to the sole match again is a new reveal request.
+    readerJumps.current += 1;
     setFindTarget({ ...next });
     if (next.target.kind === "path") setPendingReveal({ path: next.target.path });
   };
@@ -1457,7 +1497,8 @@ export function PullRequestChangesTab({
           patchRead={!!prDiff.data && !prDiff.isLoading}
           commitsSupported={commitsSupported}
           view={view}
-          jumpTo={jumpTo}
+          readerJumps={readerJumps}
+          revealFile={revealFile}
         />
       )}
       {reviewing &&
