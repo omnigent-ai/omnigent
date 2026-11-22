@@ -9,7 +9,10 @@ import type { Conversation } from "@/hooks/useConversations";
 
 import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
 import { OWNER_ONLY_REASONS } from "./sessionCommands/model";
-import { useSessionActionStore } from "./sessionCommands/sessionActionStore";
+import {
+  latestSessionActionRequest,
+  useSessionActionStore,
+} from "./sessionCommands/sessionActionStore";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({
@@ -84,7 +87,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   localStorage.clear();
-  useSessionActionStore.setState({ request: null });
+  useSessionActionStore.setState({ requests: [] });
 });
 
 describe("QuickPick ⌘K session actions", () => {
@@ -135,7 +138,7 @@ describe("QuickPick ⌘K session actions", () => {
     await waitFor(() => expect(heading()).not.toBeNull());
     fireEvent.change(input, { target: { value: "mark as unread" } });
     fireEvent.keyDown(input, { key: "Enter" });
-    expect(useSessionActionStore.getState().request).toMatchObject({
+    expect(latestSessionActionRequest()).toMatchObject({
       command: "mark-unread",
       conversation: { id: "c1" },
     });
@@ -150,7 +153,7 @@ describe("QuickPick ⌘K session actions", () => {
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onOpenChange).toHaveBeenCalledWith(false);
     // The palette is still open in this test, so its close hasn't finished yet.
-    expect(useSessionActionStore.getState().request).toBeNull();
+    expect(latestSessionActionRequest()).toBeNull();
   });
 
   it("keeps the page on a greyed action, asking nothing of the host", async () => {
@@ -160,7 +163,7 @@ describe("QuickPick ⌘K session actions", () => {
     await waitFor(() => expect(heading()).not.toBeNull());
     fireEvent.change(input, { target: { value: "rename" } });
     fireEvent.keyDown(input, { key: "Enter" });
-    expect(useSessionActionStore.getState().request).toBeNull();
+    expect(latestSessionActionRequest()).toBeNull();
     expect(onOpenChange).not.toHaveBeenCalled();
     expect(heading()).toBe("Actions for “Review notes”");
   });
@@ -233,6 +236,6 @@ describe("QuickPick ⌘K session actions", () => {
     await waitFor(() => expect(screen.queryAllByRole("option")).toEqual([]));
     fireEvent.change(input, { target: { value: "unarchive" } });
     fireEvent.keyDown(input, { key: "Enter" });
-    expect(useSessionActionStore.getState().request).toBeNull();
+    expect(latestSessionActionRequest()).toBeNull();
   });
 });
