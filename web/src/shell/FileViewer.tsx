@@ -505,9 +505,13 @@ function FileViewerBody({
   const changedFiles = useWorkspaceChangedFiles(conversationId);
   // A chosen comparison's listing says which files changed; otherwise the last commit's does.
   const comparisonListing = comparisonDiff?.base === "comparison" ? comparisonDiff : null;
-  const isDeletedFile = comparisonListing
-    ? comparisonListing.deleted
-    : (changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false);
+  // Whether the file is gone from the workspace, so there's nothing to read or open. A
+  // comparison ending at a commit can delete a file that's still here, so only one ending at
+  // the working copy answers that; otherwise the last commit's listing does.
+  const isDeletedFile =
+    comparisonListing?.headIsWorkingCopy === true
+      ? comparisonListing.deleted
+      : (changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false);
   const serverInfo = useServerInfo();
   // The host's SSH alias lets the desktop read a host on another machine directly.
   const directReads =

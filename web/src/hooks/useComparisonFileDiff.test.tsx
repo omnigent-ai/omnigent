@@ -27,7 +27,8 @@ vi.mock("@/lib/workingCopyComparison", async (importOriginal) => ({
 
 import { ComparisonOwnerContext } from "@/hooks/useComparisonOwner";
 import { comparisonFileDiffQueryKey } from "@/lib/branchPointFileDiff";
-import { ComparisonFileError } from "@/lib/workingCopyComparison";
+import { type ComparisonEntry, ComparisonFileError } from "@/lib/workingCopyComparison";
+import { comparisonEntry } from "@/test/workingCopyComparisons";
 import type { WorkingCopyComparisonOwner } from "@/lib/workingCopyComparisonOwner";
 
 import { useComparisonFileDiff } from "./useComparisonFileDiff";
@@ -40,23 +41,7 @@ const settle = () =>
     setTimeout(resolve, 0);
   });
 
-function entry(path: string, status = "modified") {
-  return {
-    path,
-    name: path,
-    status,
-    bytes: 1,
-    modified_at: null,
-    change: null,
-    baseKind: "file",
-    workingKind: "file",
-    binary: false,
-    problem: null,
-    fingerprint: `fp-${path}`,
-  };
-}
-
-function branchPoint(...entries: ReturnType<typeof entry>[]) {
+function branchPoint(...entries: ComparisonEntry[]) {
   return {
     base: "branch-point",
     status: null,
@@ -111,7 +96,7 @@ describe("useComparisonFileDiff", () => {
   });
 
   it("reads a listed file under the comparison, into the Changes review's cache entry", async () => {
-    state.comparison = branchPoint(entry("src/a.ts"));
+    state.comparison = branchPoint(comparisonEntry("src/a.ts"));
     const { result, client } = renderDiff("src/a.ts");
     const shown = result.current;
     expect(shown).toMatchObject({
@@ -133,7 +118,7 @@ describe("useComparisonFileDiff", () => {
   });
 
   it("shows the text the Changes review already read for this listing, without reading again", async () => {
-    state.comparison = branchPoint(entry("src/a.ts"));
+    state.comparison = branchPoint(comparisonEntry("src/a.ts"));
     const client = new QueryClient();
     client.setQueryData(comparisonFileDiffQueryKey(SESSION, "src/a.ts", BASE), {
       object: "session.environment.filesystem.file_diff",
@@ -150,7 +135,7 @@ describe("useComparisonFileDiff", () => {
   });
 
   it("lists again through the comparison owner when the listing went stale, then reads again", async () => {
-    state.comparison = branchPoint(entry("src/a.ts"));
+    state.comparison = branchPoint(comparisonEntry("src/a.ts"));
     reads.fetchText
       .mockRejectedValueOnce(new ComparisonFileError("comparison_expired"))
       .mockResolvedValueOnce({ before: "base", after: "relisted" });
@@ -165,7 +150,7 @@ describe("useComparisonFileDiff", () => {
   });
 
   it("says when a typed comparison's head is a commit, not the working copy", () => {
-    const committed = branchPoint(entry("src/a.ts"));
+    const committed = branchPoint(comparisonEntry("src/a.ts"));
     (committed.comparison as Record<string, unknown>).revisions = {
       spec: { base: "main", head: "feature" },
       baseDisplay: "main",
@@ -177,7 +162,7 @@ describe("useComparisonFileDiff", () => {
   });
 
   it("has no diff for a file the comparison doesn't list, and names a deleted one", () => {
-    state.comparison = branchPoint(entry("src/gone.ts", "deleted"));
+    state.comparison = branchPoint(comparisonEntry("src/gone.ts", { status: "deleted" }));
     expect(renderDiff("src/a.ts").result.current).toMatchObject({
       base: "comparison",
       changed: false,
@@ -198,7 +183,7 @@ describe("useComparisonFileDiff", () => {
     ["the workspace can't be read now", () => (state.readable = false)],
     ["the session's files aren't shared", () => (state.permitted = false)],
   ])("reads nothing while %s", async (_name, arrange) => {
-    state.comparison = branchPoint(entry("src/a.ts"));
+    state.comparison = branchPoint(comparisonEntry("src/a.ts"));
     arrange();
     const { result } = renderDiff("src/a.ts");
     expect(result.current.base).toBe("comparison");

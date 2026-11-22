@@ -119,12 +119,16 @@ vi.mock("./MonacoDiffViewer", () => ({
   // Surface the toggle-driven props as data attributes so tests can assert the
   // "⋯" menu wires wrap-lines / hide-whitespace through to the diff editor.
   MonacoDiffViewer: ({
+    before,
+    after,
     position,
     wrapLines,
     hideWhitespace,
     searchOpen,
     commentable,
   }: {
+    before?: string;
+    after?: string;
     position?: { line: number };
     wrapLines?: boolean;
     hideWhitespace?: boolean;
@@ -133,6 +137,8 @@ vi.mock("./MonacoDiffViewer", () => ({
   }) => (
     <div
       data-testid="diff-viewer"
+      data-before={before}
+      data-after={after}
       data-commentable={String(commentable ?? true)}
       data-line={position?.line}
       data-wrap-lines={String(!!wrapLines)}
@@ -921,8 +927,49 @@ describe("FileViewer URL sync — diff param", () => {
           query: comparisonQuery("base", "work"),
         },
       });
-      expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+      const viewer = await screen.findByTestId("diff-viewer");
+      // Monaco gets the comparison's own text, not the last commit's.
+      expect(viewer).toHaveAttribute("data-before", "base");
+      expect(viewer).toHaveAttribute("data-after", "work");
       expect(useFileDiff).toHaveBeenLastCalledWith("conv_1", null, { requested: true });
+    });
+
+    it("keeps a file a committed head deleted, but the workspace still has, readable and editable", async () => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      vi.stubGlobal("omnigentDesktop", {
+        kind: "electron",
+        getHostIdentity: () => Promise.resolve({ cliInstalled: true, hostId: "this-mac" }),
+      });
+      const context = localDesktopContext();
+      render(
+        <FileViewerContext.Provider value={context}>
+          {viewerTree({
+            open: true,
+            path: "notes.md",
+            comparisonDiff: {
+              base: "comparison",
+              changed: true,
+              deleted: true,
+              headIsWorkingCopy: false,
+              query: comparisonQuery("# Notes", ""),
+            },
+          })}
+        </FileViewerContext.Provider>,
+      );
+
+      // The current file is read and opens in its editor, with its workspace actions.
+      expect(useFileContent).toHaveBeenLastCalledWith("conv_1", "notes.md", { visible: true });
+      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "editor");
+      expect(screen.getByRole("textbox", { name: "Draft text" })).toBeInTheDocument();
+      expect(await screen.findByRole("button", { name: "Open in VS Code" })).toBeInTheDocument();
+
+      // The comparison's deletion is a diff to show and leave, not a file that's gone.
+      fireEvent.click(screen.getByRole("button", { name: "Show diff" }));
+      const viewer = await screen.findByTestId("diff-viewer");
+      expect(viewer).toHaveAttribute("data-before", "# Notes");
+      expect(viewer).toHaveAttribute("data-after", "");
+      fireEvent.click(screen.getByRole("button", { name: "Exit diff view" }));
+      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "editor");
     });
 
     it("keeps comments off a committed snapshot's after side, and on for the working copy", async () => {
