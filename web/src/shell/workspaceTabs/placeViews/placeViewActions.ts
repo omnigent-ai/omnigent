@@ -138,6 +138,15 @@ export function pullRequestChosen(
   return { type: "navigate", place: pullRequestTabPlace(url, section), replace: false };
 }
 
+/** The session's pull request list, asked for from one pull request: its own tab, shown. */
+export function allPullRequestsChosen(): PlaceViewAction {
+  return {
+    type: "open",
+    link: { place: { kind: "pulls" } },
+    options: { opener: "user", disposition: "focus" },
+  };
+}
+
 export function pullRequestSectionChosen(
   current: Extract<PullRequestPlace, { kind: "pull" }>,
   section: Extract<PullRequestPlace, { kind: "pull" }>["view"],

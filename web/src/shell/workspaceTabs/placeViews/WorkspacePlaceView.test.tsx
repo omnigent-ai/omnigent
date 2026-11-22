@@ -469,6 +469,16 @@ describe("pull request tab", () => {
     expect(onNavigate).not.toHaveBeenCalled();
   });
 
+  it("opens or selects the session's pull requests tab from a pull request's page", () => {
+    const { onNavigate, onOpen } = renderView({ kind: "pull", url: PR, view: "summary" });
+    captured.page!.onShowAllPullRequests();
+    expect(onOpen).toHaveBeenCalledWith(
+      { place: { kind: "pulls" } },
+      { opener: "user", disposition: "focus" },
+    );
+    expect(onNavigate).not.toHaveBeenCalled();
+  });
+
   it("says what a link points at that the tab can't show, and can settle on what's shown", async () => {
     const { onNavigate } = renderView({
       kind: "pull",

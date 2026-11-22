@@ -4,6 +4,7 @@ import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContex
 import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
   LazyFileActionHost,
+  LazyShowAllPullRequestsCommand,
   LazyWorkspaceTabsHost,
   routeToWorkspaceTabs,
   showAgentBrowserTab,
@@ -3243,6 +3244,16 @@ function AppShellImpl() {
             <LazyFileActionHost />
           </Suspense>
         </RenderErrorBoundary>
+      )}
+      {/* Mounted only for a tabs sidebar session, so without the flag nothing runs. */}
+      {tabsSidebar && serverConversationId && (
+        <Suspense fallback={null}>
+          <LazyShowAllPullRequestsCommand
+            sessionId={serverConversationId}
+            pullRequestsAvailable={railTabsAvailable.github}
+            showAll={() => openGithubTab()}
+          />
+        </Suspense>
       )}
       <TerminalFirstContextProvider value={terminalFirstContextValue}>
         <ForkDialogContextProvider value={forkDialogContextValue}>
