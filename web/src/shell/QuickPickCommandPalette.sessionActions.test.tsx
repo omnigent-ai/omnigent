@@ -3,7 +3,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type { Conversation } from "@/hooks/useConversations";
@@ -98,7 +98,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   localStorage.clear();
-  useSessionActionStore.setState({ requests: [] });
+  useSessionActionStore.setState({ request: null });
 });
 
 describe("QuickPick ⌘K session actions", () => {
@@ -160,12 +160,14 @@ describe("QuickPick ⌘K session actions", () => {
     const { input, onOpenChange } = renderPalette(undefined, { closes: true });
     openActions(input);
     await waitFor(() => expect(heading()).not.toBeNull());
+    const asked = vi.fn();
+    onTestFinished(useSessionActionStore.subscribe(asked));
     fireEvent.change(input, { target: { value: "rename" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onOpenChange).toHaveBeenCalledWith(false);
     // The dialog is still closing, so the host hasn't been asked yet.
-    expect(latestSessionActionRequest()).toBeNull();
-    await waitFor(() => expect(useSessionActionStore.getState().requests).toHaveLength(1));
+    expect(asked).not.toHaveBeenCalled();
+    await waitFor(() => expect(asked).toHaveBeenCalledTimes(1));
     expect(latestSessionActionRequest()).toMatchObject({
       command: "rename",
       conversation: { id: "c1" },

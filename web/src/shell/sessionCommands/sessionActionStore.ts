@@ -1,5 +1,5 @@
-// The session actions ⌘K asked for. `SessionActionHost` runs the newest, and keeps an older
-// one mounted, with its dialogs closed, until the writes it started have settled.
+// The session action ⌘K asked for last. `SessionActionHost` runs it once; a newer request
+// replaces it, and the writes it started report how they went on their own.
 
 import { create } from "zustand";
 
@@ -13,20 +13,19 @@ export interface SessionActionRequest {
   command: SessionCommandId;
   /** Whether the sidebar's lists held the session when its actions opened. */
   listed: boolean;
-  /** New per request, so asking again for the same action starts it again. */
+  /** New per request, and rising, so asking again for the same action starts it again. */
   key: number;
 }
 
 interface SessionActionState {
-  /** Oldest first; the last is the one the host shows. */
-  requests: readonly SessionActionRequest[];
+  request: SessionActionRequest | null;
 }
 
-export const useSessionActionStore = create<SessionActionState>(() => ({ requests: [] }));
+export const useSessionActionStore = create<SessionActionState>(() => ({ request: null }));
 
 let nextKey = 0;
-// Keys whose action has started, so a host mounted again doesn't repeat one.
-const startedKeys = new Set<number>();
+// Requests up to this key have started, so a host mounted again doesn't repeat one.
+let startedKey = 0;
 
 /** Carry out `command` on `conversation`, unless it no longer applies when the host reads it. */
 export function requestSessionAction(
@@ -35,25 +34,17 @@ export function requestSessionAction(
   { listed = false }: { listed?: boolean } = {},
 ): void {
   nextKey += 1;
-  const request = { conversation, command, listed, key: nextKey };
-  useSessionActionStore.setState((state) => ({ requests: [...state.requests, request] }));
+  useSessionActionStore.setState({ request: { conversation, command, listed, key: nextKey } });
 }
 
-/** The newest request, which the host shows. */
+/** The newest request, which the host runs. */
 export function latestSessionActionRequest(): SessionActionRequest | null {
-  return useSessionActionStore.getState().requests.at(-1) ?? null;
+  return useSessionActionStore.getState().request;
 }
 
-/** Claim `key`'s action to start it: false once it has started, on any host. */
+/** Claim `key`'s action to start it: false once it, or a newer one, has started. */
 export function startSessionAction(key: number): boolean {
-  if (startedKeys.has(key)) return false;
-  startedKeys.add(key);
+  if (key <= startedKey) return false;
+  startedKey = key;
   return true;
-}
-
-/** Done with `key`'s request: its writes settled after a newer one replaced it. */
-export function settleSessionAction(key: number): void {
-  useSessionActionStore.setState((state) => ({
-    requests: state.requests.filter((request) => request.key !== key),
-  }));
 }
