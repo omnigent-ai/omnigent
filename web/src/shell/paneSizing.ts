@@ -60,7 +60,8 @@ const windowCornerWidth = (root: HTMLElement) =>
 
 /** The row's height for panes along the view's top edge: taller at the Mac window's top. */
 const topRowHeight = (root: HTMLElement) =>
-  root.querySelector("[data-pane-strip-window-top]")?.getBoundingClientRect().height || PANE_ROW_PX;
+  root.querySelector("[data-pane-strip-title-bar-row]")?.getBoundingClientRect().height ||
+  PANE_ROW_PX;
 
 /** The height of `pane`'s own row, as drawn. */
 const rowHeightOf = (pane: HTMLElement) =>

@@ -55,6 +55,12 @@ function titleBarBottom(document: Document): number {
   return document.querySelector(".electron-drag-strip")?.getBoundingClientRect().bottom ?? 0;
 }
 
+export interface PaneStrips {
+  stripOf: (paneKey: string) => PaneStripRender | null;
+  /** The view starts under the Mac title bar's drag strip, as a pane shown alone's row does. */
+  atWindowTop: boolean;
+}
+
 export function usePaneStrips({
   source,
   panesRef,
@@ -70,7 +76,7 @@ export function usePaneStrips({
   /** Gives the keyboard to the split's chosen pane, as `paneKey`'s menu closes after a split. */
   refocus?: (paneKey: string) => void;
   placements: readonly PaneStripPlacement[];
-}): (paneKey: string) => PaneStripRender | null {
+}): PaneStrips {
   const active = source !== undefined;
   const [ownHover] = useState(() => createPaneHover());
   const hover = source?.hover ?? ownHover;
@@ -178,7 +184,7 @@ export function usePaneStrips({
     [hover],
   );
 
-  return (paneKey) => {
+  const stripOf = (paneKey: string): PaneStripRender | null => {
     if (!active) return null;
     const placement = placements.find((pane) => pane.key === paneKey);
     if (!placement) return null;
@@ -218,4 +224,5 @@ export function usePaneStrips({
       onFocusChange: (focused) => setFocusInStrip(paneKey, focused),
     };
   };
+  return { stripOf, atWindowTop: active && atWindowTop };
 }

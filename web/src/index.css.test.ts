@@ -1746,7 +1746,7 @@ describe("index.css pane strip window-corner inset", () => {
     );
     expect(macRoot.join("\n")).toContain("--pane-window-top-row: var(--mac-titlebar-height)");
     expect(
-      ruleFor("html[data-electron-mac] [data-pane-strip][data-pane-strip-window-top]"),
+      ruleFor("html[data-electron-mac] [data-pane-strip][data-pane-strip-title-bar-row]"),
     ).toContain("height: var(--pane-window-top-row)");
   });
 });

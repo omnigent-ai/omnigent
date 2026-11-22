@@ -213,6 +213,11 @@ export interface PaneTitleStripProps {
    * lines up with the headers beside it, and a movable row drags its pane, not the window.
    */
   windowTop?: boolean;
+  /**
+   * The row is as tall as the title bar, as `windowTop` makes it, also while hidden behind a
+   * maximized pane, so its pane keeps its size. Defaults to `windowTop`.
+   */
+  titleBarRow?: boolean;
   onFocusChange: (focused: boolean) => void;
   /**
    * Starts dragging the pane by the row's blank space, to move it beside another pane. Without
@@ -235,6 +240,7 @@ export function PaneTitleStrip({
   focusLine = true,
   windowCorner = false,
   windowTop = false,
+  titleBarRow = windowTop,
   onFocusChange,
   onDragStart,
   dragging = false,
@@ -276,6 +282,7 @@ export function PaneTitleStrip({
           data-pane-strip-dragging={dragging ? "" : undefined}
           data-pane-strip-held={held ? "" : undefined}
           data-pane-strip-window-top={windowTop ? "" : undefined}
+          data-pane-strip-title-bar-row={titleBarRow ? "" : undefined}
           data-pane-strip-zoomable={pane.commands?.toggleZoom ? "" : undefined}
           data-pane-strip-primary={pane.primary ? "" : undefined}
           className={cn(

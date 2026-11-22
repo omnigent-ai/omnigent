@@ -235,7 +235,7 @@ describe("measurePaneContent", () => {
     const pane = root.querySelector<HTMLElement>("[data-terminal-pane]")!;
     const strip = document.createElement("div");
     strip.dataset.paneStrip = "a";
-    strip.dataset.paneStripWindowTop = "";
+    strip.dataset.paneStripTitleBarRow = "";
     strip.getBoundingClientRect = () => ({ width: 400, height: 48 }) as DOMRect;
     pane.prepend(strip);
     const measured = measurePaneContent(root)!;

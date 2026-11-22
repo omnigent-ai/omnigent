@@ -49,6 +49,10 @@ import { usePendingAppPaneDrop } from "./appPanes";
 /** A row along the window's top, as tall as index.css makes it: the Mac title bar there. */
 export const WINDOW_TOP_ROW_HEIGHT = `var(--pane-window-top-row, ${PANE_ROW_PX}px)`;
 
+/** A pane row's height: the title bar's along the window's top, else a plain row's. */
+const paneRowHeight = (titleBarRow: boolean) =>
+  titleBarRow ? WINDOW_TOP_ROW_HEIGHT : `${PANE_ROW_PX}px`;
+
 export interface SplitPanesLayoutProps {
   conversationId: string;
   /** The split shown, or undefined for one pane: ``singlePaneKey``. */
@@ -187,7 +191,7 @@ export function SplitPanesLayout({
     : null;
   // One keyed list in a steady order: a pane moving between shown and hidden keeps its terminal.
   const paneKeys = [...new Set([...alsoMounted, ...placed.keys()])];
-  const stripOf = usePaneStrips({
+  const { stripOf, atWindowTop } = usePaneStrips({
     source: strip,
     panesRef,
     onUnzoom,
@@ -263,7 +267,11 @@ export function SplitPanesLayout({
               )}
               // Kept at the size it has when it shows alone: below its row, inside its card.
               style={
-                rowed ? { paddingTop: PANE_ROW_PX + (carded ? PANE_CARD_GAP_PX : 0) } : undefined
+                rowed
+                  ? {
+                      paddingTop: `calc(${paneRowHeight(atWindowTop)} + ${carded ? PANE_CARD_GAP_PX : 0}px)`,
+                    }
+                  : undefined
               }
             >
               {/* The shown pane's shape, so showing it never remounts its terminal. */}
@@ -353,6 +361,7 @@ export function SplitPanesLayout({
                   zoomed={paneStrip.zoomed}
                   windowCorner={paneStrip.windowCorner && !zoomedAway}
                   windowTop={paneStrip.windowTop && !zoomedAway}
+                  titleBarRow={paneStrip.windowTop}
                   onFocusChange={paneStrip.onFocusChange}
                   onDragStart={paneDrag.pointerDownFor(pane.key)}
                   dragging={paneDrag.draggingKey === pane.key}
@@ -363,13 +372,7 @@ export function SplitPanesLayout({
               {bodySlot?.paneKey === pane.key ? (
                 <ChatPaneBodyHost
                   hostRef={bodySlot.ref}
-                  top={
-                    !paneStrip
-                      ? 0
-                      : paneStrip.windowTop && !zoomedAway
-                        ? WINDOW_TOP_ROW_HEIGHT
-                        : PANE_ROW_PX
-                  }
+                  top={paneStrip ? paneRowHeight(paneStrip.windowTop) : 0}
                   onChatClick={(event) => givePaneKeyboardFromChat(event, pane.key)}
                 />
               ) : null}

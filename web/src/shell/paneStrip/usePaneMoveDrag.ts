@@ -279,6 +279,12 @@ export function usePaneMoveDrag({
     const current = gesture.current;
     if (current && (keys === null || !keys.split("\n").includes(current.key))) end(false, true);
   }, [keys, end]);
+  // The split changing under a drag, as its sizes or panes change: the preview no longer shows
+  // where the pane would land, so the drag ends as on Escape, landing nothing.
+  const shape = layout === null ? null : JSON.stringify(layout);
+  useEffect(() => {
+    if (gesture.current?.dragging) end(false);
+  }, [shape, end]);
   useEffect(() => () => end(false, true), [end]);
 
   return {

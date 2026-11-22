@@ -558,7 +558,7 @@ describe("SplitPanesLayout: off the split", () => {
     expect(refocusPane).toHaveBeenCalledWith("a");
   });
 
-  it("shows the area the pane would take as the split changes under the drag, as it lands", () => {
+  it("ends the drag as the split changes under it, though the pointer stays put, landing nothing", () => {
     const columnOverRows = (ratio: number): TerminalSplitState => ({
       layout: {
         axis: "columns",
@@ -567,22 +567,35 @@ describe("SplitPanesLayout: off the split", () => {
       },
       focusedKey: "a",
     });
-    const { onMovePane, rerender } = setup();
+    const { onMovePane, refocusPane, rerender } = setup();
     rerender({ split: columnOverRows(0.5) });
     press("a", 100);
     moveTo(120, 10);
     // b is the right column's top half: its right side is the right quarter of that half.
     moveTo(780, 100);
-    const preview = () => document.querySelector<HTMLElement>("[data-pane-drop]")!;
+    const preview = () => document.querySelector<HTMLElement>("[data-pane-drop]");
     expect(dropShown()).toBe("b:right");
-    expect(preview().style.height).toBe("50%");
-    // The saved split changes to 70/30, and the pointer moves on within b's right.
+    expect(preview()!.style.height).toBe("50%");
+    // The saved split changes to 70/30 with no pointer move: the drag ends, as on Escape.
     rerender({ split: columnOverRows(0.7) });
-    moveTo(785, 105);
-    expect(dropShown()).toBe("b:right");
-    expect(preview().style.height).toBe("70%");
-    release(785, 105);
-    expect(onMovePane).toHaveBeenCalledExactlyOnceWith({ key: "a", targetKey: "b", side: "right" });
+    expect(preview()).toBeNull();
+    expect(row("a").hasAttribute("data-pane-strip-held")).toBe(false);
+    expect(refocusPane).toHaveBeenCalledWith("a");
+    release(780, 100);
+    expect(onMovePane).not.toHaveBeenCalled();
+  });
+
+  it("keeps a held press, not yet a drag, through a change to the split", () => {
+    const { onMovePane, rerender } = setup();
+    press("a", 100);
+    rerender({
+      split: { ...SPLIT, layout: { axis: "columns", ratio: 0.6, children: ["a", "b"] } },
+    });
+    expect(row("a").hasAttribute("data-pane-strip-held")).toBe(true);
+    moveTo(120, 10);
+    moveTo(780, 300);
+    release(780, 300);
+    expect(onMovePane).toHaveBeenCalledOnce();
   });
 
   it("offers Bottom below a tall pane's middle, and keeps it near the diagonal as it lands", () => {

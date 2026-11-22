@@ -18,6 +18,7 @@ import type { TerminalSplitState } from "@/lib/paneSplitLayout";
 import { PANE_ZOOM_LABELS } from "@/shell/paneCommandTable";
 import { SplitPanesLayout, WINDOW_TOP_ROW_HEIGHT } from "@/shell/SplitPanesLayout";
 
+import { PANE_ROW_PX } from "./paneGeometry";
 import { HOVER_GRACE_MS } from "./paneHover";
 import { focusPaneToolbar } from "./paneToolbarFocus";
 import type { PaneStripCommands } from "./PaneTitleStrip";
@@ -744,6 +745,43 @@ describe("SplitPanesLayout: every pane's strip row", () => {
       expect(mounts.get("b")).toBe(1);
     },
   );
+
+  it("keeps a hidden pane's row, and a kept pane's room for one, as tall as the title bar's", () => {
+    const titleBar = document.body.appendChild(document.createElement("div"));
+    titleBar.className = "electron-drag-strip";
+    // The view starts under the title bar, edge to edge.
+    vi.mocked(HTMLElement.prototype.getBoundingClientRect).mockReturnValue({
+      left: 0,
+      top: 0,
+      right: 800,
+      bottom: 600,
+      width: 800,
+      height: 600,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    } as DOMRect);
+    const { rerender } = setup();
+    const tall = (key: string) => row(key).hasAttribute("data-pane-strip-title-bar-row");
+    expect(tall("a") && tall("b")).toBe(true);
+    // Behind a maximized pane, b's row keeps its height, so its terminal keeps its size.
+    rerender({ split: SPLIT, zoomedKey: "a" });
+    expect(row("b").hasAttribute("data-pane-strip-window-top")).toBe(false);
+    expect(tall("b")).toBe(true);
+    // Kept mounted off the split, b reserves the row it has when it shows alone.
+    rerender({ split: undefined, alsoMounted: ["b"] });
+    const kept = document.querySelector<HTMLElement>('[data-terminal-pane="b"]')!;
+    expect(kept.style.paddingTop).toContain(WINDOW_TOP_ROW_HEIGHT);
+    titleBar.remove();
+  });
+
+  it("reserves a plain row for a kept pane below the title bar", () => {
+    const { rerender } = setup();
+    rerender({ split: undefined, alsoMounted: ["b"] });
+    const kept = document.querySelector<HTMLElement>('[data-terminal-pane="b"]')!;
+    expect(kept.style.paddingTop).toContain(`${PANE_ROW_PX}px`);
+    expect(kept.style.paddingTop).not.toContain("--pane-window-top-row");
+  });
 
   it("keeps a row mounted, and what it measures, as its pane's commands appear", () => {
     let ready = false;
