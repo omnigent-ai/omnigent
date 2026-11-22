@@ -1,3 +1,4 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { PinIcon } from "lucide-react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,6 +10,14 @@ import type { BrowserRecentSessionInput } from "@/lib/nativeBridge";
 import { AVAILABLE, type PaletteCommand, usePaletteCommandsStore } from "@/store/paletteCommands";
 
 import { QuickPickShortcutHost } from "./QuickPickShortcutHost";
+
+/** Inside a query client, as in the app shell: ⌘K's recent-session row reads its cache. */
+const renderHost = () =>
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <QuickPickShortcutHost />
+    </QueryClientProvider>,
+  );
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({ useNavigate: () => navigate }));
@@ -119,14 +128,14 @@ afterEach(() => {
 
 describe("QuickPickShortcutHost", () => {
   it("steps through the sidebar's sessions as ⌘K's Next and Previous session do", () => {
-    render(<QuickPickShortcutHost />);
+    renderHost();
     press(NEXT);
     press(PREVIOUS);
     expect(navigate.mock.calls).toEqual([["/c/c"], ["/c/b"]]);
   });
 
   it("leaves the key alone when no sidebar lists sessions, or a dialog has focus", () => {
-    render(<QuickPickShortcutHost />);
+    renderHost();
     act(() =>
       useSidebarSessionOrderStore.setState({ orderedSessionIds: [], activeSessionId: null }),
     );
@@ -148,7 +157,7 @@ describe("QuickPickShortcutHost", () => {
   });
 
   it("claims its chord before a page listener that would read it too", () => {
-    render(<QuickPickShortcutHost />);
+    renderHost();
     // As the transcript's message steps do, which don't check Shift.
     const pageListener = vi.fn((event: KeyboardEvent) => event.defaultPrevented);
     window.addEventListener("keydown", pageListener);
@@ -159,14 +168,14 @@ describe("QuickPickShortcutHost", () => {
   });
 
   it("stops listening once unmounted", () => {
-    const { unmount } = render(<QuickPickShortcutHost />);
+    const { unmount } = renderHost();
     unmount();
     press(NEXT);
     expect(navigate).not.toHaveBeenCalled();
   });
 
   it("steps with Ctrl+Tab and Ctrl+Shift+Tab, with no switcher", () => {
-    render(<QuickPickShortcutHost />);
+    renderHost();
     expect(press(CTRL_TAB)).toBe(false);
     expect(press(CTRL_SHIFT_TAB)).toBe(false);
     expect(navigate.mock.calls).toEqual([["/c/c"], ["/c/b"]]);
@@ -174,7 +183,7 @@ describe("QuickPickShortcutHost", () => {
   });
 
   it("takes Ctrl+Tab from a terminal, but leaves it to a dialog", () => {
-    render(<QuickPickShortcutHost />);
+    renderHost();
     const removeTerminal = focusInside({ class: "xterm" });
     press(NEXT);
     expect(navigate).not.toHaveBeenCalled();
@@ -190,7 +199,7 @@ describe("QuickPickShortcutHost", () => {
   });
 
   it("steps once for a held Ctrl+Tab and swallows its repeats", () => {
-    render(<QuickPickShortcutHost />);
+    renderHost();
     press(CTRL_TAB);
     expect(press({ ...CTRL_TAB, repeat: true })).toBe(false);
     expect(press({ ...CTRL_TAB, repeat: true })).toBe(false);
@@ -198,7 +207,7 @@ describe("QuickPickShortcutHost", () => {
   });
 
   it("steps for Ctrl+Tab forwarded from a Browser page and clears the shell's latch", () => {
-    const { unmount } = render(<QuickPickShortcutHost />);
+    const { unmount } = renderHost();
     expect(bridge.supported).toEqual([true]);
     forwarded({});
     forwarded({ shiftKey: true });
@@ -213,7 +222,7 @@ describe("QuickPickShortcutHost", () => {
 
   it("runs the open session's header rows from the menu's keys, in their current state", () => {
     shell.openSession = "c1";
-    render(<QuickPickShortcutHost />);
+    renderHost();
     const unpin = headerRow("unpin");
     press(PIN);
     expect(unpin).toHaveBeenCalledTimes(1);
@@ -228,13 +237,13 @@ describe("QuickPickShortcutHost", () => {
   it("leaves Pin to the desktop menu, and to Go to a file off macOS", () => {
     shell.openSession = "c1";
     shell.menu = true;
-    const { unmount } = render(<QuickPickShortcutHost />);
+    const { unmount } = renderHost();
     const pin = headerRow("pin");
     press(PIN);
     unmount();
     shell.menu = false;
     shell.mac = false;
-    render(<QuickPickShortcutHost />);
+    renderHost();
     press({ key: "p", code: "KeyP", ctrlKey: true, altKey: true });
     expect(pin).not.toHaveBeenCalled();
   });

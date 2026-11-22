@@ -1,12 +1,15 @@
 // ⌘K's commands that move between sessions: one step down or up the sidebar's list, as the
 // numbered session shortcuts count it, and the recent-session switcher.
 
+import { useQueryClient } from "@tanstack/react-query";
 import { ArrowDownIcon, ArrowUpIcon, HistoryIcon } from "lucide-react";
-import { useContext, useMemo } from "react";
+import { useCallback, useMemo, useSyncExternalStore } from "react";
 
-import type { Conversation } from "@/hooks/useConversations";
-import { openRecentSessionSwitcher } from "@/hooks/useRecentSessionSwitch";
-import { SidebarDataContext } from "@/hooks/useSidebarData";
+import {
+  liveRecentSessionIds,
+  openRecentSessionSwitcher,
+  useRecentSessionSwitchStore,
+} from "@/hooks/useRecentSessionSwitch";
 import {
   type SessionStepDirection,
   stepSidebarSession,
@@ -17,25 +20,43 @@ import { AVAILABLE, HIDDEN, type PaletteCommand } from "@/store/paletteCommands"
 
 import { useCommandContext } from "./commandContext";
 
-/** The most recently active session other than `openId`, as the recent-sessions switcher picks. */
-export function recentSessionId(
-  rows: readonly Conversation[],
-  openId: string | null,
-): string | undefined {
-  let recent: Conversation | undefined;
-  for (const row of rows) {
-    if (row.id === openId || row.archived || row.provisional === true) continue;
-    if (!recent || row.updated_at > recent.updated_at) recent = row;
-  }
-  return recent?.id;
+/** Whether the switcher has a live session to open besides the ones in `openIds`. */
+export function hasOtherLiveSession(
+  liveIds: ReadonlySet<string>,
+  openIds: readonly (string | null)[],
+): boolean {
+  for (const id of liveIds) if (!openIds.includes(id)) return true;
+  return false;
+}
+
+/**
+ * Whether ⌃] has a session to switch to: any live session the client has cached, including
+ * ones a collapsed folder or the sidebar's filter hides, as the switcher lists them.
+ */
+function useCanSwitchToRecentSession(openId: string | null): boolean {
+  const queryClient = useQueryClient();
+  const openRootId = useSidebarSessionOrderStore((state) => state.activeSessionId);
+  const subscribe = useCallback(
+    (onChange: () => void) => {
+      const stopCache = queryClient.getQueryCache().subscribe(onChange);
+      const stopStore = useRecentSessionSwitchStore.subscribe(onChange);
+      return () => {
+        stopCache();
+        stopStore();
+      };
+    },
+    [queryClient],
+  );
+  return useSyncExternalStore(subscribe, () =>
+    hasOtherLiveSession(liveRecentSessionIds(), [openId, openRootId]),
+  );
 }
 
 export function useSessionNavigationCommands(): PaletteCommand[] {
   const navigate = useNavigate();
   const listed = useSidebarSessionOrderStore((state) => state.orderedSessionIds.length > 0);
   const openId = useCommandContext().session?.id ?? null;
-  const loadedRows = useContext(SidebarDataContext)?.loadedRows;
-  const recentId = useMemo(() => recentSessionId(loadedRows ?? [], openId), [loadedRows, openId]);
+  const canSwitchToRecent = useCanSwitchToRecentSession(openId);
 
   return useMemo<PaletteCommand[]>(() => {
     // Read when run, so a step taken after the list changed lands on the row shown now.
@@ -68,7 +89,7 @@ export function useSessionNavigationCommands(): PaletteCommand[] {
         shortcut: "session.recent",
         icon: HistoryIcon,
         keywords: ["last", "previous", "back", "recent", "toggle", "session", "switcher"],
-        availability: recentId ? AVAILABLE : HIDDEN,
+        availability: canSwitchToRecent ? AVAILABLE : HIDDEN,
         // The switcher, one step back through the visits, opens once the palette has closed.
         movesFocus: true,
         run: () => {
@@ -76,5 +97,5 @@ export function useSessionNavigationCommands(): PaletteCommand[] {
         },
       },
     ];
-  }, [navigate, listed, recentId]);
+  }, [navigate, listed, canSwitchToRecent]);
 }
