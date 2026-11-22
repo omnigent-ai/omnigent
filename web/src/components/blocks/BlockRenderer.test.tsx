@@ -1826,6 +1826,18 @@ describe("BlockRenderer dispatch", () => {
         expect(screen.getAllByText("Called 1 tool")).toHaveLength(2);
       });
 
+      it("reads Worked on both sides of a marker whose place in the turn is unknown", () => {
+        render(
+          turn(
+            [tool(1), marker("e1", "started", "Say hello"), tool(2), text("m1", "Said hello.")],
+            {
+              workedForS: 9,
+            },
+          ),
+        );
+        expect(outline()).toEqual(["Worked", "Started Say hello", "Worked", "Said hello."]);
+      });
+
       it("leaves a turn with markers but no message unfolded unless it continues", () => {
         const items = [tool(1), marker("e1", "started", "Say hello", 4), tool(2)];
         const view = render(turn(items, { workedForS: 10 }));
