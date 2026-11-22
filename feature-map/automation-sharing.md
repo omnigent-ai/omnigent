@@ -75,9 +75,10 @@ runs' sessions in their own Omnigent Automation folder.
   and for each of your automations Run “name” now (not for trigger automations),
   Edit “name”…, Share “name”…, Clone “name” (where the server clones) and Pause or
   Resume “name”. Each runs the row menu's own handler, greyed by the same rules as
-  the automation's header, and while a change to it is saving. Delete stays on the
-  row menu, which deletes without asking, and automations shared with you add no
-  rows. With the flag off the page mounts none of it
+  the automation's header: while a change to it is saving, every row but Share is
+  greyed, and Share stays available, as the header's button does. Delete stays on
+  the row menu, which deletes without asking, and automations shared with you add
+  no rows. With the flag off the page mounts none of it
   (`web/src/components/scheduled/automationListPaletteCommands.test.tsx`,
   `web/src/pages/TasksPage.test.tsx`,
   `tests/e2e_ui/scheduled/test_quick_pick_automation_commands.py`).

@@ -131,6 +131,8 @@ describe("automationListPaletteCommands", () => {
 
   it("greys a saving automation's rows, and an automation shared with you with the owner's reasons", () => {
     const saving = commandsFor({ busyTaskId: "st_1" });
+    // Share stays available while saving, as the header's Share button does.
+    expect(named(saving, "Share “Daily digest”…").availability).toEqual({ available: true });
     expect(named(saving, "Pause “Daily digest”").availability).toEqual({
       available: false,
       reason: AUTOMATION_SAVING,
