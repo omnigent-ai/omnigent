@@ -330,8 +330,8 @@ def test_quick_pick_archives_a_session_picked_after_the_verb(
     expect(palette_input).to_be_focused(timeout=10_000)
     palette_input.fill("archive a session")
     dialog = page.get_by_role("dialog")
-    expect(dialog.get_by_role("option").first).to_contain_text("Archive a Session…")
-    page.keyboard.press("Enter")
+    # By name: the open session's own Archive session row can rank above it.
+    dialog.get_by_role("option", name=re.compile(r"^Archive a Session…")).click()
     heading = dialog.locator('[data-slot="quick-pick-heading"]')
     expect(heading).to_have_text("Archive which session?", timeout=10_000)
 
