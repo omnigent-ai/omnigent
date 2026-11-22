@@ -5,6 +5,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectTicketBoard } from "./ProjectTicketBoard";
 import { ProjectOrchestratorPanel, ProjectTicketPanel } from "./ProjectTicketPanel";
+import { TicketCommentBody } from "./TicketCommentBody";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { fetchConversationById } from "@/hooks/useOpenSessionRow";
@@ -13,6 +14,7 @@ import type { ProjectTicket, TicketChanges, TicketEvent } from "@/lib/projectTic
 import * as api from "@/lib/projectTicketsApi";
 import * as projectsApi from "@/lib/projectsApi";
 import { Link, useLocation } from "@/lib/routing";
+import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 
 const capabilities = vi.hoisted(() => ({ lifecycle: true, involvement: true, stages: true }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -151,6 +153,101 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   clients.splice(0).forEach((client) => client.clear());
+});
+
+describe("Ticket comment previews", () => {
+  const messageUrl = buildMessageDeepLink("response:part/2", "https://app.example/c/worker");
+  const diagnostics = "Diagnostic record. ".repeat(80);
+
+  it("keeps whole Markdown blocks and exact-message links, with keyboard access to the full comment", async () => {
+    const user = userEvent.setup();
+    renderBoard(
+      <TicketCommentBody
+        body={[
+          "**Outcome**",
+          "",
+          "Built the requested change.",
+          "",
+          "**Evidence**",
+          "",
+          `[Full verification](${messageUrl})`,
+          "",
+          "**Details**",
+          "",
+          diagnostics,
+          "",
+          "Pending owner confirmation.",
+        ].join("\n")}
+      />,
+    );
+    expect(screen.getByText("Outcome")).toHaveAttribute("data-streamdown", "strong");
+    expect(screen.getByText("Evidence")).toHaveAttribute("data-streamdown", "strong");
+    expect(screen.getByRole("link", { name: "Full verification" })).toHaveAttribute(
+      "href",
+      messageUrl,
+    );
+    expect(screen.queryByText("Details")).toBeNull();
+    expect(screen.queryByText("Pending owner confirmation.")).toBeNull();
+    const toggle = screen.getByRole("button", { name: "Show full comment" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(document.getElementById(toggle.getAttribute("aria-controls")!)).toBeInTheDocument();
+    toggle.focus();
+    await user.keyboard("{Enter}");
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(toggle).toHaveFocus();
+    expect(screen.getByText("Pending owner confirmation.")).toBeInTheDocument();
+    expect(screen.getByText("Details")).toHaveAttribute("data-streamdown", "strong");
+    expect(screen.getByText(diagnostics.trim())).toBeInTheDocument();
+    expect(screen.queryByText("Preview")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Show less" }));
+    expect(screen.queryByText("Pending owner confirmation.")).toBeNull();
+    expect(screen.getByRole("link", { name: "Full verification" })).toHaveAttribute(
+      "href",
+      messageUrl,
+    );
+  });
+
+  it.each([
+    ["one oversized paragraph", `**Outcome:** ${diagnostics}[Full verification](${messageUrl})`],
+    ["a fenced block", `\`\`\`text\n${diagnostics}\n\`\`\`\n\n[Full verification](${messageUrl})`],
+    [
+      "reference definitions",
+      `[Full verification][source]\n\n${diagnostics}\n\n[source]: ${messageUrl}`,
+    ],
+    [
+      "a label before a large block",
+      `**Evidence**\n\n${diagnostics}\n\n[Full verification](${messageUrl})`,
+    ],
+  ])(
+    "uses a bounded plain preview for %s without damaging the full Markdown",
+    async (_label, body) => {
+      const user = userEvent.setup();
+      renderBoard(<TicketCommentBody body={body} />);
+      const toggle = screen.getByRole("button", { name: "Show full comment" });
+      const content = document.getElementById(toggle.getAttribute("aria-controls")!)!;
+      expect(content.textContent!.length).toBeLessThanOrEqual(601);
+      expect(content).toHaveTextContent("Diagnostic record.");
+      expect(content).not.toHaveTextContent("```");
+      expect(content).not.toHaveTextContent("**Outcome:**");
+      expect(screen.queryByRole("link")).toBeNull();
+      await user.click(toggle);
+      expect(screen.getByRole("link", { name: "Full verification" })).toHaveAttribute(
+        "href",
+        messageUrl,
+      );
+      expect(content).toHaveTextContent(diagnostics.trim());
+    },
+  );
+
+  it("bounds tall comments without cutting Markdown list items", async () => {
+    const user = userEvent.setup();
+    const body = Array.from({ length: 16 }, (_, index) => `- Check ${index + 1}`).join("\n");
+    renderBoard(<TicketCommentBody body={body} />);
+    expect(screen.queryByRole("list")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Show full comment" }));
+    expect(screen.getAllByRole("listitem")).toHaveLength(16);
+    expect(screen.getByText("Check 16")).toBeInTheDocument();
+  });
 });
 
 describe("Project ticket board", () => {
@@ -540,56 +637,72 @@ describe("Project ticket board", () => {
     expect(projectsApi.initializeProjectOrchestrator).not.toHaveBeenCalled();
   });
 
-  it("deduplicates PR outputs while retaining both events, and appends comments", async () => {
-    const url = "https://git.example.com/org/repo/pull/42";
-    const event: TicketEvent = {
-      id: "event1",
-      ticket_id: ticket.id,
-      position: 0,
-      kind: "output",
-      user_id: null,
-      session_id: null,
-      agent_id: null,
-      payload: { type: "pull_request", url },
-      created_at: 1000,
-    };
-    vi.mocked(api.listTicketEvents).mockResolvedValue({
-      data: [event, { ...event, id: "event2", position: 1 }],
-      has_more: false,
-      last_position: 1,
-    });
-    renderBoard(
-      <ProjectTicketPanel
-        projectName="Shipping"
-        ticketId="ticket"
-        onClose={vi.fn()}
-        onCreated={vi.fn()}
-      />,
-    );
-    const outputs = await screen.findByRole("region", { name: "Outputs" });
-    expect(within(outputs).getAllByRole("link")).toHaveLength(1);
-    expect(within(outputs).getByRole("link", { name: /org\/repo #42/ })).toHaveAttribute(
-      "href",
-      url,
-    );
-    const activity = await screen.findByRole("region", { name: "Ticket activity" });
-    expect(within(activity).getAllByRole("link", { name: "org/repo #42" })).toHaveLength(2);
-    expect(screen.queryByLabelText("Output URL")).toBeNull();
-    fireEvent.change(screen.getByLabelText("Add a comment"), {
-      target: { value: "Ready for review" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Attach link" }));
-    fireEvent.change(screen.getByLabelText("Output URL"), { target: { value: url } });
-    fireEvent.click(screen.getByRole("button", { name: "Comment" }));
-    await waitFor(() =>
-      expect(api.commentOnTicket).toHaveBeenCalledWith("project", "ticket", {
-        text: "Ready for review",
-        outputs: [{ type: "pull_request", url }],
-      }),
-    );
-    await waitFor(() => expect(screen.getByLabelText("Add a comment")).toHaveValue(""));
-    expect(screen.queryByLabelText("Output URL")).toBeNull();
-  });
+  it.each([false, true])(
+    "groups and deduplicates attachments without losing activity (links=%s)",
+    async (includeLink) => {
+      const url = "https://git.example.com/org/repo/pull/42";
+      const linkUrl = "https://example.test/decisions";
+      const event: TicketEvent = {
+        id: "event1",
+        ticket_id: ticket.id,
+        position: 0,
+        kind: "output",
+        user_id: null,
+        session_id: null,
+        agent_id: null,
+        payload: { type: "pull_request", url },
+        created_at: 1000,
+      };
+      vi.mocked(api.listTicketEvents).mockResolvedValue({
+        data: [
+          event,
+          { ...event, id: "event2", position: 1 },
+          ...(includeLink
+            ? [{ ...event, id: "link", position: 2, payload: { type: "link", url: linkUrl } }]
+            : []),
+        ],
+        has_more: false,
+        last_position: 1,
+      });
+      renderBoard(
+        <ProjectTicketPanel
+          projectName="Shipping"
+          ticketId="ticket"
+          onClose={vi.fn()}
+          onCreated={vi.fn()}
+        />,
+      );
+      const outputs = await screen.findByRole("region", { name: "Pull requests" });
+      expect(within(outputs).getAllByRole("link")).toHaveLength(1);
+      expect(within(outputs).getByRole("link", { name: /org\/repo #42/ })).toHaveAttribute(
+        "href",
+        url,
+      );
+      expect(screen.queryByRole("region", { name: "Outputs" })).toBeNull();
+      if (includeLink) {
+        const links = screen.getByRole("region", { name: "Links" });
+        expect(within(links).getAllByRole("link")).toHaveLength(1);
+        expect(within(links).getByRole("link")).toHaveAttribute("href", linkUrl);
+      } else expect(screen.queryByRole("region", { name: "Links" })).toBeNull();
+      const activity = await screen.findByRole("region", { name: "Ticket activity" });
+      expect(within(activity).getAllByRole("link", { name: "org/repo #42" })).toHaveLength(2);
+      expect(screen.queryByLabelText("Output URL")).toBeNull();
+      fireEvent.change(screen.getByLabelText("Add a comment"), {
+        target: { value: "Ready for review" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Attach link" }));
+      fireEvent.change(screen.getByLabelText("Output URL"), { target: { value: url } });
+      fireEvent.click(screen.getByRole("button", { name: "Comment" }));
+      await waitFor(() =>
+        expect(api.commentOnTicket).toHaveBeenCalledWith("project", "ticket", {
+          text: "Ready for review",
+          outputs: [{ type: "pull_request", url }],
+        }),
+      );
+      await waitFor(() => expect(screen.getByLabelText("Add a comment")).toHaveValue(""));
+      expect(screen.queryByLabelText("Output URL")).toBeNull();
+    },
+  );
 
   it("edits key/value tags without changing ticket status", async () => {
     renderBoard(
@@ -671,7 +784,9 @@ describe("Project ticket board", () => {
     expect(screen.getByText("System")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add tags" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Tags" })).toBeNull();
-    expect(screen.queryByRole("heading", { name: "Outputs" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Pull requests" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Links" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Show full comment" })).toBeNull();
     expect(screen.queryByRole("heading", { name: "Sessions" })).toBeNull();
     expect(screen.queryByRole("combobox", { name: "Output type" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Add plan" })).toBeNull();

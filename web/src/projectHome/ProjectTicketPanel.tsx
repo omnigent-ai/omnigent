@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useId, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   BotIcon,
@@ -47,6 +47,7 @@ import {
 import { ProjectSessionPanel } from "./ProjectSessionPanel";
 import { ticketPanelSearch } from "./projectHomeNavigation";
 import { TicketAgents } from "./TicketAgents";
+import { TicketCommentBody } from "./TicketCommentBody";
 import { TicketSessionLink } from "./TicketSessionLink";
 import { TicketError, TicketStageIcon, TicketTags } from "./TicketControls";
 import { TicketRelatedTickets } from "./TicketRelatedTickets";
@@ -514,6 +515,7 @@ function TicketCommentComposer({
   const [attaching, setAttaching] = useState(false);
   const [outputUrl, setOutputUrl] = useState("");
   const [outputType, setOutputType] = useState<TicketOutput["type"]>("pull_request");
+  const helpId = useId();
   return (
     <form
       className="space-y-2"
@@ -543,6 +545,7 @@ function TicketCommentComposer({
         <Textarea
           name="comment"
           aria-label="Add a comment"
+          aria-describedby={helpId}
           required
           maxLength={2000}
           rows={2}
@@ -614,6 +617,10 @@ function TicketCommentComposer({
           </Button>
         </div>
       </div>
+      <p id={helpId} className="px-1 text-xs text-muted-foreground">
+        Lead with the outcome. Use <code>**bold labels**</code> and{" "}
+        <code>[details](message URL)</code>; copy a message’s link from its chat.
+      </p>
       <TicketError error={comment.error} />
       <span role="status" className="sr-only">
         {comment.isSuccess ? "Comment added" : ""}
@@ -732,18 +739,28 @@ function TicketOutputs({ projectId, ticketId }: { projectId: string; ticketId: s
   const outputs = ticketOutputs(query.data?.pages.flatMap((page) => page.data) ?? []);
   if (outputs.length === 0 && !query.error && !query.hasNextPage) return null;
   return (
-    <section aria-label="Outputs" className="space-y-2">
-      <h3 className="text-sm font-medium">Outputs</h3>
+    <div className="space-y-4">
+      {(
+        [
+          ["pull_request", "Pull requests"],
+          ["link", "Links"],
+        ] as const
+      ).map(([type, label]) => {
+        const group = outputs.filter((output) => output.type === type);
+        return group.length > 0 ? (
+          <section key={type} aria-label={label} className="space-y-2">
+            <h3 className="text-sm font-medium">{label}</h3>
+            <ul className="divide-y divide-border/60 overflow-hidden rounded-lg border border-border/60">
+              {group.map((output) => (
+                <li key={output.url}>
+                  <TicketOutputLink output={output} />
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : null;
+      })}
       <TicketError error={query.error} />
-      {outputs.length > 0 && (
-        <ul className="divide-y divide-border/60 overflow-hidden rounded-lg border border-border/60">
-          {outputs.map((output) => (
-            <li key={`${output.type}:${output.url}`}>
-              <TicketOutputLink output={output} />
-            </li>
-          ))}
-        </ul>
-      )}
       {query.hasNextPage && (
         <Button
           variant="ghost"
@@ -751,10 +768,10 @@ function TicketOutputs({ projectId, ticketId }: { projectId: string; ticketId: s
           loading={query.isFetchingNextPage}
           onClick={() => void query.fetchNextPage()}
         >
-          More outputs
+          More attachments
         </Button>
       )}
-    </section>
+    </div>
   );
 }
 
@@ -954,7 +971,7 @@ function TicketActivityItem({
             {age === "now" ? "Just now" : `${age} ago`}
           </time>
         </div>
-        {body && <ProseMarkdown className="text-ui leading-relaxed">{body}</ProseMarkdown>}
+        {body && <TicketCommentBody body={body} />}
       </div>
     </li>
   );
