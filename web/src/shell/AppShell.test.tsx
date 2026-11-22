@@ -2422,16 +2422,7 @@ describe("Workspace rail maximize", () => {
   });
 });
 
-/**
- * Gadget full screen contract. These pin intended behavior; change them only on purpose.
- * - Opened from inside Omnigent (Gadget page, sidebar, pins, links), a gadget fills the screen
- *   and leaves the left sidebar as it was, open or collapsed, now and on leaving full screen.
- * - Opened from a fresh link (a page load, or the gadget link page handing a fresh load on), it
- *   fills the screen with the sidebar collapsed.
- * The links' side of this is in GadgetListPage, GadgetSidebarNav, GadgetOpenPage and
- * gadgetNavigation tests; actions from a full screen gadget are pinned in gadgetSession,
- * GadgetRailTabs, GadgetOpenSessionButton and useAdoptStartedGadgetSession tests.
- */
+/** Pins intended behavior: in-app gadget opens preserve sidebar state; fresh links collapse it. */
 describe("gadget full screen contract", () => {
   const BOARD = gadgetFixture({ id: "board", name: "Board" });
   const GADGETS_ON = serverInfo({ features: { gadgets: true } });

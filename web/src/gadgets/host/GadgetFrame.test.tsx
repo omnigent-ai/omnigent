@@ -95,7 +95,7 @@ describe("buildGadgetFrameDocument", () => {
     expect(buildGadgetFrameDocument("<p>Hi</p>", "").startsWith("<!DOCTYPE html><meta")).toBe(true);
   });
 
-  it("blocks the network", () => {
+  it("sets a content security policy with no network sources", () => {
     expect(GADGET_CONTENT_SECURITY_POLICY).toContain("connect-src 'none'");
     expect(GADGET_CONTENT_SECURITY_POLICY).toContain("default-src 'none'");
   });

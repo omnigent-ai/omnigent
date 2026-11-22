@@ -182,6 +182,18 @@ describe("a session started beside a gadget", () => {
     await waitFor(() => expect(getGadget).toHaveBeenCalledWith("board"));
     expect(deleteGadget).not.toHaveBeenCalled();
 
+    // Unpublished, but it already has a gadget session.
+    resetGadgetStarts();
+    vi.mocked(getGadget).mockResolvedValue(
+      gadgetFixture({ id: "board", published_revision: null }),
+    );
+    vi.mocked(getGadgetGadgetSession).mockResolvedValue("conv_7");
+    rememberUnbuiltGadget("board");
+    renderShell();
+    fireEvent.click(screen.getAllByRole("button", { name: "Elsewhere" }).at(-1)!);
+    await waitFor(() => expect(getGadgetGadgetSession).toHaveBeenCalledWith("board"));
+    expect(deleteGadget).not.toHaveBeenCalled();
+
     resetGadgetStarts();
     rememberUnbuiltGadget("board");
     renderShell();

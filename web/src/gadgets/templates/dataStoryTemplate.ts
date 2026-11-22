@@ -1,17 +1,6 @@
-// Data story template: a story about the viewer's own data work, built by their gadget session.
-// It starts empty. Find stories in my work asks the session to read the viewer's recent sessions
-// for data work and suggest a few stories; the viewer picks one (or asks for something else), and
-// the session gathers the data with its own tools, writes the story into fixed records and
-// designs the page for it, so every story's page is its own.
-//
-// The page is a kit plus a view, like Where was I?. The kit keeps the story ideas, build and
-// refresh progress, the look line with Back to the previous look, sources, the guide, a plain
-// story view, and the fallback to that view when a design fails to draw. The view sits between
-// the VIEW_START and VIEW_END markers; the session replaces only that region with its design,
-// which calls `Story.view({ render })`.
-//
-// The scripts are plain ES2018 inside template literals: keep them free of backticks, `${`, and
-// unescaped backslashes.
+// Data story template: a kit plus a view between the VIEW_START and VIEW_END markers, which the
+// gadget session replaces with its design. The scripts are plain ES2018 inside template literals:
+// keep them free of backticks, `${`, and unescaped backslashes.
 
 import type { CreateGadgetRevisionRequest } from "../api/gadgetApi";
 import {

@@ -336,24 +336,18 @@ async def test_sharing_follows_the_grant_levels(client: httpx.AsyncClient) -> No
     assert (await client.get(base, headers=_as(BOB))).status_code == 404
 
 
-@pytest.mark.parametrize(
-    ("body", "status"),
-    [
-        ({"user_id": ALICE, "level": 1}, 400),
-        ({"user_id": "__public__", "level": 1}, 400),
-        ({"user_id": "local", "level": 1}, 400),
-        ({"user_id": " ", "level": 1}, 400),
-        ({"user_id": BOB, "level": 4}, 400),
-    ],
-)
-async def test_grants_refuse_the_owner_the_public_and_unknown_levels(
-    client: httpx.AsyncClient, body: dict, status: int
+@pytest.mark.parametrize("user_id", [ALICE, "__public__", "local"])
+async def test_grants_refuse_the_owner_the_public_and_the_local_user(
+    client: httpx.AsyncClient, user_id: str
 ) -> None:
+    # Blank IDs and unknown levels: test_refused_grants_say_why_in_the_gadget_error_shape.
     gadget = await _published(client)
     response = await client.put(
-        f"/v1/gadgets/{gadget['id']}/permissions", json=body, headers=_as(ALICE)
+        f"/v1/gadgets/{gadget['id']}/permissions",
+        json={"user_id": user_id, "level": 1},
+        headers=_as(ALICE),
     )
-    assert response.status_code == status, response.text
+    assert response.status_code == 400, response.text
 
 
 async def test_agents_cannot_change_sharing(client: httpx.AsyncClient) -> None:

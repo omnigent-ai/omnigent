@@ -1,5 +1,3 @@
-import { createContext, runInContext } from "node:vm";
-
 import { waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -10,6 +8,12 @@ import {
   DATA_STORY_VIEW_END,
   DATA_STORY_VIEW_START,
 } from "./dataStoryTemplate";
+import {
+  SERVER_SCHEMA_KEYWORDS,
+  bootTemplatePage,
+  jsonBytes,
+  schemaKeywords,
+} from "./templateTestKit";
 
 interface Doc {
   id: string;
@@ -170,32 +174,7 @@ function startStory({
       },
     },
   };
-  const body = html.slice(html.indexOf("<body>") + "<body>".length, html.indexOf("</body>"));
-  const scripts = [...body.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)].map((match) => match[1]);
-  document.body.innerHTML = body.replace(/<script[^>]*>[\s\S]*?<\/script>/g, "");
-  const windowListeners: Record<string, ((event: unknown) => void)[]> = {};
-  const context: Record<string, unknown> = {
-    document,
-    setTimeout,
-    clearTimeout,
-    setInterval: () => 0,
-    clearInterval: () => undefined,
-    omnigent: { connect: () => Promise.resolve(client), isOmnigentError: () => false },
-    addEventListener: (type: string, listener: (event: unknown) => void) => {
-      (windowListeners[type] ??= []).push(listener);
-    },
-  };
-  context.window = context;
-  createContext(context);
-  for (const script of scripts) {
-    try {
-      runInContext(script, context);
-    } catch (error) {
-      (windowListeners.error ?? []).forEach((listener) =>
-        listener({ error, message: String(error) }),
-      );
-    }
-  }
+  bootTemplatePage(html, client);
   const emit = (name: string, items: Doc[]) => listeners[name]?.({ status: "live", items });
   const emitActions = (items: unknown[]) => actionListener?.({ status: "live", items });
   /** Loads the page with these records, as the first polls answer. */
@@ -473,8 +452,8 @@ describe("data story revision", () => {
 
   it("uses only schema keywords the server accepts", () => {
     for (const schema of Object.values(DATA_STORY_REVISION.collections)) {
-      for (const keyword of keywords(schema, new Set())) {
-        expect(SUPPORTED_KEYWORDS).toContain(keyword);
+      for (const keyword of schemaKeywords(schema)) {
+        expect(SERVER_SCHEMA_KEYWORDS).toContain(keyword);
       }
     }
   });
@@ -499,11 +478,9 @@ describe("data story revision", () => {
   it("fits the server's limits", () => {
     expect(new TextEncoder().encode(DATA_STORY_GUIDE).length).toBeLessThanOrEqual(16 * 1024);
     expect(new TextEncoder().encode(DATA_STORY_HTML).length).toBeLessThan(1024 * 1024);
-    for (const schema of Object.values(DATA_STORY_REVISION.collections)) {
-      expect(new TextEncoder().encode(JSON.stringify(schema)).length).toBeLessThanOrEqual(
-        16 * 1024,
-      );
-    }
+    // The server bounds the whole collections object, and how many there are.
+    expect(Object.keys(DATA_STORY_REVISION.collections).length).toBeLessThanOrEqual(16);
+    expect(jsonBytes(DATA_STORY_REVISION.collections)).toBeLessThanOrEqual(16 * 1024);
   });
 
   it("declares the actions the page requests", () => {
@@ -515,41 +492,3 @@ describe("data story revision", () => {
     ]);
   });
 });
-
-// The server refuses other JSON Schema keywords (omnigent/gadgets/service.py).
-const SUPPORTED_KEYWORDS = new Set([
-  "type",
-  "properties",
-  "required",
-  "additionalProperties",
-  "items",
-  "enum",
-  "minimum",
-  "maximum",
-  "exclusiveMinimum",
-  "exclusiveMaximum",
-  "minLength",
-  "maxLength",
-  "minItems",
-  "maxItems",
-  "minProperties",
-  "maxProperties",
-  "title",
-  "description",
-  "default",
-  "$schema",
-]);
-
-function keywords(schema: unknown, out: Set<string>): Set<string> {
-  if (schema && typeof schema === "object" && !Array.isArray(schema)) {
-    for (const [key, value] of Object.entries(schema)) {
-      out.add(key);
-      if (key === "properties") {
-        Object.values(value as Record<string, unknown>).forEach((child) => keywords(child, out));
-      } else if (key === "items" || key === "additionalProperties") {
-        keywords(value, out);
-      }
-    }
-  }
-  return out;
-}
