@@ -233,6 +233,8 @@ class DrainedInput:
         hidden and settles quietly as an uncertain entry.
     :param uncertain: Whether a positional drain may already have mirrored
         this entry. Restore must preserve that evidence even after eviction.
+    :param queued_during_turn: Whether the message was sent while a turn was
+        running, so it follows that turn's request instead of starting a turn.
     """
 
     pending_id: str
@@ -240,6 +242,7 @@ class DrainedInput:
     created_by: str | None = None
     stable_id: str | None = None
     background_titles_enabled: bool = True
+    queued_during_turn: bool = False
     interrupted: bool = False
     # Reconstructed entries without original delivery metadata must remain unknown.
     input_enqueued_at_ms: int | None = None
@@ -307,6 +310,8 @@ class _Entry:
         pending, is left out of the snapshot, and a later match that jumps over
         it must not call it undelivered. A mirror of its own text still drains
         it normally: the agent did record it.
+    :param queued_during_turn: ``True`` when the message was sent while a turn
+        was running, so it follows that turn's request instead of starting one.
     """
 
     pending_id: str
@@ -314,6 +319,7 @@ class _Entry:
     created_by: str | None = None
     stable_id: str | None = None
     background_titles_enabled: bool = True
+    queued_during_turn: bool = False
     # Lambda (not ``_now`` directly) so a monkeypatched ``_now`` is
     # resolved at construction time rather than bound at class def.
     created_at: float = field(default_factory=lambda: _now())
@@ -376,6 +382,7 @@ def record(
     stable_id: str | None = None,
     *,
     background_titles_enabled: bool = True,
+    queued_during_turn: bool = False,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -399,6 +406,8 @@ def record(
         directly as the persisted item's id so the store-level append is
         idempotent across client retries. ``None`` for clients that do not
         send one.
+    :param queued_during_turn: Whether the session's turn was running when
+        the message was sent (see :func:`has_pending_turn_start`).
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
 
     Beyond :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries the oldest
@@ -422,6 +431,7 @@ def record(
             created_by=created_by,
             stable_id=stable_id,
             background_titles_enabled=background_titles_enabled,
+            queued_during_turn=queued_during_turn,
         )
         entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
@@ -784,6 +794,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         created_by=drained.created_by,
         stable_id=drained.stable_id,
         background_titles_enabled=drained.background_titles_enabled,
+        queued_during_turn=drained.queued_during_turn,
         interrupted=drained.interrupted,
         uncertain=drained.uncertain,
         input_enqueued_at_ms=drained.input_enqueued_at_ms,
@@ -957,6 +968,25 @@ def has_pending(conversation_id: str) -> bool:
         return any(not entry.interrupted for entry in _pending.get(conversation_id, {}).values())
 
 
+def has_pending_turn_start(conversation_id: str) -> bool:
+    """
+    Report whether an un-consumed message will start the session's next turn.
+
+    Unlike :func:`has_pending`, a follow-up sent while a turn was running does
+    not count: the request that turn answers already reached history.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :returns: ``True`` iff a pending entry the person has not cancelled was
+        recorded while no turn was running.
+    """
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        return any(
+            not entry.interrupted and not entry.queued_during_turn
+            for entry in _pending.get(conversation_id, {}).values()
+        )
+
+
 def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
     """
     Return un-consumed messages for one session, for snapshot replay.
@@ -1010,6 +1040,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         created_by=entry.created_by,
         stable_id=entry.stable_id,
         background_titles_enabled=entry.background_titles_enabled,
+        queued_during_turn=entry.queued_during_turn,
         interrupted=entry.interrupted,
         uncertain=entry.uncertain,
         input_enqueued_at_ms=entry.input_enqueued_at_ms,

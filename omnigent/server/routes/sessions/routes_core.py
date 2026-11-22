@@ -4858,11 +4858,12 @@ def register_core_routes(
         from the truncated items instead of resuming the source's full
         native transcript.
 
-        A side chat (``body.side_chat``) forked while the source's turn is
-        running leaves out the request the source is answering: it copies
-        only the history before the source's newest user message, and a
-        native target rebuilds its transcript from those items instead of
-        cloning the source's live one.
+        A side chat (``body.side_chat``) forked while the source answers a
+        request, or while a message is still reaching its runner, leaves that
+        request out: it copies only the history before the source's newest
+        request, unless the message starting the turn is not in history yet,
+        and a native target rebuilds its transcript from those items instead
+        of cloning the source's live one.
 
         The dialog's run-config picks (``body.model_override``,
         ``body.reasoning_effort``, ``body.terminal_launch_args`` — the
@@ -5093,18 +5094,21 @@ def register_core_routes(
                     _resolve_harness, source, agent_store=agent_store, agent_cache=agent_cache
                 )
             )
-        # A side chat must not inherit the request its source is still answering,
-        # or the side chat's model takes that request up as its own.
+        # A side chat must not inherit a request its source is answering or about
+        # to answer, or the side chat's model takes that request up as its own.
         side_chat_mid_turn = (
             body.side_chat
             and copy_history
             and before_item_id is None
             and body.up_to_response_id is None
-            and _session_status_from_cache(source.id, source.live_status) == "running"
+            and (
+                _session_status_from_cache(source.id, source.live_status) == "running"
+                or _session_is_starting(source.id)
+            )
         )
-        # A web message still on its way to a native terminal is not in history yet.
-        if side_chat_mid_turn and not pending_inputs.has_pending(source.id):
-            before_item_id = await asyncio.to_thread(_latest_user_message_id, source.id)
+        # A message that will start the source's next turn is not in history yet.
+        if side_chat_mid_turn and not pending_inputs.has_pending_turn_start(source.id):
+            before_item_id = await asyncio.to_thread(_latest_request_id, source.id)
         # A fork that keeps no history has no attachments to replay.
         if copy_history:
             await asyncio.to_thread(
@@ -5358,12 +5362,12 @@ def register_core_routes(
         # source session natively. A managed fork gets its OWN fresh sandbox,
         # whose filesystem has no copy of the source's local native rollout,
         # so the clone is likewise doomed — skip the directive so the runner
-        # rebuilds from the copied Omnigent items instead. A running source's
-        # native transcript holds the request a side chat must leave out.
+        # rebuilds from the copied Omnigent items instead.
         resume_source_native_session = (
             (not switching_agent or copy_model_settings)
             and (not target_is_cursor or target_forks_opencode)
             and body.host_type != "managed"
+            # A running source's native transcript holds the request a side chat skips.
             and not side_chat_mid_turn
         )
 
@@ -6396,13 +6400,16 @@ def register_core_routes(
                 return False
             after = page.last_id
 
-    def _latest_user_message_id(session_id: str) -> str | None:
+    def _latest_request_id(session_id: str) -> str | None:
         """
-        Return the id of *session_id*'s newest user message.
+        Return the id of *session_id*'s newest request.
+
+        A request is a user message that is not an internal record, such as a
+        task notification Claude Code adds while a turn runs.
 
         :param session_id: Session to search, e.g. ``"conv_abc"``.
         :returns: The message's item id, e.g. ``"msg_abc"``, or ``None`` when
-            the session has no user message.
+            the session has no request.
         """
         after: str | None = None
         while True:
@@ -6410,7 +6417,11 @@ def register_core_routes(
                 session_id, limit=100, after=after, order="desc", type="message"
             )
             for item in page.data:
-                if isinstance(item.data, MessageData) and item.data.role == "user":
+                if (
+                    isinstance(item.data, MessageData)
+                    and item.data.role == "user"
+                    and not item.data.is_meta
+                ):
                     return item.id
             if not page.has_more or page.last_id is None:
                 return None

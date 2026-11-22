@@ -9353,6 +9353,9 @@ async def _dispatch_session_event_to_runner_impl(
                 created_by=created_by,
                 stable_id=web_stable_id,
                 background_titles_enabled=background_titles_enabled,
+                queued_during_turn=(
+                    _session_status_from_cache(session_id, conv.live_status) == "running"
+                ),
             )
             if queues_message
             else None
