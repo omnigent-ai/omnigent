@@ -343,13 +343,13 @@ class _NewestRequest(NamedTuple):
     :param item_id: The request's first item id, ``None`` when none is in reach.
     :param answered: Whether the agent produced anything after the request.
     :param end_response_id: Response id of the newest item a copy can end on.
-    :param history_empty: Whether the session has no items at all.
+    :param whole_history: Whether the read reached the session's oldest item.
     """
 
     item_id: str | None
     answered: bool
     end_response_id: str | None
-    history_empty: bool
+    whole_history: bool
 
 
 # An image a prompt carries inline rather than as a stored file.
@@ -5140,9 +5140,10 @@ def register_core_routes(
             ):
                 before_item_id = newest.item_id
             elif delivering or not source_running:
-                # The request has not reached history: copy only what is there now.
+                # The request has not reached history: copy only what is there now,
+                # which is nothing when no item a copy can end on exists.
                 up_to_response_id = newest.end_response_id
-                copy_items = not newest.history_empty
+                copy_items = newest.end_response_id is not None or not newest.whole_history
         # A fork that keeps no history has no attachments to replay.
         if copy_items:
             await asyncio.to_thread(
@@ -6471,7 +6472,7 @@ def register_core_routes(
             item_id=request.id if request is not None else None,
             answered=answered,
             end_response_id=end_response_id,
-            history_empty=not page.data,
+            whole_history=not page.has_more,
         )
 
     def _rewind_prompt(session_id: str, item_id: str) -> MessageData:
