@@ -4681,6 +4681,7 @@ function ProjectHeaderActions({
         hostId={hostId}
         hosts={hosts}
         hostsLoading={hostsLoading}
+        inPalette
       />
       {showMenu && (
         <DropdownMenu>

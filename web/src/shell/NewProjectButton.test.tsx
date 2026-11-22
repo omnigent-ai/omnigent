@@ -4,6 +4,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as CapabilitiesModule from "@/lib/CapabilitiesContext";
 import type { Host } from "@/hooks/useHosts";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
+import { registeredPaletteCommands } from "@/test/paletteCommands";
+
 import { NewProjectButton } from "./NewProjectButton";
 
 const mocks = vi.hoisted(() => ({
@@ -714,5 +717,48 @@ describe("NewProjectButton project repositories", () => {
     expect(screen.queryByLabelText("Run on")).toBeNull();
     expect(screen.queryByRole("radio", { name: "Repository" })).toBeNull();
     expect(screen.getByRole("button", { name: /Working directory/ })).toBeInTheDocument();
+  });
+});
+
+describe("New project… in the QuickPick ⌘K palette", () => {
+  const paletteButton = (inPalette: boolean) => (
+    <QueryClientProvider client={new QueryClient()}>
+      <TooltipProvider>
+        <NewProjectButton
+          onCreated={vi.fn()}
+          hostId="host_1"
+          hosts={[]}
+          hostsLoading={false}
+          inPalette={inPalette}
+        />
+      </TooltipProvider>
+    </QueryClientProvider>
+  );
+
+  beforeEach(() => {
+    mocks.serverInfo = { features: { quick_pick_palette: true } };
+    usePaletteCommandsStore.setState({ groups: {} });
+  });
+
+  it("opens the same fresh dialog as the button, once the palette has closed", () => {
+    render(paletteButton(true));
+    const command = registeredPaletteCommands().find(
+      (candidate) => candidate.label === "New project…",
+    );
+    expect(command?.movesFocus).toBe(true);
+    act(() => command!.run());
+    const name = screen.getByPlaceholderText("Project name…");
+    fireEvent.change(name, { target: { value: "Draft" } });
+    fireEvent.keyDown(name, { key: "Escape" });
+    act(() => command!.run());
+    expect(screen.getByPlaceholderText("Project name…")).toHaveValue("");
+  });
+
+  it("is offered only by the button that asks, and only with the flag on", () => {
+    render(paletteButton(false));
+    expect(registeredPaletteCommands()).toEqual([]);
+    mocks.serverInfo = { features: {} };
+    render(paletteButton(true));
+    expect(registeredPaletteCommands()).toEqual([]);
   });
 });

@@ -93,8 +93,11 @@ the header menu), and each place is a separate entry point.
   New session. Each opens the folder menu's own dialog. A rename keeps the
   folder expanded, and the new-session view follows a rename or leaves once the
   project is deleted. A session filed in a project the viewer doesn't have,
-  such as a shared one, offers none. The project home lists its own
-  (`web/src/shell/projectCommands/ProjectActionHost.test.tsx`).
+  such as a shared one, offers none, and a session's project label counts only
+  on the viewer's own session. The project home lists its own. **New project…**
+  opens the Projects header's dialog while the sidebar lists projects
+  (`web/src/shell/projectCommands/ProjectActionHost.test.tsx`,
+  `web/src/shell/NewProjectButton.test.tsx`).
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
