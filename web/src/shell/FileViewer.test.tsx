@@ -16,7 +16,7 @@
 
 import { type ComponentProps, useMemo } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, type UseQueryResult } from "@tanstack/react-query";
 import { MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
@@ -119,18 +119,27 @@ vi.mock("./MonacoDiffViewer", () => ({
   // Surface the toggle-driven props as data attributes so tests can assert the
   // "⋯" menu wires wrap-lines / hide-whitespace through to the diff editor.
   MonacoDiffViewer: ({
+    before,
+    after,
     position,
     wrapLines,
     hideWhitespace,
     searchOpen,
+    commentable,
   }: {
+    before?: string;
+    after?: string;
     position?: { line: number };
     wrapLines?: boolean;
     hideWhitespace?: boolean;
     searchOpen?: boolean;
+    commentable?: boolean;
   }) => (
     <div
       data-testid="diff-viewer"
+      data-before={before}
+      data-after={after}
+      data-commentable={String(commentable ?? true)}
       data-line={position?.line}
       data-wrap-lines={String(!!wrapLines)}
       data-hide-whitespace={String(!!hideWhitespace)}
@@ -203,7 +212,7 @@ vi.mock("@/store/chatStore", () => ({
 import { useComments } from "@/hooks/useComments";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
-import { useFileDiff } from "@/hooks/useFileDiff";
+import { type FileDiffResponse, useFileDiff } from "@/hooks/useFileDiff";
 import { prepareDiffEditor } from "./MonacoDiffViewer";
 import { MAX_PREVIEW_MARKDOWN_BYTES, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
 import { useFileContent } from "@/hooks/useFileContent";
@@ -280,6 +289,7 @@ interface RenderProps {
   onShare?: () => void;
   shareDisabledReason?: string;
   linkedCommentId?: string;
+  comparisonDiff?: ComponentProps<typeof FileViewer>["comparisonDiff"];
 }
 
 /**
@@ -310,6 +320,7 @@ function viewerTree({
   shareDisabledReason,
   registerLeaveGuard,
   linkedCommentId,
+  comparisonDiff,
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -336,6 +347,7 @@ function viewerTree({
           shareDisabledReason={shareDisabledReason}
           registerLeaveGuard={registerLeaveGuard}
           linkedCommentId={linkedCommentId}
+          comparisonDiff={comparisonDiff}
         />
       </MemoryRouter>
     </QueryClientProvider>
@@ -883,6 +895,119 @@ describe("FileViewer URL sync — diff param", () => {
         expect(useFileDiff).toHaveBeenLastCalledWith("conv_1", "other.py", { requested: false });
       },
     );
+  });
+
+  describe("under the session's chosen comparison", () => {
+    const comparisonQuery = (before: string, after: string) =>
+      ({ data: { before, after } }) as unknown as UseQueryResult<FileDiffResponse>;
+
+    it.each([
+      ["without a comparison", undefined],
+      ["under the last commit", { base: "head" as const }],
+    ])("reads the last commit's diff exactly as before %s", async (_name, comparisonDiff) => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      vi.mocked(useFileDiff).mockClear();
+      renderViewer({ open: true, initialSearch: "diff=1", comparisonDiff });
+      expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+      expect(vi.mocked(useFileDiff).mock.calls.every(([, path]) => path === "file1.py")).toBe(true);
+      expect(useFileDiff).toHaveBeenLastCalledWith("conv_1", "file1.py", { requested: true });
+    });
+
+    it("shows the comparison's diff for a file only it lists, and reads no last-commit diff", async () => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      renderViewer({
+        open: true,
+        path: "only-in-comparison.py",
+        initialSearch: "diff=1",
+        comparisonDiff: {
+          base: "comparison",
+          changed: true,
+          deleted: false,
+          headIsWorkingCopy: true,
+          query: comparisonQuery("base", "work"),
+        },
+      });
+      const viewer = await screen.findByTestId("diff-viewer");
+      // Monaco gets the comparison's own text, not the last commit's.
+      expect(viewer).toHaveAttribute("data-before", "base");
+      expect(viewer).toHaveAttribute("data-after", "work");
+      expect(useFileDiff).toHaveBeenLastCalledWith("conv_1", null, { requested: true });
+    });
+
+    it("keeps a file a committed head deleted, but the workspace still has, readable and editable", async () => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      vi.stubGlobal("omnigentDesktop", {
+        kind: "electron",
+        getHostIdentity: () => Promise.resolve({ cliInstalled: true, hostId: "this-mac" }),
+      });
+      const context = localDesktopContext();
+      render(
+        <FileViewerContext.Provider value={context}>
+          {viewerTree({
+            open: true,
+            path: "notes.md",
+            comparisonDiff: {
+              base: "comparison",
+              changed: true,
+              deleted: true,
+              headIsWorkingCopy: false,
+              query: comparisonQuery("# Notes", ""),
+            },
+          })}
+        </FileViewerContext.Provider>,
+      );
+
+      // The current file is read and opens in its editor, with its workspace actions.
+      expect(useFileContent).toHaveBeenLastCalledWith("conv_1", "notes.md", { visible: true });
+      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "editor");
+      expect(screen.getByRole("textbox", { name: "Draft text" })).toBeInTheDocument();
+      expect(await screen.findByRole("button", { name: "Open in VS Code" })).toBeInTheDocument();
+
+      // The comparison's deletion is a diff to show and leave, not a file that's gone.
+      fireEvent.click(screen.getByRole("button", { name: "Show diff" }));
+      const viewer = await screen.findByTestId("diff-viewer");
+      expect(viewer).toHaveAttribute("data-before", "# Notes");
+      expect(viewer).toHaveAttribute("data-after", "");
+      fireEvent.click(screen.getByRole("button", { name: "Exit diff view" }));
+      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "editor");
+    });
+
+    it("keeps comments off a committed snapshot's after side, and on for the working copy", async () => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      const snapshot = (headIsWorkingCopy: boolean) => ({
+        base: "comparison" as const,
+        changed: true,
+        deleted: false,
+        headIsWorkingCopy,
+        query: comparisonQuery("v1", "v2 on another branch"),
+      });
+      const { unmount } = renderViewer({
+        open: true,
+        initialSearch: "diff=1",
+        comparisonDiff: snapshot(false),
+      });
+      expect(await screen.findByTestId("diff-viewer")).toHaveAttribute("data-commentable", "false");
+      unmount();
+      renderViewer({ open: true, initialSearch: "diff=1", comparisonDiff: snapshot(true) });
+      expect(await screen.findByTestId("diff-viewer")).toHaveAttribute("data-commentable", "true");
+    });
+
+    it("offers no diff for a file the comparison doesn't list, even one the last commit changed", async () => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      renderViewer({
+        open: true,
+        initialSearch: "diff=1",
+        comparisonDiff: {
+          base: "comparison",
+          changed: false,
+          deleted: false,
+          headIsWorkingCopy: true,
+          query: comparisonQuery("", ""),
+        },
+      });
+      expect(await screen.findByTestId("code-viewer")).toBeInTheDocument();
+      expect(screen.queryByTestId("diff-viewer")).toBeNull();
+    });
   });
 
   it("does not prepare a linked diff when changed-file discovery has already failed", async () => {
