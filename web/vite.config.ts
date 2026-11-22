@@ -171,21 +171,30 @@ const useAuth = !!process.env.OMNIGENT_AUTH_TOKEN || isWorkspaceHost(parsed.host
 const isDatabricksWorkspaceEnv = parsed.pathname.replace(/\/$/, "") === WORKSPACE_API_PATH;
 if (isDatabricksWorkspaceEnv) process.env.VITE_DATABRICKS_WORKSPACE = "true";
 
-if (useAuth) {
-  const token = resolveToken(parsed.origin);
-  if (token) {
-    console.log(
-      `[dev-proxy] target=${OMNIGENT_URL} (authenticated${isDatabricksWorkspaceEnv ? ", databricks-workspace" : ""})`,
-    );
-  } else {
-    console.error(
-      `\n[dev-proxy] ERROR: No auth token for ${parsed.origin}.\n` +
-        `  Set OMNIGENT_AUTH_TOKEN or run:  databricks auth login --host ${parsed.origin}\n`,
-    );
-    process.exit(1);
-  }
-} else {
-  console.log(`[dev-proxy] target=${OMNIGENT_URL}`);
+// Only serving uses the proxy, so a build never reads credentials or stops for a missing token.
+function devProxyAuth(): Plugin {
+  return {
+    name: "dev-proxy-auth",
+    apply: "serve",
+    config() {
+      if (!useAuth) {
+        console.log(`[dev-proxy] target=${OMNIGENT_URL}`);
+        return;
+      }
+      const token = resolveToken(parsed.origin);
+      if (token) {
+        console.log(
+          `[dev-proxy] target=${OMNIGENT_URL} (authenticated${isDatabricksWorkspaceEnv ? ", databricks-workspace" : ""})`,
+        );
+        return;
+      }
+      console.error(
+        `\n[dev-proxy] ERROR: No auth token for ${parsed.origin}.\n` +
+          `  Set OMNIGENT_AUTH_TOKEN or run:  databricks auth login --host ${parsed.origin}\n`,
+      );
+      process.exit(1);
+    },
+  };
 }
 
 // Safari < 16.4 cannot parse regex lookbehind; these dependency regexes would
@@ -247,7 +256,7 @@ export default defineConfig(({ command }) => ({
   // `{base}/assets/...` at serve time (see `_rewrite_web_ui_index` in
   // omnigent/server/app.py). Dev (`vite serve`) stays at root.
   base: command === "build" ? "./" : "/",
-  plugins: [safariLookbehindWorkarounds(), react(), tailwindcss()],
+  plugins: [devProxyAuth(), safariLookbehindWorkarounds(), react(), tailwindcss()],
   // Workers have no DOM, so they take a package's worker entry over its browser one.
   worker: workerBuildOptions,
   resolve: {

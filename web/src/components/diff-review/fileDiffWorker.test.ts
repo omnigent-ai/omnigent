@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { build, type Rollup } from "vite";
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { RICH_MARKDOWN_REQUEST, startInWorkerScope } from "@/test/workerScope";
+import { RICH_MARKDOWN_REQUEST, richMarkdownAnswer, startInWorkerScope } from "@/test/workerScope";
 
 import { workerBuildPlugins } from "../../../vite.workerExports";
 
@@ -47,11 +47,26 @@ describe.each(WORKERS)("%s", (worker) => {
     expect(moduleIds().filter((id) => react.test(id) || id.endsWith(".tsx"))).toEqual([]);
   });
 
-  it("starts in a worker scope without a document, and answers a request", async () => {
+  it("starts in a worker scope without a document", () => {
+    expect(() => startInWorkerScope(chunks.get(worker)!.code)).not.toThrow();
+  });
+
+  it.runIf(worker === "fileDiffWorker.ts")("answers a file diff request", async () => {
     const started = startInWorkerScope(chunks.get(worker)!.code);
-    if (worker !== "markdownDiffWorker.ts") return;
-    expect(await started.send(RICH_MARKDOWN_REQUEST)).toEqual([
-      { id: 1, result: expect.objectContaining({ status: "ready" }) },
-    ]);
+    const request = { path: "src/app.ts", before: "a\n", after: "a\nb\n", ignoreWhitespace: false };
+    const [answer] = (await started.send({ id: 7, request: { ...request, revision: "r1" } })) as [
+      { id: number; fileDiff?: { name: string; type: string }; error?: string },
+    ];
+    expect(answer.error).toBeUndefined();
+    expect(answer.id).toBe(7);
+    expect(answer.fileDiff).toMatchObject({ name: "src/app.ts", type: "change" });
+  });
+
+  it.runIf(worker === "markdownDiffWorker.ts")("answers a rich Markdown request", async () => {
+    const started = startInWorkerScope(chunks.get(worker)!.code);
+    const answer = richMarkdownAnswer(await started.send(RICH_MARKDOWN_REQUEST));
+    expect([answer.id, answer.status]).toEqual([1, "ready"]);
+    expect(answer.rendered).toContain("katex");
+    expect(answer.text).toContain("Price & fees");
   });
 });

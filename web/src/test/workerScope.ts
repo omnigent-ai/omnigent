@@ -45,7 +45,26 @@ export function startInWorkerScope(code: string): StartedWorker {
 export const RICH_MARKDOWN_REQUEST = {
   id: 1,
   request: {
-    before: "# Notes\n\nPrice &amp; tax\n\nInline $x^2$\n",
-    after: "# Notes\n\nPrice &amp; fees\n\nInline $y^3$\n",
+    before: "# Notes\n\nPrice &amp; tax\n\n$$\nx^2\n$$\n",
+    after: "# Notes\n\nPrice &amp; fees\n\n$$\ny^3\n$$\n",
   },
 };
+
+/** What a worker's answer to {@link RICH_MARKDOWN_REQUEST} rendered: its blocks, and their text. */
+export function richMarkdownAnswer(answers: unknown[]): {
+  id: unknown;
+  status: unknown;
+  rendered: string;
+  text: string;
+} {
+  const [answer] = answers as [
+    { id: unknown; result?: { status: unknown; sections?: { text: string }[] } } | undefined,
+  ];
+  const sections = answer?.result?.sections ?? [];
+  return {
+    id: answer?.id,
+    status: answer?.result?.status,
+    rendered: JSON.stringify(sections),
+    text: sections.map((section) => section.text).join("\n"),
+  };
+}
