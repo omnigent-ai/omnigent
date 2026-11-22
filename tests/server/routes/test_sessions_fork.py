@@ -562,6 +562,7 @@ def _make_item(
     text: str,
     response_id: str = "resp_001",
     role: Literal["user", "assistant"] = "user",
+    is_meta: bool = False,
 ) -> ConversationItem:
     """
     Build a minimal ConversationItem for testing.
@@ -570,6 +571,8 @@ def _make_item(
     :param text: Message text content.
     :param response_id: Response the item belongs to, e.g. ``"resp_001"``.
     :param role: Message role, ``"user"`` or ``"assistant"``.
+    :param is_meta: Whether the message is an internal record, such as a task
+        notification, rather than something a person sent.
     :returns: A ConversationItem.
     """
     return ConversationItem(
@@ -584,6 +587,7 @@ def _make_item(
                 {"type": "output_text" if role == "assistant" else "input_text", "text": text}
             ],
             agent="test-agent" if role == "assistant" else None,
+            is_meta=is_meta,
         ),
     )
 
@@ -693,21 +697,27 @@ def test_normal_fork_does_not_copy_side_chat_routing_source() -> None:
 
 
 @pytest.mark.parametrize(
-    ("side_chat", "live_status", "delivering", "cutoff", "clones_native"),
+    ("side_chat", "live_status", "history", "pending", "cutoff", "clones_native"),
     [
-        (True, "running", False, "msg_running", False),
-        (True, "waiting", False, "msg_running", False),
-        # The request is still on its way to a native terminal, so not in history.
-        (True, "running", True, None, False),
-        (True, "idle", False, None, True),
-        (True, "failed", False, None, True),
-        (False, "running", False, None, True),
+        (True, "running", "running", None, "msg_running", False),
+        (True, "waiting", "running", None, "msg_running", False),
+        # A task notification during the turn is not a new request.
+        (True, "running", "notified", None, "msg_running", False),
+        # A follow-up still on its way leaves the running request in history.
+        (True, "running", "running", "follow_up", "msg_running", False),
+        # The message starting the turn is still on its way, so not in history.
+        (True, "running", "answered", "turn_start", None, False),
+        (True, "idle", "answered", "turn_start", None, False),
+        (True, "idle", "answered", None, None, True),
+        (True, "failed", "answered", None, None, True),
+        (False, "running", "running", None, None, True),
     ],
 )
 def test_side_chat_forked_mid_turn_leaves_out_the_running_request(
     side_chat: bool,
     live_status: str,
-    delivering: bool,
+    history: str,
+    pending: str | None,
     cutoff: str | None,
     clones_native: bool,
 ) -> None:
@@ -718,18 +728,23 @@ def test_side_chat_forked_mid_turn_leaves_out_the_running_request(
         _make_item("msg_earlier", "Remember the codename", response_id="resp_001"),
         _make_item("msg_reply", "Noted", response_id="resp_002", role="assistant"),
     ]
-    if not delivering:
+    if history != "answered":
         items += [
             _make_item("msg_running", "Run the long command", response_id="resp_003"),
             _make_item("msg_progress", "Running it now", response_id="resp_004", role="assistant"),
         ]
+    if history == "notified":
+        items.append(
+            _make_item("msg_notice", "Background task done", response_id="resp_005", is_meta=True)
+        )
     store = _ConversationStore({source.id: source}, items_by_conv={source.id: items})
     client = TestClient(_build_app(store))
-    pending_id = (
-        pending_inputs.record(source.id, [{"type": "input_text", "text": "Run the long command"}])
-        if delivering
-        else None
-    )
+    message = [{"type": "input_text", "text": "Next message"}]
+    pending_id = None
+    if pending == "turn_start":
+        pending_id = pending_inputs.record(source.id, message)
+    elif pending == "follow_up":
+        pending_id = pending_inputs.record(source.id, message, queued_during_turn=True)
     try:
         response = client.post(f"/v1/sessions/{source.id}/fork", json={"side_chat": side_chat})
     finally:
