@@ -278,7 +278,6 @@ import {
   type SessionListFilterContext,
   sessionHarnessChoices,
   sessionHarnessKey,
-  sessionProjectId,
 } from "@/lib/sessionListFilters";
 import { SessionFilterSections, sessionListFilterSummary } from "@/shell/SessionFilterSections";
 import { useClearSidebarFiltersCommand } from "@/shell/useClearSidebarFiltersCommand";
@@ -347,7 +346,9 @@ import {
   isOwnedByViewer,
   isSharedAutomationRun,
   sessionInSidebarFolder,
+  sessionSidebarFolderKey,
   sessionsListAcceptsDrop,
+  sidebarFolderKey,
   withAutomationFolder,
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
@@ -2550,42 +2551,6 @@ function ConversationList({
   // Project folders ({ id, name }) for grouping sessions — first-class id
   // and/or the legacy omni_project label, unioned server-side.
   const { data: projects = [] } = useProjects();
-  // A session's status as the Status grouping gives it, starting and working sessions included.
-  // `unseenTick` and `draftIds` version the stores it reads.
-  const liveStatusOf = useCallback(
-    (c: Conversation): StatusBucket => {
-      const unseen = showsUnreadFor(c, isConversationUnseen(c.id, c.updated_at, c.status));
-      const bucket = statusBucket(c, unseen, hasSessionDraft(c.id));
-      return bucket !== "Needs attention" && (c.id === startingId || workingIds.has(c.id))
-        ? "Working"
-        : bucket;
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [startingId, workingIds, unseenTick, draftIds],
-  );
-  // The projects a filter can choose: those with an id, as the filter keeps it.
-  const filterProjects = useMemo(
-    () => projects.flatMap((p) => (p.id === null ? [] : [{ id: p.id, name: p.name }])),
-    [projects],
-  );
-  const filterContext = useMemo<SessionListFilterContext>(
-    () => ({
-      statusOf: liveStatusOf,
-      harnessOf: sessionHarnessKey,
-      projectOf: (c) => sessionProjectId(c, filterProjects),
-    }),
-    [liveStatusOf, filterProjects],
-  );
-  const filterRows = useCallback(
-    (rows: Conversation[], openSessionId: string | null) =>
-      applySessionListFilter(rows, listFilter.value, filterContext, openSessionId),
-    [listFilter.value, filterContext],
-  );
-  const filterKey = listFilter.count > 0 ? JSON.stringify(listFilter.value) : "";
-  const harnessChoices = useMemo(
-    () => sessionHarnessChoices(allConversations, listFilter.value.harness, harnessLabels),
-    [allConversations, listFilter.value.harness, harnessLabels],
-  );
   const projectOrder = useProjectOrder();
   const saveOrder = useSaveProjectOrder();
   const [draggedProject, setDraggedProject] = useState<string | null>(null);
@@ -2696,6 +2661,43 @@ function ConversationList({
   // Other users' automation runs join the default automation folder. My sessions
   // takes them from the shared rows already loaded, so none show when those aren't.
   const includeSharedRuns = activeTab !== "mine" || sharedActive;
+  // A session's status as the Status grouping gives it, starting and working sessions included.
+  // `unseenTick` and `draftIds` version the stores it reads.
+  const liveStatusOf = useCallback(
+    (c: Conversation): StatusBucket => {
+      const unseen = showsUnreadFor(c, isConversationUnseen(c.id, c.updated_at, c.status));
+      const bucket = statusBucket(c, unseen, hasSessionDraft(c.id));
+      return bucket !== "Needs attention" && (c.id === startingId || workingIds.has(c.id))
+        ? "Working"
+        : bucket;
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [startingId, workingIds, unseenTick, draftIds],
+  );
+  // The projects a filter can choose: the viewer's folders, label-only ones included, by key.
+  const filterProjects = useMemo(
+    () => projects.map((project) => ({ id: sidebarFolderKey(project), name: project.name })),
+    [projects],
+  );
+  const filterContext = useMemo<SessionListFilterContext>(
+    () => ({
+      statusOf: liveStatusOf,
+      harnessOf: sessionHarnessKey,
+      // The folder that lists the session, owner check included, so a filter shows what it shows.
+      projectOf: (c) => sessionSidebarFolderKey(c, projects, viewerId, includeSharedRuns),
+    }),
+    [liveStatusOf, projects, viewerId, includeSharedRuns],
+  );
+  const filterRows = useCallback(
+    (rows: Conversation[], openSessionId: string | null) =>
+      applySessionListFilter(rows, listFilter.value, filterContext, openSessionId),
+    [listFilter.value, filterContext],
+  );
+  const filterKey = listFilter.count > 0 ? JSON.stringify(listFilter.value) : "";
+  const harnessChoices = useMemo(
+    () => sessionHarnessChoices(allConversations, listFilter.value.harness, harnessLabels),
+    [allConversations, listFilter.value.harness, harnessLabels],
+  );
   const mineSharedRuns = useMemo(
     () =>
       activeTab === "mine" && includeSharedRuns
@@ -2770,7 +2772,10 @@ function ConversationList({
             projects,
             sharedRunsToFile,
             projectOrder.data?.sort_mode === "manual",
-          ).filter((folder) => chosenProject.kind === "all" || folder.id === chosenProject.id);
+          ).filter(
+            (folder) =>
+              chosenProject.kind === "all" || sidebarFolderKey(folder) === chosenProject.id,
+          );
     const filedIds = new Set<string>();
     const projectGroups: {
       id: string | null;
@@ -3553,7 +3558,7 @@ function ConversationList({
   const chosenProject = listFilter.value.project;
   const chosenFolderShown =
     chosenProject.kind === "project" &&
-    sections.projectGroups.some((group) => group.id === chosenProject.id);
+    sections.projectGroups.some((group) => sidebarFolderKey(group) === chosenProject.id);
   const filtersMatchNothing =
     listFilter.count === 0 ? null : chosenFolderShown ? (
       ""

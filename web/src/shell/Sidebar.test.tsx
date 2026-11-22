@@ -83,7 +83,7 @@ const {
   useSessionWorktreesMock,
 } = vi.hoisted(() => ({
   projectsMock: [] as string[],
-  projectRowsRef: { current: undefined as { id: string; name: string }[] | undefined },
+  projectRowsRef: { current: undefined as { id: string | null; name: string }[] | undefined },
   moveToProjectSpy: vi.fn(),
   deleteProjectSpy: vi.fn(),
   renameProjectSpy: vi.fn(),
@@ -5648,6 +5648,40 @@ describe("Sidebar pull request filter", () => {
     renderWith(true);
     expect(screen.queryByRole("button", { name: /^(Alpha|Beta)/ })).toBeNull();
     expect(listed()).toEqual(["conv_unfiled"]);
+  });
+
+  it("offers and narrows to exactly the folders the sidebar shows, label-only ones included", () => {
+    projectRowsRef.current = [
+      { id: null, name: "Legacy" },
+      { id: "p_Alpha", name: "Alpha" },
+    ];
+    mockConversations([
+      conv("conv_legacy", "Codex", { labels: { omni_project: "Legacy" } }),
+      conv("conv_alpha", "Codex", { project_id: "p_Alpha" }),
+      // Filing is the owner's: another user's session with this label isn't in the folder.
+      conv("conv_theirs_alpha", "Codex", {
+        owner: "other@example.com",
+        labels: { omni_project: "Alpha" },
+      }),
+    ]);
+    renderWith(true);
+    // All sessions lists other users' sessions too, so the owner check shows.
+    selectSessionFilter("all");
+    openFilterMenu();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Legacy" }));
+    expect(screen.getByRole("button", { name: /^Legacy/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Alpha/ })).toBeNull();
+    const toggle = screen.getByRole("button", { name: /^Legacy/ });
+    if (toggle.getAttribute("aria-expanded") !== "true") fireEvent.click(toggle);
+    expect(screen.getByText("conv_legacy")).toBeInTheDocument();
+
+    openFilterMenu();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Alpha" }));
+    expect(screen.queryByText("conv_theirs_alpha")).toBeNull();
+    openFilterMenu();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "No project" }));
+    expect(screen.getByText("conv_theirs_alpha")).toBeInTheDocument();
+    expect(screen.queryByText("conv_legacy")).toBeNull();
   });
 
   it("shows a project that's gone as Missing project, and says nothing matches", () => {

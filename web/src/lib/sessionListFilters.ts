@@ -4,7 +4,6 @@
 
 import type { Conversation } from "@/hooks/useConversations";
 import { NATIVE_CODING_AGENTS, nativeCodingAgentForSession } from "@/lib/nativeCodingAgents";
-import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 
 /** Which sessions to keep by their pull request. */
 export type SessionPullRequestFilter = "all" | "open" | "draft" | "closed" | "none";
@@ -241,18 +240,4 @@ export function sessionHarnessChoices(
   return [...keys]
     .map((key) => ({ key, name: sessionHarnessName(key, catalogLabels) }))
     .sort((a, b) => a.name.localeCompare(b.name));
-}
-
-/**
- * The id of the project `row` is filed in, read both ways the sidebar's folders read it: its
- * project id, or the legacy project label naming one of `projects`. Null when in none.
- */
-export function sessionProjectId(
-  row: { project_id?: string | null; labels?: Record<string, string> },
-  projects: readonly { id: string; name: string }[],
-): string | null {
-  if (row.project_id) return row.project_id;
-  const label = row.labels?.[PROJECT_LABEL_KEY];
-  if (!label) return null;
-  return projects.find((project) => project.name === label)?.id ?? null;
 }

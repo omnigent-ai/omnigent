@@ -18,7 +18,6 @@ import {
   sessionHarnessKey,
   sessionHarnessName,
   sessionListFilterCount,
-  sessionProjectId,
 } from "./sessionListFilters";
 
 const pullRequest = (state: string | null, isDraft = false): SessionPullRequestSummary => ({
@@ -230,26 +229,5 @@ describe("sessionHarnessKey and its choices", () => {
       "claude-sdk",
       "codex",
     ]);
-  });
-});
-
-describe("sessionProjectId", () => {
-  const PROJECTS = [
-    { id: "p-alpha", name: "Alpha" },
-    { id: "p-beta", name: "Beta" },
-  ];
-
-  it("reads the project id first, then a legacy label naming a project", () => {
-    expect(
-      sessionProjectId({ project_id: "p-beta", labels: { omni_project: "Alpha" } }, PROJECTS),
-    ).toBe("p-beta");
-    expect(sessionProjectId({ labels: { omni_project: "Alpha" } }, PROJECTS)).toBe("p-alpha");
-  });
-
-  it("is none without either, or with a label naming no project", () => {
-    expect(sessionProjectId({}, PROJECTS)).toBeNull();
-    expect(
-      sessionProjectId({ project_id: null, labels: { omni_project: "Gone" } }, PROJECTS),
-    ).toBeNull();
   });
 });

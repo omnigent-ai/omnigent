@@ -238,6 +238,27 @@ export function sessionInSidebarFolder(
   );
 }
 
+/** A folder's key for the sidebar's project filter: its project id, or its name when label-only. */
+export function sidebarFolderKey(folder: { id: string | null; name: string }): string {
+  return folder.id ?? `name:${folder.name}`;
+}
+
+/**
+ * The key of the folder among `folders` that lists the session, read exactly as the folders read
+ * it ({@link sessionInSidebarFolder}); null when none does.
+ */
+export function sessionSidebarFolderKey(
+  conversation: Conversation,
+  folders: readonly { id: string | null; name: string }[],
+  viewerId: string | null,
+  includeSharedRuns: boolean,
+): string | null {
+  const folder = folders.find((candidate) =>
+    sessionInSidebarFolder(conversation, candidate, viewerId, includeSharedRuns),
+  );
+  return folder ? sidebarFolderKey(folder) : null;
+}
+
 /** A folder the sidebar shows for shared automation runs before the viewer has that project. */
 export interface PlaceholderProjectFolder {
   id: null;

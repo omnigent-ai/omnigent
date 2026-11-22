@@ -21,6 +21,8 @@ import {
   pinOrderWrites,
   resolveSidebarDrop,
   sessionInSidebarFolder,
+  sessionSidebarFolderKey,
+  sidebarFolderKey,
   sessionsListAcceptsDrop,
   sortConversations,
   startCustomOrder,
@@ -1094,6 +1096,32 @@ describe("automation runs shared with the viewer", () => {
     expect(sessionInSidebarFolder(run, { id: null, name: "Alpha" }, "bob@example.com", true)).toBe(
       false,
     );
+  });
+
+  it("keys a session by the folder that lists it, for the project filter", () => {
+    const folders = [
+      { id: null, name: "Legacy" },
+      { id: "p_alpha", name: "Alpha" },
+      { id: "p_auto", name: "Omnigent Automation" },
+    ];
+    const own = (labels: Record<string, string>) => session(labels, "bob@example.com");
+    expect(sidebarFolderKey(folders[0]!)).toBe("name:Legacy");
+    expect(sidebarFolderKey(folders[1]!)).toBe("p_alpha");
+    expect(
+      sessionSidebarFolderKey(own({ omni_project: "Legacy" }), folders, "bob@example.com", true),
+    ).toBe("name:Legacy");
+    expect(
+      sessionSidebarFolderKey(own({ omni_project: "Alpha" }), folders, "bob@example.com", true),
+    ).toBe("p_alpha");
+    // Filing is the owner's: another user's label files nothing, and an unfiled session is in none.
+    expect(
+      sessionSidebarFolderKey(session({ omni_project: "Alpha" }), folders, "bob@example.com", true),
+    ).toBeNull();
+    expect(sessionSidebarFolderKey(own({}), folders, "bob@example.com", true)).toBeNull();
+    // A shared run is in the automation folder only when the folders take shared runs.
+    const run = session({ [LAUNCH]: "st_1" });
+    expect(sessionSidebarFolderKey(run, folders, "bob@example.com", true)).toBe("p_auto");
+    expect(sessionSidebarFolderKey(run, folders, "bob@example.com", false)).toBeNull();
   });
 
   it("places the default automation folder where a new project would go", () => {
