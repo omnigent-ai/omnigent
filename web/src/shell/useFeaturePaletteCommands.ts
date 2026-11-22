@@ -1,9 +1,13 @@
 // The commands mounted features offer ⌘K (see `featurePaletteRows`), for either palette:
-// their rows, and running the one accepted. They load only where the sidebar shows as tabs.
+// their rows, and running the one accepted. They load only where a feature offering them is on:
+// the sidebar showing as tabs, or the sidebar's saved views.
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import type { FeaturePaletteRow, FeaturePaletteSource } from "./featurePaletteRows";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { sidebarSavedViewsEnabled } from "@/lib/sidebarSavedViews";
+
 import { useTabsSidebar } from "./useTabsSidebar";
 
 export type { FeaturePaletteRow };
@@ -42,8 +46,11 @@ export interface FeaturePaletteCommands {
 }
 
 export function useFeaturePaletteCommands(open: boolean): FeaturePaletteCommands {
-  // Where the sidebar shows as tabs, as the app shell decides; elsewhere nothing loads.
-  const enabled = useTabsSidebar();
+  // Where the sidebar shows as tabs, as the app shell decides, or offers saved views; elsewhere
+  // nothing loads.
+  const tabsSidebar = useTabsSidebar();
+  const savedViews = sidebarSavedViewsEnabled(useServerInfo());
+  const enabled = tabsSidebar || savedViews;
   const [source, setSource] = useState(loaded);
   useEffect(() => {
     if (!enabled || source !== null) return;

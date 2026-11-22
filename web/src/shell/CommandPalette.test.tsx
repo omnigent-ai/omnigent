@@ -9,6 +9,8 @@ import * as commandPaletteModule from "./CommandPalette";
 import { CommandPalette } from "./CommandPalette";
 import type { WorkspaceHistoryFacts } from "./workspaceCommands/model";
 import { useWorkspaceHistoryCommands } from "./workspaceCommands/useWorkspaceHistoryCommands";
+import type { SidebarSavedView } from "@/lib/sidebarSavedViews";
+import { useSidebarSavedViewCommands } from "./sidebarSavedViews/useSidebarSavedViewCommands";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({
@@ -1313,4 +1315,52 @@ describe("CommandPalette — commands a mounted feature offers", () => {
       expect(screen.queryByRole("option", { name: /Go back in the workspace/ })).toBeNull();
     },
   );
+
+  it("lists and runs the sidebar's saved views with saved views on and the tabs sidebar off", async () => {
+    serverInfo.mockReturnValue({
+      session_search_scope: true,
+      features: {
+        workspace_sidebar_v2: false,
+        sidebar_grouping_ui: true,
+        sidebar_saved_views: true,
+      },
+    });
+    const apply = vi.fn();
+    const review: SidebarSavedView = {
+      id: "view-review",
+      name: "Review",
+      grouping: "status",
+      ordering: "updated",
+      show: [],
+      sessionFilter: "mine",
+      pullRequestFilter: "all",
+    };
+    function SavedViews() {
+      useSidebarSavedViewCommands({
+        scope: { server: "https://example.com", userId: "user-1" },
+        views: [review],
+        apply,
+        openSave: vi.fn(),
+      });
+      return null;
+    }
+    render(
+      <>
+        <SavedViews />
+        <CommandPalette
+          open
+          onOpenChange={vi.fn()}
+          onToggleLeftSidebar={vi.fn()}
+          onToggleRightSidebar={vi.fn()}
+        />
+      </>,
+      { wrapper: withQueryClient() },
+    );
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "Sidebar view" },
+    });
+
+    fireEvent.click(await screen.findByRole("option", { name: /Sidebar view: Review/ }));
+    await vi.waitFor(() => expect(apply).toHaveBeenCalledWith(review));
+  });
 });

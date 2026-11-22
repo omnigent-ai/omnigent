@@ -4,6 +4,7 @@
 
 import { useCallback, useMemo, useSyncExternalStore } from "react";
 
+import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 import { randomUUID } from "@/lib/randomUUID";
 
 import { DEFAULT_SESSION_FILTER, type SessionFilter } from "./sessionFilterPreferences";
@@ -24,6 +25,13 @@ import {
 } from "./sidebarViewPreferences";
 
 const STORAGE_KEY = "omnigent:sidebar-saved-views";
+
+/** Saved views and the sidebar's filters show with their flag, in the grouping menu that offers them. */
+export function sidebarSavedViewsEnabled(info: ServerInfo | "loading"): boolean {
+  return (
+    isFeatureEnabled(info, "sidebar_grouping_ui") && isFeatureEnabled(info, "sidebar_saved_views")
+  );
+}
 /** The most views one user keeps on a server; past it a new view is refused, never an old one dropped. */
 export const SAVED_VIEW_LIMIT = 20;
 /** The longest name a view takes. */

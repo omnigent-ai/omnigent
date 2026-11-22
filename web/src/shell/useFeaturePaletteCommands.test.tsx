@@ -1,5 +1,5 @@
-// The palette's feature rows load only where the sidebar shows as tabs: the
-// workspace_sidebar_v2 flag on, in a client that isn't driven by touch.
+// The palette's feature rows load only where a feature offering them is on: the sidebar showing
+// as tabs (workspace_sidebar_v2, in a client not driven by touch), or the sidebar's saved views.
 
 import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -44,6 +44,17 @@ vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => loads.info })
 const withFlag = (enabled: boolean): ServerInfo => ({
   ...FALLBACK_SERVER_INFO,
   features: { ...FALLBACK_SERVER_INFO.features, workspace_sidebar_v2: enabled },
+});
+
+/** Saved views and the grouping menu offering them on, with the tabs sidebar off. */
+const withSavedViews = (enabled: boolean): ServerInfo => ({
+  ...FALLBACK_SERVER_INFO,
+  features: {
+    ...FALLBACK_SERVER_INFO.features,
+    workspace_sidebar_v2: false,
+    sidebar_grouping_ui: true,
+    sidebar_saved_views: enabled,
+  },
 });
 
 /** The window is `width` wide, and its primary pointer is a mouse or a finger. */
@@ -122,6 +133,21 @@ describe("useFeaturePaletteCommands", () => {
     expect(loads.count).toBe(0);
     expect(closed.result.current.rows).toEqual([]);
     expect(open.result.current.rows).toEqual([]);
+  });
+
+  it("loads the rows with saved views on and the tabs sidebar off, even on a phone", async () => {
+    loads.info = withSavedViews(true);
+    setViewport(390, "coarse");
+    await renderPaletteCommands(false);
+    await vi.waitFor(() => expect(loads.count).toBe(1));
+  });
+
+  it("loads nothing with grouping on but saved views and the tabs sidebar off", async () => {
+    loads.info = withSavedViews(false);
+    setViewport(1440);
+    await renderPaletteCommands(true);
+    await settle();
+    expect(loads.count).toBe(0);
   });
 
   it("lists no rows when they can't load, and loads them on the next try", async () => {

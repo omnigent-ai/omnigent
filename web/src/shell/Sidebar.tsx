@@ -288,6 +288,7 @@ import {
   saveView as saveSidebarView,
   type SavedViewSettings,
   type SidebarSavedView,
+  sidebarSavedViewsEnabled,
   useSidebarSavedViews,
 } from "@/lib/sidebarSavedViews";
 import { deleteViewWithUndo } from "@/shell/sidebarSavedViews/savedViewActions";
@@ -2346,9 +2347,7 @@ function ConversationList({
   // keeps its default layout and ignores any stored choice.
   const groupingUi = isFeatureEnabled(serverInfo, "sidebar_grouping_ui");
   // Only the grouping menu offers the filter, so without it none applies.
-  const pullRequestFilter = useSessionPullRequestFilter(
-    groupingUi && isFeatureEnabled(serverInfo, "sidebar_saved_views"),
-  );
+  const pullRequestFilter = useSessionPullRequestFilter(sidebarSavedViewsEnabled(serverInfo));
   const {
     view,
     updateView: saveView,

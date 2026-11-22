@@ -1,6 +1,6 @@
 // The ⌘K rows that mounted features offer through `usePaletteCommands`, such as the tabs
-// sidebar's Back and Forward, as both palettes list them. Loaded with the
-// workspace_sidebar_v2 flag only, so a deployment without it never downloads it.
+// sidebar's Back and Forward, as both palettes list them. Loaded with the workspace_sidebar_v2
+// or sidebar_saved_views flag only, so a deployment without either never downloads it.
 
 import type { LucideIcon } from "lucide-react";
 
