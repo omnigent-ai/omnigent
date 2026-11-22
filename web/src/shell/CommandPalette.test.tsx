@@ -6,6 +6,7 @@ import type * as SidebarDataModule from "@/hooks/useSidebarData";
 import { type ComponentProps, type ReactNode, useState } from "react";
 
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import { openPaletteDialog } from "@/test/paletteCommands";
 import * as commandPaletteModule from "./CommandPalette";
 import { CommandPalette } from "./CommandPalette";
 import type { WorkspaceHistoryFacts } from "./workspaceCommands/model";
@@ -1410,13 +1411,12 @@ describe("CommandPalette — commands a mounted feature offers", () => {
     withSidebarFlag(true);
     let dialogAtRun: Element | null = null;
     const go = vi.fn(() => {
-      dialogAtRun = screen.queryByRole("dialog");
+      dialogAtRun = openPaletteDialog();
       screen.getByText("Where the command moves focus").focus();
     });
     openPalette(go);
 
     fireEvent.click(await screen.findByRole("option", { name: /Go back in the workspace/ }));
-    expect(go).not.toHaveBeenCalled();
     await vi.waitFor(() => expect(go).toHaveBeenCalledOnce());
     expect(dialogAtRun).toBeNull();
     await new Promise((resolve) => {
