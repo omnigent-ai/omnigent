@@ -29,6 +29,8 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   useProjects: () => ({ data: mocks.projects }),
 }));
 
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "viewer" }));
+
 vi.mock("@/hooks/useOpenSessionRow", () => ({
   useOpenSessionRow: (id: string | null) => (id ? mocks.sessionRow : null),
 }));
@@ -57,12 +59,18 @@ function renderHost({
   view,
   path = "/c/conv-1",
   flag = true,
+  singleUser = false,
 }: {
   view: CommandView;
   path?: string;
   flag?: boolean;
+  singleUser?: boolean;
 }) {
-  const info = { ...FALLBACK_SERVER_INFO, features: { quick_pick_palette: flag } };
+  const info = {
+    ...FALLBACK_SERVER_INFO,
+    single_user: singleUser,
+    features: { quick_pick_palette: flag },
+  };
   render(
     <CapabilitiesProvider info={info}>
       <MemoryRouter initialEntries={[path]}>
@@ -94,7 +102,7 @@ const onDeleted = () => act(() => (mocks.menuArgs[4] as () => void)());
 
 beforeEach(() => {
   mocks.projects = [PAYMENTS, LABEL_ONLY];
-  mocks.sessionRow = { project_id: "project-1", labels: {} };
+  mocks.sessionRow = { project_id: "project-1", labels: {}, owner: "viewer" };
   mocks.menuArgs = [];
   vi.clearAllMocks();
 });
@@ -142,6 +150,25 @@ describe("the project in view's ⌘K commands", () => {
     expect(labels()).toEqual([]);
   });
 
+  it("matches a session's project label only when the session is the viewer's", () => {
+    const labelled = { project_id: null, labels: { [PROJECT_LABEL_KEY]: "Payments" } };
+    // A shared session from someone else whose own folder happens to share the name.
+    mocks.sessionRow = { ...labelled, owner: "someone-else" };
+    renderHost({ view: "session" });
+    expect(labels()).toEqual([]);
+    cleanup();
+
+    mocks.sessionRow = { ...labelled, owner: "viewer" };
+    renderHost({ view: "session" });
+    expect(labels()).toContain("Rename project Payments…");
+    cleanup();
+
+    // The single-user local runtime owns every session.
+    mocks.sessionRow = { ...labelled, owner: null, permission_level: null };
+    renderHost({ view: "session", singleUser: true });
+    expect(labels()).toContain("Rename project Payments…");
+  });
+
   it("follows a rename in the new-session view filed under the project", () => {
     renderHost({ view: "new-session", path: "/?project=Payments" });
     expect(labels()).not.toContain("New session in Payments");
@@ -176,11 +203,12 @@ describe("the project in view's ⌘K commands", () => {
 });
 
 describe("projectInView", () => {
-  const base = { newSessionProject: null, projects: [PAYMENTS, LABEL_ONLY] };
+  const base = { newSessionProject: null, ownSession: true, projects: [PAYMENTS, LABEL_ONLY] };
 
   it("finds a session's label-only folder by its label", () => {
     const session = { project_id: null, labels: { [PROJECT_LABEL_KEY]: "Scratch" } };
     expect(projectInView({ ...base, view: "session", session })).toBe(LABEL_ONLY);
+    expect(projectInView({ ...base, ownSession: false, view: "session", session })).toBe(null);
   });
 
   it("finds nothing while the project list loads, or for an unfiled session", () => {

@@ -6,12 +6,16 @@ import { useMemo } from "react";
 
 import { type Conversation, type ProjectSummary, useProjects } from "@/hooks/useConversations";
 import { useOpenSessionRow } from "@/hooks/useOpenSessionRow";
+import { useViewerId } from "@/hooks/useViewerId";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isSingleUserMode } from "@/lib/capabilities";
 import { useSearchParams } from "@/lib/routing";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import type { PaletteCommand } from "@/store/paletteCommands";
 
 import { type CommandView, useCommandContext } from "../commandContext";
 import { useQuickPickPaletteCommands } from "../screenCommands/useQuickPickPaletteCommands";
+import { sessionOwnership } from "../sessionCommands/model";
 import { type ProjectCommandId, requestProjectAction } from "./projectActionStore";
 
 const NO_COMMANDS: PaletteCommand[] = [];
@@ -24,15 +28,20 @@ export function newSessionInProjectPath(projectName: string): string {
 /**
  * The project the user is looking at, from the caller's own project list. None while the list
  * loads, and none for a session filed in a project the caller doesn't have, such as a shared one.
+ * A project label names a folder only in its owner's list, so only the viewer's own session
+ * is matched by it.
  */
 export function projectInView({
   view,
   session,
+  ownSession,
   newSessionProject,
   projects,
 }: {
   view: CommandView;
   session: Pick<Conversation, "project_id" | "labels"> | null;
+  /** The viewer owns the open session, as its header's owner-only actions decide. */
+  ownSession: boolean;
   newSessionProject: string | null;
   projects: readonly ProjectSummary[] | undefined;
 }): ProjectSummary | null {
@@ -44,7 +53,7 @@ export function projectInView({
   if (session.project_id != null) {
     return projects.find((project) => project.id === session.project_id) ?? null;
   }
-  const label = session.labels?.[PROJECT_LABEL_KEY];
+  const label = ownSession ? session.labels?.[PROJECT_LABEL_KEY] : undefined;
   return label ? (projects.find((project) => project.name === label) ?? null) : null;
 }
 
@@ -106,9 +115,14 @@ export function useProjectPaletteCommands(): void {
   const sessionRow = useOpenSessionRow(view === "session" ? (session?.id ?? null) : null);
   const [searchParams] = useSearchParams();
   const { data: projects } = useProjects();
+  const viewerId = useViewerId();
+  const serverInfo = useServerInfo();
   const project = projectInView({
     view,
     session: sessionRow,
+    ownSession:
+      sessionRow !== null &&
+      sessionOwnership(sessionRow, viewerId, isSingleUserMode(serverInfo)) === "mine",
     newSessionProject: searchParams.get("project"),
     projects,
   });
