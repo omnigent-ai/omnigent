@@ -24,6 +24,7 @@ import pytest
 
 from omnigent.db.account_authority import account_checks_scope
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.errors import WrongReplicaError
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -51,9 +52,11 @@ from omnigent.server.scheduled.schedule import (
     timer_rule,
 )
 from omnigent.server.startup_inputs import STARTUP_LABEL
+from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+from tests.server.scheduled.test_dispatch_scheduler import _drain
 from tests.server.scheduled.test_fire import (
     FakeAgentStore,
     FakeHostStore,
@@ -2222,8 +2225,8 @@ def _timer_deps(store: SqlAlchemyScheduledTaskStore, **overrides: Any) -> FireDe
     return _deps(store, **overrides)
 
 
-def _claim_timer(store: SqlAlchemyScheduledTaskStore, *, repeat: bool) -> _Claimed:
-    """Save a timer due now for the test session, then claim its firing as a poll would."""
+def _set_timer(store: SqlAlchemyScheduledTaskStore, *, repeat: bool) -> ScheduledTask:
+    """Save a 30-second timer, due now, for the test session on its host, as its route does."""
     now = int(time.time())
     task_id = uuid.uuid4().hex
     store.create(
@@ -2242,6 +2245,15 @@ def _claim_timer(store: SqlAlchemyScheduledTaskStore, *, repeat: bool) -> _Claim
         schedule_anchor=now - 30,
     )
     task = store.get(task_id)
+    assert task is not None
+    return task
+
+
+def _claim_timer(store: SqlAlchemyScheduledTaskStore, *, repeat: bool) -> _Claimed:
+    """Save a timer due now for the test session, then claim its firing as a poll would."""
+    task = _set_timer(store, repeat=repeat)
+    now = task.next_run_at
+    assert now is not None
     clock = FakeClock(now)
     run = store.claim_scheduled_run(
         task,
@@ -2433,3 +2445,156 @@ async def test_recovery_fails_an_interrupted_timer_firing_without_inspecting_it(
     )
     # Recording the result removes the spent one-shot timer either way.
     assert store.get(claimed.task.id) is None
+
+
+_SOURCE_ID = uuid.uuid5(uuid.NAMESPACE_DNS, "source-session").hex
+_MOVED_HOST_ID = uuid.uuid5(uuid.NAMESPACE_DNS, "moved-host").hex
+
+
+def _moved_timer_sessions(shape: str) -> _ExistingConversationStore:
+    """The timer's sub-agent or side chat, whose parent or source has moved to another host."""
+    source = _FakeConversation(id=_SOURCE_ID, agent_id=_AGENT_ID, host_id=_MOVED_HOST_ID)
+    if shape == "sub_agent":
+        session = _FakeConversation(
+            id=_CONV_ID,
+            agent_id=_AGENT_ID,
+            kind="sub_agent",
+            parent_conversation_id=_SOURCE_ID,
+            root_conversation_id=_SOURCE_ID,
+        )
+    else:
+        session = _FakeConversation(
+            id=_CONV_ID,
+            agent_id=_AGENT_ID,
+            labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: _SOURCE_ID},
+        )
+    return _ExistingConversationStore(session, source)
+
+
+async def _poll(scheduler: PersistentTaskScheduler) -> None:
+    await scheduler.poll_once()
+    await _drain(scheduler)
+
+
+@pytest.mark.parametrize("repeat", [False, True], ids=["one_shot", "repeating"])
+@pytest.mark.parametrize("shape", ["sub_agent", "side_chat"])
+async def test_a_timer_whose_session_moved_hosts_fires_once_from_the_new_hosts_replica(
+    store, shape, repeat
+) -> None:
+    timer = _set_timer(store, repeat=repeat)
+    assert timer.next_run_at is not None
+    clock = FakeClock(timer.next_run_at)
+    deps = _timer_deps(store, conversation_store=_moved_timer_sessions(shape))
+    woken: dict[str, list[str]] = {"old host": [], "new host": []}
+
+    def replica(name: str, host_id: str) -> PersistentTaskScheduler:
+        """A server replica that owns one host, as host routing would assign it."""
+
+        async def dispatch(conv: Any, task: ScheduledTask) -> None:
+            woken[name].append(conv.id)
+            if host_id != _MOVED_HOST_ID:
+                raise WrongReplicaError("the runner is on another replica", host_id=host_id)
+
+        async def owned_hosts(keys: Any) -> list[str]:
+            return [key for key in keys if key == host_id]
+
+        executor = ClaimedRunExecutor(deps, launch_dispatch=dispatch)
+        return PersistentTaskScheduler(
+            store, executor.fire, executor.recover, owned_hosts=owned_hosts, now=clock.now
+        )
+
+    old, new = replica("old host", _HOST_ID), replica("new host", _MOVED_HOST_ID)
+    try:
+        await _poll(new)
+        await _poll(old)
+        # The old host's replica handed the firing back unsent, a one-shot's included.
+        saved = store.get(timer.id)
+        assert (saved.state, saved.host_id, saved.next_run_at) == (
+            "active",
+            _MOVED_HOST_ID,
+            timer.next_run_at + 1,
+        )
+        clock.advance(1)
+        await _poll(old)
+        await _poll(new)
+        await _poll(old)
+    finally:
+        await old.stop()
+        await new.stop()
+    assert woken == {"old host": [], "new host": [_CONV_ID]}
+    if not repeat:
+        assert store.get(timer.id) is None
+        return
+    [run] = _runs(store, timer)
+    assert (run.status, run.host_id, run.conversation_id) == (
+        "succeeded",
+        _MOVED_HOST_ID,
+        _CONV_ID,
+    )
+    assert store.get(timer.id).next_run_at == timer.next_run_at + 30
+
+
+@pytest.mark.parametrize("cancelled", ["while_checking", "once_handed_back"])
+async def test_a_cancel_stops_a_timer_firing_handed_to_another_host(
+    store, caplog, cancelled
+) -> None:
+    caplog.set_level(logging.INFO, logger="omnigent.server.scheduled.dispatch_scheduler")
+    claimed = _claim_timer(store, repeat=False)
+    sessions = _HeldSessionReads(*_moved_timer_sessions("side_chat").existing.values())
+    dispatch = AsyncMock()
+    executor = ClaimedRunExecutor(
+        _timer_deps(store, conversation_store=sessions), launch_dispatch=dispatch
+    )
+    firing = asyncio.create_task(executor.fire(claimed.task, claimed.lease))
+    if cancelled == "while_checking":
+        assert await asyncio.to_thread(sessions.reading.wait, 10)
+        assert await asyncio.to_thread(store.delete, claimed.task.id)
+    sessions.release.set()
+    await firing
+    if cancelled == "once_handed_back":
+        assert await asyncio.to_thread(store.delete, claimed.task.id)
+    dispatch.assert_not_awaited()
+    expected = "timer_cancelled" if cancelled == "while_checking" else "timer_host_moved"
+    assert _startup_outcomes(caplog) == [("skipped", expected)]
+    # Nothing is left for the new host's replica to claim.
+    assert store.get(claimed.task.id) is None
+    assert store.list_due_tasks(claimed.task.next_run_at + 3600) == []
+
+
+async def test_a_timer_handed_back_to_this_replica_fires_without_waiting_for_the_poll(
+    store, monkeypatch
+) -> None:
+    """With one replica owning every host, the handed-back firing goes out a second later."""
+    read = threading.Event()
+    read_next_due = store.next_due_at
+
+    def next_due_at(after: int) -> int | None:
+        due_at = read_next_due(after)
+        read.set()
+        return due_at
+
+    monkeypatch.setattr(store, "next_due_at", next_due_at)
+    _set_timer(store, repeat=False)
+    sessions = _HeldSessionReads(*_moved_timer_sessions("side_chat").existing.values())
+    woken = asyncio.Event()
+    claimed_hosts: list[str | None] = []
+
+    async def dispatch(conv: Any, task: ScheduledTask) -> None:
+        claimed_hosts.append(task.host_id)
+        woken.set()
+
+    executor = ClaimedRunExecutor(
+        _timer_deps(store, conversation_store=sessions), launch_dispatch=dispatch
+    )
+    # The hour-long poll would leave the handed-back firing for an hour.
+    scheduler = PersistentTaskScheduler(store, executor.fire, executor.recover, poll_seconds=3600)
+    await scheduler.start()
+    try:
+        # The loop read the next due time before the claimed firing was handed back.
+        assert await asyncio.to_thread(read.wait, 10)
+        sessions.release.set()
+        await asyncio.wait_for(woken.wait(), 10)
+    finally:
+        await scheduler.stop()
+    # The wake came from the claim made after the hand-back, under the moved host.
+    assert claimed_hosts == [_MOVED_HOST_ID]

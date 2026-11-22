@@ -464,7 +464,13 @@ the database reads timer rows. Turning it off stops new timers, while existing o
 keep firing and can still be cancelled. The task's host is the one
 serving the session's runner tunnel (`routing_host_id`): a sub-agent or side chat
 with no host of its own takes its parent's or source's, so the replica holding that
-tunnel claims its firings.
+tunnel claims its firings. Each firing resolves that host again before it commits.
+If the session now routes through another host, say because a side chat's source
+moved, `hand_back_timer_firing` returns the firing unsent, under the run's lease and
+the task lock: the timer takes the new host and is due again a second later (a
+one-shot's claim reopens), and the run records `skipped` (`timer_host_moved`). The
+new host's owner claims it at its next poll, or at once when it is the same replica.
+A host that doesn't resolve, such as a broken parent chain, keeps the saved one.
 
 - **Schedule.** The rule is `FREQ=SECONDLY;INTERVAL=<n>`, plus `COUNT=1` for a
   one-shot timer, with `n` the delay rounded up to whole seconds. Firings fall at
@@ -497,13 +503,21 @@ tunnel claims its firings.
   without the quiet period: a tick due while the session runs a turn, waits on an
   approval or question, or still delivers the previous tick is moved, recording no
   run, to the next check, never past the next tick. One-shot timers always fire.
-- **History.** Claiming a timer's firing deletes its finished runs, so a timer keeps
-  only its newest outcome, and finishing a spent one-shot timer's run removes the
-  timer. Timers never stamp `last_run_at`, so a tick's bookkeeping can't race the
-  next claim. Automation lists filter by kind in the query, and the automation Inbox
-  never lists timers.
+- **History.** A timer claims one firing at a time: while its previous run is
+  unfinished, a claim changes nothing and a later poll tries again. Otherwise the
+  claim first deletes the timer's finished runs, reading at most two through the
+  task-history index, so a timer keeps only its newest outcome, and finishing a
+  spent one-shot timer's run removes the timer. Timers never stamp `last_run_at`,
+  so a tick's bookkeeping can't race the next claim. Automation lists filter by
+  kind in the query, and the automation Inbox never lists timers.
 - **Recovery.** An expired timer startup records `failed` without inspecting the
-  session or resending.
+  session or resending. So if the server stops, or a session or host read fails,
+  after a one-shot timer's firing is claimed and before it commits, the firing is
+  lost; a repeating timer goes on from its next tick.
+- **Moves during delivery.** The host check comes before the commit, and the runner
+  lookup after it. If the session moves to another replica's host in between, that
+  firing fails (`launch_failed`) and a one-shot is spent; a repeating timer's next
+  firing is handed to the new host.
 - **Rollout.** Kind 3 needs this release's migration and code on every replica that
   shares the database: an older binary can't decode a timer row.
 

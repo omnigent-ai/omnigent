@@ -3314,6 +3314,131 @@ def test_a_repeating_timer_outlives_its_finished_runs(store: SqlAlchemyScheduled
     assert store.get(timer.id).state == "active"
 
 
+def test_a_timer_claims_one_firing_at_a_time(store: SqlAlchemyScheduledTaskStore) -> None:
+    timer = _timer(store, repeat=True, interval=5)
+    first = _claim_timer(store, timer)
+    due = store.get(timer.id)
+    # The next tick comes due while the first firing is still on its way.
+    assert _claim_timer(store, due) is None
+    assert store.get(timer.id) == due
+    assert [run.id for run in store.list_runs(timer.id)[0]] == [first.id]
+    store.transition_starting_run(first, now=lambda: first.fired_at, status="failed")
+    second = _claim_timer(store, due)
+    assert second is not None
+    assert [run.id for run in store.list_runs(timer.id)[0]] == [second.id]
+
+
+def test_a_timer_claim_cleans_up_a_bounded_number_of_runs(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """However long a timer's history, one claim reads and deletes at most two of its runs."""
+    from sqlalchemy import event
+
+    timer = _timer(store, repeat=True, interval=5)
+    for index in range(4):
+        store.create_run(
+            run_id=_uid(f"old-run-{index}"),
+            scheduled_task_id=timer.id,
+            status="succeeded",
+            scheduled_at=index,
+            finished_at=index,
+        )
+    queries = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith("SELECT") and "LIMIT" in statement:
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        run = _claim_timer(store, timer)
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+    assert run is not None
+    # The two newest went; a later claim deletes the next ones.
+    assert {kept.id for kept in store.list_runs(timer.id)[0]} == {
+        _uid("old-run-0"),
+        _uid("old-run-1"),
+        run.id,
+    }
+    if store._engine.dialect.name != "sqlite":
+        return
+    [(statement, parameters)] = [query for query in queries if "scheduled_task_runs" in query[0]]
+    with store._engine.connect() as connection:
+        plan = str(connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all())
+    # The read walks the task-history index in order, so its limit bounds what it examines.
+    assert "ix_scheduled_task_runs_scheduled_task_id" in plan and "SEARCH" in plan, plan
+    assert "TEMP B-TREE" not in plan, plan
+
+
+@pytest.mark.parametrize("repeat", [False, True], ids=["one_shot", "repeating"])
+def test_a_handed_back_timer_firing_stays_due_for_its_new_host(
+    store: SqlAlchemyScheduledTaskStore, repeat: bool
+) -> None:
+    timer = _timer(store, repeat=repeat, interval=5)
+    run = _claim_timer(store, timer)
+    handed_back = store.hand_back_timer_firing(
+        run, now=lambda: _TIMER_FIRST_RUN, host_id=_uid("new-host")
+    )
+    assert handed_back is not None
+    assert (handed_back.status, handed_back.error_code, handed_back.lease_expires_at) == (
+        "skipped",
+        "timer_host_moved",
+        None,
+    )
+    # A one-shot's claim reopens: the firing is due again a second later, on the new host.
+    saved = store.get(timer.id)
+    assert (saved.state, saved.host_id, saved.next_run_at) == (
+        "active",
+        _uid("new-host"),
+        _TIMER_FIRST_RUN + 1,
+    )
+    refired = _claim_timer(store, saved)
+    assert refired is not None
+    assert [kept.id for kept in store.list_runs(timer.id)[0]] == [refired.id]
+    assert store.get(timer.id).state == ("active" if repeat else "completed")
+
+
+@pytest.mark.parametrize("repeat", [False, True], ids=["one_shot", "repeating"])
+def test_a_hand_back_never_revives_a_cancelled_timer(
+    store: SqlAlchemyScheduledTaskStore, repeat: bool
+) -> None:
+    timer = _timer(store, repeat=repeat)
+    run = _claim_timer(store, timer)
+    assert store.delete(timer.id)
+    handed_back = store.hand_back_timer_firing(
+        run, now=lambda: _TIMER_FIRST_RUN, host_id=_uid("new-host")
+    )
+    assert handed_back is not None
+    assert (handed_back.status, handed_back.error_code) == ("skipped", "timer_cancelled")
+    # Recording the run purged the cancelled timer, so no host has a firing to claim.
+    assert store.get(timer.id) is None
+    assert store.list_due_tasks(_TIMER_FIRST_RUN + 3600) == []
+
+
+@pytest.mark.parametrize("stale", ["expired", "recovered"])
+def test_a_stale_lease_cannot_hand_a_firing_back(
+    store: SqlAlchemyScheduledTaskStore, stale: str
+) -> None:
+    timer = _timer(store, repeat=True, interval=5)
+    run = _claim_timer(store, timer)
+    assert run is not None and run.lease_expires_at is not None
+    if stale == "recovered":
+        # Recovery fails the expired startup, and the next tick is claimed after it.
+        store.transition_starting_run(
+            run, now=lambda: run.lease_expires_at, status="failed", expired=True
+        )
+        assert _claim_timer(store, store.get(timer.id)) is not None
+    before = store.get(timer.id)
+    runs_before = store.list_runs(timer.id)[0]
+    handed_back = store.hand_back_timer_firing(
+        run, now=lambda: run.lease_expires_at, host_id=_uid("new-host")
+    )
+    assert handed_back is None
+    assert store.get(timer.id) == before
+    assert store.list_runs(timer.id)[0] == runs_before
+
+
 def test_list_reads_only_the_requested_kinds(store: SqlAlchemyScheduledTaskStore) -> None:
     automation = store.create(
         scheduled_task_id=_uid("st_kinds_automation"),

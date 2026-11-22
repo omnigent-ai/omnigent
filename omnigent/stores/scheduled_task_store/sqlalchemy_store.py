@@ -105,6 +105,8 @@ _FINISHED_RUN_STATUSES = {
     encode_scheduled_task_run_status(status) for status in ("succeeded", "failed", "skipped")
 }
 _TIMER_KIND = encode_scheduled_task_kind("timer")
+# Runs a timer's claim reads and cleans up; one firing at a time leaves at most one.
+_TIMER_HISTORY_READ_LIMIT = 2
 # Run now requests awaiting a claim; ordered like the expired-claims index.
 _PENDING_RUN_FILTER = (
     SqlScheduledTaskRun.status == encode_scheduled_task_run_status("scheduled"),
@@ -140,6 +142,46 @@ def _purge_finished_deleted_task(
     )
     if remaining is None:
         session.delete(task)
+
+
+def _holds_live_startup_lease(
+    row: SqlScheduledTaskRun, run: ScheduledTaskRun, timestamp: int
+) -> bool:
+    """Whether *row* is still *run*'s startup, under the same lease, unexpired at *timestamp*."""
+    return (
+        row.status == encode_scheduled_task_run_status("starting")
+        and row.lease_expires_at is not None
+        and row.lease_expires_at == run.lease_expires_at
+        and row.lease_expires_at > timestamp
+    )
+
+
+def _clear_timer_history(session: Session, task: SqlScheduledTask) -> bool:
+    """Delete a timer's finished runs before it claims another firing; the caller holds its lock.
+
+    A timer runs one firing at a time, so this finds at most one run; reading through the
+    task-history index with a limit keeps the cleanup bounded regardless. Returns False,
+    deleting nothing, while an earlier firing is unfinished.
+    """
+    runs = session.execute(
+        select(SqlScheduledTaskRun.id, SqlScheduledTaskRun.status)
+        .where(
+            SqlScheduledTaskRun.workspace_id == task.workspace_id,
+            SqlScheduledTaskRun.scheduled_task_id == task.id,
+        )
+        .order_by(SqlScheduledTaskRun.scheduled_at.desc(), SqlScheduledTaskRun.id.desc())
+        .limit(_TIMER_HISTORY_READ_LIMIT)
+    ).all()
+    if any(run.status not in _FINISHED_RUN_STATUSES for run in runs):
+        return False
+    if runs:
+        session.execute(
+            delete(SqlScheduledTaskRun).where(
+                SqlScheduledTaskRun.workspace_id == task.workspace_id,
+                SqlScheduledTaskRun.id.in_([run.id for run in runs]),
+            )
+        )
+    return True
 
 
 _DEFAULT_TIMEZONE_KEY = "scheduled_task_default_timezone"
@@ -1565,7 +1607,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         Comparing the full snapshot also catches same-second prompt/host edits;
         updated_at alone cannot serve as a revision. A uniqueness error rolls
         back the advance, as does any other write failure. Claiming the final
-        occurrence (``next_run_at=None``) marks the task completed.
+        occurrence (``next_run_at=None``) marks the task completed. A timer's claim
+        waits for its previous run to finish, then deletes it (see protocol).
         """
         self.check_dispatch_support()
         if lease_seconds <= 0 or (next_run_at is not None and next_run_at <= now):
@@ -1588,6 +1631,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             row = session.get(SqlScheduledTask, (task.workspace_id, task.id), with_for_update=True)
             if row is None or _to_entity(row) != task:
                 return None
+            if row.kind == _TIMER_KIND and not _clear_timer_history(session, row):
+                # The previous firing is still on its way; a later poll claims this one.
+                return None
             existing = session.scalar(
                 select(SqlScheduledTaskRun.id).where(
                     SqlScheduledTaskRun.workspace_id == task.workspace_id,
@@ -1602,15 +1648,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 row.updated_at = now
             if existing is not None:
                 return None
-            if row.kind == _TIMER_KIND:
-                # A timer keeps only its newest outcome, so a repeating one stays bounded.
-                session.execute(
-                    delete(SqlScheduledTaskRun).where(
-                        SqlScheduledTaskRun.workspace_id == task.workspace_id,
-                        SqlScheduledTaskRun.scheduled_task_id == task.id,
-                        SqlScheduledTaskRun.status.in_(sorted(_FINISHED_RUN_STATUSES)),
-                    )
-                )
             run = SqlScheduledTaskRun(
                 workspace_id=task.workspace_id,
                 id=run_id,
@@ -1896,13 +1933,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
             # Read once the locks are held, so a lease that lapsed meanwhile is refused.
             timestamp = int(now())
-            if (
-                row is None
-                or row.status != encode_scheduled_task_run_status("starting")
-                or row.lease_expires_at is None
-                or row.lease_expires_at != run.lease_expires_at
-                or row.lease_expires_at <= timestamp
-            ):
+            if row is None or not _holds_live_startup_lease(row, run, timestamp):
                 return None
             if task is None or task.state == encode_scheduled_task_state("deleted"):
                 return TimerDelivery(run=_run_to_entity(row), deliver=False)
@@ -1916,3 +1947,42 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return TimerDelivery(run=_run_to_entity(row), deliver=True)
 
         return run_write_transaction(self._session_immediate, "begin_timer_delivery", write)
+
+    def hand_back_timer_firing(
+        self, run: ScheduledTaskRun, *, now: Callable[[], float], host_id: str
+    ) -> ScheduledTaskRun | None:
+        """Lock the task, then the run, as deleting does. See protocol."""
+        if run.workspace_id != current_workspace_id():
+            return None
+
+        def write(session: Session) -> ScheduledTaskRun | None:
+            task = session.get(
+                SqlScheduledTask, (run.workspace_id, run.scheduled_task_id), with_for_update=True
+            )
+            row = session.get(
+                SqlScheduledTaskRun, (run.workspace_id, run.id), with_for_update=True
+            )
+            timestamp = int(now())
+            if row is None or not _holds_live_startup_lease(row, run, timestamp):
+                return None
+            row.status = encode_scheduled_task_run_status("skipped")
+            row.lease_expires_at = None
+            row.finished_at = timestamp
+            if task is None or task.state == encode_scheduled_task_state("deleted"):
+                row.error = "the timer was cancelled before this firing went out"
+                row.error_code = "timer_cancelled"
+                result = _run_to_entity(row)
+                _purge_finished_deleted_task(session, task, row)
+                return result
+            row.error = f"the timer's session moved to host {host_id}"
+            row.error_code = "timer_host_moved"
+            task.host_id = host_id
+            # Later than the claimed occurrence and any scan already under way, so the
+            # new claim gets its own trigger key and an early wake finds it.
+            task.next_run_at = timestamp + 1
+            if task.state == encode_scheduled_task_state("completed"):
+                task.state = encode_scheduled_task_state("active")
+            task.updated_at = timestamp
+            return _run_to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "hand_back_timer_firing", write)

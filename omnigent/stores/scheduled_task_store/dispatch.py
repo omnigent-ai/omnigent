@@ -93,6 +93,10 @@ class ScheduledTaskDispatchStore(Protocol):
 
         An already-recorded occurrence advances the cursor but returns None,
         as does a changed task. Neither case starts another run.
+
+        A timer runs one firing at a time: while its previous run is unfinished, this
+        returns None and changes nothing. Otherwise it first deletes the timer's
+        finished runs, so a timer keeps only its newest one.
         """
         ...
 
@@ -182,5 +186,19 @@ class ScheduledTaskDispatchStore(Protocol):
         (``deliver`` is False and nothing goes out) or finds the firing already on its
         way. A committed run records *conversation_id*; ``consume`` also deletes a
         one-shot timer. Returns None when the run's startup lease no longer matches.
+        """
+        ...
+
+    def hand_back_timer_firing(
+        self, run: ScheduledTaskRun, *, now: Callable[[], float], host_id: str
+    ) -> ScheduledTaskRun | None:
+        """Return a claimed timer firing unsent, for the replica that owns *host_id*.
+
+        For a timer whose session now routes through another host. Runs under the task
+        lock, then the run lock, as deleting does. The timer moves to *host_id* and is
+        due again a second later; a one-shot's completed claim reopens. The run records
+        ``skipped`` (``timer_host_moved``). A cancelled timer stays cancelled, and its
+        run records ``skipped`` (``timer_cancelled``). Returns the finished run, or None,
+        changing nothing, when the run's startup lease no longer matches.
         """
         ...

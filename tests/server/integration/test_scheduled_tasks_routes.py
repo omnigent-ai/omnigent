@@ -7391,20 +7391,33 @@ async def test_a_session_whose_mode_skips_approval_cant_set_timers(
 
 
 @pytest.mark.parametrize("auth_app", [True], indirect=True)
-async def test_a_sub_agent_timer_routes_to_the_host_its_parent_runs_on(
-    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+@pytest.mark.parametrize("shape", ["sub_agent", "side_chat"])
+async def test_a_sub_agent_or_side_chat_timer_routes_to_the_host_it_shares(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, shape: str
 ) -> None:
+    from omnigent.stores.conversation_store import (
+        SIDE_CHAT_LABEL_KEY,
+        SIDE_CHAT_SOURCE_LABEL_KEY,
+    )
+
     parent_id = _owned_session(db_uri)
-    # A sub-agent shares its parent's runner without a host binding of its own.
-    child_id = _owned_session(
-        db_uri, host_id=None, kind="sub_agent", parent_conversation_id=parent_id
+    # A sub-agent or side chat shares its parent's or source's runner without a host
+    # binding of its own.
+    child_id = (
+        _owned_session(db_uri, host_id=None, kind="sub_agent", parent_conversation_id=parent_id)
+        if shape == "sub_agent"
+        else _owned_session(
+            db_uri,
+            host_id=None,
+            labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: parent_id},
+        )
     )
     created = await auth_client.post(
         f"/v1/sessions/{child_id}/timers", json={"seconds": 60}, headers=_headers()
     )
     assert created.status_code == 201, created.text
     task = SqlAlchemyScheduledTaskStore(db_uri).get(created.json()["timer_id"])
-    # Its runs go to the replica holding the parent's host, and so the shared runner.
+    # Its runs go to the replica holding that session's host, and so the shared runner.
     assert (task.session_id, task.host_id) == (child_id, _HOST_ID)
 
 

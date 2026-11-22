@@ -90,7 +90,7 @@ from omnigent.native.permission_modes import (
     APPROVAL_SKIPPING_PERMISSION_MODES,
     PERMISSION_LAUNCH_ARGS,
 )
-from omnigent.runner.routing import routing_host_session
+from omnigent.runner.routing import routing_host_id, routing_host_session
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -3340,7 +3340,9 @@ async def _fire_timer(
     """Wake a timer's session with its hidden firing message, unless it was cancelled.
 
     A session that was deleted or archived, or that the timer's owner can no longer
-    send to, stops the timer instead: it is never woken or recreated. The firing is
+    send to, stops the timer instead: it is never woken or recreated. A session that
+    now routes through another host, such as a side chat whose source moved, gets the
+    firing handed back unsent, for that host's replica to claim. The firing is
     committed under the task lock before anything is sent, so a cancel that lands
     first suppresses it; a committed firing goes out even if a cancel follows.
     """
@@ -3355,6 +3357,12 @@ async def _fire_timer(
         await asyncio.to_thread(deps.scheduled_task_store.delete, task.id)
         return
     assert conv is not None
+    # An unresolved host (None) keeps the saved one: it may only mean an unreadable chain.
+    host_id = await asyncio.to_thread(routing_host_id, conv, deps.conversation_store)
+    if host_id is not None and host_id != task.host_id:
+        _logger.info("scheduled fire: timer %s handed to host %s", task.id, host_id)
+        await lease.hand_back_timer_firing(host_id)
+        return
     if not await lease.begin_timer_delivery(conv.id, consume=is_one_time_rule(task.rrule)):
         await recorder.finish(
             "skipped",

@@ -168,12 +168,19 @@ class StartupLease:
         now: Callable[[], float],
         lease_seconds: int,
         target: str | None = None,
+        wake: Callable[[], None] | None = None,
     ) -> None:
+        """
+        :param wake: Makes this replica's scheduler look for due runs again, e.g.
+            :meth:`PersistentTaskScheduler.wake`; called after a timer firing is handed
+            back, in case this replica also owns its new host.
+        """
         self.run = run
         self._store = store
         self._now = now
         self._lease_seconds = lease_seconds
         self._target = target
+        self._wake = wake
         self._lock = asyncio.Lock()
         self._writes: set[asyncio.Task[None]] = set()
 
@@ -229,6 +236,25 @@ class StartupLease:
         assert delivery is not None
         return delivery.deliver
 
+    async def hand_back_timer_firing(self, host_id: str) -> None:
+        """Return this timer firing unsent, for the replica that owns *host_id* to claim.
+
+        The run records ``skipped``: ``timer_host_moved``, or ``timer_cancelled`` when the
+        timer was cancelled first, which leaves nothing to claim.
+
+        :param host_id: The host the timer's session now routes through, e.g. ``"host_2"``.
+        :raises StartupLeaseLost: If the run's lease no longer matches.
+        """
+        finished_at = self._now()
+        await self._write(
+            lambda: self._store.hand_back_timer_firing(self.run, now=self._now, host_id=host_id),
+            committed=lambda _previous: self._log_startup_ended(
+                "skipped", error_code=self.run.error_code, finished_at=finished_at
+            ),
+        )
+        if self._wake is not None and self.run.error_code == "timer_host_moved":
+            self._wake()
+
     async def finish(
         self,
         status: str,
@@ -252,32 +278,43 @@ class StartupLease:
             )
 
         finished_at = self._now()
-
-        def log_outcome(_previous: ScheduledTaskRun) -> None:
-            _logger.info(
-                "Scheduled run %s startup ended with status %s",
-                self.run.id,
-                status,
-                extra=_run_event(
-                    "scheduled_run_startup_ended",
-                    self.run,
-                    target=self._target,
-                    outcome=status,
-                    error_code=error_code,
-                    failure_stage=failure_stage or startup_failure_stage(error_code),
-                    startup_delay_seconds=_seconds(finished_at - self.run.scheduled_at),
-                    prompt_delay_seconds=_seconds(finished_at - self.run.scheduled_at)
-                    if status in ("running", "succeeded")
-                    else None,
-                ),
-            )
-
         await self._transition(
             status,
             conversation_id=conversation_id,
             error=error,
             error_code=error_code,
-            committed=log_outcome,
+            committed=lambda _previous: self._log_startup_ended(
+                status,
+                error_code=error_code,
+                failure_stage=failure_stage,
+                finished_at=finished_at,
+            ),
+        )
+
+    def _log_startup_ended(
+        self,
+        status: str,
+        *,
+        error_code: str | None,
+        finished_at: float,
+        failure_stage: str | None = None,
+    ) -> None:
+        _logger.info(
+            "Scheduled run %s startup ended with status %s",
+            self.run.id,
+            status,
+            extra=_run_event(
+                "scheduled_run_startup_ended",
+                self.run,
+                target=self._target,
+                outcome=status,
+                error_code=error_code,
+                failure_stage=failure_stage or startup_failure_stage(error_code),
+                startup_delay_seconds=_seconds(finished_at - self.run.scheduled_at),
+                prompt_delay_seconds=_seconds(finished_at - self.run.scheduled_at)
+                if status in ("running", "succeeded")
+                else None,
+            ),
         )
 
     def _when_writes_settle(self, callback: Callable[[], None]) -> None:
@@ -1102,6 +1139,7 @@ class PersistentTaskScheduler:
             now=self._now,
             lease_seconds=self._lease_seconds,
             target=task.execution_target,
+            wake=self.wake,
         )
         # Logged only if startup ends without a final status from the executor.
         outcome = "unfinished"
