@@ -79,6 +79,7 @@ function state(overrides: Partial<InboxPaletteState> = {}): InboxPaletteState {
     entries: [approval, fileComment, unread(), automation, suggestion],
     taskDetailsEnabled: true,
     replySending: () => false,
+    canReply: () => false,
     ...overrides,
   };
 }
@@ -89,6 +90,7 @@ function handlers(): InboxPaletteHandlers {
     navigate: vi.fn(),
     markUnreadRead: vi.fn(),
     markAutomationRead: vi.fn(),
+    replyTo: vi.fn(),
   };
 }
 
@@ -135,6 +137,19 @@ describe("inboxPaletteCommands", () => {
     }
   });
 
+  it("offers Reply on an unread card only where its reply field shows, greyed while one sends", () => {
+    const replyLabel = "Reply to “Nightly build”…";
+    expect(labels(build().commands)).not.toContain(replyLabel);
+    const { commands } = build({ canReply: (id) => id === "s3" });
+    const reply = commands.find((command) => command.label === replyLabel);
+    expect(reply).toMatchObject({ movesFocus: true, availability: { available: true } });
+    const sending = build({ canReply: () => true, replySending: () => true }).commands;
+    expect(sending.find((command) => command.label === replyLabel)?.availability).toEqual({
+      available: false,
+      reason: REPLY_SENDING_REASON,
+    });
+  });
+
   it("names a session comment's action Open, as its card does", () => {
     const sessionComment = {
       ...fileComment,
@@ -178,6 +193,15 @@ describe("InboxPaletteCommands", () => {
     expect(run.markAutomationRead).toHaveBeenCalledWith("r1");
     act(() => command("Open automation “Daily digest”").run());
     expect(run.navigate).toHaveBeenLastCalledWith("/tasks/t1");
+  });
+
+  it("runs Reply as the card's reply handler, without reading or leaving the page", () => {
+    const run = handlers();
+    render(mount({ ...state({ canReply: () => true }), handlers: run }));
+    act(() => command("Reply to “Nightly build”…").run());
+    expect(run.replyTo).toHaveBeenCalledWith(expect.objectContaining({ key: "unread:s3" }));
+    expect(run.markUnreadRead).not.toHaveBeenCalled();
+    expect(run.navigate).not.toHaveBeenCalled();
   });
 
   it("keeps its rows across re-renders with the same cards, and runs the newest handlers", () => {

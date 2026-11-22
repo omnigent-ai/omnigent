@@ -2151,4 +2151,29 @@ describe("the Inbox in ⌘K", () => {
     expect(screen.getByRole("tab", { name: "Unread" })).toHaveAttribute("aria-selected", "true");
     expect(localStorage.getItem("omnigent:inbox-filter")).toBe("unread");
   });
+
+  it("expands a collapsed unread card and focuses its reply field from ⌘K's Reply", async () => {
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([unreadConversation()]),
+    );
+    renderPage(undefined, false, { quick_pick_palette: true });
+    const item = await screen.findByTestId("inbox-unread");
+    expect(within(item).queryByRole("textbox", { name: /Reply to/ })).toBeNull();
+
+    act(() => command("Reply to “Unread Session”…")!.run());
+    const box = await within(item).findByRole("textbox", { name: /Reply to/ });
+    await waitFor(() => expect(box).toHaveFocus());
+    // Replying from ⌘K leaves the card unread until the reply sends.
+    expect(screen.getByTestId("inbox-unread")).toBeInTheDocument();
+  });
+
+  it("offers no Reply on a card the viewer can't edit", async () => {
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([unreadConversation({ permission_level: 1 })]),
+    );
+    renderPage(undefined, false, { quick_pick_palette: true });
+    await screen.findByTestId("inbox-unread");
+    expect(command("Open “Unread Session”")).toBeDefined();
+    expect(command("Reply to “Unread Session”…")).toBeUndefined();
+  });
 });

@@ -1,5 +1,5 @@
 // With quick_pick_palette on, ⌘K offers the Inbox's actions: its tabs as a setting, and each
-// visible card's open and mark-read actions, run by the same handlers as the card's buttons.
+// visible card's open, mark-read and reply actions, run by the same handlers as the card's buttons.
 
 import {
   CheckIcon,
@@ -7,6 +7,7 @@ import {
   FilterIcon,
   type LucideIcon,
   MessageSquareIcon,
+  MessageSquareReplyIcon,
 } from "lucide-react";
 import { useMemo, useRef } from "react";
 
@@ -27,7 +28,7 @@ export const INBOX_FILTER_SETTING_LABEL = "Inbox filter";
 /** Why an unread card's actions wait, as its buttons do while a reply sends. */
 export const REPLY_SENDING_REASON = "Wait for the reply to send.";
 
-export type InboxCardActionKind = "open" | "mark-read";
+export type InboxCardActionKind = "open" | "mark-read" | "reply";
 
 export interface InboxCardAction {
   /** Stable for the action, its card, the session and the card's version, so a stale ⌘K row does nothing. */
@@ -40,6 +41,8 @@ export interface InboxCardAction {
   href?: string;
   /** The card it acts on. */
   entry: InboxEntry;
+  /** It focuses something on the page once ⌘K has closed. */
+  movesFocus?: boolean;
 }
 
 export interface InboxCardContext {
@@ -47,11 +50,14 @@ export interface InboxCardContext {
   taskDetailsEnabled: boolean;
   /** A reply to this session is on its way. */
   replySending: (sessionId: string) => boolean;
+  /** The card shows its reply field: the viewer can edit the session and no answer is pending. */
+  canReply: (sessionId: string) => boolean;
 }
 
 const ICONS: Record<InboxCardActionKind, LucideIcon> = {
   open: ExternalLinkIcon,
   "mark-read": CheckIcon,
+  reply: MessageSquareReplyIcon,
 };
 
 function actionId(
@@ -131,7 +137,7 @@ export function inboxCardActions(entry: InboxEntry, context: InboxCardContext): 
       const availability = context.replySending(sessionId)
         ? unavailableBecause(REPLY_SENDING_REASON)
         : AVAILABLE;
-      return [
+      const actions: InboxCardAction[] = [
         {
           // Versioned, so a row listed before newer output can't mark that output read.
           id: actionId("open", entry, sessionId, entry.item.row.updated_at),
@@ -151,6 +157,18 @@ export function inboxCardActions(entry: InboxEntry, context: InboxCardContext): 
           entry,
         },
       ];
+      if (context.canReply(sessionId)) {
+        actions.push({
+          id: actionId("reply", entry, sessionId, entry.item.row.updated_at),
+          kind: "reply",
+          label: `Reply to “${title}”…`,
+          keywords: ["inbox", "unread", "reply", "message", "send", "answer", title],
+          availability,
+          entry,
+          movesFocus: true,
+        });
+      }
+      return actions;
     }
   }
 }
@@ -161,11 +179,17 @@ export interface InboxPaletteHandlers {
   /** The unread card's Mark as read, which also drops its toggle and reply state. */
   markUnreadRead: (entry: Extract<InboxEntry, { kind: "unread" }>) => void;
   markAutomationRead: (runId: string) => void;
+  /** Expands the unread card and focuses its reply field. */
+  replyTo: (entry: Extract<InboxEntry, { kind: "unread" }>) => void;
 }
 
 /** Run `action` as the card's button does. */
 export function runInboxCardAction(action: InboxCardAction, handlers: InboxPaletteHandlers): void {
   const { entry } = action;
+  if (action.kind === "reply") {
+    if (entry.kind === "unread") handlers.replyTo(entry);
+    return;
+  }
   if (action.kind === "open") {
     // Opening an unread session is reading it, as the card's Open session does.
     if (entry.kind === "unread") handlers.markUnreadRead(entry);
@@ -212,6 +236,7 @@ export function inboxPaletteCommands(
       icon: action.entry.kind === "comment" ? MessageSquareIcon : ICONS[action.kind],
       keywords: [...action.keywords],
       availability: action.availability,
+      movesFocus: action.movesFocus,
       run: () => {
         // A row accepted after its card changed or left does nothing.
         const current = latestActions.current.find(({ id }) => id === action.id);
@@ -227,7 +252,13 @@ function inboxSignature(state: InboxPaletteState, actions: readonly InboxCardAct
   return JSON.stringify([
     state.filter,
     state.tabs,
-    actions.map(({ id, label, availability, href }) => [id, label, availability, href ?? ""]),
+    actions.map(({ id, label, availability, href, movesFocus }) => [
+      id,
+      label,
+      availability,
+      href ?? "",
+      movesFocus === true,
+    ]),
   ]);
 }
 
