@@ -38,8 +38,11 @@ export function resetUnsavedDiffFileOrder(): void {
 }
 
 function subscribe(onChange: () => void): () => void {
+  // Another window's choice, or its clearing storage (a null key), wins over an unsaved one here.
   const onStorage = (event: StorageEvent) => {
-    if (event.key === STORAGE_KEY) onChange();
+    if (event.key !== STORAGE_KEY && event.key !== null) return;
+    unsaved = null;
+    onChange();
   };
   window.addEventListener(CHANGE_EVENT, onChange);
   window.addEventListener("storage", onStorage);

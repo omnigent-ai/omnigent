@@ -48,4 +48,31 @@ describe("diff file order preference", () => {
     });
     expect(first.result.current[0]).toBe("path");
   });
+
+  it("follows another window's choice after a write here failed, and its clearing storage", () => {
+    const review = renderHook(() => useDiffFileOrder());
+    const failWrite = () => {
+      const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+        throw new Error("quota");
+      });
+      act(() => review.result.current[1]("size"));
+      setItem.mockRestore();
+      expect(review.result.current[0]).toBe("size");
+    };
+
+    failWrite();
+    act(() => {
+      window.localStorage.setItem(KEY, "path");
+      window.dispatchEvent(new StorageEvent("storage", { key: KEY }));
+    });
+    expect(review.result.current[0]).toBe("path");
+
+    failWrite();
+    act(() => {
+      window.localStorage.clear();
+      window.dispatchEvent(new StorageEvent("storage", { key: null }));
+    });
+    expect(review.result.current[0]).toBe("path");
+    expect(renderHook(() => useDiffFileOrder()).result.current[0]).toBe("path");
+  });
 });
