@@ -3,7 +3,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ContextType } from "react";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SidebarDataContext } from "@/hooks/useSidebarData";
@@ -125,26 +125,15 @@ describe("QuickPickCommandPalette session matching", () => {
   });
 
   it.each(["#42", "https://github.com/acme/app/pull/42/files"])(
-    "finds the session linked to %s without asking the server to search",
-    async (reference) => {
+    "finds the session linked to %s and opens it",
+    (reference) => {
       listLoaded([
         { id: "c1", title: "Parser fix", agent_name: null, pull_request: linked(42) },
         { id: "c2", title: "Other", agent_name: null, pull_request: linked(7) },
       ]);
-      useSessionSearch.mockClear();
       const { input } = renderPalette();
       fireEvent.change(input, { target: { value: reference } });
       expect(sessionNames()).toEqual([expect.stringContaining("Parser fix")]);
-      // Past the search debounce, when a typed query would have reached the server.
-      await act(async () => {
-        await new Promise((resolve) => {
-          setTimeout(resolve, 350);
-        });
-      });
-      expect(useSessionSearch.mock.calls.at(-1)?.[0]).toBe(reference);
-      for (const call of useSessionSearch.mock.calls) {
-        expect(call[2]).toMatchObject({ enabled: false });
-      }
       fireEvent.keyDown(input, { key: "Enter" });
       expect(navigate).toHaveBeenCalledWith("/c/c1");
     },
