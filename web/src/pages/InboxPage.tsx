@@ -153,6 +153,7 @@ import { cn } from "@/lib/utils";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import type { Conversation } from "@/hooks/useConversations";
 import { conversationDisplayLabel, getConversationAgentType } from "@/shell/sidebarNav";
+import { InboxPaletteCommands } from "./inboxPaletteCommands";
 
 /** Optimistic verdicts keyed by elicitation id, mirroring the chat store's flip. */
 type RespondedMap = Record<
@@ -215,7 +216,7 @@ const UNREAD_ONLY = ["unread"] as const;
 const PREVIEW_MAX_CHARS = 280;
 
 /** One inbox card, tagged by kind, with the epoch-seconds time it sorts and groups by. */
-type InboxEntry =
+export type InboxEntry =
   | { kind: "approval"; key: string; at: number; item: InboxItem }
   | { kind: "comment"; key: string; at: number; item: CommentInboxItem }
   | { kind: "unread"; key: string; at: number; item: UnreadInboxItem }
@@ -250,7 +251,8 @@ export function InboxPage() {
     identityReady,
   } = useSidebarData();
   const navigate = useNavigate();
-  const taskDetailsEnabled = isFeatureEnabled(useServerInfo(), "automations_v2");
+  const serverInfo = useServerInfo();
+  const taskDetailsEnabled = isFeatureEnabled(serverInfo, "automations_v2");
   const [storedFilter, setFilter] = useState<InboxFilter>(readInboxFilter);
   const {
     available: advisorAvailable,
@@ -584,6 +586,20 @@ export function InboxPage() {
     };
   };
 
+  const chooseFilter = (value: InboxFilter) => {
+    setFilter(value);
+    writeInboxFilter(value);
+  };
+  const markUnreadRead = (entry: Extract<InboxEntry, { kind: "unread" }>) => {
+    const sessionId = entry.item.row.id;
+    // Drop the toggle so a later reply re-surfaces the row collapsed, and
+    // the reply state so it can't come back stale with the row.
+    setExpandedOverrides(({ [entry.key]: _cleared, ...rest }) => rest);
+    setReplyDrafts(({ [sessionId]: _draft, ...rest }) => rest);
+    setReplyStatuses(({ [sessionId]: _status, ...rest }) => rest);
+    markConversationRead(sessionId, entry.item.row.updated_at);
+  };
+
   const rowsById = new Map(allRows.map((row) => [row.id, row]));
   const renderEntry = (entry: InboxEntry) => {
     const expanded = expandedOverrides[entry.key] ?? entry.key === defaultExpandedKey;
@@ -883,14 +899,7 @@ export function InboxPage() {
     const previewQuery = previewBySession.get(sessionId);
     const output = previewQuery?.data ?? undefined;
     const preview = output?.preview;
-    const markRead = () => {
-      // Drop the toggle so a later reply re-surfaces the row collapsed, and
-      // the reply state so it can't come back stale with the row.
-      setExpandedOverrides(({ [entry.key]: _cleared, ...rest }) => rest);
-      setReplyDrafts(({ [sessionId]: _draft, ...rest }) => rest);
-      setReplyStatuses(({ [sessionId]: _status, ...rest }) => rest);
-      markConversationRead(sessionId, item.row.updated_at);
-    };
+    const markRead = () => markUnreadRead(entry);
     // The server refuses user messages below edit access.
     const canReply = isEditorLevel(item.row.permission_level);
     const replyDraft = replyDrafts[sessionId] ?? "";
@@ -1098,9 +1107,7 @@ export function InboxPage() {
       <Tabs
         value={filter}
         onValueChange={(value) => {
-          if (!isInboxFilter(value)) return;
-          setFilter(value);
-          writeInboxFilter(value);
+          if (isInboxFilter(value)) chooseFilter(value);
         }}
         componentId="inbox.filter"
         className="mb-4"
@@ -1263,6 +1270,21 @@ export function InboxPage() {
         >
           {automationInbox.isFetchingNextPage ? "Loading…" : "Check more automations"}
         </Button>
+      )}
+      {isFeatureEnabled(serverInfo, "quick_pick_palette") && (
+        <InboxPaletteCommands
+          filter={filter}
+          tabs={INBOX_TABS.filter(({ value }) => value !== "advisor" || advisorTab)}
+          entries={groups.flatMap((group) => group.entries)}
+          taskDetailsEnabled={taskDetailsEnabled}
+          replySending={(sessionId) => replyStatuses[sessionId]?.state === "sending"}
+          handlers={{
+            chooseFilter,
+            navigate,
+            markUnreadRead,
+            markAutomationRead: automationInbox.markRead,
+          }}
+        />
       )}
     </PageScroll>
   );

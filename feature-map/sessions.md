@@ -168,6 +168,22 @@ the header menu), and each place is a separate entry point.
   row.
 - `bulk-actions`: select several rows, then mark as read or unread, archive,
   unarchive, or delete them.
+- `palette-mark-all-read`: with `quick_pick_palette` on (off by default), ⌘K
+  offers Mark all as read ("Mark all N unread sessions as read", or "Mark 1
+  unread session as read") while any loaded session shows an unread dot. It
+  marks each one read as bulk selection's Mark as read does, skipping muted and
+  archived rows, and the session on screen unless it was marked unread
+  (`web/src/shell/markAllReadPaletteCommand.test.tsx`).
+- `palette-inbox`: with `quick_pick_palette` on, the Inbox offers an Inbox filter
+  setting with its tabs, and each visible card's actions: Open “session” to
+  respond for an approval, Open file in “session” (or Open “session”) for a
+  comment, Open and Mark as read for an unread session (greyed while a reply
+  sends; opening also marks it read, as the card does), and Open automation and
+  Mark as read for a failed automation. Each runs the card's own handler. Reply
+  and suggestion cards stay on the page. With the flag off the page mounts none
+  of it (`web/src/pages/inboxPaletteCommands.test.tsx`,
+  `web/src/pages/InboxPage.test.tsx`,
+  `tests/e2e_ui/sessions/test_quick_pick_palette.py::test_quick_pick_marks_all_read_and_filters_the_inbox`).
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
   For a native target, the fork dialog also offers model, reasoning effort,
@@ -465,6 +481,10 @@ drawer, then drag it. Ordering → Custom in the filter menu keeps the order sho
 **Bulk selection:** select several rows in the sidebar, then use the selection
 actions (mark as read or unread, archive, unarchive, delete). Deleting sessions
 automations run from names those automations and deletes them first.
+
+**⌘K Mark all as read and Inbox:** with `quick_pick_palette` on, press Cmd/Ctrl+K
+and type "mark all" to clear every loaded unread dot. On the Inbox, type "inbox
+filter" to pick a tab, or a card's session name to open it or mark it read.
 
 **Session header menu:** open a session and use the menu next to its title for
 pin, fork, export, rename, mark as unread, create automation, add to project,
