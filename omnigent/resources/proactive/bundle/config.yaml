@@ -55,7 +55,6 @@ guardrails:
           gate_pushes: true
           risky_action: DENY
     # Denies the session file tools; runners released before `tool_groups.files` reject it.
-    # The sys_*_file names are what runners from before the sys_files_* rename offer.
     no_session_files:
       type: function
       on: [tool_call]
@@ -65,13 +64,7 @@ guardrails:
           action: deny
           reason: The proactive agent does not share or read session files.
           on_phases: [tool_call]
-          on_tools:
-            - sys_files_upload
-            - sys_files_list
-            - sys_files_download
-            - sys_upload_file
-            - sys_list_files
-            - sys_download_file
+          on_tools: [sys_files_upload, sys_files_list, sys_files_download]
 
 prompt: |
   You are the user's proactive assistant. You run on a schedule, without the
