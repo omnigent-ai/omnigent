@@ -168,9 +168,69 @@ describe("Project ticket board", () => {
       await screen.findByRole("link", { name: "Open ticket: Ship the board" }),
     ).toHaveAttribute("href", "/?ticket=ticket");
     expect(screen.getByText("Needs response")).toBeInTheDocument();
+    expect(screen.queryByText("Created the ticket")).toBeNull();
     expect(screen.queryByRole("searchbox")).toBeNull();
     expect(screen.queryByRole("combobox")).toBeNull();
   });
+
+  it.each([false, true])(
+    "keeps card tags compact and detail tags complete (needs response=%s)",
+    async (needsResponse) => {
+      ticket.tags = [
+        { key: "source", value: "ISSUE-123" },
+        { key: "status", value: "Waiting for the investigation to finish" },
+        { key: "assignee", value: "Unassigned" },
+        ...(needsResponse ? [{ key: "needs-human", value: "approval" }] : []),
+      ];
+      const { rerender } = renderBoard(
+        <ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />,
+      );
+      const card = await screen.findByRole("link", { name: "Open ticket: Ship the board" });
+      const source = within(card).getByText("source: ISSUE-123");
+      const badge = source.closest('[data-slot="badge"]')!;
+      expect(source).toHaveClass("truncate");
+      expect(badge).toHaveClass("text-xs", "rounded-md", "shrink");
+      expect(badge.parentElement).not.toHaveClass("flex-wrap");
+      expect(
+        within(card).getByLabelText(needsResponse ? "2 more tags" : "1 more tag"),
+      ).toHaveTextContent(needsResponse ? "+2" : "+1");
+      expect(within(card).queryByText("assignee: Unassigned")).toBeNull();
+      if (needsResponse) {
+        expect(within(card).getByText("Needs response")).toHaveClass("bg-tag-pink");
+        expect(badge.parentElement?.firstElementChild).toHaveTextContent("Needs response");
+        expect(within(card).queryByText(/status:/)).toBeNull();
+      } else {
+        expect(within(card).getByText(/status:/)).toHaveClass("truncate");
+      }
+
+      rerender(
+        <ProjectTicketPanel
+          projectName="Shipping"
+          ticketId="ticket"
+          onClose={vi.fn()}
+          onCreated={vi.fn()}
+        />,
+      );
+      expect(await screen.findByText("assignee: Unassigned")).toBeInTheDocument();
+      expect(screen.getByText("source: ISSUE-123")).not.toHaveClass("truncate");
+      expect(screen.getByText("status: Waiting for the investigation to finish")).not.toHaveClass(
+        "truncate",
+      );
+      expect(screen.queryByLabelText(/more tags?/)).toBeNull();
+      expect(api.updateTicket).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["Created the ticket", "Confirmed the issue is resolved"])(
+    "retains a real comment preview: %s",
+    async (text) => {
+      ticket.latest_update = text;
+      ticket.comment_count = 1;
+      renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
+      const card = await screen.findByRole("link", { name: "Open ticket: Ship the board" });
+      expect(within(card).getByText(text)).toBeInTheDocument();
+    },
+  );
 
   it("renders configured lane order, instructions and the first starting lane", async () => {
     ticket.stage_id = "investigating";

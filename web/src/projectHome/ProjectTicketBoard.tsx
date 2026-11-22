@@ -283,7 +283,7 @@ function TicketCard({
         if (suppressClick()) event.preventDefault();
       }}
       className={cn(
-        "flex flex-col gap-3 rounded-xl border border-border/60 bg-card p-3.5 text-left shadow-xs outline-none transition-colors hover:border-primary/70 hover:bg-primary/5 hover:ring-2 hover:ring-primary/20 focus-visible:bg-primary/5 focus-visible:ring-2 focus-visible:ring-ring",
+        "flex min-w-0 flex-col gap-3 rounded-xl border border-border/60 bg-card p-3.5 text-left shadow-xs outline-none transition-colors hover:border-primary/70 hover:bg-primary/5 hover:ring-2 hover:ring-primary/20 focus-visible:bg-primary/5 focus-visible:ring-2 focus-visible:ring-ring",
         related && "border-muted-foreground/50",
         selected && "border-primary ring-1 ring-primary/20",
         isDragging && "opacity-40",
@@ -308,10 +308,13 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
           </span>
         )}
       </div>
-      {ticket.tags.length > 0 && <TicketTags tags={ticket.tags} />}
-      <p className="line-clamp-2 text-sm leading-relaxed text-muted-foreground wrap-anywhere">
-        {ticket.latest_update}
-      </p>
+      {ticket.tags.length > 0 && <TicketTags tags={ticket.tags} compact />}
+      {ticket.latest_update &&
+        (ticket.latest_update !== "Created the ticket" || ticket.comment_count > 0) && (
+          <p className="line-clamp-2 text-sm leading-relaxed text-muted-foreground wrap-anywhere">
+            {ticket.latest_update}
+          </p>
+        )}
       <div className="flex items-center justify-between gap-2 text-sm text-muted-foreground">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
           <time
