@@ -55,6 +55,30 @@ export function nextCycledPermissionMode(
   return null;
 }
 
+/** A Shift+Tab press that didn't land: the mode it started from and the one it tried. */
+export interface PermissionModeCycleMiss {
+  sessionId: string | null;
+  from: string;
+  past: string;
+}
+
+/**
+ * The mode a Shift+Tab press moves to from *selected*. After a press that missed,
+ * the next one continues past the mode it tried instead of retrying it.
+ */
+export function nextPermissionModePress(
+  options: readonly { value: string }[],
+  selected: string,
+  sessionId: string | null,
+  miss: PermissionModeCycleMiss | null,
+): string | null {
+  const resume = miss?.sessionId === sessionId && miss.from === selected ? miss.past : null;
+  const resumed =
+    resume === null ? null : nextCycledPermissionMode(options, resume, new Set([selected]));
+  // With nothing else to move to, retry the failed mode.
+  return resumed ?? nextCycledPermissionMode(options, selected);
+}
+
 /** Which vocabulary a session's permission chip uses. */
 export type PermissionChipKind = "claude" | "devin" | "codex";
 

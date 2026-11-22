@@ -1,0 +1,266 @@
+Adds an engine-owned scroll signal to CodeView: subscribeToScroll listeners get
+{ engineOwned } saying whether a scroll landed where the view's own scroll
+correction (applyScrollFix) put it. Omnigent's rich diff review uses it to keep
+a reader's place when the width changes, without guessing ownership by time.
+
+Upstream issue: drafted, not yet filed ("CodeView scroll listeners can't tell the
+view's own scroll corrections from anyone else's"). Drop this patch once
+@pierre/diffs ships an equivalent signal. See patches/README.md.
+
+Also turns a diff row with no line on either side into a failure for that file: the
+renderer throws a DiffMissingRowError that says which side was short, and FileDiff
+hands it to an onRenderError option (passed through CodeView) instead of printing the
+error and its stack into the file. Omnigent's review shows a note for that file and
+records a diagnostic. See patches/README.md.
+
+diff --git a/dist/components/CodeView.d.ts b/dist/components/CodeView.d.ts
+index 30ad42fad4eae1a7dddbdf1bffd2550bdc09af56..465ac14b37e45a72871b86b0ea87d310740008f3 100644
+--- a/dist/components/CodeView.d.ts
++++ b/dist/components/CodeView.d.ts
+@@ -70,7 +70,11 @@ interface CodeViewCoordinator<LAnnotation> {
+   hasGutterRenderer: boolean;
+   onSnapshotChange(snapshot: CodeViewSlotSnapshot<LAnnotation> | undefined): void;
+ }
+-type CodeViewScrollListener<LAnnotation> = (scrollTop: number, viewer: CodeView<LAnnotation>) => void;
++/** About a scroll: `engineOwned` when it landed where the view's own scroll correction put it. */
++interface CodeViewScrollDetails {
++  engineOwned: boolean;
++}
++type CodeViewScrollListener<LAnnotation> = (scrollTop: number, viewer: CodeView<LAnnotation>, details: CodeViewScrollDetails) => void;
+ type OverloadCallbackArgs<TCallback> = TCallback extends ((...args: infer TArgs) => unknown) ? TArgs : never;
+ type CallbackReturn<TCallback> = TCallback extends ((...args: never[]) => infer TReturn) ? TReturn : never;
+ type OverloadFileCallbackArgs<LAnnotation, TKey extends keyof FileOptions<LAnnotation>> = OverloadCallbackArgs<NonNullable<FileOptions<LAnnotation>[TKey]>>;
+@@ -83,7 +87,7 @@ declare const CODE_VIEW_DIFF_OPTION_KEYS: readonly ['theme', 'disableLineNumbers
+ type CodeViewDiffOptionKeys = (typeof CODE_VIEW_DIFF_OPTION_KEYS)[number];
+ declare const CODE_VIEW_FILE_OPTION_KEYS: readonly ['theme', 'disableLineNumbers', 'overflow', 'themeType', 'disableFileHeader', 'disableVirtualizationBuffers', 'preferredHighlighter', 'useCSSClasses', 'useTokenTransformer', 'tokenizeMaxLineLength', 'tokenizeMaxLength', 'unsafeCSS', 'lineHoverHighlight', 'enableTokenInteractionsOnWhitespace', 'enableGutterUtility', '__debugPointerEvents', 'enableLineSelection', 'controlledSelection', 'disableErrorHandling'];
+ type CodeViewPassThroughOptions<LAnnotation> = Pick<FileDiffOptions<LAnnotation>, CodeViewDiffOptionKeys>;
+-declare const CODE_VIEW_SHARED_CALLBACK_KEYS: readonly ['renderCustomHeader', 'renderHeaderPrefix', 'renderHeaderFilenameSuffix', 'renderHeaderMetadata', 'renderAnnotation', 'renderGutterUtility', 'onPostRender', 'onGutterUtilityClick', 'onLineClick', 'onLineNumberClick', 'onLineEnter', 'onLineLeave', 'onTokenClick', 'onTokenEnter', 'onTokenLeave'];
++declare const CODE_VIEW_SHARED_CALLBACK_KEYS: readonly ['renderCustomHeader', 'renderHeaderPrefix', 'renderHeaderFilenameSuffix', 'renderHeaderMetadata', 'renderAnnotation', 'renderGutterUtility', 'onPostRender', 'onGutterUtilityClick', 'onLineClick', 'onLineNumberClick', 'onLineEnter', 'onLineLeave', 'onTokenClick', 'onTokenEnter', 'onTokenLeave', 'onRenderError'];
+ declare const CODE_VIEW_SELECTION_CALLBACK_KEYS: readonly ['onLineSelected', 'onLineSelectionStart', 'onLineSelectionChange', 'onLineSelectionEnd'];
+ type CodeViewSharedCallbackKeys = (typeof CODE_VIEW_SHARED_CALLBACK_KEYS)[number];
+ type CodeViewSelectionCallbackKeys = (typeof CODE_VIEW_SELECTION_CALLBACK_KEYS)[number];
+@@ -165,6 +169,7 @@ declare class CodeView<LAnnotation = undefined> {
+   private scrollTop;
+   private scrollPageOffset;
+   private scrollDirty;
++  private ownScrollWrite;
+   private scrollInteractionFixTimer;
+   private pointerEventsDisabled;
+   private codeOverflowFix;
+@@ -472,5 +477,5 @@ declare class CodeView<LAnnotation = undefined> {
+   private getFitPerfectlyOverscroll;
+ }
+ //#endregion
+-export { CODE_VIEW_DIFF_OPTION_KEYS, CODE_VIEW_FILE_OPTION_KEYS, CodeView, CodeViewCoordinator, CodeViewLineSelection, CodeViewOptions, CodeViewRenderedDiffItem, CodeViewRenderedFileItem, CodeViewRenderedItem, CodeViewScrollListener, CodeViewSlotSnapshot };
++export { CODE_VIEW_DIFF_OPTION_KEYS, CODE_VIEW_FILE_OPTION_KEYS, CodeView, CodeViewCoordinator, CodeViewLineSelection, CodeViewOptions, CodeViewRenderedDiffItem, CodeViewRenderedFileItem, CodeViewRenderedItem, CodeViewScrollDetails, CodeViewScrollListener, CodeViewSlotSnapshot };
+ //# sourceMappingURL=CodeView.d.ts.map
+\ No newline at end of file
+diff --git a/dist/components/CodeView.js b/dist/components/CodeView.js
+index 051e7d0a211c0cdf32badbd4ff836f04df1ff511..8bd0ec76f424d73c58898f38909c999fd2bfcaa3 100644
+--- a/dist/components/CodeView.js
++++ b/dist/components/CodeView.js
+@@ -80,7 +80,8 @@ const CODE_VIEW_SHARED_CALLBACK_KEYS = [
+ 	"onLineLeave",
+ 	"onTokenClick",
+ 	"onTokenEnter",
+-	"onTokenLeave"
++	"onTokenLeave",
++	"onRenderError"
+ ];
+ const CODE_VIEW_SELECTION_CALLBACK_KEYS = [
+ 	"onLineSelected",
+@@ -152,6 +153,8 @@ var CodeView = class CodeView {
+ 	scrollTop = 0;
+ 	scrollPageOffset = 0;
+ 	scrollDirty = true;
++	/** Where the view's own last scroll correction left the DOM, until the scroll it caused. */
++	ownScrollWrite = void 0;
+ 	scrollInteractionFixTimer;
+ 	pointerEventsDisabled = false;
+ 	codeOverflowFix = false;
+@@ -398,6 +401,7 @@ var CodeView = class CodeView {
+ 		};
+ 	}
+ 	reset() {
++		this.ownScrollWrite = void 0;
+ 		dequeueRender(this.computeRenderRangeAndEmit);
+ 		this.clearReadySubscription();
+ 		this.restoreScrollInteractions();
+@@ -1643,9 +1647,12 @@ var CodeView = class CodeView {
+ 	}
+ 	handleScroll = () => {
+ 		if (CodeView.__STOP) return;
++		const ownWrite = this.ownScrollWrite;
++		this.ownScrollWrite = void 0;
++		const engineOwned = ownWrite !== void 0 && this.root != null && roundToDevicePixel(this.root.scrollTop) === ownWrite;
+ 		this.suspendScrollInteractions();
+ 		this.scrollDirty = true;
+-		this.notifyScroll();
++		this.notifyScroll({ engineOwned });
+ 		this.render();
+ 	};
+ 	clearPendingScroll = () => {
+@@ -1803,10 +1810,16 @@ var CodeView = class CodeView {
+ 			this.scrollPageOffset = scrollPageOffset;
+ 			this.syncPagedScrollScaffolding(windowSpecs);
+ 		}
+-		if (targetPagedScrollTop !== syncedPagedScrollTop) this.root.scrollTo({
+-			top: targetPagedScrollTop,
+-			behavior: "instant"
+-		});
++		if (targetPagedScrollTop !== syncedPagedScrollTop) {
++			const domBefore = roundToDevicePixel(this.root.scrollTop);
++			this.root.scrollTo({
++				top: targetPagedScrollTop,
++				behavior: "instant"
++			});
++			const domAfter = roundToDevicePixel(this.root.scrollTop);
++			// Only a write that moved the view owns where it landed; a no-op leaves any pending scroll its owner's.
++			if (domAfter !== domBefore) this.ownScrollWrite = domAfter;
++		}
+ 		this.renderState.scrollTop = roundedTargetScrollTop;
+ 		this.scrollTop = roundedTargetScrollTop;
+ 		this.scrollDirty = false;
+@@ -1843,10 +1856,10 @@ var CodeView = class CodeView {
+ 		this.slotSnapshot = slotSnapshot;
+ 		this.slotCoordinator.onSnapshotChange(slotSnapshot);
+ 	}
+-	notifyScroll() {
++	notifyScroll(details = { engineOwned: false }) {
+ 		if (this.scrollListeners.size === 0) return;
+ 		const scrollTop = this.getScrollTop();
+-		for (const listener of this.scrollListeners) listener(scrollTop, this);
++		for (const listener of this.scrollListeners) listener(scrollTop, this, details);
+ 	}
+ 	/**
+ 	* Find the first item whose bottom edge crosses into the viewport window.
+diff --git a/dist/components/File.d.ts b/dist/components/File.d.ts
+index 1774a573fe7eecd9194003f6c3396c506d5ce1bf..8df471d828421b2272407bf4dba95af06024bfce 100644
+--- a/dist/components/File.d.ts
++++ b/dist/components/File.d.ts
+@@ -34,6 +34,8 @@ interface FileOptions<LAnnotation> extends BaseCodeOptions, InteractionManagerBa
+   renderAnnotation?(annotation: LineAnnotation<LAnnotation>): HTMLElement | undefined;
+   renderGutterUtility?(getHoveredRow: () => GetHoveredLineResult<'file'> | undefined): HTMLElement | null | undefined;
+   onPostRender?(node: HTMLElement, instance: File<LAnnotation>, phase: PostRenderPhase): unknown;
++  /** OMNIGENT-PATCH(missing-diff-row): shared with diffs in a CodeView; a file never calls it. */
++  onRenderError?(error: Error, fileDiff: import("../types.js").FileDiffMetadata | undefined): unknown;
+ }
+ interface AnnotationElementCache<LAnnotation> {
+   element: HTMLElement;
+diff --git a/dist/components/FileDiff.d.ts b/dist/components/FileDiff.d.ts
+index dd9bab56b7031152cd990bcb6b5e97209c56cfa9..62903202e285d9d73e377e1d607004a90691cd50 100644
+--- a/dist/components/FileDiff.d.ts
++++ b/dist/components/FileDiff.d.ts
+@@ -43,6 +43,12 @@ interface FileDiffOptions<LAnnotation> extends Omit<BaseDiffOptions, 'hunkSepara
+    * errors yourself.
+    */
+   disableErrorHandling?: boolean;
++  /**
++   * OMNIGENT-PATCH(missing-diff-row): called instead of showing a render error in the file. A
++   * row with no line on either side fails with an error named `DiffMissingRowError` whose
++   * `missingRow` says which side was short.
++   */
++  onRenderError?(error: Error, fileDiff: FileDiffMetadata | undefined): unknown;
+   renderAnnotation?(annotation: DiffLineAnnotation<LAnnotation>): HTMLElement | undefined;
+   renderGutterUtility?(getHoveredRow: () => GetHoveredLineResult<'diff'> | undefined): HTMLElement | null | undefined;
+   onPostRender?(node: HTMLElement, instance: FileDiff<LAnnotation>, phase: PostRenderPhase): unknown;
+diff --git a/dist/components/FileDiff.js b/dist/components/FileDiff.js
+index 4ee3d95f21fa52834ebd4e726d88669a90722dbd..1d82555e57a2a5983dc0b50d0f2fc6539aed8c37 100644
+--- a/dist/components/FileDiff.js
++++ b/dist/components/FileDiff.js
+@@ -528,8 +528,7 @@ var FileDiff = class {
+ 				this.injectUnsafeCSS();
+ 			} catch (error) {
+ 				if (disableErrorHandling) throw error;
+-				console.error(error);
+-				if (error instanceof Error) this.applyErrorToDOM(error, fileContainer);
++				this.handleRenderError(error, fileContainer);
+ 			}
+ 			if (!preventEmit) this.emitPostRender();
+ 			return true;
+@@ -563,8 +562,7 @@ var FileDiff = class {
+ 			if (this.editor != null) this.syncRenderViewToEditor();
+ 		} catch (error) {
+ 			if (disableErrorHandling) throw error;
+-			console.error(error);
+-			if (error instanceof Error) this.applyErrorToDOM(error, fileContainer);
++			this.handleRenderError(error, fileContainer);
+ 		}
+ 		if (!preventEmit) this.emitPostRender();
+ 		return true;
+@@ -1602,6 +1600,20 @@ var FileDiff = class {
+ 		setPreNodeProperties(pre, preProperties);
+ 		this.appliedPreAttributes = preProperties;
+ 	}
++	/** OMNIGENT-PATCH(missing-diff-row): an `onRenderError` owner shows the failure itself. */
++	handleRenderError(error, container) {
++		const { onRenderError } = this.options;
++		if (onRenderError == null) {
++			console.error(error);
++			if (error instanceof Error) this.applyErrorToDOM(error, container);
++			return;
++		}
++		this.cleanupErrorWrapper();
++		this.pre?.remove();
++		this.pre = void 0;
++		this.appliedPreAttributes = void 0;
++		onRenderError(error instanceof Error ? error : new Error(String(error)), this.fileDiff);
++	}
+ 	applyErrorToDOM(error, container) {
+ 		this.cleanupErrorWrapper();
+ 		this.pre?.remove();
+diff --git a/dist/renderers/DiffHunksRenderer.js b/dist/renderers/DiffHunksRenderer.js
+index db8dd4a89fca6d1d18294a8be8deafe9ba0783ab..9b5d8af96f294898cc79a6ce4c19cc70f5087626 100644
+--- a/dist/renderers/DiffHunksRenderer.js
++++ b/dist/renderers/DiffHunksRenderer.js
+@@ -669,11 +669,7 @@ var DiffHunksRenderer = class {
+ 					if (injectedRows?.before != null) pushUnifiedInjectedRows(injectedRows.before, context);
+ 					let deletionLineContent = deletionLine != null ? deletionLines[deletionLine.lineIndex] : void 0;
+ 					let additionLineContent = additionLine != null ? additionLines[additionLine.lineIndex] : void 0;
+-					if (deletionLineContent == null && additionLineContent == null) {
+-						const errorMessage = "DiffHunksRenderer.processDiffResult: deletionLine and additionLine are null, something is wrong";
+-						console.error(errorMessage, { file: fileDiff.name });
+-						throw new Error(errorMessage);
+-					}
++					if (deletionLineContent == null && additionLineContent == null) throw createMissingRowError(fileDiff, diffStyle, type, deletionLine, additionLine);
+ 					const lineType = type === "change" ? additionLine != null ? "change-addition" : "change-deletion" : type;
+ 					const lineDecoration = this.getUnifiedLineDecoration({
+ 						type,
+@@ -715,11 +711,7 @@ var DiffHunksRenderer = class {
+ 						type,
+ 						lineIndex: additionLine?.lineIndex
+ 					});
+-					if (deletionLineContent == null && additionLineContent == null) {
+-						const errorMessage = "DiffHunksRenderer.processDiffResult: deletionLine and additionLine are null, something is wrong";
+-						console.error(errorMessage, { file: fileDiff.name });
+-						throw new Error(errorMessage);
+-					}
++					if (deletionLineContent == null && additionLineContent == null) throw createMissingRowError(fileDiff, diffStyle, type, deletionLine, additionLine);
+ 					const missingSide = (() => {
+ 						if (type === "change") {
+ 							if (additionLineContent == null) return "additions";
+@@ -1187,6 +1179,24 @@ function getFallbackLineBreak(lines) {
+ 	}
+ 	return "\n";
+ }
++/**
++* OMNIGENT-PATCH(missing-diff-row): a row with no line on either side fails its file with an
++* error that says which side was short, instead of a bare message; `FileDiff` hands it to
++* `onRenderError` when one is set.
++*/
++function createMissingRowError(fileDiff, diffStyle, rowType, deletionLine, additionLine) {
++	const error = new Error("DiffHunksRenderer.processDiffResult: deletionLine and additionLine are null, something is wrong");
++	error.name = "DiffMissingRowError";
++	const shortSides = [];
++	if (deletionLine != null) shortSides.push("deletions");
++	if (additionLine != null) shortSides.push("additions");
++	error.missingRow = {
++		diffStyle,
++		rowType,
++		shortSides
++	};
++	return error;
++}
+ function isDiffMassive(diff, tokenizeMaxLength) {
+ 	return Math.max(diff.additionLines.length, diff.deletionLines.length) > tokenizeMaxLength;
+ }

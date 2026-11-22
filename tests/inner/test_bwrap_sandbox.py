@@ -377,6 +377,23 @@ def test_resolve_explicit_cwd_allow_hidden_overrides_default() -> None:
     assert policy.cwd_allow_hidden == [".cache", ".npmrc"]
 
 
+@pytestmark_bwrap
+@pytest.mark.parametrize(
+    ("allow_hidden", "warns"), [([".git"], True), (["*"], True), (None, False)]
+)
+def test_resolve_warns_when_cwd_allow_hidden_exposes_git(
+    allow_hidden: list[str] | None, warns: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Exposing ``.git`` to the agent is logged; the default allowlist is silent."""
+    spec = OSEnvSpec(
+        type="caller_process",
+        sandbox=OSEnvSandboxSpec(type="linux_bwrap", cwd_allow_hidden=allow_hidden),
+    )
+    with caplog.at_level("WARNING", logger="omnigent.inner.bwrap_sandbox"):
+        _make_backend().resolve(spec, Path.cwd())
+    assert any(".git" in record.message for record in caplog.records) is warns
+
+
 def test_resolve_raises_on_non_linux() -> None:
     """
     The resolver hard-errors on non-Linux hosts. The bwrap backend
@@ -1737,7 +1754,8 @@ def test_nested_grant_masked_in_non_recursive_default(tmp_path: Path) -> None:
     )
 
 
-def test_framework_write_root_dotfiles_not_masked(tmp_path: Path) -> None:
+@pytest.mark.parametrize("serialize", [False, True])
+def test_framework_write_root_dotfiles_not_masked(tmp_path: Path, serialize: bool) -> None:
     """
     Regression: a framework write root added via
     ``with_additional_write_roots`` (the per-helper scratch tmpdir) is
@@ -1767,6 +1785,9 @@ def test_framework_write_root_dotfiles_not_masked(tmp_path: Path) -> None:
     # Mirror the real launch: the parent folds the scratch tmpdir in as a
     # framework write root just before building the argv.
     policy = with_additional_write_roots(policy, [scratch])
+    if serialize:
+        # Exec launchers reconstruct the policy before applying bubblewrap.
+        policy = SandboxPolicy.from_jsonable(policy.to_jsonable())
     argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
 
     sock = str(scratch.resolve(strict=False) / ".egress.sock")

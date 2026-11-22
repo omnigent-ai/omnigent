@@ -13,7 +13,10 @@ export interface WorkflowDetail extends SavedWorkflow {
   planning_session_id?: string | null;
   /** Epoch seconds of its last write. */
   updated_at?: number;
-  /** The planning chat's proposal the description was saved from, until written otherwise. */
+  /**
+   * The planning chat's proposal the description was saved from or kept over, until written
+   * otherwise.
+   */
   description_source?: string | null;
 }
 
@@ -196,6 +199,7 @@ interface RawRun {
   is_current?: boolean;
   session_status: WorkflowRun["sessionStatus"];
   background_work_running?: boolean;
+  sandbox_launching?: boolean;
   archived: boolean;
   progress: {
     total: number;
@@ -226,6 +230,7 @@ function toWorkflowRun(run: RawRun): WorkflowRun {
     isCurrent: run.is_current === true,
     sessionStatus: run.session_status,
     backgroundWorkRunning: run.background_work_running ?? false,
+    sandboxLaunching: run.sandbox_launching ?? false,
     archived: run.archived,
     progress: {
       total: run.progress.total,

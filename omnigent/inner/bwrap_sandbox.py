@@ -82,7 +82,7 @@ from ._seccomp import (
     apply_seccomp_filter,
     scmp_act_errno,
 )
-from .datamodel import OSEnvSandboxSpec, OSEnvSpec
+from .datamodel import HostWritePathSpec, OSEnvSandboxSpec, OSEnvSpec
 from .sandbox import (
     HOST_SANDBOX_BACKEND_ENV,
     SandboxBackend,
@@ -322,9 +322,18 @@ class BwrapSandboxBackend(SandboxBackend):
         # Empty default honors the "no surprise writes" contract from
         # the design plan — agents that need an editable project tree
         # opt in via ``write_paths: ["."]``.
+        resolved_grants = [
+            (_resolve_grant(cwd, grant.path), grant) for grant in sandbox_spec.write_path_specs
+        ]
+        authored_roots = {
+            path for path, grant in resolved_grants if not isinstance(grant, HostWritePathSpec)
+        }
+        # A host grant for a directory the spec already grants keeps the authored mode,
+        # e.g. copy_on_write; host grants inside a copy_on_write root still fail below.
         write_grants = [
-            (_resolve_grant(cwd, grant.path), grant.copy_on_write)
-            for grant in sandbox_spec.write_path_specs
+            (path, grant.copy_on_write)
+            for path, grant in resolved_grants
+            if not (isinstance(grant, HostWritePathSpec) and path in authored_roots)
         ]
         write_roots = [path for path, _ in write_grants]
         write_files = [_resolve_grant(cwd, path) for path in sandbox_spec.write_files or []]
@@ -348,6 +357,11 @@ class BwrapSandboxBackend(SandboxBackend):
             if sandbox_spec.cwd_allow_hidden is not None
             else list(_DEFAULT_CWD_ALLOW_HIDDEN)
         )
+        if ".git" in cwd_allow_hidden or "*" in cwd_allow_hidden:
+            _LOGGER.warning(
+                "linux_bwrap: cwd_allow_hidden grants the agent access to .git "
+                "in sandbox roots; audit whether the agent actually needs it."
+            )
 
         mask_paths = (
             [_resolve_root(cwd, path) for path in sandbox_spec.mask_paths]

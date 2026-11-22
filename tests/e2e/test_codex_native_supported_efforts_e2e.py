@@ -19,7 +19,9 @@ import shutil
 import subprocess
 import time
 import tomllib
+import traceback
 import uuid
+from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -30,7 +32,11 @@ import httpx
 import pytest
 
 from omnigent.harnesses.codex_native.app_server import client_for_transport
-from omnigent.harnesses.codex_native.bridge import read_bridge_state
+from omnigent.harnesses.codex_native.bridge import (
+    CodexNativeBridgeState,
+    read_bridge_state,
+    read_bridge_state_result,
+)
 from tests._helpers.live_server import terminate_process
 from tests._helpers.native_session import create_native_session
 from tests._helpers.server_runner import ServerRunner, server_runner
@@ -161,6 +167,147 @@ pytestmark = [
 def _json(response: httpx.Response) -> Any:
     response.raise_for_status()
     return response.json()
+
+
+@dataclass(frozen=True)
+class _FreshTerminalSample:
+    ordinal: int
+    bridge_read_status: str
+    bridge_errno: int | None
+    thread_present: bool
+    session_matches: bool
+    mock_read_status: str
+    total: int | None = None
+    key_present: int | None = None
+    nonempty_string: int | None = None
+    matching: int | None = None
+
+
+def _fresh_terminal_sample(
+    model: httpx.Client, bridge: Path, session_id: str, ordinal: int
+) -> tuple[CodexNativeBridgeState | None, _FreshTerminalSample]:
+    """Keep raw ledger data and failures out of the polling frame."""
+    result = state = response = payload = requests = current = linked = None
+    errors: list[BaseException] = []
+    seen: set[int] = set()
+    bridge_status, bridge_errno = "error", None
+    thread_present = session_matches = False
+    mock_status = "bridge_error"
+    total = key_present = nonempty_string = matching = None
+    try:
+        try:
+            result = read_bridge_state_result(bridge)
+            if result.status not in {
+                "ready",
+                "missing",
+                "not_file",
+                "unreadable",
+                "invalid_encoding",
+                "invalid_json",
+                "invalid_state",
+            }:
+                raise ValueError
+            bridge_status = result.status
+            bridge_errno = result.os_errno if type(result.os_errno) is int else None
+            state = result.state
+            thread_present = bool(state is not None and state.thread_id)
+            session_matches = bool(state is not None and state.session_id == session_id)
+            mock_status = "transport_error"
+            response = model.get("/mock/requests")
+            mock_status = "http_error"
+            response.raise_for_status()
+            mock_status = "decode_error"
+            payload = response.json()
+            mock_status = "invalid_response"
+            if isinstance(payload, dict) and isinstance(payload.get("requests"), list):
+                requests = payload["requests"]
+                mock_status = "invalid_entry"
+                if all(isinstance(request, dict) for request in requests):
+                    total = len(requests)
+                    key_present = sum("prompt_cache_key" in request for request in requests)
+                    nonempty_string = sum(
+                        isinstance(request.get("prompt_cache_key"), str)
+                        and bool(request.get("prompt_cache_key"))
+                        for request in requests
+                    )
+                    matching = sum(
+                        1
+                        for request in requests
+                        if state is not None and request.get("prompt_cache_key") == state.thread_id
+                    )
+                    mock_status = "ready"
+        except BaseException as error:
+            if isinstance(error, KeyboardInterrupt):
+                mock_status = "interrupted"
+            elif isinstance(error, SystemExit):
+                mock_status = "system_exit"
+            errors.append(error)
+            while errors:
+                current = errors.pop()
+                if id(current) in seen:
+                    continue
+                seen.add(id(current))
+                for linked in (current.__cause__, current.__context__):
+                    if linked is not None:
+                        errors.append(linked)
+                if isinstance(current, BaseExceptionGroup):
+                    errors.extend(current.exceptions)
+                traceback.clear_frames(current.__traceback__)
+                current.__traceback__ = current.__cause__ = current.__context__ = None
+        return (
+            state if mock_status == "ready" and matching == 1 else None,
+            _FreshTerminalSample(
+                ordinal,
+                bridge_status,
+                bridge_errno,
+                thread_present,
+                session_matches,
+                mock_status,
+                total,
+                key_present,
+                nonempty_string,
+                matching,
+            ),
+        )
+    finally:
+        # Tracebacks can outlive both successful and failed samples under --showlocals.
+        model = bridge = session_id = None
+        result = state = response = payload = requests = current = linked = None
+        errors.clear()
+
+
+def _wait_for_fresh_terminal_request(
+    model: httpx.Client, session: _Session
+) -> CodexNativeBridgeState:
+    samples: deque[_FreshTerminalSample] = deque(maxlen=8)
+    omitted = ordinal = matching = 0
+    state = None
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            ordinal += 1
+            state, sample = _fresh_terminal_sample(model, session.bridge, session.id, ordinal)
+            if len(samples) == 8:
+                omitted += 1
+            samples.append(sample)
+            if sample.mock_read_status == "interrupted":
+                raise KeyboardInterrupt from None
+            if sample.mock_read_status == "system_exit":
+                raise SystemExit(1) from None
+            assert sample.mock_read_status == "ready", (tuple(samples), omitted)
+            matching = sample.matching
+            if matching:
+                break
+            time.sleep(0.1)
+        assert matching == 1, (
+            "Passive samples; input acceptance unknown",
+            tuple(samples),
+            "omitted",
+            omitted,
+        )
+        return state
+    finally:
+        model = session = state = None
 
 
 @dataclass
@@ -735,19 +882,7 @@ def test_fresh_terminal_turn_reports_running_before_first_model_output(
         time.sleep(0.5)
         session.tmux("send-keys", "Enter")
         try:
-            deadline = time.monotonic() + 20
-            requests = []
-            while time.monotonic() < deadline:
-                state = read_bridge_state(session.bridge)
-                requests = [
-                    request
-                    for request in _json(rig.model.get("/mock/requests"))["requests"]
-                    if state is not None and request.get("prompt_cache_key") == state.thread_id
-                ]
-                if requests:
-                    break
-                time.sleep(0.1)
-            assert len(requests) == 1, session.tmux("capture-pane", "-p")
+            state = _wait_for_fresh_terminal_request(rig.model, session)
             assert state is not None
 
             async def native_snapshot() -> dict[str, Any]:

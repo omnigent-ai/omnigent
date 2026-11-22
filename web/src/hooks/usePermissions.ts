@@ -1,6 +1,6 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 /**
- * TanStack Query hooks for session and automation permissions CRUD.
+ * TanStack Query hooks for session, automation and workflow permissions CRUD.
  * Wraps the fetch functions in `permissionsApi.ts`.
  */
 
@@ -26,6 +26,7 @@ import {
   isOwnerLevel,
   listAutomationPermissions,
   listPermissions,
+  listWorkflowPermissions,
   revokePermission,
   revokeSharePermission,
 } from "@/lib/permissionsApi";
@@ -36,9 +37,8 @@ import { useSession } from "./useSession";
 const SESSION_PERMISSIONS_KEY = ["permissions"] as const;
 
 function permissionsKey(target: ShareTarget) {
-  return target.kind === "session"
-    ? ([...SESSION_PERMISSIONS_KEY, target.id] as const)
-    : (["automation-permissions", target.id] as const);
+  if (target.kind === "session") return [...SESSION_PERMISSIONS_KEY, target.id] as const;
+  return [`${target.kind}-permissions`, target.id] as const;
 }
 
 function sessionOwnerKey(sessionId: string) {
@@ -50,10 +50,11 @@ function grantListQuery(rawTarget: ShareTarget | null, enabled: boolean) {
   const target = rawTarget?.kind === "session" && isTempConvId(rawTarget.id) ? null : rawTarget;
   return queryOptions<GrantList>({
     queryKey: target ? permissionsKey(target) : [...SESSION_PERMISSIONS_KEY, ""],
-    queryFn: () =>
-      target!.kind === "session"
-        ? listPermissions(target!.id)
-        : listAutomationPermissions(target!.id),
+    queryFn: () => {
+      if (target!.kind === "session") return listPermissions(target!.id);
+      if (target!.kind === "workflow") return listWorkflowPermissions(target!.id);
+      return listAutomationPermissions(target!.id);
+    },
     enabled: enabled && !!target,
   });
 }
@@ -113,7 +114,7 @@ function invalidateAfterShareChange(qc: QueryClient, target: ShareTarget): void 
 
 /**
  * Grant or update a permission. Invalidates the grants and session lists on
- * success. An automation is shared at read access whatever `level` says.
+ * success. An automation or a workflow is shared at read access whatever `level` says.
  */
 export function useGrantPermission(target: ShareTarget) {
   const qc = useQueryClient();
@@ -127,7 +128,7 @@ export function useGrantPermission(target: ShareTarget) {
       level: number;
       ensureMinimum?: boolean;
     }): Promise<ShareGrant> => {
-      if (target.kind === "automation") return grantSharePermission(target, userId, LEVEL_READ);
+      if (target.kind !== "session") return grantSharePermission(target, userId, LEVEL_READ);
       return ensureMinimum
         ? grantPermission(target.id, userId, level, true)
         : grantPermission(target.id, userId, level);
@@ -141,9 +142,9 @@ export function useRevokePermission(target: ShareTarget) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (userId: string) =>
-      target.kind === "automation"
-        ? revokeSharePermission(target, userId)
-        : revokePermission(target.id, userId),
+      target.kind === "session"
+        ? revokePermission(target.id, userId)
+        : revokeSharePermission(target, userId),
     onSuccess: () => invalidateAfterShareChange(qc, target),
   });
 }

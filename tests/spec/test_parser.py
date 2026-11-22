@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import ntpath
 import re
 from functools import partialmethod
@@ -3579,6 +3580,37 @@ def test_parse_tool_groups_discovery_off_once_its_consumers_are_off(tmp_path: Pa
     spec = parse(tmp_path)
     assert spec.tool_groups.agent_discovery is False
     assert spec.tool_groups.scheduled_tasks is False
+
+
+@pytest.mark.parametrize("removed", ["upload_file", "list_files", "download_file"])
+def test_parse_removed_file_tool_names_keep_the_file_tools_off(
+    tmp_path: Path, removed: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A spec that still lists a removed file tool gets none of the ``sys_`` file
+    tools, since a policy written for the old name would not match them.
+    """
+    config = {"spec_version": 1, "name": "legacy-files", "tools": {"builtins": [removed]}}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with caplog.at_level(logging.WARNING, logger="omnigent.spec.parser"):
+        spec = parse(tmp_path)
+
+    assert spec.tool_groups.files is False
+    assert f"'legacy-files' declares the removed {removed} builtins" in caplog.text
+
+
+def test_parse_files_true_alongside_a_removed_file_tool_name_is_rejected(tmp_path: Path) -> None:
+    """``files: true`` cannot turn the tools back on while an old name is still listed."""
+    config = {
+        "spec_version": 1,
+        "name": "legacy-files",
+        "tools": {"builtins": ["upload_file"]},
+        "tool_groups": {"files": True},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match="conflicts with the removed upload_file") as exc:
+        parse(tmp_path)
+    assert exc.value.code == ErrorCode.INVALID_INPUT
 
 
 # ─── Top-level ``spawn:`` flag (spawn-write opt-in) ───────────

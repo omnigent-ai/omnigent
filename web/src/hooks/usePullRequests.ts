@@ -46,7 +46,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useSyncExternalStore } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 import {
   appendReviewReply,
   type ReviewComment,
@@ -188,6 +188,9 @@ export interface PullRequest {
 
 export interface PullRequestRepo {
   name_with_owner: string | null;
+  /** Host of the repo's forge instance, e.g. "github.com"; absent from older hosts and
+   *  providers that don't report it. */
+  host?: string;
 }
 
 /** A `gh`-configured account — one option in the panel's account selector. */
@@ -299,7 +302,11 @@ export interface PullRequestInfo {
    *  @deprecated Legacy GitHub field; read `auth.authenticated`. Removal in 0.19.0. */
   authenticated?: boolean;
   branch?: string;
+  /** The selected PR's repo when one is tracked, else the workspace's. */
   repo?: PullRequestRepo | null;
+  /** The workspace checkout's own repo, whatever PR is selected; absent from older hosts,
+   *  explicit PR reads, and checkouts whose preferred remote isn't recognized. */
+  workspace_repo?: PullRequestRepo;
   /** The PR's base branch; null when there's no PR (the tab is a PR view). */
   base_ref?: string | null;
   pr?: PullRequest | null;
@@ -438,9 +445,11 @@ export function pullRequestNotFoundReason(
 export async function fetchPullRequestInfo(
   conversationId: string,
   prUrl?: string,
+  signal?: AbortSignal,
 ): Promise<PullRequestInfo> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github${prQuery(prUrl)}`,
+    { signal },
   );
   if (res.status === 404) {
     // Preserve the server's message so an outdated host (no github route) is
@@ -539,13 +548,142 @@ function usePullRequestQueryContext(rawConversationId: string | undefined) {
   return { conversationId, enabled: !!conversationId && serveable !== false, retry };
 }
 
+/** The query key of a session's pull request info, or one of its pull requests' by URL. */
+export function pullRequestInfoQueryKey(conversationId: string | undefined, prUrl?: string) {
+  return ["github-info", conversationId, ...(prUrl ? [prUrl] : [])];
+}
+
+/** Background reads of individual pull requests in flight at once, across every session. */
+const PULL_REQUEST_READ_CONCURRENCY = 2;
+
+interface QueuedPullRequestRead {
+  key: string;
+  start: () => void;
+}
+
+/**
+ * Runs reads of individual pull requests a few at a time, oldest first.
+ *
+ * The composer and the panel's list poll one read per linked PR, and each read
+ * asks the host's git provider. Unqueued, a session that links dozens of PRs
+ * keeps enough requests open to use up the browser's concurrent requests to
+ * the server, so sends and streams in every session wait behind them. Queued,
+ * those statuses fill in gradually.
+ *
+ * A prioritized PR, the one open in a details view, goes first and may use one
+ * more slot, so it doesn't wait behind background reads. That slot is shared:
+ * a read the user has moved away from keeps it until it settles, so moving
+ * between PRs faster than they load can't add more requests.
+ */
+class PullRequestReadQueue {
+  private running = 0;
+  private readonly waiting: QueuedPullRequestRead[] = [];
+  private readonly prioritized = new Map<string, number>();
+
+  async run<T>(key: string, signal: AbortSignal, read: () => Promise<T>): Promise<T> {
+    signal.throwIfAborted();
+    const release = await this.waitForTurn(key, signal);
+    try {
+      // Closing a session frees its running reads' slots before it cancels the waiting ones,
+      // so a read can be handed a slot just as it's cancelled; it must not start then.
+      signal.throwIfAborted();
+      return await read();
+    } finally {
+      release();
+    }
+  }
+
+  /** Reads `key` ahead of the queue until the returned function is called. */
+  prioritize(key: string): () => void {
+    this.prioritized.set(key, (this.prioritized.get(key) ?? 0) + 1);
+    this.drain();
+    return () => {
+      const remaining = (this.prioritized.get(key) ?? 1) - 1;
+      if (remaining > 0) this.prioritized.set(key, remaining);
+      else this.prioritized.delete(key);
+    };
+  }
+
+  /** Resolves, once `key` may start, with a function that frees its slot. */
+  private waitForTurn(key: string, signal: AbortSignal): Promise<() => void> {
+    return new Promise((resolve, reject) => {
+      const entry: QueuedPullRequestRead = {
+        key,
+        start: () => {
+          signal.removeEventListener("abort", abandon);
+          this.running += 1;
+          let holding = true;
+          const release = () => {
+            if (!holding) return;
+            holding = false;
+            signal.removeEventListener("abort", release);
+            this.running -= 1;
+            this.drain();
+          };
+          // A read that outlives its cancelled query must not keep its slot.
+          signal.addEventListener("abort", release, { once: true });
+          resolve(release);
+        },
+      };
+      // A cancelled query, such as one whose session closed, gives up its place.
+      const abandon = () => {
+        this.waiting.splice(this.waiting.indexOf(entry), 1);
+        reject(signal.reason);
+      };
+      signal.addEventListener("abort", abandon, { once: true });
+      this.waiting.push(entry);
+      this.drain();
+    });
+  }
+
+  private drain() {
+    for (;;) {
+      const viewed = this.waiting.findIndex((entry) => this.prioritized.has(entry.key));
+      if (viewed >= 0 && this.running < PULL_REQUEST_READ_CONCURRENCY + 1) {
+        this.waiting.splice(viewed, 1)[0]!.start();
+      } else if (this.waiting.length > 0 && this.running < PULL_REQUEST_READ_CONCURRENCY) {
+        this.waiting.shift()!.start();
+      } else {
+        return;
+      }
+    }
+  }
+}
+
+const pullRequestReads = new PullRequestReadQueue();
+
+function pullRequestReadKey(conversationId: string, prUrl: string): string {
+  return JSON.stringify([conversationId, prUrl]);
+}
+
+/**
+ * Reads `prUrl` ahead of the session's other PRs while the caller shows it, so the
+ * request the user opened never waits behind background status reads.
+ */
+export function usePullRequestReadPriority(
+  rawConversationId: string | undefined,
+  prUrl: string | undefined,
+): void {
+  const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
+  useEffect(() => {
+    if (!conversationId || !prUrl) return undefined;
+    return pullRequestReads.prioritize(pullRequestReadKey(conversationId, prUrl));
+  }, [conversationId, prUrl]);
+}
+
 function pullRequestInfoQueryOptions(
   { conversationId, enabled, retry }: ReturnType<typeof usePullRequestQueryContext>,
   options?: { poll?: boolean | "list" | "linked"; prUrl?: string },
 ) {
+  const prUrl = options?.prUrl;
   return queryOptions({
-    queryKey: ["github-info", conversationId, ...(options?.prUrl ? [options.prUrl] : [])],
-    queryFn: () => fetchPullRequestInfo(conversationId!, options?.prUrl),
+    queryKey: pullRequestInfoQueryKey(conversationId, prUrl),
+    queryFn: prUrl
+      ? ({ signal }) =>
+          pullRequestReads.run(pullRequestReadKey(conversationId!, prUrl), signal, () =>
+            fetchPullRequestInfo(conversationId!, prUrl, signal),
+          )
+      : () => fetchPullRequestInfo(conversationId!),
     enabled,
     retry,
     retryDelay: runnerOfflineRetryDelay,
@@ -594,6 +732,22 @@ export function usePullRequestInfo(
     "github-info",
   );
   return useQuery(pullRequestInfoQueryOptions(context, options));
+}
+
+/**
+ * Reads the shared GitHub-info entry without refetching on mount or focus. An empty
+ * entry still loads, with the context's retries; a failed one waits for another
+ * reader such as {@link usePullRequestInfo} or an invalidation.
+ */
+export function usePullRequestInfoSnapshot(rawConversationId: string | undefined) {
+  const context = usePullRequestQueryContext(rawConversationId);
+  return useQuery({
+    ...pullRequestInfoQueryOptions(context),
+    refetchOnMount: false,
+    // Otherwise every newly mounted reader refetches a failed query.
+    retryOnMount: false,
+    refetchOnWindowFocus: false,
+  });
 }
 
 /** Linked PR details at the list cadence; the session's base query handles turn-end refresh. */
@@ -1018,7 +1172,15 @@ export function useUpdateSessionPr(conversationId: string) {
       updateSessionPr(conversationId, body),
     onSuccess: async (info, body) => {
       await queryClient.cancelQueries({ queryKey: ["github-info", conversationId] });
-      queryClient.setQueryData(["github-info", conversationId], info);
+      // An attach reply reads only that PR; attaching doesn't change the workspace's repo.
+      const workspaceRepo = queryClient.getQueryData<PullRequestInfo>([
+        "github-info",
+        conversationId,
+      ])?.workspace_repo;
+      queryClient.setQueryData(
+        ["github-info", conversationId],
+        info.workspace_repo || !workspaceRepo ? info : { ...info, workspace_repo: workspaceRepo },
+      );
       if (info.selected_pr_url) {
         queryClient.setQueryData(["github-info", conversationId, info.selected_pr_url], info);
       }

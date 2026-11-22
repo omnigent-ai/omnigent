@@ -43,6 +43,11 @@ and the recording protocol for comparing revisions.
   background requests are not replayed.
 - `document-link`: click a web or relative file link directly in the editor;
   Alt-click or move the caret with the keyboard to edit it and use its link popup.
+- `tabs-sidebar`: with `workspace_sidebar_v2` on, in a desktop app or desktop browser (not a
+  touch client), file links, tool rows and `?file=` links open
+  the file in its Files tab, at the cited line. A `?comment=` link opens the file
+  at that comment's thread, a `?diff=1` link opens its diff in the Changes tab,
+  and `?fullscreen=1` fills the window with the sidebar.
 - `mobile`: use the session Files surface or a file link at a phone width.
 
 ## Driving it with the repro environment

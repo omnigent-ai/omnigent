@@ -199,7 +199,7 @@ function isLoopbackAddress(address) {
  * Judges the URL alone; `checkAgentNavigation` adds DNS resolution.
  *
  * @param {string} url
- * @returns {{ ok: true } | { ok: false, error: string }}
+ * @returns {{ ok: true } | { ok: false, error: string, localhostBlocked?: true }}
  */
 function isAgentNavigationAllowed(url, { allowLocalhost = false } = {}) {
   if (typeof url !== "string" || url.trim() === "") {
@@ -225,6 +225,7 @@ function isAgentNavigationAllowed(url, { allowLocalhost = false } = {}) {
     return {
       ok: false,
       error: `navigation blocked: host "${hostname}" is a loopback/internal host`,
+      ...(isLoopbackName(hostname) ? { localhostBlocked: true } : {}),
     };
   }
   return { ok: true };
@@ -248,7 +249,7 @@ async function lookupHostAddresses(hostname) {
  *
  * @param {string} url
  * @param {{ allowLocalhost?: boolean, resolveHost?: (hostname: string) => Promise<string[]> }} [options]
- * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
+ * @returns {Promise<{ ok: true } | { ok: false, error: string, localhostBlocked?: true }>}
  */
 async function checkAgentNavigation(
   url,

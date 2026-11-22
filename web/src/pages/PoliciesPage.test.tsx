@@ -7,7 +7,7 @@
 // policy hooks (useDefaultPolicies / usePolicyRegistry + add/update/delete
 // mutations) so no QueryClient or network is needed.
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PoliciesPage } from "./PoliciesPage";
@@ -36,10 +36,20 @@ const updateMutate = vi.fn();
 const deleteMutate = vi.fn();
 const refetchMock = vi.fn();
 
-vi.mock("@/lib/identity", () => ({
+const identityUpdates = vi.hoisted(() => new Set<() => void>());
+
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof identity>()),
   resolveIdentity: vi.fn(),
   getCurrentIsAdmin: vi.fn(),
+  getCurrentUserId: vi.fn(),
+  subscribeIdentity: (listener: () => void) => {
+    identityUpdates.add(listener);
+    return () => identityUpdates.delete(listener);
+  },
 }));
+
+beforeEach(() => identityUpdates.clear());
 vi.mock("@/hooks/useDefaultPolicies", () => ({
   useDefaultPolicies: vi.fn(),
   useAddDefaultPolicy: vi.fn(),
@@ -129,6 +139,25 @@ describe("PoliciesPage gating", () => {
     expect(screen.getByText("Loading...")).toBeInTheDocument();
   });
 
+  it("shows policy controls when identity recovers while the page stays open", async () => {
+    vi.mocked(identity.resolveIdentity).mockResolvedValue(null);
+    vi.mocked(identity.getCurrentUserId).mockReturnValue(null);
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
+    const view = renderPage();
+    await waitFor(() => expect(identity.resolveIdentity).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "Add policy" })).not.toBeInTheDocument();
+
+    vi.mocked(identity.getCurrentUserId).mockReturnValue("admin");
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
+    act(() => {
+      for (const listener of identityUpdates) listener();
+    });
+
+    expect(await screen.findByRole("button", { name: "Add policy" })).toBeInTheDocument();
+    view.unmount();
+    expect(identityUpdates.size).toBe(0);
+  });
+
   it("blocks non-admins with a permission message", async () => {
     vi.mocked(identity.resolveIdentity).mockResolvedValue("alice");
     vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
@@ -197,6 +226,55 @@ describe("PoliciesPage list", () => {
   });
 });
 
+describe("PoliciesPage Settings rows", () => {
+  it("renders the add and list rows, and each policy's actions, from their Settings catalog entries", async () => {
+    setPolicies([policy({ id: "p1", name: "block_canada", enabled: true })]);
+    renderPage();
+    await screen.findByText("block_canada");
+
+    expect(document.querySelector('[data-settings-item="policies-add"]')).not.toBeNull();
+    expect(document.querySelector('[data-settings-item="policies-list"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-region="policies-list:policies"]'),
+    ).not.toBeNull();
+    const card = screen.getByText("block_canada").closest("[data-settings-region-row]");
+    expect(card).toBeInTheDocument();
+    expect(card?.querySelector('[data-settings-row-action="toggle"]')).not.toBeNull();
+    expect(card?.querySelector('[data-settings-row-action="remove"]')).not.toBeNull();
+  });
+
+  it("names the Add dialog's filter, policy name and submit from their entries", async () => {
+    vi.mocked(policies.usePolicyRegistry).mockReturnValue({
+      data: [
+        {
+          handler: "omnigent.policies.block_canada",
+          kind: "callable",
+          name: "Block Canada",
+          description: "Deny anything mentioning Canada.",
+          params_schema: null,
+        },
+      ],
+    } as never);
+    renderPage();
+    await screen.findByText(/No global policies configured/);
+    fireEvent.click(screen.getByRole("button", { name: /Add policy/ }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog.getAttribute("data-settings-overlay-owner")).toBe("policies-add:add");
+    expect(within(dialog).getByRole("textbox", { name: "Filter policies" })).toBeInTheDocument();
+    expect(
+      dialog.querySelector('[data-settings-row-action="choose"][data-settings-region-row]'),
+    ).not.toBeNull();
+
+    fireEvent.click(within(dialog).getByText("Block Canada"));
+    expect(within(dialog).getByRole("textbox", { name: "Policy name" })).toHaveValue(
+      "block_canada",
+    );
+    expect(
+      within(dialog).getByRole("button", { name: "Add" }).getAttribute("data-settings-control"),
+    ).toBe("policies-add:submit");
+  });
+});
+
 describe("PoliciesPage actions", () => {
   it("toggling a policy's switch fires the update mutation with the new state", async () => {
     setPolicies([policy({ id: "p1", name: "block_canada", enabled: true })]);
@@ -253,6 +331,7 @@ describe("PoliciesPage actions", () => {
     fireEvent.click(within(dialog).getByText("Budget Guard"));
 
     const combo = within(dialog).getByPlaceholderText("Select or type a value…");
+    expect(combo).toHaveAccessibleName("Parameter values: expensive_models");
     fireEvent.focus(combo);
     fireEvent.mouseDown(within(dialog).getByRole("button", { name: "opus" }));
     fireEvent.mouseDown(within(dialog).getByRole("button", { name: "haiku" }));

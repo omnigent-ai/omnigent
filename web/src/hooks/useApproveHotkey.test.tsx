@@ -21,6 +21,7 @@ vi.mock("@/shell/FilesPanel", () => ({
 
 import { setEmbedRoot } from "@/lib/host";
 import { FilesPanelDrawer } from "@/shell/FilesPanelDrawer";
+import { CodeMirrorComposerInput } from "@/components/composer/engine/testing/codeMirrorComposer";
 import {
   Select,
   SelectContent,
@@ -28,7 +29,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useApprovalPromptOnScreen, useApproveHotkey } from "./useApproveHotkey";
+import {
+  OWNS_COMMAND_ENTER_ATTRIBUTE,
+  useApprovalPromptOnScreen,
+  useApproveHotkey,
+} from "./useApproveHotkey";
 
 /** Dispatch a keydown that reaches window from body (default: Cmd+Enter). */
 function press(
@@ -436,5 +441,78 @@ describe("useApproveHotkey Esc", () => {
     document.body.innerHTML = html;
     press({}, "Escape");
     expect(submitApproval).not.toHaveBeenCalled();
+  });
+});
+
+describe("useApproveHotkey with an owner of ⌘↵", () => {
+  const pending = { type: "elicitation", elicitationId: "e1", status: "pending" };
+  const owners: HTMLElement[] = [];
+  afterEach(() => {
+    for (const owner of owners.splice(0)) owner.remove();
+  });
+
+  function pressIn(target: HTMLElement, mac: boolean): void {
+    target.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Enter",
+        bubbles: true,
+        cancelable: true,
+        metaKey: mac,
+        ctrlKey: !mac,
+      }),
+    );
+  }
+
+  /** A marked owner of the chord and the element inside it a keypress starts from. */
+  function markedOwner(shape: string): { owner: HTMLElement; target: HTMLElement } {
+    const owner = document.createElement(shape === "a button" ? "button" : "div");
+    owner.setAttribute(OWNS_COMMAND_ENTER_ATTRIBUTE, "");
+    if (shape === "a button") {
+      const inside = document.createElement("span");
+      owner.append(inside);
+      return { owner, target: inside };
+    }
+    // A code editor's surface, with an empty file or a read-only one.
+    const editor = document.createElement("div");
+    editor.className = "cm-editor";
+    owner.append(editor);
+    const field = document.createElement("div");
+    field.contentEditable = shape === "a code editor with an empty file" ? "true" : "false";
+    field.tabIndex = 0;
+    field.textContent = shape === "a code editor with an empty file" ? "" : "const a = 1;";
+    editor.append(field);
+    return { owner, target: field };
+  }
+
+  it.each([
+    ["a button", true],
+    ["a button", false],
+    ["a code editor with an empty file", true],
+    ["a code editor with a read-only file", true],
+  ])(
+    "leaves the chord to %s marked as owning it, and answers elsewhere (macOS: %s)",
+    (shape, mac) => {
+      blocks = [pending];
+      renderHook(() => useApproveHotkey(mac));
+      const { owner, target } = markedOwner(shape);
+      document.body.append(owner);
+      owners.push(owner);
+      pressIn(target, mac);
+      expect(submitApproval).not.toHaveBeenCalled();
+      press(mac ? { metaKey: true } : { ctrlKey: true });
+      expect(submitApproval).toHaveBeenCalledWith("e1", "accept");
+    },
+  );
+
+  it("accepts from an empty CodeMirror chat composer, which doesn't own the chord", () => {
+    blocks = [pending];
+    renderHook(() => useApproveHotkey(true));
+    const { container } = render(
+      <CodeMirrorComposerInput aria-label="Message the agent" value="" />,
+    );
+    const content = container.querySelector<HTMLElement>(".cm-content")!;
+    content.focus();
+    pressIn(content, true);
+    expect(submitApproval).toHaveBeenCalledWith("e1", "accept");
   });
 });

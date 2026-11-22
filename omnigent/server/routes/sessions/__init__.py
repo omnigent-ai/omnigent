@@ -396,7 +396,6 @@ from omnigent.server.routes._sessions.helpers import (
     _create_session_worktree as _create_session_worktree,
     _delete_stored_session_bundle_after_failure as _delete_stored_session_bundle_after_failure,
     _derive_terminal_launch_args_from_spec as _derive_terminal_launch_args_from_spec,
-    _descendant_sessions as _descendant_sessions,
     _discovery_key as _discovery_key,
     _dispatch_skill_slash_command_to_runner as _dispatch_skill_slash_command_to_runner,
     _emit_server_routing_decision as _emit_server_routing_decision,

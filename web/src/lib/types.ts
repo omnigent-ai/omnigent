@@ -358,6 +358,8 @@ export interface Session {
    */
   backgroundAgents?: BackgroundTaskInfo[];
   createdAt: number;
+  /** Unix seconds of the last persisted change (the sidebar's sort key); absent on older servers. */
+  updatedAt?: number | null;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
    * sub-agent (the spawn tool seeds this) or a user-supplied string
@@ -448,6 +450,8 @@ export interface Session {
    * unpriced, so unknown spend is never displayed as ``$0.00``.
    */
   totalCostUsd?: number | null;
+  /** True when the operator hides USD cost: clear a cached cost, keep tokens. */
+  costHidden?: boolean;
   /**
    * Per-model breakdown of the same subtree usage, keyed by the raw harness
    * model id (e.g. `"claude-sonnet-4-6"`). Each value is the model's token

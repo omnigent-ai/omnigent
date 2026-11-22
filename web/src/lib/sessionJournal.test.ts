@@ -174,6 +174,28 @@ describe("stepProgress", () => {
     expect(restarted[1].startedAt).toBe(nextRun.at(-1)!.created_at);
   });
 
+  it.each(["done", "failed"])(
+    "times an attempt from its first start, until the step is %s and starts again",
+    (ended) => {
+      const ci = planSteps(plan(0, ["ci"]));
+      const at = (position: number, value: string, seconds: number) =>
+        status(position, "ci", value, { created_at: 1_762_534_860 + seconds });
+      // The agent restates its start with each push, and starts again after waiting for the user.
+      const attempt = [
+        at(1, "started", 0),
+        at(2, "started", 4_534),
+        at(3, "needs_input", 6_000),
+        at(4, "started", 6_440),
+        at(5, "started", 12_914),
+      ];
+      expect(stepProgress(ci, attempt, true)[0].startedAt).toBe(attempt[0].created_at);
+      const finished = [...attempt, at(6, ended, 14_840)];
+      expect(stepProgress(ci, finished, false)[0].startedAt).toBe(attempt[0].created_at);
+      const again = [...finished, at(7, "started", 15_000), at(8, "started", 16_000)];
+      expect(stepProgress(ci, again, true)[0].startedAt).toBe(again[6].created_at);
+    },
+  );
+
   it("marks a start after an earlier one as a restart", () => {
     const first = status(1, "a", "started");
     const failed = status(2, "a", "failed");

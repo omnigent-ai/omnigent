@@ -122,9 +122,6 @@ def test_builtin_names_size_matches_registry() -> None:
                 "web_read",
                 "nimble_research",
                 "nimble_extract",
-                "upload_file",
-                "list_files",
-                "download_file",
                 "search_conversations",
                 "export_agent",
                 # Hindsight long-term memory tools (optional `hindsight`
@@ -146,6 +143,11 @@ def test_builtin_names_size_matches_registry() -> None:
                 # ToolContext.conversation_id.
                 "list_comments",
                 "update_comment",
+                # Session file tools: auto-registered by ToolManager unless
+                # the spec sets ``tool_groups.files: false``.
+                "sys_upload_file",
+                "sys_list_files",
+                "sys_download_file",
                 # sys_list_models / sys_advise_models: auto-registered
                 # by ToolManager alongside the sub-agent dispatch grant.
                 # sys_advise_models is only included when smart routing

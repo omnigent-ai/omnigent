@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import type { PropsWithChildren } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -32,7 +32,7 @@ function costRequests(): URL[] {
 }
 
 // The busy child is on the second child-list page, as an older sibling.
-function routeCosts(costs: (url: URL) => Response, childBusy: boolean) {
+function routeCosts(costs: (url: URL) => Response | Promise<Response>, childBusy: boolean) {
   vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
     const url = new URL(String(input), "http://test.local");
     if (!url.pathname.endsWith("/child_sessions")) return costs(url);
@@ -188,5 +188,46 @@ describe("useAgentCosts", () => {
     await waitFor(() => expect(costRequests()).toHaveLength(2));
     await vi.advanceTimersByTimeAsync(5_000);
     expect(costRequests()).toHaveLength(2);
+  });
+
+  it("clears hidden costs even when an old read finishes and the refresh fails", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const priced = () => new Response('{"data":[{"id":"conv_child","estimated_cost_usd":0.4}]}');
+    routeCosts(priced, false);
+    const { client, result } = renderCosts(true);
+    await waitFor(() => expect(result.current.data?.get("conv_child")?.costUsd).toBe(0.4));
+    client.setQueryData(["agent_costs", "conv_unsupported"], null);
+
+    let finishRead!: (response: Response) => void;
+    const pending = new Promise<Response>((resolve) => {
+      finishRead = resolve;
+    });
+    routeCosts(() => pending, false);
+    act(() => {
+      void result.current.refetch();
+    });
+    await waitFor(() => expect(costRequests()).toHaveLength(2));
+    act(() => {
+      invalidateAgentCosts(client);
+      invalidateAgentCosts(client, true);
+    });
+    expect(client.getQueryData(["agent_costs", "conv_root"])).toEqual(new Map());
+    expect(client.getQueryData(["agent_costs", "conv_unsupported"])).toBeNull();
+
+    finishRead(priced());
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(client.getQueryData(["agent_costs", "conv_root"])).toEqual(new Map());
+    routeCosts(() => new Response("unavailable", { status: 503 }), false);
+    await act(() => vi.advanceTimersByTimeAsync(2_000));
+    await waitFor(() => expect(costRequests()).toHaveLength(3));
+    await waitFor(() =>
+      expect(client.getQueryState(["agent_costs", "conv_root"])?.status).toBe("error"),
+    );
+    expect(result.current.data).toEqual(new Map());
+
+    routeCosts(priced, false);
+    invalidateAgentCosts(client);
+    await act(() => vi.advanceTimersByTimeAsync(2_000));
+    await waitFor(() => expect(result.current.data?.get("conv_child")?.costUsd).toBe(0.4));
   });
 });

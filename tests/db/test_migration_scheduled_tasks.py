@@ -20,10 +20,18 @@ from uuid import uuid4
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from packaging.version import Version
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
-from omnigent.db.db_models import SqlScheduledTask, SqlScheduledTaskRun, SqlScheduledTaskShare
+from omnigent.db.cockroachdb import _crdb_server_version
+from omnigent.db.db_models import (
+    ConversationBase,
+    OmnigentBase,
+    SqlScheduledTask,
+    SqlScheduledTaskRun,
+    SqlScheduledTaskShare,
+)
 from omnigent.db.utils import (
     _build_alembic_config,
     clear_engine_cache,
@@ -44,6 +52,8 @@ _KIND_PREVIOUS = "b4e2d7a91c35"
 _KIND_REVISION = "27d16059fab9"
 _SHARES_PREVIOUS = "a7d4c2e9f610"
 _SHARES_REVISION = "a8be64286ffc"
+_SMART_ROUTING_PREVIOUS = "d3bda6dbade3"
+_SMART_ROUTING_REVISION = "5ab01aaca219"
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -99,6 +109,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     assert columns["source_session_id"]["nullable"] is True
     assert columns["mcp_services"]["nullable"] is True
     assert columns["kind"]["nullable"] is False
+    assert columns["smart_routing"]["nullable"] is True
     cols = set(columns)
     assert cols == {
         "workspace_id",
@@ -131,6 +142,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "session_id",
         "source_session_id",
         "kind",
+        "smart_routing",
     }
 
 
@@ -441,6 +453,26 @@ def test_kind_check_rejects_bad_code(db_engine: Engine) -> None:
 
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_smart_routing_check_rejects_bad_code(db_engine: Engine) -> None:
+    """Migrated and model-built ``smart_routing`` CHECKs both reject codes outside 1-2."""
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
+    # MySQL reports CHECK violations as OperationalError (3819).
+    with pytest.raises((IntegrityError, sa.exc.OperationalError)), db_engine.begin() as conn:
+        conn.execute(
+            tasks.insert().values(
+                id=b"r" * 16,
+                name="bad smart routing",
+                prompt=b"p",
+                rrule="FREQ=DAILY;BYHOUR=9",
+                agent_id=b"g" * 16,
+                timezone="UTC",
+                smart_routing=3,
+                created_at=1,
+            )
+        )
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_session_mode_accepts_a_continued_session(db_engine: Engine) -> None:
     """Migrated and model-built schemas both store a continued session."""
     tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
@@ -629,8 +661,9 @@ def test_occurrence_uniqueness_is_scoped_to_workspace_and_task(
 
 
 @pytest.fixture
-def dispatch_migration_engine(tmp_path: Path) -> Iterator[Engine]:
+def dispatch_migration_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[Engine]:
     """Pin rollback tests without rewinding the shared, head-migrated worker DB."""
+    starting_revision = getattr(request, "param", _DISPATCH_REVISION)
     root_uri = os.environ.get("OMNIGENT_TEST_DB_URI")
     admin = sa.create_engine(root_uri, isolation_level="AUTOCOMMIT") if root_uri else None
     uri = f"sqlite:///{tmp_path / 'dispatch.db'}"
@@ -647,12 +680,20 @@ def dispatch_migration_engine(tmp_path: Path) -> Iterator[Engine]:
         engine = sa.create_engine(uri)
         config = _build_alembic_config(uri)
         if engine.dialect.name == "cockroachdb":
-            # CRDB bootstraps metadata at head; pin rollback tests to this revision.
+            if _crdb_server_version(engine) >= Version("24.1"):
+                # Create indexes with their new tables instead of separate schema-change jobs.
+                with engine.connect().execution_options(isolation_level="SERIALIZABLE") as conn:
+                    conn.execute(sa.text("SET autocommit_before_ddl = false"))
+                    conn.commit()
+                    with conn.begin():
+                        OmnigentBase.metadata.create_all(bind=conn)
+                        ConversationBase.metadata.create_all(bind=conn)
+                command.stamp(config, "head")
             engine.dispose()
             engine = get_or_create_engine(uri).execution_options(isolation_level="SERIALIZABLE")
-            command.downgrade(config, _DISPATCH_REVISION)
+            command.downgrade(config, starting_revision)
         else:
-            command.upgrade(config, _DISPATCH_REVISION)
+            command.upgrade(config, starting_revision)
         yield engine
     finally:
         if engine is not None:
@@ -1014,14 +1055,12 @@ def _conversation_indexes(engine: Engine) -> dict[str, list[str]]:
     }
 
 
+@pytest.mark.parametrize("dispatch_migration_engine", [_SESSION_MODE_PREVIOUS], indirect=True)
 def test_session_mode_migration_defaults_existing_tasks_and_round_trips(
     dispatch_migration_engine: Engine,
 ) -> None:
     engine = dispatch_migration_engine
     config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
-    with engine.begin() as conn:
-        config.attributes["connection"] = conn
-        command.upgrade(config, _SESSION_MODE_PREVIOUS)
     values = {
         "name": "nightly",
         "prompt": b"p",
@@ -1075,14 +1114,12 @@ def test_session_mode_migration_defaults_existing_tasks_and_round_trips(
     }
 
 
+@pytest.mark.parametrize("dispatch_migration_engine", [_MCP_SERVICES_PREVIOUS], indirect=True)
 def test_mcp_services_migration_keeps_existing_tasks_and_round_trips(
     dispatch_migration_engine: Engine,
 ) -> None:
     engine = dispatch_migration_engine
     config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
-    # Later migrations open their own autocommit blocks on PostgreSQL, so this
-    # upgrade cannot run inside an outer transaction.
-    command.upgrade(config, _MCP_SERVICES_PREVIOUS)
     values = {
         "name": "nightly",
         "prompt": b"p",
@@ -1120,14 +1157,12 @@ def test_mcp_services_migration_keeps_existing_tasks_and_round_trips(
         assert conn.execute(sa.select(tasks.c.mcp_services)).scalars().all() == [None, None]
 
 
+@pytest.mark.parametrize("dispatch_migration_engine", [_KIND_PREVIOUS], indirect=True)
 def test_kind_migration_makes_existing_tasks_automations_and_round_trips(
     dispatch_migration_engine: Engine,
 ) -> None:
     engine = dispatch_migration_engine
     config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
-    # Later migrations open their own autocommit blocks on PostgreSQL, so this
-    # upgrade cannot run inside an outer transaction.
-    command.upgrade(config, _KIND_PREVIOUS)
     values = {
         "name": "nightly",
         "prompt": b"p",
@@ -1160,6 +1195,47 @@ def test_kind_migration_makes_existing_tasks_automations_and_round_trips(
         command.upgrade(config, _KIND_REVISION)
     with engine.begin() as conn:
         assert conn.execute(sa.select(tasks.c.kind)).scalars().all() == [1, 1]
+
+
+@pytest.mark.parametrize("dispatch_migration_engine", [_SMART_ROUTING_PREVIOUS], indirect=True)
+def test_smart_routing_migration_leaves_existing_tasks_unset_and_round_trips(
+    dispatch_migration_engine: Engine,
+) -> None:
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    values = {
+        "name": "nightly",
+        "prompt": b"p",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    before = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(before.insert().values(id=b"a" * 16, **values))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _SMART_ROUTING_REVISION)
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        # A task saved before the migration has no choice yet.
+        assert conn.execute(sa.select(tasks.c.smart_routing)).scalar_one() is None
+        conn.execute(tasks.insert().values(id=b"b" * 16, smart_routing=1, **values))
+        conn.execute(tasks.insert().values(id=b"c" * 16, smart_routing=2, **values))
+        choices = dict(conn.execute(sa.select(tasks.c.id, tasks.c.smart_routing)).tuples().all())
+    assert choices == {b"a" * 16: None, b"b" * 16: 1, b"c" * 16: 2}
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _SMART_ROUTING_PREVIOUS)
+    columns = {c["name"] for c in sa.inspect(engine).get_columns("scheduled_tasks")}
+    assert "smart_routing" not in columns
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(sa.func.count()).select_from(before)).scalar_one() == 3
+        config.attributes["connection"] = conn
+        command.upgrade(config, _SMART_ROUTING_REVISION)
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(tasks.c.smart_routing)).scalars().all() == [None] * 3
 
 
 @pytest.mark.parametrize(

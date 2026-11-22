@@ -85,7 +85,7 @@ def _attach(page: Page, names: list[str]) -> None:
         [
             {
                 "name": name,
-                "mimeType": "video/mp4" if name.endswith(".mp4") else "text/plain",
+                "mimeType": "video/webm" if name.endswith(".webm") else "text/plain",
                 "buffer": b"geometry",
             }
             for name in names
@@ -162,7 +162,7 @@ def test_landing_and_live_cards_share_the_geometry_contract(
     for surface in ("landing", "live"):
         _surface(page, chat, surface, viewport)
         card_locator = page.locator("[data-composer-card]")
-        if viewport["width"] < 768:
+        if viewport["width"] < 1181:
             expect(card_locator).to_have_attribute("data-mobile-composer", "collapsed")
         card = box(card_locator)
         container = box(card_locator.locator(".."))
@@ -172,7 +172,8 @@ def test_landing_and_live_cards_share_the_geometry_contract(
         assert_within_viewport(box(_submit(page, surface)), viewport["width"])
         assert document_width(page) <= viewport["width"]
         submit = box(_submit(page, surface))
-        if touch or viewport["width"] < 768:
+        mobile_layout = viewport["width"] < 1181
+        if mobile_layout:
             assert submit["width"] >= 44 and submit["height"] >= 44
         else:
             assert submit["height"] < 44
@@ -185,7 +186,7 @@ def test_landing_and_live_cards_share_the_geometry_contract(
         expect(menu).to_be_visible()
         _settle_menu(menu)
         assert_within_viewport(box(menu), viewport["width"])
-        if touch:
+        if mobile_layout:
             for row in menu.get_by_role("menuitem").all():
                 bounds = box(row)
                 assert bounds["width"] >= 44 and bounds["height"] >= 44
@@ -209,7 +210,7 @@ def test_content_and_action_controls_follow_shared_inset_lines(
     if surface == "landing":
         chat.harness = "claude-native"
     _surface(page, chat, surface, DESKTOP)
-    _attach(page, ["alpha.txt", "clip.mp4"])
+    _attach(page, ["alpha.txt", "clip.webm"])
     card = box(page.locator("[data-composer-card]"))
     input_box = box(_input(page, surface))
     chip = box(page.get_by_role("button", name="Remove alpha.txt").locator(".."))
@@ -623,6 +624,41 @@ def test_picker_rows_follow_the_row_grid(
         choice_xs = [box(choice_labels.nth(index))["x"] for index in range(choice_labels.count())]
         assert max(choice_xs) - min(choice_xs) <= TOLERANCE
         assert choice_xs[0] - box(navigation_labels[0])["x"] > TOLERANCE
+
+
+def test_model_flyout_stays_inside_the_chat_beside_the_workspace(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    chat = chat_session_contract
+    chat.set_catalog(
+        harness="claude-native",
+        models=[model_option("sonnet", display_name="Sonnet 5", is_default=True)],
+        selected_model="sonnet",
+    )
+    chat.update_session(labels={"omnigent.wrapper": "claude-code-native-ui"})
+    open_live(page, chat, DESKTOP)
+    page.get_by_role("button", name="Expand right panel").click()
+    workspace = page.get_by_role("complementary", name="Workspace")
+    expect(workspace).to_be_visible()
+    workspace.evaluate(
+        "el => Promise.all(el.getAnimations().map(animation => animation.finished))"
+    )
+    page.get_by_test_id("composer-config-gear").click()
+    page.get_by_test_id("composer-agent-edit").click()
+    flyout_menu = page.get_by_test_id("composer-agent-config-menu")
+    expect(flyout_menu).to_be_visible()
+    _settle_menu(flyout_menu)
+    chat_pane = box(page.get_by_role("main"))
+    picker = box(page.locator(".composer-agent-menu:not(.composer-agent-config-menu)"))
+    flyout = box(flyout_menu)
+    rail_left = box(workspace)["x"]
+    # The flyout fits on neither side of the picker inside this pane.
+    assert picker["x"] + picker["width"] + flyout["width"] > rail_left
+    assert picker["x"] - flyout["width"] < chat_pane["x"]
+    assert flyout["x"] >= chat_pane["x"] - TOLERANCE
+    pane_right = min(rail_left, chat_pane["x"] + chat_pane["width"])
+    assert flyout["x"] + flyout["width"] <= pane_right + TOLERANCE
 
 
 @pytest.mark.parametrize("surface", ["landing", "live"])
@@ -1198,7 +1234,6 @@ def test_composer_growth_reflows_without_covering_output(
     composer.click()
     touch_baseline = settled_geometry(page)
     assert_clearance(touch_baseline, "native touch baseline")
-    # Keep touch input emulated while measuring: ending it resizes touch-sized targets.
     with native_touch_emulation(page) as touch_session:
         touch = scroll_with_native_touch(page, touch_session)
         assert touch["settledDistance"] > 100, touch
@@ -1492,7 +1527,8 @@ def test_scrollbar_thumb_drags_by_touch(
 ) -> None:
     chat = chat_session_contract
     seed_long_transcript(chat, 30, paragraphs=6)
-    open_live(page, chat, {"width": 800, "height": 1280})
+    # Desktop layout: the mobile composer overlays the thumb parked at the bottom.
+    open_live(page, chat, {"width": 1200, "height": 1280})
     tag_scroller(page)
     expect(page.get_by_test_id("transcript-scrollbar-thumb")).to_be_visible()
     bottom = park_at_bottom(page)
