@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, dataclass, fields, replace
 from itertools import batched
 from pathlib import PureWindowsPath
 from typing import Any, Literal, Protocol, cast
@@ -42,6 +43,7 @@ from omnigent.db.compression import encode as compress_text
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
     LABEL_VALUE_MAX_LEN,
+    USAGE_TOTALS_MAX_STORED_BYTES,
     SqlAgent,
     SqlComment,
     SqlConversation,
@@ -129,6 +131,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_RUN_LABEL_KEY,
     SIDE_CHAT_COPY_ID_PREFIX_LEN,
     SIDE_CHAT_LABEL_KEY,
+    USAGE_TOTALS_BY_MODEL_DROPPED_KEY,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
@@ -140,9 +143,11 @@ from omnigent.stores.conversation_store import (
     SessionConnectivity,
     SessionTodosUpdate,
     SpawnTreeUsage,
+    add_usage_totals,
     family_pinned_label_key,
     pinned_label_key,
     runner_seen_is_fresh,
+    usage_totals_change,
 )
 from omnigent.stores.conversation_store.activity_error import (
     LATEST_ACTIVITY_ERROR_LABEL_KEY,
@@ -475,6 +480,67 @@ def _validate_inference_snapshot(value: str | None) -> None:
         )
 
 
+# The stored spawn-tree total of a new top-level session: tracked, with nothing
+# spent yet. ``NULL`` instead marks a sub-agent or a session created before
+# totals were tracked, whose usage no stored total counts.
+_NEW_TREE_USAGE_TOTALS = "{}"
+
+
+def _tree_usage_totals_for_new_session(parent_conversation_id: str | None) -> str | None:
+    """The ``subtree_usage`` a new session starts with: tracked only for a top-level one."""
+    return _NEW_TREE_USAGE_TOTALS if parent_conversation_id is None else None
+
+
+def _decode_usage_document(raw: str | None) -> dict[str, Any]:
+    """Decode a stored ``session_usage`` document, empty when unset."""
+    if not raw:
+        return {}
+    decoded = json.loads(raw)
+    return dict(decoded) if isinstance(decoded, dict) else {}
+
+
+def _decode_usage_totals(raw: str | None) -> dict[str, Any] | None:
+    """Decode a stored usage total; ``None`` when it is untracked or unreadable."""
+    if raw is None:
+        return None
+    try:
+        decoded = json.loads(raw) if raw else {}
+    except ValueError:
+        _logger.warning("Leaving an unreadable stored usage total unchanged")
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _encode_usage_totals(totals: dict[str, Any]) -> str:
+    """Serialize a usage total, dropping its per-model map for good if it would not fit."""
+    encoded = json.dumps(totals, separators=(",", ":"))
+    framed = compress_text(encoded)
+    if framed is not None and len(framed) > USAGE_TOTALS_MAX_STORED_BYTES:
+        # The flat counters stay exact; only an outsized per-model map is lost.
+        _logger.warning("Dropping the per-model breakdown from an oversized usage total")
+        flat = {key: value for key, value in totals.items() if key != "by_model"}
+        flat[USAGE_TOTALS_BY_MODEL_DROPPED_KEY] = True
+        encoded = json.dumps(flat, separators=(",", ":"))
+    return encoded
+
+
+@dataclass
+class _TreeUsageTotals:
+    """A locked top-level session's stored total and the project it counts toward."""
+
+    root_id: str
+    totals: dict[str, Any]
+    project_id: str | None
+
+
+@dataclass
+class _LockedUsage:
+    """A session's locked own usage and the locked total that counts it."""
+
+    session_usage: str | None
+    tree: _TreeUsageTotals | None
+
+
 def _new_session_metadata_row(
     conversation_id: str,
     parent_conversation_id: str | None = None,
@@ -517,6 +583,7 @@ def _new_session_metadata_row(
         terminal_launch_args=(
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
         ),
+        subtree_usage=_tree_usage_totals_for_new_session(parent_conversation_id),
     )
 
 
@@ -1404,6 +1471,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     inference_snapshot=encoded_inference_snapshot,
                     project_id=project_id,
                     side_chat_parent_id=side_chat_parent_id,
+                    subtree_usage=_tree_usage_totals_for_new_session(parent_conversation_id),
                 )
                 meta_sess.add(meta)
                 return meta
@@ -1916,6 +1984,249 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._session_immediate, "set_session_state", write)
 
+    def _lock_usage_row(self, session: Session, row_id: str) -> Any:
+        """Lock one session's usage row: its id, own usage, tree total and project."""
+        stmt = select(
+            SqlConversationMetadata.id,
+            SqlConversationMetadata.session_usage,
+            SqlConversationMetadata.subtree_usage,
+            SqlConversationMetadata.project_id,
+        ).where(
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            SqlConversationMetadata.id == row_id,
+        )
+        if self._meta_supports_for_update:
+            stmt = stmt.with_for_update()
+        return session.execute(stmt).one_or_none()
+
+    def _lock_usage_rows(self, session: Session, conversation_id: str) -> _LockedUsage | None:
+        """
+        Lock a session's usage row and its tree's top-level row for a usage write.
+
+        Metadata rows lock in ascending id order, as runner liveness and
+        deletion lock them, and the project locks last, so concurrent writers
+        wait for each other instead of deadlocking. A top-level session's own
+        row holds its tree's total. A sub-agent's tree root comes from its
+        conversation row; when that row is gone, the session is being deleted
+        and its pending metadata delete subtracts whatever usage it holds, so
+        no more may be written.
+
+        :returns: The locked session row and the total counting it, or
+            ``None`` when the session has no row or is being deleted.
+        """
+        found = session.execute(
+            select(SqlConversationMetadata.id, SqlConversationMetadata.kind).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+        ).one_or_none()
+        if found is None:
+            return None
+        member_id = found.id
+        root_id = member_id
+        if found.kind == encode_conversation_kind("sub_agent"):
+            with self._profile_label_session(
+                session, read_only=True, operation="read_usage_root"
+            ) as conv_session:
+                root_id = conv_session.scalar(
+                    select(SqlConversation.root_conversation_id).where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id == member_id,
+                    )
+                )
+            if root_id is None:
+                return None
+        locked = {}
+        for row_id in sorted({member_id, root_id}):
+            locked[row_id] = self._lock_usage_row(session, row_id)
+        member, root = locked[member_id], locked[root_id]
+        if member is None:
+            return None
+        totals = _decode_usage_totals(root.subtree_usage) if root is not None else None
+        tree = (
+            _TreeUsageTotals(root_id=root_id, totals=totals, project_id=root.project_id)
+            if totals is not None
+            else None
+        )
+        return _LockedUsage(session_usage=member.session_usage, tree=tree)
+
+    def _add_to_tree_usage_totals(
+        self, session: Session, tree: _TreeUsageTotals | None, change: dict[str, Any]
+    ) -> None:
+        """Add a member's usage change to its locked tree total and to that tree's project."""
+        if tree is None or not change:
+            return
+        add_usage_totals(tree.totals, change)
+        session.execute(
+            update(SqlConversationMetadata)
+            .where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == tree.root_id,
+            )
+            .values(subtree_usage=_encode_usage_totals(tree.totals))
+        )
+        if tree.project_id is not None:
+            self._add_to_project_usage(session, tree.project_id, change)
+
+    def _add_to_project_usage(
+        self, session: Session, project_id: str, change: dict[str, Any]
+    ) -> None:
+        """Add a usage change to a project's stored total; a deleted project is skipped."""
+        stmt = select(SqlProject.project_usage).where(
+            SqlProject.workspace_id == current_workspace_id(),
+            SqlProject.id == project_id,
+        )
+        if self._meta_supports_for_update:
+            stmt = stmt.with_for_update()
+        row = session.execute(stmt).one_or_none()
+        if row is None:
+            return
+        # A project row predating tracked totals starts from zero: only
+        # tracked top-level sessions ever add to it.
+        totals = {} if row.project_usage is None else _decode_usage_totals(row.project_usage)
+        if totals is None:
+            return
+        add_usage_totals(totals, change)
+        session.execute(
+            update(SqlProject)
+            .where(
+                SqlProject.workspace_id == current_workspace_id(),
+                SqlProject.id == project_id,
+            )
+            .values(project_usage=_encode_usage_totals(totals))
+        )
+
+    def _refile_sessions(
+        self, session: Session, project_id: str | None, *conditions: ColumnElement[bool]
+    ) -> int:
+        """
+        File the matching sessions under *project_id* and move their stored totals.
+
+        :param conditions: Filters selecting the sessions' metadata rows,
+            alongside the current workspace.
+        :returns: How many rows were refiled.
+        """
+        matching = (
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            *conditions,
+        )
+        # Ascending id order, as every multi-row metadata writer locks rows.
+        filed = (
+            select(SqlConversationMetadata.project_id, SqlConversationMetadata.subtree_usage)
+            .where(*matching)
+            .order_by(SqlConversationMetadata.id)
+        )
+        if self._meta_supports_for_update:
+            filed = filed.with_for_update()
+        previous = session.execute(filed).all()
+        result = session.execute(
+            update(SqlConversationMetadata).where(*matching).values(project_id=project_id)
+        )
+        self._move_project_usage(
+            session, [(row.project_id, row.subtree_usage) for row in previous], project_id
+        )
+        return cast(_RowCountResult, result).rowcount
+
+    def _move_project_usage(
+        self,
+        session: Session,
+        moved: Iterable[tuple[str | None, str | None]],
+        project_id: str | None,
+    ) -> None:
+        """
+        Move refiled top-level sessions' stored totals to their new project.
+
+        :param moved: Each locked session's ``(project_id, subtree_usage)``
+            before the refiling.
+        :param project_id: The project they are filed under now, or ``None``.
+        """
+        leaving: dict[str, dict[str, Any]] = {}
+        arriving: dict[str, Any] = {}
+        for old_project_id, raw_totals in moved:
+            totals = _decode_usage_totals(raw_totals)
+            if not totals or old_project_id == project_id:
+                continue
+            gained = usage_totals_change({}, totals)
+            if old_project_id is not None:
+                add_usage_totals(leaving.setdefault(old_project_id, {}), gained)
+            if project_id is not None:
+                add_usage_totals(arriving, gained)
+        changes = {
+            old_project_id: usage_totals_change(totals, {})
+            for old_project_id, totals in leaving.items()
+        }
+        if project_id is not None and arriving:
+            changes[project_id] = usage_totals_change({}, arriving)
+        # One lock order across concurrent moves.
+        for changed_project_id in sorted(changes):
+            self._add_to_project_usage(session, changed_project_id, changes[changed_project_id])
+
+    def _remove_deleted_usage(
+        self,
+        session: Session,
+        root_id: str,
+        batch_ids: tuple[str, ...],
+        *,
+        whole_tree: bool,
+    ) -> None:
+        """
+        Take a deletion batch's usage out of the stored totals still counting it.
+
+        Runs in the batch's transaction before its rows are deleted.
+
+        :param root_id: The deleted sessions' top-level session.
+        :param batch_ids: The sessions this batch deletes.
+        :param whole_tree: Whether the top-level session itself is deleted,
+            leaving only its project's total to correct.
+        """
+        if whole_tree and root_id not in batch_ids:
+            return
+        # One statement locks the batch and its top-level row in ascending id
+        # order, the order usage writers and runner liveness lock them.
+        stmt = (
+            select(
+                SqlConversationMetadata.id,
+                SqlConversationMetadata.session_usage,
+                SqlConversationMetadata.subtree_usage,
+                SqlConversationMetadata.project_id,
+            )
+            .where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id.in_({*batch_ids, root_id}),
+            )
+            .order_by(SqlConversationMetadata.id)
+        )
+        if self._meta_supports_for_update:
+            stmt = stmt.with_for_update()
+        rows = {row.id: row for row in session.execute(stmt)}
+        root = rows.get(root_id)
+        totals = _decode_usage_totals(root.subtree_usage) if root is not None else None
+        if root is None or totals is None:
+            return
+        if whole_tree:
+            if root.project_id is not None:
+                self._add_to_project_usage(
+                    session, root.project_id, usage_totals_change(totals, {})
+                )
+            # A metadata row kept as a host reservation no longer counts.
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == root_id,
+                )
+                .values(subtree_usage=None)
+            )
+            return
+        removed: dict[str, Any] = {}
+        for row_id in batch_ids:
+            row = rows.get(row_id)
+            if row is not None:
+                usage = _decode_usage_totals(row.session_usage) or {}
+                add_usage_totals(removed, usage_totals_change({}, usage))
+        tree = _TreeUsageTotals(root_id=root_id, totals=totals, project_id=root.project_id)
+        self._add_to_tree_usage_totals(session, tree, usage_totals_change(removed, {}))
+
     def set_session_usage(
         self,
         conversation_id: str,
@@ -1925,7 +2236,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         Persist the cumulative LLM token usage for a conversation.
 
         Serializes *usage* as JSON and writes it to the
-        ``session_usage`` column on the ``conversations`` table.
+        ``session_usage`` column on the ``conversations`` table. The same
+        transaction moves the session's spawn-tree and project totals by the
+        change from the stored usage.
 
         :param conversation_id: The conversation to update,
             e.g. ``"conv_abc123"``.
@@ -1939,6 +2252,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         encoded_usage = json.dumps(usage)
 
         def write(session: Session) -> None:
+            stored = self._lock_usage_rows(session, conversation_id)
+            if stored is None:
+                return
             session.execute(
                 update(SqlConversationMetadata)
                 .where(
@@ -1946,6 +2262,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id == conversation_id,
                 )
                 .values(session_usage=encoded_usage)
+            )
+            self._add_to_tree_usage_totals(
+                session,
+                stored.tree,
+                usage_totals_change(_decode_usage_document(stored.session_usage), usage),
             )
 
         run_write_transaction(self._session_immediate, "set_session_usage", write)
@@ -2205,6 +2526,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
             if self._conv_engine is not self._engine and source_meta.family_id is None:
                 family_lock.value = "pending_initial_labels"
+            if target_meta.project_id != source_meta.project_id:
+                self._move_project_usage(
+                    session,
+                    [(target_meta.project_id, target_meta.subtree_usage)],
+                    source_meta.project_id,
+                )
             target_meta.project_id = source_meta.project_id
             source_meta.family_id = family_id
             target_meta.family_id = family_id
@@ -2358,16 +2685,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         if source.family_id is None:
 
             def move_standalone(session: Session) -> bool:
-                result = session.execute(
-                    update(SqlConversationMetadata)
-                    .where(
-                        SqlConversationMetadata.workspace_id == current_workspace_id(),
-                        SqlConversationMetadata.id == conversation_id,
-                        SqlConversationMetadata.family_id.is_(None),
-                    )
-                    .values(project_id=project_id)
+                refiled = self._refile_sessions(
+                    session,
+                    project_id,
+                    SqlConversationMetadata.id == conversation_id,
+                    SqlConversationMetadata.family_id.is_(None),
                 )
-                if not cast(_RowCountResult, result).rowcount:
+                if not refiled:
                     if (
                         session.get(
                             SqlConversationMetadata, (current_workspace_id(), conversation_id)
@@ -2410,15 +2734,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                         clear_legacy_labels(labels_session, ids)
                 else:
                     ids = [conversation_id]
-            result = session.execute(
-                update(SqlConversationMetadata)
-                .where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.id.in_(ids),
-                )
-                .values(project_id=project_id)
+            return (
+                self._refile_sessions(session, project_id, SqlConversationMetadata.id.in_(ids)) > 0
             )
-            return cast(_RowCountResult, result).rowcount > 0
 
         changed = run_write_transaction(self._session_immediate, "move_session_family", write)
         if changed and self._conv_engine is not self._engine:
@@ -2457,6 +2775,9 @@ class SqlAlchemyConversationStore(ConversationStore):
           first; ``BEGIN IMMEDIATE`` prevents that by serialising at lock
           acquisition time.
 
+        The same transaction adds the applied increment to the session's
+        spawn-tree and project totals.
+
         :param conversation_id: The conversation to update.
         :param delta: Usage increments (see
             :meth:`ConversationStore.increment_session_usage`).
@@ -2467,17 +2788,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         from omnigent.stores.conversation_store import apply_session_usage_delta
 
         def write(session: Session) -> dict[str, Any]:
-            q = select(SqlConversationMetadata).where(
-                SqlConversationMetadata.workspace_id == current_workspace_id(),
-                SqlConversationMetadata.id == conversation_id,
-            )
-            if self._meta_supports_for_update:
-                q = q.with_for_update()
-            meta = session.scalars(q).first()
-            current: dict[str, Any] = (
-                dict(json.loads(meta.session_usage)) if meta and meta.session_usage else {}
-            )
+            stored = self._lock_usage_rows(session, conversation_id)
+            previous = _decode_usage_document(stored.session_usage if stored else None)
+            current = copy.deepcopy(previous)
             apply_session_usage_delta(current, delta)
+            if stored is None:
+                return current
             session.execute(
                 update(SqlConversationMetadata)
                 .where(
@@ -2485,6 +2801,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id == conversation_id,
                 )
                 .values(session_usage=json.dumps(current))
+            )
+            self._add_to_tree_usage_totals(
+                session, stored.tree, usage_totals_change(previous, current)
             )
             return current
 
@@ -7491,6 +7810,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ),
                 project_id=project_id,
                 side_chat_parent_id=side_chat_parent_id,
+                # A fork is a new top-level session; it copies no usage.
+                subtree_usage=_NEW_TREE_USAGE_TOTALS,
             )
             if continue_source:
                 current = meta_sess.get(
@@ -7695,7 +8016,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 
-        def delete_ap(ap_sess: Session) -> tuple[list[str], dict[str, str]] | None:
+        def delete_ap(ap_sess: Session) -> tuple[list[str], dict[str, str], str, str] | None:
             row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if not row:
                 return None
@@ -7750,8 +8071,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversation.id != conversation_id,
                 )
             )
+            deleted_id, root_id = row.id, row.root_conversation_id
             ap_sess.delete(row)
-            return subtree_ids, retained_tasks
+            return subtree_ids, retained_tasks, deleted_id, root_id
 
         ap_result = run_write_transaction(
             self._conv_session_immediate,
@@ -7760,7 +8082,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         if ap_result is None:
             return False
-        subtree_ids, retained_tasks = ap_result
+        subtree_ids, retained_tasks, deleted_id, root_id = ap_result
 
         def delete_metadata(session: Session, batch_ids: tuple[str, ...]) -> None:
             host_ids = session.scalars(
@@ -7781,6 +8103,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .order_by(SqlHost.host_id)
                 .with_for_update()
             ).all()
+            self._remove_deleted_usage(
+                session, root_id, batch_ids, whole_tree=deleted_id == root_id
+            )
             session.execute(
                 delete(SqlComment).where(
                     SqlComment.workspace_id == current_workspace_id(),

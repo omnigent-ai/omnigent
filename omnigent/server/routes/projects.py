@@ -24,11 +24,18 @@ from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._sessions.common import _MODEL_TOKEN_KEYS
+from omnigent.server.routes._sessions.helpers import (
+    _priced_cost_for_display,
+    _usage_by_model_for_display,
+    cost_display_hidden,
+)
 from omnigent.server.routes.sessions import announce_projects_changed
 from omnigent.server.schemas import (
     CreateProjectRequest,
     ProjectOrderRequest,
     ProjectOrderResponse,
+    ProjectUsage,
     UpdateProjectRequest,
 )
 from omnigent.server.session_orchestration import require_named_source_private
@@ -54,6 +61,29 @@ def _to_response(project: Project) -> dict[str, Any]:
         "updated_at": project.updated_at,
         "config": project.config,
     }
+
+
+def _to_usage_response(project_id: str, usage: dict[str, Any]) -> ProjectUsage:
+    """Shape a stored project usage total like a session's usage fields.
+
+    :param project_id: The project the total belongs to.
+    :param usage: The stored total in the ``session_usage`` layout.
+    :returns: The response, with cost omitted when unpriced or hidden.
+    """
+    token_counts = {
+        key: int(value)
+        for key in _MODEL_TOKEN_KEYS
+        if isinstance(value := usage.get(key), int | float) and not isinstance(value, bool)
+    }
+    return ProjectUsage.model_validate(
+        {
+            "project_id": project_id,
+            "total_cost_usd": _priced_cost_for_display(usage),
+            "cost_hidden": True if cost_display_hidden() else None,
+            "usage_by_model": _usage_by_model_for_display(usage),
+            **token_counts,
+        }
+    )
 
 
 def create_projects_router(
@@ -198,6 +228,29 @@ def create_projects_router(
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         return _to_response(project)
+
+    @router.get(
+        "/projects/{project_id}/usage",
+        response_model=ProjectUsage,
+        response_model_exclude_none=True,
+    )
+    async def get_project_usage(request: Request, project_id: str) -> ProjectUsage:
+        """Return the summed usage of one of the caller's projects.
+
+        Reads the project's stored total, which member sessions keep current as
+        they report usage, so the cost does not grow with the session count.
+
+        :param request: The incoming request, used to identify the user.
+        :param project_id: The project to read.
+        :returns: The project's summed usage.
+        :raises OmnigentError: 401 if unauthenticated, 404 if not found / not
+            owned by the caller.
+        """
+        user_id = require_user(request, auth_provider)
+        usage = await asyncio.to_thread(project_store.get_usage, project_id, user_id=user_id)
+        if usage is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        return _to_usage_response(project_id, usage)
 
     @router.patch("/projects/{project_id}")
     async def update_project(
