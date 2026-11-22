@@ -7,7 +7,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { workspaceOpenCommands, type WorkspaceCommandFacts } from "@/shell/workspaceCommands/model";
 import { HIDDEN, unavailableBecause } from "@/store/paletteCommands";
 
-import { shortcutKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { shortcutKeys } from "@/lib/shortcuts/registry";
 
 import { NewTabPage, type NewTabPlace, type NewTabRecent } from "./NewTabPage";
 

@@ -69,42 +69,18 @@ describe("filterAppCommands", () => {
 });
 
 /** Registry hotkeys whose action ⌘K also lists, by the command's id. */
-const HOTKEY_COMMANDS: Partial<Record<ShortcutId, string>> = {
-  "session.new": "new-chat",
-  "settings.open": "go-settings",
-  "sidebar.left": "toggle-left-sidebar",
-  "sidebar.right": "toggle-right-sidebar",
-};
-
-const NOT_YET = "Not in ⌘K yet.";
-const WHERE_PRESSED = "Acts on what has focus or is on screen, so it has no ⌘K row.";
+const HOTKEY_COMMANDS: Partial<Record<ShortcutId, string>> = Object.fromEntries(
+  SHORTCUT_BINDINGS.flatMap((binding) =>
+    binding.paletteCommand === undefined ? [] : [[binding.id, binding.paletteCommand]],
+  ),
+);
 
 /** Registry hotkeys with no ⌘K command, and why. */
-const HOTKEYS_WITHOUT_COMMANDS: Partial<Record<ShortcutId, string>> = {
-  "palette.commands": "Opens ⌘K itself.",
-  "palette.sessions": "Opens ⌘K's own session search.",
-  "shortcuts.show": NOT_YET,
-  "session.rename": NOT_YET,
-  "session.toggleUnread": NOT_YET,
-  "history.back": NOT_YET,
-  "history.forward": NOT_YET,
-  "sessions.recent": "Switches while Control is held.",
-  "session.number": "Picks a sidebar row by its position.",
-  "view.mode": NOT_YET,
-  "workspace.tab": "Picks a workspace tab by its position.",
-  "terminal.new": NOT_YET,
-  "model.picker": WHERE_PRESSED,
-  "model.cycle": WHERE_PRESSED,
-  "effort.cycle": WHERE_PRESSED,
-  "composer.focus": WHERE_PRESSED,
-  "dictation.toggle": WHERE_PRESSED,
-  "approval.accept": WHERE_PRESSED,
-  "approval.decline": WHERE_PRESSED,
-  "pane.previous": WHERE_PRESSED,
-  "pane.next": WHERE_PRESSED,
-  "terminal.splitRight": WHERE_PRESSED,
-  "terminal.splitDown": WHERE_PRESSED,
-};
+const HOTKEYS_WITHOUT_COMMANDS: Partial<Record<ShortcutId, string>> = Object.fromEntries(
+  SHORTCUT_BINDINGS.flatMap((binding) =>
+    binding.paletteExempt === undefined ? [] : [[binding.id, binding.paletteExempt]],
+  ),
+);
 
 // The New chat row spells out Shift off macOS, as its tooltip does.
 const sameKeys = (keys: readonly string[]) => keys.map((key) => (key === "Shift" ? "⇧" : key));
@@ -112,6 +88,13 @@ const sameKeys = (keys: readonly string[]) => keys.map((key) => (key === "Shift"
 describe("registry hotkeys in ⌘K", () => {
   const all = commands();
   const byId = new Map(all.map((command) => [command.id, command]));
+
+  it("gives every registry hotkey a command or a reason, never both", () => {
+    const both = SHORTCUT_BINDINGS.filter(
+      (binding) => binding.paletteCommand !== undefined && binding.paletteExempt !== undefined,
+    );
+    expect(both.map((binding) => binding.id)).toEqual([]);
+  });
 
   it("lists every registry hotkey exactly once, as a command or a known gap", () => {
     const listed = [...Object.keys(HOTKEY_COMMANDS), ...Object.keys(HOTKEYS_WITHOUT_COMMANDS)];

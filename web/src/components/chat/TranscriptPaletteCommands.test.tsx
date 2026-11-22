@@ -174,6 +174,29 @@ describe("TranscriptPaletteCommands", () => {
     act(() => command("Fork from latest response…").run());
     expect(openForkDialog).toHaveBeenCalledWith({ upToResponseId: "r1" });
   });
+
+  it("steps through the prompts as ⌘⌥↑ and ⌘⌥↓ do, once there is one", () => {
+    const messageNav = { goPrev: vi.fn(), goNext: vi.fn() };
+    const { rerender } = render(
+      <TranscriptPaletteCommands conversationId="c1" bubbles={BUBBLES} messageNav={messageNav} />,
+      { wrapper: withFlag(true) },
+    );
+    const previous = command("Go to previous message");
+    expect([previous.shortcut, command("Go to next message").shortcut]).toEqual([
+      "message.previous",
+      "message.next",
+    ]);
+    act(() => previous.run());
+    act(() => command("Go to next message").run());
+    expect([messageNav.goPrev.mock.calls.length, messageNav.goNext.mock.calls.length]).toEqual([
+      1, 1,
+    ]);
+
+    rerender(
+      <TranscriptPaletteCommands conversationId="c1" bubbles={[]} messageNav={messageNav} />,
+    );
+    expect(command("Go to previous message").availability?.available).toBe(false);
+  });
 });
 
 function userBlock(itemId: string, content: UserMessageBlock["content"]): UserMessageBlock {

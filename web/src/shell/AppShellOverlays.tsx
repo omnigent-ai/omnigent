@@ -20,6 +20,11 @@ const QuickPickCommandPalette = lazy(() =>
 const ThemePicker = lazy(() =>
   import("./ThemePicker").then((module) => ({ default: module.ThemePicker })),
 );
+const QuickPickShortcutHost = lazy(() =>
+  import("./quickPickShortcuts/QuickPickShortcutHost").then((module) => ({
+    default: module.QuickPickShortcutHost,
+  })),
+);
 const SessionActionHost = lazy(() =>
   import("./sessionCommands/SessionActionHost").then((module) => ({
     default: module.SessionActionHost,
@@ -108,6 +113,7 @@ export function AppShellOverlays({
       {quickPick && (
         <Suspense fallback={null}>
           <SessionActionHost />
+          <QuickPickShortcutHost />
         </Suspense>
       )}
       <RecentSessionsSwitcher
