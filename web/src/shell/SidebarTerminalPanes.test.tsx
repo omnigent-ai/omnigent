@@ -16,7 +16,12 @@ import {
 } from "./paneStartFailures";
 import { SidebarTerminalPanes } from "./SidebarTerminalPanes";
 import type { TerminalPaneSurfaceProps } from "./TerminalPaneSurface";
-import { requestTerminalFocus, settleTerminalFocus } from "./terminalFocusRequest";
+import {
+  pendingTerminalFocus,
+  requestTerminalFocus,
+  settleTerminalFocus,
+} from "./terminalFocusRequest";
+import { resetTerminalOpenRequestsForTests, useTerminalOpenRequests } from "./terminalOpenRequest";
 import {
   readTerminalGroups,
   resetTerminalGroupsCache,
@@ -30,11 +35,12 @@ import {
 } from "./terminalPlacement";
 
 const lifecycle = vi.hoisted(() => ({ mounted: [] as string[], unmounted: [] as string[] }));
+const listing = vi.hoisted(() => ({ ids: ["a", "b", "c"] }));
 
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: () => ({
-    terminals: ["a", "b", "c"].map((id) => ({ id, name: "zsh", session: id, running: true })),
+    terminals: listing.ids.map((id) => ({ id, name: "zsh", session: id, running: true })),
     listCompleteAt: 1,
     isFetching: false,
   }),
@@ -94,11 +100,13 @@ function Sidebar({
   shownKey,
   mountedKeys = NO_SHELLS,
   mainSplitsShown = true,
+  readOnly = false,
 }: {
   conversationId: string;
   shownKey: string | null;
   mountedKeys?: string[];
   mainSplitsShown?: boolean;
+  readOnly?: boolean;
 }) {
   const mainSplitMembers = useMainSplitMembers(conversationId, mainSplitsShown);
   return (
@@ -106,7 +114,7 @@ function Sidebar({
       conversationId={conversationId}
       shownKey={shownKey}
       mountedKeys={mountedKeys}
-      readOnly={false}
+      readOnly={readOnly}
       visible
       autoFocusKey={null}
       mainSplitMembers={mainSplitMembers}
@@ -127,6 +135,8 @@ afterEach(() => {
   resetPaneStartFailuresForTests();
   lifecycle.mounted.length = 0;
   lifecycle.unmounted.length = 0;
+  listing.ids = ["a", "b", "c"];
+  resetTerminalOpenRequestsForTests();
 });
 
 describe("SidebarTerminalPanes", () => {
@@ -217,6 +227,60 @@ describe("SidebarTerminalPanes", () => {
     rerender(<Sidebar conversationId={id} shownKey="terminal:a" />);
     expect(screen.getByTestId("terminal-a").dataset.active).toBe("true");
     expect(readTerminalGroups(id)[0].split.focusedKey).toBe("terminal:a");
+  });
+
+  it("hands the keyboard to the pane beside a shell that ended, if the shell's pane had it", async () => {
+    const id = nextSession();
+    updateTerminalGroups(id, () => [PAIR]);
+    const opened = vi.fn();
+    renderHook(() => useTerminalOpenRequests(id, opened));
+    const { rerender } = render(<Sidebar conversationId={id} shownKey="terminal:b" />);
+    await screen.findByTestId("terminal-a");
+    act(() => screen.getByLabelText("b terminal").focus());
+    // b's shell exits on its own: its row leaves the list, and the split goes with it.
+    listing.ids = ["a", "c"];
+    rerender(<Sidebar conversationId={id} shownKey="terminal:b" />);
+    expect(readTerminalGroups(id)).toEqual([]);
+    expect(opened).toHaveBeenCalledWith({ key: "terminal:a", focus: true });
+    expect(pendingTerminalFocus(id, "rail")?.tabKey).toBe("terminal:a");
+  });
+
+  it("leaves the keyboard where it is when a split's shell ends while its pane didn't have it", async () => {
+    const id = nextSession();
+    updateTerminalGroups(id, () => [PAIR]);
+    const opened = vi.fn();
+    renderHook(() => useTerminalOpenRequests(id, opened));
+    const outside = document.body.appendChild(document.createElement("input"));
+    try {
+      const { rerender } = render(<Sidebar conversationId={id} shownKey="terminal:b" />);
+      await screen.findByTestId("terminal-a");
+      act(() => outside.focus());
+      listing.ids = ["a", "c"];
+      rerender(<Sidebar conversationId={id} shownKey="terminal:b" />);
+      expect(readTerminalGroups(id)).toEqual([]);
+      expect(document.activeElement).toBe(outside);
+      expect(opened).not.toHaveBeenCalled();
+      expect(pendingTerminalFocus(id, "rail")).toBeNull();
+    } finally {
+      outside.remove();
+    }
+  });
+
+  it("hands no keyboard to a saved split's other shell where splits show as separate tabs", async () => {
+    const id = nextSession();
+    updateTerminalGroups(id, () => [PAIR]);
+    const opened = vi.fn();
+    renderHook(() => useTerminalOpenRequests(id, opened));
+    // A viewer sees a and b as their own tabs; b is shown, alone, and has the keyboard.
+    const { rerender } = render(<Sidebar conversationId={id} shownKey="terminal:b" readOnly />);
+    await screen.findByTestId("terminal-b");
+    expect(screen.queryByTestId("terminal-a")).toBeNull();
+    act(() => screen.getByLabelText("b terminal").focus());
+    listing.ids = ["a", "c"];
+    rerender(<Sidebar conversationId={id} shownKey="terminal:b" readOnly />);
+    // Where b's tab closing lands is the tab history's call, not a's.
+    expect(opened).not.toHaveBeenCalled();
+    expect(pendingTerminalFocus(id, "rail")).toBeNull();
   });
 
   it("never mounts a shell the main view's split owns, even in a saved group", async () => {

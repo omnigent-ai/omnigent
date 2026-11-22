@@ -21,6 +21,7 @@ import { PaneCloseDialog } from "./PaneCloseDialog";
 import { applyDividerResizes } from "./paneDividerCorners";
 import { moveSplitPane } from "./paneMove";
 import { domCellSizing } from "./paneSizing";
+import { giveNextPaneTheKeyboard } from "./paneShellClose";
 import { clearPaneStartFailure, isFailedPaneStart } from "./paneStartFailures";
 import { type SessionPaneMenu, sessionPaneStrip } from "./paneStrip/paneMenu";
 import { sidebarTargetFor } from "./sidebarSplitTarget";
@@ -35,6 +36,7 @@ import {
   usePendingTerminalFocus,
 } from "./terminalFocusRequest";
 import { readTerminalGroups, updateTerminalGroups, useTerminalGroups } from "./terminalGroupsStore";
+import { usePaneKeyboardOwner } from "./usePaneKeyboardOwner";
 import { useTerminalPaneActions } from "./terminalPaneActions";
 import { unzoomPane, useZoomedPaneKey } from "./terminalPaneZoom";
 import { NO_MAIN_SPLIT_MEMBERS, useMainOwnedTerminalKeys } from "./terminalPlacement";
@@ -129,6 +131,8 @@ export function SidebarTerminalPanes({
   const liveKeys = terminals.map(terminalTabKey).join("\n");
   const listComplete = (listCompleteAt ?? 0) > 0 && !isFetching;
   const mainKeysJoined = mainKeys.join("\n");
+  const keyboardOwner = usePaneKeyboardOwner(panesRef);
+  const shownGroupId = storedGroup?.id ?? null;
   useEffect(() => {
     const live = new Set(liveKeys ? liveKeys.split("\n") : []);
     // A failed start has no tab of its own: it stays only while its group has a running shell.
@@ -139,6 +143,7 @@ export function SidebarTerminalPanes({
       );
     const mainKeysNow = mainKeysJoined ? mainKeysJoined.split("\n") : [];
     const before = readTerminalGroups(conversationId);
+    const owner = keyboardOwner();
     updateTerminalGroups(conversationId, (current) =>
       normalizeTerminalGroups(current, {
         mainKeys: mainKeysNow,
@@ -155,7 +160,30 @@ export function SidebarTerminalPanes({
     for (const key of before.flatMap(groupKeys)) {
       if (!after.has(key)) clearPaneStartFailure(conversationId, key);
     }
-  }, [conversationId, liveKeys, listComplete, mainKeysJoined, storedGroups]);
+    // The pane with the keyboard lost its shell: the pane beside it takes the keyboard.
+    if (owner === null || live.has(owner) || after.has(owner)) return;
+    // Only a split shown here: a saved split shown as separate tabs leaves it to the tab history.
+    const ownerGroup = groupOfTerminal(before, owner);
+    if (ownerGroup === undefined || ownerGroup.id !== shownGroupId) return;
+    // The split may go with it, leaving its other shell on its own.
+    const survivor = groupKeys(ownerGroup).find(
+      (key) => key !== owner && live.has(key) && !mainKeysNow.includes(key),
+    );
+    if (survivor === undefined) return;
+    const survivorGroup = groupOfTerminal(readTerminalGroups(conversationId), survivor);
+    giveNextPaneTheKeyboard(
+      sidebarTargetFor(conversationId, survivor),
+      survivorGroup?.split.focusedKey ?? survivor,
+    );
+  }, [
+    conversationId,
+    liveKeys,
+    listComplete,
+    mainKeysJoined,
+    storedGroups,
+    keyboardOwner,
+    shownGroupId,
+  ]);
 
   const target = sidebarTargetFor(conversationId, shownKey ?? "");
   // Save a newly selected member as the focused pane, as the person moving there would.

@@ -58,6 +58,7 @@ import { applyDividerResizes } from "./paneDividerCorners";
 import { moveSplitPane } from "./paneMove";
 import { domCellSizing } from "./paneSizing";
 import { usePaneSplit } from "./paneSplitStore";
+import { giveNextPaneTheKeyboard } from "./paneShellClose";
 import { isFailedPaneStart } from "./paneStartFailures";
 import { type SessionPaneMenu, sessionPaneStrip } from "./paneStrip/paneMenu";
 import type { PaneStripPane } from "./paneStrip/PaneTitleStrip";
@@ -80,6 +81,7 @@ import {
 import { unzoomPane, useZoomedPaneKey } from "./terminalPaneZoom";
 import { usePanesSplitsAllowed } from "./panesViewGate";
 import { usePublishMainTerminalKeys } from "./terminalPlacement";
+import { usePaneKeyboardOwner } from "./usePaneKeyboardOwner";
 import { mainSplitTarget } from "./terminalSplitTarget";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 import { usePaneCycleHotkey } from "@/hooks/usePaneCycleHotkey";
@@ -167,7 +169,15 @@ function MainSplitPanes({
   const chatInPane = visible && chatShown && splitBesideChat;
   const split = visible ? savedSplit : undefined;
 
-  useReconcileMainSplit(conversationId, agentKey, terminals, listComplete, listCompleteAt);
+  const keyboardOwner = usePaneKeyboardOwner(panesRef);
+  useReconcileMainSplit(
+    conversationId,
+    agentKey,
+    terminals,
+    listComplete,
+    listCompleteAt,
+    keyboardOwner,
+  );
 
   // The web chat renders over the agent's terminal, which stays attached at its size beneath.
   const focusChatPaneRef = useRef<() => void>(() => {});
@@ -514,6 +524,7 @@ function useReconcileMainSplit(
   terminals: readonly TerminalInfo[],
   listComplete: boolean,
   listCompleteAt: number,
+  keyboardOwner: () => string | null,
 ): void {
   // Terminals seen since the list was last empty. A seen terminal that leaves the list is gone;
   // an unseen one is gone only per a complete answer newer than that reset.
@@ -528,7 +539,10 @@ function useReconcileMainSplit(
     const liveKeys = new Set(terminals.map(terminalTabKey));
     const complete = listComplete && listCompleteAt > generation.startedAt;
     const { seen } = generation;
-    mainSplitTarget(conversationId).update(
+    const target = mainSplitTarget(conversationId);
+    const before = target.read();
+    const owner = keyboardOwner();
+    target.update(
       (current) =>
         current &&
         reconcileTerminalSplit(current, withAppPanes(liveKeys, current), {
@@ -539,7 +553,16 @@ function useReconcileMainSplit(
         }),
     );
     for (const key of liveKeys) seen.add(key);
-  }, [conversationId, agentKey, terminals, listComplete, listCompleteAt]);
+    // The pane with the keyboard lost its shell: the pane beside it takes the keyboard.
+    if (owner === null || !before || liveKeys.has(owner)) return;
+    const was = terminalLayoutKeys(before.layout);
+    const after = target.read();
+    const now = after ? terminalLayoutKeys(after.layout) : [];
+    if (!was.includes(owner) || now.includes(owner)) return;
+    const kept = withAppPanes(liveKeys, before);
+    const survivor = was.find((key) => key !== owner && kept.has(key)) ?? null;
+    giveNextPaneTheKeyboard(target, after?.focusedKey ?? survivor);
+  }, [conversationId, agentKey, terminals, listComplete, listCompleteAt, keyboardOwner]);
 }
 
 /** ⌘K's Move Pane to Sidebar, for the split's focused workspace tab or shell. */

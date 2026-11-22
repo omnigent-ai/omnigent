@@ -7,7 +7,7 @@ import { useEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { TerminalInfo } from "@/hooks/useTerminals";
-import type { TerminalSplitState } from "@/lib/paneSplitLayout";
+import { terminalLayoutKeys, type TerminalSplitState } from "@/lib/paneSplitLayout";
 import { resetPanePaletteOwnerForTests } from "@/hooks/useTerminalPaneHotkeys";
 import { TERMINAL_SURFACE_ATTRIBUTE } from "@/lib/paneSurfaces";
 import { usePaletteCommandsStore } from "@/store/paletteCommands";
@@ -185,6 +185,46 @@ describe("SplitPanesMainView", () => {
       ratio: 0.5,
       children: [AGENT, "app:files"],
     });
+  });
+
+  it("gives the pane beside a shell that ended the keyboard, if the shell's pane had it", async () => {
+    const conversationId = nextConversation();
+    updatePaneSplit(conversationId, () => SIDE_BY_SIDE);
+    const view = render(<View conversationId={conversationId} />);
+    await screen.findByTestId(`terminal-${SHELL_ID}`);
+    act(() => screen.getByLabelText(`${SHELL_ID} terminal`).focus());
+    // The shell exits on its own: its row leaves the list.
+    listed.terminals = [TERMINALS[0]!];
+    view.rerender(<View conversationId={conversationId} />);
+    expect(readPaneSplit(conversationId)).toBeUndefined();
+    expect(screen.getByTestId(`terminal-${AGENT_ID}`).dataset.focusRequest).not.toBe("");
+  });
+
+  it("leaves the keyboard where it is when a shell ends while its pane didn't have it", async () => {
+    const conversationId = nextConversation();
+    updatePaneSplit(conversationId, () => ({
+      layout: {
+        axis: "columns",
+        ratio: 0.5,
+        children: [AGENT, { axis: "rows", ratio: 0.5, children: [SHELL, OTHER] }],
+      },
+      focusedKey: SHELL,
+    }));
+    listed.terminals = [...TERMINALS, { id: OTHER_ID, name: "zsh", session: "s2", running: true }];
+    const outside = document.body.appendChild(document.createElement("input"));
+    try {
+      const view = render(<View conversationId={conversationId} />);
+      await screen.findByTestId(`terminal-${SHELL_ID}`);
+      act(() => outside.focus());
+      listed.terminals = [TERMINALS[0]!, listed.terminals[2]!];
+      view.rerender(<View conversationId={conversationId} />);
+      expect(terminalLayoutKeys(readPaneSplit(conversationId)!.layout)).toEqual([AGENT, OTHER]);
+      expect(document.activeElement).toBe(outside);
+      expect(screen.getByTestId(`terminal-${AGENT_ID}`).dataset.focusRequest).toBe("");
+      expect(screen.getByTestId(`terminal-${OTHER_ID}`).dataset.focusRequest).toBe("");
+    } finally {
+      outside.remove();
+    }
   });
 
   it("hosts a workspace tab as a pane, its row titled as its tab", async () => {
