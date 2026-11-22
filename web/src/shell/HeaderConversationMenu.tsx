@@ -80,6 +80,7 @@ import { getEmbedRoot } from "@/lib/host";
 import { hasCommandModifier, isFocusInDialogOrMenu } from "@/lib/hotkeys";
 import { useNavigate } from "@/lib/routing";
 import { showArchiveUndoToast } from "./archiveUndoToast";
+import { navigateAfterArchiving, newSessionPathFor } from "./sessionCommands/archiveNavigation";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchivePrompt } from "./ArchivePrompt";
 import { cn } from "@/lib/utils";
@@ -269,8 +270,14 @@ export function HeaderConversationMenu({
     // the cached `archived` flag in onMutate), and we're viewing the session
     // being archived, so leave its chat surface now — synchronously, like
     // confirmDelete — rather than in an onSuccess callback that fires a
-    // round-trip later with a stale active session.
-    navigate("/", { replace: true });
+    // round-trip later with a stale active session. It opens the session ⌃[ would.
+    navigateAfterArchiving({
+      leavingIds: [conversation.id],
+      source: "header_menu",
+      navigate,
+      newSessionPath: newSessionPathFor(conversation),
+      queryClient,
+    });
     archive.mutate({ id: conversation.id, archived: true, deleteWorktree });
     // Fire NOW, not in a mutate onSuccess: navigating away unmounts this menu,
     // and per-call mutate callbacks don't fire once their observer unmounts.

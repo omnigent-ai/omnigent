@@ -6,7 +6,7 @@
 import { useEffect } from "react";
 
 import { useActiveRootSessionId } from "@/hooks/useSession";
-import { useLocation, useNavigate, useRebasePath } from "@/lib/routing";
+import { useLocation, useRebasePath } from "@/lib/routing";
 
 const NOTHING_OPEN: readonly (string | null)[] = [];
 let openSessionIds: readonly (string | null)[] = NOTHING_OPEN;
@@ -31,12 +31,4 @@ export function usePublishOpenSession(routedSessionId: string | null): void {
 /** Whether the page shows `sessionId` now, itself, as an open sub-agent's root or as a draft's source. */
 export function isOpenSession(sessionId: string): boolean {
   return openSessionIds.includes(sessionId);
-}
-
-/** Leaves `sessionId`'s view for home, if the page still shows it when this runs. */
-export function useLeaveOpenSessionView(sessionId: string): () => void {
-  const navigate = useNavigate();
-  return () => {
-    if (isOpenSession(sessionId)) navigate("/", { replace: true });
-  };
 }

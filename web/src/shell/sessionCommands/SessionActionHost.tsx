@@ -15,11 +15,12 @@ import { useViewerId } from "@/hooks/useViewerId";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useNavigate } from "@/lib/routing";
 
-import { useLeaveOpenSessionView } from "../openSession";
+import { isOpenSession } from "../openSession";
 import { RenameSessionDialog } from "../RenameSessionDialog";
 import { conversationDisplayLabel } from "../sidebarNav";
 import { unpinWithUndo } from "../unpinUndoToast";
 import { useSessionActions } from "../useSessionActions";
+import { leaveSessionView } from "./archiveNavigation";
 import { currentSessionRow } from "./currentSession";
 import { sessionCommand } from "./model";
 import { MoveToProjectPicker } from "./MoveToProjectPicker";
@@ -70,7 +71,11 @@ function SessionActionRunner({
     viewerId,
     serverInfo,
     // Leaving the open session, or one of its sub-agents' root, leaves its view too.
-    onLeave: useLeaveOpenSessionView(conversation.id),
+    onLeave: (cause) => {
+      // Read as the action settles, so a Leave doesn't move a user who has opened another session.
+      if (!isOpenSession(conversation.id)) return;
+      leaveSessionView(cause, { conversation, source: "palette", navigate, queryClient });
+    },
     componentIdPrefix: "palette.conversation",
   });
   const [picker, setPicker] = useState<"rename" | "move-to-project" | null>(null);

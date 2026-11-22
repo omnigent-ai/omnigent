@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type { Conversation } from "@/hooks/useConversations";
@@ -11,6 +11,9 @@ import type * as PermissionsApiModule from "@/lib/permissionsApi";
 import { LEVEL_READ } from "@/lib/permissionsApi";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
+import { useRecentSessionSwitchStore } from "@/hooks/useRecentSessionSwitch";
+
+import { resetArchiveNavigationForTests } from "./archiveNavigation";
 import { SessionActionHost } from "./SessionActionHost";
 import { usePublishOpenSession } from "../openSession";
 import { requestSessionAction, useSessionActionStore } from "./sessionActionStore";
@@ -202,6 +205,29 @@ describe("SessionActionHost", () => {
     );
   });
 
+  it("archiving the open session opens the one visited before it, with quick_pick_palette's host", () => {
+    useRecentSessionSwitchStore.setState({
+      history: ["c1", "c0"],
+      readLiveSessionIds: () => new Set(["c0", "c1"]),
+      sessionsKnown: true,
+      sessionsFailed: false,
+    });
+    onTestFinished(() => {
+      resetArchiveNavigationForTests();
+      useRecentSessionSwitchStore.setState({ history: [], readLiveSessionIds: null });
+    });
+    ui.viewing = "c1";
+    renderHost();
+    act(() => requestSessionAction(SESSION, "archive"));
+    expect(writes.archive).toHaveBeenCalledWith({
+      id: "c1",
+      archived: true,
+      deleteWorktree: false,
+    });
+    expect(location()).toBe("/c/c0");
+  });
+
+  // Without that host, as with the flag off, it goes home as before.
   it("archives a request queued before the host mounted, and leaves the open session's view", () => {
     ui.viewing = "c1";
     requestSessionAction(SESSION, "archive");

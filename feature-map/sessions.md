@@ -109,7 +109,11 @@ the header menu), and each place is a separate entry point.
   decides so), archiving also stops the managed sandbox when no other session
   uses it (another session on the host, or a side chat or sub-agent of the
   session, keeps it running); the next message after an unarchive resumes it,
-  unless the managed sandbox reaper has terminated it by then.
+  unless the managed sandbox reaper has terminated it by then. Archiving the
+  open session goes home; with `quick_pick_palette` on, it opens the session ⌃[
+  would instead (the latest visit still live, then sidebar order, then New
+  session in the archived session's project), waiting for a session list that
+  is still loading rather than guessing.
 - `row-quick-actions`: sidebar rows show hover Pin and Archive buttons beside the
   "…" menu. Settings → Appearance → Sidebar → Show Pin and Archive buttons on
   session rows (on by default) turns them off, leaving both actions in the row
