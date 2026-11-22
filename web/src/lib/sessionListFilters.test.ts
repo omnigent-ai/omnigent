@@ -123,7 +123,8 @@ describe("the sidebar's filters together", () => {
   const context: SessionListFilterContext = {
     statusOf: (row) => facts(row).status,
     harnessOf: (row) => facts(row).harness,
-    projectOf: (row) => facts(row).project,
+    inProject: (row, projectKey) => facts(row).project === projectKey,
+    inAnyProject: (row) => facts(row).project !== null,
   };
   const rows = SESSIONS.map((entry) => entry.row);
   const keptTogether = (filter: Partial<SessionListFilter>, openSessionId: string | null = null) =>

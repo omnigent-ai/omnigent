@@ -5684,6 +5684,20 @@ describe("Sidebar pull request filter", () => {
     expect(screen.queryByText("conv_legacy")).toBeNull();
   });
 
+  it("keeps a session under each folder that lists it, as the folders do", () => {
+    projectsMock.push("Alpha", "Beta");
+    // Both folders list it: Beta by its project id, Alpha by its older label.
+    mockConversations([
+      conv("conv_both", "Codex", { project_id: "p_Beta", labels: { omni_project: "Alpha" } }),
+    ]);
+    storeFilters({ project: { kind: "project", id: "p_Beta" } });
+    renderWith(true);
+    const toggle = screen.getByRole("button", { name: /^Beta/ });
+    if (toggle.getAttribute("aria-expanded") !== "true") fireEvent.click(toggle);
+    const folder = screen.getByRole("button", { name: /^Beta/ }).closest("section")!;
+    expect(within(folder).getByText("conv_both")).toBeInTheDocument();
+  });
+
   it("shows a project that's gone as Missing project, and says nothing matches", () => {
     projectsMock.push("Alpha");
     storeFilters({ project: { kind: "project", id: "p_Gone" } });
@@ -6447,6 +6461,40 @@ describe("sidebar_grouping_ui release flag", () => {
     expect(automationFolder()).toHaveTextContent("No sessions");
     const sharedScopeCalls = useConvMock.mock.calls.filter((args) => args[4] === "shared");
     expect(sharedScopeCalls.some((args) => (args[2] as { enabled?: boolean }).enabled)).toBe(false);
+  });
+
+  it("offers the automation folder shared runs show in before the viewer has that project", () => {
+    projectsMock.push("Alpha");
+    mockScopedConversations(SHARED_RUNS);
+    renderSidebar(true, "/", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: {
+        ...FALLBACK_SERVER_INFO.features,
+        sidebar_grouping_ui: true,
+        sidebar_saved_views: true,
+      },
+    });
+    selectSessionFilter("all");
+    const openFilters = () => {
+      fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+        button: 0,
+        ctrlKey: false,
+        pointerType: "mouse",
+      });
+      fireEvent.keyDown(screen.getByTestId("session-list-filter-menu"), { key: "ArrowRight" });
+    };
+    openFilters();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Omnigent Automation" }));
+    expect(screen.queryByRole("button", { name: /^Alpha/ })).toBeNull();
+    const toggle = screen.getByRole("button", { name: /^Omnigent Automation/ });
+    if (toggle.getAttribute("aria-expanded") !== "true") fireEvent.click(toggle);
+    expect(within(automationFolder()).getByText("conv_shared_run")).toBeInTheDocument();
+
+    // Filed in that folder, the runs aren't in No project.
+    openFilters();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "No project" }));
+    expect(screen.queryByText("conv_shared_run")).toBeNull();
+    expect(screen.getByText("conv_shared_other")).toBeInTheDocument();
   });
 
   it.each([

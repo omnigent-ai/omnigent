@@ -244,19 +244,33 @@ export function sidebarFolderKey(folder: { id: string | null; name: string }): s
 }
 
 /**
- * The key of the folder among `folders` that lists the session, read exactly as the folders read
- * it ({@link sessionInSidebarFolder}); null when none does.
+ * Whether the folder with `folderKey` among `folders` lists the session, read exactly as the
+ * folders read it ({@link sessionInSidebarFolder}). A session can be in more than one folder.
  */
-export function sessionSidebarFolderKey(
+export function sessionInSidebarFolderWithKey(
+  conversation: Conversation,
+  folders: readonly { id: string | null; name: string }[],
+  folderKey: string,
+  viewerId: string | null,
+  includeSharedRuns: boolean,
+): boolean {
+  const folder = folders.find((candidate) => sidebarFolderKey(candidate) === folderKey);
+  return (
+    folder !== undefined &&
+    sessionInSidebarFolder(conversation, folder, viewerId, includeSharedRuns)
+  );
+}
+
+/** Whether any of `folders` lists the session. */
+export function sessionInAnySidebarFolder(
   conversation: Conversation,
   folders: readonly { id: string | null; name: string }[],
   viewerId: string | null,
   includeSharedRuns: boolean,
-): string | null {
-  const folder = folders.find((candidate) =>
-    sessionInSidebarFolder(conversation, candidate, viewerId, includeSharedRuns),
+): boolean {
+  return folders.some((folder) =>
+    sessionInSidebarFolder(conversation, folder, viewerId, includeSharedRuns),
   );
-  return folder ? sidebarFolderKey(folder) : null;
 }
 
 /** A folder the sidebar shows for shared automation runs before the viewer has that project. */

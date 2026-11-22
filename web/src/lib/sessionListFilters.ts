@@ -124,8 +124,10 @@ export interface SessionListFilterContext {
   statusOf: (row: Conversation) => string;
   /** The session's harness key. */
   harnessOf: (row: Conversation) => string;
-  /** The id of the project the session is filed in, or null when it's in none. */
-  projectOf: (row: Conversation) => string | null;
+  /** Whether the project with this key lists the session; a session can be in more than one. */
+  inProject: (row: Conversation, projectKey: string) => boolean;
+  /** Whether any project lists the session. */
+  inAnyProject: (row: Conversation) => boolean;
 }
 
 function pickChoice<T extends string>(allowed: readonly T[], value: unknown, fallback: T): T {
@@ -180,8 +182,8 @@ export function matchesSessionListFilter(
   )
     return false;
   if (filter.harness !== null && context.harnessOf(row) !== filter.harness) return false;
-  if (filter.project.kind === "none") return context.projectOf(row) === null;
-  if (filter.project.kind === "project") return context.projectOf(row) === filter.project.id;
+  if (filter.project.kind === "none") return !context.inAnyProject(row);
+  if (filter.project.kind === "project") return context.inProject(row, filter.project.id);
   return true;
 }
 

@@ -345,8 +345,9 @@ import {
   writeLegacyPinnedConversationIds,
   isOwnedByViewer,
   isSharedAutomationRun,
+  sessionInAnySidebarFolder,
   sessionInSidebarFolder,
-  sessionSidebarFolderKey,
+  sessionInSidebarFolderWithKey,
   sessionsListAcceptsDrop,
   sidebarFolderKey,
   withAutomationFolder,
@@ -2674,19 +2675,29 @@ function ConversationList({
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [startingId, workingIds, unseenTick, draftIds],
   );
-  // The projects a filter can choose: the viewer's folders, label-only ones included, by key.
+  // The folders the project filter offers and reads: the ones the sidebar shows, label-only
+  // projects and the automation folder that shared runs show in before the viewer has it included.
+  const sharedRunsShown =
+    includeSharedRuns && loadedRows.some((c) => isSharedAutomationRun(c, viewerId));
+  const filterFolders = useMemo(
+    () =>
+      withAutomationFolder(projects, sharedRunsShown, projectOrder.data?.sort_mode === "manual"),
+    [projects, sharedRunsShown, projectOrder.data?.sort_mode],
+  );
   const filterProjects = useMemo(
-    () => projects.map((project) => ({ id: sidebarFolderKey(project), name: project.name })),
-    [projects],
+    () => filterFolders.map((folder) => ({ id: sidebarFolderKey(folder), name: folder.name })),
+    [filterFolders],
   );
   const filterContext = useMemo<SessionListFilterContext>(
     () => ({
       statusOf: liveStatusOf,
       harnessOf: sessionHarnessKey,
-      // The folder that lists the session, owner check included, so a filter shows what it shows.
-      projectOf: (c) => sessionSidebarFolderKey(c, projects, viewerId, includeSharedRuns),
+      // Each folder's own membership, owner check included, so a filter shows what folders show.
+      inProject: (c, folderKey) =>
+        sessionInSidebarFolderWithKey(c, filterFolders, folderKey, viewerId, includeSharedRuns),
+      inAnyProject: (c) => sessionInAnySidebarFolder(c, filterFolders, viewerId, includeSharedRuns),
     }),
-    [liveStatusOf, projects, viewerId, includeSharedRuns],
+    [liveStatusOf, filterFolders, viewerId, includeSharedRuns],
   );
   const filterRows = useCallback(
     (rows: Conversation[], openSessionId: string | null) =>
