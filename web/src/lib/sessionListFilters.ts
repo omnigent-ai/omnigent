@@ -104,7 +104,10 @@ export type SessionProjectFilter =
 export interface SessionListFilter {
   pullRequest: SessionPullRequestFilter;
   status: SessionStatusFilter;
-  /** A harness key, as {@link sessionHarnessKey} gives it; null keeps every harness. */
+  /**
+   * A harness key, as {@link sessionHarnessKey} gives it: "" keeps sessions without a harness,
+   * and null keeps every harness.
+   */
   harness: string | null;
   project: SessionProjectFilter;
 }
@@ -149,7 +152,8 @@ export function parseSessionListFilter(value: unknown): SessionListFilter {
       DEFAULT_SESSION_PULL_REQUEST_FILTER,
     ),
     status: pickChoice(SESSION_STATUS_FILTERS, stored.status, "all"),
-    harness: typeof stored.harness === "string" && stored.harness !== "" ? stored.harness : null,
+    // "" is a choice of its own, sessions without a harness; only a missing one keeps them all.
+    harness: typeof stored.harness === "string" ? stored.harness : null,
     project: parseProjectFilter(stored.project),
   };
 }

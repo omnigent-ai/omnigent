@@ -90,6 +90,30 @@ describe("SessionFilterSections", () => {
     expect(onChange).toHaveBeenLastCalledWith({ pullRequest: "open" });
   });
 
+  it("offers sessions without a harness as a choice of their own", () => {
+    const harnesses = [...HARNESSES, { key: "", name: "Unknown harness" }];
+    const onChange = vi.fn();
+    render(
+      <DropdownMenu open>
+        <DropdownMenuTrigger>Filter</DropdownMenuTrigger>
+        <DropdownMenuContent>
+          <SessionFilterSections
+            value={{ ...DEFAULT_SESSION_LIST_FILTER, harness: "" }}
+            onChange={onChange}
+            onClear={vi.fn()}
+            harnesses={harnesses}
+            projects={PROJECTS}
+          />
+        </DropdownMenuContent>
+      </DropdownMenu>,
+    );
+    expect(checked()).toContain("Unknown harness");
+    fireEvent.click(screen.getByText("Codex SDK"));
+    expect(onChange).toHaveBeenLastCalledWith({ harness: "codex" });
+    fireEvent.click(screen.getByText("Unknown harness"));
+    expect(onChange).toHaveBeenLastCalledWith({ harness: "" });
+  });
+
   it("goes back to All in a section", () => {
     const { onChange } = renderSections({ harness: "codex", project: { kind: "none" } });
     fireEvent.click(screen.getByText("Any harness"));

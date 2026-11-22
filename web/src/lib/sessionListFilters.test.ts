@@ -184,10 +184,12 @@ describe("the sidebar's filters together", () => {
       parseSessionListFilter({
         pullRequest: "open",
         status: "sleeping",
-        harness: "",
+        harness: 3,
         project: { kind: "project" },
       }),
     ).toEqual({ ...DEFAULT_SESSION_LIST_FILTER, pullRequest: "open" });
+    // Sessions without a harness are a choice of their own, not All.
+    expect(parseSessionListFilter({ harness: "" }).harness).toBe("");
     const every: SessionListFilter = {
       pullRequest: "draft",
       status: "unread",

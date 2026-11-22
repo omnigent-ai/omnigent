@@ -314,6 +314,11 @@ describe("matchingSavedView", () => {
     expect(matchingSavedView(project("p-2"), [inProject])).toBeNull();
   });
 
+  it("keeps a view filtered to sessions without a harness, not widening it to every harness", () => {
+    saveView(SCOPE, "No harness", { ...SETTINGS, harnessFilter: "" });
+    expect(readSavedViews(SCOPE)[0]?.harnessFilter).toBe("");
+  });
+
   it("stores a new view's status, harness and project filters", () => {
     const saved = saveView(SCOPE, "Working Codex", {
       ...SETTINGS,

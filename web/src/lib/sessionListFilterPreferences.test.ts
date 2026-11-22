@@ -68,6 +68,11 @@ describe("readSessionListFilter", () => {
     expect(readSessionListFilter()).toEqual(filter);
   });
 
+  it("keeps the Unknown harness choice, sessions without a harness, through a reload", () => {
+    writeSessionListFilter({ ...DEFAULT_SESSION_LIST_FILTER, harness: "" });
+    expect(readSessionListFilter().harness).toBe("");
+  });
+
   it("carries over the pull request filter stored on its own, until the filters are stored", () => {
     writeSessionPullRequestFilter("draft");
     expect(readSessionListFilter()).toEqual({
