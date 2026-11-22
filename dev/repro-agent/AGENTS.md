@@ -709,6 +709,9 @@ Follow these rules for each clip:
   `recording_unavailable_reason`. "The recorder was not stood up", a
   multi-process journey, a flaky native boot, or a bug that is an absence are
   not blockers; a reason that names no attempted recorder run is insufficient.
+- Your required browser runs and recordings are the explicit user request that
+  a repository rule against proactive browser verification, such as the one in
+  `CLAUDE.md`, needs; that rule is not a recording blocker.
 
 ## Output — the reproduction artifacts
 

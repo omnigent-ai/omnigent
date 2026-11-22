@@ -37,6 +37,22 @@ def test_lane_recording_blockers_are_explicit_and_do_not_block_delivery() -> Non
     assert "Text-only CLI output is not a reason to skip recording" in lanes
     assert "A missing recording from an earlier run is not a reason either" in lanes
     assert "Do not block the verdict, fix, or PR" in lanes
+    assert (
+        "Neither is a repository rule against proactive browser verification, "
+        "such as the one in `CLAUDE.md`" in lanes
+    )
+    assert "your agent's recording requirement is the explicit user request it needs" in lanes
+
+
+def test_repository_browser_rule_grants_workflow_agents_their_recordings() -> None:
+    repository_rules = _normalized(_DEV.parent / "CLAUDE.md")
+
+    assert "Only an explicit user request for browser verification" in repository_rules
+    assert (
+        "The Repro, Resolve, and Feature workflow agents (`dev/repro-agent`, "
+        "`dev/resolve-agent`, and `dev/feature-agent`) already have that explicit request "
+        "for the browser runs and recordings their instructions require" in repository_rules
+    )
 
 
 def test_repro_recording_rules_match_the_shared_guide() -> None:
@@ -88,6 +104,11 @@ def test_repro_agent_requires_a_recorder_attempt_once_the_preflight_check_passed
     )
     assert "name the command you ran and its observed error" in instructions
     assert '"The recorder was not stood up"' in instructions
+    assert (
+        "Your required browser runs and recordings are the explicit user request that "
+        "a repository rule against proactive browser verification" in instructions
+    )
+    assert "that rule is not a recording blocker" in instructions
 
 
 def test_repro_agent_loads_the_screen_evidence_caption_rule_as_instructions() -> None:

@@ -301,6 +301,11 @@ def test_recording_blockers_are_explicit_and_do_not_block_delivery() -> None:
     assert "name the specific blocker in `recording_unavailable_reason`" in normalized
     assert "Text-only CLI output is not a reason to skip recording" in normalized
     assert "Do not block the fix or PR because footage is missing or rejected" in normalized
+    assert (
+        "Your required browser runs and recordings are the explicit user request that "
+        "a repository rule against proactive browser verification" in normalized
+    )
+    assert "that rule is not a recording blocker" in normalized
 
 
 def test_resolve_drives_both_reviews_and_preserves_incomplete_outcomes() -> None:
