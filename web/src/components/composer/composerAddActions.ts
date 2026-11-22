@@ -38,6 +38,20 @@ export interface ComposerAddAction {
   availability: CommandAvailability;
 }
 
+/** An item the menu may hide, grey while its composer can't handle it, or grey while busy. */
+function menuItemAvailability(item: {
+  shown: boolean;
+  handled: boolean;
+  unhandledReason: string;
+  disabled: boolean;
+  disabledReason: string;
+}): CommandAvailability {
+  if (!item.shown) return HIDDEN;
+  if (!item.handled) return unavailableBecause(item.unhandledReason);
+  if (item.disabled) return unavailableBecause(item.disabledReason);
+  return AVAILABLE;
+}
+
 export function composerAddActions(facts: ComposerAddFacts): ComposerAddAction[] {
   return [
     {
@@ -53,24 +67,24 @@ export function composerAddActions(facts: ComposerAddFacts): ComposerAddAction[]
     {
       id: "goal",
       label: facts.goalActive ? "View or update goal…" : "Set goal…",
-      availability: !facts.showGoal
-        ? HIDDEN
-        : !facts.goal
-          ? unavailableBecause(facts.goalDescription)
-          : facts.goalDisabled
-            ? unavailableBecause(GOAL_UNAVAILABLE)
-            : AVAILABLE,
+      availability: menuItemAvailability({
+        shown: facts.showGoal,
+        handled: facts.goal,
+        unhandledReason: facts.goalDescription,
+        disabled: facts.goalDisabled,
+        disabledReason: GOAL_UNAVAILABLE,
+      }),
     },
     {
       id: "plan",
       label: facts.planActive ? "Exit Plan mode" : "Enter Plan mode",
-      availability: !facts.showPlan
-        ? HIDDEN
-        : !facts.plan
-          ? unavailableBecause(facts.planUnavailableReason)
-          : facts.planDisabled
-            ? unavailableBecause(PLAN_BUSY)
-            : AVAILABLE,
+      availability: menuItemAvailability({
+        shown: facts.showPlan,
+        handled: facts.plan,
+        unhandledReason: facts.planUnavailableReason,
+        disabled: facts.planDisabled,
+        disabledReason: PLAN_BUSY,
+      }),
     },
   ];
 }

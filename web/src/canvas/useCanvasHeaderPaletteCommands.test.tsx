@@ -25,6 +25,7 @@ const labels = () =>
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
   usePaletteCommandsStore.setState({ groups: {} });
 });
 
@@ -99,6 +100,5 @@ describe("useCanvasHeaderPaletteCommands", () => {
     expect(labels()).toEqual(["Focus conversation", "Close conversation pane"]);
     act(() => navigateTo("/canvas"));
     expect(labels()).toEqual([]);
-    vi.unstubAllGlobals();
   });
 });
