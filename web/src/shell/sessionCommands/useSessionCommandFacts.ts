@@ -14,12 +14,8 @@ import { useViewerId } from "@/hooks/useViewerId";
 import { canCreateAutomationFromSession } from "@/lib/automationFromSession";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode } from "@/lib/capabilities";
-import { isIndentedSibling } from "@/lib/sessionFamilies";
-import {
-  PIN_WRITE_MUTATION_KEY,
-  PINNED_LABEL_KEY,
-  PROJECT_LABEL_KEY,
-} from "@/lib/sessionListCache";
+import { isIndentedSibling, isSessionPinned } from "@/lib/sessionFamilies";
+import { PIN_WRITE_MUTATION_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { isConversationMuted } from "@/lib/sessionMute";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { PinCapacityContext } from "@/lib/sidebarConfig";
@@ -63,9 +59,8 @@ export function useSessionCommandFacts(
       provisional: conversation.provisional === true,
       owner,
       archived: conversation.archived === true,
-      pinned:
-        conversation.labels?.[PINNED_LABEL_KEY] != null ||
-        pinnedRows?.some((row) => row.id === conversation.id) === true,
+      // As the row decides it, so a family pinned through its leader reads as pinned.
+      pinned: isSessionPinned(conversation, new Set(pinnedRows?.map((row) => row.id))),
       indentedSibling: isIndentedSibling(conversation),
       atPinCapacity,
       pinSaving,
