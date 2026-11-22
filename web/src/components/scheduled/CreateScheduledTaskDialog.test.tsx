@@ -3941,7 +3941,7 @@ describe("automation trigger type", () => {
     it("saves a trigger the server sends without a rule, leaving rrule out", async () => {
       render(dialog({ editingTask: { ...slackTask, rrule: null } }));
       expect(screen.queryByTestId("task-trigger-schedule-replacement")).not.toBeInTheDocument();
-      type("task-trigger-instructions", "Answer every question.");
+      type("task-prompt-input", "Answer every question.");
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
       const input = updateMutateAsync.mock.calls[0][0].input;

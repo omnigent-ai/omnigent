@@ -6908,6 +6908,14 @@ async def test_a_trigger_reads_its_rrule_as_null(
     renamed = await auth_client.patch(url, json={"name": "renamed"}, headers=_headers())
     assert renamed.status_code == 200, renamed.text
     assert renamed.json()["rrule"] is None
+    cloned = await auth_client.post(f"{url}/clone", headers=_headers())
+    assert cloned.status_code == 200, cloned.text
+    assert cloned.json()["rrule"] is None
+    # The saved rule and timezone are kept, and a clone copies them.
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    for task_id in (trigger_id, cloned.json()["id"]):
+        saved = store.get(task_id)
+        assert (saved.rrule, saved.timezone) == (_VALID_RRULE, "America/Los_Angeles")
 
 
 @_SHARING
