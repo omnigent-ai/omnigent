@@ -9,6 +9,7 @@ from alembic import context
 from sqlalchemy import Connection, engine_from_config, pool
 
 from omnigent.db import ConversationBase, OmnigentBase
+from omnigent.db.dialects import is_cloudflare_d1
 from omnigent.db.utils import _set_alembic_database_url
 
 config = context.config
@@ -91,6 +92,11 @@ def _run_with_connection(connection: Connection) -> None:
         target_metadata=target_metadata,
         render_as_batch=True,  # required for SQLite ALTER TABLE support
     )
+    if is_cloudflare_d1(connection):
+        # D1 rejects SQL BEGIN/SAVEPOINT over its HTTP transport.
+        context.run_migrations()
+        return
+
     with context.begin_transaction():
         context.run_migrations()
 

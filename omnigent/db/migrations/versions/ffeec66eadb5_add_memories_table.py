@@ -21,6 +21,8 @@ from sqlalchemy.dialects.mysql import VARBINARY
 from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.dialects.postgresql import VARCHAR as PGVarchar
 
+from omnigent.db.dialects import is_sqlite_family
+
 revision: str = "ffeec66eadb5"
 down_revision: str | None = "f7c2d8a4b901"
 branch_labels: tuple[str, ...] | None = None
@@ -28,7 +30,6 @@ depends_on: tuple[str, ...] | None = None
 
 _TABLE = "memories"
 # Dialects that store a value of any type in any column.
-_SQLITE_FAMILY = frozenset({"sqlite", "cloudflare_d1"})
 # SQLite ignores declared lengths and types, so bound every column there: strings
 # at up to four bytes per character, envelopes at their stored size.
 _SQLITE_CHECKS = {
@@ -72,7 +73,7 @@ def upgrade() -> None:
         return
     checks = (
         [sa.CheckConstraint(sql, name=name) for name, sql in _SQLITE_CHECKS.items()]
-        if bind.dialect.name in _SQLITE_FAMILY
+        if is_sqlite_family(bind)
         else []
     )
     op.create_table(

@@ -39,6 +39,7 @@ from omnigent.db.db_models import (
     current_workspace_id,
     workspace_scope,
 )
+from omnigent.db.dialects import is_cloudflare_d1
 from omnigent.db.enum_codecs import (
     SCHEDULED_TASK_STATE,
     decode_scheduled_task_execution_target,
@@ -1495,7 +1496,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
     def check_dispatch_support(self) -> None:
         """D1's REST driver auto-commits each statement and cannot roll back a claim."""
-        if self._engine.dialect.name == "cloudflare_d1":
+        if is_cloudflare_d1(self._engine):
             raise NotImplementedError(
                 "The persistent scheduler cannot use Cloudflare D1: its REST driver does not "
                 "support the multi-statement transactions needed to create a run and advance "

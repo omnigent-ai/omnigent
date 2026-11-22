@@ -478,6 +478,11 @@ changing schemas, queries, transactions, or storage code. Polly uses this
 reference in its reviews and treats violations of mandatory requirements as
 blocking findings.
 
+Migrations that branch on SQLite must call `is_sqlite_family(op.get_bind())`
+from `omnigent.db.dialects`, not compare against `"sqlite"`. Cloudflare D1 runs
+SQLite under the `cloudflare_d1` dialect name; `tests/db/test_migrations_sqlite_safe.py`
+rejects literal dialect checks.
+
 Changes under `omnigent/db/migrations/`, to `omnigent/db/alembic.ini`, or to
 [`.github/CODEOWNERS`](.github/CODEOWNERS) require a GitHub approval from at
 least one of Edwin He (`@Edwinhe03`), Aravind Segu (`@aravind-segu`), Corey

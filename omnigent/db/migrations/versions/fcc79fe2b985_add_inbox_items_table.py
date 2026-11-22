@@ -24,6 +24,7 @@ from alembic import op
 from sqlalchemy.dialects.mysql import VARBINARY
 
 from omnigent.db.db_models import Uuid16
+from omnigent.db.dialects import is_sqlite_family
 
 revision: str = "fcc79fe2b985"
 down_revision: str | None = "a8be64286ffc"
@@ -37,7 +38,6 @@ _ENVELOPE_BYTES = 16_383
 # cap on every write.
 _ENVELOPE = sa.LargeBinary().with_variant(VARBINARY(_ENVELOPE_BYTES), "mysql")
 
-_SQLITE_FAMILY = frozenset({"sqlite", "cloudflare_d1"})
 # SQLite enforces neither declared lengths nor types; these bound what it stores.
 _SQLITE_CHECKS: tuple[tuple[str, str], ...] = (
     ("user_id IS NULL OR length(CAST(user_id AS BLOB)) <= 512", "ck_inbox_items_user_id_bytes"),
@@ -68,7 +68,7 @@ _SQLITE_CHECKS: tuple[tuple[str, str], ...] = (
 
 def _sqlite_checks() -> list[sa.CheckConstraint]:
     """The SQLite-only CHECKs, or none on databases that enforce column types."""
-    if op.get_bind().dialect.name not in _SQLITE_FAMILY:
+    if not is_sqlite_family(op.get_bind()):
         return []
     return [sa.CheckConstraint(expr, name=name) for expr, name in _SQLITE_CHECKS]
 

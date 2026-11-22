@@ -58,6 +58,7 @@ from omnigent.db.db_models import (
     current_workspace_id,
     uuid_to_bytes,
 )
+from omnigent.db.dialects import is_sqlite_family
 from omnigent.db.enum_codecs import (
     decode_item_status,
     decode_item_type,
@@ -2904,7 +2905,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if is_mysql:
                     data_expr = "CONVERT(ci.data USING utf8mb4)"
                     like_op = "LIKE"
-                elif self._conv_engine.dialect.name in {"sqlite", "cloudflare_d1"}:
+                elif is_sqlite_family(self._conv_engine):
                     # The fallback can also run on SQLite when FTS is disabled.
                     data_expr = "CAST(ci.data AS TEXT)"
                     like_op = "LIKE"

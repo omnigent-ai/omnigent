@@ -35,6 +35,8 @@ from collections.abc import Iterator, Sequence
 import sqlalchemy as sa
 from alembic import op
 
+from omnigent.db.dialects import is_sqlite_family
+
 revision: str = "r1a2b3c4d5e6"
 down_revision: str | None = "q1a2b3c4d5e6"
 branch_labels: str | Sequence[str] | None = None
@@ -59,7 +61,7 @@ _TABLE_PKS: dict[str, list[str]] = {
 
 
 def _is_sqlite() -> bool:
-    return op.get_bind().dialect.name == "sqlite"
+    return is_sqlite_family(op.get_bind())
 
 
 def _existing_pk_name(table: str) -> str | None:
