@@ -5,10 +5,18 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type { Conversation } from "@/hooks/useConversations";
+import type * as SessionModule from "@/hooks/useSession";
 import type * as UnseenModule from "@/hooks/useUnseenConversations";
+import type * as PermissionsApiModule from "@/lib/permissionsApi";
+import type * as RoutingModule from "@/lib/routing";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 import { SessionActionHost } from "./SessionActionHost";
-import { requestSessionAction, useSessionActionStore } from "./sessionActionStore";
+import {
+  latestSessionActionRequest,
+  requestSessionAction,
+  useSessionActionStore,
+} from "./sessionActionStore";
 
 const writes = vi.hoisted(() => ({
   pin: vi.fn(),
@@ -32,6 +40,30 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
     useRenameConversation: mutation(writes.rename),
   };
 });
+// The server's answers to Stop and Leave, which each test settles when it chooses.
+const server = vi.hoisted(() => ({ stopSession: vi.fn(), revokePermission: vi.fn() }));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  stopSession: server.stopSession,
+}));
+vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof PermissionsApiModule>()),
+  revokePermission: server.revokePermission,
+}));
+const ui = vi.hoisted(() => ({
+  toast: vi.fn(),
+  navigate: vi.fn(),
+  viewing: null as string | null,
+}));
+vi.mock("@/components/ui/toast", () => ({ showToast: ui.toast }));
+vi.mock("@/lib/routing", async (importOriginal) => ({
+  ...(await importOriginal<typeof RoutingModule>()),
+  useNavigate: () => ui.navigate,
+}));
+vi.mock("@/hooks/useSession", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionModule>()),
+  useActiveRootSessionId: () => ui.viewing,
+}));
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "viewer" }));
 const readMarks = vi.hoisted(() => ({ unread: vi.fn(), read: vi.fn() }));
 vi.mock("@/hooks/useUnseenConversations", async (importOriginal) => ({
@@ -69,8 +101,19 @@ function renderHost(queryClient = new QueryClient()) {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
-  useSessionActionStore.setState({ request: null });
+  useSessionActionStore.setState({ requests: [] });
+  ui.viewing = null;
 });
+
+function deferred() {
+  let resolve!: () => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<void>((settle, fail) => {
+    resolve = () => settle();
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
 
 describe("SessionActionHost", () => {
   it("pins through the row menu's write", () => {
@@ -145,6 +188,47 @@ describe("SessionActionHost", () => {
     await waitFor(() =>
       expect(screen.queryByRole("dialog", { name: "Delete session?" })).toBeNull(),
     );
+  });
+
+  it("runs an action once, even on a host mounted again", () => {
+    renderHost();
+    act(() => requestSessionAction(SESSION, "pin"));
+    cleanup();
+    renderHost();
+    expect(writes.pin).toHaveBeenCalledTimes(1);
+  });
+
+  describe("keeps a replaced action until its write settles", () => {
+    const RUNNING: Conversation = { ...SESSION, host_id: "h1", runner_id: "r1" };
+
+    it("still reports a Stop that fails after another action started", async () => {
+      const stop = deferred();
+      server.stopSession.mockReturnValue(stop.promise);
+      renderHost();
+      act(() => requestSessionAction(RUNNING, "stop"));
+      fireEvent.click(await screen.findByTestId("stop-session-confirm"));
+      act(() => requestSessionAction(SESSION, "mark-unread"));
+      expect(useSessionActionStore.getState().requests).toHaveLength(2);
+      await act(async () => stop.reject(new Error("runner unreachable")));
+      await waitFor(() =>
+        expect(ui.toast).toHaveBeenCalledWith("Couldn't stop the session: runner unreachable"),
+      );
+      await waitFor(() => expect(useSessionActionStore.getState().requests).toHaveLength(1));
+      expect(latestSessionActionRequest()?.command).toBe("mark-unread");
+    });
+
+    it("still leaves the page after Leave succeeds, though another action started", async () => {
+      const leave = deferred();
+      server.revokePermission.mockReturnValue(leave.promise);
+      ui.viewing = "c1";
+      renderHost();
+      act(() => requestSessionAction({ ...SESSION, owner: "someone-else" }, "leave"));
+      fireEvent.click(await screen.findByTestId("confirm-leave-conversation"));
+      await waitFor(() => expect(server.revokePermission).toHaveBeenCalledWith("c1", "viewer"));
+      act(() => requestSessionAction(SESSION, "mark-unread"));
+      await act(async () => leave.resolve());
+      await waitFor(() => expect(ui.navigate).toHaveBeenCalledWith("/", { replace: true }));
+    });
   });
 
   describe("looks the session up as the action starts", () => {
