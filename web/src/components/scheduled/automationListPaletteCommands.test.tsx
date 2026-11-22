@@ -229,6 +229,27 @@ describe("AutomationListPaletteCommands", () => {
     expect(labels(registeredPaletteCommands())).not.toContain("Pause “Daily digest”");
   });
 
+  it("replaces an automation's rows after an edit within the same second, so Edit opens the new content", () => {
+    const { rerender } = render(mount({ ...state(), handlers: handlers() }));
+    const listed = registeredPaletteCommands().find(
+      ({ label }) => label === "Edit “Daily digest”…",
+    )!;
+    const latest = handlers();
+    // updatedAt has second precision, so a prompt-only edit can keep it.
+    rerender(
+      mount({
+        ...state({ tasks: [task({ prompt: "Summarize, then file issues" })] }),
+        handlers: latest,
+      }),
+    );
+    const edit = registeredPaletteCommands().find(({ label }) => label === listed.label)!;
+    expect(edit.id).not.toBe(listed.id);
+    act(() => edit.run());
+    expect(latest.edit).toHaveBeenCalledWith(
+      expect.objectContaining({ prompt: "Summarize, then file issues" }),
+    );
+  });
+
   it("registers nothing with quick_pick_palette off", () => {
     render(mount({ ...state(), handlers: handlers() }, false));
     expect(registeredPaletteCommands()).toEqual([]);

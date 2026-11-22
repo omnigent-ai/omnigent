@@ -15,6 +15,7 @@ import {
 import { useMemo, useRef } from "react";
 
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+import { hashText } from "@/lib/textHash";
 import { useQuickPickPaletteCommands } from "@/shell/screenCommands/useQuickPickPaletteCommands";
 import {
   AVAILABLE,
@@ -180,6 +181,14 @@ function runAction(handlers: AutomationListHandlers, action: AutomationListActio
   }
 }
 
+/**
+ * Everything the list loaded for `task`. Any edit changes it, unlike `updatedAt`, which
+ * counts whole seconds and so stays put for an edit in the same second.
+ */
+function taskFingerprint(task: ScheduledTask): string {
+  return hashText(JSON.stringify(task));
+}
+
 /** The list's ⌘K commands; `handlers` is read when a command runs. */
 export function automationListPaletteCommands(
   state: AutomationListState,
@@ -216,7 +225,7 @@ export function automationListPaletteCommands(
     const { task } = action;
     commands.push({
       // A new version of the automation gets new rows, so a stale row never acts on it.
-      id: `automations-list.${action.id}:${task.id}:${task.updatedAt}:${task.state}`,
+      id: `automations-list.${action.id}:${task.id}:${taskFingerprint(task)}`,
       label: action.label,
       icon: ICONS[action.id],
       keywords: ["automation", "task", "schedule", task.name],
@@ -234,8 +243,7 @@ function listSignature(state: AutomationListState): string {
     automationFiltersShown(state) ? state.filter : null,
     automationListActions(state).map(({ task, id, label, availability }) => [
       task.id,
-      task.updatedAt,
-      task.state,
+      taskFingerprint(task),
       id,
       label,
       availability,
