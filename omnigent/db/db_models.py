@@ -1777,6 +1777,16 @@ class SqlScheduledTask(OmnigentBase):
             "created_at",
             "id",
         ),
+        # Lists one kind of a user's tasks without reading other kinds' rows, and finds
+        # any task of a kind in one lookup, as the timer-kind downgrade does.
+        Index(
+            "ix_scheduled_tasks_kind_scope",
+            "kind",
+            "workspace_id",
+            "user_id",
+            "created_at",
+            "id",
+        ),
         # Pages one agent's tasks across owners, e.g. every proactive-agent task.
         Index("ix_scheduled_tasks_agent", "workspace_id", "agent_id", "id"),
     )
