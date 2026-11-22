@@ -1378,10 +1378,12 @@ async def test_refused_codex_startup_effort_follows_the_server_rollback_contract
 
 
 @pytest.mark.asyncio
-async def test_buffered_continuation_skips_transient_idle() -> None:
+@pytest.mark.parametrize("stored", [True, False], ids=["stored_messages", "unstored_messages"])
+async def test_buffered_continuation_skips_transient_idle(stored: bool) -> None:
     """End-of-turn `idle` is suppressed when a buffered message will start a new turn.
 
-    The new turn's running edge names the stored items it takes up instead, oldest first.
+    The new turn's running edge names the stored items it takes up instead, oldest first,
+    and names none for messages the server did not store.
     """
     import asyncio as _aio
 
@@ -1440,7 +1442,7 @@ async def test_buffered_continuation_skips_transient_idle() -> None:
                     "model": "test-agent",
                     "content": [{"type": "input_text", "text": text}],
                     "harness": "openai-agents",
-                    "persisted_item_id": item_id,
+                    **({"persisted_item_id": item_id} if stored else {}),
                 },
             )
 
@@ -1464,7 +1466,7 @@ async def test_buffered_continuation_skips_transient_idle() -> None:
         for event in collected
         if event.get("type") == "session.status" and event.get("status") == "running"
     ]
-    assert starts == [None, held_items]
+    assert starts == [None, held_items if stored else []]
 
 
 @pytest.mark.asyncio

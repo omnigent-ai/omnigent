@@ -171,37 +171,22 @@ async def _side_chat_history(client: httpx.AsyncClient, session_id: str) -> list
     return history
 
 
-async def test_side_chat_leaves_out_the_turn_a_follow_up_was_steered_into(
-    client: httpx.AsyncClient, native_session: str
+@pytest.mark.parametrize("follow_up", ["steered_in", "sent_before_it_ran"])
+async def test_side_chat_leaves_out_a_turn_with_a_follow_up(
+    client: httpx.AsyncClient, native_session: str, follow_up: str
 ) -> None:
-    """A message sent into the running turn does not expose that turn's request."""
+    """A follow-up steered in, or sent before the turn is seen running, keeps its request out."""
     await _exchange(client, native_session)
     await _send(client, native_session, "Run the long command")
+    if follow_up == "sent_before_it_ran":
+        await _send(client, native_session, "Also check the parser")
     await _status(client, native_session, "running")
     await _mirror(client, native_session, "user", "Run the long command", "claude_turn_2")
     await _mirror(client, native_session, "assistant", "Running it now", "claude_turn_2")
-    await _send(client, native_session, "Also check the parser")
+    if follow_up == "steered_in":
+        await _send(client, native_session, "Also check the parser")
     await _mirror(client, native_session, "user", "Also check the parser", "claude_turn_2")
     await _mirror(client, native_session, "assistant", "Checking the parser too", "claude_turn_2")
-
-    assert await _side_chat_history(client, native_session) == [_CODENAME, _NOTED]
-
-
-async def test_side_chat_leaves_out_a_turn_whose_follow_up_was_sent_before_it_ran(
-    client: httpx.AsyncClient, native_session: str
-) -> None:
-    """A follow-up sent before the turn is seen running does not become the turn's start."""
-    await _exchange(client, native_session)
-    await _send(client, native_session, "Run the long command")
-    await _send(client, native_session, "Also check the parser")
-    await _status(client, native_session, "running")
-    for role, text in (
-        ("user", "Run the long command"),
-        ("assistant", "Running it now"),
-        ("user", "Also check the parser"),
-        ("assistant", "Checking the parser too"),
-    ):
-        await _mirror(client, native_session, role, text, "claude_turn_2")
 
     assert await _side_chat_history(client, native_session) == [_CODENAME, _NOTED]
 
@@ -288,40 +273,27 @@ async def _sdk_turn(
     await _mirror(client, session_id, "assistant", reply, turn)
 
 
+@pytest.mark.parametrize("follow_up", ["steered_in", "sent_before_it_ran"])
 @pytest.mark.parametrize("request_kind", ["message", "skill"])
-async def test_sdk_side_chat_leaves_out_the_turn_a_follow_up_was_steered_into(
-    client: httpx.AsyncClient, runner: None, request_kind: str
+async def test_sdk_side_chat_leaves_out_a_turn_with_a_follow_up(
+    client: httpx.AsyncClient, runner: None, request_kind: str, follow_up: str
 ) -> None:
-    """An SDK session's running request stays out once a follow-up is steered in."""
+    """An SDK session's running request stays out whenever its follow-up was sent."""
     session_id = await _session(client, native=False)
     await _sdk_turn(client, session_id, lambda: _send(client, session_id, _CODENAME), _NOTED, "r1")
     sessions_module._publish_status(session_id, "idle")
-
-    async def send_request() -> None:
-        if request_kind == "message":
-            await _send(client, session_id, "Review the parser")
-        else:
-            skill = {"kind": "skill", "name": "grill-me", "arguments": "the parser"}
-            await _post(client, session_id, {"type": "slash_command", "data": skill})
-
-    await _sdk_turn(client, session_id, send_request, "Reviewing it", "r2")
-    await _send(client, session_id, "Also check the lexer")
-    await _mirror(client, session_id, "assistant", "Checking the lexer too", "r2")
-
-    assert await _side_chat_history(client, session_id) == [_CODENAME, _NOTED]
-
-
-async def test_sdk_side_chat_leaves_out_a_turn_whose_follow_up_was_sent_before_it_ran(
-    client: httpx.AsyncClient, runner: None
-) -> None:
-    """An SDK follow-up sent before the runner reports the turn running is not its start."""
-    session_id = await _session(client, native=False)
-    await _sdk_turn(client, session_id, lambda: _send(client, session_id, _CODENAME), _NOTED, "r1")
-    sessions_module._publish_status(session_id, "idle")
-    await _send(client, session_id, "Review the parser")
-    await _send(client, session_id, "Also check the lexer")
+    if request_kind == "message":
+        await _send(client, session_id, "Review the parser")
+    else:
+        skill = {"kind": "skill", "name": "grill-me", "arguments": "the parser"}
+        await _post(client, session_id, {"type": "slash_command", "data": skill})
+    if follow_up == "sent_before_it_ran":
+        await _send(client, session_id, "Also check the lexer")
     sessions_module._publish_status(session_id, "running")
-    await _mirror(client, session_id, "assistant", "Reviewing both", "r2")
+    await _mirror(client, session_id, "assistant", "Reviewing it", "r2")
+    if follow_up == "steered_in":
+        await _send(client, session_id, "Also check the lexer")
+    await _mirror(client, session_id, "assistant", "Checking the lexer too", "r2")
 
     assert await _side_chat_history(client, session_id) == [_CODENAME, _NOTED]
 
@@ -389,16 +361,26 @@ class _TurnRunner:
         self.held[session_id].pop(0)
 
     async def continue_turn(
-        self, session_id: str, store: SqlAlchemyConversationStore, *, names_items: bool = True
+        self,
+        session_id: str,
+        store: SqlAlchemyConversationStore,
+        *,
+        names_items: bool = True,
+        take: int | None = None,
     ) -> None:
-        """Start a turn with the held messages as the turn before it ends, with no idle edge.
+        """Start a turn with held messages as the turn before it ends, with no idle edge.
 
-        :param names_items: Name the held messages on the running edge; older runners do not.
+        :param names_items: Name the messages on the running edge; older runners do not.
+        :param take: How many of the oldest held messages the turn takes up, e.g. one at a
+            time while a ``/compact`` waits among them, or none for the compaction turn.
+            ``None`` takes them all.
         """
-        held = self.held.pop(session_id)
+        held = self.held.get(session_id, [])
+        taken = held[:] if take is None else held[:take]
+        del held[: len(taken)]
         edge: dict[str, Any] = {"type": "session.status", "status": "running"}
         if names_items:
-            edge["input_item_ids"] = held
+            edge["input_item_ids"] = taken
         stream = _RunnerStream([edge])
         await _relay_runner_stream_once(session_id, stream, store)  # type: ignore[arg-type]
 
@@ -506,3 +488,29 @@ async def test_sdk_side_chat_keeps_a_message_a_runner_steered_into_a_finished_tu
 
     history = await _side_chat_history(client, session_id)
     assert history == [_CODENAME, _NOTED, *finished]
+
+
+async def test_sdk_side_chat_cuts_before_each_held_message_a_runner_takes_up_alone(
+    client: httpx.AsyncClient, turn_runner: _TurnRunner, db_uri: str
+) -> None:
+    """Held messages the runner takes up one turn at a time each start their own turn."""
+    session_id = await _session(client, native=False)
+    await _sdk_turn(client, session_id, lambda: _send(client, session_id, _CODENAME), _NOTED, "r1")
+    turn_runner.end_turn(session_id)
+    await _sdk_turn(
+        client, session_id, lambda: _send(client, session_id, "Review the parser"), "On it", "r2"
+    )
+    await _send(client, session_id, "Also check the lexer")
+    skill = {"kind": "skill", "name": "grill-me", "arguments": "the parser"}
+    await _post(client, session_id, {"type": "slash_command", "data": skill})
+    await _mirror(client, session_id, "assistant", "The parser looks fine", "r2")
+    store = SqlAlchemyConversationStore(db_uri)
+    # A /compact queued between them makes the runner take each up alone, with no idle edge.
+    await turn_runner.continue_turn(session_id, store, take=1)
+    await _mirror(client, session_id, "assistant", "The lexer looks fine", "r3")
+    await turn_runner.continue_turn(session_id, store, take=0)
+    await turn_runner.continue_turn(session_id, store, take=1)
+    await _mirror(client, session_id, "assistant", "Grilling it", "r4")
+
+    history = await _side_chat_history(client, session_id)
+    assert history == [_CODENAME, _NOTED, "Review the parser", "On it", "Also check the lexer"]
