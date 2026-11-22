@@ -954,7 +954,10 @@ export async function setBrowserForwardedChords(chords: BrowserForwardedChord[])
   const electron = electronApi();
   if (!electron?.browserSetForwardedChords) return;
   try {
-    await electron.browserSetForwardedChords(chords);
+    const result = await electron.browserSetForwardedChords(chords);
+    if (result?.ok === false) {
+      console.warn("[nativeBridge] browser forwarded chords update refused:", result.error);
+    }
   } catch (err) {
     console.warn("[nativeBridge] browser forwarded chords update failed:", err);
   }

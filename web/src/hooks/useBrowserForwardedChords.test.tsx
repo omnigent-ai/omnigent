@@ -85,24 +85,31 @@ describe("forwardedChordsFor", () => {
 });
 
 describe("useBrowserForwardedChords", () => {
-  it("lists the chords on a capable shell, again on window focus, and none on unmount", () => {
+  it("lists the chords on a capable shell, and none on unmount", () => {
     const bridge = capableBridge();
     const { unmount } = renderHook(() => useBrowserForwardedChords(["palette.commands"], true));
-    const listed = [chord({ key: "k", metaKey: true }), chord({ key: "K", metaKey: true })];
-    expect(bridge.browserSetForwardedChords).toHaveBeenLastCalledWith(listed);
-
-    // The shell clears the list when this page's load is interrupted; focus sends it again.
-    act(() => {
-      window.dispatchEvent(new Event("focus"));
-    });
-    expect(bridge.browserSetForwardedChords).toHaveBeenCalledTimes(2);
-    expect(bridge.browserSetForwardedChords).toHaveBeenLastCalledWith(listed);
+    expect(bridge.browserSetForwardedChords).toHaveBeenCalledExactlyOnceWith([
+      chord({ key: "k", metaKey: true }),
+      chord({ key: "K", metaKey: true }),
+    ]);
 
     unmount();
     expect(bridge.unsubscribe).toHaveBeenCalled();
     expect(bridge.browserSetForwardedChords).toHaveBeenLastCalledWith([]);
-    window.dispatchEvent(new Event("focus"));
-    expect(bridge.browserSetForwardedChords).toHaveBeenCalledTimes(3);
+  });
+
+  it("warns when the shell refuses the list", async () => {
+    const bridge = capableBridge();
+    bridge.browserSetForwardedChords.mockResolvedValue({ ok: false, error: "untrusted sender" });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    renderHook(() => useBrowserForwardedChords(["palette.commands"], true));
+    await vi.waitFor(() =>
+      expect(warn).toHaveBeenCalledWith(
+        "[nativeBridge] browser forwarded chords update refused:",
+        "untrusted sender",
+      ),
+    );
+    warn.mockRestore();
   });
 
   it("replays a forwarded ⌘K where the palette hotkey hears it", () => {
@@ -123,11 +130,19 @@ describe("useBrowserForwardedChords", () => {
     stale.remove();
   });
 
-  it("asks for nothing on a shell missing either method, or with an empty list", () => {
+  it("asks for nothing without a desktop bridge, on a shell missing either method, or with an empty list", () => {
+    setBridge(undefined);
+    renderHook(() => useBrowserForwardedChords(["palette.commands"], true)).unmount();
+
     const browserSetForwardedChords = vi.fn().mockResolvedValue({ ok: true });
     setBridge({ browserSetForwardedChords });
-    renderHook(() => useBrowserForwardedChords(["palette.commands"], true));
+    renderHook(() => useBrowserForwardedChords(["palette.commands"], true)).unmount();
     expect(browserSetForwardedChords).not.toHaveBeenCalled();
+
+    const onBrowserForwardedInput = vi.fn(() => () => {});
+    setBridge({ onBrowserForwardedInput });
+    renderHook(() => useBrowserForwardedChords(["palette.commands"], true)).unmount();
+    expect(onBrowserForwardedInput).not.toHaveBeenCalled();
 
     const bridge = capableBridge();
     renderHook(() => useBrowserForwardedChords([], true));

@@ -1,7 +1,5 @@
-// A focused embedded browser page keeps its own keystrokes, so app chords such as ⌘K
-// don't reach the window's hotkey listeners. On a desktop shell that can, this asks it to
-// hand over exactly the given shortcuts' chords and replays each one as a keydown, so the
-// same hotkey hooks handle it as if the page weren't there.
+// A focused embedded page keeps its keystrokes from the window, so this asks the desktop shell
+// for the app's own chords (⌘K, the tab chords) and replays each as a keydown the hotkeys hear.
 
 import { useEffect } from "react";
 
@@ -19,11 +17,12 @@ import {
   type ShortcutId,
 } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
 
-/** The app chords a focused browser page hands over in the tabs sidebar. */
+/**
+ * The app chords a focused browser page hands over in the tabs sidebar. Back and Forward stay
+ * with the page: ⌘← and ⌘→ move its caret, and off the Mac their Ctrl+Alt chords type AltGr.
+ */
 export const TABS_SIDEBAR_FORWARDED_SHORTCUTS: readonly ShortcutId[] = [
   "palette.commands",
-  "workspace.back",
-  "workspace.forward",
   "workspace.newTab",
   "workspace.closeTab",
   "workspace.reopenTab",
@@ -102,8 +101,7 @@ export function replayForwardedKeydown(input: BrowserForwardedKeydown): void {
 
 /**
  * Hand `ids`' chords from a focused embedded page to the app, on shells that can. An older
- * shell, and an empty list, leave every key with the page. The list is sent again whenever
- * the window regains focus, since the shell clears it if this page's load was interrupted.
+ * shell, and an empty list, leave every key with the page.
  */
 export function useBrowserForwardedChords(
   ids: readonly ShortcutId[],
@@ -113,12 +111,9 @@ export function useBrowserForwardedChords(
   useEffect(() => {
     if (!key || !browserForwardsChords()) return;
     const chords = forwardedChordsFor(key.split("\n") as ShortcutId[], mac);
-    const send = () => void setBrowserForwardedChords(chords);
     const unsubscribe = onBrowserForwardedInput(replayForwardedKeydown);
-    send();
-    window.addEventListener("focus", send);
+    void setBrowserForwardedChords(chords);
     return () => {
-      window.removeEventListener("focus", send);
       unsubscribe();
       void setBrowserForwardedChords([]);
     };
