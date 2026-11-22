@@ -253,7 +253,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _pushed_model_options_cache,
     _read_explicit_unread,
     _read_last_seen,
-    _record_forwarded_request,
+    _record_sent_request,
     _session_active_response_cache,
     _session_background_agents_cache,
     _session_background_task_count_cache,
@@ -8686,6 +8686,8 @@ async def _dispatch_skill_slash_command_to_runner(
         [visible_item, meta_item],
     )
     visible = persisted_items[0]
+    if not visible.deduplicated:
+        _record_sent_request(session_id, visible.id, runner_item_id=persisted_items[1].id)
 
     # Mirror the plain-message path's title seeding: a session whose FIRST
     # message is a skill invocation (web landing composer, REPL) would
@@ -8732,17 +8734,10 @@ async def _dispatch_skill_slash_command_to_runner(
         runner_body["harness_override"] = conv.harness_override
 
     try:
-        reply = await runner_client.post(
+        await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=runner_body,
             timeout=_RUNNER_FORWARD_TIMEOUT,
-        )
-        _record_forwarded_request(
-            session_id,
-            visible.id,
-            reply,
-            turn_running=_session_status_from_cache(session_id, conv.live_status) == "running",
-            runner_item_id=runner_body["persisted_item_id"],
         )
         event = OutputItemDoneEvent(type="response.output_item.done", item=visible.to_api_dict())
         session_stream.publish(session_id, event.model_dump())

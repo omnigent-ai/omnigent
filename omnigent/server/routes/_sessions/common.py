@@ -8,7 +8,6 @@ so a single instance is imported by reference across the package.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import math
 import re
@@ -670,9 +669,12 @@ _session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScoped
 # with it; the turn's end drops it.
 _session_turn_request_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
-# The first message a runner held for a running turn, as the runner's item id and
-# the item a side chat cuts before, until the turn the runner starts with it.
-_session_held_request_cache: WorkspaceScopedCache[str, tuple[str, str]] = WorkspaceScopedCache()
+# Messages sent to an SDK runner while a turn's start is recorded, oldest first, as
+# the item id the runner knows each by mapped to the item a side chat cuts before.
+_session_held_request_cache: WorkspaceScopedCache[str, dict[str, str]] = WorkspaceScopedCache()
+
+# Most messages tracked per session for the turn after the running one.
+_MAX_HELD_REQUESTS = 64
 
 
 def _record_turn_request(session_id: str, item_id: str) -> None:
@@ -689,60 +691,51 @@ def _record_turn_request(session_id: str, item_id: str) -> None:
     _session_turn_request_cache.setdefault(session_id, item_id)
 
 
-def _record_forwarded_request(
-    session_id: str,
-    item_id: str,
-    reply: httpx.Response,
-    *,
-    turn_running: bool,
-    runner_item_id: str | None = None,
+def _record_sent_request(
+    session_id: str, item_id: str, *, runner_item_id: str | None = None
 ) -> None:
     """
-    Record a message forwarded to *session_id*'s runner by what the runner did with it.
+    Record a message or skill persisted for *session_id*'s SDK runner.
 
-    The runner replies ``{"status": "accepted"}`` when the message started a turn,
-    and ``{"status": "buffered"}`` when it holds the message for a running turn. A
-    runner that cannot steer takes held messages up together in its next turn. Any
-    other reply, e.g. from an older runner, falls back to :func:`_record_turn_request`.
+    The first since the last turn ended is the turn's start. A later one waits:
+    the runner steers it into the running turn, or holds it for a turn that
+    starts as this one ends (see :func:`_record_held_turn_start`).
 
     :param session_id: Session the message was sent to, e.g. ``"conv_abc123"``.
-    :param item_id: The message's persisted item id.
-    :param reply: The runner's reply to the forwarded message.
-    :param turn_running: Whether the server has seen a turn running.
+    :param item_id: The persisted item a side chat cuts before.
     :param runner_item_id: The stored item the runner knows the message by, when it
         is not *item_id*, e.g. a skill's hidden prompt.
     """
-    body: object = None
-    with contextlib.suppress(ValueError, AttributeError):
-        body = reply.json()
-    status = body.get("status") if isinstance(body, dict) else None
-    if status == "accepted":
+    if session_id not in _session_turn_request_cache:
         _session_turn_request_cache[session_id] = item_id
-    elif status == "buffered" and turn_running:
-        _session_held_request_cache.setdefault(session_id, (runner_item_id or item_id, item_id))
-    else:
-        _record_turn_request(session_id, item_id)
+        return
+    held = _session_held_request_cache.setdefault(session_id, {})
+    if len(held) < _MAX_HELD_REQUESTS:
+        held.setdefault(runner_item_id or item_id, item_id)
 
 
-def _record_held_turn_start(session_id: str, input_item_ids: object) -> None:
+def _record_held_turn_start(session_id: str, input_item_ids: object, *, continued: bool) -> None:
     """
     Record the start of a turn a runner began with messages it held.
 
     The runner starts such a turn as the one before it ends, with no idle edge
     between, and names the stored items the turn takes up on its running edge.
-    Older runners name none, which leaves the previous turn's record in place.
+    An older runner names none; its running edge then arrives while a turn already
+    runs, and the turn takes up the oldest held message.
 
     :param session_id: Session whose turn started, e.g. ``"conv_abc123"``.
     :param input_item_ids: The runner's item ids for the messages, oldest first,
-        e.g. ``["msg_b", "msg_c"]``.
+        e.g. ``["msg_b", "msg_c"]``, or ``None`` when the edge names none.
+    :param continued: Whether the edge arrived while a turn was already running.
     """
-    if not isinstance(input_item_ids, list) or not input_item_ids:
+    named = input_item_ids if isinstance(input_item_ids, list) else []
+    if not named and not continued:
         return
-    held = _session_held_request_cache.pop(session_id, None)
-    if held is not None and held[0] in input_item_ids:
-        _session_turn_request_cache[session_id] = held[1]
-    elif isinstance(first := input_item_ids[0], str):
-        _session_turn_request_cache[session_id] = first
+    held = _session_held_request_cache.pop(session_id, None) or {}
+    if named and isinstance(first := named[0], str):
+        _session_turn_request_cache[session_id] = held.get(first, first)
+    elif held:
+        _session_turn_request_cache[session_id] = next(iter(held.values()))
 
 
 _session_background_task_count_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
@@ -1312,6 +1305,7 @@ __all__ = [
     "_LAST_TASK_ERROR_TITLE_LABEL_KEY",
     "_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S",
     "_MANAGED_RESUMABLE_TUNNEL_STALE_S",
+    "_MAX_HELD_REQUESTS",
     "_MAX_TERMINAL_LAUNCH_ARGS",
     "_MAX_TERMINAL_LAUNCH_ARG_LEN",
     "_MCP_ELICITATION_TYPE",
@@ -1377,8 +1371,8 @@ __all__ = [
     "_read_explicit_unread",
     "_read_last_seen",
     "_recent_mirrored_tool_calls",
-    "_record_forwarded_request",
     "_record_held_turn_start",
+    "_record_sent_request",
     "_record_turn_request",
     "_runner_relay_tasks",
     "_runner_status_probe_backoff",

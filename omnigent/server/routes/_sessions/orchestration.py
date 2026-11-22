@@ -245,8 +245,8 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _policy_evaluation_locks,
     _pushed_model_options_cache,
     _recent_mirrored_tool_calls,
-    _record_forwarded_request,
     _record_held_turn_start,
+    _record_sent_request,
     _record_turn_request,
     _RelayHandle,
     _RelayStatusSnapshot,
@@ -8283,6 +8283,8 @@ async def _forward_event_to_runner(
             persisted = await asyncio.to_thread(
                 conversation_store.append, session_id, [replacement]
             )
+        if not persisted[0].deduplicated:
+            _record_sent_request(session_id, persisted[0].id)
         return persisted
 
     # Run controls wait for routing and a fresh guard before entering replayable history.
@@ -8778,12 +8780,6 @@ async def _forward_event_to_runner(
                 f"Runner rejected the message: {_reject_detail}",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
-        _record_forwarded_request(
-            session_id,
-            persisted_items[0].id,
-            _forward_resp,
-            turn_running=_session_status_from_cache(session_id, conv.live_status) == "running",
-        )
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         _publish_input_consumed(session_id, persisted_items[0])
@@ -10702,6 +10698,7 @@ async def _relay_runner_stream_once(
                                     )
                                 else:
                                     continue
+                            continued = _session_status_cache.get(session_id) == "running"
                             _publish_status(
                                 session_id,
                                 status,
@@ -10742,7 +10739,9 @@ async def _relay_runner_stream_once(
                             # turn left un-consumed (e.g. its terminal event
                             # never reached the relay across a reconnect).
                             _llm_response_denied_turns.pop(session_id, None)
-                            _record_held_turn_start(session_id, event.get("input_item_ids"))
+                            _record_held_turn_start(
+                                session_id, event.get("input_item_ids"), continued=continued
+                            )
                         continue
 
                     # Terminal spin-up status from the runner's auto-create
