@@ -656,3 +656,58 @@ def test_model_turn_uploads_only_from_the_session_workspace(
     assert outputs["outside"].startswith("Error: sys_upload_file failed:"), outputs["outside"]
     assert set(stored) == {"report.md"}, stored
     assert shared == b"cli report"
+
+
+def test_sessions_in_a_project_share_its_files(
+    http_client: httpx.Client, live_runner_id: str, mock_llm_server_url: str
+) -> None:
+    """
+    Sessions filed in one project share its files through the file tools' project
+    scope, over the server-to-runner hop native CLIs use. A session in another
+    project can neither list nor read them, and the owner sees them over REST.
+    """
+
+    def project(name: str) -> str:
+        created = http_client.post("/v1/projects", json={"name": name})
+        created.raise_for_status()
+        return str(created.json()["id"])
+
+    def filed_session(project_id: str) -> str:
+        session_id = _model_session(
+            http_client,
+            runner_id=live_runner_id,
+            mock_llm_server_url=mock_llm_server_url,
+            model=f"mock-project-files-{uuid.uuid4().hex[:8]}",
+            spec_overrides={"os_env": _OS_ENV},
+        )
+        filed = http_client.patch(f"/v1/sessions/{session_id}", json={"project_id": project_id})
+        filed.raise_for_status()
+        return session_id
+
+    suffix = uuid.uuid4().hex[:8]
+    shared, other = project(f"files-{suffix}"), project(f"other-{suffix}")
+    writer, reader, outsider = filed_session(shared), filed_session(shared), filed_session(other)
+    http_client.put(
+        f"/v1/sessions/{writer}/resources/environments/default/filesystem/plan.md",
+        json={"content": "the plan", "encoding": "utf-8"},
+    ).raise_for_status()
+
+    upload = _mcp_tool_call(
+        http_client, writer, "sys_upload_file", {"path": "plan.md", "scope": "project"}
+    )
+    file_id = json.loads(upload).get("file_id")
+    listed = _mcp_tool_call(http_client, reader, "sys_list_files", {"scope": "project"})
+    read_back = _mcp_tool_call(
+        http_client, reader, "sys_download_file", {"file_id": file_id, "scope": "project"}
+    )
+    outsider_listed = _mcp_tool_call(http_client, outsider, "sys_list_files", {"scope": "project"})
+    outsider_read = _mcp_tool_call(
+        http_client, outsider, "sys_download_file", {"file_id": file_id, "scope": "project"}
+    )
+    owner_listed = http_client.get(f"/v1/projects/{shared}/resources/files")
+
+    assert [entry["name"] for entry in json.loads(listed)["data"]] == ["plan.md"], listed
+    assert read_back == "the plan"
+    assert json.loads(outsider_listed)["data"] == [], outsider_listed
+    assert outsider_read.startswith("Error: download returned 404"), outsider_read
+    assert [entry["id"] for entry in owner_listed.json()["data"]] == [file_id], owner_listed.text

@@ -15,10 +15,11 @@ projects share that scope.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Query, Request
 
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
@@ -32,7 +33,9 @@ from omnigent.server.schemas import (
     UpdateProjectRequest,
 )
 from omnigent.server.session_orchestration import require_named_source_private
+from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore, apply_project_order
 
@@ -56,11 +59,49 @@ def _to_response(project: Project) -> dict[str, Any]:
     }
 
 
+_logger = logging.getLogger(__name__)
+
+
+def _delete_project_blobs(
+    artifact_store: ArtifactStore, project_id: str, blob_keys: list[str]
+) -> None:
+    """
+    Delete a deleted project's file blobs after the response, best-effort.
+
+    A failed delete leaves its blob behind and is logged, as for a deleted session.
+
+    :param artifact_store: Store holding the bytes.
+    :param project_id: The deleted project, for the log.
+    :param blob_keys: Blobs no file row references any more.
+    """
+    failed = 0
+    for blob_key in blob_keys:
+        try:
+            artifact_store.delete(blob_key)
+        except Exception as exc:  # noqa: BLE001 - one failed blob must not stop the rest
+            failed += 1
+            _logger.warning(
+                "Failed to delete file blob %s of deleted project %s: %s",
+                blob_key,
+                project_id,
+                type(exc).__name__,
+            )
+    if failed:
+        _logger.warning(
+            "Project %s deleted with %d of %d file blobs left behind",
+            project_id,
+            failed,
+            len(blob_keys),
+        )
+
+
 def create_projects_router(
     project_store: ProjectStore,
     auth_provider: AuthProvider | None = None,
     conversation_store: ConversationStore | None = None,
     permission_store: PermissionStore | None = None,
+    file_store: FileStore | None = None,
+    artifact_store: ArtifactStore | None = None,
 ) -> APIRouter:
     """Build the projects router (``/v1/projects``).
 
@@ -69,6 +110,8 @@ def create_projects_router(
         ``None`` in single-user mode (owner scope is ``None``).
     :param conversation_store: Resolves the calling session an agent tool names.
     :param permission_store: Checks whether that session is shared with edit access.
+    :param file_store: Holds project files' metadata, deleted with their project.
+    :param artifact_store: Holds project files' bytes.
     :returns: A configured :class:`APIRouter`.
     """
     router = APIRouter()
@@ -233,14 +276,18 @@ def create_projects_router(
         return _to_response(project)
 
     @router.delete("/projects/{project_id}")
-    async def delete_project(request: Request, project_id: str) -> dict[str, Any]:
-        """Delete one of the caller's projects.
+    async def delete_project(
+        request: Request, project_id: str, background_tasks: BackgroundTasks
+    ) -> dict[str, Any]:
+        """Delete one of the caller's projects and its files.
 
         Member sessions are not deleted; they are left for the caller to
-        unfile (clearing their ``project_id``).
+        unfile (clearing their ``project_id``). The project's file rows are
+        deleted before responding and their bytes afterwards.
 
         :param request: The incoming request, used to identify the user.
         :param project_id: The project to delete.
+        :param background_tasks: Runs the blob deletion after the response.
         :returns: ``{"id": ..., "object": "project.deleted", "deleted": True}``.
         :raises OmnigentError: 401 if unauthenticated, 404 if not found / not
             owned by the caller.
@@ -250,6 +297,11 @@ def create_projects_router(
         deleted = await asyncio.to_thread(project_store.delete, project_id, user_id=user_id)
         if not deleted:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        if file_store is not None and artifact_store is not None:
+            # After the project row is gone: an upload racing this delete either
+            # committed before this sweep, or finds the project gone and removes itself.
+            orphaned = await asyncio.to_thread(file_store.delete_all_for_project, project_id)
+            background_tasks.add_task(_delete_project_blobs, artifact_store, project_id, orphaned)
         # Drop the folder from the owner's other connected clients live.
         announce_projects_changed(user_id)
         return {"id": project_id, "object": "project.deleted", "deleted": True}

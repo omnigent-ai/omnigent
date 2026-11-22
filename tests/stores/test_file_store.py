@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import pytest
+import sqlalchemy
 
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 
 # Files are always listed per session, so pagination/ordering tests
 # scope their fixtures to a single session id.
 _SID = "94c349190e241f85a984b3df8f129696"
+_PROJECT = "7d3b1f4e2a9c4b6d8e0f1a2b3c4d5e6f"
+_OTHER_PROJECT = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
 
 
 @pytest.fixture()
@@ -337,3 +340,84 @@ def test_delete_all_for_session_returns_only_orphaned_blobs(
     # Deleting the fork finally orphans the shared blob.
     orphaned_after = file_store.delete_all_for_session(fork_session)
     assert set(orphaned_after) == {shared.blob_key}
+
+
+# ── project files ────────────────────────────────────────────────
+
+
+def test_project_files_are_reachable_only_through_their_project(
+    file_store: SqlAlchemyFileStore,
+) -> None:
+    """A project file is listed, fetched and deleted only through its own project."""
+    mine = file_store.create("plan.md", 5, project_id=_PROJECT)
+    file_store.create("other.md", 6, project_id=_OTHER_PROJECT)
+    file_store.create("notes.md", 7, session_id=_SID)
+
+    assert (mine.project_id, mine.session_id) == (_PROJECT, None)
+    assert [f.filename for f in file_store.list_for_project(_PROJECT).data] == ["plan.md"]
+    assert file_store.get(mine.id, project_id=_PROJECT) is not None
+    assert file_store.get(mine.id, project_id=_OTHER_PROJECT) is None
+    assert file_store.get(mine.id, session_id=_SID) is None
+    assert file_store.delete(mine.id, project_id=_OTHER_PROJECT) is False
+    assert file_store.delete(mine.id, project_id=_PROJECT) is True
+    assert file_store.list_for_project(_PROJECT).data == []
+
+
+def test_a_project_file_is_not_a_global_file(file_store: SqlAlchemyFileStore) -> None:
+    """Project files have no session, but unscoped listing returns only true global files."""
+    file_store.create("global.txt", 1)
+    file_store.create("plan.md", 2, project_id=_PROJECT)
+
+    page = file_store.list(session_id=_SID, include_unscoped=True)
+
+    assert [f.filename for f in page.data] == ["global.txt"]
+
+
+def test_create_refuses_a_file_owned_by_a_session_and_a_project(
+    file_store: SqlAlchemyFileStore,
+) -> None:
+    with pytest.raises(ValueError, match="a session or a project"):
+        file_store.create("plan.md", 1, session_id=_SID, project_id=_PROJECT)
+
+
+def test_list_for_project_paginates(file_store: SqlAlchemyFileStore) -> None:
+    created = {
+        file_store.create(f"f{index}.txt", index, project_id=_PROJECT).id for index in range(3)
+    }
+
+    first = file_store.list_for_project(_PROJECT, limit=2, order="asc")
+    rest = file_store.list_for_project(_PROJECT, limit=2, order="asc", after=first.last_id)
+
+    assert len(first.data) == 2 and first.has_more
+    assert len(rest.data) == 1 and not rest.has_more
+    assert {f.id for f in first.data} | {f.id for f in rest.data} == created
+
+
+def test_delete_all_for_project_keeps_blobs_other_rows_share(
+    file_store: SqlAlchemyFileStore,
+) -> None:
+    """Deleting a project returns only the blobs no surviving row references."""
+    shared = file_store.create("shared.md", 8, project_id=_PROJECT)
+    solo = file_store.create("solo.md", 8, project_id=_PROJECT)
+    file_store.create("shared.md", 8, session_id=_SID, blob_key=shared.blob_key)
+    file_store.create("kept.md", 8, project_id=_OTHER_PROJECT)
+
+    assert set(file_store.delete_all_for_project(_PROJECT)) == {solo.id}
+    assert file_store.list_for_project(_PROJECT).data == []
+    assert [f.filename for f in file_store.list_for_project(_OTHER_PROJECT).data] == ["kept.md"]
+
+
+def test_rows_without_a_blob_key_still_reference_their_blob(
+    db_uri: str, file_store: SqlAlchemyFileStore
+) -> None:
+    """Rows written before ``blob_key`` existed keep their bytes under ``id`` and still count."""
+    legacy = file_store.create("old.png", 8, session_id=_SID)
+    engine = sqlalchemy.create_engine(db_uri)
+    with engine.begin() as connection:
+        connection.execute(sqlalchemy.text("UPDATE files SET blob_key = NULL"))
+    engine.dispose()
+
+    fetched = file_store.get(legacy.id)
+    assert fetched is not None and fetched.blob_key is None
+    assert file_store.is_blob_key_orphaned(legacy.id) is False
+    assert file_store.delete_all_for_session(_SID) == [legacy.id]

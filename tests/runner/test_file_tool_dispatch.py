@@ -1167,3 +1167,88 @@ async def test_send_message_failure_surfaces_child_delete_http_error(
     assert len(copies) == 1
     assert len(events) == 1
     assert deletes == [_CHILD_ID, _CHILD_ID]
+
+
+_PROJECT_FILE_ID = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "method", "route"),
+    [
+        ("sys_upload_file", {"path": "plan.md", "scope": "project"}, "POST", "project-files"),
+        ("sys_list_files", {"scope": "project"}, "GET", "project-files"),
+        (
+            "sys_download_file",
+            {"file_id": _PROJECT_FILE_ID, "scope": "project"},
+            "GET",
+            f"project-files/{_PROJECT_FILE_ID}/content",
+        ),
+        ("sys_list_files", {}, "GET", "files"),
+    ],
+    ids=["upload", "list", "download", "session-default"],
+)
+@pytest.mark.asyncio
+async def test_scope_picks_the_session_or_project_file_routes(
+    tool_name: str, arguments: dict[str, Any], method: str, route: str, tmp_path: Path
+) -> None:
+    """The project scope goes through the session's project-file routes, where the
+    server resolves and authorizes the project; the agent never names one."""
+    (tmp_path / "plan.md").write_text("plan")
+    captured: list[httpx.Request] = []
+    client = _recording_client(captured)
+    try:
+        await execute_tool(
+            tool_name=tool_name,
+            arguments=json.dumps(arguments),
+            server_client=client,
+            agent_spec=_placeholder_cwd_spec(),
+            conversation_id=_CONVERSATION_ID,
+            session_workspace=tmp_path,
+        )
+    finally:
+        await client.aclose()
+
+    assert [(request.method, request.url.path) for request in captured] == [
+        (method, f"/v1/sessions/{_CONVERSATION_ID}/resources/{route}")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_scope_is_refused_before_any_request() -> None:
+    captured: list[httpx.Request] = []
+    client = _recording_client(captured)
+    try:
+        output = await execute_tool(
+            tool_name="sys_list_files",
+            arguments=json.dumps({"scope": "team"}),
+            server_client=client,
+            agent_spec=_placeholder_cwd_spec(),
+            conversation_id=_CONVERSATION_ID,
+        )
+    finally:
+        await client.aclose()
+
+    assert output == "Error: sys_list_files failed: scope must be 'session' or 'project'"
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_a_refused_project_call_says_why() -> None:
+    """The server's reason reaches the agent, e.g. that its session is in no project."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        error = {"code": "not_found", "message": "This session is not in a project"}
+        return httpx.Response(404, json={"error": error})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://ap-server"
+    ) as client:
+        output = await execute_tool(
+            tool_name="sys_list_files",
+            arguments=json.dumps({"scope": "project"}),
+            server_client=client,
+            agent_spec=_placeholder_cwd_spec(),
+            conversation_id=_CONVERSATION_ID,
+        )
+
+    assert output == "Error: sys_list_files returned 404: This session is not in a project"

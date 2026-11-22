@@ -6,10 +6,10 @@ import builtins
 import json
 from typing import Any
 
-from sqlalchemy import and_, asc, desc, func, or_, select
+from sqlalchemy import ColumnElement, Select, and_, asc, desc, or_, select
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlFile, Uuid16, current_workspace_id, normalize_uuid
+from omnigent.db.db_models import SqlFile, current_workspace_id, normalize_uuid
 from omnigent.db.query_context import query_name_scope
 from omnigent.db.utils import (
     generate_file_id,
@@ -40,12 +40,45 @@ def _to_entity(row: SqlFile) -> StoredFile:
         source_metadata=(
             json.loads(row.source_metadata) if row.source_metadata is not None else None
         ),
+        project_id=row.project_id,
     )
 
 
 def _effective_blob_key(row: SqlFile) -> str:
     """Artifact-store key for *row*'s bytes: ``blob_key`` or ``id`` if NULL."""
     return row.blob_key if row.blob_key is not None else row.id
+
+
+def _references_blob(blob_key: str) -> ColumnElement[bool]:
+    """
+    Match the rows whose bytes live under *blob_key*.
+
+    Equivalent to ``COALESCE(blob_key, id) = :key``, written so it can use the
+    ``blob_key`` index and the primary key: new rows always store ``blob_key``,
+    and only rows from before it existed fall back to ``id``.
+
+    :param blob_key: The artifact-store key, e.g. ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
+    :returns: The filter for the workspace's rows that reference it.
+    """
+    key = normalize_uuid(blob_key)
+    return and_(
+        SqlFile.workspace_id == current_workspace_id(),
+        or_(SqlFile.blob_key == key, and_(SqlFile.blob_key.is_(None), SqlFile.id == key)),
+    )
+
+
+def _owned_by(row: SqlFile, session_id: str | None, project_id: str | None) -> bool:
+    """
+    Whether *row* belongs to the given session or project, when one is given.
+
+    :param row: The file row.
+    :param session_id: Required owning session, or ``None`` to skip the check.
+    :param project_id: Required owning project, or ``None`` to skip the check.
+    :returns: ``False`` when a given owner doesn't match.
+    """
+    if session_id is not None and row.session_id != normalize_uuid(session_id):
+        return False
+    return project_id is None or row.project_id == normalize_uuid(project_id)
 
 
 class SqlAlchemyFileStore(FileStore):
@@ -84,6 +117,7 @@ class SqlAlchemyFileStore(FileStore):
         file_id: str | None = None,
         blob_key: str | None = None,
         source_metadata: dict[str, Any] | None = None,
+        project_id: str | None = None,
     ) -> StoredFile:
         """
         Record a new file in the database.
@@ -102,8 +136,12 @@ class SqlAlchemyFileStore(FileStore):
         :param source_metadata: Opaque JSON-able dict of metadata about
             the original upload before any server-side transform, or
             ``None`` when there is nothing to record.
+        :param project_id: Owning project for a project file, or ``None``.
         :returns: The newly created :class:`StoredFile`.
+        :raises ValueError: If both ``session_id`` and ``project_id`` are set.
         """
+        if session_id is not None and project_id is not None:
+            raise ValueError("a file belongs to a session or a project, not both")
         file_id = file_id if file_id is not None else generate_file_id()
         # New rows always store an explicit blob_key so the shared-blob
         # reference count is a plain equality (no COALESCE needed for them);
@@ -120,6 +158,7 @@ class SqlAlchemyFileStore(FileStore):
                 bytes=bytes,
                 content_type=content_type,
                 session_id=session_id,
+                project_id=project_id,
                 blob_key=blob_key,
                 source_metadata=encoded_metadata,
             )
@@ -143,15 +182,7 @@ class SqlAlchemyFileStore(FileStore):
         """
         with self._session("count_blob_key_refs") as session:
             row = session.execute(
-                select(SqlFile.id)
-                .where(
-                    SqlFile.workspace_id == current_workspace_id(),
-                    # id/blob_key are Uuid16 (binary); type the COALESCE so the
-                    # bound value is encoded the same way, not compared as text.
-                    func.coalesce(SqlFile.blob_key, SqlFile.id, type_=Uuid16())
-                    == normalize_uuid(blob_key),
-                )
-                .limit(1)
+                select(SqlFile.id).where(_references_blob(blob_key)).limit(1)
             ).first()
             return row is None
 
@@ -159,23 +190,23 @@ class SqlAlchemyFileStore(FileStore):
         self,
         file_id: str,
         session_id: str | None = None,
+        project_id: str | None = None,
     ) -> StoredFile | None:
         """
         Fetch file metadata by ID.
 
-        When ``session_id`` is set, only returns the file if it
-        belongs to that session.
+        When ``session_id`` or ``project_id`` is set, only returns the
+        file if it belongs to that session or project.
 
         :param file_id: Unique file identifier.
-        :param session_id: If set, verify ownership.
+        :param session_id: If set, verify session ownership.
+        :param project_id: If set, verify project ownership.
         :returns: The :class:`StoredFile` if found, otherwise
             ``None``.
         """
         with self._session("select_file_by_id") as session:
             row = session.get(SqlFile, (current_workspace_id(), file_id))
-            if row is None:
-                return None
-            if session_id is not None and row.session_id != normalize_uuid(session_id):
+            if row is None or not _owned_by(row, session_id, project_id):
                 return None
             return _to_entity(row)
 
@@ -200,81 +231,62 @@ class SqlAlchemyFileStore(FileStore):
         :param before: Cursor file ID for backward pagination.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :param include_unscoped: When ``True``, also return global
-            files (``session_id IS NULL``).
+            files, which belong to no session and no project.
         :returns: A :class:`PagedList` of :class:`StoredFile`.
         """
+        owner = SqlFile.session_id == session_id
+        if include_unscoped:
+            unscoped = and_(SqlFile.session_id.is_(None), SqlFile.project_id.is_(None))
+            owner = or_(owner, unscoped)
         with self._session("list_files") as session:
-            is_desc = order == "desc"
-            sort_fn = desc if is_desc else asc
-            stmt = select(SqlFile).where(SqlFile.workspace_id == current_workspace_id())
-            if include_unscoped:
-                stmt = stmt.where(
-                    or_(SqlFile.session_id == session_id, SqlFile.session_id.is_(None))
-                )
-            else:
-                stmt = stmt.where(SqlFile.session_id == session_id)
-            if after:
-                sub = (
-                    select(SqlFile.created_at)
-                    .where(
-                        SqlFile.workspace_id == current_workspace_id(),
-                        SqlFile.id == after,
-                    )
-                    .scalar_subquery()
-                )
-                ts_cmp = SqlFile.created_at < sub if is_desc else SqlFile.created_at > sub
-                id_cmp = SqlFile.id < after if is_desc else SqlFile.id > after
-                stmt = stmt.where(or_(ts_cmp, and_(SqlFile.created_at == sub, id_cmp)))
-            if before:
-                sub = (
-                    select(SqlFile.created_at)
-                    .where(
-                        SqlFile.workspace_id == current_workspace_id(),
-                        SqlFile.id == before,
-                    )
-                    .scalar_subquery()
-                )
-                ts_cmp = SqlFile.created_at > sub if is_desc else SqlFile.created_at < sub
-                id_cmp = SqlFile.id > before if is_desc else SqlFile.id < before
-                stmt = stmt.where(or_(ts_cmp, and_(SqlFile.created_at == sub, id_cmp)))
-            stmt = stmt.order_by(
-                sort_fn(SqlFile.created_at),
-                sort_fn(SqlFile.id),
-            ).limit(limit + 1)
-            rows = list(session.execute(stmt).scalars().all())
-            has_more = len(rows) > limit
-            if has_more:
-                rows = rows[:limit]
-            entities = [_to_entity(r) for r in rows]
-            return PagedList(
-                data=entities,
-                first_id=entities[0].id if entities else None,
-                last_id=entities[-1].id if entities else None,
-                has_more=has_more,
-            )
+            return _page(session, owner, limit=limit, after=after, before=before, order=order)
+
+    def list_for_project(
+        self,
+        project_id: str,
+        limit: int = 20,
+        after: str | None = None,
+        before: str | None = None,
+        order: str = "desc",
+    ) -> PagedList[StoredFile]:
+        """
+        List a project's files with cursor-based pagination.
+
+        Served by ``ix_files_project_id_created_at``.
+
+        :param project_id: Owning project whose files to list.
+        :param limit: Maximum number of files to return.
+        :param after: Cursor file ID for forward pagination.
+        :param before: Cursor file ID for backward pagination.
+        :param order: Sort direction, ``"desc"`` or ``"asc"``.
+        :returns: A :class:`PagedList` of :class:`StoredFile`.
+        """
+        owner = SqlFile.project_id == normalize_uuid(project_id)
+        with self._session("list_project_files") as session:
+            return _page(session, owner, limit=limit, after=after, before=before, order=order)
 
     def delete(
         self,
         file_id: str,
         session_id: str | None = None,
+        project_id: str | None = None,
     ) -> bool:
         """
         Delete file metadata by ID.
 
-        When ``session_id`` is set, only deletes if the file
-        belongs to that session.
+        When ``session_id`` or ``project_id`` is set, only deletes if
+        the file belongs to that session or project.
 
         :param file_id: Unique file identifier.
-        :param session_id: If set, verify ownership.
+        :param session_id: If set, verify session ownership.
+        :param project_id: If set, verify project ownership.
         :returns: ``True`` if deleted, ``False`` otherwise.
         """
 
         def write(session: Session) -> bool:
             with query_name_scope("omnigent.file_store.select_file_by_id"):
                 row = session.get(SqlFile, (current_workspace_id(), file_id))
-            if not row:
-                return False
-            if session_id is not None and row.session_id != normalize_uuid(session_id):
+            if not row or not _owned_by(row, session_id, project_id):
                 return False
             session.delete(row)
             return True
@@ -294,34 +306,126 @@ class SqlAlchemyFileStore(FileStore):
         :param session_id: Owning session/conversation id.
         :returns: The now-orphaned artifact-store keys to clean up.
         """
+        return self._delete_all(
+            SqlFile.session_id == session_id,
+            transaction_name="delete_session_files",
+            select_name="list_session_files_for_delete",
+        )
+
+    def delete_all_for_project(self, project_id: str) -> builtins.list[str]:
+        """
+        Delete all file metadata for a project.
+
+        :param project_id: Owning project id.
+        :returns: The now-orphaned artifact-store keys to clean up.
+        """
+        return self._delete_all(
+            SqlFile.project_id == normalize_uuid(project_id),
+            transaction_name="delete_project_files",
+            select_name="list_project_files_for_delete",
+        )
+
+    def _delete_all(
+        self, owner: ColumnElement[bool], *, transaction_name: str, select_name: str
+    ) -> builtins.list[str]:
+        """
+        Delete one owner's file rows and report the blobs nothing references any more.
+
+        :param owner: Filter selecting the owner's rows, e.g.
+            ``SqlFile.project_id == project_id``.
+        :param transaction_name: Semantic name of the write transaction, e.g.
+            ``"delete_project_files"``.
+        :param select_name: Semantic name of the row lookup, e.g.
+            ``"list_project_files_for_delete"``.
+        :returns: The now-orphaned artifact-store keys to clean up.
+        """
 
         def write(session: Session) -> builtins.list[str]:
-            stmt = select(SqlFile).where(
-                SqlFile.workspace_id == current_workspace_id(),
-                SqlFile.session_id == session_id,
-            )
-            with query_name_scope("omnigent.file_store.list_session_files_for_delete"):
+            stmt = select(SqlFile).where(SqlFile.workspace_id == current_workspace_id(), owner)
+            with query_name_scope(f"omnigent.file_store.{select_name}"):
                 rows = list(session.execute(stmt).scalars().all())
             blob_keys = {_effective_blob_key(row) for row in rows}
             for row in rows:
                 session.delete(row)
             session.flush()
             # After the rows are gone, a blob is orphaned only if no surviving
-            # row (any session) still references it.
+            # row (any session or project) still references it.
             orphaned: builtins.list[str] = []
             for blob_key in blob_keys:
                 with query_name_scope("omnigent.file_store.count_blob_key_refs"):
                     still_referenced = session.execute(
-                        select(SqlFile.id)
-                        .where(
-                            SqlFile.workspace_id == current_workspace_id(),
-                            func.coalesce(SqlFile.blob_key, SqlFile.id, type_=Uuid16())
-                            == normalize_uuid(blob_key),
-                        )
-                        .limit(1)
+                        select(SqlFile.id).where(_references_blob(blob_key)).limit(1)
                     ).first()
                 if still_referenced is None:
                     orphaned.append(blob_key)
             return orphaned
 
-        return run_write_transaction(self._session_immediate, "delete_session_files", write)
+        return run_write_transaction(self._session_immediate, transaction_name, write)
+
+
+def _page(
+    session: Session,
+    owner: ColumnElement[bool],
+    *,
+    limit: int,
+    after: str | None,
+    before: str | None,
+    order: str,
+) -> PagedList[StoredFile]:
+    """
+    Return one page of an owner's files, newest or oldest first.
+
+    :param session: Open database session.
+    :param owner: Filter selecting the owner's rows, e.g.
+        ``SqlFile.session_id == session_id``.
+    :param limit: Maximum number of files to return.
+    :param after: Cursor file ID for forward pagination.
+    :param before: Cursor file ID for backward pagination.
+    :param order: Sort direction, ``"desc"`` or ``"asc"``.
+    :returns: A :class:`PagedList` of :class:`StoredFile`.
+    """
+    is_desc = order == "desc"
+    sort_fn = desc if is_desc else asc
+    stmt: Select[tuple[SqlFile]] = select(SqlFile).where(
+        SqlFile.workspace_id == current_workspace_id(), owner
+    )
+    if after:
+        stmt = stmt.where(_beyond_cursor(after, older=is_desc))
+    if before:
+        stmt = stmt.where(_beyond_cursor(before, older=not is_desc))
+    stmt = stmt.order_by(sort_fn(SqlFile.created_at), sort_fn(SqlFile.id)).limit(limit + 1)
+    rows = list(session.execute(stmt).scalars().all())
+    has_more = len(rows) > limit
+    if has_more:
+        rows = rows[:limit]
+    entities = [_to_entity(r) for r in rows]
+    return PagedList(
+        data=entities,
+        first_id=entities[0].id if entities else None,
+        last_id=entities[-1].id if entities else None,
+        has_more=has_more,
+    )
+
+
+def _beyond_cursor(cursor: str, *, older: bool) -> ColumnElement[bool]:
+    """
+    Match rows strictly older or newer than the cursor row, by ``(created_at, id)``.
+
+    :param cursor: The cursor file ID.
+    :param older: ``True`` for rows before the cursor, ``False`` for rows after it.
+    :returns: The filter.
+    """
+    cursor_created_at = (
+        select(SqlFile.created_at)
+        .where(SqlFile.workspace_id == current_workspace_id(), SqlFile.id == cursor)
+        .scalar_subquery()
+    )
+    if older:
+        return or_(
+            SqlFile.created_at < cursor_created_at,
+            and_(SqlFile.created_at == cursor_created_at, SqlFile.id < cursor),
+        )
+    return or_(
+        SqlFile.created_at > cursor_created_at,
+        and_(SqlFile.created_at == cursor_created_at, SqlFile.id > cursor),
+    )

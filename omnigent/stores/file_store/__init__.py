@@ -16,12 +16,12 @@ class FileStore(ABC):
     Tracks file metadata (filename, size, content type). Binary
     content is managed separately by :class:`ArtifactStore`.
 
-    All methods accept an optional ``session_id`` to scope
-    operations to a specific session. New callers should pass a
-    session id. ``None`` exists only for historical unscoped rows
-    and low-level tests. When set, ``create`` stamps the file with
-    session ownership, ``get`` and ``delete`` verify ownership, and
-    ``list`` filters to that session's files only.
+    A file belongs to a session (``session_id``) or to a project
+    (``project_id``), never both. ``create`` stamps the owner, ``get``
+    and ``delete`` verify it when given one, and ``list`` /
+    ``list_for_project`` return one owner's files. A row with neither is
+    a historical unscoped ("global") file; new callers always pass an
+    owner, and ``None`` otherwise exists only for low-level tests.
     """
 
     def __init__(self, storage_location: str) -> None:
@@ -43,6 +43,7 @@ class FileStore(ABC):
         file_id: str | None = None,
         blob_key: str | None = None,
         source_metadata: dict[str, Any] | None = None,
+        project_id: str | None = None,
     ) -> StoredFile:
         """
         Record a new file. Generates a unique file_id unless given one.
@@ -66,7 +67,11 @@ class FileStore(ABC):
             metadata about the original upload before any server-side
             transform (e.g. ``{"width", "height"}`` for a downscaled
             image), or ``None`` when there is nothing to record.
+        :param project_id: Owning project for a project file, e.g.
+            ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``. Mutually exclusive
+            with ``session_id``.
         :returns: The newly created :class:`StoredFile`.
+        :raises ValueError: If both ``session_id`` and ``project_id`` are set.
         """
         ...
 
@@ -91,19 +96,22 @@ class FileStore(ABC):
         self,
         file_id: str,
         session_id: str | None = None,
+        project_id: str | None = None,
     ) -> StoredFile | None:
         """
         Return the file metadata, or ``None`` if not found.
 
-        When ``session_id`` is set, only returns the file if it
-        belongs to that session.
+        When ``session_id`` or ``project_id`` is set, only returns the
+        file if it belongs to that session or project.
 
         :param file_id: Unique file identifier,
             e.g. ``"file_abc123"``.
         :param session_id: If set, verify the file belongs to
-            this session. ``None`` returns any file.
+            this session.
+        :param project_id: If set, verify the file belongs to this
+            project. With neither set, any file is returned.
         :returns: The :class:`StoredFile` if found (and owned
-            when session_id is set), otherwise ``None``.
+            when an owner is given), otherwise ``None``.
         """
         ...
 
@@ -128,8 +136,30 @@ class FileStore(ABC):
         :param after: Cursor file ID for forward pagination.
         :param before: Cursor file ID for backward pagination.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param include_unscoped: When ``True``, also return files
-            with ``session_id IS NULL`` (global/unscoped files).
+        :param include_unscoped: When ``True``, also return global
+            files, which belong to no session and no project.
+        :returns: A :class:`PagedList` of :class:`StoredFile`.
+        """
+        ...
+
+    @abstractmethod
+    def list_for_project(
+        self,
+        project_id: str,
+        limit: int = 20,
+        after: str | None = None,
+        before: str | None = None,
+        order: str = "desc",
+    ) -> PagedList[StoredFile]:
+        """
+        List a project's files with cursor-based pagination.
+
+        :param project_id: Owning project whose files to list, e.g.
+            ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
+        :param limit: Maximum number of files to return.
+        :param after: Cursor file ID for forward pagination.
+        :param before: Cursor file ID for backward pagination.
+        :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :returns: A :class:`PagedList` of :class:`StoredFile`.
         """
         ...
@@ -139,17 +169,20 @@ class FileStore(ABC):
         self,
         file_id: str,
         session_id: str | None = None,
+        project_id: str | None = None,
     ) -> bool:
         """
         Delete file metadata.
 
-        When ``session_id`` is set, only deletes if the file
-        belongs to that session. Returns ``False`` if not found
-        or not owned.
+        When ``session_id`` or ``project_id`` is set, only deletes if
+        the file belongs to that session or project. Returns ``False``
+        if not found or not owned.
 
         :param file_id: Unique file identifier.
-        :param session_id: If set, verify ownership before
-            deleting. ``None`` deletes any file.
+        :param session_id: If set, verify session ownership before
+            deleting.
+        :param project_id: If set, verify project ownership before
+            deleting. With neither set, any file is deleted.
         :returns: ``True`` if deleted, ``False`` otherwise.
         """
         ...
@@ -165,6 +198,21 @@ class FileStore(ABC):
         is not returned and therefore survives.
 
         :param session_id: Owning session/conversation id.
+        :returns: The now-orphaned artifact-store keys to clean up.
+        """
+        ...
+
+    @abstractmethod
+    def delete_all_for_project(self, project_id: str) -> builtins.list[str]:
+        """
+        Delete all file metadata for a project.
+
+        Like :meth:`delete_all_for_session`, returns only the artifact-store
+        keys that no surviving row references, so the caller deletes exactly
+        those bytes.
+
+        :param project_id: Owning project id, e.g.
+            ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
         :returns: The now-orphaned artifact-store keys to clean up.
         """
         ...

@@ -14,6 +14,7 @@ import time
 import urllib.parse
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
@@ -64,6 +65,10 @@ from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
+    get_session_owner_id,
+    require_user,
+)
+from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -101,6 +106,7 @@ from omnigent.server.routes._sessions.helpers import (
     _read_upload_capped,
     _require_filesystem_attachment_harness,
     _stored_file_to_resource,
+    _stored_project_file_to_resource,
     require_filesystem_attachment_runtime,
 )
 from omnigent.server.routes._sessions.orchestration import (
@@ -119,6 +125,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.session_pull_request_store import SessionPullRequestLimitError
 
 if TYPE_CHECKING:
@@ -226,6 +233,20 @@ _attachment_upload_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
 )
 
 
+@dataclass(frozen=True)
+class _ProjectAccess:
+    """
+    A project the caller may use for project files, and the owner it was found under.
+
+    :param project_id: The destination project, e.g. ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
+    :param owner_id: The project's owner, e.g. ``"alice@example.com"``; ``None``
+        without authentication.
+    """
+
+    project_id: str
+    owner_id: str | None
+
+
 def _attachment_upload_lock(session_id: str) -> asyncio.Lock:
     """Return the lock serializing one session's attachment quota check and store."""
     lock = _attachment_upload_locks.get(session_id)
@@ -266,6 +287,7 @@ def register_resources_routes(
     host_registry: HostRegistry | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
     pull_request_refresher: server_prs.PullRequestRefresher | None = None,
+    project_store: ProjectStore | None = None,
 ) -> None:
     """Register the resources routes on router."""
     pull_request_store = server_prs.open_store(conversation_store)
@@ -2008,6 +2030,41 @@ def register_resources_routes(
         request: Request, session_id: str, file: UploadFile, *, initial_input: bool = False
     ) -> dict[str, Any]:
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        stored = await _store_uploaded_file(request, file, conv=conv, initial_input=initial_input)
+        resource = _stored_file_to_resource(session_id, stored)
+        _publish_and_persist_resource_event(
+            session_id,
+            "session.resource.created",
+            resource_id=stored.id,
+            resource_type="file",
+            conversation_store=conversation_store,
+            resource=resource,
+        )
+        return resource
+
+    async def _store_uploaded_file(
+        request: Request,
+        file: UploadFile,
+        *,
+        conv: Conversation | None = None,
+        project: _ProjectAccess | None = None,
+        initial_input: bool = False,
+    ) -> StoredFile:
+        """
+        Validate an upload and store it for a session or a project.
+
+        :param request: The incoming request, for the attachment policy.
+        :param file: The multipart upload.
+        :param conv: The destination session, already authorized for edit.
+        :param project: The destination project, already authorized; exactly one
+            of ``conv`` and ``project`` is set.
+        :param initial_input: Whether the upload belongs to a session being created.
+        :returns: The stored file.
+        :raises OmnigentError: 404 when the destination project was deleted
+            during the upload.
+        """
+        session_id = conv.id if conv is not None else None
+        project_id = project.project_id if project is not None else None
         if file_store is None or artifact_store is None:
             raise HTTPException(
                 status_code=501,
@@ -2051,7 +2108,8 @@ def register_resources_routes(
             # Drop the declared type so the file is never stored as text, even
             # when the policy leaves its extension out.
             content_type = _resolve_content_type("application/octet-stream", file.filename)
-        if filesystem_required:
+        if filesystem_required and conv is not None:
+            # Only a session's harness reads attachments from disk.
             if initial_input:
                 # The host does not exist yet; dispatch validates its runtime after provisioning.
                 await _require_filesystem_attachment_harness(conv, file.filename)
@@ -2065,7 +2123,7 @@ def register_resources_routes(
         # Hold the quota check through the store below, so parallel uploads can't
         # all spend the same remaining allowance.
         attachment_lock = (
-            _attachment_upload_lock(session_id)
+            _attachment_upload_lock(session_id or f"project:{project_id}")
             if filesystem_required
             else contextlib.nullcontext()
         )
@@ -2074,6 +2132,7 @@ def register_resources_routes(
                 read_limit = _enforce_filesystem_attachment_policy(
                     [file.filename],
                     session_id=session_id,
+                    project_id=project_id,
                     file_store=file_store,
                 )
             else:
@@ -2134,6 +2193,7 @@ def register_resources_routes(
                 source_metadata = {DELIVERY_KEY: FILESYSTEM_DELIVERY}
             stored = file_store.create(
                 session_id=session_id,
+                project_id=project_id,
                 filename=filename,
                 bytes=len(content),
                 content_type=content_type,
@@ -2144,7 +2204,7 @@ def register_resources_routes(
             except Exception as exc:
                 # Release quota before another upload can acquire the session lock.
                 try:
-                    file_store.delete(stored.id, session_id=session_id)
+                    file_store.delete(stored.id, session_id=session_id, project_id=project_id)
                 except Exception:
                     _logger.warning(
                         "Failed to delete uploaded file row during rollback: session=%s file_id=%s",
@@ -2165,16 +2225,28 @@ def register_resources_routes(
                     "Failed to upload file. Please try again.",
                     code=ErrorCode.INTERNAL_ERROR,
                 ) from exc
-        resource = _stored_file_to_resource(session_id, stored)
-        _publish_and_persist_resource_event(
-            session_id,
-            "session.resource.created",
-            resource_id=stored.id,
-            resource_type="file",
-            conversation_store=conversation_store,
-            resource=resource,
+        if project is not None and not await _project_still_exists(project):
+            # The project was deleted while this file was stored. Its delete may have
+            # run its file sweep before this row existed, so remove the row here.
+            await _discard_file(stored, project_id=project.project_id)
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        return stored
+
+    async def _project_still_exists(project: _ProjectAccess) -> bool:
+        """Whether *project* is still its owner's, read after a project upload stored."""
+        assert project_store is not None
+        found = await asyncio.to_thread(
+            project_store.get, project.project_id, user_id=project.owner_id
         )
-        return resource
+        return found is not None
+
+    async def _discard_file(stored: StoredFile, *, project_id: str) -> None:
+        """Delete a project file row, and its blob once nothing references it."""
+        assert file_store is not None and artifact_store is not None
+        await asyncio.to_thread(file_store.delete, stored.id, project_id=project_id)
+        blob_key = stored.blob_key or stored.id
+        if await asyncio.to_thread(file_store.is_blob_key_orphaned, blob_key):
+            await asyncio.to_thread(artifact_store.delete, blob_key)
 
     async def _upload_initial_file(
         request: Request, session_id: str, file: UploadFile
@@ -2246,6 +2318,17 @@ def register_resources_routes(
                 "File not found",
                 code=ErrorCode.NOT_FOUND,
             )
+        return await _file_content_response(request, stored)
+
+    async def _file_content_response(request: Request, stored: StoredFile) -> Response:
+        """
+        Serve a stored file's bytes as a forced download.
+
+        :param request: The incoming request, for ``If-None-Match``.
+        :param stored: The file, already authorized for the caller.
+        :returns: The bytes, or 304 when the caller's cached copy is current.
+        """
+        assert artifact_store is not None
         # The bytes live under blob_key (== id for own uploads; the source's
         # blob for a fork copy that shares it). Content is immutable per blob,
         # so a still-valid cached copy can be answered before ever touching the
@@ -2338,6 +2421,203 @@ def register_resources_routes(
             "object": "session.resource.deleted",
             "deleted": True,
         }
+
+    # ── Project files: shared by every session filed in a project ──
+
+    def _require_project_file_store() -> FileStore:
+        """The file store, or 501 when this server can't store project files."""
+        if file_store is None or artifact_store is None or project_store is None:
+            raise HTTPException(status_code=501, detail="file store not configured")
+        return file_store
+
+    async def _owned_project_access(request: Request, project_id: str) -> _ProjectAccess:
+        """
+        The caller's own project, for the owner's project file routes.
+
+        :param request: The incoming request, for the caller's identity.
+        :param project_id: The project, e.g. ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
+        :returns: The project and its owner.
+        :raises OmnigentError: 404 when the project is missing or someone else's.
+        """
+        _require_project_file_store()
+        assert project_store is not None
+        user_id = require_user(request, auth_provider)
+        project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        return _ProjectAccess(project_id=project.id, owner_id=user_id)
+
+    async def _session_project_access(
+        request: Request, session_id: str, required_level: int
+    ) -> _ProjectAccess:
+        """
+        The project a session's agent may use: the one the session is filed in.
+
+        Checked on every request: the caller's level on the session, the session's
+        project (a sub-agent uses its root session's), and that the project still
+        exists and belongs to the session's owner.
+
+        :param request: The incoming request, for the caller's identity.
+        :param session_id: The calling session, e.g. ``"conv_abc123"``.
+        :param required_level: Minimum level on the session, e.g. ``LEVEL_EDIT``.
+        :returns: The project and its owner.
+        :raises OmnigentError: 404 when the session is in no project, or its
+            project is gone or not its owner's.
+        """
+        _require_project_file_store()
+        assert project_store is not None
+        conv = await _validate_session(session_id, request, required_level)
+        project_id = conv.project_id
+        if project_id is None and conv.root_conversation_id != conv.id:
+            root = await asyncio.to_thread(
+                conversation_store.get_conversation, conv.root_conversation_id
+            )
+            project_id = root.project_id if root is not None else None
+        if project_id is None:
+            raise OmnigentError("This session is not in a project", code=ErrorCode.NOT_FOUND)
+        owner_id = (
+            await asyncio.to_thread(
+                get_session_owner_id, conv.root_conversation_id, permission_store
+            )
+            if auth_provider is not None
+            else None
+        )
+        project = await asyncio.to_thread(project_store.get, project_id, user_id=owner_id)
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        return _ProjectAccess(project_id=project.id, owner_id=owner_id)
+
+    async def _project_files_page(
+        project_id: str, *, limit: int, after: str | None, before: str | None, order: str
+    ) -> dict[str, Any]:
+        """One page of a project's files, as a list response."""
+        stores = _require_project_file_store()
+        page = await asyncio.to_thread(
+            stores.list_for_project,
+            project_id,
+            limit=limit,
+            after=after,
+            before=before,
+            order=order,
+        )
+        return {
+            "object": "list",
+            "data": [_stored_project_file_to_resource(project_id, f) for f in page.data],
+            "first_id": page.first_id,
+            "last_id": page.last_id,
+            "has_more": page.has_more,
+        }
+
+    async def _project_file(project_id: str, file_id: str) -> StoredFile:
+        """A project's file, or 404."""
+        stores = _require_project_file_store()
+        stored = await asyncio.to_thread(stores.get, file_id, project_id=project_id)
+        if stored is None:
+            raise OmnigentError("File not found", code=ErrorCode.NOT_FOUND)
+        return stored
+
+    @router.get("/projects/{project_id}/resources/files", response_model=None)
+    async def list_project_files(
+        request: Request,
+        project_id: str,
+        limit: int = Query(default=20, ge=1, le=1000),
+        after: str | None = Query(default=None),
+        before: str | None = Query(default=None),
+        order: str = Query(default="desc", pattern="^(asc|desc)$"),
+    ) -> dict[str, Any]:
+        """List one of the caller's projects' files."""
+        project = await _owned_project_access(request, project_id)
+        return await _project_files_page(
+            project.project_id, limit=limit, after=after, before=before, order=order
+        )
+
+    @router.post(
+        "/projects/{project_id}/resources/files",
+        status_code=201,
+        response_model=None,
+        dependencies=[Depends(require_trusted_origin)],
+    )
+    async def upload_project_file(
+        request: Request,
+        project_id: str,
+        file: Annotated[UploadFile, File(...)],
+    ) -> dict[str, Any]:
+        """Upload a file to one of the caller's projects."""
+        project = await _owned_project_access(request, project_id)
+        stored = await _store_uploaded_file(request, file, project=project)
+        return _stored_project_file_to_resource(project.project_id, stored)
+
+    @router.get("/projects/{project_id}/resources/files/{file_id}", response_model=None)
+    async def get_project_file(request: Request, project_id: str, file_id: str) -> dict[str, Any]:
+        """Return a project file's metadata."""
+        project = await _owned_project_access(request, project_id)
+        stored = await _project_file(project.project_id, file_id)
+        return _stored_project_file_to_resource(project.project_id, stored)
+
+    @router.get("/projects/{project_id}/resources/files/{file_id}/content", response_model=None)
+    async def get_project_file_content(
+        request: Request, project_id: str, file_id: str
+    ) -> Response:
+        """Download a project file's bytes."""
+        project = await _owned_project_access(request, project_id)
+        return await _file_content_response(
+            request, await _project_file(project.project_id, file_id)
+        )
+
+    @router.delete("/projects/{project_id}/resources/files/{file_id}", response_model=None)
+    async def delete_project_file(
+        request: Request, project_id: str, file_id: str
+    ) -> dict[str, Any]:
+        """Delete a project file, and its bytes once no other row references them."""
+        project = await _owned_project_access(request, project_id)
+        await _discard_file(
+            await _project_file(project.project_id, file_id), project_id=project.project_id
+        )
+        return {"id": file_id, "object": "project.resource.deleted", "deleted": True}
+
+    @router.get("/sessions/{session_id}/resources/project-files", response_model=None)
+    async def list_session_project_files(
+        request: Request,
+        session_id: str,
+        limit: int = Query(default=20, ge=1, le=1000),
+        after: str | None = Query(default=None),
+        before: str | None = Query(default=None),
+        order: str = Query(default="desc", pattern="^(asc|desc)$"),
+    ) -> dict[str, Any]:
+        """List the files of the project this session is filed in."""
+        project = await _session_project_access(request, session_id, LEVEL_READ)
+        return await _project_files_page(
+            project.project_id, limit=limit, after=after, before=before, order=order
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/project-files",
+        status_code=201,
+        response_model=None,
+        dependencies=[Depends(require_trusted_origin)],
+    )
+    async def upload_session_project_file(
+        request: Request,
+        session_id: str,
+        file: Annotated[UploadFile, File(...)],
+    ) -> dict[str, Any]:
+        """Upload a file to the project this session is filed in."""
+        project = await _session_project_access(request, session_id, LEVEL_EDIT)
+        stored = await _store_uploaded_file(request, file, project=project)
+        return _stored_project_file_to_resource(project.project_id, stored)
+
+    @router.get(
+        "/sessions/{session_id}/resources/project-files/{file_id}/content",
+        response_model=None,
+    )
+    async def get_session_project_file_content(
+        request: Request, session_id: str, file_id: str
+    ) -> Response:
+        """Download a file of the project this session is filed in."""
+        project = await _session_project_access(request, session_id, LEVEL_READ)
+        return await _file_content_response(
+            request, await _project_file(project.project_id, file_id)
+        )
 
     @router.post(
         "/sessions/{session_id}/resources/files:copy",

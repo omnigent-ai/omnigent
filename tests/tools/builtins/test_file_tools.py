@@ -9,9 +9,10 @@ from typing import Any
 
 import pytest
 
-from omnigent.tools.base import ToolContext
+from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins.download_file import DownloadFileTool
 from omnigent.tools.builtins.list_files import ListFilesTool
+from omnigent.tools.builtins.upload_file import UploadFileTool
 
 # ── Stubs ─────────────────────────────────────────────────
 
@@ -30,6 +31,7 @@ class _FakeFile:
         for global (unscoped) files.
     :param blob_key: Artifact-store key for the bytes, or ``None`` to
         read them under ``id`` (matches :class:`StoredFile`).
+    :param project_id: Owning project for a project file, or ``None``.
     """
 
     id: str
@@ -39,6 +41,7 @@ class _FakeFile:
     created_at: int
     session_id: str | None = None
     blob_key: str | None = None
+    project_id: str | None = None
 
 
 @dataclass
@@ -706,3 +709,59 @@ def test_download_file_allows_global_file(
     assert "error" not in result
     assert result["filename"] == "shared.txt"
     assert result["bytes"] == len(content)
+
+
+def test_download_file_treats_a_project_file_as_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_ctx: ToolContext,
+) -> None:
+    """A project file has no session, but it is not a global file any session can read."""
+    content = b"project plan"
+    monkeypatch.setattr(
+        "omnigent.runtime.get_file_store",
+        lambda: _FakeFileStore(
+            [
+                _FakeFile(
+                    "file_project",
+                    "plan.md",
+                    len(content),
+                    "text/markdown",
+                    1000,
+                    project_id="7d3b1f4e2a9c4b6d8e0f1a2b3c4d5e6f",
+                ),
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.get_artifact_store",
+        lambda: _FakeArtifactStore({"file_project": content}),
+    )
+
+    result = json.loads(DownloadFileTool().invoke('{"file_id": "file_project"}', tool_ctx))
+
+    assert "not found" in result["error"].lower()
+
+
+@pytest.mark.parametrize("tool", [UploadFileTool, ListFilesTool, DownloadFileTool])
+def test_file_tools_offer_a_project_scope(tool: type[Tool]) -> None:
+    """Each file tool takes ``scope`` and says what the project scope shares."""
+    function = tool().get_schema()["function"]
+
+    assert function["parameters"]["properties"]["scope"]["enum"] == ["session", "project"]
+    assert "scope" not in function["parameters"]["required"]
+    assert "project" in function["description"]
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        (UploadFileTool, '{"path": "plan.md", "scope": "project"}'),
+        (ListFilesTool, '{"scope": "project"}'),
+        (DownloadFileTool, '{"file_id": "file_project", "scope": "project"}'),
+    ],
+)
+def test_in_process_file_tools_refuse_the_project_scope(
+    tool: type[Tool], arguments: str, tool_ctx: ToolContext
+) -> None:
+    """Only the runner, through the server's checks, reaches a project's files."""
+    assert "only available in agent sessions" in tool().invoke(arguments, tool_ctx)

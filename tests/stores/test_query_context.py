@@ -144,6 +144,20 @@ def test_file_store_names_each_application_query(db_uri: str) -> None:
             "omnigent.file_store.count_blob_key_refs",
         ]
 
+        project_id = "7d3b1f4e2a9c4b6d8e0f1a2b3c4d5e6f"
+        file_store.create("plan.md", 1, project_id=project_id)
+        query_names.clear()
+        file_store.list_for_project(project_id)
+        assert query_names == ["omnigent.file_store.list_project_files"]
+
+        query_names.clear()
+        file_store.delete_all_for_project(project_id)
+        assert query_names == [
+            "omnigent.file_store.list_project_files_for_delete",
+            "omnigent.file_store.delete_project_files",
+            "omnigent.file_store.count_blob_key_refs",
+        ]
+
 
 def test_conversation_store_names_create_and_get_queries(
     split_db_conversation_store: SqlAlchemyConversationStore,

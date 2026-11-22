@@ -14,17 +14,26 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.tools.base import Tool, ToolContext
-from omnigent.tools.builtins._arguments import parse_json_object_arguments
+from omnigent.tools.builtins._arguments import (
+    FILE_SCOPE_PARAMETER,
+    PROJECT_FILE_SCOPE,
+    parse_file_scope,
+    parse_json_object_arguments,
+)
+
+_DESCRIPTION = (
+    "Upload a file from the workspace so the user can download it. "
+    "Takes a relative path within the workspace (e.g. 'output/chart.png'). "
+    "Returns a file_id that the user's client can use to download the file. "
+    "With scope 'project', the file goes to this session's project instead, "
+    "where every session in the project can read it."
+)
 
 _SCHEMA: dict[str, Any] = {
     "type": "function",
     "function": {
         "name": "sys_upload_file",
-        "description": (
-            "Upload a file from the workspace so the user can download it. "
-            "Takes a relative path within the workspace (e.g. 'output/chart.png'). "
-            "Returns a file_id that the user's client can use to download the file."
-        ),
+        "description": _DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": {
@@ -35,6 +44,7 @@ _SCHEMA: dict[str, Any] = {
                         "e.g. 'output/chart.png' or 'results.csv'."
                     ),
                 },
+                "scope": FILE_SCOPE_PARAMETER,
             },
             "required": ["path"],
         },
@@ -84,11 +94,7 @@ class UploadFileTool(Tool):
         """
         :returns: Human-readable description of the tool.
         """
-        return (
-            "Upload a file from the workspace so the user can download it. "
-            "Takes a relative path within the workspace (e.g. 'output/chart.png'). "
-            "Returns a file_id that the user's client can use to download the file."
-        )
+        return _DESCRIPTION
 
     def get_schema(self) -> dict[str, Any]:
         """
@@ -113,6 +119,11 @@ class UploadFileTool(Tool):
         rel_path = parsed.get("path", "")
         if not isinstance(rel_path, str) or not rel_path:
             return "Error: path must be a non-empty string"
+        scope = parse_file_scope(parsed)
+        if scope is None:
+            return "Error: scope must be 'session' or 'project'"
+        if scope == PROJECT_FILE_SCOPE:
+            return "Error: project files are only available in agent sessions"
 
         if ctx.workspace is None:
             return "Error: no workspace available"
