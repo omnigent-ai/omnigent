@@ -151,30 +151,24 @@ def test_the_sidebar_and_the_backdrop_beside_the_chat_are_one_surface(
 
 
 @pytest.mark.parametrize("scheme", ["light", "dark"])
-def test_without_floating_panes_the_layout_stays_edge_to_edge(
+def test_without_floating_panes_the_layout_stays_edge_to_edge_and_the_sidebar_paints_the_same(
     page: Page, seeded_session: tuple[str, str], scheme: str
 ) -> None:
-    """With the flag off the chat has no card, and the dark sidebar keeps its edge."""
-    base_url, session_id = seeded_session
-    _open(page, base_url, session_id, scheme=scheme, floating=False)
-    geometry = _geometry(page)
-    assert geometry["chatRadius"] == "0px"
-    assert geometry["chatBorder"] == "0px"
-    assert geometry["sidebarBorder"] == ("1px" if scheme == "dark" else "0px")
-    _capture(page, f"edge-to-edge-{scheme}")
-
-
-@pytest.mark.parametrize("scheme", ["light", "dark"])
-def test_the_sidebar_paints_as_it_does_without_floating_panes(
-    page: Page, seeded_session: tuple[str, str], scheme: str
-) -> None:
-    """The sidebar's own surface is the same either way, so its rows keep their contrast."""
+    """With the flag off the chat has no card and the dark sidebar keeps its edge; the
+    sidebar's own surface is the same either way, so its rows keep their contrast."""
     base_url, session_id = seeded_session
     regions: list[Image.Image] = []
     for floating in (True, False):
         _open(page, base_url, session_id, scheme=scheme, floating=floating)
-        sidebar_right = round(_geometry(page)["sidebarRight"])
-        image = _capture(page, f"sidebar-{scheme}-{'floating' if floating else 'flat'}")
+        geometry = _geometry(page)
+        if not floating:
+            assert geometry["chatRadius"] == "0px"
+            assert geometry["chatBorder"] == "0px"
+            assert geometry["sidebarBorder"] == ("1px" if scheme == "dark" else "0px")
+        sidebar_right = round(geometry["sidebarRight"])
+        image = _capture(
+            page, f"sidebar-{scheme}-floating" if floating else f"edge-to-edge-{scheme}"
+        )
         # The empty lower part of the sidebar, clear of its rows and its edge.
         regions.append(image.crop((16, 760, sidebar_right - 16, 860)))
     floating_region, flat_region = regions
@@ -185,14 +179,14 @@ def test_the_sidebar_paints_as_it_does_without_floating_panes(
     assert worst <= _MAX_STEP, f"the sidebar paints up to {worst} differently"
 
 
-@pytest.mark.parametrize("scheme", ["light", "dark"])
 def test_the_chat_card_stays_rounded_after_switching_sessions(
-    page: Page, seeded_session_pair: tuple[str, str, str], scheme: str
+    page: Page, seeded_session_pair: tuple[str, str, str]
 ) -> None:
-    """Picking another session in the sidebar and back, in place, keeps the chat's card."""
+    """Picking another session in the sidebar and back, in place, keeps the chat's card. The
+    switch exercises no theme rule, so one scheme covers it."""
     base_url, first, second = seeded_session_pair
     page.add_init_script("window.__documentLoadMarker = crypto.randomUUID();")
-    _open(page, base_url, first, scheme=scheme, floating=True)
+    _open(page, base_url, first, scheme="light", floating=True)
     load_marker = page.evaluate("window.__documentLoadMarker")
     for session_id in (second, first):
         page.locator(f'a[href="/c/{session_id}"]').click()
