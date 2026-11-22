@@ -150,6 +150,12 @@ def test_ticket_pages_seek_indexes_without_sorting(ticket_engine):
             "ix_project_ticket_events_notification",
         ),
         (
+            "project_ticket_events",
+            "(workspace_id, project_id, ticket_id, id) > (:workspace, :project, :ticket, :id)",
+            "workspace_id, project_id, ticket_id, id",
+            "sqlite_autoindex_project_ticket_events_1",
+        ),
+        (
             "project_ticket_sessions",
             f"{ticket} AND session_id > :id",
             "session_id",
@@ -281,7 +287,7 @@ def test_note_migration_preserves_text_metadata_and_retries_without_duplicates(
     tickets.update(
         project.id,
         history_ticket["id"],
-        UpdateTicket(lead_session_id=actor.session_id, labels=[{"key": "needs-human"}]),
+        UpdateTicket(labels=[{"key": "needs-human"}]),
         actor,
     )
     tickets.link_ticket(project.id, history_ticket["id"], snapshot_ticket["id"], "attach", actor)
@@ -463,6 +469,241 @@ def test_note_migration_preserves_text_metadata_and_retries_without_duplicates(
                 assert [
                     dict(row) for row in connection.execute(sa.select(table)).mappings()
                 ] == after[table.name]
+    finally:
+        engine.dispose()
+        clear_engine_cache()
+
+
+@pytest.mark.parametrize("interruption", [None, "page", "column"])
+def test_response_field_removal_preserves_other_data_and_retries(tmp_path, interruption):
+    from omnigent.db.envelope import open_envelope
+    from omnigent.entities.project_ticket import (
+        CommentOnTicket,
+        CreateTicket,
+        TicketActor,
+        UpdateTicket,
+        UpdateTicketStages,
+    )
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+    from omnigent.stores.project_ticket_store import ProjectTicketStore
+
+    uri = f"sqlite:///{tmp_path / 'field-removal.db'}"
+    engine = get_or_create_engine(uri)
+    config = _build_alembic_config(uri)
+    actor = TicketActor("owner", uuid4().hex, uuid4().hex)
+    projects = SqlAlchemyProjectStore(uri)
+    project, other = [projects.create(uuid4().hex, name, actor.user_id) for name in ("A", "B")]
+    tickets = ProjectTicketStore(uri)
+    tickets.update_stages(
+        project.id,
+        UpdateTicketStages(
+            stages=[
+                {"id": "triage", "name": "Triage", "instructions": "Read evidence"},
+                {"id": "shipped", "name": "Shipped"},
+            ]
+        ),
+        actor,
+    )
+    records = [
+        tickets.create(owner.id, CreateTicket(title=title, description="Keep the scope"), actor)
+        for owner, title in ((project, "Work"), (project, "Related"), (other, "Other work"))
+    ]
+    main, related, _ = records
+    tickets.link_session(
+        project.id, main["id"], actor.session_id, "attach", actor, involvement="Stage owner"
+    )
+    tickets.link_ticket(project.id, main["id"], related["id"], "attach", actor)
+    tickets.update(
+        project.id,
+        main["id"],
+        UpdateTicket(stage_id="shipped", labels=[{"key": "needs-human", "value": "decision"}]),
+        actor,
+    )
+    prose = "**Evidence**\n\nKeep café 🦊 and the authored `lead_session_id` text.\n"
+    tickets.comment(
+        project.id,
+        main["id"],
+        CommentOnTicket(text=prose, outputs=[{"type": "link", "url": "https://example.com/work"}]),
+        actor,
+    )
+    cases = [
+        (1, {"lead_session_id": actor.session_id}, None),
+        (1, {"changes": {"lead_session_id": None}}, None),
+        (
+            1,
+            {"changes": {"lead_session_id": actor.session_id, "plan": prose, "tags": []}},
+            {"changes": {"plan": prose, "tags": []}},
+        ),
+        (
+            1,
+            {
+                "action": "remove",
+                "session_id": actor.session_id,
+                "changes": {"lead_session_id": None},
+            },
+            {"action": "remove", "session_id": actor.session_id},
+        ),
+        (2, {"lead_session_id": actor.session_id, "text": prose}, {"text": prose}),
+        (0, {"lead_session_id": actor.session_id}, {}),
+        (
+            1,
+            {
+                "lead_session_id": None,
+                "changes": {"lead_session_id": actor.session_id, "description": prose},
+            },
+            {"changes": {"description": prose}},
+        ),
+    ]
+    event_table = SqlProjectTicketEvent.__table__
+    original_tables = (*TABLES, SqlProject.__table__)
+
+    def snapshot(connection):
+        return {
+            table.name: list(
+                connection.exec_driver_sql(
+                    f"SELECT * FROM {table.name} "
+                    f"ORDER BY {', '.join(table.primary_key.columns.keys())}"
+                ).mappings()
+            )
+            for table in original_tables
+        }
+
+    expected_payloads = {}
+    try:
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, "2c3d4e5f6a7b")
+            legacy = sa.Table("project_tickets", sa.MetaData(), autoload_with=connection)
+            for record in records:
+                connection.execute(
+                    legacy.update()
+                    .where(legacy.c.id == bytes.fromhex(record["id"]))
+                    .values(lead_session_id=bytes.fromhex(actor.session_id))
+                )
+            for offset in range(110):
+                record = records[offset % len(records)]
+                kind, payload, expected = cases[offset % len(cases)]
+                event_id = uuid4().hex
+                expected_payloads[bytes.fromhex(event_id)] = expected
+                connection.execute(
+                    event_table.insert().values(
+                        workspace_id=0,
+                        project_id=record["project_id"],
+                        ticket_id=record["id"],
+                        id=event_id,
+                        position=100 + offset,
+                        kind=kind,
+                        user_id=actor.user_id,
+                        session_id=actor.session_id,
+                        agent_id=actor.agent_id,
+                        payload=payload,
+                        created_at=1000 + offset,
+                        notification_state=offset % 3,
+                    )
+                )
+            for record in records:
+                connection.execute(
+                    legacy.update()
+                    .where(legacy.c.id == bytes.fromhex(record["id"]))
+                    .values(next_event_position=210)
+                )
+            before = snapshot(connection)
+
+        mutations = 0
+
+        def interrupt_cleanup(_conn, _cursor, statement, _parameters, _context, _many):
+            nonlocal mutations
+            if statement.startswith(
+                ("UPDATE project_ticket_events", "DELETE FROM project_ticket_events")
+            ):
+                mutations += 1
+                if interruption == "page" and mutations == 101:
+                    raise RuntimeError("Interrupted field cleanup")
+            if interruption == "column" and statement.startswith(
+                "ALTER TABLE project_tickets DROP COLUMN"
+            ):
+                raise RuntimeError("Interrupted field cleanup")
+
+        if interruption:
+            sa.event.listen(engine, "after_cursor_execute", interrupt_cleanup)
+            try:
+                with pytest.raises(RuntimeError, match="Interrupted field cleanup"):
+                    with engine.connect() as connection:
+                        config.attributes["connection"] = connection
+                        command.upgrade(config, "head")
+            finally:
+                sa.event.remove(engine, "after_cursor_execute", interrupt_cleanup)
+            with engine.connect() as connection:
+                assert (
+                    connection.scalar(sa.text("SELECT version_num FROM alembic_version"))
+                    == "2c3d4e5f6a7b"
+                )
+                partial = connection.execute(
+                    sa.select(event_table.c.id, event_table.c.payload)
+                ).all()
+                remaining = sum(
+                    "lead_session_id" in row.payload
+                    or "lead_session_id" in row.payload.get("changes", {})
+                    for row in partial
+                )
+                assert 0 < remaining < 110 if interruption == "page" else remaining == 0
+            assert (
+                "lead_session_id"
+                in {col["name"] for col in sa.inspect(engine).get_columns("project_tickets")}
+            ) == (interruption == "page")
+
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "head")
+        assert "lead_session_id" not in {
+            col["name"] for col in sa.inspect(engine).get_columns("project_tickets")
+        }
+        with engine.connect() as connection:
+            after = snapshot(connection)
+        assert after["project_tickets"] == [
+            {key: value for key, value in row.items() if key != "lead_session_id"}
+            for row in before["project_tickets"]
+        ]
+        for table in (
+            SqlProject.__table__,
+            SqlProjectTicketSession.__table__,
+            SqlProjectTicketLink.__table__,
+        ):
+            assert after[table.name] == before[table.name]
+        surviving = {row["id"]: dict(row) for row in after[event_table.name]}
+        removed = {event_id for event_id, payload in expected_payloads.items() if payload is None}
+        assert set(surviving) == {row["id"] for row in before[event_table.name]} - removed
+        for original in before[event_table.name]:
+            event_id = original["id"]
+            if event_id in removed:
+                continue
+            row = surviving[event_id]
+            if event_id not in expected_payloads:
+                assert row == original
+            else:
+                assert open_envelope(row["payload"]) == expected_payloads[event_id]
+                assert {key: value for key, value in row.items() if key != "payload"} == {
+                    key: value for key, value in original.items() if key != "payload"
+                }
+
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, "2c3d4e5f6a7b")
+            assert (
+                connection.scalar(
+                    sa.text(
+                        "SELECT COUNT(*) FROM project_tickets WHERE lead_session_id IS NOT NULL"
+                    )
+                )
+                == 0
+            )
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "head")
+            assert snapshot(connection) == after
+        page = tickets.events(project.id, main["id"], user_id=actor.user_id, after=99)
+        assert page["last_position"] > 99
+        assert all(entry["position"] >= 100 for entry in page["data"])
     finally:
         engine.dispose()
         clear_engine_cache()
