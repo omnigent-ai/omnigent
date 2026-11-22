@@ -177,7 +177,7 @@ function toolQuery(item: ToolCallItem, key: string, call: QueryCall): TurnQuery 
     const recorded = readResult(item.output);
     const parsed = parseShellToolOutput(recorded.text, call.outputFormat);
     // A shell's own output may say anything; only its exit status or a harness flag is a failure.
-    let failure = recorded.flagged;
+    let failure = recorded.flagged ?? sysOsShellRefusal(recorded.text, call.outputFormat);
     if (parsed.timedOut) failure = "Timed out";
     else if (parsed.exitCode !== null && parsed.exitCode !== 0) failure = `Exit ${parsed.exitCode}`;
     const status = callStatus(item.state, failure);
@@ -192,6 +192,16 @@ function toolQuery(item: ToolCallItem, key: string, call: QueryCall): TurnQuery 
       : callStatus(item.state, failure);
   const size = call.language === "sql" ? sqlResultSize(parsed) : lineCount(parsed.text);
   return { ...base, ...status, resultSize: sizeUnlessFailed(status, size) };
+}
+
+/** `sys_os_shell`'s own error when it ran no command: an `error` and neither output stream. */
+function sysOsShellRefusal(text: string, format: QueryCall["outputFormat"]): string | null {
+  if (format !== "sys-os-json") return null;
+  const parsed = parseToolOutput(text);
+  if (parsed.kind !== "json" || !isRecord(parsed.value)) return null;
+  const { stdout, stderr, error } = parsed.value;
+  if (typeof stdout === "string" || typeof stderr === "string") return null;
+  return typeof error === "string" && error.length > 0 ? error : null;
 }
 
 function sizeUnlessFailed(status: { status: TurnCallStatus }, size: string): string | null {

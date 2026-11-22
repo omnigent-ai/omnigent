@@ -111,6 +111,59 @@ describe("collectTurnWork", () => {
     ]);
   });
 
+  it("reads claude-sdk's bare sys_os_shell and its raw JSON result", () => {
+    const result = (fields: Record<string, unknown>) =>
+      JSON.stringify({
+        stdout: "",
+        stderr: "",
+        timed_out: false,
+        shell: "bash",
+        cwd: "/w",
+        ...fields,
+      });
+    const failed = result({
+      stderr: "failed",
+      exit_code: 2,
+      error: "Command exited with status 2: failed",
+    });
+    const timedOut = result({ stdout: "partial\n", exit_code: null, timed_out: true, error: "x" });
+    const refusal = "tool 'sys_os_shell' is not enabled for this agent";
+    const refused = JSON.stringify({ error: refusal });
+    const work = collectTurnWork([
+      tool("fail", "sys_os_shell", { command: "psql -c 'select 1'" }, failed),
+      tool("ok", "sys_os_shell", { command: "ls" }, result({ stdout: "a\nb\n", exit_code: 0 })),
+      tool("slow", "sys_os_shell", { command: "sleep 99" }, timedOut),
+      // The tool's own refusal carries no stream, unlike a command that prints one.
+      tool("refused", "sys_os_shell", { command: "ls" }, refused),
+      tool(
+        "relayed",
+        "mcp__omnigent__sys_os_shell",
+        { command: "ls" },
+        JSON.stringify([{ type: "text", text: refused }]),
+      ),
+      tool(
+        "printed",
+        "sys_os_shell",
+        { command: "cat" },
+        result({ stdout: refused, exit_code: 0 }),
+      ),
+    ]);
+    expect(work.queries).toMatchObject([
+      {
+        language: "shell",
+        text: "psql -c 'select 1'",
+        status: "failed",
+        error: "Exit 2",
+        resultSize: null,
+      },
+      { language: "shell", text: "ls", status: "completed", error: null, resultSize: "2 lines" },
+      { status: "failed", error: "Timed out", resultSize: null },
+      { status: "failed", error: refusal, resultSize: null },
+      { status: "failed", error: refusal, resultSize: null },
+      { status: "completed", error: null, resultSize: "1 line" },
+    ]);
+  });
+
   it("reports a tool's own error output and no result size", () => {
     const work = collectTurnWork([
       tool("bad", "query", { sql: "SELECT * FROM missing" }, "Error: table not found"),
