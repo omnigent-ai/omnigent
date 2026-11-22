@@ -1,7 +1,7 @@
 """add gadget_shares table
 
 Revision ID: e4c7a91b2d3f
-Revises: d3bda6dbade3
+Revises: 5ab01aaca219
 Create Date: 2026-11-19 00:00:00.000000
 
 Adds ``gadget_shares``, one row per user or group a gadget is shared with, at
@@ -14,7 +14,7 @@ application code that writes it. Rollout and rollback order:
 - The upgrade runs at startup. A server started against the upgraded database
   needs a build that knows this revision; older builds refuse to start.
 - To roll back to a build without this revision, first downgrade to
-  ``d3bda6dbade3`` with a build that knows it. The downgrade drops the table and
+  ``5ab01aaca219`` with a build that knows it. The downgrade drops the table and
   any shares in it, so it is safe only before the first share is saved.
 
 There are no foreign-key constraints (schema Rule R032).
@@ -30,7 +30,7 @@ from alembic import op
 from omnigent.db.db_models import Uuid16
 
 revision: str = "e4c7a91b2d3f"
-down_revision: str | None = "d3bda6dbade3"
+down_revision: str | None = "5ab01aaca219"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 # Dialects that store a value of any type in any column, and ignore VARCHAR lengths.

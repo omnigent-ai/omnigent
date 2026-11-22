@@ -1,12 +1,14 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
-import type { ComponentProps, ReactNode } from "react";
+import { type ComponentProps, type ReactNode, useState } from "react";
 
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import * as commandPaletteModule from "./CommandPalette";
 import { CommandPalette } from "./CommandPalette";
+import type { WorkspaceHistoryFacts } from "./workspaceCommands/model";
+import { useWorkspaceHistoryCommands } from "./workspaceCommands/useWorkspaceHistoryCommands";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({
@@ -104,7 +106,11 @@ beforeEach(() => {
   setSessions([]);
   setSearchGroups({});
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  // QuickPick records accepted commands under Recent; a later case starts without them.
+  localStorage.clear();
+});
 
 /** Every non-empty live region's text, so both palettes' status messages read the same. */
 const announced = () =>
@@ -646,6 +652,21 @@ describe("CommandPalette — mobile full-screen sheet", () => {
     expect(screen.getByLabelText("Close search")).toBeTruthy();
   });
 
+  it("pins the mobile sheet to the top of the visible viewport in the iOS app", () => {
+    // The iOS app's dialogs center on the keyboard-aware viewport inline; the sheet must not.
+    vi.stubGlobal("omnigentNative", { kind: "ios" });
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    setMobile(true);
+    renderPalette();
+
+    const style = (dialogContent() as HTMLElement | null)?.style;
+    expect(style?.top).toBe("0px");
+    expect(style?.height).toBe("var(--omnigent-viewport-height, 100dvh)");
+    expect(style?.maxHeight).toBe("var(--omnigent-viewport-height, 100dvh)");
+  });
+
   it("keeps the centered dialog and shows no close button on desktop", () => {
     setMobile(false);
     renderPalette();
@@ -1164,4 +1185,132 @@ describe("CommandPalette — empty state", () => {
 
     expect(screen.getByText("No results found")).toBeTruthy();
   });
+});
+
+describe("CommandPalette — commands a mounted feature offers", () => {
+  const BACK_ONLY: WorkspaceHistoryFacts = {
+    back: { target: "Files", waitingForPage: false },
+    forward: { target: null, waitingForPage: false },
+  };
+
+  const FORWARD_ONLY: WorkspaceHistoryFacts = {
+    back: { target: null, waitingForPage: false },
+    forward: { target: "Files", waitingForPage: false },
+  };
+
+  /** The tabs sidebar's Back and Forward, registered as its host registers them. */
+  function WorkspaceHistory({ go, facts }: { go: () => void; facts: WorkspaceHistoryFacts }) {
+    useWorkspaceHistoryCommands({ conversationId: "conv_a", facts, go }, true);
+    return null;
+  }
+
+  /** A palette opened from a button. */
+  function OpenedPalette({
+    go,
+    facts = BACK_ONLY,
+  }: {
+    go: () => void;
+    facts?: WorkspaceHistoryFacts;
+  }) {
+    const [open, setOpen] = useState(false);
+    return (
+      <>
+        <button type="button" onClick={() => setOpen(true)}>
+          Open palette
+        </button>
+        <button type="button">Where the command moves focus</button>
+        <WorkspaceHistory go={go} facts={facts} />
+        <CommandPalette
+          open={open}
+          onOpenChange={setOpen}
+          onToggleLeftSidebar={vi.fn()}
+          onToggleRightSidebar={vi.fn()}
+        />
+      </>
+    );
+  }
+
+  const withSidebarFlag = (enabled: boolean) =>
+    serverInfo.mockReturnValue({
+      session_search_scope: true,
+      features: { workspace_sidebar_v2: enabled },
+    });
+
+  function openPalette(go: () => void, facts?: WorkspaceHistoryFacts) {
+    render(<OpenedPalette go={go} facts={facts} />, { wrapper: withQueryClient() });
+    const opener = screen.getByRole("button", { name: "Open palette" });
+    opener.focus();
+    fireEvent.click(opener);
+    return opener;
+  }
+
+  it("lists them with their chords, and one that can't run says why", async () => {
+    withSidebarFlag(true);
+    openPalette(vi.fn());
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "in the workspace" },
+    });
+
+    const back = await screen.findByRole("option", { name: /Go back in the workspace/ });
+    expect(back.textContent).toContain("←");
+    const forward = screen.getByRole("option", { name: /Go forward in the workspace/ });
+    expect(forward).toHaveAttribute("aria-disabled", "true");
+    expect(forward.textContent).toContain("There's nothing to go forward to in the workspace.");
+  });
+
+  it("highlights the first one that can run, so Enter runs it past one that can't", async () => {
+    withSidebarFlag(true);
+    const go = vi.fn();
+    openPalette(go, FORWARD_ONLY);
+    const input = screen.getByTestId("command-palette-input");
+    fireEvent.change(input, { target: { value: "in the workspace" } });
+
+    const forward = await screen.findByRole("option", { name: /Go forward in the workspace/ });
+    expect(screen.getByRole("option", { name: /Go back in the workspace/ })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    // Once the rows have settled, before anyone moves the selection.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 300);
+    });
+    expect(forward).toHaveAttribute("aria-selected", "true");
+    fireEvent.keyDown(input, { key: "Enter" });
+    await vi.waitFor(() => expect(go).toHaveBeenCalledWith("forward"));
+  });
+
+  it("runs one that moves focus once the palette has closed, so the focus stays", async () => {
+    withSidebarFlag(true);
+    let dialogAtRun: Element | null = null;
+    const go = vi.fn(() => {
+      dialogAtRun = screen.queryByRole("dialog");
+      screen.getByText("Where the command moves focus").focus();
+    });
+    openPalette(go);
+
+    fireEvent.click(await screen.findByRole("option", { name: /Go back in the workspace/ }));
+    expect(go).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(go).toHaveBeenCalledOnce());
+    expect(dialogAtRun).toBeNull();
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
+    // The dialog's own focus return, to the opener, came first and didn't undo it.
+    expect(document.activeElement).toBe(screen.getByText("Where the command moves focus"));
+  });
+
+  // The QuickPick palette lists them under its own flag; its own test covers that.
+  it.skipIf("QUICK_PICK_PALETTE" in commandPaletteModule)(
+    "lists none without the workspace_sidebar_v2 flag",
+    async () => {
+      withSidebarFlag(false);
+      openPalette(vi.fn());
+      fireEvent.change(screen.getByTestId("command-palette-input"), {
+        target: { value: "in the workspace" },
+      });
+
+      await screen.findByText("No results found");
+      expect(screen.queryByRole("option", { name: /Go back in the workspace/ })).toBeNull();
+    },
+  );
 });

@@ -10,6 +10,9 @@ import { setOmnigentHostConfig } from "./host";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ScheduledTaskApiError,
+  cloneCreatedMessage,
+  cloneFailedMessage,
+  cloneScheduledTask,
   createScheduledTask,
   deleteScheduledTask,
   getScheduledTask,
@@ -19,6 +22,7 @@ import {
   listSharedScheduledTasks,
   listAutomationFailures,
   runScheduledTaskNow,
+  reportLocalTimezone,
   updateScheduledTask,
 } from "./scheduledTasksApi";
 
@@ -429,6 +433,81 @@ describe("updateScheduledTask", () => {
   });
 });
 
+describe("cloneScheduledTask", () => {
+  it("POSTs /v1/scheduled-tasks/{id}/clone and returns the copy", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ ...TASK_WIRE, id: "st_2", name: "Nightly triage (copy)" }),
+    );
+    const clone = await cloneScheduledTask({ id: "st 1", hostId: "host_a" });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/v1/scheduled-tasks/st%201/clone");
+    expect(init.method).toBe("POST");
+    // The original's host routes the request to its replica.
+    expect(JSON.parse(init.body)).toEqual({ host_id: "host_a" });
+    expect(new Headers(init.headers).get("x-omnigent-automation-source")).toBe("ui");
+    expect(clone).toMatchObject({ id: "st_2", name: "Nightly triage (copy)" });
+  });
+
+  it("sends the browser tools mode header so the copy's source session keeps it", async () => {
+    const win = window as unknown as { omnigentDesktop?: unknown };
+    const before = win.omnigentDesktop;
+    win.omnigentDesktop = { browserTabs: () => undefined };
+    try {
+      fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, id: "st_2" }));
+      await cloneScheduledTask({ id: "st_1", hostId: null });
+      const [, init] = fetchMock.mock.calls[0];
+      // An unpinned automation names no host.
+      expect(JSON.parse(init.body)).toEqual({});
+      expect(new Headers(init.headers).get("X-Omnigent-Browser-Agent-Tools")).toBe("on");
+    } finally {
+      win.omnigentDesktop = before;
+    }
+  });
+
+  it("throws the server's reason", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse(
+        { error: { code: "invalid_input", message: "Only an automation can be cloned" } },
+        { ok: false, status: 400 },
+      ),
+    );
+    const error = await cloneScheduledTask({ id: "st_1", hostId: null }).catch(
+      (err: unknown) => err,
+    );
+    expect(error).toMatchObject({ status: 400, message: "Only an automation can be cloned" });
+    expect(cloneFailedMessage(error)).toBe(
+      "Couldn't clone the automation: Only an automation can be cloned",
+    );
+  });
+
+  it.each([
+    ["a server error", new ScheduledTaskApiError("boom", 500, null)],
+    ["a network failure", new Error("offline")],
+  ])("keeps the reason out of the toast for %s", (_label, error) => {
+    expect(cloneFailedMessage(error)).toBe("Couldn't clone the automation");
+  });
+
+  it.each([
+    [
+      "an armed copy",
+      { state: "active", nextRunAt: "2026-11-20T09:00:00Z" },
+      "Automation cloned. Pause or delete the original so they don't both run.",
+    ],
+    [
+      "a paused copy",
+      { state: "paused", nextRunAt: null },
+      "Automation cloned. The copy is paused like the original.",
+    ],
+    [
+      "a copy whose schedule ran out",
+      { state: "active", nextRunAt: null },
+      "Automation cloned. Its schedule has no runs left.",
+    ],
+  ] as const)("tells the owner what's left after %s", (_label, clone, text) => {
+    expect(cloneCreatedMessage(clone)).toBe(text);
+  });
+});
+
 describe("deleteScheduledTask", () => {
   it("DELETEs /v1/scheduled-tasks/{id}", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ deleted: true, id: "st_1" }));
@@ -436,6 +515,52 @@ describe("deleteScheduledTask", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/v1/scheduled-tasks/st_1");
     expect(init.method).toBe("DELETE");
+  });
+});
+
+describe("reportLocalTimezone", () => {
+  const mockBrowserZone = (timeZone: string) =>
+    vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockReturnValue({
+      timeZone,
+    } as Intl.ResolvedDateTimeFormatOptions);
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("PUTs the browser's zone as the caller's default", async () => {
+    mockBrowserZone("America/Chicago");
+    fetchMock.mockResolvedValueOnce(mockResponse({ timezone: "America/Chicago" }));
+    await reportLocalTimezone();
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/v1/scheduled-tasks/default-timezone");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body)).toEqual({ timezone: "America/Chicago" });
+  });
+
+  it.each(["empty", "throws"])("does not report a zone when discovery %s", async (failure) => {
+    if (failure === "throws") {
+      vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockImplementationOnce(() => {
+        throw new Error("timezone discovery unavailable");
+      });
+    } else {
+      mockBrowserZone("");
+    }
+    await expect(reportLocalTimezone()).resolves.toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a failed request", () => fetchMock.mockRejectedValueOnce(new TypeError("offline"))],
+    [
+      "a server that predates the endpoint",
+      () => fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 405 })),
+    ],
+  ])("ignores %s", async (_case, respond) => {
+    mockBrowserZone("America/Chicago");
+    respond();
+    await expect(reportLocalTimezone()).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 

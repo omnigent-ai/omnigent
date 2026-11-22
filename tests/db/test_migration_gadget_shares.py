@@ -20,7 +20,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from omnigent.db.db_models import SqlGadgetShare
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache, get_or_create_engine
 
-_PREVIOUS = "d3bda6dbade3"
+_PREVIOUS = "5ab01aaca219"
 _REVISION = "e4c7a91b2d3f"
 _TABLE = "gadget_shares"
 _SCHEMA_PATHS = [

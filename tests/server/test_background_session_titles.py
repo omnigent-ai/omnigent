@@ -23,6 +23,7 @@ from omnigent.server.background_session_titles import (
     normalize_background_title,
     prepare_background_session_title,
     runner_title_instructions,
+    saved_workflow_run_title,
 )
 from omnigent.server.schemas import BackgroundSessionTitleRequest, SessionEventInput
 from omnigent.server.server_config import SESSION_TITLE_INSTRUCTIONS_MAX_CHARS
@@ -152,6 +153,73 @@ async def test_slash_command_background_title_uses_persisted_seed(db_uri: str) -
     await pending.coordinator.wait_for_idle()
 
     assert store.get_conversation(conversation.id).title == "Review migration plan"
+
+
+_WORKFLOW_RUN = f'Run the saved workflow "Blah borgus" (ID {"0" * 32}).'
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        SessionEventInput(
+            type="message",
+            data={
+                "role": "user",
+                "content": [{"type": "input_text", "text": f"/workflow {_WORKFLOW_RUN}\n\nFast"}],
+            },
+        ),
+        SessionEventInput(
+            type="message",
+            data={
+                "role": "user",
+                "content": [{"type": "input_text", "text": f"$workflow {_WORKFLOW_RUN}"}],
+            },
+        ),
+        SessionEventInput(
+            type="slash_command",
+            data={"kind": "skill", "name": "workflow", "arguments": _WORKFLOW_RUN},
+        ),
+    ],
+    ids=["message", "codex-message", "slash-command"],
+)
+async def test_saved_workflow_runs_keep_the_workflow_name_title(
+    db_uri: str, event: SessionEventInput
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        return "Run Saved Workflow"
+
+    pending = prepare_background_session_title(
+        coordinator=BackgroundSessionTitleCoordinator(store, generator),
+        conversation=store.create_conversation(kind="default"),
+        event=event,
+    )
+
+    assert pending is None
+
+
+@pytest.mark.parametrize(
+    ("text", "title"),
+    [
+        (f"/workflow {_WORKFLOW_RUN}", "Blah borgus"),
+        (f'/workflow Run the saved workflow "{"n" * 80}" (ID {"0" * 32}).', "n" * 80),
+        (f'/workflow Run the saved workflow "{"n" * 81}" (ID {"0" * 32}).', None),
+        # Names are literal, not message markup.
+        (
+            f'/workflow Run the saved workflow "[Attached: report.txt]" (ID {"0" * 32}).',
+            "[Attached: report.txt]",
+        ),
+        (
+            f'/workflow Run the saved workflow "[Attached: /tmp/r.txt]" (ID {"0" * 32}).',
+            "[Attached: /tmp/r.txt]",
+        ),
+        (f"Please /workflow {_WORKFLOW_RUN}", None),
+        (f"/workflow {_WORKFLOW_RUN} Then stop.", None),
+    ],
+)
+async def test_saved_workflow_run_title(text: str, title: str | None) -> None:
+    assert saved_workflow_run_title([{"type": "input_text", "text": text}]) == title
 
 
 @pytest.mark.parametrize("excluded_session", ["titled", "child"])

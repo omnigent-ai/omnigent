@@ -12,7 +12,7 @@
 // client-recomputed instant can't match the server anchor for INTERVAL>1 rules)
 // is not violated. Paused rows are NOT dimmed — the title stays fully legible
 // and the pill is the sole paused signal. A hover-revealed ellipsis (⋯) action
-// menu (Run now / Edit / Share / Pause or Resume / Delete) sits on the right;
+// menu (Run now / Edit / Share / Clone / Pause or Resume / Delete) sits on the right;
 // right-clicking the card opens the same actions as a context menu. On an
 // automation shared with the viewer the subline names its owner, and every
 // action shows disabled with a tooltip saying only the owner can take it.
@@ -20,6 +20,7 @@
 import { useId, useMemo, useState, type ComponentType, type ReactNode } from "react";
 import {
   CirclePlayIcon,
+  CopyIcon,
   MoreHorizontalIcon,
   PauseIcon,
   PencilIcon,
@@ -61,6 +62,7 @@ export function ScheduledTaskRow({
   onDelete,
   onShare,
   shareDisabledReason,
+  onClone,
   busy,
 }: {
   task: ScheduledTask;
@@ -77,6 +79,8 @@ export function ScheduledTaskRow({
   onShare?: (task: ScheduledTask) => void;
   /** Shows Share disabled with this reason, e.g. while the server turns sharing off. */
   shareDisabledReason?: string;
+  /** Offers Clone when set: the server can copy an automation under a new ID. */
+  onClone?: (task: ScheduledTask) => void;
   busy: boolean;
 }) {
   const navigate = useNavigate();
@@ -161,6 +165,7 @@ export function ScheduledTaskRow({
     onDelete,
     onShare,
     shareDisabledReason,
+    onClone,
   };
 
   const card = (
@@ -304,6 +309,7 @@ function TaskMenuItems({
   onDelete,
   onShare,
   shareDisabledReason,
+  onClone,
 }: {
   Item: ComponentType<TaskMenuItemProps>;
   task: ScheduledTask;
@@ -317,6 +323,7 @@ function TaskMenuItems({
   onDelete: (task: ScheduledTask) => void;
   onShare?: (task: ScheduledTask) => void;
   shareDisabledReason?: string;
+  onClone?: (task: ScheduledTask) => void;
 }) {
   const { trackClick } = useOmnigentAnalytics();
   // One action: disabled with the owner-only reason on a shared automation.
@@ -395,6 +402,19 @@ function TaskMenuItems({
           </Item>
         ))
       )}
+      {onClone &&
+        action(
+          "task-clone",
+          OWNER_ONLY_REASONS.clone,
+          () => {
+            trackClick("tasks.scheduled.clone", "button");
+            onClone(task);
+          },
+          <>
+            <CopyIcon className="size-4" />
+            Clone
+          </>,
+        )}
       {action(
         "task-pause-toggle",
         paused ? OWNER_ONLY_REASONS.resume : OWNER_ONLY_REASONS.pause,

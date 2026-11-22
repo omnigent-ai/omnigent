@@ -417,6 +417,7 @@ class ApiKeyAuth:
     :param base_url: Optional OpenAI-compatible endpoint URL,
         e.g. ``"https://my-gateway.example.com/v1"``. When omitted,
         the default ``https://api.openai.com/v1`` is used.
+    :param source_env_names: Credential environment names retained before expansion.
     """
 
     # Required: the resolved API key value (env-var refs expanded at parse time).
@@ -424,6 +425,8 @@ class ApiKeyAuth:
     # Optional: custom endpoint; None means use the default OpenAI endpoint.
     base_url: str | None = None
     type: Literal["api_key"] = "api_key"
+    # Original credential env refs survive expansion for child-process scrubbing.
+    source_env_names: tuple[str, ...] = field(default=(), repr=False, compare=False, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -906,6 +909,8 @@ class ToolGroupsConfig:
         which write to and read the owner's Inbox. The runner also drops them
         unless the server offers the Inbox to the session's owner.
     :param memory: The ``memory_*`` long-term memory tools (5).
+    :param files: ``sys_upload_file``, ``sys_list_files`` and ``sys_download_file``,
+        which share workspace files through the session's file store.
     :param gadgets: The ``sys_gadget_*`` tools (13), which build and run gadgets.
         The runner also drops them unless the server enables the ``gadgets`` feature.
     """
@@ -919,6 +924,7 @@ class ToolGroupsConfig:
     projects: bool = True
     user_inbox: bool = True
     memory: bool = True
+    files: bool = True
     gadgets: bool = True
 
 

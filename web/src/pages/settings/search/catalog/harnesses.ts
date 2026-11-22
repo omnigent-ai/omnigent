@@ -149,6 +149,17 @@ export const HARNESS_CARD_ENTRIES = settingsEntryFamily({
   },
 });
 
+/**
+ * The harness a Harnesses row is for: the page it lives on, or for a card, which lives on the
+ * grid and so names no page, the card's own harness.
+ */
+export function harnessOfSettingsEntry(entry: SettingsEntry): string | undefined {
+  if (entry.harness !== undefined) return entry.harness;
+  return HARNESS_CARD_ENTRIES.members.find(
+    (harness) => HARNESS_CARD_ENTRIES.entry(harness).id === entry.id,
+  );
+}
+
 /** The fix a harness page's setup warning offers, by its name's key: "Set up" unless one of these. */
 export type HarnessFixActionName = "install" | "update" | "reconfigure" | "tmux";
 
@@ -432,6 +443,12 @@ export const MCP_SERVER_LIST_ENTRIES = settingsEntryFamily({
       harness,
       label: `MCP servers for ${name}`,
       regions: { servers: OPENS_BY_NAME, listed: {} },
+      // The list isn't a row of its own, so its page's MCP servers tab stands in for it.
+      revealedBy: {
+        entry: `harness-${harness}-detail`,
+        part: "tab",
+        choice: INVENTORY_KIND_LABELS.mcps,
+      },
     };
     if (harness === "claude-native" || harness === "codex-native") {
       return {

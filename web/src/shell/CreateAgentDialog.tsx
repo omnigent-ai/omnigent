@@ -424,6 +424,7 @@ function AgentFormFields({
           {...settingsFieldProps(settingsEntry, "name")}
           id="create-agent-name"
           data-testid="create-agent-name"
+          aria-required
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="my-agent"
@@ -476,6 +477,7 @@ function AgentFormFields({
               ? settingsControlProps(settingsEntry, "harness")
               : { "aria-label": "Harness" })}
             data-testid="create-agent-harness"
+            aria-required
             className="w-full"
           >
             <SelectValue />
@@ -503,6 +505,7 @@ function AgentFormFields({
           {...settingsFieldProps(settingsEntry, "model")}
           id="create-agent-model"
           data-testid="create-agent-model"
+          aria-required
           value={model}
           onChange={(e) => setModel(e.target.value)}
           placeholder="claude-sonnet-4-20250514"

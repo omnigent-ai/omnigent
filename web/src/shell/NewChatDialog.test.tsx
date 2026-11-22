@@ -6,6 +6,7 @@ import {
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { insertComposerText } from "@/lib/composerText";
 import { testAgent } from "@/test/agentFixtures";
+import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { fetchSandboxProfiles, SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
 import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
 
@@ -121,6 +122,7 @@ vi.mock("@/pages/settings/HarnessFixDialog", () => ({
   },
 }));
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import { SHELL_MENTION_REFUSAL } from "@/components/composer/composerHighlight";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
@@ -10337,13 +10339,13 @@ describe("NewChatLandingScreen attachments", () => {
   // the user never wanted.
   it("rejects an unsupported attachment instead of attaching it", () => {
     renderLanding();
-    const clip = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const clip = new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" });
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
       target: { files: [clip] },
     });
-    expect(screen.queryByText("clip.mp4")).toBeNull();
+    expect(screen.queryByText("clip.webm")).toBeNull();
     expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
-      "archives, office documents, and databases are supported",
+      "archives, office documents, databases, and MP4 videos are supported",
     );
   });
 
@@ -10370,12 +10372,12 @@ describe("NewChatLandingScreen attachments", () => {
     renderLanding();
     const composer = screen.getByTestId("new-chat-landing-composer");
     const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
-    const clip = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const clip = new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" });
     fireEvent.drop(composer, { dataTransfer: fileDrag([ok, clip]) });
     expect(screen.getByText("notes.txt")).toBeTruthy();
-    expect(screen.queryByText("clip.mp4")).toBeNull();
+    expect(screen.queryByText("clip.webm")).toBeNull();
     expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
-      "clip.mp4",
+      "clip.webm",
     );
     // Removing the accepted chip clears the stale rejection notice too.
     fireEvent.click(screen.getByRole("button", { name: "Remove notes.txt" }));
@@ -10387,7 +10389,7 @@ describe("NewChatLandingScreen attachments", () => {
     // nothing else clears the notice. Left sticky it reads as a blocker on a
     // composer that can actually be submitted.
     renderLanding();
-    const clip = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const clip = new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" });
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
       target: { files: [clip] },
     });
@@ -10476,7 +10478,7 @@ describe("NewChatLandingScreen attachments", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
       target: { files: [ok] },
     });
-    const clip = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const clip = new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" });
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
       target: { files: [clip] },
     });
@@ -10493,7 +10495,7 @@ describe("NewChatLandingScreen attachments", () => {
     await waitFor(() => expect(screen.getByTestId("new-chat-landing-error")).toBeTruthy());
     expect(screen.getByText("notes.txt")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-attachment-error")).toBeTruthy();
-    expect(screen.queryByText("clip.mp4")).toBeNull();
+    expect(screen.queryByText("clip.webm")).toBeNull();
   });
 });
 
@@ -14266,6 +14268,149 @@ describe("NewChatLandingScreen picker curation", () => {
   });
 });
 
+describe("NewChatLandingScreen composer highlight", () => {
+  const ROOT = "/Users/corey/repo";
+  beforeEach(() => {
+    setupLandingMocks();
+    setPendingInitialPromptMock.mockReset();
+    authenticatedFetchMock.mockImplementation(
+      async (url) =>
+        ({
+          ok: true,
+          json: async () => (String(url) === "/v1/sessions" ? { id: "conv_new" } : {}),
+        }) as Response,
+    );
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  function landingAgent(harness: string) {
+    mockAgents([
+      testAgent("a1", `${harness}-ui`, {
+        display_name: harness,
+        harness,
+        skills: [{ name: "team", description: "Run a team" }],
+      }),
+    ]);
+  }
+  const input = () => screen.getByTestId("new-chat-landing-input");
+  const type = (value: string) => fireEvent.change(input(), { target: { value } });
+
+  it("tints a known skill but not an unknown command", () => {
+    landingAgent("claude-sdk");
+    renderLanding();
+    type("/team fix the bug");
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay).toHaveTextContent("/team fix the bug");
+    expect(within(overlay).getByText("/team")).toHaveClass("text-brand-accent");
+    expect(input()).toHaveAttribute("data-slash-command", "true");
+
+    type("/typo fix the bug");
+    expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+    expect(input()).not.toHaveAttribute("data-slash-command");
+  });
+
+  it("marks a claude-native `!` draft as a shell command and sends it unchanged", async () => {
+    landingAgent("claude-native");
+    renderLanding();
+    type("!git status --short");
+    expect(input()).toHaveAttribute("data-shell-command", "true");
+    expect(input()).toHaveAccessibleDescription("Shell command");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({ text: "!git status --short" }),
+      ),
+    );
+  });
+
+  it("decides shell mode on the sanitized text but mirrors the raw draft", () => {
+    landingAgent("claude-native");
+    renderLanding();
+    // Sanitizing drops DEL, which the claude-native check alone would keep.
+    type("\x7f!echo ok");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay.textContent).toBe("\x7f!echo ok");
+    expect(within(overlay).getByText("!")).toHaveClass("text-brand-accent");
+  });
+
+  it("refuses a `!` send that carries a tag, keeps the draft, then sends once it is gone", async () => {
+    landingAgent("claude-native");
+    useHostFilesystemMock.mockImplementation(((_hostId: string | null, path: string | null) => ({
+      data: {
+        entries:
+          path === ROOT
+            ? [
+                {
+                  name: "README.md",
+                  path: `${ROOT}/README.md`,
+                  type: "file",
+                  bytes: 10,
+                  modified_at: 0,
+                },
+              ]
+            : [],
+        truncated: false,
+      },
+      isLoading: false,
+      error: null,
+      isPlaceholderData: false,
+    })) as unknown as typeof useHostFilesystem);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(input(), { target: { value: "!cat @", selectionStart: 6 } });
+    fireEvent.click(screen.getByTitle("Attach README.md"));
+    expect(input()).toHaveValue("!cat @README.md ");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+      SHELL_MENTION_REFUSAL,
+    );
+
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    expect(await screen.findByTestId("new-chat-landing-error")).toHaveTextContent(
+      SHELL_MENTION_REFUSAL,
+    );
+    expect(input()).toHaveValue("!cat @README.md ");
+    expect(setPendingInitialPromptMock).not.toHaveBeenCalled();
+    expect(authenticatedFetchMock).not.toHaveBeenCalledWith("/v1/sessions", expect.anything());
+
+    // Backspace over the token drops the tag without an edit event; the refusal goes with it.
+    (input() as HTMLTextAreaElement).setSelectionRange(15, 15);
+    fireEvent.keyDown(input(), { key: "Backspace" });
+    expect(input()).toHaveValue("!cat  ");
+    expect(screen.queryByTestId("new-chat-landing-error")).toBeNull();
+
+    type("!cat README.md");
+    expect(screen.queryByTestId("new-chat-landing-error")).toBeNull();
+    fireEvent.click(submit);
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({ text: "!cat README.md" }),
+      ),
+    );
+  });
+
+  it("does not offer shell mode on a harness without native `!` input", () => {
+    landingAgent("claude-sdk");
+    renderLanding();
+    type("!git status");
+    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+    expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+  });
+});
+
 describe("New Chat composer engine", () => {
   beforeEach(() => setupLandingMocks());
   afterEach(() => {
@@ -14335,6 +14480,66 @@ describe("New Chat composer engine", () => {
 
     expect(composerTargetOf(editor)?.value).toBe("@Alpha planning ");
     expect(editor).not.toHaveClass("text-transparent");
+  });
+
+  const commandMarks = () =>
+    Array.from(document.querySelectorAll('[data-testid="composer-command-token"]'), (mark) => [
+      mark.textContent,
+      mark.className,
+    ]);
+  async function typeInEditor(harness: string, value: string) {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    mockAgents([
+      testAgent("a1", `${harness}-ui`, {
+        display_name: harness,
+        harness,
+        skills: [{ name: "team", description: "Run a team" }],
+      }),
+    ]);
+    renderLanding({
+      features: {
+        harness_install: false,
+        codex_plan_at_launch: true,
+        chat_composer_codemirror: true,
+      },
+    });
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    const editor = screen.getByTestId("new-chat-landing-input");
+    act(() => insertComposerText(composerTargetOf(editor)!, value));
+    return editor;
+  }
+
+  it("tints a known skill in CodeMirror but not an unknown command", async () => {
+    const editor = await typeInEditor("claude-sdk", "/team fix the bug");
+    expect(commandMarks()).toEqual([["/team", COMMAND_TOKEN_CLASS]]);
+    expect(editor).toHaveAttribute("data-slash-command", "true");
+
+    act(() => insertComposerText(composerTargetOf(editor)!, "/typo", 0, 5));
+    expect(commandMarks()).toEqual([]);
+    expect(editor).not.toHaveAttribute("data-slash-command");
+  });
+
+  it("tints a claude-native `!` in CodeMirror, even with its command right after it, and sends it unchanged", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const editor = await typeInEditor("claude-native", "!pwd");
+    expect(commandMarks()).toEqual([["!", COMMAND_TOKEN_CLASS]]);
+    expect(editor).toHaveAttribute("data-shell-command", "true");
+    expect(editor).toHaveAccessibleDescription("Shell command");
+
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({ text: "!pwd" }),
+      ),
+    );
   });
 
   it("keeps the textarea when the flag is off", () => {

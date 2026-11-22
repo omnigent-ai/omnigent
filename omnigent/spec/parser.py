@@ -67,6 +67,7 @@ from omnigent.spec.types import (
     ToolsConfig,
 )
 from omnigent.spec.validator import _SKILL_NAME_MAX_LEN, _SKILL_NAME_PATTERN
+from omnigent.util.env_credentials import _ENV_REF_RE, env_names_with_omnigent_prefix
 
 _log = logging.getLogger(__name__)
 
@@ -348,6 +349,12 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         raw.get("tool_groups"),
         builtins=tools_config.builtins,
         own_tool_names=_own_tool_names(root, local_tools, mcp_servers),
+        agent_name=raw.get("name"),
+    )
+    tool_groups = resolve_file_tool_group(
+        tool_groups,
+        raw.get("tool_groups"),
+        builtins=tools_config.builtins,
         agent_name=raw.get("name"),
     )
 
@@ -638,6 +645,54 @@ def resolve_memory_tool_group(
     return tool_groups
 
 
+_REMOVED_FILE_TOOLS = frozenset({"upload_file", "list_files", "download_file"})
+
+
+def resolve_file_tool_group(
+    tool_groups: ToolGroupsConfig,
+    raw_tool_groups: object,
+    *,
+    builtins: Iterable[BuiltinToolConfig],
+    agent_name: str | None,
+) -> ToolGroupsConfig:
+    """
+    Keep the file tools off for an agent that still declares their removed names.
+
+    ``upload_file``, ``list_files`` and ``download_file`` became the default
+    ``sys_upload_file``, ``sys_list_files`` and ``sys_download_file``. A policy
+    written for an old name does not match the new one, so an agent that still
+    lists an old name gets no file tools until those entries are removed.
+
+    :param tool_groups: The parsed groups.
+    :param raw_tool_groups: The raw ``tool_groups:`` value, to tell an explicit
+        ``files: true`` from the default.
+    :param builtins: The spec's ``tools.builtins`` entries.
+    :param agent_name: The spec's name, for the warning.
+    :returns: *tool_groups*, with ``files`` off when a removed name is declared.
+    :raises OmnigentError: If ``files: true`` is set alongside a removed name.
+    """
+    removed = sorted({b.name for b in builtins} & _REMOVED_FILE_TOOLS)
+    if not removed:
+        return tool_groups
+    if isinstance(raw_tool_groups, dict) and raw_tool_groups.get("files") is True:
+        raise OmnigentError(
+            f"tool_groups.files: true conflicts with the removed {', '.join(removed)} "
+            "builtins: remove them from tools.builtins, and rename any policy selector "
+            "that names them to the sys_ tool.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if tool_groups.files:
+        _log.warning(
+            "Agent %r declares the removed %s builtins, so its sys_upload_file, "
+            "sys_list_files and sys_download_file tools stay off: a policy written for "
+            "the old names would not apply to them. Remove those tools.builtins entries "
+            "and rename any policy selector that names them.",
+            agent_name,
+            ", ".join(removed),
+        )
+    return replace(tool_groups, files=False)
+
+
 def _reject_orphaned_agent_id_tools(groups: ToolGroupsConfig, *, spawn: bool) -> None:
     """
     Refuse disabling agent discovery while a tool that takes an agent id stays on.
@@ -904,6 +959,19 @@ def _parse_executor(
     )
 
 
+def _api_key_source_env_names(raw_key: str) -> tuple[str, ...]:
+    """Retain credential references before expanding a legacy API key."""
+    return tuple(
+        sorted(
+            {
+                name
+                for match in _ENV_REF_RE.finditer(raw_key)
+                for name in env_names_with_omnigent_prefix(match.group(1) or match.group(2))
+            }
+        )
+    )
+
+
 def _parse_executor_auth(
     raw: dict[str, object],
     *,
@@ -951,6 +1019,20 @@ def _parse_executor_auth(
                 "executor.auth.api_key is required when type is 'api_key'",
                 code=ErrorCode.INVALID_INPUT,
             )
+        source_env_names = set(_api_key_source_env_names(raw_key))
+        serialized_names = raw_auth.get("source_env_names", ())
+        if not isinstance(serialized_names, (list, tuple)):
+            raise OmnigentError(
+                "executor.auth.source_env_names must be a list of environment variable names",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        for name in serialized_names:
+            if not isinstance(name, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+                raise OmnigentError(
+                    "executor.auth.source_env_names must contain valid environment variable names",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            source_env_names.update(env_names_with_omnigent_prefix(name))
         api_key = expand_env_vars({"api_key": raw_key})["api_key"] if expand_env else raw_key
         raw_base_url = raw_auth.get("base_url")
         base_url: str | None = None
@@ -961,7 +1043,9 @@ def _parse_executor_auth(
                 if expand_env
                 else raw_base_url_str
             )
-        return ApiKeyAuth(api_key=api_key, base_url=base_url)
+        return ApiKeyAuth(
+            api_key=api_key, base_url=base_url, source_env_names=tuple(sorted(source_env_names))
+        )
     if auth_type == "databricks":
         profile_val = str(raw_auth.get("profile") or "")
         if not profile_val:

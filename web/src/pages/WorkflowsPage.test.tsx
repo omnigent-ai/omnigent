@@ -74,6 +74,7 @@ function mockWorkflows(state: Partial<ReturnType<typeof useSavedWorkflows>>) {
     isLoading: false,
     isError: false,
     refresh,
+    reload: vi.fn(),
     pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
     ...state,
   });
@@ -92,6 +93,7 @@ function mockShared(
     isLoading: false,
     isError: false,
     refresh,
+    reload: vi.fn(),
     pagination: { hasMore, loadingMore: false, loadMore },
     ...state,
   });

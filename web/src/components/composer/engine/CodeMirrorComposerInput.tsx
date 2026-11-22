@@ -41,10 +41,14 @@ import type {
   ComposerInputProps,
   ComposerKeyboardEvent,
   ComposerTextTarget,
+  ComposerTokenAt,
 } from "./composerInput";
+import { readlineKeys } from "./codeMirrorReadline";
 
 /** What the editor takes from the app, handed in by the loader. */
 export interface CodeMirrorComposerEnvironment {
+  /** Whether the platform is macOS, which binds the readline keys. */
+  mac: boolean;
   /** The attribute that marks a composer input's focusable node. */
   inputAttribute: string;
   /** The attribute that carries an input's id within its composer. */
@@ -119,20 +123,39 @@ function mentionTokenField(environment: CodeMirrorComposerEnvironment): Extensio
   );
 }
 
+type CommandToken = string | ComposerTokenAt | null;
+
 /** The command token the editor paints; reconfigured through a compartment when it changes. */
-const commandTokenFacet = Facet.define<string | null, string | null>({
+const commandTokenFacet = Facet.define<CommandToken, CommandToken>({
   combine: (inputs) => inputs[inputs.length - 1] ?? null,
 });
 
-/** Where `token` sits when `text` starts with it, after any leading whitespace; else null. */
-export function leadingCommandSpan(text: string, token: string | null): TokenSpan | null {
+/**
+ * Where `token` leads `text` after any whitespace, else null; a placed token matches only at
+ * its offset.
+ */
+export function leadingCommandSpan(text: string, token: CommandToken): TokenSpan | null {
   if (!token) return null;
+  if (typeof token !== "string") {
+    const end = token.start + token.token.length;
+    return token.token && text.slice(token.start, end) === token.token
+      ? { start: token.start, end }
+      : null;
+  }
   const start = text.length - text.trimStart().length;
   const end = start + token.length;
   if (text.slice(start, end) !== token) return null;
   // A longer word that merely starts with the token, like /contexts, isn't the command.
   if (end < text.length && !/\s/.test(text[end] ?? "")) return null;
   return { start, end };
+}
+
+/** `props.commandToken` with a placed token's offset moved from the value into the document. */
+function documentCommandToken(props: ComposerInputProps): CommandToken {
+  const token = props.commandToken ?? null;
+  if (token === null || typeof token === "string") return token;
+  const start = normalizeLineBreaks((props.value ?? "").slice(0, token.start)).length;
+  return { token: token.token, start };
 }
 
 /** Paints the draft's leading command token, checked against the editor's own text. */
@@ -263,6 +286,7 @@ function attributes(
       ...(props["data-testid"] ? { "data-testid": props["data-testid"] } : {}),
       ...(props["data-has-draft"] ? { "data-has-draft": props["data-has-draft"] } : {}),
       ...(props["data-slash-command"] ? { "data-slash-command": props["data-slash-command"] } : {}),
+      ...(props["data-shell-command"] ? { "data-shell-command": props["data-shell-command"] } : {}),
     }),
   ];
 }
@@ -390,15 +414,7 @@ function CodeMirrorComposer({
   environment: CodeMirrorComposerEnvironment;
   forwardedRef: Ref<ComposerTextTarget>;
 }) {
-  const {
-    value,
-    placeholder,
-    autoFocus,
-    heightMode = "compact",
-    className,
-    mentionTokens,
-    commandToken = null,
-  } = props;
+  const { value, placeholder, autoFocus, heightMode = "compact", className, mentionTokens } = props;
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const surfaceRef = useRef<ComposerEditorSurface | null>(null);
@@ -485,6 +501,7 @@ function CodeMirrorComposer({
               },
             }),
           ),
+          readlineKeys(environment.mac),
           keymap.of(COMPOSER_EDITING_KEYMAP),
           compartments.history.of(history()),
           EditorView.lineWrapping,
@@ -493,7 +510,7 @@ function CodeMirrorComposer({
           compartments.theme.of(theme(initial.heightMode ?? "compact")),
           compartments.mentionTokens.of(mentionTokensFacet.of(initial.mentionTokens ?? [])),
           mentionTokenField(environment),
-          compartments.commandToken.of(commandTokenFacet.of(initial.commandToken ?? null)),
+          compartments.commandToken.of(commandTokenFacet.of(documentCommandToken(initial))),
           commandTokenField(environment),
           EditorView.updateListener.of((update) => {
             const fromUser = !update.transactions.some((transaction) =>
@@ -563,6 +580,7 @@ function CodeMirrorComposer({
     props["data-testid"],
     props["data-has-draft"],
     props["data-slash-command"],
+    props["data-shell-command"],
   ]);
   // In layout, so a draft that turns disabled or read-only takes no keys after the render.
   useLayoutEffect(() => {
@@ -595,11 +613,15 @@ function CodeMirrorComposer({
       ),
     });
   }, [compartments, mentionTokensKey]);
+  // Keyed by content, as a placed token is a new object each render.
+  const commandTokenKey = JSON.stringify(documentCommandToken(props));
   useLayoutEffect(() => {
     viewRef.current?.dispatch({
-      effects: compartments.commandToken.reconfigure(commandTokenFacet.of(commandToken)),
+      effects: compartments.commandToken.reconfigure(
+        commandTokenFacet.of(documentCommandToken(latest.current)),
+      ),
     });
-  }, [compartments, commandToken]);
+  }, [compartments, commandTokenKey]);
   useEffect(() => {
     if (autoFocus) viewRef.current?.focus();
   }, [autoFocus]);

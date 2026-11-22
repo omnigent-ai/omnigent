@@ -4,7 +4,7 @@ import { useMemo } from "react";
 
 import type { Conversation } from "@/hooks/useConversations";
 import { useSessionBadgeStates } from "@/hooks/useSessionBadgeStates";
-import type { SessionState } from "@/hooks/useSessionState";
+import { type SessionState, withUnreadState } from "@/hooks/useSessionState";
 import { useConversationReadState } from "@/hooks/useUnseenConversations";
 import { isConversationMuted, showsUnreadFor } from "@/lib/sessionMute";
 import { useChatStore } from "@/store/chatStore";
@@ -42,9 +42,11 @@ export function useSessionIndicatorState(
   const isMuted = isConversationMuted(conversation);
   const unread = readState.unseen && (!isActive || readState.explicitlyUnread);
   const hasUnseenMessages = showsUnreadFor(conversation, unread);
-  // Approvals and failures outrank the unread dot without clearing read state.
+  // Approvals, turns and failures outrank the unread dot without clearing read
+  // state; background work alone yields to it.
   const badgeConversations = useMemo(() => [conversation], [conversation]);
   const [derivedState] = useSessionBadgeStates(badgeConversations);
+  const badgeState = withUnreadState(derivedState, hasUnseenMessages);
   // The bound session's launch/relaunch window: a send is in flight (local
   // status "streaming") or the runner is auto-creating the PTY
   // (`terminalPending`), but the server hasn't confirmed `running` yet — a
@@ -56,10 +58,10 @@ export function useSessionIndicatorState(
     (s) => s.conversationId === conversation.id && (s.status === "streaming" || s.terminalPending),
   );
   const sessionState: SessionState | null =
-    derivedState?.kind === "awaiting" || derivedState?.kind === "running"
-      ? derivedState
+    badgeState?.kind === "awaiting" || badgeState?.kind === "running"
+      ? badgeState
       : isStartingUp
         ? { kind: "starting" }
-        : (derivedState ?? (hasUnseenMessages ? { kind: "unseen" } : null));
+        : badgeState;
   return { sessionState, unread, hasUnseenMessages, isMuted };
 }

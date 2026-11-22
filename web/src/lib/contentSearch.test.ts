@@ -1,12 +1,22 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import wholeWordCases from "@/lib/__fixtures__/contentSearchWholeWord.json";
 import {
   CONTENT_SEARCH_QUERY_LIMIT,
   contentSearchPattern,
+  fetchContentSearch,
   fitsContentSearchLimit,
   wholeWordRegexProblem,
 } from "@/lib/contentSearch";
+import { authenticatedFetch } from "@/lib/identity";
+import { searchTextViaWorkspaceApi } from "@/lib/workspaceApi";
+
+vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/workspaceApi", () => ({ searchTextViaWorkspaceApi: vi.fn() }));
+
+afterEach(() => {
+  vi.resetAllMocks();
+});
 
 // The runner test sends each case's pattern through real ripgrep against the
 // same corpus, so these patterns and the matched lines stay in step.
@@ -135,5 +145,44 @@ describe("fitsContentSearchLimit", () => {
     expect(astral.length).toBe(2 * CONTENT_SEARCH_QUERY_LIMIT);
     expect(fitsContentSearchLimit(astral)).toBe(true);
     expect(fitsContentSearchLimit(`${astral}x`)).toBe(false);
+  });
+});
+
+describe("fetchContentSearch", () => {
+  const options = { caseSensitive: false, regex: true, include: "src/**", exclude: "" };
+  const found = {
+    matches: [{ path: "a.ts", line: 1, column: 1, text: "needle", match_start: 0, match_end: 6 }],
+    truncated: false,
+    warning: null,
+  };
+
+  it("uses the workspace API's answer without REST", async () => {
+    vi.mocked(searchTextViaWorkspaceApi).mockResolvedValue(found);
+
+    expect(await fetchContentSearch("s1", "ne+dle", options)).toEqual(found);
+
+    expect(searchTextViaWorkspaceApi).toHaveBeenCalledWith("s1", "ne+dle", options, undefined);
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+
+  it("falls back to REST, which reports an invalid search", async () => {
+    vi.mocked(searchTextViaWorkspaceApi).mockResolvedValue(null);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(Response.json(found));
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(
+      Response.json({ error: "regex parse error" }),
+    );
+
+    expect(await fetchContentSearch("s1", "ne+dle", options)).toEqual(found);
+    await expect(fetchContentSearch("s1", "[", options)).rejects.toThrow("regex parse error");
+
+    const url = new URL(String(vi.mocked(authenticatedFetch).mock.calls[0]![0]), "http://test");
+    expect(url.pathname).toBe("/v1/sessions/s1/resources/environments/default/content-search");
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      q: "ne+dle",
+      case_sensitive: "false",
+      regex: "true",
+      include: "src/**",
+      exclude: "",
+    });
   });
 });

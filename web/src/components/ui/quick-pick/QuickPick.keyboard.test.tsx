@@ -321,6 +321,8 @@ describe("QuickPick other navigation keys", () => {
     expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
     expect(scrollIntoView.mock.contexts.at(-1)).toBe(screen.getByRole("option", { name: "s2" }));
     press("Enter");
-    expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ id: "s2" }));
+    expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ id: "s2" }), {
+      alternate: false,
+    });
   });
 });

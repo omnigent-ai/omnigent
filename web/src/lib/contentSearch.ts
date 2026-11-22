@@ -2,6 +2,25 @@
 // route already understands (`q` plus `regex`), so Whole word needs no runner
 // change. The runner searches with ripgrep, whose regex dialect this targets.
 
+import { authenticatedFetch } from "@/lib/identity";
+import { searchTextViaWorkspaceApi, type TextSearchOptions } from "@/lib/workspaceApi";
+
+/** One matching line, for its first match; offsets count UTF-16 code units. */
+export interface ContentMatch {
+  path: string;
+  line: number;
+  column: number;
+  text: string;
+  match_start: number;
+  match_end: number;
+}
+
+export interface ContentSearchResult {
+  matches: ContentMatch[];
+  truncated: boolean;
+  warning: string | null;
+}
+
 /** The longest `q` the server and runner accept, counted in code points. */
 export const CONTENT_SEARCH_QUERY_LIMIT = 4096;
 
@@ -117,4 +136,41 @@ export function wholeWordRegexProblem(query: string): WholeWordRegexProblem | nu
 /** Whether `pattern` fits the server's limit, counting code points as the server does. */
 export function fitsContentSearchLimit(pattern: string): boolean {
   return Array.from(pattern).length <= CONTENT_SEARCH_QUERY_LIMIT;
+}
+
+/**
+ * Search a session's workspace contents: through the workspace API when a
+ * route serves it, else through the REST content-search route.
+ *
+ * @param pattern The query to send, from {@link contentSearchPattern}.
+ * @throws Error with a user-facing message when the search can't run.
+ */
+export async function fetchContentSearch(
+  conversationId: string,
+  pattern: string,
+  options: TextSearchOptions,
+  signal?: AbortSignal,
+): Promise<ContentSearchResult> {
+  const viaApi = await searchTextViaWorkspaceApi(conversationId, pattern, options, signal);
+  if (viaApi) return viaApi;
+  const params = new URLSearchParams({
+    q: pattern,
+    case_sensitive: String(options.caseSensitive),
+    regex: String(options.regex),
+    include: options.include,
+    exclude: options.exclude,
+  });
+  const response = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/default/content-search?${params}`,
+    { signal },
+  );
+  const body = await response.json().catch(() => null);
+  if (!response.ok || body?.error || !Array.isArray(body?.matches)) {
+    throw new Error(
+      (typeof body?.error === "string" ? body.error : body?.error?.message) ||
+        (typeof body?.detail === "string" ? body.detail : null) ||
+        "Content search is unavailable. Check that the runner is online and up to date.",
+    );
+  }
+  return body as ContentSearchResult;
 }

@@ -99,10 +99,14 @@ class SysScheduledTaskCreateTool(Tool):
                             ),
                         },
                         "timezone": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": (
                                 "IANA timezone the rule is evaluated in, e.g. "
-                                "'America/Los_Angeles'. Defaults to 'UTC'."
+                                "'America/Los_Angeles'. Use the zone the user names; "
+                                "otherwise omit it or send JSON null. Current runners "
+                                "request their recorded browser timezone, falling back "
+                                "to UTC when unavailable or unsupported. "
+                                "Do not infer a zone from the host or environment."
                             ),
                         },
                         "model_override": {
@@ -244,7 +248,11 @@ class SysScheduledTaskListTool(Tool):
     @classmethod
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
-        return "List your scheduled tasks (recurring agent runs) with their schedules and state."
+        return (
+            "List your scheduled tasks (recurring agent runs) with their schedules and state. "
+            "A trigger automation, which watches a service such as Jira or Slack for new "
+            "items, is listed with rrule null when the server decides when it polls."
+        )
 
     def get_schema(self) -> dict[str, Any]:
         """:returns: The OpenAI-format tool schema."""

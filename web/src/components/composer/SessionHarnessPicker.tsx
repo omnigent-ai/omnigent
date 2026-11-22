@@ -21,6 +21,10 @@ import {
   ComposerConfigSections,
   type ComposerConfigSection,
 } from "@/components/composer/ComposerConfigSections";
+import {
+  ComposerPaletteSettings,
+  MODEL_BUSY_REASON,
+} from "@/components/composer/composerSectionSettings";
 import { useComposerConfigCycleHotkeys } from "@/hooks/useComposerConfigCycleHotkeys";
 import { buildFusionSections } from "@/components/composer/fusionSections";
 import { fusionOption, isFusionModelUid } from "@/lib/devinFusion";
@@ -84,6 +88,7 @@ export function SessionHarnessPicker({
   openNonce = 0,
   modelPickerShortcutEnabled = false,
   renderIcon,
+  paletteSettingsSource,
 }: {
   appearance?: "composer" | "header";
   busy: boolean;
@@ -113,6 +118,8 @@ export function SessionHarnessPicker({
   sessionId?: string;
   /** Renders the session's harness glyph a second time, e.g. on another surface. */
   renderIcon?: (icon: ReactNode) => ReactNode;
+  /** Offer Model and Reasoning Effort in ⌘K under this; unset while quick_pick_palette is off. */
+  paletteSettingsSource?: string;
 }) {
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -509,86 +516,109 @@ export function SessionHarnessPicker({
       />
     </>
   );
+  const picker = (
+    <HarnessPicker
+      contentSide={appearance === "header" ? "bottom" : "top"}
+      cyclePreview={
+        preview === "models"
+          ? cycleModelSection
+          : preview === "efforts"
+            ? cycleEffortSection
+            : undefined
+      }
+      cyclePreviewHint={
+        staged ? "Applies after 2 seconds · Enter to apply · Esc to cancel" : undefined
+      }
+      onDismissCyclePreview={dismissPreview}
+      open={menuOpen}
+      onOpenChange={(next) => {
+        if (!next || (!disabled && !busy && configurable)) setMenuOpen(next);
+        if (!next) setConfigOpen(false);
+      }}
+      trigger={{
+        appearance,
+        label: "Configure session",
+        model: label,
+        effort: effortLabel ?? undefined,
+        icon: (
+          <ComposerAgentIcon
+            agent={iconAgent}
+            className={appearance === "header" ? "size-5" : undefined}
+          />
+        ),
+        disabled: busy || !configurable,
+        "aria-disabled": disabled || busy || !configurable,
+        className: disabled ? "cursor-default opacity-50" : undefined,
+        testIdPrefix: "composer",
+        "data-testid": "composer-config-gear",
+        loading: modelLabelLoading && !routingOn,
+        pending:
+          (sessionModelSeeded || pendingModelChange !== null) &&
+          (modelPickerKind === "claude" || modelPickerKind === "codex"),
+      }}
+      tooltip={
+        <>
+          <ComposerConfigTooltipRows rows={summary} />
+          {modelPickerShortcutEnabled && (
+            <span className="flex items-center gap-2 pt-1 text-muted-foreground">
+              Open model picker
+              <CompactShortcutKeys keys={MODEL_PICKER_KEYS} />
+            </span>
+          )}
+        </>
+      }
+      tooltipTestId="composer-config-gear-tooltip"
+      testId="composer-agent-menu"
+    >
+      {isMobile && configOpen ? (
+        <HarnessPickerConfigPage
+          backTestId="composer-agent-config-back"
+          testId="composer-agent-config-menu"
+          onBack={() => setConfigOpen(false)}
+        >
+          {configContent}
+        </HarnessPickerConfigPage>
+      ) : (
+        <HarnessPickerConfigRow
+          label={nativeAgent?.displayName ?? harnessLabel ?? "Session"}
+          value={routingOn ? SMART_ROUTING_LABEL : (modelSummary ?? "Default")}
+          open={configOpen}
+          onOpenChange={setConfigOpen}
+          isMobile={isMobile}
+          disabled={busy || pendingModelChange !== null}
+          valueTestId="composer-agent-model-summary"
+          testId="composer-agent-edit"
+          configTestId="composer-agent-config-menu"
+        >
+          {configContent}
+        </HarnessPickerConfigRow>
+      )}
+    </HarnessPicker>
+  );
+  const routing = costRoutingEligible &&
+    showModels && {
+      active: routingOn,
+      unavailableReason: busy || pendingModelChange !== null ? MODEL_BUSY_REASON : undefined,
+      select: () => {
+        cancelCycle();
+        void apply(() => useChatStore.getState().setCostControlMode("on", ...target));
+      },
+    };
+  // The picker keeps its place as a source comes and goes, so it never remounts; without a
+  // source the ⌘K settings never mount and their hooks never run.
   return (
     <>
+      {paletteSettingsSource !== undefined && (
+        <ComposerPaletteSettings
+          source={paletteSettingsSource}
+          models={disabled ? undefined : modelSection}
+          efforts={disabled ? undefined : effortSection}
+          effortRouted={routingOn}
+          routing={routing || undefined}
+        />
+      )}
       {renderIcon?.(<ComposerAgentIcon agent={iconAgent} />)}
-      <HarnessPicker
-        contentSide={appearance === "header" ? "bottom" : "top"}
-        cyclePreview={
-          preview === "models"
-            ? cycleModelSection
-            : preview === "efforts"
-              ? cycleEffortSection
-              : undefined
-        }
-        cyclePreviewHint={
-          staged ? "Applies after 2 seconds · Enter to apply · Esc to cancel" : undefined
-        }
-        onDismissCyclePreview={dismissPreview}
-        open={menuOpen}
-        onOpenChange={(next) => {
-          if (!next || (!disabled && !busy && configurable)) setMenuOpen(next);
-          if (!next) setConfigOpen(false);
-        }}
-        trigger={{
-          appearance,
-          label: "Configure session",
-          model: label,
-          effort: effortLabel ?? undefined,
-          icon: (
-            <ComposerAgentIcon
-              agent={iconAgent}
-              className={appearance === "header" ? "size-5" : undefined}
-            />
-          ),
-          disabled: busy || !configurable,
-          "aria-disabled": disabled || busy || !configurable,
-          className: disabled ? "cursor-default opacity-50" : undefined,
-          testIdPrefix: "composer",
-          "data-testid": "composer-config-gear",
-          loading: modelLabelLoading && !routingOn,
-          pending:
-            (sessionModelSeeded || pendingModelChange !== null) &&
-            (modelPickerKind === "claude" || modelPickerKind === "codex"),
-        }}
-        tooltip={
-          <>
-            <ComposerConfigTooltipRows rows={summary} />
-            {modelPickerShortcutEnabled && (
-              <span className="flex items-center gap-2 pt-1 text-muted-foreground">
-                Open model picker
-                <CompactShortcutKeys keys={MODEL_PICKER_KEYS} />
-              </span>
-            )}
-          </>
-        }
-        tooltipTestId="composer-config-gear-tooltip"
-        testId="composer-agent-menu"
-      >
-        {isMobile && configOpen ? (
-          <HarnessPickerConfigPage
-            backTestId="composer-agent-config-back"
-            testId="composer-agent-config-menu"
-            onBack={() => setConfigOpen(false)}
-          >
-            {configContent}
-          </HarnessPickerConfigPage>
-        ) : (
-          <HarnessPickerConfigRow
-            label={nativeAgent?.displayName ?? harnessLabel ?? "Session"}
-            value={routingOn ? SMART_ROUTING_LABEL : (modelSummary ?? "Default")}
-            open={configOpen}
-            onOpenChange={setConfigOpen}
-            isMobile={isMobile}
-            disabled={busy || pendingModelChange !== null}
-            valueTestId="composer-agent-model-summary"
-            testId="composer-agent-edit"
-            configTestId="composer-agent-config-menu"
-          >
-            {configContent}
-          </HarnessPickerConfigRow>
-        )}
-      </HarnessPicker>
+      {picker}
     </>
   );
 }

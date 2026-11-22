@@ -66,6 +66,7 @@ import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { writeLastHostChoice } from "@/lib/hostPreferences";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
+import { ARIA_MOD_KEY, ENTER_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ComposerPresentationContext, type ComposerPresentation } from "./composerPresentation";
 
@@ -560,6 +561,24 @@ describe("NewChatLandingScreen in the floating panel", () => {
     expect(onOpenSession).not.toHaveBeenCalled();
   });
 
+  // The panel keeps the prompt when delivery fails, and remounts the composer when it succeeds.
+  it("keeps the prompt in the composer after it hands a create to the panel", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    renderLanding([], {}, panel);
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(panel.launch).toHaveBeenCalled());
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("inspect the repo");
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+  });
+
   it.each([true, undefined])(
     "says whether a sandbox create took the first message (durable input %s)",
     async (durable) => {
@@ -757,6 +776,44 @@ describe("NewChatLandingScreen in the floating panel", () => {
     await waitFor(() => expect(panel.launch).toHaveBeenCalled());
   });
 
+  it("fills the panel with a borderless composer and keeps its send chord in view", async () => {
+    renderLanding([], {}, floatingPanel());
+    await waitForWorkspaceSeed();
+
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    expect(composer).toHaveAttribute("data-composer-appearance", "panel");
+    expect(composer).toHaveClass("flex-1");
+    expect(composer).not.toHaveClass("composer-reference-surface");
+    expect(composer).not.toHaveClass("border");
+    expect(composer).not.toHaveClass("rounded-2xl");
+    // The prompt takes the panel's height and scrolls inside it.
+    expect(composer.querySelector("[data-composer-input-area]")).toHaveClass(
+      "flex-1",
+      "overflow-y-auto",
+    );
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveClass("flex-1", "max-h-none");
+    expect(screen.getByTestId("new-chat-landing-actions")).toHaveClass("border-t");
+    expect(screen.getByTestId("new-chat-landing-send-shortcut")).toHaveTextContent(
+      `${MOD_KEY}${ENTER_KEY}`,
+    );
+    expect(screen.getByTestId("new-chat-landing-submit")).toHaveAttribute(
+      "aria-keyshortcuts",
+      `${ARIA_MOD_KEY}+Enter`,
+    );
+  });
+
+  it("keeps the main window's composer card, with no chord hint", async () => {
+    renderLanding([]);
+    await waitForWorkspaceSeed();
+
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    expect(composer).not.toHaveAttribute("data-composer-appearance");
+    expect(composer).toHaveClass("composer-reference-surface", "border", "rounded-2xl");
+    expect(screen.getByTestId("new-chat-landing-actions")).not.toHaveClass("border-t");
+    expect(screen.queryByTestId("new-chat-landing-send-shortcut")).not.toBeInTheDocument();
+    expect(screen.getByTestId("new-chat-landing-submit")).not.toHaveAttribute("aria-keyshortcuts");
+  });
+
   it("tells the panel when the native file picker opens and closes", async () => {
     const panel = floatingPanel();
 
@@ -928,6 +985,40 @@ describe("NewChatLandingScreen create flow", () => {
     },
   );
 
+  it("moves the new session to its real id with the requests in its URL, such as a cited file", async () => {
+    const tempConvId = "temp:1234567890abcdef1234567890abcdef";
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId,
+      pendingMsgTempId: "pend_file",
+      createToken: "1234567890abcdef1234567890abcdef",
+    });
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding([]);
+    await waitForWorkspaceSeed();
+    typeMessage("Open the readme");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(hydrateLocalConversationMock).toHaveBeenCalledOnce());
+
+    const hydrateNavigate = hydrateLocalConversationMock.mock.calls[0][7];
+    const previousUrl = window.location.href;
+    try {
+      window.history.replaceState(
+        {},
+        "",
+        `/c/${encodeURIComponent(tempConvId)}?file=README.md&line=4`,
+      );
+      hydrateNavigate("/c/conv_new", { replace: true });
+      expect(navigateMock).toHaveBeenLastCalledWith("/c/conv_new?file=README.md&line=4", {
+        replace: true,
+      });
+    } finally {
+      window.history.replaceState({}, "", previousUrl);
+    }
+  });
+
   it.each([
     { query: "canvas=main", canvasId: "main", project: undefined },
     {
@@ -1085,7 +1176,9 @@ describe("NewChatLandingScreen create flow", () => {
           );
         });
         if (query.startsWith("sibling=")) {
-          expect(client.getQueryData(["nested-session-drafts"])).toEqual([]);
+          expect(client.getQueryData(["nested-session-drafts"])).toEqual([
+            expect.objectContaining({ creating: false, created: false }),
+          ]);
         }
         await waitFor(() =>
           expect(navigateMock).toHaveBeenLastCalledWith({ pathname: "/", search: `?${query}` }),
@@ -1106,7 +1199,9 @@ describe("NewChatLandingScreen create flow", () => {
         expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
         if (query.startsWith("sibling=") && !sourceDeleted) {
           cleanup();
-          expect(reopenedClient.getQueryData(["nested-session-drafts"])).toEqual([]);
+          expect(reopenedClient.getQueryData(["nested-session-drafts"])).toEqual([
+            expect.objectContaining({ creating: false, created: false }),
+          ]);
         }
       } finally {
         window.history.replaceState({}, "", previousUrl);
@@ -1362,7 +1457,8 @@ describe("NewChatLandingScreen create flow", () => {
         [],
         "pend_1",
         null,
-        navigateMock,
+        // Hydration navigates through a wrapper that keeps the page's query.
+        expect.any(Function),
         expect.any(Function),
         project,
         false,
@@ -1470,7 +1566,8 @@ describe("NewChatLandingScreen create flow", () => {
         [],
         "pend_1",
         null,
-        navigateMock,
+        // Hydration navigates through a wrapper that keeps the page's query.
+        expect.any(Function),
         expect.any(Function),
         undefined,
         false,
@@ -1517,7 +1614,8 @@ describe("NewChatLandingScreen create flow", () => {
         [],
         "pend_managed",
         null,
-        navigateMock,
+        // Hydration navigates through a wrapper that keeps the page's query.
+        expect.any(Function),
         expect.any(Function),
         undefined,
         false,
@@ -1770,7 +1868,8 @@ describe("NewChatLandingScreen create flow", () => {
         [],
         "pend_b",
         null,
-        navigateMock,
+        // Hydration navigates through a wrapper that keeps the page's query.
+        expect.any(Function),
         expect.any(Function),
         undefined,
         false,

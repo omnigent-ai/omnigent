@@ -8,12 +8,20 @@ import { type ReactNode, useEffect, useRef } from "react";
 export function scrollTabIntoView(tab: HTMLElement | null): void {
   const viewport = tab?.closest<HTMLElement>("[data-workspace-tabs-viewport]");
   if (!tab || !viewport) return;
+  scrollViewportToShow(viewport, tab.getBoundingClientRect());
+}
+
+/** Scroll `viewport` just far enough to show `box`, of which `width` pixels are visible. */
+export function scrollViewportToShow(
+  viewport: HTMLElement,
+  box: DOMRect,
+  width = viewport.clientWidth,
+): void {
   const left = viewport.getBoundingClientRect().left + viewport.clientLeft;
-  const right = left + viewport.clientWidth;
-  const box = tab.getBoundingClientRect();
+  const right = left + width;
   if (box.left < left) {
     // A tab wider than the strip whose end already shows keeps its close button in view.
-    if (box.right <= right && box.width > viewport.clientWidth) return;
+    if (box.right <= right && box.width > width) return;
     viewport.scrollLeft -= left - box.left;
   } else if (box.right > right) {
     // A tab wider than the strip keeps its start in view.

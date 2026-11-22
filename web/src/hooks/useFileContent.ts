@@ -117,6 +117,16 @@ export async function fetchFileContent(
     const viaApi = await readFileViaWorkspaceApi(conversationId, path, signal, sshTarget);
     if (viaApi) return viaApi;
   }
+  return fetchFileContentViaRest(conversationId, path, signal, query);
+}
+
+/** {@link fetchFileContent} through the REST route only, for a caller that already asked the API. */
+export async function fetchFileContentViaRest(
+  conversationId: string,
+  path: string,
+  signal?: AbortSignal,
+  query: { scope?: "workspace" } = {},
+): Promise<FileContentResponse> {
   const res = await authenticatedFetch(workspaceFileUrl(conversationId, path, query), { signal });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   // Older servers ignore scope; automatic previews must fail closed there.
@@ -192,7 +202,19 @@ function clickDownloadLink(href: string, filename: string): void {
  */
 export async function downloadWorkspaceFile(conversationId: string, path: string): Promise<void> {
   const url = workspaceFileUrl(conversationId, path, { download: "true" });
-  const filename = path.split("/").pop() ?? path;
+  await downloadApiFile(url, path.split("/").pop() ?? path);
+}
+
+/**
+ * Save an app API response's bytes as `filename`; see {@link downloadWorkspaceFile}.
+ * `typeImageName` adds an image extension from the fetched type; the link path
+ * gets the server's `Content-Disposition` name instead.
+ */
+async function downloadApiFile(
+  url: string,
+  filename: string,
+  typeImageName = false,
+): Promise<void> {
   if (!isDatabricksWorkspace() && !isIOSShell() && !isAndroidShell()) {
     // A direct anchor navigation, so it must carry the deployment subpath the
     // fetch paths get for free via hostFetch/authenticatedFetch. Without it a
@@ -204,7 +226,101 @@ export async function downloadWorkspaceFile(conversationId: string, path: string
   }
   const res = await authenticatedFetch(url);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  triggerBrowserDownload(await res.blob(), filename);
+  const blob = await res.blob();
+  triggerBrowserDownload(blob, typeImageName ? withImageExtension(filename, blob.type) : filename);
+}
+
+// The page already holds these bytes, so saving them sends no request.
+const IN_MEMORY_IMAGE_SOURCE = /^(?:blob|data):/i;
+
+/** Each savable image type's extensions; the first is the one a name gets. */
+const IMAGE_EXTENSIONS_BY_TYPE = new Map<string, readonly string[]>([
+  ["image/png", ["png"]],
+  ["image/jpeg", ["jpg", "jpeg"]],
+  ["image/gif", ["gif"]],
+  ["image/webp", ["webp"]],
+  ["image/avif", ["avif"]],
+  ["image/bmp", ["bmp"]],
+  ["image/svg+xml", ["svg"]],
+]);
+
+function imageExtensions(type: string): readonly string[] | undefined {
+  return IMAGE_EXTENSIONS_BY_TYPE.get(type.split(";")[0].trim().toLowerCase());
+}
+
+/**
+ * End a save's name in its image type's extension. The name can come from a
+ * transcript, so an SVG named `invoice.html` saves as `invoice.html.svg`.
+ */
+function withImageExtension(name: string, type: string): string {
+  const extensions = imageExtensions(type);
+  if (!extensions) return name;
+  const extension = name.match(/\.([^./\s]+)$/)?.[1].toLowerCase();
+  return extension && extensions.includes(extension) ? name : `${name}.${extensions[0]}`;
+}
+
+/** The type a `data:` URL declares, e.g. ``"image/png"``; undefined for other sources. */
+function dataUrlType(src: string): string | undefined {
+  return src.match(/^data:([^;,]*)/i)?.[1];
+}
+
+/** Only the app's own API is re-read; anything else would be a new request elsewhere. */
+function isAppApiPath(path: string | undefined): path is string {
+  return path !== undefined && path.startsWith("/v1/");
+}
+
+/** Where to read an on-screen image's bytes from, besides the source it displays. */
+export interface ImageDownloadSource {
+  /** The app API path the image was read from. */
+  apiPath?: string;
+  /** The image's bytes, which stay valid after the page revokes its object URL. */
+  blob?: Blob;
+}
+
+/**
+ * Whether {@link downloadImage} can save an on-screen image.
+ *
+ * :param src: The source the `<img>` displays.
+ * :param source: Other places its bytes can be read from.
+ */
+export function canDownloadImage(
+  src: string | undefined,
+  { apiPath, blob }: ImageDownloadSource = {},
+): boolean {
+  // The iOS shell's web view has no download handler, so a save would never land.
+  if (src === undefined || isIOSShell()) return false;
+  if (blob !== undefined) return true;
+  // A browser shows a `data:` image of any `image/*` type it can decode; only
+  // types this can name are saved.
+  const dataType = dataUrlType(src);
+  if (dataType !== undefined) return imageExtensions(dataType) !== undefined;
+  return IN_MEMORY_IMAGE_SOURCE.test(src) || isAppApiPath(apiPath);
+}
+
+/**
+ * Save an on-screen image from held bytes, its `blob:`/`data:` source, or its
+ * app API path; never fetches a remote URL.
+ *
+ * :param src: The source the `<img>` displays.
+ * :param filename: The suggested filename for the save dialog.
+ * :param source: The held bytes or app API path, e.g. an `apiPath` of
+ *     ``"/v1/sessions/s/resources/files/f/content"``.
+ */
+export async function downloadImage(
+  src: string,
+  filename: string,
+  { apiPath, blob }: ImageDownloadSource = {},
+): Promise<void> {
+  if (!canDownloadImage(src, { apiPath, blob })) throw new Error("This image can't be downloaded");
+  if (blob) {
+    triggerBrowserDownload(blob, withImageExtension(filename, blob.type));
+    return;
+  }
+  if (IN_MEMORY_IMAGE_SOURCE.test(src)) {
+    clickDownloadLink(src, withImageExtension(filename, dataUrlType(src) ?? ""));
+    return;
+  }
+  if (apiPath) await downloadApiFile(apiPath, filename, true);
 }
 
 /** How often an on-screen text file is re-read to show other writers' edits. */
@@ -232,6 +348,23 @@ export function fileContentPollInterval(
 ): number | false {
   if (data?.encoding !== "utf-8" || data.bytes > FILE_CONTENT_POLL_MAX_BYTES) return false;
   return failing ? FILE_CONTENT_FAILING_POLL_MS : FILE_CONTENT_POLL_MS;
+}
+
+/**
+ * The query for one file's contents, shared by the viewer and prefetch so a
+ * prefetched file opens from the cache.
+ */
+export function fileContentQuery(serverId: string, path: string, sshTarget?: string | null) {
+  return {
+    queryKey: ["file-content", serverId, path],
+    queryFn: async ({ signal }: { signal: AbortSignal }) => {
+      await fileWritesSettled(serverId, path);
+      // Cancelled while waiting (a newer write started): don't send the read.
+      signal.throwIfAborted();
+      return fetchFileContent(serverId, path, signal, { sshTarget });
+    },
+    staleTime: 5_000,
+  };
 }
 
 /**
@@ -294,15 +427,8 @@ export function useFileContent(
   }, [serverId, path, sessionActive, visible, queryClient]);
 
   return useQuery({
-    queryKey: ["file-content", serverId, path],
-    queryFn: async ({ signal }) => {
-      await fileWritesSettled(serverId!, path!);
-      // Cancelled while waiting (a newer write started): don't send the read.
-      signal.throwIfAborted();
-      return fetchFileContent(serverId!, path!, signal, { sshTarget: options.sshTarget });
-    },
+    ...fileContentQuery(serverId ?? "", path ?? "", options.sshTarget),
     enabled: !!serverId && !!path && serveable !== false,
-    staleTime: 5_000,
     refetchInterval: visible
       ? (query) => fileContentPollInterval(query.state.data, query.state.status === "error")
       : false,

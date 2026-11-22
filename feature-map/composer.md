@@ -159,6 +159,18 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   harness as text. A claude-sdk `/clear` continues in a new, empty session on
   the same machine and the view follows it. States: loading, error/retry,
   unavailable while disconnected, and an incomplete catalog.
+- `command-and-shell-tint`: in the main chat, side chats, Canvas grid cells
+  and the new-session composer (textarea or CodeMirror), a leading known
+  command or skill is tinted (the main chat's built-ins in any case, as they
+  run) and an unknown `/word` is not; the sent bubble keeps the tint, except
+  for a message relayed from another session. In Claude Code and Codex native
+  sessions a leading `!` is tinted with a "Shell command" hint (Codex skips
+  leading whitespace and treats `!!` as text). States: known or unknown
+  command; quotes or attachments (no tint); shell mode; refused shell send,
+  with the reason as the hint and the draft kept (an @-tag, review comments, a
+  reply quote, or a Codex non-owner, whom the server would reject); permission
+  still loading or a pending Codex side-chat tab (no shell mode). See the
+  [native shell recipes](native-harnesses.md#driving-it-with-the-repro-environment).
 - `goal-command`: in sessions with a Goal control, bare `/goal` or its slash-menu
   row opens the same dialog as **+ → Goal**. `/goal <objective>` keeps its
   existing message path. Sessions without the control keep sending the text
@@ -259,7 +271,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `new-command`: `/new` opens a blank new-session composer in the same project;
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
-  be removed. State: unsupported file type rejected without losing the message.
+  be removed. Supported native coding agents receive binary attachments, including
+  MP4 uploads up to 50 MiB, as local files.
+  State: unsupported file type rejected without losing the message.
 - `at-mentions`: a bare `@` in the in-session or new-session composer shows a
   "Sessions" row. Opening it (click, Enter, Tab or →) shows a "Subagents" row
   for the current session's subagents, then every other session the sidebar
@@ -312,13 +326,17 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   can be steered into the running turn. Side-chat composers queue and steer the
   same way, with their own queue strip.
   A message sent mid-turn to a native session says the agent will read it
-  after its current step in the timestamp row. It appears on desktop hover or
-  focus and stays visible with truncation on touch, without adding row height.
+  after its current step in the timestamp row. The note stays visible, with
+  truncation, on desktop and touch until the agent reads the message, while the
+  row's timestamp and actions keep their hover reveal on desktop.
 - `host-offline-hold`: a message sent to a native session whose host is offline
   waits in the queue as "Waiting for host", ahead of other queued messages, and
   sends once the host reconnects; no failed turn is recorded.
-- `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
-  and always-steer preference, keeping their element screenshots.
+- `browser-pointer-queue`: desktop Design-mode instructions (older shells) follow
+  the same queue and always-steer preference, keeping their element screenshots.
+  Annotate/Draw requests skip the queue: they wait in their own outbox, saved in
+  the browser, send once the session is idle and its account is still the one
+  signed in, and show Retry/Remove above the composer (a side chat's too).
 - `pi-compact`: `/compact` follows the normal queue/Always steer preference.
   Send now interrupts the turn and compacts. During compaction, queued messages
   wait in the web queue; immediate sends are retained by the Pi integration.
@@ -360,6 +378,15 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   transcript shows a yellow banner with the deployment's instructions. Provisioning
   continues, and the banner leaves when the launch moves on. Dismissing hides
   only that warning; a later one shows again.
+- `palette-model-effort`: with `quick_pick_palette` on (off by default), ⌘K lists
+  the open session composer's **Model** and **Reasoning Effort** (**Thinking
+  Level** for Pi) under **Composer**, each showing its current value. Enter opens
+  the menu's choices; picking one runs the menu's own handler. Model lists Smart
+  Routing first where the composer offers it, and the whole effort row is greyed
+  while Smart Routing picks the effort. A value the menu greys says why. With the
+  flag off the picker mounts none of it
+  (`web/src/components/composer/composerSectionSettings.test.tsx`,
+  `web/src/components/composer/SessionHarnessPicker.test.tsx`).
 - `custom-agent-placement`: New session and Add nested agent can launch an uploaded
   custom agent on a fresh sandbox with repositories when `session_bundle_workspaces`
   is advertised. Nested custom agents can also use new or existing worktrees on a
@@ -370,6 +397,14 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   bundle and selects it. States: import in flight (Cancel and Create locked),
   rejected bundle, imported agent missing from the refreshed list, and hidden on
   a server without agent install.
+- `palette-add-actions`: with `quick_pick_palette` on (off by default), ⌘K lists
+  the open session composer's Add menu under **Composer**: Attach files and
+  images…, Start a new side chat, Set goal… (View or update goal… once one is
+  set), and Enter or Exit Plan mode. Each reads the menu item's availability
+  and runs its handler, so a row the menu hides is absent and a greyed one says
+  why. Only the open session's composer offers them; side chats and the
+  new-session composer add none
+  (`web/src/components/composer/useComposerAddPaletteCommands.test.tsx`).
 - `mobile-labels`: on narrow screens labels collapse to icons without
   overlapping the stop button.
 
@@ -378,6 +413,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - In a Codex native chat, a Claude Code native chat, or a Polly session with a
   Goal control, send `/goal`, choose `/goal` from the slash menu, or open
   **+ → Goal**.
+- In the in-session composer, a side chat, a Canvas grid cell, or the
+  new-session composer, type a known command or skill such as `/help`; in a
+  Claude Code or Codex native session (or with that agent chosen on the
+  new-session composer), type a draft that starts with `!`.
 
 **In-session composer** (open any session):
 
@@ -450,12 +489,20 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 **Desktop browser pointer** (open a session in the desktop app):
 
-- Choose **+ → Browser** to open a Browser soft tab, navigate to a page, enable
-  Design mode, and click an element. Type an instruction in the floating popup
-  and use Send or Enter.
+- Choose **+ → Browser** to open a Browser soft tab and navigate to a page. Use
+  Annotate to click an element and type an instruction, or Draw to mark up the
+  page and add a note, then send. Where they're unavailable (older shells),
+  enable Design mode instead, click an element, type an instruction in the
+  floating popup, and use Send or Enter.
 - Change Settings → Always steer (on by default) to choose whether
-  busy-session follow-ups queue or send immediately. Existing queued messages
-  retain FIFO ordering.
+  busy-session Design-mode follow-ups queue or send immediately. Existing queued
+  messages retain FIFO ordering. Annotate/Draw requests ignore it: they wait above
+  the composer (Send/Enter, then Retry or Remove) until the turn ends. With
+  `quick_pick_palette` on, ⌘K also lists Always steer as a setting row: type
+  "always steer", press Enter, and pick On or Off
+  (`web/src/shell/QuickPickCommandPalette.appCommands.test.tsx`).
+- With `quick_pick_palette` on, in an open session press Cmd/Ctrl+K, type
+  "model" or "reasoning effort", press Enter, then pick a value.
 
 **New-session composer** (landing page, or New session):
 
@@ -571,6 +618,10 @@ and opens the composer with its prompt`).
   Under picker curation (`restrict_to_agent_names`, see
   `native-harnesses.md`) this New Chat entry point is absent: a curated
   deployment offers no bundle import from New Chat.
+
+- With `quick_pick_palette` on, open a session, press Cmd/Ctrl+K and type
+  "attach", "side chat", "goal" or "plan mode", then press Enter to run the
+  Add menu's action. A row that can't run stays listed with the reason.
 
 **Fork dialog** (Fork in the session header menu, or Fork from here on a
 message, with a native target): the same model, effort, and permission mode
@@ -874,6 +925,18 @@ composer with its prompt`).
   incomplete catalog:
   `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`.
   claude-sdk `/clear` is in the `/clear` and `slash-rewind` recipe above.
+- **`command-and-shell-tint`:** component coverage, run with vitest from
+  `web/`: `web/src/components/composer/composerHighlight.test.ts`
+  (classification, including the harness-specific `!` rules),
+  `web/src/pages/ChatPage.composer.test.tsx` (`Composer native shell mode` and
+  the CodeMirror release-flag cases),
+  `web/src/components/chat/SideChatPane.test.tsx`,
+  `web/src/shell/NewChatDialog.test.tsx` and
+  `web/src/pages/ChatPage.userBubble.test.tsx` (sent-bubble tint). Manually,
+  in a Codex native session as owner, type `!echo hi`: the `!` is tinted and
+  the hint shows; add an @-tag and send to see the refusal. Repeat in a side
+  chat, a Canvas grid cell and on the new-session composer, with and without
+  `chat_composer_codemirror`.
 - **`goal-command`:**
   `tests/e2e_ui/chat/test_codex_goal_mode.py::test_codex_goal_mode_processes_first_message_with_untrusted_hooks`
   drives a real Codex native session through **+ → Goal**, bare `/goal`, and
@@ -1039,7 +1102,9 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   The native mid-turn notice has component coverage in
   `web/src/pages/ChatPage.userBubble.test.tsx`.
   `tests/browser_ui/chat/test_status_indicators.py::test_mobile_layout_reveals_timestamps_and_pending_steering`
-  verifies their visibility without hover in the mobile layout.
+  verifies their visibility without hover in the mobile layout, and
+  `test_steering_explanation_stays_visible_on_desktop` keeps the notice visible
+  without hover on desktop.
 - **`host-offline-hold`:** no browser-level coverage.
   `tests/server/integration/test_session_host_launch.py::test_offline_host_send_held_by_client_records_nothing`
   (plain `uv run pytest`) checks that a held send is refused with nothing
@@ -1055,6 +1120,9 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   Repeat in a fresh session with Always steer on: both entry points send while
   busy and the pointer popup says "Sent to agent." If older messages are already
   queued, new pointer instructions must join them even with Always steer on.
+  With Annotate or Draw instead, the request waits above the composer while the
+  turn runs and sends once it ends; after a reload it comes back for Retry or
+  Remove.
 - **`pi-compact`:** in a Pi session, start a long turn, type `/comp`, press Tab,
   then Enter. With Always steer off, confirm `/compact` queues; use Send now to
   interrupt and compact. With Always steer on and an empty queue, Enter should

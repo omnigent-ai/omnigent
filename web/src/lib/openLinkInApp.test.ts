@@ -2,10 +2,12 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { showToast } from "@/components/ui/toast";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
-import { maybeOpenLinkInApp, onInAppLinkOpen, parseHttpUrl } from "@/lib/openLinkInApp";
+import type { BrowserNavigationResult } from "@/lib/nativeBridge";
+import { maybeOpenLinkInApp, onInAppLinkOpen, openLink, parseHttpUrl } from "@/lib/openLinkInApp";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
+vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn(async () => []) }));
 
 const getSessionSlim = vi.fn();
 vi.mock("@/lib/sessionsApi", () => ({
@@ -272,20 +274,66 @@ it("omits host options when the owning session has no resolvable host", async ()
   expect(getSessionSlim).toHaveBeenCalledWith(CONV);
 });
 
-it("resolves the current host for a new link after the session moves", async () => {
-  getSessionSlim
-    .mockResolvedValueOnce({ id: CONV, hostId: "local-host", parentSessionId: null })
-    .mockResolvedValue({ id: CONV, hostId: "remote-host", parentSessionId: null });
-  maybeOpenLinkInApp(CONV, "http://127.0.0.1:5173/before");
-  await vi.waitFor(() => expect(surfaced).toHaveLength(1));
-  maybeOpenLinkInApp(CONV, "http://127.0.0.1:5173/after");
-  await vi.waitFor(() =>
+it.each([false, true])(
+  "resolves the current host for a new link after the session moves (during consent: %s)",
+  async (movesDuringConsent) => {
+    let hostId = "local-host";
+    getSessionSlim.mockImplementation(async (id: string) => ({
+      id,
+      hostId,
+      parentSessionId: null,
+    }));
+    maybeOpenLinkInApp(CONV, "http://127.0.0.1:5173/before");
+    await vi.waitFor(() => expect(surfaced).toHaveLength(1));
+    hostId = "remote-host";
+    let answerConsent!: (result: BrowserNavigationResult) => void;
+    const consent = new Promise<BrowserNavigationResult>((resolve) => {
+      answerConsent = resolve;
+    });
+    if (movesDuringConsent) {
+      Object.assign(window, {
+        omnigentDesktop: {
+          kind: "electron",
+          browserOpenOrNavigate: openOrNavigate,
+          browserHasView: hasView,
+          browserClose: closeView,
+          getDesktopFeatures: async () => ({ sshLocalhostPreview: true }),
+        },
+      });
+      openOrNavigate.mockReturnValueOnce(consent);
+    }
+    maybeOpenLinkInApp(CONV, "http://127.0.0.1:5173/after");
+    await vi.waitFor(() => expect(openOrNavigate).toHaveBeenCalledTimes(2));
     expect(openOrNavigate).toHaveBeenLastCalledWith(
       expect.any(String),
       "http://127.0.0.1:5173/after",
       undefined,
-      { agent: true, sourceHostId: "remote-host", sessionHostProtocol: 1 },
-    ),
-  );
-  expect(getSessionSlim).toHaveBeenCalledTimes(2);
+      {
+        agent: true,
+        sourceHostId: "remote-host",
+        sessionHostProtocol: 1,
+        ...(movesDuringConsent ? { sshPreviewProtocol: 1 } : {}),
+      },
+    );
+    if (movesDuringConsent) {
+      expect(surfaced).toHaveLength(1);
+      hostId = "ungranted-host";
+      answerConsent({ ok: false, retryWithFreshHost: true, navigationRetryToken: "link" });
+      await vi.waitFor(() => expect(closeView).toHaveBeenCalledOnce());
+      expect(showToast).toHaveBeenCalledWith(expect.stringContaining("session host changed"));
+    } else {
+      await vi.waitFor(() => expect(surfaced).toHaveLength(2));
+    }
+    expect(openOrNavigate).toHaveBeenCalledTimes(2);
+    expect(getSessionSlim).toHaveBeenCalledTimes(movesDuringConsent ? 3 : 2);
+    expect(surfaced).toHaveLength(movesDuringConsent ? 1 : 2);
+  },
+);
+
+it("opens a link in a new window unless the in-app browser takes it", () => {
+  openLink(CONV, URL_);
+  expect(window.open).not.toHaveBeenCalled();
+  writeOpenLinksInApp(false);
+  openLink(CONV, URL_);
+  expect(window.open).toHaveBeenCalledWith(URL_, "_blank", "noopener,noreferrer");
 });

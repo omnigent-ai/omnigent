@@ -104,6 +104,28 @@ afterEach(() => {
   document.body.replaceChildren();
 });
 
+describe("ChatComposer's panel appearance", () => {
+  it.each([
+    ["panel", "none"],
+    ["default", "180px"],
+  ] as const)("sizes the editor for the %s appearance", async (appearance, maxHeight) => {
+    await loadedCodeMirror();
+    render(
+      <ChatComposer
+        appearance={appearance}
+        engine="codemirror"
+        keyboard={KEYBOARD}
+        input={{ "aria-label": "Message the agent", value: "", onChange: () => {} }}
+        actions={{ leading: null, trailing: null }}
+      />,
+    );
+
+    // A panel's editor grows with the draft; its prompt area scrolls instead.
+    await waitFor(() => expect(document.querySelector(".cm-scroller")).not.toBeNull());
+    expect(getComputedStyle(document.querySelector(".cm-scroller")!).maxHeight).toBe(maxHeight);
+  });
+});
+
 describe("effectiveComposerEngine", () => {
   it.each([
     [false, false, "ready", "textarea"],

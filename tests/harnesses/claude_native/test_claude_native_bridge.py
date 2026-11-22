@@ -1914,6 +1914,38 @@ def test_read_transcript_rewrites_prompt_too_long(tmp_path: Path, raw_text: str)
     assert "/clear" in text
 
 
+# The constant Claude Code writes when a response ends with stop_reason
+# "max_tokens" (read out of @anthropic-ai/claude-code 2.1.268).
+_RAW_OUTPUT_LIMIT_ERROR = (
+    "API Error: Claude's response exceeded the 32000 output token maximum. "
+    "To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS "
+    "environment variable."
+)
+# The same record without the "API Error: " prefix, at a raised, comma-formatted
+# limit and with a typographic apostrophe.
+_RAW_OUTPUT_LIMIT_ERROR_VARIANT = (
+    "Claude’s response exceeded the 64,000 output token maximum. To configure "
+    "this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable."
+)
+
+
+@pytest.mark.parametrize("raw_text", [_RAW_OUTPUT_LIMIT_ERROR, _RAW_OUTPUT_LIMIT_ERROR_VARIANT])
+def test_read_transcript_rewrites_output_token_limit(tmp_path: Path, raw_text: str) -> None:
+    """The CLI's flagged output-token-limit error becomes guidance the web user can act on."""
+    text = _assistant_transcript_text(tmp_path, raw_text, is_api_error=True)
+
+    assert text.startswith("Output limit reached")
+    assert "shorter" in text
+    assert "smaller pieces" in text
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in text
+    assert "output token maximum" not in text
+
+
+def test_read_transcript_leaves_unflagged_output_token_text_untouched(tmp_path: Path) -> None:
+    """A model reply quoting the constant verbatim is unflagged, so it is forwarded as-is."""
+    assert _assistant_transcript_text(tmp_path, _RAW_OUTPUT_LIMIT_ERROR) == _RAW_OUTPUT_LIMIT_ERROR
+
+
 def _assistant_transcript_text(
     tmp_path: Path,
     raw_text: str,
@@ -4544,6 +4576,24 @@ def test_augment_claude_args_disables_auto_mode_setup_offer(
 
     settings = _load_invocation_settings(args)
     assert settings.get("skillOverrides") == {"auto-mode-setup": "off"}
+
+
+def test_augment_claude_args_keeps_auto_compaction_on(tmp_path: Path) -> None:
+    """
+    Every launch turns Claude's automatic compaction on in the settings sidecar.
+
+    A user setting of ``autoCompactEnabled: false`` makes Claude refuse each turn
+    with "Prompt is too long" once the context fills, until someone types
+    ``/compact``. Flag settings outrank user settings, so the sidecar value wins.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = _load_invocation_settings(args)
+    assert settings.get("autoCompactEnabled") is True
 
 
 @pytest.mark.parametrize(
@@ -9902,6 +9952,23 @@ def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
     assert "omni setup" in login.failure_message
 
 
+def test_hook_record_stop_failure_output_limit_details_are_rewritten() -> None:
+    """The output-token-limit constant in ``error_details`` becomes the same guidance."""
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": "max_output_tokens",
+                "error_details": _RAW_OUTPUT_LIMIT_ERROR,
+            }
+        )
+    )
+    assert record.failure_category == "max_output_tokens"
+    assert record.failure_message is not None
+    assert record.failure_message.startswith("Output limit reached")
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in record.failure_message
+
+
 @pytest.mark.parametrize(
     ("text", "code", "starts_with"),
     [
@@ -11706,6 +11773,8 @@ def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
     capture observed while the loop was still deciding. A box-less capture
     followed by a box-present one that arrives only after the deadline
     proves the point: the box-present frame must NOT leak into the error.
+    A live-pane stub and disabled slow-boot extension keep this zero-budget
+    check focused on the error tail instead of startup recovery.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
@@ -11724,11 +11793,16 @@ def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
         return observed if calls["n"] == 1 else late_ready
 
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", fake_capture)
-    with pytest.raises(RuntimeError) as excinfo:
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
             "/tmp/example/tmux.sock",
             "claude:0.0",
             timeout_s=0.0,
+            extend_for_slow_boot=False,
         )
     message = str(excinfo.value)
     # The tail reflects what the loop observed, and the late box-present
@@ -18066,3 +18140,35 @@ def test_a_sandboxed_helper_accepts_the_bridge_under_its_read_only_pinned_tmpdir
             bridge._trusted_parent_for_bridge_dir(pinned / "elsewhere")
     finally:
         pinned.chmod(0o700)
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"claude_session_id": "", "cost_usd": 1.0, "restored": None},
+        {"claude_session_id": "sid", "cost_usd": 0, "restored": None},
+        {"claude_session_id": "sid", "cost_usd": float("nan"), "restored": None},
+        {"claude_session_id": "sid", "cost_usd": 10**400, "restored": None},
+        {"claude_session_id": "sid", "cost_usd": True, "restored": None},
+        {"claude_session_id": "sid", "cost_usd": "1.0", "restored": None},
+        {"claude_session_id": "sid", "cost_usd": 1.0, "restored": "yes"},
+        ["sid", 1.0],
+    ],
+    ids=[
+        "no-session",
+        "zero",
+        "nan",
+        "overflow",
+        "bool",
+        "string",
+        "bad-decision",
+        "not-an-object",
+    ],
+)
+def test_read_resume_cost_baseline_ignores_a_malformed_record(
+    tmp_path: Path, record: object
+) -> None:
+    """A malformed record seeds nothing rather than a wrong cost."""
+    (tmp_path / "resume_cost_baseline.json").write_text(json.dumps(record), encoding="utf-8")
+
+    assert claude_native_bridge.read_resume_cost_baseline(tmp_path) is None

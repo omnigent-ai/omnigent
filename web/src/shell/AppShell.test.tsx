@@ -19,7 +19,7 @@ import type * as SessionsApiModule from "@/lib/sessionsApi";
 import type * as GadgetApiModule from "@/gadgets/api/gadgetApi";
 import { getGadgetShelf, getSessionGadgets, listGadgets } from "@/gadgets/api/gadgetApi";
 import { resetGadgetRailRequests } from "@/lib/gadgetRailTabs";
-import { DESKTOP_VIEWPORT_QUERY } from "@/hooks/useIsMobileViewport";
+import { MOBILE_BREAKPOINT_PX } from "@/hooks/useIsMobileViewport";
 import { gadgetFixture } from "@/gadgets/ui/testUtils";
 import { IN_APP_GADGET_OPEN } from "@/gadgets/ui/gadgetNavigation";
 import { resetGadgetTabOrders } from "@/gadgets/ui/GadgetRailTabs";
@@ -2176,6 +2176,8 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
     expect(rail().className).toContain("md:shrink-0");
     expect(rail().className).not.toContain("md:absolute");
+    expect(screen.getByRole("main")).toHaveAttribute("data-flyout-boundary");
+    expect(screen.getByRole("main")).not.toContainElement(rail());
     fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
 
     // Maximize → the rail breaks out to cover the content region, and the left
@@ -2522,7 +2524,7 @@ describe("gadget full screen contract", () => {
       const baseMatchMedia = window.matchMedia;
       const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
         ...baseMatchMedia(query),
-        matches: query === DESKTOP_VIEWPORT_QUERY || query === "(min-width: 1181px)",
+        matches: query === `(min-width: ${MOBILE_BREAKPOINT_PX}px)`,
       }));
       onTestFinished(() => matchMedia.mockRestore());
     });
@@ -7122,7 +7124,8 @@ describe("AppShell desktop Close", () => {
       renderShell("/c/conv_shell_fail");
       expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
       if (layout === "fullscreen") {
-        fireEvent.click(screen.getByRole("button", { name: "Open sidebar" }));
+        // The desktop app starts with the sidebar docked open at any window width.
+        expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
         fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
       } else if (layout === "collapsed") {
         fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
