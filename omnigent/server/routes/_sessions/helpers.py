@@ -12713,25 +12713,22 @@ def _enforce_filesystem_attachment_policy(
     session_id: str | None,
     file_store: FileStore,
     sizes: Sequence[int] | None = None,
-    project_id: str | None = None,
 ) -> int:
     """
-    Apply deployment policy to files requiring filesystem tools entering a session or project.
+    Apply deployment policy to files requiring filesystem tools entering a session.
 
-    Enforces the operator denylist and the per-session (or per-project) file-count
-    and total-byte quotas before any bytes are read, so a rejected upload or copy
-    never buffers. The server accounts for all stored uploads, including files that
+    Enforces the operator denylist and the per-session file-count and total-byte
+    quotas before any bytes are read, so a rejected upload or copy never
+    buffers. The server accounts for all stored uploads, including files that
     are not currently present in the runner cache.
 
     :param filenames: The incoming files' names, e.g. ``["bundle.zip"]``.
     :param session_id: Destination session, whose existing attachments are counted,
-        or ``None`` for a new, empty destination or a project destination.
-    :param file_store: Store used to total the destination's current usage.
+        or ``None`` for a new, empty destination.
+    :param file_store: Store used to total the session's current usage.
     :param sizes: The incoming files' byte sizes when already known (a copy),
         checked against the per-file and remaining-session limits. ``None``
         for an upload, whose size is enforced by the returned read cap.
-    :param project_id: Destination project, whose existing files are counted
-        instead of a session's, e.g. ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
     :returns: The byte cap a single upload must stay within.
     :raises HTTPException: 415 when an extension is denied by configuration,
         or 413 when the files would exceed a per-file or per-session quota.
@@ -12760,26 +12757,19 @@ def _enforce_filesystem_attachment_policy(
     used_files = 0
     used_bytes = 0
     after: str | None = None
-    holder = "project" if project_id is not None else "session"
     # Walk every page: stopping at a fixed page count would let a session hide
     # filesystem attachments behind enough inline ones. The walk ends early once the
     # quota is already exhausted, since the answer can't change after that.
     while (
-        (session_id is not None or project_id is not None)
+        session_id is not None
         and used_files + len(filenames) <= max_files
         and used_bytes < max_total_bytes
     ):
-        page = (
-            file_store.list_for_project(
-                project_id, limit=_FILESYSTEM_QUOTA_PAGE_SIZE, after=after, order="asc"
-            )
-            if project_id is not None
-            else file_store.list(
-                session_id=cast(str, session_id),
-                limit=_FILESYSTEM_QUOTA_PAGE_SIZE,
-                after=after,
-                order="asc",
-            )
+        page = file_store.list(
+            session_id=session_id,
+            limit=_FILESYSTEM_QUOTA_PAGE_SIZE,
+            after=after,
+            order="asc",
         )
         for stored in page.data:
             # This quota covers the files delivered through filesystem tools.
@@ -12794,7 +12784,7 @@ def _enforce_filesystem_attachment_policy(
         raise HTTPException(
             status_code=413,
             detail=(
-                f"This {holder} already holds {used_files} file attachments "
+                f"This session already holds {used_files} file attachments "
                 f"(limit {max_files}). Remove one before attaching another."
             ),
         )
@@ -12803,7 +12793,7 @@ def _enforce_filesystem_attachment_policy(
         raise HTTPException(
             status_code=413,
             detail=(
-                f"This {holder}'s file attachments would exceed the "
+                f"This session's file attachments would exceed the "
                 f"{max_total_bytes // (1024 * 1024)} MB limit "
                 f"({used_bytes // (1024 * 1024)} MB already used)."
             ),

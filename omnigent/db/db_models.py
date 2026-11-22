@@ -313,7 +313,7 @@ class SqlFile(OmnigentBase):
             "id",
         ),
         # Serves the reference check made before a shared blob is deleted.
-        Index("ix_files_blob_key", "workspace_id", "blob_key"),
+        Index("ix_files_blob_key", "workspace_id", "blob_key", "id"),
     )
 
 

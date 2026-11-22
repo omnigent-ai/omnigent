@@ -555,6 +555,7 @@ def test_native_cli_uploads_a_workspace_file_through_the_omnigent_relay(
         content = client.get(
             f"/v1/projects/{project_id}/resources/files/{project_file_id}/content"
         )
+        content.raise_for_status()
         assert content.content == b"native report"
 
 
@@ -739,6 +740,7 @@ def test_sessions_in_a_project_share_its_files(
         http_client, outsider, "sys_download_file", {"file_id": file_id, "scope": "project"}
     )
     owner_listed = http_client.get(f"/v1/projects/{shared}/resources/files")
+    owner_listed.raise_for_status()
 
     assert [entry["name"] for entry in json.loads(listed)["data"]] == ["plan.md"], listed
     assert read_back == "the plan"
@@ -808,7 +810,10 @@ def test_model_turns_in_one_project_share_a_file(
         ),
         timeout=120,
     )
-    shared = json.loads(_outputs_by_call_id(writer_turn)["share"])
+    assert writer_turn["status"] == "completed", writer_turn.get("error")
+    share_output = _outputs_by_call_id(writer_turn).get("share", "")
+    assert share_output.startswith("{"), share_output
+    shared = json.loads(share_output)
     configure_mock_llm(
         mock_llm_server_url,
         [
@@ -901,6 +906,17 @@ def test_deleting_a_project_removes_its_files(tmp_path: Path) -> None:
             owner_after = client.get(f"/v1/projects/{project_id}/resources/files")
             agent_after = _mcp_tool_call(
                 client, session_id, "sys_list_files", {"scope": "project"}
+            )
+            # The bytes go in a background task after the delete responds.
+            wait_for(
+                lambda: (
+                    not {brief_id, plan_id}
+                    & {path.name for path in stack.artifact_location.iterdir()}
+                    or None
+                ),
+                timeout=30,
+                what="the deleted project's blobs to be removed",
+                interval=0.2,
             )
             stored_after = {path.name for path in stack.artifact_location.iterdir()}
 

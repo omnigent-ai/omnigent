@@ -9369,6 +9369,11 @@ async def _execute_file_tool(
     scope = parse_file_scope(args)
     if scope is None:
         return f"Error: {tool_name} failed: scope must be 'session' or 'project'"
+    if scope == PROJECT_FILE_SCOPE and not await _server_has_project_files(server_client):
+        return (
+            f"Error: {tool_name} failed: this Omnigent server doesn't support project "
+            "files; use the default session scope"
+        )
     resource = "project-files" if scope == PROJECT_FILE_SCOPE else "files"
     files_path = f"{_session_url(conversation_id)}/resources/{resource}"
 
@@ -9430,6 +9435,20 @@ async def _execute_file_tool(
             return f"Error: {tool_name} failed: {exc}"
 
     return f"Error: {tool_name} not implemented in file dispatch"
+
+
+async def _server_has_project_files(server_client: httpx.AsyncClient) -> bool:
+    """
+    Whether the server advertises project files in ``/v1/info``; older servers don't.
+
+    :param server_client: HTTP client for the Omnigent server.
+    :returns: ``True`` only when ``/v1/info`` reports ``project_files: true``.
+    """
+    try:
+        info = await server_client.get("/v1/info", timeout=30.0)
+        return info.status_code == 200 and info.json().get("project_files") is True
+    except (httpx.HTTPError, ValueError):
+        return False
 
 
 def _file_error_detail(resp: httpx.Response) -> str:

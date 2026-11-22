@@ -1768,6 +1768,7 @@ def _stores_with(
     blob: bytes,
     session_id: str | None = None,
     source_metadata: dict[str, Any] | None = None,
+    project_id: str | None = None,
 ) -> tuple[FakeFileStore, FakeArtifactStore]:
     """Build fake stores holding one attachment.
 
@@ -1783,6 +1784,7 @@ def _stores_with(
                 content_type=content_type,
                 session_id=session_id,
                 source_metadata=source_metadata,
+                project_id=project_id,
             )
         }
     )
@@ -1892,3 +1894,23 @@ def test_skips_foreign_session_file() -> None:
     content = [{"type": "input_file", "file_id": "file_csv"}]
     out = extract_text_attachments(content, fs, arts, session_id="mine")  # type: ignore[arg-type]
     assert out == []
+
+
+def test_a_project_file_is_neither_scanned_nor_inlined_from_a_message() -> None:
+    """A project file has no session, but a message in any session can't pull it in."""
+    fs, arts = _stores_with(
+        "file_plan",
+        "plan.txt",
+        "text/plain",
+        b"project plan",
+        project_id="7d3b1f4e2a9c4b6d8e0f1a2b3c4d5e6f",
+    )
+    block = {"type": "input_file", "file_id": "file_plan", "filename": "plan.txt"}
+
+    assert extract_text_attachments([block], fs, arts, session_id="mine") == []  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="no longer exists"):
+        resolve_content_references(
+            [_make_conversation_item([block])],
+            fs,
+            arts,  # type: ignore[arg-type]
+        )

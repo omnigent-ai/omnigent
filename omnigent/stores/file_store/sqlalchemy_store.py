@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import ColumnElement, Select, and_, asc, desc, or_, select
@@ -20,6 +21,22 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import PagedList, StoredFile
 from omnigent.stores.file_store import FileStore
+
+# Rows deleted per transaction when deleting all of one session's or project's files.
+_DELETE_BATCH_SIZE = 500
+
+
+@dataclass(frozen=True)
+class _DeletedBatch:
+    """
+    One batch of an owner's deleted file rows.
+
+    :param deleted: How many rows the batch deleted, at most ``_DELETE_BATCH_SIZE``.
+    :param orphaned: Blob keys no surviving row references any more.
+    """
+
+    deleted: int
+    orphaned: list[str]
 
 
 def _to_entity(row: SqlFile) -> StoredFile:
@@ -331,17 +348,25 @@ class SqlAlchemyFileStore(FileStore):
         """
         Delete one owner's file rows and report the blobs nothing references any more.
 
+        Runs in bounded batches, one transaction each, over the owner's index. A
+        failure leaves the remaining rows for a retry.
+
         :param owner: Filter selecting the owner's rows, e.g.
             ``SqlFile.project_id == project_id``.
-        :param transaction_name: Semantic name of the write transaction, e.g.
-            ``"delete_project_files"``.
-        :param select_name: Semantic name of the row lookup, e.g.
+        :param transaction_name: Semantic name of each batch's write transaction,
+            e.g. ``"delete_project_files"``.
+        :param select_name: Semantic name of each batch's row lookup, e.g.
             ``"list_project_files_for_delete"``.
         :returns: The now-orphaned artifact-store keys to clean up.
         """
 
-        def write(session: Session) -> builtins.list[str]:
-            stmt = select(SqlFile).where(SqlFile.workspace_id == current_workspace_id(), owner)
+        def delete_batch(session: Session) -> _DeletedBatch:
+            stmt = (
+                select(SqlFile)
+                .where(SqlFile.workspace_id == current_workspace_id(), owner)
+                .order_by(SqlFile.created_at, SqlFile.id)
+                .limit(_DELETE_BATCH_SIZE)
+            )
             with query_name_scope(f"omnigent.file_store.{select_name}"):
                 rows = list(session.execute(stmt).scalars().all())
             blob_keys = {_effective_blob_key(row) for row in rows}
@@ -358,9 +383,14 @@ class SqlAlchemyFileStore(FileStore):
                     ).first()
                 if still_referenced is None:
                     orphaned.append(blob_key)
-            return orphaned
+            return _DeletedBatch(deleted=len(rows), orphaned=orphaned)
 
-        return run_write_transaction(self._session_immediate, transaction_name, write)
+        orphaned: builtins.list[str] = []
+        while True:
+            batch = run_write_transaction(self._session_immediate, transaction_name, delete_batch)
+            orphaned.extend(batch.orphaned)
+            if batch.deleted < _DELETE_BATCH_SIZE:
+                return orphaned
 
 
 def _page(

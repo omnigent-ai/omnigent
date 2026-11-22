@@ -40,7 +40,7 @@ def upgrade() -> None:
     with op.batch_alter_table(_TABLE) as batch:
         batch.add_column(sa.Column("project_id", Uuid16(), nullable=True))
     op.create_index(_PROJECT_INDEX, _TABLE, ["workspace_id", "project_id", "created_at", "id"])
-    op.create_index(_BLOB_KEY_INDEX, _TABLE, ["workspace_id", "blob_key"])
+    op.create_index(_BLOB_KEY_INDEX, _TABLE, ["workspace_id", "blob_key", "id"])
 
 
 def downgrade() -> None:

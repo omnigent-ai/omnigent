@@ -278,12 +278,15 @@ def _multi_user_app(
     *,
     artifact_root: Path | None = None,
     project_store: SqlAlchemyProjectStore | None = None,
+    file_store: SqlAlchemyFileStore | None = None,
 ) -> FastAPI:
     """Build a header-auth app mounting sessions + projects at ``/v1``.
 
     :param db_uri: The test database.
     :param artifact_root: Directory for file bytes; ``None`` mounts no file stores.
     :param project_store: The project store to mount, e.g. one that injects a fault.
+    :param file_store: The file store to mount with ``artifact_root``, e.g. one
+        that injects a fault.
     """
     app = FastAPI()
 
@@ -299,7 +302,7 @@ def _multi_user_app(
     project_store = project_store or SqlAlchemyProjectStore(db_uri)
     file_stores = (
         {
-            "file_store": SqlAlchemyFileStore(db_uri),
+            "file_store": file_store or SqlAlchemyFileStore(db_uri),
             "artifact_store": LocalArtifactStore(str(artifact_root)),
         }
         if artifact_root is not None
@@ -566,16 +569,24 @@ def test_a_collaborator_reaches_the_project_through_a_shared_session(
 
 
 def test_a_sub_agent_uses_its_root_sessions_project(db_uri: str, tmp_path: Path) -> None:
+    """A sub-agent reaches its root's project, even when filed elsewhere itself."""
     _ensure_agent(db_uri)
     client = TestClient(_multi_user_app(db_uri, artifact_root=tmp_path / "artifacts"))
     project = client.post("/v1/projects", json={"name": "P"}, headers=_hdr(ALICE)).json()
+    other = client.post("/v1/projects", json={"name": "Q"}, headers=_hdr(ALICE)).json()
     root = _filed_session(db_uri, client, ALICE, project["id"])
     _upload_to_project(client, root, ALICE, "plan.md")
-    child = SqlAlchemyConversationStore(db_uri).create_conversation(
+    conversations = SqlAlchemyConversationStore(db_uri)
+    child = conversations.create_conversation(
         title="worker", agent_id=AGENT_ID, parent_conversation_id=root
     )
+    conversations.set_conversation_project(child.id, other["id"])
 
     assert _project_file_names(client, child.id, ALICE) == ["plan.md"]
+    unfile = client.patch(f"/v1/sessions/{root}", json={"project_id": ""}, headers=_hdr(ALICE))
+    assert unfile.status_code == 200, unfile.text
+    orphaned = client.get(f"/v1/sessions/{child.id}/resources/project-files", headers=_hdr(ALICE))
+    assert orphaned.status_code == 404
 
 
 def test_deleting_a_project_deletes_its_files(db_uri: str, tmp_path: Path) -> None:
@@ -657,3 +668,63 @@ def test_an_upload_racing_a_project_delete_leaves_no_file(db_uri: str, tmp_path:
     assert resp.status_code == 404, resp.text
     assert SqlAlchemyFileStore(db_uri).list_for_project(project["id"]).data == []
     assert list(artifacts.iterdir()) == []
+
+
+class _SweepFailsOnce(SqlAlchemyFileStore):
+    """A file store whose first project file sweep fails, like a lost database connection."""
+
+    def __init__(self, db_uri: str) -> None:
+        super().__init__(db_uri)
+        self.failures_left = 1
+
+    def delete_all_for_project(self, project_id: str) -> list[str]:
+        if self.failures_left:
+            self.failures_left -= 1
+            raise RuntimeError("database unavailable")
+        return super().delete_all_for_project(project_id)
+
+
+def test_a_failed_file_sweep_keeps_the_project_for_a_retry(db_uri: str, tmp_path: Path) -> None:
+    """The files go before the project, so a failed delete can simply be retried."""
+    _ensure_agent(db_uri)
+    artifacts = tmp_path / "artifacts"
+    app = _multi_user_app(db_uri, artifact_root=artifacts, file_store=_SweepFailsOnce(db_uri))
+    client = TestClient(app, raise_server_exceptions=False)
+    project = client.post("/v1/projects", json={"name": "P"}, headers=_hdr(ALICE)).json()
+    member = _filed_session(db_uri, client, ALICE, project["id"])
+    _upload_to_project(client, member, ALICE, "plan.md")
+
+    failed = client.delete(f"/v1/projects/{project['id']}", headers=_hdr(ALICE))
+    assert failed.status_code == 500
+    assert client.get(f"/v1/projects/{project['id']}", headers=_hdr(ALICE)).status_code == 200
+    assert _project_file_names(client, member, ALICE) == ["plan.md"]
+
+    retried = client.delete(f"/v1/projects/{project['id']}", headers=_hdr(ALICE))
+    assert retried.status_code == 200, retried.text
+    assert SqlAlchemyFileStore(db_uri).list_for_project(project["id"]).data == []
+    assert list(artifacts.iterdir()) == []
+
+
+@pytest.mark.parametrize("route", ["owner", "session"])
+def test_a_project_refuses_files_that_need_local_tools(
+    db_uri: str, tmp_path: Path, route: str
+) -> None:
+    """Archives and documents stay session attachments; a project stores what agents can read."""
+    _ensure_agent(db_uri)
+    client = TestClient(_multi_user_app(db_uri, artifact_root=tmp_path / "artifacts"))
+    project = client.post("/v1/projects", json={"name": "P"}, headers=_hdr(ALICE)).json()
+    member = _filed_session(db_uri, client, ALICE, project["id"])
+    url = (
+        f"/v1/projects/{project['id']}/resources/files"
+        if route == "owner"
+        else f"/v1/sessions/{member}/resources/project-files"
+    )
+
+    resp = client.post(
+        url,
+        files={"file": ("bundle.zip", b"PK\x03\x04", "application/zip")},
+        headers=_hdr(ALICE),
+    )
+
+    assert resp.status_code == 415, resp.text
+    assert SqlAlchemyFileStore(db_uri).list_for_project(project["id"]).data == []

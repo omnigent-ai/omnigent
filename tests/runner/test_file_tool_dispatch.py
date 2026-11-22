@@ -1172,6 +1172,27 @@ async def test_send_message_failure_surfaces_child_delete_http_error(
 _PROJECT_FILE_ID = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
 
 
+def _project_files_server(
+    captured: list[httpx.Request], *, info: dict[str, Any] | None = None
+) -> httpx.AsyncClient:
+    """
+    A server client that answers ``/v1/info`` with *info* and records every other request.
+
+    :param captured: Receives each non-info request.
+    :param info: The ``/v1/info`` body; defaults to one advertising project files.
+    :returns: An ``httpx.AsyncClient`` over a mock transport.
+    """
+    body = {"project_files": True} if info is None else info
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json=body)
+        captured.append(request)
+        return httpx.Response(201, json={"id": "file_abc123"})
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(_handler), base_url="http://ap-server")
+
+
 @pytest.mark.parametrize(
     ("tool_name", "arguments", "method", "route"),
     [
@@ -1195,7 +1216,7 @@ async def test_scope_picks_the_session_or_project_file_routes(
     server resolves and authorizes the project; the agent never names one."""
     (tmp_path / "plan.md").write_text("plan")
     captured: list[httpx.Request] = []
-    client = _recording_client(captured)
+    client = _project_files_server(captured)
     try:
         await execute_tool(
             tool_name=tool_name,
@@ -1237,6 +1258,8 @@ async def test_a_refused_project_call_says_why() -> None:
     """The server's reason reaches the agent, e.g. that its session is in no project."""
 
     def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"project_files": True})
         error = {"code": "not_found", "message": "This session is not in a project"}
         return httpx.Response(404, json={"error": error})
 
@@ -1252,3 +1275,25 @@ async def test_a_refused_project_call_says_why() -> None:
         )
 
     assert output == "Error: sys_list_files returned 404: This session is not in a project"
+
+
+@pytest.mark.asyncio
+async def test_project_scope_fails_closed_on_an_older_server(tmp_path: Path) -> None:
+    """A server without project files is told no, and nothing goes to its session routes."""
+    (tmp_path / "plan.md").write_text("plan")
+    captured: list[httpx.Request] = []
+    client = _project_files_server(captured, info={"version": "0.23.0"})
+    try:
+        output = await execute_tool(
+            tool_name="sys_upload_file",
+            arguments=json.dumps({"path": "plan.md", "scope": "project"}),
+            server_client=client,
+            agent_spec=_placeholder_cwd_spec(),
+            conversation_id=_CONVERSATION_ID,
+            session_workspace=tmp_path,
+        )
+    finally:
+        await client.aclose()
+
+    assert "doesn't support project files" in output, output
+    assert captured == []

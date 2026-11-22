@@ -200,7 +200,7 @@ async def test_file_tools_round_trip_through_the_real_server(
     assert [entry["id"] for entry in listed["data"]] == [uploaded["file_id"]]
     assert downloaded == "quarterly report\n"
     assert other_listed["data"] == []
-    assert other_downloaded == "Error: download returned 404"
+    assert other_downloaded == "Error: download returned 404: File not found"
 
 
 # ── 5. File delete ────────────────────────────────────────

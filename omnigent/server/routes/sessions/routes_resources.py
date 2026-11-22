@@ -2108,8 +2108,14 @@ def register_resources_routes(
             # Drop the declared type so the file is never stored as text, even
             # when the policy leaves its extension out.
             content_type = _resolve_content_type("application/octet-stream", file.filename)
+        if filesystem_required and conv is None:
+            # Only a session's harness reads these from disk, and their per-session
+            # quotas have no bounded per-project equivalent.
+            raise HTTPException(
+                status_code=415,
+                detail=f"{file.filename!r} needs local tools, so it can't be a project file.",
+            )
         if filesystem_required and conv is not None:
-            # Only a session's harness reads attachments from disk.
             if initial_input:
                 # The host does not exist yet; dispatch validates its runtime after provisioning.
                 await _require_filesystem_attachment_harness(conv, file.filename)
@@ -2123,8 +2129,8 @@ def register_resources_routes(
         # Hold the quota check through the store below, so parallel uploads can't
         # all spend the same remaining allowance.
         attachment_lock = (
-            _attachment_upload_lock(session_id or f"project:{project_id}")
-            if filesystem_required
+            _attachment_upload_lock(conv.id)
+            if filesystem_required and conv is not None
             else contextlib.nullcontext()
         )
         async with attachment_lock:
@@ -2132,7 +2138,6 @@ def register_resources_routes(
                 read_limit = _enforce_filesystem_attachment_policy(
                     [file.filename],
                     session_id=session_id,
-                    project_id=project_id,
                     file_store=file_store,
                 )
             else:
@@ -2207,8 +2212,10 @@ def register_resources_routes(
                     file_store.delete(stored.id, session_id=session_id, project_id=project_id)
                 except Exception:
                     _logger.warning(
-                        "Failed to delete uploaded file row during rollback: session=%s file_id=%s",
+                        "Failed to delete uploaded file row during rollback: "
+                        "session=%s project=%s file_id=%s",
                         session_id,
+                        project_id,
                         stored.id,
                         exc_info=True,
                     )
@@ -2216,8 +2223,10 @@ def register_resources_routes(
                     artifact_store.delete(stored.id)
                 except Exception:
                     _logger.warning(
-                        "Failed to delete uploaded file blob during rollback: session=%s file_id=%s",
+                        "Failed to delete uploaded file blob during rollback: "
+                        "session=%s project=%s file_id=%s",
                         session_id,
+                        project_id,
                         stored.id,
                         exc_info=True,
                     )
@@ -2454,8 +2463,8 @@ def register_resources_routes(
         The project a session's agent may use: the one the session is filed in.
 
         Checked on every request: the caller's level on the session, the session's
-        project (a sub-agent uses its root session's), and that the project still
-        exists and belongs to the session's owner.
+        project (always its root session's, so a sub-agent filed elsewhere still uses
+        its root's), and that the project still exists and belongs to the session's owner.
 
         :param request: The incoming request, for the caller's identity.
         :param session_id: The calling session, e.g. ``"conv_abc123"``.
@@ -2467,12 +2476,12 @@ def register_resources_routes(
         _require_project_file_store()
         assert project_store is not None
         conv = await _validate_session(session_id, request, required_level)
-        project_id = conv.project_id
-        if project_id is None and conv.root_conversation_id != conv.id:
+        root: Conversation | None = conv
+        if conv.root_conversation_id != conv.id:
             root = await asyncio.to_thread(
                 conversation_store.get_conversation, conv.root_conversation_id
             )
-            project_id = root.project_id if root is not None else None
+        project_id = root.project_id if root is not None else None
         if project_id is None:
             raise OmnigentError("This session is not in a project", code=ErrorCode.NOT_FOUND)
         owner_id = (

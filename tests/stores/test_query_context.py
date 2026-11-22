@@ -197,3 +197,23 @@ def test_conversation_store_names_create_and_get_queries(
             "omnigent.conversation_store.select_conversation_metadata_by_id",
             "omnigent.conversation_store.select_conversation_labels",
         ]
+
+
+def test_project_file_deletion_runs_in_bounded_batches(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deleting a project's files takes one bounded transaction per batch, not one for all."""
+    monkeypatch.setattr("omnigent.stores.file_store.sqlalchemy_store._DELETE_BATCH_SIZE", 2)
+    file_store = SqlAlchemyFileStore(db_uri)
+    project_id = "7d3b1f4e2a9c4b6d8e0f1a2b3c4d5e6f"
+    created = {
+        file_store.create(f"f{index}.md", 1, project_id=project_id).id for index in range(5)
+    }
+
+    with _capture_application_query_names(file_store._engine) as query_names:
+        orphaned = file_store.delete_all_for_project(project_id)
+
+    assert set(orphaned) == created
+    assert query_names.count("omnigent.file_store.list_project_files_for_delete") == 3
+    assert query_names.count("omnigent.file_store.delete_project_files") == 3
+    assert file_store.list_for_project(project_id).data == []

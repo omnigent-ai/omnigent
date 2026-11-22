@@ -283,7 +283,8 @@ def create_projects_router(
 
         Member sessions are not deleted; they are left for the caller to
         unfile (clearing their ``project_id``). The project's file rows are
-        deleted before responding and their bytes afterwards.
+        deleted before and after the project row, and their bytes after the
+        response.
 
         :param request: The incoming request, used to identify the user.
         :param project_id: The project to delete.
@@ -294,14 +295,28 @@ def create_projects_router(
         """
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
-        deleted = await asyncio.to_thread(project_store.delete, project_id, user_id=user_id)
+        if file_store is None or artifact_store is None:
+            deleted = await asyncio.to_thread(project_store.delete, project_id, user_id=user_id)
+        else:
+            if await asyncio.to_thread(project_store.get, project_id, user_id=user_id) is None:
+                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+            # Files go first, so a failed sweep leaves the project in place to delete again.
+            orphaned = await asyncio.to_thread(file_store.delete_all_for_project, project_id)
+            deleted = await asyncio.to_thread(project_store.delete, project_id, user_id=user_id)
+            # An upload racing this delete committed before this second sweep, or
+            # finds the project gone and removes itself.
+            orphaned += await asyncio.to_thread(file_store.delete_all_for_project, project_id)
+            if deleted:
+                background_tasks.add_task(
+                    _delete_project_blobs, artifact_store, project_id, orphaned
+                )
+            else:
+                # A concurrent delete won the row; still drop the bytes this one unlinked.
+                await asyncio.to_thread(
+                    _delete_project_blobs, artifact_store, project_id, orphaned
+                )
         if not deleted:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-        if file_store is not None and artifact_store is not None:
-            # After the project row is gone: an upload racing this delete either
-            # committed before this sweep, or finds the project gone and removes itself.
-            orphaned = await asyncio.to_thread(file_store.delete_all_for_project, project_id)
-            background_tasks.add_task(_delete_project_blobs, artifact_store, project_id, orphaned)
         # Drop the folder from the owner's other connected clients live.
         announce_projects_changed(user_id)
         return {"id": project_id, "object": "project.deleted", "deleted": True}
