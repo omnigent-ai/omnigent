@@ -211,8 +211,11 @@ jobs:
           uv export --frozen --format requirements-txt \
             --extra antigravity --extra all --no-default-groups > /tmp/uv-req-antigravity.txt
           grep -v '^-e ' /tmp/uv-req-antigravity.txt > /tmp/uv-req-ag.txt
-          uvx pip-audit --requirement /tmp/uv-req.txt --no-deps
-          uvx pip-audit --requirement /tmp/uv-req-ag.txt --no-deps
+          # --disable-pip audits the exported pins as locked instead of asking
+          # pip to re-resolve them, so a uv override-dependencies entry (which
+          # pip cannot see) does not fail the install dry run.
+          uvx pip-audit --requirement /tmp/uv-req.txt --no-deps --disable-pip
+          uvx pip-audit --requirement /tmp/uv-req-ag.txt --no-deps --disable-pip
 
       - name: Semgrep (changed files, local rules)
         if: ${{ steps.gate.outputs.scan == 'true' }}
