@@ -5379,7 +5379,7 @@ def _publish_status(
         _session_turn_request_cache.pop(session_id, None)
         # A message the runner held for the ended turn starts the next one.
         if (held := _session_held_request_cache.pop(session_id, None)) is not None:
-            _session_turn_request_cache[session_id] = held
+            _session_turn_request_cache[session_id] = held[1]
     # Keep the background-shell tally sticky alongside the status (see the
     # cache's declaration). A ``Stop`` hook reports an authoritative count
     # (``None`` is never sent by it): a positive count sets the tally, and
@@ -8742,6 +8742,7 @@ async def _dispatch_skill_slash_command_to_runner(
             visible.id,
             reply,
             turn_running=_session_status_from_cache(session_id, conv.live_status) == "running",
+            runner_item_id=runner_body["persisted_item_id"],
         )
         event = OutputItemDoneEvent(type="response.output_item.done", item=visible.to_api_dict())
         session_stream.publish(session_id, event.model_dump())

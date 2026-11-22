@@ -4454,6 +4454,7 @@ def create_runner_app(
         *,
         source_error: Mapping[str, object] | None = None,
         response_id: str | None = None,
+        input_item_ids: list[str] | None = None,
     ) -> None:
         if status == "running":
             # A new turn pulls any backed-off native idle watcher back to the
@@ -4485,6 +4486,9 @@ def create_runner_app(
             # response's own terminal error; the id lets it recognise this edge
             # as the same failure instead of adding a second card.
             event["response_id"] = response_id
+        if input_item_ids:
+            # The stored messages a turn takes up when it follows the last one with no idle edge.
+            event["input_item_ids"] = input_item_ids
         if status == "failed":
             source = source_error if source_error is not None else (error or {})
             dimensions: dict[str, str] = {}
@@ -5563,7 +5567,15 @@ def create_runner_app(
                     for body in all_bodies
                     if isinstance(pending_id := body.get("pending_id"), str)
                 }
-                _publish_turn_status(session_id, "running")
+                _publish_turn_status(
+                    session_id,
+                    "running",
+                    input_item_ids=[
+                        item_id
+                        for body in all_bodies
+                        if isinstance(item_id := body.get("persisted_item_id"), str)
+                    ],
+                )
                 _turn_task = asyncio.create_task(
                     _run_turn_bg(next_body, session_id),
                     name=f"turn-cont-{session_id}",

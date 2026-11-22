@@ -246,6 +246,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _pushed_model_options_cache,
     _recent_mirrored_tool_calls,
     _record_forwarded_request,
+    _record_held_turn_start,
     _record_turn_request,
     _RelayHandle,
     _RelayStatusSnapshot,
@@ -10741,6 +10742,7 @@ async def _relay_runner_stream_once(
                             # turn left un-consumed (e.g. its terminal event
                             # never reached the relay across a reconnect).
                             _llm_response_denied_turns.pop(session_id, None)
+                            _record_held_turn_start(session_id, event.get("input_item_ids"))
                         continue
 
                     # Terminal spin-up status from the runner's auto-create

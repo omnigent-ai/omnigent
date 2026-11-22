@@ -670,9 +670,9 @@ _session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScoped
 # with it; the turn's end drops it.
 _session_turn_request_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
-# The first message a runner held for a running turn. It becomes the next turn's
-# start unless that turn begins with a message of its own.
-_session_held_request_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+# The first message a runner held for a running turn, as the runner's item id and
+# the item a side chat cuts before. It becomes the next turn's start.
+_session_held_request_cache: WorkspaceScopedCache[str, tuple[str, str]] = WorkspaceScopedCache()
 
 
 def _record_turn_request(session_id: str, item_id: str) -> None:
@@ -690,7 +690,12 @@ def _record_turn_request(session_id: str, item_id: str) -> None:
 
 
 def _record_forwarded_request(
-    session_id: str, item_id: str, reply: httpx.Response, *, turn_running: bool
+    session_id: str,
+    item_id: str,
+    reply: httpx.Response,
+    *,
+    turn_running: bool,
+    runner_item_id: str | None = None,
 ) -> None:
     """
     Record a message forwarded to *session_id*'s runner by what the runner did with it.
@@ -704,6 +709,8 @@ def _record_forwarded_request(
     :param item_id: The message's persisted item id.
     :param reply: The runner's reply to the forwarded message.
     :param turn_running: Whether the server has seen a turn running.
+    :param runner_item_id: The stored item the runner knows the message by, when it
+        is not *item_id*, e.g. a skill's hidden prompt.
     """
     body: object = None
     with contextlib.suppress(ValueError, AttributeError):
@@ -712,9 +719,30 @@ def _record_forwarded_request(
     if status == "accepted":
         _session_turn_request_cache[session_id] = item_id
     elif status == "buffered" and turn_running:
-        _session_held_request_cache.setdefault(session_id, item_id)
+        _session_held_request_cache.setdefault(session_id, (runner_item_id or item_id, item_id))
     else:
         _record_turn_request(session_id, item_id)
+
+
+def _record_held_turn_start(session_id: str, input_item_ids: object) -> None:
+    """
+    Record the start of a turn a runner began with messages it held.
+
+    The runner starts such a turn as the one before it ends, with no idle edge
+    between, and names the stored items the turn takes up on its running edge.
+    Older runners name none, which leaves the record to the next turn's end.
+
+    :param session_id: Session whose turn started, e.g. ``"conv_abc123"``.
+    :param input_item_ids: The runner's item ids for the messages, oldest first,
+        e.g. ``["msg_b", "msg_c"]``.
+    """
+    if not isinstance(input_item_ids, list) or not input_item_ids:
+        return
+    held = _session_held_request_cache.pop(session_id, None)
+    if held is not None and held[0] in input_item_ids:
+        _session_turn_request_cache[session_id] = held[1]
+    elif isinstance(first := input_item_ids[0], str):
+        _session_turn_request_cache[session_id] = first
 
 
 _session_background_task_count_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
@@ -1350,6 +1378,7 @@ __all__ = [
     "_read_last_seen",
     "_recent_mirrored_tool_calls",
     "_record_forwarded_request",
+    "_record_held_turn_start",
     "_record_turn_request",
     "_runner_relay_tasks",
     "_runner_status_probe_backoff",
