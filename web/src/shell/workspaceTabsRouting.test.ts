@@ -182,3 +182,19 @@ describe("loadFileActionHost", () => {
     expect(console.error).toHaveBeenCalled();
   });
 });
+
+describe("loadShowAllPullRequestsCommand", () => {
+  it("loads the command, or one that registers nothing when its code can't load", async () => {
+    const { loadShowAllPullRequestsCommand } = await routing();
+    const ShowAllPullRequestsCommand = () => null;
+    expect(
+      (await loadShowAllPullRequestsCommand(async () => ({ ShowAllPullRequestsCommand }))).default,
+    ).toBe(ShowAllPullRequestsCommand);
+    const failed = await loadShowAllPullRequestsCommand(async () => {
+      throw new Error("Failed to fetch dynamically imported module");
+    });
+    const props = { sessionId: "conv_1", pullRequestsAvailable: true, showAll: () => {} };
+    expect(render(createElement(failed.default, props)).container).toBeEmptyDOMElement();
+    expect(console.error).toHaveBeenCalled();
+  });
+});

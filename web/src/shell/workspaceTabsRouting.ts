@@ -9,6 +9,7 @@ import type { AgentBrowserTabRequest } from "@/components/BrowserPane/agentTools
 import { readBrowserTabsState } from "@/hooks/useBrowserTabs";
 import { onBrowserActionSettled } from "@/lib/browserActionBus";
 
+import type { ShowAllPullRequestsCommandProps } from "./workspaceCommands/useShowAllPullRequestsCommand";
 import type * as WorkspaceTabsSessions from "./workspaceTabs/workspaceTabsSessions";
 
 type WorkspaceTabsModule = typeof WorkspaceTabsSessions;
@@ -43,6 +44,27 @@ export function loadFileActionHost(
 
 /** Carries out the file actions the tabs sidebar's menus and ⌘K ask for; loaded with the sidebar. */
 export const LazyFileActionHost = lazy(() => loadFileActionHost());
+
+interface ShowAllPullRequestsCommandModule {
+  ShowAllPullRequestsCommand: ComponentType<ShowAllPullRequestsCommandProps>;
+}
+
+/** ⌘K's Show all pull requests, or nothing when its code can't load: only that row is missing. */
+export function loadShowAllPullRequestsCommand(
+  load: () => Promise<ShowAllPullRequestsCommandModule> = () =>
+    import("./workspaceCommands/useShowAllPullRequestsCommand"),
+): Promise<{ default: ComponentType<ShowAllPullRequestsCommandProps> }> {
+  return load().then(
+    (module) => ({ default: module.ShowAllPullRequestsCommand }),
+    (error: unknown) => {
+      console.error("[pull-requests] couldn't load Show all pull requests:", error);
+      return { default: () => null };
+    },
+  );
+}
+
+/** Registers ⌘K's Show all pull requests for a tabs sidebar session; loaded with the sidebar. */
+export const LazyShowAllPullRequestsCommand = lazy(() => loadShowAllPullRequestsCommand());
 
 export { useTabsSidebar } from "./useTabsSidebar";
 

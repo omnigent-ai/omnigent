@@ -39,6 +39,7 @@ import {
   changesOverview,
   fileTabFileChosen,
   fileViewDiffRequested,
+  allPullRequestsChosen,
   pullRequestChosen,
   pullRequestSectionChosen,
   shownPullRequestPlace,
@@ -380,6 +381,7 @@ function PullRequestPlaceView({
           section={place.view}
           active={active}
           onSectionChange={(section) => run(pullRequestSectionChosen(place, section))}
+          onShowAllPullRequests={() => run(allPullRequestsChosen())}
         />
       )}
     </div>

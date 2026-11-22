@@ -220,6 +220,19 @@ def test_tabs_sidebar_files_history_and_pull_request(
         "aria-selected", "true"
     )
 
+    # The PR's page and ⌘K both show the session's list in a tab of its own.
+    list_tab = sidebar.get_by_role("tab", name=re.compile(r"^Pull requests"))
+    sidebar.get_by_role("button", name="All pull requests").click()
+    expect(list_tab).to_have_attribute("aria-selected", "true", timeout=30_000)
+    pr_tab.click()
+    page.keyboard.press("ControlOrMeta+k")
+    palette = page.get_by_test_id("command-palette-input")
+    expect(palette).to_be_focused(timeout=10_000)
+    palette.fill("Show all pull requests")
+    page.get_by_role("option", name=re.compile("Show all pull requests")).click()
+    expect(list_tab).to_have_attribute("aria-selected", "true")
+    expect(list_tab).to_have_count(1)
+
     # From another tab, the composer's link to its one PR shows that PR's tab again; it
     # waits for the selection to move, so the click's effect has landed.
     file_tab.click()
