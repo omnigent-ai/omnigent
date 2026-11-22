@@ -16,7 +16,7 @@
 
 import { type ComponentProps, useMemo } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, type UseQueryResult } from "@tanstack/react-query";
 import { MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
@@ -203,7 +203,7 @@ vi.mock("@/store/chatStore", () => ({
 import { useComments } from "@/hooks/useComments";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
-import { useFileDiff } from "@/hooks/useFileDiff";
+import { type FileDiffResponse, useFileDiff } from "@/hooks/useFileDiff";
 import { prepareDiffEditor } from "./MonacoDiffViewer";
 import { MAX_PREVIEW_MARKDOWN_BYTES, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
 import { useFileContent } from "@/hooks/useFileContent";
@@ -280,6 +280,7 @@ interface RenderProps {
   onShare?: () => void;
   shareDisabledReason?: string;
   linkedCommentId?: string;
+  comparisonDiff?: ComponentProps<typeof FileViewer>["comparisonDiff"];
 }
 
 /**
@@ -310,6 +311,7 @@ function viewerTree({
   shareDisabledReason,
   registerLeaveGuard,
   linkedCommentId,
+  comparisonDiff,
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -336,6 +338,7 @@ function viewerTree({
           shareDisabledReason={shareDisabledReason}
           registerLeaveGuard={registerLeaveGuard}
           linkedCommentId={linkedCommentId}
+          comparisonDiff={comparisonDiff}
         />
       </MemoryRouter>
     </QueryClientProvider>
@@ -883,6 +886,56 @@ describe("FileViewer URL sync — diff param", () => {
         expect(useFileDiff).toHaveBeenLastCalledWith("conv_1", "other.py", { requested: false });
       },
     );
+  });
+
+  describe("under the session's chosen comparison", () => {
+    const comparisonQuery = (before: string, after: string) =>
+      ({ data: { before, after } }) as unknown as UseQueryResult<FileDiffResponse>;
+
+    it.each([
+      ["without a comparison", undefined],
+      ["under the last commit", { base: "head" as const }],
+    ])("reads the last commit's diff exactly as before %s", async (_name, comparisonDiff) => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      vi.mocked(useFileDiff).mockClear();
+      renderViewer({ open: true, initialSearch: "diff=1", comparisonDiff });
+      expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+      expect(vi.mocked(useFileDiff).mock.calls.every(([, path]) => path === "file1.py")).toBe(true);
+      expect(useFileDiff).toHaveBeenLastCalledWith("conv_1", "file1.py", { requested: true });
+    });
+
+    it("shows the comparison's diff for a file only it lists, and reads no last-commit diff", async () => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      renderViewer({
+        open: true,
+        path: "only-in-comparison.py",
+        initialSearch: "diff=1",
+        comparisonDiff: {
+          base: "comparison",
+          changed: true,
+          deleted: false,
+          query: comparisonQuery("base", "work"),
+        },
+      });
+      expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+      expect(useFileDiff).toHaveBeenLastCalledWith("conv_1", null, { requested: true });
+    });
+
+    it("offers no diff for a file the comparison doesn't list, even one the last commit changed", async () => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      renderViewer({
+        open: true,
+        initialSearch: "diff=1",
+        comparisonDiff: {
+          base: "comparison",
+          changed: false,
+          deleted: false,
+          query: comparisonQuery("", ""),
+        },
+      });
+      expect(await screen.findByTestId("code-viewer")).toBeInTheDocument();
+      expect(screen.queryByTestId("diff-viewer")).toBeNull();
+    });
   });
 
   it("does not prepare a linked diff when changed-file discovery has already failed", async () => {

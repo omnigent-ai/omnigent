@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { useComparisonFileDiff } from "@/hooks/useComparisonFileDiff";
 import { type FileContentResponse, useFileContent } from "@/hooks/useFileContent";
 import type { CodeMirrorFileEditor } from "@/shell/codeMirror/CodeMirrorFileEditor";
 import type { FileViewer } from "@/shell/FileViewer";
@@ -15,6 +16,16 @@ const captured = vi.hoisted(() => ({
 }));
 
 vi.mock("@/hooks/useFileContent", () => ({ useFileContent: vi.fn() }));
+const comparison = vi.hoisted(() => ({
+  diff: { base: "head" } as ReturnType<typeof useComparisonFileDiff>,
+  useDiff: vi.fn(),
+}));
+vi.mock("@/hooks/useComparisonFileDiff", () => ({
+  useComparisonFileDiff: (...args: unknown[]) => {
+    comparison.useDiff(...args);
+    return comparison.diff;
+  },
+}));
 vi.mock("@/shell/codeMirror/CodeMirrorFileEditor", () => ({
   CodeMirrorFileEditor: (props: ComponentProps<typeof CodeMirrorFileEditor>) => {
     captured.editor = props;
@@ -58,6 +69,7 @@ function renderViewer(
 beforeEach(() => {
   captured.editor = null;
   captured.viewer = null;
+  comparison.useDiff.mockClear();
   vi.mocked(useFileContent).mockReset();
 });
 afterEach(cleanup);
@@ -73,6 +85,21 @@ describe("showsInFileViewer", () => {
 });
 
 describe("FilesPageViewer", () => {
+  it("gives the app's viewer the diff under the session's comparison, and leaves the text editor out of it", () => {
+    const diff = { base: "comparison", changed: true, deleted: false, query: {} } as ReturnType<
+      typeof useComparisonFileDiff
+    >;
+    comparison.diff = diff;
+    renderViewer("README.md", { data: file("README.md", "# Title") });
+    expect(captured.viewer?.comparisonDiff).toBe(diff);
+    expect(comparison.useDiff).toHaveBeenCalledWith("conv_1", "README.md");
+    cleanup();
+    comparison.useDiff.mockClear();
+    renderViewer("src/app.ts", { data: file("src/app.ts", "code") });
+    expect(comparison.useDiff).not.toHaveBeenCalled();
+    comparison.diff = { base: "head" };
+  });
+
   it("reads the file only while its tab is on screen", () => {
     renderViewer("a.ts", { data: file("a.ts", "x") }, { active: false });
     expect(useFileContent).toHaveBeenCalledWith("conv_1", "a.ts", { visible: false });

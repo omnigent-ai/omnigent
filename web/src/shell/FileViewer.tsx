@@ -102,6 +102,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { workspaceSocketBridge } from "@/lib/nativeBridge";
 import { isVideoFile } from "@/lib/video";
+import type { ComparisonFileDiff } from "@/hooks/useComparisonFileDiff";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { useInertRef } from "@/hooks/useInertRef";
 import {
@@ -380,6 +381,11 @@ interface FileViewerProps {
    */
   permissionLevel?: number | null;
   /**
+   * The file's diff under the session's chosen comparison, for a viewer that shows what the
+   * Changes review shows. Without it, the diff is against the last commit, as it always was.
+   */
+  comparisonDiff?: ComparisonFileDiff;
+  /**
    * Frameless mode: renders as a flex-1 div filling the parent instead
    * of a push-panel aside with its own width and slide animation. Used
    * when the viewer is embedded inside the inline right panel.
@@ -446,6 +452,7 @@ function FileViewerBody({
   onShare,
   shareDisabledReason,
   permissionLevel,
+  comparisonDiff,
   frameless,
   mobileOverlay = false,
   viewport,
@@ -496,8 +503,11 @@ function FileViewerBody({
   const keyboardInset = useIOSNativeKeyboardInset((!frameless || mobileOverlay) && open);
   const onScreen = open && isActiveViewport && mediaActive;
   const changedFiles = useWorkspaceChangedFiles(conversationId);
-  const isDeletedFile =
-    changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
+  // A chosen comparison's listing says which files changed; otherwise the last commit's does.
+  const comparisonListing = comparisonDiff?.base === "comparison" ? comparisonDiff : null;
+  const isDeletedFile = comparisonListing
+    ? comparisonListing.deleted
+    : (changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false);
   const serverInfo = useServerInfo();
   // The host's SSH alias lets the desktop read a host on another machine directly.
   const directReads =
@@ -957,7 +967,9 @@ function FileViewerBody({
     !isVideo &&
     !isModel &&
     !isSpreadsheet &&
-    (changedFiles.data?.data.some((f) => f.path === path) ?? false);
+    (comparisonListing
+      ? comparisonListing.changed
+      : (changedFiles.data?.data.some((f) => f.path === path) ?? false));
   const revealTarget = useRevealTarget(path);
   const openInActions = useOpenInActions(isDeletedFile ? null : path);
 
@@ -986,7 +998,10 @@ function FileViewerBody({
     requestedDiff &&
     linkedFileRef.current?.conversationId === conversationId &&
     linkedFileRef.current?.path === path;
-  const diffQuery = useFileDiff(conversationId, isVideo ? null : path, { requested: linkedDiff });
+  const lastCommitDiff = useFileDiff(conversationId, isVideo || comparisonListing ? null : path, {
+    requested: linkedDiff,
+  });
+  const diffQuery = comparisonListing ? comparisonListing.query : lastCommitDiff;
   const prepareDiff =
     requestedDiff &&
     (isDiffAvailable || (linkedDiff && changedFiles.data === undefined && !changedFiles.isError));

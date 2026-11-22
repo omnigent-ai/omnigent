@@ -2,7 +2,14 @@
 // and Markdown (rich preview and edit), images, PDFs, 3D models and binaries in the app's viewer.
 
 import { FileDiffIcon, XIcon } from "lucide-react";
-import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import {
+  type ComponentProps,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -14,6 +21,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
+import { useComparisonFileDiff } from "@/hooks/useComparisonFileDiff";
 import { useFileContent } from "@/hooks/useFileContent";
 import { fileContentText } from "@/lib/workspaceSidebarSource";
 import { cn } from "@/lib/utils";
@@ -82,7 +90,7 @@ export function FilesPageViewer({
   const rich =
     file.data != null && (commentId !== undefined || showsInFileViewer(path, contentType));
   const appViewer = (
-    <FileViewer
+    <ComparisonFileViewer
       // Another linked comment opens its thread afresh.
       key={commentId}
       linkedCommentId={commentId}
@@ -151,6 +159,12 @@ export function FilesPageViewer({
       </div>
     </div>
   );
+}
+
+/** The app's viewer, whose diff is the one the Changes review shows under the session's comparison. */
+function ComparisonFileViewer(props: Omit<ComponentProps<typeof FileViewer>, "comparisonDiff">) {
+  const comparisonDiff = useComparisonFileDiff(props.conversationId, props.path);
+  return <FileViewer {...props} comparisonDiff={comparisonDiff} />;
 }
 
 function TextFile({
