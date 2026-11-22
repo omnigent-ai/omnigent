@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -229,8 +230,15 @@ def test_quick_pick_sets_the_open_sessions_reasoning_effort(
 
         poll_until(effort, timeout_s=15.0)
     finally:
-        if session_id is not None:
-            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        if respawned is not None:
-            respawned.terminate()
-            respawned.wait(timeout=10)
+        try:
+            if session_id is not None:
+                httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        finally:
+            # A respawned runner must not outlive the test, even if the delete fails.
+            if respawned is not None:
+                respawned.terminate()
+                try:
+                    respawned.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    respawned.kill()
+                    respawned.wait(timeout=5)
