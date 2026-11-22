@@ -388,6 +388,14 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   bundle and selects it. States: import in flight (Cancel and Create locked),
   rejected bundle, imported agent missing from the refreshed list, and hidden on
   a server without agent install.
+- `palette-add-actions`: with `quick_pick_palette` on (off by default), ⌘K lists
+  the open session composer's Add menu under **Composer**: Attach files and
+  images…, Start a new side chat, Set goal… (View or update goal… once one is
+  set), and Enter or Exit Plan mode. Each reads the menu item's availability
+  and runs its handler, so a row the menu hides is absent and a greyed one says
+  why. Only the open session's composer offers them; side chats and the
+  new-session composer add none
+  (`web/src/components/composer/useComposerAddPaletteCommands.test.tsx`).
 - `mobile-labels`: on narrow screens labels collapse to icons without
   overlapping the stop button.
 
@@ -599,6 +607,10 @@ and opens the composer with its prompt`).
   Under picker curation (`restrict_to_agent_names`, see
   `native-harnesses.md`) this New Chat entry point is absent: a curated
   deployment offers no bundle import from New Chat.
+
+- With `quick_pick_palette` on, open a session, press Cmd/Ctrl+K and type
+  "attach", "side chat", "goal" or "plan mode", then press Enter to run the
+  Add menu's action. A row that can't run stays listed with the reason.
 
 **Fork dialog** (Fork in the session header menu, or Fork from here on a
 message, with a native target): the same model, effort, and permission mode
