@@ -10636,6 +10636,7 @@ async def _relay_runner_stream_once(
                                 from_runner=True,
                             )
                             pending_subagent_return_id = None
+                        continued = False
                         if status:
                             # Forward the runner's failure detail on a
                             # ``failed`` transition so a SETUP-phase
