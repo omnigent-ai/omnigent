@@ -480,13 +480,19 @@ A host that doesn't resolve, such as a broken parent chain, keeps the saved one.
   using the midnight-anchored RRULE search, and a timer is exempt from the automation
   minimum interval.
 - **Delivery.** The built-in executor skips the automation steps (budgets, sharing,
-  run labels) for a timer. A session that was deleted or archived, that the owner
-  can no longer send to, or whose permission mode skips approval (which the route
-  also refuses at creation, as a continued automation must) records `skipped`
+  run labels) for a timer. A session that was deleted, archived or closed (its
+  `omnigent.closed` label, or an older row's title marker), that the owner can no
+  longer send to, or whose permission mode skips approval (the route refuses each
+  of these at creation, as a continued automation must) records `skipped`
   (`timer_session_unavailable`) and deletes the timer without waking anything.
   Otherwise `begin_timer_delivery` commits the firing under the task lock that
   deleting takes, then the prompt, a hidden
   (`is_meta`) user message, goes in through the continued-session wake and dispatch.
+  Before any runner is woken, the wake meets the session's REQUEST-phase policies
+  as a message does (`_evaluate_input_policy`). A denial, or an ASK, which no one
+  can approve for a timer, records `skipped` (`timer_policy_denied`) and leaves the
+  `[Denied by policy: …]` reply in the session, as for a message; a repeating timer
+  tries again at its next tick.
   A sub-agent session whose runner is gone first moves to its parent's live runner,
   output relay included, before anything launches a runner of its own, as a message
   to it would. If no ancestor runner is live, the session owning their host (while

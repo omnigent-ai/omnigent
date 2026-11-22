@@ -179,6 +179,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
 )
+from omnigent.util.session_lifecycle import is_session_closed
 
 if TYPE_CHECKING:
     import httpx
@@ -2670,6 +2671,9 @@ def _make_reuse_dispatch(deps: FireDeps) -> LaunchDispatch:
             ensure_runner_connected,
         )
 
+        if task.kind == "timer":
+            # Before any runner is woken, as for a message to the session.
+            await _check_timer_wake(deps, task, conv)
         with fire_stage("runner_start", session_id=conv.id):
             launch = None
             if conv.host_id is None and task.execution_target == "managed_sandbox":
@@ -3311,6 +3315,8 @@ async def _timer_session_problem(
         return "the session no longer exists"
     if conv.archived:
         return "the session is archived"
+    if is_session_closed(conv.labels, conv.title):
+        return "the session is closed to new messages"
     if deps.permission_store is not None and not await asyncio.to_thread(
         check_session_access,
         task.user_id or RESERVED_USER_LOCAL,
@@ -3330,6 +3336,53 @@ async def _timer_session_problem(
     return None
 
 
+class TimerWakeRefused(Exception):
+    """The session's input policies refused a timer's wake; the message is the reason."""
+
+
+async def _check_timer_wake(deps: FireDeps, task: ScheduledTask, conv: Conversation) -> None:
+    """Check a timer's wake against the session's input policies, as a message is checked.
+
+    A refusal is recorded in the session as a message's is. A policy that asks for
+    approval refuses the wake too: no one is there to approve it.
+
+    :raises TimerWakeRefused: With the policy's reason, when the wake must not be sent.
+    """
+    from omnigent.server.routes.sessions import (
+        _build_actor,
+        _evaluate_input_policy,
+        _persist_policy_deny_sentinel,
+    )
+
+    if conv.agent_id is None:
+        return
+    start_fire_stage("input_policy", session_id=conv.id)
+    try:
+        verdict = await _evaluate_input_policy(
+            None,
+            conv.id,
+            conv,
+            _task_event(task),
+            deps.conversation_store,
+            deps.agent_store,
+            deps.runner_router,
+            actor=_build_actor(task.user_id),
+            file_store=deps.file_store,
+            artifact_store=deps.artifact_store,
+        )
+    except Exception as exc:
+        # As for a message, a policy that can't be checked refuses the input.
+        _logger.warning("Input policy evaluation failed for timer %s", task.id, exc_info=True)
+        verdict = {"reason": f"Denied by policy (policy evaluation error: {type(exc).__name__})."}
+    if verdict is None:
+        return
+    reason = str(verdict.get("reason") or "Denied by policy")
+    await _persist_policy_deny_sentinel(
+        conv.id, conv, reason, deps.conversation_store, deps.agent_store
+    )
+    raise TimerWakeRefused(reason)
+
+
 async def _fire_timer(
     deps: FireDeps,
     task: ScheduledTask,
@@ -3344,7 +3397,8 @@ async def _fire_timer(
     now routes through another host, such as a side chat whose source moved, gets the
     firing handed back unsent, for that host's replica to claim. The firing is
     committed under the task lock before anything is sent, so a cancel that lands
-    first suppresses it; a committed firing goes out even if a cancel follows.
+    first suppresses it; a committed firing goes out even if a cancel follows, unless
+    the session's input policies refuse the wake, as they would a message.
     """
     session_id = task.session_id
     assert session_id is not None  # a timer always names its session
@@ -3373,6 +3427,15 @@ async def _fire_timer(
         return
     try:
         await dispatch(conv, task)
+    except TimerWakeRefused as refused:
+        _logger.info("scheduled fire: a policy refused timer %s's wake: %s", task.id, refused)
+        await recorder.finish(
+            "skipped",
+            conversation_id=conv.id,
+            error=str(refused),
+            error_code="timer_policy_denied",
+        )
+        return
     except Exception:
         _logger.exception("scheduled fire: timer %s could not wake session %s", task.id, conv.id)
         await recorder.finish(

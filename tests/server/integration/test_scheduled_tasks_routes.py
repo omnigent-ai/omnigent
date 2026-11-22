@@ -7391,6 +7391,25 @@ async def test_a_session_whose_mode_skips_approval_cant_set_timers(
 
 
 @pytest.mark.parametrize("auth_app", [True], indirect=True)
+@pytest.mark.parametrize(
+    "fields",
+    [{"labels": {"omnigent.closed": "true"}}, {"title": "researcher:auth:closed:conv_abc123"}],
+    ids=["closed-label", "closed-title"],
+)
+async def test_a_closed_session_cant_set_timers(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, fields: dict
+) -> None:
+    # Closed without being archived, so it refuses messages but is still listed.
+    session_id = _owned_session(db_uri, **fields)
+    refused = await auth_client.post(
+        f"/v1/sessions/{session_id}/timers", json={"seconds": 60}, headers=_headers()
+    )
+    assert refused.status_code == 400, refused.text
+    assert "closed to new messages" in refused.text
+    assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
+
+
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
 @pytest.mark.parametrize("shape", ["sub_agent", "side_chat"])
 async def test_a_sub_agent_or_side_chat_timer_routes_to_the_host_it_shares(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, shape: str

@@ -56,6 +56,7 @@ from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SO
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests.server.scheduled.test_dispatch_scheduler import _drain
 from tests.server.scheduled.test_fire import (
     FakeAgentStore,
@@ -2354,6 +2355,9 @@ async def test_a_cancel_after_the_commit_stops_later_ticks_but_not_this_one(stor
         ("no_access", "can no longer send"),
         # Switched after the timer was set: a timer never runs it unattended in that mode.
         ("skips_approval", "'bypassPermissions', which skips approval"),
+        # Closed but not archived: by its label, or by an older row's title marker.
+        ("closed_label", "closed to new messages"),
+        ("closed_title", "closed to new messages"),
     ],
 )
 async def test_a_timer_stops_without_waking_a_session_it_may_no_longer_wake(
@@ -2361,16 +2365,19 @@ async def test_a_timer_stops_without_waking_a_session_it_may_no_longer_wake(
 ) -> None:
     caplog.set_level(logging.INFO)
     claimed = _claim_timer(store, repeat=True)
-    labels = (
-        {"omnigent.claude_native.permission_mode": "bypassPermissions"}
-        if problem == "skips_approval"
-        else {}
-    )
+    labels = {
+        "skips_approval": {"omnigent.claude_native.permission_mode": "bypassPermissions"},
+        "closed_label": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+    }.get(problem, {})
     sessions = (
         _ExistingConversationStore()
         if problem == "deleted"
         else _ExistingConversationStore(
-            _timer_session(archived=problem == "archived", labels=labels)
+            _timer_session(
+                archived=problem == "archived",
+                labels=labels,
+                title="researcher:auth:closed:conv_abc123" if problem == "closed_title" else None,
+            )
         )
     )
     permissions = FakePermissionStore()
@@ -2411,6 +2418,8 @@ async def test_a_wake_that_reaches_no_runner_fails_only_that_tick(
             AsyncMock(side_effect=lambda **kwargs: (object(), kwargs["conv"])),
         )
         monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", AsyncMock())
+        # The session's input policies allow the wake; the runner is what declines it.
+        monkeypatch.setattr(sessions, "_evaluate_input_policy", AsyncMock(return_value=None))
         monkeypatch.setattr(fire_mod, "_agent_revision", AsyncMock(return_value=None))
         declined = sessions._SessionEventDispatchResult(
             item_id=None, pending_id=None, accepted=False

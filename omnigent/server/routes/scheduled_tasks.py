@@ -113,6 +113,7 @@ from omnigent.tools.browser_agent_tools import (
     browser_agent_tools_creation_labels,
 )
 from omnigent.tools.builtins.timer import validate_timer_set_args
+from omnigent.util.session_lifecycle import is_session_closed
 from omnigent.util.uuid import normalize_uuid
 
 _logger = logging.getLogger(__name__)
@@ -2265,8 +2266,8 @@ def create_scheduled_tasks_router(
         :returns: ``timer_id``, ``status`` ``"scheduled"``, the UTC ``fire_at`` of the
             first firing, ``interval_seconds`` for a repeating timer (else ``None``),
             and the ``seconds``, ``repeat`` and ``note`` it was set with.
-        :raises OmnigentError: 400 for bad arguments, an archived session, a session whose
-            permission mode skips approval, or a server with timers off (no database
+        :raises OmnigentError: 400 for bad arguments, an archived or closed session, a
+            session whose permission mode skips approval, or a server with timers off (no database
             scheduler, or the ``session_timers`` feature off); 403/404 as for posting a
             message.
         """
@@ -2289,6 +2290,11 @@ def create_scheduled_tasks_router(
         if conv.archived:
             raise OmnigentError(
                 "This session is archived, so it can't take timers",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if is_session_closed(conv.labels, conv.title):
+            raise OmnigentError(
+                "This session is closed to new messages, so it can't take timers",
                 code=ErrorCode.INVALID_INPUT,
             )
         if conv.agent_id is None:
