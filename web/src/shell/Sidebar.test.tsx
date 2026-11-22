@@ -215,6 +215,7 @@ vi.mock("@/lib/serverOrigin", () => ({
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
 import { Sidebar } from "./Sidebar";
+import { reportProjectRenamed } from "./projectCommands/projectActionStore";
 import {
   COLLAPSED_SESSION_FAMILIES_STORAGE_KEY,
   EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
@@ -3232,6 +3233,22 @@ describe("Sidebar project sections", () => {
     openProjectsMenu();
     expect(screen.queryByTestId("expand-all-projects")).toBeNull();
     expect(screen.getByTestId("collapse-all-projects")).toBeInTheDocument();
+  });
+
+  it("keeps a folder expanded under its new name when ⌘K renames it", () => {
+    projectsMock.push("Alpha", "Beta");
+    mockConversations([
+      conv("conv_a", "Claude Code", { labels: { omni_project: "Alpha" } }),
+      conv("conv_b", "Claude Code", { labels: { omni_project: "Beta" } }),
+    ]);
+    renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+
+    act(() => reportProjectRenamed("Alpha", "Gamma"));
+
+    expect(JSON.parse(localStorage.getItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY)!)).toEqual([
+      "Gamma",
+    ]);
   });
 
   it("offers both Expand all and Collapse all while folders are in mixed states", () => {

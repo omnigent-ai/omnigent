@@ -86,6 +86,15 @@ the header menu), and each place is a separate entry point.
   (`web/src/components/chat/TranscriptPaletteCommands.test.tsx`,
   `web/src/canvas/useCanvasHeaderPaletteCommands.test.tsx`,
   `web/src/grid/useGridPaletteCommands.test.tsx`).
+- `palette-project-commands`: with `quick_pick_palette` on, ⌘K lists the project
+  in view's folder actions under **Project**, each naming it: New session in it,
+  Project settings, Rename project and Delete project. The project in view is the
+  open session's, or the one the new-session view is filed under, which skips
+  New session. Each opens the folder menu's own dialog. A rename keeps the
+  folder expanded, and the new-session view follows a rename or leaves once the
+  project is deleted. A session filed in a project the viewer doesn't have,
+  such as a shared one, offers none. The project home lists its own
+  (`web/src/shell/projectCommands/ProjectActionHost.test.tsx`).
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
@@ -455,6 +464,8 @@ choose Rename project. Start typing as soon as the dialog opens. Delete project
 archives every session in the folder; when any of them has an agent working,
 awaiting approval, or running background work, the dialog says how many and
 that deleting stops them, then asks again with Delete anyway.
+With `quick_pick_palette` on, open a session filed in a project, press
+Cmd/Ctrl+K and type "rename project" to open the same dialog for its project.
 
 **Project folder sessions:** expand a project with more than five sessions,
 then click Show more under its rows. Opening one of its older sessions from

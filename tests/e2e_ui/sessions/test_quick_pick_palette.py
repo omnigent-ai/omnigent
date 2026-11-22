@@ -21,12 +21,14 @@ import json
 import os
 import re
 import subprocess
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 from tests._helpers.compat import (
     COMPAT_SERVER_VERSION_ENV,
@@ -344,6 +346,86 @@ def test_quick_pick_archives_a_session_picked_after_the_verb(
     poll_until(lambda: session_archived(base_url, other_id), timeout_s=15.0)
     # The open session stays open; only the picked one was archived.
     expect(page).to_have_url(f"{base_url}/c/{open_id}")
+
+
+def _create_project(base_url: str, name: str) -> str:
+    response = httpx.post(f"{base_url}/v1/projects", json={"name": name}, timeout=10.0)
+    response.raise_for_status()
+    return response.json()["id"]
+
+
+def _project_names(base_url: str) -> set[str]:
+    response = httpx.get(f"{base_url}/v1/projects", timeout=10.0)
+    response.raise_for_status()
+    return {project["name"] for project in response.json()["data"]}
+
+
+def _project_folder(page: Page, name: str) -> Locator:
+    """The sidebar folder header for project ``name``."""
+    return page.locator('button[data-slot="context-menu-trigger"]').filter(has_text=name)
+
+
+def test_quick_pick_renames_the_open_sessions_project(
+    request: pytest.FixtureRequest, seeded_session: tuple[str, str]
+) -> None:
+    """⌘K names the open session's project and renames it with the folder menu's dialog."""
+    base_url, session_id = seeded_session
+    # The server is shared, so each run names its own project.
+    name = f"Osprey {uuid.uuid4().hex[:6]}"
+    project_id = _create_project(base_url, name)
+    patch_session(base_url, session_id, project_id=project_id)
+    page: Page = request.getfixturevalue("page")
+    enable_quick_pick_palette(page)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(_project_folder(page, name)).to_be_visible(timeout=30_000)
+
+    run_palette_command(page, f"rename project {name}", f"Rename project {name}…")
+    dialog = page.get_by_role("dialog", name="Rename project")
+    name_input = dialog.locator("input")
+    expect(name_input).to_be_focused(timeout=10_000)
+    expect(name_input).to_have_value(name)
+    renamed = f"{name} field notes"
+    name_input.fill(renamed)
+    page.get_by_test_id("rename-project-confirm").click()
+    expect(dialog).to_have_count(0)
+    expect(_project_folder(page, renamed)).to_be_visible()
+    poll_until(lambda: renamed in _project_names(base_url), timeout_s=15.0)
+
+
+def test_quick_pick_deletes_the_project_a_new_session_starts_in(
+    request: pytest.FixtureRequest, seeded_session: tuple[str, str]
+) -> None:
+    """From the new-session view filed under a project, ⌘K deletes it and leaves the view."""
+    base_url, session_id = seeded_session
+    name = f"Plover {uuid.uuid4().hex[:6]}"
+    project_id = _create_project(base_url, name)
+    patch_session(base_url, session_id, project_id=project_id)
+    page: Page = request.getfixturevalue("page")
+    enable_quick_pick_palette(page)
+    page.goto(f"{base_url}/?project={quote(name)}")
+    expect(_project_folder(page, name)).to_be_visible(timeout=30_000)
+
+    page.keyboard.press("ControlOrMeta+k")
+    palette_input = page.get_by_role("combobox", name="Command palette")
+    expect(palette_input).to_be_focused(timeout=10_000)
+    palette_input.fill(name)
+    palette = page.get_by_role("dialog")
+    delete = palette.get_by_role(
+        "option", name=re.compile("^" + re.escape(f"Delete project {name}…"))
+    )
+    expect(delete).to_be_visible()
+    # The view already starts a session in the project, so ⌘K doesn't offer it again.
+    new_session = re.compile("^" + re.escape(f"New session in {name}"))
+    expect(palette.get_by_role("option", name=new_session)).to_have_count(0)
+    delete.click()
+
+    confirm = page.get_by_role("dialog", name="Delete project?")
+    confirm.get_by_role("button", name="Delete project").click()
+    expect(confirm).to_have_count(0)
+    expect(_project_folder(page, name)).to_have_count(0)
+    expect(page).to_have_url(f"{base_url}/")
+    poll_until(lambda: session_archived(base_url, session_id), timeout_s=15.0)
+    assert name not in _project_names(base_url)
 
 
 def _viewer_unread(base_url: str, session_id: str) -> bool:

@@ -30,6 +30,11 @@ const SessionActionHost = lazy(() =>
     default: module.SessionActionHost,
   })),
 );
+const ProjectActionHost = lazy(() =>
+  import("./projectCommands/ProjectActionHost").then((module) => ({
+    default: module.ProjectActionHost,
+  })),
+);
 
 // Dev-only preview; lazy so the sample data never ships in production bundles.
 const ImportContextPreview = import.meta.env.DEV
@@ -109,10 +114,11 @@ export function AppShellOverlays({
           <ThemePicker />
         </Suspense>
       )}
-      {/* Carries out a session's action picked from ⌘↵ on its ⌘K row. */}
+      {/* Carries out a session's action picked from ⌘↵ on its ⌘K row, and the project in view's. */}
       {quickPick && (
         <Suspense fallback={null}>
           <SessionActionHost />
+          <ProjectActionHost />
           <QuickPickShortcutHost />
         </Suspense>
       )}
