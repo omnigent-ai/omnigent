@@ -44,19 +44,17 @@ export interface BulkSessionCommand {
 export const BULK_BUSY_REASON = "The last change to the selection is still saving.";
 export const BULK_NONE_FLAGGABLE_REASON = "Muted sessions can't be marked unread.";
 export const BULK_NONE_OWNED_REASON = "You can only change sessions you own.";
-export const BULK_NONE_ARCHIVABLE_REASON = "The selected sessions are already archived.";
 export const BULK_MOVE_FAMILY_REASON = "Select a nested session's top session to move it.";
 
 export function bulkSessionCommands(facts: BulkSessionFacts): BulkSessionCommand[] {
   const ownedUnarchived = facts.owned - facts.ownedArchived;
   // The bar swaps Archive for Unarchive when every owned row is archived.
   const allArchived = facts.owned > 0 && ownedUnarchived === 0;
-  const unlessBusy = (blocked: string | null): CommandAvailability =>
-    facts.busy
-      ? unavailableBecause(BULK_BUSY_REASON)
-      : blocked
-        ? unavailableBecause(blocked)
-        : AVAILABLE;
+  const unlessBusy = (blocked: string | null): CommandAvailability => {
+    if (facts.busy) return unavailableBecause(BULK_BUSY_REASON);
+    if (blocked) return unavailableBecause(blocked);
+    return AVAILABLE;
+  };
   const listedIf = (listed: boolean, availability: CommandAvailability) =>
     listed ? availability : HIDDEN;
   const noneOwned = facts.owned === 0 ? BULK_NONE_OWNED_REASON : null;
@@ -79,10 +77,8 @@ export function bulkSessionCommands(facts: BulkSessionFacts): BulkSessionCommand
     {
       id: "archive",
       label: "Archive selected",
-      availability: listedIf(
-        !allArchived,
-        unlessBusy(noneOwned ?? (ownedUnarchived === 0 ? BULK_NONE_ARCHIVABLE_REASON : null)),
-      ),
+      // Archive is listed only while some owned row isn't archived, so it needs no reason of its own.
+      availability: listedIf(!allArchived, unlessBusy(noneOwned)),
       destructive: false,
     },
     {

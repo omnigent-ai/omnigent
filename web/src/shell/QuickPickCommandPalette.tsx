@@ -216,14 +216,18 @@ export function QuickPickCommandPalette({
       : [];
 
   const { visibleSessions, contentSessions, searching } = search;
-  const activePage =
-    childPage?.kind === "setting-choices"
-      ? settingPage
-      : childPage?.kind === "session-actions"
-        ? sessionPage
-        : childPage
-          ? optionsPage
-          : null;
+  const activePage = (() => {
+    switch (childPage?.kind) {
+      case "setting-choices":
+        return settingPage;
+      case "session-actions":
+        return sessionPage;
+      case "command-options":
+        return optionsPage;
+      default:
+        return null;
+    }
+  })();
   const pageItems = activePage?.items ?? null;
   const rootSegments: QuickPickSegment<PaletteRow>[] = [
     {
@@ -414,14 +418,7 @@ export function QuickPickCommandPalette({
     : optionsPage.open
       ? optionsPage.status
       : settingPage.notice;
-  const back = () =>
-    restoreParent(
-      settingPage.open
-        ? settingPage.back()
-        : sessionPage.open
-          ? sessionPage.back()
-          : optionsPage.back(),
-    );
+  const back = () => restoreParent((activePage ?? optionsPage).back());
   const pageHeading = settingPage.heading ?? sessionPage.heading ?? optionsPage.heading;
 
   return (
