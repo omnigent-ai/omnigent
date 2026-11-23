@@ -34,7 +34,7 @@ export function tabGroup(id: TabGroupId): TabGroup {
   return TAB_GROUPS.find((group) => group.id === id)!;
 }
 
-/** The group closes `tab` is taken by, given whether its pull request has merged. */
+/** The group closes that take a tab in `group`, given whether its pull request has merged. */
 export function groupClosesOf(group: TabGroupId, merged: boolean): WorkspaceTabGroupCloseAction[] {
   const { closeAll, closeMerged } = tabGroup(group);
   return [...(closeMerged && merged ? [closeMerged] : []), ...(closeAll ? [closeAll] : [])];

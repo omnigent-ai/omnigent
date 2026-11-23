@@ -414,8 +414,7 @@ function WorkspaceTabsPanelImpl({
     tab.binding?.kind === "agent" ? [subagentTabId(tab.binding.id)] : [],
   );
   const agentLabels = useSubagentTabLabels(agentTabIds);
-  // Recent pull requests on any new-tab page, and the open PR tabs' in the tab list, named from
-  // what the session already knows of them.
+  // PRs on new-tab pages and open PR tabs, named from what the session already knows of them.
   const recentPullRequestUrls = [
     ...new Set(
       knownTabs.flatMap((tab) =>

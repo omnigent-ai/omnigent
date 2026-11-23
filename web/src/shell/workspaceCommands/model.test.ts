@@ -474,7 +474,14 @@ describe("workspaceTabActionCommands", () => {
   it("offers a group's close only where the tab list groups tabs, counting what it closes", () => {
     const base = { canReopen: false, selectedIndex: 0, tabCount: 4 };
     expect(
-      workspaceTabActionCommands(base).some((command) => command.action.startsWith("close-p")),
+      workspaceTabActionCommands(base).some((command) =>
+        [
+          "close-merged-pull-requests",
+          "close-pull-request-tabs",
+          "close-file-tabs",
+          "close-page-tabs",
+        ].includes(command.action),
+      ),
     ).toBe(false);
     const commands = workspaceTabActionCommands({
       ...base,
