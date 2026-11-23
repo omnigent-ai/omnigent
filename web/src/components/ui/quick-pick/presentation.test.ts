@@ -380,6 +380,36 @@ describe("buildQuickPickRows ranked across groups", () => {
     ]);
   });
 
+  it("orders groups by the rows they show, not one an earlier segment already listed", () => {
+    const rows = buildQuickPickRows({
+      segments: [
+        {
+          sourceId: "first",
+          ranking: "client",
+          items: [item("archive-session", { label: "Archive" })],
+        },
+        {
+          sourceId: "commands",
+          ranking: "client",
+          groupOrder: "bestMatch",
+          fuzzyMatching: "words",
+          items: [
+            item("archive-builds", { label: "Archive old builds", group: "Builds" }),
+            item("archive-session", { label: "Archive", group: "Sessions" }),
+            item("archive-notes", { label: "Notes to archive", group: "Sessions" }),
+          ],
+        },
+      ],
+      query: "archive",
+    });
+    expect(describeRows(rows).slice(1)).toEqual([
+      "# Builds",
+      "archive-builds",
+      "# Sessions",
+      "archive-notes",
+    ]);
+  });
+
   it("keeps the first row for an ID that an earlier segment listed", () => {
     const ranked = buildQuickPickRows({
       segments: [

@@ -168,8 +168,10 @@ function rankSegment<Value>(
   const rankedItems = ranked.map(({ item }) => item);
   return groupedRows(
     segment.sourceId,
-    // Groups appear as their best rows rank, so an exact match's group comes first.
-    segment.groupOrder === "bestMatch" ? rankedItems : segment.items,
+    // Groups appear as their best shown rows rank, so an exact match's group comes first.
+    segment.groupOrder === "bestMatch"
+      ? rankedItems.filter((item) => !seen.has(item.id))
+      : segment.items,
     rowsByItem,
     rankedItems,
     seen,
