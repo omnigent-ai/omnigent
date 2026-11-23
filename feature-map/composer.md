@@ -312,8 +312,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   many earlier items a compaction summary replaced, and has no figure for a
   native harness that keeps its own history (all but Claude Code). An open
   breakdown refreshes when a turn starts, when it ends, and when the measured
-  total changes. A server without the breakdown route still shows the measured
-  header.
+  total or the context window changes. A server without the breakdown route
+  still shows the measured header.
 - `review-context`: submitting an Agent comment in PR Changes attaches a chip
   to the session composer. Hover previews the comment, click reveals it in
   Changes, and X deletes the saved comment. Failed deletion retains the chip.

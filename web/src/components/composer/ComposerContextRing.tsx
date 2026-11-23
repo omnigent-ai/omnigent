@@ -26,7 +26,7 @@ const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
  *   the ring is a plain tooltip.
  * @param turnActive - Whether a turn is running. An open breakdown refreshes
  *   when a turn starts and when it ends, since history can change while the
- *   measured total stays the same.
+ *   measured total stays the same. It also refreshes on a new total or window.
  */
 export function ComposerContextRing({
   contextWindow,
@@ -141,8 +141,8 @@ function ContextBreakdownLoader({
   tokensUsed: number;
 }) {
   const breakdown = useQuery({
-    // A new measured total keys a new breakdown; turn boundaries refetch below.
-    queryKey: ["session-context-breakdown", sessionId, tokensUsed],
+    // A new measured total or window keys a new breakdown; turn boundaries refetch below.
+    queryKey: ["session-context-breakdown", sessionId, tokensUsed, contextWindow],
     queryFn: ({ signal }) => getSessionContextBreakdown(sessionId, { signal }),
     // Keep this session's last breakdown on screen while a new total's one loads.
     placeholderData: (previous, previousQuery) =>

@@ -34,9 +34,12 @@ function renderRing(
   );
 }
 
-function breakdownWithHistory(historyTokens: number): SessionContextBreakdown {
+function breakdownWithHistory(
+  historyTokens: number,
+  contextWindow = 200_000,
+): SessionContextBreakdown {
   return {
-    measured: { totalTokens: 50_000, contextWindow: 200_000 },
+    measured: { totalTokens: 50_000, contextWindow },
     categories: [
       {
         kind: "history",
@@ -45,6 +48,14 @@ function breakdownWithHistory(historyTokens: number): SessionContextBreakdown {
         origin: "server",
         count: 12,
         detail: "12 messages and tool calls",
+      },
+      {
+        kind: "free",
+        tokens: contextWindow - 50_000,
+        source: "measured",
+        origin: "server",
+        count: null,
+        detail: null,
       },
     ],
     estimatesExceedMeasured: false,
@@ -119,23 +130,24 @@ describe("ComposerContextRing", () => {
     expect(screen.queryByText("25% context used")).not.toBeInTheDocument();
   });
 
-  it("refreshes an open breakdown at turn boundaries and on a new total only", async () => {
+  it("refreshes an open breakdown at turn boundaries and on a new total or window only", async () => {
     vi.mocked(getSessionContextBreakdown)
       .mockResolvedValueOnce(BREAKDOWN)
       .mockResolvedValueOnce(breakdownWithHistory(45_000))
       .mockResolvedValueOnce(breakdownWithHistory(60_000))
-      .mockResolvedValueOnce(breakdownWithHistory(61_000))
-      .mockResolvedValueOnce(breakdownWithHistory(62_000))
-      .mockResolvedValueOnce(breakdownWithHistory(63_000))
+      .mockResolvedValueOnce(breakdownWithHistory(60_000, 100_000))
+      .mockResolvedValueOnce(breakdownWithHistory(61_000, 100_000))
+      .mockResolvedValueOnce(breakdownWithHistory(62_000, 100_000))
+      .mockResolvedValueOnce(breakdownWithHistory(63_000, 100_000))
       .mockReturnValueOnce(new Promise(() => {}));
     const entry = (itemId: string) => ({ ctx: { itemId } }) as unknown as AnyBlock;
     useChatStore.setState({ conversationId: "conv_1", blocks: [entry("msg_1")] });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const ring = (turnActive: boolean, tokensUsed = 50_000) => (
+    const ring = (turnActive: boolean, tokensUsed = 50_000, contextWindow = 200_000) => (
       <QueryClientProvider client={queryClient}>
         <TooltipProvider>
           <ComposerContextRing
-            contextWindow={200_000}
+            contextWindow={contextWindow}
             tokensUsed={tokensUsed}
             sessionId="conv_1"
             turnActive={turnActive}
@@ -148,6 +160,7 @@ describe("ComposerContextRing", () => {
     await user.click(screen.getByTestId("composer-context-ring"));
     const dialog = await screen.findByRole("dialog", { name: "Context window breakdown" });
     const history = () => within(dialog).getByTestId("context-row-history");
+    const free = () => within(dialog).getByTestId("context-row-free");
     await waitFor(() => expect(history()).toHaveTextContent("~40K"));
 
     // A turn starting refetches once; entries streamed during it don't.
@@ -166,21 +179,31 @@ describe("ComposerContextRing", () => {
     rerender(ring(false));
     await act(async () => {});
     expect(getSessionContextBreakdown).toHaveBeenCalledTimes(3);
+    expect(within(dialog).getByText("25% used")).toBeInTheDocument();
+    expect(free()).toHaveTextContent("150K");
 
-    // A new measured total fetches again, keeping the last figure until it lands.
-    rerender(ring(false, 51_000));
-    expect(history()).toHaveTextContent("~60K");
-    await waitFor(() => expect(history()).toHaveTextContent("~61K"));
+    // A new window with the same total and no turn change refetches too.
+    rerender(ring(false, 50_000, 100_000));
+    await waitFor(() => expect(within(dialog).getByText("50% used")).toBeInTheDocument());
+    expect(within(dialog).getByText(/50K \/ 100K tokens/)).toBeInTheDocument();
+    expect(free()).toHaveTextContent("50K");
+    expect(free()).not.toHaveTextContent("150K");
     expect(getSessionContextBreakdown).toHaveBeenCalledTimes(4);
 
+    // A new measured total fetches again, keeping the last figure until it lands.
+    rerender(ring(false, 51_000, 100_000));
+    expect(history()).toHaveTextContent("~60K");
+    await waitFor(() => expect(history()).toHaveTextContent("~61K"));
+    expect(getSessionContextBreakdown).toHaveBeenCalledTimes(5);
+
     // A second turn with the same total never falls back to an earlier figure.
-    rerender(ring(true, 51_000));
+    rerender(ring(true, 51_000, 100_000));
     expect(history()).toHaveTextContent("~61K");
     await waitFor(() => expect(history()).toHaveTextContent("~62K"));
 
     // Reopening shows the latest breakdown while it refreshes.
-    rerender(ring(false, 51_000));
-    await waitFor(() => expect(getSessionContextBreakdown).toHaveBeenCalledTimes(6));
+    rerender(ring(false, 51_000, 100_000));
+    await waitFor(() => expect(getSessionContextBreakdown).toHaveBeenCalledTimes(7));
     await user.keyboard("{Escape}");
     await user.click(screen.getByTestId("composer-context-ring"));
     const reopened = await screen.findByRole("dialog", { name: "Context window breakdown" });
