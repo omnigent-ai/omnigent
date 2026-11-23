@@ -1175,16 +1175,29 @@ describe.each(["textarea", "codemirror"] as const)(
       act(() => composerTargetOf(composerInput())!.setSelectionRange(offset, offset));
     const typeAt = (text: string, offset = valueOf().length) =>
       act(() => insertComposerText(composerTargetOf(composerInput())!, text, offset, offset));
-    /** A key at the caret. A textarea gets beforeinput first and inserts only if it isn't cancelled. */
+    /**
+     * A key at the caret, as the engine delivers it: a textarea gets beforeinput and inserts only if
+     * it isn't cancelled; CodeMirror gets a typed transaction.
+     */
     const typeKey = (text: string) =>
       act(() => {
+        if (engine === "codemirror") {
+          const view = EditorView.findFromDOM(composerInput())!;
+          const { from, to } = view.state.selection.main;
+          view.dispatch({
+            changes: { from, to, insert: text },
+            selection: { anchor: from + text.length },
+            userEvent: "input.type",
+          });
+          return;
+        }
         const beforeInput = new InputEvent("beforeinput", {
           bubbles: true,
           cancelable: true,
           inputType: "insertText",
           data: text,
         });
-        if (engine === "codemirror" || composerInput().dispatchEvent(beforeInput)) {
+        if (composerInput().dispatchEvent(beforeInput)) {
           insertComposerText(composerTargetOf(composerInput())!, text);
         }
       });
@@ -1311,15 +1324,74 @@ describe.each(["textarea", "codemirror"] as const)(
       expect(props.onSend).toHaveBeenCalledWith("Read x [Attached: readme.md]", undefined);
     });
 
-    it("undoes text typed beside a pill, and the space it added, in one step with the pill kept", async () => {
+    it.runIf(engine === "codemirror")(
+      "undoes text typed beside a pill, and the space it added, in one step with the pill kept",
+      async () => {
+        await renderComposer(composerProps());
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        caretAt("Read @readme.md".length);
+        typeKey("x");
+
+        undoTo("Read @readme.md ");
+        expect(tokens()).toEqual(["@readme.md"]);
+      },
+    );
+
+    it("places the caret after a typed @ that lands before a pill", async () => {
       await renderComposer(composerProps());
       typeAt("Read @rea");
       fireEvent.click(screen.getByTitle("Attach readme.md"));
-      caretAt("Read @readme.md".length);
-      typeKey("x");
+      caretAt("Read ".length);
+      typeKey("@");
 
-      undoTo("Read @readme.md ");
+      expect(valueOf()).toBe("Read @ @readme.md ");
+      expect(caretOf()).toBe("Read @".length);
       expect(tokens()).toEqual(["@readme.md"]);
+    });
+
+    it.runIf(engine === "textarea")(
+      "leaves an input the browser cannot cancel to insert natively",
+      async () => {
+        await renderComposer(composerProps());
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        caretAt("Read @readme.md".length);
+        const beforeInput = new InputEvent("beforeinput", {
+          bubbles: true,
+          cancelable: false,
+          inputType: "insertText",
+          data: "x",
+        });
+
+        expect(composerInput().dispatchEvent(beforeInput)).toBe(true);
+        expect(valueOf()).toBe("Read @readme.md ");
+      },
+    );
+
+    it.runIf(engine === "textarea").each([
+      ["unavailable", undefined],
+      ["failing", () => false],
+    ])("keeps a pill when text is pasted after it with execCommand %s", async (_label, command) => {
+      const props = composerProps();
+      await renderComposer(props);
+      typeAt("Read @rea");
+      fireEvent.click(screen.getByTitle("Attach readme.md"));
+      caretAt("Read @readme.md".length);
+      Object.defineProperty(document, "execCommand", { configurable: true, value: command });
+      try {
+        fireEvent.paste(composerInput(), {
+          clipboardData: { getData: (kind: string) => (kind === "text/plain" ? "x" : "") },
+        });
+      } finally {
+        delete (document as { execCommand?: unknown }).execCommand;
+      }
+
+      expect(valueOf()).toBe("Read @readme.md x ");
+      expect(caretOf()).toBe("Read @readme.md x".length);
+      expect(tokens()).toEqual(["@readme.md"]);
+      fireEvent.submit(composerInput().closest("form")!);
+      expect(props.onSend).toHaveBeenCalledWith("Read [Attached: readme.md] x", undefined);
     });
 
     it.runIf(engine === "codemirror")(

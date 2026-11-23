@@ -18,7 +18,7 @@ import { ArrowUpIcon, Loader2Icon, SquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import { cn } from "@/lib/utils";
-import { insertComposerText } from "@/lib/composerText";
+import { insertComposerText, registerComposerInsertAdjuster } from "@/lib/composerText";
 import {
   COMPOSER_INPUT_ID_ATTRIBUTE,
   COMPOSER_INPUT_MARKER,
@@ -675,30 +675,28 @@ export const ComposerTextarea = forwardRef<
     [ref],
   );
   // Native beforeinput: React's onBeforeInput does not carry the inserted text for every input.
+  // Every insert, typed or programmatic, is adjusted in insertComposerText via the registration.
   useEffect(() => {
     const element = elementRef.current;
     if (!element) return;
-    let inserting = false;
+    const unregister = registerComposerInsertAdjuster(
+      element,
+      (value, insert) => adjustRef.current?.(value, insert) ?? null,
+    );
     const onBeforeInput = (event: InputEvent) => {
-      const adjust = adjustRef.current;
-      if (inserting || !adjust || event.isComposing || event.inputType !== "insertText") return;
+      // An input that can't be cancelled inserts natively, so it can't be rewritten here.
+      if (!event.cancelable || event.isComposing || event.inputType !== "insertText") return;
       if (event.data === null) return;
       const { selectionStart: start, selectionEnd: end, value } = element;
-      const adjusted = adjust(value, { start, end, text: event.data });
-      if (!adjusted) return;
-      // Insert the adjusted text as one edit, so undo removes it whole.
+      if (!adjustRef.current?.(value, { start, end, text: event.data })) return;
       event.preventDefault();
-      inserting = true;
-      try {
-        if (insertComposerText(element, adjusted.text, start, end, { separateUndo: true })) {
-          element.setSelectionRange(start + adjusted.caret, start + adjusted.caret);
-        }
-      } finally {
-        inserting = false;
-      }
+      insertComposerText(element, event.data, start, end, { separateUndo: true });
     };
     element.addEventListener("beforeinput", onBeforeInput);
-    return () => element.removeEventListener("beforeinput", onBeforeInput);
+    return () => {
+      element.removeEventListener("beforeinput", onBeforeInput);
+      unregister();
+    };
   }, []);
   return (
     <textarea

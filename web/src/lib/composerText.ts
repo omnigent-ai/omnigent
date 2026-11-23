@@ -1,10 +1,27 @@
 import {
   isComposerTextarea,
+  type ComposerInsertAdjuster,
   type ComposerInsertOptions,
   type ComposerPasteEvent,
   type ComposerTextTarget,
 } from "@/components/composer/engine/composerInput";
 import { createTextFieldMirror } from "@/lib/textFieldMirror";
+
+const insertAdjusters = new WeakMap<HTMLTextAreaElement, ComposerInsertAdjuster>();
+
+/**
+ * Rewrite every insert that reaches `textarea`, typed or programmatic, before it lands. Returns
+ * the unregister function.
+ */
+export function registerComposerInsertAdjuster(
+  textarea: HTMLTextAreaElement,
+  adjust: ComposerInsertAdjuster,
+): () => void {
+  insertAdjusters.set(textarea, adjust);
+  return () => {
+    if (insertAdjusters.get(textarea) === adjust) insertAdjusters.delete(textarea);
+  };
+}
 
 /**
  * Replace ``[start, end)`` (default: the selection) as typed input, so onChange
@@ -26,21 +43,32 @@ export function insertComposerText(
   }
   const textarea = target;
   if (textarea.readOnly || textarea.disabled) return false;
+  const adjusted = insertAdjusters.get(textarea)?.(textarea.value, { start, end, text }) ?? null;
+  const insertedText = adjusted?.text ?? text;
+  const caret = adjusted === null ? null : start + adjusted.caret;
   // Chromium merges an insert into the typing around it unless the selection moved since.
   if (options?.separateUndo) breakTypingGroup(textarea);
   textarea.setSelectionRange(start, end);
   const valueBefore = textarea.value;
+  // The browser fires `input` inside the command, so the caret is placed before that listener runs.
+  const placeCaret = () => {
+    if (caret !== null) textarea.setSelectionRange(caret, caret);
+  };
+  textarea.addEventListener("input", placeCaret, { capture: true, once: true });
   const inserted =
     typeof document.execCommand === "function" &&
-    (text || start === end
-      ? document.execCommand("insertText", false, text)
+    (insertedText || start === end
+      ? document.execCommand("insertText", false, insertedText)
       : document.execCommand("delete"));
-  // A beforeinput handler that cancels this command may have inserted an adjusted text itself.
+  textarea.removeEventListener("input", placeCaret, { capture: true });
+  // A command that reports failure but still changed the text is not inserted again.
   if (!inserted && textarea.value === valueBefore) {
-    textarea.setRangeText(text, start, end, "end");
+    textarea.setRangeText(insertedText, start, end, "end");
+    placeCaret();
     textarea.dispatchEvent(new Event("input", { bubbles: true }));
   }
   if (options?.separateUndo) breakTypingGroup(textarea);
+  placeCaret();
   revealCaretLine(textarea);
   return true;
 }
