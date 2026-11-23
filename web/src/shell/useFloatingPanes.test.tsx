@@ -9,6 +9,9 @@ import { paneCornersPreference } from "@/lib/paneCornersPreference";
 
 import { useFloatingPanesShown } from "./useFloatingPanes";
 
+const touch = vi.hoisted(() => ({ client: false }));
+vi.mock("@/hooks/useTouchClient", () => ({ useTouchClient: () => touch.client }));
+
 const listeners = new Set<() => void>();
 let width = 1440;
 
@@ -36,21 +39,33 @@ vi.spyOn(window, "matchMedia").mockImplementation(
 );
 
 function shownWith(floatingPanes: boolean | undefined, sidebarV2 = floatingPanes === true) {
-  // `undefined` is an older server that doesn't list the flag.
-  const { floating_panes: _listed, ...others } = FALLBACK_SERVER_INFO.features ?? {};
-  const features = {
-    ...(floatingPanes === undefined ? others : { ...others, floating_panes: floatingPanes }),
-    workspace_sidebar_v2: sidebarV2,
+  const policy = { floatingPanes, sidebarV2 };
+  const wrapper = ({ children }: { children: ReactNode }) => {
+    // `undefined` is an older server that doesn't list the flag.
+    const { floating_panes: _listed, ...others } = FALLBACK_SERVER_INFO.features ?? {};
+    const features = {
+      ...(policy.floatingPanes === undefined
+        ? others
+        : { ...others, floating_panes: policy.floatingPanes }),
+      workspace_sidebar_v2: policy.sidebarV2,
+    };
+    return (
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, features }}>
+        {children}
+      </CapabilitiesProvider>
+    );
   };
-  const wrapper = ({ children }: { children: ReactNode }) => (
-    <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, features }}>
-      {children}
-    </CapabilitiesProvider>
-  );
-  return renderHook(() => useFloatingPanesShown(), { wrapper });
+  const view = renderHook(() => useFloatingPanesShown(), { wrapper });
+  /** The server's policy changes while the hook stays mounted. */
+  const setPolicy = (next: boolean) => {
+    policy.floatingPanes = next;
+    view.rerender();
+  };
+  return { ...view, setPolicy };
 }
 
 afterEach(() => {
+  touch.client = false;
   resizeTo(1440);
   act(() => paneCornersPreference.write("automatic"));
 });
@@ -86,5 +101,19 @@ describe("useFloatingPanesShown", () => {
     act(() => paneCornersPreference.write("floating"));
     expect(shownWith(false, false).result.current).toBe(false);
     expect(shownWith(undefined, false).result.current).toBe(false);
+  });
+
+  it("follows the server's policy as it changes, while this device stays on Automatic", () => {
+    const view = shownWith(true, true);
+    view.setPolicy(false);
+    expect(view.result.current).toBe(false);
+    view.setPolicy(true);
+    expect(view.result.current).toBe(true);
+  });
+
+  it("keeps a touch client's panes edge to edge, whatever the policy or choice", () => {
+    touch.client = true;
+    act(() => paneCornersPreference.write("floating"));
+    expect(shownWith(true).result.current).toBe(false);
   });
 });
