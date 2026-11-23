@@ -198,9 +198,12 @@ export function usePaletteSessionSearch({
     return () => clearTimeout(timer);
   }, [serverInfoLoading, searching, serverInfoWaitExpired]);
   const awaitingServerInfo = serverInfoLoading && !serverInfoWaitExpired;
+  // A session picker's policy holds for the server's matches too; ⌘K's root search keeps archived.
+  const searchIncludesArchived = includeArchived ?? true;
   const searchOptions = {
     enabled: open && searching && !awaitingServerInfo,
     limit: SEARCH_GROUP_PAGE_SIZE,
+    includeArchived: searchIncludesArchived,
   };
   const titleSearch = useSessionSearch(
     debouncedQuery,
@@ -249,7 +252,7 @@ export function usePaletteSessionSearch({
   const sessions = useMemo(() => {
     const serverMatches = showingServerMatches
       ? paletteSessions(titleSearch.data?.pages ?? [], {
-          includeArchived: true,
+          includeArchived: searchIncludesArchived,
           projects,
           parentTitles,
         })
@@ -300,6 +303,7 @@ export function usePaletteSessionSearch({
     matchingLoaded,
     sessionsOnly,
     includeArchived,
+    searchIncludesArchived,
     projects,
     parentTitles,
   ]);
@@ -309,13 +313,20 @@ export function usePaletteSessionSearch({
     () =>
       showingServerMatches
         ? paletteSessions(contentSearch.data?.pages ?? [], {
-            includeArchived: true,
+            includeArchived: searchIncludesArchived,
             projects,
             parentTitles,
             excludeIds: new Set(sessions.map((s) => s.id)),
           })
         : [],
-    [contentSearch.data, showingServerMatches, sessions, projects, parentTitles],
+    [
+      contentSearch.data,
+      showingServerMatches,
+      searchIncludesArchived,
+      sessions,
+      projects,
+      parentTitles,
+    ],
   );
   const visibleSessions = sessionsOnly ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT) : sessions;
   const searchGroups = [titleSearch, contentSearch];
