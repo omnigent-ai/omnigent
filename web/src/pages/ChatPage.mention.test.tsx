@@ -483,6 +483,20 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(tokens()).toEqual(["@readme.md"]);
   });
 
+  it("Ctrl-N and Ctrl-P step the open menu like the arrows, and only while it's open", () => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+    const ta = textarea();
+    expect(ta.closest("[data-pick-list-input]")).toBeNull();
+    type("@");
+    expect(ta.closest("[data-pick-list-input]")).not.toBeNull();
+    // From row 0, Ctrl-P wraps to the last row; Ctrl-N comes back; Ctrl-N again is readme.md.
+    fireEvent.keyDown(ta, { key: "p", code: "KeyP", ctrlKey: true });
+    fireEvent.keyDown(ta, { key: "n", code: "KeyN", ctrlKey: true });
+    fireEvent.keyDown(ta, { key: "n", code: "KeyN", ctrlKey: true });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(tokens()).toEqual(["@readme.md"]);
+  });
+
   it("Enter on a directory row drills in rather than attaching", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");

@@ -18,6 +18,7 @@ import {
   sessionMentionToken,
   type TaggedMentions,
 } from "@/lib/composerMentions";
+import { holdReadlineStep, readlineListStep } from "@/lib/listNavigationKeys";
 import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 
@@ -331,19 +332,20 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
       goBack();
       return true;
     }
-    if (rowCount === 0) return false;
+    if (rowCount === 0) return holdReadlineStep(e);
     const onCategory = category !== null && mentionIndex === 0;
     const activeSession =
       mentionIndex >= sessionOffset && mentionIndex < fileOffset
         ? sessionRows[mentionIndex - sessionOffset]
         : undefined;
     const active = mentionIndex >= fileOffset ? fileRows[mentionIndex - fileOffset] : undefined;
-    if (e.key === "ArrowDown") {
+    const readlineStep = readlineListStep(e);
+    if (e.key === "ArrowDown" || readlineStep === "next") {
       e.preventDefault();
       setMentionIndex((i) => (i + 1) % rowCount);
       return true;
     }
-    if (e.key === "ArrowUp") {
+    if (e.key === "ArrowUp" || readlineStep === "previous") {
       e.preventDefault();
       setMentionIndex((i) => (i <= 0 ? rowCount - 1 : i - 1));
       return true;

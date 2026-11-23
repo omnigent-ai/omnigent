@@ -13,6 +13,7 @@ import {
 import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
+import { pickListInputProps } from "@/lib/listNavigationKeys";
 import { getCurrentAuthorId } from "@/lib/identity";
 import type {
   ComposerKeyboardEvent,
@@ -1558,6 +1559,7 @@ function SideChatComposer({
         onActiveInputChange={rebindActiveInput}
         hasContent={!pending && files.length > 0}
         data-side-chat="true"
+        {...pickListInputProps(slashCompletion.open)}
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
         className={highlight.cardClassName}
         input={{

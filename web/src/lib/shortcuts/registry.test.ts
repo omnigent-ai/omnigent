@@ -499,3 +499,39 @@ describe("currentShortcutEnvironment", () => {
     expect(currentShortcutEnvironment(environment)).toBe(environment);
   });
 });
+
+describe("Ctrl-N / Ctrl-P", () => {
+  // Pick lists step on these; every app-wide chord listed here must yield to an open
+  // list through pickListOwnsKey (useNewSessionHotkey).
+  it("are claimed only by the chords that yield to pick lists, and by the slash menu", () => {
+    const claims: string[] = [];
+    for (const onMac of [true, false]) {
+      for (const native of [false, true]) {
+        const environment = { mac: onMac, native, desktopMenu: false };
+        for (const letter of ["n", "p"]) {
+          const input = press({ key: letter, code: `Key${letter.toUpperCase()}`, ctrlKey: true });
+          for (const binding of SHORTCUT_BINDINGS) {
+            if (matchesShortcut(input, binding.id, environment)) {
+              claims.push(
+                `${onMac ? "mac" : "other"}${native ? " native" : ""} ^${letter}: ${binding.id}`,
+              );
+            }
+          }
+        }
+      }
+    }
+    expect(claims.sort()).toEqual(
+      [
+        "mac ^n: slash.next",
+        "mac ^p: slash.previous",
+        "mac native ^n: slash.next",
+        "mac native ^p: slash.previous",
+        "other ^n: slash.next",
+        "other ^p: slash.previous",
+        "other native ^n: session.new",
+        "other native ^n: slash.next",
+        "other native ^p: slash.previous",
+      ].sort(),
+    );
+  });
+});

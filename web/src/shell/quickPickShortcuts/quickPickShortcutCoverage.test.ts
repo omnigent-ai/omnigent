@@ -89,7 +89,11 @@ describe("shortcuts that wait for quick_pick_palette", () => {
           const taken = others.filter((other) =>
             other
               .chords(environment)
-              .some((otherChord) => chordMatches(otherChord, press, environment.mac)),
+              // An open menu's keys match under any modifiers, but only while that menu has focus.
+              .some(
+                (otherChord) =>
+                  !otherChord.anyModifiers && chordMatches(otherChord, press, environment.mac),
+              ),
           );
           const replaced = TAKES_OVER[binding.id] ?? [];
           expect(

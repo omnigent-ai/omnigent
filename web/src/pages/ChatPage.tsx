@@ -302,6 +302,7 @@ import {
   permissionChip,
   type PermissionChipKind,
 } from "@/lib/permissionModeCycle";
+import { pickListInputProps } from "@/lib/listNavigationKeys";
 import { getCliServerUrl } from "@/lib/host";
 import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
 import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/components/goal";
@@ -4550,6 +4551,7 @@ function ComposerImpl(
         draftKey={conversationId ?? null}
         activeInputId={activeTextId ?? COMPOSER_TAIL_INPUT_ID}
         onActiveInputChange={rebindActiveInput}
+        {...pickListInputProps(slashCompletion.open || mentionOpen)}
         input={{
           ref: bindTailTextarea,
           value: draft.text,

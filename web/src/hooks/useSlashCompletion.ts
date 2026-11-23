@@ -1,5 +1,7 @@
 import { useLayoutEffect, useRef, useState, type RefObject } from "react";
 import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
+import { holdReadlineStep } from "@/lib/listNavigationKeys";
+import { matchesShortcut, type ShortcutId } from "@/lib/shortcuts/registry";
 import { rankedSlashCommandNames } from "@/components/SlashCommandMenu";
 
 function commandContinuationLength(token: string | undefined, tokenSuffix: string, cmd: string) {
@@ -23,8 +25,26 @@ const NO_LABELS: Readonly<Record<string, string>> = {};
 /** The slice of a textarea keydown the menu reads. */
 export interface SlashCompletionKeyEvent {
   key: string;
+  code?: string;
   shiftKey: boolean;
+  metaKey?: boolean;
+  ctrlKey?: boolean;
+  altKey?: boolean;
   preventDefault: () => void;
+}
+
+/** True when an open menu's key `id` was pressed; the menu ignores held modifiers. */
+function isMenuKey(event: SlashCompletionKeyEvent, id: ShortcutId): boolean {
+  return matchesShortcut(
+    {
+      key: event.key,
+      shiftKey: event.shiftKey,
+      metaKey: event.metaKey === true,
+      ctrlKey: event.ctrlKey === true,
+      altKey: event.altKey === true,
+    },
+    id,
+  );
 }
 
 /** What the focused composer surface reports about the send chord. */
@@ -199,9 +219,10 @@ export function useSlashCompletion({
     e: SlashCompletionKeyEvent,
     { shouldPreferSendOverCompletion }: SlashCompletionKeyIntent,
   ): boolean {
+    const pressed = (id: ShortcutId) => isMenuKey(e, id);
     if (
       open &&
-      e.key === "Escape" &&
+      pressed("slash.dismiss") &&
       (!escapeClearsOnlyWithContent || matches.length > 0 || status != null)
     ) {
       e.preventDefault();
@@ -216,30 +237,32 @@ export function useSlashCompletion({
       status === "loading" &&
       matches.length === 0 &&
       !shouldPreferSendOverCompletion &&
-      (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !mobile))
+      (pressed("slash.apply") || (e.key === "Enter" && !e.shiftKey && !mobile))
     ) {
       e.preventDefault();
       return true;
     }
+    // An empty or loading menu still owns Ctrl-N/Ctrl-P; arrows keep falling through.
+    if (open && matches.length === 0 && holdReadlineStep(e)) return true;
     if (open && matches.length > 0) {
-      if (e.key === "ArrowDown") {
+      if (pressed("slash.next")) {
         e.preventDefault();
         setIndex((i) => (i + 1) % matches.length);
         return true;
       }
-      if (e.key === "ArrowUp") {
+      if (pressed("slash.previous")) {
         e.preventDefault();
         setIndex((i) => (i <= 0 ? matches.length - 1 : i - 1));
         return true;
       }
       if (
         !shouldPreferSendOverCompletion &&
-        (e.key === "Tab" ||
+        (pressed("slash.apply") ||
           (e.key === "Enter" && !e.shiftKey && (!mobile || mobileEnterCompletes))) &&
         index >= 0
       ) {
         e.preventDefault();
-        (e.key === "Tab" ? onTabComplete : onSelect)(matches[index]!);
+        (pressed("slash.apply") ? onTabComplete : onSelect)(matches[index]!);
         return true;
       }
     }

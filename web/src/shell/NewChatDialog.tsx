@@ -5,6 +5,7 @@ import {
 } from "@/lib/nestedSessionDrafts";
 import { useSiblingSessionDestinations } from "@/hooks/useSharing";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { pickListInputProps } from "@/lib/listNavigationKeys";
 import { useComposerContext } from "@/hooks/useComposerContext";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
 import { useMcpRegistrySelection } from "@/hooks/useMcpRegistry";
@@ -7642,6 +7643,7 @@ function NewChatLandingContent({
               keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
               className={cn(isDragActive && "ring-2 ring-ring ring-inset", highlight.cardClassName)}
               data-testid="new-chat-landing-composer"
+              {...pickListInputProps(slashCompletion.open || mentionOpen)}
               input={{
                 ref: bindTextarea,
                 value: message,

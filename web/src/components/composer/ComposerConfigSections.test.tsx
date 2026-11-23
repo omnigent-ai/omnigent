@@ -355,6 +355,21 @@ describe("model catalog browsing", () => {
     expect(modelRow("Gemini 3 Pro")).toBeVisible();
   });
 
+  it("moves from search to rows with Ctrl-N, and owns Ctrl-P at the top", () => {
+    renderSections({ models: catalogSection(MIXED_CATALOG, "") });
+    const search = screen.getByRole("textbox", { name: "Search models" });
+    expect(search).toHaveAttribute("data-pick-list-input");
+
+    fireEvent.keyDown(search, { key: "n", code: "KeyN", ctrlKey: true });
+    expect(modelRow("Default")).toHaveFocus();
+    // From the first row, Ctrl-P goes back up to the search field, as ArrowUp does.
+    fireEvent.keyDown(modelRow("Default")!, { key: "p", code: "KeyP", ctrlKey: true });
+    expect(search).toHaveFocus();
+    // Nothing above the search field, but the key stays the list's (no Print, no Sessions).
+    expect(fireEvent.keyDown(search, { key: "p", code: "KeyP", ctrlKey: true })).toBe(false);
+    expect(search).toHaveFocus();
+  });
+
   it("keeps small or single-creator catalogs simple", () => {
     const { unmount } = renderSections({
       models: catalogSection(MIXED_CATALOG.slice(3, 8), "openai/gpt-5.5"),

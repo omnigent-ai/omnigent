@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { ChevronDownIcon, CheckIcon, ChevronUpIcon } from "lucide-react";
 import { MobileMenuGlassSurface } from "@/components/MobileMenuGlassSurface";
+import { withReadlineListSteps } from "@/lib/listNavigationKeys";
 
 function Select({
   componentId,
@@ -102,6 +103,7 @@ function SelectContent({
         position={position}
         align={align}
         {...props}
+        onKeyDown={withReadlineListSteps(props.onKeyDown)}
       >
         <MobileMenuGlassSurface />
         <SelectScrollUpButton />

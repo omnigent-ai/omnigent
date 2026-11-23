@@ -505,8 +505,6 @@ export function QuickPickCommandPalette({
       onOpenChange={onOpenChange}
       // Go to Session… hands the palette's return target to the switcher opening in its place.
       successorName={sessionsOnly ? SESSION_SWITCHER : undefined}
-      // ⌘K steps with Ctrl-N/Ctrl-P, trading the query's readline caret keys for row steps.
-      stepsWithCtrlNP
       contentClassName={
         isMobile
           ? "inset-x-0 flex w-full max-w-full translate-x-0 flex-col rounded-none border-0 shadow-none sm:max-w-full"

@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import { CheckIcon, ChevronRightIcon } from "lucide-react";
 import { MenuItem } from "./menu-item";
 import { MobileMenuGlassSurface } from "@/components/MobileMenuGlassSurface";
+import { withReadlineListSteps } from "@/lib/listNavigationKeys";
 
 function DropdownMenu({ ...props }: React.ComponentProps<typeof DropdownMenuPrimitive.Root>) {
   return <DropdownMenuPrimitive.Root data-slot="dropdown-menu" {...props} />;
@@ -49,6 +50,7 @@ const DropdownMenuContent = React.forwardRef<
           className,
         )}
         {...props}
+        onKeyDown={withReadlineListSteps(props.onKeyDown)}
       >
         <MobileMenuGlassSurface />
         {children}
@@ -270,6 +272,7 @@ const DropdownMenuSubContent = React.forwardRef<
           className,
         )}
         {...props}
+        onKeyDown={withReadlineListSteps(props.onKeyDown)}
       >
         <MobileMenuGlassSurface />
         {children}

@@ -6,6 +6,7 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { pickListInputProps, readlineListStep } from "@/lib/listNavigationKeys";
 import { type NativeModelLabelFields, nativeModelLabel } from "@/lib/composerModelLabel";
 import {
   MODEL_CATALOG_BROWSE_MIN,
@@ -168,9 +169,13 @@ function ModelCatalogChoices({
   const onSearchKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     // Typed characters must not reach the menu's typeahead; Tab stays trapped.
     if (event.key !== "Tab") event.stopPropagation();
-    if (event.key === "ArrowDown") {
+    const readlineStep = readlineListStep(event);
+    if (event.key === "ArrowDown" || readlineStep === "next") {
       event.preventDefault();
       enabledMenuItems(listRef.current)[0]?.focus();
+    } else if (readlineStep === "previous") {
+      // Already at the top; the field still owns the key.
+      event.preventDefault();
     }
   };
   return (
@@ -185,6 +190,7 @@ function ModelCatalogChoices({
           value={query}
           onChange={(event) => setQuery(event.target.value)}
           onKeyDown={onSearchKeyDown}
+          {...pickListInputProps(true)}
           data-testid={`${testId}-search`}
         />
       </div>

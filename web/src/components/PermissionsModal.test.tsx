@@ -780,6 +780,29 @@ describe("PermissionsModal", () => {
       expect(input.value).toBe("alice@example.com");
     });
 
+    it("steps open suggestions with Ctrl-N/Ctrl-P, and leaves them to the field while closed", async () => {
+      listMock.mockResolvedValue(grantList([]));
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createWrapper(),
+      });
+      await waitFor(() => expect(listMock).toHaveBeenCalled());
+
+      const input = screen.getByPlaceholderText("alice@example.com") as HTMLInputElement;
+      const ctrl = (key: string) => ({ key, code: `Key${key.toUpperCase()}`, ctrlKey: true });
+      expect(input).not.toHaveAttribute("data-pick-list-input");
+      expect(fireEvent.keyDown(input, ctrl("n"))).toBe(true);
+      fireEvent.focus(input);
+      fireEvent.change(input, { target: { value: "a" } });
+      await waitFor(() => expect(screen.getByRole("listbox")).toBeInTheDocument());
+      expect(input).toHaveAttribute("data-pick-list-input");
+
+      expect(fireEvent.keyDown(input, ctrl("n"))).toBe(false);
+      fireEvent.keyDown(input, ctrl("n"));
+      fireEvent.keyDown(input, ctrl("p"));
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(input.value).toBe("alice@example.com");
+    });
+
     it("shows an empty-state message when the searcher returns no matches", async () => {
       listMock.mockResolvedValue(grantList([]));
       render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {

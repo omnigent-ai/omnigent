@@ -280,12 +280,16 @@ describe("QuickPick other navigation keys", () => {
     expect(active()).toBe("row-0");
   });
 
-  it("leave Ctrl+N/P and Ctrl+J/K to the text field", () => {
+  it("step with Ctrl+N/P, and leave Ctrl+J/K to the text field", () => {
     const { press, active } = renderPicker();
-    for (const key of ["n", "j", "p", "k"]) {
+    for (const key of ["j", "k"]) {
       expect(press(key, { ctrlKey: true })).toBe(true);
       expect(active()).toBe("s1");
     }
+    expect(press("n", { ctrlKey: true })).toBe(false);
+    expect(active()).toBe("s2");
+    expect(press("p", { ctrlKey: true })).toBe(false);
+    expect(active()).toBe("s1");
   });
 
   it("pages by the rows that fit once the list is measured", () => {

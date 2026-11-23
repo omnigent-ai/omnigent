@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { FolderIcon, FolderOpenIcon } from "lucide-react";
 
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
+import { pickListInputProps, readlineListStep } from "@/lib/listNavigationKeys";
 import { isNavigablePath } from "./WorkspacePicker";
 
 // DOM-safety bound only; the dropdown scrolls and overflow is
@@ -219,7 +220,15 @@ export function WorkspacePathField({
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
-    if (e.key === "ArrowDown") {
+    // Ctrl-N/Ctrl-P step an open list only; closed, they stay text editing.
+    const readlineStep = dropdownOpen ? readlineListStep(e) : null;
+    if (readlineStep === "next") {
+      e.preventDefault();
+      setHighlight((h) => Math.min(h + 1, items.length - 1));
+    } else if (readlineStep === "previous") {
+      e.preventDefault();
+      setHighlight((h) => Math.max(h - 1, -1));
+    } else if (e.key === "ArrowDown") {
       e.preventDefault();
       if (!open) {
         setOpen(true);
@@ -279,6 +288,7 @@ export function WorkspacePathField({
           aria-label="Working directory path"
           aria-autocomplete="list"
           aria-expanded={dropdownOpen}
+          {...pickListInputProps(dropdownOpen)}
           aria-controls="workspace-path-listbox"
           aria-activedescendant={dropdownOpen ? activeDescendantId : undefined}
           aria-invalid={invalid || undefined}

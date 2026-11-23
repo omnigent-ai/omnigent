@@ -23,6 +23,7 @@ import { useCreateHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesy
 import { useHostWorktrees, useVerifiedGitWorktrees } from "@/hooks/useHostWorktrees";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { pickListInputProps, readlineListStep } from "@/lib/listNavigationKeys";
 import {
   chooseDirectory,
   droppedFilePath,
@@ -699,10 +700,13 @@ export function WorkspacePicker({
 
   function handleSearchKeyDown(event: KeyboardEvent<HTMLInputElement>) {
     if (isImeCompositionKeyEvent(event, isComposingRef.current)) return;
-    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    const readlineStep = readlineListStep(event);
+    if (event.key === "ArrowDown" || event.key === "ArrowUp" || readlineStep !== null) {
+      // The list owns Ctrl-N/Ctrl-P even while it has nothing to step through.
+      if (readlineStep !== null) event.preventDefault();
       if (navigationPending || directories.length === 0) return;
       event.preventDefault();
-      const step = event.key === "ArrowDown" ? 1 : -1;
+      const step = event.key === "ArrowDown" || readlineStep === "next" ? 1 : -1;
       const from = highlightedIndex ?? (step > 0 ? -1 : directories.length);
       setActivePath(directories[Math.min(Math.max(from + step, 0), directories.length - 1)].path);
     } else if (event.key === "Enter") {
@@ -1029,6 +1033,7 @@ export function WorkspacePicker({
                   setActivePath(null);
                 }}
                 onKeyDown={handleSearchKeyDown}
+                {...pickListInputProps(true)}
                 onCompositionStart={() => {
                   isComposingRef.current = true;
                 }}

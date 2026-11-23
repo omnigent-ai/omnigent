@@ -12,6 +12,7 @@ import {
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { modelPickerKindForConv } from "@/lib/composerCapabilities";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 
 /** The key fields the cycle check reads from a React keyboard event. */
@@ -26,14 +27,7 @@ export interface PermissionModeCycleKeyEvent {
 
 /** Bare Shift+Tab (no Ctrl, Cmd or Alt), outside IME composition. */
 export function isPermissionModeCycleKey(event: PermissionModeCycleKeyEvent): boolean {
-  return (
-    event.key === "Tab" &&
-    event.shiftKey &&
-    !event.ctrlKey &&
-    !event.metaKey &&
-    !event.altKey &&
-    !isImeCompositionKeyEvent(event)
-  );
+  return matchesShortcut(event, "composer.cyclePermissionMode") && !isImeCompositionKeyEvent(event);
 }
 
 /**

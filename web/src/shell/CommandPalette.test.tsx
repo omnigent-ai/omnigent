@@ -983,6 +983,26 @@ describe("CommandPalette — title and content groups", () => {
     expect(navigate).toHaveBeenCalledWith("/c/second");
   });
 
+  it("steps the rows with Ctrl-N and Ctrl-P as the arrows do, leaving Ctrl+J alone", () => {
+    setSessions([conv("c1", "Fix the parser"), conv("c2", "Deploy API"), conv("c3", "Ship it")]);
+    render(
+      <CommandPalette
+        open
+        onOpenChange={vi.fn()}
+        onToggleLeftSidebar={vi.fn()}
+        onToggleRightSidebar={vi.fn()}
+      />,
+      { wrapper: withQueryClient() },
+    );
+    const input = screen.getByTestId("command-palette-input");
+    fireEvent.keyDown(input, { key: "n", code: "KeyN", ctrlKey: true });
+    fireEvent.keyDown(input, { key: "n", code: "KeyN", ctrlKey: true });
+    fireEvent.keyDown(input, { key: "p", code: "KeyP", ctrlKey: true });
+    fireEvent.keyDown(input, { key: "j", code: "KeyJ", ctrlKey: true });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/c2");
+  });
+
   it("selects the top row again when the palette reopens", () => {
     setSessions([conv("c1", "Fix the parser"), conv("c2", "Deploy API")]);
     const props = {

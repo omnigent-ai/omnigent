@@ -137,7 +137,7 @@ const MENU_COMMAND = "The desktop app's menu runs it; ⌘K offers the same actio
 const NOT_LISTED = (): boolean => false;
 
 const ENTER: Chord = { key: "Enter" };
-const SLASH_NEXT: Chord = { key: "ArrowDown" };
+const SLASH_NEXT: Chord = { key: "ArrowDown", anyModifiers: true };
 const MOD_ENTER: Chord = { mod: true, key: "Enter" };
 /** A question's first nine rows by digit: its options, then the custom answer. */
 const QUESTION_OPTION_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"] as const;
@@ -778,7 +778,9 @@ const APP_BINDINGS = {
     handler: SLASH_MENU,
     paletteExempt: ACTS_ON_MENU,
     label: "Navigate suggestions",
-    chords: () => [{ key: "ArrowUp" }],
+    chords: () => [{ key: "ArrowUp", anyModifiers: true }],
+    // Readline's Ctrl-P, as in every other pick list.
+    secondaryChords: () => [{ ctrl: true, key: "p" }],
     rowKeys: (keys, { environment }) => [...keys, ...chordKeys(SLASH_NEXT, environment.mac)],
   },
   "slash.next": {
@@ -787,6 +789,8 @@ const APP_BINDINGS = {
     paletteExempt: ACTS_ON_MENU,
     label: "Navigate suggestions",
     chords: () => [SLASH_NEXT],
+    // Readline's Ctrl-N, as in every other pick list.
+    secondaryChords: () => [{ ctrl: true, key: "n" }],
     // Listed on Navigate suggestions' row, beside ↑.
     partOf: "slash.previous",
   },
@@ -795,14 +799,14 @@ const APP_BINDINGS = {
     handler: SLASH_MENU,
     paletteExempt: ACTS_ON_MENU,
     label: "Apply highlighted command",
-    chords: () => [{ key: "Tab" }],
+    chords: () => [{ key: "Tab", anyModifiers: true }],
   },
   "slash.dismiss": {
     group: "slash",
     handler: SLASH_MENU,
     paletteExempt: ACTS_ON_MENU,
     label: "Dismiss menu",
-    chords: () => [{ key: "Escape" }],
+    chords: () => [{ key: "Escape", anyModifiers: true }],
   },
 } satisfies Record<string, ShortcutBindingDefinition>;
 

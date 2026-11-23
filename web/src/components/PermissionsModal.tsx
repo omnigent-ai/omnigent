@@ -55,6 +55,7 @@ import { useUserSearch } from "@/hooks/useUserSearch";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { SHARING_OFF_REASON } from "@/lib/capabilities";
 import { copyText } from "@/lib/clipboard";
+import { pickListInputProps, readlineListStep } from "@/lib/listNavigationKeys";
 import { updateSession } from "@/lib/sessionsApi";
 import { getOmnigentUserSearch } from "@/lib/host";
 import { getSessionSharePath, getShareableSessionLink } from "@/lib/shareLink";
@@ -693,7 +694,15 @@ function AddUserCombobox({ value, onChange, disabled }: AddUserFieldProps) {
   }
 
   function handleKeyDown(e: KeyboardEvent<HTMLInputElement>) {
-    if (e.key === "ArrowDown") {
+    // Ctrl-N/Ctrl-P step an open list only; closed, they stay text editing.
+    const readlineStep = isOpen ? readlineListStep(e) : null;
+    if (readlineStep === "next") {
+      e.preventDefault();
+      setActiveIndex((i) => Math.min(i + 1, suggestions.length - 1));
+    } else if (readlineStep === "previous") {
+      e.preventDefault();
+      setActiveIndex((i) => Math.max(i - 1, 0));
+    } else if (e.key === "ArrowDown") {
       e.preventDefault();
       if (!isOpen) {
         setOpen(true);
@@ -729,6 +738,7 @@ function AddUserCombobox({ value, onChange, disabled }: AddUserFieldProps) {
         id="perm-user"
         role="combobox"
         aria-expanded={isOpen}
+        {...pickListInputProps(isOpen)}
         aria-controls={listId}
         aria-autocomplete="list"
         aria-activedescendant={activeId}

@@ -5,6 +5,7 @@ import { getEmbedRoot } from "@/lib/host";
 import { cn } from "@/lib/utils";
 import { CheckIcon, ChevronRightIcon } from "lucide-react";
 import { MobileMenuGlassSurface } from "@/components/MobileMenuGlassSurface";
+import { withReadlineListSteps } from "@/lib/listNavigationKeys";
 
 function ContextMenu({ ...props }: React.ComponentProps<typeof ContextMenuPrimitive.Root>) {
   return <ContextMenuPrimitive.Root data-slot="context-menu" {...props} />;
@@ -43,6 +44,7 @@ function ContextMenuContent({
           className,
         )}
         {...props}
+        onKeyDown={withReadlineListSteps(props.onKeyDown)}
       >
         <MobileMenuGlassSurface />
         {children}
@@ -249,6 +251,7 @@ function ContextMenuSubContent({
           className,
         )}
         {...props}
+        onKeyDown={withReadlineListSteps(props.onKeyDown)}
       >
         <MobileMenuGlassSurface />
         {children}

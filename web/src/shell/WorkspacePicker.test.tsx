@@ -727,6 +727,25 @@ describe("WorkspacePicker keyboard and sorting", () => {
     expect(onNavigate).toHaveBeenLastCalledWith("/x/scripts");
   });
 
+  it("moves over folders with Ctrl-N and Ctrl-P like the arrows", () => {
+    const onNavigate = vi.fn();
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);
+    const search = screen.getByTestId("workspace-picker-search-input");
+    expect(search).toHaveAttribute("data-pick-list-input");
+    const ctrl = (key: string) => ({ key, code: `Key${key.toUpperCase()}`, ctrlKey: true });
+
+    expect(fireEvent.keyDown(search, ctrl("n"))).toBe(false);
+    expect(screen.getByTestId("workspace-picker-entry-docs")).toHaveAttribute("data-active");
+    fireEvent.keyDown(search, ctrl("n"));
+    fireEvent.keyDown(search, ctrl("n"));
+    fireEvent.keyDown(search, ctrl("n"));
+    expect(screen.getByTestId("workspace-picker-entry-src")).toHaveAttribute("data-active");
+    fireEvent.keyDown(search, ctrl("p"));
+    fireEvent.keyDown(search, { key: "Enter" });
+
+    expect(onNavigate).toHaveBeenLastCalledWith("/x/scripts");
+  });
+
   it("opens the first search match on Enter", () => {
     const onNavigate = vi.fn();
     render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);

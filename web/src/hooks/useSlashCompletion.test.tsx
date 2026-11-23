@@ -146,6 +146,36 @@ describe("useSlashCompletion highlight retention", () => {
     expect(view.result.current.index).toBe(0);
   });
 
+  it("moves with Ctrl-N and Ctrl-P like the arrows, wrapping at the ends", () => {
+    const { view } = setup({ text: "/" });
+    const ctrl = (key: string) => ({
+      ...keyEvent(key),
+      code: `Key${key.toUpperCase()}`,
+      ctrlKey: true,
+    });
+    act(() => {
+      expect(view.result.current.handleKey(ctrl("n"), NO_PREFERENCE)).toBe(true);
+    });
+    expect(view.result.current.index).toBe(1);
+    act(() => {
+      view.result.current.handleKey(ctrl("p"), NO_PREFERENCE);
+      view.result.current.handleKey(ctrl("p"), NO_PREFERENCE);
+    });
+    expect(view.result.current.index).toBe(view.result.current.matches.length - 1);
+    // Plain N is typing, not a step.
+    expect(view.result.current.handleKey(keyEvent("n"), NO_PREFERENCE)).toBe(false);
+  });
+
+  it("holds Ctrl-N/Ctrl-P in an open menu with no matches, leaving arrows and the index alone", () => {
+    const { view } = setup({ text: "/zzz" });
+    expect(view.result.current.open).toBe(true);
+    const ctrlP = { ...keyEvent("p"), code: "KeyP", ctrlKey: true };
+    expect(view.result.current.handleKey(ctrlP, NO_PREFERENCE)).toBe(true);
+    expect(ctrlP.preventDefault).toHaveBeenCalledOnce();
+    expect(view.result.current.index).toBe(-1);
+    expect(view.result.current.handleKey(keyEvent("ArrowUp"), NO_PREFERENCE)).toBe(false);
+  });
+
   it("resets to -1 when the query has no matches", () => {
     const { view } = setup({ text: "/zzz" });
     expect(view.result.current.open).toBe(true);

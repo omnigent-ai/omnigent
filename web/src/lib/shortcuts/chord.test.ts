@@ -80,6 +80,15 @@ describe("chordMatches", () => {
     expect(chordMatches(rename, altGraph, false)).toBe(false);
   });
 
+  it("matches an open menu's key whatever modifiers are held, but not under AltGr", () => {
+    const tab: Chord = { key: "Tab", anyModifiers: true };
+    for (const modifiers of [{}, { shiftKey: true }, { metaKey: true, altKey: true }]) {
+      expect(chordMatches(tab, press({ key: "Tab", ...modifiers }), true)).toBe(true);
+    }
+    expect(chordMatches(tab, press({ key: "Enter" }), true)).toBe(false);
+    expect(chordMatches(tab, press({ key: "Tab", altGraph: true }), false)).toBe(false);
+  });
+
   it("compares the key exactly only for a chord that opts in", () => {
     const kelvin = press({ key: "\u212A", metaKey: true });
     expect(chordMatches({ mod: true, key: "k" }, kelvin, true)).toBe(true);

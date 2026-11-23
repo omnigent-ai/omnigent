@@ -352,6 +352,13 @@ describe("chord results in Settings search", () => {
     expect(keysFor("down")).not.toContain("slash.next");
   });
 
+  it("finds an open menu's key by the key alone, not with the modifiers it ignores", () => {
+    expect(keysFor("tab")).toContain("slash.apply");
+    expect(keysFor("shift tab")).not.toContain("slash.apply");
+    expect(keysFor("ctrl tab")).not.toContain("slash.apply");
+    expect(keysFor("ctrl n")).toContain("slash.previous");
+  });
+
   it("ranks other queries by text alone", () => {
     for (const query of ["sidebar", "terminal", "send"]) {
       expect(keysFor(query)).toEqual(

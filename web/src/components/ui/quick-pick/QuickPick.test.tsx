@@ -97,9 +97,8 @@ describe("QuickPick accessibility", () => {
 });
 
 describe("QuickPick keyboard", () => {
-  it("steps with Ctrl-N and Ctrl-P like the arrows once opted in, skipping disabled rows", async () => {
+  it("steps with Ctrl-N and Ctrl-P like the arrows, skipping disabled rows", async () => {
     const { input, onAccept } = renderPicker({
-      stepsWithCtrlNP: true,
       segments: [
         {
           ...commands,
@@ -125,19 +124,16 @@ describe("QuickPick keyboard", () => {
     expect(onAccept).toHaveBeenCalledWith(commands.items[1], expect.anything());
   });
 
-  it("leaves ⌘N and Ctrl-Shift-N alone when opted in", () => {
-    const { input } = renderPicker({ stepsWithCtrlNP: true });
+  it("leaves ⌘N and Ctrl-Shift-N alone", () => {
+    const { input } = renderPicker();
     for (const chord of [{ metaKey: true }, { ctrlKey: true, shiftKey: true }]) {
       expect(fireEvent.keyDown(input, { key: "n", code: "KeyN", ...chord })).toBe(true);
       expect(activeOption(input)).toHaveTextContent("New session");
     }
   });
 
-  it("marks its query field as an open pick list's only when it steps with Ctrl-N/P", () => {
-    const { input, unmount } = renderPicker({ stepsWithCtrlNP: true });
-    expect(input).toHaveAttribute("data-pick-list-input");
-    unmount();
-    expect(renderPicker().input).not.toHaveAttribute("data-pick-list-input");
+  it("marks its query field as an open pick list's, so app-wide Ctrl-N/Ctrl-P leave it", () => {
+    expect(renderPicker().input).toHaveAttribute("data-pick-list-input");
   });
 });
 

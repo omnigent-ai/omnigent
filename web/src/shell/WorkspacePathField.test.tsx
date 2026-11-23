@@ -209,6 +209,32 @@ describe("WorkspacePathField", () => {
     expect(onChange).toHaveBeenCalledWith("/Users/corey/projects");
   });
 
+  it("steps an open list with Ctrl-N/Ctrl-P, and leaves them to the field while closed", () => {
+    mockListing(ENTRIES);
+    const onChange = vi.fn();
+    render(
+      <WorkspacePathField
+        hostId="host_1"
+        value={VALUE}
+        onChange={onChange}
+        onBrowse={vi.fn()}
+        recent={[]}
+      />,
+    );
+    const input = screen.getByTestId("workspace-path-input");
+    const ctrl = (key: string) => ({ key, code: `Key${key.toUpperCase()}`, ctrlKey: true });
+    // Closed: readline's own Ctrl-N/Ctrl-P.
+    expect(input).not.toHaveAttribute("data-pick-list-input");
+    expect(fireEvent.keyDown(input, ctrl("n"))).toBe(true);
+    fireEvent.focus(input);
+    expect(input).toHaveAttribute("data-pick-list-input");
+    expect(fireEvent.keyDown(input, ctrl("n"))).toBe(false);
+    fireEvent.keyDown(input, ctrl("n"));
+    fireEvent.keyDown(input, ctrl("p"));
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onChange).toHaveBeenCalledWith("/Users/corey/projects");
+  });
+
   it("commits the typed absolute path on Enter when no row is highlighted", () => {
     // The regression: typing a full path and pressing Enter (without
     // arrowing into the dropdown) did nothing. Enter on an absolute

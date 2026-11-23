@@ -2663,6 +2663,19 @@ describe("side-chat slash commands", () => {
     return input as HTMLTextAreaElement;
   }
 
+  it("marks its composer as an open pick list only while the slash menu shows", () => {
+    conversationRegistry.acquire(childId).setState({ sessionHarness: "claude-sdk" });
+    skillsFixture.current = { skills: [review], skillsStatus: "ready" };
+    renderPane(<SideChatPane childId={childId} />);
+    const field = screen.getByTestId("side-chat-input");
+    expect(field.closest("[data-pick-list-input]")).toBeNull();
+    typeSlash("/rev");
+    // Ctrl-N/Ctrl-P then step the menu, and app-wide chords leave them to it.
+    expect(field.closest("[data-pick-list-input]")).not.toBeNull();
+    typeSlash("/review 123");
+    expect(field.closest("[data-pick-list-input]")).toBeNull();
+  });
+
   it("offers the child's skills when typing / in a live side chat", () => {
     conversationRegistry.acquire(childId).setState({ sessionHarness: "claude-sdk" });
     skillsFixture.current = { skills: [review], skillsStatus: "ready" };

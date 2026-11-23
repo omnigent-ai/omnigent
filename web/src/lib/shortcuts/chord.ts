@@ -18,6 +18,8 @@ export interface Chord {
   key?: string;
   /** Compare `key` exactly, case included, for chords that always compared it exactly. */
   exactKey?: boolean;
+  /** Match the key whatever modifiers are held, as an open menu's keys do. */
+  anyModifiers?: boolean;
 }
 
 /** The fields a chord is matched against. */
@@ -53,15 +55,19 @@ export function chordMatches(
 ): boolean {
   const keys = "getModifierState" in input ? keyChordInput(input) : input;
   if (keys.altGraph) return false;
-  const wantMeta = mac && !!chord.mod;
-  const wantCtrl = !!chord.ctrl || (!mac && !!chord.mod);
-  if (keys.metaKey !== wantMeta || keys.ctrlKey !== wantCtrl) return false;
-  if (keys.altKey !== !!chord.alt || keys.shiftKey !== !!chord.shift) return false;
+  if (!chord.anyModifiers && !modifiersMatch(chord, keys, mac)) return false;
   if (chord.code !== undefined) return keys.code === chord.code;
   if (chord.key === undefined) return false;
   return chord.exactKey
     ? keys.key === chord.key
     : keys.key.toLowerCase() === chord.key.toLowerCase();
+}
+
+function modifiersMatch(chord: Chord, keys: KeyChordInput, mac: boolean): boolean {
+  const wantMeta = mac && !!chord.mod;
+  const wantCtrl = !!chord.ctrl || (!mac && !!chord.mod);
+  if (keys.metaKey !== wantMeta || keys.ctrlKey !== wantCtrl) return false;
+  return keys.altKey === !!chord.alt && keys.shiftKey === !!chord.shift;
 }
 
 /** Modifier key caps: symbols on macOS, words elsewhere; Shift is ⇧ everywhere. */

@@ -245,15 +245,22 @@ function isBarePrintable(chord: Chord): boolean {
   );
 }
 
+/** An open menu's key matches whatever modifiers are held, but is found by the key alone. */
+function searchedChord(chord: Chord): Chord {
+  if (!chord.anyModifiers) return chord;
+  const { anyModifiers: _anyModifiers, ...bare } = chord;
+  return bare;
+}
+
 /**
  * The chords a binding can be found by here: its active chords and the desktop menu's
  * accelerators for it, but not bare printable keys, such as the digit a workspace tab takes
  * after its chord, which only works in context.
  */
 export function searchableChords(id: ShortcutId, environment: ShortcutEnvironment): Chord[] {
-  return [...activeShortcutChords(id, environment), ...menuShortcutChords(id, environment)].filter(
-    (chord) => !isBarePrintable(chord),
-  );
+  return [...activeShortcutChords(id, environment), ...menuShortcutChords(id, environment)]
+    .map(searchedChord)
+    .filter((chord) => !isBarePrintable(chord));
 }
 
 /**

@@ -40,6 +40,7 @@ vi.mock("@/hooks/useSidebarData", () => ({
   useOptionalLoadedConversations: () => useTestConversations().data,
 }));
 import { useSkills } from "@/hooks/useSkills";
+import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 
 vi.mock("@/hooks/useSkills", () => ({ useSkills: vi.fn() }));
 import type * as IdentityModule from "@/lib/identity";
@@ -49,7 +50,16 @@ import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ChatStoreModule from "@/store/chatStore";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Profiler, type ProfilerOnRenderCallback, useCallback } from "react";
 import {
@@ -9725,6 +9735,31 @@ describe("NewChatLandingScreen skills menu", () => {
     );
   });
 
+  it("keeps Ctrl-N/Ctrl-P in the open slash menu off macOS, for the menu alone", () => {
+    const openSessions = vi.fn();
+    renderHook(() => useCommandPaletteHotkey(vi.fn(), true, false, openSessions));
+    mockAgents([skilledAgent()]);
+    renderLanding();
+    typeMessage("/");
+    const field = screen.getByTestId("new-chat-landing-input");
+    field.focus();
+    expect(fireEvent.keyDown(field, { key: "n", code: "KeyN", ctrlKey: true })).toBe(false);
+    expect(fireEvent.keyDown(field, { key: "p", code: "KeyP", ctrlKey: true })).toBe(false);
+    expect(openSessions).not.toHaveBeenCalled();
+  });
+
+  it("holds Ctrl-P in an open slash menu with no matches, so neither Sessions nor Print runs", () => {
+    const openSessions = vi.fn();
+    renderHook(() => useCommandPaletteHotkey(vi.fn(), true, false, openSessions));
+    mockAgents([skilledAgent()]);
+    renderLanding();
+    typeMessage("/zzzzdoesnotexist");
+    const field = screen.getByTestId("new-chat-landing-input");
+    field.focus();
+    expect(fireEvent.keyDown(field, { key: "p", code: "KeyP", ctrlKey: true })).toBe(false);
+    expect(openSessions).not.toHaveBeenCalled();
+  });
+
   it("closes the menu once the command name is complete (space typed)", () => {
     mockAgents([skilledAgent()]);
     renderLanding();
@@ -10283,6 +10318,28 @@ describe("NewChatLandingScreen @-file-mention", () => {
     // Host absolute paths are shown as workspace-relative rows (folders first).
     expect(screen.getByTitle("Open omnigent")).toBeInTheDocument();
     expect(screen.getByTitle("Attach README.md")).toBeInTheDocument();
+  });
+
+  it("steps the open @ list with Ctrl-N/Ctrl-P off macOS instead of opening Sessions", async () => {
+    const openSessions = vi.fn();
+    renderHook(() => useCommandPaletteHotkey(vi.fn(), true, false, openSessions));
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    const field = input();
+    field.focus();
+    fireEvent.change(field, { target: { value: "@", selectionStart: 1 } });
+    expect(screen.getByTitle("Attach README.md")).toBeInTheDocument();
+    const active = () => document.querySelector('[role="option"][data-active="true"]');
+    const first = active();
+    expect(first).not.toBeNull();
+    // From the first row, Ctrl-P wraps to the last row (README.md), and Ctrl-N comes back.
+    fireEvent.keyDown(field, { key: "p", code: "KeyP", ctrlKey: true });
+    expect(active()).toHaveTextContent("README.md");
+    fireEvent.keyDown(field, { key: "n", code: "KeyN", ctrlKey: true });
+    expect(active()).toBe(first);
+    expect(openSessions).not.toHaveBeenCalled();
   });
 
   it("does not accept the highlighted mention when Enter is pressed on mobile", async () => {

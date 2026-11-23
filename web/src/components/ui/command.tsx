@@ -1,6 +1,7 @@
 import * as React from "react";
 import { Command as CommandPrimitive } from "cmdk";
 
+import { pickListInputProps } from "@/lib/listNavigationKeys";
 import { cn } from "@/lib/utils";
 import {
   Dialog,
@@ -63,6 +64,8 @@ function CommandInput({
       <InputGroup className="h-8! rounded-lg! border-input/30 bg-input/30 shadow-none! *:data-[slot=input-group-addon]:pl-2!">
         <CommandPrimitive.Input
           data-slot="command-input"
+          // cmdk moves its selection on Ctrl-N/Ctrl-P, so app-wide chords leave them to it.
+          {...pickListInputProps(true)}
           className={cn(
             "w-full text-ui outline-hidden disabled:cursor-not-allowed disabled:opacity-50",
             className,

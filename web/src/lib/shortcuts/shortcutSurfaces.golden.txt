@@ -49,8 +49,8 @@ pane.previous | Focus previous pane | chords=mod+alt+shift+code:BracketLeft | ke
 pane.next | Focus next pane | chords=mod+alt+shift+code:BracketRight | keys=⌥ ⇧ ⌘ ] | aria=Meta+Alt+Shift+] | editor=Mod-Alt-Shift-] | matches=true
 terminal.splitRight | Split terminal right | chords=mod+alt+shift+code:Backslash | keys=⌥ ⇧ ⌘ \ | aria=Meta+Alt+Shift+\ | editor=Mod-Alt-Shift-\ | matches=true
 terminal.splitDown | Split terminal down | chords=mod+alt+code:Minus | keys=⌥ ⌘ - | aria=Meta+Alt+- | editor=Mod-Alt-- | matches=true
-slash.previous | Navigate suggestions | chords=key:ArrowUp | keys=↑ | aria=ArrowUp | editor=ArrowUp | matches=true
-slash.next | Navigate suggestions | chords=key:ArrowDown | keys=↓ | aria=ArrowDown | editor=ArrowDown | matches=true
+slash.previous | Navigate suggestions | chords=key:ArrowUp ctrl+key:p | keys=↑ | aria=ArrowUp | editor=ArrowUp Ctrl-p | matches=true true
+slash.next | Navigate suggestions | chords=key:ArrowDown ctrl+key:n | keys=↓ | aria=ArrowDown | editor=ArrowDown Ctrl-n | matches=true true
 slash.apply | Apply highlighted command | chords=key:Tab | keys=Tab | aria=Tab | editor=Tab | matches=true
 slash.dismiss | Dismiss menu | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
 session.pin | Pin or unpin current session | chords=- | keys=⌥ ⌘ P | aria=Meta+Alt+P | editor=- | matches=-
@@ -153,8 +153,8 @@ pane.previous | search=pane.previous
 pane.next | search=pane.next
 terminal.splitRight | search=terminal.splitRight
 terminal.splitDown | search=terminal.splitDown
-slash.previous | search=composer.previousPrompt,slash.previous
-slash.next | search=composer.nextPrompt,slash.previous
+slash.previous | search=composer.previousPrompt,slash.previous slash.previous
+slash.next | search=composer.nextPrompt,slash.previous slash.previous
 slash.apply | search=slash.apply
 slash.dismiss | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
 # mac native no-menu
@@ -208,8 +208,8 @@ pane.previous | Focus previous pane | chords=mod+alt+shift+code:BracketLeft | ke
 pane.next | Focus next pane | chords=mod+alt+shift+code:BracketRight | keys=⌥ ⇧ ⌘ ] | aria=Meta+Alt+Shift+] | editor=Mod-Alt-Shift-] | matches=true
 terminal.splitRight | Split terminal right | chords=mod+alt+shift+code:Backslash | keys=⌥ ⇧ ⌘ \ | aria=Meta+Alt+Shift+\ | editor=Mod-Alt-Shift-\ | matches=true
 terminal.splitDown | Split terminal down | chords=mod+alt+code:Minus | keys=⌥ ⌘ - | aria=Meta+Alt+- | editor=Mod-Alt-- | matches=true
-slash.previous | Navigate suggestions | chords=key:ArrowUp | keys=↑ | aria=ArrowUp | editor=ArrowUp | matches=true
-slash.next | Navigate suggestions | chords=key:ArrowDown | keys=↓ | aria=ArrowDown | editor=ArrowDown | matches=true
+slash.previous | Navigate suggestions | chords=key:ArrowUp ctrl+key:p | keys=↑ | aria=ArrowUp | editor=ArrowUp Ctrl-p | matches=true true
+slash.next | Navigate suggestions | chords=key:ArrowDown ctrl+key:n | keys=↓ | aria=ArrowDown | editor=ArrowDown Ctrl-n | matches=true true
 slash.apply | Apply highlighted command | chords=key:Tab | keys=Tab | aria=Tab | editor=Tab | matches=true
 slash.dismiss | Dismiss menu | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
 session.pin | Pin or unpin current session | chords=mod+alt+code:KeyP | keys=⌥ ⌘ P | aria=Meta+Alt+P | editor=Mod-Alt-p | matches=true
@@ -312,8 +312,8 @@ pane.previous | search=pane.previous
 pane.next | search=pane.next
 terminal.splitRight | search=terminal.splitRight
 terminal.splitDown | search=terminal.splitDown
-slash.previous | search=composer.previousPrompt,slash.previous
-slash.next | search=composer.nextPrompt,slash.previous
+slash.previous | search=composer.previousPrompt,slash.previous slash.previous
+slash.next | search=composer.nextPrompt,slash.previous slash.previous
 slash.apply | search=slash.apply
 slash.dismiss | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
 # mac browser menu
@@ -367,8 +367,8 @@ pane.previous | Focus previous pane | chords=mod+alt+shift+code:BracketLeft | ke
 pane.next | Focus next pane | chords=mod+alt+shift+code:BracketRight | keys=⌥ ⇧ ⌘ ] | aria=Meta+Alt+Shift+] | editor=Mod-Alt-Shift-] | matches=true
 terminal.splitRight | Split terminal right | chords=mod+alt+shift+code:Backslash | keys=⌥ ⇧ ⌘ \ | aria=Meta+Alt+Shift+\ | editor=Mod-Alt-Shift-\ | matches=true
 terminal.splitDown | Split terminal down | chords=mod+alt+code:Minus | keys=⌥ ⌘ - | aria=Meta+Alt+- | editor=Mod-Alt-- | matches=true
-slash.previous | Navigate suggestions | chords=key:ArrowUp | keys=↑ | aria=ArrowUp | editor=ArrowUp | matches=true
-slash.next | Navigate suggestions | chords=key:ArrowDown | keys=↓ | aria=ArrowDown | editor=ArrowDown | matches=true
+slash.previous | Navigate suggestions | chords=key:ArrowUp ctrl+key:p | keys=↑ | aria=ArrowUp | editor=ArrowUp Ctrl-p | matches=true true
+slash.next | Navigate suggestions | chords=key:ArrowDown ctrl+key:n | keys=↓ | aria=ArrowDown | editor=ArrowDown Ctrl-n | matches=true true
 slash.apply | Apply highlighted command | chords=key:Tab | keys=Tab | aria=Tab | editor=Tab | matches=true
 slash.dismiss | Dismiss menu | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
 session.pin | Pin or unpin current session | chords=- | keys=⌥ ⌘ P | aria=Meta+Alt+P | editor=- | matches=-
@@ -471,8 +471,8 @@ pane.previous | search=pane.previous
 pane.next | search=pane.next
 terminal.splitRight | search=terminal.splitRight
 terminal.splitDown | search=terminal.splitDown
-slash.previous | search=composer.previousPrompt,slash.previous
-slash.next | search=composer.nextPrompt,slash.previous
+slash.previous | search=composer.previousPrompt,slash.previous slash.previous
+slash.next | search=composer.nextPrompt,slash.previous slash.previous
 slash.apply | search=slash.apply
 slash.dismiss | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
 # mac browser no-menu
@@ -526,8 +526,8 @@ pane.previous | Focus previous pane | chords=mod+alt+shift+code:BracketLeft | ke
 pane.next | Focus next pane | chords=mod+alt+shift+code:BracketRight | keys=⌥ ⇧ ⌘ ] | aria=Meta+Alt+Shift+] | editor=Mod-Alt-Shift-] | matches=true
 terminal.splitRight | Split terminal right | chords=mod+alt+shift+code:Backslash | keys=⌥ ⇧ ⌘ \ | aria=Meta+Alt+Shift+\ | editor=Mod-Alt-Shift-\ | matches=true
 terminal.splitDown | Split terminal down | chords=mod+alt+code:Minus | keys=⌥ ⌘ - | aria=Meta+Alt+- | editor=Mod-Alt-- | matches=true
-slash.previous | Navigate suggestions | chords=key:ArrowUp | keys=↑ | aria=ArrowUp | editor=ArrowUp | matches=true
-slash.next | Navigate suggestions | chords=key:ArrowDown | keys=↓ | aria=ArrowDown | editor=ArrowDown | matches=true
+slash.previous | Navigate suggestions | chords=key:ArrowUp ctrl+key:p | keys=↑ | aria=ArrowUp | editor=ArrowUp Ctrl-p | matches=true true
+slash.next | Navigate suggestions | chords=key:ArrowDown ctrl+key:n | keys=↓ | aria=ArrowDown | editor=ArrowDown Ctrl-n | matches=true true
 slash.apply | Apply highlighted command | chords=key:Tab | keys=Tab | aria=Tab | editor=Tab | matches=true
 slash.dismiss | Dismiss menu | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
 session.pin | Pin or unpin current session | chords=mod+alt+code:KeyP | keys=⌥ ⌘ P | aria=Meta+Alt+P | editor=Mod-Alt-p | matches=true
@@ -630,8 +630,8 @@ pane.previous | search=pane.previous
 pane.next | search=pane.next
 terminal.splitRight | search=terminal.splitRight
 terminal.splitDown | search=terminal.splitDown
-slash.previous | search=composer.previousPrompt,slash.previous
-slash.next | search=composer.nextPrompt,slash.previous
+slash.previous | search=composer.previousPrompt,slash.previous slash.previous
+slash.next | search=composer.nextPrompt,slash.previous slash.previous
 slash.apply | search=slash.apply
 slash.dismiss | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
 # other native menu
@@ -685,8 +685,8 @@ pane.previous | Focus previous pane | chords=mod+alt+shift+code:BracketLeft | ke
 pane.next | Focus next pane | chords=mod+alt+shift+code:BracketRight | keys=Ctrl Alt ⇧ ] | aria=Control+Alt+Shift+] | editor=Mod-Alt-Shift-] | matches=true
 terminal.splitRight | Split terminal right | chords=mod+alt+shift+code:Backslash | keys=Ctrl Alt ⇧ \ | aria=Control+Alt+Shift+\ | editor=Mod-Alt-Shift-\ | matches=true
 terminal.splitDown | Split terminal down | chords=mod+alt+code:Minus | keys=Ctrl Alt - | aria=Control+Alt+- | editor=Mod-Alt-- | matches=true
-slash.previous | Navigate suggestions | chords=key:ArrowUp | keys=↑ | aria=ArrowUp | editor=ArrowUp | matches=true
-slash.next | Navigate suggestions | chords=key:ArrowDown | keys=↓ | aria=ArrowDown | editor=ArrowDown | matches=true
+slash.previous | Navigate suggestions | chords=key:ArrowUp ctrl+key:p | keys=↑ | aria=ArrowUp | editor=ArrowUp Ctrl-p | matches=true true
+slash.next | Navigate suggestions | chords=key:ArrowDown ctrl+key:n | keys=↓ | aria=ArrowDown | editor=ArrowDown Ctrl-n | matches=true true
 slash.apply | Apply highlighted command | chords=key:Tab | keys=Tab | aria=Tab | editor=Tab | matches=true
 slash.dismiss | Dismiss menu | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
 session.pin | Pin or unpin current session | chords=- | keys=Ctrl Alt P | aria=Control+Alt+P | editor=- | matches=-
@@ -739,7 +739,7 @@ file.unfold | Unfold | chords=ctrl+shift+code:BracketRight | keys=Ctrl ⇧ ] | a
 file.foldAll | Fold all | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
-session.new | search=session.new
+session.new | search=session.new,slash.previous
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
 palette.sessions | search=palette.sessions
@@ -789,8 +789,8 @@ pane.previous | search=pane.previous
 pane.next | search=pane.next
 terminal.splitRight | search=terminal.splitRight
 terminal.splitDown | search=terminal.splitDown
-slash.previous | search=composer.previousPrompt,slash.previous
-slash.next | search=composer.nextPrompt,slash.previous
+slash.previous | search=composer.previousPrompt,slash.previous slash.previous
+slash.next | search=composer.nextPrompt,slash.previous session.new,slash.previous
 slash.apply | search=slash.apply
 slash.dismiss | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
 # other native no-menu
@@ -844,8 +844,8 @@ pane.previous | Focus previous pane | chords=mod+alt+shift+code:BracketLeft | ke
 pane.next | Focus next pane | chords=mod+alt+shift+code:BracketRight | keys=Ctrl Alt ⇧ ] | aria=Control+Alt+Shift+] | editor=Mod-Alt-Shift-] | matches=true
 terminal.splitRight | Split terminal right | chords=mod+alt+shift+code:Backslash | keys=Ctrl Alt ⇧ \ | aria=Control+Alt+Shift+\ | editor=Mod-Alt-Shift-\ | matches=true
 terminal.splitDown | Split terminal down | chords=mod+alt+code:Minus | keys=Ctrl Alt - | aria=Control+Alt+- | editor=Mod-Alt-- | matches=true
-slash.previous | Navigate suggestions | chords=key:ArrowUp | keys=↑ | aria=ArrowUp | editor=ArrowUp | matches=true
-slash.next | Navigate suggestions | chords=key:ArrowDown | keys=↓ | aria=ArrowDown | editor=ArrowDown | matches=true
+slash.previous | Navigate suggestions | chords=key:ArrowUp ctrl+key:p | keys=↑ | aria=ArrowUp | editor=ArrowUp Ctrl-p | matches=true true
+slash.next | Navigate suggestions | chords=key:ArrowDown ctrl+key:n | keys=↓ | aria=ArrowDown | editor=ArrowDown Ctrl-n | matches=true true
 slash.apply | Apply highlighted command | chords=key:Tab | keys=Tab | aria=Tab | editor=Tab | matches=true
 slash.dismiss | Dismiss menu | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
 session.pin | Pin or unpin current session | chords=- | keys=- | aria=- | editor=- | matches=-
@@ -898,7 +898,7 @@ file.unfold | Unfold | chords=ctrl+shift+code:BracketRight | keys=Ctrl ⇧ ] | a
 file.foldAll | Fold all | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
-session.new | search=session.new
+session.new | search=session.new,slash.previous
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
 palette.sessions | search=palette.sessions
@@ -948,8 +948,8 @@ pane.previous | search=pane.previous
 pane.next | search=pane.next
 terminal.splitRight | search=terminal.splitRight
 terminal.splitDown | search=terminal.splitDown
-slash.previous | search=composer.previousPrompt,slash.previous
-slash.next | search=composer.nextPrompt,slash.previous
+slash.previous | search=composer.previousPrompt,slash.previous slash.previous
+slash.next | search=composer.nextPrompt,slash.previous session.new,slash.previous
 slash.apply | search=slash.apply
 slash.dismiss | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
 # other browser menu
@@ -1003,8 +1003,8 @@ pane.previous | Focus previous pane | chords=mod+alt+shift+code:BracketLeft | ke
 pane.next | Focus next pane | chords=mod+alt+shift+code:BracketRight | keys=Ctrl Alt ⇧ ] | aria=Control+Alt+Shift+] | editor=Mod-Alt-Shift-] | matches=true
 terminal.splitRight | Split terminal right | chords=mod+alt+shift+code:Backslash | keys=Ctrl Alt ⇧ \ | aria=Control+Alt+Shift+\ | editor=Mod-Alt-Shift-\ | matches=true
 terminal.splitDown | Split terminal down | chords=mod+alt+code:Minus | keys=Ctrl Alt - | aria=Control+Alt+- | editor=Mod-Alt-- | matches=true
-slash.previous | Navigate suggestions | chords=key:ArrowUp | keys=↑ | aria=ArrowUp | editor=ArrowUp | matches=true
-slash.next | Navigate suggestions | chords=key:ArrowDown | keys=↓ | aria=ArrowDown | editor=ArrowDown | matches=true
+slash.previous | Navigate suggestions | chords=key:ArrowUp ctrl+key:p | keys=↑ | aria=ArrowUp | editor=ArrowUp Ctrl-p | matches=true true
+slash.next | Navigate suggestions | chords=key:ArrowDown ctrl+key:n | keys=↓ | aria=ArrowDown | editor=ArrowDown Ctrl-n | matches=true true
 slash.apply | Apply highlighted command | chords=key:Tab | keys=Tab | aria=Tab | editor=Tab | matches=true
 slash.dismiss | Dismiss menu | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
 session.pin | Pin or unpin current session | chords=- | keys=Ctrl Alt P | aria=Control+Alt+P | editor=- | matches=-
@@ -1107,8 +1107,8 @@ pane.previous | search=pane.previous
 pane.next | search=pane.next
 terminal.splitRight | search=terminal.splitRight
 terminal.splitDown | search=terminal.splitDown
-slash.previous | search=composer.previousPrompt,slash.previous
-slash.next | search=composer.nextPrompt,slash.previous
+slash.previous | search=composer.previousPrompt,slash.previous slash.previous
+slash.next | search=composer.nextPrompt,slash.previous slash.previous
 slash.apply | search=slash.apply
 slash.dismiss | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
 # other browser no-menu
@@ -1162,8 +1162,8 @@ pane.previous | Focus previous pane | chords=mod+alt+shift+code:BracketLeft | ke
 pane.next | Focus next pane | chords=mod+alt+shift+code:BracketRight | keys=Ctrl Alt ⇧ ] | aria=Control+Alt+Shift+] | editor=Mod-Alt-Shift-] | matches=true
 terminal.splitRight | Split terminal right | chords=mod+alt+shift+code:Backslash | keys=Ctrl Alt ⇧ \ | aria=Control+Alt+Shift+\ | editor=Mod-Alt-Shift-\ | matches=true
 terminal.splitDown | Split terminal down | chords=mod+alt+code:Minus | keys=Ctrl Alt - | aria=Control+Alt+- | editor=Mod-Alt-- | matches=true
-slash.previous | Navigate suggestions | chords=key:ArrowUp | keys=↑ | aria=ArrowUp | editor=ArrowUp | matches=true
-slash.next | Navigate suggestions | chords=key:ArrowDown | keys=↓ | aria=ArrowDown | editor=ArrowDown | matches=true
+slash.previous | Navigate suggestions | chords=key:ArrowUp ctrl+key:p | keys=↑ | aria=ArrowUp | editor=ArrowUp Ctrl-p | matches=true true
+slash.next | Navigate suggestions | chords=key:ArrowDown ctrl+key:n | keys=↓ | aria=ArrowDown | editor=ArrowDown Ctrl-n | matches=true true
 slash.apply | Apply highlighted command | chords=key:Tab | keys=Tab | aria=Tab | editor=Tab | matches=true
 slash.dismiss | Dismiss menu | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
 session.pin | Pin or unpin current session | chords=- | keys=- | aria=- | editor=- | matches=-
@@ -1266,7 +1266,7 @@ pane.previous | search=pane.previous
 pane.next | search=pane.next
 terminal.splitRight | search=terminal.splitRight
 terminal.splitDown | search=terminal.splitDown
-slash.previous | search=composer.previousPrompt,slash.previous
-slash.next | search=composer.nextPrompt,slash.previous
+slash.previous | search=composer.previousPrompt,slash.previous slash.previous
+slash.next | search=composer.nextPrompt,slash.previous slash.previous
 slash.apply | search=slash.apply
 slash.dismiss | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
