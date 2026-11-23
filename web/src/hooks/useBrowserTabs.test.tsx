@@ -111,13 +111,15 @@ describe("browser tab titles", () => {
     "delayed with a live update",
     "retried",
     "retried with a live update",
+    "another window",
   ] as const)("labels a tab whose view is gone with identity %s", async (identityState) => {
     let finishIdentity!: (userId: string) => void;
     const pendingIdentity = new Promise<string>((resolve) => {
       finishIdentity = resolve;
     });
     const retried = identityState.startsWith("retried");
-    if (identityState !== "ready") {
+    const elsewhere = identityState === "another window";
+    if (identityState !== "ready" && !elsewhere) {
       vi.mocked(getCurrentUserId).mockReturnValue(null);
       vi.mocked(resolveIdentity).mockReturnValue(retried ? Promise.resolve(null) : pendingIdentity);
     }
@@ -130,12 +132,26 @@ describe("browser tab titles", () => {
     const onBrowserUrlChanged = vi.fn<(listener: Listener) => () => void>(() => () => {});
     Object.assign(window, {
       omnigentDesktop: {
-        browserHasView: vi.fn().mockResolvedValue({ exists: false }),
+        browserHasView: vi.fn().mockResolvedValue({ exists: false, elsewhere }),
         onBrowserUrlChanged,
       },
     });
     const { result } = renderHook(() => useBrowserTabs("session-a"));
     const live = identityState.endsWith("with a live update");
+    if (elsewhere) {
+      // The other window saves its new address without emitting a local URL event.
+      await act(async () => {});
+      expect(result.current.labelFor("restored", 0)).toBe("Browser 1");
+      act(() =>
+        writeSessionWorkspaceState("session-a", {
+          browserPages: {
+            restored: { url: "https://docs.example/newer", title: "Newer", owner: "user-a" },
+          },
+        }),
+      );
+      expect(await result.current.pageUrl("restored")).toBe("https://docs.example/newer");
+      return;
+    }
     if (identityState !== "ready") {
       await waitFor(() => expect(resolveIdentity).toHaveBeenCalled());
       expect(result.current.labelFor("restored", 0)).toBe("Browser 1");

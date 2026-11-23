@@ -48,7 +48,7 @@ interface BrowserTabsBridge {
   ) => Promise<{ ok: boolean; error?: string }>;
   browserHasView?: (
     viewId: string,
-  ) => Promise<BrowserPage & { exists: boolean; pendingUrl?: string }>;
+  ) => Promise<BrowserPage & { exists: boolean; elsewhere?: boolean; pendingUrl?: string }>;
   onBrowserUrlChanged?: (
     callback: (page: BrowserPage & { conversationId: string }) => void,
   ) => () => void;
@@ -334,6 +334,11 @@ export function useBrowserTabs(conversationId: string) {
         // Live updates take precedence over an earlier restore snapshot.
         if (!active || updated.has(viewId) || !page) return;
         if (!page.exists) {
+          // The owning window's navigations do not update this window's page cache.
+          if (page.elsewhere) {
+            setPage(viewId, {});
+            return;
+          }
           // A tab whose view the shell destroyed keeps its saved page's label.
           snapshots.set(viewId, null);
           await resolveIdentity();
