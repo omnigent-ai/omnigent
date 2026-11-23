@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 _POOL = 2000
 # Below this many paths, one thread matches faster than starting more.
 _PARALLEL_FROM = 50_000
+# Matching 1.6 million paths on 32 cores: 9-12 ms at 8 threads, 7-8 ms at 16, none faster past it.
 _MAX_THREADS = 16
 _MAX_CACHED_CORPORA = 8
 # Paths kept in cached corpora; the oldest go first, keeping the newest.
