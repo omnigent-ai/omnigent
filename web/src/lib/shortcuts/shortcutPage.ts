@@ -160,6 +160,7 @@ export function shortcutPageGroups(
         {
           label: shortcutBinding("session.number").label,
           keys: shortcutRowKeys("session.number", environment, context),
+          shortcutId: "session.number",
         },
       ],
     },
@@ -175,6 +176,7 @@ export function shortcutPageGroups(
         {
           label: shortcutBinding("workspace.tab").label,
           keys: shortcutRowKeys("workspace.tab", environment, context),
+          shortcutId: "workspace.tab",
         },
         // ⌘T is the desktop menu's New Browser Tab, so older shells have no chord.
         ...when(context.browser && context.desktopCommands, [
