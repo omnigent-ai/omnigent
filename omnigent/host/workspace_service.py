@@ -77,6 +77,8 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
 from omnigent.host import workspace_fuzzy
 from omnigent.host.frames import HostWorkspaceCallFrame, HostWorkspaceReplyFrame
 from omnigent.host.workspace_git import comparison, context, working_copy
+from omnigent.host.workspace_git.ignored import ignored_paths
+from omnigent.host.workspace_git.runner import Deadline, GitError
 from omnigent.host.workspace_methods import WORKSPACE_METHODS
 from omnigent.host.workspace_search import search_files, search_text
 from omnigent.host.workspace_tokens import new_token_key, verify_token
@@ -88,6 +90,8 @@ _logger = logging.getLogger(__name__)
 
 # Matches the largest page the web Files tree asks for.
 _MAX_PAGE_SIZE = 1000
+# How long ListDirectory may ask Git which entries it ignores, across its pages.
+_IGNORED_DEADLINE_S = 10.0
 # Small enough to keep a stream responsive, large enough to keep framing cheap.
 _READ_CHUNK_BYTES = 64 * 1024
 _ERROR_CODES = {
@@ -107,7 +111,7 @@ class _Served:
     :param features: Optional features it offers, e.g. ``"search_files.substring"``.
     :param tool: A program it needs on ``PATH``; without it, the method isn't listed.
     :param optional_features: Returns the features this host can offer only when
-        a library they need loads.
+        what they need is there, such as a library that loads or a program on ``PATH``.
     """
 
     features: tuple[str, ...] = ()
@@ -117,7 +121,10 @@ class _Served:
 
 # The methods this host answers. Only these, and GetCapabilities, are dispatched.
 _SERVED: dict[str, _Served] = {
-    "ListDirectory": _Served(features=("list_directory.collapse_single_child_directories",)),
+    "ListDirectory": _Served(
+        features=("list_directory.collapse_single_child_directories",),
+        optional_features=lambda: _git_features("gitignore"),
+    ),
     "ReadFile": _Served(),
     "StatPath": _Served(),
     "ReadLinkText": _Served(),
@@ -134,6 +141,11 @@ _SERVED: dict[str, _Served] = {
     "ListBranchCommits": _Served(features=("branch_commits",), tool="git"),
     "ResolveRepositoryContext": _Served(tool="git"),
 }
+
+
+def _git_features(*features: str) -> tuple[str, ...]:
+    """``features``, offered only while ``git`` is on ``PATH``."""
+    return features if shutil.which("git") else ()
 
 
 def capabilities() -> list[str]:
@@ -188,19 +200,33 @@ class WorkspaceService(WorkspaceServiceMethods):
         if request.page_size < 0:
             raise ConnectError(Code.INVALID_ARGUMENT, "page_size must not be negative")
         reader = await _read(self._reader_for, ctx)
-        page = await _read(
-            reader.list_directory,
-            request.path,
-            limit=min(request.page_size or _MAX_PAGE_SIZE, _MAX_PAGE_SIZE),
-            after=request.page_token or None,
-            collapse_single_child_directories=request.collapse_single_child_directories,
-        )
-        # The REST listing has no symlink flag, so look at each entry itself.
-        links = await _read(_symlinks, reader.root, [item["path"] for item in page.data])
-        entries = [_entry(item, is_symlink=item["path"] in links) for item in page.data]
-        # The cursor is the last entry's id; the proto keeps it opaque.
-        next_page_token = page.last_id if page.has_more and page.last_id else ""
-        return ListDirectoryResponse(entries=entries, next_page_token=next_page_token)
+        limit = min(request.page_size or _MAX_PAGE_SIZE, _MAX_PAGE_SIZE)
+        deadline = Deadline(_IGNORED_DEADLINE_S)
+        entries: list[Entry] = []
+        after = request.page_token or None
+        while True:
+            page = await _read(
+                reader.list_directory,
+                request.path,
+                limit=limit - len(entries),
+                after=after,
+                collapse_single_child_directories=request.collapse_single_child_directories,
+            )
+            paths = [item["path"] for item in page.data]
+            # The REST listing has no symlink flag, so look at each entry itself.
+            links = await _read(_symlinks, reader.root, paths)
+            ignored = await _ignored(reader.root, paths, deadline)
+            entries += [
+                _entry(item, is_symlink=item["path"] in links, ignored=item["path"] in ignored)
+                for item in page.data
+                if not (request.hide_ignored and item["path"] in ignored)
+            ]
+            # The cursor is the last entry's id; the proto keeps it opaque.
+            next_page_token = page.last_id if page.has_more and page.last_id else ""
+            # Hidden entries leave room, so read on: a page comes back empty only at the end.
+            if not (request.hide_ignored and next_page_token and len(entries) < limit):
+                return ListDirectoryResponse(entries=entries, next_page_token=next_page_token)
+            after = next_page_token
 
     async def read_file(
         self,
@@ -313,7 +339,18 @@ class WorkspaceService(WorkspaceServiceMethods):
         return ReadLinkTextResponse(target=await _read(reader.read_link_text, request.path))
 
 
-def _entry(item: ListedEntry, *, is_symlink: bool) -> Entry:
+async def _ignored(root: Path, paths: list[str], deadline: Deadline) -> set[str]:
+    """The ``paths`` Git ignores; none when Git can't say, so the listing still answers."""
+    if not shutil.which("git"):
+        return set()
+    try:
+        return await ignored_paths(root, paths, deadline)
+    except GitError as exc:
+        _logger.info("Listing without ignored files: %s", exc.problem.name)
+        return set()
+
+
+def _entry(item: ListedEntry, *, is_symlink: bool, ignored: bool = False) -> Entry:
     return Entry(
         name=item["name"],
         path=item["path"],
@@ -322,6 +359,7 @@ def _entry(item: ListedEntry, *, is_symlink: bool) -> Entry:
         modify_time=Timestamp(seconds=item["modified_at"]),
         is_symlink=is_symlink,
         leaf_directory_path=item.get("leaf_directory_path", ""),
+        ignored=ignored,
     )
 
 

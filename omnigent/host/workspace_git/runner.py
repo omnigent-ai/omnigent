@@ -77,6 +77,9 @@ _SUBCOMMAND_OPTIONS = {
     "diff": ("--no-ext-diff", "--no-textconv"),
     "log": ("--no-show-signature", "--no-color", "--no-ext-diff", "--no-textconv"),
 }
+# check-ignore refuses literal pathspecs, so it runs without them. It reads only
+# stdin paths, which its callers prefix with "./" so that none reads as magic.
+_MAGIC_PATHSPEC_SUBCOMMANDS = frozenset({"check-ignore"})
 
 # Tests add variables here, such as GIT_TRACE2_EVENT, to observe Git.
 test_environment: dict[str, str] = {}
@@ -214,11 +217,13 @@ def trusted_search_path() -> str:
     return os.pathsep.join(entry for entry in entries if os.path.isabs(entry))
 
 
-def _environment() -> dict[str, str]:
+def _environment(*, literal_pathspecs: bool = True) -> dict[str, str]:
     environment = {name: os.environ[name] for name in _INHERITED_VARIABLES if name in os.environ}
     environment["PATH"] = trusted_search_path()
     environment.update(_FIXED_VARIABLES)
     environment.update(test_environment)
+    if not literal_pathspecs:
+        environment.pop("GIT_LITERAL_PATHSPECS", None)
     return environment
 
 
@@ -482,6 +487,7 @@ async def _run(
     stdout_bytes: int = SMALL_OUTPUT_BYTES,
     allow_partial: bool = False,
     stdout_sink: Callable[[bytes], None] | None = None,
+    literal_pathspecs: bool = True,
 ) -> GitOutput:
     """Start one Git child once ``slots`` allow it, and clean up its process group."""
     if deadline.expired():
@@ -500,7 +506,10 @@ async def _run(
         argv += arguments
         try:
             process = await start_owned_process(
-                argv, cwd=working_directory, env=_environment(), stdin=stdin
+                argv,
+                cwd=working_directory,
+                env=_environment(literal_pathspecs=literal_pathspecs),
+                stdin=stdin,
             )
         except OSError:
             raise GitError(GitProblem.UNAVAILABLE) from None
@@ -737,4 +746,5 @@ class GitRepository:
             stdout_bytes=stdout_bytes,
             allow_partial=allow_partial,
             stdout_sink=stdout_sink,
+            literal_pathspecs=subcommand not in _MAGIC_PATHSPEC_SUBCOMMANDS,
         )

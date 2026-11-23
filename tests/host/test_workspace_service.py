@@ -63,6 +63,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+from omnigent.host.workspace_git.runner import GitError, GitProblem
 from omnigent.host.workspace_service import (
     _SERVED,
     WorkspaceService,
@@ -75,6 +76,7 @@ from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry, deliver_workspace_reply
 from omnigent.workspace_fs import WorkspaceReader, single_child_chain
 from tests._helpers.polling import poll_until_async
+from tests.host.test_workspace_git_runner import _git, _repository
 from tests.server.routes.test_shell_permission_gate import _StubAgentStore, _StubConversationStore
 
 pytestmark = pytest.mark.asyncio
@@ -270,6 +272,89 @@ async def test_list_directory_matches_rest_listing_across_pages(
         )
         for e in cast("list[dict[str, object]]", rest)
     ]
+
+
+def _ignoring_workspace(root: Path) -> Path:
+    """A repository where Git ignores a folder and a pattern, beside a tracked match."""
+    _repository(root)
+    (root / ".gitignore").write_text("build/\n*.log\n")
+    (root / "build").mkdir()
+    (root / "build" / "out.o").write_text("x")
+    for name in ("debug.log", "main.py", "tracked.log", "zeta.md"):
+        (root / name).write_text("x")
+    _git(root, "add", "-f", "tracked.log")
+    return root
+
+
+def _listed(entries: Any) -> dict[str, bool]:
+    """Each listed path and whether it's marked ignored, leaving out Git's own folder."""
+    return {entry.path: entry.ignored for entry in entries if entry.path != ".git"}
+
+
+async def test_list_directory_marks_what_git_ignores_and_hides_it_when_asked(
+    tmp_path: Path, client_for: ClientFor
+) -> None:
+    client = client_for(_ignoring_workspace(tmp_path / "repo"))
+
+    listed = await client.list_directory(ListDirectoryRequest())
+    hidden = await client.list_directory(ListDirectoryRequest(hide_ignored=True))
+
+    assert _listed(listed.entries) == {
+        ".gitignore": False,
+        "a.txt": False,
+        "build": True,
+        "debug.log": True,
+        "main.py": False,
+        "tracked.log": False,
+        "zeta.md": False,
+    }
+    assert _listed(hidden.entries) == {
+        ".gitignore": False,
+        "a.txt": False,
+        "main.py": False,
+        "tracked.log": False,
+        "zeta.md": False,
+    }
+
+
+async def test_list_directory_reads_past_hidden_entries_so_no_page_is_empty_before_the_end(
+    tmp_path: Path, client_for: ClientFor
+) -> None:
+    client = client_for(_ignoring_workspace(tmp_path / "repo"))
+
+    pages: list[list[str]] = []
+    token = ""
+    while True:
+        page = await client.list_directory(
+            ListDirectoryRequest(page_size=1, page_token=token, hide_ignored=True)
+        )
+        pages.append([entry.path for entry in page.entries])
+        token = page.next_page_token
+        if not token:
+            break
+
+    # `build` and `debug.log` sit between `a.txt` and `main.py`; the page holding
+    # `main.py` read past them.
+    assert all(len(page) == 1 for page in pages[:-1])
+    listed = [path for page in pages for path in page if path != ".git"]
+    assert listed == [".gitignore", "a.txt", "main.py", "tracked.log", "zeta.md"]
+
+
+async def test_list_directory_answers_with_nothing_marked_when_git_cant_say(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def time_out(*_args: object) -> set[str]:
+        raise GitError(GitProblem.TIMEOUT)
+
+    monkeypatch.setattr("omnigent.host.workspace_service.ignored_paths", time_out)
+    reader = WorkspaceReader(_ignoring_workspace(tmp_path / "repo"))
+    app = WorkspaceServiceASGIApplication(WorkspaceService(lambda _ctx: reader))
+    client = _connect(app, "http://workspace.test", ProtocolType.CONNECT)
+
+    listed = await client.list_directory(ListDirectoryRequest(hide_ignored=True))
+
+    assert "build" in _listed(listed.entries)
+    assert not any(_listed(listed.entries).values())
 
 
 async def test_read_file_matches_rest_file_content(tmp_path: Path, client_for: ClientFor) -> None:
@@ -695,6 +780,7 @@ async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: 
     assert set(response.capabilities) ^ (_RG_METHODS - _WITH_RG) == {
         "ListDirectory",
         "list_directory.collapse_single_child_directories",
+        "gitignore",
         "ReadFile",
         "StatPath",
         "ReadLinkText",
