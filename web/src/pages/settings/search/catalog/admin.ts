@@ -20,12 +20,13 @@ export const PROACTIVE_AGENT_WORKSPACE_ENTRY = settingsEntry({
   presence: {
     // The retry button shows only after the settings fail to load.
     retry: { states: ["load failed"] },
-    // The admin controls show once the settings have loaded; the editor, once the prompt has too.
+    // The admin controls show once the settings have loaded or failed; the editor, once the
+    // prompt has loaded, as its own read.
     prompt: { states: ["prompt loaded"] },
     save: { states: ["prompt loaded"] },
     reset: { states: ["prompt loaded"] },
-    users: { states: ["settings loaded"] },
-    run: { states: ["settings loaded"] },
+    users: { states: ["settings loaded", "load failed"] },
+    run: { states: ["settings loaded", "load failed"] },
   },
   available: (availability) => availability.proactiveAgent,
 });

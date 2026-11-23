@@ -29,26 +29,45 @@ export function ProactiveAgentSettingControl({
   const [error, setError] = useState<string | null>(null);
   if (!available) return null;
   if (!settings) {
-    if (query.isError) {
+    const retry = query.isError ? (
+      <>
+        <span role="alert" className="text-destructive">
+          Couldn’t load {PROACTIVE_AGENT_DISPLAY_NAME} settings.
+        </span>
+        <Button
+          {...settingsControlProps(entry, "retry")}
+          variant="outline"
+          size="sm"
+          onClick={() => void query.refetch()}
+          disabled={query.isFetching}
+          componentId={`settings.proactive_agent.${scope}.retry`}
+        >
+          Retry
+        </Button>
+      </>
+    ) : null;
+    const loading = <p className="text-ui text-muted-foreground">Loading...</p>;
+    // The row's other controls, such as the prompt editor, don't depend on this read.
+    if (children) {
       return (
-        <SettingsItem entry={entry} className="flex items-center justify-between gap-6 text-ui">
-          <span role="alert" className="text-destructive">
-            Couldn’t load {PROACTIVE_AGENT_DISPLAY_NAME} settings.
-          </span>
-          <Button
-            {...settingsControlProps(entry, "retry")}
-            variant="outline"
-            size="sm"
-            onClick={() => void query.refetch()}
-            disabled={query.isFetching}
-            componentId={`settings.proactive_agent.${scope}.retry`}
-          >
-            Retry
-          </Button>
+        <SettingsItem entry={entry} className="flex flex-col gap-6">
+          {retry ? (
+            <div className="flex items-center justify-between gap-6 text-ui">{retry}</div>
+          ) : (
+            loading
+          )}
+          {children}
         </SettingsItem>
       );
     }
-    return <p className="text-ui text-muted-foreground">Loading...</p>;
+    if (retry) {
+      return (
+        <SettingsItem entry={entry} className="flex items-center justify-between gap-6 text-ui">
+          {retry}
+        </SettingsItem>
+      );
+    }
+    return loading;
   }
   if (scope === "workspace" && !settings.can_manage_workspace) return null;
   const turnedOffByAdmin = scope === "me" && !settings.workspace_enabled;

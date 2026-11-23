@@ -95,6 +95,26 @@ describe("ProactiveAgentSettingControl", () => {
     },
   );
 
+  it.each([
+    ["loading", false],
+    ["failed", true],
+  ] as const)("keeps the row's other controls while its settings are %s", (_state, isError) => {
+    mocks.settings = undefined;
+    mocks.query.isError = isError;
+    render(
+      <ProactiveAgentSettingControl scope="workspace" entry={PROACTIVE_AGENT_WORKSPACE_ENTRY}>
+        <button type="button">Run now</button>
+      </ProactiveAgentSettingControl>,
+    );
+    const runNow = screen.getByRole("button", { name: "Run now" });
+    // Inside the row, so a Settings link to its part still reaches it.
+    expect(runNow.closest("[data-settings-item]")).toHaveAttribute(
+      "data-settings-item",
+      PROACTIVE_AGENT_WORKSPACE_ENTRY.id,
+    );
+    expect(screen.queryByRole("switch")).toBeNull();
+  });
+
   it("turns the viewer's own setting off", () => {
     render(<ProactiveAgentSettingControl scope="me" entry={PROACTIVE_AGENT_ENTRY} />);
     const toggle = screen.getByRole("switch", { name: "Omni Advisor" });

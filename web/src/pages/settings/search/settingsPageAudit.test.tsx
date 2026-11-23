@@ -851,9 +851,9 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
     section: "admin",
     scenario: "web › Omni Advisor failed to load",
     info: { proactive_agent_available: true },
-    routes: [OMNI_ADVISOR_SETTINGS_FAIL],
+    routes: [OMNI_ADVISOR_SETTINGS_FAIL, OMNI_ADVISOR_PROMPT],
     ready: [{ row: "nested-agent-destinations" }],
-    states: { "proactive-agent-workspace": ["load failed"] },
+    states: { "proactive-agent-workspace": ["load failed", "prompt loaded"] },
   },
   {
     section: "archived",
