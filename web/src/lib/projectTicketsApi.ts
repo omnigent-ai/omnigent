@@ -75,6 +75,13 @@ export interface ProjectTicket {
   comment_count: number;
   created_at: number;
   updated_at: number;
+  /** The viewer's last-seen activity position; null when never opened. Absent for agents. */
+  viewer_seen_position?: number | null;
+  /** Comments and updates by others after the viewer's last-seen position. */
+  new_comment_count?: number;
+  new_update_count?: number;
+  /** Position of the first new comment or update, or null when nothing is new. */
+  first_new_position?: number | null;
 }
 export interface TicketEvent {
   id: string;
@@ -185,6 +192,13 @@ export function updateTicket(
 export function commentOnTicket(projectId: string, ticketId: string, body: TicketComment) {
   return request<ProjectTicket>(`${path(projectId, ticketId)}/comments`, "POST", body).then(
     normalizeTicket,
+  );
+}
+export function markTicketSeen(projectId: string, ticketId: string, seenPosition: number) {
+  return request<{ viewer_seen_position: number }>(
+    `${path(projectId, ticketId)}/read-state`,
+    "PUT",
+    { seen_position: seenPosition },
   );
 }
 export function listTicketEvents(

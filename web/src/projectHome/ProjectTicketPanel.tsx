@@ -1,4 +1,4 @@
-import { useState, type KeyboardEvent, type ReactNode } from "react";
+import { Fragment, useState, type KeyboardEvent, type ReactNode, type Ref } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   BotIcon,
@@ -52,6 +52,7 @@ import { TicketCommentBody } from "./TicketCommentBody";
 import { TicketSessionLink } from "./TicketSessionLink";
 import { TicketError, TicketStageIcon, TicketLabels } from "./TicketControls";
 import { TicketRelatedTickets } from "./TicketRelatedTickets";
+import { useTicketSeen } from "./useTicketSeen";
 import {
   useTicket,
   useTicketActions,
@@ -455,7 +456,7 @@ function TicketDetails({
           {!editing && <TicketError error={update.error} />}
           <TicketOutputs projectId={projectId} ticketId={ticketId} />
           {lifecycle && <TicketRelatedTickets projectId={projectId} ticketId={ticketId} />}
-          <TicketActivity projectId={projectId} ticketId={ticketId} />
+          <TicketActivity projectId={projectId} ticket={ticket} />
         </Panel>
       </div>
       {chatSessionId ? (
@@ -834,11 +835,19 @@ function ActivityChange({ event }: { event: TicketEvent }) {
   );
 }
 
-function TicketActivity({ projectId, ticketId }: { projectId: string; ticketId: string }) {
-  const query = useTicketEvents(projectId, ticketId);
+function TicketActivity({ projectId, ticket }: { projectId: string; ticket: ProjectTicket }) {
+  const query = useTicketEvents(projectId, ticket.id);
   const now = useNow();
   const viewerId = useViewerId();
   const events = query.data?.pages.flatMap((page) => page.data) ?? [];
+  const { dividerPosition, dividerRef } = useTicketSeen({
+    projectId,
+    ticket,
+    events,
+    hasNextPage: query.hasNextPage,
+    isFetching: query.isFetching,
+    fetchNextPage: query.fetchNextPage,
+  });
   if (!query.isPending && !query.error && !query.hasNextPage && events.length === 0) return null;
   return (
     <section aria-label="Ticket activity" className="space-y-4 border-t border-border/60 pt-5">
@@ -847,12 +856,10 @@ function TicketActivity({ projectId, ticketId }: { projectId: string; ticketId: 
       {query.isPending && <Spinner aria-label="Loading activity" />}
       <ol>
         {events.map((event) => (
-          <TicketActivityItem
-            key={event.id}
-            event={event}
-            nowMs={now.getTime()}
-            viewerId={viewerId}
-          />
+          <Fragment key={event.id}>
+            {event.position === dividerPosition && <TicketNewDivider dividerRef={dividerRef} />}
+            <TicketActivityItem event={event} nowMs={now.getTime()} viewerId={viewerId} />
+          </Fragment>
         ))}
       </ol>
       {query.hasNextPage && (
@@ -866,6 +873,20 @@ function TicketActivity({ projectId, ticketId }: { projectId: string; ticketId: 
         </Button>
       )}
     </section>
+  );
+}
+
+function TicketNewDivider({ dividerRef }: { dividerRef: Ref<HTMLLIElement> }) {
+  return (
+    <li
+      ref={dividerRef}
+      data-testid="ticket-new-divider"
+      className="flex scroll-mt-4 items-center gap-2 pb-4 text-xs font-semibold text-primary"
+    >
+      <span className="h-px flex-1 bg-primary/60" />
+      New
+      <span className="h-px flex-1 bg-primary/60" />
+    </li>
   );
 }
 

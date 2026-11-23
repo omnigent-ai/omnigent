@@ -390,16 +390,41 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
             {relativeTime(ticket.updated_at * 1000, now.getTime())}
           </time>
         </div>
-        {ticket.comment_count > 0 && (
-          <span
-            className="flex items-center gap-1.5 tabular-nums"
-            aria-label={`${ticket.comment_count} comments`}
-          >
-            <MessageSquareIcon aria-hidden className="size-3.5" />
-            {ticket.comment_count}
-          </span>
-        )}
+        <div className="flex items-center gap-2">
+          <TicketNewActivity ticket={ticket} />
+          {ticket.comment_count > 0 && (
+            <span
+              className="flex items-center gap-1.5 tabular-nums"
+              aria-label={`${ticket.comment_count} comments`}
+            >
+              <MessageSquareIcon aria-hidden className="size-3.5" />
+              {ticket.comment_count}
+            </span>
+          )}
+        </div>
       </div>
     </>
+  );
+}
+
+/** Activity from others since the viewer last opened the ticket, like the sidebar Inbox badge. */
+function TicketNewActivity({ ticket }: { ticket: ProjectTicket }) {
+  const comments = ticket.new_comment_count ?? 0;
+  const updates = ticket.new_update_count ?? 0;
+  if (comments + updates === 0) return null;
+  const parts = [
+    comments > 0 && `${comments} new ${comments === 1 ? "comment" : "comments"}`,
+    updates > 0 && `${updates} new ${updates === 1 ? "update" : "updates"}`,
+  ].filter(Boolean);
+  const label = parts.join(", ");
+  return (
+    <span
+      data-testid="ticket-new-activity"
+      title={label}
+      aria-label={label}
+      className="rounded-full bg-primary px-1.5 text-xs leading-5 font-semibold text-primary-foreground tabular-nums"
+    >
+      {comments > 0 ? `+${comments}` : "New"}
+    </span>
   );
 }

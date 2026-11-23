@@ -7,7 +7,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select, union_all
+from sqlalchemy import and_, func, or_, select, union_all
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
@@ -16,6 +17,7 @@ from omnigent.db.db_models import (
     SqlProjectTicket,
     SqlProjectTicketEvent,
     SqlProjectTicketLink,
+    SqlProjectTicketRead,
     SqlProjectTicketSession,
     current_workspace_id,
 )
@@ -36,6 +38,7 @@ from omnigent.entities.project_ticket import (
     TICKET_PAGE_MAX,
     CommentOnTicket,
     CreateTicket,
+    MarkTicketSeen,
     TicketActor,
     TicketStage,
     TicketStages,
@@ -45,10 +48,14 @@ from omnigent.entities.project_ticket import (
 )
 from omnigent.entities.project_ticket_legacy import legacy_ticket_notes
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 TICKET_ACTIVITY_SESSION_MAX = 100
 TICKET_SUMMARY_SCAN_MAX = 1000
+# Outputs ride along with a comment, so only these kinds count as new activity.
+NEW_COMMENT_KINDS = (EVENT_CODES["comment"], EVENT_CODES["execution"])
+NEW_UPDATE_KINDS = (EVENT_CODES["created"], EVENT_CODES["updated"])
 
 
 @dataclass(frozen=True)
@@ -379,6 +386,109 @@ class ProjectTicketStore:
                 )
                 for ticket_id, session_ids in grouped.items()
             }
+
+    def unseen_activity(
+        self, project_id: str, ticket_ids: builtins.list[str], *, user_id: str | None
+    ) -> dict[str, dict[str, Any]]:
+        """Count each ticket's activity after the viewer's marker, excluding their own edits."""
+        if len(ticket_ids) > TICKET_PAGE_MAX:
+            raise OmnigentError("Too many tickets", code=ErrorCode.INVALID_INPUT)
+        ids = sorted({_identifier(ticket_id) for ticket_id in ticket_ids})
+        viewer = RESERVED_USER_LOCAL if user_id is None else user_id
+        event, read = SqlProjectTicketEvent, SqlProjectTicketRead
+        # An agent acting for the viewer carries a session; only direct edits are the viewer's own.
+        by_others = or_(
+            event.session_id.is_not(None),
+            event.agent_id.is_not(None),
+            event.user_id.is_not(None)
+            if user_id is None
+            else or_(event.user_id.is_(None), event.user_id != user_id),
+        )
+        with self._session("read_ticket_unseen_activity") as session:
+            project = self._project(session, project_id, user_id)
+            result: dict[str, dict[str, Any]] = {
+                ticket_id: {
+                    "viewer_seen_position": None,
+                    "new_comment_count": 0,
+                    "new_update_count": 0,
+                    "first_new_position": None,
+                }
+                for ticket_id in ids
+            }
+            if not ids:
+                return result
+            for ticket_id, seen_position in session.execute(
+                select(read.ticket_id, read.seen_position).where(
+                    read.workspace_id == project.workspace_id,
+                    read.project_id == project.id,
+                    read.ticket_id.in_(ids),
+                    read.user_id == viewer,
+                )
+            ):
+                result[ticket_id]["viewer_seen_position"] = seen_position
+            counts = session.execute(
+                select(event.ticket_id, event.kind, func.count(), func.min(event.position))
+                .select_from(event)
+                .outerjoin(
+                    read,
+                    and_(
+                        read.workspace_id == event.workspace_id,
+                        read.project_id == event.project_id,
+                        read.ticket_id == event.ticket_id,
+                        read.user_id == viewer,
+                    ),
+                )
+                .where(
+                    event.workspace_id == project.workspace_id,
+                    event.project_id == project.id,
+                    event.ticket_id.in_(ids),
+                    event.kind.in_(NEW_COMMENT_KINDS + NEW_UPDATE_KINDS),
+                    event.position > func.coalesce(read.seen_position, -1),
+                    by_others,
+                )
+                .group_by(event.ticket_id, event.kind)
+            )
+            for ticket_id, kind, count, first_position in counts:
+                entry = result[ticket_id]
+                field = "new_comment_count" if kind in NEW_COMMENT_KINDS else "new_update_count"
+                entry[field] += count
+                if entry["first_new_position"] is None or first_position < entry["first_new_position"]:
+                    entry["first_new_position"] = first_position
+            return result
+
+    def mark_seen(
+        self, project_id: str, ticket_id: str, body: MarkTicketSeen, *, user_id: str | None
+    ) -> dict[str, Any]:
+        """Advance the viewer's marker, never backwards and never past the latest activity."""
+        viewer = RESERVED_USER_LOCAL if user_id is None else user_id
+
+        def write(session: Session) -> dict[str, Any]:
+            project = self._project(session, project_id, user_id)
+            require_active_account(session, user_id)
+            ticket = self._row(session, project_id, ticket_id)
+            position = min(body.seen_position, ticket.next_event_position - 1)
+            key = (project.workspace_id, project.id, ticket.id, viewer)
+            marker = session.get(SqlProjectTicketRead, key)
+            if marker is None:
+                marker = SqlProjectTicketRead(
+                    workspace_id=project.workspace_id,
+                    project_id=project.id,
+                    ticket_id=ticket.id,
+                    user_id=viewer,
+                    seen_position=position,
+                    seen_at=now_epoch(),
+                )
+                session.add(marker)
+            elif position > marker.seen_position:
+                marker.seen_position = position
+                marker.seen_at = now_epoch()
+            return {"viewer_seen_position": marker.seen_position}
+
+        try:
+            return run_write_transaction(self._write, "mark_ticket_seen", write)
+        except IntegrityError:
+            # A concurrent first view inserted the marker; merge into it instead.
+            return run_write_transaction(self._write, "mark_ticket_seen", write)
 
     def stages(
         self, project_id: str, *, user_id: str | None, include_usage: bool = False

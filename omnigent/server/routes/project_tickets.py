@@ -15,6 +15,7 @@ from omnigent.entities.project_ticket import (
     CreateTicket,
     LinkRelatedTicket,
     LinkTicketSession,
+    MarkTicketSeen,
     TicketActor,
     TicketEventKind,
     TicketStageId,
@@ -175,7 +176,19 @@ def create_project_tickets_router(
             }
 
         metadata = await asyncio.to_thread(identities)
+        # Seen state belongs to the person viewing the board, not to agents reading tickets.
+        unseen = (
+            await asyncio.to_thread(
+                store.unseen_activity,
+                project_id,
+                [ticket["id"] for ticket in tickets],
+                user_id=who.user_id,
+            )
+            if who.session_id is None
+            else {}
+        )
         for ticket in tickets:
+            ticket.update(unseen.get(ticket["id"], {}))
             linked = links[ticket["id"]]
             ticket["has_running_agents"] = _has_running_agents(
                 linked.session_ids, sessions, has_more=linked.has_more
@@ -262,6 +275,15 @@ def create_project_tickets_router(
             ticket = await asyncio.to_thread(store.update, project_id, ticket_id, body, who)
         wake(request)
         return ticket
+
+    @router.put("/{ticket_id}/read-state")
+    async def mark_seen(
+        request: Request, project_id: str, ticket_id: str, body: MarkTicketSeen
+    ) -> dict[str, Any]:
+        who = await actor(request, project_id)
+        return await asyncio.to_thread(
+            store.mark_seen, project_id, ticket_id, body, user_id=who.user_id
+        )
 
     @router.post("/{ticket_id}/comments", status_code=201)
     async def comment(

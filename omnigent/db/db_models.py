@@ -1071,6 +1071,20 @@ class SqlProjectTicketSession(OmnigentBase):
     involvement: Mapped[str | None] = mapped_column(EnvelopedText(2048), nullable=True)
 
 
+class SqlProjectTicketRead(OmnigentBase):
+    """A viewer's last-seen activity position on one ticket; later positions read as new."""
+
+    __tablename__ = "project_ticket_reads"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    project_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    ticket_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # Single-user mode stores the reserved local user rather than NULL.
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    seen_position: Mapped[int] = mapped_column(Integer, nullable=False)
+    seen_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
 class SqlProjectTicketLink(OmnigentBase):
     """An untyped, undirected link stored once with the smaller ticket ID first."""
 

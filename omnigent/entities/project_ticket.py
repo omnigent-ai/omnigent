@@ -205,6 +205,14 @@ class UpdateTicket(BaseModel):
         return None if labels is None else CreateTicket.unique_keys(labels)
 
 
+class MarkTicketSeen(BaseModel):
+    """The latest activity position the viewer has seen; later positions read as new."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    seen_position: int = Field(ge=-1, le=2**31 - 1)
+
+
 class CommentOnTicket(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

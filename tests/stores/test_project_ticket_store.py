@@ -11,6 +11,7 @@ from omnigent.db.utils import get_or_create_engine
 from omnigent.entities.project_ticket import (
     CommentOnTicket,
     CreateTicket,
+    MarkTicketSeen,
     TicketActor,
     UpdateTicket,
     UpdateTicketStages,
@@ -92,6 +93,66 @@ def test_atomic_edits_and_append_only_outputs(board):
     history = tickets.events(project.id, ticket["id"], user_id="alice")["data"]
     assert len(history) == 9
     assert history[-2]["payload"] == {"text": "Delivered and tested"}
+
+
+def test_unseen_activity_counts_others_after_the_forward_only_marker(board):
+    tickets, _, project = board
+    owner = TicketActor("alice")
+    agent = TicketActor("alice", uuid4().hex, uuid4().hex)
+    mine = tickets.create(project.id, CreateTicket(title="Mine"), owner)
+    theirs = tickets.create(project.id, CreateTicket(title="Theirs"), agent)
+    tickets.comment(project.id, mine["id"], CommentOnTicket(text="Own note"), owner)
+    tickets.comment(
+        project.id,
+        mine["id"],
+        CommentOnTicket(
+            text="Done",
+            kind="execution",
+            outputs=[{"type": "link", "url": "https://example.com/evidence"}],
+        ),
+        agent,
+    )
+    tickets.update(project.id, mine["id"], UpdateTicket(stage_id="planning"), agent)
+    ids = [mine["id"], theirs["id"]]
+
+    unseen = tickets.unseen_activity(project.id, ids, user_id="alice")
+    # Never viewed: the agent-created ticket is new; own edits and outputs never count.
+    assert unseen[theirs["id"]] == {
+        "viewer_seen_position": None,
+        "new_comment_count": 0,
+        "new_update_count": 1,
+        "first_new_position": 0,
+    }
+    assert unseen[mine["id"]] == {
+        "viewer_seen_position": None,
+        "new_comment_count": 1,
+        "new_update_count": 1,
+        "first_new_position": 2,
+    }
+
+    assert tickets.mark_seen(
+        project.id, mine["id"], MarkTicketSeen(seen_position=2), user_id="alice"
+    ) == {"viewer_seen_position": 2}
+    assert tickets.unseen_activity(project.id, ids, user_id="alice")[mine["id"]] == {
+        "viewer_seen_position": 2,
+        "new_comment_count": 0,
+        "new_update_count": 1,
+        "first_new_position": 4,
+    }
+    # The marker never moves backwards and clamps to the latest activity.
+    assert tickets.mark_seen(
+        project.id, mine["id"], MarkTicketSeen(seen_position=0), user_id="alice"
+    ) == {"viewer_seen_position": 2}
+    assert tickets.mark_seen(
+        project.id, mine["id"], MarkTicketSeen(seen_position=99), user_id="alice"
+    ) == {"viewer_seen_position": 4}
+    assert tickets.unseen_activity(project.id, ids, user_id="alice")[mine["id"]][
+        "new_update_count"
+    ] == 0
+    with pytest.raises(OmnigentError):
+        tickets.mark_seen(project.id, mine["id"], MarkTicketSeen(seen_position=4), user_id="bob")
+    with pytest.raises(OmnigentError):
+        tickets.unseen_activity(project.id, ids, user_id="bob")
 
 
 def test_labels_project_existing_storage_and_history_without_rewriting_it(board, db_uri):
