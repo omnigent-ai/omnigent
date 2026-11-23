@@ -1101,6 +1101,34 @@ async def test_a_later_pass_out_of_time_ends_the_search_as_truncated(
 
 
 @needs_rg
+async def test_waiting_for_the_change_list_stops_at_the_end_of_the_search_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _priority_workspace(tmp_path / "repo")
+    released = asyncio.Event()
+
+    async def never_ready(*_arguments: object) -> list[str]:
+        await released.wait()
+        return []
+
+    monkeypatch.setattr(workspace_text_priority, "_changed_directories", never_ready)
+    monkeypatch.setattr(workspace_text_priority, "_CHANGES_WAIT_S", 60.0)
+    monkeypatch.setattr(workspace_search, "RIPGREP_TIME_LIMIT_S", 1.0)
+
+    try:
+        async with asyncio.timeout(10):
+            responses = await _search_text(
+                root, "needle", order=SEARCH_ORDER_PRIORITY, focused_paths=["focus/deep/open.txt"]
+            )
+    finally:
+        released.set()
+
+    # The focused file and its folder were searched before the time ran out.
+    assert _paths_in_order(responses) == ["focus/deep/open.txt", "focus/deep/beside.txt"]
+    assert responses[-1].done and responses[-1].truncated
+
+
+@needs_rg
 async def test_closing_a_priority_search_early_stops_its_pass(tmp_path: Path) -> None:
     root = _priority_workspace(tmp_path / "repo")
     (root / "many.txt").write_text("needle\n" * 400)

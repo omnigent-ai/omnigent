@@ -21,6 +21,7 @@ import os
 import re
 import stat
 import sys
+import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -581,6 +582,31 @@ def _skip_globs(run: SearchRun) -> list[str]:
     return [*files, *folders]
 
 
+class _SearchBudget:
+    """Seconds a search spends waiting for its passes and their matches, out of ``seconds``.
+
+    The time a client takes to read the matches doesn't count.
+    """
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+        self._used = 0.0
+        self._since: float | None = None
+
+    async def timed[T](self, waiting: Awaitable[T]) -> T:
+        self._since = time.monotonic()
+        try:
+            return await waiting
+        finally:
+            self._used += time.monotonic() - self._since
+            self._since = None
+
+    def left(self) -> float:
+        """Seconds left, counting a wait still under way."""
+        waiting = time.monotonic() - self._since if self._since is not None else 0.0
+        return self.seconds - self._used - waiting
+
+
 async def _walk_run(start_paths: list[str]) -> AsyncGenerator[SearchRun]:
     yield SearchRun(start_paths, [], [])
 
@@ -615,6 +641,7 @@ async def search_text(
             time_limit=time_limit,
         )
 
+    budget = _SearchBudget(RIPGREP_TIME_LIMIT_S)
     try:
         # Invalid queries and filters are refused before anything runs.
         script(SearchRun(start_paths, [], []), limit)
@@ -633,39 +660,28 @@ async def search_text(
                 start_paths=start_paths,
                 in_scope=scope.allows,
                 walk_options=walk_options,
+                time_left=budget.left,
             )
         else:
             runs = _walk_run(start_paths)
-        loop = asyncio.get_running_loop()
-        # Seconds spent waiting for passes and their matches, shared by all passes; the
-        # time a client takes to read the matches doesn't count.
-        used = 0.0
-
-        async def timed[T](waiting: Awaitable[T]) -> T:
-            nonlocal used
-            started = loop.time()
-            try:
-                return await waiting
-            finally:
-                used += loop.time() - started
-
         batch: list[TextSearchMatch] = []
         found = 0
         truncated = False
         warning = ""
         async with contextlib.aclosing(runs) as passes:
-            while (run := await timed(anext(passes, None))) is not None:
-                if found == limit or used >= RIPGREP_TIME_LIMIT_S:
+            while (run := await budget.timed(anext(passes, None))) is not None:
+                left = budget.left()
+                if found == limit or left <= 0:
                     truncated = True  # later passes may match more
                     break
                 # Each script stops its ripgrep with time left to report the results cut short.
                 records = _content_search_records(
                     root,
-                    script(run, limit - found, RIPGREP_TIME_LIMIT_S - used),
-                    SCRIPT_TIMEOUT_S - used,
+                    script(run, limit - found, left),
+                    SCRIPT_TIMEOUT_S - RIPGREP_TIME_LIMIT_S + left,
                 )
                 async with contextlib.aclosing(records) as stream:
-                    while (record := await timed(anext(stream, None))) is not None:
+                    while (record := await budget.timed(anext(stream, None))) is not None:
                         if "match" not in record:
                             truncated = bool(record["truncated"])
                             warning = warning or str(record["warning"] or "")

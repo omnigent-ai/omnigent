@@ -148,15 +148,22 @@ def _only_towards(parent: str, name: str) -> list[str]:
 
 
 async def _reached_files(
-    root: Path, directory: str, start_paths: Sequence[str], options: Sequence[str]
+    root: Path,
+    directory: str,
+    start_paths: Sequence[str],
+    options: Sequence[str],
+    time_left: Callable[[], float],
 ) -> set[str]:
     """The files directly in ``directory`` that the walk, with ``options``, reaches.
 
     It walks from the start above ``directory`` through only the folders on the way,
     so each of them is pruned, or not, by the same globs and ignore files as in the walk.
+
+    :param time_left: Seconds the search has left; the walk takes no longer.
     """
     start = _start_of(directory, start_paths)
-    if start is None:
+    deadline = min(_REACH_DEADLINE_S, time_left())
+    if start is None or deadline <= 0:
         return set()
     names = directory[len(start) :].strip("/").split("/") if directory != start else []
     globs: list[str] = []
@@ -185,7 +192,7 @@ async def _reached_files(
     chunks: list[bytes] = []
     received = 0
     try:
-        async with asyncio.timeout(_REACH_DEADLINE_S):
+        async with asyncio.timeout(deadline):
             while received < _LIST_FILES_BYTES and (chunk := await process.stdout.read(65536)):
                 chunks.append(chunk)
                 received += len(chunk)
@@ -200,10 +207,17 @@ async def _reached_files(
 
 
 async def _reached_in(
-    root: Path, directories: Sequence[str], start_paths: Sequence[str], options: Sequence[str]
+    root: Path,
+    directories: Sequence[str],
+    start_paths: Sequence[str],
+    options: Sequence[str],
+    time_left: Callable[[], float],
 ) -> dict[str, set[str]]:
     found = await asyncio.gather(
-        *(_reached_files(root, directory, start_paths, options) for directory in directories)
+        *(
+            _reached_files(root, directory, start_paths, options, time_left)
+            for directory in directories
+        )
     )
     return dict(zip(directories, found, strict=True))
 
@@ -229,12 +243,14 @@ async def reachable_focused_files(
     start_paths: Sequence[str],
     in_scope: Callable[[str], bool],
     walk_options: Sequence[str],
+    time_left: Callable[[], float],
 ) -> list[str]:
     """The request's focused files a full walk would search, in the order given.
 
     :param start_paths: Where the walk starts, ``./``-prefixed or ``.``.
     :param in_scope: Whether a workspace path is inside the search's directory scope.
     :param walk_options: The walk's ripgrep options: the user's globs, then the search's.
+    :param time_left: Seconds the search has left, which bounds the check.
     """
     candidates: list[str] = []
     for raw in request.focused_paths[:MAX_FOCUSED_FILES]:
@@ -253,7 +269,7 @@ async def reachable_focused_files(
     if not candidates:
         return []
     reached = await _reached_in(
-        root, sorted({_parent(path) for path in candidates}), start_paths, walk_options
+        root, sorted({_parent(path) for path in candidates}), start_paths, walk_options, time_left
     )
     return [path for path in candidates if path in reached[_parent(path)]]
 
@@ -265,15 +281,22 @@ async def priority_runs(
     start_paths: Sequence[str],
     in_scope: Callable[[str], bool],
     walk_options: Sequence[str],
+    time_left: Callable[[], float],
 ) -> AsyncGenerator[SearchRun]:
     """The runs of a priority search, each computed once the previous one finished.
 
     :param start_paths: Where the whole-scope walk starts, ``./``-prefixed or ``.``.
     :param in_scope: Whether a workspace path is inside the search's directory scope.
     :param walk_options: The walk's ripgrep options, to decide what it would reach.
+    :param time_left: Seconds the search has left; preparing a run waits no longer.
     """
     focused = await reachable_focused_files(
-        root, request, start_paths=start_paths, in_scope=in_scope, walk_options=walk_options
+        root,
+        request,
+        start_paths=start_paths,
+        in_scope=in_scope,
+        walk_options=walk_options,
+        time_left=time_left,
     )
     # Started after the focused files are checked, so the two don't compete for Git's index.
     kind = request.changed_against
@@ -287,14 +310,14 @@ async def priority_runs(
         yield SearchRun([f"./{directory}"], focused, list(searched))
         searched.append(directory)
 
-    done, _ = await asyncio.wait({changes}, timeout=_CHANGES_WAIT_S)
+    done, _ = await asyncio.wait({changes}, timeout=max(0.0, min(_CHANGES_WAIT_S, time_left())))
     changed = (changes.result() if done else None) or []
     candidates = [
         directory
         for directory in ordered_directories(changed, searched)
         if in_scope(directory) and not _is_git_path(directory) and _real_directory(root, directory)
     ]
-    reached = await _reached_in(root, candidates, start_paths, walk_options)
+    reached = await _reached_in(root, candidates, start_paths, walk_options, time_left)
     for directory in candidates:
         # Searched early only where the walk reaches files of its own.
         if not reached[directory]:
