@@ -6,7 +6,9 @@ commands, and a pane's title strip has a menu that closes it. With a split shown
 the panes on screen and the web chat is the agent's pane. A shell tab in the workspace sidebar
 splits the same way, and its split shows as one strip entry that closes whole. With the flag
 off, the same session keeps the classic Terminal view. A divider drag saves its size on
-release, also when the macOS app drops the divider's pointer capture just before it.
+release, also when the macOS app drops the divider's pointer capture just before it. With
+floating panes, each pane is a card whose move handle shows on hover and lifts it as it's
+dragged.
 
 The session is terminal-first (``omnigent.ui = terminal``), so the runner starts the agent's
 own terminal, and its agent declares a ``zsh`` shell, running ``bash``, for splits. The flag is
@@ -93,21 +95,27 @@ def panes_session(
             respawned_runner.wait(timeout=10)
 
 
-def _set_flag(page: Page, enabled: bool) -> None:
-    """Answer ``/v1/info`` with the server's own payload and the flag set to ``enabled``."""
+def _set_flag(page: Page, enabled: bool, *, floating: bool = False) -> None:
+    """Answer ``/v1/info`` with the server's own payload and the flag set to ``enabled``; with
+    ``floating``, the ``floating_panes`` policy on too."""
 
     def answer(route: Route) -> None:
         response = route.fetch()
         info = response.json()
-        info["features"] = {**(info.get("features") or {}), "workspace_sidebar_v2": enabled}
+        features = {**(info.get("features") or {}), "workspace_sidebar_v2": enabled}
+        if floating:
+            features["floating_panes"] = True
+        info["features"] = features
         route.fulfill(response=response, json=info)
 
     page.route("**/v1/info", answer)
 
 
-def _open(page: Page, base_url: str, session_id: str, *, flag: bool = True) -> None:
+def _open(
+    page: Page, base_url: str, session_id: str, *, flag: bool = True, floating: bool = False
+) -> None:
     page.add_init_script(_REPORT_MAC)
-    _set_flag(page, flag)
+    _set_flag(page, flag, floating=floating)
     page.set_viewport_size(_DESKTOP)
     page.goto(f"{base_url}/c/{session_id}")
 
@@ -257,6 +265,59 @@ def test_flag_off_keeps_the_classic_terminal_view(
     _connected(page.locator(".main-terminal-view").get_by_test_id("terminal-view").first)
     expect(page.get_by_test_id("split-panes-main-view")).to_have_count(0)
     expect(page.locator("[data-pane-strip]")).to_have_count(0)
+
+
+def test_a_floating_pane_shows_its_handle_on_hover_and_lifts_when_pressed(
+    page: Page, panes_session: tuple[str, str]
+) -> None:
+    """Between floating panes the gap draws no resize line, only the cursor. A pane's move handle
+    shows while the pointer is over its row; pressing the row lifts the pane, through the drag,
+    and the drop sets it down on the other side."""
+    base_url, session_id = panes_session
+    _open(page, base_url, session_id, floating=True)
+    expect(page.locator(".app-shell[data-floating-panes]")).to_have_count(1)
+    _select_view(page, "terminal")
+    panes = _main_panes(page)
+    agent = _connected(panes.locator(_AGENT_PANE).get_by_test_id("terminal-view"))
+    _split_from(page, panes, agent)
+    # The panes are the cards: the session's column draws no card of its own around them.
+    expect(page.locator('[data-main-view="terminal"]')).to_have_count(1)
+    shell_pane = panes.locator(f"[data-terminal-pane]:not({_AGENT_PANE})").first
+    agent_pane = panes.locator(_AGENT_PANE).first
+    strip = shell_pane.locator("[data-pane-strip]")
+    handle = strip.locator("[data-pane-strip-drag-handle]")
+    held = panes.locator("[data-pane-held]")
+    page.mouse.move(5, 5)
+    expect(handle).to_have_css("opacity", "0")
+
+    # The gap between the cards resizes by its cursor alone, as the sidebars' edges do.
+    divider = page.get_by_test_id("terminal-split-divider")
+    divider.hover()
+    expect(divider).to_have_css("cursor", "col-resize")
+    expect(divider.locator("> div")).to_have_css("background-color", "rgba(0, 0, 0, 0)")
+
+    box = strip.bounding_box()
+    assert box is not None
+    page.mouse.move(box["x"] + 10, box["y"] + box["height"] / 2)
+    expect(handle).to_have_css("opacity", "1")
+    expect(held).to_have_count(0)
+
+    # Pressed, not yet moved: the pane lifts.
+    page.mouse.down()
+    expect(held).to_have_count(1)
+    expect(held).not_to_have_css("box-shadow", "none")
+    agent_box = agent_pane.bounding_box()
+    assert agent_box is not None
+    page.mouse.move(box["x"] + 30, box["y"] + box["height"] / 2, steps=4)
+    page.mouse.move(agent_box["x"] + 20, agent_box["y"] + agent_box["height"] / 2, steps=8)
+    expect(page.locator("[data-pane-drop]")).to_have_count(1)
+    expect(held).to_have_count(1)
+    page.mouse.up()
+    expect(held).to_have_count(0)
+    # The shell now takes the left half.
+    page.wait_for_function(
+        "el => parseFloat(el.style.left) === 0", arg=shell_pane.element_handle(), timeout=15_000
+    )
 
 
 # Records the page's pointer releases and each pointer capture it loses, in order.

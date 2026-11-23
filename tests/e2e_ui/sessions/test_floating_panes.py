@@ -544,7 +544,9 @@ def test_a_terminal_first_chat_switches_views_from_its_own_row(
         content_top = terminal_box["y"] + float(
             terminal_view.evaluate("(el) => parseFloat(getComputedStyle(el).paddingTop)")
         )
-        assert content_top >= strip_box["y"] + strip_box["height"] - 0.5, (strip_box, content_top)
+        # Right below it, with no band between the row and the terminal.
+        strip_bottom = strip_box["y"] + strip_box["height"]
+        assert strip_bottom - 0.5 <= content_top <= strip_bottom + 1.5, (strip_box, content_top)
     _capture(page, f"{name}-terminal")
 
     view_switch.get_by_role("button", name="Chat view").click()

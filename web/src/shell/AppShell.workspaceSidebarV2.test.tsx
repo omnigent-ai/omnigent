@@ -192,6 +192,7 @@ import { TEMP_CONV_ID_PREFIX } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 import { openTasksTab, showTasksTabBesideChat } from "@/store/sessionTasksActions";
 import { AppShell } from "./AppShell";
+import { setSplitBesideChat } from "./chatPaneToolbarHost";
 import { FileViewerContext, useOpenGithubTab } from "./FileViewerContext";
 import { isMobileViewport } from "./Sidebar";
 import * as workspaceTabsSessions from "./workspaceTabs/workspaceTabsSessions";
@@ -506,6 +507,21 @@ describe("workspace_sidebar_v2", () => {
     else expect(shell).not.toHaveAttribute("data-floating-panes");
     // The session column is marked, so the styling cards its chat page and nothing else.
     expect(document.querySelector("[data-main-view]")).toHaveAttribute("data-main-view", "chat");
+  });
+
+  it("leaves the column uncarded while a split beside the chat floats as its own cards", () => {
+    setViewport(DESKTOP);
+    renderShell({
+      ...withFlag(true),
+      features: { ...withFlag(true).features, floating_panes: true },
+    });
+    const column = () => document.querySelector("[data-main-view]");
+    expect(column()).toHaveAttribute("data-main-view", "chat");
+
+    act(() => setSplitBesideChat("conv_ws", true));
+    expect(column()).toHaveAttribute("data-main-view", "terminal");
+    act(() => setSplitBesideChat("conv_ws", false));
+    expect(column()).toHaveAttribute("data-main-view", "chat");
   });
 
   it("reserves the header's room for the rail only while the rail sits inline", async () => {

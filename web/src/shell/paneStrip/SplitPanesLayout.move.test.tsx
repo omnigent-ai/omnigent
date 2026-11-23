@@ -183,6 +183,71 @@ describe("SplitPanesLayout: dragging a pane by its row", () => {
     expect(onMovePane).toHaveBeenCalledTimes(1);
   });
 
+  it("shows the drag handle only while the pointer is over the row", () => {
+    setup();
+    const handle = row("a").querySelector<HTMLElement>("[data-pane-strip-drag-handle]")!;
+    expect(handle.className).toMatch(/(^|\s)opacity-0(\s|$)/);
+    expect(handle.className).toMatch(/group-hover\/pane-strip:opacity-100/);
+    expect(row("a").className).toMatch(/group\/pane-strip/);
+  });
+
+  it("lifts the pane from the press, before it drags, until the drag ends", () => {
+    const { onMovePane } = setup();
+    const card = (key: string) => row(key).parentElement!;
+    const handle = () => row("a").querySelector<HTMLElement>("[data-pane-strip-drag-handle]")!;
+    const lifted = (key: string) =>
+      card(key).hasAttribute("data-pane-held") && row(key).hasAttribute("data-pane-strip-held");
+    expect(lifted("a")).toBe(false);
+    expect(card("a").className).not.toMatch(/shadow-lg|ring-primary/);
+
+    // Pressed and not yet moved: lifted, with the handle shown, stretched in the accent.
+    press("a", 200);
+    expect(lifted("a")).toBe(true);
+    expect(lifted("b")).toBe(false);
+    expect(row("a").hasAttribute("data-pane-strip-dragging")).toBe(false);
+    expect(card("a").className).toMatch(/-translate-y-px/);
+    expect(card("a").className).toMatch(/shadow-lg/);
+    expect(card("a").className).toMatch(/ring-primary/);
+    expect(card("a").parentElement!.className).toMatch(/z-\[5\]/);
+    expect(handle().className).toMatch(/bg-primary/);
+    expect(handle().className).toMatch(/w-12/);
+    expect(handle().className).not.toMatch(/opacity-0/);
+
+    // Still lifted through the drag, and set down where it lands.
+    moveTo(780, 300);
+    expect(lifted("a")).toBe(true);
+    release(780, 300);
+    expect(onMovePane).toHaveBeenCalledTimes(1);
+    expect(lifted("a")).toBe(false);
+    expect(handle().className).toMatch(/opacity-0/);
+
+    // A plain click sets it down as it lets go.
+    press("a", 200);
+    expect(lifted("a")).toBe(true);
+    release(200, 10);
+    expect(lifted("a")).toBe(false);
+
+    // Escape mid-drag, or a cancelled pointer, sets it down unmoved.
+    press("a", 200);
+    moveTo(780, 300);
+    act(() => void fireEvent.keyDown(window, { key: "Escape" }));
+    expect(lifted("a")).toBe(false);
+    press("a", 200);
+    act(() => void fireEvent.pointerCancel(window, { pointerId: 1 }));
+    expect(lifted("a")).toBe(false);
+    expect(onMovePane).toHaveBeenCalledTimes(1);
+  });
+
+  it("never lifts a pane that can't move, nor on a Ctrl-press", () => {
+    setup({ movable: false });
+    press("a", 200);
+    expect(row("a").hasAttribute("data-pane-strip-held")).toBe(false);
+    cleanup();
+    setup();
+    fireEvent.pointerDown(row("a"), { button: 0, ctrlKey: true, pointerId: 1, clientX: 200 });
+    expect(row("a").hasAttribute("data-pane-strip-held")).toBe(false);
+  });
+
   it("never lifts or drags on a Ctrl-press, the Mac's right-click, which opens the row's menu", () => {
     const { onMovePane } = setup();
     fireEvent.pointerDown(row("a"), { button: 0, ctrlKey: true, pointerId: 1, clientX: 200 });
