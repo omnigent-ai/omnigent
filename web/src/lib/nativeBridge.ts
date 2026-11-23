@@ -369,6 +369,8 @@ export interface FloatingComposerBridge {
   ) => Promise<{ ok: true } | { ok: false; error: FloatingComposerOpenError }>;
   /** From the panel: its native file picker opened or closed. */
   filePicker: (state: "open" | "closed") => void;
+  /** From the panel: its composer rendered, so the shell shows it without a loading state. Newer shells only. */
+  ready?: () => void;
 }
 
 /** Native menu commands the desktop shell hands to the page (see lib/desktopCommands). */

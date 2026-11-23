@@ -292,6 +292,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     announceSupport: (version) => ipcRenderer.send("omnigent:floating-composer:announce", version),
     /** From the panel: hide it, keeping its draft. */
     dismiss: () => ipcRenderer.send("omnigent:floating-composer:dismiss"),
+    /** From the panel: its composer rendered, so the shell can show it without a loading state. */
+    ready: () => ipcRenderer.send("omnigent:floating-composer:ready"),
     /**
      * From the panel: open `/c/<id>` or a page it links to in a main window of its server,
      * then hide. Resolves `{ ok: true }` or
