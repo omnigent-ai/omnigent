@@ -12,7 +12,7 @@ afterEach(() => {
   useSessionTasksActions.setState({
     tasksTabToOpen: null,
     taskToShow: null,
-    tasksTabAutoOpen: false,
+    tasksTabRequestedBy: "click",
   });
 });
 
@@ -32,7 +32,7 @@ describe("a live journal entry", () => {
     appended("conv", journalPlan(0, ["a"]));
     expect(useSessionTasksActions.getState()).toMatchObject({
       tasksTabToOpen: "conv",
-      tasksTabAutoOpen: true,
+      tasksTabRequestedBy: "first-plan",
     });
   });
 });

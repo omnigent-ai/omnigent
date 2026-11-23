@@ -5,10 +5,10 @@ import { useChatStore } from "@/store/chatStore";
 import { showTasksTabBesideChat } from "@/store/sessionTasksActions";
 
 /**
- * Opening a session that has a plan or tasks, from anywhere, shows its Tasks
- * tab once they're known. Only the opening does: a tab picked afterwards stays
- * until the session is opened again. Renders nothing, so journal updates don't
- * re-render the shell.
+ * Opening a session that has a plan or tasks, from anywhere, selects its Tasks
+ * tab once they're known, without opening a collapsed rail. Only the opening
+ * does: a tab picked afterwards stays until the session is opened again.
+ * Renders nothing, so journal updates don't re-render the shell.
  */
 export function TasksTabOnOpen({
   conversationId,
@@ -32,7 +32,7 @@ export function TasksTabOnOpen({
   useEffect(() => {
     if (conversationId === undefined || openingRef.current !== conversationId || !known) return;
     openingRef.current = undefined;
-    if (hasTasks && !skip) showTasksTabBesideChat(conversationId);
+    if (hasTasks && !skip) showTasksTabBesideChat(conversationId, "session-open");
   }, [conversationId, known, hasTasks, skip]);
   return null;
 }

@@ -21,8 +21,11 @@ interface SessionTasksActionsState {
   tasksTabToOpen: string | null;
   /** The task the Tasks tab should scroll to and highlight; the tab clears it once shown. */
   taskToShow: { conversationId: string; stepId: string } | null;
-  /** True when the agent, not a click, asked for the tab: a phone's drawer then stays shut. */
-  tasksTabAutoOpen: boolean;
+  /**
+   * Who asked for the tab: a click opens it; the agent's first plan keeps a phone's drawer
+   * shut; a session opening only selects it, leaving the rail as the session restored it.
+   */
+  tasksTabRequestedBy: "click" | "first-plan" | "session-open";
 }
 
 /**
@@ -40,7 +43,7 @@ export const useSessionTasksActions = create<SessionTasksActionsState>(() => ({
   stopWork: {},
   tasksTabToOpen: null,
   taskToShow: null,
-  tasksTabAutoOpen: false,
+  tasksTabRequestedBy: "click",
 }));
 
 /**
@@ -128,18 +131,22 @@ export function openTasksTab(conversationId: string, stepId?: string): void {
   useSessionTasksActions.setState({
     tasksTabToOpen: conversationId,
     taskToShow: stepId ? { conversationId, stepId } : null,
-    tasksTabAutoOpen: false,
+    tasksTabRequestedBy: "click",
   });
 }
 
 /**
- * Show a session's Tasks tab beside the chat, not over it on a phone: when the
- * agent makes the session's first plan, or a session with tasks opens.
+ * Show a session's Tasks tab beside the chat, not over it on a phone: open it for
+ * the agent's first plan, or select it when a session with tasks opens.
+ * A session opening keeps a request already waiting for it, e.g. a click that navigated there.
  */
-export function showTasksTabBesideChat(conversationId: string): void {
-  useSessionTasksActions.setState({
-    tasksTabToOpen: conversationId,
-    taskToShow: null,
-    tasksTabAutoOpen: true,
-  });
+export function showTasksTabBesideChat(
+  conversationId: string,
+  requestedBy: "first-plan" | "session-open",
+): void {
+  useSessionTasksActions.setState((state) =>
+    requestedBy === "session-open" && state.tasksTabToOpen === conversationId
+      ? state
+      : { tasksTabToOpen: conversationId, taskToShow: null, tasksTabRequestedBy: requestedBy },
+  );
 }
