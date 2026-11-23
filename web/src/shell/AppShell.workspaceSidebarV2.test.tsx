@@ -487,6 +487,50 @@ describe("workspace_sidebar_v2", () => {
     },
   );
 
+  it.each([
+    ["follows the flag", { floating_panes: true }, "fine", true],
+    ["stays off when the server says off", { floating_panes: false }, "fine", false],
+    ["stays off on an older server without it", {}, "fine", false],
+    ["stays off on a touch client", { floating_panes: true }, "coarse", false],
+  ] as const)("marks the shell for floating panes: %s", (_, features, pointer, floating) => {
+    setViewport(DESKTOP, pointer);
+    const info = withFlag(true);
+    const { floating_panes: _withoutIt, ...base } = info.features ?? {};
+    renderShell({ ...info, features: { ...base, ...features } });
+
+    const shell = document.querySelector(".app-shell");
+    if (floating) expect(shell).toHaveAttribute("data-floating-panes", "");
+    else expect(shell).not.toHaveAttribute("data-floating-panes");
+    // The session column is marked, so the styling cards its chat page and nothing else.
+    expect(document.querySelector("[data-main-view]")).toHaveAttribute("data-main-view", "chat");
+  });
+
+  it("reserves the header's room for the rail only while the rail sits inline", async () => {
+    setViewport(1000);
+    renderShell({
+      ...withFlag(true),
+      features: { ...withFlag(true).features, floating_panes: true },
+    });
+    const column = () => document.querySelector<HTMLElement>("[data-main-view]")!;
+    const offset = () => column().style.getPropertyValue("--workspace-panel-offset");
+    expect(await screen.findByTestId("tabs-host")).toBeInTheDocument();
+    expect(tabs.host).toMatchObject({ placement: "drawer" });
+    expect(offset()).toBe("0px");
+
+    // Opening the drawer and putting it away leaves the rail open, and still out of the header's way.
+    fireEvent.click(screen.getByRole("button", { name: "Open linked PR" }));
+    const drawer = screen.getByTestId("workspace-tabs-drawer");
+    await waitFor(() => expect(drawer).toHaveAttribute("data-state", "open"));
+    expect(offset()).toBe("0px");
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close", hidden: true }));
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(offset()).toBe("0px");
+
+    resizeTo(DESKTOP);
+    await waitFor(() => expect(tabs.host).toMatchObject({ placement: "rail" }));
+    expect(Number.parseFloat(offset())).toBeGreaterThan(0);
+  });
+
   it("shows the tabs in the Workspace drawer in a narrow desktop window", async () => {
     setViewport(NARROW_DESKTOP);
     renderShell(withFlag(true));

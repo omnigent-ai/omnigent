@@ -10,6 +10,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { ChatHeader } from "./ChatHeader";
+import { claimChatPaneViewToggleHost, releaseChatPaneViewToggleHost } from "./chatPaneToolbarHost";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
@@ -672,6 +673,30 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
   it("omits the toggle when there is no TerminalFirst context", () => {
     renderHeaderWithSession(null);
     expect(screen.queryByRole("group", { name: /switch between chat and terminal/i })).toBeNull();
+  });
+});
+
+describe("ChatHeader — the switch in the chat pane's strip", () => {
+  it("renders the Chat/Terminal switch in the chat pane's spot while one is claimed", () => {
+    const view = renderHeaderWithSession(makeTerminalFirstCtx());
+    const header = view.container.querySelector("header")!;
+    const switchIn = (root: ParentNode) =>
+      root.querySelector('[role="group"][aria-label="Switch between chat and terminal"]');
+    expect(switchIn(header)).toHaveAttribute("data-variant", "header");
+
+    const spot = document.createElement("span");
+    document.body.append(spot);
+    act(() => claimChatPaneViewToggleHost("sess-1", spot));
+    expect(switchIn(header)).toBeNull();
+    expect(switchIn(spot)).toHaveAttribute("data-variant", "pane");
+    // One switch, so its chord stays bound once.
+    expect(
+      screen.getAllByRole("group", { name: /switch between chat and terminal/i }),
+    ).toHaveLength(1);
+
+    act(() => releaseChatPaneViewToggleHost("sess-1", spot));
+    expect(switchIn(header)).toHaveAttribute("data-variant", "header");
+    spot.remove();
   });
 });
 
