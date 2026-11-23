@@ -802,6 +802,22 @@ describe("closing a group of tabs", () => {
     expect(store.serialize()).toEqual(before);
   });
 
+  it("closes nothing when a tab is pinned while it asks about unsaved edits", async () => {
+    const { store, dirty, requestLeave } = makeStore({ initial: initial([files, a, b], "F") });
+    dirty.add("A");
+    requestLeave.mockImplementation(async () => {
+      store.setPinned(["B"], true);
+      return "leave";
+    });
+    await expect(store.closeMany(["A", "B"], () => undefined)).resolves.toEqual({
+      ok: false,
+      stale: true,
+    });
+    expect(store.findTab("A")).toBeDefined();
+    expect(store.findTab("B")).toBeDefined();
+    expectInvariant(store);
+  });
+
   it("selects a neighbour when the selected tab closes, and reopens each one", async () => {
     const { store } = makeStore({ initial: initial([files, a, b], "A") });
     await store.closeMany(["A", "B"], () => undefined);
