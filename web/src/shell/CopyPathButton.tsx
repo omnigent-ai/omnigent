@@ -12,10 +12,17 @@ import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { COPY_PATH_LABELS } from "./fileCommands/model";
+import { type CopyPathCommandId, pathToCopy, useFileCommandTarget } from "./fileCommands/target";
 
 interface CopyPathButtonProps {
   /** Path to place on the clipboard, e.g. ``"src/main.py"``. */
   path: string;
+  /**
+   * The file menu's copy action to perform, which then names the tooltip; without it the
+   * button copies `path` as given.
+   */
+  command?: CopyPathCommandId;
   /** Tooltip text at rest, e.g. ``"Copy path"``. */
   label?: string;
   /**
@@ -39,9 +46,13 @@ interface CopyPathButtonProps {
  */
 export function CopyPathButton({
   path,
-  label = "Copy path",
+  command,
+  label = command ? COPY_PATH_LABELS[command] : "Copy path",
   revealOnHover = false,
 }: CopyPathButtonProps) {
+  // With a menu action, the same text as the menu copies, with feedback in place on the row.
+  const target = useFileCommandTarget(path);
+  const copiedPath = (command && target && pathToCopy(target, command)?.text) || path;
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState(false);
   const timerRef = useRef<number>(0);
@@ -61,7 +72,7 @@ export function CopyPathButton({
     e.stopPropagation();
     window.clearTimeout(timerRef.current);
     try {
-      await copyText(path);
+      await copyText(copiedPath);
       setCopyError(false);
       setCopied(true);
       timerRef.current = window.setTimeout(() => setCopied(false), 2000);

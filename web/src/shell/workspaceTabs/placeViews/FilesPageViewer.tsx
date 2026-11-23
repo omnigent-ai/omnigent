@@ -21,6 +21,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { useComparisonFileDiff } from "@/hooks/useComparisonFileDiff";
 import { useFileContent } from "@/hooks/useFileContent";
 import { fileContentText } from "@/lib/workspaceSidebarSource";
@@ -33,8 +34,10 @@ import {
   isModelFile,
   isPdfFile,
 } from "@/shell/codeViewerHelpers";
+import { workspaceFolderName } from "@/shell/breadcrumbPaths";
+import { FileBreadcrumbs } from "@/shell/FileBreadcrumbs";
 import { FileViewer } from "@/shell/FileViewer";
-import type { FilePosition } from "@/shell/FileViewerContext";
+import { type FilePosition, useWorkspacePaths } from "@/shell/FileViewerContext";
 
 import { WORKSPACE_SIDEBAR_LAYOUT, WORKSPACE_TOOLBAR_CLASS } from "../WorkspaceSidebarLayout";
 
@@ -53,6 +56,8 @@ export interface FilesPageViewerProps {
   onClose: () => void;
   /** Shows the file's changes, in the Changes review. */
   onShowChanges?: () => void;
+  /** Opens a file picked from the path's breadcrumbs; without it they only show the path. */
+  onOpenFile?: (path: string) => void;
   /** Registers the question the tab asks before it leaves unsaved edits; returns the unregister. */
   registerLeaveGuard?: (guard: FilesPageLeaveGuard) => () => void;
   /** The session's permission level, which limits the app's viewer as it does elsewhere. */
@@ -80,10 +85,23 @@ export function FilesPageViewer({
   toolbarLeading,
   onClose,
   onShowChanges,
+  onOpenFile,
   registerLeaveGuard,
   permissionLevel,
   commentId,
 }: FilesPageViewerProps) {
+  const { root: workspaceRoot } = useWorkspacePaths();
+  // The path as breadcrumbs, each folder listing the files beside it.
+  const breadcrumbs = (
+    <TooltipProvider>
+      <FileBreadcrumbs
+        conversationId={conversationId}
+        path={path}
+        workspaceName={workspaceFolderName(workspaceRoot)}
+        onOpenFile={onOpenFile}
+      />
+    </TooltipProvider>
+  );
   const file = useFileContent(conversationId, path, { visible: active });
   const contentType = file.data?.content_type;
   // Markdown, media and binaries show in the app's viewer, under the same toolbar as text.
@@ -99,6 +117,7 @@ export function FilesPageViewer({
     onClose,
     registerLeaveGuard,
     permissionLevel,
+    pathHeader: breadcrumbs,
   };
   // Another linked comment opens its thread afresh.
   const appViewer = <ComparisonFileViewer key={commentId} {...viewerProps} />;
@@ -107,13 +126,8 @@ export function FilesPageViewer({
     <div className={cn("flex min-h-0 flex-col bg-background", WORKSPACE_SIDEBAR_LAYOUT.page)}>
       <div className={cn(WORKSPACE_TOOLBAR_CLASS, WORKSPACE_SIDEBAR_LAYOUT.toolbar)}>
         {toolbarLeading}
-        {/* The app's viewer names the file in its own header. */}
-        <span
-          className="min-w-0 flex-1 truncate font-mono text-ui text-muted-foreground"
-          title={rich ? undefined : path}
-        >
-          {rich ? null : path}
-        </span>
+        {/* The app's viewer shows the breadcrumbs in its own header. */}
+        <div className="flex min-w-0 flex-1">{rich ? null : breadcrumbs}</div>
         {onShowChanges && (
           <Button type="button" variant="ghost" size="sm" onClick={onShowChanges}>
             <FileDiffIcon aria-hidden="true" />
