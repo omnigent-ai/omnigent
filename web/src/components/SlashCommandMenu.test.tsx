@@ -649,3 +649,15 @@ describe("/mcp panel connection state", () => {
     expect(screen.queryByRole("button", { name: "Reconnect" })).toBeNull();
   });
 });
+
+describe("placement", () => {
+  it("opens above the prompt by default and below its first line when placed below", () => {
+    const { rerender } = render(<SlashCommandMenu {...props} />);
+    expect(screen.getByTestId("slash-command-menu").className).toContain("bottom-full");
+
+    rerender(<SlashCommandMenu {...props} placement="below" />);
+    const menu = screen.getByTestId("slash-command-menu");
+    expect(menu.className).toContain("top-11");
+    expect(menu.className).not.toContain("bottom-full");
+  });
+});
