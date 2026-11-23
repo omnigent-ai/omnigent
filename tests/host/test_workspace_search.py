@@ -25,6 +25,8 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     FILE_SEARCH_MODE_SUBSTRING,
     FILE_SEARCH_MODE_UNSPECIFIED,
     SEARCH_ORDER_PRIORITY,
+    SEARCH_ORDER_UNSPECIFIED,
+    SEARCH_ORDER_WALK,
     SearchFilesRequest,
     SearchFilesResponse,
     SearchTextRequest,
@@ -606,8 +608,9 @@ async def test_an_invalid_pattern_is_the_users_to_fix(tmp_path: Path) -> None:
     assert "regex parse error" in refused.value.message
 
 
+@pytest.mark.parametrize("order", [SEARCH_ORDER_WALK, SEARCH_ORDER_PRIORITY])
 async def test_closing_a_text_search_early_stops_ripgrep(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, order: int
 ) -> None:
     """A client that goes away leaves no ripgrep or descendant running."""
     pids = tmp_path / "pids"
@@ -628,7 +631,7 @@ async def test_closing_a_text_search_early_stops_ripgrep(
     root = tmp_path / "workspace"
     root.mkdir()
 
-    stream = search_text(root, SearchTextRequest(query="needle"))
+    stream = search_text(root, SearchTextRequest(query="needle", order=order))  # type: ignore[arg-type]
     first = await anext(stream)
     await stream.aclose()
 
@@ -859,10 +862,37 @@ async def test_priority_order_searches_focus_then_its_folder_then_changes_then_t
 
 
 @needs_rg
-async def test_walk_order_ignores_the_priority_fields(tmp_path: Path) -> None:
+async def test_the_first_sixteen_focused_files_are_searched_first_in_the_order_given(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "many").mkdir()
+    for index in range(17):
+        (tmp_path / "many" / f"f{index:02}.txt").write_text("needle\n")
+    (tmp_path / "rest.txt").write_text("needle\n")
+    focused = [f"many/f{index:02}.txt" for index in reversed(range(17))]
+
+    responses = await _search_text(
+        tmp_path, "needle", order=SEARCH_ORDER_PRIORITY, focused_paths=focused
+    )
+
+    assert [m.path for m in responses[0].matches] == focused[:16]
+    # The seventeenth comes with its folder, then the rest of the workspace.
+    assert _paths_in_order(responses)[16:] == ["many/f00.txt", "rest.txt"]
+
+
+@needs_rg
+@pytest.mark.parametrize("order", [SEARCH_ORDER_UNSPECIFIED, SEARCH_ORDER_WALK])
+async def test_walk_order_ignores_the_priority_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, order: int
+) -> None:
     root = _priority_workspace(tmp_path / "repo")
 
-    walked = await _search_text(root, "needle", focused_paths=["zzz/last.txt"])
+    def unplanned(*_arguments: object, **_options: object) -> None:
+        raise AssertionError("a walk plans no priority passes")
+
+    monkeypatch.setattr(workspace_search, "priority_runs", unplanned)
+
+    walked = await _search_text(root, "needle", order=order, focused_paths=["zzz/last.txt"])
 
     assert sorted(_paths_in_order(walked)) == [
         "aaa/first.txt",
@@ -1039,7 +1069,10 @@ async def test_a_slow_change_list_is_skipped_then_used_by_the_next_search(
     released = asyncio.Event()
     listing = workspace_text_priority._changed_directories
 
+    listings: list[object] = []
+
     async def slow(*arguments: object) -> object:
+        listings.append(arguments)
         await released.wait()
         return await listing(*arguments)  # type: ignore[arg-type]
 
@@ -1055,6 +1088,7 @@ async def test_a_slow_change_list_is_skipped_then_used_by_the_next_search(
 
     assert len(_paths_in_order(first)) == 5  # complete without waiting for the changes
     assert _paths_in_order(second)[2] == "changed/edited.txt"
+    assert len(listings) == 1  # the second search used the first one's list
 
 
 @needs_rg
@@ -1148,18 +1182,3 @@ async def test_waiting_for_the_change_list_stops_at_the_end_of_the_search_time(
     # The focused file and its folder were searched before the time ran out.
     assert _paths_in_order(responses) == ["focus/deep/open.txt", "focus/deep/beside.txt"]
     assert responses[-1].done and responses[-1].truncated
-
-
-@needs_rg
-async def test_closing_a_priority_search_early_stops_its_pass(tmp_path: Path) -> None:
-    root = _priority_workspace(tmp_path / "repo")
-    (root / "many.txt").write_text("needle\n" * 400)
-    request = SearchTextRequest(
-        query="needle", order=SEARCH_ORDER_PRIORITY, focused_paths=["many.txt"]
-    )
-
-    stream = search_text(root, request)
-    first = await anext(stream)
-    await stream.aclose()
-
-    assert len(first.matches) == 100 and not first.done
