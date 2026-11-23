@@ -155,7 +155,6 @@ import { ChatHeader } from "./ChatHeader";
 import { ProjectHomeHeaderActions, ProjectHomeTitle } from "@/projectHome/ProjectHomeHeader";
 import { projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
 import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
-import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
 import type { FilePosition, OpenFileOptions, FileNavigationGuard } from "./FileViewerContext";
 import { revealFolderInFilesPanel } from "./FilesPanel";
 import { selectPullRequestInPanel } from "./PullRequestPanel";
@@ -3409,7 +3408,6 @@ function AppShellImpl() {
                     subAgentName={activeSession?.subAgentName ?? null}
                     conversationId={conversationId}
                     workingDirectory={activeSession?.workspace ?? activeConv?.workspace}
-                    createdBySessionId={activeSession?.labels?.[CREATED_BY_SESSION_LABEL_KEY]}
                     permissionLevel={permissionLevel}
                     actionConversation={actionConversation}
                     conversationTitle={headerConversationTitle}
