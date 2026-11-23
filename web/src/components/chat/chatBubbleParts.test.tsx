@@ -1317,6 +1317,32 @@ describe("withUncommittedUserBubbles with failed uploads", () => {
     ]);
   });
 
+  it("names the whole message when its failure names no attachment", () => {
+    const failure = { message: "Upload cancelled", retry: vi.fn(), remove: vi.fn() };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{
+            kind: "user",
+            itemId: "pend_4",
+            pending: true,
+            uploadFailure: failure,
+            content: [{ type: "input_text", text: "read this" }],
+          }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByText("Upload cancelled")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Retry upload of this message" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Remove failed upload of this message" }),
+    ).toBeInTheDocument();
+  });
+
   it("gives a sibling of a failed upload a settled placeholder, not a spinner", () => {
     const failure = {
       fileId: "pending:a.png",

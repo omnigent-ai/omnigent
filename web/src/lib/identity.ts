@@ -676,6 +676,11 @@ export async function authenticatedFetch(
   // the modal host for cache affinity. An explicit caller header wins.
   // OSS ingress deployments opt in to this routing.
   const url = typeof input === "string" ? input : input.toString();
+  // A retried attempt re-sends the whole body, so its progress restarts from zero.
+  const retryAttempt = (requestInit: RequestInit, routing: { unkeyed?: boolean } = {}) => {
+    onUploadProgress?.(0, null);
+    return hostFetch(url, requestInit, { ...routing, onUploadProgress });
+  };
   // Resolve this session's host BEFORE deriving the slice key below, so a fresh
   // session sub-path request keys to the right replica on the first attempt
   // instead of guessing the modal host and self-healing via the keyless retry.
@@ -770,13 +775,7 @@ export async function authenticatedFetch(
     if (sentKey === null) clearHostKeyless(resendKey);
     const keyedHeaders = new Headers(headers);
     keyedHeaders.set(SLICE_KEY_HEADER, resendKey);
-    // A retried attempt re-sends the whole body: restart the bar with it.
-    onUploadProgress?.(0, null);
-    res = await hostFetch(
-      url,
-      { ...init, headers: keyedHeaders, cache: "no-store" },
-      { onUploadProgress },
-    );
+    res = await retryAttempt({ ...init, headers: keyedHeaders, cache: "no-store" }, {});
     if (res.ok) clearHostKeyless(resendKey);
     derivedHostId = resendKey;
     stampedSliceKey = sentKey !== null;
@@ -795,16 +794,13 @@ export async function authenticatedFetch(
     // (callers/tests hold it by reference).
     const retryHeaders = new Headers(headers);
     retryHeaders.delete(SLICE_KEY_HEADER);
-    // A retried attempt re-sends the whole body: restart the bar with it.
-    onUploadProgress?.(0, null);
-    res = await hostFetch(
-      url,
+    res = await retryAttempt(
       {
         ...init,
         headers: retryHeaders,
         cache: "no-store",
       },
-      { unkeyed: true, onUploadProgress },
+      { unkeyed: true },
     );
     // Only a successful keyless retry proves this host uses the default replica.
     // Failed retries must preserve the host key for subsequent requests.
@@ -834,24 +830,15 @@ export async function authenticatedFetch(
       if (hostId !== null && !demoted) {
         const retryHeaders = new Headers(headers);
         retryHeaders.set(SLICE_KEY_HEADER, hostId);
-        // A retried attempt re-sends the whole body: restart the bar with it.
-        onUploadProgress?.(0, null);
-        res = await hostFetch(
-          url,
-          { ...init, headers: retryHeaders, cache: "no-store" },
-          { onUploadProgress },
-        );
+        res = await retryAttempt({ ...init, headers: retryHeaders, cache: "no-store" }, {});
       }
     }
     if (await _isWrongReplica(res)) {
       const retryHeaders = new Headers(headers);
       retryHeaders.delete(SLICE_KEY_HEADER);
-      // A retried attempt re-sends the whole body: restart the bar with it.
-      onUploadProgress?.(0, null);
-      res = await hostFetch(
-        url,
+      res = await retryAttempt(
         { ...init, headers: retryHeaders, cache: "no-store" },
-        { unkeyed: true, onUploadProgress },
+        { unkeyed: true },
       );
       if (hostId !== null && res.ok) {
         markHostKeyless(hostId);
@@ -860,13 +847,7 @@ export async function authenticatedFetch(
         clearHostKeyless(hostId);
         const keyedHeaders = new Headers(headers);
         keyedHeaders.set(SLICE_KEY_HEADER, hostId);
-        // A retried attempt re-sends the whole body: restart the bar with it.
-        onUploadProgress?.(0, null);
-        res = await hostFetch(
-          url,
-          { ...init, headers: keyedHeaders, cache: "no-store" },
-          { onUploadProgress },
-        );
+        res = await retryAttempt({ ...init, headers: keyedHeaders, cache: "no-store" }, {});
       }
     }
   } else if (

@@ -4880,6 +4880,36 @@ describe("chatStore — a stopped upload keeps its message until the user acts",
     useChatStore.setState({ conversationId, abortController: new AbortController() });
   });
 
+  it("a Cancel after the uploads finish names the message, not a file", async () => {
+    const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) =>
+      String(input).endsWith("/resources/files")
+        ? mockResponse({ id: "file_done" })
+        : defaultFetchHandler(input, init),
+    );
+    let releasePost: () => void = () => {};
+    const held = new Promise<null>((resolve) => {
+      releasePost = () => resolve(null);
+    });
+    void useChatStore.getState().send("read this", "agent_xyz", [file], { beforePost: () => held });
+    await flush();
+    const message = useChatStore.getState().pendingUserMessages[0]!;
+    const cancel =
+      useUploadProgressStore.getState().uploads[
+        uploadProgressKey(message.tempId, pendingFileId(message))
+      ]!.cancel!;
+
+    cancel();
+    releasePost();
+    await flush();
+
+    expect(callsToEvents()).toHaveLength(0);
+    expect(useChatStore.getState().failedUploads[0]?.uploadFailure).toMatchObject({
+      message: "Upload cancelled",
+    });
+    expect(useChatStore.getState().failedUploads[0]?.uploadFailure?.fileId).toBeUndefined();
+  });
+
   it("Remove drops the message and leaves the composer's own draft alone", async () => {
     const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
     const parked = await parkFailedUpload("read this", file);

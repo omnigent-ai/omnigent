@@ -27,7 +27,7 @@ export function PendingAttachment({
   fallback: ReactNode;
 }) {
   const upload = useUploadProgress(uploadProgressKey(messageId, fileId));
-  if (failure?.fileId === fileId) {
+  if (failure !== undefined && failure.fileId === fileId) {
     return <FailedAttachment name={name} failure={failure} image={image} />;
   }
   if (upload !== undefined)
@@ -54,9 +54,9 @@ function UploadingAttachment({
       ? null
       : Math.min(100, Math.floor((upload.loaded / upload.total) * 100));
   const sizeLabel =
-    percent === null
+    upload.total === null || upload.total <= 0
       ? formatFileSize(upload.size)
-      : `${formatFileSize(upload.loaded)} of ${formatFileSize(upload.total ?? 0)}`;
+      : `${formatFileSize(Math.min(upload.loaded, upload.total))} of ${formatFileSize(upload.total)}`;
   return (
     <div
       data-testid="uploading-attachment"
@@ -95,7 +95,7 @@ function UploadingAttachment({
   );
 }
 
-function FailedAttachment({
+export function FailedAttachment({
   name,
   failure,
   image,

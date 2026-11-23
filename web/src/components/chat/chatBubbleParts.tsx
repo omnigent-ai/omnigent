@@ -115,7 +115,7 @@ import { useForkDialog } from "@/shell/ForkDialogContext";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/components/SessionImage";
-import { PendingAttachment } from "./PendingAttachment";
+import { FailedAttachment, PendingAttachment } from "./PendingAttachment";
 import { UndeliveredMessageNotice } from "@/components/chat/UndeliveredMessageNotice";
 import { EditSentMessageContext } from "@/components/chat/editSentMessage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
@@ -360,7 +360,6 @@ export function placeUndeliveredBubbles(committed: Bubble[], undelivered: Bubble
   return [...committed.slice(0, notice), ...undelivered, ...committed.slice(notice)];
 }
 
-/**
 /** Submission order within one second: the optimistic bubble's sequence number from its temp id. */
 function sendSequence(message: PendingUserMessage): number {
   const match = /_(\d+)$/.exec(message.tempId);
@@ -1387,6 +1386,11 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
           </div>
         </div>
+        {bubble.uploadFailure !== undefined && bubble.uploadFailure.fileId === undefined && (
+          <div className="flex justify-end pt-1">
+            <FailedAttachment name="this message" failure={bubble.uploadFailure} image={false} />
+          </div>
+        )}
         {bubble.undelivered && (
           <UndeliveredMessageNotice sessionId={sessionId} text={text} content={bubble.content} />
         )}

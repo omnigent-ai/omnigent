@@ -30,8 +30,8 @@ export interface ActiveResponse {
 
 /** The attachment whose upload failed, the server's reason, and the user's two choices. */
 export interface UploadFailure {
-  /** The failed file's pending id, as its chip names it. */
-  fileId: string;
+  /** The failed file's pending id, as its chip names it; absent when the message as a whole failed. */
+  fileId?: string;
   /** The failure's text, as the send's error shows it. */
   message: string;
   /** Re-uploads the same files and sends the message once they're in. */

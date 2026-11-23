@@ -162,11 +162,17 @@ describe("managed first-message routing", () => {
 
     await authenticatedFetch(EVENTS_URL, { method: "POST", body: "{}", onUploadProgress });
 
-    expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+    const attempts = fetchMock.mock.calls.length;
+    expect(attempts).toBeGreaterThan(1);
     for (const call of fetchMock.mock.calls) {
       expect(call[2]).toMatchObject({ onUploadProgress });
     }
-    expect(onUploadProgress).toHaveBeenCalledWith(0, null);
+    // Each retry restarts the bar once, before its own attempt; the first attempt has no reset.
+    expect(onUploadProgress).toHaveBeenCalledTimes(attempts - 1);
+    for (const [index, reset] of onUploadProgress.mock.invocationCallOrder.entries()) {
+      expect(onUploadProgress.mock.calls[index]).toEqual([0, null]);
+      expect(reset).toBeLessThan(fetchMock.mock.invocationCallOrder[index + 1]!);
+    }
   });
 
   it("does not loop when every retry reports wrong_replica", async () => {

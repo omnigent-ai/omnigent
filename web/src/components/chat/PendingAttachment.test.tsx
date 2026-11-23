@@ -74,6 +74,20 @@ describe("PendingAttachment", () => {
     expect(screen.getByText("2 KB")).toBeInTheDocument();
   });
 
+  it("never shows more loaded than the total, so the label agrees with the bar", () => {
+    useUploadProgressStore.setState({
+      uploads: {
+        [key]: { name: "big.zip", size: 2048, loaded: 3072, total: 2048, cancel: vi.fn() },
+      },
+    });
+    renderAttachment();
+    expect(screen.getByRole("progressbar", { name: "Uploading big.zip" })).toHaveAttribute(
+      "aria-valuetext",
+      "100%",
+    );
+    expect(screen.getByText("2 KB of 2 KB")).toBeInTheDocument();
+  });
+
   it("omits Cancel once the owner no longer allows it", () => {
     useUploadProgressStore.setState({
       uploads: { [key]: { name: "big.zip", size: 10, loaded: 0, total: 10 } },

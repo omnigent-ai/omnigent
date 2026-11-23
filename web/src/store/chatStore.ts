@@ -3164,6 +3164,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         opts?.signal,
       );
       uploads.uploading = false;
+      // Only a failure, or a Cancel while an upload runs, names a file; later stops name the message.
+      uploads.file = undefined;
       const serverContent: ContentBlock[] = [
         ...fileBlocks,
         ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
@@ -3466,12 +3468,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         const parkedIn = failTarget;
         // Retry and Remove each act once, whichever comes first.
         let settled = false;
-        const failedFile = uploads.file ?? files?.[0];
+        const failedFile = uploads.file;
         parked = {
           ...parkedEntry,
           initialDraft: undefined,
           uploadFailure: {
-            fileId: pendingFileIdOf(failedFile!),
+            fileId: failedFile === undefined ? undefined : pendingFileIdOf(failedFile),
             message: cancelled ? UPLOAD_CANCELLED_MESSAGE : message,
             retry: () => {
               if (settled) return;
