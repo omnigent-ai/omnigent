@@ -61,7 +61,7 @@ import {
 import { readSavedBrowserPage } from "@/lib/browserTabPages";
 import { browserViewOwnerId } from "@/lib/browserTabs";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
-import { resolveIdentity } from "@/lib/identity";
+import { resolveIdentity, subscribeIdentity } from "@/lib/identity";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
 import { previewHostOptions, withPreviewHostRetry } from "@/lib/previewHostOptions";
 import { cn } from "@/lib/utils";
@@ -311,24 +311,21 @@ export function BrowserPane({
     if (!bridge) return;
     let cancelled = false;
     let viewChanged = false;
+    let unsubscribeIdentity: (() => void) | undefined;
     const urlEvents = urlEventsRef.current;
     const urlEdits = urlEditsRef.current;
     // Recover the address after sign-out; loading it requires Reload or Enter.
-    const restoreSavedAddress = async () => {
-      try {
-        const saved = readSavedBrowserPage(conversationId, await resolveIdentity());
-        if (
-          !saved ||
-          cancelled ||
-          viewChanged ||
-          urlEventsRef.current !== urlEvents ||
-          urlEditsRef.current !== urlEdits
-        )
-          return;
-        setCurrentUrl(saved.url);
-      } catch {
-        // Identity lookup can fail while disconnected; manual navigation remains available.
-      }
+    const restoreSavedAddress = () => {
+      const saved = readSavedBrowserPage(conversationId);
+      if (
+        !saved ||
+        cancelled ||
+        viewChanged ||
+        urlEventsRef.current !== urlEvents ||
+        urlEditsRef.current !== urlEdits
+      )
+        return;
+      setCurrentUrl(saved.url);
     };
 
     // A newer lifecycle event takes precedence over this asynchronous snapshot.
@@ -336,7 +333,13 @@ export function BrowserPane({
       if (cancelled || viewChanged || !r) return;
       if (!r.exists) {
         // A page open in another window stays there.
-        if (!r.elsewhere) void restoreSavedAddress();
+        if (!r.elsewhere) {
+          // Keep the original edit/event guards across transient identity failures.
+          unsubscribeIdentity = subscribeIdentity(restoreSavedAddress);
+          void resolveIdentity()
+            .then(restoreSavedAddress)
+            .catch(() => {});
+        }
         return;
       }
       setHasView(true);
@@ -366,6 +369,7 @@ export function BrowserPane({
     });
     return () => {
       cancelled = true;
+      unsubscribeIdentity?.();
       unsubCreated?.();
       unsubClosed?.();
     };

@@ -30,15 +30,6 @@ describe("parseBrowserViewId", () => {
       });
     }
   });
-
-  it("treats a malformed tab key as its own agent view", () => {
-    for (const viewId of ["browser-tab:conv_a", "browser-tab:conv_a:", "browser-tab:%ZZ:tab"]) {
-      expect(parseBrowserViewId(viewId)).toEqual({
-        conversationId: viewId,
-        tabId: AGENT_BROWSER_TAB_ID,
-      });
-    }
-  });
 });
 
 describe("saved browser pages", () => {

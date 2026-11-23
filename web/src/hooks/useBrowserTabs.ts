@@ -5,7 +5,7 @@ import { readSavedBrowserPage, saveBrowserPage } from "@/lib/browserTabPages";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import { AGENT_BROWSER_TAB_ID, browserViewId, browserViewOwnerId } from "@/lib/browserTabs";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
-import { resolveIdentity } from "@/lib/identity";
+import { resolveIdentity, subscribeIdentity } from "@/lib/identity";
 import type { BrowserHostOptions } from "@/lib/nativeBridge";
 import { previewHostOptions, withPreviewHostRetry } from "@/lib/previewHostOptions";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
@@ -306,9 +306,16 @@ export function useBrowserTabs(conversationId: string) {
     if (!bridge || viewIds.size === 0) return;
     let active = true;
     const updated = new Set<string>();
+    const missingViews = new Set<string>();
     const setPage = (viewId: string, page: BrowserPage) => {
       setPages((current) => ({ ...current, [viewId]: page }));
     };
+    const restoreSavedLabel = (viewId: string) => {
+      if (active && !updated.has(viewId)) setPage(viewId, readSavedBrowserPage(viewId) ?? {});
+    };
+    const unsubscribeIdentity = subscribeIdentity(() => {
+      for (const viewId of missingViews) restoreSavedLabel(viewId);
+    });
     const unsubscribe = bridge.onBrowserUrlChanged?.((page) => {
       if (!active || !viewIds.has(page.conversationId)) return;
       updated.add(page.conversationId);
@@ -321,9 +328,9 @@ export function useBrowserTabs(conversationId: string) {
         if (!active || updated.has(viewId) || !page) return;
         if (!page.exists) {
           // A tab whose view the shell destroyed keeps its saved page's label.
-          const userId = await resolveIdentity();
-          if (!active || updated.has(viewId)) return;
-          setPage(viewId, readSavedBrowserPage(viewId, userId) ?? {});
+          missingViews.add(viewId);
+          await resolveIdentity();
+          restoreSavedLabel(viewId);
           return;
         }
         const url = page.url && page.url !== "about:blank" ? page.url : page.pendingUrl;
@@ -337,6 +344,7 @@ export function useBrowserTabs(conversationId: string) {
     for (const viewId of viewIds) void restore(viewId);
     return () => {
       active = false;
+      unsubscribeIdentity();
       unsubscribe?.();
     };
   }, [viewIdsKey]);

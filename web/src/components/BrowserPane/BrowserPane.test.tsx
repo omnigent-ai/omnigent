@@ -17,11 +17,18 @@ import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { BrowserPane } from "./BrowserPane";
 
 const getSessionSlim = vi.fn();
-const identity = vi.hoisted(() => ({ userId: "user-a" as string | null }));
+const identity = vi.hoisted(() => ({
+  userId: "user-a" as string | null,
+  listeners: new Set<() => void>(),
+}));
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof Identity>()),
   getCurrentUserId: () => identity.userId,
   resolveIdentity: vi.fn(async () => identity.userId),
+  subscribeIdentity: (listener: () => void) => {
+    identity.listeners.add(listener);
+    return () => identity.listeners.delete(listener);
+  },
 }));
 vi.mock("@/lib/sessionsApi", () => ({
   getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
@@ -120,6 +127,7 @@ afterEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
   identity.userId = "user-a";
+  identity.listeners.clear();
   vi.mocked(resolveIdentity)
     .mockReset()
     .mockImplementation(async () => identity.userId);
@@ -216,64 +224,79 @@ describe("BrowserPane cold-start (no view yet)", () => {
   );
 
   it.each([
-    "unchanged",
-    "focused",
-    "edited",
-    "cleared",
-    "navigated",
-    "created",
-    "unmounted",
-  ] as const)("handles delayed saved-address identity when the pane is %s", async (change) => {
-    savedReport();
-    let finishIdentity!: (userId: string) => void;
-    const pendingIdentity = new Promise<string>((resolve) => {
-      finishIdentity = resolve;
-    });
-    vi.mocked(resolveIdentity).mockReturnValue(pendingIdentity);
-    const bridge = installBridge();
-    const { unmount } = render(<BrowserPane conversationId="browser-tab:conv_a:two" />);
-    await waitFor(() => expect(resolveIdentity).toHaveBeenCalled());
-    const bar = screen.getByRole("textbox", { name: "Address bar" });
-    expect(bar).toHaveValue("");
-    if (change === "focused") {
-      fireEvent.focus(bar);
-    } else if (change === "edited" || change === "cleared") {
-      fireEvent.focus(bar);
-      fireEvent.change(bar, { target: { value: "https://example.org/chosen" } });
-      if (change === "cleared") fireEvent.change(bar, { target: { value: "" } });
-      fireEvent.blur(bar);
-    } else if (change === "navigated") {
-      act(() =>
-        bridge.onBrowserUrlChanged.mock.calls.at(-1)![0]({
-          conversationId: "browser-tab:conv_a:two",
-          url: "https://example.org/chosen",
-        }),
+    ["delayed", "unchanged"],
+    ["delayed", "focused"],
+    ["delayed", "edited"],
+    ["delayed", "cleared"],
+    ["delayed", "navigated"],
+    ["delayed", "created"],
+    ["delayed", "unmounted"],
+    ["retried", "unchanged"],
+    ["retried", "edited"],
+    ["retried", "navigated"],
+    ["retried", "unmounted"],
+  ] as const)(
+    "handles %s saved-address identity when the pane is %s",
+    async (resolution, change) => {
+      savedReport();
+      let finishIdentity!: (userId: string) => void;
+      const pendingIdentity = new Promise<string>((resolve) => {
+        finishIdentity = resolve;
+      });
+      identity.userId = null;
+      vi.mocked(resolveIdentity).mockReturnValue(
+        resolution === "retried" ? Promise.resolve(null) : pendingIdentity,
       );
-    } else if (change === "created") {
-      act(() =>
-        bridge.onBrowserViewCreated.mock.calls.at(-1)![0]({
-          conversationId: "browser-tab:conv_a:two",
-        }),
-      );
-    } else if (change === "unmounted") {
-      unmount();
-    }
-    await act(async () => {
-      finishIdentity("user-a");
-      await pendingIdentity;
-    });
-    if (change !== "unmounted") {
-      expect(bar).toHaveValue(
-        change === "unchanged" || change === "focused"
-          ? "https://example.com/report"
-          : change === "edited" || change === "navigated"
-            ? "https://example.org/chosen"
-            : "",
-      );
-    }
-    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
-    expect(getSessionSlim).not.toHaveBeenCalled();
-  });
+      const bridge = installBridge();
+      const { unmount } = render(<BrowserPane conversationId="browser-tab:conv_a:two" />);
+      await waitFor(() => expect(resolveIdentity).toHaveBeenCalled());
+      const bar = screen.getByRole("textbox", { name: "Address bar" });
+      expect(bar).toHaveValue("");
+      if (change === "focused") {
+        fireEvent.focus(bar);
+      } else if (change === "edited" || change === "cleared") {
+        fireEvent.focus(bar);
+        fireEvent.change(bar, { target: { value: "https://example.org/chosen" } });
+        if (change === "cleared") fireEvent.change(bar, { target: { value: "" } });
+        fireEvent.blur(bar);
+      } else if (change === "navigated") {
+        act(() =>
+          bridge.onBrowserUrlChanged.mock.calls.at(-1)![0]({
+            conversationId: "browser-tab:conv_a:two",
+            url: "https://example.org/chosen",
+          }),
+        );
+      } else if (change === "created") {
+        act(() =>
+          bridge.onBrowserViewCreated.mock.calls.at(-1)![0]({
+            conversationId: "browser-tab:conv_a:two",
+          }),
+        );
+      } else if (change === "unmounted") {
+        unmount();
+        expect(identity.listeners.size).toBe(0);
+      }
+      await act(async () => {
+        identity.userId = "user-a";
+        finishIdentity("user-a");
+        await pendingIdentity;
+        if (resolution === "retried") {
+          for (const listener of identity.listeners) listener();
+        }
+      });
+      if (change !== "unmounted") {
+        expect(bar).toHaveValue(
+          change === "unchanged" || change === "focused"
+            ? "https://example.com/report"
+            : change === "edited" || change === "navigated"
+              ? "https://example.org/chosen"
+              : "",
+        );
+      }
+      expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+      expect(getSessionSlim).not.toHaveBeenCalled();
+    },
+  );
 
   it("reattaches the retained page without navigating when its rail is reopened", async () => {
     let fireActive: ((p: { conversationId: string | null }) => void) | undefined;
