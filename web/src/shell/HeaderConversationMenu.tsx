@@ -11,6 +11,7 @@ import {
   GitForkIcon,
   InfoIcon,
   MailIcon,
+  MailOpenIcon,
   PencilIcon,
   PinIcon,
   PinOffIcon,
@@ -69,7 +70,12 @@ import {
 } from "@/lib/automationFromSession";
 import { type OpenSessionCommandId, useOpenSessionPaletteCommands } from "./openSessionCommands";
 import { ProjectPicker } from "./ProjectPicker";
-import { markConversationUnread } from "@/hooks/useUnseenConversations";
+import {
+  isExplicitlyUnread,
+  markConversationRead,
+  markConversationUnread,
+  useReadStateSnapshot,
+} from "@/hooks/useUnseenConversations";
 import { useAddSiblingSessionHotkey } from "@/hooks/useAddSiblingSessionHotkey";
 import { useTargetedShortcut } from "@/lib/shortcuts/shortcutTargets";
 import { useOmnigentAnalytics } from "@/lib/analytics";
@@ -189,6 +195,8 @@ export function HeaderConversationMenu({
   const addSiblingShortcut = useTargetedShortcut("session.addSibling", conversation.id);
   const renameShortcut = useTargetedShortcut("session.rename", conversation.id);
   const unreadShortcut = useTargetedShortcut("session.toggleUnread", conversation.id);
+  // The row offers what ⌘⌥U does here: an explicitly unread session is marked read.
+  const explicitlyUnread = useReadStateSnapshot(() => isExplicitlyUnread(conversation.id));
 
   const closeMenu = () => {
     setMenuOpen(false);
@@ -430,17 +438,29 @@ export function HeaderConversationMenu({
         <PencilIcon className="size-3.5" />
         Rename
       </DropdownMenuItem>
-      {/* A muted session can't be flagged unread, matching its row menu. */}
-      {canFlagUnread(conversation) && (
+      {explicitlyUnread ? (
         <DropdownMenuItem
-          data-testid="header-mark-unread-conversation"
+          data-testid="header-mark-read-conversation"
           className={itemClass}
           shortcut={unreadShortcut}
-          onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
+          onSelect={() => markConversationRead(conversation.id, conversation.updated_at)}
         >
-          <MailIcon className="size-3.5" />
-          Mark as unread
+          <MailOpenIcon className="size-3.5" />
+          Mark as read
         </DropdownMenuItem>
+      ) : (
+        // A muted session can't be flagged unread, matching its row menu.
+        canFlagUnread(conversation) && (
+          <DropdownMenuItem
+            data-testid="header-mark-unread-conversation"
+            className={itemClass}
+            shortcut={unreadShortcut}
+            onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
+          >
+            <MailIcon className="size-3.5" />
+            Mark as unread
+          </DropdownMenuItem>
+        )
       )}
       {canCreateAutomation && (
         <DropdownMenuItem

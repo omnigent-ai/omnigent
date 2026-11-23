@@ -270,6 +270,31 @@ describe("HeaderConversationMenu", () => {
     expect(unread).not.toHaveAttribute("aria-keyshortcuts");
   });
 
+  it("offers Mark as read, as ⌘⌥U does, while the session is marked unread", async () => {
+    const readState = await vi.importActual<typeof UnseenConversationsModule>(
+      "@/hooks/useUnseenConversations",
+    );
+    readState.markConversationUnread(CONVERSATION.id, CONVERSATION.updated_at);
+    try {
+      renderMenu();
+      act(() =>
+        shortcutTargetsStore.setState({ targets: { "session.toggleUnread": CONVERSATION.id } }),
+      );
+      openMenu();
+      expect(screen.queryByTestId("header-mark-unread-conversation")).toBeNull();
+      const read = screen.getByTestId("header-mark-read-conversation");
+      expect(read).toHaveTextContent("Mark as read");
+      expect(read).toHaveAttribute("aria-keyshortcuts", "Control+Alt+U");
+
+      fireEvent.click(read);
+      expect(readState.isExplicitlyUnread(CONVERSATION.id)).toBe(false);
+      openMenu();
+      expect(screen.getByTestId("header-mark-unread-conversation")).toBeInTheDocument();
+    } finally {
+      readState.resetReadStateForTests();
+    }
+  });
+
   it("lists ⌘⌥A on Add nested agent, whose chord this menu binds for its session", () => {
     renderMenu();
     openMenu();
