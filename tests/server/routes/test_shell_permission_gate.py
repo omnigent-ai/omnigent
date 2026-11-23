@@ -1228,22 +1228,43 @@ async def test_workspace_direct_access_is_owner_only(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("session", "status"), [("conv_share", 403), ("conv_open", 200)])
+@pytest.mark.parametrize(("session", "passes"), [("conv_share", False), ("conv_open", True)])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "ReadFile",
+        "StatPath",
+        "ReadLinkText",
+        "SearchFiles",
+        "SearchText",
+        "ResolveWorkingCopyBase",
+        "ListWorkingCopyChanges",
+        "ReadBaseFile",
+        "ListRepositoryRefs",
+        "ListBranchCommits",
+        "ResolveRepositoryContext",
+    ],
+)
 async def test_workspace_api_follows_the_file_read_gate(
-    client: httpx.AsyncClient, session: str, status: int
+    client: httpx.AsyncClient, session: str, passes: bool, method: str
 ) -> None:
     """A view-only collaborator reads the workspace API only where files are shared."""
+    streaming = method in ("ReadFile", "SearchText", "ReadBaseFile")
     resp = await client.post(
         f"/v1/sessions/{session}/workspace"
-        "/omnigent.api.workspace.v1alpha1.WorkspaceService/ReadFile",
+        f"/omnigent.api.workspace.v1alpha1.WorkspaceService/{method}",
         headers={
             "X-Forwarded-Email": "viewer@example.com",
-            "Content-Type": "application/connect+json",
+            "Content-Type": "application/connect+json" if streaming else "application/json",
         },
-        content=b"\x00\x00\x00\x00\x02{}",  # one enveloped Connect message
+        # A stream takes one enveloped Connect message; a unary call, the bare message.
+        content=b"\x00\x00\x00\x00\x02{}" if streaming else b"{}",
     )
 
-    assert resp.status_code == status, resp.text
-    if status == 200:
-        # Past the gate; this harness has no host, so the stream ends with that error.
-        assert b"unavailable" in resp.content
+    if not passes:
+        assert resp.status_code == 403, resp.text
+        return
+    # Past the gate; this harness has no host, so the call ends with that error. A
+    # stream reports it in its body, a unary call as its status.
+    assert resp.status_code == (200 if streaming else 503), resp.text
+    assert b"unavailable" in resp.content

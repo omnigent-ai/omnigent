@@ -17,7 +17,6 @@
   "tests/e2e/test_host_codex_native_e2e.py": 1,
   "tests/e2e/test_native_subagent_terminal_status_e2e.py": 2,
   "tests/e2e/test_pi_interrupt_reap_budget_race_e2e.py": 1,
-  "tests/e2e_ui/agents/test_add_agent_focus_ring_clipping.py": 1,
   "tests/e2e_ui/agents/test_spawn_bounds_fanout_cap.py": 1,
   "tests/e2e_ui/base_path/test_base_path.py": 1,
   "tests/e2e_ui/browser/test_browser_priority_guidance.py": 1,

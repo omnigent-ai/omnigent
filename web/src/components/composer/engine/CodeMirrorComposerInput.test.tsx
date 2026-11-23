@@ -192,6 +192,22 @@ describe("CodeMirrorComposerInput", () => {
 });
 
 describe("CodeMirrorComposerInput change events", () => {
+  it.each([undefined, { separateUndo: true }])(
+    "makes a programmatic insert (%o) its own undo step apart from typing",
+    (options) => {
+      const { content, target } = mount({ value: "" });
+      const editor = EditorView.findFromDOM(content)!;
+      act(
+        () =>
+          void editor.dispatch({ changes: { from: 0, insert: "typed" }, userEvent: "input.type" }),
+      );
+      act(() => insertComposerText(target(), " inserted", 5, 5, options));
+      expect(target().value).toBe("typed inserted");
+      act(() => void undo(editor));
+      expect(target().value).toBe("typed");
+    },
+  );
+
   it("says when an undo or redo made the change", () => {
     const onChange = vi.fn((event: ComposerInputEvent) => isHistoryInput(event));
     const { content, target } = mount({ onChange });
@@ -202,6 +218,22 @@ describe("CodeMirrorComposerInput change events", () => {
     act(() => void undo(editor));
     act(() => void redo(editor));
     expect(onChange.mock.results.map((result) => result.value)).toEqual([false, true, true]);
+  });
+
+  it("reports an undo as 'undo' and a redo as 'redo', and an ordinary edit with no direction", () => {
+    const onChange = vi.fn<(event: ComposerInputEvent) => void>();
+    const { content, target } = mount({ onChange });
+    act(() => {
+      insertComposerText(target(), "draft", 0, 0);
+    });
+    const editor = EditorView.findFromDOM(content)!;
+    act(() => void undo(editor));
+    act(() => void redo(editor));
+    expect(onChange.mock.calls.map(([event]) => event.historyDirection)).toEqual([
+      undefined,
+      "undo",
+      "redo",
+    ]);
   });
 
   it("takes a controlled value without reporting it or making it undoable", () => {
@@ -509,6 +541,27 @@ describe("CodeMirrorComposerInput command token", () => {
     expect(commandMarks(view.container)).toEqual([["/review", COMMAND_TOKEN_CLASS]]);
   });
 
+  it("tints a placed `!` behind a control character, with its command right after it", () => {
+    const { container } = mount({ value: "\x01!pwd", commandToken: { token: "!", start: 1 } });
+    expect(commandMarks(container)).toEqual([["!", COMMAND_TOKEN_CLASS]]);
+  });
+
+  it("places a token by the value's offset when the editor folds its CRLF line breaks", () => {
+    const view = mount({ value: "\r\n!ls", commandToken: { token: "!", start: 2 } });
+    expect(commandMarks(view.container)).toEqual([["!", COMMAND_TOKEN_CLASS]]);
+
+    // A new value and token reconfigure the mark through the same offset mapping.
+    view.rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value={"\r\n\r\n!ls"}
+        commandToken={{ token: "!", start: 4 }}
+      />,
+    );
+    expect(commandMarks(view.container)).toEqual([["!", COMMAND_TOKEN_CLASS]]);
+    expect(view.container.querySelector(".cm-content")?.textContent).toBe("!ls");
+  });
+
   it("never marks text the token no longer leads, even before the token prop catches up", () => {
     const { container, target } = mount({ value: "/context", commandToken: "/context" });
     act(() => {
@@ -527,5 +580,14 @@ describe("leadingCommandSpan", () => {
     expect(leadingCommandSpan("/contexts", "/context")).toBeNull();
     expect(leadingCommandSpan("say /context", "/context")).toBeNull();
     expect(leadingCommandSpan("/context", null)).toBeNull();
+  });
+
+  it("places a positioned token only where the text still holds it", () => {
+    expect(leadingCommandSpan("!ls", { token: "!", start: 0 })).toEqual({ start: 0, end: 1 });
+    expect(leadingCommandSpan("\x01!ls", { token: "!", start: 1 })).toEqual({ start: 1, end: 2 });
+    expect(leadingCommandSpan("ls", { token: "!", start: 0 })).toBeNull();
+    // The bare-string rule would refuse both: no word break after `!`, and \x01 isn't whitespace.
+    expect(leadingCommandSpan("!ls", "!")).toBeNull();
+    expect(leadingCommandSpan("\x01! ls", "!")).toBeNull();
   });
 });

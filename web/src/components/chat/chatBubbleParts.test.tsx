@@ -621,6 +621,8 @@ describe("UserBubble literal text", () => {
     expect(screen.getByText("<code>").tagName).toBe("CODE");
     expect(screen.getAllByRole("listitem")).toHaveLength(2);
     expect(screen.getByTestId("message-bubble")).toHaveTextContent("<exact lines>");
+    // An ordinary message, not a design-tool one: no design request card.
+    expect(screen.queryByTestId("design-request")).toBeNull();
   });
 });
 

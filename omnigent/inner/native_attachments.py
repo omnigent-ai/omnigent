@@ -100,21 +100,36 @@ MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES: int = 50 * 1024 * 1024
 MAX_SESSION_FILESYSTEM_ATTACHMENTS: int = 20
 MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES: int = 200 * 1024 * 1024
 
-# These formats require the harness's filesystem tools by default. Match by
-# extension because browsers can mislabel Office documents as ZIP or generic
-# binary data.
-DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS: frozenset[str] = frozenset(
+# Older runtimes recognize only these extensions without a delivery record.
+_LEGACY_FILESYSTEM_ATTACHMENT_EXTENSIONS: frozenset[str] = frozenset(
     {".zip", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".sqlite3"}
+)
+# Match by extension because browsers can mislabel binary files.
+DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS: frozenset[str] = (
+    _LEGACY_FILESYSTEM_ATTACHMENT_EXTENSIONS | {".mp4"}
 )
 
 # Harnesses supporting uploads and history restoration for these file formats.
 FILESYSTEM_ATTACHMENT_HARNESSES: frozenset[str] = frozenset({"claude-native", "codex-native"})
 
+# These adapters already render uploaded attachments as local file paths.
+FILESYSTEM_ATTACHMENT_UPLOAD_HARNESSES: frozenset[str] = FILESYSTEM_ATTACHMENT_HARNESSES | {
+    "pi-native",
+    "cursor-native",
+    "kiro-native",
+    "goose-native",
+    "antigravity-native",
+    "qwen-native",
+    "kimi-native",
+    "hermes-native",
+    "devin-native",
+}
+
 # Advertised by builds that can deliver and restore these attachments.
 CAP_FILESYSTEM_ATTACHMENTS = "filesystem_attachments"
 
 # Advertised by builds that follow the delivery recorded for an upload, so a
-# type outside the default extensions also reaches the harness as a file.
+# type outside the legacy extensions also reaches the harness as a file.
 CAP_FILESYSTEM_ATTACHMENT_DELIVERY = "filesystem_attachment_delivery"
 
 # Key recording how an upload is delivered, in its ``source_metadata`` and on
@@ -151,7 +166,7 @@ def requires_filesystem(filename: str | None) -> bool:
     Whether an attachment needs a harness that can open local files.
 
     :param filename: The original filename, e.g. ``"report.docx"``.
-    :returns: True for supported archives, Office documents, and databases.
+    :returns: True for supported archives, Office documents, databases, and MP4 videos.
     """
     return DEFAULT_FILESYSTEM_ATTACHMENT_POLICY.matches(filename)
 
@@ -181,9 +196,13 @@ def filesystem_attachment_capability(filenames: Iterable[str | None]) -> str:
 
     :param filenames: Names of files delivered as files, e.g. ``["a.zip"]``.
     :returns: :data:`CAP_FILESYSTEM_ATTACHMENT_DELIVERY` when any name is
-        outside the default extensions, else :data:`CAP_FILESYSTEM_ATTACHMENTS`.
+        outside the legacy extensions, else :data:`CAP_FILESYSTEM_ATTACHMENTS`.
     """
-    if all(requires_filesystem(filename) for filename in filenames):
+    if all(
+        filename is not None
+        and PurePath(filename).suffix.lower() in _LEGACY_FILESYSTEM_ATTACHMENT_EXTENSIONS
+        for filename in filenames
+    ):
         return CAP_FILESYSTEM_ATTACHMENTS
     return CAP_FILESYSTEM_ATTACHMENT_DELIVERY
 

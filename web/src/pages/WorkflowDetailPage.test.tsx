@@ -252,6 +252,7 @@ function mockSavedWorkflows(workflows: SavedWorkflow[]) {
     isLoading: false,
     isError: false,
     refresh: vi.fn(),
+    reload: vi.fn(),
     pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
   });
 }

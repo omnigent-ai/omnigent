@@ -40,7 +40,7 @@ class ToolContext:
     :param agent_id: The registered agent ID,
         e.g. ``"ag_xyz789"``.
     :param workspace: Per-conversation persistent working
-        directory. ``upload_file`` resolves paths against it;
+        directory. ``sys_files_upload`` resolves paths against it;
         ``sys_terminal_launch`` uses it as the cwd default
         (per ``designs/OMNIGENT_TERMINAL_BRIDGE.md`` §4.6 cwd-resolution
         precedence). ``None`` when no workspace is available (e.g.

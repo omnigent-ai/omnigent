@@ -20,10 +20,25 @@ const assert = require("node:assert/strict");
 const { readFileSync } = require("node:fs");
 const fs = require("node:fs");
 const os = require("node:os");
-const { createRequire } = require("node:module");
+const moduleLoader = require("node:module");
 const path = require("node:path");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
+
+const { createRequire } = moduleLoader;
+const electronStub = {
+  shell: {
+    openExternal: async () => {
+      throw new Error("unexpected system-browser launch");
+    },
+  },
+  safeStorage: { isEncryptionAvailable: () => false },
+};
+const originalLoad = moduleLoader["_load"];
+moduleLoader["_load"] = function (request, ...rest) {
+  if (request === "electron") return electronStub;
+  return originalLoad.call(this, request, ...rest);
+};
 
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
 const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
@@ -48,7 +63,7 @@ const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/
 
 /** A fake workspace behind the real databricks-session module: `verdict` answers session-create. */
 function createWorkspaceNetwork(origin, { oauth: oauthOverrides, account = {} } = {}) {
-  const network = { verdict: "allow", sessionCreates: 0, browserSignIns: 0 };
+  const network = { verdict: "allow", sessionCreates: 0, browserSignIns: 0, sessionChecks: [] };
   let jar = [];
   const cookies = Object.assign(new EventEmitter(), { get: async () => jar });
   // Chromium removes the old cookie before inserting its replacement.
@@ -159,6 +174,7 @@ function loadNavigationHarness({
   cliPath = null,
   hostConnectResult = { ok: true },
   sshConnectResult = { ok: true, shownInConsole: true },
+  sshPreviewVerification = null,
   serverAuthResult = { ok: true },
   managedServerNames = {},
   // A createWorkspaceNetwork() to run the real session module against.
@@ -375,7 +391,17 @@ function loadNavigationHarness({
         if (options?.webPreferences?.preload?.endsWith("find_preload.js")) {
           let destroyed = false;
           const bar = Object.assign(new EventEmitter(), {
-            webContents: { send: () => {} },
+            webContents: {
+              sent: [],
+              send: (channel, data) => bar.webContents.sent.push({ channel, data }),
+            },
+            focused: false,
+            isFocused: () => bar.focused,
+            focus: () => {
+              bar.focused = true;
+            },
+            show: () => {},
+            setBounds: () => {},
             isDestroyed: () => destroyed,
             close() {
               destroyed = true;
@@ -428,8 +454,9 @@ function loadNavigationHarness({
     clipboard: { writeText: (text) => clipboardWriteText(text) },
     dialog: {},
     globalShortcut: {
-      register: (accelerator) => {
+      register: (accelerator, press) => {
         (calls.globalShortcuts ??= []).push(["register", accelerator]);
+        (calls.presses ??= new Map()).set(accelerator, press);
         return true;
       },
       unregister: (accelerator) => (calls.globalShortcuts ??= []).push(["unregister", accelerator]),
@@ -605,6 +632,17 @@ function loadNavigationHarness({
     },
     "./databricks-auth": {
       ...require("../src/databricks-auth"),
+      createDatabricksAuth(options) {
+        const auth = require("../src/databricks-auth").createDatabricksAuth(options);
+        return {
+          ...auth,
+          checkSession(...args) {
+            const pending = auth.checkSession(...args);
+            network?.sessionChecks?.push(pending);
+            return pending;
+          },
+        };
+      },
       readDatabricksAuthMode: () => databricksMode,
     },
     // The bounce's behavior is unit-tested in workspace-root-bounce.test.js;
@@ -698,6 +736,12 @@ function loadNavigationHarness({
     },
   };
 
+  if (sshPreviewVerification) {
+    localRequires["./sshPreviewIdentity"] = {
+      verifySshPreviewIdentity: sshPreviewVerification,
+    };
+  }
+
   if (arcaConsentResult !== undefined) {
     localRequires["./arca_connect_window"] = {
       createArcaConnectFlow: (deps) => ({
@@ -720,7 +764,8 @@ function loadNavigationHarness({
   const source =
     fs.readFileSync(mainPath, "utf8") +
     "\nmodule.exports.sshHosts = sshHosts;" +
-    "\nmodule.exports.panelTestApi = { activeWindow, mainWindows, enqueueDeepLink, floatingComposer, floatingComposerPanelIsCurrent, closePanelsOnSignIn, loadSetupPage, beginConnectionAttempt };" +
+    "\nmodule.exports.panelTestApi = { activeWindow, mainWindows, enqueueDeepLink, floatingComposer, floatingComposerPanelIsCurrent, closePanelsOnSignIn, loadSetupPage, beginConnectionAttempt, openFloatingComposerFromShortcut, focusAfterBrowserSignIn };" +
+    "\nmodule.exports.quitStarted = () => quitConfirmation.quitStarted();" +
     "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, serverResponseTimeoutMs: () => serverResponseTimeoutMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
@@ -754,6 +799,7 @@ function loadNavigationHarness({
   vm.runInNewContext(source, sandbox, { filename: mainPath });
   const api = module.exports.testApi;
   Object.assign(api, module.exports.panelTestApi);
+  api.quitStarted = module.exports.quitStarted;
   api.windows.set(win, {
     origin: new URL(serverUrl).origin,
     serverUrl,
@@ -842,7 +888,9 @@ describe("Arca extend IPC", () => {
         arcaPreviewRecovery: true,
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
+        sshLocalhostPreview: true,
         floatingComposer: true,
+        floatingComposerShortcut: true,
       },
     );
     assert.deepEqual(await extend(event, "overnight"), { ok: true, shutdownAt: null });
@@ -3436,6 +3484,55 @@ describe("navigation fallback wiring (src/main.js)", () => {
   });
 });
 
+describe("a page objecting to leaving (src/main.js)", () => {
+  for (const [button, choice, left] of [
+    ["Leave", 0, true],
+    ["Stay", 1, false],
+  ]) {
+    it(`asks the user, and ${left ? "leaves" : "stays"} on ${button}`, (t) => {
+      const harness = loadNavigationHarness({ registerFallbacks: false });
+      t.after(harness.cleanup);
+      const asked = [];
+      harness.electron.dialog.showMessageBoxSync = (parent, options) => {
+        // Spread: main's arrays are from its own context.
+        asked.push({ parent, buttons: [...options.buttons], detail: options.detail });
+        return choice;
+      };
+      harness.api.createWindow("https://host.example/ml/omnigents");
+      let prevented = false;
+      harness.webContents.emitWith("will-prevent-unload", {
+        preventDefault: () => (prevented = true),
+      });
+      assert.deepEqual(asked, [
+        {
+          parent: harness.win,
+          buttons: ["Leave", "Stay"],
+          detail: "Changes you made may not be saved.",
+        },
+      ]);
+      assert.equal(prevented, left, "preventDefault lets the unload go ahead");
+    });
+  }
+
+  it("leaves without asking once the app is quitting, its cleanup already under way", (t) => {
+    const harness = loadNavigationHarness({ registerFallbacks: false });
+    t.after(harness.cleanup);
+    let asked = 0;
+    harness.electron.dialog.showMessageBoxSync = () => {
+      asked += 1;
+      return 1;
+    };
+    harness.api.createWindow("https://host.example/ml/omnigents");
+    harness.api.quitStarted();
+    let prevented = false;
+    harness.webContents.emitWith("will-prevent-unload", {
+      preventDefault: () => (prevented = true),
+    });
+    assert.equal(asked, 0);
+    assert.equal(prevented, true);
+  });
+});
+
 describe("browser view detach on main-frame navigation (src/main.js)", () => {
   it("detaches the embedded browser view when the shell commits a new document", () => {
     // Regression: the session-expiry watcher reloads the window onto the
@@ -3496,7 +3593,7 @@ describe("window-open policy wiring (src/main.js)", () => {
   it("routes setWindowOpenHandler decisions through decideWindowOpen as live code", () => {
     assert.match(
       liveCode,
-      /setWindowOpenHandler\(\s*\(\{\s*url,\s*disposition,\s*features\s*\}\)\s*=>\s*\{[\s\S]{0,500}decideWindowOpen\(/,
+      /setWindowOpenHandler\(\s*\(\{\s*url,\s*disposition,\s*features(?:,\s*frameName)?\s*\}\)\s*=>\s*\{[\s\S]{0,500}decideWindowOpen\(/,
       [
         "src/main.js no longer passes window.open through decideWindowOpen. Either every",
         "popup is denied (OAuth sign-in breaks) or popups open without the",
@@ -3714,6 +3811,36 @@ describe("CLI deep-link handoff", () => {
   }
 });
 
+/** Lets the harness window act as the panel the shell builds; returns its visible state. */
+function asPanelWindow(h) {
+  const panel = { visible: false, destroyed: false };
+  Object.assign(h.win, {
+    setAlwaysOnTop() {},
+    setVisibleOnAllWorkspaces() {},
+    setBounds() {},
+    getBounds: () => ({ x: 0, y: 0, width: 620, height: 360 }),
+    setOpacity() {},
+    moveTop() {},
+    showInactive: () => (panel.visible = true),
+    isVisible: () => panel.visible,
+    hide: () => (panel.visible = false),
+    isDestroyed: () => panel.destroyed,
+    destroy() {
+      panel.destroyed = true;
+      h.emitWindow("closed");
+    },
+  });
+  Object.assign(h.webContents, { isCrashed: () => false, focus() {}, isDestroyed: () => false });
+  const display = { id: 1, workArea: { x: 0, y: 0, width: 1440, height: 900 } };
+  Object.assign(h.electron.screen, {
+    getAllDisplays: () => [display],
+    getCursorScreenPoint: () => ({ x: 10, y: 10 }),
+    getDisplayNearestPoint: () => display,
+  });
+  h.electron.systemPreferences.getAnimationSettings = () => ({ prefersReducedMotion: true });
+  return panel;
+}
+
 describe("floating panel wiring", () => {
   const chord = "CommandOrControl+Shift+Space";
   const serverUrl = "https://host.example/ml/omnigents";
@@ -3784,6 +3911,7 @@ describe("floating panel wiring", () => {
     assert.equal(h.calls.globalShortcuts, undefined);
     const event = { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } };
     assert.equal(h.ipc.get("omnigent:get-desktop-features")(event).floatingComposer, false);
+    assert.equal(h.ipc.get("omnigent:get-desktop-features")(event).floatingComposerShortcut, false);
   });
 
   it("Find does nothing while a panel has focus, instead of searching the window behind", (t) => {
@@ -3815,35 +3943,47 @@ describe("floating panel wiring", () => {
   });
 
   /** Turns the harness window into its server's panel, opened as ⇧⌘Space would. */
-  function openPanel(h) {
-    const panel = { visible: false, destroyed: false };
-    Object.assign(h.win, {
-      setAlwaysOnTop() {},
-      setVisibleOnAllWorkspaces() {},
-      setBounds() {},
-      getBounds: () => ({ x: 0, y: 0, width: 620, height: 360 }),
-      setOpacity() {},
-      moveTop() {},
-      showInactive: () => (panel.visible = true),
-      isVisible: () => panel.visible,
-      hide: () => (panel.visible = false),
-      isDestroyed: () => panel.destroyed,
-      destroy() {
-        panel.destroyed = true;
-        h.emitWindow("closed");
-      },
-    });
-    Object.assign(h.webContents, { isCrashed: () => false, focus() {} });
-    const display = { id: 1, workArea: { x: 0, y: 0, width: 1440, height: 900 } };
-    Object.assign(h.electron.screen, {
-      getAllDisplays: () => [display],
-      getCursorScreenPoint: () => ({ x: 10, y: 10 }),
-      getDisplayNearestPoint: () => display,
-    });
-    h.electron.systemPreferences.getAnimationSettings = () => ({ prefersReducedMotion: true });
+  function openPanel(h, { ready = true } = {}) {
+    const panel = asPanelWindow(h);
     h.api.floatingComposer().show(serverUrl);
+    // Its page has loaded and rendered the composer.
+    if (ready) h.api.floatingComposer().markReady(h.win);
     return panel;
   }
+
+  it("shows the panel once its own top document on its panel page says it's ready", (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const main = addMain(h);
+    const steals = [];
+    h.electron.app.focus = (options) => steals.push(options);
+    let shown = 0;
+    h.win.show = () => (shown += 1);
+    const panel = openPanel(h, { ready: false });
+    assert.equal(panel.visible, false, "its page is still loading");
+    const ready = (frame, { mainFrame = frame, sender = h.webContents } = {}) => {
+      sender.mainFrame = mainFrame;
+      h.ipc.get("omnigent:floating-composer:ready")({ sender, senderFrame: frame });
+    };
+    h.setUrl(`${serverUrl}/compose/floating`);
+    ready({ url: h.webContents.getURL() }, { mainFrame: { url: "top" } });
+    assert.equal(panel.visible, false, "a subframe can't speak for the panel");
+    ready({ url: main.url }, { sender: main.webContents });
+    assert.equal(panel.visible, false, "nor can a main window");
+    ready({ url: "https://evil.example/compose/floating" });
+    assert.equal(panel.visible, false, "nor a page from another origin");
+    h.setUrl(`${serverUrl}/`);
+    ready({ url: h.webContents.getURL() });
+    assert.equal(panel.visible, false, "nor a page that left the panel route");
+    h.setUrl(`${serverUrl}/compose/floating`);
+    ready({ url: h.webContents.getURL() });
+    assert.equal(panel.visible, true);
+    // It came on screen without activating the app or raising the main window.
+    assert.equal(shown, 0, "show() orders a window front with the app");
+    assert.deepEqual(steals, []);
+    assert.equal(main.focused, 0);
+  });
 
   /** A main window of the panel's server, beside it, whose page is at `url`. */
   function addMain(h, { url = `${serverUrl}/`, minimized = false } = {}) {
@@ -3873,27 +4013,141 @@ describe("floating panel wiring", () => {
     sender: h.webContents,
     senderFrame: { url: h.webContents.getURL() },
   });
+  /**
+   * The harness window as the panel, beside a separate main window of its server that announces
+   * support, on mocked timers.
+   */
+  function preloadScenario(t, { platform = "darwin" } = {}) {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const panel = asPanelWindow(h);
+    h.api.windows.get(h.win).role = "panel";
+    h.setUrl(`${serverUrl}/compose/floating`);
+    const main = addMain(h);
+    const announceFromMain = () => {
+      const frame = { url: main.url };
+      main.webContents.mainFrame = frame;
+      h.ipc.get("omnigent:floating-composer:announce")(
+        { sender: main.webContents, senderFrame: frame },
+        1,
+      );
+    };
+    const built = () => (h.calls.windowOptions ?? []).filter((o) => o.type === "panel").length;
+    return { h, panel, main, announceFromMain, built };
+  }
+
+  it("builds the panel hidden once the app is quiet after a page can render it", (t) => {
+    const { panel, announceFromMain, built } = preloadScenario(t);
+    announceFromMain();
+    t.mock.timers.tick(2999);
+    assert.equal(built(), 0);
+    t.mock.timers.tick(1);
+    assert.equal(built(), 1);
+    assert.equal(panel.visible, false, "built out of sight");
+  });
+
+  it("builds nothing ahead while the user has turned the shortcut off", (t) => {
+    const { h, announceFromMain, built } = preloadScenario(t);
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({ floating_composer_shortcut: { enabled: false, accelerator: chord } }),
+    );
+    announceFromMain();
+    t.mock.timers.tick(3000);
+    assert.equal(built(), 0);
+  });
+
+  it("builds nothing ahead off macOS", (t) => {
+    const { announceFromMain, built } = preloadScenario(t, { platform: "linux" });
+    announceFromMain();
+    t.mock.timers.tick(3000);
+    assert.equal(built(), 0);
+  });
+
+  it("an early ⇧⌘Space builds the panel itself and calls off the build ahead", (t) => {
+    const { h, announceFromMain, built } = preloadScenario(t);
+    announceFromMain();
+    t.mock.timers.tick(1000);
+    h.calls.presses.get(chord)();
+    assert.equal(built(), 1);
+    // A build ahead still pending would build the panel again once this one is gone.
+    h.api.floatingComposer().close(h.win);
+    t.mock.timers.tick(3000);
+    assert.equal(built(), 1);
+  });
+
+  it("a crashed panel built ahead isn't rebuilt until ⇧⌘Space", (t) => {
+    const { h, announceFromMain, built } = preloadScenario(t);
+    announceFromMain();
+    t.mock.timers.tick(3000);
+    assert.equal(built(), 1);
+    h.api.floatingComposer().markReady(h.win);
+    h.webContents.isCrashed = () => true;
+    h.webContents.emitWith("render-process-gone", {}, { reason: "crashed" });
+    t.mock.timers.tick(10_000);
+    assert.equal(built(), 1);
+    h.calls.presses.get(chord)();
+    assert.equal(built(), 2);
+  });
+
+  it("lets a panel built ahead go 3 s after its server's latest revoke, unless it announces again", (t) => {
+    const { panel, main, announceFromMain, built } = preloadScenario(t);
+    announceFromMain();
+    t.mock.timers.tick(3000);
+    assert.equal(built(), 1);
+    // A reload: the old document goes, the new one announces a second later.
+    main.webContents.emit("did-navigate");
+    t.mock.timers.tick(1000);
+    announceFromMain();
+    t.mock.timers.tick(3000);
+    assert.equal(panel.destroyed, false, "the announcement called the release off");
+    // Another reload, then the page goes again before its first release was due.
+    main.webContents.emit("did-navigate");
+    t.mock.timers.tick(1000);
+    announceFromMain();
+    t.mock.timers.tick(500);
+    main.webContents.emit("did-navigate");
+    t.mock.timers.tick(2999);
+    assert.equal(panel.destroyed, false, "the wait restarts from the latest revoke");
+    t.mock.timers.tick(1);
+    assert.equal(panel.destroyed, true);
+  });
+
   const openFromPanel = async (h, routePath) => ({
     ...(await h.ipc.get("omnigent:floating-composer:open-in-main-window")(fromPanel(h), routePath)),
   });
 
-  for (const [routePath, comesForward] of [
-    ["/c/abc", false],
-    ["/settings/import", true],
-  ]) {
+  for (const routePath of ["/c/abc", "/settings/import"]) {
     it(`opens ${routePath} in its server's main window, then hides the panel`, async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
       const h = loadNavigationHarness({ platform: "darwin" });
       t.after(h.cleanup);
       h.api.registerIpc();
+      let hides = 0;
+      h.electron.app.hide = () => (hides += 1);
+      const steals = [];
+      h.electron.app.focus = (options) => steals.push(options);
+      // Opened over another app.
       const panel = openPanel(h);
       const main = addMain(h, { minimized: true });
       assert.equal(panel.visible, true);
       assert.deepEqual(await openFromPanel(h, routePath), { ok: true });
       assert.deepEqual(main.sent, [["omnigent:open-path", routePath]]);
-      // A linked page comes forward, restored; a launched session waits behind the app in front.
-      assert.equal(main.focused, comesForward ? 1 : 0);
-      assert.equal(main.restored, comesForward ? 1 : 0);
+      // What the panel launched or links to comes forward, restored, over the app in front.
+      assert.equal(main.focused, 1);
+      assert.equal(main.restored, 1);
+      assert.equal(steals.length, 1);
+      assert.equal(steals[0].steal, true);
       assert.equal(panel.visible, false);
+      // Putting the panel away now, at once or a tick later, hides nothing.
+      h.ipc.get("omnigent:floating-composer:dismiss")(fromPanel(h));
+      t.mock.timers.tick(0);
+      h.ipc.get("omnigent:floating-composer:dismiss")(fromPanel(h));
+      t.mock.timers.tick(0);
+      assert.equal(hides, 0);
+      assert.equal(main.focused, 1);
     });
   }
 
@@ -3975,14 +4229,59 @@ describe("floating panel wiring", () => {
     assert.equal(panel.visible, false);
   });
 
-  it("hides the panel when its page dismisses it", (t) => {
+  for (const platform of ["darwin", "linux"]) {
+    it(`on ${platform}, the close button puts away only the panel and raises nothing`, (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const h = loadNavigationHarness({ platform });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      const main = addMain(h);
+      let hides = 0;
+      h.electron.app.hide = () => (hides += 1);
+      const steals = [];
+      h.electron.app.focus = (options) => steals.push(options);
+      // Opened over another app.
+      const panel = openPanel(h);
+      h.ipc.get("omnigent:floating-composer:dismiss")(fromPanel(h));
+      t.mock.timers.tick(0);
+      assert.equal(panel.visible, false);
+      assert.equal(panel.destroyed, false, "the draft stays");
+      assert.equal(hides, 0, "Omnigent's other windows stay as they were");
+      assert.deepEqual(steals, []);
+      assert.equal(main.focused, 0);
+    });
+  }
+
+  it("⇧⌘Space while the panel is open goes back to it, never to raising a window", (t) => {
     const h = loadNavigationHarness({ platform: "darwin" });
     t.after(h.cleanup);
     h.api.registerIpc();
     const panel = openPanel(h);
-    h.ipc.get("omnigent:floating-composer:dismiss")(fromPanel(h));
-    assert.equal(panel.visible, false);
-    assert.equal(panel.destroyed, false);
+    // The most recent main window can't open the panel now (its page hasn't announced).
+    const main = addMain(h);
+    const steals = [];
+    h.electron.app.focus = (options) => steals.push(options);
+    h.api.openFloatingComposerFromShortcut();
+    assert.equal(panel.visible, true);
+    assert.equal(main.focused, 0);
+    assert.deepEqual(steals, []);
+  });
+
+  it("signing in brings a main window forward, never a panel", (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    const steals = [];
+    h.electron.app.focus = (options) => steals.push(options);
+    let shown = 0;
+    h.win.show = () => (shown += 1);
+    h.win.focus = () => {};
+    h.api.focusAfterBrowserSignIn(h.win);
+    assert.equal(shown, 1);
+    assert.equal(steals.length, 1);
+    h.api.windows.get(h.win).role = "panel";
+    h.api.focusAfterBrowserSignIn(h.win);
+    assert.equal(shown, 1);
+    assert.equal(steals.length, 1);
   });
 
   it("closes the panel when any main window of its server lands on its sign-in page", (t) => {
@@ -4376,9 +4675,12 @@ describe("HTTP error status fallback (src/main.js)", () => {
     assert.ok(h.calls.auth.every((call) => call[2].interactive === false));
   });
 
-  it("keeps the plain fallback for a Databricks 404 and other servers' 503", async (t) => {
+  it("keeps the plain fallback for a Databricks 404, a 403 without a session, and other servers' 503", async (t) => {
     const notFound = workspaceHarness(t, [20]);
     notFound.emit("did-navigate", page, 404, "Not Found");
+    // No renewable session is attached to this window, so there is nothing to check.
+    const forbidden = workspaceHarness(t, [20]);
+    forbidden.emit("did-navigate", page, 403, "Forbidden");
     const other = loadNavigationHarness();
     t.after(other.cleanup);
     other.api.setReconnectDelaysMs([20]);
@@ -4386,6 +4688,7 @@ describe("HTTP error status fallback (src/main.js)", () => {
     await wait(60);
     for (const [h, error] of [
       [notFound, "404 Not Found"],
+      [forbidden, "403 Forbidden"],
       [other, "503 Service Unavailable"],
     ]) {
       assert.equal(h.calls.loadFile.length, 1);
@@ -4835,6 +5138,7 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
   for (const [trigger, drop] of [
     ["the session cookie is removed", (_h, network) => network.removeCookie()],
     ["the workspace redirects to login", loginRedirect],
+    ["a reload is refused", (h) => h.emit("did-navigate", `${workspace}/c/456`, 403, "Forbidden")],
   ]) {
     it(`reconnects by itself when the VPN returns after ${trigger} off the VPN`, async (t) => {
       const { h, network } = await connected(t, Array(6).fill(40));
@@ -4867,6 +5171,42 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       assert.equal(h.calls.loadURL.length, 2);
       assert.ok(h.calls.auth.every((call) => call[2].interactive === false));
       assert.equal(network.browserSignIns, 0);
+    });
+  }
+
+  it("shows a reload's 403 on the setup page when the session still renews", async (t) => {
+    const { h, network } = await connected(t, [20]);
+    const sessionCreates = network.sessionCreates;
+    h.emit("did-navigate", `${workspace}/c/456`, 403, "Forbidden");
+    await until(() => h.calls.loadFile.length === 1, "the setup page");
+    assert.deepEqual(shown(h), { error: "403 Forbidden", url: workspace });
+    assert.equal(network.sessionCreates, sessionCreates + 1);
+    assert.deepEqual(h.overlay.shows, []);
+    await wait(60);
+    assert.equal(network.sessionCreates, sessionCreates + 1);
+    assert.equal(h.calls.loadURL.length, 1);
+    assert.equal(network.browserSignIns, 0);
+  });
+
+  for (const verdict of ["allow", "blocked", "forbidden"]) {
+    it(`leaves a newer page load alone when a reload's session check ends in ${verdict}`, async (t) => {
+      const { h, network } = await connected(t, [20]);
+      const sessionCreates = network.sessionCreates;
+      const checksBefore = network.sessionChecks.length;
+      network.verdict = verdict;
+      h.emit("did-navigate", `${workspace}/c/456`, 403, "Forbidden");
+      const newerPage = `${workspace}/c/789`;
+      h.setUrl(newerPage);
+      h.emit("did-navigate", newerPage, 200, "OK");
+      const loadsBefore = structuredClone(h.calls.loadURL);
+      await until(() => network.sessionCreates === sessionCreates + 1, "the session check");
+      assert.equal(network.sessionChecks.length, checksBefore + 1);
+      await network.sessionChecks.at(-1);
+      assert.deepEqual(h.calls.loadFile, []);
+      assert.deepEqual(h.calls.loadURL, loadsBefore);
+      assert.equal(h.webContents.getURL(), newerPage);
+      assert.deepEqual(h.overlay.shows, []);
+      assert.equal(h.api.windows.get(h.win).origin, origin);
     });
   }
 
@@ -5096,7 +5436,9 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         arcaPreviewRecovery: true,
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
+        sshLocalhostPreview: true,
         floatingComposer: true,
+        floatingComposerShortcut: true,
       },
     );
   });
@@ -5289,6 +5631,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
 
   it("returns immediately and shares one consent prompt across agent retries", async (t) => {
     const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const resolvedOrigin = "https://accounts.cloud.databricks.com";
     const hostId = "a".repeat(32);
     let settleConsent;
     const consent = new Promise((resolve) => {
@@ -5296,18 +5639,38 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     });
     const h = loadNavigationHarness({
       serverUrl,
+      databricksMode: "browser",
+      ensureSession: async () => resolvedOrigin,
       internalFeatures: true,
       arcaPath: "/usr/local/bin/arca",
       arcaConsentResult: () => consent,
     });
     t.after(h.cleanup);
     h.api.registerIpc();
+    const resolvedUrl = await h.api.loadServerUrl(h.win, serverUrl);
+    assert.equal(resolvedUrl, `${resolvedOrigin}/omnigent`);
+    assert.notEqual(resolvedUrl, serverUrl);
     const deps = h.browserIpcDeps();
     const recover = deps.recoverAgentNavigationForEvent;
     const hint = deps.getAgentNavigationHintForEvent;
-    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+    const event = { sender: h.webContents, senderFrame: { url: resolvedUrl } };
+    let previewPrompts = 0;
+    h.electron.dialog.showMessageBox = async () => {
+      previewPrompts++;
+      return { response: 0 };
+    };
 
     assert.equal(await recover(event, "http://localhost:5173", hostId, hostId), false);
+    assert.equal(
+      await deps.requestPreviewHostForEvent(event, "http://localhost:5173", {
+        sourceHostId: hostId,
+        sourceSshTarget: "devbox",
+        sessionHostProtocol: 1,
+        sshPreviewProtocol: 1,
+      }),
+      false,
+    );
+    assert.equal(previewPrompts, 0, "pending reconnect consent must not start another prompt");
     assert.equal(h.calls.arcaConsentRuns.length, 1);
     assert.equal(h.calls.arcaConsentRuns[0].serverUrl, serverUrl);
     assert.equal(h.calls.arcaConsentRuns[0].options.reason, "preview-reconnect");
@@ -6326,6 +6689,144 @@ describe("find bar teardown (src/main.js)", () => {
   });
 });
 
+describe("find bar selection prefill (src/main.js)", () => {
+  function harness(t, selection) {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    h.webContents.isDestroyed = () => false;
+    h.webContents.stopFindInPage = () => {};
+    h.win.removeListener = () => {};
+    h.win.getContentBounds = () => ({ x: 0, y: 0, width: 1280, height: 860 });
+    const order = [];
+    h.webContents.executeJavaScriptInIsolatedWorld = async () => {
+      order.push("read-selection");
+      return selection.current;
+    };
+    const send = h.webContents.send;
+    h.webContents.send = (channel, data) => {
+      order.push(channel);
+      send(channel, data);
+    };
+    return { h, order };
+  }
+  const prefills = (bar) =>
+    bar.webContents.sent.filter(({ channel }) => channel === "omnigent:find-prefill");
+  const settle = () =>
+    new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+
+  it("fills a new bar with the page's selection once it can receive it", async (t) => {
+    const { h, order } = harness(t, { current: " migration\n" });
+    h.api.openFindBar(h.win);
+    assert.deepEqual(order, ["read-selection", "omnigent:find-opened"]);
+    const bar = h.findBars[0];
+    await settle();
+    assert.deepEqual(prefills(bar), []);
+    bar.emit("ready-to-show");
+    await settle();
+    assert.deepEqual(
+      prefills(bar).map(({ data }) => data.text),
+      ["migration"],
+    );
+  });
+
+  it("leaves a new bar empty without a usable selection", async (t) => {
+    const { h } = harness(t, { current: "" });
+    h.api.openFindBar(h.win);
+    const bar = h.findBars[0];
+    bar.emit("ready-to-show");
+    await settle();
+    assert.deepEqual(prefills(bar), []);
+  });
+
+  it("replaces an open bar's query with a new page selection", async (t) => {
+    const selection = { current: "migration" };
+    const { h } = harness(t, selection);
+    h.api.openFindBar(h.win);
+    const bar = h.findBars[0];
+    bar.emit("ready-to-show");
+    await settle();
+    selection.current = "rollback";
+    h.api.openFindBar(h.win);
+    await settle();
+    assert.equal(h.findBars.length, 1);
+    assert.deepEqual(
+      prefills(bar).map(({ data }) => data.text),
+      ["migration", "rollback"],
+    );
+  });
+
+  it("keeps the query when Cmd/Ctrl+F is pressed inside the bar", async (t) => {
+    const selection = { current: "migration" };
+    const { h, order } = harness(t, selection);
+    h.api.openFindBar(h.win);
+    const bar = h.findBars[0];
+    bar.emit("ready-to-show");
+    await settle();
+    // A slow page read from the chat is still pending when the user, now typing in
+    // the bar, presses Cmd/Ctrl+F there.
+    let finishRead;
+    selection.current = new Promise((resolve) => {
+      finishRead = resolve;
+    });
+    h.api.openFindBar(h.win);
+    bar.focused = true;
+    order.length = 0;
+    h.api.openFindBar(h.win);
+    finishRead("rollback");
+    await settle();
+    assert.deepEqual(order, ["omnigent:find-opened"]);
+    assert.ok(bar.webContents.sent.some(({ channel }) => channel === "omnigent:find-activate"));
+    assert.deepEqual(
+      prefills(bar).map(({ data }) => data.text),
+      ["migration"],
+    );
+  });
+
+  it("fills a bar that is still loading with the latest selection", async (t) => {
+    const selection = { current: "migration" };
+    const { h } = harness(t, selection);
+    h.api.openFindBar(h.win);
+    const bar = h.findBars[0];
+    selection.current = "rollback";
+    h.api.openFindBar(h.win);
+    await settle();
+    assert.deepEqual(prefills(bar), []);
+    bar.emit("ready-to-show");
+    await settle();
+    assert.deepEqual(
+      prefills(bar).map(({ data }) => data.text),
+      ["rollback"],
+    );
+  });
+
+  it("applies only the latest selection when Cmd/Ctrl+F is pressed twice", async (t) => {
+    const selection = { current: "migration" };
+    const { h } = harness(t, selection);
+    h.api.openFindBar(h.win);
+    const bar = h.findBars[0];
+    bar.emit("ready-to-show");
+    await settle();
+    let finishRead;
+    selection.current = new Promise((resolve) => {
+      finishRead = resolve;
+    });
+    h.api.openFindBar(h.win);
+    // The user clicks back into the chat to select another word.
+    bar.focused = false;
+    selection.current = "snapshot";
+    h.api.openFindBar(h.win);
+    await settle();
+    finishRead("rollback");
+    await settle();
+    assert.deepEqual(
+      prefills(bar).map(({ data }) => data.text),
+      ["migration", "snapshot"],
+    );
+  });
+});
+
 describe("server names from the manifest", () => {
   const server = "https://omni.example";
   const setupEvent = (h) => ({
@@ -6620,6 +7121,178 @@ describe("SSH connect IPC", () => {
   });
 });
 
+describe("localhost previews for hosts reached over SSH", () => {
+  const server = "https://host.example/ml/omnigents";
+  const hostId = "0123456789abcdef0123456789abcdef";
+  const preview = "http://127.0.0.1:8787/";
+
+  /** A window on `server` whose SSH connect reaches `hostId`, answering previews with `answer()`. */
+  function previewHarness(t, answer) {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      sshConnectResult: { ok: true, shownInConsole: true, identity: { hostId } },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.api.createBrowserRegistryForWindow(h.win);
+    const questions = [];
+    h.electron.dialog.showMessageBox = async (win, options) => {
+      assert.equal(win, h.win);
+      questions.push(options.message);
+      return { response: answer() };
+    };
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const deps = h.browserIpcDeps();
+    return {
+      h,
+      event,
+      deps,
+      questions,
+      context: () =>
+        deps.getAgentContextForEvent(event, {
+          sourceHostId: hostId,
+          sessionHostProtocol: 1,
+          sshPreviewProtocol: 1,
+        }),
+      eligible: h.browserRegistryDeps().allowsLocalhost,
+      connect: () => h.ipc.get("omnigent:ssh-connect")(event, "devbox"),
+    };
+  }
+
+  it("asks once about a host connected over SSH, then lets its sessions open localhost pages", async (t) => {
+    const { h, event, deps, questions, context, eligible, connect } = previewHarness(t, () => 1);
+    const request = (url, source = hostId, from = event) =>
+      deps.requestPreviewHostForEvent(from, url, {
+        sourceHostId: source,
+        sessionHostProtocol: 1,
+        sshPreviewProtocol: 1,
+      });
+    const elsewhere = { sender: h.webContents, senderFrame: { url: "https://elsewhere.example/" } };
+
+    assert.equal(await request(preview), false, "nothing is recorded for the host yet");
+    assert.equal((await connect()).ok, true);
+    assert.equal(eligible(context()), false);
+    assert.equal(await request("https://example.com/"), false);
+    assert.equal(await request(preview, "b".repeat(32)), false);
+    assert.equal(await request(preview, hostId, elsewhere), false);
+    assert.deepEqual(questions, []);
+
+    assert.equal(await request(preview), true);
+    assert.deepEqual(questions, ['Let sessions on "devbox" open localhost pages?']);
+    assert.equal(eligible(context()), true);
+    assert.equal(context().hostIsSshPreview, true);
+    assert.equal(context().hostIsThisMachine, false);
+    assert.equal(eligible({ ...context(), sourceHostId: "b".repeat(32) }), false);
+    assert.equal(eligible(deps.getAgentContextForEvent(event, { sourceHostId: hostId })), false);
+    assert.equal(
+      eligible(
+        deps.getAgentContextForEvent(event, { sourceHostId: hostId, sessionHostProtocol: 1 }),
+      ),
+      false,
+      "an older renderer cannot reuse another renderer's SSH preview grant",
+    );
+    assert.equal(await request(preview), false, "an allowed host needs no retry");
+    assert.equal(questions.length, 1);
+  });
+
+  it("keeps a verified preview destination separate from SSH file access", async (t) => {
+    const proofs = [];
+    let questions = 0;
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      sshPreviewVerification: async (...args) => {
+        proofs.push(args);
+        return true;
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.api.createBrowserRegistryForWindow(h.win);
+    const approve = async () => {
+      questions++;
+      return { response: 1 };
+    };
+    h.electron.dialog.showMessageBox = approve;
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const deps = h.browserIpcDeps();
+    const opts = {
+      sourceHostId: hostId,
+      sourceSshTarget: "devbox",
+      sessionHostProtocol: 1,
+      sshPreviewProtocol: 1,
+    };
+    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), true);
+    assert.deepEqual(proofs, [[server, hostId, "devbox"]]);
+    assert.equal(h.sshHosts.destination(server, hostId), null);
+    const savedProof = require("../src/sshHosts").createSshHostStore(() =>
+      path.join(path.dirname(h.settingsPath), "ssh-preview-hosts.json"),
+    );
+    assert.equal(savedProof.destination(server, hostId), "devbox");
+    const context = deps.getAgentContextForEvent(event, opts);
+    assert.equal(h.browserRegistryDeps().allowsLocalhost(context), true);
+    h.sshHosts.record(server, hostId, "devbox");
+    assert.equal(h.browserRegistryDeps().allowsLocalhost(context), true);
+    h.sshHosts.record(server, hostId, "replacement");
+    h.sshHosts.record(server, hostId, "devbox");
+    assert.equal(h.browserRegistryDeps().allowsLocalhost(context), false);
+
+    const consent = Promise.withResolvers();
+    h.electron.dialog.showMessageBox = () => {
+      questions++;
+      return consent.promise;
+    };
+    const pending = deps.requestPreviewHostForEvent(event, preview, opts);
+    await until(() => questions === 2, "fresh consent for the restored destination");
+    h.sshHosts.record(server, hostId, "replacement");
+    h.sshHosts.record(server, hostId, "devbox");
+    consent.resolve({ response: 1 });
+    assert.equal(await pending, false, "intermediate writes must invalidate pending consent too");
+    assert.equal(h.browserRegistryDeps().allowsLocalhost(context), false);
+
+    h.electron.dialog.showMessageBox = approve;
+    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), true);
+    assert.equal(questions, 3);
+    assert.equal(proofs.length, 1, "the file-access route is already proven");
+    h.sshHosts.record(server, hostId, "replacement");
+    assert.equal(h.browserRegistryDeps().allowsLocalhost(context), false);
+  });
+
+  it("keeps a declined host blocked until restart and tells the agent why", async (t) => {
+    const { event, deps, questions, context, eligible, connect } = previewHarness(t, () => 0);
+    assert.equal((await connect()).ok, true);
+    assert.equal(deps.getAgentNavigationHintForEvent(event, preview, hostId), null);
+
+    const opts = { sourceHostId: hostId, sessionHostProtocol: 1, sshPreviewProtocol: 1 };
+    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
+    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
+    assert.equal(questions.length, 1);
+    assert.equal(eligible(context()), false);
+    assert.match(
+      deps.getAgentNavigationHintForEvent(event, preview, hostId),
+      /"devbox" were declined/,
+    );
+    assert.equal(deps.getAgentNavigationHintForEvent(event, "https://example.com/", hostId), null);
+  });
+
+  it("does not ask an older renderer even for a recorded destination or supplied hint", async (t) => {
+    const { event, deps, questions, eligible, connect } = previewHarness(t, () => 1);
+    assert.equal((await connect()).ok, true);
+    await Promise.all(
+      [undefined, 0, 2].map(async (sshPreviewProtocol) => {
+        const opts = {
+          sourceHostId: hostId,
+          sessionHostProtocol: 1,
+          sshPreviewProtocol,
+          sourceSshTarget: "devbox",
+        };
+        assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
+        assert.equal(eligible(deps.getAgentContextForEvent(event, opts)), false);
+      }),
+    );
+    assert.deepEqual(questions, []);
+  });
+});
+
 describe("main-owned local host eligibility", () => {
   it("denies local eligibility when the window loses its pinned origin or is destroyed", (t) => {
     const h = loadNavigationHarness({ serverUrl: "https://server.example" });
@@ -6715,6 +7388,84 @@ describe("Close menu item", () => {
     assert.equal(sentCloses(), 1);
     assert.equal(closes, 1);
   });
+
+  it("names the page whose design tool's overlay holds the keys", (t) => {
+    // A fresh design tools module, whose overlays are views made here.
+    const Module = require("node:module");
+    const load = Module["_load"];
+    class WebContentsView {
+      constructor({ webContents }) {
+        this.webContents = webContents;
+      }
+      setBackgroundColor() {}
+      setBounds() {}
+      setVisible() {}
+    }
+    Module["_load"] = function (request, ...rest) {
+      if (request === "electron") return { WebContentsView };
+      return load.call(this, request, ...rest);
+    };
+    const designToolsPath = require.resolve("../src/designTools");
+    Reflect.deleteProperty(require.cache, designToolsPath);
+    t.after(() => {
+      Module["_load"] = load;
+      Reflect.deleteProperty(require.cache, designToolsPath);
+    });
+    const h = loadNavigationHarness({ serverUrl: server, savedServerUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.api.createWindow();
+    h.setUrl(server);
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    h.ipc.get("omnigent:set-desktop-command-state")(
+      { sender: h.webContents, senderFrame: { url: server } },
+      { commands: ["close"] },
+    );
+    h.api.buildMenu();
+    const page = Object.assign(new EventEmitter(), {
+      isFocused: () => false,
+      isDestroyed: () => false,
+      getZoomFactor: () => 1,
+    });
+    const entry = {
+      view: Object.assign(new EventEmitter(), { webContents: page, getBounds: () => null }),
+    };
+    h.api.windows.get(h.win).browserRegistry = {
+      activeConversationId: () => "view-1",
+      get: (id) => (id === "view-1" ? entry : undefined),
+      closeAll: () => {},
+    };
+    const tools = require("../src/designTools").sharedDesignTools();
+    const owner = Object.assign(new EventEmitter(), { isDestroyed: () => false });
+    const host = {
+      webContents: owner,
+      isDestroyed: () => false,
+      contentView: { children: [entry.view], addChildView: () => {}, removeChildView: () => {} },
+    };
+    const { frame, session } = tools.start("view-1", entry, {}, { send: () => {}, owner });
+    t.after(() => tools.stop(entry, session));
+    const overlay = Object.assign(new EventEmitter(), {
+      focusedNow: false,
+      isFocused: () => overlay.focusedNow,
+      isDestroyed: () => false,
+      focus: () => (overlay.focusedNow = true),
+      setWindowOpenHandler: () => {},
+      getZoomFactor: () => 1,
+      setZoomFactor: () => {},
+    });
+    tools
+      .windowOpen(host, { url: "about:blank", frameName: frame })
+      .createWindow({ webContents: overlay, webPreferences: {} });
+    const closeNames = () => {
+      h.calls.progress.length = 0;
+      h.calls.appMenu.getMenuItemById("close").click();
+      return h.calls.progress.find((message) => message.channel === "omnigent:desktop-command")
+        ?.data.browserViewId;
+    };
+    assert.equal(closeNames(), "view-1");
+    overlay.focusedNow = false;
+    assert.equal(closeNames(), null);
+  });
 });
 
 describe("New Window keeps its source's server (src/main.js)", () => {
@@ -6727,5 +7478,18 @@ describe("New Window keeps its source's server (src/main.js)", () => {
     h.api.buildMenu();
     h.calls.appMenu.getMenuItemById("new_window").click();
     assert.equal(h.api.windows.get(h.win).serverUrl, "https://host.example/ml/omnigents");
+  });
+});
+
+describe("floating panel loading", () => {
+  it("shows no connection overlay over a panel, which loads out of sight", async (t) => {
+    const h = loadNavigationHarness({ platform: "darwin", loadServer: async () => {} });
+    t.after(h.cleanup);
+    h.api.windows.get(h.win).role = "panel";
+    await h.api.loadServerUrl(h.win, "https://example.com/");
+    assert.equal(
+      (h.calls.loading ?? []).some((call) => call.action === "show"),
+      false,
+    );
   });
 });

@@ -126,6 +126,14 @@ describe("scope merge", () => {
     ).toEqual(["s", "m"]);
     expect(mergeScopeRows([row("m", 20)], [], false, false).rows).toHaveLength(1);
   });
+  it("keeps every loaded row for per-scope sections beside the complete prefix", () => {
+    const mine = [row("m1", 100), row("m2", 80)];
+    const merged = mergeScopeRows(mine, [row("s-old", 10), row("s-new", 90)], true, false);
+    // Mine has more pages, so the mixed prefix stops at its tail...
+    expect(merged.rows.map((r) => r.id)).toEqual(["m1", "s-new", "m2"]);
+    // ...while each scope's own loaded rows are complete for its section.
+    expect(merged.loaded.map((r) => r.id)).toEqual(["m1", "s-new", "m2", "s-old"]);
+  });
   it("deduplicates overlapping sources and picks the newest row", () => {
     expect(dedupeSessionRows([row("same", 10), row("same", 20)])).toEqual([row("same", 20)]);
   });

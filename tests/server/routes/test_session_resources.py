@@ -2780,7 +2780,7 @@ async def test_copy_refuses_a_workspace_file_for_a_harness_without_a_workspace(
     )
 
     assert resp.status_code == 415, resp.text
-    assert "Claude Code or Codex" in resp.text
+    assert "local file attachments" in resp.text
     listed = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf", limit=10)
     assert listed.data == []
 
@@ -11657,6 +11657,7 @@ async def test_native_send_rechecks_runtime_after_upload(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("filename", ["trace.gz", "clip.mp4"])
 @pytest.mark.parametrize(
     ("retained_history", "host_has_attachments", "status"),
     [(False, True, 409), (True, True, 202), (True, False, 409)],
@@ -11665,11 +11666,12 @@ async def test_native_send_requires_delivery_support_for_new_types(
     file_client: httpx.AsyncClient,
     file_app: FastAPI,
     file_conv_store: _ConversationStore,
+    filename: str,
     retained_history: bool,
     host_has_attachments: bool,
     status: int,
 ) -> None:
-    """Only a file sent now needs the runtime to deliver types beyond the defaults.
+    """Only a file sent now needs the runtime to deliver types beyond the legacy extensions.
 
     A recorded file in retained history still needs filesystem attachment support.
     """
@@ -11683,12 +11685,13 @@ async def test_native_send_requires_delivery_support_for_new_types(
     runner = _FakeRunnerClient(payload={})
     set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
     set_runner_client(runner)  # type: ignore[arg-type]
-    file_app.state.filesystem_attachment_policy = lambda: FilesystemAttachmentPolicy(
-        all_types=True
-    )
+    if filename.endswith(".gz"):
+        file_app.state.filesystem_attachment_policy = lambda: FilesystemAttachmentPolicy(
+            all_types=True
+        )
     upload = await file_client.post(
         f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("trace.gz", b"\x1f\x8b", "application/gzip")},
+        files={"file": (filename, b"data", "application/octet-stream")},
     )
     assert upload.status_code == 201, upload.text
     content = [{"type": "input_file", "file_id": upload.json()["id"]}]

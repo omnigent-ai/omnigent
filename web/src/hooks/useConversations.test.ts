@@ -33,6 +33,7 @@ import {
   useProjectSessions,
   useRenameProject,
   useUpdateProjectConfig,
+  useSyncMutedProjects,
   useMoveToProject,
   useMoveToNest,
   withMoveTombstone,
@@ -52,7 +53,12 @@ import {
   type PinnedConversationsResult,
 } from "./useConversations";
 import { PINNED_LABEL_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
-import { isConversationMuted, MUTED_LABEL_KEY } from "@/lib/sessionMute";
+import { isConversationMuted, MUTE_REINDEX_GRACE_MS, MUTED_LABEL_KEY } from "@/lib/sessionMute";
+import {
+  isExplicitlyUnread,
+  markConversationUnread,
+  resetReadStateForTests,
+} from "./useUnseenConversations";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
 import { useScopeCache } from "./useScopeCache";
@@ -2864,17 +2870,79 @@ describe("useUpdateProjectConfig cache seeding", () => {
     fetchMock
       .mockResolvedValueOnce(mockResponse({ id: "p_new", name: "Work" })) // apiCreateProject
       .mockResolvedValueOnce(
-        mockResponse({ id: "p_new", name: "Work", config: { agent_id: "ag_x" } }),
+        mockResponse({ id: "p_new", name: "Work", config: { agent_id: "ag_x", muted: true } }),
       );
 
     const { result } = renderHook(() => useUpdateProjectConfig(), { wrapper });
-    result.current.mutate({ id: null, name: "Work", config: { agent_id: "ag_x" } });
+    result.current.mutate({ id: null, name: "Work", config: { agent_id: "ag_x", muted: true } });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     // The config cache holds the fresh value keyed by the NEW id.
-    expect(queryClient.getQueryData(["project-config", "p_new"])).toEqual({ agent_id: "ag_x" });
-    // The projects list now resolves "Work" → the promoted first-class id.
-    expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_new", name: "Work" }]);
+    expect(queryClient.getQueryData(["project-config", "p_new"])).toEqual({
+      agent_id: "ag_x",
+      muted: true,
+    });
+    // The projects list now resolves "Work" → the promoted first-class id, muted.
+    expect(queryClient.getQueryData(["projects"])).toEqual([
+      { id: "p_new", name: "Work", muted: true },
+    ]);
+  });
+});
+
+describe("useSyncMutedProjects", () => {
+  it("mirrors the viewer's muted projects into the mute store as the projects query changes", async () => {
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("me");
+    onTestFinished(() => viewer.mockRestore());
+    let reply: unknown = [
+      { id: "p_factory", name: "Factory", muted: true },
+      { id: "p_other", name: "Other", muted: false },
+    ];
+    fetchMock.mockImplementation(async (url: string) =>
+      url === "/v1/sessions/projects"
+        ? mockResponse(reply)
+        : mockResponse({}, { ok: false, status: 404 }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useSyncMutedProjects(), { wrapper });
+
+    const mine = { id: "a", labels: {}, project_id: "p_factory", owner: "me" };
+    await waitFor(() => expect(isConversationMuted(mine)).toBe(true));
+    // Only the viewer's own sessions are filed in their projects.
+    expect(isConversationMuted({ ...mine, owner: "alice" })).toBe(false);
+    expect(isConversationMuted({ ...mine, project_id: "p_other" })).toBe(false);
+
+    // An unmute saved elsewhere reaches the store on the next projects read.
+    reply = [{ id: "p_factory", name: "Factory", muted: false }];
+    await act(() => queryClient.refetchQueries({ queryKey: ["projects"] }));
+    await waitFor(() => expect(isConversationMuted(mine)).toBe(false));
+  });
+
+  it("keeps the last list when the projects reply isn't one, instead of throwing at the app root", async () => {
+    let reply: unknown = [{ id: "p_factory", name: "Factory", muted: true }];
+    fetchMock.mockImplementation(async (url: string) =>
+      url === "/v1/sessions/projects"
+        ? mockResponse(reply)
+        : mockResponse({}, { ok: false, status: 404 }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(
+      () => {
+        useSyncMutedProjects();
+        return useProjects().data;
+      },
+      { wrapper },
+    );
+    const filed = { id: "a", labels: {}, project_id: "p_factory" };
+    await waitFor(() => expect(isConversationMuted(filed)).toBe(true));
+
+    reply = { error: "unexpected" };
+    await act(() => queryClient.refetchQueries({ queryKey: ["projects"] }));
+    await waitFor(() => expect(result.current).toEqual({ error: "unexpected" }));
+    expect(isConversationMuted(filed)).toBe(true);
   });
 });
 
@@ -3904,6 +3972,11 @@ describe("useArchiveConversation", () => {
       expect(d.pages[0].data[0].archived).toBe(true);
     });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    // The confirmed timestamp lands without a push frame, so recency sorts see the archive.
+    const settled = queryClient.getQueryData(["conversations", "", true]) as {
+      pages: { data: { updated_at: number }[] }[];
+    };
+    expect(settled.pages[0].data[0].updated_at).toBe(10);
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_a");
@@ -4722,6 +4795,11 @@ describe("mute writes", () => {
           labels: muted ? { keep: "me" } : { keep: "me", [MUTED_LABEL_KEY]: "1" },
         }),
       ]);
+      // Saving mute must leave the viewer's read state alone.
+      fetchMock.mockResolvedValue(mockResponse({}));
+      markConversationUnread("conv_m", 100);
+      onTestFinished(resetReadStateForTests);
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
       let resolvePatch!: (response: Response) => void;
       let resolveList!: (response: Response) => void;
       fetchMock.mockImplementation(
@@ -4754,12 +4832,15 @@ describe("mute writes", () => {
       let list = readStarts === "before" ? startList() : undefined;
       act(() => result.current.mutate({ id: "conv_m", muted }));
       await waitFor(() => expect(resolvePatch).toBeDefined());
+      expect(cachedRow(queryClient, "conv_m").updated_at).toBe(100);
       list ??= startList();
       await waitFor(() => expect(resolveList).toBeDefined());
       await act(async () => {
         resolvePatch(mockResponse({ labels: muted ? { [MUTED_LABEL_KEY]: "1" } : {} }));
       });
       await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(cachedRow(queryClient, "conv_m").updated_at).toBe(100);
+      expect(isExplicitlyUnread("conv_m")).toBe(true);
       // The read predates the save, so its labels are stale when it lands.
       await act(async () => {
         resolveList(mockResponse(stale.pages[0]));
@@ -4775,7 +4856,17 @@ describe("mute writes", () => {
       });
       expect(isConversationMuted(cachedRow(queryClient, "conv_m"))).toBe(muted);
 
-      // A read started after the save reports another device's later change.
+      // Right after the save, a lagging index still reports the old label.
+      fetchMock.mockResolvedValueOnce(mockResponse(stale.pages[0]));
+      await act(async () => {
+        await startList();
+      });
+      expect(isConversationMuted(cachedRow(queryClient, "conv_m"))).toBe(muted);
+
+      // Once the reindex window passes, a read reports another device's later change.
+      const later = performance.now() + MUTE_REINDEX_GRACE_MS;
+      const clock = vi.spyOn(performance, "now").mockReturnValue(later);
+      onTestFinished(() => clock.mockRestore());
       fetchMock.mockResolvedValueOnce(
         mockResponse(
           infinitePage([
@@ -4876,13 +4967,6 @@ describe("mute writes", () => {
         conversation({ id: "conv_other", labels: {} }),
       ]),
     );
-    // Cancellation must not roll back another session's pending preference.
-    void queryClient
-      .fetchQuery({
-        queryKey: ["conversations", "", false],
-        queryFn: () => new Promise<ConversationsInfiniteData>(() => {}),
-      })
-      .catch(() => {});
     onTestFinished(() => queryClient.clear());
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);

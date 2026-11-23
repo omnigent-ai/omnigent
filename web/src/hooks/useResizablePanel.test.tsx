@@ -1,5 +1,5 @@
 import { act, renderHook } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readPanelSizePreference } from "@/lib/panelSizePreferences";
 import { resetSharedWidthStoreForTesting, useResizablePanel } from "./useResizablePanel";
 
@@ -17,6 +17,23 @@ afterEach(() => {
   localStorage.clear();
   resetSharedWidthStoreForTesting();
   setInnerWidth(originalInnerWidth);
+  vi.unstubAllGlobals();
+});
+
+describe("useResizablePanel layout", () => {
+  it.each([
+    ["a browser", false, false],
+    ["the desktop app", true, true],
+  ])("sizes the panel inline below md only in %s", (_name, desktopApp, inline) => {
+    setInnerWidth(900);
+    if (desktopApp) vi.stubGlobal("omnigentDesktop", { kind: "electron" });
+
+    const { result } = renderHook(() => useResizablePanel(true));
+
+    expect(result.current.isDesktop).toBe(inline);
+    // 50vw of 900px; the mobile layout leaves the width to its drawer classes.
+    expect(result.current.panelWidth).toBe(inline ? 450 : undefined);
+  });
 });
 
 describe("useResizablePanel persistence", () => {

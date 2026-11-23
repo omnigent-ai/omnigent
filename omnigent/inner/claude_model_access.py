@@ -19,8 +19,8 @@ from collections.abc import Awaitable, Callable, Collection, Mapping, MutableMap
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TypeVar, cast
-from urllib.parse import urlsplit
+from typing import Literal, TypeVar, cast
+from urllib.parse import SplitResult, urlsplit
 
 from omnigent.databricks_ai_gateway import (
     CLAUDE_CODE_AGENT,
@@ -57,7 +57,7 @@ from .model_signing import (
     _validate_json_body,
     _validate_secret_value,
 )
-from .sandbox import SandboxPolicy, protect_credential_source
+from .sandbox import HarnessSandboxValidationError, SandboxPolicy, protect_credential_source
 
 HELPER_ENV = "OMNIGENT_CLAUDE_API_KEY_HELPER"
 _SECRET_ENV = frozenset(
@@ -247,6 +247,36 @@ class ClaudeAuthRequired(ProviderAuthRequired):
         super().__init__("Claude model authentication is unavailable; sign in again and retry.")
 
 
+class ClaudeCredentialConfigurationError(ProviderAuthRequired):
+    """Fixed guidance for an unsupported credential configuration."""
+
+    title = "Claude credential configuration required"
+    cause = "A user settings apiKeyHelper cannot fall back to saved OAuth in a sandbox."
+
+    def __init__(
+        self,
+        reason: Literal["settings_helper", "renewable_helper", "endpoint"] = "settings_helper",
+    ) -> None:
+        message = {
+            "settings_helper": (
+                "Sandboxed Claude cannot use a user settings apiKeyHelper with OAuth fallback; "
+                "configure a supported provider credential, such as ANTHROPIC_AUTH_TOKEN or "
+                "ANTHROPIC_API_KEY, then retry."
+            ),
+            "renewable_helper": (
+                "Sandboxed Claude cannot execute a renewable shell auth helper in the host; "
+                "use a provider API key or a parent-owned credential source and retry."
+            ),
+            "endpoint": (
+                "Sandboxed Claude requires an exact HTTPS model endpoint on port 443. "
+                "Correct the provider endpoint and retry."
+            ),
+        }[reason]
+        if reason != "settings_helper":
+            self.cause = message
+        super().__init__(message)
+
+
 def validate_claude_sandbox_backend(policy: SandboxPolicy) -> None:
     """Require an active backend that enforces filesystem and network isolation."""
     if not policy.active:
@@ -260,6 +290,29 @@ def validate_claude_sandbox_backend(policy: SandboxPolicy) -> None:
             f"sandbox backend {policy.backend_type!r} is unsupported. "
             "Use linux_bwrap or darwin_seatbelt."
         )
+
+
+def _validated_model_endpoint(base_url: str) -> SplitResult:
+    try:
+        parsed = urlsplit(base_url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ClaudeCredentialConfigurationError("endpoint") from exc
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or not is_dns_safe_host(parsed.hostname)
+        or port not in (None, 443)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or any(c in parsed.path for c in "%?#\\")
+        or any(part in (".", "..") for part in parsed.path.split("/"))
+        or any(ord(c) < 0x21 or ord(c) > 0x7E for c in base_url)
+    ):
+        raise ClaudeCredentialConfigurationError("endpoint")
+    return parsed
 
 
 class _CredentialResolver:
@@ -325,21 +378,7 @@ class ClaudeModelAccess:
             value = getattr(self, name)
             if value is not None and (not math.isfinite(value) or value <= 0):
                 raise ValueError(f"{name} must be a positive finite number or None")
-        parsed = urlsplit(self.base_url)
-        if (
-            parsed.scheme != "https"
-            or not parsed.hostname
-            or not is_dns_safe_host(parsed.hostname)
-            or parsed.port not in (None, 443)
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-            or any(c in parsed.path for c in "%?#\\")
-            or any(part in (".", "..") for part in parsed.path.split("/"))
-            or any(ord(c) < 0x21 or ord(c) > 0x7E for c in self.base_url)
-        ):
-            raise ValueError("sandboxed Claude requires an exact HTTPS model endpoint on port 443")
+        _validated_model_endpoint(self.base_url)
         if self.auth_header not in ("authorization", "x-api-key"):
             raise ValueError("unsupported Claude credential type")
         resolver = self.credential
@@ -866,8 +905,12 @@ def resolve_claude_model_access(
     """Resolve credentials in the trusted parent, before starting any worker."""
     for flag in _ALTERNATE_TRANSPORT_FLAGS:
         if env.get(flag) not in (None, "", "0", "false"):
-            raise ValueError("sandboxed Claude model relay requires an Anthropic-compatible API")
+            raise HarnessSandboxValidationError(
+                "sandboxed Claude model relay requires an Anthropic-compatible API",
+                reason="provider_transport",
+            )
     base_url = env.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
+    endpoint = _validated_model_endpoint(base_url)
     config_dir = Path(env.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
     # Claude resolves relative config paths from its cwd without expanding '~'.
     config_dir = Path(os.path.abspath((cwd or Path.cwd()) / config_dir))
@@ -892,14 +935,13 @@ def resolve_claude_model_access(
     helper = env.get(HELPER_ENV)
     if helper:
         # Static keys generated by the provider layer require no shell execution.
-        words = shlex.split(helper)
+        try:
+            words = shlex.split(helper)
+        except ValueError as exc:
+            raise ClaudeCredentialConfigurationError("renewable_helper") from exc
         if len(words) == 3 and words[:2] == ["printf", "%s"]:
             token = words[2]
-            header = (
-                "x-api-key"
-                if urlsplit(base_url).hostname == "api.anthropic.com"
-                else "authorization"
-            )
+            header = "x-api-key" if endpoint.hostname == "api.anthropic.com" else "authorization"
             return ClaudeModelAccess(
                 base_url,
                 header,
@@ -938,10 +980,7 @@ def resolve_claude_model_access(
                 auth_executable=executable,
                 source_env_names=source_env_names,
             )
-        raise ValueError(
-            "sandboxed Claude cannot execute a renewable shell auth helper in the host; "
-            "use a provider API key or a parent-owned credential source"
-        )
+        raise ClaudeCredentialConfigurationError("renewable_helper")
     for key, header, oauth in (
         ("ANTHROPIC_AUTH_TOKEN", "authorization", False),
         ("CLAUDE_CODE_OAUTH_TOKEN", "authorization", True),
@@ -960,10 +999,7 @@ def resolve_claude_model_access(
             )
 
     if user_settings_has_api_key_helper:
-        raise ValueError(
-            "sandboxed Claude cannot use a user settings apiKeyHelper with OAuth fallback; "
-            "configure a supported provider credential"
-        )
+        raise ClaudeCredentialConfigurationError()
 
     credential_path = config_dir / ".credentials.json"
     canonical_credential_path = credential_path.resolve()

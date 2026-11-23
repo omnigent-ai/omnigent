@@ -56,6 +56,7 @@ from omnigent.server.scheduled.fire import (
     BUSY_QUIET_SECONDS,
     BUSY_RECHECK_SECONDS,
     BUSY_SKIP_MAX_SECONDS,
+    CONTEXT_FULL_ERROR_CODE,
     FireDeps,
     build_busy_until,
     build_on_fire,
@@ -107,6 +108,7 @@ class _FakeConversation:
     parent_conversation_id: str | None = None
     root_conversation_id: str = ""
     terminal_launch_args: list[str] | None = None
+    title: str | None = None
 
     def __post_init__(self) -> None:
         self.root_conversation_id = self.root_conversation_id or self.id
@@ -474,6 +476,9 @@ class FakePermissionStore:
 
     def check_access(self, user_id: str | None, conversation_id: str, required_level: int) -> bool:
         return conversation_id not in self.unowned
+
+    def is_admin(self, user_id: str) -> bool:
+        return False
 
     def grant(self, user_id: str, conversation_id: str, level: int) -> Any:
         self.grant_workspace_ids.append(current_workspace_id())
@@ -3262,7 +3267,7 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
         (_continued_session(agent_id="ag_other"), {}, "continued_session_incompatible"),
         (_continued_session(), {"base_branch": "HEAD"}, "continued_session_incompatible"),
         # A reused session keeps its own mode, so one switched to a mode that skips
-        # approval must not take prompts from a task that never selected such a mode.
+        # approval must not take prompts from a task that selected a mode asking for it.
         (
             _continued_session(
                 labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
@@ -3275,7 +3280,7 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
             _continued_session(
                 terminal_launch_args=["--dangerously-bypass-approvals-and-sandbox"]
             ),
-            {},
+            {"permission_mode": "auto"},
             "permission_mode_not_allowed",
         ),
         (
@@ -3403,12 +3408,25 @@ async def test_continue_never_replaces_an_unusable_session(
             ),
         ),
         ("full-access", _continued_session(labels={CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"})),
+        # A task without a mode, such as a reminder, wakes the session in its own mode.
+        (
+            None,
+            _continued_session(
+                labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
+            ),
+        ),
+        (
+            None,
+            _continued_session(
+                terminal_launch_args=["--dangerously-bypass-approvals-and-sandbox"]
+            ),
+        ),
     ],
 )
-async def test_continue_accepts_a_session_in_a_mode_the_task_selects(
-    task_mode: str, session: _FakeConversation
+async def test_continue_accepts_a_session_whose_mode_skips_approval(
+    task_mode: str | None, session: _FakeConversation
 ) -> None:
-    """A task that selects a mode skipping approval keeps sending into its session in one."""
+    """A task selecting no mode, or one skipping approval, keeps sending into such a session."""
     conv_store = _ExistingConversationStore(session)
     store = FakeScheduledTaskStore(rows={"task_1": _continuing_task(permission_mode=task_mode)})
 
@@ -3803,6 +3821,49 @@ async def test_continue_fails_when_the_owner_no_longer_owns_the_session() -> Non
     assert [(run["status"], run["error_code"]) for run in store.runs] == [
         ("failed", "continued_session_forbidden")
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_code", "error_message", "context_full"),
+    [
+        ("context_length_exceeded", "Context limit reached", True),
+        # A gateway's request-size rejection is shown to the owner as a full context.
+        (
+            "native_turn_error",
+            "API Error: 400 Request size exceeds the maximum allowed limit",
+            True,
+        ),
+        ("native_turn_error", "Not logged in", False),
+        # Cleared labels: the session's next turn started.
+        ("", "", False),
+    ],
+    ids=["overflow", "request-size", "other-error", "cleared"],
+)
+async def test_continue_sends_nothing_while_the_session_context_is_full(
+    error_code: str, error_message: str, context_full: bool
+) -> None:
+    """A session whose last turn overflowed its context window gets no further prompt."""
+    conv_store = _ExistingConversationStore(
+        _continued_session(
+            labels={
+                "omnigent.last_task_error_code": error_code,
+                "omnigent.last_task_error_message": error_message,
+            }
+        )
+    )
+    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    [run] = store.runs
+    if context_full:
+        assert launched == []
+        assert (run["status"], run["error_code"]) == ("failed", CONTEXT_FULL_ERROR_CODE)
+        assert "/compact" in run["error"]
+    else:
+        assert [conv.id for conv in launched] == ["conv_prev"]
+        assert run["status"] == "succeeded"
 
 
 def _running_run(fired_at: int) -> ScheduledTaskRun:
@@ -4604,16 +4665,17 @@ async def test_sdk_agent_default_mode_gates_the_fire(spec_mode: str | None, fire
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("task_mode", "fires"),
-    [(None, False), ("auto", False), ("bypassPermissions", True)],
+    [(None, True), ("auto", False), ("bypassPermissions", True)],
 )
 async def test_sdk_agent_default_mode_gates_a_continued_session(
     task_mode: str | None, fires: bool
 ) -> None:
     """A continued session keeps the SDK spec's bypassPermissions default.
 
-    SDK agents take no task mode at save, so these tasks were saved while the agent ran a
-    native harness, and it was then reinstalled under the same id as this SDK agent.
-    Only a task selecting an approval-skipping mode may continue; ``auto`` is refused.
+    SDK agents take no task mode at save, so the tasks with a mode were saved while the
+    agent ran a native harness, and it was then reinstalled under the same id as this SDK
+    agent. A task without a mode wakes the session in that default, as does one selecting
+    an approval-skipping mode; ``auto`` asks for approval, so it is refused.
     """
     store = FakeScheduledTaskStore(rows={"task_1": _continuing_task(permission_mode=task_mode)})
     conv_store = _ExistingConversationStore(_continued_session())
