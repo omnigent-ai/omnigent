@@ -15,6 +15,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from stat import S_ISDIR, S_ISREG
 from typing import NotRequired, TypedDict
 
 import httpx
@@ -362,6 +363,49 @@ def _observe_transcript_discovery(
         extra={"session_id": session_id},
     )
     diagnostics.warning_logged = True
+
+
+# Shapes of a hook-reported transcript path. ``unusable`` covers everything that is
+# neither a readable regular file nor a plain absence; such a poll never reads it.
+_TRANSCRIPT_FILE = "file"
+_TRANSCRIPT_NOT_YET_PRESENT = "not_yet_present"
+_TRANSCRIPT_UNUSABLE = "unusable"
+
+
+def _transcript_shape(transcript_path: Path) -> str:
+    """
+    Classify a hook-reported transcript path as readable, not yet written, or unusable.
+
+    :param transcript_path: Transcript path reported by a hook, e.g.
+        ``"/home/u/.claude/projects/-work/abc.jsonl"``.
+    :returns: ``"file"`` for a readable regular file; ``"not_yet_present"`` when the
+        file is absent under a searchable directory; ``"unusable"`` for anything
+        else, including unreadable files, directories, a non-directory parent,
+        an unsearchable ancestor, and special files.
+    """
+    try:
+        status = os.stat(transcript_path)
+    except FileNotFoundError:
+        # Missing directories are not an obstacle: the first existing ancestor decides.
+        ancestor = transcript_path.parent
+        while True:
+            try:
+                ancestor_status = os.stat(ancestor)
+                break
+            except FileNotFoundError:
+                if ancestor.parent == ancestor:
+                    return _TRANSCRIPT_UNUSABLE
+                ancestor = ancestor.parent
+            except OSError:
+                return _TRANSCRIPT_UNUSABLE
+        if S_ISDIR(ancestor_status.st_mode) and os.access(ancestor, os.X_OK):
+            return _TRANSCRIPT_NOT_YET_PRESENT
+        return _TRANSCRIPT_UNUSABLE
+    except OSError:
+        return _TRANSCRIPT_UNUSABLE
+    if not S_ISREG(status.st_mode) or not os.access(transcript_path, os.R_OK):
+        return _TRANSCRIPT_UNUSABLE
+    return _TRANSCRIPT_FILE
 
 
 def _log_new_observer_hook_stderr(
@@ -1562,7 +1606,29 @@ async def forward_claude_transcript_to_session(
                         transcript_path=transcript_path,
                         diagnostics=transcript_diagnostics,
                     )
-                    if transcript_path is not None:
+                    if (
+                        transcript_path is not None
+                        and _transcript_shape(transcript_path) == _TRANSCRIPT_UNUSABLE
+                    ):
+                        # Reads of an unusable transcript would raise and restart this
+                        # loop, so the poll forwards hook records only; the saved
+                        # transcript cursor is left untouched for when the file is usable.
+                        hook_state = await _forward_available_status_events(
+                            client=client,
+                            session_id=current_session_id,
+                            bridge_dir=bridge_dir,
+                            state=hook_state,
+                            retry_tracker=status_retries,
+                            compaction_retry_tracker=compaction_retries,
+                            dedupe=dedupe,
+                            task_subjects=task_subjects,
+                            task_statuses=task_statuses,
+                            task_order=task_order,
+                            response_id=state.current_response_id if state is not None else None,
+                            diagnostic_health=diagnostic_health,
+                            hooks_cutoff_byte_offset=None,
+                        )
+                    elif transcript_path is not None:
                         state = await _ensure_state_for_transcript(
                             bridge_dir=bridge_dir,
                             state=state,
