@@ -105,6 +105,11 @@ export function subscribeTerminalTheme(listener: TerminalThemeListener): () => v
   };
 }
 
+/** Tell readers on screen the stored mode, after something wrote storage directly, such as an import. */
+export function notifyTerminalThemeChanged(): void {
+  emit(readTerminalThemeMode());
+}
+
 /** Notify subscribers of the given terminal theme mode. Called after every write. */
 function emit(mode: TerminalThemeMode): void {
   for (const listener of listeners) listener(mode);

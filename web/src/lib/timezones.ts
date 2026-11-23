@@ -11,13 +11,18 @@ export function timezoneRequestHeaders(): Record<string, string> {
   return { [TIMEZONE_HEADER]: localTimezone() };
 }
 
+/** The viewer's IANA timezone, or `null` if the platform can't report one. */
+export function resolvedLocalTimezone(): string | null {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || null;
+  } catch {
+    return null;
+  }
+}
+
 /** The viewer's local IANA timezone, or `UTC` if it can't be resolved. */
 export function localTimezone(): string {
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-  } catch {
-    return "UTC";
-  }
+  return resolvedLocalTimezone() ?? "UTC";
 }
 
 const FALLBACK_ZONES = [

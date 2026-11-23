@@ -2538,19 +2538,16 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
     }
     grace = 0.2
     hold = {"expired": 1.0, "host_flaps_expired": 1.5}.get(scenario, 30.0)
+    finite_hold = scenario in {"expired", "host_flaps_expired"}
     monkeypatch.setattr(sessions_module, "RUNNER_DISCONNECT_GRACE_S", grace)
     monkeypatch.setattr(sessions_module, "HOST_OFFLINE_HOLD_S", hold)
     monkeypatch.setattr(sessions_module, "HOST_OFFLINE_RECHECK_S", 0.05)
     _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
     host_checks: list[str] = []
-    first_host_check: float | None = None
     # What the host row reads: offline, back online, or unreadable.
     host_row: list[bool | None] = [scenario != "host_online"]
 
     async def scripted_host_row_offline(host_store: object, host_id: str) -> bool | None:
-        nonlocal first_host_check
-        if first_host_check is None:
-            first_host_check = asyncio.get_running_loop().time()
         host_checks.append(host_id)
         return host_row[0]
 
@@ -2582,14 +2579,16 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
     host_id = "0123456789abcdef0123456789abcdef"
     hold_now = 0.0
     within_grace_recheck = asyncio.Event()
-    if local_host_return:
-        # Control hold deadlines while the tunnel and event loop keep real timers.
+    # Hold deadlines follow the scripted clock, so a slow event loop cannot expire them.
+    scripted_clock = local_host_return or finite_hold
+    if scripted_clock:
         hold_loop = SimpleNamespace(time=lambda: hold_now)
         monkeypatch.setattr(
             server_app,
             "asyncio",
             SimpleNamespace(**(vars(asyncio) | {"get_running_loop": lambda: hold_loop})),
         )
+    if local_host_return:
         registry = ap_app.state.tunnel_registry
         wait_for_runner = registry.wait_for_runner
 
@@ -2822,7 +2821,9 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             return
         if scenario.startswith("host_flaps_") or scenario == "host_back_unreadable":
             # Each brief host return must earn a fresh, uninterrupted runner grace.
-            for _ in range(1 if scenario == "host_back_unreadable" else 2):
+            for index in range(1 if scenario == "host_back_unreadable" else 2):
+                if scripted_clock:
+                    hold_now = grace * (index + 1)
                 host_row[0] = False
                 await asyncio.wait_for(_host_checked(1), timeout=budget(5.0))
                 host_row[0] = None if scenario == "host_back_unreadable" else True
@@ -2925,12 +2926,14 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             assert sessions_module._session_status_cache[session_id] == expected_status
             return
         # Expiry, or one more grace after the host returned: the turn fails.
-        timeout = budget(5.0)
-        if scenario == "host_flaps_expired":
-            # Returning hosts cannot restart or extend the original absolute hold.
-            assert first_host_check is not None
-            timeout = first_host_check + hold + 0.3 - asyncio.get_running_loop().time()
-        error = await asyncio.wait_for(_failed(), timeout=timeout)
+        if finite_hold:
+            if scenario == "host_flaps_expired":
+                # Returning hosts cannot restart or extend the original absolute hold.
+                hold_now = hold - grace
+                await asyncio.wait_for(_host_checked(2), timeout=budget(5.0))
+                assert sessions_module._session_status_cache.get(session_id) == "running"
+            hold_now = hold
+        error = await asyncio.wait_for(_failed(), timeout=budget(5.0))
         if local_host_return:
             # Settle the old turn before launch rotates its binding, keeping the cause
             # across a replacement runner's passive reconnect.

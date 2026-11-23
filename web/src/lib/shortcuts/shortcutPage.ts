@@ -19,6 +19,8 @@ export interface ShortcutPageRow {
   alternateKeys?: string[];
   /** Hidden on touch and narrow layouts, where Enter inserts a newline instead of submitting. */
   desktopOnly?: boolean;
+  /** The registry binding behind a row whose label and keys come from the registry. */
+  shortcutId?: ShortcutId;
 }
 
 export interface ShortcutPageGroup {
@@ -66,6 +68,7 @@ export function shortcutPageGroups(
   const bound = (id: ShortcutId): ShortcutPageRow => ({
     label: shortcutBinding(id).label,
     keys: shortcutKeys(id, environment),
+    shortcutId: id,
   });
   const when = (shown: boolean, rows: ShortcutPageRow[]) => (shown ? rows : []);
   const sendWithMod = context.submitWithModEnter;
@@ -181,6 +184,10 @@ export function shortcutPageGroups(
         ...when(context.desktopCommands && context.browser, [
           { label: "Reload the browser tab", keys: [mod, "R"] },
           { label: "Focus the browser address bar", keys: [mod, "L"] },
+        ]),
+        // Touch and narrow layouts have no workspace full screen.
+        ...when(!context.preventsKeyboardSubmit, [
+          { label: "Exit full screen from a file", keys: ["Esc"] },
         ]),
       ],
     },

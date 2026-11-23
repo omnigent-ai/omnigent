@@ -1,21 +1,30 @@
 import { type ReactNode, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
-/** Move one portal host between layouts without remounting its editor or drafts. */
+const FILL_HOST = "flex min-h-0 flex-1 flex-col overflow-hidden";
+const FILL_TARGET = "flex min-h-0 flex-1 flex-col";
+
+/**
+ * Move one portal host between layouts without remounting its editor or drafts. `contents`
+ * gives the host and its desktop place no box, for children that size themselves.
+ */
 export function ResponsiveViewerSlot({
   mobile,
   mobileTarget,
+  layout = "fill",
   children,
 }: {
   mobile: boolean;
   mobileTarget: HTMLElement | null;
+  layout?: "fill" | "contents";
   children: ReactNode;
 }) {
   const desktopTarget = useRef<HTMLDivElement>(null);
   const focusedElement = useRef<HTMLElement | null>(null);
+  // The layout is fixed for the slot's life, as the host is.
   const [host] = useState(() => {
     const element = document.createElement("div");
-    element.className = "flex min-h-0 flex-1 flex-col overflow-hidden";
+    element.className = layout === "contents" ? "contents" : FILL_HOST;
     return element;
   });
 
@@ -95,7 +104,7 @@ export function ResponsiveViewerSlot({
 
   return (
     <>
-      <div ref={desktopTarget} className="flex min-h-0 flex-1 flex-col" />
+      <div ref={desktopTarget} className={layout === "contents" ? "contents" : FILL_TARGET} />
       {createPortal(children, host)}
     </>
   );

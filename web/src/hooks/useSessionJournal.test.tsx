@@ -120,6 +120,38 @@ describe("useSessionJournal", () => {
     expect(result.current.entries).toContainEqual(done);
   });
 
+  it("reads no run boundary when the loaded entries reach the journal's start", async () => {
+    const workflowId = "0123456789abcdef0123456789abcdef";
+    const boundary = journalEntry(0, {
+      kind: "plan_status",
+      workflow_id: workflowId,
+      content: { status: "started" },
+    });
+    const origin = { ...journalPlan(1, ["a"], ["b"]), workflow_id: workflowId };
+    respond(journalPage([journalPlan(2, ["a"], ["b"]), origin, boundary]));
+    const { result } = renderHook(() => useSessionJournal(SESSION, true), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(planWorkflowId(result.current.entries)).toBe(workflowId);
+    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["an internal gap", "older pages"])(
+    "reads the run boundary when the loaded journal has %s",
+    async (shape) => {
+      if (shape === "older pages") {
+        respond(journalPage([journalEntry(104)], { has_more: true }));
+        byKind = { plan: journalPage([journalPlan(0, ["a"])]) };
+      } else {
+        respond(
+          journalPage([journalEntry(4), journalPlan(3, ["a"]), journalEntry(1), journalEntry(0)]),
+        );
+      }
+      const { result } = renderHook(() => useSessionJournal(SESSION, true), { wrapper });
+      await waitFor(() => expect(result.current.isLoading).toBe(false));
+      expect(requestedQueries().map((query) => query.get("kind"))).toContain("plan_status");
+    },
+  );
+
   it("adds live entries once, including entries written during an automation run", async () => {
     respond(journalPage([journalEntry(0)]));
     const { result } = renderHook(() => useSessionJournal(SESSION, true), { wrapper });

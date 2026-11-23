@@ -595,6 +595,84 @@ describe("HostBadge", () => {
     expect(onReconnect).toHaveBeenCalledTimes(1);
   });
 
+  it("labels a disconnected host beside the composer trigger and reconnects in one click", () => {
+    // The trigger is icon-only, so the offline state and its fix must be
+    // visible without opening the host menu.
+    useSessionHostOnlineMock.mockReturnValue(false);
+    const onReconnect = vi.fn();
+    render(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={onReconnect} />);
+    const chip = screen.getByTestId("composer-host-offline");
+    expect(chip).toHaveTextContent(/^Offline\s*·\s*Reconnect$/);
+    expect(within(chip).getByTestId("composer-host-select")).toHaveAccessibleName(
+      "Host mac-laptop, offline",
+    );
+    fireEvent.click(within(chip).getByRole("button", { name: "Reconnect host" }));
+    expect(onReconnect).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    // The trigger keeps its menu, so Switch host… stays one click away.
+    fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Switch host…" })).toBeInTheDocument();
+  });
+
+  it("keeps the same composer host trigger mounted as the reconnect label comes and goes", () => {
+    // Remounting the menu as liveness flips would drop focus and strand its open state.
+    const onReconnect = vi.fn();
+    const badge = () => (
+      <HostBadge sessionId="conv_1" appearance="composer" onReconnect={onReconnect} />
+    );
+    const { rerender } = render(badge());
+    const trigger = screen.getByTestId("composer-host-select");
+    useSessionHostOnlineMock.mockReturnValue(false);
+    rerender(badge());
+    expect(screen.getByTestId("composer-host-offline")).toContainElement(trigger);
+    useSessionHostOnlineMock.mockReturnValue(true);
+    rerender(badge());
+    expect(screen.queryByTestId("composer-host-offline")).not.toBeInTheDocument();
+    expect(screen.getByTestId("composer-host-select")).toBe(trigger);
+  });
+
+  it.each<{
+    state: string;
+    online: boolean;
+    hostResumable?: boolean;
+    readOnly?: boolean;
+    appearance?: "composer" | "header";
+    withReconnect?: boolean;
+  }>([
+    { state: "an online host", online: true },
+    { state: "an asleep resumable host", online: false, hostResumable: true },
+    { state: "a read-only viewer", online: false, readOnly: true },
+    { state: "the mobile header trigger", online: false, appearance: "header" },
+    { state: "a session without a reconnect handler", online: false, withReconnect: false },
+  ])(
+    "keeps the host trigger icon-only for $state",
+    ({
+      online,
+      hostResumable = false,
+      readOnly = false,
+      appearance = "composer",
+      withReconnect = true,
+    }) => {
+      useSessionMock.mockReturnValue({
+        session: { hostId: "host_a1b2", hostResumable },
+        isLoading: false,
+        error: null,
+      });
+      useSessionHostOnlineMock.mockReturnValue(online);
+      render(
+        <HostBadge
+          sessionId="conv_1"
+          appearance={appearance}
+          readOnly={readOnly}
+          onReconnect={withReconnect ? vi.fn() : undefined}
+        />,
+      );
+      expect(screen.getByTestId("composer-host-select")).toBeInTheDocument();
+      expect(screen.queryByTestId("composer-host-offline")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Reconnect host" })).not.toBeInTheDocument();
+    },
+  );
+
   it("spins the chip and menu dot while waking an asleep sandbox, then shows it online", async () => {
     useHostsMock.mockReturnValue({
       data: [host({ name: "omnigent-arclet-1234", sandbox_provider: "arclet" })],

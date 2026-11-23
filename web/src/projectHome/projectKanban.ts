@@ -1,4 +1,5 @@
 import type { Conversation } from "@/hooks/useConversations";
+import { canFlagUnread } from "@/lib/sessionMute";
 import { sessionFamilyGroups } from "@/lib/sessionFamilies";
 import {
   dedupeConversationsById,
@@ -104,6 +105,7 @@ export type KanbanDropAction = "mark_read" | "mark_unread";
  */
 export function kanbanDropAction(card: KanbanCard, target: StatusBucket): KanbanDropAction | null {
   if (card.column === "Unread" && target === "Done") return "mark_read";
-  if (card.column === "Done" && target === "Unread") return "mark_unread";
+  if (card.column === "Done" && target === "Unread" && canFlagUnread(card.conversation))
+    return "mark_unread";
   return null;
 }

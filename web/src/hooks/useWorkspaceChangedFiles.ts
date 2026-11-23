@@ -23,7 +23,7 @@ import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useSession } from "@/hooks/useSession";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { authenticatedFetch } from "@/lib/identity";
-import { listDirectoryViaWorkspaceApi } from "@/lib/workspaceApi";
+import { listDirectoryViaWorkspaceApi, searchFilesViaWorkspaceApi } from "@/lib/workspaceApi";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 
@@ -346,6 +346,11 @@ export interface WorkspaceFile {
   type: "file" | "directory";
   bytes: number | null;
   modified_at: number | null;
+  /**
+   * For a listed directory whose only entry is a directory, and so on: the
+   * deepest directory of that chain, when the host reports it.
+   */
+  leaf_directory_path?: string;
 }
 
 export interface WorkspaceAllFilesResult {
@@ -362,6 +367,7 @@ interface FilesystemListResponse {
     type: string;
     bytes: number | null;
     modified_at: number | null;
+    leaf_directory_path?: string;
   }[];
   has_more: boolean;
   last_id?: string | null;
@@ -390,16 +396,20 @@ function mapFilesystemEntries(
   prefix = "",
 ): WorkspaceFile[] {
   const echoed = target && !target.startsWith("/") ? `${target}/` : "";
-  return json.data.map((e) => {
-    const relative = echoed && e.path.startsWith(echoed) ? e.path.slice(echoed.length) : e.path;
-    return {
-      path: joinBrowseLocation(prefix, relative),
-      name: e.name,
-      type: e.type === "directory" ? "directory" : "file",
-      bytes: e.bytes,
-      modified_at: e.modified_at,
-    };
-  });
+  // An entry's path, and a directory chain's end, both come back in the listed location's shape.
+  const rebased = (path: string) =>
+    joinBrowseLocation(
+      prefix,
+      echoed && path.startsWith(echoed) ? path.slice(echoed.length) : path,
+    );
+  return json.data.map((e) => ({
+    path: rebased(e.path),
+    name: e.name,
+    type: e.type === "directory" ? "directory" : "file",
+    bytes: e.bytes,
+    modified_at: e.modified_at,
+    ...(e.leaf_directory_path ? { leaf_directory_path: rebased(e.leaf_directory_path) } : {}),
+  }));
 }
 
 /** A workspace directory listed through the workspace API, or null to list through REST. */
@@ -594,6 +604,9 @@ export interface WorkspaceFileSearchResult {
   unavailable: boolean;
 }
 
+// One cap for both routes, so the API and REST return the same matches.
+const FILE_SEARCH_LIMIT = 500;
+
 async function fetchWorkspaceFileSearch(
   conversationId: string,
   query: string,
@@ -602,7 +615,29 @@ async function fetchWorkspaceFileSearch(
   location: string,
   signal?: AbortSignal,
 ): Promise<WorkspaceFileSearchResult> {
-  const params = new URLSearchParams({ limit: "500" });
+  // The workspace API only searches inside the workspace.
+  if (!browseLocationBase(location)) {
+    const viaApi = await searchFilesViaWorkspaceApi(
+      conversationId,
+      query,
+      { path: location, include, exclude, limit: FILE_SEARCH_LIMIT },
+      signal,
+    );
+    if (viaApi) {
+      return {
+        // Already relative to `location`; stripping it again would break a nested same-named folder.
+        files: mapFilesystemEntries({
+          object: "list",
+          data: viaApi.data,
+          has_more: viaApi.hasMore,
+        }),
+        truncated: viaApi.truncated,
+        hasMore: viaApi.hasMore,
+        unavailable: false,
+      };
+    }
+  }
+  const params = new URLSearchParams({ limit: String(FILE_SEARCH_LIMIT) });
   if (query) params.set("q", query);
   if (include) params.set("include", include);
   if (exclude) params.set("exclude", exclude);
@@ -1101,11 +1136,26 @@ export function useWorkspaceDirectory(
 ) {
   const serveable = useWorkspaceServeable(conversationId);
   return useQuery({
-    queryKey: ["workspace-dir", conversationId, dirPath, location],
-    queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath!, location),
+    ...workspaceDirectoryQuery(conversationId ?? "", dirPath ?? "", location),
     enabled: !!conversationId && !!dirPath && serveable !== false,
-    staleTime: 5_000,
   });
+}
+
+/** The query for one directory's listing, shared by the tree and prefetch so they share a cache. */
+export function workspaceDirectoryQuery(
+  conversationId: string,
+  dirPath: string,
+  location = "",
+  refreshToken = 0,
+) {
+  return {
+    queryKey:
+      refreshToken === 0
+        ? ["workspace-dir", conversationId, dirPath, location]
+        : ["workspace-dir", conversationId, dirPath, location, refreshToken],
+    queryFn: () => fetchWorkspaceDirectory(conversationId, dirPath, location),
+    staleTime: 5_000,
+  };
 }
 
 /** One expanded lazy directory's fetched children + load/error state. */
@@ -1156,13 +1206,8 @@ export function useWorkspaceDirectories(
   );
   return useQueries({
     queries: dirPaths.map((dirPath) => ({
-      queryKey:
-        refreshToken === 0
-          ? ["workspace-dir", conversationId, dirPath, location]
-          : ["workspace-dir", conversationId, dirPath, location, refreshToken],
-      queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath, location),
+      ...workspaceDirectoryQuery(conversationId ?? "", dirPath, location, refreshToken),
       enabled,
-      staleTime: 5_000,
     })),
     combine,
   });

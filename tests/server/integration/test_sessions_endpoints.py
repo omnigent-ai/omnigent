@@ -36,9 +36,11 @@ from omnigent.entities import (
     NewConversationItem,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harnesses.claude_native import forwarder
 from omnigent.host.frames import HostHelloFrame
 from omnigent.llms.context_window import ModelPricing
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.runner.session_init_protocol import parse_runner_session_init_envelope
 from omnigent.runner.transports.ws_tunnel.frames import EventAckFrame, EventBatchFrame
 from omnigent.runtime import inflight_text
@@ -6467,6 +6469,23 @@ _OLD_CLI_CARD = {
     "remediation": "Run `claude update` on the host, then start a new session.",
 }
 
+_CONTENT_POLICY_REFUSAL_DETAIL = (
+    "API Error: Sonnet 4 can't help with this. Start a new session to continue.\n\n"
+    "Send feedback with /feedback or learn more: https://www.anthropic.com/legal/aup"
+)
+_CONTENT_POLICY_REFUSAL_CARD = {
+    "title": "The model's safeguards blocked this message",
+    "cause": (
+        "The model provider's usage-policy safeguards refused this request, which can "
+        "happen with ordinary content. The flagged content stays in this session's "
+        "history, so later turns here may be refused too."
+    ),
+    "remediation": (
+        "Start a new session and rephrase the request without the flagged content, "
+        "or choose a different model with the model picker or /model."
+    ),
+}
+
 
 _CODEX_MODEL_DETAIL = (
     "The 'system.ai.gpt-6-1-sol' model is not supported when using Codex with a ChatGPT account."
@@ -6600,6 +6619,22 @@ _CODEX_PROVIDER_DISK_FULL_CARD = {
             _OLD_CLI_DETAIL,
             "client_update_required",
             _OLD_CLI_CARD,
+            "claude-code-native-ui",
+            False,
+            {},
+        ),
+        (
+            _CONTENT_POLICY_REFUSAL_DETAIL,
+            "content_policy_refusal",
+            _CONTENT_POLICY_REFUSAL_CARD,
+            "claude-code-native-ui",
+            False,
+            {},
+        ),
+        (
+            "The terminal printed 'safeguards flagged this message' on an earlier turn.",
+            "native_turn_error",
+            {},
             "claude-code-native-ui",
             False,
             {},
@@ -6865,6 +6900,18 @@ async def test_post_external_session_status_propagates_runner_delivery_failure(
     # The runner's delivery-not-confirmed reason is retained in AP's error
     # message. If absent, Omnigent flattened the failure and made diagnosis harder.
     assert "missing_parent_inbox" in error["message"]
+
+    # The child's forwarder must stop resending a result no retry can deliver.
+    rejection = httpx.HTTPStatusError(
+        "rejected", request=status_resp.request, response=status_resp
+    )
+    monkeypatch.setattr(forwarder, "_forward_health", forwarder._ForwardHealth())
+    retries = forwarder._PostRetryTracker(base_delay_s=0.0)
+    decisions = [
+        retries.record_failure("hook:idle", rejection, session_id=child["id"])
+        for _ in range(forwarder._SUBAGENT_DELIVERY_NOT_CONFIRMED_MAX_ATTEMPTS)
+    ]
+    assert decisions[-1].exhausted, decisions[-1]
 
 
 async def test_post_external_output_text_delta_publishes_transient_delta(
@@ -12274,6 +12321,59 @@ async def test_patch_approval_mode_forwards_and_persists_label(
     ]
     assert len(mode_events) == 1
     assert mode_events[0]["approval_mode"] == "full-access"
+
+
+_APPROVE_FOR_ME = PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]
+
+
+@pytest.mark.parametrize(
+    ("harness", "reported", "launch_args", "expected"),
+    [
+        pytest.param(
+            "codex-native", "read-only", _APPROVE_FOR_ME, "read-only", id="reported-mode"
+        ),
+        # Anyone who can edit the session can write the label, so it can't claim
+        # a mode that skips approval.
+        pytest.param(
+            "codex-native",
+            "full-access",
+            _APPROVE_FOR_ME,
+            "approve-for-me",
+            id="reported-approval-skipping-mode",
+        ),
+        pytest.param("cursor-native", None, ["--auto-review"], "auto-review", id="cursor"),
+        pytest.param(
+            "antigravity-native",
+            None,
+            ["--dangerously-skip-permissions"],
+            "skip",
+            id="antigravity",
+        ),
+        pytest.param("devin-native", None, ["--permission-mode", "smart"], "smart", id="devin"),
+        pytest.param(None, "read-only", _APPROVE_FOR_ME, None, id="harness-without-modes"),
+    ],
+)
+async def test_session_snapshot_reports_its_permission_mode(
+    client: httpx.AsyncClient,
+    harness: str | None,
+    reported: str | None,
+    launch_args: list[str],
+    expected: str | None,
+) -> None:
+    """The snapshot names the mode a session reports, over the one it launched in."""
+    executor = {"type": "omnigent", "config": {"harness": harness}} if harness else None
+    agent = await create_test_agent(client, executor=executor)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.codex_native.approval_mode": reported} if reported else None,
+        terminal_launch_args=launch_args,
+    )
+
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["permission_mode"] == expected
 
 
 @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])

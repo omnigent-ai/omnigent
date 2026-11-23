@@ -5,6 +5,8 @@ import { useId, useMemo, useState, type ReactNode } from "react";
 import { CheckIcon, ChevronDownIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   DropdownMenu,
@@ -18,12 +20,16 @@ import { ScheduleTimePicker } from "./ScheduleTimePicker";
 import { useScheduleEscape } from "./useScheduleEscape";
 import { cn } from "@/lib/utils";
 import { commonTimezones, dateInTimezone, endOfDayInTimezone } from "@/lib/timezones";
+import { describeSchedule } from "@/lib/scheduleText";
 import {
+  buildRecurringRule,
   DEFAULT_SCHEDULE_MODEL,
   MAX_MINUTE_INTERVAL,
   minimumScheduleInterval,
   MIN_SUBHOUR_MINUTE_INTERVAL,
   formatUntil,
+  normalizeRuleText,
+  parseRRuleToScheduleModel,
   parseUntil,
   validateSchedule,
   WEEKDAY_CODES,
@@ -55,7 +61,9 @@ const INTERVAL_UNITS: Record<CustomFreq, string> = {
   weekly: "week",
   monthly: "month",
   yearly: "year",
+  rule: "",
 };
+const RULE_EXAMPLE = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0";
 const MONTHS = Array.from({ length: 12 }, (_, month) => ({
   value: String(month + 1),
   label: new Intl.DateTimeFormat("en", { month: "long", timeZone: "UTC" }).format(
@@ -109,6 +117,10 @@ export function ScheduleFields({
 }) {
   const errorId = useId();
   const endingErrorId = useId();
+  const ruleInputId = useId();
+  const ruleHintId = useId();
+  // The visual schedule to return to when RRULE text has no visual equivalent.
+  const [visualBeforeRule, setVisualBeforeRule] = useState<ScheduleModel | null>(null);
   const minuteSchedulesSupported =
     minimumScheduleInterval("minutely", sessionMode, subhourSupported, executionTarget) ===
     MIN_SUBHOUR_MINUTE_INTERVAL;
@@ -148,8 +160,9 @@ export function ScheduleFields({
     activeDateInput?.error ??
     validateSchedule({ ...DEFAULT_SCHEDULE_MODEL, end: model.end }, { allowPastEnd });
   const until = model.end?.type === "until" ? parseUntil(model.end.until) : null;
+  const ruleMode = model.preset === "custom" && model.customFreq === "rule";
   const minutely = model.preset === "custom" && model.customFreq === "minutely";
-  const custom = model.preset === "custom" && (!minutely || customMinutes);
+  const custom = !ruleMode && model.preset === "custom" && (!minutely || customMinutes);
   const hourly = model.preset === "hourly" || (custom && model.customFreq === "hourly");
   const weekly = model.preset === "weekly" || (custom && model.customFreq === "weekly");
   const monthDays = custom && (model.customFreq === "monthly" || model.customFreq === "yearly");
@@ -206,6 +219,22 @@ export function ScheduleFields({
     } else if (model.customFreq === "minutely") next.interval = 1;
     if (value === "hourly" && !Number.isInteger(next.minute)) next.minute = 0;
     onChange(next);
+  }
+
+  function changeEditor(value: string) {
+    if (value === "rule") {
+      setVisualBeforeRule(model);
+      onChange({ ...model, preset: "custom", customFreq: "rule", rule: buildRecurringRule(model) });
+    } else {
+      const parsed = parseRRuleToScheduleModel(normalizeRuleText(model.rule));
+      const visual =
+        parsed !== null && parsed.customFreq !== "rule"
+          ? parsed
+          : (visualBeforeRule ?? DEFAULT_SCHEDULE_MODEL);
+      setCustomMinutes(visual.preset === "custom");
+      onChange({ ...visual, end: model.end });
+    }
+    onRecurrenceSelect?.();
   }
 
   function changeEnd(value: string) {
@@ -316,8 +345,66 @@ export function ScheduleFields({
       </DropdownMenuContent>
     </DropdownMenu>
   );
+  const ruleText = normalizeRuleText(model.rule);
+  const ruleSummary = ruleMode && !error ? describeSchedule(ruleText) : null;
+  const timezoneRow = (className: string) => (
+    <div className={cn("flex min-w-0 items-center justify-between gap-3", className)}>
+      <span className="shrink-0">Timezone</span>
+      <div className="flex min-w-0 flex-1 justify-end">{timezonePicker}</div>
+    </div>
+  );
+  const ruleFields = (
+    <>
+      <div className="space-y-1.5 py-3">
+        <label htmlFor={ruleInputId}>RRULE string</label>
+        <Textarea
+          id={ruleInputId}
+          data-testid="schedule-rule"
+          rows={3}
+          spellCheck={false}
+          autoComplete="off"
+          disabled={!anchoredScheduling}
+          placeholder={RULE_EXAMPLE}
+          aria-invalid={error ? true : undefined}
+          aria-describedby={error ? `${errorId} ${ruleHintId}` : ruleHintId}
+          value={model.rule}
+          className="font-mono break-all"
+          // A rule is one line; Enter shouldn't add a second.
+          onKeyDown={(event) => {
+            if (event.key === "Enter") event.preventDefault();
+          }}
+          onChange={(event) => onChange({ ...model, rule: event.target.value })}
+        />
+        <p
+          id={ruleHintId}
+          className="text-sm text-muted-foreground"
+          data-testid="schedule-rule-summary"
+        >
+          {/* A rule without a plain-language summary describes itself. */}
+          {ruleSummary !== null && ruleSummary !== ruleText
+            ? ruleSummary
+            : "RFC 5545 RRULE, run in the timezone below. Set the end under Ends."}
+        </p>
+      </div>
+      {timezoneRow("py-2")}
+    </>
+  );
   const recurrenceFields = (
     <div className="flex min-w-0 flex-col gap-2" data-testid="schedule-fields">
+      <Tabs value={ruleMode ? "rule" : "visual"} onValueChange={changeEditor} className="px-3 pt-2">
+        <TabsList variant="pill" aria-label="Schedule editor">
+          <TabsTrigger value="visual" className="flex-none px-2 py-0.5 text-xs">
+            Visual
+          </TabsTrigger>
+          <TabsTrigger
+            value="rule"
+            disabled={!anchoredScheduling}
+            className="flex-none px-2 py-0.5 text-xs"
+          >
+            RRULE
+          </TabsTrigger>
+        </TabsList>
+      </Tabs>
       <div
         className={cn(
           "divide-y divide-border px-3",
@@ -325,7 +412,9 @@ export function ScheduleFields({
           !embedded && "rounded-xl border border-border",
         )}
       >
-        {embedded ? (
+        {ruleMode ? (
+          ruleFields
+        ) : embedded ? (
           <div
             className="pb-2"
             role="radiogroup"
@@ -430,7 +519,7 @@ export function ScheduleFields({
                   variant="outline"
                   className={cn(
                     inlineChoiceClass,
-                    "h-8 min-w-0 max-w-[85%] gap-2 px-0 font-normal",
+                    "h-8 min-w-0 max-w-[85%] gap-2 px-2 font-normal",
                     pickerTriggerClass,
                   )}
                   disabled={custom && !anchoredScheduling}
@@ -460,7 +549,7 @@ export function ScheduleFields({
                   aria-label="Days of the month"
                   className={cn(
                     inlineChoiceClass,
-                    "h-8 min-w-0 max-w-[85%] gap-2 px-0 font-normal",
+                    "h-8 min-w-0 max-w-[85%] gap-2 px-2 font-normal",
                     pickerTriggerClass,
                   )}
                 >
@@ -500,7 +589,7 @@ export function ScheduleFields({
             </ScheduleDaysPopover>
           </div>
         )}
-        {!(custom && minutely) && (
+        {!ruleMode && !(custom && minutely) && (
           <div className="space-y-0.5">
             <div
               className={cn(
@@ -534,12 +623,7 @@ export function ScheduleFields({
                   ))}
               </div>
             </div>
-            {!minutely && (
-              <div className="flex min-w-0 items-center justify-between gap-3 pb-2">
-                <span className="shrink-0">Timezone</span>
-                <div className="flex min-w-0 flex-1 justify-end">{timezonePicker}</div>
-              </div>
-            )}
+            {!minutely && timezoneRow("pb-2")}
           </div>
         )}
       </div>

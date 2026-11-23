@@ -39,6 +39,9 @@ vi.mock("@/pages/ProjectHomePage", () => ({
 }));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
+vi.mock("@/shell/floatingComposer/FloatingComposerPage", () => ({
+  FloatingComposerPage: () => <div>floating composer page</div>,
+}));
 vi.mock("@/pages/TaskDetailPage", () => ({ TaskDetailPage: () => <div>task detail page</div> }));
 vi.mock("@/pages/WorkflowsPage", () => ({ WorkflowsPage: () => <div>workflows page</div> }));
 vi.mock("@/pages/WorkflowDetailPage", () => ({
@@ -377,6 +380,31 @@ describe("Extension page routes", () => {
     );
 
     expect(await screen.findByText("not found")).toBeInTheDocument();
+  });
+});
+
+describe("Floating composer route", () => {
+  afterEach(() => {
+    delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+  });
+
+  it("is not found with the flag off, or outside the desktop app", async () => {
+    (window as { omnigentDesktop?: unknown }).omnigentDesktop = { kind: "electron" };
+    renderRoute("/compose/floating");
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    cleanup();
+
+    delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+    renderRoute("/compose/floating", { floating_composer: true });
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    expect(screen.queryByText("floating composer page")).toBeNull();
+  });
+
+  it("renders the panel page in the desktop app with the flag on, outside the shell", async () => {
+    (window as { omnigentDesktop?: unknown }).omnigentDesktop = { kind: "electron" };
+    renderRoute("/compose/floating", { floating_composer: true });
+    expect(await screen.findByText("floating composer page")).toBeInTheDocument();
+    expect(screen.queryByText("app shell")).toBeNull();
   });
 });
 

@@ -8,6 +8,7 @@
 
 import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
 import { type ChangeEvent, useEffect, useRef, useState } from "react";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { ENTER_KEY } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
@@ -31,6 +32,7 @@ import {
   isTextEntry,
 } from "@/lib/hotkeys";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { isComposerInput } from "@/components/composer/engine/composerInput";
 
 /**
  * Map from question id/text → either a single selected label
@@ -271,6 +273,11 @@ export function AskUserQuestionForm({
   };
   const firstUnansweredIndex = questions.findIndex((question) => !isAnswered(question));
   const allAnswered = firstUnansweredIndex === -1;
+  // Says which question keeps Submit disabled; it can be on another page.
+  const firstUnanswered = questions[firstUnansweredIndex];
+  const submitBlockedReason = firstUnanswered
+    ? `Answer question ${firstUnansweredIndex + 1}${firstUnanswered.header ? ` (${firstUnanswered.header})` : ""} to submit`
+    : undefined;
 
   const handleSubmit = () => {
     const finalAnswers: AskUserQuestionAnswers = {};
@@ -324,7 +331,7 @@ export function AskUserQuestionForm({
     };
     // The chat composer. Side-chat composers are excluded and count as other inputs.
     const composer =
-      !inside && target instanceof HTMLTextAreaElement
+      !inside && isComposerInput(target)
         ? target.closest<HTMLElement>("[data-composer-card]:not([data-side-chat])")
         : null;
     const suggestionsOpen = composer?.dataset.suggestionsOpen === "true";
@@ -610,20 +617,22 @@ export function AskUserQuestionForm({
           </Button>
         )}
         {isLast && (
-          <Button
-            size="sm"
-            onClick={handleSubmit}
-            disabled={!allAnswered}
-            className="mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal"
-            data-testid="ask-user-question-submit"
-            componentId="question.submit"
-          >
-            <CheckIcon className="mr-1 size-3.5" />
-            Submit
-            {showKeyHints && allAnswered && allSeen && (
-              <CompactShortcutKeys keys={[ENTER_KEY]} className="ml-1.5" />
-            )}
-          </Button>
+          <DisabledActionTooltip reason={submitBlockedReason} label="Submit">
+            <Button
+              size="sm"
+              onClick={handleSubmit}
+              disabled={!allAnswered}
+              className="mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal"
+              data-testid="ask-user-question-submit"
+              componentId="question.submit"
+            >
+              <CheckIcon className="mr-1 size-3.5" />
+              Submit
+              {showKeyHints && allAnswered && allSeen && (
+                <CompactShortcutKeys keys={[ENTER_KEY]} className="ml-1.5" />
+              )}
+            </Button>
+          </DisabledActionTooltip>
         )}
         <Button
           size="sm"

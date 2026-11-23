@@ -206,14 +206,15 @@ jobs:
                       elif startswith("<!-- polly-skipped-sha: ") then split("\n")[0]
                       else "" end)] | @tsv' > /tmp/pr_comments.tsv
 
-          if grep -qF "<!-- polly-skipped-sha: ${head_sha} -->" /tmp/pr_comments.tsv; then
+          if awk -F '\t' -v marker="<!-- polly-skipped-sha: ${head_sha} -->" \
+            '$2 == marker { found = 1 } END { exit !found }' /tmp/pr_comments.tsv; then
             echo "::notice::Already posted a skip notice for ${head_sha}."
             echo "duplicate=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          prior="$(grep -F "<!-- polly-reviewed-sha: ${head_sha} -->" /tmp/pr_comments.tsv \
-            | tail -1 | cut -f1)" || true
+          prior="$(awk -F '\t' -v marker="<!-- polly-reviewed-sha: ${head_sha} -->" \
+            '$2 == marker { url = $1 } END { print url }' /tmp/pr_comments.tsv)" || true
           if [ -z "$prior" ]; then
             exit 0
           fi
@@ -293,7 +294,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .venv
-          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}-${{ hashFiles('uv.toml') }}
 
       - name: Install dependencies
         if: steps.creds.outputs.available == 'true'

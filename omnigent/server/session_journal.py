@@ -120,6 +120,20 @@ def open_store(conversation_store: object) -> SessionJournalStore | None:
         return store
 
 
+def titled_for_workflow_run(
+    conversation_store: ConversationStore, conversation_id: str, title: str | None
+) -> bool:
+    """Whether *title* is the name of the saved workflow the session's first run follows.
+
+    :param title: The session's title, e.g. ``"Release"``.
+    """
+    store = open_store(conversation_store)
+    if store is None or title is None:
+        return False
+    run = store.first_workflow_runs([conversation_id]).get(conversation_id)
+    return run is not None and run.content.get("name") == title
+
+
 def _require_store(conversation_store: ConversationStore) -> SessionJournalStore:
     store = open_store(conversation_store)
     if store is None:
