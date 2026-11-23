@@ -653,6 +653,37 @@ describe("SettingsPage", () => {
     expect(getGlobalShortcut).toHaveBeenCalledWith("floatingComposer");
   });
 
+  it("offers the right sidebar window setting in Desktop app only on shells that have it", async () => {
+    const name = { name: "Widen window when opening the right sidebar" };
+    renderPage("/settings/general");
+    expect(screen.queryByTestId("settings-group-desktop-app")).toBeNull();
+    cleanup();
+
+    const rightSidebarWindow = {
+      getWidensWindow: vi.fn().mockResolvedValue(false),
+      setWidensWindow: vi.fn().mockResolvedValue(true),
+      opened: vi.fn(),
+      closed: vi.fn(),
+    };
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      setBadgeCount: vi.fn(),
+      notify: vi.fn(),
+      getGlobalShortcut: vi.fn().mockResolvedValue({ enabled: false, accelerator: "Alt+Space" }),
+      setGlobalShortcut: vi.fn(),
+      rightSidebarWindow,
+    };
+    renderPage("/settings/general");
+    const group = screen.getByTestId("settings-group-desktop-app");
+    const toggle = within(group).getByRole("switch", name);
+    // Off by default.
+    await waitFor(() => expect(toggle).toBeEnabled());
+    expect(toggle).not.toBeChecked();
+    await act(async () => fireEvent.click(toggle));
+    expect(rightSidebarWindow.setWidensWindow).toHaveBeenCalledWith(true);
+    expect(toggle).toBeChecked();
+  });
+
   it("offers the kanban board switch under Composer only when the server has the board", () => {
     renderPage("/settings/general");
     expect(screen.queryByTestId("settings-group-projects")).toBeNull();

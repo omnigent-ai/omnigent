@@ -359,6 +359,8 @@ export function useResizableInlinePanel(
 
   return {
     panelWidth: resolvedWidth,
+    /** The user's width for the panel before the viewport clamp. */
+    preferredWidth: preferredPanelWidth,
     preferredContentWidth: preferredPanelWidth + chatMinWidthPx + GAP_PX,
     handleProps,
     isDragging,

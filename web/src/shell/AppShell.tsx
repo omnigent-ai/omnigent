@@ -72,6 +72,7 @@ import {
   isIOSShell,
   isMacElectronShell,
   onNativeSidebarDrag,
+  reportRightSidebarVisibility,
   supportsBrowser,
   updateBridge,
 } from "@/lib/nativeBridge";
@@ -701,9 +702,14 @@ function AppShellImpl() {
     },
     [cancelRightPanelVisibilityMotion],
   );
+  // Whether the rail can show here and its preferred width, for the shell's "widen window" setting.
+  const rightSidebarWindowRef = useRef({ canShow: false, width: 0 });
   const setRightPanelOpenAnimated = useCallback((open: boolean) => {
     if (rightPanelOpenRef.current === open) return;
     rightPanelOpenRef.current = open;
+    // Only in-session opens and closes resize the window; a session switch restores its rail.
+    const rail = rightSidebarWindowRef.current;
+    if (rail.canShow) reportRightSidebarVisibility(open, rail.width);
     if (rightPanelMotionTimerRef.current !== null) {
       window.clearTimeout(rightPanelMotionTimerRef.current);
     }
@@ -1188,6 +1194,7 @@ function AppShellImpl() {
   }, [rootSessionId, rootSessionResolved]);
   const {
     panelWidth: inlinePanelWidth,
+    preferredWidth: preferredInlinePanelWidth,
     preferredContentWidth: preferredConversationWidth,
     handleProps: inlinePanelHandleProps,
     isDragging: inlinePanelResizing,
@@ -1247,6 +1254,10 @@ function AppShellImpl() {
   // no-filesystem agent with no terminals/sub-agents would otherwise
   // render an empty white card with no way to dismiss it.
   const hasRailContent = Object.values(railTabsAvailable).some(Boolean);
+  rightSidebarWindowRef.current = {
+    canShow: Boolean(conversationId) && hasRailContent,
+    width: preferredInlinePanelWidth,
+  };
   const initialWorkspaceTab = readInitialWorkspaceTab();
   const fallbackWorkspaceTab =
     initialWorkspaceTab !== null && railTabsAvailable[initialWorkspaceTab]

@@ -1,0 +1,49 @@
+import { useCallback, useEffect, useState } from "react";
+import { toast } from "sonner";
+
+import { Switch } from "@/components/ui/switch";
+import { getWidenWindowForRightSidebar, setWidenWindowForRightSidebar } from "@/lib/nativeBridge";
+import { WIDEN_WINDOW_FOR_RIGHT_SIDEBAR_ENTRY } from "./search/catalog/general";
+import { SettingsEntryLabel, SettingsItem } from "./search/SettingsItem";
+import { settingsControlProps } from "./search/settingsControl";
+
+/** The desktop shell's opt-in to widen the window when the right sidebar opens. */
+export function WidenWindowForRightSidebarControl() {
+  // Null until the shell answers; the switch stays off and disabled meanwhile.
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void getWidenWindowForRightSidebar().then((saved) => {
+      if (!cancelled) setEnabled(saved ?? false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const toggle = useCallback(async (next: boolean) => {
+    setEnabled(next);
+    if (await setWidenWindowForRightSidebar(next)) return;
+    setEnabled(!next);
+    toast.error("Couldn't save this setting. Try again.");
+  }, []);
+
+  return (
+    <SettingsItem
+      entry={WIDEN_WINDOW_FOR_RIGHT_SIDEBAR_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={WIDEN_WINDOW_FOR_RIGHT_SIDEBAR_ENTRY} className="flex-1" />
+      <Switch
+        {...settingsControlProps(WIDEN_WINDOW_FOR_RIGHT_SIDEBAR_ENTRY)}
+        checked={enabled === true}
+        disabled={enabled === null}
+        onCheckedChange={(next) => void toggle(next)}
+        data-testid="widen-window-for-right-sidebar-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.widen_window_for_right_sidebar"
+      />
+    </SettingsItem>
+  );
+}

@@ -219,6 +219,22 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.invoke("omnigent:record-global-shortcut", shortcutId(id)),
   cancelGlobalShortcutRecording: () =>
     ipcRenderer.invoke("omnigent:cancel-global-shortcut-recording"),
+  /**
+   * Settings → "Widen window when opening the right sidebar" (off by default), and the page's
+   * reports of its right sidebar opening and closing, which the shell acts on when it's on.
+   */
+  rightSidebarWindow: {
+    /** Resolves whether the setting is on. */
+    getWidensWindow: () => ipcRenderer.invoke("omnigent:get-right-sidebar-widens-window"),
+    /** Resolves false when the shell couldn't save it. */
+    setWidensWindow: (enabled) =>
+      ipcRenderer.invoke("omnigent:set-right-sidebar-widens-window", enabled === true),
+    /** The user opened the right sidebar, `width` CSS px wide. Fire-and-forget. */
+    opened: (width) =>
+      ipcRenderer.send("omnigent:right-sidebar-visibility", { open: true, width: Number(width) }),
+    /** The user closed the right sidebar. Fire-and-forget. */
+    closed: () => ipcRenderer.send("omnigent:right-sidebar-visibility", { open: false }),
+  },
   /** The runner picked during onboarding for this server ("local" |
    *  "remote"), returned once, else null. */
   takeOnboardingRunner: () => ipcRenderer.invoke("omnigent:take-onboarding-runner"),
