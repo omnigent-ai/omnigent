@@ -1,6 +1,6 @@
 """Live view of a Chrome reachable from the runner over the DevTools protocol.
 
-The runner's operator points ``OMNIGENT_REMOTE_BROWSER_CDP_URL`` at a Chrome
+The runner's operator points ``OMNIGENT_CHROME_BROWSER_CDP_URL`` at a Chrome
 started with ``--remote-debugging-port`` on the runner's own machine. A viewer
 attaches over a WebSocket and gets that Chrome's page as a stream of JPEG
 frames, and sends back pointer, keyboard and navigation messages.
@@ -35,12 +35,12 @@ from fastapi import FastAPI, Query, WebSocket
 
 _logger = logging.getLogger(__name__)
 
-REMOTE_BROWSER_CDP_URL_ENV: Final[str] = "OMNIGENT_REMOTE_BROWSER_CDP_URL"
+CHROME_BROWSER_CDP_URL_ENV: Final[str] = "OMNIGENT_CHROME_BROWSER_CDP_URL"
 
 # Application close codes; the web pane retries everything except "not configured".
-WS_CLOSE_REMOTE_BROWSER_NOT_CONFIGURED: Final[int] = 4404
-WS_CLOSE_REMOTE_BROWSER_PAGE_GONE: Final[int] = 4405
-WS_CLOSE_REMOTE_BROWSER_UNREACHABLE: Final[int] = 4502
+WS_CLOSE_CHROME_BROWSER_NOT_CONFIGURED: Final[int] = 4404
+WS_CLOSE_CHROME_BROWSER_PAGE_GONE: Final[int] = 4405
+WS_CLOSE_CHROME_BROWSER_UNREACHABLE: Final[int] = 4502
 
 _LOOPBACK_HOSTS: Final[frozenset[str]] = frozenset({"localhost", "127.0.0.1", "::1"})
 _DISCOVERY_TIMEOUT_S: Final[float] = 5.0
@@ -73,8 +73,8 @@ _HIDDEN_TAB_URL_PREFIXES: Final[tuple[str, ...]] = ("devtools://", "chrome-exten
 _NAVIGABLE_SCHEMES: Final[frozenset[str]] = frozenset({"http", "https"})
 
 
-class RemoteBrowserError(Exception):
-    """A remote browser problem that should close the viewer with *close_code*."""
+class ChromeBrowserError(Exception):
+    """A Chrome browser problem that should close the viewer with *close_code*."""
 
     def __init__(self, message: str, *, close_code: int) -> None:
         super().__init__(message)
@@ -109,7 +109,7 @@ class CdpTransport(Protocol):
 
 def configured_cdp_url(environ: Mapping[str, str] | None = None) -> str | None:
     """Return the operator's DevTools endpoint, or ``None`` when unset or blank."""
-    value = (environ if environ is not None else os.environ).get(REMOTE_BROWSER_CDP_URL_ENV, "")
+    value = (environ if environ is not None else os.environ).get(CHROME_BROWSER_CDP_URL_ENV, "")
     return value.strip() or None
 
 
@@ -121,19 +121,19 @@ def validate_cdp_url(raw_url: str) -> str:
 
     :param raw_url: ``http://127.0.0.1:9222`` or a ``ws://`` browser endpoint.
     :returns: The URL, trimmed.
-    :raises RemoteBrowserError: If the scheme or host is not allowed.
+    :raises ChromeBrowserError: If the scheme or host is not allowed.
     """
     url = raw_url.strip()
     parts = urlsplit(url)
     if parts.scheme not in {"http", "ws"} or parts.username or parts.password:
-        raise RemoteBrowserError(
-            "remote browser endpoint must be an http:// or ws:// URL",
-            close_code=WS_CLOSE_REMOTE_BROWSER_NOT_CONFIGURED,
+        raise ChromeBrowserError(
+            "Chrome browser endpoint must be an http:// or ws:// URL",
+            close_code=WS_CLOSE_CHROME_BROWSER_NOT_CONFIGURED,
         )
     if (parts.hostname or "").lower() not in _LOOPBACK_HOSTS:
-        raise RemoteBrowserError(
-            "remote browser endpoint must be on localhost",
-            close_code=WS_CLOSE_REMOTE_BROWSER_NOT_CONFIGURED,
+        raise ChromeBrowserError(
+            "Chrome browser endpoint must be on localhost",
+            close_code=WS_CLOSE_CHROME_BROWSER_NOT_CONFIGURED,
         )
     return url
 
@@ -159,7 +159,7 @@ async def resolve_browser_websocket_url(
     :param cdp_url: A URL accepted by :func:`validate_cdp_url`.
     :param http_client: Client for the discovery request; tests inject one.
     :returns: A ``ws://`` URL on the configured host and port.
-    :raises RemoteBrowserError: If Chrome does not answer the discovery request.
+    :raises ChromeBrowserError: If Chrome does not answer the discovery request.
     """
     if urlsplit(cdp_url).scheme == "ws":
         return cdp_url
@@ -176,9 +176,9 @@ async def resolve_browser_websocket_url(
         if not isinstance(advertised_url, str):
             raise TypeError("webSocketDebuggerUrl is not a string")
     except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
-        raise RemoteBrowserError(
-            "remote browser is not reachable",
-            close_code=WS_CLOSE_REMOTE_BROWSER_UNREACHABLE,
+        raise ChromeBrowserError(
+            "Chrome browser is not reachable",
+            close_code=WS_CLOSE_CHROME_BROWSER_UNREACHABLE,
         ) from exc
     return browser_websocket_url(cdp_url, advertised_url)
 
@@ -413,7 +413,7 @@ class _ViewerFrames:
         return len(self.in_flight) < _MAX_FRAMES_IN_FLIGHT
 
 
-class RemoteBrowserSession:
+class ChromeBrowserSession:
     """Bridges one viewer WebSocket to one page of the remote Chrome."""
 
     def __init__(self, viewer: ViewerSocket, cdp: CdpConnection, *, read_only: bool) -> None:
@@ -539,14 +539,14 @@ class RemoteBrowserSession:
         while True:
             event = await self._cdp.events.get()
             if event is None:
-                raise RemoteBrowserError(
-                    "remote browser disconnected",
-                    close_code=WS_CLOSE_REMOTE_BROWSER_UNREACHABLE,
+                raise ChromeBrowserError(
+                    "Chrome browser disconnected",
+                    close_code=WS_CLOSE_CHROME_BROWSER_UNREACHABLE,
                 )
             try:
                 await self._handle_event(event)
             except CdpCommandError as exc:
-                _logger.debug("remote browser event %s failed: %s", event.get("method"), exc)
+                _logger.debug("Chrome browser event %s failed: %s", event.get("method"), exc)
 
     async def _handle_event(self, event: Mapping[str, Any]) -> None:
         method = event.get("method")
@@ -558,8 +558,8 @@ class RemoteBrowserSession:
         if method == "Target.targetDestroyed":
             self._tabs.pop(str(params.get("targetId", "")), None)
             if params.get("targetId") == self._target_id:
-                raise RemoteBrowserError(
-                    "the page was closed", close_code=WS_CLOSE_REMOTE_BROWSER_PAGE_GONE
+                raise ChromeBrowserError(
+                    "the page was closed", close_code=WS_CLOSE_CHROME_BROWSER_PAGE_GONE
                 )
             await self._send_state()
             return
@@ -707,14 +707,14 @@ async def _connect_cdp(websocket_url: str) -> CdpConnection:
             open_timeout=_DISCOVERY_TIMEOUT_S,
         )
     except Exception as exc:
-        raise RemoteBrowserError(
-            "remote browser is not reachable",
-            close_code=WS_CLOSE_REMOTE_BROWSER_UNREACHABLE,
+        raise ChromeBrowserError(
+            "Chrome browser is not reachable",
+            close_code=WS_CLOSE_CHROME_BROWSER_UNREACHABLE,
         ) from exc
     return CdpConnection(transport)
 
 
-async def bridge_remote_browser_to_websocket(
+async def bridge_chrome_browser_to_websocket(
     websocket: ViewerSocket,
     *,
     read_only: bool,
@@ -731,37 +731,37 @@ async def bridge_remote_browser_to_websocket(
     cdp: CdpConnection | None = None
     try:
         if endpoint is None:
-            raise RemoteBrowserError(
-                "no remote browser is configured on this host",
-                close_code=WS_CLOSE_REMOTE_BROWSER_NOT_CONFIGURED,
+            raise ChromeBrowserError(
+                "no Chrome browser is configured on this host",
+                close_code=WS_CLOSE_CHROME_BROWSER_NOT_CONFIGURED,
             )
         websocket_url = await resolve_browser_websocket_url(validate_cdp_url(endpoint))
         cdp = await _connect_cdp(websocket_url)
-        await RemoteBrowserSession(websocket, cdp, read_only=read_only).run()
-    except RemoteBrowserError as exc:
+        await ChromeBrowserSession(websocket, cdp, read_only=read_only).run()
+    except ChromeBrowserError as exc:
         with contextlib.suppress(Exception):
             await websocket.close(code=exc.close_code, reason=str(exc))
     except Exception:
-        _logger.exception("remote browser bridge failed")
+        _logger.exception("Chrome browser bridge failed")
         with contextlib.suppress(Exception):
             await websocket.close(
-                code=WS_CLOSE_REMOTE_BROWSER_UNREACHABLE, reason="remote browser bridge failed"
+                code=WS_CLOSE_CHROME_BROWSER_UNREACHABLE, reason="Chrome browser bridge failed"
             )
     finally:
         if cdp is not None:
             await cdp.close()
 
 
-def register_remote_browser_routes(app: FastAPI) -> None:
-    """Add the remote browser attach route to the runner app."""
+def register_chrome_browser_routes(app: FastAPI) -> None:
+    """Add the Chrome browser attach route to the runner app."""
 
-    @app.websocket("/v1/sessions/{session_id}/resources/remote_browser/attach")
-    async def remote_browser_attach_ws(
+    @app.websocket("/v1/sessions/{session_id}/resources/chrome_browser/attach")
+    async def chrome_browser_attach_ws(
         websocket: WebSocket,
         session_id: str,
         read_only: bool = Query(default=False),
     ) -> None:
         # The server authorized the viewer for this session before relaying it here.
-        _logger.debug("remote browser attach for session %s", session_id)
+        _logger.debug("Chrome browser attach for session %s", session_id)
         await websocket.accept()
-        await bridge_remote_browser_to_websocket(websocket, read_only=read_only)
+        await bridge_chrome_browser_to_websocket(websocket, read_only=read_only)

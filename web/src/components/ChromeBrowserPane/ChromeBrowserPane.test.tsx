@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { RemoteBrowserPane } from "./RemoteBrowserPane";
+import { ChromeBrowserPane } from "./ChromeBrowserPane";
 
 class FakeWebSocket {
   static readonly OPEN = 1;
@@ -100,12 +100,12 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("RemoteBrowserPane", () => {
+describe("ChromeBrowserPane", () => {
   it("attaches to the session's stream and shows the page's address once live", async () => {
-    render(<RemoteBrowserPane conversationId="conv_1" />);
+    render(<ChromeBrowserPane conversationId="conv_1" />);
 
-    expect(socket().url).toContain("/v1/sessions/conv_1/resources/remote_browser/attach");
-    expect(screen.getByRole("status")).toHaveTextContent("Connecting to the remote browser…");
+    expect(socket().url).toContain("/v1/sessions/conv_1/resources/chrome_browser/attach");
+    expect(screen.getByRole("status")).toHaveTextContent("Connecting to the Chrome browser…");
 
     await goLive();
 
@@ -118,7 +118,7 @@ describe("RemoteBrowserPane", () => {
   });
 
   it("acknowledges each frame after drawing it", async () => {
-    render(<RemoteBrowserPane conversationId="conv_1" />);
+    render(<ChromeBrowserPane conversationId="conv_1" />);
     await goLive();
 
     await act(async () => {
@@ -131,7 +131,7 @@ describe("RemoteBrowserPane", () => {
   });
 
   it("sends presses in the page's own pixels, and typed keys", async () => {
-    render(<RemoteBrowserPane conversationId="conv_1" />);
+    render(<ChromeBrowserPane conversationId="conv_1" />);
     await goLive();
     await act(async () => {
       socket().receive(frame(1, 1280, 800));
@@ -152,7 +152,7 @@ describe("RemoteBrowserPane", () => {
   });
 
   it("navigates to a typed address, adding the scheme", async () => {
-    render(<RemoteBrowserPane conversationId="conv_1" />);
+    render(<ChromeBrowserPane conversationId="conv_1" />);
     await goLive();
     const address = screen.getByRole("textbox", { name: "Address bar" });
 
@@ -167,7 +167,7 @@ describe("RemoteBrowserPane", () => {
   });
 
   it("lets a view-only viewer watch without sending input", async () => {
-    render(<RemoteBrowserPane conversationId="conv_1" readOnly />);
+    render(<ChromeBrowserPane conversationId="conv_1" readOnly />);
     expect(socket().url).toContain("read_only=true");
     await goLive(true);
 
@@ -179,7 +179,7 @@ describe("RemoteBrowserPane", () => {
 
   it("says so and stops dialing when the host has no browser set up", async () => {
     vi.useFakeTimers();
-    render(<RemoteBrowserPane conversationId="conv_1" />);
+    render(<ChromeBrowserPane conversationId="conv_1" />);
 
     act(() => socket().drop(4404));
     act(() => {
@@ -187,17 +187,17 @@ describe("RemoteBrowserPane", () => {
     });
 
     expect(screen.getByRole("status")).toHaveTextContent(
-      "No remote browser is set up on this session's host.",
+      "No Chrome browser is set up on this session's host.",
     );
     expect(FakeWebSocket.instances).toHaveLength(1);
   });
 
   it("dials again after the stream drops", async () => {
     vi.useFakeTimers();
-    render(<RemoteBrowserPane conversationId="conv_1" />);
+    render(<ChromeBrowserPane conversationId="conv_1" />);
 
     act(() => socket().drop(4502));
-    expect(screen.getByRole("status")).toHaveTextContent("Reconnecting to the remote browser…");
+    expect(screen.getByRole("status")).toHaveTextContent("Reconnecting to the Chrome browser…");
     act(() => {
       vi.advanceTimersByTime(120_000);
     });
@@ -206,7 +206,7 @@ describe("RemoteBrowserPane", () => {
   });
 
   it("holds no connection while it is off screen", () => {
-    render(<RemoteBrowserPane conversationId="conv_1" active={false} />);
+    render(<ChromeBrowserPane conversationId="conv_1" active={false} />);
     expect(FakeWebSocket.instances).toHaveLength(0);
   });
 });

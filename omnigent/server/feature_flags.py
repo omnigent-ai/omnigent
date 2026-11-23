@@ -63,7 +63,7 @@ class Feature(StrEnum):
     FLOATING_COMPOSER = "floating_composer"
     WORKSPACE_SIDEBAR_V2 = "workspace_sidebar_v2"
     SIDEBAR_SAVED_VIEWS = "sidebar_saved_views"
-    REMOTE_BROWSER = "remote_browser"
+    CHROME_BROWSER = "chrome_browser"
 
 
 @dataclass(frozen=True)
@@ -363,7 +363,7 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         review_by_release="0.28.0",
     ),
     FeatureDefinition(
-        feature=Feature.REMOTE_BROWSER,
+        feature=Feature.CHROME_BROWSER,
         description="Show a Chrome running on the session's host live in the workspace",
         owner="server",
         review_by_release="0.28.0",

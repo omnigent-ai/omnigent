@@ -1,4 +1,4 @@
-"""WebSocket relay from a web viewer to the session runner's remote browser."""
+"""WebSocket relay from a web viewer to the session runner's Chrome browser."""
 
 from __future__ import annotations
 
@@ -31,14 +31,14 @@ _logger = logging.getLogger(__name__)
 _WS_CLOSE_TRY_AGAIN_LATER: Final[int] = 1013
 
 
-def create_remote_browser_attach_router(
+def create_chrome_browser_attach_router(
     *,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     conversation_store: ConversationStore | None = None,
 ) -> APIRouter:
     """
-    Build the router exposing the remote browser attach WebSocket route.
+    Build the router exposing the Chrome browser attach WebSocket route.
 
     Access follows terminal attach: a viewer that can type into the page drives
     a browser on the owner's host, so it needs owner access, and a read-only
@@ -51,14 +51,14 @@ def create_remote_browser_attach_router(
     """
     router = APIRouter()
 
-    @router.websocket("/sessions/{session_id}/resources/remote_browser/attach")
-    async def attach_remote_browser(
+    @router.websocket("/sessions/{session_id}/resources/chrome_browser/attach")
+    async def attach_chrome_browser(
         websocket: WebSocket,
         session_id: str,
         read_only: bool = Query(default=False),
     ) -> None:
         """
-        Relay a viewer to the remote browser on the session's runner.
+        Relay a viewer to the Chrome browser on the session's runner.
 
         :param websocket: The viewer's WebSocket.
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
@@ -78,13 +78,13 @@ def create_remote_browser_attach_router(
         ws_factory = get_runner_ws_factory()
         if ws_factory is None:
             # No tunnel: the runner shares this process, so bridge directly.
-            from omnigent.runner.remote_browser import bridge_remote_browser_to_websocket
+            from omnigent.runner.chrome_browser import bridge_chrome_browser_to_websocket
 
-            await bridge_remote_browser_to_websocket(websocket, read_only=read_only)
+            await bridge_chrome_browser_to_websocket(websocket, read_only=read_only)
             return
 
         runner_path = (
-            f"/v1/sessions/{session_id}/resources/remote_browser/attach"
+            f"/v1/sessions/{session_id}/resources/chrome_browser/attach"
             f"?read_only={'true' if read_only else 'false'}"
         )
         try:
@@ -116,7 +116,7 @@ def create_remote_browser_attach_router(
             with contextlib.suppress(RuntimeError):
                 await websocket.close(code=code, reason=closed.reason or "")
         except Exception:
-            _logger.exception("remote browser relay failed for session %s", session_id)
+            _logger.exception("Chrome browser relay failed for session %s", session_id)
             with contextlib.suppress(RuntimeError):
                 await websocket.close(
                     code=WS_CLOSE_INTERNAL_ERROR, reason="runner attach proxy failed"

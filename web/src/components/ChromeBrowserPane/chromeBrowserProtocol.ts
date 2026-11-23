@@ -1,11 +1,11 @@
-/** Wire protocol of the remote browser stream; the runner's `remote_browser.py` is its other end. */
+/** Wire protocol of the Chrome browser stream; the runner's `chrome_browser.py` is its other end. */
 
-/** The host has no remote browser configured; retrying cannot help. */
+/** The host has no Chrome browser configured; retrying cannot help. */
 export const WS_CLOSE_NOT_CONFIGURED = 4404;
 /** The server refused the viewer. */
 const WS_CLOSE_POLICY_VIOLATION = 1008;
 
-export interface RemoteBrowserFrame {
+export interface ChromeBrowserFrame {
   seq: number;
   /** Page size in CSS pixels, which pointer coordinates use. */
   width: number;
@@ -13,28 +13,28 @@ export interface RemoteBrowserFrame {
   jpeg: Uint8Array<ArrayBuffer>;
 }
 
-export interface RemoteBrowserTab {
+export interface ChromeBrowserTab {
   id: string;
   title: string;
   url: string;
 }
 
-export interface RemoteBrowserState {
+export interface ChromeBrowserState {
   url: string;
   title: string;
   canGoBack: boolean;
   canGoForward: boolean;
   loading: boolean;
   tabId: string | null;
-  tabs: RemoteBrowserTab[];
+  tabs: ChromeBrowserTab[];
 }
 
-export type RemoteBrowserServerMessage =
+export type ChromeBrowserServerMessage =
   | { type: "ready"; readOnly: boolean }
-  | { type: "state"; state: RemoteBrowserState }
+  | { type: "state"; state: ChromeBrowserState }
   | { type: "notice"; message: string };
 
-export type RemoteBrowserClientMessage =
+export type ChromeBrowserClientMessage =
   | { type: "frame_ack"; seq: number }
   | { type: "resize"; width: number; height: number }
   | {
@@ -65,7 +65,7 @@ export type RemoteBrowserClientMessage =
 
 export type MouseButtonName = "none" | "left" | "middle" | "right";
 
-export function remoteBrowserAttachPath(
+export function chromeBrowserAttachPath(
   sessionId: string,
   readOnly: boolean,
   hostId?: string,
@@ -75,12 +75,12 @@ export function remoteBrowserAttachPath(
   // A WebSocket handshake cannot carry headers, so the routing key rides the query.
   if (hostId) params.set("omnigent_slice_key", hostId);
   const query = params.toString();
-  const path = `/v1/sessions/${encodeURIComponent(sessionId)}/resources/remote_browser/attach`;
+  const path = `/v1/sessions/${encodeURIComponent(sessionId)}/resources/chrome_browser/attach`;
   return query ? `${path}?${query}` : path;
 }
 
 /** Split a binary message into its JSON header and JPEG; null when malformed. */
-export function decodeFrame(buffer: ArrayBuffer): RemoteBrowserFrame | null {
+export function decodeFrame(buffer: ArrayBuffer): ChromeBrowserFrame | null {
   if (buffer.byteLength < 4) return null;
   const headerLength = new DataView(buffer).getUint32(0);
   if (headerLength === 0 || 4 + headerLength > buffer.byteLength) return null;
@@ -99,7 +99,7 @@ export function decodeFrame(buffer: ArrayBuffer): RemoteBrowserFrame | null {
   }
 }
 
-function tabsFrom(value: unknown): RemoteBrowserTab[] {
+function tabsFrom(value: unknown): ChromeBrowserTab[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((tab) =>
     typeof tab === "object" && tab !== null && typeof tab.id === "string"
@@ -109,7 +109,7 @@ function tabsFrom(value: unknown): RemoteBrowserTab[] {
 }
 
 /** Parse a text message from the runner; null for anything this build does not know. */
-export function parseServerMessage(text: string): RemoteBrowserServerMessage | null {
+export function parseServerMessage(text: string): ChromeBrowserServerMessage | null {
   let payload: unknown;
   try {
     payload = JSON.parse(text);
@@ -202,8 +202,8 @@ interface KeyLike extends ModifierKeys {
 export function keyMessage(
   event: KeyLike,
   kind: "down" | "up",
-): Extract<RemoteBrowserClientMessage, { type: "key" }> {
-  const message: Extract<RemoteBrowserClientMessage, { type: "key" }> = {
+): Extract<ChromeBrowserClientMessage, { type: "key" }> {
+  const message: Extract<ChromeBrowserClientMessage, { type: "key" }> = {
     type: "key",
     event: kind,
     key: event.key,

@@ -8,8 +8,8 @@ import {
   mouseButtonName,
   pagePoint,
   parseServerMessage,
-  remoteBrowserAttachPath,
-} from "./remoteBrowserProtocol";
+  chromeBrowserAttachPath,
+} from "./chromeBrowserProtocol";
 
 function encodeFrame(header: unknown, jpeg: number[]): ArrayBuffer {
   const headerBytes = new TextEncoder().encode(JSON.stringify(header));
@@ -22,13 +22,13 @@ function encodeFrame(header: unknown, jpeg: number[]): ArrayBuffer {
 
 const NO_MODIFIERS = { altKey: false, ctrlKey: false, metaKey: false, shiftKey: false };
 
-describe("remoteBrowserAttachPath", () => {
+describe("chromeBrowserAttachPath", () => {
   it("adds only the parameters that are set", () => {
-    expect(remoteBrowserAttachPath("conv 1", false)).toBe(
-      "/v1/sessions/conv%201/resources/remote_browser/attach",
+    expect(chromeBrowserAttachPath("conv 1", false)).toBe(
+      "/v1/sessions/conv%201/resources/chrome_browser/attach",
     );
-    expect(remoteBrowserAttachPath("conv_1", true, "host_9")).toBe(
-      "/v1/sessions/conv_1/resources/remote_browser/attach?read_only=true&omnigent_slice_key=host_9",
+    expect(chromeBrowserAttachPath("conv_1", true, "host_9")).toBe(
+      "/v1/sessions/conv_1/resources/chrome_browser/attach?read_only=true&omnigent_slice_key=host_9",
     );
   });
 });

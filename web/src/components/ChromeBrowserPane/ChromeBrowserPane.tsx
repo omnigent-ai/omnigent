@@ -1,5 +1,5 @@
 /**
- * RemoteBrowserPane — a live view of a Chrome running on the session's host.
+ * ChromeBrowserPane — a live view of a Chrome running on the session's host.
  *
  * The page arrives as a stream of JPEG frames over a WebSocket and is drawn on
  * a canvas; pointer and keyboard input on the canvas go back the same way. It
@@ -29,11 +29,11 @@ import {
   mouseButtonName,
   pagePoint,
   parseServerMessage,
-  remoteBrowserAttachPath,
+  chromeBrowserAttachPath,
   WS_CLOSE_NOT_CONFIGURED,
-  type RemoteBrowserClientMessage,
-  type RemoteBrowserState,
-} from "./remoteBrowserProtocol";
+  type ChromeBrowserClientMessage,
+  type ChromeBrowserState,
+} from "./chromeBrowserProtocol";
 
 type Status = "connecting" | "live" | "reconnecting" | "not-configured" | "refused";
 
@@ -44,16 +44,16 @@ const NOTICE_MS = 6_000;
 const WHEEL_LINE_PX = 16;
 
 const STATUS_TEXT: Record<Exclude<Status, "live">, string> = {
-  connecting: "Connecting to the remote browser…",
-  reconnecting: "Reconnecting to the remote browser…",
-  "not-configured": "No remote browser is set up on this session's host.",
-  refused: "You don't have access to this session's remote browser.",
+  connecting: "Connecting to the Chrome browser…",
+  reconnecting: "Reconnecting to the Chrome browser…",
+  "not-configured": "No Chrome browser is set up on this session's host.",
+  refused: "You don't have access to this session's Chrome browser.",
 };
 
 const TOOLBAR_BUTTON =
   "flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40";
 
-export interface RemoteBrowserPaneProps {
+export interface ChromeBrowserPaneProps {
   conversationId: string;
   /** Show the page without sending input; for viewers who don't own the session. */
   readOnly?: boolean;
@@ -67,19 +67,19 @@ function attachUrl(conversationId: string, readOnly: boolean): string {
   const hostId = isHostRoutingEnabled() ? getSessionHost(conversationId) : null;
   const unkeyed = hostId !== null && isDatabricksWorkspace() && isHostKeyless(hostId);
   return resolveWebSocketUrl(
-    remoteBrowserAttachPath(conversationId, readOnly, unkeyed ? undefined : (hostId ?? undefined)),
+    chromeBrowserAttachPath(conversationId, readOnly, unkeyed ? undefined : (hostId ?? undefined)),
     { unkeyed },
   );
 }
 
-export function RemoteBrowserPane({
+export function ChromeBrowserPane({
   conversationId,
   readOnly = false,
   active = true,
   className,
-}: RemoteBrowserPaneProps) {
+}: ChromeBrowserPaneProps) {
   const [status, setStatus] = useState<Status>("connecting");
-  const [browser, setBrowser] = useState<RemoteBrowserState | null>(null);
+  const [browser, setBrowser] = useState<ChromeBrowserState | null>(null);
   const [viewOnly, setViewOnly] = useState(readOnly);
   const [notice, setNotice] = useState<string | null>(null);
   const [address, setAddress] = useState("");
@@ -93,10 +93,10 @@ export function RemoteBrowserPane({
   const pageSizeRef = useRef(pageSize);
   const stageSizeRef = useRef(stageSize);
   const drawnSequenceRef = useRef(0);
-  const pendingMoveRef = useRef<RemoteBrowserClientMessage | null>(null);
+  const pendingMoveRef = useRef<ChromeBrowserClientMessage | null>(null);
   const moveFrameRef = useRef<number | null>(null);
 
-  const send = useCallback((message: RemoteBrowserClientMessage) => {
+  const send = useCallback((message: ChromeBrowserClientMessage) => {
     const socket = socketRef.current;
     if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
   }, []);
@@ -308,7 +308,7 @@ export function RemoteBrowserPane({
   return (
     <div
       className={cn("flex min-h-0 min-w-0 flex-col", className)}
-      data-remote-browser-pane={conversationId}
+      data-chrome-browser-pane={conversationId}
     >
       <div className="flex shrink-0 items-center gap-1 border-border border-b bg-card px-2 py-1.5">
         <button
@@ -400,7 +400,7 @@ export function RemoteBrowserPane({
           ref={canvasRef}
           tabIndex={interactive ? 0 : -1}
           role={interactive ? "application" : "img"}
-          aria-label={browser?.title ? `Remote browser: ${browser.title}` : "Remote browser"}
+          aria-label={browser?.title ? `Chrome browser: ${browser.title}` : "Chrome browser"}
           style={{ width: drawn.width, height: drawn.height }}
           className={cn("outline-none", status !== "live" && "opacity-40")}
           onMouseDown={

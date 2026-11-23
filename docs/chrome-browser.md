@@ -1,6 +1,6 @@
-# Remote browser
+# Chrome browser
 
-The remote browser shows a Chrome that runs on a session's host as a live
+The Chrome browser tab shows a Chrome that runs on a session's host as a live
 picture in the workspace. The session's owner can click, type, scroll and
 navigate in it; people the session is shared with can watch. It works in a
 plain browser tab and in the desktop app.
@@ -14,25 +14,25 @@ up in the pane.
 
 Both halves are needed.
 
-1. On the server, enable the `remote_browser` feature:
+1. On the server, enable the `chrome_browser` feature:
 
    ```bash
-   OMNIGENT_FEATURES=remote_browser omnigent server
+   OMNIGENT_FEATURES=chrome_browser omnigent server
    ```
 
 2. On the host, start Chrome with a debugging port and a profile of its own,
    then give the runner that address before `omnigent host` starts:
 
    ```bash
-   google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.omnigent-remote-browser" &
-   export OMNIGENT_REMOTE_BROWSER_CDP_URL=http://127.0.0.1:9222
+   google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.omnigent-chrome-browser" &
+   export OMNIGENT_CHROME_BROWSER_CDP_URL=http://127.0.0.1:9222
    omnigent host --server https://omnigent.example.com
    ```
 
    Add `--headless=new` to run Chrome without a window. The address may be the
    `http://` debugging address or Chrome's `ws://` browser endpoint.
 
-Then open a session on that host and choose **+** > **Remote browser** in the
+Then open a session on that host and choose **+** > **Chrome browser** in the
 workspace.
 
 ## Limits and safety

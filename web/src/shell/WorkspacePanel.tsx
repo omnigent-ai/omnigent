@@ -63,11 +63,11 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
-import { RemoteBrowserPane } from "@/components/RemoteBrowserPane/RemoteBrowserPane";
+import { ChromeBrowserPane } from "@/components/ChromeBrowserPane/ChromeBrowserPane";
 import {
-  REMOTE_BROWSER_LABEL,
-  useRemoteBrowserTab,
-} from "@/components/RemoteBrowserPane/useRemoteBrowserTab";
+  CHROME_BROWSER_LABEL,
+  useChromeBrowserTab,
+} from "@/components/ChromeBrowserPane/useChromeBrowserTab";
 import { browserViewId, useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useInertRef } from "@/hooks/useInertRef";
 import { requestSandboxWake } from "@/hooks/useSandboxAutoWake";
@@ -203,7 +203,7 @@ function NewTabMenu({
   onOpenPanel,
   onOpenTerminal,
   onOpenBrowser,
-  onOpenRemoteBrowser,
+  onOpenChromeBrowser,
   onOpen,
   onOpenSideChat,
   onCreateStart,
@@ -218,7 +218,7 @@ function NewTabMenu({
   onOpenTerminal: (key: string) => void;
   onOpenBrowser?: () => void;
   /** Open the live view of the browser on the session's host. */
-  onOpenRemoteBrowser?: () => void;
+  onOpenChromeBrowser?: () => void;
   /** Called as the menu opens, before it takes focus, so its caller can note what had it. */
   onOpen?: () => void;
   /** Open a new side chat (a fork of this conversation) as a rail tab. Absent
@@ -253,7 +253,7 @@ function NewTabMenu({
   // declare a non-empty ``terminals:`` block.
   const declaredTerminals = agent?.terminals ?? [];
   const canOpenShell = declaredTerminals.length > 0;
-  const hasBrowserItem = Boolean(onOpenBrowser || onOpenRemoteBrowser);
+  const hasBrowserItem = Boolean(onOpenBrowser || onOpenChromeBrowser);
   if (!canOpenShell && !hasBrowserItem && !onOpenSideChat && panels.length === 0) return null;
 
   // The remembered shell, or the first declared type. Used only when shell
@@ -370,10 +370,10 @@ function NewTabMenu({
             )}
           </DropdownMenuItem>
         )}
-        {onOpenRemoteBrowser && (
-          <DropdownMenuItem onSelect={onOpenRemoteBrowser} className="cursor-pointer">
+        {onOpenChromeBrowser && (
+          <DropdownMenuItem onSelect={onOpenChromeBrowser} className="cursor-pointer">
             <MonitorPlayIcon className="size-4" />
-            {REMOTE_BROWSER_LABEL}
+            {CHROME_BROWSER_LABEL}
           </DropdownMenuItem>
         )}
         {onOpenSideChat && (
@@ -739,7 +739,7 @@ interface WorkspacePanelProps {
   /** Whether the session has a Tasks tab. */
   showTasksTab?: boolean;
   /** Whether the server offers a live view of a browser on the session's host. */
-  showRemoteBrowser?: boolean;
+  showChromeBrowser?: boolean;
   /** Whether Browser soft tabs are available — hidden without a browser bridge. */
   showBrowserTab: boolean;
   /** Reveal the workspace when a global shortcut opens a tab. */
@@ -920,7 +920,7 @@ function WorkspacePanelImpl({
   showContentSearch = false,
   showGithubTab,
   showTasksTab = false,
-  showRemoteBrowser = false,
+  showChromeBrowser = false,
   showBrowserTab,
   onReveal,
   onHide,
@@ -965,7 +965,7 @@ function WorkspacePanelImpl({
   const railRef = useRef<HTMLElement | null>(null);
   const railContentRef = useRef<HTMLDivElement | null>(null);
   const browsers = useBrowserTabs(conversationId);
-  const remoteBrowser = useRemoteBrowserTab(conversationId);
+  const chromeBrowser = useChromeBrowserTab(conversationId);
   const sideChats = useSideChats(conversationId);
   const mobileViewport = useIsMobileViewport();
   const isMobile = mobileViewport && !contained;
@@ -976,12 +976,12 @@ function WorkspacePanelImpl({
       selectedTerminalKey,
       selectedBrowserId: browsers.selected,
       selectedSideChatId: sideChats.selected,
-      remoteBrowserOpen: remoteBrowser.open,
+      chromeBrowserOpen: chromeBrowser.open,
     },
     {
       terminalPresent: (key) => openTerminals.includes(key),
       showBrowserTab,
-      showRemoteBrowser,
+      showChromeBrowser,
       showGithubTab,
       showTasksTab: showTasksTab && Boolean(conversationId),
       showContentSearch,
@@ -989,11 +989,11 @@ function WorkspacePanelImpl({
       mobile: isMobile,
     },
   );
-  const { browserSelected, remoteBrowserSelected, sideChatSelected } = activeView;
-  const remoteBrowserTabShown = showRemoteBrowser && remoteBrowser.open;
-  const openRemoteBrowser = () => {
-    remoteBrowser.setOpen(true);
-    onRightRailTabChange("remote-browser");
+  const { browserSelected, chromeBrowserSelected, sideChatSelected } = activeView;
+  const chromeBrowserTabShown = showChromeBrowser && chromeBrowser.open;
+  const openChromeBrowser = () => {
+    chromeBrowser.setOpen(true);
+    onRightRailTabChange("chrome-browser");
     onReveal?.();
   };
   const terminalShown = activeView.terminalKey !== null;
@@ -1398,7 +1398,7 @@ function WorkspacePanelImpl({
       openFiles.length > 0 ||
       openTerminals.length > 0 ||
       sideChats.tabs.length > 0 ||
-      remoteBrowserTabShown ||
+      chromeBrowserTabShown ||
       (showBrowserTab && browsers.tabs.length > 0));
   const newTabMenu = (menuAlign: "start" | "end") => (
     <NewTabMenu
@@ -1406,7 +1406,7 @@ function WorkspacePanelImpl({
       panels={unpinnedTabs}
       onOpenPanel={selectPermanentTab}
       onOpenBrowser={showBrowserTab ? addBrowserFromMenu : undefined}
-      onOpenRemoteBrowser={showRemoteBrowser ? openRemoteBrowser : undefined}
+      onOpenChromeBrowser={showChromeBrowser ? openChromeBrowser : undefined}
       onOpen={noteMenuOrigin}
       onOpenSideChat={onNewSideChat}
       onOpenTerminal={openTerminalTab}
@@ -1455,7 +1455,7 @@ function WorkspacePanelImpl({
   useEffect(() => {
     if (
       ((rightRailTab === "browser" && browsers.selected === null) ||
-        (rightRailTab === "remote-browser" && !remoteBrowserTabShown) ||
+        (rightRailTab === "chrome-browser" && !chromeBrowserTabShown) ||
         (rightRailTab === "sidechat" && sideChats.selected === null)) &&
       selectedFilePath === null &&
       selectedTerminalKey === null
@@ -1465,7 +1465,7 @@ function WorkspacePanelImpl({
   }, [
     rightRailTab,
     browsers.selected,
-    remoteBrowserTabShown,
+    chromeBrowserTabShown,
     sideChats.selected,
     selectedFilePath,
     selectedTerminalKey,
@@ -1518,13 +1518,13 @@ function WorkspacePanelImpl({
       },
       disabled: false,
     })),
-    ...(remoteBrowserTabShown
+    ...(chromeBrowserTabShown
       ? [
           {
-            key: "remote-browser",
-            label: REMOTE_BROWSER_LABEL,
-            active: remoteBrowserSelected,
-            select: openRemoteBrowser,
+            key: "chrome-browser",
+            label: CHROME_BROWSER_LABEL,
+            active: chromeBrowserSelected,
+            select: openChromeBrowser,
             disabled: false,
           },
         ]
@@ -1606,8 +1606,8 @@ function WorkspacePanelImpl({
         void closeSideChat(sideChats.selected);
       } else if (scopeView === "browser" && browsers.selected !== null) {
         void closeBrowserTab(browsers.selected);
-      } else if (scopeView === "remote-browser") {
-        remoteBrowser.setOpen(false);
+      } else if (scopeView === "chrome-browser") {
+        chromeBrowser.setOpen(false);
       } else if (openPanel !== undefined) {
         closePanel(openPanel);
       } else if (onHide) {
@@ -1970,11 +1970,11 @@ function WorkspacePanelImpl({
                       </button>
                     </div>
                   ))}
-                {remoteBrowserTabShown && (
+                {chromeBrowserTabShown && (
                   <div
                     className={cn(
                       "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
-                      remoteBrowserSelected
+                      chromeBrowserSelected
                         ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
                         : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
                     )}
@@ -1982,24 +1982,24 @@ function WorkspacePanelImpl({
                     <button
                       type="button"
                       role="tab"
-                      aria-selected={remoteBrowserSelected}
+                      aria-selected={chromeBrowserSelected}
                       className="flex min-w-0 items-center gap-1"
                       onAuxClick={(event) => {
                         if (event.button === 1) {
                           event.preventDefault();
-                          remoteBrowser.setOpen(false);
+                          chromeBrowser.setOpen(false);
                         }
                       }}
-                      onClick={openRemoteBrowser}
+                      onClick={openChromeBrowser}
                     >
                       <MonitorPlayIcon className="size-4 shrink-0" />
-                      <span className="max-w-44 truncate">{REMOTE_BROWSER_LABEL}</span>
+                      <span className="max-w-44 truncate">{CHROME_BROWSER_LABEL}</span>
                     </button>
                     <button
                       type="button"
-                      aria-label={`Close ${REMOTE_BROWSER_LABEL}`}
+                      aria-label={`Close ${CHROME_BROWSER_LABEL}`}
                       className="flex size-4 items-center justify-center rounded hover:bg-muted"
-                      onClick={() => remoteBrowser.setOpen(false)}
+                      onClick={() => chromeBrowser.setOpen(false)}
                     >
                       <XIcon className="size-3" />
                     </button>
@@ -2260,9 +2260,9 @@ function WorkspacePanelImpl({
                 onFocused={clearBrowserFocus}
                 className="min-h-0 flex-1"
               />
-            ) : scopeView === "remote-browser" ? (
-              <RenderErrorBoundary name="remote browser" resetKey={conversationId}>
-                <RemoteBrowserPane
+            ) : scopeView === "chrome-browser" ? (
+              <RenderErrorBoundary name="Chrome browser" resetKey={conversationId}>
+                <ChromeBrowserPane
                   conversationId={conversationId}
                   readOnly={!isOwnerLevel(permissionLevel)}
                   active={open && !inert}

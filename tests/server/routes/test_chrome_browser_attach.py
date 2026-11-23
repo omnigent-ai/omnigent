@@ -1,4 +1,4 @@
-"""Tests for the server's remote browser attach relay route."""
+"""Tests for the server's Chrome browser attach relay route."""
 
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from omnigent.runner.remote_browser import WS_CLOSE_REMOTE_BROWSER_NOT_CONFIGURED
+from omnigent.runner.chrome_browser import WS_CLOSE_CHROME_BROWSER_NOT_CONFIGURED
 from omnigent.runtime import _globals, set_runner_ws_factory
 from omnigent.server._runner_ws_tunnel import make_tunnel_ws_factory
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
-from omnigent.server.routes.remote_browser_attach import create_remote_browser_attach_router
+from omnigent.server.routes.chrome_browser_attach import create_chrome_browser_attach_router
 from tests.server.routes.test_terminal_attach import (
     _FakeRunnerWSConn,
     _FakeRunnerWSFactory,
@@ -21,7 +21,7 @@ from tests.server.routes.test_terminal_attach import (
     _StubPermissionStore,
 )
 
-_ATTACH_PATH = "/v1/sessions/conv_alice/resources/remote_browser/attach"
+_ATTACH_PATH = "/v1/sessions/conv_alice/resources/chrome_browser/attach"
 _OWNER = {"X-Forwarded-Email": "owner@example.com"}
 _READER = {"X-Forwarded-Email": "reader@example.com"}
 
@@ -41,7 +41,7 @@ def _app_with_permissions() -> FastAPI:
     permission_store.add_grant("reader@example.com", "conv_alice", LEVEL_READ)
     app = FastAPI()
     app.include_router(
-        create_remote_browser_attach_router(
+        create_chrome_browser_attach_router(
             auth_provider=UnifiedAuthProvider(source="header"),
             permission_store=permission_store,  # type: ignore[arg-type]
             conversation_store=conversation_store,  # type: ignore[arg-type]
@@ -85,7 +85,7 @@ def test_reader_may_watch_but_not_drive() -> None:
 
 def test_runner_close_code_reaches_the_viewer() -> None:
     conn = _FakeRunnerWSConn(
-        close_code=WS_CLOSE_REMOTE_BROWSER_NOT_CONFIGURED, close_reason="not configured"
+        close_code=WS_CLOSE_CHROME_BROWSER_NOT_CONFIGURED, close_reason="not configured"
     )
     set_runner_ws_factory(_FakeRunnerWSFactory(conn))
 
@@ -93,11 +93,11 @@ def test_runner_close_code_reaches_the_viewer() -> None:
         with pytest.raises(WebSocketDisconnect) as closed:
             ws.receive_bytes()
 
-    assert closed.value.code == WS_CLOSE_REMOTE_BROWSER_NOT_CONFIGURED
+    assert closed.value.code == WS_CLOSE_CHROME_BROWSER_NOT_CONFIGURED
     assert closed.value.reason == "not configured"
 
 
-def test_tunnel_factory_accepts_the_remote_browser_path() -> None:
+def test_tunnel_factory_accepts_the_chrome_browser_path() -> None:
     class _NoRunnerRouter:
         def client_for_existing_conversation(self, conversation_id: str) -> None:
             self.conversation_id = conversation_id

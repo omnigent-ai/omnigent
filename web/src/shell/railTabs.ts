@@ -5,8 +5,8 @@
  */
 
 /** The selectable tabs in the right workspace rail, in display order.
- *  "browser", "remote-browser" and "sidechat" are dynamic-tab modes (a browser tab,
- *  the remote browser or a side-chat tab is selected), not fixed nav tabs — the
+ *  "browser", "chrome-browser" and "sidechat" are dynamic-tab modes (a browser tab,
+ *  the Chrome browser or a side-chat tab is selected), not fixed nav tabs — the
  *  nav strip renders the first four.
  *  "github" is a stable stored id for the Pull Requests tab; renaming it drops saved choices. */
 export type RightRailTab =
@@ -16,7 +16,7 @@ export type RightRailTab =
   | "tasks"
   | "subagents"
   | "browser"
-  | "remote-browser"
+  | "chrome-browser"
   | "sidechat"
   | "content-search";
 

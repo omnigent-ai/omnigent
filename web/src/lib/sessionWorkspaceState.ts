@@ -20,7 +20,7 @@ const WORKSPACE_PANEL_TABS: readonly DefaultWorkspaceTab[] = [
 const RAIL_TABS: readonly RightRailTab[] = [
   ...WORKSPACE_PANEL_TABS,
   "browser",
-  "remote-browser",
+  "chrome-browser",
   "sidechat",
   "content-search",
 ];
@@ -44,8 +44,8 @@ export interface SessionWorkspaceState {
   selectedTerminalKey?: string | null;
   openBrowsers?: string[];
   selectedBrowserId?: string | null;
-  /** Whether the remote browser tab is open in the rail's tab strip. */
-  remoteBrowserOpen?: boolean;
+  /** Whether the Chrome browser tab is open in the rail's tab strip. */
+  chromeBrowserOpen?: boolean;
   /** Ordered list of open side-chat tabs (child conversation ids). */
   openSideChats?: string[];
   /** Side chats closed on this device; discovery must not reopen them. */
@@ -133,8 +133,8 @@ function sanitize(entry: unknown): SessionWorkspaceState {
     state.selectedTerminalKey = record.selectedTerminalKey;
   }
   if (Array.isArray(record.openBrowsers)) state.openBrowsers = uniqueIds(record.openBrowsers);
-  if (typeof record.remoteBrowserOpen === "boolean") {
-    state.remoteBrowserOpen = record.remoteBrowserOpen;
+  if (typeof record.chromeBrowserOpen === "boolean") {
+    state.chromeBrowserOpen = record.chromeBrowserOpen;
   }
   if (record.selectedBrowserId === null || typeof record.selectedBrowserId === "string") {
     state.selectedBrowserId = record.selectedBrowserId;

@@ -1,4 +1,4 @@
-"""Tests for the runner's remote browser bridge."""
+"""Tests for the runner's Chrome browser bridge."""
 
 from __future__ import annotations
 
@@ -10,14 +10,14 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.runner.remote_browser import (
-    WS_CLOSE_REMOTE_BROWSER_NOT_CONFIGURED,
-    WS_CLOSE_REMOTE_BROWSER_PAGE_GONE,
-    WS_CLOSE_REMOTE_BROWSER_UNREACHABLE,
+from omnigent.runner.chrome_browser import (
+    WS_CLOSE_CHROME_BROWSER_NOT_CONFIGURED,
+    WS_CLOSE_CHROME_BROWSER_PAGE_GONE,
+    WS_CLOSE_CHROME_BROWSER_UNREACHABLE,
     CdpConnection,
-    RemoteBrowserError,
-    RemoteBrowserSession,
-    bridge_remote_browser_to_websocket,
+    ChromeBrowserError,
+    ChromeBrowserSession,
+    bridge_chrome_browser_to_websocket,
     browser_websocket_url,
     clamp_viewport,
     configured_cdp_url,
@@ -127,7 +127,7 @@ async def _start(
     chrome: _FakeChrome, *, read_only: bool = False
 ) -> tuple[_FakeViewer, asyncio.Task[None]]:
     viewer = _FakeViewer()
-    session = RemoteBrowserSession(viewer, CdpConnection(chrome), read_only=read_only)
+    session = ChromeBrowserSession(viewer, CdpConnection(chrome), read_only=read_only)
     task = asyncio.create_task(session.run())
     await _settle()
     return viewer, task
@@ -153,9 +153,9 @@ def _decode_frame(frame: bytes) -> tuple[dict[str, Any], bytes]:
 
 def test_configured_cdp_url_ignores_blank_values() -> None:
     assert configured_cdp_url({}) is None
-    assert configured_cdp_url({"OMNIGENT_REMOTE_BROWSER_CDP_URL": "  "}) is None
+    assert configured_cdp_url({"OMNIGENT_CHROME_BROWSER_CDP_URL": "  "}) is None
     assert (
-        configured_cdp_url({"OMNIGENT_REMOTE_BROWSER_CDP_URL": " http://127.0.0.1:9222 "})
+        configured_cdp_url({"OMNIGENT_CHROME_BROWSER_CDP_URL": " http://127.0.0.1:9222 "})
         == "http://127.0.0.1:9222"
     )
 
@@ -179,9 +179,9 @@ def test_validate_cdp_url_accepts_loopback(url: str) -> None:
     ],
 )
 def test_validate_cdp_url_rejects_everything_else(url: str) -> None:
-    with pytest.raises(RemoteBrowserError) as rejected:
+    with pytest.raises(ChromeBrowserError) as rejected:
         validate_cdp_url(url)
-    assert rejected.value.close_code == WS_CLOSE_REMOTE_BROWSER_NOT_CONFIGURED
+    assert rejected.value.close_code == WS_CLOSE_CHROME_BROWSER_NOT_CONFIGURED
 
 
 def test_browser_websocket_url_keeps_the_configured_address() -> None:
@@ -212,10 +212,10 @@ async def test_resolve_browser_websocket_url_reports_an_unreachable_chrome() -> 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda request: httpx.Response(500))
     ) as client:
-        with pytest.raises(RemoteBrowserError) as unreachable:
+        with pytest.raises(ChromeBrowserError) as unreachable:
             await resolve_browser_websocket_url("http://127.0.0.1:40123", http_client=client)
 
-    assert unreachable.value.close_code == WS_CLOSE_REMOTE_BROWSER_UNREACHABLE
+    assert unreachable.value.close_code == WS_CLOSE_CHROME_BROWSER_UNREACHABLE
 
 
 def test_encode_frame_round_trips() -> None:
@@ -479,20 +479,20 @@ async def test_closing_the_watched_page_ends_the_session() -> None:
 
     chrome.emit("Target.targetDestroyed", {"targetId": "page-1"}, in_page=False)
 
-    with pytest.raises(RemoteBrowserError) as gone:
+    with pytest.raises(ChromeBrowserError) as gone:
         await asyncio.wait_for(task, timeout=2)
-    assert gone.value.close_code == WS_CLOSE_REMOTE_BROWSER_PAGE_GONE
+    assert gone.value.close_code == WS_CLOSE_CHROME_BROWSER_PAGE_GONE
 
 
 async def test_bridge_closes_the_viewer_when_nothing_is_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("OMNIGENT_REMOTE_BROWSER_CDP_URL", raising=False)
+    monkeypatch.delenv("OMNIGENT_CHROME_BROWSER_CDP_URL", raising=False)
     viewer = _FakeViewer()
 
-    await bridge_remote_browser_to_websocket(viewer, read_only=False)
+    await bridge_chrome_browser_to_websocket(viewer, read_only=False)
 
     assert viewer.closed == (
-        WS_CLOSE_REMOTE_BROWSER_NOT_CONFIGURED,
-        "no remote browser is configured on this host",
+        WS_CLOSE_CHROME_BROWSER_NOT_CONFIGURED,
+        "no Chrome browser is configured on this host",
     )

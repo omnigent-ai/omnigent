@@ -8,7 +8,7 @@ import type { RightRailTab } from "./railTabs";
 export type WorkspaceScopeView =
   | "sidechat"
   | "browser"
-  | "remote-browser"
+  | "chrome-browser"
   | "github"
   | "tasks"
   | "subagents"
@@ -22,16 +22,16 @@ export interface WorkspaceSelection {
   selectedTerminalKey: string | null;
   selectedBrowserId: string | null;
   selectedSideChatId: string | null;
-  /** Whether the remote browser tab is open; absent reads as closed. */
-  remoteBrowserOpen?: boolean;
+  /** Whether the Chrome browser tab is open; absent reads as closed. */
+  chromeBrowserOpen?: boolean;
 }
 
 export interface WorkspaceViewAvailability {
   /** Whether the selected shell's terminal is present. */
   terminalPresent: (key: string) => boolean;
   showBrowserTab: boolean;
-  /** Whether the server offers the remote browser; absent reads as not offered. */
-  showRemoteBrowser?: boolean;
+  /** Whether the server offers the Chrome browser; absent reads as not offered. */
+  showChromeBrowser?: boolean;
   showGithubTab: boolean;
   /** Whether the session has a Tasks page. */
   showTasksTab: boolean;
@@ -51,7 +51,7 @@ export interface WorkspaceActiveView {
   flat: boolean;
   sideChatSelected: boolean;
   browserSelected: boolean;
-  remoteBrowserSelected: boolean;
+  chromeBrowserSelected: boolean;
 }
 
 export function resolveWorkspaceActiveView(
@@ -69,18 +69,18 @@ export function resolveWorkspaceActiveView(
     rightRailTab === "sidechat" && nothingInFront && selection.selectedSideChatId !== null;
   const browserSelected =
     rightRailTab === "browser" && nothingInFront && selection.selectedBrowserId !== null;
-  const remoteBrowserSelected =
-    rightRailTab === "remote-browser" &&
+  const chromeBrowserSelected =
+    rightRailTab === "chrome-browser" &&
     nothingInFront &&
-    selection.remoteBrowserOpen === true &&
-    availability.showRemoteBrowser === true;
+    selection.chromeBrowserOpen === true &&
+    availability.showChromeBrowser === true;
   const scope: WorkspaceScopeView =
     sideChatSelected && !availability.mobile
       ? "sidechat"
       : browserSelected && availability.showBrowserTab
         ? "browser"
-        : remoteBrowserSelected
-          ? "remote-browser"
+        : chromeBrowserSelected
+          ? "chrome-browser"
           : rightRailTab === "github" && availability.showGithubTab
             ? "github"
             : rightRailTab === "tasks" && availability.showTasksTab
@@ -99,6 +99,6 @@ export function resolveWorkspaceActiveView(
     flat: rightRailTab === "changes",
     sideChatSelected,
     browserSelected,
-    remoteBrowserSelected,
+    chromeBrowserSelected,
   };
 }

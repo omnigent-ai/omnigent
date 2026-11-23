@@ -96,15 +96,15 @@ vi.mock("./ContentSearchPanel", () => ({
     return <input data-testid="content-search-stub" ref={inputRef} />;
   },
 }));
-vi.mock("@/components/RemoteBrowserPane/RemoteBrowserPane", () => ({
-  RemoteBrowserPane: ({
+vi.mock("@/components/ChromeBrowserPane/ChromeBrowserPane", () => ({
+  ChromeBrowserPane: ({
     conversationId,
     readOnly,
   }: {
     conversationId: string;
     readOnly: boolean;
   }) => (
-    <div data-testid="remote-browser-pane-stub" data-read-only={String(readOnly)}>
+    <div data-testid="chrome-browser-pane-stub" data-read-only={String(readOnly)}>
       {conversationId}
     </div>
   ),
@@ -256,7 +256,7 @@ function renderWorkspace(
     showContentSearch?: boolean;
     showFilesPanel?: boolean;
     showBrowserTab?: boolean;
-    showRemoteBrowser?: boolean;
+    showChromeBrowser?: boolean;
     openTerminals?: string[];
     selectedTerminalKey?: string | null;
     maximized?: boolean;
@@ -315,7 +315,7 @@ function renderWorkspace(
         showContentSearch={overrides.showContentSearch}
         showGithubTab={overrides.showGithubTab ?? false}
         showBrowserTab={overrides.showBrowserTab ?? false}
-        showRemoteBrowser={overrides.showRemoteBrowser}
+        showChromeBrowser={overrides.showChromeBrowser}
         onReveal={onReveal}
         onHide={overrides.withHide === false ? undefined : onHide}
         changedCount={overrides.changedCount ?? 0}
@@ -1100,45 +1100,45 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(screen.queryByRole("button", { name: "Open new" })).toBeNull();
   });
 
-  it("leaves the remote browser out of the menu where the server doesn't offer it", async () => {
+  it("leaves the Chrome browser out of the menu where the server doesn't offer it", async () => {
     declaresShell();
     renderWorkspace({});
 
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
     await screen.findByRole("menuitem", { name: /shell \(zsh\)/i });
 
-    expect(screen.queryByRole("menuitem", { name: "Remote browser" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Chrome browser" })).toBeNull();
   });
 
-  it("opens the remote browser as a tab from the menu", async () => {
-    const { onRightRailTabChange } = renderWorkspace({ showRemoteBrowser: true });
+  it("opens the Chrome browser as a tab from the menu", async () => {
+    const { onRightRailTabChange } = renderWorkspace({ showChromeBrowser: true });
 
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Remote browser" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Chrome browser" }));
 
-    expect(onRightRailTabChange).toHaveBeenCalledWith("remote-browser");
-    expect(await screen.findByRole("tab", { name: "Remote browser" })).toBeInTheDocument();
+    expect(onRightRailTabChange).toHaveBeenCalledWith("chrome-browser");
+    expect(await screen.findByRole("tab", { name: "Chrome browser" })).toBeInTheDocument();
   });
 
-  it("shows the remote browser read-only to non-owners, and closes its tab", async () => {
-    writeSessionWorkspaceState("conv_ws", { remoteBrowserOpen: true });
+  it("shows the Chrome browser read-only to non-owners, and closes its tab", async () => {
+    writeSessionWorkspaceState("conv_ws", { chromeBrowserOpen: true });
     const { onRightRailTabChange } = renderWorkspace({
-      showRemoteBrowser: true,
-      rightRailTab: "remote-browser",
+      showChromeBrowser: true,
+      rightRailTab: "chrome-browser",
       permissionLevel: 1,
     });
 
-    expect(screen.getByTestId("remote-browser-pane-stub")).toHaveAttribute(
+    expect(screen.getByTestId("chrome-browser-pane-stub")).toHaveAttribute(
       "data-read-only",
       "true",
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Close Remote browser" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close Chrome browser" }));
 
     await waitFor(() =>
-      expect(screen.queryByRole("tab", { name: "Remote browser" })).not.toBeInTheDocument(),
+      expect(screen.queryByRole("tab", { name: "Chrome browser" })).not.toBeInTheDocument(),
     );
-    expect(screen.queryByTestId("remote-browser-pane-stub")).toBeNull();
+    expect(screen.queryByTestId("chrome-browser-pane-stub")).toBeNull();
     expect(onRightRailTabChange).toHaveBeenCalledWith("files");
   });
 
