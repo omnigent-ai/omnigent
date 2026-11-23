@@ -285,6 +285,7 @@ describe("sessionWorkspaceState", () => {
         "tab-3":"https://bare.example/",
         "tab-4":{"url":"https://unowned.example/"},
         "tab-5":{"url":"https://app.example/?PHPSESSID=synthetic","owner":"user-a"},
+        "tab-6":{"url":"https://app.example/report;jsessionid=synthetic","owner":"user-a"},
         "__proto__":{"url":"https://proto.example/","owner":"user-a"}
       }}}]`,
     );

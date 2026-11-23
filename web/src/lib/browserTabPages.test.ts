@@ -94,11 +94,18 @@ describe("saved browser pages", () => {
 
   it("rejects recognized URL credentials without replacing the previous page", () => {
     writeSessionWorkspaceState("conv_a", { openBrowsers: ["tab-1"] });
-    saveBrowserPage(
-      userTab,
+    const ordinaryParams = "country_code=US&sort_key=date&countryCode=GB&sortKey=name";
+    for (const url of [
       "https://docs.example/?q=release&page=2&author=jane&keyword=notes",
-      "Search",
-    );
+      `https://docs.example/?${ordinaryParams}`,
+      `https://docs.example/#${ordinaryParams}`,
+      `https://docs.example/#/guide?${ordinaryParams}`,
+      "https://docs.example/reports;country_code=US;sort_key=date/summary",
+    ]) {
+      saveBrowserPage(userTab, url, "Search");
+      expect(readSavedBrowserPage(userTab), url).toEqual({ url, title: "Search" });
+    }
+    const previousPage = readSavedBrowserPage(userTab);
     for (const url of [
       "https://app.example/callback?code=abc&state=xyz",
       "https://app.example/#access_token=abc&token_type=bearer",
@@ -110,6 +117,8 @@ describe("saved browser pages", () => {
       "https://app.example/#route=home?sig=abc",
       "https://app.example/return?auth_code=abc",
       "https://app.example/return?accessCode=abc",
+      "https://app.example/return?authorizationCode=synthetic",
+      "https://app.example/return?oauth_code=synthetic",
       "https://app.example/return?oauth_verifier=abc",
       "https://app.example/login?pwd=abc",
       "https://files.example/report?authkey=abc",
@@ -124,13 +133,15 @@ describe("saved browser pages", () => {
         `https://app.example/?${name}=synthetic`,
         `https://app.example/#${name}=synthetic`,
         `https://app.example/#/callback?${name}=synthetic`,
+        `https://app.example/report;${name}=synthetic`,
       ]),
+      "https://app.example/reports;lang=en;jsessionid=synthetic/details",
+      "https://app.example/report;%6Asessionid=synthetic",
+      "https://app.example/report%3Bjsessionid%3Dsynthetic",
+      "https://app.example/report;code=synthetic",
     ]) {
       saveBrowserPage(userTab, url);
-      expect(readSavedBrowserPage(userTab), url).toEqual({
-        url: "https://docs.example/?q=release&page=2&author=jane&keyword=notes",
-        title: "Search",
-      });
+      expect(readSavedBrowserPage(userTab), url).toEqual(previousPage);
     }
   });
 

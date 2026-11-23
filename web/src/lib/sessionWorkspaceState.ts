@@ -76,18 +76,17 @@ const MAX_SESSIONS = 100;
 export const MAX_OPEN_TABS = 20;
 const MAX_BROWSER_URL_LENGTH = 8192;
 const MAX_BROWSER_TITLE_LENGTH = 512;
-// Query and fragment parameters that can carry a credential (OAuth codes and tokens,
-// signed links, API keys), by part of their name (authkey, passcode) or by its last
-// word (auth_code, apiKey). This rejects known credential names, not arbitrary URL secrets.
+// Recognized credential names, including authentication compounds. Generic suffixes
+// such as country_code and sort_key are ordinary page state. This remains a heuristic.
 const CREDENTIAL_PARAM_PART = new RegExp(
   [
     "token|secret|passw|signature|credential|verifier|api[-_]?key|sess(ion)?[-_]?id",
     "saml(request|response|art)",
-    "(access|auth|login|pass|private|secure|signing)[-_.]?(code|key|pwd|sig|ticket)",
+    "(access|auth(?:orization)?|oauth|login|pass|private|secure|signing)[-_.]?(code|key|pwd|sig|ticket)",
   ].join("|"),
   "i",
 );
-const CREDENTIAL_PARAM_WORD = /(^|[-_.])(auth|authorization|code|jwt|key|otp|pass|pwd|sig|ticket)$/;
+const CREDENTIAL_PARAM_NAME = /^(auth|authorization|code|jwt|key|otp|pass|pwd|sig|ticket)$/i;
 
 function isValidWidth(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
@@ -121,18 +120,21 @@ function uniqueIds(values: unknown[]): string[] {
 }
 
 function isCredentialParam(name: string): boolean {
-  const words = name.replace(/([a-z\d])([A-Z])/g, "$1_$2").toLowerCase();
-  return CREDENTIAL_PARAM_PART.test(name) || CREDENTIAL_PARAM_WORD.test(words);
+  return CREDENTIAL_PARAM_PART.test(name) || CREDENTIAL_PARAM_NAME.test(name);
 }
 
-function carriesCredential({ username, password, search, hash }: URL): boolean {
+function carriesCredential({ username, password, pathname, search, hash }: URL): boolean {
   if (username !== "" || password !== "") return true;
+  // Some servers rewrite session credentials into semicolon-delimited path parameters.
+  const pathParams = decodeURIComponent(pathname)
+    .split("/")
+    .flatMap((segment) => segment.split(";").slice(1));
   // A hash-routed app's fragment holds its own query (`#/callback?code=…`).
   const fragmentQueries = hash
     .slice(1)
     .split("?")
     .filter((part) => part.includes("="));
-  const params = [search, ...fragmentQueries].flatMap((query) => [
+  const params = [search, ...fragmentQueries, ...pathParams].flatMap((query) => [
     ...new URLSearchParams(query).keys(),
   ]);
   return params.some(isCredentialParam);
