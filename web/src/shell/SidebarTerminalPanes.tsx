@@ -36,6 +36,7 @@ import {
   usePendingTerminalFocus,
 } from "./terminalFocusRequest";
 import { readTerminalGroups, updateTerminalGroups, useTerminalGroups } from "./terminalGroupsStore";
+import { currentTerminalListGeneration, useTerminalListGeneration } from "./terminalListGeneration";
 import { usePaneKeyboardOwner } from "./usePaneKeyboardOwner";
 import { useTerminalPaneActions } from "./terminalPaneActions";
 import { unzoomPane, useZoomedPaneKey } from "./terminalPaneZoom";
@@ -94,6 +95,7 @@ export function SidebarTerminalPanes({
   mainSplitMembers = NO_MAIN_SPLIT_MEMBERS,
 }: SidebarTerminalPanesProps) {
   const { terminals, listCompleteAt, isFetching } = useTerminals(conversationId);
+  const listGeneration = useTerminalListGeneration(conversationId, terminals.length);
   const { setTerminalConnectionState, markTerminalActive } = useTerminalStatuses(terminals);
   // Splits are managed only by desktop owners; everyone else sees one shell per tab.
   const splitAllowed = usePanesSplitsAllowed(readOnly);
@@ -129,7 +131,7 @@ export function SidebarTerminalPanes({
 
   // Saved groups follow: the main view's terminals leave them, and a shell that has ended goes.
   const liveKeys = terminals.map(terminalTabKey).join("\n");
-  const listComplete = (listCompleteAt ?? 0) > 0 && !isFetching;
+  const listComplete = !isFetching;
   const mainKeysJoined = mainKeys.join("\n");
   const keyboardOwner = usePaneKeyboardOwner(panesRef);
   const shownGroupId = storedGroup?.id ?? null;
@@ -142,13 +144,16 @@ export function SidebarTerminalPanes({
         (member) => member !== key && live.has(member),
       );
     const mainKeysNow = mainKeysJoined ? mainKeysJoined.split("\n") : [];
+    // Only a complete answer newer than the list's last empty one says which shells ended.
+    const generation = currentTerminalListGeneration(listGeneration, conversationId, live.size);
+    const complete = listComplete && (listCompleteAt ?? 0) > generation.startedAt;
     const before = readTerminalGroups(conversationId);
     const owner = keyboardOwner();
     updateTerminalGroups(conversationId, (current) =>
       normalizeTerminalGroups(current, {
         mainKeys: mainKeysNow,
         // Ended shells drop out only once the list is known to be whole.
-        isGone: (key) => listComplete && !live.has(key) && !keptFailedStart(current, key),
+        isGone: (key) => complete && !live.has(key) && !keptFailedStart(current, key),
       }),
     );
     // A group that went with its last shell takes its failed starts along; one the main view
@@ -179,6 +184,8 @@ export function SidebarTerminalPanes({
     conversationId,
     liveKeys,
     listComplete,
+    listCompleteAt,
+    listGeneration,
     mainKeysJoined,
     storedGroups,
     keyboardOwner,

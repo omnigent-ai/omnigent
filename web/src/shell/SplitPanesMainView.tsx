@@ -7,6 +7,7 @@ import { MessageSquareIcon, PanelRightIcon } from "lucide-react";
 import {
   type ComponentProps,
   type ReactNode,
+  type RefObject,
   useCallback,
   useEffect,
   useMemo,
@@ -79,6 +80,11 @@ import {
 } from "./terminalPaneMoves";
 import { unzoomPane, useZoomedPaneKey } from "./terminalPaneZoom";
 import { usePanesSplitsAllowed } from "./panesViewGate";
+import {
+  currentTerminalListGeneration,
+  type TerminalListGeneration,
+  useTerminalListGeneration,
+} from "./terminalListGeneration";
 import { usePublishMainTerminalKeys } from "./terminalPlacement";
 import { PublishedTerminalView } from "./PublishedTerminalView";
 import { usePaneKeyboardOwner } from "./usePaneKeyboardOwner";
@@ -104,6 +110,8 @@ export interface SplitPanesMainViewProps extends Omit<
 export function SplitPanesMainView(props: SplitPanesMainViewProps) {
   const { conversationId, initialTerminalKey, readOnly = false, sandboxOffline = false } = props;
   const { terminals, listCompleteAt, isFetching } = useTerminals(conversationId);
+  // Kept here, since the panes unmount while the list is empty.
+  const listGeneration = useTerminalListGeneration(conversationId, terminals.length);
   const agentTerminal = useMemo(() => findAgentTerminal(terminals), [terminals]);
   const savedSplit = usePaneSplit(conversationId);
   // While the list briefly lacks the agent's terminal, the saved split keeps its pane, so the
@@ -133,6 +141,7 @@ export function SplitPanesMainView(props: SplitPanesMainViewProps) {
       terminals={terminals}
       listComplete={(listCompleteAt ?? 0) > 0 && !isFetching}
       listCompleteAt={listCompleteAt ?? 0}
+      listGeneration={listGeneration}
     />
   );
 }
@@ -142,6 +151,7 @@ interface MainSplitPanesProps extends SplitPanesMainViewProps {
   terminals: TerminalInfo[];
   listComplete: boolean;
   listCompleteAt: number;
+  listGeneration: RefObject<TerminalListGeneration>;
 }
 
 function MainSplitPanes({
@@ -150,6 +160,7 @@ function MainSplitPanes({
   terminals,
   listComplete,
   listCompleteAt,
+  listGeneration,
   visible = true,
   active = visible,
   readOnly = false,
@@ -183,6 +194,7 @@ function MainSplitPanes({
     terminals,
     listComplete,
     listCompleteAt,
+    listGeneration,
     keyboardOwner,
   );
 
@@ -543,18 +555,16 @@ function useReconcileMainSplit(
   terminals: readonly TerminalInfo[],
   listComplete: boolean,
   listCompleteAt: number,
+  listGeneration: RefObject<TerminalListGeneration>,
   keyboardOwner: () => string | null,
 ): void {
-  // Terminals seen since the list was last empty. A seen terminal that leaves the list is gone;
-  // an unseen one is gone only per a complete answer newer than that reset.
-  const generationRef = useRef({ conversationId, seen: new Set<string>(), startedAt: 0 });
   useEffect(() => {
-    let generation = generationRef.current;
-    if (generation.conversationId !== conversationId || terminals.length === 0) {
-      generation = { conversationId, seen: new Set(), startedAt: Date.now() };
-      generationRef.current = generation;
-      if (terminals.length === 0) return;
-    }
+    const generation = currentTerminalListGeneration(
+      listGeneration,
+      conversationId,
+      terminals.length,
+    );
+    if (terminals.length === 0) return;
     const liveKeys = new Set(terminals.map(terminalTabKey));
     const complete = listComplete && listCompleteAt > generation.startedAt;
     const { seen } = generation;
@@ -581,7 +591,15 @@ function useReconcileMainSplit(
     const kept = withAppPanes(liveKeys, before);
     const survivor = was.find((key) => key !== owner && kept.has(key)) ?? null;
     giveNextPaneTheKeyboard(target, after?.focusedKey ?? survivor);
-  }, [conversationId, agentKey, terminals, listComplete, listCompleteAt, keyboardOwner]);
+  }, [
+    conversationId,
+    agentKey,
+    terminals,
+    listComplete,
+    listCompleteAt,
+    listGeneration,
+    keyboardOwner,
+  ]);
 }
 
 /** ⌘K's Move Pane to Sidebar, for the split's focused workspace tab or shell. */

@@ -229,6 +229,20 @@ describe("SidebarTerminalPanes", () => {
     expect(readTerminalGroups(id)[0].split.focusedKey).toBe("terminal:a");
   });
 
+  it("keeps a live shell in its group when the list refills after an empty one, before a new answer", async () => {
+    const id = nextSession();
+    updateTerminalGroups(id, () => [PAIR]);
+    const { rerender } = render(<Sidebar conversationId={id} shownKey="terminal:a" />);
+    await screen.findByTestId("terminal-b");
+    // The list empties, as on an agent switch, and refills one shell at a time while the last
+    // complete answer is still the one from before.
+    listing.ids = [];
+    rerender(<Sidebar conversationId={id} shownKey="terminal:a" />);
+    listing.ids = ["a"];
+    rerender(<Sidebar conversationId={id} shownKey="terminal:a" />);
+    expect(readTerminalGroups(id).map((group) => group.split.layout)).toEqual([PAIR.split.layout]);
+  });
+
   it("hands the keyboard to the pane beside a shell that ended, if the shell's pane had it", async () => {
     const id = nextSession();
     updateTerminalGroups(id, () => [PAIR]);

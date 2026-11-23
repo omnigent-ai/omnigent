@@ -36,12 +36,17 @@ const OTHER = `terminal:${OTHER_ID}`;
 
 const listed = vi.hoisted(() => ({
   terminals: [] as TerminalInfo[],
+  listCompleteAt: 1,
   splitsAllowed: true,
   launch: vi.fn(),
 }));
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
-  useTerminals: () => ({ terminals: listed.terminals, listCompleteAt: 1, isFetching: false }),
+  useTerminals: () => ({
+    terminals: listed.terminals,
+    listCompleteAt: listed.listCompleteAt,
+    isFetching: false,
+  }),
   useCreateTerminal: () => ({ launch: listed.launch, isPending: false }),
   useDeleteTerminal: () => ({ mutate: vi.fn(), isPending: false }),
 }));
@@ -105,6 +110,7 @@ const paneCommandLabels = () =>
 
 beforeEach(() => {
   listed.terminals = TERMINALS;
+  listed.listCompleteAt = 1;
   listed.splitsAllowed = true;
   listed.launch.mockClear();
   vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
@@ -224,6 +230,21 @@ describe("SplitPanesMainView", () => {
       ratio: 0.5,
       children: [AGENT, "app:files"],
     });
+  });
+
+  it("keeps a live shell in the split when the list refills after an empty one, before a new answer", async () => {
+    const conversationId = nextConversation();
+    updatePaneSplit(conversationId, () => SIDE_BY_SIDE);
+    const view = render(<View conversationId={conversationId} />);
+    await screen.findByTestId(`terminal-${SHELL_ID}`);
+    // The list empties, as on an agent switch, and refills one terminal at a time while the
+    // last complete answer is still the one from before.
+    listed.terminals = [];
+    view.rerender(<View conversationId={conversationId} />);
+    listed.terminals = [TERMINALS[0]!];
+    view.rerender(<View conversationId={conversationId} />);
+    await screen.findByTestId(`terminal-${AGENT_ID}`);
+    expect(readPaneSplit(conversationId)?.layout).toEqual(SIDE_BY_SIDE.layout);
   });
 
   it("gives the pane beside a shell that ended the keyboard, if the shell's pane had it", async () => {
