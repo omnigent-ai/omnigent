@@ -38,6 +38,11 @@ import {
   holdsItsDividers,
 } from "./paneDividerCorners";
 import { PaneSplitDivider } from "./PaneSplitDivider";
+import {
+  type LayoutDragEnd,
+  type PointerDragEnd,
+  reportDividerDragEnd,
+} from "./paneDividerDragEnd";
 import { TerminalSplitCorner } from "./TerminalSplitCorner";
 import { TerminalZoomPill } from "./TerminalZoomPill";
 import { PANE_ROW_PX } from "./paneStrip/paneGeometry";
@@ -102,6 +107,8 @@ export interface SplitPanesLayoutProps {
 
 const NO_PANES: readonly string[] = [];
 
+/** The handle a drag holds, as its log line names it. */
+const handleOf = (dragged: DividerDragSession) => (dragged.corner ? "corner" : "divider");
 // A pane's content is keyed in both its shown and hidden shapes, so the strip row and pill around
 // it in one shape never shift it to another position and remount it.
 const PANE_CONTENT_KEY = "pane-content";
@@ -149,9 +156,30 @@ export function SplitPanesLayout({
     terminalLayoutKeys(split.layout).includes(zoomedKey);
   const liveSession =
     session && split && !maximized && holdsItsDividers(session, split.layout) ? session : null;
+  // Why the layout ended a drag it no longer shows, named in the log a snapped-back report holds.
+  const layoutEnded: LayoutDragEnd | null =
+    session && !liveSession
+      ? !split
+        ? "split-hidden"
+        : maximized
+          ? "pane-maximized"
+          : "divider-gone"
+      : null;
   useEffect(() => {
-    if (session && !liveSession) setSession(null);
-  }, [session, liveSession]);
+    if (!session || layoutEnded === null) return;
+    reportDividerDragEnd(conversationId, handleOf(session), layoutEnded);
+    setSession(null);
+  }, [conversationId, session, layoutEnded]);
+  // The panes leaving the screen mid-drag, as when the list of terminals empties, end it too.
+  const liveOnUnmount = useRef({ conversationId, liveSession });
+  liveOnUnmount.current = { conversationId, liveSession };
+  useEffect(
+    () => () => {
+      const { conversationId: id, liveSession: live } = liveOnUnmount.current;
+      if (live) reportDividerDragEnd(id, handleOf(live), "panes-unmounted");
+    },
+    [],
+  );
   // A divider stops where a pane it shrinks would fall below the minimum.
   const keeps = (before: TerminalLayout, after: TerminalLayout) => {
     const rule = sizing ? sizing() : domCellSizing(panesRef.current);
@@ -176,7 +204,8 @@ export function SplitPanesLayout({
     setSession(null);
     if (resizes && liveSession) onResize(resizes);
   };
-  const abortDrag = () => {
+  const abortDrag = (reason: PointerDragEnd) => {
+    if (liveSession) reportDividerDragEnd(conversationId, handleOf(liveSession), reason);
     latestResizes.current = null;
     setSession(null);
   };

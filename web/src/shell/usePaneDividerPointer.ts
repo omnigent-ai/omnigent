@@ -4,6 +4,7 @@
 import { type PointerEvent, type RefObject, useEffect, useRef } from "react";
 
 import { paneDividerDrag } from "@/shell/paneDividerDrag";
+import type { PointerDragEnd } from "@/shell/paneDividerDragEnd";
 
 /** A point as percent of the panes' view, as the layout geometry places dividers. */
 export interface ViewPoint {
@@ -27,7 +28,7 @@ export function usePaneDividerPointer({
   /** The pointer was released: the drag's sizes are saved. */
   onCommit: () => void;
   /** The pointer was taken away mid-drag: its sizes are dropped. */
-  onAbort: () => void;
+  onAbort: (reason: PointerDragEnd) => void;
 }) {
   // The pointer this handle holds, and the call that ends the window's drag marker, once.
   const held = useRef<{ element: HTMLElement; pointerId: number } | null>(null);
@@ -78,7 +79,8 @@ export function usePaneDividerPointer({
       });
     },
     onPointerUp: end(onCommit),
-    onPointerCancel: end(onAbort),
-    onLostPointerCapture: end(onAbort),
+    // After a release the drag is already over, so these drop nothing more.
+    onPointerCancel: end(() => onAbort("pointer-cancelled")),
+    onLostPointerCapture: end(() => onAbort("pointer-lost")),
   };
 }
