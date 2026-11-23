@@ -1420,11 +1420,21 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
                 check=True,
                 timeout=5,
             )
-            poll_until(
-                lambda: "draft-end" in bridge._capture_pane(advert["socket_path"], target),
-                timeout_s=10,
-            )
-            raw = bridge._capture_pane(advert["socket_path"], target)
+            raw = ""
+
+            def draft_rendered(expected_marker: str = marker) -> bool:
+                nonlocal raw
+                raw = bridge._capture_pane(advert["socket_path"], target)
+                box = bridge._composer_box(raw)
+                return bool(
+                    box is not None
+                    and box.framed
+                    and len(box.rows) > 1
+                    and expected_marker in box.rows[0]
+                    and "draft-end" in "\n".join(box.rows)
+                )
+
+            poll_until(draft_rendered, timeout_s=10)
             joined = bridge._capture_pane(advert["socket_path"], target, join_wrapped=True)
             (evidence / f"{kind}-renderer.json").write_text(
                 json.dumps(
