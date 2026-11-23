@@ -38,9 +38,9 @@ def _count_transcript_scans(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     scans: list[Path] = []
     real_scan = forwarder._tool_use_ids_in_transcript
 
-    def counting_scan(path: Path, **kwargs: Any) -> Any:
+    def counting_scan(path: Path, *, include_sidechains: bool) -> forwarder._SpawnIdScan | None:
         scans.append(path)
-        return real_scan(path, **kwargs)
+        return real_scan(path, include_sidechains=include_sidechains)
 
     monkeypatch.setattr(forwarder, "_tool_use_ids_in_transcript", counting_scan)
     return scans

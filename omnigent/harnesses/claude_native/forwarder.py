@@ -2741,22 +2741,27 @@ def _tool_use_ids_in_transcript(
     transcript_path: Path,
     *,
     include_sidechains: bool,
-    previous: _SpawnIdScan | None = None,
 ) -> _SpawnIdScan | None:
     """Return assistant spawn tool-use ids from a Claude transcript.
 
-    A trailing record without its newline is left for the next scan because
-    Claude may still be writing it.
+    The scan continues from this file's memo entry in the same sidechain mode
+    while the bytes before that entry's end are unchanged; otherwise it starts
+    from the beginning. A trailing record without its newline is left for the
+    next scan because Claude may still be writing it.
 
     :param transcript_path: Claude JSONL transcript to inspect.
     :param include_sidechains: Whether records mirrored from child agents
         belong to this transcript owner.
-    :param previous: An earlier scan of this file to continue from. It is
-        used only while the bytes before its end are unchanged; otherwise the
-        file is scanned from the start.
     :returns: The scan, or ``None`` when the file could not be read so the
         caller retries on the next poll.
     """
+    with _SPAWN_TOOL_USE_ID_CACHE_LOCK:
+        cached = _SPAWN_TOOL_USE_ID_CACHE.get(transcript_path)
+    previous = (
+        cached.scan
+        if cached is not None and cached.include_sidechains == include_sidechains
+        else None
+    )
     try:
         with transcript_path.open("rb") as handle:
             scan = _EMPTY_SPAWN_ID_SCAN
@@ -2861,22 +2866,18 @@ def _spawn_tool_use_ids_cached(
             # Re-insert so the entry is the most recently used.
             _SPAWN_TOOL_USE_ID_CACHE[transcript_path] = cached
             return cached.scan.tool_use_ids
-    # Only a grown file can be an append; any other change rescans from the start.
-    previous = (
-        cached.scan
-        if cached is not None
-        and cached.include_sidechains == include_sidechains
-        and stat.st_size > cached.size
-        else None
-    )
+        # Only a grown file can be an append; keep its entry for the scan to
+        # continue from, and drop any other so it rescans from the start.
+        if cached is not None and stat.st_size > cached.size:
+            _SPAWN_TOOL_USE_ID_CACHE[transcript_path] = cached
     # Stat before read: a write landing in between is filed under the older
     # stat, so the next poll sees a changed file and continues the scan.
-    scan = _tool_use_ids_in_transcript(
-        transcript_path, include_sidechains=include_sidechains, previous=previous
-    )
+    scan = _tool_use_ids_in_transcript(transcript_path, include_sidechains=include_sidechains)
     if scan is None:
         # A failed read is not an empty transcript; leave it uncached so the
         # next poll retries instead of trusting an empty result.
+        with _SPAWN_TOOL_USE_ID_CACHE_LOCK:
+            _SPAWN_TOOL_USE_ID_CACHE.pop(transcript_path, None)
         return frozenset()
     with _SPAWN_TOOL_USE_ID_CACHE_LOCK:
         _SPAWN_TOOL_USE_ID_CACHE[transcript_path] = _TranscriptSpawnIdCacheEntry(
