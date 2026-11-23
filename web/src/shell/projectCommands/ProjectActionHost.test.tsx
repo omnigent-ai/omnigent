@@ -6,12 +6,13 @@ import type { Conversation, ProjectSummary } from "@/hooks/useConversations";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
-import { usePaletteCommandsStore } from "@/store/paletteCommands";
+import { isCommandAvailable, usePaletteCommandsStore } from "@/store/paletteCommands";
 import { registeredPaletteCommands } from "@/test/paletteCommands";
 
 import { type CommandSession, CommandContextProvider, type CommandView } from "../commandContext";
 import { ProjectActionHost } from "./ProjectActionHost";
 import { useProjectActionStore } from "./projectActionStore";
+import { projectOrderingStore } from "./projectOrderingStore";
 import { projectInView } from "./useProjectPaletteCommands";
 
 const PAYMENTS: ProjectSummary = { id: "project-1", name: "Payments", icon: "💸" };
@@ -111,6 +112,60 @@ afterEach(() => {
   cleanup();
   usePaletteCommandsStore.setState({ groups: {} });
   useProjectActionStore.setState({ request: null, lastRename: null });
+  projectOrderingStore.setState({ ordering: null });
+});
+
+describe("moving the project in view from ⌘K", () => {
+  const LOADED = { orderLoaded: true, saving: false, selecting: false, editing: false };
+  /** The sidebar's project order, as it publishes it while mounted. */
+  function publishOrder(names: string[], facts = LOADED) {
+    const move = vi.fn();
+    projectOrderingStore.setState({ ordering: { names, facts, move } });
+    return move;
+  }
+  const command = (label: string) =>
+    registeredPaletteCommands().find((candidate) => candidate.label === label);
+
+  it("offers the folder menu's moves, running the sidebar's move", () => {
+    const move = publishOrder(["Inbox", "Payments", "Zebra"]);
+    renderHost({ view: "session" });
+    expect(labels()).toEqual([
+      "New session in Payments",
+      "Project settings for Payments…",
+      "Rename project Payments…",
+      "Delete project Payments…",
+      "Move Project Payments Up",
+      "Move Project Payments Down",
+      "Move Project Payments to the Top",
+      "Move Project Payments to the Bottom",
+    ]);
+    run("Move Project Payments Up");
+    expect(move).toHaveBeenCalledExactlyOnceWith("Payments", "up");
+  });
+
+  it("greys the moves past the list's edge, and every move while the order saves", () => {
+    publishOrder(["Payments", "Zebra"]);
+    renderHost({ view: "session" });
+    expect(isCommandAvailable(command("Move Project Payments Up")!.availability)).toBe(false);
+    expect(command("Move Project Payments Down")!.availability).toEqual({ available: true });
+
+    act(() => {
+      publishOrder(["Payments", "Zebra"], { ...LOADED, saving: true });
+    });
+    expect(command("Move Project Payments Down")!.availability).toEqual({
+      available: false,
+      reason: "Saving the project order…",
+    });
+  });
+
+  it("offers no moves while no sidebar lists the project", () => {
+    renderHost({ view: "session" });
+    expect(labels().filter((label) => label.startsWith("Move"))).toEqual([]);
+    act(() => {
+      publishOrder(["Inbox"]);
+    });
+    expect(labels().filter((label) => label.startsWith("Move"))).toEqual([]);
+  });
 });
 
 describe("the project in view's ⌘K commands", () => {

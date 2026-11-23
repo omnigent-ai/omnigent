@@ -488,6 +488,10 @@ awaiting approval, or running background work, the dialog says how many and
 that deleting stops them, then asks again with Delete anyway.
 With `quick_pick_palette` on, open a session filed in a project, press
 Cmd/Ctrl+K and type "rename project" to open the same dialog for its project.
+Type "move project" there for the folder menu's Move choices (greyed at the
+list's edges and while the order loads or saves), or "sort projects", "expand
+all projects", "collapse all projects" and "select sessions" for the Projects
+header's actions, which ⌘K offers whenever the header does.
 
 **Project folder sessions:** expand a project with more than five sessions,
 then click Show more under its rows. Opening one of its older sessions from
