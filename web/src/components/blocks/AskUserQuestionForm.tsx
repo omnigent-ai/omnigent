@@ -33,12 +33,26 @@ import {
   isTextEntry,
 } from "@/lib/hotkeys";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import type { SessionMention } from "@/lib/composerMentions";
+import {
+  presentTaggedMentions,
+  type MentionState,
+  type SessionMention,
+} from "@/lib/composerMentions";
+import { useMentionBrowser } from "@/hooks/useMentionBrowser";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import {
+  MENTION_SEARCH_DEBOUNCE_MS,
+  useSessionMentionEntries,
+} from "@/hooks/useSessionMentionEntries";
 import {
   type ComposerTextTarget,
   isComposerInput,
 } from "@/components/composer/engine/composerInput";
-import { AskUserQuestionAnswerEditor, expandAnswerMentions } from "./AskUserQuestionAnswerEditor";
+import {
+  AskUserQuestionAnswerEditor,
+  expandAnswerMentions,
+  NO_FILE_ENTRIES,
+} from "./AskUserQuestionAnswerEditor";
 
 /**
  * Map from question id/text → either a single selected label
@@ -174,27 +188,58 @@ export function AskUserQuestionForm({
     draft?.customSelected ?? initial.customSelected,
   );
   const [customInputs, setCustomInputs] = useState(draft?.customInputs ?? initial.customInputs);
-  // Session tags in the custom answers, shared by every question. A tag whose token is no
-  // longer in an answer is left out when that answer is sent.
-  const [sessionMentions, setSessionMentions] = useState<SessionMention[]>(
-    draft?.sessionMentions ?? [],
+  // The @-mention state of the custom answer. The open menu belongs to one question.
+  const [typedMention, setTypedMention] = useState<{ key: string; state: MentionState } | null>(
+    null,
   );
+  const questionKeyNow = questions[currentIndex] ? questionKey(questions[currentIndex]) : "";
+  const mention = typedMention?.key === questionKeyNow ? typedMention.state : null;
+  const setMention = (next: MentionState | null) =>
+    setTypedMention(next ? { key: questionKeyNow, state: next } : null);
+  const debouncedMentionQuery = useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS);
+  const sessionEntries = useSessionMentionEntries({
+    mention,
+    debouncedQuery: debouncedMentionQuery,
+    currentSessionId: null,
+  });
+  // Session tags are shared by every question; the hook releases one once its token is gone from
+  // every answer, and an undo brings it back.
+  const mentionBrowser = useMentionBrowser({
+    mention,
+    setMention,
+    mentionEntries: NO_FILE_ENTRIES,
+    sessionEntries,
+    text: customInputs[questionKeyNow] ?? "",
+    setText: (text) => setCustomInputs((prev) => ({ ...prev, [questionKeyNow]: text })),
+    textareaRef: customInputRef,
+    isMobile: isMobileViewport,
+    initialMentions: { files: [], sessions: draft?.sessionMentions ?? [] },
+    segments: questions.map((q) => customInputs[questionKey(q)] ?? ""),
+  });
+  const mentionedSessions = mentionBrowser.mentionedSessions;
 
   useEffect(() => {
     const answers = {
       selections: { ...selections },
       customSelected: { ...customSelected },
       customInputs: { ...customInputs },
-      sessionMentions: [...sessionMentions],
+      sessionMentions: [] as SessionMention[],
     };
-    // Answers to a secret question are never kept past this mount.
+    // Answers to a secret question are never kept past this mount, nor their session tags.
+    const savedTexts: string[] = [];
     for (const q of draftQuestions) {
-      if (!q.isSecret) continue;
       const key = questionKey(q);
+      if (!q.isSecret) {
+        savedTexts.push(customInputs[key] ?? "");
+        continue;
+      }
       answers.selections[key] = initial.selections[key]!;
       answers.customSelected[key] = initial.customSelected[key]!;
       answers.customInputs[key] = initial.customInputs[key]!;
     }
+    // Only tags whose token still shows in a saved answer are kept.
+    answers.sessionMentions =
+      presentTaggedMentions({ files: [], sessions: mentionedSessions }, savedTexts)?.sessions ?? [];
     // Untouched cards keep no draft, so they cannot evict real ones.
     if (currentIndex === 0 && JSON.stringify(answers) === JSON.stringify(initial)) {
       clearAskUserQuestionDraft(elicitationId, signature);
@@ -210,7 +255,7 @@ export function AskUserQuestionForm({
     selections,
     customSelected,
     customInputs,
-    sessionMentions,
+    mentionedSessions,
   ]);
 
   useEffect(() => {
@@ -304,7 +349,7 @@ export function AskUserQuestionForm({
         q,
         selections[key] ?? "",
         customSelected[key] ?? false,
-        expandAnswerMentions(customInputs[key] ?? "", sessionMentions),
+        expandAnswerMentions(customInputs[key] ?? "", mentionedSessions),
       );
       if (answer === null) return; // unreachable while ``allAnswered`` gates the button
       finalAnswers[key] = answer;
@@ -585,8 +630,10 @@ export function AskUserQuestionForm({
                   inputRef={customInputRef}
                   value={customRowValue}
                   onValueChange={(text) => handleCustomInput(currentKey, text)}
-                  sessions={sessionMentions}
-                  onSessionsChange={setSessionMentions}
+                  mention={mention}
+                  setMention={setMention}
+                  sessionEntries={sessionEntries}
+                  browser={mentionBrowser}
                 />
               ) : (
                 /* ``field-sizing-content`` (Tailwind v4 / CSS) auto-grows

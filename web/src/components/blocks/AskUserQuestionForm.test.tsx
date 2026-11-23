@@ -13,6 +13,9 @@ import type * as UseSidebarDataModule from "@/hooks/useSidebarData";
 import * as CodeMirrorModule from "@/components/composer/engine/CodeMirrorComposerInput";
 import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
+import { undo } from "@codemirror/commands";
+import { EditorView } from "@codemirror/view";
+import { askUserQuestionSignature, getAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -923,6 +926,78 @@ describe("AskUserQuestionForm — prompt editor", () => {
     expect(screen.getByTestId("mention-pill")).toHaveTextContent("@Fix flaky CI job");
     expect(document.body.textContent).not.toContain("[Session:");
     expect(document.body.textContent).not.toContain("Tagged sessions");
+  });
+
+  /** Tags Fix CI in the editor, then deletes its token whole with Backspace. */
+  async function tagThenDeleteToken() {
+    const onSubmit = vi.fn();
+    const elicitationId = nextElicitationId();
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <AskUserQuestionForm
+          elicitationId={elicitationId}
+          questions={[framework]}
+          onSubmit={onSubmit}
+          onReject={vi.fn()}
+        />
+      </CapabilitiesProvider>,
+    );
+    const editor = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(editor)!, "Use @Fix"));
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(composerTargetOf(editor)!.value).toBe("Use @Fix CI ");
+    act(() => composerTargetOf(editor)!.setSelectionRange(11, 11));
+    fireEvent.keyDown(editor, { key: "Backspace" });
+    expect(composerTargetOf(editor)!.value).toBe("Use  ");
+    return { editor, onSubmit, elicitationId };
+  }
+
+  it("sends a deleted session token typed again as plain text", async () => {
+    sessionList.loaded = [sessionRow("s_ci", "Fix CI")];
+    const { editor, onSubmit } = await tagThenDeleteToken();
+    act(() => insertComposerText(composerTargetOf(editor)!, "@Fix CI", 5, 5));
+    const typed = composerTargetOf(editor)!.value;
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({ framework: typed });
+    expect(typed).toBe("Use  @Fix CI");
+  });
+
+  it("restores a deleted session token with undo", async () => {
+    sessionList.loaded = [sessionRow("s_ci", "Fix CI")];
+    const { editor, onSubmit } = await tagThenDeleteToken();
+    act(() => void undo(EditorView.findFromDOM(editor)!));
+    expect(composerTargetOf(editor)!.value).toBe("Use @Fix CI ");
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      framework: `Use [Session: "Fix CI" id=s_ci subagent=no]\n\n${SESSION_MENTION_HINT}`,
+    });
+  });
+
+  it("keeps a session tagged in a secret answer out of the saved draft", async () => {
+    sessionList.loaded = [sessionRow("s_ci", "Fix CI")];
+    const secret: ClaudeQuestion = { ...color, id: "secret", isSecret: true };
+    const elicitationId = nextElicitationId();
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <AskUserQuestionForm
+          elicitationId={elicitationId}
+          questions={[framework, secret]}
+          onSubmit={vi.fn()}
+          onReject={vi.fn()}
+        />
+      </CapabilitiesProvider>,
+    );
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    const editor = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(editor)!, "Use @Fix"));
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(composerTargetOf(editor)!.value).toBe("Use @Fix CI ");
+    const draft = getAskUserQuestionDraft(
+      elicitationId,
+      askUserQuestionSignature([framework, secret]),
+    );
+    expect(draft?.currentIndex).toBe(1);
+    expect(draft?.sessionMentions).toEqual([]);
   });
 
   it("keeps a tagged session when the card remounts with its draft", async () => {

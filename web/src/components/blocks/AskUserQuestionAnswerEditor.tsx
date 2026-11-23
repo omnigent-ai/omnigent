@@ -1,17 +1,11 @@
 // The custom-answer field on the CodeMirror prompt editor, with the chat composer's @-session
-// menu. Rendered only on that engine, so the textarea path never mounts its session search.
+// menu. The form owns the mention state, so session tags outlive a question change.
 
-import type { Dispatch, RefObject, SetStateAction } from "react";
-import { useState } from "react";
+import type { RefObject } from "react";
 import { ComposerEngineContext, ComposerEngineInput } from "@/components/composer/ChatComposer";
 import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
-import { useDebouncedValue } from "@/hooks/useDebouncedValue";
-import { useMentionBrowser } from "@/hooks/useMentionBrowser";
-import {
-  MENTION_SEARCH_DEBOUNCE_MS,
-  useSessionMentionEntries,
-} from "@/hooks/useSessionMentionEntries";
+import type { MentionBrowser } from "@/hooks/useMentionBrowser";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import {
   composerInlineMentions,
@@ -23,7 +17,7 @@ import {
   type SessionMention,
 } from "@/lib/composerMentions";
 
-const NO_FILE_ENTRIES: WorkspaceFile[] = [];
+export const NO_FILE_ENTRIES: WorkspaceFile[] = [];
 
 /**
  * An answer's text as the agent receives it: each tagged session becomes the marker the chat
@@ -38,25 +32,21 @@ interface AskUserQuestionAnswerEditorProps {
   inputRef: RefObject<ComposerTextTarget | null>;
   value: string;
   onValueChange: (text: string) => void;
-  /** Sessions tagged in any question's answer; shared across the card's questions. */
-  sessions: SessionMention[];
-  onSessionsChange: Dispatch<SetStateAction<SessionMention[]>>;
+  mention: MentionState | null;
+  setMention: (next: MentionState | null) => void;
+  sessionEntries: readonly SessionMention[];
+  browser: MentionBrowser;
 }
 
 export function AskUserQuestionAnswerEditor({
   inputRef,
   value,
   onValueChange,
-  sessions,
-  onSessionsChange,
+  mention,
+  setMention,
+  sessionEntries,
+  browser,
 }: AskUserQuestionAnswerEditorProps) {
-  const [mention, setMention] = useState<MentionState | null>(null);
-  const debouncedQuery = useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS);
-  const sessionEntries = useSessionMentionEntries({
-    mention,
-    debouncedQuery,
-    currentSessionId: null,
-  });
   const {
     mentionIndex,
     mentionOpen,
@@ -69,20 +59,7 @@ export function AskUserQuestionAnswerEditor({
     handleKeyDown,
     handleTokenBackspace,
     dismiss,
-  } = useMentionBrowser({
-    mention,
-    setMention,
-    mentionEntries: NO_FILE_ENTRIES,
-    sessionEntries,
-    text: value,
-    setText: onValueChange,
-    textareaRef: inputRef,
-    tags: {
-      mentions: { files: [], sessions },
-      updateMentions: (update) =>
-        onSessionsChange((current) => update({ files: [], sessions: current }).sessions),
-    },
-  });
+  } = browser;
 
   return (
     <div

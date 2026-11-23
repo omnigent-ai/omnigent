@@ -1,3 +1,9 @@
+// These suites render question cards without the app's QueryClient; the card's @-menu
+// listing is not under test here, so it lists nothing.
+vi.mock("@/hooks/useSessionMentionEntries", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  useSessionMentionEntries: () => [],
+}));
 // Tests for ComposerMicButton — Web Speech API voice dictation plus the
 // server-dictation fallback.
 //
