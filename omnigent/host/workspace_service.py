@@ -74,10 +74,11 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     StatPathRequest,
     StatPathResponse,
 )
+from omnigent.entities.pagination import PagedList
 from omnigent.host import workspace_fuzzy
 from omnigent.host.frames import HostWorkspaceCallFrame, HostWorkspaceReplyFrame
 from omnigent.host.workspace_git import comparison, context, working_copy
-from omnigent.host.workspace_git.ignored import ignored_paths
+from omnigent.host.workspace_git.ignored import DirectoryIgnores
 from omnigent.host.workspace_git.runner import Deadline, GitError
 from omnigent.host.workspace_methods import WORKSPACE_METHODS
 from omnigent.host.workspace_search import search_files, search_text
@@ -203,30 +204,54 @@ class WorkspaceService(WorkspaceServiceMethods):
         limit = min(request.page_size or _MAX_PAGE_SIZE, _MAX_PAGE_SIZE)
         deadline = Deadline(_IGNORED_DEADLINE_S)
         entries: list[Entry] = []
+        # The cursor is the last consumed entry's id; the proto keeps it opaque.
         after = request.page_token or None
-        while True:
-            page = await _read(
+
+        async def read_page(after: str | None) -> PagedList[ListedEntry]:
+            return await _read(
                 reader.list_directory,
                 request.path,
-                limit=limit - len(entries),
+                limit=limit,
                 after=after,
                 collapse_single_child_directories=request.collapse_single_child_directories,
             )
+
+        page = await read_page(after)
+        # The listing has accepted the path: one repository answers for the whole request.
+        ignores = await _directory_ignores(reader.root / request.path, deadline)
+        while True:
             paths = [item["path"] for item in page.data]
             # The REST listing has no symlink flag, so look at each entry itself.
             links = await _read(_symlinks, reader.root, paths)
-            ignored = await _ignored(reader.root, paths, deadline)
-            entries += [
-                _entry(item, is_symlink=item["path"] in links, ignored=item["path"] in ignored)
-                for item in page.data
-                if not (request.hide_ignored and item["path"] in ignored)
-            ]
-            # The cursor is the last entry's id; the proto keeps it opaque.
-            next_page_token = page.last_id if page.has_more and page.last_id else ""
+            ignored = await _ignored(ignores, [item["name"] for item in page.data], deadline)
+            if ignored is None and entries:
+                # Git stopped answering partway: end here rather than mix in unfiltered pages.
+                return ListDirectoryResponse(entries=entries, next_page_token=after or "")
+            ignored = ignored or set()
+            for index, item in enumerate(page.data):
+                after = item["id"]
+                hidden = request.hide_ignored and item["name"] in ignored
+                if not hidden:
+                    entries.append(
+                        _entry(
+                            item,
+                            is_symlink=item["path"] in links,
+                            ignored=item["name"] in ignored,
+                        )
+                    )
+                if len(entries) == limit:
+                    more = page.has_more or index < len(page.data) - 1
+                    return ListDirectoryResponse(
+                        entries=entries, next_page_token=after if more else ""
+                    )
             # Hidden entries leave room, so read on: a page comes back empty only at the end.
-            if not (request.hide_ignored and next_page_token and len(entries) < limit):
-                return ListDirectoryResponse(entries=entries, next_page_token=next_page_token)
-            after = next_page_token
+            if not (request.hide_ignored and page.has_more and page.last_id):
+                return ListDirectoryResponse(
+                    entries=entries,
+                    next_page_token=page.last_id if page.has_more and page.last_id else "",
+                )
+            after = page.last_id
+            page = await read_page(after)
 
     async def read_file(
         self,
@@ -339,15 +364,28 @@ class WorkspaceService(WorkspaceServiceMethods):
         return ReadLinkTextResponse(target=await _read(reader.read_link_text, request.path))
 
 
-async def _ignored(root: Path, paths: list[str], deadline: Deadline) -> set[str]:
-    """The ``paths`` Git ignores; none when Git can't say, so the listing still answers."""
+async def _directory_ignores(directory: Path, deadline: Deadline) -> DirectoryIgnores | None:
+    """The listed directory's ignore rules; none without Git, so the listing still answers."""
     if not shutil.which("git"):
-        return set()
+        return None
     try:
-        return await ignored_paths(root, paths, deadline)
+        return await DirectoryIgnores.for_directory(directory, deadline)
     except GitError as exc:
         _logger.info("Listing without ignored files: %s", exc.problem.name)
+        return None
+
+
+async def _ignored(
+    ignores: DirectoryIgnores | None, names: list[str], deadline: Deadline
+) -> set[str] | None:
+    """The ``names`` Git ignores, empty without a repository, or ``None`` when Git failed."""
+    if ignores is None:
         return set()
+    try:
+        return await ignores.ignored(names, deadline)
+    except GitError as exc:
+        _logger.info("Listing without ignored files: %s", exc.problem.name)
+        return None
 
 
 def _entry(item: ListedEntry, *, is_symlink: bool, ignored: bool = False) -> Entry:

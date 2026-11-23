@@ -2,14 +2,15 @@
 
 ListDirectory marks them with ``Entry.ignored``, or leaves them out when asked to.
 Git decides with its own rules: ``.gitignore`` files at every level,
-``.git/info/exclude`` and the global excludes file. Tracked files are never ignored.
+``.git/info/exclude`` and the global excludes file. Tracked files are never ignored,
+and neither is a folder that holds one.
 """
 
 from __future__ import annotations
 
 import os
-import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from omnigent.host.workspace_git.runner import (
@@ -19,46 +20,68 @@ from omnigent.host.workspace_git.runner import (
     failure,
 )
 
-# check-ignore matches its paths as pathspecs against the index, so a name like "*.log"
-# would match a tracked file. "./" keeps a leading ":" from reading as magic, and a
-# backslash before each glob character makes Git read the name literally.
+# "./" keeps a leading ":" from reading as pathspec magic. Names go to check-ignore as
+# they are, so its ignore rules see the real name; --no-index stops it from also matching
+# them as globs against the index, and ls-files, which reads pathspecs literally, finds
+# the tracked ones instead.
 _PREFIX = "./"
-_GLOB_CHARACTERS = re.compile(r"([*?\[\\])")
 
 
-def _literal(path: str) -> str:
-    """``path`` as a pathspec that matches only itself."""
-    return _PREFIX + _GLOB_CHARACTERS.sub(r"\\\1", path)
+@dataclass(frozen=True)
+class DirectoryIgnores:
+    """Asks Git which entries of one listed directory it ignores.
 
-
-async def ignored_paths(root: Path, paths: Sequence[str], deadline: Deadline) -> set[str]:
-    """The ``paths`` Git ignores, relative to the workspace ``root``.
-
-    Outside a Git repository nothing is ignored.
-
-    :param root: The workspace directory, resolved.
-    :param paths: Workspace-relative paths, e.g. ``["build", "src/main.py"]``.
-    :param deadline: The RPC's deadline, shared by every command.
-    :raises GitError: When Git can't answer.
+    :param repository: The repository holding the directory, found from the directory
+        itself, so a submodule or a folder behind a symlink answers for its own files.
     """
-    if not paths:
-        return set()
-    repository = await GitRepository.discover(root, deadline)
-    if repository is None:
-        return set()
-    # Git echoes each path as it was given, so answers map back through the escaped form.
-    asked = {_literal(path): path for path in paths}
-    stdin = b"".join(os.fsencode(query) + b"\0" for query in asked)
-    output = await repository.run_unchecked(
-        ["check-ignore", "-z", "--stdin"],
-        deadline=deadline,
-        stdin=stdin,
-        stdout_bytes=LISTING_OUTPUT_BYTES,
-    )
-    # Exit 1 means none of the paths is ignored.
-    if output.returncode == 1:
-        return set()
-    if not output.success:
-        raise failure(output, "check-ignore")
-    records = (os.fsdecode(record) for record in output.stdout.split(b"\0") if record)
-    return {asked[record] for record in records if record in asked}
+
+    repository: GitRepository
+
+    @classmethod
+    async def for_directory(cls, directory: Path, deadline: Deadline) -> DirectoryIgnores | None:
+        """The directory's repository, or ``None`` outside one, where nothing is ignored."""
+        repository = await GitRepository.discover(directory, deadline)
+        return None if repository is None else cls(repository)
+
+    async def ignored(self, names: Sequence[str], deadline: Deadline) -> set[str]:
+        """The ``names`` (entries of the directory) that Git ignores.
+
+        :raises GitError: When Git can't answer.
+        """
+        if not names:
+            return set()
+        matched = await self._matching_ignore_rules(names, deadline)
+        if not matched:
+            return set()
+        return matched - await self._holding_tracked_files(matched, deadline)
+
+    async def _matching_ignore_rules(self, names: Sequence[str], deadline: Deadline) -> set[str]:
+        stdin = b"".join(os.fsencode(_PREFIX + name) + b"\0" for name in names)
+        output = await self.repository.run_unchecked(
+            ["check-ignore", "--no-index", "-z", "--stdin"],
+            deadline=deadline,
+            stdin=stdin,
+            stdout_bytes=LISTING_OUTPUT_BYTES,
+        )
+        # Exit 1 means none of the names is ignored.
+        if output.returncode == 1:
+            return set()
+        if not output.success:
+            raise failure(output, "check-ignore")
+        asked = set(names)
+        records = (os.fsdecode(record) for record in output.stdout.split(b"\0") if record)
+        return {name for record in records if (name := record.removeprefix(_PREFIX)) in asked}
+
+    async def _holding_tracked_files(self, names: set[str], deadline: Deadline) -> set[str]:
+        """The ``names`` that are tracked files, or folders holding a tracked file.
+
+        Only tracked files the ignore rules cover can sit in an ignored name, so listing
+        those keeps the answer as small as the overlap.
+        """
+        output = await self.repository.run(
+            ["ls-files", "-z", "--cached", "--ignored", "--exclude-standard", "--", *names],
+            deadline=deadline,
+            stdout_bytes=LISTING_OUTPUT_BYTES,
+        )
+        tracked = (os.fsdecode(record) for record in output.split(b"\0") if record)
+        return {path.split("/", 1)[0] for path in tracked} & names

@@ -63,6 +63,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+from omnigent.host.workspace_git.ignored import DirectoryIgnores
 from omnigent.host.workspace_git.runner import GitError, GitProblem
 from omnigent.host.workspace_service import (
     _SERVED,
@@ -346,7 +347,7 @@ async def test_list_directory_answers_with_nothing_marked_when_git_cant_say(
     async def time_out(*_args: object) -> set[str]:
         raise GitError(GitProblem.TIMEOUT)
 
-    monkeypatch.setattr("omnigent.host.workspace_service.ignored_paths", time_out)
+    monkeypatch.setattr(DirectoryIgnores, "ignored", time_out)
     reader = WorkspaceReader(_ignoring_workspace(tmp_path / "repo"))
     app = WorkspaceServiceASGIApplication(WorkspaceService(lambda _ctx: reader))
     client = _connect(app, "http://workspace.test", ProtocolType.CONNECT)
@@ -355,6 +356,65 @@ async def test_list_directory_answers_with_nothing_marked_when_git_cant_say(
 
     assert "build" in _listed(listed.entries)
     assert not any(_listed(listed.entries).values())
+
+
+async def test_list_directory_resumes_after_the_last_entry_it_returned(
+    tmp_path: Path, client_for: ClientFor
+) -> None:
+    client = client_for(_ignoring_workspace(tmp_path / "repo"))
+
+    # The second source page fills the response at `main.py`, ahead of the page's end.
+    first = await client.list_directory(ListDirectoryRequest(page_size=4, hide_ignored=True))
+    rest = await client.list_directory(
+        ListDirectoryRequest(page_size=4, page_token=first.next_page_token, hide_ignored=True)
+    )
+
+    assert [entry.path for entry in first.entries] == [".git", ".gitignore", "a.txt", "main.py"]
+    assert [entry.path for entry in rest.entries] == ["tracked.log", "zeta.md"]
+    assert rest.next_page_token == ""
+
+
+async def test_list_directory_stops_where_git_stopped_answering(
+    tmp_path: Path, client_for: ClientFor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer = DirectoryIgnores.ignored
+    calls = 0
+
+    async def answer_once(self: DirectoryIgnores, *args: Any) -> set[str]:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise GitError(GitProblem.TIMEOUT)
+        return await answer(self, *args)
+
+    monkeypatch.setattr(DirectoryIgnores, "ignored", answer_once)
+    client = client_for(_ignoring_workspace(tmp_path / "repo"))
+
+    listed = await client.list_directory(ListDirectoryRequest(page_size=4, hide_ignored=True))
+
+    # No unfiltered `debug.log` after the filtered first page; the token resumes there.
+    assert [entry.path for entry in listed.entries] == [".git", ".gitignore", "a.txt"]
+    assert listed.next_page_token == "build"
+
+
+async def test_list_directory_marks_ignored_entries_of_a_subfolder(
+    tmp_path: Path, client_for: ClientFor
+) -> None:
+    root = _ignoring_workspace(tmp_path / "repo")
+    (root / "src").mkdir()
+    (root / "src" / ".gitignore").write_text("generated.py\n")
+    for name in ("main.py", "generated.py", "debug.log"):
+        (root / "src" / name).write_text("x")
+    client = client_for(root)
+
+    listed = await client.list_directory(ListDirectoryRequest(path="src"))
+
+    assert _listed(listed.entries) == {
+        "src/.gitignore": False,
+        "src/debug.log": True,
+        "src/generated.py": True,
+        "src/main.py": False,
+    }
 
 
 async def test_read_file_matches_rest_file_content(tmp_path: Path, client_for: ClientFor) -> None:
