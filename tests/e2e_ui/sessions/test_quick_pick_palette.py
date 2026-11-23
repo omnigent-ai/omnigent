@@ -41,7 +41,11 @@ from tests._helpers.compat import (
 from tests._helpers.live_server import isolated_local_server
 from tests._helpers.polling import poll_until
 from tests.e2e_ui._claude_sdk_session import create_claude_sdk_session
-from tests.e2e_ui._quick_pick_palette import enable_quick_pick_palette, run_palette_command
+from tests.e2e_ui._quick_pick_palette import (
+    enable_quick_pick_palette,
+    open_quick_pick_palette,
+    run_palette_command,
+)
 from tests.e2e_ui.conftest import (
     _BUILD_OUTPUT,
     _REPO_ROOT,
@@ -112,9 +116,7 @@ def test_flag_on_runs_the_quick_pick_palette(page: Page, quick_pick_server: str)
     """With the flag, ⌘K opens QuickPick; initials, Escape and Enter work."""
     page.goto(f"{quick_pick_server}/")
     expect(page.get_by_role("heading", name="What should we build?")).to_be_visible(timeout=30_000)
-    page.keyboard.press("ControlOrMeta+k")
-    palette_input = page.get_by_role("combobox", name="Command palette")
-    expect(palette_input).to_be_focused(timeout=10_000)
+    palette_input = open_quick_pick_palette(page)
     dialog = page.get_by_role("dialog")
     expect(dialog.locator('[data-slot="quick-pick"]')).to_have_count(1)
     expect(dialog.locator("[cmdk-root]")).to_have_count(0)
@@ -149,9 +151,7 @@ def test_quick_pick_reopened_over_its_picker_takes_the_keys(
     """⌘K pressed right after a row opens another picker brings the palette back with the keys."""
     page.goto(f"{quick_pick_server}/")
     expect(page.get_by_role("heading", name="What should we build?")).to_be_visible(timeout=30_000)
-    page.keyboard.press("ControlOrMeta+k")
-    palette_input = page.get_by_role("combobox", name="Command palette")
-    expect(palette_input).to_be_focused(timeout=10_000)
+    palette_input = open_quick_pick_palette(page)
     palette_input.fill("select theme")
     page.keyboard.press("Enter")
     themes = page.get_by_role("combobox", name="Select theme")
@@ -169,6 +169,20 @@ def test_quick_pick_reopened_over_its_picker_takes_the_keys(
     page.keyboard.press("Escape")
     expect(palette_input).to_have_count(0)
     expect(themes).to_have_count(0)
+
+
+def test_quick_pick_palette_opens_on_a_page_still_applying_its_flags(
+    page: Page, quick_pick_server: str
+) -> None:
+    """On a slow page, ⌘K first opens the flag-off palette; the helper waits for QuickPick."""
+    # A 4x slower CPU makes /v1/info land after first render, as on a loaded machine.
+    page.context.new_cdp_session(page).send("Emulation.setCPUThrottlingRate", {"rate": 4})
+    page.goto(f"{quick_pick_server}/")
+    expect(page.get_by_role("heading", name="What should we build?")).to_be_visible(timeout=60_000)
+    palette_input = open_quick_pick_palette(page)
+    palette_input.fill("select theme")
+    page.keyboard.press("Enter")
+    expect(page.get_by_role("combobox", name="Select theme")).to_be_focused(timeout=20_000)
 
 
 def test_quick_pick_on_an_open_session(
@@ -292,9 +306,7 @@ def test_quick_pick_archives_another_session_from_its_row(
     page.goto(f"{base_url}/c/{open_id}")
     expect(page.get_by_placeholder("Send a message…")).to_be_visible(timeout=30_000)
 
-    page.keyboard.press("ControlOrMeta+k")
-    palette_input = page.get_by_role("combobox", name="Command palette")
-    expect(palette_input).to_be_focused(timeout=10_000)
+    palette_input = open_quick_pick_palette(page)
     palette_input.fill("kestrel")
     dialog = page.get_by_role("dialog")
     sessions = dialog.get_by_role("group", name="Sessions")
@@ -327,9 +339,7 @@ def test_quick_pick_archives_a_session_picked_after_the_verb(
     page.goto(f"{base_url}/c/{open_id}")
     expect(page.get_by_placeholder("Send a message…")).to_be_visible(timeout=30_000)
 
-    page.keyboard.press("ControlOrMeta+k")
-    palette_input = page.get_by_role("combobox", name="Command palette")
-    expect(palette_input).to_be_focused(timeout=10_000)
+    palette_input = open_quick_pick_palette(page)
     palette_input.fill("archive a session")
     dialog = page.get_by_role("dialog")
     # By name: the open session's own Archive session row can rank above it.
@@ -426,9 +436,7 @@ def test_quick_pick_deletes_the_project_a_new_session_starts_in(
     page.goto(f"{base_url}/?project={quote(name)}")
     expect(_project_folder(page, name)).to_be_visible(timeout=30_000)
 
-    page.keyboard.press("ControlOrMeta+k")
-    palette_input = page.get_by_role("combobox", name="Command palette")
-    expect(palette_input).to_be_focused(timeout=10_000)
+    palette_input = open_quick_pick_palette(page)
     palette_input.fill(name)
     palette = page.get_by_role("dialog")
     delete = palette.get_by_role(
@@ -468,10 +476,8 @@ def test_quick_pick_ctrl_tab_steps_through_the_sidebar(
     expect(page.locator(f'li[data-sidebar-session-id="{other_id}"]')).to_be_visible(timeout=30_000)
     rows = _rendered_row_ids(page)
     below = rows[(rows.index(open_id) + 1) % len(rows)]
-    # The chords wait for quick_pick_palette, which ⌘K opening the QuickPick palette shows.
-    page.keyboard.press("ControlOrMeta+k")
-    palette_input = page.get_by_role("combobox", name="Command palette")
-    expect(palette_input).to_be_focused(timeout=10_000)
+    # The chords wait for quick_pick_palette, which the QuickPick palette opening shows.
+    palette_input = open_quick_pick_palette(page)
     page.keyboard.press("Escape")
     expect(palette_input).to_have_count(0)
 
@@ -601,9 +607,7 @@ def test_quick_pick_marks_all_read_and_filters_the_inbox(
             and json.loads(candidate.request.post_data or "{}").get("unread") is False
         )
 
-    page.keyboard.press("ControlOrMeta+k")
-    palette_input = page.get_by_role("combobox", name="Command palette")
-    expect(palette_input).to_be_focused(timeout=10_000)
+    palette_input = open_quick_pick_palette(page)
     palette_input.fill("mark all as read")
     # Wait for the list to settle: rows from before the query can linger for a moment.
     options = page.get_by_role("dialog").get_by_role("option")
@@ -636,9 +640,7 @@ def test_quick_pick_marks_all_read_and_filters_the_inbox(
 
 def _palette_row_keys(page: Page, query: str, name: str) -> list[str]:
     """Open ⌘K, filter to ``query`` and read the key caps of the option named ``name``."""
-    page.keyboard.press("ControlOrMeta+k")
-    palette_input = page.get_by_role("combobox", name="Command palette")
-    expect(palette_input).to_be_focused(timeout=10_000)
+    palette_input = open_quick_pick_palette(page)
     palette_input.fill(query)
     option = page.get_by_role("dialog").get_by_role("option", name=name).first
     expect(option).to_be_visible()
