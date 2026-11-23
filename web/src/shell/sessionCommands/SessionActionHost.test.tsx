@@ -12,6 +12,7 @@ import { LEVEL_READ } from "@/lib/permissionsApi";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 import { SessionActionHost } from "./SessionActionHost";
+import { usePublishOpenSession } from "../openSession";
 import { requestSessionAction, useSessionActionStore } from "./sessionActionStore";
 
 const writes = vi.hoisted(() => ({
@@ -83,10 +84,17 @@ function Location() {
 }
 
 /** On the open session's page; `remountHost` mounts the host again in the same app. */
+/** Publishes the open session as the app shell does; its root comes from `ui.viewing`. */
+function OpenSessionShell() {
+  usePublishOpenSession(ui.viewing);
+  return null;
+}
+
 function renderHost(queryClient = new QueryClient()) {
   const app = (hostMounted: boolean) => (
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={["/c/c1"]}>
+        <OpenSessionShell />
         {hostMounted && <SessionActionHost />}
         <Location />
       </MemoryRouter>
