@@ -138,7 +138,9 @@ What a gadget keeps, and how long:
 
 Only those who may publish read unpublished revisions. Deleting an account deletes the gadgets
 it owns, with their grants and its shelf, and its username cannot be registered again until
-they are gone, as for workflows.
+they are gone, as for workflows. A password change or reset revokes the account's sessions but
+not its gadgets: gadgets and the shelf belong to the registration, and each new generation is
+linked to it, while a username registered again starts with none.
 
 The frame's write and action controls follow these: the SDK disables controls marked
 `data-omnigent-requires="write"` or `"action"` for viewers without that access.

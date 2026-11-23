@@ -1561,7 +1561,7 @@ def test_prompt_write_rechecks_the_admin_under_its_lock(db_uri: str) -> None:
 
 def _gadgets(db_uri: str, tmp_path, accounts: SqlAlchemyAccountStore):
     from omnigent.gadgets.access import PermissionStoreGadgetAccess
-    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.gadgets.accounts import DeletedAccountGadgets, gadget_registration
     from omnigent.gadgets.service import GadgetService, GadgetViewer
     from omnigent.stores.gadget_store.local import LocalGadgetStore
 
@@ -1576,7 +1576,9 @@ def _gadgets(db_uri: str, tmp_path, accounts: SqlAlchemyAccountStore):
             account = accounts.get_user(user)
             self.generation = account.account_generation if account is not None else None
             self.user = user
-            self.service = GadgetService(store, access, GadgetViewer(user, self.generation))
+            # As the gadget routes resolve a request's viewer.
+            viewer = GadgetViewer(user, gadget_registration(store, user, self.generation))
+            self.service = GadgetService(store, access, viewer)
 
         def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
             method = getattr(self.service, name)
@@ -1617,6 +1619,51 @@ def test_deletion_removes_the_accounts_gadgets_and_who_they_were_shared_with(
     assert service("alice").shelf()["pinned"] == []
     assert service("alice").shared() == {"items": [], "next_cursor": None}
     assert store.get(kept["id"]) is not None
+
+
+def test_a_password_change_keeps_the_accounts_gadgets_and_pins(db_uri: str, tmp_path) -> None:
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    _, access, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("bob")
+    before = service("alice")
+    board = before.create("Synthetic board")
+    before.pin(board["id"], {"pinned": True})
+    permissions.grant_for_gadget("bob", board["id"], 1)
+
+    # Rotating the generation revokes Alice's sessions, not her gadgets.
+    for round_ in range(2):
+        accounts.update_password("alice", f"hash-{round_}", revoke_sessions=True)
+    after = service("alice")
+    assert after.generation != before.generation
+    assert [item["id"] for item in after.list_owned()["items"]] == [board["id"]]
+    assert [pin["id"] for pin in after.shelf()["pinned"]] == [board["id"]]
+    assert after.get(board["id"])["id"] == board["id"]
+    assert [item.gadget.id for item in access.shared_with("bob").items] == [board["id"]]
+
+
+def test_deleting_an_account_after_password_changes_removes_its_gadgets_for_good(
+    db_uri: str, tmp_path
+) -> None:
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    store, access, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("bob")
+    board = service("alice").create("Synthetic board")
+    permissions.grant_for_gadget("bob", board["id"], 1)
+    accounts.update_password("alice", "hash-1", revoke_sessions=True)
+    accounts.update_password("alice", "hash-2", revoke_sessions=True)
+
+    assert accounts.delete_user("alice") is True
+    assert store.get(board["id"]) is None
+    assert permissions.list_for_gadget(board["id"]) == ([], None)
+    accounts.create_user_with_password("alice", "replacement-hash")
+    # Bob's earlier access doesn't come back with the name, and the new Alice starts empty.
+    assert access.shared_with("bob").items == []
+    assert service("alice").list_owned() == {"items": [], "next_cursor": None}
+    assert service("alice").shelf()["pinned"] == []
 
 
 def test_reregistration_finishes_removing_the_gadget_grants_a_deleted_account_held(

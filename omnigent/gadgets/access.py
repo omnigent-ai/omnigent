@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from omnigent.db.account_authority import account_generation
+from omnigent.gadgets.registration import gadget_registration
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.stores.gadget_store import Gadget, GadgetStore
 from omnigent.stores.permission_store import MAX_SHARED_GADGETS_PAGE_SIZE, PermissionStore
@@ -152,7 +153,7 @@ class PermissionStoreGadgetAccess(GadgetAccess):
     def permissions_many(
         self, viewer_id: str, gadgets: Sequence[Gadget]
     ) -> dict[str, GadgetPermissions]:
-        generation = account_generation(viewer_id)
+        generation = gadget_registration(self._store, viewer_id, account_generation(viewer_id))
         result = {
             gadget.id: FULL_ACCESS for gadget in gadgets if owned_by(gadget, viewer_id, generation)
         }

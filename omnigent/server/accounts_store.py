@@ -79,6 +79,9 @@ class DeletedAccountResources(Protocol):
     def owns_any(self, user_id: str, generation: str | None = None) -> bool:
         """Whether anything the deleted account *user_id* (*generation*) owns is left there."""
 
+    def carry(self, user_id: str, old: str, new: str) -> None:
+        """Keep what the account owns there when its generation rotates from *old* to *new*."""
+
 
 _HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
 
@@ -857,6 +860,9 @@ class SqlAlchemyAccountStore:
                 new_generation = uuid.uuid4().hex
                 if generation is not None:
                     _carry_registration_work(session, user_id, old=generation, new=new_generation)
+                    if self._gadgets is not None:
+                        # Before the commit: a failed one leaves only an unused link.
+                        self._gadgets.carry(user_id, generation, new_generation)
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(
