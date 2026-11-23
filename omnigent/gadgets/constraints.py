@@ -344,50 +344,59 @@ class ConstraintGuard:
             unique={name: dict(keys) for name, keys in state.get("unique", {}).items()},
             operations=[primary],
         )
-        visited = {(collection, record_id)}
+        # The records this plan deletes or updates, and their planned operation and value.
+        gone: set[tuple[str, str]] = {(collection, record_id)} if after is None else set()
+        planned: dict[tuple[str, str], tuple[dict, Any]] = {}
         queue: list[tuple[str, str, Any, Any]] = [(collection, record_id, before, after)]
         while queue:
             changed_collection, changed_id, old, new = queue.pop(0)
             for rule in self.rules:
                 if rule["collection"] == changed_collection:
                     self._check(rule, plan, changed_id, old, new)
-                if (
-                    rule["kind"] == "reference"
-                    and rule["target"] == changed_collection
-                    and old is not None
-                    and new is None
-                ):
-                    for dependent in self._dependents(rule, changed_id):
-                        key = (rule["collection"], dependent.id)
-                        if key in visited:
-                            continue
-                        if rule["on_delete"] == "restrict":
-                            raise ConstraintViolation(rule)
-                        visited.add(key)
-                        operation = {
-                            "collection": rule["collection"],
-                            "id": dependent.id,
-                            "if_version": dependent.version,
-                            "operation_id": self._derived_operation(primary, len(plan.operations)),
-                            "actor": self.actor,
-                        }
-                        if rule["on_delete"] == "cascade":
-                            plan.operations.append({**operation, "kind": "delete"})
-                            queue.append((rule["collection"], dependent.id, dependent.value, None))
-                        else:
-                            plan.operations.append(
-                                {**operation, "kind": "unset", "field": rule["field"]}
-                            )
-                            remaining = {
-                                k: v for k, v in dependent.value.items() if k != rule["field"]
-                            }
-                            queue.append(
-                                (rule["collection"], dependent.id, dependent.value, remaining)
-                            )
-                        if len(plan.operations) > MAX_PLAN_OPERATIONS:
-                            raise CapacityExceeded(
-                                f"This change would update more than {MAX_PLAN_OPERATIONS} records"
-                            )
+            if old is None or new is not None:
+                continue
+            # Every reference rule on the deleted record, gathered per dependent first, so
+            # a dependent referencing it through several fields meets all of their rules.
+            effects: dict[tuple[str, str], tuple[Document, list[dict]]] = {}
+            for rule in self.rules:
+                if rule["kind"] != "reference" or rule["target"] != changed_collection:
+                    continue
+                for dependent in self._dependents(rule, changed_id):
+                    key = (rule["collection"], dependent.id)
+                    effects.setdefault(key, (dependent, []))[1].append(rule)
+            for key, (dependent, rules) in effects.items():
+                if key in gone:
+                    continue
+                restricting = [rule for rule in rules if rule["on_delete"] == "restrict"]
+                if restricting:
+                    raise ConstraintViolation(restricting[0])
+                operation: dict[str, Any] | None
+                operation, current = planned.get(key, (None, dependent.value))
+                if operation is None:
+                    operation = {
+                        "collection": key[0],
+                        "id": dependent.id,
+                        "if_version": dependent.version,
+                        "operation_id": self._derived_operation(primary, len(plan.operations)),
+                        "actor": self.actor,
+                    }
+                    plan.operations.append(operation)
+                if any(rule["on_delete"] == "cascade" for rule in rules):
+                    operation["kind"] = "delete"
+                    operation.pop("fields", None)
+                    gone.add(key)
+                    planned[key] = (operation, None)
+                    queue.append((key[0], dependent.id, current, None))
+                else:
+                    fields = sorted({*operation.get("fields", []), *(r["field"] for r in rules)})
+                    operation["kind"], operation["fields"] = "unset", fields
+                    remaining = {k: v for k, v in current.items() if k not in fields}
+                    planned[key] = (operation, remaining)
+                    queue.append((key[0], dependent.id, current, remaining))
+                if len(plan.operations) > MAX_PLAN_OPERATIONS:
+                    raise CapacityExceeded(
+                        f"This change would update more than {MAX_PLAN_OPERATIONS} records"
+                    )
         return plan
 
     def _check(self, rule: dict, plan: _Plan, record_id: str, old: Any, new: Any) -> None:
@@ -477,7 +486,9 @@ class ConstraintGuard:
         source = self.data.get_version(collection, record_id, operation["if_version"])
         if source is None:
             raise NotFound("The record to update was deleted")
-        value = {key: item for key, item in source.value.items() if key != operation["field"]}
+        # Older pending plans named one field.
+        fields = set(operation.get("fields") or [operation["field"]])
+        value = {key: item for key, item in source.value.items() if key not in fields}
         return self.data.replace(
             collection, record_id, value, operation["if_version"], operation_id, actor
         ).to_dict()

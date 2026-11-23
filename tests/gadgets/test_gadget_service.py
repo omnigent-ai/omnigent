@@ -437,7 +437,11 @@ _RULED_COLLECTIONS = {
     "runs": {
         "type": "object",
         "required": ["state"],
-        "properties": {"cardId": {"type": "string"}, "state": {"type": "string"}},
+        "properties": {
+            "cardId": {"type": "string"},
+            "reviewCardId": {"type": "string"},
+            "state": {"type": "string"},
+        },
     },
 }
 WIP_LIMIT = {
@@ -667,6 +671,58 @@ def test_a_reference_rule_checks_targets_and_applies_its_delete_rule(
     else:
         assert remaining["value"] == {"state": "done"}
     assert rpc(service, app, "get", collection="runs", id="r2")["value"] == {"state": "done"}
+
+
+@pytest.mark.parametrize(
+    ("second", "deleted"),
+    [("restrict", False), ("unset", True), ("cascade", True)],
+)
+def test_every_reference_rule_on_one_record_applies(
+    gadgets: Fixture, second: str, deleted: bool
+) -> None:
+    """A run referencing one card through two fields meets both fields' rules, whichever
+    the store happens to see first."""
+    service = gadgets.service()
+    rules = [
+        {
+            "name": name,
+            "kind": "reference",
+            "collection": "runs",
+            "field": field,
+            "target": "cards",
+            "on_delete": on_delete,
+        }
+        for name, field, on_delete in (
+            ("run_card", "cardId", "unset"),
+            ("run_review", "reviewCardId", second),
+        )
+    ]
+    app = publish_ruled_board(service, rules)
+    target = card(service, app, "a", "doing")
+    rpc(
+        service,
+        app,
+        "create",
+        collection="runs",
+        id="r1",
+        value={"cardId": "a", "reviewCardId": "a", "state": "done"},
+        operation_id="r1",
+    )
+    delete = {"id": "a", "if_version": target["version"], "operation_id": "d-a"}
+    if not deleted:
+        with pytest.raises(ConstraintViolation):
+            rpc(service, app, "delete", **delete)
+        assert rpc(service, app, "get", id="a") is not None
+        run = rpc(service, app, "get", collection="runs", id="r1")
+        assert run["value"] == {"cardId": "a", "reviewCardId": "a", "state": "done"}
+        return
+    rpc(service, app, "delete", **delete)
+    run = rpc(service, app, "get", collection="runs", id="r1")
+    if second == "cascade":
+        assert run is None
+    else:
+        # Both references are gone, in one update: no dangling second reference.
+        assert run["value"] == {"state": "done"}
 
 
 def test_a_change_left_half_done_is_finished_by_the_next_writer(
