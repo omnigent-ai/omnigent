@@ -151,12 +151,12 @@ export function usePaletteSessionSearch({
       setPageLimit(SESSION_SEARCH_PAGE_BATCH);
     }
   }, [open]);
-  // And again in the render that opens it, so a palette reopened while the last close is still
-  // settling never shows that query, and keys typed at once don't add to it.
+  // The QuickPick palette resets again in the render that opens it, so one reopened while the
+  // last close is still settling never shows that query, and keys typed at once don't add to it.
   const [renderedOpen, setRenderedOpen] = useState(open);
   if (renderedOpen !== open) {
     setRenderedOpen(open);
-    if (open) {
+    if (open && matchLoaded) {
       setQuery("");
       setDebouncedQuery("");
       setPageLimit(SESSION_SEARCH_PAGE_BATCH);
