@@ -12,6 +12,8 @@ import type { SessionCommandId } from "./sessionCommands/model";
 export interface PaletteParentPlace {
   query: string;
   activeId: string | null;
+  /** The child page Back reopens, with its own parent, when the parent is itself a page. */
+  page?: { page: PaletteChildPage; parent: PaletteParentPlace | null };
 }
 
 export type PaletteChildPage =
@@ -94,7 +96,7 @@ export function openPaletteChildPage(page: PaletteChildPage): void {
 export function leavePaletteChildPage(): PaletteParentPlace | null {
   paletteIntents.revoke();
   const { parent } = paletteChildPageStore.getState();
-  paletteChildPageStore.setState({ page: null, parent: null });
+  paletteChildPageStore.setState(parent?.page ?? { page: null, parent: null });
   return parent;
 }
 

@@ -389,8 +389,12 @@ export function QuickPickCommandPalette({
         (candidate) => candidate.id === row.id,
       );
       if (!picked) return "keepOpen";
-      const parent = paletteChildPageStore.getState().parent ?? { query: "", activeId: null };
-      sessionPage.openActions(picked.conversation, picked.label, parent);
+      // Back returns to the picker, on this session and with the query that found it.
+      sessionPage.openActions(picked.conversation, picked.label, {
+        query,
+        activeId: item.id,
+        page: { page: picking, parent: paletteChildPageStore.getState().parent },
+      });
       setPageQuery("");
       setParkedId(`session-action:${picked.id}:${picking.command}`);
       setPickedAction({ sessionId: picked.id, title: picked.label, command: picking.command });

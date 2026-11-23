@@ -352,6 +352,28 @@ describe("QuickPick ⌘K verb-first session actions", () => {
     );
   });
 
+  it("goes back from a picked session's actions to the picker, then to the verb's row", async () => {
+    const { input } = renderWithPicks();
+    fireEvent.change(input, { target: { value: "archive a session" } });
+    await screen.findByRole("option", { name: /Archive a Session…/ });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(heading()).toBe("Archive which session?"));
+    fireEvent.change(input, { target: { value: "parser" } });
+    await waitFor(() => expect(optionNames()).toEqual([expect.stringContaining("Fix the parser")]));
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(heading()).toBe("Actions for “Fix the parser”"));
+
+    fireEvent.keyDown(input, { key: "Escape" });
+    await waitFor(() => expect(heading()).toBe("Archive which session?"));
+    expect(input).toHaveValue("parser");
+    await waitFor(() => expect(activeRow(input)).toHaveTextContent("Fix the parser"));
+
+    fireEvent.keyDown(input, { key: "Escape" });
+    await waitFor(() => expect(heading()).toBeNull());
+    expect(input).toHaveValue("archive a session");
+    await waitFor(() => expect(activeRow(input)).toHaveTextContent("Archive a Session…"));
+  });
+
   it("says when the session doesn't offer the verb's action", async () => {
     const { input } = renderWithPicks();
     fireEvent.change(input, { target: { value: "unpin a session" } });
