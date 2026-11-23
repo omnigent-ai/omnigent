@@ -1,7 +1,9 @@
 import { act, renderHook } from "@testing-library/react";
+import type { ContextType, ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Conversation } from "@/hooks/useConversations";
+import { SidebarDataContext } from "@/hooks/useSidebarData";
 import { useSidebarSessionOrderStore } from "@/hooks/useSidebarSessionOrder";
 import { isCommandListed } from "@/store/paletteCommands";
 
@@ -23,6 +25,17 @@ function row(id: string, updated: number, overrides: Partial<Conversation> = {})
     ...overrides,
   };
 }
+
+type SidebarData = ContextType<typeof SidebarDataContext>;
+const loaded = (rows: Conversation[]) => ({ loadedRows: rows }) as unknown as SidebarData;
+const SEVERAL_LOADED = loaded([row("a", 1), row("b", 9), row("c", 5)]);
+const ONLY_OPEN_LOADED = loaded([row("b", 9)]);
+/** The sidebar's loaded rows, as the shell provides them. */
+const withRows = (sidebarData: SidebarData) => ({
+  wrapper: ({ children }: { children: ReactNode }) => (
+    <SidebarDataContext.Provider value={sidebarData}>{children}</SidebarDataContext.Provider>
+  ),
+});
 
 afterEach(() => {
   navigate.mockClear();
@@ -53,6 +66,17 @@ describe("useSessionNavigationCommands", () => {
     const { result } = renderHook(() => useSessionNavigationCommands());
     expect(isCommandListed(command(result.current, "next-session").availability)).toBe(false);
     expect(isCommandListed(command(result.current, "previous-session").availability)).toBe(false);
+  });
+
+  it("switches to the most recent other session, and offers none without one", () => {
+    const { result } = renderHook(() => useSessionNavigationCommands(), withRows(SEVERAL_LOADED));
+    command(result.current, "recent-session").run();
+    expect(navigate).toHaveBeenCalledWith("/c/c");
+
+    const alone = renderHook(() => useSessionNavigationCommands(), withRows(ONLY_OPEN_LOADED));
+    expect(isCommandListed(command(alone.result.current, "recent-session").availability)).toBe(
+      false,
+    );
   });
 
   it("stays put on a single listed session that's already open", () => {
