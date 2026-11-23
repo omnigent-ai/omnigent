@@ -182,6 +182,37 @@ function selectedTab(list: HTMLElement): HTMLElement | null {
  * Waiting stops when the navigation is aborted, when focus moves somewhere else after the
  * navigation began, or when the window closes.
  */
+/**
+ * Keeps a revealed control in view while its row settles during the reveal window, as when
+ * content loading above it pushes it down. The user's own input, or focus leaving it, ends this.
+ */
+function keepFocusedControlInView(
+  row: HTMLElement,
+  control: HTMLElement,
+  signal: AbortSignal,
+  windowEndsAt: number,
+) {
+  if (typeof ResizeObserver === "undefined") return;
+  let stopped = false;
+  const observer = new ResizeObserver(() => {
+    if (stopped) return;
+    if (document.activeElement === control) control.scrollIntoView?.({ block: "nearest" });
+    else stop();
+  });
+  const timer = window.setTimeout(stop, Math.max(0, windowEndsAt - Date.now()));
+  const userEvents = ["keydown", "pointerdown", "wheel", "touchstart"] as const;
+  function stop() {
+    stopped = true;
+    observer.disconnect();
+    window.clearTimeout(timer);
+    signal.removeEventListener("abort", stop);
+    for (const type of userEvents) document.removeEventListener(type, stop, true);
+  }
+  signal.addEventListener("abort", stop);
+  for (const type of userEvents) document.addEventListener(type, stop, true);
+  observer.observe(row);
+}
+
 function focusControlWhenReady(
   row: HTMLElement,
   entry: SettingsEntry,
@@ -203,8 +234,11 @@ function focusControlWhenReady(
     if (control === standIn && document.activeElement === standIn) return false;
     control.focus({ preventScroll: true });
     if (document.activeElement !== control) return false;
+    // A row taller than the window is centered on its middle; bring the control itself in too.
+    control.scrollIntoView?.({ block: "nearest" });
     const wanted = candidates[0] === control && isAskedFor(row, entry, part, control);
     standIn = wanted ? null : control;
+    if (wanted) keepFocusedControlInView(row, control, signal, windowEndsAt);
     return wanted;
   };
   if (focusIfReady()) return;

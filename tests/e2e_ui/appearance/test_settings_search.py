@@ -7,9 +7,12 @@ field focused.
 
 from __future__ import annotations
 
+import json
 import re
 
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import Locator, Page, Route, expect
+
+from tests.e2e_ui.conftest import fetch_with_retry
 
 _HIGHLIGHT = "data-settings-highlight"
 
@@ -70,7 +73,8 @@ _SCROLLS = """(list) => {
 def test_settings_search_lists_its_best_matches_without_scrolling(
     page: Page, live_server: str
 ) -> None:
-    """A broad query lists ten results, which a full-height window fits."""
+    """A broad query lists ten results: a full-height window fits them; a short one scrolls,
+    keeping the selected result in view."""
     page.set_viewport_size({"width": 1280, "height": 800})
     page.goto(f"{live_server}/settings/general")
     field = _search_field(page)
@@ -81,6 +85,66 @@ def test_settings_search_lists_its_best_matches_without_scrolling(
     listbox = page.get_by_role("listbox")
     assert not listbox.evaluate(_SCROLLS), "a full-height window shouldn't scroll the results"
     expect(options.last).to_be_in_viewport()
+
+    page.set_viewport_size({"width": 1280, "height": 480})
+    expect(options.last).not_to_be_in_viewport()
+    assert listbox.evaluate(_SCROLLS), "a short window should scroll the results"
+    # Moving the selection to the last result scrolls it into view.
+    field.focus()
+    page.keyboard.press("End")
+    expect(options.last).to_have_attribute("aria-selected", "true")
+    expect(options.last).to_be_in_viewport()
+
+
+# A prompt long enough that the Omni Advisor row is taller than a 720px window.
+_LONG_ADVISOR_PROMPT = "\n".join(f"Instruction {n}: be useful." for n in range(80))
+
+
+def _offer_omni_advisor(page: Page) -> None:
+    """Report Omni Advisor as offered, with its settings and a long prompt loaded."""
+
+    def info(route: Route) -> None:
+        response = fetch_with_retry(route)
+        body = response.json()
+        body["proactive_agent_available"] = True
+        route.fulfill(response=response, body=json.dumps(body))
+
+    page.route("**/v1/info", info)
+    page.route(
+        "**/v1/proactive-agent/settings",
+        lambda route: route.fulfill(
+            json={
+                "workspace_enabled": True,
+                "user_enabled": True,
+                "enabled": True,
+                "can_manage_workspace": True,
+            }
+        ),
+    )
+    page.route(
+        "**/v1/proactive-agent/prompt",
+        lambda route: route.fulfill(
+            json={
+                "prompt": _LONG_ADVISOR_PROMPT,
+                "default_prompt": _LONG_ADVISOR_PROMPT,
+                "overridden": False,
+            }
+        ),
+    )
+
+
+def test_a_revealed_control_in_a_row_taller_than_the_window_is_on_screen(
+    page: Page, live_server: str
+) -> None:
+    """Picking a part low in a tall row brings that control into view, not just the row."""
+    page.set_viewport_size({"width": 1280, "height": 720})
+    _offer_omni_advisor(page)
+    page.goto(f"{live_server}/settings/admin#proactive-agent-workspace:users")
+    users = page.locator('[data-settings-item="proactive-agent-workspace"]').get_by_role(
+        "textbox", name="Users to run now"
+    )
+    expect(users).to_be_focused(timeout=30_000)
+    expect(users).to_be_in_viewport()
 
 
 def _open_command_palette(page: Page) -> Locator:

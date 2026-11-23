@@ -2,7 +2,7 @@
 // and is marked briefly. A navigation starts a new reveal window, and a row that mounts after
 // the window doesn't move the page.
 
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -105,13 +105,23 @@ function renderAt(hash: string, rows: ReactNode) {
 const row = () => document.querySelector<HTMLElement>(`[data-settings-item="${ROW.id}"]`)!;
 const highlighted = () => row().hasAttribute(SETTINGS_HIGHLIGHT_ATTRIBUTE);
 
+/** The rows a reveal centered, apart from the controls it then brought into view. */
 let scrolled: Element[] = [];
+let scrollOptions: (ScrollIntoViewOptions | boolean | undefined)[] = [];
+let controlsScrolled: Element[] = [];
 
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
   scrolled = [];
-  Element.prototype.scrollIntoView = function scrollIntoView(this: Element) {
-    scrolled.push(this);
+  scrollOptions = [];
+  controlsScrolled = [];
+  Element.prototype.scrollIntoView = function scrollIntoView(
+    this: Element,
+    options?: ScrollIntoViewOptions | boolean,
+  ) {
+    scrollOptions.push(options);
+    if (typeof options === "object" && options.block === "nearest") controlsScrolled.push(this);
+    else scrolled.push(this);
   };
   fixtureEntries.clear();
   fixtureEntries.set(CHILD.id, CHILD);
@@ -125,11 +135,54 @@ afterEach(() => {
 describe("revealing a Settings row from its hash", () => {
   it("scrolls to the row, focuses the named part and marks the row until the mark fades", () => {
     renderAt("#fixture-row:field", <FixtureRow entry={ROW} />);
+    const field = screen.getByRole("textbox", { name: "Field" });
     expect(scrolled).toEqual([row()]);
-    expect(screen.getByRole("textbox", { name: "Field" })).toHaveFocus();
+    expect(field).toHaveFocus();
     expect(highlighted()).toBe(true);
     act(() => vi.advanceTimersByTime(SETTINGS_HIGHLIGHT_MS));
     expect(highlighted()).toBe(false);
+  });
+
+  it("centers the row, then brings the focused control into view, as a tall row can hide it", () => {
+    renderAt("#fixture-row:reset", <FixtureRow entry={ROW} />);
+    const reset = screen.getByRole("button", { name: "Reset" });
+    expect(reset).toHaveFocus();
+    expect(scrolled).toEqual([row()]);
+    expect(controlsScrolled).toEqual([reset]);
+    expect(scrollOptions).toEqual([{ block: "center" }, { block: "nearest" }]);
+  });
+
+  it("keeps the focused control in view while its row resizes, until the user acts", () => {
+    const observers = new Set<() => void>();
+    const resize = () => [...observers].forEach((callback) => callback());
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        private readonly callback: () => void;
+        constructor(callback: () => void) {
+          this.callback = callback;
+        }
+        observe() {
+          observers.add(this.callback);
+        }
+        disconnect() {
+          observers.delete(this.callback);
+        }
+      },
+    );
+    try {
+      renderAt("#fixture-row:reset", <FixtureRow entry={ROW} />);
+      const reset = screen.getByRole("button", { name: "Reset" });
+      expect(controlsScrolled).toEqual([reset]);
+      // Content loading above it, such as a prompt editor, pushes it down.
+      act(resize);
+      expect(controlsScrolled).toEqual([reset, reset]);
+      fireEvent.keyDown(document, { key: "ArrowDown" });
+      act(resize);
+      expect(controlsScrolled).toEqual([reset, reset]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("focuses the row's main control for a bare row, which is its first control", () => {
