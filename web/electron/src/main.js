@@ -2082,6 +2082,17 @@ function fallbackAppWindow(serverUrl, excluded) {
 }
 
 /**
+ * Whether the user has moved on from the launch: the panel is back on screen, or no Omnigent
+ * window has focus. A route opened then must not take focus from either.
+ *
+ * @param {BrowserWindow} panel
+ * @returns {boolean}
+ */
+function userMovedOn(panel) {
+  return (!panel.isDestroyed() && panel.isVisible()) || BrowserWindow.getFocusedWindow() === null;
+}
+
+/**
  * The window a launch's first message can be offered to: the server's app window, when its page
  * subscribed for offers and isn't still connecting. Null otherwise.
  *
@@ -3096,6 +3107,7 @@ function createWindow(targetUrl, opts = {}) {
   };
   const win = new BrowserWindow({
     ...(isMain ? mainWindowOptions : opts.windowOptions),
+    ...(opts.inactive === true ? { show: false } : {}),
     webPreferences: {
       // Security: the SPA is remote/untrusted relative to the shell, so we
       // keep Node out of the renderer and isolate the preload's context.
@@ -3111,6 +3123,12 @@ function createWindow(targetUrl, opts = {}) {
       spellcheck: true,
     },
   });
+  // A window opened behind the user's back appears without taking focus.
+  if (opts.inactive === true) {
+    win.once("ready-to-show", () => {
+      if (!win.isDestroyed()) win.showInactive();
+    });
+  }
   const sendFullScreenState = () => {
     if (!win.isDestroyed()) {
       win.webContents.send("omnigent:full-screen-changed", win.isFullScreen());
@@ -5561,7 +5579,7 @@ function registerIpc() {
       contents.removeListener("destroyed", revoke);
       floatingComposerSupport.revoke(contents.id);
       // Launches offered to this document end now, so the panel delivers them without waiting.
-      floatingLaunchOffers.forget(contents);
+      floatingLaunchOffers.forget(contents, { documentGone: true });
       // A panel built ahead goes once its server has had no supporting page for a while; a
       // reload announces again within moments, which calls the release off.
       if (!floatingComposerSupport.serves(serverUrl)) {
@@ -5673,17 +5691,19 @@ function registerIpc() {
           message,
         );
         if (outcome === "confirmed") return { ok: true, delivery: "page" };
-        // The panel delivers. A window whose page took the message must not also navigate to the
-        // session, or the queued message would be sent twice; another window takes the route.
+        // The panel delivers. A window whose page still holds the taken message must not also
+        // navigate to the session, or the message would be sent twice; a reloaded window holds none.
         const fallback = fallbackAppWindow(
           serverUrl,
           outcome === "handed-out" ? handOffTarget : null,
         );
+        // This runs after the wait: take focus only if the user is still where they launched from.
+        const away = userMovedOn(panel);
         if (fallback !== null) {
-          if (fallback !== handOffTarget) focusAndRestore(fallback);
+          if (fallback !== handOffTarget && !away) focusAndRestore(fallback);
           sendOpenPath(fallback, openPath);
         } else {
-          createWindow(undefined, { serverUrl, path: openPath });
+          createWindow(undefined, { serverUrl, path: openPath, inactive: away });
         }
         return { ok: true };
       }

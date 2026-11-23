@@ -19,6 +19,12 @@ const FLOATING_LAUNCH_TAKE_TIMEOUT_MS = 2000;
  *   stopTimer?: (timer: unknown) => void,
  * }} [options]
  */
+/** How an offer ends: by whether it was taken, and whether the document that took it has gone. */
+function endingOutcome(offer, documentGone) {
+  if (!offer.handedOut) return "not-taken";
+  return documentGone ? "document-gone" : "handed-out";
+}
+
 function createFloatingLaunchOffers({
   timeoutMs = FLOATING_LAUNCH_TAKE_TIMEOUT_MS,
   startTimer = (callback, ms) => setTimeout(callback, ms),
@@ -39,24 +45,26 @@ function createFloatingLaunchOffers({
       return takers.has(contents);
     },
     /**
-     * The document went, or unsubscribed: it takes no more offers, and its pending ones end.
-     * An offer whose message was already handed out ends as "handed-out".
+     * The page stops taking offers, or its document is gone (`documentGone`), and its pending
+     * offers end. An offer whose message was taken ends as "handed-out" while the page is still
+     * there, and as "document-gone" once the document that took it has gone.
      */
-    forget(contents) {
+    forget(contents, { documentGone = false } = {}) {
       takers.delete(contents);
       for (const offer of [...outstanding.values()]) {
-        if (offer.contents === contents) offer.settle(offer.handedOut ? "handed-out" : "not-taken");
+        if (offer.contents === contents) offer.settle(endingOutcome(offer, documentGone));
       }
     },
     /**
      * Offers `message` to the top document of `contents`. Resolves "confirmed" when that page
-     * confirms it queued the message, "handed-out" when it took the message and then ended
-     * unconfirmed, or "not-taken" when it never took it.
+     * confirms it queued the message; "handed-out" when it took the message and ended unconfirmed
+     * with its document still there; "document-gone" when that document went after taking it; or
+     * "not-taken" when it never took it.
      *
      * @param {object} contents
      * @param {{ sessionId: string, path: string }} target
      * @param {object} message
-     * @returns {Promise<"confirmed" | "handed-out" | "not-taken">}
+     * @returns {Promise<"confirmed" | "handed-out" | "document-gone" | "not-taken">}
      */
     offer(contents, { sessionId, path }, message) {
       return new Promise((resolve) => {
@@ -69,7 +77,7 @@ function createFloatingLaunchOffers({
         };
         const offer = { contents, message, handedOut: false, settle };
         outstanding.set(id, offer);
-        timer = startTimer(() => settle(offer.handedOut ? "handed-out" : "not-taken"), timeoutMs);
+        timer = startTimer(() => settle(endingOutcome(offer, false)), timeoutMs);
         try {
           contents.send(FLOATING_LAUNCH_OFFER_CHANNEL, { id, sessionId, path });
         } catch {

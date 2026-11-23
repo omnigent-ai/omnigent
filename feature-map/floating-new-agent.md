@@ -33,7 +33,9 @@ off by default.
   chat, as New Chat does, so it stays visible while the harness starts. The panel
   sends it itself when no page takes and confirms the offer within 2 s, when the
   page's window goes or unsubscribes first, or when the attachments are over 25 MB
-  in total. A successful launch clears the panel for the next prompt.
+  in total. Then the session opens in a ready window of the server, or in a new one;
+  if the panel is back on screen, or no Omnigent window has focus, that route takes
+  no focus. A successful launch clears the panel for the next prompt.
 - `launch-failure`: when the first message can't be delivered (the server never
   stored it, or the runner refused it), the panel keeps the prompt and says why. A
   message a main window's page sends reports its failure in that chat instead.

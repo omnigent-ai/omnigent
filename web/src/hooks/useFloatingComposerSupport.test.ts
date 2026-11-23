@@ -183,7 +183,11 @@ describe("useFloatingComposerSupport launch offers", () => {
     expect(unsubscribeOffers).toHaveBeenCalledTimes(1);
   });
 
-  it("still announces in a shell that predates launch offers", async () => {
+  it("still announces in a shell that predates launch offers, without a warning", async () => {
+    // The hook's catch would swallow a TypeError here, so the warning is what shows a regression.
+    // An earlier test may have left its console.warn spy in place, so start from a clean count.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    warn.mockClear();
     stubShell({
       kind: "electron",
       getDesktopFeatures,
@@ -197,5 +201,7 @@ describe("useFloatingComposerSupport launch offers", () => {
     renderHook(() => useFloatingComposerSupport(navigate));
     await settle();
     expect(announceSupport).toHaveBeenCalledTimes(1);
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
   });
 });

@@ -186,3 +186,22 @@ test("a stale expiry after a take and before confirm ends the offer once, handed
   assert.equal(offers.confirm(contents, id), false);
   assert.equal(offers.take(contents, id), null);
 });
+
+test("a taken offer ends as document-gone when its document goes, and as handed-out when the page unsubscribes", async () => {
+  const { offers } = setUp();
+  const gone = page();
+  const goneSettled = offers.offer(gone, target, message);
+  offers.take(gone, gone.sent[0].payload.id);
+  offers.forget(gone, { documentGone: true });
+  assert.equal(await goneSettled, "document-gone");
+
+  const unsubscribed = page();
+  const unsubscribedSettled = offers.offer(unsubscribed, target, message);
+  offers.take(unsubscribed, unsubscribed.sent[0].payload.id);
+  offers.forget(unsubscribed);
+  assert.equal(
+    await unsubscribedSettled,
+    "handed-out",
+    "the page is still there, holding the message",
+  );
+});

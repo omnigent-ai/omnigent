@@ -330,6 +330,11 @@ function loadNavigationHarness({
       if (!winListeners.has(eventName)) winListeners.set(eventName, []);
       winListeners.get(eventName).push(listener);
     },
+    once: (eventName, listener) => {
+      if (!winListeners.has(eventName)) winListeners.set(eventName, []);
+      winListeners.get(eventName).push(listener);
+    },
+    showInactive: () => {},
     loadFile: (...args) => {
       calls.loadFile.push(args);
       currentUrl = `file://${args[0]}?${args[1]?.search ?? ""}`;
@@ -4318,27 +4323,92 @@ describe("floating panel wiring", () => {
     });
   }
 
-  it("leaves a panel reopened during the wait shown, and focuses nothing when the wait ends", async (t) => {
+  for (const scenario of [
+    { what: "no page took it, so the same window gets the route", taken: false, other: false },
+    {
+      what: "a page took it and went quiet, so another window gets the route",
+      taken: true,
+      other: true,
+    },
+    {
+      what: "a page took it and went quiet, with no other window, so a new one opens",
+      taken: true,
+      other: false,
+    },
+  ]) {
+    it(`leaves a panel reopened during the wait shown, and focuses nothing when the wait ends (${scenario.what})`, async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const h = loadNavigationHarness({ platform: "darwin" });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      const steals = [];
+      h.electron.app.focus = (options) => steals.push(options);
+      const panel = openPanel(h);
+      // Its page is the panel's, so reopening it reuses the window.
+      h.setUrl(`${serverUrl}/compose/floating`);
+      const main = addTakingMain(h);
+      const other = scenario.other ? addMain(h) : null;
+      const built = h.calls.windowOptions.length;
+      const opened = openFromPanel(h, "/c/abc", launchMessage);
+      if (scenario.taken) await takeFrom(h, main, offerTo(main).id);
+      assert.equal(panel.visible, false);
+      // The user reopens the panel while the launch waits.
+      h.api.floatingComposer().show(serverUrl);
+      t.mock.timers.tick(FLOATING_LAUNCH_TAKE_TIMEOUT_MS);
+      assert.deepEqual(await opened, { ok: true });
+      assert.equal(panel.visible, true, "the late answer doesn't hide the panel");
+      assert.equal(steals.length, 1, "only the launch itself brings Omnigent forward");
+      const routes = (window) =>
+        window.sent.filter(([channel]) => channel === "omnigent:open-path");
+      if (other) {
+        assert.deepEqual(routes(other), [["omnigent:open-path", "/c/abc"]]);
+        assert.equal(other.focused, 0, "the route's window isn't focused over the reopened panel");
+        assert.equal(routes(main).length, 0, "the window holding the message gets no route");
+      } else if (scenario.taken) {
+        assert.equal(h.calls.windowOptions.length, built + 1);
+        assert.equal(h.calls.windowOptions.at(-1).show, false, "the new window doesn't take focus");
+        assert.equal(routes(main).length, 0, "the window holding the message gets no route");
+      } else {
+        assert.equal(main.focused, 1);
+        assert.deepEqual(main.sent.at(-1), ["omnigent:open-path", "/c/abc"]);
+      }
+    });
+  }
+
+  it("brings the route's window forward when the user is still in Omnigent when the wait ends", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout"] });
     const h = loadNavigationHarness({ platform: "darwin" });
     t.after(h.cleanup);
     h.api.registerIpc();
-    const steals = [];
-    h.electron.app.focus = (options) => steals.push(options);
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
     const panel = openPanel(h);
-    // Its page is the panel's, so reopening it reuses the window.
-    h.setUrl(`${serverUrl}/compose/floating`);
     const main = addTakingMain(h);
+    const other = addMain(h);
     const opened = openFromPanel(h, "/c/abc", launchMessage);
-    assert.equal(panel.visible, false);
-    // The user reopens the panel while the launch waits.
-    h.api.floatingComposer().show(serverUrl);
+    await takeFrom(h, main, offerTo(main).id);
     t.mock.timers.tick(FLOATING_LAUNCH_TAKE_TIMEOUT_MS);
     assert.deepEqual(await opened, { ok: true });
-    assert.equal(panel.visible, true, "the late answer doesn't hide the panel");
-    assert.equal(steals.length, 1, "only the launch itself brings Omnigent forward");
-    assert.equal(main.focused, 1);
-    assert.deepEqual(main.sent.at(-1), ["omnigent:open-path", "/c/abc"]);
+    assert.equal(panel.visible, false, "the panel stays put away");
+    assert.equal(other.focused, 1, "Omnigent still has focus, so the route's window comes forward");
+    assert.deepEqual(other.sent, [["omnigent:open-path", "/c/abc"]]);
+  });
+
+  it("opens a new window rather than route to a connecting window, which can't take it yet", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addTakingMain(h);
+    const connecting = addMain(h);
+    h.api.beginConnectionAttempt(connecting);
+    const built = h.calls.windowOptions.length;
+    const opened = openFromPanel(h, "/c/abc", launchMessage);
+    await takeFrom(h, main, offerTo(main).id);
+    t.mock.timers.tick(FLOATING_LAUNCH_TAKE_TIMEOUT_MS);
+    assert.deepEqual(await opened, { ok: true });
+    assert.equal(h.calls.windowOptions.length, built + 1);
+    assert.deepEqual(connecting.sent, [], "a connecting window gets no route it might drop");
   });
 
   it("can't take or confirm an offer once it expired, and a confirmed one doesn't expire into a route", async (t) => {
@@ -4388,12 +4458,11 @@ describe("floating panel wiring", () => {
     t.after(h.cleanup);
     h.api.registerIpc();
     openPanel(h);
-    const main = addTakingMain(h);
+    addTakingMain(h);
     assert.deepEqual(
       { ...h.ipc.get("omnigent:floating-composer:can-hand-off")(fromPanel(h)) },
       { maxFileBytes: FLOATING_LAUNCH_MAX_FILE_BYTES },
     );
-    assert.ok(main);
   });
 
   it("reports the attachment cap while the window that would take a launch is up, not connecting", (t) => {
@@ -4471,23 +4540,21 @@ describe("floating panel wiring", () => {
     assert.deepEqual(main.sent.at(-1), ["omnigent:open-path", "/c/abc"]);
   });
 
-  it("hands the route to another window when the page that took the message goes before confirming", async (t) => {
+  it("reuses the only window when its page reloads while the launch waits, opening no second one", async (t) => {
     const h = loadNavigationHarness({ platform: "darwin" });
     t.after(h.cleanup);
     h.api.registerIpc();
     openPanel(h);
     const main = addTakingMain(h);
-    const other = addMain(h);
     const opened = openFromPanel(h, "/c/abc", launchMessage);
     const { id } = offerTo(main);
     assert.deepEqual(await takeFrom(h, main, id), launchMessage);
+    const built = h.calls.windowOptions.length;
+    // The reload replaces the document that took the message; the window's new page holds none.
     main.webContents.emit("did-navigate");
     assert.deepEqual(await opened, { ok: true });
-    assert.deepEqual(
-      main.sent.map(([channel]) => channel),
-      ["omnigent:floating-composer:launch-offer"],
-    );
-    assert.deepEqual(other.sent, [["omnigent:open-path", "/c/abc"]]);
+    assert.equal(h.calls.windowOptions.length, built);
+    assert.deepEqual(main.sent.at(-1), ["omnigent:open-path", "/c/abc"]);
     assert.equal(await confirmFrom(h, main, id), false, "a late confirm is refused");
   });
 
@@ -4521,7 +4588,6 @@ describe("floating panel wiring", () => {
     const opened = openFromPanel(h, "/c/abc", launchMessage);
     const built = h.calls.windowOptions.length;
     // The renderer dies, but the window isn't destroyed and still shows the same URL.
-    crashing.webContents.crashed = true;
     crashing.crashed = true;
     crashing.webContents.emit("render-process-gone");
     assert.deepEqual(await opened, { ok: true });
