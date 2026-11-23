@@ -30,7 +30,7 @@ export const PANE_CORNERS_ENTRY = settingsEntry({
   label: "Pane corners",
   description: "Show the chat and workspace sidebar as rounded cards, or edge to edge.",
   keywords: ["floating panes", "sharp corners", "rounded", "cards", "layout"],
-  // As the select names them; Automatic adds what it gives now, e.g. "Automatic (Floating panes)".
+  // The select's base labels; it shows Automatic with what it gives now, e.g. "Automatic (Floating panes)".
   choices: ["Automatic", "Floating panes", "Sharp corners"],
   available: (availability) => availability.floatingPanes,
 });

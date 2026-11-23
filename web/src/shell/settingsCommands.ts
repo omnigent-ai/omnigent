@@ -123,6 +123,12 @@ export function settingSwitchSetting(
   return booleanSetting({ ...setting, owner: "app", enabled, write });
 }
 
+const PANE_CORNERS_DESCRIPTIONS: Record<PaneCornersChoice, string> = {
+  automatic: "Follows this server's default for floating panes.",
+  floating: "Show the chat and workspace sidebar as rounded cards.",
+  sharp: "Show the chat and workspace sidebar edge to edge.",
+};
+
 /**
  * Floating panes or sharp corners on this device. Automatic follows the server's policy and
  * names what it gives now; the row shows only where the floating design exists.
@@ -145,12 +151,7 @@ export function paneCornersSetting(
         value === "automatic"
           ? `Automatic (${PANE_CORNERS_LABELS[policyFloating ? "floating" : "sharp"]})`
           : PANE_CORNERS_LABELS[value],
-      description:
-        value === "automatic"
-          ? "Follows this server's default for floating panes."
-          : value === "floating"
-            ? "Show the chat and workspace sidebar as rounded cards."
-            : "Show the chat and workspace sidebar edge to edge.",
+      description: PANE_CORNERS_DESCRIPTIONS[value],
     })),
     choose: (value) => {
       if (isPaneCornersChoice(value)) write(value);
