@@ -1526,7 +1526,7 @@ def _create_memory_store(backend: str | None, db_uri: str, memory_config: object
             api_url: https://api.hindsight.vectorize.io   # optional
             api_key: env:HINDSIGHT_API_KEY
 
-    :param backend: ``"sqlalchemy"``, ``"hindsight"`` or ``None`` for the config file's choice.
+    :param backend: ``"sqlalchemy"``, ``"hindsight"``, ``"databricks"`` or ``None``.
     :param db_uri: The server database, used by the SQLAlchemy backend.
     :param memory_config: The config file's ``memory`` block, or ``None``.
     :returns: A :class:`omnigent.stores.memory_store.MemoryStore`.
@@ -1538,9 +1538,12 @@ def _create_memory_store(backend: str | None, db_uri: str, memory_config: object
         from omnigent.stores.memory_store.sqlalchemy_store import SqlAlchemyMemoryStore
 
         return SqlAlchemyMemoryStore(db_uri)
+    if chosen == "databricks":
+        return _create_databricks_memory_store(config.get("databricks"))
     if chosen != "hindsight":
         raise click.ClickException(
-            f"Unknown memory backend {chosen!r}; expected 'sqlalchemy' or 'hindsight'."
+            f"Unknown memory backend {chosen!r}; "
+            "expected 'sqlalchemy', 'hindsight', or 'databricks'."
         )
     hindsight_config = config.get("hindsight")
     hindsight_config = hindsight_config if isinstance(hindsight_config, dict) else {}
@@ -1562,6 +1565,63 @@ def _create_memory_store(backend: str | None, db_uri: str, memory_config: object
     except OmnigentError as exc:
         raise click.ClickException(str(exc)) from exc
     return HindsightMemoryStore(client)
+
+
+def _create_databricks_memory_store(config: object) -> Any:  # type: ignore[explicit-any]  # optional backend
+    """Validate the configured store and its server credential before serving requests."""
+    if not isinstance(config, dict):
+        raise click.ClickException(
+            "The databricks memory backend needs a memory.databricks block."
+        )
+    allowed = {"store_id", "namespace", "workspace_host", "profile", "auth_type"}
+    if set(config) - allowed:
+        raise click.ClickException(
+            "Unrecognized field in memory.databricks. Configure credentials through "
+            "Databricks SDK environment variables or profiles."
+        )
+    for key in ("store_id", "namespace"):
+        value = config.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise click.ClickException(f"memory.databricks.{key} is required.")
+    if "/" in config["store_id"]:
+        raise click.ClickException("memory.databricks.store_id must be a bare store identifier.")
+    if len(config["namespace"]) > 128:
+        raise click.ClickException("memory.databricks.namespace must be at most 128 characters.")
+    for key in ("workspace_host", "profile", "auth_type"):
+        value = config.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise click.ClickException(f"memory.databricks.{key} must be a nonblank string.")
+
+    from omnigent.stores.memory_store.databricks_client import DatabricksManagedMemoryClient
+    from omnigent.stores.memory_store.databricks_store import DatabricksManagedMemoryStore
+
+    try:
+        client = DatabricksManagedMemoryClient(
+            config["store_id"],
+            workspace_host=config.get("workspace_host"),
+            profile=config.get("profile"),
+            auth_type=config.get("auth_type"),
+        )
+        store = DatabricksManagedMemoryStore(client, namespace=config["namespace"])
+        client.get_store()
+        permission = client.get_effective_permission()
+        if permission.get("permission") != "WRITE":
+            raise click.ClickException(
+                "The Managed Memory server identity needs WRITE permission "
+                "on the configured store."
+            )
+    except click.ClickException:
+        raise
+    except ImportError as exc:
+        raise click.ClickException(
+            "The databricks memory backend requires pip install 'omnigent[databricks]'."
+        ) from exc
+    except Exception as exc:
+        raise click.ClickException(
+            "Cannot connect to the configured Managed Memory store. Check the workspace host, "
+            "Databricks SDK server authentication, store identifier, and WRITE permission."
+        ) from exc
+    return store
 
 
 def _create_artifact_store(location: str) -> Any:  # type: ignore[explicit-any]  # returns ArtifactStore protocol (optional deps)
@@ -4685,10 +4745,11 @@ def _bind_server_listener(host: str, port: int) -> Iterator[socket.socket]:
 )
 @click.option(
     "--memory-backend",
-    type=click.Choice(["sqlalchemy", "hindsight"]),
+    type=click.Choice(["sqlalchemy", "hindsight", "databricks"]),
     default=None,
     help="Long-term memory backend.  sqlalchemy stores memory in --database-uri; "
-    "hindsight needs `omnigent[hindsight]` and a `memory.hindsight` config block.  "
+    "hindsight needs `omnigent[hindsight]` and a `memory.hindsight` config block; "
+    "databricks needs `omnigent[databricks]` and a `memory.databricks` config block.  "
     "[default: sqlalchemy]",
 )
 @click.option(

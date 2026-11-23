@@ -20,6 +20,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.memory_store import MemoryStore
 from omnigent.stores.memory_store.hindsight_store import HindsightMemoryStore
 from omnigent.stores.memory_store.sqlalchemy_store import SqlAlchemyMemoryStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -46,6 +47,12 @@ def with_permissions() -> bool:
 
 
 @pytest.fixture
+def memory_store_override() -> MemoryStore | None:
+    """An external backend can run the same authenticated route scenarios."""
+    return None
+
+
+@pytest.fixture
 def auth_app(
     runtime_init: None,
     db_uri: str,
@@ -53,11 +60,12 @@ def auth_app(
     monkeypatch: pytest.MonkeyPatch,
     memory_backend: str,
     with_permissions: bool,
+    memory_store_override: MemoryStore | None,
 ) -> FastAPI:
     """An auth-enabled app with a memory store and memory turned on (it is opt-in)."""
     monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "admin-credentials"))
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
-    memory_store = (
+    memory_store = memory_store_override or (
         HindsightMemoryStore(FakeHindsight())
         if memory_backend == "hindsight"
         else SqlAlchemyMemoryStore(db_uri)

@@ -88,6 +88,7 @@ backend.
 | --- | --- | --- |
 | SQLAlchemy | Default | Stores memory in the server database (`--database-uri`). Lists in path order. No search, so agents don't get `memory_search` |
 | Hindsight | `--memory-backend hindsight`, or `memory.backend: hindsight` in the config file (the only way for `omnigent server --background`, which rejects the flag) | Needs `pip install 'omnigent[hindsight]'` with `hindsight-client` 0.5.0 or later. One Hindsight bank per user and one document per path; lists most recently updated first; search uses Hindsight's recall |
+| Databricks Managed Memory | `--memory-backend databricks`, or `memory.backend: databricks` | Needs `pip install 'omnigent[databricks]'`, an existing Managed Memory store, and server credentials with `WRITE` access. Supports ranked search |
 
 Hindsight is configured in the server config file. The API key is a secret
 reference resolved on the server, never written into agent specs:
@@ -99,6 +100,67 @@ memory:
     api_url: https://api.hindsight.vectorize.io   # optional; defaults to Hindsight Cloud
     api_key: env:HINDSIGHT_API_KEY                # or keychain:<name>
 ```
+
+### Databricks Managed Memory
+
+Configure the OSS server to use a separately provisioned Managed Memory store:
+
+```yaml
+memory:
+  backend: databricks
+  databricks:
+    workspace_host: https://workspace.example.com
+    store_id: support-memory                 # bare ID, without memory-stores/
+    namespace: support-oss                   # stable identifier for this deployment
+    auth_type: oauth-m2m
+    # profile: memory-service                # optional SDK profile
+```
+
+For OAuth M2M, supply `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET` through
+the server's secret environment. Keep credentials out of this YAML and agent
+specs. For workload identity, use a Databricks SDK-supported federation method;
+for example, set `auth_type: env-oidc` and supply `DATABRICKS_CLIENT_ID` and
+`DATABRICKS_OIDC_TOKEN` on the server, with the corresponding Databricks federation
+policy already configured. The SDK obtains and refreshes access tokens.
+For a long-running workload, its subject credential must also stay fresh. Use a
+rotating token provider, such as `file-oidc` with a refreshed token file, rather
+than relying on a one-time exported OIDC token indefinitely.
+
+`workspace_host`, `profile`, and `auth_type` are optional selectors for SDK unified
+authentication. A named profile follows SDK precedence: ambient `DATABRICKS_*`
+variables can override profile fields. Use a dedicated server environment and
+select the intended authentication type when multiple credentials are present.
+
+An administrator must grant the server identity `WRITE` permission on the Managed
+Memory store (`WRITE` includes `READ`). Omnigent checks store access and effective
+permission at startup and fails if configuration, authentication, or access is
+unavailable. It does not create stores, change grants, or fall back to local memory.
+The permission-self endpoint must be available in the target workspace.
+
+End users sign in to Omnigent normally. They do not need Databricks identities or
+access to the backing Lakebase. The server uses its configured identity for every
+backend request and derives an opaque `actor_id` from the namespace, local
+workspace, and authenticated user. Agents and API request bodies cannot choose
+another actor. Existing restrictions on memory tools in shared sessions still apply.
+
+Keep `namespace` stable across replicas and restarts. Use a different namespace
+for independent OSS installations sharing a store; changing it makes the previous
+partition inaccessible through that configuration. This backend uses deterministic
+entry IDs and cross-session memories in its partitions. Only Omnigent should
+write those partitions; this does not import or share a user's Managed Omnigent
+memories. Backend selection does not migrate existing SQLAlchemy or Hindsight data.
+
+Enable the existing memory feature and start the server:
+
+```sh
+OMNIGENT_FEATURES=memory omnigent server --config server.yaml
+```
+
+To verify a deployment, sign in as two Omnigent users. Save a memory as the first,
+then read, list, search, replace, and delete it through the memory tools. The
+second user's list and search must not contain it. Restart with the same namespace
+and confirm that retained memories remain available. Switching to a different
+namespace should present a separate empty partition.
 
 Deployments that embed the server pass any `MemoryStore` implementation to
 `create_app(memory_store=...)`.
