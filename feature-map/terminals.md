@@ -67,6 +67,12 @@ with their own terminal retain the switcher.
   ⌘/Ctrl+Alt+- splits down with the default shell, skipping the picker; the
   chords work only while those buttons show. ⌘/Ctrl+Alt+Shift+] / [ focus the
   next / previous pane. All of them work with focus inside a terminal.
+- On desktop with `workspace_sidebar_v2` on, a session owner's Terminal view is
+  the panes view: the agent's terminal is one pane, ⌘D splits it with a shell,
+  ⌘⌥ plus an arrow key moves between panes, ⌘K lists the pane commands, and each
+  pane's title strip has a menu with Close Pane. While a split shows, Chat keeps
+  the panes on screen with the web chat as the agent's pane, and ⌘D from its
+  composer splits again. With the flag off, the classic Terminal view above stays.
 
 **User shells:**
 
@@ -154,6 +160,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `OMNIGENT_CLAUDE_CLI_E2E=1` and follow
   [the worker prerequisites](../docs/CLAUDE_SANDBOX_TESTING.md); a passing
   mock-provider run does not establish live Anthropic authentication.
+- **`split-panes` with `workspace_sidebar_v2`:**
+  `tests/e2e_ui/shells/test_panes_view.py` splits, moves between, lists and
+  closes panes in the Terminal view, and splits from Chat's composer beside a split.
 - **`agent-terminal-view`, `user-shell`, `split-panes`, keyboard:** no e2e
   coverage; component tests `web/src/hooks/useViewModeToggleHotkey.test.tsx`,
   `web/src/hooks/useNewShellHotkey.test.tsx`,
