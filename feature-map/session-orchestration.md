@@ -144,7 +144,7 @@ MCP independent creation.
   `tests/server/integration/test_session_orchestration_projects.py::test_project_tools_list_and_file_running_sessions`,
   `::test_organizing_tools_rename_pin_archive_and_manage_projects`,
   `::test_organizing_tools_refuse_a_source_shared_with_edit_access`,
-  `::test_a_child_cannot_archive_its_rebound_parent`,
+  `::test_a_child_cannot_archive_its_parent`,
   `::test_the_tool_archives_sub_agents_in_any_of_the_owners_trees`
   and the browser journeys in
   `tests/e2e_ui/sessions/test_agent_files_sessions_into_projects.py`.

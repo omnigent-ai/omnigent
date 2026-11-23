@@ -447,6 +447,7 @@ async def test_sharded_archive_requires_the_host_replica(
             assert error["code"] == "wrong_replica"
             assert error["slice_key"] == _SHARDED_HOST_ID
             assert archived is False
+            mock_stop.assert_not_awaited()
             mock_teardown.assert_not_awaited()
         else:
             assert archived is True

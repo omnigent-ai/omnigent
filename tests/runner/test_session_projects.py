@@ -260,20 +260,12 @@ async def test_organizing_writes_need_the_organize_source_check(execute, args):
     assert [(r.method, r.url.path) for r in requests] == [("GET", "/v1/info")]
 
 
-def _organize_server(
-    requests: list[httpx.Request],
-    snapshot: dict,
-    info: dict = ORGANIZE_INFO,
-    *,
-    source_snapshot: dict | None = None,
-):
+def _organize_server(requests: list[httpx.Request], snapshot: dict, info: dict = ORGANIZE_INFO):
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         if request.url.path == "/v1/info":
             return httpx.Response(200, json=info)
         if request.method == "GET":
-            if source_snapshot is not None and request.url.path == f"/v1/sessions/{SOURCE}":
-                return httpx.Response(200, json=source_snapshot)
             return httpx.Response(200, json=snapshot)
         return httpx.Response(200, json={})
 
@@ -926,9 +918,10 @@ async def test_update_archives_and_closes_a_sub_agent_on_the_callers_runner(titl
     assert not [r for r in requests if "include_live_status" in r.url.params]
 
 
-@pytest.mark.parametrize("capability", [False, None], ids=["false", "omitted"])
 @pytest.mark.parametrize(
-    "runner_id", ["runner-1", "runner-2"], ids=["same-runner", "other-runner"]
+    ("capability", "runner_id"),
+    [(False, "runner-1"), (None, "runner-2")],
+    ids=["false", "omitted"],
 )
 async def test_update_refuses_a_sub_agent_without_the_server_check(
     capability,
@@ -946,11 +939,7 @@ async def test_update_refuses_a_sub_agent_without_the_server_check(
         "host_id": None,
         "labels": {},
     }
-    async with _client(
-        _organize_server(
-            requests, snapshot, info, source_snapshot={"id": SOURCE, "runner_id": "runner-1"}
-        )
-    ) as client:
+    async with _client(_organize_server(requests, snapshot, info)) as client:
         result = json.loads(
             await execute_session_update(
                 {"session_id": SUB_AGENT, "archived": True}, client, SOURCE

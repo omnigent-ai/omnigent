@@ -727,52 +727,6 @@ async def test_the_tool_archives_sub_agents_in_any_of_the_owners_trees(
         f"Stopped worker:closed:{closed_child.id}"
     )
 
-    # A grandchild cannot archive its sub-agent parent: the server's lineage guard refuses.
-    lead = store.create_conversation(
-        kind="sub_agent",
-        agent_id=source["agent_id"],
-        parent_conversation_id=source["id"],
-        title="Lead",
-    )
-    grandchild = store.create_conversation(
-        kind="sub_agent",
-        agent_id=source["agent_id"],
-        parent_conversation_id=lead.id,
-        title="Helper",
-    )
-    for session_id in (lead.id, grandchild.id):
-        assert store.set_runner_id(session_id, runner_id) is True
-
-    async def undo_after_snapshot(response):
-        if response.request.method == "GET" and response.request.url.path == (
-            f"/v1/sessions/{lead.id}"
-        ):
-            await response.aread()
-            assert response.json()["archived"] is True
-            restored = await auth_client.patch(f"/v1/sessions/{lead.id}", json={"archived": False})
-            assert restored.status_code == 200, restored.text
-
-    for archived_snapshot in (False, True):
-        store.update_conversation(lead.id, archived=archived_snapshot)
-        with monkeypatch.context() as patch:
-            if archived_snapshot:
-                # Undo after the read keeps source validation from masking the lineage guard.
-                patch.setitem(
-                    auth_client.event_hooks,
-                    "response",
-                    [*auth_client.event_hooks["response"], undo_after_snapshot],
-                )
-            refused = await _project_tool(
-                auth_client,
-                {"id": grandchild.id},
-                "sys_session_update",
-                session_id=lead.id,
-                archived=True,
-            )
-        assert "cannot archive a session it runs under" in refused["error"], refused
-        unchanged = store.get_conversation(lead.id)
-        assert unchanged.archived is not True and unchanged.title == "Lead"
-        assert "omnigent.closed" not in unchanged.labels
     # Siblings left on the caller's runner after their parent was rebound: the
     # host-bound one owns it, so archiving it would stop the caller; it is refused.
     rebound = store.create_conversation(
@@ -848,37 +802,78 @@ async def test_organizing_tools_refuse_a_source_shared_with_edit_access(
 
 
 @_ONE_ENVIRONMENT
-async def test_a_child_cannot_archive_its_rebound_parent(auth_client, peers, db_uri):
+@pytest.mark.parametrize("parent_case", ["rebound-root", "sub-agent", "sub-agent-undo"])
+async def test_a_child_cannot_archive_its_parent(
+    auth_client, peers, db_uri, monkeypatch, parent_case
+):
     source, _, _ = peers
     store = SqlAlchemyConversationStore(db_uri)
+    parent = store.get_conversation(source["id"])
+    if parent_case != "rebound-root":
+        parent = store.create_conversation(
+            kind="sub_agent",
+            agent_id=source["agent_id"],
+            parent_conversation_id=source["id"],
+            title="Lead",
+            runner_id=parent.runner_id,
+        )
     child = store.create_conversation(
-        agent_id=source["agent_id"], parent_conversation_id=source["id"]
+        kind="sub_agent",
+        agent_id=source["agent_id"],
+        parent_conversation_id=parent.id,
+        title="Helper",
     )
-    # The parent moved to another runner while the child stayed on the original.
     auth_client.headers.update(_bind_runner(db_uri, child.id))
-    store.clear_runner_id(source["id"])
-    assert store.set_runner_id(source["id"], "rebound-runner")
-
-    existing_id = await _project(auth_client, "Existing")
+    if parent_case == "rebound-root":
+        # The parent moved to another runner while the child stayed on the original.
+        store.clear_runner_id(parent.id)
+        assert store.set_runner_id(parent.id, "rebound-runner")
 
     async def archive_parent(**fields) -> dict:
-        return json.loads(
-            await execute_tool(
-                tool_name="sys_session_update",
-                arguments=json.dumps({"session_id": source["id"], "archived": True, **fields}),
-                server_client=auth_client,
-                conversation_id=child.id,
-            )
+        return await _project_tool(
+            auth_client,
+            {"id": child.id},
+            "sys_session_update",
+            session_id=parent.id,
+            archived=True,
+            **fields,
         )
 
-    result = await archive_parent()
+    async def undo_after_snapshot(response):
+        if response.request.method == "GET" and response.request.url.path == (
+            f"/v1/sessions/{parent.id}"
+        ):
+            await response.aread()
+            assert response.json()["archived"] is True
+            restored = await auth_client.patch(
+                f"/v1/sessions/{parent.id}", json={"archived": False}
+            )
+            assert restored.status_code == 200, restored.text
+
+    with monkeypatch.context() as patch:
+        if parent_case == "sub-agent-undo":
+            store.update_conversation(parent.id, archived=True)
+            # Undo after the read keeps source validation from masking the lineage guard.
+            patch.setitem(
+                auth_client.event_hooks,
+                "response",
+                [*auth_client.event_hooks["response"], undo_after_snapshot],
+            )
+        result = await archive_parent()
     assert "cannot archive a session it runs under" in result["error"], result
+    unchanged = store.get_conversation(parent.id)
+    assert unchanged.archived is not True and unchanged.title == parent.title
+    assert unchanged.labels == parent.labels and unchanged.project_id is None
+    if parent_case != "rebound-root":
+        return
+
+    existing_id = await _project(auth_client, "Existing")
     into_existing = await archive_parent(project="Existing")
     assert "a session it runs under" in into_existing["error"], into_existing
     into_new = await archive_parent(project="Brand new")
     assert "in separate calls" in into_new["error"], into_new
-    parent = store.get_conversation(source["id"])
-    assert parent.archived is not True and parent.project_id is None
+    unchanged = store.get_conversation(parent.id)
+    assert unchanged.archived is not True and unchanged.project_id is None
     projects = (await auth_client.get("/v1/projects")).json()["data"]
     assert [project["id"] for project in projects] == [existing_id]
 
