@@ -216,15 +216,16 @@ describe("useResizableInlinePanel persistence", () => {
 describe("useResizableInlinePanel width in a wider window", () => {
   it("gives the default width the panel takes once the window grows by it", () => {
     const { result } = renderHook(() => useResizableInlinePanel(SESSION));
-    // 900px wide: 506px more makes 1406px, whose default is 0.36 * 1406 = 506.
+    // 900px wide: 522px more (a 512px panel and its 10px gutter) makes 1422px,
+    // whose default is 0.36 * 1422 = 512, so the chat keeps its 900px.
     setInnerWidth(900);
     act(() => window.dispatchEvent(new Event("resize")));
-    expect(result.current.widthInWiderWindow()).toBe(506);
-    // The default stays in its [420, 600] band.
+    expect(result.current.widthInWiderWindow()).toBe(522);
+    // The default stays in its [420, 600] band; the gutter comes on top.
     setInnerWidth(2000);
-    expect(result.current.widthInWiderWindow()).toBe(600);
+    expect(result.current.widthInWiderWindow()).toBe(610);
     setInnerWidth(600);
-    expect(result.current.widthInWiderWindow()).toBe(420);
+    expect(result.current.widthInWiderWindow()).toBe(430);
   });
 
   it("renders the reported width on every open of a window that grows and shrinks back", () => {
@@ -236,9 +237,10 @@ describe("useResizableInlinePanel width in a wider window", () => {
     resizeTo(960);
     for (let open = 0; open < 2; open += 1) {
       const reported = result.current.widthInWiderWindow();
-      expect(reported).toBe(540);
+      expect(reported).toBe(556);
       resizeTo(960 + reported);
-      expect(result.current.panelWidth).toBe(reported);
+      // The rest of the growth is the 10px gutter beside the panel.
+      expect(result.current.panelWidth).toBe(reported - 10);
       resizeTo(960);
       expect(result.current.panelWidth).toBe(420);
     }
@@ -251,7 +253,7 @@ describe("useResizableInlinePanel width in a wider window", () => {
     setInnerWidth(1000);
     act(() => window.dispatchEvent(new Event("resize")));
     expect(result.current.panelWidth).toBe(508);
-    expect(result.current.widthInWiderWindow()).toBe(620);
+    expect(result.current.widthInWiderWindow()).toBe(630);
   });
 });
 

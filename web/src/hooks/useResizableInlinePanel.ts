@@ -58,10 +58,15 @@ function defaultWidthPx(): number {
   return Math.max(DEFAULT_MIN_PX, Math.min(DEFAULT_MAX_PX, candidate));
 }
 
-/** The default width once the window grows by it, which keeps the chat's width unchanged. */
-function defaultWidthInWiderWindowPx(): number {
+/**
+ * The default width once the window grows by it plus `extraPx` (the gutter that opens
+ * with the panel), which keeps the chat's width unchanged.
+ */
+function defaultWidthInWiderWindowPx(extraPx = 0): number {
   if (typeof window === "undefined") return DEFAULT_SSR_PX;
-  const candidate = Math.round((window.innerWidth * DEFAULT_RATIO) / (1 - DEFAULT_RATIO));
+  const candidate = Math.round(
+    ((window.innerWidth + extraPx) * DEFAULT_RATIO) / (1 - DEFAULT_RATIO),
+  );
   return Math.max(DEFAULT_MIN_PX, Math.min(DEFAULT_MAX_PX, candidate));
 }
 
@@ -347,8 +352,10 @@ export function useResizableInlinePanel(
   // The store holds the choice clamped to this viewport; a wider window can fit all of it.
   const widthInWiderWindow = useCallback(() => {
     const chosen = sessionId === currentSessionId ? widthStore.getPreferred() : effectiveRaw;
-    return Math.max(minWidthPx, chosen ?? defaultWidthInWiderWindowPx());
-  }, [sessionId, effectiveRaw, minWidthPx]);
+    // The resize gutter opens with the panel and takes width too, so the window grows by both.
+    const gutterPx = anyCoarse ? COARSE_GUTTER_PX : FINE_GUTTER_PX;
+    return Math.max(minWidthPx, chosen ?? defaultWidthInWiderWindowPx(gutterPx)) + gutterPx;
+  }, [sessionId, effectiveRaw, minWidthPx, anyCoarse]);
 
   return {
     panelWidth: resolvedWidth,
