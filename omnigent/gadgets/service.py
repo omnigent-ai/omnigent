@@ -1036,13 +1036,17 @@ class GadgetService:
     def _register_gadget_session(self, gadget: Gadget, session_id: str) -> dict:
         store = self._sessions(gadget)
         record_id = self.viewer.key
-        operation_id = "session-" + _digest([record_id, session_id])
         current = store.get("viewers", record_id)
         value = {
             "session_id": session_id,
             "viewer": self.viewer.user_id,
             "open": self._open_records(current),
         }
+        # Named by the version it replaces and the value it writes: a retry of this change
+        # repeats it, and returning to an earlier session later is a change of its own.
+        operation_id = "session-" + _digest(
+            [record_id, current.version if current is not None else None, value]
+        )
         if current is None:
             saved = store.create("viewers", record_id, value, operation_id, self.viewer.user_id)
         elif current.value.get("session_id") == session_id:

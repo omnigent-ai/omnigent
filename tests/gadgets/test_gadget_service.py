@@ -994,6 +994,11 @@ def test_each_viewer_keeps_their_own_gadget_session(gadgets: Fixture) -> None:
         == "s_owner_2"
     )
     assert gadgets.service().get_gadget_session(app["id"])["session_id"] == "s_owner_2"
+    # Going back to the first session is a change of its own, not a replay of the first.
+    assert (
+        owner.set_gadget_session(app["id"], {"session_id": "s_owner"})["session_id"] == "s_owner"
+    )
+    assert owner.get_gadget_session(app["id"])["session_id"] == "s_owner"
     with pytest.raises(InvalidInput):
         owner.set_gadget_session(app["id"], {"session_id": "../s"})
 
@@ -1104,6 +1109,11 @@ def test_session_links_show_readable_gadgets_and_route_actions(gadgets: Fixture)
     again = owner.link_session(first["id"], session, {"linked": True})
     assert [item["id"] for item in again["items"]] == [first["id"], second["id"]]
     # The session it is shown in also gets the actions requested from the gadget's page.
+    assert owner.get_gadget_session(first["id"])["session_id"] == session
+    # Showing it in another session, then this one again, moves the actions back here.
+    owner.link_session(first["id"], "Session_B2", {"linked": True})
+    assert owner.get_gadget_session(first["id"])["session_id"] == "Session_B2"
+    owner.link_session(first["id"], session, {"linked": True})
     assert owner.get_gadget_session(first["id"])["session_id"] == session
     assert owner.session_gadgets("other")["items"] == []
 
