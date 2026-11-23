@@ -2372,7 +2372,7 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
         executable.chmod(0o755)
     parameters = (
         "query = 'needle'\ncase_sensitive = False\nregex = False\nlimit = 2\nglob_args = []\n"
-        "extra_args = []\nsearch_paths = ['.']\n"
+        "extra_args = []\nsearch_paths = ['.']\ntime_limit = 15.0\n"
     )
     timer = ""
     if mode == "timeout":
