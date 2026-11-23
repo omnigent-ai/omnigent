@@ -103,6 +103,7 @@ function openActions(input: HTMLElement) {
 
 beforeEach(() => {
   navigate.mockClear();
+  useSessionSearch.mockImplementation(() => ({ isFetching: false }));
   listSessions(MINE, SHARED);
 });
 afterEach(() => {
@@ -382,6 +383,42 @@ describe("QuickPick ⌘K verb-first session actions", () => {
     // The list it reads asks the server for archived sessions too.
     expect(useConversations).toHaveBeenLastCalledWith("", true, expect.anything());
     expect(optionNames().some((name) => name.includes("Old spike"))).toBe(true);
+  });
+
+  it("leaves an archived server match out of a typed search in Archive's picker", async () => {
+    const archived: Conversation = { ...MINE, id: "c3", title: "Old spike", archived: true };
+    listSessions(MINE);
+    // A typed query reaches the server, which answers with the archived session.
+    useSessionSearch.mockImplementation((...args: unknown[]) =>
+      args[0] === "spike"
+        ? { isFetching: false, data: { pages: [{ data: [archived] }] } }
+        : { isFetching: false },
+    );
+    const { input } = renderWithPicks();
+    fireEvent.change(input, { target: { value: "archive a session" } });
+    fireEvent.click(await screen.findByRole("option", { name: /^Archive a Session…/ }));
+    await waitFor(() => expect(heading()).toBe("Archive which session?"));
+    fireEvent.change(input, { target: { value: "spike" } });
+    await waitFor(() =>
+      expect(useSessionSearch).toHaveBeenCalledWith(
+        "spike",
+        "title",
+        expect.objectContaining({ enabled: true, includeArchived: false }),
+      ),
+    );
+    expect(screen.queryAllByRole("option").map((option) => option.textContent)).not.toContainEqual(
+      expect.stringContaining("Old spike"),
+    );
+
+    fireEvent.keyDown(input, { key: "Escape" });
+    await waitFor(() => expect(heading()).toBeNull());
+    fireEvent.change(input, { target: { value: "unarchive a session" } });
+    fireEvent.click(await screen.findByRole("option", { name: /^Unarchive a Session…/ }));
+    await waitFor(() => expect(heading()).toBe("Unarchive which session?"));
+    fireEvent.change(input, { target: { value: "spike" } });
+    await waitFor(() =>
+      expect(optionNames().some((name) => name.includes("Old spike"))).toBe(true),
+    );
   });
 
   it.each(["#42", "https://github.com/acme/app/pull/42"])(

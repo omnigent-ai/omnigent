@@ -22,7 +22,12 @@ function conv(id: string, title: string) {
 }
 
 function renderSearch(
-  props: { open: boolean; sessionsOnly: boolean; matchLoaded?: boolean },
+  props: {
+    open: boolean;
+    sessionsOnly: boolean;
+    matchLoaded?: boolean;
+    includeArchived?: boolean;
+  },
   queryClient = new QueryClient(),
 ) {
   const wrapper = ({ children }: { children: ReactNode }) => (
@@ -57,6 +62,7 @@ describe("usePaletteSessionSearch", () => {
     expect(useSessionSearch).toHaveBeenLastCalledWith("deploy", "content", {
       enabled: true,
       limit: 8,
+      includeArchived: true,
     });
 
     rerender({ open: false, sessionsOnly: false });
@@ -74,6 +80,7 @@ describe("usePaletteSessionSearch", () => {
     expect(useSessionSearch).toHaveBeenLastCalledWith("deploy", "content", {
       enabled: false,
       limit: 8,
+      includeArchived: true,
     });
   });
 
@@ -129,6 +136,62 @@ describe("usePaletteSessionSearch", () => {
     },
   );
 
+  describe("a session picker's archived policy", () => {
+    const archivedHit = { ...conv("old", "Kestrel archive"), archived: true };
+    const activeHit = conv("new", "Kestrel notes");
+    const searchFor = (includeArchived?: boolean) => {
+      // Both groups answer with an archived match, as a server that ignores the filter would.
+      useSessionSearch.mockImplementation((query: string, scope: string) =>
+        query === ""
+          ? { isFetching: false }
+          : {
+              isFetching: false,
+              data: {
+                pages: [{ data: scope === "title" ? [archivedHit, activeHit] : [archivedHit] }],
+              },
+            },
+      );
+      const { result } = renderSearch({
+        open: true,
+        sessionsOnly: false,
+        matchLoaded: true,
+        includeArchived,
+      });
+      act(() => result.current.setQuery("kestrel"));
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      return result;
+    };
+    const ids = (sessions: { id: string }[]) => sessions.map((session) => session.id);
+
+    it("asks both groups for active sessions only and lists none archived, for Archive", () => {
+      const result = searchFor(false);
+      for (const scope of ["title", "content"]) {
+        expect(useSessionSearch).toHaveBeenCalledWith(
+          "kestrel",
+          scope,
+          expect.objectContaining({ enabled: true, includeArchived: false }),
+        );
+      }
+      expect(ids(result.current.visibleSessions)).toEqual(["new"]);
+      expect(ids(result.current.contentSessions)).toEqual([]);
+    });
+
+    it.each([true, undefined])(
+      "keeps the archived matches where archived sessions apply (includeArchived=%s)",
+      (includeArchived) => {
+        const result = searchFor(includeArchived);
+        expect(useSessionSearch).toHaveBeenLastCalledWith(
+          "kestrel",
+          "content",
+          expect.objectContaining({ includeArchived: true }),
+        );
+        expect(ids(result.current.visibleSessions)).toEqual(["old", "new"]);
+      },
+    );
+  });
+
   describe("matching loaded sessions", () => {
     const loaded = (...rows: ReturnType<typeof conv>[]) =>
       useConversations.mockReturnValue({ data: { pages: [{ data: rows }] }, isFetching: false });
@@ -151,6 +214,7 @@ describe("usePaletteSessionSearch", () => {
       expect(useSessionSearch).toHaveBeenLastCalledWith("https://example.test/design", "content", {
         enabled: true,
         limit: 8,
+        includeArchived: true,
       });
     });
 
