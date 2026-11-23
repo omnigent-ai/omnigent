@@ -131,6 +131,47 @@ describe("a gadget beside a session", () => {
     expect(retry).toEqual(first);
   });
 
+  it("leaves a newer draft alone when an earlier comment finishes saving", async () => {
+    let finish: (() => void) | undefined;
+    vi.mocked(createGadgetComment).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = () =>
+            resolve({
+              id: "c1",
+              body: "Move it to Done",
+              status: "draft",
+              anchor: { text: "Ship it", label: null, ref: null, occurrence: 1 },
+              createdBy: BOARD.viewer_id,
+              createdAt: 1,
+              updatedAt: 1,
+            });
+        }),
+    );
+    renderView();
+    await waitFor(() => expect(frameProps?.onAddComment).toBeDefined());
+    const select = (text: string) =>
+      act(() =>
+        frameProps?.onAddComment?.({ text, occurrence: 1, rect: { x: 0, y: 0, width: 1, height: 1 } }),
+      );
+    select("Ship it");
+    fireEvent.change(screen.getByPlaceholderText("Add a comment…"), {
+      target: { value: "Move it to Done" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add Comment" }));
+    await waitFor(() => expect(createGadgetComment).toHaveBeenCalledTimes(1));
+
+    // While it saves, the viewer selects other text and starts the next comment.
+    select("Launch date");
+    fireEvent.change(screen.getByPlaceholderText("Add a comment…"), {
+      target: { value: "Check this" },
+    });
+    await act(async () => finish?.());
+
+    expect(screen.getByPlaceholderText("Add a comment…")).toHaveValue("Check this");
+    expect(screen.getByText("Launch date")).toBeInTheDocument();
+  });
+
   it("loads the page again with what the viewer may do after their access changes", async () => {
     const reader = gadgetFixture({
       id: "board",

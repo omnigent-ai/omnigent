@@ -123,11 +123,15 @@ export function CommentsPanel({
   const activeSelectionStart = activeSelection?.start_index;
   const activeSelectionEnd = activeSelection?.end_index;
   const activeCommentId = activeSelection?.comment_id;
+  const activeAnchor = activeSelection?.anchor_content;
+  // Counts selections, so a save that finishes after the viewer moved on leaves the new text.
+  const selectionGeneration = useRef(0);
 
   useEffect(() => {
+    selectionGeneration.current += 1;
     setBody("");
     if (pendingBodyRef) pendingBodyRef.current = "";
-  }, [activeSelectionStart, activeSelectionEnd, activeCommentId, pendingBodyRef]);
+  }, [activeSelectionStart, activeSelectionEnd, activeCommentId, activeAnchor, pendingBodyRef]);
 
   const submitComment = () => {
     const clear = () => {
@@ -136,8 +140,9 @@ export function CommentsPanel({
     };
     const outcome = onAddComment(body.trim());
     if (outcome instanceof Promise) {
+      const generation = selectionGeneration.current;
       void outcome.then((saved) => {
-        if (saved) clear();
+        if (saved && selectionGeneration.current === generation) clear();
       });
     } else {
       clear();

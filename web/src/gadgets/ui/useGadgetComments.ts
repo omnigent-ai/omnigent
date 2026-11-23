@@ -207,7 +207,8 @@ export function useGadgetComments(
         await run(async () => {
           await createGadgetComment(gadgetId, { body, anchor, operationId: pendingOperationId });
           saved = true;
-          setPending(null);
+          // A selection made while this saved is the viewer's next comment; it stays.
+          setPending((current) => (current === anchor ? null : current));
         });
         return saved;
       },
