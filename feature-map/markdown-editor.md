@@ -47,7 +47,9 @@ and the recording protocol for comparing revisions.
   touch client), file links, tool rows and `?file=` links open
   the file in its Files tab, at the cited line. A `?comment=` link opens the file
   at that comment's thread, a `?diff=1` link opens its diff in the Changes tab,
-  and `?fullscreen=1` fills the window with the sidebar.
+  and `?fullscreen=1` fills the window with the sidebar. The strip's All tabs list
+  groups file tabs under **Files**, whose **Close all** (⌘K: **Close all file tabs**)
+  keeps pinned tabs and asks once about unsaved edits; cancelling closes none.
 - `mobile`: use the session Files surface or a file link at a phone width.
 
 ## Driving it with the repro environment
