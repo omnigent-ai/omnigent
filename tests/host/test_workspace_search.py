@@ -753,6 +753,27 @@ async def test_fuzzy_mode_keeps_ranking_past_many_deleted_files(tmp_path: Path) 
     assert not response.truncated
 
 
+async def test_a_match_past_a_full_shortlist_is_still_found_behind_deleted_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A shortlist no bigger than the limit, as for a limit of 2,000 or more.
+    monkeypatch.setattr(workspace_fuzzy, "_POOL", 2)
+    monkeypatch.setattr(workspace_search, "_SPARE_RANKED", 1)
+    root = _repository(tmp_path / "repo")
+    for index in range(6):
+        (root / "src" / f"d{index}").mkdir(parents=True)
+        (root / "src" / f"d{index}" / "report.md").write_text("x")
+    _git(root, "add", ".")
+    for index in range(5):
+        (root / "src" / f"d{index}" / "report.md").unlink()  # still in the index
+
+    # The query spans folders, so file names alone never match it.
+    response = await _fuzzy(root, "src report", maximum_results=1)
+
+    assert _paths(response) == ["src/d5/report.md"]
+    assert not response.truncated
+
+
 @pytest.mark.parametrize(("kept", "truncated"), [((0,), False), ((0, 33), True)])
 async def test_a_filled_limit_says_more_matched_only_for_a_file_still_there(
     tmp_path: Path, kept: tuple[int, ...], truncated: bool
