@@ -2940,10 +2940,8 @@ async def _ensure_catalog(state: _ReaderState) -> dict[str, object]:
 # wired to the Task 8 interaction bridge (real-time elicitation over the Task 9
 # hook + RPC step reads + the default deliver). This wiring lives here so the two
 # callers share one definition instead of duplicating the bridge/elicitation
-# plumbing. (The retired transcript forwarder used a post-hoc policy audit instead
-# of real-time elicitation; that audit is gone — agy exposes no firing PreToolUse
-# hook, so a tool cannot be blocked before it runs, and the live elicitation card
-# is the honest enforcement surface.)
+# plumbing. Session policies are enforced separately, before each tool runs, by the
+# PreToolUse hook in the isolated ``hooks.json`` (:mod:`.hook`).
 
 
 async def _agy_elicitation_retry_sleep(seconds: float) -> None:

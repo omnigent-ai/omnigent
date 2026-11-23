@@ -27,7 +27,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -46,6 +46,7 @@ from omnigent.harnesses.antigravity_native.bridge import bridge_dir_for_bridge_i
 from omnigent.harnesses.antigravity_native.main import _materialize_antigravity_agent_spec
 from omnigent.onboarding.gemini_auth import gemini_auth_has_credential
 from omnigent.runner.identity import token_bound_runner_id
+from tests._helpers.session import send_user_text
 from tests.e2e_ui.conftest import _find_free_port
 from tests.e2e_ui.shells.test_terminal_direct_attach import _BLOCK_LOOPBACK_DIALS
 
@@ -60,17 +61,24 @@ pytestmark = [
 _ROOT = Path(__file__).resolve().parents[3]
 
 
+@dataclass
+class GeminiMock:
+    replies: list[str] = field(default_factory=list)
+    tool_calls: list[dict] = field(default_factory=list)
+    tool_results: list[dict] = field(default_factory=list)
+
+
 @pytest.fixture
 def antigravity_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, built_spa: None
-) -> Iterator[list[str] | None]:
+) -> Iterator[GeminiMock | None]:
     """Build with the caller's HOME before isolating agy credentials."""
     if os.environ.get("OMNIGENT_E2E_ANTIGRAVITY") != "mock":
         assert gemini_auth_has_credential(), "set GEMINI_API_KEY or sign in with `agy`, then rerun"
         yield None
         return
 
-    replies: list[str] = []
+    mock = GeminiMock()
 
     class GeminiHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
@@ -82,20 +90,47 @@ def antigravity_model(
                 self.send_error(404)
                 return
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            reply = "Ready."
-            for content in reversed(request.get("contents", [])):
+            contents = request.get("contents", [])
+            results = [
+                part["functionResponse"]
+                for part in (contents[-1].get("parts", []) if contents else [])
+                if "functionResponse" in part
+            ]
+            parts: list[dict] = [{"text": "Ready."}]
+            if results:
+                mock.tool_results.extend(results)
+                parts = [{"text": "DONE."}]
+            for content in [] if results else reversed(contents):
                 if content.get("role") != "user":
                     continue
                 text = "\n".join(part.get("text", "") for part in content.get("parts", []))
                 matches = re.findall(r"Reply (agy-e2e-[0-9a-f]{8})\.", text)
+                write = re.search(
+                    r"Create the file (/\S+) containing the single word (\w+)\.", text
+                )
                 if matches:
-                    reply = matches[-1]
-                    replies.append(reply)
+                    mock.replies.append(matches[-1])
+                    parts = [{"text": matches[-1]}]
+                    break
+                if write and request.get("tools"):
+                    call = {
+                        "name": "write_to_file",
+                        "args": {
+                            "TargetFile": write[1],
+                            "CodeContent": write[2],
+                            "Overwrite": False,
+                            "Description": "Create the requested file",
+                            "toolSummary": "Create file",
+                            "toolAction": "Creating file",
+                        },
+                    }
+                    mock.tool_calls.append(call)
+                    parts = [{"functionCall": call}]
                     break
             response = {
                 "candidates": [
                     {
-                        "content": {"role": "model", "parts": [{"text": reply}]},
+                        "content": {"role": "model", "parts": parts},
                         "finishReason": "STOP",
                         "index": 0,
                     }
@@ -126,7 +161,7 @@ def antigravity_model(
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            yield replies
+            yield mock
         finally:
             server.shutdown()
             thread.join(timeout=5)
@@ -206,24 +241,25 @@ def _write_tmux_shim(directory: Path, real_tmux: str) -> Path:
     return shim_dir
 
 
-def _create_session(base_url: str, directory: Path) -> str:
+def _create_session(
+    base_url: str, directory: Path, terminal_launch_args: list[str] | None = None
+) -> str:
     spec = _materialize_antigravity_agent_spec(directory)
     bundle = io.BytesIO()
     with tarfile.open(fileobj=bundle, mode="w:gz") as archive:
         archive.add(spec, arcname=spec.name)
+    metadata: dict[str, object] = {
+        "labels": {
+            WRAPPER_LABEL_KEY: ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
+            UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
+        },
+        "workspace": str(directory),
+    }
+    if terminal_launch_args:
+        metadata["terminal_launch_args"] = terminal_launch_args
     response = httpx.post(
         f"{base_url}/v1/sessions",
-        data={
-            "metadata": json.dumps(
-                {
-                    "labels": {
-                        WRAPPER_LABEL_KEY: ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
-                        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-                    },
-                    "workspace": str(directory),
-                }
-            )
-        },
+        data={"metadata": json.dumps(metadata)},
         files={"bundle": ("agent.tar.gz", bundle.getvalue(), "application/gzip")},
         timeout=30,
     )
@@ -232,7 +268,9 @@ def _create_session(base_url: str, directory: Path) -> str:
 
 
 @contextlib.contextmanager
-def _antigravity_stack(directory: Path) -> Iterator[AntigravitySession]:
+def _antigravity_stack(
+    directory: Path, terminal_launch_args: list[str] | None = None
+) -> Iterator[AntigravitySession]:
     tmux = shutil.which("tmux")
     assert tmux is not None, "install tmux before running this test"
     shim_dir = _write_tmux_shim(directory, tmux)
@@ -311,7 +349,7 @@ def _antigravity_stack(directory: Path) -> Iterator[AntigravitySession]:
 
         try:
             _wait_until(ready, f"server/runner did not become ready; see {directory}", 120)
-            session_id = _create_session(base_url, directory)
+            session_id = _create_session(base_url, directory, terminal_launch_args)
             session = AntigravitySession(base_url, session_id, runner, directory, tmux)
             response = httpx.patch(
                 f"{base_url}/v1/sessions/{session_id}", json={"runner_id": runner_id}, timeout=30
@@ -334,16 +372,17 @@ def _antigravity_stack(directory: Path) -> Iterator[AntigravitySession]:
 
 @pytest.fixture
 def antigravity_session(
-    request: pytest.FixtureRequest, tmp_path: Path, antigravity_model: list[str] | None
+    request: pytest.FixtureRequest, tmp_path: Path, antigravity_model: GeminiMock | None
 ) -> Iterator[AntigravitySession]:
     assert not request.config.getoption("--ui-base-url"), "this test requires its own server"
     assert shutil.which("agy"), "install agy before running this test"
-    with _antigravity_stack(tmp_path) as session:
+    launch_args = getattr(request, "param", None)
+    with _antigravity_stack(tmp_path, terminal_launch_args=launch_args) as session:
         yield session
 
 
 def test_antigravity_survives_probe_outage_then_detects_exit(
-    page: Page, antigravity_session: AntigravitySession, antigravity_model: list[str] | None
+    page: Page, antigravity_session: AntigravitySession, antigravity_model: GeminiMock | None
 ) -> None:
     session = antigravity_session
     page.add_init_script(_BLOCK_LOOPBACK_DIALS)
@@ -361,7 +400,7 @@ def test_antigravity_survives_probe_outage_then_detects_exit(
         reply = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
         expect(reply.filter(has_text=token)).to_have_count(1, timeout=180_000)
         if antigravity_model is not None:
-            assert token in antigravity_model, "agy did not request this reply from the mock model"
+            assert token in antigravity_model.replies, "agy did not request this reply"
         expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=60_000)
         page.get_by_test_id("view-mode-terminal").click()
         expect(terminal).to_have_attribute("data-state", "connected", timeout=30_000)
@@ -426,3 +465,43 @@ def test_antigravity_survives_probe_outage_then_detects_exit(
     response.raise_for_status()
     assert response.json()["status"] == "idle"
     assert session.runner.poll() is None, "terminal exit killed the runner"
+
+
+@pytest.mark.parametrize(
+    "antigravity_session", [["--dangerously-skip-permissions"]], indirect=True, ids=["full-access"]
+)
+def test_full_access_session_applies_deny_policy_before_native_write(
+    antigravity_session: AntigravitySession, antigravity_model: GeminiMock | None
+) -> None:
+    if antigravity_model is None:
+        pytest.skip("the scripted file-write tool call needs OMNIGENT_E2E_ANTIGRAVITY=mock")
+    session = antigravity_session
+    probe = session.directory / "probe.txt"
+    _wait_until(session.terminals, "runner did not start the Antigravity terminal", 120)
+    response = httpx.post(
+        f"{session.base_url}/v1/sessions/{session.session_id}/policies",
+        json={
+            "name": "deny_all_tool_calls",
+            "type": "python",
+            "handler": "omnigent.policies.builtins.cel.cel_policy",
+            "factory_params": {
+                "expression": 'event.type == "tool_call" ? {"result": "DENY"} : null',
+                "reason": "Session policy denies every tool call.",
+            },
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
+    with httpx.Client(base_url=session.base_url) as client:
+        send_user_text(
+            client,
+            session_id=session.session_id,
+            text=f"Create the file {probe} containing the single word x. "
+            "Use your file-writing tool, not the shell. Then say DONE.",
+        )
+    _wait_until(lambda: antigravity_model.tool_calls, "agy never requested a tool", 180)
+    deadline = time.monotonic() + 60
+    while not (antigravity_model.tool_results or probe.exists()) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert not probe.exists(), "agy ran its native write although a session policy denies it"
+    assert "Session policy denies every tool call." in json.dumps(antigravity_model.tool_results)

@@ -108,6 +108,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     update_conversation_id,
     write_bridge_state,
     write_mcp_config,
+    write_policy_hook_config,
     write_tmux_target,
 )
 from omnigent.harnesses.antigravity_native.launch import (
@@ -1008,12 +1009,20 @@ async def _launch_and_record(
     # survey/trust seeds below rewrote the user's own settings.json. HOME stays real
     # so keyring-backed auth (macOS Keychain) keeps working (#1477).
     await asyncio.to_thread(write_mcp_config, bridge_dir)
+    await asyncio.to_thread(
+        write_policy_hook_config,
+        bridge_dir,
+        server_url=str(client.base_url),
+        session_id=session_id,
+        auth_headers=dict(client.headers),
+    )
     env_overrides = {
         **env_overrides,
         **await asyncio.to_thread(
             seed_isolated_agy_home,
             bridge_dir,
             trusted_workspace=Path.cwd().resolve(),
+            enforce_policy=True,
         ),
     }
     # agy's feedback survey shares its "esc to cancel" footer with the running-turn
@@ -1108,8 +1117,8 @@ async def _attach_terminal(
         The reader does NOT have refresh-capable auth here: it snapshots
         ``headers`` (the local server has none; a remote server's bearer is used
         for its lifetime — ``recover`` refreshes the *attach* headers on reconnect
-        but not the reader's client). There is no pre-tool policy audit on this
-        path; real-time elicitation is the enforcement surface now.
+        but not the reader's client). Session policies are enforced before each
+        tool runs by the PreToolUse hook seeded at launch, not by this reader.
 
     :param base_url: Omnigent server base URL.
     :param headers: HTTP auth headers (mutated in place by ``recover``).

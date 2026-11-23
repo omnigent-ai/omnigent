@@ -1,26 +1,18 @@
 """Post-hoc tool-call policy audit helpers for native Antigravity (agy).
 
 .. note::
-    **Currently dormant.** This module's only consumer was the transcript
-    forwarder, retired in the Task 12 cutover. The RPC read path that superseded
-    it surfaces agy's ``request-review`` prompts as real-time Omnigent
-    elicitations (:mod:`omnigent.harnesses.antigravity_native.interactions`) instead of a
-    post-hoc audit, so nothing wires these helpers today. They are kept (with
-    their unit tests) as the building blocks for a future post-hoc audit pass; the
-    references below to "the forwarder" are historical.
+    **Mostly dormant.** The blocking gate is the PreToolUse hook in
+    :mod:`omnigent.harnesses.antigravity_native.hook`, which reuses
+    :func:`build_audit_evaluation_request`. The remaining helpers served the
+    retired transcript forwarder and are kept (with their unit tests) for a
+    future post-hoc audit pass; references below to "the forwarder" are historical.
 
-**This is POST-HOC, NOT a blocking gate.** agy writes a transcript step only at
-``DONE`` (after the tool has executed; there is no token streaming and no
-pre-execution signal), and its ``hooks.json`` ``PreToolUse`` hook does **not**
-fire on tool execution in agy 1.0.8 (verified — see
-``docs/claude/antigravity-native-governance-design.md`` §2.3). So unlike
-claude-native's ``PreToolUse`` / codex-native's trusted hook, this harness
-**cannot intercept a tool before it runs**. The only honest Omnigent policy
-enforcement here is to *observe* each tool call as it appears in the transcript,
-evaluate it against the session's policies, and — on a DENY/ASK — surface a
-warning conversation item (and, optionally, best-effort interrupt the in-flight
-turn; see :func:`maybe_interrupt_turn`). The offending tool has already run by
-the time the warning lands.
+**The audit flow is POST-HOC, NOT a blocking gate.** agy writes a transcript step
+only at ``DONE``, after the tool has executed. The audit *observes* each tool call
+as it appears in the transcript, evaluates it against the session's policies, and
+— on a DENY/ASK — surfaces a warning conversation item (and, optionally,
+best-effort interrupts the in-flight turn; see :func:`maybe_interrupt_turn`). The
+offending tool has already run by the time the warning lands.
 
 This module owns the pure, unit-testable pieces of that flow:
 

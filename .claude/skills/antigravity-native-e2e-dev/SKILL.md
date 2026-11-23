@@ -271,10 +271,10 @@ leave the TUI empty while the session records an error.
 - **Placeholder until cold-start.** Before agy mints its real cascade id, bridge
   state holds an `agy_conv_*` placeholder and RPC is skipped; a turn fired too
   early just queues into the TUI.
-- **Permission gating is all-or-nothing + post-hoc.** agy honors only
-  `--dangerously-skip-permissions` (no firing pre-tool hook), so a headless launch
-  auto-bypasses and the genuine Omnigent gate is the elicitation + post-hoc audit
-  (`antigravity_native_audit`), not a per-tool pre-empt.
+- **agy prompts are all-or-nothing; policies are per tool.** agy's own prompts
+  are controlled only by `--dangerously-skip-permissions`, so a headless launch
+  auto-bypasses them. Omnigent session policies still run before each tool via
+  the `omnigent-policy` PreToolUse entry in the isolated `hooks.json`.
 - **Stale module header.** `antigravity_native.py`'s top docstring says web turns
   go over `SendUserCascadeMessage` RPC — the live executor types into the TUI
   instead (#1156/#1158). Trust `antigravity_native_executor.py`.

@@ -16,6 +16,7 @@ import pytest
 
 import omnigent.harnesses.antigravity_native.bridge as _mod
 from omnigent.harnesses.antigravity_native.bridge import (
+    AGY_POLICY_HOOK_NAME,
     ANTIGRAVITY_NATIVE_BRIDGE_DIR_ENV_VAR,
     ANTIGRAVITY_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     AntigravityNativeBridgeState,
@@ -23,12 +24,14 @@ from omnigent.harnesses.antigravity_native.bridge import (
     agy_home_dir,
     build_antigravity_native_spawn_env,
     build_mcp_config,
+    build_policy_hook_entry,
     clear_bridge_state,
     ensure_agy_feedback_survey_disabled,
     ensure_agy_onboarding_complete,
     inject_user_message_via_tui,
     prepare_bridge_dir,
     read_bridge_state,
+    read_policy_hook_config,
     read_tmux_info,
     seed_isolated_agy_home,
     send_interaction_keys_via_tui,
@@ -36,6 +39,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     write_bridge_state,
     write_mcp_bridge_config,
     write_mcp_config,
+    write_policy_hook_config,
     write_tmux_target,
 )
 from omnigent.process_logging import data_dir
@@ -2369,6 +2373,65 @@ def test_seed_isolated_agy_hooks_keeps_previous_copy_on_refresh_error(
     assert isolated.read_bytes() == previous
     assert not list(isolated.parent.glob("hooks.json.*"))
     assert "Could not refresh Antigravity hooks" in caplog.text
+
+
+@pytest.mark.parametrize("user_hooks", ["present", "absent", "invalid"])
+def test_seed_isolated_agy_home_registers_policy_hook_after_user_hooks(
+    tmp_path: Path, global_hooks: Path, user_hooks: str
+) -> None:
+    if user_hooks == "absent":
+        global_hooks.unlink()
+    elif user_hooks == "invalid":
+        global_hooks.write_text("{invalid json", encoding="utf-8")
+    bridge = tmp_path / "bridge"
+
+    seed_isolated_agy_home(bridge, enforce_policy=True)
+
+    hooks = json.loads((agy_gemini_dir(bridge) / "config" / "hooks.json").read_text())
+    user_entries = ["example"] if user_hooks == "present" else []
+    assert list(hooks) == [*user_entries, AGY_POLICY_HOOK_NAME]
+    assert hooks[AGY_POLICY_HOOK_NAME] == build_policy_hook_entry(bridge)
+
+
+def test_seed_isolated_agy_home_raises_when_policy_hook_cannot_be_written(
+    tmp_path: Path, global_hooks: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = tmp_path / "bridge"
+    seed_isolated_agy_home(bridge)
+    isolated = agy_gemini_dir(bridge) / "config" / "hooks.json"
+    previous = isolated.read_bytes()
+
+    def failed_replace(src, dst):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(_mod.os, "replace", failed_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        seed_isolated_agy_home(bridge, enforce_policy=True)
+    assert isolated.read_bytes() == previous
+    assert not list(isolated.parent.glob("hooks.json.*"))
+
+
+def test_policy_hook_config_round_trips_owner_only(tmp_path: Path) -> None:
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    assert read_policy_hook_config(bridge) is None
+
+    write_policy_hook_config(
+        bridge,
+        server_url="http://127.0.0.1:6767",
+        session_id="conv_abc",
+        auth_headers={"Authorization": "Bearer t"},
+    )
+
+    assert read_policy_hook_config(bridge) == (
+        "http://127.0.0.1:6767",
+        "conv_abc",
+        {"Authorization": "Bearer t"},
+    )
+    assert (bridge / "policy_hook.json").stat().st_mode & 0o777 == 0o600
+    (bridge / "policy_hook.json").write_text('{"ap_server_url": "http://x"}', encoding="utf-8")
+    assert read_policy_hook_config(bridge) is None
 
 
 def test_seed_isolated_agy_home_exposes_user_skill_dirs(
