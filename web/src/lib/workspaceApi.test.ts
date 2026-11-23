@@ -312,7 +312,9 @@ describe("readFileViaWorkspaceApi", () => {
   it("lists a directory through the server in the REST listing's shape, page by page", async () => {
     enable("workspace_api_server_access");
     const tokens: string[] = [];
-    vi.mocked(authenticatedFetch).mockImplementation(async (_input, init) => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
+      // An older host, without GetCapabilities, still lists.
+      if (methodOf(input) === "GetCapabilities") return unimplemented();
       const request = fromBinary(ListDirectoryRequestSchema, init!.body as Uint8Array);
       tokens.push(request.pageToken);
       const page = request.pageToken
@@ -360,7 +362,7 @@ describe("readFileViaWorkspaceApi", () => {
       hasMore: false,
     });
     expect(tokens).toEqual(["", "src/a"]);
-    expect(String(vi.mocked(authenticatedFetch).mock.calls[0]![0])).toBe(
+    expect(String(methodCalls("ListDirectory")[0]![0])).toBe(
       "/v1/sessions/s-list/workspace/omnigent.api.workspace.v1alpha1.WorkspaceService/ListDirectory",
     );
 
@@ -372,7 +374,8 @@ describe("readFileViaWorkspaceApi", () => {
   it("asks for pages up to the caller's limit, ending on a partial page", async () => {
     enable("workspace_api_server_access");
     const pageSizes: number[] = [];
-    vi.mocked(authenticatedFetch).mockImplementation(async (_input, init) => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
+      if (methodOf(input) === "GetCapabilities") return unimplemented();
       const request = fromBinary(ListDirectoryRequestSchema, init!.body as Uint8Array);
       pageSizes.push(request.pageSize);
       const first = Number(request.pageToken || 0);
@@ -405,18 +408,19 @@ describe("readFileViaWorkspaceApi", () => {
       entries: Array.from({ length: entries }, () => ({ name: "a.ts", path: "src/a.ts" })),
       nextPageToken: "src/a.ts",
     });
-    vi.mocked(authenticatedFetch).mockImplementation(
-      async () =>
-        new Response(toBinary(ListDirectoryResponseSchema, page), {
-          headers: { "content-type": "application/proto" },
-        }),
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) =>
+      methodOf(input) === "GetCapabilities"
+        ? unimplemented()
+        : new Response(toBinary(ListDirectoryResponseSchema, page), {
+            headers: { "content-type": "application/proto" },
+          }),
     );
 
     const listed = await listDirectoryViaWorkspaceApi("s-list-stalled", "src", 1000);
 
     expect(listed?.hasMore).toBe(true);
     expect(listed?.data.map((entry) => entry.path)).toEqual(entries ? ["src/a.ts"] : []);
-    expect(authenticatedFetch).toHaveBeenCalledTimes(requests);
+    expect(methodCalls("ListDirectory")).toHaveLength(requests);
   });
 
   it("leaves a listing the host answers with an error to REST, and keeps the route for reads", async () => {
@@ -431,6 +435,69 @@ describe("readFileViaWorkspaceApi", () => {
     expect((await readFileViaWorkspaceApi("s-list-error", "notes.md"))?.content).toBe("héllo");
   });
 
+  it("asks for single-child directory chains when the route's host lists them", async () => {
+    enable("workspace_api_server_access");
+    const asked: boolean[] = [];
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(
+          capabilitiesBody("ListDirectory", "list_directory.collapse_single_child_directories"),
+          { headers: PROTO_HEADERS },
+        ),
+      ListDirectory: (body) => {
+        asked.push(fromBinary(ListDirectoryRequestSchema, body).collapseSingleChildDirectories);
+        const page = create(ListDirectoryResponseSchema, {
+          entries: [
+            { name: "com", path: "com", type: EntryType.DIRECTORY, leafDirectoryPath: "com/a/b" },
+          ],
+        });
+        return new Response(toBinary(ListDirectoryResponseSchema, page), {
+          headers: PROTO_HEADERS,
+        });
+      },
+    });
+
+    const listed = await listDirectoryViaWorkspaceApi("s-chains", "", 1000);
+    await listDirectoryViaWorkspaceApi("s-chains", "", 1000);
+
+    expect(asked).toEqual([true, true]);
+    expect(listed?.data[0]?.leaf_directory_path).toBe("com/a/b");
+    // The route's capabilities are read once and shared.
+    expect(methodCalls("GetCapabilities")).toHaveLength(1);
+  });
+
+  it.each([
+    [
+      "doesn't list them",
+      () => new Response(capabilitiesBody("ListDirectory"), { headers: PROTO_HEADERS }),
+    ],
+    ["has no GetCapabilities", unimplemented],
+    [
+      "fails GetCapabilities",
+      () => Response.json({ code: "internal", message: "down" }, { status: 500 }),
+    ],
+  ])("lists without directory chains when the route's host %s", async (hostCase, capabilities) => {
+    enable("workspace_api_server_access");
+    const asked: boolean[] = [];
+    serveMethods({
+      GetCapabilities: capabilities,
+      ListDirectory: (body) => {
+        asked.push(fromBinary(ListDirectoryRequestSchema, body).collapseSingleChildDirectories);
+        const page = create(ListDirectoryResponseSchema, {
+          entries: [{ name: "com", path: "com", type: EntryType.DIRECTORY }],
+        });
+        return new Response(toBinary(ListDirectoryResponseSchema, page), {
+          headers: PROTO_HEADERS,
+        });
+      },
+    });
+
+    const listed = await listDirectoryViaWorkspaceApi(`s-no-chains-${hostCase}`, "", 1000);
+
+    expect(asked).toEqual([false]);
+    expect(listed?.data.map((entry) => entry.path)).toEqual(["com"]);
+  });
+
   it.each([
     ["answers", ["src/b.ts"]],
     ["fails too", null],
@@ -442,14 +509,22 @@ describe("readFileViaWorkspaceApi", () => {
         entries: [{ name: "a.ts", path: "src/a.ts", type: EntryType.FILE }],
         nextPageToken: "src/a.ts",
       });
-      socket.mockResolvedValueOnce({
-        status: 200,
-        headers: { "content-type": "application/proto" },
-        body: toBinary(ListDirectoryResponseSchema, firstPage),
+      let socketListings = 0;
+      socket.mockImplementation(async (request) => {
+        if (methodOf((request as { path: string }).path) === "GetCapabilities") {
+          return fromSocket(capabilitiesBody("ListDirectory"));
+        }
+        socketListings += 1;
+        if (socketListings > 1) throw new Error("the SSH connection closed");
+        return {
+          status: 200,
+          headers: { "content-type": "application/proto" },
+          body: toBinary(ListDirectoryResponseSchema, firstPage),
+        };
       });
-      socket.mockRejectedValueOnce(new Error("the SSH connection closed"));
       const serverTokens: string[] = [];
       vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
+        if (methodOf(input) === "GetCapabilities") return unimplemented();
         if (String(input).endsWith("/direct-access")) {
           return Response.json({
             host_id: "host-1",
@@ -472,7 +547,7 @@ describe("readFileViaWorkspaceApi", () => {
 
       const listed = await listDirectoryViaWorkspaceApi(`s-partial-${serverOutcome}`, "src", 1000);
       expect(listed && listed.data.map((entry) => entry.path)).toEqual(expected);
-      expect(socket).toHaveBeenCalledTimes(2);
+      expect(socketListings).toBe(2);
       expect(serverTokens).toEqual([""]);
     },
   );
