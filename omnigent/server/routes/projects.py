@@ -26,6 +26,7 @@ from omnigent.entities import Project
 from omnigent.entities.project import MandateProposal
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.server import session_live_state
 from omnigent.server.auth import AuthProvider
 from omnigent.server.project_main_session import (
     ProjectSessionCreator,
@@ -362,6 +363,9 @@ def create_projects_router(
         if result is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         project, proposal = result
+        if source_session is not None:
+            # The owner must accept or dismiss it, so the proposing session needs their eyes.
+            session_live_state.raise_attention(source_session)
         announce_projects_changed(user_id)
         return {"proposal": _proposal_response(proposal), "project": await response(project)}
 

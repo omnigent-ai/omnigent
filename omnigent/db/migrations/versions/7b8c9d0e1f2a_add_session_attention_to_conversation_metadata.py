@@ -1,7 +1,7 @@
 """Add session attention columns to conversation metadata.
 
 Revision ID: 7b8c9d0e1f2a
-Revises: 5f6a7b8c9d0e
+Revises: c4f7a2e91b3d
 
 Adds two nullable columns to ``omnigent_conversation_metadata``, beside the
 other live-state columns so their writes cannot bump
@@ -30,7 +30,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "7b8c9d0e1f2a"
-down_revision: str | None = "5f6a7b8c9d0e"
+down_revision: str | None = "c4f7a2e91b3d"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
