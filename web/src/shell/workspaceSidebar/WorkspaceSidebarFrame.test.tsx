@@ -120,9 +120,7 @@ function Host({
                   width={stripWidth.width}
                   onKeyDown={(event) => actions.handleTabKeyDown(event, tab.id)}
                   menu={
-                    <StripTabMenu
-                      items={actions.menuItemsFor(tab.id, index, `#${label(tab.id)}`, true)}
-                    />
+                    <StripTabMenu items={actions.menuItemsFor(tab.id, `#${label(tab.id)}`, true)} />
                   }
                 />
               ),

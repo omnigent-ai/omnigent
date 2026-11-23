@@ -1440,7 +1440,7 @@ function WorkspaceTabsPanelImpl({
                             onKeyDown={(event) => actions.handleTabKeyDown(event, tab.id)}
                             menu={
                               <StripTabMenu
-                                items={actions.menuItemsFor(tab.id, index, title.label, closable)}
+                                items={actions.menuItemsFor(tab.id, title.label, closable)}
                               />
                             }
                           />

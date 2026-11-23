@@ -292,18 +292,14 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
   };
 
   /** The menu every ordinary tab shows: close it or the others, move it, reopen one. */
-  const menuItemsFor = (
-    tabId: TabId,
-    index: number,
-    label: string,
-    closable: boolean,
-  ): StripTabMenuItem[] => {
+  const menuItemsFor = (tabId: TabId, label: string, closable: boolean): StripTabMenuItem[] => {
     // This tab's own commands, so its rows read as the menus and ⌘K do, and Close names it
     // even while another tab is selected.
     const rowTab = store.findTab(tabId);
     const rowCommands = workspaceTabActionCommands({
       ...facts,
-      selectedIndex: index,
+      // Its place among the strip's entries, which Move Left and Right go by, a split being one.
+      selectedIndex: entryIds.indexOf(tabId),
       selectedLabel: label,
       selectedPinned: rowTab !== undefined && isPinnedTab(rowTab),
       selectedPinRefusal: pinning?.refusalFor?.(tabId),

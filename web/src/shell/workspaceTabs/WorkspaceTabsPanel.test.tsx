@@ -1151,6 +1151,42 @@ describe("a shell's tab", () => {
       expect(store.tabs()).toHaveLength(4);
     });
 
+    it("offers Move right in a tab's menu by its place among the entries, past a split", async () => {
+      panesGate.shown = true;
+      const { store } = await openShells(
+        "s-group-menu-move",
+        ["term_a", "term_b", "term_c", "term_d"],
+        {
+          permissionLevel: LEVEL_OWNER,
+        },
+      );
+      act(() =>
+        updateTerminalGroups("s-group-menu-move", () => [
+          {
+            id: "g_ab",
+            split: {
+              layout: {
+                axis: "columns",
+                ratio: 0.5,
+                children: ["terminal:term_a", "terminal:term_b"],
+              },
+              focusedKey: "terminal:term_a",
+            },
+          },
+        ]),
+      );
+      await waitFor(() => expect(stripNames()).toEqual(["term_a:s +1", "term_c:s", "term_d:s"]));
+      // c is the third tab but the second entry: d still follows it.
+      fireEvent.contextMenu(
+        screen.getByRole("tab", { name: "term_c:s" }).closest("[data-tab-strip-entry]")!,
+      );
+      const moveRight = await screen.findByRole("menuitem", { name: /^Move right/ });
+      expect(moveRight).not.toHaveAttribute("data-disabled");
+      fireEvent.click(moveRight);
+      expect(stripNames()).toEqual(["term_a:s +1", "term_d:s", "term_c:s"]);
+      expect(store.tabs()).toHaveLength(4);
+    });
+
     it("unpins a pinned shell as it joins a split", async () => {
       const { store } = await openShells("s-group-pin", ["term_a", "term_b", "term_c"], {
         permissionLevel: LEVEL_OWNER,
