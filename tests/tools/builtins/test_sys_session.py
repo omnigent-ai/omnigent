@@ -38,6 +38,7 @@ from omnigent.tools.builtins.spawn import (
     _HISTORY_MAX_TAIL,
     _HISTORY_MAX_TOTAL_CHARS,
     SysSessionCloseTool,
+    SysSessionCreateTool,
     SysSessionGetHistoryTool,
     SysSessionListTool,
     SysSessionSendTool,
@@ -300,18 +301,31 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
     }
 
 
-def test_send_description_announces_wake_notice() -> None:
+@pytest.mark.parametrize(
+    "sub_specs",
+    [{"claude": AgentSpec(spec_version=1, name="claude", description="Review helper.")}, {}],
+    ids=["named-mode", "session-id-only"],
+)
+def test_send_description_announces_wake_notice(sub_specs: dict[str, AgentSpec]) -> None:
     """
-    The dispatch tool tells the model the exact wake notice the runtime
-    posts when a child finishes, so the notice is recognised as
-    runtime-originated instead of read as a user-typed instruction.
+    Both dispatch tool variants tell the model the exact wake notice the
+    runtime posts when a child finishes, so the notice is recognised as
+    runtime-originated instead of read as a user-typed instruction, and say
+    the send returns a handle rather than the child's output, so the model
+    ends its turn instead of sleeping and polling.
     """
-    tool = SysSessionSendTool(
-        {"claude": AgentSpec(spec_version=1, name="claude", description="Review helper.")}
-    )
-    desc = tool.get_schema()["function"]["description"]
+    desc = SysSessionSendTool(sub_specs).get_schema()["function"]["description"]
     assert SUBAGENT_WAKE_NOTICE_SHAPE in desc
     assert "not from a person" in desc
+    assert "launch handle immediately, not the child's output" in desc
+    assert "Don't sleep or poll" in desc
+
+
+def test_create_description_separates_child_wake_from_independent_polling() -> None:
+    """A child announces its finish; only independent sessions need monitoring."""
+    desc = SysSessionCreateTool.description()
+    assert SUBAGENT_WAKE_NOTICE_SHAPE in desc
+    assert "Independent sessions post no notice: monitor them" in desc
 
 
 def test_peek_schema_required_fields_and_no_extra_props() -> None:
