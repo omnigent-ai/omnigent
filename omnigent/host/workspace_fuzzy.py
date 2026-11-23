@@ -23,8 +23,11 @@ if TYPE_CHECKING:
 _POOL = 2000
 # Below this many paths, one thread matches faster than starting more.
 _PARALLEL_FROM = 50_000
-_MAX_THREADS = 8
+# Matching 1.6 million paths on 32 cores: 9-12 ms at 8 threads, 7-8 ms at 16, none faster past it.
+_MAX_THREADS = 16
 _MAX_CACHED_CORPORA = 8
+# Paths kept in cached corpora; the oldest go first, keeping the newest.
+_MAX_CACHED_CORPUS_PATHS = 4_000_000
 
 
 @functools.cache
@@ -62,10 +65,10 @@ class PathCorpus:
         frizbee = _frizbee()
         if frizbee is None:
             raise RuntimeError("Fuzzy matching is unavailable on this host")
-        self.paths = list(paths)
-        self.names = [file_name(path) for path in self.paths]
+        self.paths = paths if isinstance(paths, list) else list(paths)
+        # Names are matched in frizbee and derived again only for the shortlisted paths.
         self._path_haystacks: Haystacks = frizbee.Haystacks(self.paths)
-        self._name_haystacks: Haystacks = frizbee.Haystacks(self.names)
+        self._name_haystacks: Haystacks = frizbee.Haystacks(map(file_name, self.paths))
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -75,7 +78,7 @@ class PathCorpus:
         haystacks = self._name_haystacks if names else self._path_haystacks
         if len(self.paths) < _PARALLEL_FROM:
             return matcher.match_list(haystacks)
-        threads = min(_MAX_THREADS, max(1, (os.cpu_count() or 2) - 1))
+        threads = min(_MAX_THREADS, max(1, (os.cpu_count() or 2) - 1))  # leave one core
         return matcher.match_list_parallel(haystacks, threads)
 
 
@@ -124,7 +127,10 @@ class CorpusCache:
                 with self._lock:
                     self._entries[key] = (sources, built)
                     self._entries.move_to_end(key)
-                    while len(self._entries) > _MAX_CACHED_CORPORA:
+                    while len(self._entries) > 1 and (
+                        len(self._entries) > _MAX_CACHED_CORPORA
+                        or self._paths_held() > _MAX_CACHED_CORPUS_PATHS
+                    ):
                         self._entries.popitem(last=False)
                 return built
         finally:
@@ -144,6 +150,15 @@ class CorpusCache:
             return None
         self._entries.move_to_end(key)
         return cached[1]
+
+    def _paths_held(self) -> int:
+        """Paths in the lists the entries keep alive, corpora and sources, each list once."""
+        held = {
+            id(paths): len(paths)
+            for sources, corpus in self._entries.values()
+            for paths in (*sources, corpus.paths)
+        }
+        return sum(held.values())
 
 
 @dataclass(frozen=True)
@@ -220,7 +235,7 @@ def rank(corpora: Sequence[PathCorpus], query: str, limit: int) -> tuple[list[Ra
             path_hit = scorer.match_one(path, index)
             if path_hit is None:
                 continue
-            name_hit = scorer.match_one(corpus.names[index], index)
+            name_hit = scorer.match_one(file_name(path), index)
             score = path_hit.score + (name_hit.score if name_hit is not None else 0)
             scored.append((-score, len(path), path))
     scored.sort()

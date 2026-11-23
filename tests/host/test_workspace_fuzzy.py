@@ -215,6 +215,40 @@ def test_a_key_is_built_once_at_a_time_even_as_its_sources_change() -> None:
     assert found["later"] is found["new"]
 
 
+def test_older_corpora_are_dropped_past_the_path_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(workspace_fuzzy, "_MAX_CACHED_CORPUS_PATHS", 3)
+    cache = CorpusCache()
+    older, newer = ["a.py", "b.py"], ["c.py", "d.py"]
+    first = cache.corpus("older", (older,), lambda: list(older))
+    cache.corpus("newer", (newer,), lambda: list(newer))
+
+    rebuilt = cache.corpus("older", (older,), lambda: list(older))
+
+    # Each corpus holds 2 paths and keeps its 2-path source: 8 in all, past 3, so "older" went.
+    assert rebuilt is not first
+
+
+def test_the_source_lists_corpora_keep_count_toward_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(workspace_fuzzy, "_MAX_CACHED_CORPUS_PATHS", 4)
+    separate = CorpusCache()
+    first_workspace, second_workspace = ["a/x.py", "b/y.py"], ["c/x.py", "d/y.py"]
+    first = separate.corpus("first", (first_workspace,), lambda: ["x.py"])
+    separate.corpus("second", (second_workspace,), lambda: ["x.py"])
+    shared = CorpusCache()
+    workspace = ["a/x.py", "b/y.py"]
+    scoped = shared.corpus("a", (workspace,), lambda: ["x.py"])
+    shared.corpus("b", (workspace,), lambda: ["y.py"])
+
+    # Two one-path corpora keep 6 paths alive through their sources: over the budget.
+    assert separate.corpus("first", (first_workspace,), lambda: ["x.py"]) is not first
+    # A source both corpora keep counts once: 4 paths.
+    assert shared.corpus("a", (workspace,), lambda: ["x.py"]) is scoped
+
+
 def test_without_its_library_the_host_offers_no_fuzzy_features(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
