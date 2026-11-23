@@ -659,5 +659,8 @@ describe("placement", () => {
     const menu = screen.getByTestId("slash-command-menu");
     expect(menu.className).toContain("top-11");
     expect(menu.className).not.toContain("bottom-full");
+    // Capped to the window, it clips rather than scrolls, leaving its list the only scroller.
+    expect(menu.className).toContain("overflow-hidden");
+    expect(menu.className).not.toContain("overflow-y-auto");
   });
 });

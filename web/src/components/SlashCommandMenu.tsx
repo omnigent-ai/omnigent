@@ -823,11 +823,12 @@ export function SlashCommandMenu({
           "menu-surface mobile-menu-glass absolute right-0 left-0 z-30 w-full rounded-[16px] border border-border bg-popover p-2 shadow-menu",
           placement === "above"
             ? "bottom-full mb-2 overflow-hidden"
-            : "top-11 max-h-[calc(100%-2.75rem)] overflow-y-auto",
+            : "top-11 flex max-h-[calc(100%-2.75rem)] flex-col overflow-hidden",
         )}
       >
         <MobileMenuGlassSurface />
-        <div ref={listRef} className="max-h-[22rem] overflow-y-auto">
+        {/* The list is the only scroller, also when the menu is capped below the prompt. */}
+        <div ref={listRef} className="max-h-[22rem] min-h-0 overflow-y-auto">
           {builtinRows.length > 0 && sectionHeader("Commands")}
           {builtinRows.map((row) => (
             <MenuRowButton

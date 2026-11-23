@@ -107,15 +107,19 @@ export function FileMentionMenu({
         "absolute left-0 z-30 flex gap-2",
         placement === "above"
           ? "bottom-full mb-2 items-end"
-          : "top-11 max-h-[calc(100%-2.75rem)] items-start overflow-y-auto",
+          : "top-11 max-h-[calc(100%-2.75rem)] items-stretch overflow-hidden",
       )}
     >
       <div
         data-testid="file-mention-menu"
-        className="mobile-menu-glass max-md:relative w-80 max-w-[calc(100vw-2rem)] shrink-0 overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
+        className={cn(
+          "mobile-menu-glass max-md:relative w-80 max-w-[calc(100vw-2rem)] shrink-0 overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150",
+          // Capped below the prompt, the card shrinks to fit and its list is the only scroller.
+          placement === "below" && "flex flex-col",
+        )}
       >
         <MobileMenuGlassSurface />
-        <div ref={listRef} role="listbox" className="max-h-80 overflow-y-auto">
+        <div ref={listRef} role="listbox" className="max-h-80 min-h-0 overflow-y-auto">
           {level && (
             <button
               type="button"
