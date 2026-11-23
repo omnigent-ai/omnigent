@@ -77,6 +77,63 @@ describe("treeOrderedFiles", () => {
   });
 });
 
+describe("treeOrderedFiles by size", () => {
+  const sized = (path: string, additions: number | null, deletions: number | null = 0) =>
+    reviewFile(path, "modified", { additions, deletions });
+  const bySize = (list: ReturnType<typeof sized>[]) => paths(treeOrderedFiles(list, "size"));
+
+  it("puts the most changed lines first at each level, a folder weighing all its files", () => {
+    expect(
+      bySize([
+        sized("README.md", 3),
+        sized("src/app/main.py", 1),
+        sized("src/app/session_list.py", 14, 6),
+        sized("src/uploads.py", 5, 2),
+        sized("docs/guide.md", 30),
+      ]),
+    ).toEqual([
+      // docs/ weighs 30, src/ 28 (its app/ 21 before uploads.py's 7), then the 3-line README.
+      "docs/guide.md",
+      "src/app/session_list.py",
+      "src/app/main.py",
+      "src/uploads.py",
+      "README.md",
+    ]);
+  });
+
+  it("keeps the path order between rows of the same size", () => {
+    const tied = [sized("c.ts", 2), sized("a.ts", 1, 1), sized("lib/d.ts", 2), sized("b.ts", 2)];
+    // All weigh 2, so the tree's own order decides: folders first, then by name.
+    expect(bySize(tied)).toEqual(["lib/d.ts", "a.ts", "b.ts", "c.ts"]);
+    expect(bySize(tied)).toEqual(paths(treeOrderedFiles(tied, "path")));
+  });
+
+  it("puts a file without counts after every counted one, even an empty change", () => {
+    expect(
+      bySize([sized("image.png", null, null), sized("empty.txt", 0), sized("big.ts", 9)]),
+    ).toEqual(["big.ts", "empty.txt", "image.png"]);
+    // A folder of only uncounted files goes after counted rows, even an empty change.
+    expect(bySize([sized("assets/logo.png", null, null), sized("a.ts", 1)])).toEqual([
+      "a.ts",
+      "assets/logo.png",
+    ]);
+    expect(bySize([sized("assets/image.png", null, null), sized("empty.txt", 0)])).toEqual([
+      "empty.txt",
+      "assets/image.png",
+    ]);
+    // Once one of its files has counts, the folder weighs what they changed.
+    expect(
+      bySize([sized("assets/image.png", null, null), sized("assets/a.svg", 2), sized("b.ts", 1)]),
+    ).toEqual(["assets/a.svg", "assets/image.png", "b.ts"]);
+  });
+
+  it("keeps the path order unless asked for size", () => {
+    const list = [sized("z.ts", 50), sized("a/b.ts", 1)];
+    expect(paths(treeOrderedFiles(list))).toEqual(["a/b.ts", "z.ts"]);
+    expect(paths(treeOrderedFiles(list, "path"))).toEqual(["a/b.ts", "z.ts"]);
+  });
+});
+
 describe("reviewFile", () => {
   it("classifies language, tests, and generated files from the path", () => {
     expect(files.map((file) => [file.language, file.isTest, file.isGenerated])).toEqual([
@@ -214,13 +271,14 @@ describe("lineBreakdown", () => {
       reviewFile("assets/empty.bin", "added", { isBinary: true }),
     ];
     const { totals, languages } = lineBreakdown(listed, sourceCounts);
-    expect(totals).toEqual({ additions: 20, deletions: 36 });
+    expect(totals).toEqual({ files: 5, additions: 20, deletions: 36 });
     const sum = languages.reduce(
       (acc, entry) => ({
+        files: acc.files + entry.files,
         additions: acc.additions + entry.additions,
         deletions: acc.deletions + entry.deletions,
       }),
-      { additions: 0, deletions: 0 },
+      { files: 0, additions: 0, deletions: 0 },
     );
     expect(sum).toEqual(totals);
     expect(languages.reduce((count, entry) => count + entry.files, 0)).toBe(listed.length);
@@ -253,10 +311,36 @@ describe("lineBreakdown", () => {
     ]);
   });
 
+  it("totals the files not viewed apart, while languages count every file", () => {
+    const listed = [
+      reviewFile("a.ts", "modified", { additions: 10, deletions: 2 }),
+      reviewFile("b.ts", "modified", { additions: 5, deletions: 1 }),
+      reviewFile("c.py", "added", { additions: 3, deletions: 0 }),
+    ];
+    const breakdown = lineBreakdown(listed, sourceCounts, (file) => file.path === "a.ts");
+    expect(breakdown.totals).toEqual({ files: 3, additions: 18, deletions: 3 });
+    expect(breakdown.notViewed).toEqual({ files: 2, additions: 8, deletions: 1 });
+    expect(breakdown.languages[0]).toEqual({
+      language: "TypeScript",
+      files: 2,
+      additions: 15,
+      deletions: 3,
+    });
+    // Nothing viewed: both totals agree; everything viewed: none left.
+    expect(lineBreakdown(listed, sourceCounts).notViewed).toEqual(
+      lineBreakdown(listed, sourceCounts).totals,
+    );
+    expect(lineBreakdown(listed, sourceCounts, () => true).notViewed).toEqual({
+      files: 0,
+      additions: 0,
+      deletions: 0,
+    });
+  });
+
   it("takes every file's counts from the one source the totals use, such as a loaded diff", () => {
     const listed = [reviewFile("a.ts", "modified", { additions: 100, deletions: 100 })];
     const loaded = lineBreakdown(listed, () => ({ additions: 7, deletions: 1 }));
-    expect(loaded.totals).toEqual({ additions: 7, deletions: 1 });
+    expect(loaded.totals).toEqual({ files: 1, additions: 7, deletions: 1 });
     expect(loaded.languages[0]).toMatchObject({ additions: 7, deletions: 1 });
   });
 });

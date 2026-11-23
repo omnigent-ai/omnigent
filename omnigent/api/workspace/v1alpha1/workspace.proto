@@ -615,6 +615,12 @@ message BranchCommit {
   // It has no parent; compare it with the empty tree, which a revision
   // comparison accepts as its base.
   bool root = 5;
+
+  // The message after the subject line, trimmed: at most 4096 bytes, cut
+  // at a character boundary and ending in "…" when cut. Empty when the
+  // message is the subject alone, when the listing was too large to carry
+  // bodies, and from hosts that predate this field.
+  string body = 6;
 }
 
 // At most 200 commits, newest first. Feature "branch_commits".

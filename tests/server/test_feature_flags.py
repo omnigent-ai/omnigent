@@ -64,6 +64,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "workspace_direct_access": False,
         "workspace_api_server_access": False,
         "floating_composer": False,
+        "sidebar_saved_views": False,
     }
 
 
@@ -232,6 +233,15 @@ def test_workspace_sidebar_v2_is_an_opt_in_frontend_feature() -> None:
 
     assert flags.enabled(Feature.WORKSPACE_SIDEBAR_V2)
     assert flags.frontend_dict()["workspace_sidebar_v2"] is True
+
+
+def test_sidebar_saved_views_is_an_opt_in_frontend_feature() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.SIDEBAR_SAVED_VIEWS)
+
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "sidebar_saved_views"})
+
+    assert flags.enabled(Feature.SIDEBAR_SAVED_VIEWS)
+    assert flags.frontend_dict()["sidebar_saved_views"] is True
 
 
 def test_sibling_sessions_explicit_enable_preserves_default_features() -> None:

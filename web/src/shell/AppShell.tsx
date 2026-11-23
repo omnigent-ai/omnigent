@@ -3,6 +3,8 @@ import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContext";
 import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
+  LazyFileActionHost,
+  LazyShowAllPullRequestsCommand,
   LazyWorkspaceTabsHost,
   routeToWorkspaceTabs,
   showAgentBrowserTab,
@@ -70,6 +72,8 @@ import {
   isIOSShell,
   isMacElectronShell,
   onNativeSidebarDrag,
+  reportRightSidebarVisibility,
+  resetRightSidebarWindowTracking,
   supportsBrowser,
   updateBridge,
 } from "@/lib/nativeBridge";
@@ -153,7 +157,6 @@ import { ChatHeader } from "./ChatHeader";
 import { ProjectHomeHeaderActions, ProjectHomeTitle } from "@/projectHome/ProjectHomeHeader";
 import { projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
 import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
-import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
 import type { FilePosition, OpenFileOptions, FileNavigationGuard } from "./FileViewerContext";
 import { revealFolderInFilesPanel } from "./FilesPanel";
 import { selectPullRequestInPanel } from "./PullRequestPanel";
@@ -700,9 +703,17 @@ function AppShellImpl() {
     },
     [cancelRightPanelVisibilityMotion],
   );
+  // Whether the rail can show here and how far it widens the window, for the shell's setting.
+  const rightSidebarWindowRef = useRef({ canShow: false, width: (): number => 0 });
+  useEffect(() => {
+    resetRightSidebarWindowTracking();
+  }, [conversationId]);
   const setRightPanelOpenAnimated = useCallback((open: boolean) => {
     if (rightPanelOpenRef.current === open) return;
     rightPanelOpenRef.current = open;
+    // Only in-session opens and closes resize the window; a session switch restores its rail.
+    const rail = rightSidebarWindowRef.current;
+    if (rail.canShow) reportRightSidebarVisibility(open, open ? rail.width() : 0);
     if (rightPanelMotionTimerRef.current !== null) {
       window.clearTimeout(rightPanelMotionTimerRef.current);
     }
@@ -3213,6 +3224,7 @@ function AppShellImpl() {
   }, [workspacePanelVisible, focusWorkspaceTabs]);
   const {
     panelWidth: inlinePanelWidth,
+    widthInWiderWindow: inlinePanelWidthInWiderWindow,
     preferredContentWidth: preferredConversationWidth,
     handleProps: inlinePanelHandleProps,
     isDragging: inlinePanelResizing,
@@ -3224,6 +3236,10 @@ function AppShellImpl() {
     rootSessionResolved,
     canvasMode ? CANVAS_CONVERSATION_MIN_WIDTH : undefined,
   );
+  rightSidebarWindowRef.current = {
+    canShow: Boolean(conversationId) && hasRailContent,
+    width: inlinePanelWidthInWiderWindow,
+  };
 
   return (
     <AppShellRootProviders
@@ -3235,6 +3251,25 @@ function AppShellImpl() {
       }}
       fileViewer={fileViewerContextValue}
     >
+      {/* One for the whole window, so a grid of sidebars runs each request once. */}
+      {/* A host that breaks only disables the file actions. */}
+      {tabsSidebar && (
+        <RenderErrorBoundary name="file actions" fallback={null}>
+          <Suspense fallback={null}>
+            <LazyFileActionHost />
+          </Suspense>
+        </RenderErrorBoundary>
+      )}
+      {/* Mounted only for a tabs sidebar session, so without the flag nothing runs. */}
+      {tabsSidebar && serverConversationId && (
+        <Suspense fallback={null}>
+          <LazyShowAllPullRequestsCommand
+            sessionId={serverConversationId}
+            pullRequestsAvailable={railTabsAvailable.github}
+            showAll={() => openGithubTab()}
+          />
+        </Suspense>
+      )}
       <TerminalFirstContextProvider value={terminalFirstContextValue}>
         <ForkDialogContextProvider value={forkDialogContextValue}>
           {/* `app-shell` paints the shared canvas behind the sidebar and
@@ -3389,7 +3424,6 @@ function AppShellImpl() {
                     subAgentName={activeSession?.subAgentName ?? null}
                     conversationId={conversationId}
                     workingDirectory={activeSession?.workspace ?? activeConv?.workspace}
-                    createdBySessionId={activeSession?.labels?.[CREATED_BY_SESSION_LABEL_KEY]}
                     permissionLevel={permissionLevel}
                     actionConversation={actionConversation}
                     conversationTitle={headerConversationTitle}

@@ -4578,6 +4578,24 @@ def test_augment_claude_args_disables_auto_mode_setup_offer(
     assert settings.get("skillOverrides") == {"auto-mode-setup": "off"}
 
 
+def test_augment_claude_args_keeps_auto_compaction_on(tmp_path: Path) -> None:
+    """
+    Every launch turns Claude's automatic compaction on in the settings sidecar.
+
+    A user setting of ``autoCompactEnabled: false`` makes Claude refuse each turn
+    with "Prompt is too long" once the context fills, until someone types
+    ``/compact``. Flag settings outrank user settings, so the sidecar value wins.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = _load_invocation_settings(args)
+    assert settings.get("autoCompactEnabled") is True
+
+
 @pytest.mark.parametrize(
     ("launch_args", "default_mode"),
     [

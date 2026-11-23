@@ -7,6 +7,7 @@ const bridge = vi.hoisted(() => ({
   dismiss: vi.fn(),
   filePicker: vi.fn(),
   announceSupport: vi.fn(),
+  ready: vi.fn(),
 }));
 vi.mock("@/lib/nativeBridge", () => ({ floatingComposerBridge: () => bridge }));
 vi.mock("./floatingLaunch", () => ({ launchFromPanel: vi.fn() }));
@@ -71,6 +72,64 @@ beforeEach(() => {
 });
 
 describe("FloatingComposerPage", () => {
+  it("tells a hidden panel's shell it's ready at once, since a hidden window gets no frames", async () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    try {
+      vi.resetModules();
+      const { FloatingComposerPage: FreshPage } = await import("./FloatingComposerPage");
+      render(<FreshPage />);
+      expect(bridge.ready).toHaveBeenCalledTimes(1);
+    } finally {
+      visibility.mockRestore();
+    }
+  });
+
+  it("tells the shell it's ready once per document, after the composer painted", async () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    try {
+      // A fresh module is a fresh document.
+      vi.resetModules();
+      const { FloatingComposerPage: FreshPage } = await import("./FloatingComposerPage");
+      const first = render(<FreshPage />);
+      expect(bridge.ready).not.toHaveBeenCalled();
+      // The first frame's callback runs before that frame paints; ready waits for the next one.
+      for (const frame of frames.splice(0)) frame(0);
+      expect(bridge.ready).not.toHaveBeenCalled();
+      for (const frame of frames.splice(0)) frame(0);
+      expect(bridge.ready).toHaveBeenCalledTimes(1);
+      first.unmount();
+      render(<FreshPage />);
+      for (const frame of frames.splice(0)) frame(0);
+      for (const frame of frames.splice(0)) frame(0);
+      expect(bridge.ready).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("works with a shell too old to hear that the panel is ready", async () => {
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      callback(0);
+      return 0;
+    });
+    const ready = bridge.ready;
+    try {
+      // Older shells show the panel without a readiness signal.
+      Reflect.deleteProperty(bridge, "ready");
+      vi.resetModules();
+      const { FloatingComposerPage: FreshPage } = await import("./FloatingComposerPage");
+      expect(() => render(<FreshPage />)).not.toThrow();
+      expect(prompt()).toBeInTheDocument();
+    } finally {
+      Object.assign(bridge, { ready });
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("hides on Escape and keeps what was typed", () => {
     render(<FloatingComposerPage />);
     fireEvent.change(prompt(), { target: { value: "half a thought" } });

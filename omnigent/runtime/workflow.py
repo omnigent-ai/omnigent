@@ -63,6 +63,7 @@ from omnigent.onboarding.databricks_config import (
 from omnigent.onboarding.detected import (
     codex_config_provider_dismissed,
     effective_config_with_detected,
+    resolve_named_provider,
 )
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
@@ -1203,16 +1204,7 @@ def _resolve_provider_for_build(
     if isinstance(auth, ProviderAuth):
         # A named provider is resolved against the explicit config merged with
         # ambient detections, so a spec may name a detected provider too.
-        providers = load_providers(effective_config_with_detected(explicit_config))
-        entry = providers.get(auth.name)
-        if entry is None and os.environ.get("OMNIGENT_INFERENCE_CONFIG"):
-            # The managed-sandbox overlay replaces the local providers block, so an
-            # explicitly named provider from ~/.omnigent/config.yaml would vanish.
-            # Server bindings already won above; fall back to the local config.
-            from omnigent.onboarding.provider_config import _load_config
-
-            local_providers = load_providers(effective_config_with_detected(_load_config()))
-            entry = local_providers.get(auth.name)
+        entry = resolve_named_provider(auth.name, explicit_config)
         if entry is None:
             raise HarnessConfigurationError(
                 "The provider named by executor.auth is not configured. "

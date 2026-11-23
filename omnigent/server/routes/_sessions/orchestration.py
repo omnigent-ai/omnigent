@@ -34,7 +34,7 @@ from omnigent.db.utils import (
     rollback_shared_reads,
     shared_read_scope,
 )
-from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import (
     Agent,
@@ -306,6 +306,7 @@ from omnigent.server.routes._sessions.helpers import (
     _get_runner_client,
     _handle_advise_models_mcp,
     _HostRunnerStopAttempt,
+    _inherited_parent_permission_launch_args,
     _invalidate_runner_backed_snapshot_state,
     _is_codex_native_subagent,
     _is_kiro_native_session,
@@ -1784,6 +1785,7 @@ def _build_session_response(
             conv, agent_store=agent_store, agent_cache=agent_cache, agent=agent
         )
     from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+    from omnigent.server.scheduled.harness_settings import session_permission_mode
 
     native_usage_baseline = None
     if harness in ("pi-native", "claude-native") or (
@@ -1836,6 +1838,7 @@ def _build_session_response(
         root_conversation_id=conv.root_conversation_id,
         llm_model=llm_model,
         harness=harness,
+        permission_mode=session_permission_mode(conv, harness) if harness else None,
         model_override=conv.model_override,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
@@ -1904,6 +1907,86 @@ def _build_session_response(
         project_id=conv.project_id,
         side_chat_parent_id=conv.side_chat_parent_id,
     )
+
+
+# Warn-once keys for pricing fallbacks: an unconfigured provider name, or a
+# per-agent lookup failure. Pricing runs per usage event, so each logs once.
+_WARNED_PRICING_LOOKUPS: WorkspaceScopedSet[str] = WorkspaceScopedSet()
+
+
+def _resolve_session_provider_entry(
+    conv: Any,
+) -> Any | None:
+    """Return the ProviderEntry for the session's actual named provider, if any.
+
+    When a session's agent declares ``executor.auth: {type: provider, name: X}``,
+    the pricing path must use provider X's configured rates rather than the
+    harness default's rates. This helper loads the agent spec via the agent
+    cache and returns the named entry when the auth is a ProviderAuth, else
+    None so the caller falls back to the default-provider lookup.
+
+    A failed lookup returns None with a warning, so it never breaks cost
+    accounting; the caller then falls back to catalog or default-provider pricing.
+
+    Known limitation: the provider is read from the agent's current bundle, not
+    the identity captured at launch. Republishing an agent with a different
+    named provider while one of its sessions is running can misattribute that
+    session's cost until the session restarts. Persisting the launch identity
+    needs an additive column, tracked as a follow-up in a separate schema PR.
+    """
+    if conv is None or not getattr(conv, "agent_id", None):
+        return None
+    try:
+        from omnigent.inference_config import load_runtime_inference_config
+        from omnigent.onboarding.detected import resolve_named_provider
+        from omnigent.onboarding.provider_config import load_config
+        from omnigent.runtime import get_agent_cache, get_agent_store
+        from omnigent.spec.types import ProviderAuth
+
+        # Bundle-resolution site: this reads the agent's CURRENT bundle (see the
+        # known limitation in the docstring), not the provider the live process
+        # launched with.
+        agent = get_agent_store().get(conv.agent_id)
+        if agent is None:
+            return None
+        agent_cache = get_agent_cache()
+        # Gate env expansion on operator_authored, not session_id: a user bundle
+        # can have no session yet still be tenant input whose ${VAR} must not expand.
+        loaded = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+        )
+        # Sub-agent sessions price on their own executor; resolve the child
+        # spec recursively (as the policy builder does) so nested sub-agents
+        # and the synthesized web_fetch researcher use their own provider.
+        executor = loaded.spec.executor
+        if conv.sub_agent_name:
+            sub = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
+            if sub is not None and sub is not loaded.spec:
+                executor = sub.executor
+        auth = executor.auth if executor else None
+        if not isinstance(auth, ProviderAuth):
+            return None
+        entry = resolve_named_provider(auth.name, load_runtime_inference_config(load_config()))
+        if entry is None and auth.name not in _WARNED_PRICING_LOOKUPS:
+            # A declared provider absent from config silently reverts to
+            # default-provider pricing; warn once per name so persistent
+            # mispricing is visible without spamming this per-event path.
+            _WARNED_PRICING_LOOKUPS.add(auth.name)
+            _logger.warning(
+                "session executor names provider %r but it is not configured; "
+                "pricing falls back to the default provider",
+                auth.name,
+            )
+        return entry
+    except Exception:  # noqa: BLE001 — broken spec must never break cost accounting
+        # Pricing reverts to the default provider here, the mispricing this
+        # resolver exists to remove, so make it visible: once per agent, since
+        # this runs on every usage event.
+        warn_key = f"lookup-error:{getattr(conv, 'agent_id', None)}"
+        if warn_key not in _WARNED_PRICING_LOOKUPS:
+            _WARNED_PRICING_LOOKUPS.add(warn_key)
+            _logger.warning("named-provider lookup failed for pricing", exc_info=True)
+        return None
 
 
 def _sane_relay_token_count(value: object) -> int:
@@ -2040,8 +2123,15 @@ def _accumulate_session_usage(
             provider_config = load_config()
             # Resolve harness from conversation (agent spec + overrides)
             harness = _resolve_harness(conv) if conv else None
+            # Resolve the actual provider the session was launched with so
+            # sessions on a non-default named provider are priced at their
+            # configured rate rather than the harness default's rate.
+            provider_entry = _resolve_session_provider_entry(conv)
             pricing = fetch_model_pricing_with_provider(
-                llm_model, provider_config=provider_config, harness=harness
+                llm_model,
+                provider_config=provider_config,
+                harness=harness,
+                provider_entry=provider_entry,
             )
             priced = pricing is not None
             if pricing is not None:
@@ -2354,8 +2444,14 @@ def _persist_native_cumulative_usage(
             provider_config = load_config()
             # Resolve harness from conversation (agent spec + overrides)
             harness = _resolve_harness(conv) if conv else None
+            # Resolve the actual named provider so non-default sessions are
+            # priced at their configured rate, not the harness default's rate.
+            provider_entry = _resolve_session_provider_entry(conv)
             pricing = fetch_model_pricing_with_provider(
-                model_name, provider_config=provider_config, harness=harness
+                model_name,
+                provider_config=provider_config,
+                harness=harness,
+                provider_entry=provider_entry,
             )
             if pricing is not None:
                 # SET (cumulative) — price the running token totals.
@@ -11614,7 +11710,7 @@ async def _evaluate_tool_call_policy(
 
 
 async def _evaluate_input_policy(
-    request: Request,
+    request: Request | None,
     session_id: str,
     conv: Conversation,
     body: SessionEventInput,
@@ -11642,7 +11738,8 @@ async def _evaluate_input_policy(
 
     :param request: The active FastAPI request, threaded to
         :func:`_hold_native_ask_gate` for upstream-disconnect detection
-        while parked on an ASK.
+        while parked on an ASK. ``None`` when no one waits on this input,
+        such as a timer's wake: an ASK then denies, as no one can approve it.
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param conv: The session's :class:`Conversation` entity.
@@ -11742,6 +11839,11 @@ async def _evaluate_input_policy(
     # deciding policy's writes only on accept (POLICIES.md §7.2). Accept ->
     # ALLOW (fall through to forward the message); decline / timeout ->
     # DENY (fail-closed).
+    if request is None:
+        return {
+            "verdict": "deny",
+            "reason": f"{result.reason or 'Approval required'} (no one can approve this wake)",
+        }
     try:
         approved = await _hold_native_ask_gate(
             request,
@@ -12776,6 +12878,57 @@ def _created_session_title(body: SessionCreateInput, workflow: Workflow | None) 
     return workflow.name
 
 
+# Agent-spec keys with which a worker's own agent chooses its permission mode.
+_SPEC_PERMISSION_MODE_KEYS = ("permission_mode", "yolo", "exec_mode")
+
+
+def _spec_leaves_permission_mode_open(spec: AgentSpec | None) -> bool:
+    """
+    Whether *spec* was read and chooses no permission mode of its own, even its default.
+
+    A spec the server couldn't read might choose one, so it never counts as open.
+
+    :param spec: The new session's agent spec, or ``None`` when it couldn't be loaded.
+    :returns: ``True`` when the spec sets none of :data:`_SPEC_PERMISSION_MODE_KEYS`.
+    """
+    if spec is None:
+        return False
+    return not any(key in spec.executor.config for key in _SPEC_PERMISSION_MODE_KEYS)
+
+
+def _creator_permission_launch_options(
+    creator: Conversation,
+    body: SessionCreateInput,
+    *,
+    harness: str | None,
+    conversation_store: ConversationStore,
+    agent_store: AgentStore,
+    agent_cache: AgentCache | None,
+) -> tuple[list[str] | None, dict[str, str]] | None:
+    """
+    Launch options that start a session *creator* asks for in *creator*'s permission mode.
+
+    :param creator: The server-authorized session that requested the create.
+    :param body: The create request, after its placement was resolved.
+    :param harness: The new session's harness, e.g. ``"codex-native"``.
+    :param conversation_store: Store used to find the creator's host.
+    :param agent_store: Store used to resolve the creator's harness.
+    :param agent_cache: Cache used to load the creator's spec.
+    :returns: Launch args and labels, or ``None`` for the new session's agent default.
+    """
+    from omnigent.server.scheduled.harness_settings import creator_session_launch_options
+
+    creator_host_id = routing_host_id(creator, conversation_store)
+    return creator_session_launch_options(
+        creator,
+        harness=harness,
+        creator_harness=_resolve_harness(
+            creator, agent_store=agent_store, agent_cache=agent_cache
+        ),
+        on_creator_host=creator_host_id is not None and body.host_id == creator_host_id,
+    )
+
+
 async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -12829,8 +12982,8 @@ async def _create_session_from_existing_agent(
         no project is filed there, so it sits beside the session that started it.
     :param created_by_scheduled_task_id: The automation whose run is that source, if
         any. A worker whose request carries no launch args runs in its permission mode.
-    :param created_by: That source session. A worker that picks no MCP services of
-        its own starts with the source's.
+    :param created_by: That source session. A worker that picks no MCP services or
+        permission mode of its own starts with the source's.
     :param launched_by_scheduled_task_id: The automation whose run's tree that source
         is in, if any, stamped as the worker's ``SCHEDULED_TASK_LAUNCH_LABEL_KEY``.
     :returns: The newly created session snapshot, its conversation row, and
@@ -13494,6 +13647,35 @@ async def _create_session_from_existing_agent(
                 f"invalid terminal_launch_args in agent spec: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+    # A sub-agent nothing above configured starts in its parent's current mode.
+    if needs_launch_args_from_spec and validated_launch_args is None:
+        validated_launch_args = await asyncio.to_thread(
+            _inherited_parent_permission_launch_args,
+            _parent_for_routing,
+            selected_harness,
+            own_spec,
+        )
+
+    # Inherit the creator's mode only when the request, automation and readable spec
+    # select none.
+    creator_permission_labels: dict[str, str] = {}
+    if (
+        needs_launch_args_from_spec
+        and validated_launch_args is None
+        and created_by is not None
+        and _spec_leaves_permission_mode_open(own_spec)
+    ):
+        creator_launch_options = await asyncio.to_thread(
+            _creator_permission_launch_options,
+            created_by,
+            body,
+            harness=selected_harness,
+            conversation_store=conversation_store,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+        )
+        if creator_launch_options is not None:
+            validated_launch_args, creator_permission_labels = creator_launch_options
 
     if reasoning_effort is None:
         effort_spec: AgentSpec | None = sub_spec if sub_spec is not None else own_spec
@@ -13519,6 +13701,7 @@ async def _create_session_from_existing_agent(
         initial_labels[SCHEDULED_TASK_LAUNCH_LABEL_KEY] = launched_by_scheduled_task_id
     initial_labels.update(registry_labels)
     initial_labels.update(automation_permission_labels)
+    initial_labels.update(creator_permission_labels)
     initial_labels.update(inherited_mcp_labels)
     if created_worktree_path is not None:
         from omnigent.server.routes._host_worktree import (
@@ -13882,6 +14065,7 @@ def _create_session_from_bundle(
     git_branch: str | None = None,
     created_by: str | None = None,
     agent_store: AgentStore | None = None,
+    parent: Conversation | None = None,
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
@@ -13912,6 +14096,8 @@ def _create_session_from_bundle(
         owner. ``None`` in single-user mode.
     :param agent_store: Store holding the uploader's agents. ``None``
         gives every upload its own row.
+    :param parent: The authorized parent session row of a child upload. A
+        child whose spec sets no launch args starts in its current mode.
     :returns: Response with the new session id.
     :raises OmnigentError: If bundle validation or agent insert
         integrity checks fail, or the parent session vanished
@@ -13947,6 +14133,10 @@ def _create_session_from_bundle(
                 f"invalid terminal_launch_args in bundled child spec: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+        if terminal_launch_args is None:
+            terminal_launch_args = _inherited_parent_permission_launch_args(
+                parent, _spec_harness(spec), spec
+            )
         metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
     elif metadata.terminal_launch_args is None:
         # Top-level bundle create (the ``omnigent run <dir>`` shape): honor the

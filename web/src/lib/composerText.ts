@@ -1,5 +1,6 @@
 import {
   isComposerTextarea,
+  type ComposerInsertOptions,
   type ComposerPasteEvent,
   type ComposerTextTarget,
 } from "@/components/composer/engine/composerInput";
@@ -9,21 +10,24 @@ import { createTextFieldMirror } from "@/lib/textFieldMirror";
  * Replace ``[start, end)`` (default: the selection) as typed input, so onChange
  * sees it. The editing commands also keep it on the undo stack; the fallback
  * covers environments without them. Returns false when the input is locked and
- * nothing changed.
+ * nothing changed. `separateUndo` keeps the edit its own undo step, apart from typing.
  */
 export function insertComposerText(
   target: ComposerTextTarget,
   text: string,
   start = target.selectionStart,
   end = target.selectionEnd,
+  options?: ComposerInsertOptions,
 ): boolean {
   if (!isComposerTextarea(target)) {
-    const inserted = target.insertText(text, start, end);
+    const inserted = target.insertText(text, start, end, options);
     if (inserted) target.revealCaret();
     return inserted;
   }
   const textarea = target;
   if (textarea.readOnly || textarea.disabled) return false;
+  // Chromium merges an insert into the typing around it unless the selection moved since.
+  if (options?.separateUndo) breakTypingGroup(textarea);
   textarea.setSelectionRange(start, end);
   const inserted =
     typeof document.execCommand === "function" &&
@@ -34,8 +38,18 @@ export function insertComposerText(
     textarea.setRangeText(text, start, end, "end");
     textarea.dispatchEvent(new Event("input", { bubbles: true }));
   }
+  if (options?.separateUndo) breakTypingGroup(textarea);
   revealCaretLine(textarea);
   return true;
+}
+
+/** Move the selection away and back, which ends the browser's open typing undo group. */
+function breakTypingGroup(textarea: HTMLTextAreaElement) {
+  const { selectionStart, selectionEnd, selectionDirection } = textarea;
+  // An empty field has nowhere to move the caret, so its typing group can't be broken here.
+  const elsewhere = selectionEnd === 0 ? Math.min(1, textarea.value.length) : 0;
+  textarea.setSelectionRange(elsewhere, elsewhere);
+  textarea.setSelectionRange(selectionStart, selectionEnd, selectionDirection ?? undefined);
 }
 
 // Typing scrolls the caret's line into view, but Chromium skips that after a

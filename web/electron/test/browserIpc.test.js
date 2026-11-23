@@ -673,6 +673,213 @@ it("does not mistake subframe loading for an initial main-frame navigation", () 
   assert.equal("pendingUrl" in result, false);
 });
 
+describe("browser IPC localhost previews from hosts reached over SSH", () => {
+  /** A registry that grants one host only, recording each step. */
+  function previewSetup({ request, recover } = {}) {
+    const ipcMain = makeIpcMain();
+    const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
+    const state = { allowed: false, allowedHost: "host-1", calls: [], loaded: [] };
+    const registry = {
+      ...createBrowserViewRegistry(),
+      checkAgentNavigation: async (_id, _url, context) => {
+        const allowed = state.allowed && context.sourceHostId === state.allowedHost;
+        state.calls.push(allowed ? "allowed" : "denied");
+        return allowed ? { ok: true } : { ok: false, error: "blocked", localhostBlocked: true };
+      },
+      openOrNavigate: (_id, url) => {
+        state.calls.push("navigate");
+        state.loaded.push(url);
+        return { ok: true, created: false };
+      },
+    };
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => registry,
+      getAgentContextForEvent: (_event, opts) => ({ sourceHostId: opts?.sourceHostId ?? null }),
+      ...(recover ? { recoverAgentNavigationForEvent: recover } : {}),
+      requestPreviewHostForEvent: async (...args) => {
+        state.calls.push("request");
+        return request(state, ...args);
+      },
+    });
+    const navigate = (opts, url = "http://127.0.0.1:8787/") =>
+      ipcMain.invoke(
+        "omnigent:browser-open-or-navigate",
+        {},
+        {
+          conversationId: "source",
+          url,
+          opts: { sessionHostProtocol: 1, sshPreviewProtocol: 1, ...opts },
+        },
+      );
+    return { state, navigate, registry, ipcMain };
+  }
+
+  it("asks about the source host, then requires fresh provenance before retrying", async () => {
+    const seen = [];
+    const { state, navigate } = previewSetup({
+      request: (current, _event, url, opts) => {
+        seen.push([url, opts.sourceHostId]);
+        current.allowed = true;
+        return true;
+      },
+    });
+    const result = await navigate({ force: true, sourceHostId: "host-1" });
+    assert.equal(result.ok, false);
+    assert.equal(result.retryWithFreshHost, true);
+    assert.equal(typeof result.navigationRetryToken, "string");
+    assert.deepEqual(seen, [["http://127.0.0.1:8787/", "host-1"]]);
+    assert.deepEqual(state.calls, ["denied", "request"]);
+    const retry = { sourceHostId: "host-1", navigationRetryToken: result.navigationRetryToken };
+    assert.equal((await navigate(retry)).ok, true);
+    assert.equal((await navigate(retry)).superseded, true, "a retry token is single-use");
+    assert.deepEqual(state.calls, ["denied", "request", "allowed", "navigate"]);
+  });
+
+  for (const action of [
+    "newer navigation",
+    "close",
+    "closeAll",
+    "go-back",
+    "go-forward",
+    "reload",
+  ]) {
+    it(`refuses a post-consent continuation after ${action}`, async () => {
+      const { state, navigate, registry, ipcMain } = previewSetup({
+        request: (current) => {
+          current.allowed = true;
+          return true;
+        },
+      });
+      const source = { agent: true, sourceHostId: "host-1" };
+      const first = await navigate(source);
+      assert.equal(first.retryWithFreshHost, true);
+      const newer = "https://example.com/newer";
+      if (action === "newer navigation") {
+        assert.equal((await navigate({ sourceHostId: "host-1" }, newer)).ok, true);
+      } else if (["go-back", "go-forward", "reload"].includes(action)) {
+        const webContents = makeWebContents({ canBack: true, canForward: true });
+        registry.get = () => ({ view: { webContents } });
+        const result = await ipcMain.invoke(
+          `omnigent:browser-${action}`,
+          {},
+          {
+            conversationId: "source",
+          },
+        );
+        assert.equal(result.ok, true);
+        assert.equal(webContents.calls.length, 1, "the toolbar operation must run");
+      } else {
+        registry[action]("source");
+      }
+      const calls = [...state.calls];
+      const obsolete = await navigate({
+        ...source,
+        navigationRetryToken: first.navigationRetryToken,
+      });
+      assert.equal(obsolete.ok, false);
+      assert.equal(obsolete.superseded, true);
+      assert.deepEqual(state.calls, calls, "an obsolete retry must not start a navigation");
+      assert.deepEqual(state.loaded, action === "newer navigation" ? [newer] : []);
+    });
+  }
+
+  it("asks after identity recovery declines an agent navigation", async () => {
+    const { state, navigate } = previewSetup({
+      recover: async () => {
+        state.calls.push("recover");
+        return false;
+      },
+      request: (current) => {
+        current.allowed = true;
+        return true;
+      },
+    });
+    const result = await navigate({ agent: true, sourceHostId: "host-1" });
+    assert.equal(result.ok, false);
+    assert.equal(result.retryWithFreshHost, true);
+    assert.deepEqual(state.calls, ["denied", "recover", "request"]);
+  });
+
+  it("doesn't ask when identity recovery already allowed the page", async () => {
+    const { state, navigate } = previewSetup({
+      recover: async () => {
+        state.calls.push("recover");
+        state.allowed = true;
+        return true;
+      },
+      request: () => assert.fail("must not ask"),
+    });
+    assert.equal((await navigate({ agent: true, sourceHostId: "host-1" })).ok, true);
+    assert.deepEqual(state.calls, ["denied", "recover", "allowed", "navigate"]);
+  });
+
+  it("keeps the denial when the host isn't allowed or the question fails", async () => {
+    const requests = [
+      () => false,
+      () => {
+        throw new Error("no window");
+      },
+    ];
+    await Promise.all(
+      requests.map(async (request) => {
+        const { state, navigate } = previewSetup({ request });
+        const result = await navigate({ sourceHostId: "host-1" });
+        assert.deepEqual(result, { ok: false, created: false, error: "blocked" });
+        assert.deepEqual(state.calls, ["denied", "request"]);
+      }),
+    );
+  });
+
+  it("doesn't ask about a page the policy allowed", async () => {
+    const { state, navigate } = previewSetup({ request: () => assert.fail("must not ask") });
+    state.allowed = true;
+    assert.equal((await navigate({ sourceHostId: "host-1" })).ok, true);
+    assert.deepEqual(state.calls, ["allowed", "navigate"]);
+  });
+
+  for (const protocol of [undefined, 0, 2]) {
+    it(`doesn't ask when the renderer's host protocol is ${protocol}`, async () => {
+      const { state, navigate } = previewSetup({ request: () => true });
+      assert.equal(
+        (await navigate({ sourceHostId: "host-1", sessionHostProtocol: protocol })).ok,
+        false,
+      );
+      assert.deepEqual(state.calls, ["denied"]);
+    });
+    it(`doesn't ask when the renderer's SSH preview protocol is ${protocol}`, async () => {
+      const { state, navigate } = previewSetup({ request: () => true });
+      assert.equal(
+        (await navigate({ sourceHostId: "host-1", sshPreviewProtocol: protocol })).ok,
+        false,
+      );
+      assert.deepEqual(state.calls, ["denied"]);
+    });
+  }
+
+  for (const failure of ["policy", "open", "revocation"]) {
+    it(`doesn't ask after an unrelated ${failure} error`, async () => {
+      const { state, navigate, registry } = previewSetup({ request: () => true });
+      const denied = async () => ({ ok: false, error: "unrelated failure" });
+      if (failure === "policy") registry.checkAgentNavigation = denied;
+      if (failure === "open") {
+        state.allowed = true;
+        registry.openOrNavigate = denied;
+      }
+      if (failure === "revocation") {
+        registry.get = () => ({});
+        registry.needsAgentViewRevocation = () => true;
+        registry.revokeAgentView = denied;
+      }
+      const result = await navigate({ sourceHostId: "host-1" });
+      assert.equal(result.ok, false);
+      assert.equal(result.error, "unrelated failure");
+      assert.equal(state.calls.includes("request"), false);
+    });
+  }
+});
+
 describe("browserIpc — set active", () => {
   it("focuses the attached page only when asked", () => {
     const { ipcMain, event, wc } = setup();
@@ -2037,10 +2244,15 @@ it("applies navigation policy even when renderer options claim user intent", asy
 });
 
 describe("browser IPC sessions on this machine", () => {
-  function localNavigation({ hostId = "local", live = true, protocol = 1 } = {}) {
+  function localNavigation({
+    hostId = "local",
+    live = true,
+    protocol = 1,
+    sshPreview = false,
+  } = {}) {
     const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
     const { createBrowserViewBoundsController } = require("../src/browserViewBounds");
-    const { isHostThisMachine } = require("../src/hostIdentity");
+    const { isHostThisMachine, hasHostLocalAccess } = require("../src/hostIdentity");
     let liveEnrollment = live;
     const webContents = makeWebContents();
     webContents.loadURL = () => {};
@@ -2051,7 +2263,7 @@ describe("browser IPC sessions on this machine", () => {
       sendToRenderer: () => {},
       attachToHost: () => {},
       detachFromHost: () => {},
-      allowsLocalhost: (context) => context?.hostIsThisMachine === true,
+      allowsLocalhost: hasHostLocalAccess,
       resolveHost: async (hostname) =>
         hostname === "alias.example" ? ["127.0.0.1"] : ["93.184.215.14"],
     });
@@ -2063,6 +2275,7 @@ describe("browser IPC sessions on this machine", () => {
       getAgentContextForEvent: (_event, opts) => ({
         sourceHostId: opts?.sourceHostId,
         hostIsThisMachine:
+          !sshPreview &&
           opts?.sessionHostProtocol === 1 &&
           isHostThisMachine(
             { hostId: opts?.sourceHostId, serverUrl: "https://server.example" },
@@ -2071,9 +2284,22 @@ describe("browser IPC sessions on this machine", () => {
               liveDaemonRecordFor: () => (liveEnrollment ? { host_id: "local" } : null),
             },
           ),
+        hostIsSshPreview:
+          sshPreview &&
+          liveEnrollment &&
+          opts?.sessionHostProtocol === 1 &&
+          opts?.sshPreviewProtocol === 1 &&
+          opts?.sourceHostId === "local",
       }),
     });
-    const navigate = (url, opts = { sourceHostId: hostId, sessionHostProtocol: protocol }) =>
+    const navigate = (
+      url,
+      opts = {
+        sourceHostId: hostId,
+        sessionHostProtocol: protocol,
+        ...(sshPreview ? { sshPreviewProtocol: 1 } : {}),
+      },
+    ) =>
       ipcMain.invoke(
         "omnigent:browser-open-or-navigate",
         {},
@@ -2090,84 +2316,175 @@ describe("browser IPC sessions on this machine", () => {
     };
   }
 
-  for (const transport of ["screenshot", "snapshot", "click", "type", "legacy"]) {
-    for (const scenario of [
-      {
-        name: "same host",
-        opts: { sessionHostProtocol: 1, sourceHostId: "local" },
-        allowed: true,
-        blank: false,
-      },
-      {
-        name: "different host",
-        opts: { sessionHostProtocol: 1, sourceHostId: "remote" },
-        allowed: false,
-        blank: true,
-      },
-      {
-        name: "unknown host",
-        opts: { sessionHostProtocol: 1, sourceHostId: null },
-        allowed: false,
-        blank: false,
-      },
-      { name: "no marker", opts: { sourceHostId: "local" }, allowed: false, blank: false },
-    ]) {
-      it(`${transport}: ${scenario.name} ${scenario.allowed ? "can" : "cannot"} read a privileged view`, async () => {
-        const { navigate, ipcMain, registry, webContents } = localNavigation();
-        // Click is trusted input; type without real input stays a page script.
-        const trustedInput = transport === "click";
-        if (trustedInput) withFakeDebugger(webContents);
-        await navigate("http://127.0.0.1:5173");
-        const entry = registry.get("conv");
-        const loads = [];
-        let reads = 0;
-        webContents.loadURL = async (url) => {
-          loads.push(url);
-        };
-        webContents.capturePage = async () => {
-          reads++;
-          return { toPNG: () => Buffer.from("fixture") };
-        };
-        const pageScript = webContents.executeJavaScript;
-        webContents.executeJavaScript = async (js) => {
-          reads++;
-          return trustedInput ? pageScript(js) : "{}";
-        };
-        const channel =
-          transport === "screenshot"
-            ? "omnigent:browser-screenshot"
-            : transport === "legacy"
-              ? "omnigent:browser-execute"
-              : "omnigent:browser-perform-action";
-        const result = await ipcMain.invoke(
-          channel,
-          {},
-          {
-            conversationId: "conv",
-            opts: scenario.opts,
-            action: transport === "screenshot" || transport === "legacy" ? undefined : transport,
-            params:
-              transport === "click"
-                ? { ref: 1 }
-                : transport === "type"
-                  ? { ref: 1, text: "hello" }
+  for (const sshPreview of [false, true]) {
+    for (const transport of ["screenshot", "snapshot", "click", "type", "legacy"]) {
+      for (const scenario of [
+        {
+          name: "same host",
+          opts: { sessionHostProtocol: 1, sourceHostId: "local" },
+          allowed: true,
+          blank: false,
+        },
+        {
+          name: "different host",
+          opts: { sessionHostProtocol: 1, sourceHostId: "remote" },
+          allowed: false,
+          blank: true,
+        },
+        {
+          name: "unknown host",
+          opts: { sessionHostProtocol: 1, sourceHostId: null },
+          allowed: false,
+          blank: false,
+        },
+        { name: "no marker", opts: { sourceHostId: "local" }, allowed: false, blank: false },
+      ]) {
+        it(`${sshPreview ? "SSH" : "local"} ${transport}: ${scenario.name} ${scenario.allowed ? "can" : "cannot"} read a privileged view`, async () => {
+          const { navigate, ipcMain, registry, webContents } = localNavigation({ sshPreview });
+          // Click is trusted input; type without real input stays a page script.
+          const trustedInput = transport === "click";
+          if (trustedInput) withFakeDebugger(webContents);
+          await navigate("http://127.0.0.1:5173");
+          const entry = registry.get("conv");
+          const loads = [];
+          let reads = 0;
+          webContents.loadURL = async (url) => {
+            loads.push(url);
+          };
+          webContents.capturePage = async () => {
+            reads++;
+            return { toPNG: () => Buffer.from("fixture") };
+          };
+          const pageScript = webContents.executeJavaScript;
+          webContents.executeJavaScript = async (js) => {
+            reads++;
+            return trustedInput ? pageScript(js) : "{}";
+          };
+          const channel =
+            transport === "screenshot"
+              ? "omnigent:browser-screenshot"
+              : transport === "legacy"
+                ? "omnigent:browser-execute"
+                : "omnigent:browser-perform-action";
+          const result = await ipcMain.invoke(
+            channel,
+            {},
+            {
+              conversationId: "conv",
+              opts: sshPreview ? { ...scenario.opts, sshPreviewProtocol: 1 } : scenario.opts,
+              action: transport === "screenshot" || transport === "legacy" ? undefined : transport,
+              params:
+                transport === "click"
+                  ? { ref: 1 }
+                  : transport === "type"
+                    ? { ref: 1, text: "hello" }
+                    : undefined,
+              js:
+                transport === "legacy"
+                  ? require("./fixtures/browserActions-v0.18.json").requests[0].script
                   : undefined,
-            js:
-              transport === "legacy"
-                ? require("./fixtures/browserActions-v0.18.json").requests[0].script
-                : undefined,
-          },
-        );
-        assert.equal(result.ok, scenario.allowed);
-        // Trusted input locates its target with page scripts first.
-        if (trustedInput) assert.equal(reads > 0, scenario.allowed);
-        else assert.equal(reads, scenario.allowed ? 1 : 0);
-        assert.equal(registry.get("conv"), entry, "a denial keeps the view");
-        assert.deepEqual(loads, scenario.blank ? ["about:blank"] : []);
-        assert.equal(entry.agentContext?.hostIsThisMachine === true, !scenario.blank);
-      });
+            },
+          );
+          assert.equal(result.ok, scenario.allowed);
+          // Trusted input locates its target with page scripts first.
+          if (trustedInput) assert.equal(reads > 0, scenario.allowed);
+          else assert.equal(reads, scenario.allowed ? 1 : 0);
+          assert.equal(registry.get("conv"), entry, "a denial keeps the view");
+          assert.deepEqual(loads, scenario.blank ? ["about:blank"] : []);
+          assert.equal(
+            entry.agentContext?.hostIsThisMachine === true,
+            !sshPreview && !scenario.blank,
+          );
+          assert.equal(
+            entry.agentContext?.hostIsSshPreview === true,
+            sshPreview && !scenario.blank,
+          );
+        });
+      }
     }
   }
+
+  it("exposes SSH preview privilege without claiming the remote host is this machine", async () => {
+    const { navigate, ipcMain } = localNavigation({ sshPreview: true });
+    assert.deepEqual(await navigate("http://localhost:5173"), {
+      ok: true,
+      created: true,
+      hostIsThisMachine: false,
+      sshPreviewHost: true,
+      error: undefined,
+    });
+    const view = ipcMain.invoke("omnigent:browser-has-view", {}, { conversationId: "conv" });
+    assert.equal(view.hostIsThisMachine, false);
+    assert.equal(view.sshPreviewHost, true);
+  });
+
+  for (const protocol of [1, undefined]) {
+    it(`preserves an approved SSH host across public navigation only with preview protocol ${protocol}`, async () => {
+      const { navigate, registry, webContents } = localNavigation({ sshPreview: true });
+      assert.equal((await navigate("http://localhost:5173")).ok, true);
+      const entry = registry.get("conv");
+      const loads = [];
+      webContents.loadURL = async (url) => loads.push(url);
+      assert.equal(
+        (
+          await navigate("https://example.com/login", {
+            sourceHostId: "local",
+            sessionHostProtocol: 1,
+            sshPreviewProtocol: protocol,
+          })
+        ).ok,
+        true,
+      );
+      const redirect = {
+        prevented: false,
+        preventDefault() {
+          this.prevented = true;
+        },
+      };
+      for (const listener of webContents.listeners.get("will-redirect")) {
+        listener(redirect, "http://localhost:5173/callback");
+      }
+      assert.equal(redirect.prevented, protocol !== 1);
+      assert.equal(registry.get("conv"), entry);
+      assert.equal(entry.agentContext.hostIsSshPreview, protocol === 1);
+      assert.deepEqual(
+        loads,
+        protocol === 1
+          ? ["https://example.com/login"]
+          : ["about:blank", "https://example.com/login"],
+      );
+    });
+  }
+
+  it("revokes an SSH preview before a different host navigates the same tab", async () => {
+    const { navigate, ipcMain, registry, webContents } = localNavigation({ sshPreview: true });
+    await navigate("http://localhost:5173");
+    const blank = Promise.withResolvers();
+    webContents.loadURL = (url) => (url === "about:blank" ? blank.promise : Promise.resolve());
+    const pending = navigate("https://example.com", {
+      sourceHostId: "remote",
+      sessionHostProtocol: 1,
+    });
+    assert.equal(registry.get("conv").agentContext.revoked, true);
+    assert.equal((await readView(ipcMain, "screenshot")).ok, false);
+    blank.resolve();
+    assert.equal((await pending).ok, true);
+    assert.equal(registry.get("conv").agentContext.hostIsSshPreview, false);
+  });
+
+  it("revokes an SSH preview on reads after its destination grant stops matching", async () => {
+    const { navigate, ipcMain, registry, webContents, setLive } = localNavigation({
+      sshPreview: true,
+    });
+    await navigate("http://localhost:5173");
+    assert.equal((await readView(ipcMain, "screenshot")).ok, true);
+    const loads = [];
+    webContents.loadURL = async (url) => loads.push(url);
+    setLive(false);
+    assert.equal((await readView(ipcMain, "screenshot")).ok, false);
+    assert.deepEqual(loads, ["about:blank"]);
+    assert.equal(registry.get("conv").agentContext, null);
+  });
 
   it("refuses a tab check from a different host without blanking its page", async () => {
     const { navigate, ipcMain, registry, webContents } = localNavigation();
@@ -2200,7 +2517,7 @@ describe("browser IPC sessions on this machine", () => {
         conversationId: "conv",
         action,
         params: { ref: 1, text: "hello" },
-        opts: { sessionHostProtocol: 1, sourceHostId },
+        opts: { sessionHostProtocol: 1, sshPreviewProtocol: 1, sourceHostId },
       },
     );
   }

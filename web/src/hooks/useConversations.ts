@@ -41,6 +41,7 @@ import {
   markRecentlyCreated,
   mergeItemsIntoPages,
   overlayArchivedIntoCaches,
+  settleUpdatedAtIntoCaches,
   overlayTitleIntoCaches,
   PIN_WRITE_MUTATION_KEY,
   PINNED_LABEL_KEY,
@@ -1181,6 +1182,7 @@ export function useArchiveConversation() {
       queryClient.setQueryData<Session>(["session", updated.id], (old) =>
         old ? { ...old, archived } : old,
       );
+      settleUpdatedAtIntoCaches(queryClient, updated.id, updated.updated_at);
       settleOpenSessionRow(queryClient, updated.id, { archived });
       if (archived && context?.marked !== undefined) {
         expireSessionsArchiving(context.marked, [updated.id]);

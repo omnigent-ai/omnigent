@@ -39,6 +39,7 @@ import {
   changesOverview,
   fileTabFileChosen,
   fileViewDiffRequested,
+  allPullRequestsChosen,
   pullRequestChosen,
   pullRequestSectionChosen,
   shownPullRequestPlace,
@@ -51,6 +52,7 @@ import {
 } from "./placeViewActions";
 import { FILES_TREE_WIDTH } from "./filesTreeWidth";
 import { FilesPageTree } from "./FilesPageTree";
+import { FilesTreeOptionsMenu, useFilesTreeOptionCommands } from "./filesTreeOptions";
 import { type FilesPageLeaveGuard, FilesPageViewer } from "./FilesPageViewer";
 import {
   HIDE_FILES_TREE_LABEL,
@@ -187,13 +189,18 @@ function FilesPlaceView({
     enabled: commandsActive,
   });
   useFilesTreeShowRequests(active ? conversationId : undefined, tree.show);
-  // Every Files place, the Files tab or a file tab, shows the same tree beside its file.
+  useFilesTreeOptionCommands(files, commandsActive);
+  // Every Files place, the Files tab or a file tab, shows the same tree beside its file; a
+  // docked tree's options sit beside its toggle.
   const treeToggle = (
-    <WorkspaceSidebarToggle
-      state={tree}
-      showLabel={SHOW_FILES_TREE_LABEL}
-      hideLabel={HIDE_FILES_TREE_LABEL}
-    />
+    <>
+      <WorkspaceSidebarToggle
+        state={tree}
+        showLabel={SHOW_FILES_TREE_LABEL}
+        hideLabel={HIDE_FILES_TREE_LABEL}
+      />
+      {tree.wide && tree.shown ? <FilesTreeOptionsMenu {...files} /> : null}
+    </>
   );
   return (
     <WorkspaceSidebarLayout
@@ -207,6 +214,7 @@ function FilesPlaceView({
           activePath={place.path}
           sort={files.sort}
           showHidden={files.showHidden}
+          onShowHidden={() => files.onShowHiddenChange(true)}
           onFileSelect={(path, options) => {
             tree.dismissPopover();
             // A file tab's tree steps that tab; the Files tab's opens there as before.
@@ -373,6 +381,7 @@ function PullRequestPlaceView({
           section={place.view}
           active={active}
           onSectionChange={(section) => run(pullRequestSectionChosen(place, section))}
+          onShowAllPullRequests={() => run(allPullRequestsChosen())}
         />
       )}
     </div>

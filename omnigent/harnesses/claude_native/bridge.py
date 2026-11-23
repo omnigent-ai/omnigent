@@ -2665,7 +2665,9 @@ def build_hook_settings(
     server (``enableAllProjectMcpServers``): the "New MCP server found"
     dialog is another unhookable startup gate that a host-spawned terminal
     can never answer. It also turns off auto mode's post-turn
-    environment-setup offer (``skillOverrides``) for the same reason.
+    environment-setup offer (``skillOverrides``) for the same reason, and keeps
+    automatic compaction on (``autoCompactEnabled``) so a full context compacts
+    instead of refusing every turn until someone types ``/compact``.
 
     :param bridge_dir: Bridge directory path.
     :param python_executable: Python executable to run, e.g.
@@ -3011,6 +3013,10 @@ def build_hook_settings(
     # only the terminal can answer it, so web-UI messages stall behind it. This
     # Claude Code switch turns off that offer and its /auto-mode-setup wizard.
     settings["skillOverrides"] = {"auto-mode-setup": "off"}
+    # With auto-compaction off, a full context refuses every turn until someone
+    # types /compact, which an unattended run never does. This outranks the
+    # user's setting; DISABLE_AUTO_COMPACT and managed policy still win.
+    settings["autoCompactEnabled"] = True
     if launch_effort and launch_effort in CLAUDE_EFFORTS:
         settings["effortLevel"] = launch_effort
     if api_key_helper:
@@ -3292,6 +3298,29 @@ def _args_request_bypass_permissions(args: tuple[str, ...]) -> bool:
     return "--dangerously-skip-permissions" in args or (
         _arg_value(args, "--permission-mode") == "bypassPermissions"
     )
+
+
+_CLAUDE_LAUNCH_PERMISSION_MODES = frozenset(
+    {"default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}
+)
+
+
+def claude_launch_permission_mode(args: Sequence[str] | None) -> str | None:
+    """Return the known permission mode Claude Code launches in with ``args``.
+
+    The bypass flag wins over any ``--permission-mode``; otherwise the last one does.
+    Everything from an ``--`` option terminator on is positional text.
+
+    :param args: Claude CLI args, e.g. ``["--permission-mode=plan"]``.
+    :returns: The mode, e.g. ``"plan"``, or ``None`` when absent or unknown.
+    """
+    launch_args = tuple(args or ())
+    if "--" in launch_args:
+        launch_args = launch_args[: launch_args.index("--")]
+    if _args_request_bypass_permissions(launch_args):
+        return "bypassPermissions"
+    candidate = _arg_value(launch_args, "--permission-mode")
+    return candidate if candidate in _CLAUDE_LAUNCH_PERMISSION_MODES else None
 
 
 def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:

@@ -33,6 +33,20 @@ function dismiss() {
   floatingComposerBridge()?.dismiss();
 }
 
+// Ready is said once per document: the composer stays mounted across launches.
+let readySent = false;
+
+/** Tells the shell the composer has painted, so an open shows it without a loading state. */
+function sayReady() {
+  if (readySent) return;
+  readySent = true;
+  const send = () => floatingComposerBridge()?.ready?.();
+  // A hidden window gets no frames, and nothing paints until it shows; its content is laid out.
+  if (document.visibilityState === "hidden") send();
+  // A frame callback runs before that frame paints; the next one runs after it has.
+  else requestAnimationFrame(() => requestAnimationFrame(send));
+}
+
 export function FloatingComposerPage() {
   // A delivered launch starts a fresh composer; a failed one keeps the prompt where it was.
   const [generation, setGeneration] = useState(0);
@@ -64,6 +78,9 @@ export function FloatingComposerPage() {
     }),
     [],
   );
+
+  // New Chat renders its composer synchronously, so it's on screen by the time this runs.
+  useEffect(sayReady, []);
 
   // Escape hides the panel, after any open picker or menu has taken its own Escape.
   useEffect(() => {

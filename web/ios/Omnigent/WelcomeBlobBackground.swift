@@ -6,6 +6,8 @@ import SwiftUI
 struct WelcomeBlobBackground: View {
   @Environment(\.colorScheme) private var colorScheme
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  /// Height of the top region the blobs orbit in; nil centers them in the whole view.
+  var orbitRegionHeight: CGFloat?
 
   var body: some View {
     // The blobs drift slowly, so 30fps looks identical and halves the redraw cost.
@@ -13,7 +15,8 @@ struct WelcomeBlobBackground: View {
       let time = reduceMotion ? 0 : timeline.date.timeIntervalSinceReferenceDate
       orbit(at: time)
     }
-    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .frame(height: orbitRegionHeight)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     .background(colorScheme == .dark ? Self.darkBase : Self.lightBase)
     .overlay(colorScheme == .dark ? Color.black.opacity(0.2) : Color.white.opacity(0.08))
     .overlay(grid)

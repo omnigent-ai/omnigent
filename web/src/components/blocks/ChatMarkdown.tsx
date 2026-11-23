@@ -686,6 +686,8 @@ interface SessionMentionPillProps {
   id: string;
   isSubagent: boolean;
   children: React.ReactNode;
+  /** Extra pill classes, e.g. ``"min-w-0"`` so a long title truncates in a flex row. */
+  className?: string;
 }
 
 /** A session pill (e.g. ``@Fix CI``) that opens session ``id`` without reloading the page. */
@@ -700,12 +702,17 @@ export function SessionMentionPill(props: SessionMentionPillProps) {
 
 // The routing seam's Link rebases the href under an embed's mount, routes plain
 // clicks in-app and leaves modified clicks (new tab) to the browser.
-function RoutedSessionMentionPill({ id, isSubagent, children }: SessionMentionPillProps) {
+function RoutedSessionMentionPill({
+  id,
+  isSubagent,
+  children,
+  className,
+}: SessionMentionPillProps) {
   return (
     <Link
       to={`/c/${encodeURIComponent(id)}`}
       data-testid="mention-pill"
-      className={MENTION_PILL_CLASS}
+      className={cn(MENTION_PILL_CLASS, className)}
       title={isSubagent ? "Subagent" : "Session"}
       onClick={(event) => event.stopPropagation()}
     >
@@ -714,12 +721,12 @@ function RoutedSessionMentionPill({ id, isSubagent, children }: SessionMentionPi
   );
 }
 
-function SessionPillLink({ id, isSubagent, children }: SessionMentionPillProps) {
+function SessionPillLink({ id, isSubagent, children, className }: SessionMentionPillProps) {
   return (
     <a
       data-testid="mention-pill"
       href={withBasePath(`/c/${encodeURIComponent(id)}`)}
-      className={MENTION_PILL_CLASS}
+      className={cn(MENTION_PILL_CLASS, className)}
       title={isSubagent ? "Subagent" : "Session"}
       onClick={(event) => event.stopPropagation()}
     >

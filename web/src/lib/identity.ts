@@ -28,8 +28,10 @@ import { clientRoutingKey, SLICE_KEY_HEADER } from "./routingKey";
 import {
   clearHostKeyless,
   getSessionHost,
+  getSessionHostRouting,
   isHostKeyless,
   markHostKeyless,
+  setSessionHost,
   updatesRoutingKey,
 } from "@/lib/sessionHost";
 
@@ -623,23 +625,35 @@ export function getCurrentAuthorId(): string | null {
  * redirects to the login page.
  */
 /**
- * Whether a response is the server's wrong-replica signal
- * ({@link WRONG_REPLICA_CODE}). Gated on 400 first so the body is only read
- * on the rare failure; reads a CLONE so the original response body stays intact
- * for the caller when this returns false.
+ * The `error` object of the server's wrong-replica signal
+ * ({@link WRONG_REPLICA_CODE}), or `null` for any other response. Gated on 400
+ * first so the body is only read on the rare failure; reads a CLONE so the
+ * original response body stays intact for the caller.
  *
  * @param res The response to inspect.
- * @returns `true` when the JSON body carries `error.code === "wrong_replica"`.
+ * @returns The JSON body's `error` when it carries `code === "wrong_replica"`.
  */
-async function _isWrongReplica(res: Response): Promise<boolean> {
-  if (res.status !== 400) return false;
+async function _wrongReplicaError(res: Response): Promise<{ slice_key?: unknown } | null> {
+  if (res.status !== 400) return null;
   try {
-    const body = (await res.clone().json()) as { error?: { code?: string } };
-    return body.error?.code === WRONG_REPLICA_CODE;
+    const body = (await res.clone().json()) as {
+      error?: { code?: string; slice_key?: unknown };
+    };
+    return body.error?.code === WRONG_REPLICA_CODE ? body.error : null;
   } catch {
     // Non-JSON / empty body — not the structured wrong_replica error.
-    return false;
+    return null;
   }
+}
+
+async function _isWrongReplica(res: Response): Promise<boolean> {
+  return (await _wrongReplicaError(res)) !== null;
+}
+
+/** Return the nonempty host key named by a 400 wrong_replica response. */
+async function _wrongReplicaResendKey(res: Response): Promise<string | null> {
+  const sliceKey = (await _wrongReplicaError(res))?.slice_key;
+  return typeof sliceKey === "string" && sliceKey !== "" ? sliceKey : null;
 }
 
 export async function authenticatedFetch(
@@ -704,6 +718,8 @@ export async function authenticatedFetch(
       headers.set(SLICE_KEY_HEADER, clientRoutingKey());
     }
   }
+  const recoverySessionId = sessionIdForRecovery(url, init?.method);
+  const sentRouting = recoverySessionId === null ? null : getSessionHostRouting(recoverySessionId);
   // Bypass the browser HTTP cache for all API calls. Session
   // endpoints (GET /v1/sessions/{id}) carry volatile in-memory state
   // (pending_elicitations) that changes between fetches without any
@@ -719,6 +735,39 @@ export async function authenticatedFetch(
     },
     { unkeyed },
   );
+
+  // After a host switch this page can still key a session by its old host, which
+  // neither that key nor the default replica reaches; follow the host the refusal
+  // names. A managed launch stays keyed by the new host it launches.
+  const resendKey =
+    isDatabricksWorkspace() &&
+    !callerKeyed &&
+    recoverySessionId !== null &&
+    !isManagedLaunchRequest(url, init?.body)
+      ? await _wrongReplicaResendKey(res)
+      : null;
+  const sentKey = unkeyed ? null : headers.get(SLICE_KEY_HEADER);
+  if (recoverySessionId !== null && resendKey !== null && resendKey !== sentKey) {
+    init?.signal?.throwIfAborted();
+    // Correct only the original owner, preserving newer host and ancestry observations.
+    const currentRouting = getSessionHostRouting(recoverySessionId);
+    if (
+      sentRouting !== null &&
+      currentRouting.revision === sentRouting.revision &&
+      currentRouting.ownerId === sentRouting.ownerId
+    ) {
+      setSessionHost(sentRouting.ownerId ?? recoverySessionId, resendKey);
+    }
+    // A keyless miss shows the default replica doesn't hold this host; don't retry it.
+    if (sentKey === null) clearHostKeyless(resendKey);
+    const keyedHeaders = new Headers(headers);
+    keyedHeaders.set(SLICE_KEY_HEADER, resendKey);
+    res = await hostFetch(url, { ...init, headers: keyedHeaders, cache: "no-store" });
+    if (res.ok) clearHostKeyless(resendKey);
+    derivedHostId = resendKey;
+    stampedSliceKey = sentKey !== null;
+    unkeyed = false;
+  }
 
   // Wrong-replica fallback: a keyed request that reached the wrong replica comes
   // back 400 wrong_replica. Re-address ONCE with the key removed so it routes by
