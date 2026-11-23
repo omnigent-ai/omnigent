@@ -1,11 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { authenticatedFetch } from "@/lib/identity";
+import type * as IdentityModule from "@/lib/identity";
 import { journalEntry, journalPlan as plan } from "@/test/journalFixtures";
 import {
+  fetchJournalEntryPosition,
   currentPlan,
   failedUpstream,
   finishedTaskCount,
   isPlanComplete,
   isRestart,
+  latestStatusText,
   mergeJournalEntries,
   nativeTaskProgress,
   pausedLabel,
@@ -23,6 +27,11 @@ import {
   type NativeTask,
 } from "./sessionJournal";
 
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  authenticatedFetch: vi.fn(),
+}));
+
 const RUN = "0b6c5f0d8a7e4c3b9a1d2e3f4a5b6c7d";
 
 function status(position: number, step: string, value: string, fields: Partial<JournalEntry> = {}) {
@@ -33,6 +42,38 @@ function status(position: number, step: string, value: string, fields: Partial<J
     ...fields,
   });
 }
+
+describe("latestStatusText", () => {
+  it("is the words of the status written last, whichever step it is on", () => {
+    const entries = [
+      status(4, "explore", "done", { content: { status: "done", text: "Found it" } }),
+      status(9, "fix", "failed", { content: { status: "failed", text: "CI is down" } }),
+      status(6, "test", "done", { content: { status: "done", text: "Tests pass" } }),
+    ];
+    expect(latestStatusText(entries)).toEqual({ status: "failed", text: "CI is down" });
+  });
+
+  it("skips a status with no words, such as started, and anything that isn't a status", () => {
+    const entries = [
+      status(2, "explore", "done", { content: { status: "done", text: " Found it " } }),
+      status(5, "fix", "started", { content: { status: "started", text: null } }),
+      status(7, "test", "done", { content: { status: "done", text: "  " } }),
+      journalEntry(8, { kind: "note", content: { body: "A note" } }),
+      status(9, "ship", "done", { content: { status: "paused", text: "Unknown status" } }),
+    ];
+    expect(latestStatusText(entries)).toEqual({ status: "done", text: "Found it" });
+    expect(latestStatusText([entries[1]!, entries[3]!])).toBeNull();
+    expect(latestStatusText([])).toBeNull();
+  });
+
+  it("counts a started status that has words", () => {
+    const entries = [
+      status(2, "explore", "done", { content: { status: "done", text: "Found it" } }),
+      status(5, "fix", "started", { content: { status: "started", text: "Retrying the build" } }),
+    ];
+    expect(latestStatusText(entries)).toEqual({ status: "started", text: "Retrying the build" });
+  });
+});
 
 describe("mergeJournalEntries", () => {
   it("orders by position and keeps one copy of each entry", () => {
@@ -132,6 +173,28 @@ describe("stepProgress", () => {
     expect(restarted.map((item) => item.state)).toEqual(["ready", "running", "ready", "ready"]);
     expect(restarted[1].startedAt).toBe(nextRun.at(-1)!.created_at);
   });
+
+  it.each(["done", "failed"])(
+    "times an attempt from its first start, until the step is %s and starts again",
+    (ended) => {
+      const ci = planSteps(plan(0, ["ci"]));
+      const at = (position: number, value: string, seconds: number) =>
+        status(position, "ci", value, { created_at: 1_762_534_860 + seconds });
+      // The agent restates its start with each push, and starts again after waiting for the user.
+      const attempt = [
+        at(1, "started", 0),
+        at(2, "started", 4_534),
+        at(3, "needs_input", 6_000),
+        at(4, "started", 6_440),
+        at(5, "started", 12_914),
+      ];
+      expect(stepProgress(ci, attempt, true)[0].startedAt).toBe(attempt[0].created_at);
+      const finished = [...attempt, at(6, ended, 14_840)];
+      expect(stepProgress(ci, finished, false)[0].startedAt).toBe(attempt[0].created_at);
+      const again = [...finished, at(7, "started", 15_000), at(8, "started", 16_000)];
+      expect(stepProgress(ci, again, true)[0].startedAt).toBe(again[6].created_at);
+    },
+  );
 
   it("marks a start after an earlier one as a restart", () => {
     const first = status(1, "a", "started");
@@ -564,5 +627,29 @@ describe("taskPreviewText", () => {
       false,
     );
     expect(taskPreviewText(heldUp)).toBe("Failed: fix");
+  });
+});
+
+describe("fetchJournalEntryPosition", () => {
+  const respond = (body: unknown, code = 200) =>
+    vi
+      .mocked(authenticatedFetch)
+      .mockResolvedValueOnce(new Response(JSON.stringify(body), { status: code }));
+
+  it("places an entry just after the one before it, or first", async () => {
+    respond({ object: "list", data: [{ position: 4 }] });
+    await expect(fetchJournalEntryPosition("session", "entry")).resolves.toBe(5);
+    expect(vi.mocked(authenticatedFetch).mock.calls.at(-1)?.[0]).toBe(
+      "/v1/sessions/session/journal?order=desc&after=entry&limit=1",
+    );
+    respond({ object: "list", data: [] });
+    await expect(fetchJournalEntryPosition("session", "entry")).resolves.toBe(0);
+  });
+
+  it("reports an entry the journal doesn't hold, and rejects other failures", async () => {
+    respond({ error: { code: "stale_cursor", message: "stale_cursor: no such entry" } }, 400);
+    await expect(fetchJournalEntryPosition("session", "elsewhere")).resolves.toBeNull();
+    respond({ error: { code: "server_error", message: "Try again" } }, 500);
+    await expect(fetchJournalEntryPosition("session", "entry")).rejects.toThrow("500");
   });
 });

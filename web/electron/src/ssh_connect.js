@@ -898,6 +898,7 @@ function startSshConnect(serverUrl, destination, deps) {
 }
 
 module.exports = {
+  REMOTE_PATH,
   SIGN_IN_FIRST_PORT,
   SIGN_IN_LAST_PORT,
   SshConnectError,

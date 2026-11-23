@@ -97,7 +97,7 @@ def _app(
             stores.conversations.storage_location
         ),
         feature_flags=resolve_feature_flags(
-            {"OMNIGENT_FEATURES": "proactive_agent" if enabled else ""}
+            {"OMNIGENT_FEATURES": "" if enabled else "-user_inbox"}
         ),
         **extra,
     )
@@ -476,22 +476,35 @@ async def test_authenticated_owners_see_only_their_items(
         assert len((await c.get("/v1/inbox/items", headers=alice)).json()["data"]) == 1
 
 
+async def test_routes_serve_every_agent_while_the_proactive_agent_is_off(
+    client: httpx.AsyncClient,
+) -> None:
+    assert (await client.get("/v1/inbox/items")).status_code == 200
+    info = (await client.get("/v1/info")).json()
+    assert info["inbox_items_available"] is True
+    assert info["proactive_agent_available"] is False
+
+
 async def test_routes_are_off_without_the_feature(stores: SimpleNamespace, tmp_path: Path) -> None:
-    transport = httpx.ASGITransport(app=_app(stores, tmp_path, enabled=False))
+    app = _app(stores, tmp_path, enabled=False, proactive_agent=True)
+    transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         assert (await c.get("/v1/inbox/items")).status_code == 404
-        assert (await c.get("/v1/info")).json()["proactive_agent_available"] is False
+        info = (await c.get("/v1/info")).json()
+        assert info["inbox_items_available"] is False
+        # The proactive agent posts to the Inbox, so it is off with it.
+        assert info["proactive_agent_available"] is False
 
 
 async def test_a_per_request_gate_turns_the_routes_on_and_off(
     stores: SimpleNamespace, tmp_path: Path
 ) -> None:
     gate = {"on": False}
-    app = _app(stores, tmp_path, enabled=False, proactive_agent=lambda: gate["on"])
+    app = _app(stores, tmp_path, user_inbox=lambda: gate["on"])
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as c:
         assert (await c.get("/v1/inbox/items")).status_code == 404
         gate["on"] = True
         assert (await c.get("/v1/inbox/items")).status_code == 200
-        assert (await c.get("/v1/info")).json()["proactive_agent_available"] is True
+        assert (await c.get("/v1/info")).json()["inbox_items_available"] is True

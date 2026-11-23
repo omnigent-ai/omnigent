@@ -44,9 +44,21 @@ def test_default_workspace_tab_setting_opens_session_on_chosen_tab(
 @pytest.mark.parametrize(
     ("default_tab", "default_label", "tab_order"),
     [
-        ("changes", "Changes", ["Changes", "Files", "Pull Requests", "Agents", "Tasks"]),
-        ("github", "Pull Requests", ["Pull Requests", "Files", "Changes", "Agents", "Tasks"]),
-        ("subagents", "Agents", ["Agents", "Files", "Changes", "Pull Requests", "Tasks"]),
+        (
+            "changes",
+            "Changes",
+            ["Changes", "Files", "Pull Requests", "Agents", "Tasks", "Content search"],
+        ),
+        (
+            "github",
+            "Pull Requests",
+            ["Pull Requests", "Files", "Changes", "Agents", "Tasks", "Content search"],
+        ),
+        (
+            "subagents",
+            "Agents",
+            ["Agents", "Files", "Changes", "Pull Requests", "Tasks", "Content search"],
+        ),
     ],
 )
 def test_changed_default_applies_to_visited_session_after_reload(

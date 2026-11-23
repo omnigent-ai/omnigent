@@ -41,6 +41,8 @@ function readRatio(): number {
 }
 
 interface CanvasControls {
+  /** A conversation pane is open; the bare board keeps its header mounted, hidden. */
+  conversationOpen: boolean;
   compact: boolean;
   focused: boolean;
   closeConversation: () => void;
@@ -117,12 +119,13 @@ export function CanvasWorkspace({
   }, [navigate, searchParams]);
   const controls = useMemo(
     () => ({
+      conversationOpen: Boolean(conversationId),
       compact,
       focused,
       closeConversation,
       toggleFocus: () => (focused ? showCanvas() : setFocused(true)),
     }),
-    [compact, focused, closeConversation, showCanvas],
+    [conversationId, compact, focused, closeConversation, showCanvas],
   );
 
   const resize = (next: number) => {

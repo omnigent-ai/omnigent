@@ -7,32 +7,45 @@
 // row — no patch-in-place gymnastics are needed here.
 
 import {
+  keepPreviousData,
+  useInfiniteQuery,
   useMutation,
   useQueries,
   useQuery,
   useQueryClient,
+  type InfiniteData,
   type QueryClient,
 } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
 import { invalidateSessionGrants } from "@/hooks/usePermissions";
 import { LIST_ROW_QUERY_ROOTS } from "@/lib/sessionListCache";
 import {
+  cloneScheduledTask,
   createScheduledTask,
   deleteScheduledTask,
   getScheduledTask,
+  listScheduledTaskRunPullRequests,
   listScheduledTaskRuns,
   listScheduledTaskRunSteps,
   listScheduledTasks,
+  listSharedScheduledTasks,
   runScheduledTaskNow,
   updateScheduledTask,
   type CreateScheduledTaskInput,
   type ScheduledTask,
+  type SharedScheduledTasksPage,
   type ScheduledTaskRun,
+  type ScheduledTaskRunPullRequests,
+  type ScheduledTaskRunPullRequestsPage,
   type ScheduledTaskRunSteps,
   type UpdateScheduledTaskInput,
 } from "@/lib/scheduledTasksApi";
 
 /** Query key for the caller's scheduled-tasks list. */
 export const SCHEDULED_TASKS_KEY = ["scheduled-tasks"] as const;
+
+/** Query key for the automations other users shared with the caller. */
+export const SHARED_SCHEDULED_TASKS_KEY = ["scheduled-tasks-shared"] as const;
 
 /** Query key for one task's detail. */
 export function scheduledTaskKey(id: string): readonly unknown[] {
@@ -69,6 +82,31 @@ export function useScheduledTasks() {
 }
 
 /**
+ * The automations shared with the caller, a page at a time. Polls like
+ * {@link useScheduledTasks}, under the same page-scoped contract: mount it only
+ * on the Automations page. `enabled` is false where the server can't share them.
+ */
+export function useSharedScheduledTasks(enabled: boolean) {
+  return useInfiniteQuery({
+    queryKey: SHARED_SCHEDULED_TASKS_KEY,
+    queryFn: ({ pageParam }) => listSharedScheduledTasks(pageParam),
+    initialPageParam: null as string | null,
+    getNextPageParam: (page) => page.nextCursor,
+    enabled,
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+}
+
+/** A task from the loaded pages of {@link useSharedScheduledTasks}, if any. */
+function cachedSharedTask(queryClient: QueryClient, id: string): ScheduledTask | undefined {
+  return queryClient
+    .getQueryData<InfiniteData<SharedScheduledTasksPage>>(SHARED_SCHEDULED_TASKS_KEY)
+    ?.pages.flatMap((page) => page.tasks)
+    .find((task) => task.id === id);
+}
+
+/**
  * One task's detail (the `/tasks/:taskId` page). Seeds initial data from the
  * already-cached list so navigating from the list paints instantly, then
  * refetches to pick up any fields the list row didn't carry / staleness. The
@@ -83,9 +121,10 @@ export function useScheduledTask(id: string, enabled = true) {
     queryFn: () => getScheduledTask(id),
     enabled: enabled && id !== "",
     staleTime: 30_000,
-    // Paint from the list cache while the detail fetch is in flight.
+    // Paint from either list's cache while the detail fetch is in flight.
     placeholderData: () =>
-      queryClient.getQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY)?.find((t) => t.id === id),
+      queryClient.getQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY)?.find((t) => t.id === id) ??
+      cachedSharedTask(queryClient, id),
   });
 }
 
@@ -184,7 +223,8 @@ const RUN_STEPS_PAGE = 20;
  * refresh a page when a short continuation finishes between history polls.
  *
  * @param runs - The task's runs, most recent first, from `useScheduledTaskRuns`.
- * @param enabled - Whether the server supports workflow history.
+ * @param enabled - Whether to fetch: the server supports workflow history and the
+ *     caller owns the automation, since a viewer's history has no plans.
  */
 export function useScheduledTaskRunSteps(
   id: string,
@@ -223,6 +263,97 @@ export function useScheduledTaskRunSteps(
   });
 }
 
+/** How often a page whose PRs may still change, or whose last request failed, asks again. */
+const RUN_PULL_REQUESTS_REFETCH_MS = 60_000;
+/** A run's last PR report can reach the server this long after the run finished. */
+const RUN_PULL_REQUESTS_LATE_REPORT_MS = 5 * 60_000;
+
+/**
+ * Whether a page's PRs may still change without its runs changing: the server is
+ * refreshing one of its sessions, a PR is open or of unknown state, or a run
+ * finished recently enough that its last PR report may not have arrived.
+ */
+function runPullRequestsMayChange(
+  runs: readonly ScheduledTaskRun[],
+  page: ScheduledTaskRunPullRequestsPage | undefined,
+  nowMs: number,
+): boolean {
+  if (page?.refreshPending) return true;
+  if (
+    page?.runs.some((run) => run.pullRequests.some((pr) => pr.state == null || pr.state === "OPEN"))
+  )
+    return true;
+  return runs.some(
+    (run) =>
+      run.finishedAt != null && nowMs - run.finishedAt * 1000 < RUN_PULL_REQUESTS_LATE_REPORT_MS,
+  );
+}
+
+/**
+ * The PRs each of an automation's runs created or worked on, by run ID. Pages
+ * 20 runs at a time like {@link useScheduledTaskRunSteps}. The server refreshes
+ * sessions in the background and its PR reports don't change the runs, so a
+ * page asks again each minute while its PRs may still change.
+ *
+ * @param runs - The task's runs, most recent first, from `useScheduledTaskRuns`.
+ * @param enabled - Whether to fetch: the server lists run PRs and the caller owns
+ *     the automation, since a viewer gets none.
+ */
+export function useScheduledTaskRunPullRequests(
+  id: string,
+  runs: readonly ScheduledTaskRun[] | undefined,
+  enabled: boolean,
+): ReadonlyMap<string, ScheduledTaskRunPullRequests> {
+  const pages: ScheduledTaskRun[][] = [];
+  for (let start = 0; start < (runs?.length ?? 0); start += RUN_STEPS_PAGE) {
+    pages.push((runs ?? []).slice(start, start + RUN_STEPS_PAGE));
+  }
+  const newestUnsettled = hasUnsettledRun(pages[0]);
+  // A run's status or session activity can bring new PRs. The pages ask again
+  // without changing their keys, so a failed answer keeps the PRs already known.
+  const queryClient = useQueryClient();
+  const activity = (runs ?? [])
+    .map((run) => `${run.id}:${run.status}:${run.conversationUpdatedAt ?? ""}`)
+    .join(",");
+  const seenActivity = useRef(activity);
+  useEffect(() => {
+    if (seenActivity.current === activity) return;
+    seenActivity.current = activity;
+    if (enabled) {
+      void queryClient.invalidateQueries({ queryKey: ["scheduled-task-run-pull-requests", id] });
+    }
+  }, [activity, enabled, id, queryClient]);
+  return useQueries({
+    queries: pages.map((page, index) => {
+      const after = index === 0 ? undefined : pages[index - 1]!.at(-1)!.id;
+      return {
+        queryKey: [
+          "scheduled-task-run-pull-requests",
+          id,
+          after ?? null,
+          page.map((run) => run.id),
+        ],
+        queryFn: () => listScheduledTaskRunPullRequests(id, { limit: RUN_STEPS_PAGE, after }),
+        enabled,
+        staleTime: 30_000,
+        // A page that shifts when a run is added keeps its PRs until it answers.
+        placeholderData: keepPreviousData,
+        refetchInterval: (query: {
+          state: { data?: ScheduledTaskRunPullRequestsPage; status: string };
+        }) =>
+          index === 0 && newestUnsettled
+            ? RUNS_REFETCH_INTERVAL_MS
+            : query.state.status === "error" ||
+                runPullRequestsMayChange(page, query.state.data, Date.now())
+              ? RUN_PULL_REQUESTS_REFETCH_MS
+              : false,
+      };
+    }),
+    combine: (results) =>
+      new Map(results.flatMap((result) => result.data?.runs ?? []).map((prs) => [prs.runId, prs])),
+  });
+}
+
 /** Create a scheduled task, then refresh the list. */
 export function useCreateScheduledTask() {
   const queryClient = useQueryClient();
@@ -230,6 +361,18 @@ export function useCreateScheduledTask() {
     mutationFn: (input: CreateScheduledTaskInput) => createScheduledTask(input),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
+    },
+  });
+}
+
+/** Clone an automation, then refresh the list and any session lists its source copy joins. */
+export function useCloneScheduledTask() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (task: Pick<ScheduledTask, "id" | "hostId">) => cloneScheduledTask(task),
+    onSuccess: (clone) => {
+      void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
+      if (clone.sourceSessionId) refreshAutomationSourceSession(queryClient, clone.sourceSessionId);
     },
   });
 }

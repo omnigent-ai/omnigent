@@ -99,10 +99,14 @@ class SysScheduledTaskCreateTool(Tool):
                             ),
                         },
                         "timezone": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": (
                                 "IANA timezone the rule is evaluated in, e.g. "
-                                "'America/Los_Angeles'. Defaults to 'UTC'."
+                                "'America/Los_Angeles'. Use the zone the user names; "
+                                "otherwise omit it or send JSON null. Current runners "
+                                "request their recorded browser timezone, falling back "
+                                "to UTC when unavailable or unsupported. "
+                                "Do not infer a zone from the host or environment."
                             ),
                         },
                         "model_override": {
@@ -146,9 +150,11 @@ class SysScheduledTaskCreateTool(Tool):
                         "max_cost_usd": {
                             "type": "number",
                             "description": (
-                                "Optional per-firing cost budget in USD. When set, each "
-                                "fired session is capped at this spend — all models are "
-                                "blocked once the limit is reached. Omit for no cap."
+                                "Optional per-firing cost budget in USD. Omit unless the "
+                                "user explicitly requests a cost limit; do not invent a "
+                                "budget. Reaching the limit blocks further model requests "
+                                "and tool calls and may leave the task incomplete. "
+                                "Omit for no automation-specific cap."
                             ),
                         },
                         "session_mode": {
@@ -158,7 +164,9 @@ class SysScheduledTaskCreateTool(Tool):
                                 "Optional. 'new' (default) starts a new session for every "
                                 "run. 'continue' sends every run's prompt into one session, "
                                 "keeping its context: session_id when given, otherwise the "
-                                "session the first run creates."
+                                "session the first run creates. A prompt that runs a saved "
+                                "workflow ('/workflow Run the saved workflow ...') needs "
+                                "'new': every workflow run gets its own session."
                             ),
                         },
                         "session_id": {
@@ -240,7 +248,11 @@ class SysScheduledTaskListTool(Tool):
     @classmethod
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
-        return "List your scheduled tasks (recurring agent runs) with their schedules and state."
+        return (
+            "List your scheduled tasks (recurring agent runs) with their schedules and state. "
+            "A trigger automation, which watches a service such as Jira or Slack for new "
+            "items, is listed with rrule null when the server decides when it polls."
+        )
 
     def get_schema(self) -> dict[str, Any]:
         """:returns: The OpenAI-format tool schema."""
@@ -335,9 +347,14 @@ class SysScheduledTaskUpdateTool(Tool):
                             ),
                         },
                         "max_cost_usd": {
-                            "type": "number",
+                            "type": ["number", "null"],
                             "description": (
-                                "New per-firing cost budget in USD. Null clears the cap."
+                                "New per-firing cost budget in USD. Omit to preserve the "
+                                "current setting. Set or change a limit only when the user "
+                                "explicitly requests it; do not invent a budget. Send JSON "
+                                "null only when the user requests removing the cap. "
+                                "Reaching the limit blocks further model requests and tool "
+                                "calls and may leave the task incomplete."
                             ),
                         },
                         "session_mode": {
@@ -345,7 +362,8 @@ class SysScheduledTaskUpdateTool(Tool):
                             "enum": ["new", "continue"],
                             "description": (
                                 "'new' starts a new session for every run; 'continue' sends "
-                                "every run's prompt into one session."
+                                "every run's prompt into one session. A prompt that runs a "
+                                "saved workflow needs 'new'."
                             ),
                         },
                         "session_id": {
@@ -560,8 +578,8 @@ class SysReminderSetTool(Tool):
             "reminders; sys_scheduled_task_list does. Cancel one with "
             "sys_scheduled_task_delete and the returned "
             "scheduled_task_id. Works in top-level sessions you own on a "
-            "connected host, not in sub-agent sessions, side chats, managed sandboxes, or "
-            "sessions running in a permission mode that skips approval. For "
+            "connected host, not in sub-agent sessions, side chats or managed sandboxes, "
+            "and wakes the session in whatever permission mode it is in then. For "
             "a shorter wait inside an active turn, use sys_timer_set (when enabled)."
         )
 

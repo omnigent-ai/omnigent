@@ -7,7 +7,7 @@ import { authenticatedFetch } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type FeatureValues } from "@/lib/capabilities";
 
-import { useDeleteWorkflow, useSavedWorkflows } from "./useSavedWorkflows";
+import { useDeleteWorkflow, useSavedWorkflows, useSharedWorkflows } from "./useSavedWorkflows";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: vi.fn() }));
@@ -109,6 +109,159 @@ describe("useSavedWorkflows", () => {
       );
     },
   );
+});
+
+describe("workflows shared with the user", () => {
+  afterEach(cleanup);
+
+  const SHARING = {
+    ...FALLBACK_SERVER_INFO,
+    workflows: true,
+    workflow_sharing: true,
+    features: { workflows: true },
+  };
+  const own = { id: "own", name: "Deploy", description: "" };
+  const shared = {
+    id: "b".repeat(32),
+    name: "Release",
+    description: "",
+    viewer_role: "viewer" as const,
+    owner_display_name: "Alice",
+  };
+  const later = { ...shared, id: "c".repeat(32), name: "Rollback" };
+
+  function respond(url: string): Response {
+    if (url.startsWith("/v1/workflows/shared")) {
+      return Response.json(
+        url.includes("after=")
+          ? { data: [later], next_cursor: null }
+          : { data: [shared], next_cursor: shared.id },
+      );
+    }
+    return Response.json({ data: [own], has_more: false, last_id: own.id });
+  }
+
+  it("pages the shared list by its cursor", async () => {
+    vi.mocked(useServerInfo).mockReturnValue(SHARING);
+    vi.mocked(authenticatedFetch).mockImplementation(async (url) => respond(String(url)));
+    const { result } = renderWithClient(() => useSharedWorkflows());
+
+    await waitFor(() => expect(result.current.workflows).toEqual([shared]));
+    act(() => result.current.pagination.loadMore());
+    await waitFor(() => expect(result.current.workflows).toEqual([shared, later]));
+    expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => url)).toEqual([
+      "/v1/workflows/shared?limit=100",
+      `/v1/workflows/shared?limit=100&after=${shared.id}`,
+    ]);
+  });
+
+  it("lists them after the user's own only when asked, loading more of either on request", async () => {
+    vi.mocked(useServerInfo).mockReturnValue(SHARING);
+    vi.mocked(authenticatedFetch).mockImplementation(async (url) => respond(String(url)));
+    const { result } = renderWithClient(() => useSavedWorkflows({ includeShared: true }));
+
+    await waitFor(() => expect(result.current.workflows).toEqual([own, shared]));
+    expect(result.current.pagination.hasMore).toBe(true);
+    act(() => result.current.pagination.loadMore());
+    await waitFor(() => expect(result.current.workflows).toEqual([own, shared, later]));
+
+    cleanup();
+    vi.mocked(authenticatedFetch).mockClear();
+    const plain = renderWithClient(() => useSavedWorkflows());
+    await waitFor(() => expect(plain.result.current.workflows).toEqual([own]));
+    expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => url)).toEqual([
+      "/v1/workflows?limit=200",
+    ]);
+  });
+
+  it.each([
+    ["empty", Response.json({ data: [], next_cursor: null })],
+    ["failed", new Response(null, { status: 500, statusText: "Server Error" })],
+  ])(
+    "refreshes both lists when the mounted combined list is refreshed (shared list %s)",
+    async (_label, first) => {
+      vi.mocked(useServerInfo).mockReturnValue(SHARING);
+      let sharedCalls = 0;
+      vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
+        if (!String(url).startsWith("/v1/workflows/shared")) return respond(String(url));
+        sharedCalls += 1;
+        return sharedCalls === 1
+          ? first.clone()
+          : Response.json({ data: [shared], next_cursor: null });
+      });
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const { result } = renderWithClient(() => useSavedWorkflows({ includeShared: true }), client);
+      await waitFor(() => expect(sharedCalls).toBe(1));
+      await waitFor(() => expect(result.current.workflows).toEqual([own]));
+
+      // Shared since the list loaded, or the service recovered: a refresh shows it.
+      act(() => result.current.refresh());
+      await waitFor(() => expect(result.current.workflows).toEqual([own, shared]));
+      expect(sharedCalls).toBe(2);
+    },
+  );
+
+  it("resolves a reload with what both lists hold then, the user's own first", async () => {
+    vi.mocked(useServerInfo).mockReturnValue(SHARING);
+    let sharedCalls = 0;
+    vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
+      if (!String(url).startsWith("/v1/workflows/shared")) return respond(String(url));
+      sharedCalls += 1;
+      return sharedCalls === 1
+        ? Response.json({ data: [], next_cursor: null })
+        : respond(String(url));
+    });
+    const { result } = renderWithClient(() => useSavedWorkflows({ includeShared: true }));
+    await waitFor(() => expect(sharedCalls).toBe(1));
+    await waitFor(() => expect(result.current.workflows).toEqual([own]));
+
+    // Shared since the list loaded, with another page after it: the reload resolves with both.
+    let reloaded: unknown;
+    await act(async () => {
+      reloaded = await result.current.reload();
+    });
+    expect(reloaded).toEqual({ workflows: [own, shared], hasMore: true, failed: false });
+    expect(sharedCalls).toBe(2);
+  });
+
+  it("reports a reload that failed, with what the list held before", async () => {
+    vi.mocked(useServerInfo).mockReturnValue(SHARING);
+    let ownCalls = 0;
+    vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
+      if (String(url).startsWith("/v1/workflows/shared")) {
+        return Response.json({ data: [], next_cursor: null });
+      }
+      ownCalls += 1;
+      return ownCalls === 1
+        ? respond(String(url))
+        : new Response(null, { status: 503, statusText: "Service Unavailable" });
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderWithClient(() => useSavedWorkflows({ includeShared: true }), client);
+    await waitFor(() => expect(result.current.workflows).toEqual([own]));
+
+    let reloaded: unknown;
+    await act(async () => {
+      reloaded = await result.current.reload();
+    });
+    expect(reloaded).toEqual({ workflows: [own], hasMore: false, failed: true });
+    expect(ownCalls).toBe(2);
+  });
+
+  it.each([
+    ["a server that doesn't share workflows", { ...SHARING, workflow_sharing: false }],
+    ["a single-user server", { ...SHARING, single_user: true }],
+  ])("asks nothing of %s", async (_label, info) => {
+    vi.mocked(useServerInfo).mockReturnValue(info);
+    vi.mocked(authenticatedFetch).mockImplementation(async (url) => respond(String(url)));
+    const { result } = renderWithClient(() => useSavedWorkflows({ includeShared: true }));
+
+    await waitFor(() => expect(result.current.workflows).toEqual([own]));
+    expect(result.current.pagination.hasMore).toBe(false);
+    expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => url)).toEqual([
+      "/v1/workflows?limit=200",
+    ]);
+  });
 });
 
 describe("useDeleteWorkflow", () => {

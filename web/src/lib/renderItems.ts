@@ -37,7 +37,7 @@ import {
 } from "./routingDecision";
 import type { AssistantMessagePhase } from "./conversationItems";
 import { isSystemUserContent } from "./systemMessage";
-import { repeatsTaskMarker } from "./taskActivity";
+import { readTaskActivity, repeatsTaskMarker } from "./taskActivity";
 import type { AgyPermission, CodexPersistMode, FileEditRequest, RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
@@ -104,7 +104,17 @@ export type RenderItem =
       label: string;
       data: Record<string, unknown>;
     }
-  | { kind: "subagent_activity"; itemId: string | null; data: Record<string, unknown> }
+  | {
+      kind: "subagent_activity";
+      itemId: string | null;
+      data: Record<string, unknown>;
+      /**
+       * Seconds into the turn's work when this task marker landed, on the clock
+       * `Bubble.workedForS` spans, so the marker can split that duration. Only task
+       * markers carry it, and only when the turn's first work shares their clock.
+       */
+      turnElapsedS?: number;
+    }
   | {
       kind: "slash_command";
       itemId: string | null;
@@ -162,6 +172,7 @@ export type RenderItem =
         cwd: string | null;
         reason: string | null;
         execPolicyAmendment: string[] | null;
+        requestFingerprint?: string | null;
       } | null;
       allowAllEdits?: boolean;
       allowAutoMode?: boolean;
@@ -1178,6 +1189,7 @@ function walkBubbles(
         lifecycle,
         crossBubbleResults,
         liveTurnId !== null && groupResponseId === liveTurnId,
+        workBlocks,
       ),
       ...(workedForS !== undefined ? { workedForS } : {}),
       ...(lastActivityAtS !== undefined ? { lastActivityAtS } : {}),
@@ -1482,15 +1494,48 @@ function turnWorkedForS(groupBlocks: AnyBlock[]): number | undefined {
   const first = groupBlocks[0];
   const last = groupBlocks[groupBlocks.length - 1];
   if (first === undefined || last === undefined || first === last) return undefined;
-  if (first.ctx.timestamp > 0 && last.ctx.timestamp >= first.ctx.timestamp) {
-    return last.ctx.timestamp - first.ctx.timestamp;
-  }
+  const clock = sharedClock(first, last);
+  return clock === undefined ? undefined : secondsOn(clock, first, last);
+}
+
+type TurnClock = "page" | "server";
+
+/** The clock both ends of a span carry, page clock first (see `turnWorkedForS`). */
+function sharedClock(first: AnyBlock, last: AnyBlock): TurnClock | undefined {
+  if (first.ctx.timestamp > 0 && last.ctx.timestamp >= first.ctx.timestamp) return "page";
   const firstCreated = first.ctx.createdAtS;
   const lastCreated = last.ctx.createdAtS;
   if (firstCreated !== undefined && lastCreated !== undefined && lastCreated >= firstCreated) {
-    return lastCreated - firstCreated;
+    return "server";
   }
   return undefined;
+}
+
+/** Seconds from `from` to `to` on `clock`, negative when `to` came first. */
+function secondsOn(clock: TurnClock, from: AnyBlock, to: AnyBlock): number | undefined {
+  const stamp = ({ ctx }: AnyBlock): number | undefined => {
+    if (clock === "server") return ctx.createdAtS;
+    return ctx.timestamp > 0 ? ctx.timestamp : undefined;
+  };
+  const start = stamp(from);
+  const end = stamp(to);
+  return start === undefined || end === undefined ? undefined : end - start;
+}
+
+/**
+ * How far into the turn's work a task marker landed, on the clock that spans the
+ * turn. A journal write's marker can be recorded just before the call it marks,
+ * so one ahead of the turn's first work counts from its start.
+ */
+function taskMarkerElapsedS(turnWork: AnyBlock[], marker: NativeToolBlock): number | undefined {
+  const first = turnWork[0];
+  const last = turnWork[turnWork.length - 1];
+  if (first === undefined || last === undefined || readTaskActivity(marker.data) === null) {
+    return undefined;
+  }
+  const clock = sharedClock(first, last);
+  const elapsed = clock === undefined ? undefined : secondsOn(clock, first, marker);
+  return elapsed === undefined ? undefined : Math.max(0, elapsed);
 }
 
 function isSubagentActivityBlock(
@@ -1623,13 +1668,15 @@ function groupHasInterruptedText(blocks: AnyBlock[]): boolean {
  * this bubble's own results and delayed cross-turn outputs alike,
  * while a reused callId can never adopt another turn's output —
  * and tool-state derivation from bubble lifecycle plus the trailing
- * live tool phase.
+ * live tool phase. `turnWork` is the span `turnWorkedForS` measures,
+ * which task markers measure their place in the turn against.
  */
 function buildAssistantItems(
   groupBlocks: AnyBlock[],
   lifecycle: ActiveResponse["state"],
   crossBubbleResults: Map<string, ToolResultBlock>,
   sessionLive = false,
+  turnWork: AnyBlock[] = [],
 ): RenderItem[] {
   // Results render only by folding into a call's card — strip them so
   // an absorbed out-of-band result can't split a text/reasoning run.
@@ -1714,7 +1761,13 @@ function buildAssistantItems(
     }
 
     if (isSubagentActivityBlock(b)) {
-      items.push({ kind: "subagent_activity", itemId: b.ctx.itemId, data: b.data });
+      const turnElapsedS = taskMarkerElapsedS(turnWork, b);
+      items.push({
+        kind: "subagent_activity",
+        itemId: b.ctx.itemId,
+        data: b.data,
+        ...(turnElapsedS !== undefined ? { turnElapsedS } : {}),
+      });
       i += 1;
       continue;
     }

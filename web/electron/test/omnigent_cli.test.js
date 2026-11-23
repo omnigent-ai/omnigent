@@ -6,6 +6,7 @@
 
 const { describe, it, mock, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
+const { execFileSync } = require("child_process");
 const fs = require("fs");
 const http = require("http");
 const os = require("os");
@@ -33,6 +34,7 @@ const {
   readLocalHostId,
   liveDaemonRecordFor,
 } = require("../src/omnigent_cli");
+const { isHostThisMachine } = require("../src/hostIdentity");
 
 describe("cliCommandParts", () => {
   it("keeps plain CLI paths bare and adds fixed isaac argv without a shell", () => {
@@ -91,6 +93,53 @@ describe("runCli", () => {
       assert.deepEqual(res.failure, { kind: "timed-out", exitCode: 7 });
     },
   );
+
+  it("kills the child when its signal aborts", { timeout: 10000 }, async () => {
+    const readyFile = path.join(os.tmpdir(), `runcli-ready-${process.pid}-${Date.now()}`);
+    const controller = new AbortController();
+    const pending = runCli(
+      nodeScript(
+        'require("fs").writeFileSync(process.argv[1], String(process.pid)); setTimeout(() => {}, 60000);',
+      ),
+      [readyFile],
+      { signal: controller.signal },
+    );
+    try {
+      await new Promise((resolve, reject) => {
+        const deadline = Date.now() + 5000;
+        const timer = setInterval(() => {
+          if (fs.existsSync(readyFile)) {
+            clearInterval(timer);
+            resolve();
+          } else if (Date.now() > deadline) {
+            clearInterval(timer);
+            reject(new Error("the child never started"));
+          }
+        }, 25);
+      });
+      const started = Date.now();
+      controller.abort();
+      const res = await pending;
+      assert.notEqual(res.code, 0);
+      const pid = Number(fs.readFileSync(readyFile, "utf8"));
+      // An unreaped zombie still answers signal 0, so ask `ps` for the process state.
+      const state = (() => {
+        try {
+          return execFileSync("ps", ["-o", "stat=", "-p", String(pid)])
+            .toString()
+            .trim();
+        } catch {
+          return "";
+        }
+      })();
+      assert.ok(state === "" || state.startsWith("Z"), `the child is still running (${state})`);
+      assert.ok(Date.now() - started < 5000, "the abort ended the run before its 60s sleep");
+    } finally {
+      // A child that never reported ready must not outlive a failed test.
+      controller.abort();
+      fs.rmSync(readyFile, { force: true });
+    }
+  });
 
   it("does not mistake execFile's maxBuffer kill for a timeout", async () => {
     // 2 MiB of stdout overflows execFile's default 1 MiB maxBuffer.
@@ -334,6 +383,29 @@ describe("matchesServer", () => {
       assert.equal(matchesServer({ server_url: recordUrl }, serverUrl), expected);
     });
   }
+  const workspaceApi = "https://ws.example.com/api/2.0/omnigent";
+  const workspaceUi = "https://ws.example.com/omnigent";
+  for (const [record, serverUrl, expected] of [
+    [{ server_url: workspaceApi }, workspaceUi, true],
+    [{ target: `${workspaceApi}?o=1` }, `${workspaceUi}?o=1`, true],
+    [{ target: `${workspaceApi}/` }, `${workspaceUi}/`, true],
+    [{ server_url: `${workspaceApi}s` }, workspaceUi, true],
+    [{ target: `${workspaceApi}?o=1` }, `${workspaceUi}?o=2`, false],
+    [{ server_url: workspaceApi }, "https://other.example.com/omnigent", false],
+    [{ server_url: workspaceApi }, "http://ws.example.com/omnigent", false],
+    [{ server_url: "https://ws.example.com/api/2.0/other" }, workspaceUi, false],
+    [{ target: `${workspaceApi}?o=1` }, `${workspaceUi}/?o=1`, true],
+    [
+      { server_url: "http://localhost:6767/api/2.0/omnigent" },
+      "http://127.0.0.1:6767/omnigent",
+      true,
+    ],
+  ]) {
+    it(`${JSON.stringify(record)} ${expected ? "matches" : "does not match"} ${serverUrl}`, () => {
+      assert.equal(matchesServer(record, serverUrl), expected);
+    });
+  }
+
   it("matches on server_url or target, ignoring trailing slashes", () => {
     assert.equal(matchesServer({ server_url: "https://x.com/" }, "https://x.com"), true);
     assert.equal(matchesServer({ target: "https://x.com" }, "https://x.com/"), true);
@@ -522,6 +594,21 @@ describe("probeServerAuth — /v1/me auth gate", () => {
     assert.deepEqual(await probeServerAuth(url), { authed: false, reachable: true });
   });
 
+  it("ends early, reporting unreachable, when its signal aborts", { timeout: 3000 }, async () => {
+    mock.method(fs, "readFileSync", () => "{}");
+    mock.method(globalThis, "fetch", (_target, init) => {
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    });
+    const controller = new AbortController();
+
+    const pending = probeServerAuth("https://app.example.com", { signal: controller.signal });
+    controller.abort();
+
+    assert.deepEqual(await pending, { authed: false, reachable: false });
+  });
+
   it("returns unreachable (never authed) when fetch throws", async () => {
     mock.method(fs, "readFileSync", () => "{}");
     mock.method(globalThis, "fetch", async () => {
@@ -616,6 +703,33 @@ describe("liveDaemonRecordFor", () => {
     mock.method(fs, "readFileSync", () => JSON.stringify(record));
     assert.equal(liveDaemonRecordFor("http://localhost:6767").pid, process.pid);
     assert.equal(liveDaemonRecordFor("http://localhost:6768"), null);
+  });
+
+  it("finds a workspace daemon from the window's web-UI mount", async () => {
+    const record = {
+      pid: process.pid,
+      target: "https://ws.example.com/api/2.0/omnigent?o=123",
+      mode: "server",
+      server_url: "https://ws.example.com/api/2.0/omnigent",
+      host_id: "host_local",
+    };
+    mock.method(fs, "readdirSync", () => ["live.json"]);
+    mock.method(fs, "readFileSync", () => JSON.stringify(record));
+    const windowServerUrl = "https://ws.example.com/omnigent?o=123";
+    assert.equal(liveDaemonRecordFor(windowServerUrl)?.pid, process.pid);
+    // No bearer token is stored for the window's URL, so the probe must not send a request.
+    const fetch = mock.method(globalThis, "fetch", async () => ({ ok: true }));
+    const { connected, verified } = await getHostConnectionFast(windowServerUrl);
+    assert.deepEqual({ connected, verified }, { connected: true, verified: false });
+    assert.equal(fetch.mock.callCount(), 0);
+    assert.equal(
+      isHostThisMachine(
+        { hostId: "local", serverUrl: windowServerUrl },
+        { readLocalHostId: () => "local", liveDaemonRecordFor },
+      ),
+      true,
+    );
+    assert.equal(liveDaemonRecordFor("https://ws.example.com/omnigent?o=456"), null);
   });
 });
 

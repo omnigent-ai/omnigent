@@ -33,6 +33,7 @@ import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
 import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
+  conversationRowFromSession,
   filtersFromConversationQueryKey,
   findCachedListRow,
   lastIdAfterFiltering,
@@ -40,6 +41,7 @@ import {
   markRecentlyCreated,
   mergeItemsIntoPages,
   overlayArchivedIntoCaches,
+  settleUpdatedAtIntoCaches,
   overlayTitleIntoCaches,
   PIN_WRITE_MUTATION_KEY,
   PINNED_LABEL_KEY,
@@ -54,6 +56,16 @@ import {
   type SessionListWireItem,
 } from "@/lib/sessionListCache";
 import { showToast } from "@/components/ui/toast";
+import {
+  beginMuteSave,
+  clearSessionMuteState,
+  hasMuteEntries,
+  isConversationMuted,
+  muteReadMarker,
+  MUTED_LABEL_KEY,
+  reconcileMuteLabel,
+  settleMuteSave,
+} from "@/lib/sessionMute";
 import {
   conversationDisplayLabel,
   isPinOrderUnit,
@@ -256,6 +268,8 @@ export interface Conversation {
   provisional?: boolean;
   /** Client-only composer destination before a nested draft is submitted. */
   nested_draft_source_id?: string;
+  /** Client-only project whose new-session composer this ghost row reopens. */
+  project_draft_name?: string;
   /**
    * Total review comments (any status) on this session. Together with
    * `comments_updated_at` it forms a change fingerprint: an add or edit
@@ -431,6 +445,7 @@ export function isSessionArchiving(id: string): boolean {
 // Preserve optimistic membership across stale fetches and frames until the
 // server confirms the move.
 interface MoveTombstone {
+  family?: Conversation["family"];
   /** Target folder name; `null` unfiles. */
   project: string | null;
   projectId: string | null;
@@ -450,17 +465,32 @@ function unmarkSessionMoving(id: string, entry?: MoveTombstone): void {
 
 /** Give a fetched or streamed row the membership of its in-flight move. */
 export function withMoveTombstone<
-  T extends { id: string; project_id?: string | null; labels?: Record<string, string> },
+  T extends {
+    id: string;
+    project_id?: string | null;
+    labels?: Record<string, string>;
+    family?: Conversation["family"];
+  },
 >(row: T): T {
   const entry = movingSessions.get(row.id);
   if (entry === undefined) return row;
   const label = row.labels?.[PROJECT_LABEL_KEY] || undefined;
-  if ((row.project_id ?? null) === entry.projectId && label === entry.projectLabel) return row;
+  if (
+    (row.project_id ?? null) === entry.projectId &&
+    label === entry.projectLabel &&
+    (entry.family === undefined || row.family === entry.family)
+  )
+    return row;
   const labels = Object.fromEntries(
     Object.entries(row.labels ?? {}).filter(([key]) => key !== PROJECT_LABEL_KEY),
   );
   if (entry.projectLabel !== undefined) labels[PROJECT_LABEL_KEY] = entry.projectLabel;
-  return { ...row, project_id: entry.projectId, labels };
+  return {
+    ...row,
+    project_id: entry.projectId,
+    labels,
+    ...(entry.family !== undefined ? { family: entry.family } : {}),
+  };
 }
 
 /** Wipe module-level tombstones between tests. */
@@ -468,20 +498,29 @@ export function clearSessionTombstones(): void {
   unmarkSessionsDeleting();
   unmarkSessionsArchiving();
   for (const id of [...movingSessions.keys()]) unmarkSessionMoving(id);
+  clearSessionMuteState();
 }
 
 /**
- * Apply optimistic delete/archive/move state to a freshly fetched page.
+ * Apply optimistic delete/archive/move state, and the viewer's recorded mute
+ * preferences, to a freshly fetched page.
  *
+ * @param readMarker - {@link muteReadMarker} captured before the page was requested.
  * @param project - The folder the page is scoped to; rows moving out of it are dropped.
  */
 function applySessionTombstones(
   page: ConversationsPage,
+  readMarker: number,
   dropArchiving = false,
   originalPage = page,
   project?: string,
 ): ConversationsPage {
-  if (deletingSessionIds.size === 0 && archivingSessions.size === 0 && movingSessions.size === 0)
+  if (
+    deletingSessionIds.size === 0 &&
+    archivingSessions.size === 0 &&
+    movingSessions.size === 0 &&
+    !hasMuteEntries()
+  )
     return page;
   let changed = false;
   let lastDroppedId: string | null = null;
@@ -491,7 +530,7 @@ function applySessionTombstones(
       changed = true;
       continue;
     }
-    const conv = withMoveTombstone(fetched);
+    const conv = reconcileMuteLabel(withMoveTombstone(fetched), readMarker);
     if (conv !== fetched) changed = true;
     const move = movingSessions.get(conv.id);
     if (project && move !== undefined && move.project !== project) {
@@ -625,6 +664,7 @@ export async function fetchConversationsPage({
   // hang, and the palette shows "Searching…" for the whole in-flight window.
   // Plain list pagination is indexed/fast, so it keeps no timeout.
   const signal = searchQuery ? AbortSignal.timeout(SEARCH_FETCH_TIMEOUT_MS) : requestSignal;
+  const readMarker = muteReadMarker();
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
   // Carries the server's `code`, so a dead cursor stays recognizable as
   // `stale_cursor` instead of an opaque "400 Bad Request".
@@ -653,6 +693,7 @@ export async function fetchConversationsPage({
       queryClient,
       visibility,
     ),
+    readMarker,
     !includeArchived && visibility !== "archived",
     page,
     project,
@@ -1141,6 +1182,7 @@ export function useArchiveConversation() {
       queryClient.setQueryData<Session>(["session", updated.id], (old) =>
         old ? { ...old, archived } : old,
       );
+      settleUpdatedAtIntoCaches(queryClient, updated.id, updated.updated_at);
       settleOpenSessionRow(queryClient, updated.id, { archived });
       if (archived && context?.marked !== undefined) {
         expireSessionsArchiving(context.marked, [updated.id]);
@@ -1818,12 +1860,17 @@ async function fetchPinnedScope(
   for (;;) {
     if (after) params.set("after", after);
     // Each page advances the raw session cursor, including members of large families.
+    const readMarker = muteReadMarker();
     // eslint-disable-next-line no-await-in-loop
     const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
     // eslint-disable-next-line no-await-in-loop
     if (!res.ok) throw await apiErrorFromResponse(res);
-    // eslint-disable-next-line no-await-in-loop
-    const page = applySessionTombstones((await res.json()) as ConversationsPage, true);
+    const page = applySessionTombstones(
+      // eslint-disable-next-line no-await-in-loop
+      (await res.json()) as ConversationsPage,
+      readMarker,
+      true,
+    );
     for (const row of page.data) byId.set(row.id, row);
     if (
       !page.has_more ||
@@ -1953,20 +2000,7 @@ function findCachedConversationRow(queryClient: QueryClient, id: string): Conver
 
 function cachedSessionRow(queryClient: QueryClient, id: string): Conversation | undefined {
   const session = queryClient.getQueryData<Session>(["session", id]);
-  if (!session) return undefined;
-  return {
-    id,
-    object: "conversation",
-    title: session.title,
-    created_at: session.createdAt,
-    updated_at: session.createdAt,
-    labels: session.labels ?? {},
-    permission_level: session.permissionLevel,
-    agent_id: session.agentId,
-    harness: session.harness,
-    archived: session.archived,
-    family: session.family,
-  };
+  return session ? conversationRowFromSession(session) : undefined;
 }
 
 function invalidateFamilyLists(queryClient: QueryClient) {
@@ -1989,30 +2023,7 @@ function refuseOverlappingPinWrite(queryClient: QueryClient) {
 
 // Restore only the pin label across rendered caches (each row's own copy).
 function restorePinLabelInCaches(queryClient: QueryClient, id: string, pin: string | undefined) {
-  const withPin = (labels: Record<string, string> | undefined) => {
-    const rest = Object.fromEntries(
-      Object.entries(labels ?? {}).filter(([k]) => k !== PINNED_LABEL_KEY),
-    );
-    return pin === undefined ? rest : { ...rest, [PINNED_LABEL_KEY]: pin };
-  };
-  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-    queryKey: ["conversations"],
-  })) {
-    const row = data?.pages.flatMap((p) => p.data).find((c) => c.id === id);
-    if (!row) continue;
-    const { data: next } = mergeItemsIntoPages(
-      data,
-      new Map([[id, { id, labels: withPin(row.labels) } satisfies SessionListWireItem]]),
-      filtersFromConversationQueryKey(key),
-    );
-    if (next !== data) queryClient.setQueryData(key, next);
-  }
-  queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
-    old ? { ...old, labels: withPin(old.labels) } : old,
-  );
-  queryClient.setQueryData<Session>(["session", id], (old) =>
-    old ? { ...old, labels: withPin(old.labels) } : old,
-  );
+  overlayLabelIntoCaches(queryClient, id, PINNED_LABEL_KEY, pin);
 }
 
 // Apply a pin/unpin to every cache that renders the row. `labels` is the
@@ -2184,11 +2195,23 @@ export function useTogglePinnedConversation() {
     onError: (_err, { id, pinned }, ctx) => {
       // No context: `onMutate` refused the write and already said why.
       if (!ctx) return;
-      // Roll back only the pin key (other labels may have changed meanwhile),
-      // then restore the pinned section's own snapshot.
+      // Restore this row's pin and membership without reverting other preferences.
       restorePinLabelInCaches(queryClient, id, ctx.prevPin);
       if (ctx.prevPinned !== undefined) {
-        queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, ctx.prevPinned);
+        const previousPinned = ctx.prevPinned;
+        const previousIndex = previousPinned.conversations.findIndex((row) => row.id === id);
+        const previousRow = previousPinned.conversations[previousIndex];
+        const restoredRow = findRow(id) ?? previousRow;
+        queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (current) => {
+          const conversations = (current?.conversations ?? []).filter((row) => row.id !== id);
+          if (previousRow && restoredRow) {
+            conversations.splice(Math.min(previousIndex, conversations.length), 0, restoredRow);
+          }
+          return {
+            filterHonored: current?.filterHonored ?? previousPinned.filterHonored,
+            conversations,
+          };
+        });
       }
       // The row snaps back, so say why (e.g. an Undo re-pin that didn't save).
       showToast(pinned ? "Couldn't pin the session." : "Couldn't unpin the session.");
@@ -2285,6 +2308,107 @@ export function useReorderPinnedConversations() {
       if (writes.some(({ id }) => findCachedConversationRow(queryClient, id)?.family)) {
         invalidateFamilyLists(queryClient);
       }
+    },
+  });
+}
+
+// ── Mute hooks ────────────────────────────────────────────────────────────────
+
+/**
+ * Set or clear one label on every cached copy of a session row, leaving its
+ * other labels as each cache has them.
+ */
+function overlayLabelIntoCaches(
+  queryClient: QueryClient,
+  id: string,
+  key: string,
+  value: string | undefined,
+) {
+  const withLabel = (labels: Record<string, string> | undefined) => {
+    const rest = Object.fromEntries(Object.entries(labels ?? {}).filter(([k]) => k !== key));
+    return value === undefined ? rest : { ...rest, [key]: value };
+  };
+  for (const [listKey, filtersOf] of [
+    [["conversations"], filtersFromConversationQueryKey],
+    [["project-sessions"], filtersFromProjectQueryKey],
+  ] as const) {
+    for (const [cacheKey, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: listKey,
+    })) {
+      const row = data?.pages.flatMap((page) => page.data).find((c) => c.id === id);
+      if (!row) continue;
+      const { data: next } = mergeItemsIntoPages(
+        data,
+        new Map([[id, { id, labels: withLabel(row.labels) } satisfies SessionListWireItem]]),
+        filtersOf(cacheKey),
+      );
+      if (next !== data) queryClient.setQueryData(cacheKey, next);
+    }
+  }
+  queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+    old
+      ? {
+          ...old,
+          conversations: old.conversations.map((c) =>
+            c.id === id ? { ...c, labels: withLabel(c.labels) } : c,
+          ),
+        }
+      : old,
+  );
+  queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
+    old ? { ...old, labels: withLabel(old.labels) } : old,
+  );
+  queryClient.setQueryData<Session>(["session", id], (old) =>
+    old ? { ...old, labels: withLabel(old.labels) } : old,
+  );
+}
+
+/**
+ * Mute / unmute a session for the viewer via `PATCH /v1/sessions/{id}` (the
+ * `omnigent.muted` label; an empty value deletes it). The preference is
+ * recorded in the mute store (see `@/lib/sessionMute`) and painted into the
+ * cached rows; a failed save restores the previous preference. Like a pin, the
+ * write leaves `updated_at` alone, so it never changes the row's read state.
+ */
+export function useSetConversationMuted() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, muted }: { id: string; muted: boolean }) => {
+      const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ labels: { [MUTED_LABEL_KEY]: muted ? "1" : "" } }),
+      });
+      if (!res.ok) throw await apiErrorFromResponse(res);
+      return (await res.json()) as { labels?: Record<string, string> };
+    },
+    onMutate: ({ id, muted }) => {
+      const previous = isConversationMuted({
+        id,
+        labels: findCachedConversationRow(queryClient, id)?.labels,
+      });
+      // Serialize each session's writes so a rollback restores a saved value.
+      if (!beginMuteSave(id, muted)) {
+        const message = "Still saving. Try again in a moment.";
+        showToast(message);
+        throw new Error(message);
+      }
+      overlayLabelIntoCaches(queryClient, id, MUTED_LABEL_KEY, muted ? "1" : undefined);
+      return { previous };
+    },
+    onError: (_err, { muted }, ctx) => {
+      // No context: `onMutate` refused the write and already said why.
+      if (!ctx) return;
+      showToast(muted ? "Couldn't mute the session." : "Couldn't unmute the session.");
+    },
+    onSettled: (saved, error, { id, muted }, ctx) => {
+      if (!ctx) return;
+      // A failure restores the previous value; otherwise the server's echo wins.
+      let value = muted;
+      if (error) value = ctx.previous;
+      else if (saved?.labels) value = !!saved.labels[MUTED_LABEL_KEY];
+      settleMuteSave(id, value);
+      overlayLabelIntoCaches(queryClient, id, MUTED_LABEL_KEY, value ? "1" : undefined);
     },
   });
 }
@@ -2487,6 +2611,118 @@ export async function moveConversationToProject(
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as Conversation;
+}
+
+/** Move one session while shielding its optimistic membership from stale frames. */
+export function useMoveToNest() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, destination }: { id: string; destination: Conversation | null }) => {
+      const response = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nest_source_id: destination?.id ?? null }),
+      });
+      if (!response.ok) throw await apiErrorFromResponse(response);
+      return (await response.json()) as Conversation;
+    },
+    onMutate: async ({ id, destination }) => {
+      await Promise.all(
+        ["conversations", "project-sessions"].map((key) =>
+          queryClient.cancelQueries({ queryKey: [key] }),
+        ),
+      );
+      const row = findCachedConversationRow(queryClient, id);
+      if (!row) return;
+      const projectId = destination ? (destination.project_id ?? null) : (row.project_id ?? null);
+      const projectLabel = (destination ?? row).labels[PROJECT_LABEL_KEY];
+      const project =
+        queryClient.getQueryData<ProjectSummary[]>(["projects"])?.find((p) => p.id === projectId)
+          ?.name ??
+        projectLabel ??
+        null;
+      const move: MoveTombstone = {
+        project,
+        projectId,
+        projectLabel,
+        family: destination?.family ?? null,
+      };
+      markSessionMoving(id, move);
+      const moved = withMoveTombstone(row);
+      const queries = ["conversations", "project-sessions"].flatMap((key) =>
+        queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: [key] }),
+      );
+      const backfill = queryClient.getQueryData<Conversation | null>(["conversation-backfill", id]);
+      const pins = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
+      for (const [key, data] of queries) {
+        const inProject = key[0] === "project-sessions";
+        const scope = inProject ? parseProjectSessionsQueryKey(key) : null;
+        const globallyVisible = queries.some(
+          ([windowKey, window]) =>
+            windowKey[0] === "conversations" &&
+            (windowKey[5] ?? "updated_at") === scope?.sortBy &&
+            scope?.archived === (row.archived === true) &&
+            window?.pages.some((page) => page.data.some((item) => item.id === id)),
+        );
+        const targetLoaded = queries.some(
+          ([targetKey, target]) =>
+            targetKey[0] === "project-sessions" &&
+            targetKey[1] === project &&
+            target &&
+            parseProjectSessionsQueryKey(targetKey).sortBy === scope?.sortBy &&
+            parseProjectSessionsQueryKey(targetKey).archived === scope?.archived,
+        );
+        if (inProject && key[1] !== project && !globallyVisible && !targetLoaded) continue;
+        const filters = inProject
+          ? filtersFromProjectQueryKey(key)
+          : filtersFromConversationQueryKey(key);
+        const items = new Map([[id, moved]]);
+        let next = mergeItemsIntoPages(data, items, filters).data;
+        if (inProject && key[1] === project && !globallyVisible)
+          next = insertNewRowsIntoPages(next, items, filters).data;
+        if (next !== data) queryClient.setQueryData(key, next);
+      }
+      queryClient.setQueryData(["conversation-backfill", id], backfill ? moved : backfill);
+      if (pins)
+        queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, {
+          ...pins,
+          conversations: pins.conversations.map((c) => (c.id === id ? moved : c)),
+        });
+      return { queries, backfill, pins, move };
+    },
+    onError: (error, { id }, previous) => {
+      showToast(error.message);
+      if (!previous) return;
+      unmarkSessionMoving(id, previous.move);
+      for (const [key, data] of previous.queries) if (data) queryClient.setQueryData(key, data);
+      restoreOpenSessionRow(queryClient, id, previous.backfill);
+      queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, previous.pins);
+    },
+    onSuccess: (updated, _variables, previous) => {
+      if (!previous) return;
+      previous.move.family = updated.family ?? null;
+      previous.move.projectId = updated.project_id ?? null;
+      previous.move.projectLabel = updated.labels?.[PROJECT_LABEL_KEY] || undefined;
+      previous.move.project =
+        queryClient
+          .getQueryData<ProjectSummary[]>(["projects"])
+          ?.find((project) => project.id === updated.project_id)?.name ??
+        previous.move.projectLabel ??
+        null;
+    },
+    onSettled: async (_data, _error, { id }, previous) => {
+      await Promise.all(
+        [
+          ["conversations"],
+          ["project-sessions"],
+          ["projects"],
+          ["session", id],
+          PINNED_CONVERSATIONS_KEY,
+        ].map((queryKey) => queryClient.invalidateQueries({ queryKey })),
+      );
+      if (previous) unmarkSessionMoving(id, previous.move);
+    },
+  });
 }
 
 /**
@@ -2763,6 +2999,7 @@ async function fetchProjectSessionsPage(
   if (after) params.set("after", after);
   // Requests are sequential because each page supplies the next cursor.
   for (;;) {
+    const readMarker = muteReadMarker();
     // eslint-disable-next-line no-await-in-loop
     const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
     // Carries the server's code, so a dead cursor stays recognizable.
@@ -2770,7 +3007,7 @@ async function fetchProjectSessionsPage(
     if (!res.ok) throw await apiErrorFromResponse(res);
     // eslint-disable-next-line no-await-in-loop
     const fetched = (await res.json()) as ConversationsPage;
-    const page = applySessionTombstones(fetched, !archived, fetched, project);
+    const page = applySessionTombstones(fetched, readMarker, !archived, fetched, project);
     if (!archived) return page;
     const data = page.data.filter((row) => row.archived === true);
     if (data.length || !page.has_more || !page.last_id) return { ...page, data };

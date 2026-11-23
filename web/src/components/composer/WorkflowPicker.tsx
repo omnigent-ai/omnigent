@@ -1,13 +1,28 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { CheckIcon, PlusIcon, SearchIcon, WorkflowIcon, XIcon } from "lucide-react";
 
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
+import { enabledItems } from "@/components/ui/menu-filter";
 import type { SavedWorkflow, WorkflowPagination } from "@/hooks/useSavedWorkflows";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 
 /**
- * Searchable list of the user's saved workflows, laid out like `ProjectPicker`'s
- * "Search or create project" list. The "+" menu shows it in place of its items
- * for Run a workflow; New automation shows it in its Workflow field's menu.
+ * Whether Run a workflow has saved workflows to list, rather than going straight to
+ * describing a new one. Drafts can't run, so the list leaves them out.
+ */
+export function offersSavedWorkflows(
+  workflows: readonly SavedWorkflow[],
+  pagination?: Pick<WorkflowPagination, "hasMore">,
+): boolean {
+  // A list whose loaded pages show nothing yet can still have more to load.
+  return workflows.some((workflow) => !workflow.is_draft) || pagination?.hasMore === true;
+}
+
+/**
+ * Searchable list of the user's saved workflows, and any shared with them, laid out
+ * like `ProjectPicker`'s "Search or create project" list. The "+" menu shows it in place of its items
+ * for Run a workflow, and `RunWorkflowMenu` in its own menu; New automation shows it in its
+ * Workflow field's menu.
  *
  * Picking one calls `onSelect(workflow)`. Below the list, "New workflow" calls
  * `onDescribe(text)` with whatever was typed, and "No workflow" calls `onClear()`.
@@ -32,26 +47,45 @@ export function WorkflowPicker({
   heading?: string | null;
 }) {
   const [search, setSearch] = useState("");
+  const searchRef = useRef<HTMLInputElement>(null);
   const trimmed = search.trim();
   const filtered = workflows.filter(
     (workflow) => !workflow.is_draft && workflow.name.toLowerCase().includes(trimmed.toLowerCase()),
   );
 
   return (
-    <div className="flex flex-col gap-0.5" data-testid="composer-workflow-picker">
+    <div
+      className="flex flex-col gap-0.5"
+      data-testid="composer-workflow-picker"
+      // Up from the first item goes back to the search.
+      onKeyDownCapture={(event) => {
+        if (event.key !== "ArrowUp" || event.target !== enabledItems(searchRef.current)[0]) return;
+        event.preventDefault();
+        event.stopPropagation();
+        searchRef.current?.focus();
+      }}
+    >
       {heading && (
         <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">{heading}</div>
       )}
       <div className="flex items-center gap-2 border-b px-2 py-1.5">
         <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
         <input
+          ref={searchRef}
           aria-label="Search workflows"
           className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
           placeholder="Search workflows"
           value={search}
           onChange={(event) => setSearch(event.target.value)}
-          // Typing filters the list rather than jumping between menu items.
-          onKeyDown={(event) => event.stopPropagation()}
+          // Typing filters the list rather than reaching the menu's typeahead. Tab stays in
+          // the menu, and ArrowDown moves to the first item.
+          onKeyDown={(event) => {
+            if (event.key !== "Tab") event.stopPropagation();
+            if (event.key === "ArrowDown" && !isImeCompositionKeyEvent(event)) {
+              event.preventDefault();
+              enabledItems(event.currentTarget)[0]?.focus();
+            }
+          }}
           autoFocus
         />
       </div>
@@ -71,6 +105,11 @@ export function WorkflowPicker({
             <span className="flex min-w-0 flex-1 items-center gap-2">
               <span className="max-w-[70%] shrink-0 truncate">{workflow.name}</span>
               <span className="min-w-0 flex-1 truncate text-xs leading-4 text-muted-foreground">
+                {workflow.viewer_role === "viewer" && (
+                  <span data-testid="composer-saved-workflow-owner">
+                    Shared by {workflow.owner_display_name ?? "someone else"} ·{" "}
+                  </span>
+                )}
                 {workflow.description.split("\n")[0]}
               </span>
             </span>

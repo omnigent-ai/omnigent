@@ -6,18 +6,22 @@
  * block with saved launch settings, and the run history.
  *
  * All data + mutations come from the existing scheduled-tasks hooks; editing
- * reuses `CreateScheduledTaskDialog` in its edit mode. Nothing here is
- * fabricated: each run renders only the fields the server actually returns
- * (status, timestamp, duration, an errorCode-derived message, and an
- * open-conversation link) — never an invented summary line.
+ * reuses `CreateScheduledTaskDialog` in its edit mode. For an automation shared
+ * with the viewer the page names its owner and is read-only: every action that
+ * changes it shows disabled with a tooltip, and each run shows its outcome, without
+ * its session's cost, approvals or tasks. Nothing here is fabricated: each run
+ * renders only the fields the server actually returns (status, timestamp,
+ * duration, an errorCode-derived message, and an open-conversation link) — never
+ * an invented summary line.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   CalendarOffIcon,
   ChevronDownIcon,
   ChevronLeftIcon,
   Loader2Icon,
+  MessageSquareIcon,
   PencilIcon,
   PlayIcon,
   ShareIcon,
@@ -32,7 +36,20 @@ import { Switch } from "@/components/ui/switch";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { AutomationPaletteCommands } from "@/components/scheduled/AutomationPaletteCommands";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
+import { RunPullRequests } from "@/components/scheduled/RunPullRequests";
+import {
+  type AutomationDetailActionId,
+  automationDetailActionAvailable,
+  automationDetailActions,
+} from "@/components/scheduled/automationDetailActions";
+import {
+  automationOwnerName,
+  isSharedWithViewer,
+  OWNER_ONLY_REASONS,
+} from "@/components/scheduled/ownerOnlyActions";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import {
   decodeTriggerPrompt,
@@ -49,13 +66,14 @@ import {
   RunWorkflowButton,
   useRunTaskMenus,
 } from "@/components/workflows/RunTasks";
-import { planRunControl } from "@/shell/PlanRunButton";
+import { planRunButtonState, planRunControl } from "@/shell/PlanRunButton";
 import { WorkflowGraphOverlay } from "@/components/workflows/WorkflowStepsGraph";
 import {
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
   useScheduledTask,
   scheduledTaskRunsKey,
+  useScheduledTaskRunPullRequests,
   useScheduledTaskRuns,
   useScheduledTaskRunSteps,
   useUpdateScheduledTask,
@@ -68,6 +86,7 @@ import {
 import { useNow } from "@/hooks/useNow";
 import { useSession } from "@/hooks/useSession";
 import { useViewerId } from "@/hooks/useViewerId";
+import { usePlanStopping } from "@/hooks/usePlanStopping";
 import { useSessionWorking } from "@/hooks/useSessionWorking";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
@@ -77,6 +96,7 @@ import { nativeCodingAgentForAvailableAgent } from "@/lib/nativeCodingAgents";
 import { canonicalNativeHarness, nativePermissionOptions } from "@/lib/nativeHarnessModes";
 import { formatStatusEffortLabel, formatStatusModelLabel } from "@/lib/composerModelLabel";
 import { formatSessionCostUsd } from "@/lib/formatCost";
+import { groupRunsBySession } from "@/lib/runSessionGroups";
 import {
   describeRunFailure,
   describeSchedule,
@@ -86,16 +106,20 @@ import {
 } from "@/lib/scheduleText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AUTOMATION_SHARE_PARAM } from "@/lib/automationFromSession";
-import {
-  isFeatureEnabled,
-  isSharingOff,
-  sandboxOptionLabel,
-  SHARING_OFF_REASON,
-} from "@/lib/capabilities";
-import { canShareAutomation } from "@/lib/permissionsApi";
+import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
+import { automationShareDisabledReason, canShareAutomation } from "@/lib/permissionsApi";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
-import type { ScheduledTaskRun, ScheduledTaskRunSteps } from "@/lib/scheduledTasksApi";
-import { stepProgress } from "@/lib/sessionJournal";
+import type {
+  ScheduledTaskRun,
+  ScheduledTaskRunPullRequest,
+  ScheduledTaskRunSteps,
+} from "@/lib/scheduledTasksApi";
+import {
+  latestStatusText,
+  stepProgress,
+  WAITING_FOR_YOU,
+  type StepStatus,
+} from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
 
 const RUN_HIGHLIGHT_DURATION_MS = 3_000;
@@ -136,8 +160,17 @@ function TaskDetail({ taskId }: { taskId: string }) {
     isError: runsError,
     isFetchedAfterMount: runsFetchedAfterMount,
   } = useScheduledTaskRuns(taskId, taskId !== "", awaitingRunRow);
-  const workflowsEnabled = isFeatureEnabled(info, "workflows");
-  const runSteps = useScheduledTaskRunSteps(taskId, runs, workflowsEnabled);
+  // Plans are session content, which a viewer's run history leaves out. The owner's
+  // steps load alongside the task; the server sends a viewer none either way.
+  const runStepsEnabled =
+    isFeatureEnabled(info, "workflows") && !(task != null && isSharedWithViewer(task));
+  const runSteps = useScheduledTaskRunSteps(taskId, runs, runStepsEnabled);
+  // PRs are session content too, so a viewer gets none.
+  const runPullRequestsEnabled =
+    info !== "loading" &&
+    info.scheduled_task_run_pull_requests === true &&
+    !(task != null && isSharedWithViewer(task));
+  const runPullRequests = useScheduledTaskRunPullRequests(taskId, runs, runPullRequestsEnabled);
 
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
@@ -269,7 +302,9 @@ function TaskDetail({ taskId }: { taskId: string }) {
     // Null hostId = the server picks the owner's live host when the task fires.
     // Same wording as the edit dialog's host picker.
     if (task.hostId == null) return "Most recently active host";
-    return hosts?.find((h) => h.host_id === task.hostId)?.name ?? task.hostId;
+    const name = hosts?.find((h) => h.host_id === task.hostId)?.name;
+    // A viewer can't see the owner's hosts.
+    return name ?? (isSharedWithViewer(task) ? "The owner's host" : task.hostId);
   }, [hosts, sandboxLabel, task]);
 
   if (isLoading) {
@@ -339,13 +374,26 @@ function TaskDetail({ taskId }: { taskId: string }) {
       ? "Agent default"
       : (permissionOption?.label ?? task.permissionMode);
   const scheduleSummary = describeSchedule(task.rrule, task.timezone);
+  const readOnly = isSharedWithViewer(task);
   const canShare = canShareAutomation(info, viewerId, task.ownerUserId);
-  // As for sessions, sharing off disables Share rather than hiding it.
-  const sharingOff = isSharingOff(info);
+  // As for sessions, a reason such as sharing off disables Share rather than hiding it.
+  const shareDisabledReason = automationShareDisabledReason(info, task);
   const nextRun = formatNextRunAt(task.nextRunAt, now);
   // A single per-task busy flag: the header actions disable while any of this
   // task's mutations are in flight.
   const busy = updateMutation.isPending || deleteMutation.isPending || runNowMutation.isPending;
+  // The header buttons' states, shared with ⌘K's automation commands.
+  const actions = automationDetailActions({
+    readOnly,
+    busy,
+    triggerMode,
+    runStarting: awaitingRunRow,
+    paused,
+    canShare,
+    shareDisabledReason,
+  });
+  const actionAvailable = (id: AutomationDetailActionId) =>
+    automationDetailActionAvailable(actions, id);
 
   function handlePauseToggle() {
     updateMutation.mutate({
@@ -412,25 +460,75 @@ function TaskDetail({ taskId }: { taskId: string }) {
     });
   }
 
+  function renderRun(run: ScheduledTaskRun, showCost: boolean) {
+    return (
+      <RunRow
+        key={run.id}
+        run={run}
+        now={now}
+        highlighted={run.id === highlightedRunId}
+        showCost={showCost}
+        steps={runStepsEnabled ? runSteps.get(run.id) : undefined}
+        pullRequests={
+          runPullRequestsEnabled ? runPullRequests.get(run.id)?.pullRequests : undefined
+        }
+      />
+    );
+  }
+
   return (
     <PageScroll contentClassName="px-6" data-testid="task-detail-page">
       <BackLink />
+      <AutomationPaletteCommands
+        taskId={task.id}
+        actions={actions}
+        run={{
+          "run-now": handleRunNow,
+          edit: () => setEditOpen(true),
+          share: () => setShareOpen(true),
+          pause: handlePauseToggle,
+          resume: handlePauseToggle,
+        }}
+      />
 
       {/* Header: title + right-aligned actions. */}
       <div className="mt-4 flex items-start justify-between gap-4">
-        <h1 className="min-w-0 break-words text-2xl font-semibold" data-testid="task-detail-title">
-          {task.name}
-        </h1>
+        <div className="flex min-w-0 flex-col gap-1">
+          <h1
+            className="min-w-0 break-words text-2xl font-semibold"
+            data-testid="task-detail-title"
+          >
+            {task.name}
+          </h1>
+          {readOnly && (
+            <p className="text-sm text-muted-foreground" data-testid="task-detail-owner">
+              Shared by {automationOwnerName(task)}
+            </p>
+          )}
+        </div>
         <div className="flex shrink-0 items-center gap-2">
-          {canShare &&
-            (sharingOff ? (
+          {readOnly ? (
+            <DisabledActionTooltip reason={OWNER_ONLY_REASONS.share} label="Share automation">
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Share automation"
+                data-testid="task-detail-share"
+                disabled
+              >
+                <ShareIcon className="size-4" />
+              </Button>
+            </DisabledActionTooltip>
+          ) : (
+            canShare &&
+            (shareDisabledReason ? (
               <Tooltip>
                 <TooltipTrigger asChild>
                   {/* Disabled buttons don't receive pointer events, so the wrapper
                       owns hover/focus for the explanatory tooltip. */}
                   <span
                     tabIndex={0}
-                    aria-label={`Share automation disabled: ${SHARING_OFF_REASON}`}
+                    aria-label={`Share automation disabled: ${shareDisabledReason}`}
                     className="inline-flex"
                   >
                     <Button
@@ -444,7 +542,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
                     </Button>
                   </span>
                 </TooltipTrigger>
-                <TooltipContent>{SHARING_OFF_REASON}</TooltipContent>
+                <TooltipContent>{shareDisabledReason}</TooltipContent>
               </Tooltip>
             ) : (
               <Button
@@ -456,45 +554,56 @@ function TaskDetail({ taskId }: { taskId: string }) {
               >
                 <ShareIcon className="size-4" />
               </Button>
-            ))}
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            aria-label="Edit automation"
-            data-testid="task-detail-edit"
-            disabled={busy}
-            onClick={() => setEditOpen(true)}
-          >
-            <PencilIcon className="size-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            aria-label="Delete automation"
-            data-testid="task-detail-delete"
-            disabled={busy}
-            onClick={handleDelete}
-          >
-            <Trash2Icon className="size-4" />
-          </Button>
-          {!triggerMode && (
+            ))
+          )}
+          <OwnerOnly readOnly={readOnly} label="Edit automation" reason={OWNER_ONLY_REASONS.edit}>
             <Button
-              data-testid="task-detail-run-now"
-              disabled={busy || awaitingRunRow}
-              onClick={handleRunNow}
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Edit automation"
+              data-testid="task-detail-edit"
+              disabled={!actionAvailable("edit")}
+              onClick={() => setEditOpen(true)}
             >
-              {runNowMutation.isPending || awaitingRunRow ? (
-                <>
-                  <Loader2Icon className="size-4 animate-spin" />
-                  In progress
-                </>
-              ) : (
-                <>
-                  <PlayIcon className="size-4" />
-                  Run now
-                </>
-              )}
+              <PencilIcon className="size-4" />
             </Button>
+          </OwnerOnly>
+          <OwnerOnly
+            readOnly={readOnly}
+            label="Delete automation"
+            reason={OWNER_ONLY_REASONS.delete}
+          >
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Delete automation"
+              data-testid="task-detail-delete"
+              disabled={!actionAvailable("delete")}
+              onClick={handleDelete}
+            >
+              <Trash2Icon className="size-4" />
+            </Button>
+          </OwnerOnly>
+          {!triggerMode && (
+            <OwnerOnly readOnly={readOnly} label="Run now" reason={OWNER_ONLY_REASONS.runNow}>
+              <Button
+                data-testid="task-detail-run-now"
+                disabled={!actionAvailable("run-now")}
+                onClick={handleRunNow}
+              >
+                {runNowMutation.isPending || awaitingRunRow ? (
+                  <>
+                    <Loader2Icon className="size-4 animate-spin" />
+                    In progress
+                  </>
+                ) : (
+                  <>
+                    <PlayIcon className="size-4" />
+                    Run now
+                  </>
+                )}
+              </Button>
+            </OwnerOnly>
           )}
         </div>
       </div>
@@ -503,13 +612,19 @@ function TaskDetail({ taskId }: { taskId: string }) {
           schedule + next-run. The Switch sits to the LEFT of the pill. */}
       <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">
         {/* ON = active. handlePauseToggle derives the next state from `paused`. */}
-        <Switch
-          aria-label={paused ? "Resume automation" : "Pause automation"}
-          data-testid="task-detail-pause-toggle"
-          checked={!paused}
-          disabled={busy}
-          onCheckedChange={handlePauseToggle}
-        />
+        <OwnerOnly
+          readOnly={readOnly}
+          label={paused ? "Resume automation" : "Pause automation"}
+          reason={paused ? OWNER_ONLY_REASONS.resume : OWNER_ONLY_REASONS.pause}
+        >
+          <Switch
+            aria-label={paused ? "Resume automation" : "Pause automation"}
+            data-testid="task-detail-pause-toggle"
+            checked={!paused}
+            disabled={!actionAvailable(paused ? "resume" : "pause")}
+            onCheckedChange={handlePauseToggle}
+          />
+        </OwnerOnly>
         <span
           data-testid="task-detail-state-pill"
           className={cn(
@@ -529,10 +644,19 @@ function TaskDetail({ taskId }: { taskId: string }) {
 
       {task.sourceSessionId && (
         <Section title="Starts from">
-          <SourceSessionLink sessionId={task.sourceSessionId} />
-          <p className="mt-1 text-sm text-muted-foreground">
-            Each run starts with a copy of this session&apos;s history.
-          </p>
+          {readOnly ? (
+            // The copy is the owner's own session.
+            <p className="text-sm text-muted-foreground" data-testid="task-detail-starts-from">
+              Each run starts with a copy of a session the owner chose.
+            </p>
+          ) : (
+            <>
+              <SourceSessionLink sessionId={task.sourceSessionId} />
+              <p className="mt-1 text-sm text-muted-foreground">
+                Each run starts with a copy of this session&apos;s history.
+              </p>
+            </>
+          )}
         </Section>
       )}
 
@@ -607,18 +731,25 @@ function TaskDetail({ taskId }: { taskId: string }) {
               }
               testId="task-detail-workspace"
             />
-            {(task.projectId != null || (info !== "loading" && info.scheduled_task_projects)) && (
-              <ConfigField
-                label="Project"
-                value={
-                  projects?.find((project) => project.id === task.projectId)?.name ??
-                  task.projectId ??
-                  "No project"
-                }
-                testId="task-detail-project"
-              />
-            )}
+            {/* The project is the owner's, so a viewer has no name for it. */}
+            {!readOnly &&
+              (task.projectId != null || (info !== "loading" && info.scheduled_task_projects)) && (
+                <ConfigField
+                  label="Project"
+                  value={
+                    projects?.find((project) => project.id === task.projectId)?.name ??
+                    task.projectId ??
+                    "No project"
+                  }
+                  testId="task-detail-project"
+                />
+              )}
             <ConfigField label="Timezone" value={task.timezone} testId="task-detail-timezone" />
+            <ConfigField
+              label="Cost limit per run"
+              value={task.maxCostUsd == null ? "No limit" : formatSessionCostUsd(task.maxCostUsd)}
+              testId="task-detail-cost-limit"
+            />
           </dl>
           {task.sessionMode === "continue" && task.sessionId && (
             <p className="mt-3 text-xs text-muted-foreground">
@@ -633,12 +764,6 @@ function TaskDetail({ taskId }: { taskId: string }) {
 
       {/* Runs. */}
       <h2 className="mb-2 text-sm font-medium text-muted-foreground">Runs</h2>
-      {runs?.some((run) => run.sessionCostUsd != null) && (
-        <p className="mb-2 text-xs text-muted-foreground">
-          Session cost is each session’s current recorded total. Runs sharing a session show the
-          same total. Separate sub-agent sessions are excluded.
-        </p>
-      )}
       {runsLoading ? (
         <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
@@ -654,25 +779,35 @@ function TaskDetail({ taskId }: { taskId: string }) {
         </p>
       ) : (
         <ul className="flex flex-col gap-1" data-testid="task-detail-runs">
-          {(runs ?? []).map((run) => (
-            <RunRow
-              key={run.id}
-              run={run}
-              now={now}
-              highlighted={run.id === highlightedRunId}
-              steps={workflowsEnabled ? runSteps.get(run.id) : undefined}
-            />
-          ))}
+          {groupRunsBySession(
+            runs ?? [],
+            task.sessionMode === "continue" ? (task.sessionId ?? null) : null,
+          ).map((entry) =>
+            entry.kind === "run" ? (
+              renderRun(entry.run, true)
+            ) : (
+              <RunSessionGroup
+                key={`session:${entry.sessionId}`}
+                sessionId={entry.sessionId}
+                runs={entry.runs}
+                readOnly={readOnly}
+              >
+                {entry.runs.map((run) => renderRun(run, false))}
+              </RunSessionGroup>
+            ),
+          )}
         </ul>
       )}
 
-      <CreateScheduledTaskDialog
-        open={editOpen}
-        onOpenChange={setEditOpen}
-        editingTask={task}
-        sessionLink={sessionLink}
-      />
-      {canShare && !sharingOff && (
+      {!readOnly && (
+        <CreateScheduledTaskDialog
+          open={editOpen}
+          onOpenChange={setEditOpen}
+          editingTask={task}
+          sessionLink={sessionLink}
+        />
+      )}
+      {canShare && !shareDisabledReason && (
         <PermissionsModal
           automation={task}
           open={shareOpen || shareRequested}
@@ -680,6 +815,26 @@ function TaskDetail({ taskId }: { taskId: string }) {
         />
       )}
     </PageScroll>
+  );
+}
+
+/** Shows an owner-only control disabled, with a tooltip saying why, to a viewer. */
+function OwnerOnly({
+  readOnly,
+  label,
+  reason,
+  children,
+}: {
+  readOnly: boolean;
+  label: string;
+  reason: string;
+  children: ReactNode;
+}) {
+  if (!readOnly) return children;
+  return (
+    <DisabledActionTooltip reason={reason} label={label}>
+      {children}
+    </DisabledActionTooltip>
   );
 }
 
@@ -753,12 +908,66 @@ function useRunUnread(run: ScheduledTaskRun): boolean {
 }
 
 /**
+ * Runs that went into one session, listed under a link to it with its running
+ * total, so the total reads as the session's rather than each run's.
+ */
+function RunSessionGroup({
+  sessionId,
+  runs,
+  readOnly,
+  children,
+}: {
+  sessionId: string;
+  runs: readonly ScheduledTaskRun[];
+  readOnly: boolean;
+  children: ReactNode;
+}) {
+  // The session is the owner's, so a viewer has no title for it.
+  const { session } = useSession(readOnly ? null : sessionId);
+  const title = session?.title || "Continued session";
+  // Every run in the group reports the same session total.
+  const totalCostUsd = runs.find((run) => run.sessionCostUsd != null)?.sessionCostUsd ?? null;
+  return (
+    <li className="flex flex-col gap-1" data-testid="run-session-group">
+      <Link
+        to={`/c/${encodeURIComponent(sessionId)}`}
+        data-testid="run-session-group-open"
+        className="flex items-center gap-3 rounded-lg px-2 py-2 transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none"
+      >
+        <span className="flex size-5 shrink-0 items-center justify-center">
+          <MessageSquareIcon
+            aria-hidden="true"
+            className="size-4 text-muted-foreground"
+            strokeWidth={1.75}
+          />
+        </span>
+        <span className="flex min-w-0 flex-wrap items-baseline gap-x-2">
+          <span className="min-w-0 truncate text-sm font-medium">{title}</span>
+          {totalCostUsd != null && (
+            <span className="text-xs text-muted-foreground" data-testid="run-session-group-cost">
+              {formatSessionCostUsd(totalCostUsd)} total
+            </span>
+          )}
+        </span>
+      </Link>
+      <ul
+        aria-label={`Runs in ${title}`}
+        className="ml-[17px] flex flex-col gap-1 border-l border-border pl-1.5"
+      >
+        {children}
+      </ul>
+    </li>
+  );
+}
+
+/**
  * One run in the history list. Layout (LEFT status column + whole-row click):
  * - LEADING: a single status icon chosen by priority (see `RunStatusIcon`) —
  *   failed triangle > skipped circle-slash > succeeded-unread blue dot >
  *   succeeded-read grey dot — each with an explanatory tooltip.
- * - BODY: the fire timestamp, the duration (muted), and — for skipped/failed —
- *   the stage the fire stopped at and why, derived from `errorCode`.
+ * - BODY: the fire timestamp, the duration (muted), the cost of a run that has
+ *   its session to itself, and — for skipped/failed — the stage the fire stopped
+ *   at and why, derived from `errorCode`.
  *
  * When the run produced a conversation the ENTIRE row is the click target
  * (a real `<Link>`: keyboard-focusable, Enter/Space activate natively) that
@@ -766,17 +975,31 @@ function useRunUnread(run: ScheduledTaskRun): boolean {
  * Runs without a conversation (e.g. skipped) render as a plain, non-interactive
  * row: no hover highlight, no pointer, not focusable.
  */
+// Shown before a run's status text, since the words alone don't say how the work went.
+const STATUS_TEXT_LABELS: Record<StepStatus, string> = {
+  started: "Started: ",
+  done: "Done: ",
+  failed: "Failed: ",
+  needs_input: `${WAITING_FOR_YOU}: `,
+};
+
 function RunRow({
   run,
   now,
   highlighted,
+  showCost,
   steps,
+  pullRequests,
 }: {
   run: ScheduledTaskRun;
   now: Date;
   highlighted: boolean;
+  /** `false` for a run listed under its shared session, which shows the session's total. */
+  showCost: boolean;
   /** The run's latest plan, independent of the automation's current prompt. */
   steps?: ScheduledTaskRunSteps;
+  /** The PRs the run created or worked on. */
+  pullRequests?: readonly ScheduledTaskRunPullRequest[];
 }) {
   const timestamp = formatRunTimestamp(run.firedAt ?? run.scheduledAt, now);
   // A workflow run's tasks, as the workflow's page shows them.
@@ -789,18 +1012,44 @@ function RunRow({
     () => (steps ? stepProgress(steps.steps, steps.statuses, sessionWorking) : []),
     [steps, sessionWorking],
   );
+  // What the run's agent last wrote about its work, when the run wrote a plan.
+  const statusText = useMemo(() => (steps ? latestStatusText(steps.statuses) : null), [steps]);
   const sessionId = run.conversationId;
   const showTasks = progress.length > 0 && sessionId != null;
+  const showPullRequests = (pullRequests?.length ?? 0) > 0;
+  // The PR summary and task buttons are controls of their own, so they sit over
+  // the row's link rather than in it.
+  const overlaid = showTasks || showPullRequests;
+  // The run's first line leaves room for the PR summary over its right end.
+  const summaryRef = useRef<HTMLSpanElement>(null);
+  const [summaryWidth, setSummaryWidth] = useState(0);
+  useLayoutEffect(() => {
+    const element = summaryRef.current;
+    if (!element) {
+      setSummaryWidth(0);
+      return;
+    }
+    const measure = () => setSummaryWidth(element.getBoundingClientRect().width);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [showPullRequests]);
   const [graphOpen, setGraphOpen] = useState(false);
   // The saved workflow the run's plan follows, when the Workflows page can open it.
   const workflowId = isFeatureEnabled(useServerInfo(), "workflows")
     ? (steps?.workflowId ?? null)
     : null;
   // Stop while the run's session works; play once it stopped with tasks left.
-  const control =
-    showTasks && steps?.isCurrent && steps.planId
-      ? planRunControl(progress, steps.statuses, sessionWorking, steps.planGraphRevision)
-      : null;
+  const canAct = showTasks && steps?.isCurrent === true && !!steps.planId;
+  const stopping = usePlanStopping(canAct ? (sessionId ?? null) : null, sessionWorking);
+  const control = canAct
+    ? planRunButtonState(
+        planRunControl(progress, steps.statuses, sessionWorking, steps.planGraphRevision),
+        stopping,
+      )
+    : null;
   // What the run's buttons and task menus refresh once its session takes them.
   const refreshKeys = [
     scheduledTaskRunsKey(run.scheduledTaskId),
@@ -811,10 +1060,13 @@ function RunRow({
     steps?.isCurrent ? sessionId : null,
     refreshKeys,
     steps?.planId ?? null,
+    stopping,
   );
-  // Room on the row's link for the buttons over its right end.
-  const buttonPadding = ["", "pr-11", "pr-18", "pr-25"][
-    1 + (workflowId ? 1 : 0) + (control ? 1 : 0)
+  // Room on the row's link for the buttons over its right end, in icon widths;
+  // "Stopping…" takes about four.
+  const controlWidth = control === "stopping" ? 4 : Number(control !== null);
+  const buttonPadding = ["", "pr-11", "pr-18", "pr-25", "pr-32", "pr-39", "pr-46"][
+    1 + (workflowId ? 1 : 0) + controlWidth
   ];
   const duration = formatRunDuration(run.firedAt, run.finishedAt);
   // Unread only applies to a succeeded run that produced a conversation.
@@ -831,16 +1083,20 @@ function RunRow({
         <RunStatusIcon run={run} unread={unread} showSessionActivity={showSessionActivity} />
       </span>
       <span className="flex min-w-0 flex-1 flex-col">
-        <span className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+        <span
+          className="flex flex-wrap items-baseline gap-x-2 gap-y-1"
+          style={summaryWidth ? { paddingRight: summaryWidth } : undefined}
+        >
           <span className="text-sm font-normal">{timestamp ?? "—"}</span>
           {duration && (
             <span className="text-xs text-muted-foreground" data-testid="run-duration">
               {duration}
             </span>
           )}
-          {run.sessionCostUsd != null && (
+          {showCost && run.sessionCostUsd != null && (
             <span className="text-xs text-muted-foreground" data-testid="run-cost">
-              Session cost {formatSessionCostUsd(run.sessionCostUsd)}
+              {formatSessionCostUsd(run.sessionCostUsd)}
+              {inFlightLabel !== undefined && " so far"}
             </span>
           )}
           {inFlightLabel && !(run.conversationPendingApprovals ?? 0) && (
@@ -860,6 +1116,22 @@ function RunRow({
               Session needs approval · Open to review
             </span>
           )}
+        {statusText && (
+          <span
+            className={cn(
+              "min-w-0 truncate text-xs",
+              statusText.status === "failed"
+                ? "text-amber-700 dark:text-amber-400"
+                : "text-muted-foreground",
+            )}
+            data-testid="run-status-text"
+            data-run-status={statusText.status}
+            title={statusText.text}
+          >
+            <span className="font-medium">{STATUS_TEXT_LABELS[statusText.status]}</span>
+            {statusText.text}
+          </span>
+        )}
         {failure && (
           <span className="text-xs text-muted-foreground" data-testid="run-failure">
             {failure.stage && (
@@ -897,8 +1169,10 @@ function RunRow({
       className={cn(
         "relative rounded-lg",
         highlighted && "animate-message-highlight",
-        // The row's timeline sits under its link, so the whole row lights up, once.
-        showTasks && "transition-colors hover:bg-muted has-[a:focus-visible]:bg-muted",
+        // The row's timeline, PRs and buttons sit over or under its link, so the whole
+        // row lights up, once.
+        overlaid &&
+          "transition-colors hover:bg-muted has-[a:focus-visible]:bg-muted has-[button:focus-visible]:bg-muted",
       )}
       style={highlighted ? { animationDuration: `${RUN_HIGHLIGHT_DURATION_MS}ms` } : undefined}
     >
@@ -909,7 +1183,9 @@ function RunRow({
           className={cn(
             commonClassName,
             "cursor-pointer focus-visible:outline-none",
-            showTasks ? buttonPadding : "transition-colors hover:bg-muted focus-visible:bg-muted",
+            showTasks
+              ? buttonPadding
+              : !overlaid && "transition-colors hover:bg-muted focus-visible:bg-muted",
           )}
         >
           {body}
@@ -918,30 +1194,39 @@ function RunRow({
         <div className={commonClassName}>{body}</div>
       )}
       {showTasks && (
-        <>
-          <RunTimeline
-            sessionId={sessionId}
-            progress={progress}
-            menuActionFor={taskMenus}
-            className="pr-3 pb-2.5 pl-10"
-          />
-          <div className="absolute top-1.5 right-2 z-10 flex items-center gap-0.5">
-            {control && steps?.planId && (
-              <RunPlanButton
-                sessionId={sessionId}
-                runId={steps.planId}
-                planName={steps?.planName ?? null}
-                control={control}
-                refreshKeys={refreshKeys}
+        <RunTimeline
+          sessionId={sessionId}
+          progress={progress}
+          menuActionFor={taskMenus}
+          className="pr-3 pb-2.5 pl-10"
+        />
+      )}
+      {overlaid && (
+        <div className="absolute top-1.5 right-2 z-10 flex items-center gap-0.5">
+          {showPullRequests && pullRequests && (
+            <span ref={summaryRef} className="flex h-7 min-w-0 items-center pr-2 pl-3">
+              <RunPullRequests pullRequests={pullRequests} nowMs={now.getTime()} />
+            </span>
+          )}
+          {showTasks && (
+            <>
+              {control && steps?.planId && (
+                <RunPlanButton
+                  sessionId={sessionId}
+                  runId={steps.planId}
+                  planName={steps?.planName ?? null}
+                  control={control}
+                  refreshKeys={refreshKeys}
+                />
+              )}
+              {workflowId && <RunWorkflowButton workflowId={workflowId} />}
+              <RunGraphButton
+                runName={`the ${timestamp ?? ""} run`}
+                onClick={() => setGraphOpen(true)}
               />
-            )}
-            {workflowId && <RunWorkflowButton workflowId={workflowId} />}
-            <RunGraphButton
-              runName={`the ${timestamp ?? ""} run`}
-              onClick={() => setGraphOpen(true)}
-            />
-          </div>
-        </>
+            </>
+          )}
+        </div>
       )}
       {graphOpen && showTasks && steps && (
         <WorkflowGraphOverlay

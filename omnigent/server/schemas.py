@@ -2440,6 +2440,12 @@ class SessionResponse(BaseModel):
         family instead of inferring it from the model string (which
         is wrong when the agent declares no model). ``None`` when
         the agent cannot be looked up.
+    :param permission_mode: The permission mode the session is in, in its
+        harness's vocabulary, e.g. ``"auto"`` or ``"approve-for-me"`` (the
+        names ``sys_session_create`` takes). Follows a switch made while it
+        runs to a mode that keeps approval; a mode that skips approval shows
+        only when the session's launch settings select it. ``None`` when the
+        harness has no permission modes or the mode cannot be told.
     :param model_override: Per-session LLM model override,
         e.g. ``"claude-opus-4-7"``. ``None`` means no override is
         active (the agent's ``llm_model`` applies). Set via
@@ -2486,6 +2492,9 @@ class SessionResponse(BaseModel):
         seed their cost indicator on resume without waiting for the
         next ``session.usage`` SSE event.
         Also ``None`` when ``usage_included`` is ``False``.
+    :param cost_hidden: ``True`` when the operator set ``OMNIGENT_HIDE_COST``;
+        clients then clear any cached cost instead of keeping it. ``None``
+        otherwise.
     :param usage_by_model: Per-model breakdown of the same subtree usage,
         keyed by the raw harness model id, e.g.
         ``{"claude-sonnet-4-6": ModelUsage(input_tokens=12000, ...)}``.
@@ -2499,9 +2508,10 @@ class SessionResponse(BaseModel):
         them with a separate ``GET /v1/sessions/{id}`` using
         ``include_usage=true``, ``include_items=false``,
         ``include_liveness=false``, and ``refresh_state=false``.
-    :param native_usage_baseline: Pi's own cumulative token baseline, excluding
-        descendants. Available even when display usage aggregation is skipped;
-        ``None`` for other harnesses or older servers.
+    :param native_usage_baseline: Own cumulative usage baseline for Pi, Claude
+        native and Codex side chats, excluding descendants. Available even when
+        display usage aggregation is skipped; ``None`` for other harnesses or
+        older servers.
     :param last_task_error: Error details from the most recently
         failed task. Only present when ``status == "failed"`` and
         the task stored an error. Lets clients display the failure
@@ -2629,6 +2639,7 @@ class SessionResponse(BaseModel):
     root_conversation_id: str | None = None
     llm_model: str | None = None
     harness: str | None = None
+    permission_mode: str | None = None
     model_override: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
@@ -2636,6 +2647,7 @@ class SessionResponse(BaseModel):
     context_window: int | None = None
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
+    cost_hidden: bool | None = None
     usage_by_model: dict[str, ModelUsage] | None = None
     usage_included: bool = True
     native_usage_baseline: NativeUsageBaseline | None = None
@@ -2797,6 +2809,7 @@ class UpdateSessionRequest(BaseModel):
 
     runner_id: str | None = None
     family_pinned: bool | None = None
+    nest_source_id: str | None = None
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] | None = None
     reasoning_effort: str | None = None
@@ -3437,7 +3450,8 @@ class WorkflowStep(BaseModel):
     :param id: Stable step ID, e.g. ``"build"``: lowercase letters, digits,
         ``-`` and ``_``, starting with a letter or digit; at most 64 characters.
     :param name: One line of at most 80 characters, e.g. ``"Build"``.
-    :param goal: What the step achieves, at most 300 characters, or ``None``.
+    :param goal: The step's description in Markdown, e.g. what it reads, does and
+        produces, or ``None``.
     :param depends_on: IDs of the steps that must be done before it.
     """
 
@@ -3453,13 +3467,19 @@ class WorkflowSummary(BaseModel):
     """
     A saved workflow as a list page returns it, without its steps.
 
-    :param id: Workflow ID, a bare 32-character hex UUID.
+    :param id: Workflow ID, bare 32-character hex.
     :param object: Discriminator; always ``"workflow"``.
     :param name: One line, unique among the owner's workflows.
     :param description: What the workflow is for.
     :param created_at: Unix epoch seconds when it was saved.
     :param updated_at: Unix epoch seconds of the last write.
     :param is_draft: Derived from whether the saved plan has no steps.
+    :param viewer_role: ``"owner"``, or ``"viewer"`` for someone it is shared with, who
+        may view, run and copy it but not change it.
+    :param owner_display_name: The owner's name for a viewer; ``None`` for the owner.
+    :param shareable: Whether the workflow itself can be shared where the server shares
+        workflows (``/v1/info`` ``workflow_sharing``); ``False`` for one whose grants
+        the server cannot keep.
     """
 
     id: str
@@ -3469,6 +3489,9 @@ class WorkflowSummary(BaseModel):
     created_at: int
     updated_at: int
     is_draft: bool = False
+    viewer_role: Literal["owner", "viewer"] = "owner"
+    owner_display_name: str | None = None
+    shareable: bool = True
 
 
 class WorkflowObject(WorkflowSummary):
@@ -3477,10 +3500,14 @@ class WorkflowObject(WorkflowSummary):
 
     :param steps: The workflow's graph.
     :param planning_session_id: The conversation for proposing revisions, separate from runs.
+    :param description_source: The planning conversation's journal entry for the proposal
+        the description was saved from or kept over, until the description is written
+        otherwise.
     """
 
     steps: list[WorkflowStep]
     planning_session_id: str | None = None
+    description_source: str | None = None
 
 
 class WorkflowList(BaseModel):
@@ -3504,6 +3531,23 @@ class WorkflowList(BaseModel):
     has_more: bool = False
 
 
+class SharedWorkflowList(BaseModel):
+    """
+    One page of the workflows other people shared with the caller, for
+    ``GET /v1/workflows/shared``, ordered by ID.
+
+    :param object: Discriminator; always ``"list"``.
+    :param data: The page's workflows, without their steps, each with ``viewer_role``
+        ``"viewer"`` and its owner's ``owner_display_name``.
+    :param next_cursor: Pass it as ``after`` for the next page; ``None`` on the last
+        page. A page can be short, even empty, while it is set.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[WorkflowSummary] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
 class WorkflowRunProgress(BaseModel):
     """
     Where a run's latest plan stands within its invocation, counted by each
@@ -3523,11 +3567,24 @@ class WorkflowRunProgress(BaseModel):
     failed: int = 0
 
 
+class WorkflowRunStarter(BaseModel):
+    """
+    The session that started a workflow run.
+
+    :param session_id: That session's ID.
+    :param title: Its title; empty when it has none yet.
+    """
+
+    session_id: str
+    title: str
+
+
 class WorkflowRun(BaseModel):
     """
     One run of a saved workflow: a session that started it.
 
     :param id: The run's ID: that of the plan entry that started it.
+    :param workflow_id: The saved workflow the run follows.
     :param plan_graph_revision: Stable graph ID, or the earliest position of the
         unchanged legacy graph. ``None`` when authoritative context is unavailable.
     :param session_id: The session that ran it.
@@ -3537,14 +3594,32 @@ class WorkflowRun(BaseModel):
     :param session_status: The session's status, ``"idle"``, ``"running"`` or
         ``"failed"``, including active direct sub-agents.
     :param background_work_running: Whether background work outlives the session's turn.
+    :param sandbox_launching: Whether the session's sandbox is still launching, so
+        the run is starting; ``False`` once it is up and for a failed launch.
     :param archived: Whether the session is archived.
     :param progress: Where the run's steps stand.
     :param steps: The latest plan's steps within this invocation.
     :param statuses: Each of those steps' newest status entry; a step with
         none yet is left out.
+    :param workflow_name: The workflow's name when it is the caller's own;
+        ``None`` for someone else's workflow or a deleted one.
+    :param started_by: The session that started it, when another session did
+        and the caller can read that session.
+    :param descendant_runs: The first page of the workflow runs below this one:
+        those of the sessions its session started while it was current, then
+        theirs, each right after the run that started it. Empty on the runs
+        listed here.
+    :param descendant_run_count: How many workflow runs are below this one, on
+        every page.
+    :param descendant_runs_cursor: Continues ``descendant_runs`` from
+        ``GET /v1/workflows/{workflow_id}/runs/{id}/descendant_runs``;
+        ``None`` when they are all here.
+    :param descendant_runs_active: Whether any run below this one, on any
+        page, is working or waiting for input.
     """
 
     id: str
+    workflow_id: str
     plan_graph_revision: str | int | None = None
     session_id: str
     title: str
@@ -3552,10 +3627,17 @@ class WorkflowRun(BaseModel):
     is_current: bool = False
     session_status: Literal["idle", "running", "failed"]
     background_work_running: bool = False
+    sandbox_launching: bool = False
     archived: bool = False
     progress: WorkflowRunProgress
     steps: list[WorkflowStep] = Field(default_factory=list)
     statuses: list[SessionJournalEntry] = Field(default_factory=list)
+    workflow_name: str | None = None
+    started_by: WorkflowRunStarter | None = None
+    descendant_runs: list[WorkflowRun] = Field(default_factory=list)
+    descendant_run_count: int = 0
+    descendant_runs_cursor: str | None = None
+    descendant_runs_active: bool = False
 
 
 class WorkflowRunList(BaseModel):
@@ -3600,6 +3682,11 @@ class UpdateWorkflowRequest(BaseModel):
     :param name: A new name.
     :param description: A new description, subject to the same character and
         stored-byte limits as creation.
+    :param expected_description: Apply ``description`` only while the stored
+        description is still this text, so one written meanwhile stays.
+    :param description_source: The journal entry ID of the planning-chat proposal
+        ``description`` was saved from or kept over; a description written without one
+        clears it.
     :param steps: New steps, replacing the old ones.
     :param planning_session_id: The private owned session for iterating on the plan.
     """
@@ -3608,6 +3695,8 @@ class UpdateWorkflowRequest(BaseModel):
 
     name: str | None = None
     description: str | None = None
+    expected_description: str | None = None
+    description_source: str | None = None
     steps: list[WorkflowStep] | None = None
     planning_session_id: str | None = None
 
@@ -4420,6 +4509,8 @@ class SessionUsageEvent(_SSEEventBase):
         so the client keeps its prior value (the snapshot seeds the
         initial "—" for an unpriced session). Once a session is priced
         the total only grows, so it never reverts to unpriced.
+    :param cost_hidden: ``True`` when the operator set ``OMNIGENT_HIDE_COST``,
+        telling the client to clear a cached cost rather than keep it.
     :param usage_by_model: Per-model breakdown of the same subtree usage
         after this update, keyed by raw harness model id, e.g.
         ``{"claude-sonnet-4-6": ModelUsage(input_tokens=12000, ...)}``.
@@ -4437,6 +4528,7 @@ class SessionUsageEvent(_SSEEventBase):
     context_tokens: int | None = None
     context_window: int | None = None
     total_cost_usd: float | None = None
+    cost_hidden: bool | None = None
     usage_by_model: dict[str, ModelUsage] | None = None
 
 

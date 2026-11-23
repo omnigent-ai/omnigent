@@ -173,6 +173,32 @@ it("replaces the default selection and the removed PR's cached metadata", async 
   expect(client.getQueryData(["github-info", "conv", url])).toMatchObject(empty);
 });
 
+it("keeps the workspace's repo when an attach reply describes only the PR", async () => {
+  const url = "https://github.com/example/other/pull/7";
+  const workspaceRepo = { name_with_owner: "example/one", host: "github.com" };
+  const attached = { object: "session.github.info", selected_pr_url: url, prs: [{ url }] };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(new Response(JSON.stringify(attached), { status: 200 })),
+  );
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  client.setQueryData(["github-info", "conv"], {
+    object: "session.github.info",
+    prs: [],
+    workspace_repo: workspaceRepo,
+  });
+  const { result } = renderHook(() => useUpdateSessionPr("conv"), {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
+  await act(() => result.current.mutateAsync({ url, action: "attach" }));
+  expect(client.getQueryData(["github-info", "conv"])).toMatchObject({
+    ...attached,
+    workspace_repo: workspaceRepo,
+  });
+});
+
 it("keeps a link to its own session when the panel switches sessions", async () => {
   const url = "https://github.com/example/one/pull/42";
   const linked = { object: "session.github.info", tracking_available: true, prs: [{ url }] };

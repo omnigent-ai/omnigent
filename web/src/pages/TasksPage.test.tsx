@@ -1,7 +1,7 @@
 // Tests for /tasks: lists, filters, gallery tabs, and row actions.
 // Scheduled-task hooks are mocked; the creation dialog exposes its seed props and close action.
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setOmnigentHostConfig } from "@/lib/host";
@@ -14,6 +14,24 @@ import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { showToast } from "@/components/ui/toast";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type * as AutomationListPaletteCommandsModule from "@/components/scheduled/automationListPaletteCommands";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
+import { registeredPaletteCommands } from "@/test/paletteCommands";
+
+// Counts renders of the list's ⌘K commands, which render nothing themselves.
+const listPaletteCommands = vi.hoisted(() => ({ renders: 0 }));
+vi.mock("@/components/scheduled/automationListPaletteCommands", async (importOriginal) => {
+  const original = await importOriginal<typeof AutomationListPaletteCommandsModule>();
+  return {
+    ...original,
+    AutomationListPaletteCommands: (
+      props: Parameters<typeof original.AutomationListPaletteCommands>[0],
+    ) => {
+      listPaletteCommands.renders += 1;
+      return original.AutomationListPaletteCommands(props);
+    },
+  };
+});
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
@@ -21,9 +39,11 @@ vi.mock("@/hooks/useViewerId", () => ({ useViewerId: vi.fn() }));
 
 vi.mock("@/hooks/useScheduledTasks", () => ({
   useScheduledTasks: vi.fn(),
+  useSharedScheduledTasks: vi.fn(),
   useUpdateScheduledTask: vi.fn(),
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
+  useCloneScheduledTask: vi.fn(),
 }));
 
 // Stub the create dialog — its internals are covered separately; here we only
@@ -117,6 +137,7 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
 const mutate = vi.fn();
 const deleteMutate = vi.fn();
 const runNowMutate = vi.fn();
+const cloneMutate = vi.fn();
 
 function setTasks(
   tasks: ScheduledTask[] | undefined,
@@ -130,8 +151,27 @@ function setTasks(
   } as unknown as ReturnType<typeof hooks.useScheduledTasks>);
 }
 
+const fetchNextSharedPage = vi.fn();
+
+function setSharedPages(
+  pages: { tasks: ScheduledTask[]; nextCursor: string | null }[] | undefined,
+  state: { isLoading?: boolean; isError?: boolean; isFetchingNextPage?: boolean } = {},
+) {
+  vi.mocked(hooks.useSharedScheduledTasks).mockReturnValue({
+    data: pages ? { pages, pageParams: pages.map(() => null) } : undefined,
+    isLoading: state.isLoading ?? false,
+    isError: state.isError ?? false,
+    hasNextPage: (pages?.at(-1)?.nextCursor ?? null) !== null,
+    isFetchingNextPage: state.isFetchingNextPage ?? false,
+    fetchNextPage: fetchNextSharedPage,
+    refetch: vi.fn(),
+  } as unknown as ReturnType<typeof hooks.useSharedScheduledTasks>);
+}
+
 const analytics = vi.fn();
 beforeEach(() => {
+  fetchNextSharedPage.mockReset();
+  setSharedPages(undefined);
   analytics.mockReset();
   setOmnigentHostConfig({ analytics });
   localStorage.clear();
@@ -139,6 +179,7 @@ beforeEach(() => {
   mutate.mockReset();
   deleteMutate.mockReset();
   runNowMutate.mockReset();
+  cloneMutate.mockReset();
   vi.mocked(showToast).mockReset();
   vi.mocked(hooks.useUpdateScheduledTask).mockReturnValue({
     mutate,
@@ -155,6 +196,11 @@ beforeEach(() => {
     isPending: false,
     variables: undefined,
   } as unknown as ReturnType<typeof hooks.useRunScheduledTaskNow>);
+  vi.mocked(hooks.useCloneScheduledTask).mockReturnValue({
+    mutate: cloneMutate,
+    isPending: false,
+    variables: undefined,
+  } as unknown as ReturnType<typeof hooks.useCloneScheduledTask>);
 });
 
 afterEach(() => {
@@ -183,6 +229,10 @@ function renderPage(
               <Route
                 path={`${basename}/tasks/templates`}
                 element={<TasksPage key="templates" templatesOnly />}
+              />
+              <Route
+                path={`${basename}/tasks/:taskId`}
+                element={<div data-testid="task-detail-route" />}
               />
             </Routes>
           </RoutingProvider>
@@ -467,6 +517,35 @@ describe("sort order", () => {
         .getAllByTestId("scheduled-task-row")
         .map((r) => r.querySelector(".font-semibold")?.textContent);
       expect(names).toEqual(expected);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("sorts every row by name when Name is picked, and back by next run", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    try {
+      setTasks([
+        task({ id: "z", name: "Zulu", state: "active", rrule: "FREQ=DAILY;BYHOUR=6" }),
+        task({ id: "m", name: "Mike", state: "active", rrule: "FREQ=DAILY;BYHOUR=18" }),
+        task({ id: "a", name: "Alpha", state: "paused", rrule: "FREQ=DAILY;BYHOUR=1" }),
+      ]);
+      renderPage();
+      const names = () =>
+        screen
+          .getAllByTestId("scheduled-task-row")
+          .map((r) => r.querySelector(".font-semibold")?.textContent);
+      expect(screen.getByTestId("tasks-sort")).toHaveTextContent("Next run");
+      expect(names()).toEqual(["Zulu", "Mike", "Alpha"]);
+
+      fireEvent.click(screen.getByTestId("tasks-sort"));
+      fireEvent.click(screen.getByRole("option", { name: "Name" }));
+      expect(names()).toEqual(["Alpha", "Mike", "Zulu"]);
+
+      fireEvent.click(screen.getByTestId("tasks-sort"));
+      fireEvent.click(screen.getByRole("option", { name: "Next run" }));
+      expect(names()).toEqual(["Zulu", "Mike", "Alpha"]);
     } finally {
       vi.useRealTimers();
     }
@@ -760,20 +839,93 @@ describe("row actions", () => {
   });
 });
 
+describe("cloning from the row menu", () => {
+  const CLONE_INFO = {
+    ...TRIGGER_INFO,
+    scheduled_task_clone: true,
+    features: { ...TRIGGER_INFO.features, automations_v2: true },
+  };
+
+  it("offers Clone only on a server that can clone", () => {
+    setTasks([task()]);
+    renderPage();
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    expect(screen.queryByTestId("task-clone")).toBeNull();
+  });
+
+  it("opens the copy and says what's left once the clone is created", () => {
+    setTasks([task({ id: "st_1", state: "active" })]);
+    renderPage("/tasks", "", CLONE_INFO);
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Clone" }));
+
+    expect(cloneMutate).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "st_1" }),
+      expect.any(Object),
+    );
+    expect(showToast).not.toHaveBeenCalled();
+
+    act(() =>
+      cloneMutate.mock.calls[0][1].onSuccess(
+        task({ id: "st_2", nextRunAt: "2026-11-20T09:00:00+00:00" }),
+      ),
+    );
+    expect(showToast).toHaveBeenCalledExactlyOnceWith(
+      "Automation cloned. Pause or delete the original so they don't both run.",
+    );
+    expect(screen.getByTestId("task-detail-route")).toBeInTheDocument();
+  });
+
+  it("stays on the list when the server has no automation pages", () => {
+    setTasks([task({ id: "st_1" })]);
+    renderPage("/tasks", "", { ...TRIGGER_INFO, scheduled_task_clone: true });
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Clone" }));
+
+    act(() => cloneMutate.mock.calls[0][1].onSuccess(task({ id: "st_2" })));
+    expect(showToast).toHaveBeenCalledOnce();
+    expect(screen.queryByTestId("task-detail-route")).toBeNull();
+    expect(screen.getByTestId("tasks-list")).toBeInTheDocument();
+  });
+
+  it("stays on the list and shows the server's reason when the clone is refused", () => {
+    setTasks([task()]);
+    renderPage("/tasks", "", CLONE_INFO);
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Clone" }));
+
+    cloneMutate.mock.calls[0][1].onError(
+      new ScheduledTaskApiError("Only an automation can be cloned", 400, "invalid_input"),
+    );
+    expect(showToast).toHaveBeenCalledExactlyOnceWith(
+      "Couldn't clone the automation: Only an automation can be cloned",
+    );
+    expect(screen.getByTestId("tasks-list")).toBeInTheDocument();
+  });
+});
+
 describe("sharing from the row menu", () => {
   const SHARING_INFO = { ...TRIGGER_INFO, scheduled_task_sharing: true };
 
-  function openRowMenu(viewerId: string, info: typeof SERVER_INFO_OFFLINE_FALLBACK) {
+  function openRowMenu(
+    viewerId: string,
+    info: typeof SERVER_INFO_OFFLINE_FALLBACK,
+    overrides: Partial<ScheduledTask> = {},
+  ) {
     vi.mocked(useViewerId).mockReturnValue(viewerId);
-    setTasks([task({ id: "st_share", ownerUserId: "alice@example.com" })]);
+    setTasks([task({ id: "st_share", ownerUserId: "alice@example.com", ...overrides })]);
     renderPage("/tasks", "", info);
     // A known viewer gets the first-visit guide; dismiss it.
     fireEvent.click(screen.getByRole("button", { name: "Maybe later" }));
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
   }
 
-  it("opens the share dialog for an automation the viewer owns", () => {
-    openRowMenu("alice@example.com", SHARING_INFO);
+  // An older server sends no `shareable`.
+  it.each([
+    ["shareable", { shareable: true }],
+    ["from an older server", {}],
+  ])("opens the share dialog for an automation the viewer owns (%s)", (_label, overrides) => {
+    openRowMenu("alice@example.com", SHARING_INFO, overrides);
     fireEvent.click(screen.getByTestId("task-share"));
     expect(screen.getByTestId("share-dialog-open")).toHaveAttribute(
       "data-automation-id",
@@ -781,10 +933,23 @@ describe("sharing from the row menu", () => {
     );
   });
 
-  it("disables Share while the server turns sharing off", () => {
-    openRowMenu("alice@example.com", { ...SHARING_INFO, sharing_mode: "off" });
+  const SHARING_OFF = "Sharing has been disabled for this Omnigent server.";
+  const LEGACY = "This is a legacy automation. Recreate it to share it.";
+  it.each([
+    ["while the server turns sharing off", "off" as const, true, SHARING_OFF],
+    ["on a legacy automation", undefined, false, LEGACY],
+    // Sharing off wins.
+    ["on a legacy automation while sharing is off", "off" as const, false, SHARING_OFF],
+  ])("disables Share with its reason %s", async (_label, sharingMode, shareable, reason) => {
+    openRowMenu(
+      "alice@example.com",
+      { ...SHARING_INFO, ...(sharingMode && { sharing_mode: sharingMode }) },
+      { shareable },
+    );
     const share = screen.getByTestId("task-share");
     expect(share).toHaveAttribute("aria-disabled", "true");
+    fireEvent.focus(share);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
     fireEvent.click(share);
     expect(screen.queryByTestId("share-dialog-open")).toBeNull();
   });
@@ -796,6 +961,126 @@ describe("sharing from the row menu", () => {
     openRowMenu(viewerId, info);
     expect(screen.getByTestId("task-edit")).toBeInTheDocument();
     expect(screen.queryByTestId("task-share")).toBeNull();
+  });
+});
+
+describe("automations shared with the viewer", () => {
+  const SHARING_INFO = {
+    ...TRIGGER_INFO,
+    scheduled_task_sharing: true,
+    scheduled_task_shared_with_me: true,
+  };
+  const shared = (overrides: Partial<ScheduledTask> = {}) =>
+    task({
+      id: "st_shared",
+      name: "Team digest",
+      ownerUserId: "alice@example.com",
+      viewerRole: "viewer",
+      ownerDisplayName: "Alice",
+      ...overrides,
+    });
+
+  function openSharedTab(info: typeof SERVER_INFO_OFFLINE_FALLBACK = SHARING_INFO) {
+    vi.mocked(useViewerId).mockReturnValue("bob@example.com");
+    setTasks([task({ id: "st_mine", name: "Mine", ownerUserId: "bob@example.com" })]);
+    renderPage("/tasks?view=shared", "", info);
+    // Without the tab the page falls back to the viewer's list, whose guide shows once.
+    const dismissGuide = screen.queryByRole("button", { name: "Maybe later" });
+    if (dismissGuide) fireEvent.click(dismissGuide);
+  }
+
+  it("lists them on their own tab, naming each owner", () => {
+    setSharedPages([{ tasks: [shared()], nextCursor: null }]);
+    openSharedTab();
+    expect(hooks.useSharedScheduledTasks).toHaveBeenLastCalledWith(true);
+    expect(screen.getByRole("tab", { name: "Shared with me" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    const list = screen.getByTestId("shared-tasks-list");
+    const row = within(list).getByTestId("scheduled-task-row");
+    expect(within(row).getByText("Team digest")).toBeInTheDocument();
+    expect(within(row).getByTestId("task-owner")).toHaveTextContent("Shared by Alice");
+    expect(within(list).queryByText("Mine")).toBeNull();
+  });
+
+  it("shows every action disabled with why, and takes none", async () => {
+    setSharedPages([{ tasks: [shared()], nextCursor: null }]);
+    openSharedTab({ ...SHARING_INFO, scheduled_task_clone: true });
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    for (const testId of [
+      "task-run-now",
+      "task-edit",
+      "task-share",
+      "task-clone",
+      "task-pause-toggle",
+      "task-delete",
+    ]) {
+      const item = screen.getByTestId(testId);
+      expect(item).toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(item);
+    }
+    expect(runNowMutate).not.toHaveBeenCalled();
+    expect(mutate).not.toHaveBeenCalled();
+    expect(deleteMutate).not.toHaveBeenCalled();
+    expect(cloneMutate).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("manual-dialog-open")).toBeNull();
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+    fireEvent.focus(screen.getByTestId("task-clone").parentElement!);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "Only the automation's owner can clone it.",
+    );
+  });
+
+  it("loads more on request, and past a page that came back empty", () => {
+    setSharedPages([{ tasks: [], nextCursor: "st_0" }]);
+    openSharedTab();
+    // Nothing to show yet, so the next page loads by itself.
+    expect(fetchNextSharedPage).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("shared-tasks-empty-state")).toBeNull();
+
+    fetchNextSharedPage.mockReset();
+    cleanup();
+    setSharedPages([{ tasks: [shared()], nextCursor: "st_shared" }]);
+    openSharedTab();
+    expect(fetchNextSharedPage).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("shared-tasks-show-more"));
+    expect(fetchNextSharedPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops loading past an empty page once a page fails, until Retry", () => {
+    // An empty page with more to come, whose next page failed.
+    setSharedPages([{ tasks: [], nextCursor: "st_0" }], { isError: true });
+    openSharedTab();
+
+    expect(fetchNextSharedPage).not.toHaveBeenCalled();
+    expect(screen.getByTestId("shared-tasks-load-error")).toBeInTheDocument();
+  });
+
+  it("says when nothing is shared with the viewer", () => {
+    setSharedPages([{ tasks: [], nextCursor: null }]);
+    openSharedTab();
+    expect(screen.getByTestId("shared-tasks-empty-state")).toHaveTextContent(
+      "No automations are shared with you yet",
+    );
+  });
+
+  it.each([
+    ["a server that cannot share automations", TRIGGER_INFO],
+    ["a single-user server", { ...SHARING_INFO, single_user: true }],
+    [
+      "an older server that shares automations but cannot list them",
+      { ...TRIGGER_INFO, scheduled_task_sharing: true },
+    ],
+  ])("has no Shared with me tab on %s", (_label, info) => {
+    setSharedPages([{ tasks: [shared()], nextCursor: null }]);
+    openSharedTab(info);
+    expect(screen.queryByRole("tab", { name: "Shared with me" })).toBeNull();
+    expect(hooks.useSharedScheduledTasks).toHaveBeenLastCalledWith(false);
+    expect(screen.getByRole("tab", { name: "Your automations" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
   });
 });
 
@@ -862,5 +1147,45 @@ describe("trigger templates", () => {
     selectView("Your automations");
     expect(screen.getByText("No automations yet")).toBeVisible();
     expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
+  });
+});
+
+describe("the list's actions in ⌘K", () => {
+  const withQuickPick = (on: boolean) => ({
+    ...TRIGGER_INFO,
+    features: { ...TRIGGER_INFO.features, quick_pick_palette: on },
+  });
+  /** Markup without React's generated ids, which count every `useId` call in the tree. */
+  const markup = (element: HTMLElement) => element.innerHTML.replace(/:r[0-9a-z]+:/g, ":id:");
+  const command = (label: string) =>
+    registeredPaletteCommands().find((candidate) => candidate.label === label);
+
+  beforeEach(() => {
+    listPaletteCommands.renders = 0;
+  });
+  afterEach(() => usePaletteCommandsStore.setState({ groups: {} }));
+
+  it("mounts nothing with quick_pick_palette off, and the page renders the same", () => {
+    setTasks([task()]);
+    const { container, unmount } = renderPage("/tasks", "", withQuickPick(false));
+    const withoutCommands = markup(container);
+    expect(listPaletteCommands.renders).toBe(0);
+    expect(registeredPaletteCommands()).toEqual([]);
+    unmount();
+
+    // The commands render nothing themselves, so turning the flag on changes no markup.
+    const { container: withFlag } = renderPage("/tasks", "", withQuickPick(true));
+    expect(listPaletteCommands.renders).toBeGreaterThan(0);
+    expect(markup(withFlag)).toBe(withoutCommands);
+  });
+
+  it("runs the row menu's Pause and the New button's editor from ⌘K", () => {
+    setTasks([task()]);
+    renderPage("/tasks", "", withQuickPick(true));
+    act(() => command("Pause “Nightly triage”")!.run());
+    expect(mutate).toHaveBeenCalledWith({ id: "st_1", input: { state: "paused" } });
+    expect(command("Delete “Nightly triage”")).toBeUndefined();
+    act(() => command("New automation…")!.run());
+    expect(screen.getByTestId("manual-dialog-open")).toBeInTheDocument();
   });
 });

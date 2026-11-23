@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib
 import logging
 import re
 from pathlib import Path
@@ -452,10 +453,11 @@ def test_attachment_cache_defaults_to_omnigent_folder(
 
 
 @pytest.mark.parametrize(
-    "filename", ["archive.zip", "report.docx", "sheet.xlsx", "deck.pptx", "app.sqlite3"]
+    "filename",
+    ["archive.zip", "report.docx", "sheet.xlsx", "deck.pptx", "app.sqlite3", "clip.MP4"],
 )
 def test_requires_filesystem_allowed(filename: str) -> None:
-    """Archives, office documents, and databases are filesystem."""
+    """Default binary formats are delivered through filesystem tools."""
     assert requires_filesystem(filename)
 
 
@@ -495,6 +497,36 @@ async def test_re_resolution_takes_the_filename_from_stored_metadata() -> None:
 
 
 @pytest.mark.parametrize(
+    "key", ["pi", "cursor", "kiro", "goose", "antigravity", "qwen", "kimi", "hermes", "devin"]
+)
+async def test_native_file_delivery(key: str, tmp_path: Path) -> None:
+    """File-path adapters expose uploaded MP4 bytes through the existing renderer."""
+    from omnigent.inner.native_attachments import (
+        FILESYSTEM_ATTACHMENT_UPLOAD_HARNESSES,
+    )
+
+    assert f"{key}-native" in FILESYSTEM_ATTACHMENT_UPLOAD_HARNESSES
+    render = importlib.import_module(f"omnigent.inner.{key}_native_executor")._content_to_text
+    bridge = tmp_path / key
+    body = b"synthetic video bytes"
+    client = _FakeFileClient(
+        {
+            "name": "clip.mp4",
+            "content_type": "video/mp4",
+            "metadata": {"source_metadata": {"delivery": "filesystem"}},
+        },
+        body=body,
+    )
+    block = {"type": "input_file", "file_id": "video-file"}
+    resolved = await resolve_file_id_block(block, session_id="session-example", client=client)
+    assert resolved is not None
+    path = attachment_cache_dir(bridge) / "clip.mp4"
+    assert str(path) in render([resolved[0]], bridge)
+    assert path.read_bytes() == body
+    assert path.stat().st_mode & 0o111 == 0
+
+
+@pytest.mark.parametrize(
     ("filename", "metadata", "expected"),
     [
         ("trace.gz", {"delivery": "filesystem"}, True),
@@ -516,10 +548,11 @@ def test_uses_filesystem_delivery(filename: str, metadata: object, expected: boo
     [
         (["a.zip", "b.docx"], CAP_FILESYSTEM_ATTACHMENTS),
         (["a.zip", "trace.gz"], CAP_FILESYSTEM_ATTACHMENT_DELIVERY),
+        (["clip.MP4"], CAP_FILESYSTEM_ATTACHMENT_DELIVERY),
     ],
 )
 def test_filesystem_attachment_capability(filenames: list[str], capability: str) -> None:
-    """Only types outside the default extensions need the newer runtime capability."""
+    """Formats beyond the original extensions need recorded-delivery support."""
     assert filesystem_attachment_capability(filenames) == capability
 
 
