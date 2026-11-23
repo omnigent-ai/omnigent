@@ -5832,8 +5832,7 @@ describe("Sidebar view options", () => {
           created_at: 2,
         }),
       ]);
-      if (pinned) renderGroupingSidebar();
-      else renderSidebar();
+      renderSidebar();
 
       const link = screen.getByRole("link", { name: "conv_worker" });
       if (pinned) fireEvent.focus(link);
