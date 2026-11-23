@@ -356,10 +356,20 @@ async def inherited_approval_skipping_problem(agent: Any, agent_cache: Any) -> s
 
 
 async def validate_scheduled_permission_support(
-    *, permission_mode: str | None, agent: Any, agent_cache: Any
+    *,
+    permission_mode: str | None,
+    agent: Any,
+    agent_cache: Any,
+    continues_session: bool = False,
 ) -> None:
-    """Reject modes belonging to a different harness, or an inherited approval-skipping mode."""
+    """Reject modes belonging to a different harness, or an inherited approval-skipping mode.
+
+    :param continues_session: Whether the task continues a session. Without a mode of its
+        own, the task wakes that session in the session's mode, so nothing is inherited.
+    """
     if permission_mode is None:
+        if continues_session:
+            return
         problem = await inherited_approval_skipping_problem(agent, agent_cache)
         if problem is not None:
             raise OmnigentError(problem, code=ErrorCode.INVALID_INPUT)

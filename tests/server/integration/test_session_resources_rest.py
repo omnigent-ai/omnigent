@@ -20,7 +20,7 @@ import httpx
 import pytest
 
 from omnigent.runner.tool_dispatch import execute_tool
-from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.spec.types import AgentSpec, ExecutorSpec, ToolGroupsConfig
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -147,7 +147,7 @@ async def _file_tool(
     :param client: The test HTTP client, standing in for the runner's server client.
     :param session_id: The calling session, e.g. ``"conv_abc123"``.
     :param workspace: The session's own workspace, where its native terminal runs.
-    :param name: File tool name, e.g. ``"sys_upload_file"``.
+    :param name: File tool name, e.g. ``"sys_files_upload"``.
     :param args: Tool arguments, e.g. ``path="out/report.txt"``.
     :returns: The tool's output string.
     """
@@ -159,6 +159,7 @@ async def _file_tool(
             spec_version=1,
             skills_filter="none",
             executor=ExecutorSpec(config={"harness": "claude-native"}),
+            tool_groups=ToolGroupsConfig(files=True),
         ),
         conversation_id=session_id,
         runner_workspace=workspace,
@@ -171,7 +172,7 @@ async def test_file_tools_round_trip_through_the_real_server(
     client: httpx.AsyncClient, tmp_path: Path
 ) -> None:
     """
-    The default file tools, called from a native harness with no spec opt-in,
+    The file tools, called from a native harness whose spec turns them on,
     upload a workspace file to the calling session, list it and read it back,
     while another session can neither list nor read it.
     """
@@ -183,17 +184,17 @@ async def test_file_tools_round_trip_through_the_real_server(
     (workspace / "out" / "report.txt").write_text("quarterly report\n")
 
     uploaded = json.loads(
-        await _file_tool(client, session_id, workspace, "sys_upload_file", path="out/report.txt")
+        await _file_tool(client, session_id, workspace, "sys_files_upload", path="out/report.txt")
     )
-    listed = json.loads(await _file_tool(client, session_id, workspace, "sys_list_files"))
+    listed = json.loads(await _file_tool(client, session_id, workspace, "sys_files_list"))
     downloaded = await _file_tool(
-        client, session_id, workspace, "sys_download_file", file_id=uploaded["file_id"]
+        client, session_id, workspace, "sys_files_download", file_id=uploaded["file_id"]
     )
     other_listed = json.loads(
-        await _file_tool(client, other_session_id, workspace, "sys_list_files")
+        await _file_tool(client, other_session_id, workspace, "sys_files_list")
     )
     other_downloaded = await _file_tool(
-        client, other_session_id, workspace, "sys_download_file", file_id=uploaded["file_id"]
+        client, other_session_id, workspace, "sys_files_download", file_id=uploaded["file_id"]
     )
 
     assert uploaded["filename"] == "report.txt"

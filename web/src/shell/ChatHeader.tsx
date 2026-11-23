@@ -47,7 +47,6 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
 import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
-import { CreatedBySession } from "./CreatedBySession";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { HeaderProjectTag } from "./HeaderProjectTag";
@@ -168,7 +167,6 @@ interface ChatHeaderProps {
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
   workingDirectory?: string | null;
-  createdBySessionId?: string | null;
   /** Effective access to the active session. */
   permissionLevel?: number | null;
   /** Owner-managed top-level row backing the title-adjacent action menu. */
@@ -367,7 +365,6 @@ export function ChatHeader({
   subAgentName,
   conversationId,
   workingDirectory,
-  createdBySessionId,
   permissionLevel,
   actionConversation = null,
   conversationTitle,
@@ -685,9 +682,6 @@ export function ChatHeader({
             compact={isMobile}
             className="pr-1"
           />
-        )}
-        {conversationId && createdBySessionId && (
-          <CreatedBySession key={createdBySessionId} sessionId={createdBySessionId} />
         )}
         {hasPageTitle && pageTitle}
       </div>
