@@ -30,7 +30,12 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
 from omnigent.entities.environment_filesystem import InvalidPath
 from omnigent.host.workspace_git.runner import GitError, start_owned_process, trusted_search_path
 from omnigent.host.workspace_git.working_copy import list_working_copy_changes
-from omnigent.runner.environment_filesystem import _lstat_beneath, _validate_path
+from omnigent.inner.async_utils import run_sync_on_thread
+from omnigent.runner.environment_filesystem import (
+    _lstat_beneath,
+    _validate_path,
+    read_regular_file_beneath,
+)
 from omnigent.workspace_content_search import literal_glob
 
 MAX_FOCUSED_FILES = 16
@@ -43,6 +48,8 @@ _CHANGES_REUSE_S = 30.0
 _MAX_CACHED_CHANGES = 16
 _LIST_FILES_BYTES = 4 * 1024 * 1024
 _REACH_DEADLINE_S = 5.0
+# A focused file is searched first only if this much of it, or all, is text.
+_TEXT_CHECK_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -222,9 +229,19 @@ async def _reached_in(
     return dict(zip(directories, found, strict=True))
 
 
-def _regular_file(root: Path, path: str) -> bool:
-    found = _lstat_beneath(root, path)
-    return found is not None and stat.S_ISREG(found.st_mode)
+def _text_files(root: Path, paths: Sequence[str]) -> list[str]:
+    """The regular files of ``paths`` that hold no NUL byte, checked whole.
+
+    Ripgrep searches a file it's given by name even past a NUL, but a walk
+    skips such a binary file, so only text is searched ahead of the walk.
+    """
+    resolved = root.resolve()
+    kept: list[str] = []
+    for path in paths:
+        content = read_regular_file_beneath(resolved, path, _TEXT_CHECK_BYTES)
+        if content is not None and len(content) <= _TEXT_CHECK_BYTES and b"\0" not in content:
+            kept.append(path)
+    return kept
 
 
 def _real_directory(root: Path, path: str) -> bool:
@@ -258,14 +275,9 @@ async def reachable_focused_files(
             path = _validate_path(raw) if raw else ""
         except InvalidPath:
             continue
-        if (
-            path
-            and path not in candidates
-            and not _is_git_path(path)
-            and in_scope(path)
-            and _regular_file(root, path)
-        ):
+        if path and path not in candidates and not _is_git_path(path) and in_scope(path):
             candidates.append(path)
+    candidates = await run_sync_on_thread(_text_files, root, candidates)
     if not candidates:
         return []
     reached = await _reached_in(

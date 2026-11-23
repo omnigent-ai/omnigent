@@ -1002,6 +1002,24 @@ async def test_focused_files_in_folders_the_walk_prunes_are_not_searched_first(
 
 
 @needs_rg
+@pytest.mark.parametrize("content", [b"needle\n\0rest\n", b"\0\nneedle\n"], ids=["late", "early"])
+async def test_a_focused_binary_file_is_searched_as_the_walk_searches_it(
+    tmp_path: Path, content: bytes
+) -> None:
+    root = _priority_workspace(tmp_path / "repo")
+    (root / "focus" / "deep" / "image.bin").write_bytes(content)
+    focused = {"focused_paths": ["focus/deep/image.bin", "focus/deep/open.txt"]}
+
+    walked = await _search_text(root, "needle", **focused)
+    prioritized = await _search_text(root, "needle", order=SEARCH_ORDER_PRIORITY, **focused)
+
+    # A walk skips a file with a NUL byte, though ripgrep searches one it's given by name.
+    assert "focus/deep/image.bin" not in _paths_in_order(walked)
+    assert sorted(_paths_in_order(prioritized)) == sorted(_paths_in_order(walked))
+    assert _paths_in_order(prioritized)[0] == "focus/deep/open.txt"
+
+
+@needs_rg
 async def test_a_file_name_holding_a_newline_never_lets_an_ignored_file_in_first(
     tmp_path: Path,
 ) -> None:
