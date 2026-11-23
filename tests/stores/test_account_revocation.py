@@ -1598,6 +1598,35 @@ def test_deletion_removes_the_accounts_gadgets_and_who_they_were_shared_with(
     assert store.get(kept["id"]) is not None
 
 
+def test_reregistration_finishes_removing_the_gadget_grants_a_deleted_account_held(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    _, _, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("bob")
+    board = service("bob").create("Bob's board")
+    permissions.grant_for_gadget("alice", board["id"], 2)
+    original = accounts_module.delete_deleted_account_gadget_grants
+    # The grant cleanup fails during the deletion and the first re-registration.
+    monkeypatch.setattr(
+        accounts_module, "delete_deleted_account_gadget_grants", lambda *args, **kwargs: 0
+    )
+    assert accounts.delete_user("alice") is True
+    assert permissions.resolve_gadget_access(["alice"], board["id"]) == 2
+    with pytest.raises(OmnigentError) as refused:
+        accounts.create_user_with_password("alice", "replacement-hash")
+    assert refused.value.code == ErrorCode.CONFLICT
+    assert "gadget grants" in refused.value.message
+
+    monkeypatch.setattr(accounts_module, "delete_deleted_account_gadget_grants", original)
+    assert accounts.create_user_with_password("alice", "replacement-hash").id == "alice"
+    # The new Alice does not inherit the old one's access to Bob's board.
+    assert permissions.resolve_gadget_access(["alice"], board["id"]) is None
+    assert service("alice").shared() == {"items": [], "next_cursor": None}
+
+
 def test_reregistration_waits_until_the_deleted_accounts_gadgets_are_gone(
     db_uri: str, tmp_path, monkeypatch
 ) -> None:

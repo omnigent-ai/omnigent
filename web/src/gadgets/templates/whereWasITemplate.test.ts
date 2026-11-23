@@ -13,15 +13,13 @@ import {
   bootTemplatePage,
   jsonBytes,
   schemaKeywords,
+  recordingCollections,
+  type TemplateDoc,
+  type TemplateListener,
 } from "./templateTestKit";
 
-interface Doc {
-  id: string;
-  version: string;
-  value: unknown;
-  updatedAt?: string;
-}
-type Listener = (snapshot: { status: string; items: unknown[] }) => void;
+type Doc = TemplateDoc;
+type Listener = TemplateListener;
 
 const REVISION = "a".repeat(32);
 const PREVIOUS = "b".repeat(32);
@@ -101,6 +99,7 @@ function startRadar({
   canAct = true,
   canWrite = true,
   delivery = "sent",
+  allowErrors = false,
 }: {
   html?: string;
   preview?: boolean;
@@ -108,36 +107,13 @@ function startRadar({
   canWrite?: boolean;
   /** How the host answers a request: `starting` while the viewer has no gadget session yet. */
   delivery?: "sent" | "starting";
+  /** A design that is meant to throw while the page loads. */
+  allowErrors?: boolean;
 } = {}) {
-  const listeners: Record<string, Listener> = {};
+  const { listeners, writes, collection } = recordingCollections();
   let actionListener: Listener | null = null;
-  const stored: Record<string, Record<string, Doc>> = {};
-  const writes: { collection: string; op: string; id: string; value: unknown }[] = [];
   const requests: { action: string; params: unknown }[] = [];
   const automations: unknown[] = [];
-  const collection = (name: string) => {
-    const docs = (stored[name] ??= {});
-    return {
-      watch: (listener: Listener) => {
-        listeners[name] = listener;
-        return { dispose: () => undefined };
-      },
-      get: (id: string) => Promise.resolve(docs[id] ?? null),
-      create: (value: unknown, options: { id?: string }) => {
-        const doc = { id: options?.id ?? "x", version: "v1", value };
-        writes.push({ collection: name, op: "create", id: doc.id, value });
-        docs[doc.id] = doc;
-        return Promise.resolve(doc);
-      },
-      replace: (id: string, value: unknown) => {
-        const doc = { id, version: "v2", value };
-        writes.push({ collection: name, op: "replace", id, value });
-        docs[id] = doc;
-        return Promise.resolve(doc);
-      },
-      delete: () => Promise.resolve({ deleted: true }),
-    };
-  };
   const client = {
     context: {
       app: { id: "app1", name: "Where was I?" },
@@ -169,7 +145,7 @@ function startRadar({
       },
     },
   };
-  bootTemplatePage(html, client);
+  bootTemplatePage(html, client, { allowErrors });
   const emit = (name: string, items: Doc[]) => listeners[name]?.({ status: "live", items });
   const emitSnapshot = (name: string, snapshot: { status: string; items: unknown[] }) =>
     listeners[name]?.(snapshot);
@@ -853,7 +829,7 @@ describe("where was I designs", () => {
 
   it("falls back to the plain view when a design's script fails to load", async () => {
     const html = withView("", "Radar.view(lanesThatDoNotExist.render);");
-    const { emit, reports, ready } = startRadar({ html });
+    const { emit, reports, ready } = startRadar({ html, allowErrors: true });
     await waitFor(() => expect(ready()).toBe(true));
     emit("radar", [{ id: "current", version: "v1", value: RADAR }]);
 

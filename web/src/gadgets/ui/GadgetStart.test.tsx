@@ -128,6 +128,29 @@ describe("New gadget", () => {
     expect(publishGadgetRevision).toHaveBeenCalledWith("where-2", "rev-2", "v0");
   });
 
+  it("publishes the uploaded revision again when only the publish failed", async () => {
+    const created = gadgetFixture({ id: "where-3", name: "Where was I?", version: "v0" });
+    vi.mocked(createGadget).mockResolvedValue(created);
+    vi.mocked(createGadgetRevision).mockResolvedValue({ id: "rev-3" });
+    vi.mocked(publishGadgetRevision)
+      .mockRejectedValueOnce(new Error("Publish failed."))
+      .mockResolvedValue(created);
+    renderWithGadgets(<GadgetStartPage />, { path: "/gadget/new" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Where was I?" }));
+    const preview = await screen.findByRole("dialog", { name: "Where was I?" });
+    fireEvent.click(within(preview).getByRole("button", { name: "Use template" }));
+    expect(await within(preview).findByRole("alert")).toHaveTextContent("Publish failed.");
+    fireEvent.click(within(preview).getByRole("button", { name: "Try again" }));
+
+    await waitFor(() => expect(location().pathname).toBe("/gadget/where-3"));
+    // Neither the gadget nor its revision is made twice.
+    expect(createGadget).toHaveBeenCalledTimes(1);
+    expect(createGadgetRevision).toHaveBeenCalledTimes(1);
+    expect(publishGadgetRevision).toHaveBeenCalledTimes(2);
+    expect(publishGadgetRevision).toHaveBeenLastCalledWith("where-3", "rev-3", "v0");
+  });
+
   it("starts a blank gadget in New session with one click", async () => {
     vi.mocked(createGadget).mockResolvedValue(CREATED);
     renderWithGadgets(<GadgetStartPage />, { path: "/gadget/new" });

@@ -13,14 +13,13 @@ import {
   bootTemplatePage,
   jsonBytes,
   schemaKeywords,
+  recordingCollections,
+  type TemplateDoc,
+  type TemplateListener,
 } from "./templateTestKit";
 
-interface Doc {
-  id: string;
-  version: string;
-  value: unknown;
-}
-type Listener = (snapshot: { status: string; items: unknown[] }) => void;
+type Doc = TemplateDoc;
+type Listener = TemplateListener;
 
 const REVISION = "a".repeat(32);
 const PREVIOUS = "b".repeat(32);
@@ -114,36 +113,19 @@ function startStory({
   preview = false,
   canAct = true,
   canWrite = true,
-}: { html?: string; preview?: boolean; canAct?: boolean; canWrite?: boolean } = {}) {
-  const listeners: Record<string, Listener> = {};
+  allowErrors = false,
+}: {
+  html?: string;
+  preview?: boolean;
+  canAct?: boolean;
+  canWrite?: boolean;
+  /** A design that is meant to throw while the page loads. */
+  allowErrors?: boolean;
+} = {}) {
+  const { listeners, writes, collection } = recordingCollections();
   let actionListener: Listener | null = null;
-  const stored: Record<string, Record<string, Doc>> = {};
-  const writes: { collection: string; op: string; id: string; value: unknown }[] = [];
   const requests: { action: string; params: unknown }[] = [];
   const opened: string[] = [];
-  const collection = (name: string) => {
-    const docs = (stored[name] ??= {});
-    return {
-      watch: (listener: Listener) => {
-        listeners[name] = listener;
-        return { dispose: () => undefined };
-      },
-      get: (id: string) => Promise.resolve(docs[id] ?? null),
-      create: (value: unknown, options: { id?: string }) => {
-        const doc = { id: options?.id ?? "x", version: "v1", value };
-        writes.push({ collection: name, op: "create", id: doc.id, value });
-        docs[doc.id] = doc;
-        return Promise.resolve(doc);
-      },
-      replace: (id: string, value: unknown) => {
-        const doc = { id, version: "v2", value };
-        writes.push({ collection: name, op: "replace", id, value });
-        docs[id] = doc;
-        return Promise.resolve(doc);
-      },
-      delete: () => Promise.resolve({ deleted: true }),
-    };
-  };
   const client = {
     context: {
       app: { id: "app1", name: "Data story" },
@@ -174,7 +156,7 @@ function startStory({
       },
     },
   };
-  bootTemplatePage(html, client);
+  bootTemplatePage(html, client, { allowErrors });
   const emit = (name: string, items: Doc[]) => listeners[name]?.({ status: "live", items });
   const emitActions = (items: unknown[]) => actionListener?.({ status: "live", items });
   /** Loads the page with these records, as the first polls answer. */
@@ -436,7 +418,7 @@ describe("data story designs", () => {
 
   it("falls back to the plain story when a design's script fails to load", async () => {
     const broken = withView("", "Story.view({ name: 'Broken', render: function () {} ");
-    const { load, ready } = startStory({ html: broken });
+    const { load, ready } = startStory({ html: broken, allowErrors: true });
     await waitFor(() => expect(ready()).toBe(true));
     load({ story: STORY, series: { weekly: WEEKLY } });
 

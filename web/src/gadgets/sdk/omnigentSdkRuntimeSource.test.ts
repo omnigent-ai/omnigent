@@ -485,16 +485,25 @@ describe("omnigent SDK runtime", () => {
       const cursor = "c".repeat(GADGET_LIMITS.maxIdentifierLength * 3);
       const ifVersion = "v".repeat(GADGET_LIMITS.maxIdentifierLength * 3);
 
-      void cards.list({ cursor });
+      // Both calls are cancelled and awaited, so none outlives the test.
+      const controller = new AbortController();
+      const listed = cards.list({ cursor }, { signal: controller.signal });
       expect(lastFrameMessage(hostPort)).toMatchObject({
         method: "data.v1.list",
         params: { cursor },
       });
-      void cards.replace("c1", { title: "x" }, { ifVersion });
+      const replaced = cards.replace(
+        "c1",
+        { title: "x" },
+        { ifVersion, signal: controller.signal },
+      );
       expect(lastFrameMessage(hostPort)).toMatchObject({
         method: "data.v1.replace",
         params: { ifVersion },
       });
+      controller.abort();
+      await expect(listed).rejects.toMatchObject({ code: "CANCELLED" });
+      await expect(replaced).rejects.toMatchObject({ code: "CANCELLED" });
     });
 
     describe("with fake timers", () => {

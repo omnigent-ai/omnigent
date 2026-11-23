@@ -327,6 +327,93 @@ describe("GadgetFrame", () => {
     });
   });
 
+  describe("the viewer's sessions", () => {
+    function connectWithSessions() {
+      const view = render(
+        <MemoryRouter>
+          <GadgetFrame
+            app={APP}
+            content={{ ...CONTENT, capabilities: ["data.read", "sessions.read"] }}
+            onRevisionChanged={() => {}}
+          />
+        </MemoryRouter>,
+      );
+      const frame = view.container.querySelector("iframe") as HTMLIFrameElement;
+      const frameWindow = frame.contentWindow as Window;
+      vi.spyOn(frameWindow, "postMessage").mockImplementation(() => {});
+      greet(frameWindow, { type: GADGET_HELLO_MESSAGE_TYPE, ...mountOf(frame) });
+      const port = FakeMessageChannel.created[0].port1;
+      const onMessage = port.addEventListener.mock.calls[0][1] as (event: MessageEvent) => void;
+      const list = (id: string) =>
+        act(() => {
+          onMessage(
+            new MessageEvent("message", {
+              data: {
+                v: 1,
+                kind: "request",
+                id,
+                method: "sessions.v1.list",
+                params: {},
+                deadlineMs: 5_000,
+              },
+            }),
+          );
+        });
+      const responseFor = (id: string) =>
+        port.postMessage.mock.calls
+          .map(([message]) => message as { kind: string; id: string; ok?: boolean })
+          .find((message) => message.kind === "response" && message.id === id);
+      return { list, responseFor };
+    }
+
+    it("lists them only after the viewer allows it, asking once per page", async () => {
+      const fetchMock = vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              data: [{ id: "s1", title: "Ship it", status: "idle" }],
+              has_more: false,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const { list, responseFor } = connectWithSessions();
+
+      list("r1");
+      expect(await screen.findByText("Let this gadget see your sessions?")).toBeVisible();
+      // Nothing is read before the viewer answers.
+      expect(fetchMock).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Allow" }));
+      await waitFor(() => expect(responseFor("r1")).toMatchObject({ ok: true }));
+      const [url] = fetchMock.mock.calls[0] as unknown as [string];
+      expect(String(url)).toContain("/v1/sessions?");
+
+      // Allowed once, a later list in the same page does not ask again.
+      list("r2");
+      await waitFor(() => expect(responseFor("r2")).toMatchObject({ ok: true }));
+      expect(screen.queryByText("Let this gadget see your sessions?")).toBeNull();
+    });
+
+    it("refuses the list, and reads nothing, when the viewer does not allow it", async () => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      const { list, responseFor } = connectWithSessions();
+
+      list("r1");
+      fireEvent.click(await screen.findByRole("button", { name: "Don’t allow" }));
+      await waitFor(() =>
+        expect(responseFor("r1")).toMatchObject({
+          ok: false,
+          error: { code: "PERMISSION_DENIED" },
+        }),
+      );
+      list("r2");
+      await waitFor(() => expect(responseFor("r2")).toMatchObject({ ok: false }));
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+  });
+
   it("stops a frame that navigates and says so, then reloads it on request", () => {
     const { frame } = renderFrame();
     const first = mountOf(frame());

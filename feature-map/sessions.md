@@ -327,7 +327,9 @@ the header menu), and each place is a separate entry point.
   the screen with the sidebar collapsed. A gadget action that needs a session
   keeps the gadget full screen: it goes to the linked session, or opens the
   **Create session** menu over a dimmed page, and the session created there is
-  linked to the gadget and gets the action.
+  linked to the gadget and gets the action. On a phone, the session header's menu
+  lists each linked gadget by name; choosing one opens it in a drawer over the
+  session, and **Close** shows the session again.
 
 ## How to get to it (user POV)
 

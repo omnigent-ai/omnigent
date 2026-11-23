@@ -1,6 +1,6 @@
-// Shared mechanics for the template tests: the JSON Schema keywords the server accepts, and
-// booting a template's page in a VM context against jsdom. Scenarios and assertions stay in
-// each template's own test.
+// Shared mechanics for the template tests: the JSON Schema keywords the server accepts, the
+// in-memory collections a page writes to, and booting a template's page in a VM context against
+// jsdom. Scenarios and assertions stay in each template's own test.
 import { readFileSync } from "node:fs";
 import { createContext, runInContext } from "node:vm";
 
@@ -35,12 +35,65 @@ export function jsonBytes(value: unknown): number {
   return new TextEncoder().encode(JSON.stringify(value)).length;
 }
 
+export interface TemplateDoc {
+  id: string;
+  version: string;
+  value: unknown;
+  updatedAt?: string;
+}
+export type TemplateListener = (snapshot: { status: string; items: unknown[] }) => void;
+export interface TemplateWrite {
+  collection: string;
+  op: string;
+  id: string;
+  value: unknown;
+}
+
+/**
+ * In-memory collections for a page under test: each records the page's writes and keeps the
+ * listener the page watches it with, so a test can push snapshots.
+ */
+export function recordingCollections() {
+  const listeners: Record<string, TemplateListener> = {};
+  const stored: Record<string, Record<string, TemplateDoc>> = {};
+  const writes: TemplateWrite[] = [];
+  const collection = (name: string) => {
+    const docs = (stored[name] ??= {});
+    return {
+      watch: (listener: TemplateListener) => {
+        listeners[name] = listener;
+        return { dispose: () => undefined };
+      },
+      get: (id: string) => Promise.resolve(docs[id] ?? null),
+      create: (value: unknown, options: { id?: string }) => {
+        const doc = { id: options?.id ?? "x", version: "v1", value };
+        writes.push({ collection: name, op: "create", id: doc.id, value });
+        docs[doc.id] = doc;
+        return Promise.resolve(doc);
+      },
+      replace: (id: string, value: unknown) => {
+        const doc = { id, version: "v2", value };
+        writes.push({ collection: name, op: "replace", id, value });
+        docs[id] = doc;
+        return Promise.resolve(doc);
+      },
+      delete: () => Promise.resolve({ deleted: true }),
+    };
+  };
+  return { listeners, writes, collection };
+}
+
 /**
  * Runs the page's scripts in order in one context that is its own window, against jsdom, with
  * `client` as the SDK's connection. As in a browser, a script that throws reports the error to
- * the window's error listeners and the next script still runs.
+ * the window's error listeners and the next script still runs; unless `allowErrors`, the boot
+ * then fails with the first error, so a broken page cannot pass by its own error handling.
  */
-export function bootTemplatePage(html: string, client: unknown): void {
+export function bootTemplatePage(
+  html: string,
+  client: unknown,
+  { allowErrors = false }: { allowErrors?: boolean } = {},
+): void {
   const body = html.slice(html.indexOf("<body>") + "<body>".length, html.indexOf("</body>"));
   const scripts = [...body.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)].map((match) => match[1]);
   document.body.innerHTML = body.replace(/<script[^>]*>[\s\S]*?<\/script>/g, "");
@@ -58,13 +111,18 @@ export function bootTemplatePage(html: string, client: unknown): void {
   };
   context.window = context;
   createContext(context);
+  const thrown: unknown[] = [];
   for (const script of scripts) {
     try {
       runInContext(script, context);
     } catch (error) {
+      thrown.push(error);
       (windowListeners.error ?? []).forEach((listener) =>
         listener({ error, message: String(error) }),
       );
     }
+  }
+  if (thrown.length > 0 && !allowErrors) {
+    throw new Error(`A script in the page threw: ${String(thrown[0])}`);
   }
 }
