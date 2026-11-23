@@ -12,11 +12,15 @@ Which sessions belong to an action: the session the agent recorded on it and
 that session's children; otherwise the gadget session and the sessions started
 from it (child sessions, and independent ones that carry its
 ``omnigent.created_by_session_id`` label) between this action's delivery and the
-next one's. A session is working while its turn runs or waits, or while a
+delivery of the next action the gadget session took up; one still queued behind it
+doesn't cut the window short. Deliveries in the same second keep the order the
+viewer made them in. A session is working while its turn runs or waits, or while a
 background task it left running is still going, the same rule the session's
-Tasks tab uses. Sessions are matched by creation time, so attribution without a
-recorded session can include an unrelated child and keep the action running
-longer, never shorter.
+Tasks tab uses. A session bound to a runner or host that hasn't reported in counts
+as offline, not as running in-process. Sessions are matched by creation time, so
+attribution without a recorded session can include an unrelated child and keep the
+action running longer, never shorter, and when the listings of sessions reach their
+limits (so a worker may be missing) an action is not called finished.
 """
 
 from __future__ import annotations
@@ -45,6 +49,8 @@ MAX_CHILD_SESSIONS = 100
 MAX_RECENT_SESSIONS = 50
 
 REPORTED_TERMINAL = ("done", "failed", "cancelled")
+# Reported states that say the gadget session took the action up.
+_STARTED = ("running", "needs_input", *REPORTED_TERMINAL)
 OPEN_STATUSES = ("pending", "queued", "running", "needs_input")
 # What the gadget is told, most specific first.
 STATUSES = (
@@ -78,8 +84,25 @@ class SessionState:
 
 @dataclass(frozen=True)
 class Delivery:
+    """When an action reached its gadget session.
+
+    :param sequence: The viewer's delivery count at that point, which orders deliveries made
+        in the same second; ``0`` for one recorded without it.
+    """
+
     session_id: str
     delivered_at: int
+    sequence: int = 0
+
+
+class SessionStates(dict[str, SessionState]):
+    """Sessions by ID, and whether every session that could belong to the work was read.
+
+    ``complete`` is ``False`` when a listing reached its limit, so a session doing the work
+    may be missing; progress then never concludes that the work stopped.
+    """
+
+    complete: bool = True
 
 
 @dataclass(frozen=True)
@@ -103,7 +126,8 @@ def delivery_of(raw: Any) -> Delivery | None:
     session_id, delivered_at = raw.get("session_id"), raw.get("delivered_at")
     if not isinstance(session_id, str) or type(delivered_at) is not int:
         return None
-    return Delivery(session_id, delivered_at)
+    sequence = raw.get("delivery_sequence")
+    return Delivery(session_id, delivered_at, sequence if type(sequence) is int else 0)
 
 
 def _descendants(root: str, sessions: dict[str, SessionState]) -> list[str]:
@@ -190,6 +214,11 @@ def derive_progress(
         if earlier_open:
             return ActionProgress("queued", None, tuple(ids))
         return ActionProgress("running", None, tuple(ids))
+    # Not every session that could do the work was read: one of them may still run it.
+    if not getattr(sessions, "complete", True) and now - delivery.delivered_at < (
+        SILENT_RUNNING_LIMIT_S
+    ):
+        return ActionProgress("running", "sessions_not_all_read", tuple(ids))
     stopped = [state for state in states if _working(state)]
     if stopped:
         offline = any(not state.runner_online for state in stopped)
@@ -271,10 +300,20 @@ def derive_ledger_progress(
                 (delivery.delivered_at, record_id, value, delivery)
             )
     for delivered in by_session.values():
-        delivered.sort(key=lambda item: (item[0], item[1]))
+        # Delivery order: the time, then the viewer's delivery count within the same second.
+        delivered.sort(key=lambda item: (item[0], item[3].sequence, item[1]))
         earlier_open = False
         for index, (_, record_id, value, delivery) in enumerate(delivered):
-            next_at = delivered[index + 1][0] if index + 1 < len(delivered) else None
+            # This action's sessions are those started before the gadget session took up a
+            # later action; one still queued behind it doesn't end this one's window.
+            next_at = next(
+                (
+                    later[0]
+                    for later in delivered[index + 1 :]
+                    if later[2].get("state") in _STARTED or isinstance(later[2].get("session_id"), str)
+                ),
+                None,
+            )
             progress = derive_progress(
                 value,
                 delivery,
@@ -309,7 +348,7 @@ class SessionStateReader:
         conversation = self._store.get_conversations([session_id]).get(session_id)
         return conversation is not None and not getattr(conversation, "archived", False)
 
-    def read(self, session_ids: Iterable[str]) -> dict[str, SessionState]:
+    def read(self, session_ids: Iterable[str]) -> SessionStates:
         from omnigent.server.routes._sessions.helpers import (
             _last_task_error_from_labels,
             _session_status_from_cache,
@@ -319,8 +358,9 @@ class SessionStateReader:
             session_id for session_id in dict.fromkeys(session_ids) if self._can_read(session_id)
         ]
         if not roots:
-            return {}
+            return SessionStates()
         conversations = dict(self._store.get_conversations(roots))
+        complete = True
         for conversation in list(conversations.values()):
             page = self._store.list_conversations(
                 limit=MAX_CHILD_SESSIONS,
@@ -328,6 +368,7 @@ class SessionStateReader:
                 root_conversation_id=conversation.root_conversation_id,
                 include_archived=True,
             )
+            complete = complete and not page.has_more
             for child in page.data:
                 conversations.setdefault(child.id, child)
         # Independent sessions have no parent link, only a label naming the session that started
@@ -335,6 +376,8 @@ class SessionStateReader:
         recent = self._store.list_conversations(
             limit=MAX_RECENT_SESSIONS, kind=None, owned_by=self._user_id, include_archived=True
         )
+        # Older sessions may have been started from these too; that can't be ruled out.
+        complete = complete and not recent.has_more
         started = [
             conversation
             for conversation in recent.data
@@ -350,24 +393,32 @@ class SessionStateReader:
                 root_conversation_id=conversation.root_conversation_id,
                 include_archived=True,
             )
+            complete = complete and not page.has_more
             for child in page.data:
                 conversations.setdefault(child.id, child)
         connectivity = self._store.get_session_connectivity(list(conversations))
         now = int(time.time())
         own_liveness: dict[str, bool] = {}
+        hosted: set[str] = set()
         for session_id, link in connectivity.items():
             if link.runner_last_seen is not None:
                 own_liveness[session_id] = runner_seen_is_fresh(link.runner_last_seen, now)
+            elif link.runner_id is not None or link.host_id is not None:
+                # Bound to a runner or host that hasn't reported in: starting, or gone.
+                hosted.add(session_id)
 
         def runner_online(session_id: str) -> bool:
-            # Children run in their parent's runner and may carry no stamp of their own; a tree
-            # with no stamp at all runs in-process, and the silent-running limit still applies.
+            # Children run in their parent's runner and may carry no stamp of their own. A
+            # tree with no stamp is online only when nothing in it is bound to a runner or
+            # host, which means it runs in-process; the silent-running limit still applies.
             seen: set[str] = set()
+            chain: list[str] = []
             current: str | None = session_id
             while current is not None and current not in seen:
                 if current in own_liveness:
                     return own_liveness[current]
                 seen.add(current)
+                chain.append(current)
                 parent = conversations.get(current)
                 current = (
                     (
@@ -377,9 +428,10 @@ class SessionStateReader:
                     if parent is not None
                     else None
                 )
-            return True
+            return not any(link in hosted for link in chain)
 
-        states: dict[str, SessionState] = {}
+        states = SessionStates()
+        states.complete = complete
         for conversation in conversations.values():
             status = _session_status_from_cache(conversation.id, conversation.live_status)
             if conversation.live_status == "waiting" and status == "running":

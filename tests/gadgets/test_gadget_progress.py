@@ -30,6 +30,8 @@ class FakeConversations:
     def __init__(self) -> None:
         self.rows: dict[str, SimpleNamespace] = {}
         self.seen: dict[str, int | None] = {}
+        # Sessions bound to a runner or host, which a missing stamp then means is not running.
+        self.bound: set[str] = set()
 
     def add(
         self,
@@ -43,6 +45,7 @@ class FakeConversations:
         pending: int = 0,
         labels: dict | None = None,
         background: bool = False,
+        bound: bool = False,
     ) -> None:
         root = self.rows[parent].root_conversation_id if parent else session_id
         self.rows[session_id] = SimpleNamespace(
@@ -57,6 +60,8 @@ class FakeConversations:
             background_work_running=background,
         )
         self.seen[session_id] = seen
+        if bound:
+            self.bound.add(session_id)
 
     def set(self, session_id: str, **changes: Any) -> None:
         if "seen" in changes:
@@ -86,11 +91,16 @@ class FakeConversations:
             for row in self.rows.values()
             if root_conversation_id is None or row.root_conversation_id == root_conversation_id
         ]
-        return SimpleNamespace(data=sorted(rows, key=lambda row: -row.created_at)[:limit])
+        ordered = sorted(rows, key=lambda row: -row.created_at)
+        return SimpleNamespace(data=ordered[:limit], has_more=len(ordered) > limit)
 
     def get_session_connectivity(self, ids: list[str]) -> dict:
         return {
-            session_id: SimpleNamespace(runner_last_seen=self.seen.get(session_id))
+            session_id: SimpleNamespace(
+                runner_last_seen=self.seen.get(session_id),
+                runner_id="runner_1" if session_id in self.bound else None,
+                host_id=None,
+            )
             for session_id in ids
             if session_id in self.rows
         }
@@ -180,6 +190,44 @@ def test_an_action_waits_while_a_stopped_gadget_session_wakes_up(
     conversations.set("s_gadget", seen=NOW - 3600)
     clock["now"] = NOW + 11 * 60
     assert status(service, app, action_id) == ("interrupted", "runner_offline")
+
+
+def test_a_session_bound_to_a_runner_that_never_reported_in_is_not_online(
+    gadgets: Fixture, clock: dict
+) -> None:
+    conversations = FakeConversations()
+    # Bound to a host's runner, with no heartbeat yet: starting, or gone, not in-process.
+    conversations.add("s_gadget", seen=None, bound=True)
+    service = progress_service(gadgets, conversations)
+    app = publish_actions_board(service)
+    service.set_gadget_session(app["id"], {"session_id": "s_gadget"})
+    action_id = request_and_deliver(service, app, "c1")
+    conversations.set("s_gadget", status="running", updated=NOW + 1)
+
+    clock["now"] = NOW + 30
+    assert status(service, app, action_id) == ("queued", None)
+    clock["now"] = NOW + 11 * 60
+    assert status(service, app, action_id) == ("interrupted", "runner_offline")
+
+
+def test_an_action_stays_running_while_not_every_session_could_be_read(
+    gadgets: Fixture, clock: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(progress_module, "MAX_CHILD_SESSIONS", 2)
+    conversations = FakeConversations()
+    conversations.add("s_gadget")
+    service = progress_service(gadgets, conversations)
+    app = publish_actions_board(service)
+    service.set_gadget_session(app["id"], {"session_id": "s_gadget"})
+    action_id = request_and_deliver(service, app, "c1")
+    # An older worker the action started, then newer, idle children that fill the listing.
+    conversations.add("s_worker", parent="s_gadget", created=NOW + 1, status="running", updated=NOW + 5)
+    for n in range(3):
+        conversations.add(f"s_new{n}", parent="s_gadget", created=NOW + 10 + n, updated=NOW + 12)
+    conversations.set("s_gadget", updated=NOW + 20)
+    clock["now"] = NOW + 30
+
+    assert status(service, app, action_id) == ("running", "sessions_not_all_read")
 
 
 def test_a_child_session_keeps_the_action_running_after_the_gadget_session_hands_it_off(
@@ -407,14 +455,52 @@ def test_progress_rules_without_the_store():
     progress = derive_ledger_progress(
         [
             ("a1", {"state": "running"}, Delivery("s_gadget", NOW)),
+            ("a2", {"state": "running"}, Delivery("s_gadget", NOW + 30)),
+        ],
+        sessions=sessions,
+        now=NOW + 60,
+    )
+    # A child started after the gadget session took up the second action belongs to it.
+    assert progress["a1"].status == "finished_unreported"
+    assert progress["a2"].status == "running"
+    # While the second action still waits its turn, a child started meanwhile may be the
+    # first one's worker, so the first stays running.
+    waiting = derive_ledger_progress(
+        [
+            ("a1", {"state": "running"}, Delivery("s_gadget", NOW)),
             ("a2", {"state": "queued"}, Delivery("s_gadget", NOW + 30)),
         ],
         sessions=sessions,
         now=NOW + 60,
     )
-    # A child started after the second delivery belongs to the second action.
-    assert progress["a1"].status == "finished_unreported"
-    assert progress["a2"].status == "running"
+    assert waiting["a1"].status == "running"
+    # Deliveries in the same second keep the order they were made in.
+    same_second = derive_ledger_progress(
+        [
+            ("b", {"state": "running"}, Delivery("s_gadget", NOW + 30, sequence=2)),
+            ("a", {"state": "running"}, Delivery("s_gadget", NOW + 30, sequence=1)),
+        ],
+        sessions=sessions,
+        now=NOW + 60,
+    )
+    assert same_second["a"].status == "finished_unreported"
+    assert same_second["b"].status == "running"
+    # When not every session that could do the work was read, the work is not called done.
+    partial = progress_module.SessionStates(
+        {
+            **sessions,
+            "s_late": SessionState(
+                "s_late", NOW + 40, NOW + 45, "s_gadget", "s_gadget", "idle", True, False, 0, None
+            ),
+        }
+    )
+    partial.complete = False
+    unsure = derive_ledger_progress(
+        [("a1", {"state": "running"}, Delivery("s_gadget", NOW))], sessions=partial, now=NOW + 60
+    )
+    assert unsure["a1"] == progress_module.ActionProgress(
+        "running", "sessions_not_all_read", ("s_gadget", "s_late")
+    )
     # A session reported running that has been silent past the limit no longer holds the action.
     silent = {
         **sessions,

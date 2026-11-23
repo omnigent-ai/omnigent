@@ -1243,7 +1243,21 @@ class GadgetService:
         if record is None:
             raise NotFound("That action is not one of your open actions")
         if delivery_of(record) is None:
-            delivered = {**record, "session_id": session_id, "delivered_at": int(time.time())}
+            # The viewer's delivery count orders deliveries made in the same second.
+            sequence = 1 + max(
+                (
+                    item["delivery_sequence"]
+                    for item in open_records
+                    if type(item.get("delivery_sequence")) is int
+                ),
+                default=0,
+            )
+            delivered = {
+                **record,
+                "session_id": session_id,
+                "delivered_at": int(time.time()),
+                "delivery_sequence": sequence,
+            }
             open_records = [delivered if item is record else item for item in open_records]
             self._save_viewer(gadget, viewer, open_records, f"deliver-{action_id}")
         return self.action_progress(app_id, [action_id])
