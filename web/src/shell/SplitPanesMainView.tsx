@@ -52,6 +52,7 @@ import {
 } from "./chatPaneToolbarHost";
 import { FileTypeIcon } from "./FileTypeIcon";
 import type { MainTerminalView } from "./MainTerminalView";
+import { type AgentRecoveryAllowance, MissingAgentPane } from "./MissingAgentPane";
 import { MissingTerminalPane } from "./MissingTerminalPane";
 import { PaneCloseDialog } from "./PaneCloseDialog";
 import { applyDividerResizes } from "./paneDividerCorners";
@@ -176,6 +177,14 @@ function MainSplitPanes({
   const appPaneTitles = useAppPaneTitles(conversationId);
   const { setTerminalConnectionState, markTerminalActive } = useTerminalStatuses(terminals);
   const panesRef = useRef<HTMLDivElement>(null);
+  // One recovery per opening: a healthy agent spends it, so a later reap waits for Resume session.
+  const agentRecovery = useRef<AgentRecoveryAllowance>({ attempted: false });
+  const agentHealthy =
+    runnerOnline === true && terminals.some((terminal) => terminalTabKey(terminal) === agentKey);
+  useEffect(() => {
+    if (!visible) agentRecovery.current.attempted = false;
+    else if (agentHealthy) agentRecovery.current.attempted = true;
+  }, [visible, agentHealthy]);
 
   // In Chat, a split of more than the chat pane still shows, with the web chat as its pane.
   const splitBesideChat =
@@ -503,6 +512,18 @@ function MainSplitPanes({
             );
           }
           const terminal = terminals.find((t) => terminalTabKey(t) === paneKey);
+          if (!terminal && paneKey === agentKey) {
+            return (
+              <MissingAgentPane
+                conversationId={conversationId}
+                onResume={onResume}
+                visible={visible}
+                readOnly={readOnly}
+                listSettled={listComplete}
+                allowance={agentRecovery}
+              />
+            );
+          }
           if (!terminal) {
             return (
               <MissingTerminalPane

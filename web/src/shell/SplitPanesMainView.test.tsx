@@ -37,6 +37,7 @@ const OTHER = `terminal:${OTHER_ID}`;
 const listed = vi.hoisted(() => ({
   terminals: [] as TerminalInfo[],
   listCompleteAt: 1,
+  hostOnline: true as boolean | null,
   splitsAllowed: true,
   launch: vi.fn(),
 }));
@@ -49,6 +50,9 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   }),
   useCreateTerminal: () => ({ launch: listed.launch, isPending: false }),
   useDeleteTerminal: () => ({ mutate: vi.fn(), isPending: false }),
+}));
+vi.mock("@/hooks/RunnerHealthProvider", () => ({
+  useSessionHostOnline: () => listed.hostOnline,
 }));
 vi.mock("@/hooks/useAgents", () => ({ useSessionAgent: () => ({ data: { terminals: ["zsh"] } }) }));
 vi.mock("./useTerminalStatuses", () => ({
@@ -111,6 +115,7 @@ const paneCommandLabels = () =>
 beforeEach(() => {
   listed.terminals = TERMINALS;
   listed.listCompleteAt = 1;
+  listed.hostOnline = true;
   listed.splitsAllowed = true;
   listed.launch.mockClear();
   vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
@@ -244,6 +249,39 @@ describe("SplitPanesMainView", () => {
     listed.terminals = [TERMINALS[0]!];
     view.rerender(<View conversationId={conversationId} />);
     await screen.findByTestId(`terminal-${AGENT_ID}`);
+    expect(readPaneSplit(conversationId)?.layout).toEqual(SIDE_BY_SIDE.layout);
+  });
+
+  it("recovers a missing agent beside a live shell, which stays mounted, and offers Resume if that fails", async () => {
+    let failResume!: (error: Error) => void;
+    const onResume = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          failResume = reject;
+        }),
+    );
+    const conversationId = nextConversation();
+    updatePaneSplit(conversationId, () => SIDE_BY_SIDE);
+    const view = render(<View conversationId={conversationId} onResume={onResume} />);
+    const shell = await screen.findByTestId(`terminal-${SHELL_ID}`);
+
+    listed.terminals = [TERMINALS[1]!];
+    view.rerender(<View conversationId={conversationId} onResume={onResume} />);
+    expect(await screen.findByRole("status")).toHaveTextContent("Reconnecting…");
+    expect(onResume).toHaveBeenCalledTimes(1);
+    await act(async () => failResume(new Error("unavailable")));
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Couldn't reconnect the terminal automatically.",
+    );
+    expect(screen.getByTestId(`terminal-${SHELL_ID}`)).toBe(shell);
+
+    onResume.mockResolvedValueOnce(undefined);
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Resume session" })));
+    expect(onResume).toHaveBeenCalledTimes(2);
+    listed.terminals = TERMINALS;
+    view.rerender(<View conversationId={conversationId} onResume={onResume} />);
+    await screen.findByTestId(`terminal-${AGENT_ID}`);
+    expect(screen.getByTestId(`terminal-${SHELL_ID}`)).toBe(shell);
     expect(readPaneSplit(conversationId)?.layout).toEqual(SIDE_BY_SIDE.layout);
   });
 
