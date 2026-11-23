@@ -1324,6 +1324,8 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
         f"The native catalog did not preserve its configured pins: {catalog!r}"
     )
     reset_mock_llm(mock_llm_server_url)
+    evidence = Path(os.environ.get("OMNIGENT_E2E_RECORD_DIR", str(tmp_path)))
+    evidence.mkdir(parents=True, exist_ok=True)
 
     # The second Opus pick keeps the same resolved model; the following Sonnet
     # turn proves switching back, rather than accepting an unchanged pane.
@@ -1378,6 +1380,51 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
             mock_llm_server_url, marker, model, native_session=native_session, user_text=user_text
         )
         expect(page.get_by_test_id("error-headline")).to_have_count(0)
+        if index == 1:
+            advert = _tmux_advert(base_url, session_id)
+            assert advert is not None
+            bridge_id = snapshot["labels"].get(BRIDGE_ID_LABEL_KEY) or session_id
+            raw_status = json.loads(
+                (bridge_dir_for_bridge_id(bridge_id) / CONTEXT_RAW_FILE).read_text()
+            )
+            assert raw_status["session_id"] == native_session
+            socket, target = advert["socket_path"], advert["tmux_target"]
+            assert model_switch._draft(bridge._capture_pane(socket, target)) == ""
+            bridge._run_tmux(socket, "send-keys", "-l", "-t", target, "/model")
+            bridge._run_tmux(socket, "send-keys", "-t", target, "Enter")
+            poll_until(
+                lambda socket=socket, target=target: (
+                    model_switch._picker(bridge._capture_pane(socket, target)) is not None
+                ),
+                timeout_s=10,
+            )
+            pane = bridge._capture_pane(socket, target)
+            (evidence / "first-selection-native-picker.json").write_text(
+                json.dumps(
+                    {
+                        "alias": alias,
+                        "resolved_model": model,
+                        "native_session": native_session,
+                        "status_line": {
+                            key: raw_status.get(key)
+                            for key in ("version", "session_id", "model", "context_window")
+                        },
+                        "picker": pane,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            assert model_switch._picker(pane) == model_switch._picker(
+                bridge._capture_pane(socket, target)
+            )
+            bridge._run_tmux(socket, "send-keys", "-t", target, "Escape")
+            poll_until(
+                lambda socket=socket, target=target: (
+                    model_switch._draft(bridge._capture_pane(socket, target)) == ""
+                ),
+                timeout_s=10,
+            )
 
     _open_terminal_view(page)
     _wait_terminal_connected(page)
@@ -1394,8 +1441,6 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
             timeout=5,
         )
     )
-    evidence = Path(os.environ.get("OMNIGENT_E2E_RECORD_DIR", str(tmp_path)))
-    evidence.mkdir(parents=True, exist_ok=True)
     with httpx.Client(base_url=base_url, timeout=40) as client:
         for kind in ("soft-wrap", "hard-newline"):
             nonce = uuid.uuid4().hex[:8]
