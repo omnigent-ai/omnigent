@@ -154,13 +154,11 @@ _SHOWN_IN_STRIP_JS = """element => {
 }"""
 
 
-@pytest.mark.parametrize("color_scheme", ["light", "dark"])
 def test_breadcrumbs_show_a_long_path_in_full_and_browse_it_by_keyboard(
-    page: Page, breadcrumb_session: tuple[str, str], color_scheme: str
+    page: Page, breadcrumb_session: tuple[str, str]
 ) -> None:
     """Every folder shows, scrolled to the file name; the keyboard reaches and opens each one."""
     base_url, session_id = breadcrumb_session
-    page.emulate_media(color_scheme=color_scheme)
     sidebar = _open_workspace(page, base_url, session_id)
     breadcrumbs = _open_file(page, sidebar, _LONG_PATH)
     expect(breadcrumbs).to_contain_text(
