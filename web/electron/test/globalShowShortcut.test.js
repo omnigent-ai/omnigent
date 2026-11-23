@@ -15,6 +15,7 @@ const {
  * return false; `throws` chords make it throw; `saveFails` makes saving throw.
  */
 function harness({
+  id = "show",
   settings = {},
   refused = [],
   throws = [],
@@ -38,6 +39,7 @@ function harness({
     },
   };
   const controller = createGlobalShowShortcut({
+    id,
     globalShortcut,
     loadSettings: () => structuredClone(stored),
     saveSettings: (next) => {
@@ -214,7 +216,7 @@ describe("createGlobalShowShortcut", () => {
       assert.match(result.error, /already in use/);
       assert.equal(result.suggestion, "Control+Alt+Shift+Space");
       // The saved chord is never released, so another app can't take it meanwhile.
-      assert.equal(h.calls.unregistered.includes("Alt+Space"), false);
+      assert.deepEqual(h.calls.unregistered, ["Control+Alt+Shift+Space"]);
       assert.deepEqual(h.registered(), ["Alt+Space"]);
       assert.deepEqual(h.calls.saved, []);
       assert.deepEqual(h.saved().global_shortcut, { enabled: true, accelerator: "Alt+Space" });
@@ -829,5 +831,40 @@ describe("acceleratorLabel", () => {
   it("reads like the Settings page: glyphs on macOS, Ctrl+ elsewhere", () => {
     assert.equal(acceleratorLabel("Control+Alt+Shift+Command+K", true), "⌃⌥⇧⌘K");
     assert.equal(acceleratorLabel("Control+Alt+Space", false), "Ctrl+Alt+Space");
+  });
+
+  it("resolves aliases and CommandOrControl per platform", () => {
+    assert.equal(acceleratorLabel("CommandOrControl+Shift+Space", true), "⇧⌘Space");
+    assert.equal(acceleratorLabel("CommandOrControl+Shift+Space", false), "Ctrl+Shift+Space");
+    assert.equal(acceleratorLabel("Cmd+Ctrl+Option+k", true), "⌃⌥⌘K");
+    assert.equal(acceleratorLabel("CmdOrCtrl+Option+k", false), "Ctrl+Alt+K");
+  });
+});
+
+describe("the New Agent shortcut's default chord on macOS", () => {
+  const defaultChord = "CommandOrControl+Shift+Space";
+  const settings = { floating_composer_shortcut: { enabled: true, accelerator: defaultChord } };
+
+  it("names the chord as ⇧⌘Space when Electron refuses it at launch", () => {
+    const h = harness({ id: "floatingComposer", isMac: true, settings, refused: [defaultChord] });
+    h.shortcut.apply();
+
+    assert.deepEqual(h.shortcut.current(), {
+      enabled: true,
+      accelerator: defaultChord,
+      error: "⇧⌘Space isn't working. Another app may be using it.",
+      suggestion: "Control+Alt+Shift+Space",
+    });
+  });
+
+  it("names the chord as ⇧⌘Space when a save of it is refused", async () => {
+    const h = harness({ id: "floatingComposer", isMac: true, refused: [defaultChord] });
+
+    const result = await h.shortcut.set({ enabled: true, accelerator: defaultChord });
+
+    assert.equal(
+      result.error,
+      "Couldn't use ⇧⌘Space. It may be invalid or already in use by another app.",
+    );
   });
 });

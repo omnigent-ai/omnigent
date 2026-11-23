@@ -85,8 +85,10 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
   const [setting, setSetting] = useState<GlobalShortcutSetting | null>(null);
   const [recording, setRecording] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // A free chord the shell proposes in place of the one it couldn't register.
-  const [suggestion, setSuggestion] = useState<string | null>(null);
+  // A free chord the shell proposes, with the on or off state of the attempt it replaces.
+  const [suggestion, setSuggestion] = useState<{ accelerator: string; enabled: boolean } | null>(
+    null,
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -104,7 +106,9 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
       // On, but the shell couldn't register it.
       if (saved?.error) {
         setError(saved.error);
-        setSuggestion(saved.suggestion ?? null);
+        setSuggestion(
+          saved.suggestion ? { accelerator: saved.suggestion, enabled: saved.enabled } : null,
+        );
       }
     })();
     return () => {
@@ -124,7 +128,9 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
         setSuggestion(null);
       } else {
         setError(result.error ?? "Couldn't save the shortcut.");
-        setSuggestion(result.suggestion ?? null);
+        setSuggestion(
+          result.suggestion ? { accelerator: result.suggestion, enabled: next.enabled } : null,
+        );
       }
     },
     [shortcutId],
@@ -230,10 +236,15 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
           variant="outline"
           size="sm"
           className="self-start"
+          {...settingsControlProps(entry, "suggestion", {
+            runtime: formatAccelerator(suggestion.accelerator),
+          })}
           data-testid={`${ids.testIdPrefix}-suggestion`}
-          onClick={() => void save({ enabled: setting.enabled, accelerator: suggestion })}
+          onClick={() =>
+            void save({ enabled: suggestion.enabled, accelerator: suggestion.accelerator })
+          }
         >
-          Use {formatAccelerator(suggestion)} instead
+          Use {formatAccelerator(suggestion.accelerator)} instead
         </Button>
       )}
     </SettingsItem>

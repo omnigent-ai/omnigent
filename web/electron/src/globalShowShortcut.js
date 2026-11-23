@@ -42,11 +42,16 @@ const NAMED_KEYS = new Map([
   ["Tab", "Tab"],
 ]);
 
+/** Keyed by `chordKey`'s names. */
 const MAC_MODIFIER_GLYPHS = new Map([
-  ["Control", "⌃"],
-  ["Alt", "⌥"],
-  ["Shift", "⇧"],
-  ["Command", "⌘"],
+  ["control", "⌃"],
+  ["alt", "⌥"],
+  ["shift", "⇧"],
+  ["command", "⌘"],
+]);
+const OTHER_MODIFIER_LABELS = new Map([
+  ["control", "Ctrl"],
+  ["command", "Super"],
 ]);
 
 const MODIFIER_ALIASES = new Map([
@@ -435,11 +440,23 @@ function createGlobalShortcuts({ presses, active = {}, ...deps }) {
   return shortcuts;
 }
 
-/** The chord as the user reads it: ⌃⌥⇧⌘ glyphs on macOS, `Ctrl+Alt+Space` elsewhere. */
+/**
+ * The chord as the user reads it: ⌃⌥⇧⌘ glyphs on macOS, `Ctrl+Alt+Space` elsewhere. Reads the
+ * canonical `chordKey` form, so aliases such as `CommandOrControl` resolve for the platform.
+ */
 function acceleratorLabel(accelerator, isMac) {
-  const parts = accelerator.split("+");
-  if (isMac) return parts.map((part) => MAC_MODIFIER_GLYPHS.get(part) ?? part).join("");
-  return parts.map((part) => (part === "Control" ? "Ctrl" : part)).join("+");
+  const parts = chordKey(accelerator, isMac).split("+");
+  const key = capitalized(parts.pop());
+  const modifiers = parts.map((name) =>
+    isMac
+      ? (MAC_MODIFIER_GLYPHS.get(name) ?? capitalized(name))
+      : (OTHER_MODIFIER_LABELS.get(name) ?? capitalized(name)),
+  );
+  return isMac ? [...modifiers, key].join("") : [...modifiers, key].join("+");
+}
+
+function capitalized(word) {
+  return word.charAt(0).toUpperCase() + word.slice(1);
 }
 
 module.exports = {

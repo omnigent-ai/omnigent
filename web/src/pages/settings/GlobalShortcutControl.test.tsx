@@ -353,19 +353,51 @@ describe("GlobalShortcutControl", () => {
   });
 
   it("offers a proposed chord when the shell refuses the one that was just turned on", async () => {
-    installBridge(
+    const bridge = installBridge(
       { enabled: false, accelerator: "Alt+Space" },
-      {
-        ok: false,
-        error: "Couldn't use Alt+Space. It may be invalid or already in use by another app.",
-        suggestion: "Control+Alt+Shift+Space",
-      },
+      { ok: true, setting: { enabled: true, accelerator: "Control+Alt+Shift+Space" } },
     );
+    bridge.setGlobalShortcut.mockResolvedValueOnce({
+      ok: false,
+      error: "Couldn't use Alt+Space. It may be invalid or already in use by another app.",
+      suggestion: "Control+Alt+Shift+Space",
+    });
     renderControl();
+    const toggle = await screen.findByRole("switch", { name: SWITCH_NAME });
 
-    fireEvent.click(await screen.findByRole("switch", { name: SWITCH_NAME }));
+    fireEvent.click(toggle);
 
     expect(await screen.findByRole("alert")).toHaveTextContent("already in use by another app");
-    expect(screen.getByRole("button", { name: /^Use .+ instead$/ })).toBeInTheDocument();
+    expect(toggle).not.toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: /^Use .+ instead$/ }));
+
+    await waitFor(() => expect(toggle).toBeChecked());
+    expect(bridge.setGlobalShortcut).toHaveBeenLastCalledWith({
+      enabled: true,
+      accelerator: "Control+Alt+Shift+Space",
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("still records a chord while off after a refused enable", async () => {
+    const bridge = installBridge({ enabled: false, accelerator: "Alt+Space" });
+    bridge.setGlobalShortcut.mockResolvedValueOnce({
+      ok: false,
+      error: "Couldn't use Alt+Space. It may be invalid or already in use by another app.",
+      suggestion: "Control+Alt+Shift+Space",
+    });
+    renderControl();
+    fireEvent.click(await screen.findByRole("switch", { name: SWITCH_NAME }));
+    await screen.findByRole("alert");
+
+    fireEvent.click(screen.getByTestId(RECORDER_TEST_ID));
+    fireEvent.keyDown(window, { code: "KeyK", ctrlKey: true, shiftKey: true });
+
+    await waitFor(() =>
+      expect(bridge.setGlobalShortcut).toHaveBeenLastCalledWith({
+        enabled: false,
+        accelerator: "Control+Shift+K",
+      }),
+    );
   });
 });
