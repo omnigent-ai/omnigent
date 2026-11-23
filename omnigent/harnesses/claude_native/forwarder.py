@@ -2826,10 +2826,9 @@ class _TranscriptSpawnIdCacheEntry:
     scan: _SpawnIdScan
 
 
-# Spawn-id memo keyed by transcript path: an unregistered meta re-runs
-# correlation every poll, so unchanged files must not be re-parsed and grown
-# ones only from where the last scan stopped. Shared by every session's
-# forwarder thread (hence the lock); LRU entries age out.
+# Per-transcript spawn-id memo shared by forwarder threads (locked, LRU): an
+# unregistered meta re-runs correlation every poll, so unchanged files are not
+# re-parsed and grown ones resume from the last scanned offset.
 _SPAWN_TOOL_USE_ID_CACHE: dict[Path, _TranscriptSpawnIdCacheEntry] = {}
 _SPAWN_TOOL_USE_ID_CACHE_LOCK = threading.Lock()
 _SPAWN_TOOL_USE_ID_CACHE_MAX_ENTRIES = 1024

@@ -44,7 +44,7 @@ import logging
 import re
 import sqlite3
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -488,19 +488,55 @@ def _pending_started_ms(obj: dict[str, object]) -> int | None:
     return marker if isinstance(marker, int) else None
 
 
-# A blob's ``(rowid, id, length(data))``. cursor's store is append-only and its
-# blob ids are content hashes, so an unchanged key means unchanged bytes.
-_BlobKey = tuple[int, str, int | None]
 # Each ``toolCallId`` part of a blob, in order: the pending call, or ``None`` once
 # the part shows the call committed or resolved.
 _BlobToolCallParts = tuple[tuple[str, CursorPendingToolCall | None], ...]
 
-# Parsed parts per store and blob, so each poll parses only blobs added since the
-# last one. Shared by every session's supervisor thread (hence the lock); LRU
-# stores age out.
-_PENDING_SCAN_CACHE: dict[Path, dict[_BlobKey, _BlobToolCallParts]] = {}
-_PENDING_SCAN_CACHE_LOCK = threading.Lock()
-_PENDING_SCAN_CACHE_MAX_STORES = 64
+# Blobs read per statement, and statements per poll, while classifying a store.
+_PENDING_SCAN_BATCH_ROWS = 256
+_PENDING_SCAN_MAX_BATCHES = 8
+
+
+@dataclass
+class _PendingScan:
+    """Tool-call classification of one store's blobs through ``last_rowid``.
+
+    :param identity: ``(st_dev, st_ino)`` of the store file this describes.
+    :param last_rowid: Highest ``blobs.rowid`` already classified.
+    :param pending: Marker'd calls not yet committed or resolved, first-seen order.
+    :param finished: ``toolCallId`` values seen committed or resolved.
+    :param reported: Pending calls as of the last poll that reached the newest blob.
+    :param lock: Serializes polls of this store across supervisor threads.
+    """
+
+    identity: tuple[int, int]
+    last_rowid: int = 0
+    pending: dict[str, CursorPendingToolCall] = field(default_factory=dict)
+    finished: set[str] = field(default_factory=set)
+    reported: set[str] = field(default_factory=set)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def restart(self) -> None:
+        """Forget every classified blob so the next read starts from the first."""
+        self.last_rowid = 0
+        self.pending.clear()
+        self.finished.clear()
+        self.reported.clear()
+
+    def classify(self, parts: _BlobToolCallParts) -> None:
+        """Fold one blob's tool-call parts into the classification."""
+        for tool_call_id, call in parts:
+            if call is None:
+                self.finished.add(tool_call_id)
+                self.pending.pop(tool_call_id, None)
+            elif tool_call_id not in self.finished:
+                self.pending[tool_call_id] = call
+
+
+# Shared by every session's supervisor thread (hence the lock); LRU stores age out.
+_PENDING_SCANS: dict[Path, _PendingScan] = {}
+_PENDING_SCANS_LOCK = threading.Lock()
+_PENDING_SCANS_MAX_STORES = 64
 
 
 def _blob_tool_call_parts(data: object) -> _BlobToolCallParts:
@@ -540,11 +576,38 @@ def _blob_tool_call_parts(data: object) -> _BlobToolCallParts:
     return tuple(parts)
 
 
+def _classify_new_blobs(con: sqlite3.Connection, scan: _PendingScan) -> bool:
+    """Classify blobs past ``scan.last_rowid``, a bounded number of batches.
+
+    Each statement is its own short read transaction. cursor's store is
+    append-only, so a newest rowid below the mark means the table was rewritten
+    and is classified again from the start.
+
+    :returns: Whether the scan reached the newest blob.
+    """
+    (max_rowid,) = con.execute("SELECT MAX(rowid) FROM blobs").fetchone()
+    if max_rowid is None or max_rowid < scan.last_rowid:
+        scan.restart()
+    for _ in range(_PENDING_SCAN_MAX_BATCHES):
+        if max_rowid is None or scan.last_rowid >= max_rowid:
+            break
+        rows = con.execute(
+            "SELECT rowid, data FROM blobs WHERE rowid > ? ORDER BY rowid LIMIT ?",
+            (scan.last_rowid, _PENDING_SCAN_BATCH_ROWS),
+        ).fetchall()
+        if not rows:
+            break
+        for rowid, data in rows:
+            scan.classify(_blob_tool_call_parts(data))
+            scan.last_rowid = rowid
+    return max_rowid is None or scan.last_rowid >= max_rowid
+
+
 def read_cursor_pending_tool_calls(store_path: Path) -> list[CursorPendingToolCall]:
     """Return the gated tool calls currently awaiting a human in *store_path*.
 
-    Scans every blob for embedded JSON messages and classifies each
-    ``toolCallId`` by how its ``tool-call`` part appears:
+    Scans blobs for embedded JSON messages and classifies each ``toolCallId`` by
+    how its ``tool-call`` part appears:
 
     * **pending** — appears in an object WITH ``pendingToolCallStartedAtMs``
       (cursor is blocking on it),
@@ -557,55 +620,36 @@ def read_cursor_pending_tool_calls(store_path: Path) -> list[CursorPendingToolCa
     ONLY with the marker (never committed) until answered, while an
     auto-approved / committed call appears without it — so this excludes the
     auto-approve flash structurally, with no timing heuristic. Read-only, so it
-    is safe to run alongside the forwarder tailing the same store; each blob is
-    parsed once and its parts reused by later polls.
+    is safe to run alongside the forwarder tailing the same store.
+
+    Each poll classifies only blobs added since the previous one, in bounded
+    batches; a replaced store file is classified again from its first blob.
+    Until a poll reaches the newest blob it reports only calls already reported,
+    so a call answered in a blob not yet read is never surfaced.
 
     :param store_path: This session's cursor ``store.db``.
     :returns: Active pending tool calls (cursor shows them one at a time, but the
         list supports more than one defensively), in first-seen order.
     """
-    with _PENDING_SCAN_CACHE_LOCK:
-        cached = _PENDING_SCAN_CACHE.get(store_path, {})
-
-    def read_new_blobs(
-        con: sqlite3.Connection,
-    ) -> tuple[list[_BlobKey], dict[int, object]]:
-        # One read transaction, so the data matches the key listing.
-        con.execute("BEGIN")
-        keys: list[_BlobKey] = con.execute(
-            "SELECT rowid, id, length(data) FROM blobs ORDER BY rowid"
-        ).fetchall()
-        unparsed = [key for key in keys if key not in cached]
-        if not unparsed:
-            return keys, {}
-        rows = con.execute(
-            "SELECT rowid, data FROM blobs WHERE rowid >= ? ORDER BY rowid", (unparsed[0][0],)
-        ).fetchall()
-        return keys, dict(rows)
-
-    result = _query_store(store_path, read_new_blobs)
-    if result is None:
+    try:
+        stat = store_path.stat()
+    except OSError:
         return []
-    keys, data_by_rowid = result
-    current: dict[_BlobKey, _BlobToolCallParts] = {}
-    pending: dict[str, CursorPendingToolCall] = {}
-    finished: set[str] = set()
-    for key in keys:
-        parts = cached.get(key)
-        if parts is None:
-            parts = _blob_tool_call_parts(data_by_rowid.get(key[0]))
-        current[key] = parts
-        for tool_call_id, call in parts:
-            if call is None:
-                finished.add(tool_call_id)
-            else:
-                pending[tool_call_id] = call
-    with _PENDING_SCAN_CACHE_LOCK:
-        _PENDING_SCAN_CACHE.pop(store_path, None)
-        _PENDING_SCAN_CACHE[store_path] = current
-        while len(_PENDING_SCAN_CACHE) > _PENDING_SCAN_CACHE_MAX_STORES:
-            _PENDING_SCAN_CACHE.pop(next(iter(_PENDING_SCAN_CACHE)))
-    return [call for tcid, call in pending.items() if tcid not in finished]
+    identity = (stat.st_dev, stat.st_ino)
+    with _PENDING_SCANS_LOCK:
+        scan = _PENDING_SCANS.pop(store_path, None)
+        if scan is None or scan.identity != identity:
+            scan = _PendingScan(identity=identity)
+        _PENDING_SCANS[store_path] = scan
+        while len(_PENDING_SCANS) > _PENDING_SCANS_MAX_STORES:
+            _PENDING_SCANS.pop(next(iter(_PENDING_SCANS)))
+    with scan.lock:
+        caught_up = _query_store(store_path, lambda con: _classify_new_blobs(con, scan))
+        if caught_up is None:
+            return []
+        if caught_up:
+            scan.reported = set(scan.pending)
+        return [call for tcid, call in scan.pending.items() if tcid in scan.reported]
 
 
 def _preview_for_args(args: dict[str, object]) -> str:

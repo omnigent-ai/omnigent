@@ -201,6 +201,19 @@ def _write_store(path: Path, blobs: list[bytes]) -> None:
         con.close()
 
 
+def _append_blobs(path: Path, blobs: list[bytes]) -> None:
+    """Append raw blobs to a store created by :func:`_write_store`."""
+    con = _sqlite3.connect(str(path))
+    try:
+        con.executemany(
+            "INSERT INTO blobs (id, data) VALUES (?, ?)",
+            [(f"appended{index}", data) for index, data in enumerate(blobs)],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
 def _framed(obj: dict) -> bytes:
     """Wrap a JSON message in fake binary protobuf noise, as cursor checkpoints do.
 
@@ -295,15 +308,7 @@ def test_read_pending_drops_a_call_answered_after_an_earlier_poll(tmp_path: Path
         store, [_framed(_pending_tool_call_obj("call_late\nfc", "Delete", {"path": "/a"}))]
     )
     assert [call.tool_name for call in read_cursor_pending_tool_calls(store)] == ["Delete"]
-    con = _sqlite3.connect(str(store))
-    try:
-        con.execute(
-            "INSERT INTO blobs (id, data) VALUES (?, ?)",
-            ("blob1", _json.dumps(_tool_result_obj("call_late\nfc")).encode("utf-8")),
-        )
-        con.commit()
-    finally:
-        con.close()
+    _append_blobs(store, [_json.dumps(_tool_result_obj("call_late\nfc")).encode("utf-8")])
     assert read_cursor_pending_tool_calls(store) == []
 
 
@@ -399,6 +404,123 @@ def test_repeat_poll_of_an_unchanged_store_scans_no_blobs(
         f"the second poll of an unchanged store re-scanned {len(scanned_sizes)} blobs "
         f"({sum(scanned_sizes)} bytes; the first poll scanned {first_poll_bytes})"
     )
+
+
+def _filler_blob(index: int) -> bytes:
+    return _json.dumps({"role": "user", "content": f"turn {index}"}).encode("utf-8")
+
+
+def _record_blob_reads(monkeypatch: pytest.MonkeyPatch) -> tuple[list[object], list[str]]:
+    """Record each blob the reader classifies and each SQL statement it runs."""
+    classified: list[object] = []
+    statements: list[str] = []
+    real_parts = cnp._blob_tool_call_parts
+    real_query_store = cnp._query_store
+
+    def recording_parts(data: object) -> cnp._BlobToolCallParts:
+        classified.append(data)
+        return real_parts(data)
+
+    def traced_query_store(
+        path: Path, query: Callable[[_sqlite3.Connection], bool]
+    ) -> bool | None:
+        def traced(con: _sqlite3.Connection) -> bool:
+            con.set_trace_callback(statements.append)
+            return query(con)
+
+        return real_query_store(path, traced)
+
+    monkeypatch.setattr(cnp, "_blob_tool_call_parts", recording_parts)
+    monkeypatch.setattr(cnp, "_query_store", traced_query_store)
+    return classified, statements
+
+
+def test_read_pending_reads_a_backlog_in_bounded_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A long store is read a few blobs per statement and poll, reporting once caught up."""
+    monkeypatch.setattr(cnp, "_PENDING_SCAN_BATCH_ROWS", 2)
+    monkeypatch.setattr(cnp, "_PENDING_SCAN_MAX_BATCHES", 2)
+    store = tmp_path / "store.db"
+    _write_store(
+        store,
+        [
+            _framed(_pending_tool_call_obj("call_old\nfc", "Delete", {"path": "/a"})),
+            *[_filler_blob(index) for index in range(4)],
+            _json.dumps(_tool_result_obj("call_old\nfc")).encode("utf-8"),
+            _framed(_pending_tool_call_obj("call_new\nfc", "Write", {"path": "/b"})),
+            _filler_blob(4),
+            _filler_blob(5),
+        ],
+    )
+    classified, statements = _record_blob_reads(monkeypatch)
+
+    results: list[list[str]] = []
+    classified_per_poll: list[int] = []
+    for _ in range(4):
+        before = len(classified)
+        results.append([call.tool_name for call in read_cursor_pending_tool_calls(store)])
+        classified_per_poll.append(len(classified) - before)
+
+    assert results == [[], [], ["Write"], ["Write"]], (
+        "a call answered later in the backlog must not be reported mid-scan"
+    )
+    assert classified_per_poll == [4, 4, 1, 0]
+    data_reads = [sql for sql in statements if "data FROM blobs" in sql]
+    assert data_reads and all(sql.rstrip().endswith("LIMIT 2") for sql in data_reads), data_reads
+
+
+def test_read_pending_keeps_reported_calls_while_catching_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial poll keeps an open card and surfaces new calls only once caught up."""
+    monkeypatch.setattr(cnp, "_PENDING_SCAN_BATCH_ROWS", 2)
+    monkeypatch.setattr(cnp, "_PENDING_SCAN_MAX_BATCHES", 1)
+    store = tmp_path / "store.db"
+    _write_store(
+        store, [_framed(_pending_tool_call_obj("call_shown\nfc", "Delete", {"path": "/a"}))]
+    )
+    assert [call.tool_name for call in read_cursor_pending_tool_calls(store)] == ["Delete"]
+    _append_blobs(
+        store,
+        [
+            _framed(_pending_tool_call_obj("call_next\nfc", "Write", {"path": "/b"})),
+            _filler_blob(0),
+            _json.dumps(_tool_result_obj("call_shown\nfc")).encode("utf-8"),
+        ],
+    )
+
+    assert [call.tool_name for call in read_cursor_pending_tool_calls(store)] == ["Delete"]
+    assert [call.tool_name for call in read_cursor_pending_tool_calls(store)] == ["Write"]
+
+
+def test_read_pending_reclassifies_a_replaced_or_shrunken_store(tmp_path: Path) -> None:
+    """A store file replaced in place, or whose newest blob falls below the mark, is reread."""
+    store = tmp_path / "store.db"
+    _write_store(
+        store,
+        [
+            _filler_blob(0),
+            _framed(_pending_tool_call_obj("call_gone\nfc", "Delete", {"path": "/a"})),
+        ],
+    )
+    assert [call.tool_name for call in read_cursor_pending_tool_calls(store)] == ["Delete"]
+
+    con = _sqlite3.connect(str(store))
+    try:
+        con.execute("DELETE FROM blobs WHERE rowid > 1")
+        con.commit()
+    finally:
+        con.close()
+    assert read_cursor_pending_tool_calls(store) == []
+
+    replacement = tmp_path / "replacement.db"
+    _write_store(
+        replacement,
+        [_framed(_pending_tool_call_obj("call_fresh\nfc", "Write", {"path": "/b"}))],
+    )
+    replacement.replace(store)
+    assert [call.tool_name for call in read_cursor_pending_tool_calls(store)] == ["Write"]
 
 
 def test_tool_call_elicitation_id_is_stable_and_scoped(tmp_path: Path) -> None:

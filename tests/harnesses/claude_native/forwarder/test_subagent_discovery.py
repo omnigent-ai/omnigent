@@ -1050,6 +1050,35 @@ def test_spawn_id_memo_rescans_only_changed_files_and_stays_bounded(
     assert set(forwarder._SPAWN_TOOL_USE_ID_CACHE) == {paths[0]}
 
 
+def test_spawn_id_memo_resumes_only_past_unchanged_complete_lines(tmp_path: Path) -> None:
+    """A record finished after a scan is read once complete; a grown rewrite and a
+    truncated file are rescanned from the start, dropping ids no longer present."""
+    path = tmp_path / "session.jsonl"
+    kept = json.dumps(_spawn_record("toolu_kept", "spawn", sidechain=False)) + "\n"
+    partial = json.dumps(_spawn_record("toolu_partial", "spawn", sidechain=False))
+    path.write_text(kept + partial[:40], encoding="utf-8")
+    assert forwarder._spawn_tool_use_ids_cached(path, include_sidechains=False) == {"toolu_kept"}
+
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(partial[40:] + "\n")
+    assert forwarder._spawn_tool_use_ids_cached(path, include_sidechains=False) == {
+        "toolu_kept",
+        "toolu_partial",
+    }
+
+    grown_size = path.stat().st_size
+    rewritten = "".join(json.dumps(_user_turn_record(index)) + "\n" for index in range(8))
+    rewritten += json.dumps(_spawn_record("toolu_rewritten", "spawn", sidechain=False)) + "\n"
+    path.write_text(rewritten, encoding="utf-8")
+    assert path.stat().st_size > grown_size
+    assert forwarder._spawn_tool_use_ids_cached(path, include_sidechains=False) == {
+        "toolu_rewritten"
+    }
+
+    path.write_text(kept, encoding="utf-8")
+    assert forwarder._spawn_tool_use_ids_cached(path, include_sidechains=False) == {"toolu_kept"}
+
+
 def test_transient_read_failure_is_not_memoized_as_an_empty_scan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
