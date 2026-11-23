@@ -18,6 +18,7 @@ from omnigent.server.scheduled.workflow_automations import (
     CONTINUED_SESSION_MESSAGE,
     TASK_SESSION_MESSAGE,
     _workflow_reading,
+    saved_workflow_id,
     workflow_session_reuse_error,
 )
 
@@ -49,6 +50,8 @@ def test_a_schedule_that_runs_a_saved_workflow_cant_continue_a_session(
 ) -> None:
     expected = CONTINUED_SESSION_MESSAGE if session_mode == "continue" else None
     assert workflow_session_reuse_error(prompt, session_mode) == expected
+    # Each of its runs starts as a run of that workflow.
+    assert saved_workflow_id(prompt) == "0123456789abcdef0123456789abcdef"
 
 
 @pytest.mark.parametrize(
@@ -68,6 +71,7 @@ def test_a_schedule_that_runs_a_saved_workflow_cant_continue_a_session(
 )
 def test_other_prompts_can_continue_a_session(prompt: str) -> None:
     assert workflow_session_reuse_error(prompt, "continue") is None
+    assert saved_workflow_id(prompt) is None
 
 
 @pytest.mark.parametrize("session_mode", ["new", "continue"])
@@ -85,6 +89,9 @@ def test_a_workflow_trigger_cant_send_every_match_to_one_task_session(
     for prompt in (per_match, _header(source=source) + per_match):
         assert _workflow_reading(prompt) == (True, False)
         assert workflow_session_reuse_error(prompt, session_mode) is None
+    # The sessions it starts for its matches run the workflow, not the trigger's own.
+    for prompt in (task_session, per_match):
+        assert saved_workflow_id(prompt) is None
 
 
 def test_reads_instructions_that_keep_the_prompt_from_splitting() -> None:

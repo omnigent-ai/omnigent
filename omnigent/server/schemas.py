@@ -3579,6 +3579,18 @@ class WorkflowRunStarter(BaseModel):
     title: str
 
 
+class WorkflowRunAutomation(BaseModel):
+    """
+    The automation whose scheduled run started a workflow run.
+
+    :param id: The automation's ID, e.g. ``"0123456789abcdef0123456789abcdef"``.
+    :param name: Its name, e.g. ``"Nightly triage"``.
+    """
+
+    id: str
+    name: str
+
+
 class WorkflowRun(BaseModel):
     """
     One run of a saved workflow: a session that started it.
@@ -3605,6 +3617,8 @@ class WorkflowRun(BaseModel):
         ``None`` for someone else's workflow or a deleted one.
     :param started_by: The session that started it, when another session did
         and the caller can read that session.
+    :param automation: The automation whose scheduled run started its session,
+        when the caller owns that automation or it is shared with them.
     :param descendant_runs: The first page of the workflow runs below this one:
         those of the sessions its session started while it was current, then
         theirs, each right after the run that started it. Empty on the runs
@@ -3634,6 +3648,7 @@ class WorkflowRun(BaseModel):
     statuses: list[SessionJournalEntry] = Field(default_factory=list)
     workflow_name: str | None = None
     started_by: WorkflowRunStarter | None = None
+    automation: WorkflowRunAutomation | None = None
     descendant_runs: list[WorkflowRun] = Field(default_factory=list)
     descendant_run_count: int = 0
     descendant_runs_cursor: str | None = None

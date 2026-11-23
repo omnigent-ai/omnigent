@@ -4513,6 +4513,7 @@ def create_app(
             conversation_store,
             auth_provider=auth_provider,
             permission_store=permission_store,
+            scheduled_task_store=scheduled_task_store,
         ),
         prefix="/v1",
         tags=["workflows"],
