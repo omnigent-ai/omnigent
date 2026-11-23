@@ -2,7 +2,7 @@
 // row labels, which rollbacks and lagging reads can leave stale.
 
 import { useSyncExternalStore } from "react";
-import { sessionProjectId } from "@/lib/sessionListFilters";
+import { sessionBelongsToProject } from "@/shell/sidebarNav";
 
 /**
  * The reserved `conversation_labels` key recording that the viewer muted a
@@ -30,6 +30,7 @@ interface LabeledRow {
   id: string;
   labels?: Record<string, string> | null;
   project_id?: string | null;
+  owner?: string | null;
 }
 
 interface MutedProject {
@@ -41,6 +42,8 @@ const entries = new Map<string, MuteEntry>();
 const recheckListeners = new Set<(id: string) => void>();
 const recheckTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let mutedProjects: readonly MutedProject[] = [];
+// Only the viewer's own sessions are filed in their projects.
+let mutedProjectsViewerId: string | null = null;
 const mutedProjectListeners = new Set<() => void>();
 
 /**
@@ -49,11 +52,13 @@ const mutedProjectListeners = new Set<() => void>();
  */
 export function setMutedProjects(
   projects: readonly { id: string | null; name: string; muted?: boolean }[],
+  viewerId: string | null,
 ): void {
   const next = projects.flatMap((project) =>
     project.muted === true && project.id !== null ? [{ id: project.id, name: project.name }] : [],
   );
   const unchanged =
+    viewerId === mutedProjectsViewerId &&
     next.length === mutedProjects.length &&
     next.every(
       (project, index) =>
@@ -61,6 +66,7 @@ export function setMutedProjects(
     );
   if (unchanged) return;
   mutedProjects = next;
+  mutedProjectsViewerId = viewerId;
   for (const listener of mutedProjectListeners) listener();
 }
 
@@ -90,11 +96,11 @@ export function isSessionMuted(row: LabeledRow): boolean {
   return entries.get(row.id)?.muted ?? !!row.labels?.[MUTED_LABEL_KEY];
 }
 
-/** Whether the session is filed in a project the viewer muted. */
+/** Whether the session sits in the folder of a project the viewer muted. */
 export function isInMutedProject(row: LabeledRow): boolean {
-  if (mutedProjects.length === 0) return false;
-  const projectId = sessionProjectId({ ...row, labels: row.labels ?? undefined }, mutedProjects);
-  return projectId !== null && mutedProjects.some((project) => project.id === projectId);
+  return mutedProjects.some((project) =>
+    sessionBelongsToProject(row, project, mutedProjectsViewerId),
+  );
 }
 
 /** Capture before a server read starts; pass the result to {@link reconcileMuteLabel}. */
@@ -206,4 +212,5 @@ export function clearSessionMuteState(): void {
   for (const id of [...recheckTimers.keys()]) cancelRecheck(id);
   entries.clear();
   mutedProjects = [];
+  mutedProjectsViewerId = null;
 }

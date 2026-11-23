@@ -90,7 +90,7 @@ describe("detectIdleTransitions", () => {
   });
 
   it("ignores a finished conversation in a muted project, but not one outside it", () => {
-    setMutedProjects([{ id: "factory", name: "Factory", muted: true }]);
+    setMutedProjects([{ id: "factory", name: "Factory", muted: true }], null);
     const prev = statusMap({ worker: "running", coordinator: "running" });
     const worker = { ...conv("worker", "idle"), project_id: "factory" };
     const coordinator = conv("coordinator", "idle");

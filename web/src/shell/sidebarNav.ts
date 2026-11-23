@@ -178,7 +178,10 @@ export function getConversationAgentType(conversation: Conversation): string {
  * ``null`` until identity resolves and is then treated as "not the owner" for
  * shared rows, so they never flash into the viewer's own lists.
  */
-export function isOwnedByViewer(conversation: Conversation, viewerId: string | null): boolean {
+export function isOwnedByViewer(
+  conversation: Pick<Conversation, "owner">,
+  viewerId: string | null,
+): boolean {
   const owner = conversation.owner ?? null;
   if (owner === null) return true;
   return owner === viewerId;
@@ -191,7 +194,9 @@ export function isOwnedByViewer(conversation: Conversation, viewerId: string | n
  * viewer owns it.
  */
 export function sessionBelongsToProject(
-  conversation: Conversation,
+  conversation: Pick<Conversation, "owner" | "project_id"> & {
+    labels?: Record<string, string> | null;
+  },
   project: { id: string | null; name: string },
   viewerId: string | null,
 ): boolean {

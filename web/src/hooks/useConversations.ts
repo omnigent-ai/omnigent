@@ -2466,9 +2466,10 @@ export function useProjects({ enabled = true }: { enabled?: boolean } = {}) {
 /** Feed the viewer's muted projects to the mute store every mute check reads. */
 export function useSyncMutedProjects(): void {
   const { data } = useProjects();
+  const viewerId = useViewerId();
   useEffect(() => {
-    if (data) setMutedProjects(data);
-  }, [data]);
+    if (data) setMutedProjects(data, viewerId);
+  }, [data, viewerId]);
 }
 
 /**

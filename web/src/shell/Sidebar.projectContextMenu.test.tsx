@@ -520,7 +520,7 @@ describe("project mute", () => {
   });
 
   it("marks a muted project and unmutes it from the same menu", () => {
-    act(() => setMutedProjects([{ id: PROJECT_ID, name: PROJECT_NAME, muted: true }]));
+    act(() => setMutedProjects([{ id: PROJECT_ID, name: PROJECT_NAME, muted: true }], null));
     mocks.projectConfig = { host_id: "h1", muted: true };
     renderSidebar({ info: MUTE_SERVER });
     expect(screen.getByTestId("project-muted-icon")).toBeInTheDocument();
@@ -535,7 +535,7 @@ describe("project mute", () => {
   });
 
   it("points a member session's own Mute at the project that muted it", () => {
-    act(() => setMutedProjects([{ id: PROJECT_ID, name: PROJECT_NAME, muted: true }]));
+    act(() => setMutedProjects([{ id: PROJECT_ID, name: PROJECT_NAME, muted: true }], null));
     localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify([PROJECT_NAME]));
     renderSidebar({ info: MUTE_SERVER });
 
