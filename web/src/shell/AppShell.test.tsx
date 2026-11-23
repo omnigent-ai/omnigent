@@ -347,7 +347,12 @@ const getSessionSlimMock = vi.mocked(getSessionSlim);
 import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
-import { useChatStore } from "@/store/chatStore";
+import { bindConversationForTest, useChatStore } from "@/store/chatStore";
+import {
+  openTasksTab,
+  showTasksTabBesideChat,
+  useSessionTasksActions,
+} from "@/store/sessionTasksActions";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
 
@@ -3280,6 +3285,140 @@ describe("Right workspace card visibility", () => {
       expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
     },
   );
+
+  function bindSessionWithTasks({ phone = false } = {}) {
+    const viewport: Record<string, boolean> = {
+      "(min-width: 1181px)": !phone,
+      "(max-width: 1180.98px)": phone,
+    };
+    const baseMatchMedia = window.matchMedia;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      ...baseMatchMedia(query),
+      matches: viewport[query] ?? baseMatchMedia(query).matches,
+    }));
+    onTestFinished(() => matchMedia.mockRestore());
+    mockConversations([
+      { id: "conv_tasks", permission_level: null },
+      { id: "conv_other", permission_level: null },
+    ]);
+    bindConversationForTest("conv_tasks", {
+      todos: [{ content: "Only item", status: "pending", activeForm: "" }],
+    });
+    onTestFinished(() => {
+      bindConversationForTest(null);
+    });
+  }
+  const workspaceRail = () => screen.queryByRole("complementary", { name: "Workspace" });
+  const tasksTabShown = () =>
+    waitFor(() => expect(readSessionWorkspaceState("conv_tasks").rightRailTab).toBe("tasks"));
+
+  it.each([
+    ["follows the collapsed default", "collapsed", undefined, false],
+    ["keeps the rail the user left open", "collapsed", true, true],
+    ["keeps the rail the user collapsed", "open", false, false],
+  ] as const)(
+    "opening a session with tasks %s, on the Tasks tab",
+    async (_, panelDefault, savedOpen, expectOpen) => {
+      writeWorkspacePanelDefault(panelDefault);
+      if (savedOpen !== undefined) writeSessionWorkspaceState("conv_tasks", { open: savedOpen });
+      bindSessionWithTasks();
+      renderShell("/c/conv_tasks", serverInfo());
+
+      await tasksTabShown();
+      if (expectOpen) {
+        expect(workspaceRail()).toBeInTheDocument();
+      } else {
+        expect(workspaceRail()).toBeNull();
+        fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+      }
+      expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
+    },
+  );
+
+  it("keeps a session with tasks collapsed after the user collapses it and comes back", async () => {
+    writeWorkspacePanelDefault("open");
+    bindSessionWithTasks();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <CapabilitiesProvider info={serverInfo()}>
+        {sessionShellTree(
+          client,
+          "/c/conv_tasks",
+          <>
+            <Link to="/c/conv_other">Other chat</Link>
+            <Link to="/c/conv_tasks">Chat with tasks</Link>
+          </>,
+        )}
+      </CapabilitiesProvider>,
+    );
+    await tasksTabShown();
+    expect(workspaceRail()).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+    fireEvent.click(screen.getByRole("link", { name: "Other chat" }));
+    const requests: string[] = [];
+    onTestFinished(
+      useSessionTasksActions.subscribe(({ tasksTabToOpen }) => {
+        if (tasksTabToOpen) requests.push(tasksTabToOpen);
+      }),
+    );
+    fireEvent.click(screen.getByRole("link", { name: "Chat with tasks" }));
+
+    await waitFor(() => {
+      expect(requests).toContain("conv_tasks");
+      expect(useSessionTasksActions.getState().tasksTabToOpen).toBeNull();
+    });
+    expect(workspaceRail()).toBeNull();
+  });
+
+  it.each([
+    ["the agent's first plan", () => showTasksTabBesideChat("conv_tasks", "first-plan")],
+    ["a click", () => openTasksTab("conv_tasks")],
+  ])("opens a collapsed rail on the Tasks tab for %s", async (_, requestTasksTab) => {
+    writeWorkspacePanelDefault("collapsed");
+    bindSessionWithTasks();
+    renderShell("/c/conv_tasks", serverInfo());
+    await tasksTabShown();
+    expect(workspaceRail()).toBeNull();
+
+    act(requestTasksTab);
+
+    expect(workspaceRail()).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("opens a collapsed rail on the Tasks tab for a click that navigates to its session", async () => {
+    writeWorkspacePanelDefault("collapsed");
+    bindSessionWithTasks();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <CapabilitiesProvider info={serverInfo()}>
+        {sessionShellTree(client, "/c/conv_other", <Link to="/c/conv_tasks">Chat with tasks</Link>)}
+      </CapabilitiesProvider>,
+    );
+    const link = await screen.findByRole("link", { name: "Chat with tasks" });
+
+    act(() => openTasksTab("conv_tasks"));
+    fireEvent.click(link);
+
+    await waitFor(() => expect(workspaceRail()).toBeInTheDocument());
+    expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it.each([
+    ["the session opening", "closed", () => showTasksTabBesideChat("conv_tasks", "session-open")],
+    ["the agent's first plan", "closed", () => showTasksTabBesideChat("conv_tasks", "first-plan")],
+    ["a click", "open", () => openTasksTab("conv_tasks")],
+  ] as const)("on a phone, %s leaves the Tasks drawer %s", async (_, state, requestTasksTab) => {
+    bindSessionWithTasks({ phone: true });
+    renderShell("/c/conv_tasks", serverInfo());
+    await screen.findByTestId("tasks-panel-drawer");
+
+    act(requestTasksTab);
+
+    expect(useSessionTasksActions.getState().tasksTabToOpen).toBeNull();
+    expect(screen.getByTestId("tasks-panel-drawer")).toHaveAttribute("data-state", state);
+  });
 
   it.each([true, false])(
     "waits for capabilities before validating restored search (enabled=%s)",
