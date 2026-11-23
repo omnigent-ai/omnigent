@@ -152,6 +152,9 @@ class _SubagentWorkEntry:
     :param awaiting_child_start_since: Unix timestamp when runner delivery
         finalization first recorded a validated native receipt, or ``None``
         when no turn-start report is awaited.
+    :param turn_resumed: Whether the child started a new turn on its own after
+        this dispatch's result reached the parent, so that turn's confirmed
+        result is delivered too.
     """
 
     parent_session_id: str
@@ -173,6 +176,7 @@ class _SubagentWorkEntry:
     child_start_response_id: str | None = None
     awaiting_child_start_since: float | None = None
     native_acceptance: NativeTurnAcceptance | None = None
+    turn_resumed: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -226,6 +230,9 @@ _children_accepted_turns: dict[str, _AcceptedChildTurn] = {}
 # Pending request evidence survives settlement until delivery finalization or deletion.
 _pending_child_acceptances: dict[str, set[_ChildAcceptanceRequest]] = {}
 _drained_delivered_subagent_children: set[str] = set()
+# Delivered dispatches the parent drained, kept so a turn the child starts on its
+# own can still report under the same dispatch. A new send or teardown clears it.
+_drained_subagent_work: dict[str, _SubagentWorkEntry] = {}
 # Optimistic (grace-timer) cancellations, delivered then drained, kept so a
 # surviving child's confirmed completion can still correct the parent under the
 # same dispatch. Confirmed aborts are not kept; a new send or teardown clears it.
@@ -350,6 +357,7 @@ def register_subagent_work(
         created_by=created_by,
     )
     _drained_delivered_subagent_children.discard(child_session_id)
+    _drained_subagent_work.pop(child_session_id, None)
     _provisional_cancelled_subagent_work.pop(child_session_id, None)
     _subagent_work_by_child[child_session_id] = entry
     _subagent_work_by_parent.setdefault(parent_session_id, set()).add(child_session_id)
@@ -383,6 +391,29 @@ def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | No
     if entry.status in {"launching", "waiting"}:
         entry.status = "running"
     return entry
+
+
+def note_subagent_child_resumed(child_session_id: str) -> None:
+    """
+    Record that a child started a new turn after its result reached the parent.
+
+    A native child can begin a turn nobody sent, for example when one of its
+    background agents finishes. The dispatch's delivery stays settled; only the
+    new turn's confirmed terminal edge is delivered, so replayed idles are not.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: None.
+    """
+    entry = _subagent_work_by_child.get(child_session_id)
+    if entry is None:
+        entry = _drained_subagent_work.get(child_session_id)
+    if (
+        entry is not None
+        and entry.delivered
+        and entry.status in _SUBAGENT_TERMINAL_STATUSES
+        and not entry.launch_timed_out
+    ):
+        entry.turn_resumed = True
 
 
 def begin_subagent_child_acceptance(child_session_id: str) -> _ChildAcceptanceRequest:
@@ -611,6 +642,7 @@ def unregister_subagent_work(
         return
     if remember_drained_delivery and entry.delivered:
         _drained_delivered_subagent_children.add(child_session_id)
+        _drained_subagent_work[child_session_id] = entry
         if entry.status == "cancelled" and not entry.cancellation_confirmed:
             # Keep an optimistic cancellation so a surviving child's confirmed
             # completion can still correct this drained record.
@@ -656,11 +688,13 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
             finish_subagent_child_acceptance(request)
         note_subagent_child_turn_settled(child_id)
     _drained_delivered_subagent_children.discard(session_id)
+    _drained_subagent_work.pop(session_id, None)
     _provisional_cancelled_subagent_work.pop(session_id, None)
     _in_flight_send_locks.pop(session_id, None)
     for child_id in list(_subagent_work_by_parent.get(session_id, set())):
         _subagent_work_by_child.pop(child_id, None)
         _drained_delivered_subagent_children.discard(child_id)
+        _drained_subagent_work.pop(child_id, None)
         _provisional_cancelled_subagent_work.pop(child_id, None)
         _in_flight_send_locks.pop(child_id, None)
     # Drained optimistic cancellations are retained keyed by child id, outside the
@@ -669,6 +703,9 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     for child_id, provisional in list(_provisional_cancelled_subagent_work.items()):
         if provisional.parent_session_id == session_id:
             _provisional_cancelled_subagent_work.pop(child_id, None)
+    for child_id, drained in list(_drained_subagent_work.items()):
+        if drained.parent_session_id == session_id:
+            _drained_subagent_work.pop(child_id, None)
     _subagent_work_by_parent.pop(session_id, None)
 
 
@@ -986,6 +1023,9 @@ def mark_subagent_work_terminal(
                 _provisional_cancelled_subagent_work.pop(child_session_id, None)
             elif corrects_cancellation:
                 return _deliver_corrected_completion(provisional, output)
+        drained = _drained_subagent_work.get(child_session_id)
+        if drained is not None and _reports_resumed_turn(drained, status, confirmed_completion):
+            return _deliver_resumed_turn(drained, status=status, output=output)
         if child_session_id in _drained_delivered_subagent_children:
             return _SubagentDeliveryAck(
                 entry=None,
@@ -1023,6 +1063,14 @@ def mark_subagent_work_terminal(
             # The child survived an optimistic cancellation and finished; its
             # confirmed completion corrects the already-delivered record.
             return _deliver_corrected_completion(entry, output)
+        if entry.delivered and _reports_resumed_turn(entry, status, confirmed_completion):
+            entry.turn_resumed = False
+            entry.status = status
+            entry.output = output
+            entry.completed_at = time.time()
+            entry.corrected_status = None
+            entry.delivered = False
+            return _deliver_subagent_completion(entry)
         # ``failed`` outranks ``completed``: a quiescence-derived ``completed``
         # (the watcher's ``idle`` edge) can be recorded — and delivered — before
         # the turn's real ``failed`` edge lands. The failure must replace it and
@@ -1104,6 +1152,44 @@ def _deliver_corrected_completion(
     entry.output = output
     entry.completed_at = time.time()
     entry.corrected_status = cancelled_entry.status
+    return _deliver_subagent_completion(entry)
+
+
+def _reports_resumed_turn(
+    entry: _SubagentWorkEntry, status: str, confirmed_completion: bool
+) -> bool:
+    """Whether a terminal report is the outcome of a turn the child started itself."""
+    return entry.turn_resumed and (
+        status == "failed" or (status == "completed" and confirmed_completion)
+    )
+
+
+def _deliver_resumed_turn(
+    drained_entry: _SubagentWorkEntry, *, status: str, output: str | None
+) -> _SubagentDeliveryAck:
+    """
+    Deliver a self-started turn's result under the drained dispatch's ``work_id``.
+
+    Reusing the id keeps the durable delivered receipt matching the dispatch.
+
+    :param drained_entry: The delivered, drained entry whose child resumed.
+    :param status: Terminal status of the resumed turn, e.g. ``"completed"``.
+    :param output: The resumed turn's output or error text.
+    :returns: Delivery acknowledgement for the resumed turn.
+    """
+    entry = register_subagent_work(
+        parent_session_id=drained_entry.parent_session_id,
+        child_session_id=drained_entry.child_session_id,
+        agent=drained_entry.agent,
+        title=drained_entry.title,
+        wrapper_label=drained_entry.wrapper_label,
+        created_by=drained_entry.created_by,
+        work_id=drained_entry.work_id,
+    )
+    entry.status = status
+    entry.output = output
+    entry.completed_at = time.time()
+    entry.child_start_reported = True
     return _deliver_subagent_completion(entry)
 
 

@@ -216,6 +216,7 @@ from omnigent.runner.subagent_work import (
     list_subagent_work,
     mark_subagent_work_started,
     mark_subagent_work_terminal,
+    note_subagent_child_resumed,
     note_subagent_child_start_reported,
     note_subagent_child_turn_settled,
     unregister_child_session,
@@ -2271,6 +2272,9 @@ def create_runner_app(
             event["blocked_on"] = blocked_on
         if inferred:
             event["inferred"] = True
+        elif status == "running":
+            # A native child can start a turn on its own after reporting its result.
+            note_subagent_child_resumed(session_id)
         _publish_event(session_id, event)
         if wire_status != status:
             # Only the server's copy is downgraded: the agent still works in
@@ -8522,6 +8526,8 @@ def create_runner_app(
                 # them here too; the idle watchdog reads them for native turns.
                 _record_native_pane_status(conversation_id, status)
                 resource_registry.note_external_session_status(conversation_id, status)
+                if status == "running":
+                    note_subagent_child_resumed(conversation_id)
                 if status in ("running", "waiting"):
                     note_subagent_child_start_reported(
                         conversation_id,

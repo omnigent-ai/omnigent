@@ -610,6 +610,151 @@ async def test_confirmed_stop_blocks_late_completion_after_drain(
         subagent_work._provisional_cancelled_subagent_work.pop(rig.child_id, None)
 
 
+async def _deliver_first_result(rig: _Rig, client: Any, *, drain: bool) -> str:
+    """Complete the dispatched turn, optionally drain it, and return its work id."""
+    from omnigent.runner.tool_dispatch import _cleanup_drained_subagent_work
+
+    await rig.create_child_session(client)
+    resp = await rig.post_status(
+        client, {"status": "idle", "turn_completed": True, "output": "the verdict"}
+    )
+    assert resp.status_code == 204, resp.text
+    first = rig.drained()
+    assert [(item["status"], item["output"]) for item in first] == [("completed", "the verdict")]
+    if drain:
+        for payload in first:
+            await _cleanup_drained_subagent_work(payload, server_client=None)
+        assert subagent_work.get_subagent_work(rig.child_id) is None
+    return str(first[0]["work_id"])
+
+
+def _forget_drained_child(child_id: str) -> None:
+    subagent_work._drained_delivered_subagent_children.discard(child_id)
+    subagent_work._drained_subagent_work.pop(child_id, None)
+
+
+@pytest.mark.parametrize("drain_first", [True, False], ids=["drained", "registered"])
+@pytest.mark.parametrize(
+    ("resumed_end", "expected"),
+    [
+        (
+            {"status": "idle", "turn_completed": True, "output": "open the PR?"},
+            ("completed", "open the PR?"),
+        ),
+        ({"status": "failed", "output": "Error: rate limited"}, ("failed", "Error: rate limited")),
+    ],
+    ids=["completed", "failed"],
+)
+@pytest.mark.asyncio
+async def test_self_resumed_turn_result_reaches_parent_once(
+    drain_first: bool, resumed_end: dict[str, Any], expected: tuple[str, str]
+) -> None:
+    """A turn the child starts on its own reports under the original dispatch.
+
+    Claude Code resumes a worker when one of its background agents finishes. The
+    resumed turn's end must reach the parent whether or not the parent already
+    drained the first result, and a retried edge must not deliver it twice.
+    """
+    rig = _Rig("claude-native")
+    subagent_work._subagent_work_by_child[rig.child_id].wrapper_label = "claude-native-ui"
+    try:
+        async with _runner_client(rig.app) as client:
+            work_id = await _deliver_first_result(rig, client, drain=drain_first)
+            for data in ({"status": "running"}, resumed_end, resumed_end):
+                resp = await rig.post_status(client, data)
+                assert resp.status_code == 204, resp.text
+        resumed = rig.drained()
+        assert [(item["status"], item["output"], item["work_id"]) for item in resumed] == [
+            (*expected, work_id)
+        ]
+        entry = subagent_work.get_subagent_work(rig.child_id)
+        assert entry is not None
+        assert (entry.work_id, entry.wrapper_label) == (work_id, "claude-native-ui")
+    finally:
+        rig.close()
+        _forget_drained_child(rig.child_id)
+
+
+@pytest.mark.parametrize(
+    "edges", [[], [{"status": "waiting"}]], ids=["retried-stop", "background-hold"]
+)
+@pytest.mark.parametrize("drain_first", [True, False], ids=["drained", "registered"])
+@pytest.mark.asyncio
+async def test_delivered_result_is_not_resent_without_a_new_turn(
+    edges: list[dict[str, Any]], drain_first: bool
+) -> None:
+    """Without a new running turn, a repeated confirmed Stop is the same result."""
+    rig = _Rig("claude-native")
+    try:
+        async with _runner_client(rig.app) as client:
+            await _deliver_first_result(rig, client, drain=drain_first)
+            for data in [
+                *edges,
+                {"status": "idle", "turn_completed": True, "output": "the verdict"},
+            ]:
+                resp = await rig.post_status(client, data)
+                assert resp.status_code == 204, resp.text
+        assert rig.drained() == []
+    finally:
+        rig.close()
+        _forget_drained_child(rig.child_id)
+
+
+@pytest.mark.parametrize("inferred", [False, True], ids=["pane-busy", "inferred"])
+@pytest.mark.asyncio
+async def test_pane_running_edge_reopens_drained_dispatch(inferred: bool) -> None:
+    """The pane watcher's busy edge, not an inferred one, marks a self-started turn."""
+    rig = _Rig("claude-native")
+    try:
+        async with _runner_client(rig.app) as client:
+            await _deliver_first_result(rig, client, drain=True)
+            publish = rig.app.state.session_resource_registry._session_status_publisher
+            publish(rig.child_id, "running", None, inferred=inferred)
+            resp = await rig.post_status(
+                client, {"status": "idle", "turn_completed": True, "output": "open the PR?"}
+            )
+            assert resp.status_code == 204, resp.text
+        outputs = [item["output"] for item in rig.drained()]
+        assert outputs == ([] if inferred else ["open the PR?"])
+    finally:
+        rig.close()
+        _forget_drained_child(rig.child_id)
+
+
+def test_parent_teardown_drops_resumable_drained_dispatch() -> None:
+    """A resumed child of a deleted parent does not re-register work for it."""
+    parent_id = uuid.uuid4().hex
+    child_id = uuid.uuid4().hex
+    subagent_work._session_inboxes_ref[parent_id] = asyncio.Queue()
+    subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="researcher",
+        title="cite-check",
+    )
+    try:
+        ack = subagent_work.mark_subagent_work_terminal(
+            child_id, status="completed", output="the verdict", confirmed_completion=True
+        )
+        assert ack.delivered_now
+        subagent_work.unregister_subagent_work(child_id, remember_drained_delivery=True)
+        subagent_work.note_subagent_child_resumed(child_id)
+
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work_for_session(parent_id)
+        assert child_id not in subagent_work._drained_subagent_work
+
+        late = subagent_work.mark_subagent_work_terminal(
+            child_id, status="completed", output="open the PR?", confirmed_completion=True
+        )
+        assert late.delivered and not late.delivered_now
+        assert subagent_work.get_subagent_work(child_id) is None
+    finally:
+        subagent_work.unregister_subagent_work_for_session(parent_id)
+        _forget_drained_child(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+
 @pytest.mark.asyncio
 async def test_legacy_bare_idle_does_not_overturn_optimistic_cancellation() -> None:
     """A legacy harness's bare idle must not launder an optimistic cancellation.

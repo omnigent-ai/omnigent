@@ -59,6 +59,7 @@ def _clean_subagent_registry() -> Iterator[None]:
         dict(subagent_work._children_reporting_start),
         dict(subagent_work._children_accepted_turns),
         {k: set(v) for k, v in subagent_work._pending_child_acceptances.items()},
+        dict(subagent_work._drained_subagent_work),
     )
     subagent_work._subagent_work_by_child.clear()
     subagent_work._subagent_work_by_parent.clear()
@@ -69,6 +70,7 @@ def _clean_subagent_registry() -> Iterator[None]:
     subagent_work._children_reporting_start.clear()
     subagent_work._children_accepted_turns.clear()
     subagent_work._pending_child_acceptances.clear()
+    subagent_work._drained_subagent_work.clear()
     try:
         yield
     finally:
@@ -90,6 +92,8 @@ def _clean_subagent_registry() -> Iterator[None]:
         subagent_work._children_accepted_turns.update(saved[7])
         subagent_work._pending_child_acceptances.clear()
         subagent_work._pending_child_acceptances.update(saved[8])
+        subagent_work._drained_subagent_work.clear()
+        subagent_work._drained_subagent_work.update(saved[9])
 
 
 class _SnapshotServerClient(NullServerClient):
@@ -613,10 +617,10 @@ async def test_retained_result_is_delivered_when_parent_inbox_is_created(
 
 
 @pytest.mark.asyncio
-async def test_replayed_idle_after_drain_does_not_redeliver(
+async def test_drained_child_delivers_new_turn_but_not_replayed_idle(
     _clean_subagent_registry: None,
 ) -> None:
-    """The recovery must not re-deliver a child already delivered and drained.
+    """A drained child's replayed idle is not re-delivered, but its next turn is.
 
     Guards the snapshot-recovery arm against a duplicate: once a completion was
     delivered and the parent drained it, the runner keeps a delivered tombstone.
@@ -624,6 +628,7 @@ async def test_replayed_idle_after_drain_does_not_redeliver(
     production shape) must NOT rebuild the work entry and re-enqueue — it stays a
     benign already-delivered 204. (The existing suite's dedup test uses a stub
     snapshot with no parent, so it would not catch a recovery-induced re-deliver.)
+    A later running edge starts a new turn whose completion must still wake the parent.
     """
     child_body = _child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID)
     # First completion delivers normally.
@@ -660,9 +665,28 @@ async def test_replayed_idle_after_drain_does_not_redeliver(
             f"/v1/sessions/{CHILD_SESSION_ID}/events",
             json={"type": "external_session_status", "data": {"status": "idle", "output": "x"}},
         )
+        assert replay.status_code == 204
+        assert inbox.qsize() == 0, "replayed idle re-delivered a duplicate to the parent inbox"
 
-    assert replay.status_code == 204
-    assert inbox.qsize() == 0, "replayed idle re-delivered a duplicate to the parent inbox"
+        # Claude Code resumes the child on its own (e.g. a background task finished).
+        started = await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={"type": "external_session_status", "data": {"status": "running"}},
+        )
+        finished = await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle", "output": "open the PR?", "turn_completed": True},
+            },
+        )
+
+    assert started.status_code == 204
+    assert finished.status_code == 204
+    assert inbox.qsize() == 1, "self-resumed turn's result never reached the parent inbox"
+    delivered = inbox.get_nowait()
+    assert delivered["task_id"] == CHILD_SESSION_ID
+    assert "open the PR?" in str(delivered)
 
 
 @pytest.mark.asyncio
