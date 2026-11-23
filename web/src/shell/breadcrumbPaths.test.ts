@@ -72,6 +72,14 @@ describe("segment folders", () => {
     expect(segmentFolder(name)).toBe("/tmp");
   });
 
+  it("lists a Windows path's segments beside their siblings at every depth", () => {
+    const segments = breadcrumbSegments("docs\\sub\\notes.md");
+    expect(segments.map(segmentFolder)).toEqual(["", "docs", "docs/sub"]);
+    expect(
+      segments.map((segment) => pathWithinFolder(segment.path, segmentFolder(segment))),
+    ).toEqual(["docs", "sub", "notes.md"]);
+  });
+
   it("selects the segment itself within the listed folder", () => {
     for (const segment of breadcrumbSegments("/tmp/logs/run.txt")) {
       expect(pathWithinFolder(segment.path, segmentFolder(segment))).toBe(segment.label);

@@ -88,18 +88,15 @@ describe("FileBreadcrumbs", () => {
     expect(tree).toHaveAttribute("data-reveal", reveal);
   });
 
-  it.each([
-    ["docs", "", "docs"],
-    ["sub", "docs", "sub"],
-    ["notes.md", "docs/sub", "notes.md"],
-  ])("lists a Windows path's %s beside its siblings", (segment, expectedFolder, expectedReveal) => {
+  // Each depth's folder is in the path helpers' tests; one segment shows the wiring.
+  it("lists a Windows path's folder beside its siblings", () => {
     const { breadcrumbs } = renderBreadcrumbs("docs\\sub\\notes.md");
 
-    fireEvent.click(within(breadcrumbs).getByRole("button", { name: segment }));
+    fireEvent.click(within(breadcrumbs).getByRole("button", { name: "sub" }));
 
     const tree = screen.getByTestId("folder-tree");
-    expect(tree).toHaveAttribute("data-folder", expectedFolder);
-    expect(tree).toHaveAttribute("data-reveal", expectedReveal);
+    expect(tree).toHaveAttribute("data-folder", "docs");
+    expect(tree).toHaveAttribute("data-reveal", "sub");
   });
 
   it("titles a root-level file's siblings with the workspace name", () => {
