@@ -343,7 +343,9 @@ export function FilesPageTree({
           <TreeMessage>
             {result.truncated
               ? "No matches in the files searched so far. The search stopped early, so narrow it with an include glob to search the rest."
-              : summary.emptyText}
+              : result.hasMore
+                ? "The first matches are all hidden files, so others may come after them. Type more of the name to narrow it."
+                : summary.emptyText}
           </TreeMessage>
         ) : (
           <>

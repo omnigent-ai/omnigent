@@ -457,6 +457,23 @@ describe("FilesPageTree", () => {
       },
     );
 
+    it("says visible matches may lie past a limit filled with hidden ones", () => {
+      vi.useFakeTimers();
+      vi.mocked(useWorkspaceFileSearch).mockReturnValue({
+        data: {
+          files: [entry(".cache/app.log")],
+          truncated: false,
+          hasMore: true,
+          unavailable: false,
+        },
+      } as never);
+      renderTree(listed([entry("src")]));
+      fireEvent.click(filterButton());
+      typeName("app");
+      expect(screen.getByText(/^The first matches are all hidden files/)).toBeInTheDocument();
+      expect(screen.queryByText("No files match “app”.")).toBeNull();
+    });
+
     it("says a search that stopped early may have missed matches", () => {
       vi.useFakeTimers();
       vi.mocked(useWorkspaceFileSearch).mockReturnValue({
