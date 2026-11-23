@@ -11,6 +11,8 @@ import { settingsControlProps } from "./search/settingsControl";
 export function WidenWindowForRightSidebarControl() {
   // Null until the shell answers; the switch stays off and disabled meanwhile.
   const [enabled, setEnabled] = useState<boolean | null>(null);
+  // One save at a time, so a failed save always rolls back to the shell's value.
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -24,7 +26,10 @@ export function WidenWindowForRightSidebarControl() {
 
   const toggle = useCallback(async (next: boolean) => {
     setEnabled(next);
-    if (await setWidenWindowForRightSidebar(next)) return;
+    setSaving(true);
+    const saved = await setWidenWindowForRightSidebar(next);
+    setSaving(false);
+    if (saved) return;
     setEnabled(!next);
     toast.error("Couldn't save this setting. Try again.");
   }, []);
@@ -38,7 +43,7 @@ export function WidenWindowForRightSidebarControl() {
       <Switch
         {...settingsControlProps(WIDEN_WINDOW_FOR_RIGHT_SIDEBAR_ENTRY)}
         checked={enabled === true}
-        disabled={enabled === null}
+        disabled={enabled === null || saving}
         onCheckedChange={(next) => void toggle(next)}
         data-testid="widen-window-for-right-sidebar-toggle"
         className="mt-0.5 shrink-0"

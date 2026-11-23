@@ -59,6 +59,27 @@ describe("WidenWindowForRightSidebarControl", () => {
     expect(toastError).not.toHaveBeenCalled();
   });
 
+  it("disables the switch until the shell answers a save", async () => {
+    const bridge = installBridge(false);
+    let finishSave: (saved: boolean) => void = () => {};
+    bridge.setWidensWindow.mockReturnValue(
+      new Promise<boolean>((resolve) => {
+        finishSave = resolve;
+      }),
+    );
+    renderControl();
+    const toggle = screen.getByRole("switch", { name: SWITCH_NAME });
+    await waitFor(() => expect(toggle).toBeEnabled());
+
+    await act(async () => fireEvent.click(toggle));
+    expect(toggle).toBeChecked();
+    expect(toggle).toBeDisabled();
+
+    await act(async () => finishSave(false));
+    expect(toggle).not.toBeChecked();
+    expect(toggle).toBeEnabled();
+  });
+
   it("reverts and says so when the shell can't save it", async () => {
     installBridge(false, false);
     renderControl();

@@ -655,6 +655,7 @@ describe("SettingsPage", () => {
 
   it("offers the right sidebar window setting in Desktop app only on shells that have it", async () => {
     const name = { name: "Widen window when opening the right sidebar" };
+    const newAgent = { name: "Open New Agent from anywhere" };
     renderPage("/settings/general");
     expect(screen.queryByTestId("settings-group-desktop-app")).toBeNull();
     cleanup();
@@ -669,19 +670,13 @@ describe("SettingsPage", () => {
       kind: "electron",
       setBadgeCount: vi.fn(),
       notify: vi.fn(),
-      getGlobalShortcut: vi.fn().mockResolvedValue({ enabled: false, accelerator: "Alt+Space" }),
-      setGlobalShortcut: vi.fn(),
       rightSidebarWindow,
     };
+    // A shell without global shortcuts still gets the Desktop app group for this setting.
     renderPage("/settings/general");
     const group = screen.getByTestId("settings-group-desktop-app");
-    const toggle = within(group).getByRole("switch", name);
-    // Off by default.
-    await waitFor(() => expect(toggle).toBeEnabled());
-    expect(toggle).not.toBeChecked();
-    await act(async () => fireEvent.click(toggle));
-    expect(rightSidebarWindow.setWidensWindow).toHaveBeenCalledWith(true);
-    expect(toggle).toBeChecked();
+    await waitFor(() => expect(within(group).getByRole("switch", name)).toBeEnabled());
+    expect(within(group).queryByRole("switch", newAgent)).toBeNull();
   });
 
   it("offers the kanban board switch under Composer only when the server has the board", () => {

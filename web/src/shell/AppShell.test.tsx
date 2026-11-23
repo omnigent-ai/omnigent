@@ -3476,6 +3476,12 @@ describe("Right workspace card visibility", () => {
 
   it("reveals a collapsed workspace when New Browser Tab opens a tab", async () => {
     writeWorkspacePanelDefault("collapsed");
+    const rightSidebarWindow = {
+      getWidensWindow: vi.fn().mockResolvedValue(true),
+      setWidensWindow: vi.fn().mockResolvedValue(true),
+      opened: vi.fn(),
+      closed: vi.fn(),
+    };
     let sendCommand: (event: {
       command: string;
       browserViewId: string | null;
@@ -3490,6 +3496,7 @@ describe("Right workspace card visibility", () => {
         return () => {};
       },
       setDesktopCommandState: () => {},
+      rightSidebarWindow,
     });
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
@@ -3510,6 +3517,8 @@ describe("Right workspace card visibility", () => {
         "true",
       );
       expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+      // A reveal opens the sidebar too, so the desktop shell can widen the window for it.
+      expect(rightSidebarWindow.opened).toHaveBeenCalledOnce();
     } finally {
       cleanup();
       vi.unstubAllGlobals();

@@ -109,6 +109,23 @@ describe("useResizableInlinePanel width in a wider window", () => {
     expect(result.current.widthInWiderWindow()).toBe(420);
   });
 
+  it("renders the reported width on every open of a window that grows and shrinks back", () => {
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+    const resizeTo = (px: number) => {
+      setInnerWidth(px);
+      act(() => window.dispatchEvent(new Event("resize")));
+    };
+    resizeTo(960);
+    for (let open = 0; open < 2; open += 1) {
+      const reported = result.current.widthInWiderWindow();
+      expect(reported).toBe(540);
+      resizeTo(960 + reported);
+      expect(result.current.panelWidth).toBe(reported);
+      resizeTo(960);
+      expect(result.current.panelWidth).toBe(420);
+    }
+  });
+
   it("gives the user's width, even while a narrow window squeezes the panel", () => {
     const { result } = renderHook(() => useResizableInlinePanel(SESSION));
     expect(nudgeWiderOnce(result)).toBe(620);

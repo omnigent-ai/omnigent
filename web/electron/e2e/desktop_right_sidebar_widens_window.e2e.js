@@ -13,10 +13,20 @@ const { eventually, startDesignBackend } = require("./desktopDesignPromptHarness
 
 const RECORD_DIR = process.env.OMNIGENT_DESKTOP_RECORD_DIR;
 const deps = desktopDepsAvailable();
+// The native shell's Toggle Right Sidebar accelerator.
+const TOGGLE_RIGHT_SIDEBAR =
+  process.platform === "darwin" ? "Meta+Shift+KeyB" : "Control+Shift+KeyB";
 
 function pause(ms = 1_500) {
   return new Promise((resolve) => {
     setTimeout(resolve, RECORD_DIR ? ms : 0);
+  });
+}
+
+/** A real wait before a check that the window did not change, past the resize IPC's latency. */
+function settle(ms = 1_000) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
   });
 }
 
@@ -62,6 +72,22 @@ async function setWindowBounds(electronApp, bounds) {
   }, bounds);
 }
 
+/** Counts the shell window's `setBounds` calls from now on; resolves a reader for the count. */
+async function countSetBounds(electronApp) {
+  await electronApp.evaluate(({ BrowserWindow }) => {
+    const win = BrowserWindow.getAllWindows().find((candidate) =>
+      candidate.webContents.getURL().startsWith("http"),
+    );
+    globalThis.setBoundsCalls = 0;
+    const original = win.setBounds.bind(win);
+    win.setBounds = (...args) => {
+      globalThis.setBoundsCalls += 1;
+      return original(...args);
+    };
+  });
+  return () => electronApp.evaluate(() => globalThis.setBoundsCalls);
+}
+
 async function setFullScreen(electronApp, fullScreen) {
   await electronApp.evaluate(({ BrowserWindow }, next) => {
     BrowserWindow.getAllWindows()
@@ -79,6 +105,23 @@ async function waitForBounds(electronApp, expected, label) {
     label,
     10_000,
   );
+}
+
+/** The window's bounds once two reads half a second apart agree. */
+async function settledBounds(electronApp) {
+  let previous = null;
+  let current = (await windowState(electronApp)).bounds;
+  await eventually(
+    async () => {
+      await settle(500);
+      previous = current;
+      current = (await windowState(electronApp)).bounds;
+      return JSON.stringify(current) === JSON.stringify(previous);
+    },
+    "window bounds settled",
+    10_000,
+  );
+  return current;
 }
 
 async function chatWidth(page) {
@@ -109,6 +152,7 @@ it(
       const { workArea } = await windowState(electronApp);
       const home = { x: workArea.x + 40, y: workArea.y + 40, width: 960, height: 760 };
       await setWindowBounds(electronApp, home);
+      await waitForBounds(electronApp, home, "window at its starting bounds");
       await page.goto(`${serverUrl}/c/${sessionId}`);
       const composer = page.getByRole("textbox", { name: "Message the agent" });
       await composer.waitFor({ timeout: 45_000 });
@@ -119,6 +163,7 @@ it(
       // The setting is off by default, so opening the sidebar keeps the window's size.
       await expand.click();
       await collapse.waitFor();
+      await settle();
       assert.deepEqual((await windowState(electronApp)).bounds, home);
       await collapse.click();
       await expand.waitFor();
@@ -183,12 +228,17 @@ it(
         step(`sidebar closed, window ${home.width}px`);
         await pause(2_500);
 
-        await page.keyboard.press("Control+Shift+KeyB");
+        await page.keyboard.press(TOGGLE_RIGHT_SIDEBAR);
         await collapse.waitFor();
         await waitForBounds(electronApp, widened, "hotkey widened the window");
+        await eventually(
+          async () => Math.abs((await chatWidth(page)) - before) <= 1,
+          "chat kept its width on the second open",
+          10_000,
+        );
         step("sidebar open with Ctrl+Shift+B, window widened");
         await pause(2_500);
-        await page.keyboard.press("Control+Shift+KeyB");
+        await page.keyboard.press(TOGGLE_RIGHT_SIDEBAR);
         await expand.waitFor();
         await waitForBounds(electronApp, home, "hotkey narrowed the window");
         step("sidebar closed with Ctrl+Shift+B, window back");
@@ -229,22 +279,62 @@ it(
           "window in full screen",
           10_000,
         );
-        await pause(1_500);
-        const fullScreen = (await windowState(electronApp)).bounds;
+        const fullScreen = await settledBounds(electronApp);
+        // Xvfb ignores setBounds on a full-screen window, so also check the shell never called it.
+        const setBoundsCalls = await countSetBounds(electronApp);
         step("shell put in full screen");
         await pause(2_000);
         await expand.click();
         await collapse.waitFor();
-        await pause(1_500);
+        await settle(1_500);
         assert.deepEqual((await windowState(electronApp)).bounds, fullScreen);
+        assert.equal(await setBoundsCalls(), 0);
         step("sidebar open, full-screen window keeps its size");
         await pause(2_000);
         await collapse.click();
         await expand.waitFor();
-        await pause(1_500);
+        await settle(1_500);
         assert.deepEqual((await windowState(electronApp)).bounds, fullScreen);
+        assert.equal(await setBoundsCalls(), 0);
         step("sidebar closed, window size unchanged");
+        await pause(2_000);
+
+        // A sidebar closed in full screen gives its width back once the window leaves it.
+        await setFullScreen(electronApp, false);
+        await eventually(
+          async () => !(await windowState(electronApp)).fullScreen,
+          "window left full screen",
+          10_000,
+        );
+        await settle();
+        await expand.click();
+        await collapse.waitFor();
+        await eventually(
+          async () => (await windowState(electronApp)).bounds.width > home.width,
+          "window widened again",
+          10_000,
+        );
+        step("left full screen, sidebar open, window widened");
         await pause(2_500);
+        await setFullScreen(electronApp, true);
+        await eventually(
+          async () => (await windowState(electronApp)).fullScreen,
+          "window in full screen again",
+          10_000,
+        );
+        const widenedFullScreen = await settledBounds(electronApp);
+        step("full screen with the sidebar open");
+        await pause(2_000);
+        await collapse.click();
+        await expand.waitFor();
+        await settle(1_500);
+        assert.deepEqual((await windowState(electronApp)).bounds, widenedFullScreen);
+        step("sidebar closed in full screen, window unchanged");
+        await pause(2_500);
+        await setFullScreen(electronApp, false);
+        await waitForBounds(electronApp, nearEdge, "window shrank after leaving full screen");
+        step("left full screen, window shrank back into place");
+        await pause(3_000);
       });
     } finally {
       if (app) {

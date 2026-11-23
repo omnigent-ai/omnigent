@@ -51,6 +51,8 @@ function canResize(win) {
 function createRightSidebarWindow({ loadSettings, saveSettings, workAreaFor, animate = false }) {
   /** What each window grew by for its sidebar, until the sidebar closes. */
   const growths = new WeakMap();
+  /** Windows whose sidebar closed while they couldn't resize, to shrink once they can. */
+  const pendingCloses = new WeakSet();
 
   function enabled() {
     return widenWindowForRightSidebarEnabled(loadSettings());
@@ -81,6 +83,7 @@ function createRightSidebarWindow({ loadSettings, saveSettings, workAreaFor, ani
     ) {
       return false;
     }
+    pendingCloses.delete(win);
     if (growths.has(win) || !canResize(win) || !enabled()) return false;
     const extra = Math.round(sidebarWidth * win.webContents.getZoomFactor());
     const bounds = win.getBounds();
@@ -91,18 +94,38 @@ function createRightSidebarWindow({ loadSettings, saveSettings, workAreaFor, ani
     return true;
   }
 
-  /** The right sidebar closed. A maximized or full-screen window keeps its growth for later. */
+  /** The right sidebar closed. A maximized or full-screen window shrinks once it's restored. */
   function closed(win) {
     const growth = growths.get(win);
-    if (!growth || !canResize(win)) return false;
+    if (!growth) return false;
+    if (!canResize(win)) {
+      pendingCloses.add(win);
+      return false;
+    }
+    return shrink(win, growth);
+  }
+
+  /** The window may have left full screen or maximize; applies a close made meanwhile. */
+  function restored(win) {
+    const growth = growths.get(win);
+    if (!growth || !pendingCloses.has(win) || !canResize(win)) return false;
+    const bounds = win.getBounds();
+    const workArea = workAreaFor(bounds);
+    // Some window systems report the restored bounds after the state change; wait for them.
+    if (bounds.width >= workArea.width && bounds.height >= workArea.height) return false;
+    return shrink(win, growth);
+  }
+
+  function shrink(win, growth) {
     growths.delete(win);
+    pendingCloses.delete(win);
     const bounds = win.getBounds();
     const [minWidth = 0] = win.getMinimumSize();
     win.setBounds(narrowedBounds(bounds, workAreaFor(bounds), growth, minWidth), animate);
     return true;
   }
 
-  return { enabled, setEnabled, opened, closed };
+  return { enabled, setEnabled, opened, closed, restored };
 }
 
 module.exports = {

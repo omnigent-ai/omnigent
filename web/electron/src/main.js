@@ -3004,6 +3004,11 @@ function createWindow(targetUrl, opts = {}) {
   };
   win.on("enter-full-screen", sendFullScreenState);
   win.on("leave-full-screen", sendFullScreenState);
+  // A right sidebar closed while full screen or maximized shrinks the window once it's restored.
+  const restoreRightSidebarWindow = () => rightSidebarWindow.restored(win);
+  win.on("leave-full-screen", restoreRightSidebarWindow);
+  win.on("unmaximize", restoreRightSidebarWindow);
+  win.on("resize", restoreRightSidebarWindow);
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
   // CLI config stores the API mount; Electron boots the browser-facing SPA.

@@ -181,17 +181,58 @@ describe("createRightSidebarWindow", () => {
     }
   });
 
-  it("shrinks a window that grew once it leaves full screen and the sidebar closes", () => {
+  it("shrinks a window whose sidebar closed in full screen or maximized once it's restored", () => {
+    const { controller } = harness();
+    for (const flag of ["fullScreen", "maximized"]) {
+      const win = fakeWindow();
+      controller.opened(win, 500);
+      win.state[flag] = true;
+      assert.equal(controller.closed(win), false);
+      assert.equal(controller.restored(win), false);
+      win.state[flag] = false;
+      assert.equal(controller.restored(win), true);
+      assert.equal(win.getBounds().width, 800);
+      // Only once: later restores and closes leave the window alone.
+      assert.equal(controller.restored(win), false);
+      assert.equal(controller.closed(win), false);
+      assert.equal(win.getBounds().width, 800);
+    }
+  });
+
+  it("keeps the growth when the sidebar reopens before the window is restored", () => {
     const { controller } = harness();
     const win = fakeWindow();
     controller.opened(win, 500);
     win.state.fullScreen = true;
-    assert.equal(controller.closed(win), false);
-    win.state.fullScreen = false;
-    // Reopening doesn't grow it again; closing takes the width back off.
+    controller.closed(win);
     assert.equal(controller.opened(win, 500), false);
+    win.state.fullScreen = false;
+    assert.equal(controller.restored(win), false);
+    assert.equal(win.getBounds().width, 1300);
     assert.equal(controller.closed(win), true);
     assert.equal(win.getBounds().width, 800);
+  });
+
+  it("waits for a restored window's bounds to leave the full work area", () => {
+    const { controller } = harness();
+    const win = fakeWindow();
+    controller.opened(win, 500);
+    win.state.maximized = true;
+    controller.closed(win);
+    win.state.maximized = false;
+    win.state.bounds = { ...WORK_AREA };
+    assert.equal(controller.restored(win), false);
+    win.state.bounds = { x: 100, y: 50, width: 1300, height: 700 };
+    assert.equal(controller.restored(win), true);
+    assert.equal(win.getBounds().width, 800);
+  });
+
+  it("ignores restores while the sidebar is open", () => {
+    const { controller } = harness();
+    const win = fakeWindow();
+    controller.opened(win, 500);
+    assert.equal(controller.restored(win), false);
+    assert.equal(win.getBounds().width, 1300);
   });
 
   it("ignores widths that aren't a sidebar's", () => {

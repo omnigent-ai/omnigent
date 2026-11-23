@@ -236,18 +236,17 @@ export function useResizableInlinePanel(
 
   // Re-clamp on viewport resize so the panel can't overflow a shrunken window.
   // Re-derive the effective width from the persisted preference so widening the
-  // window restores the user's saved choice. Deliberately clamped WITHOUT
-  // `reservedPx`: the store holds the preferred width, and the reserve is
-  // applied at render time, so an open sidebar's squeeze is never written in
-  // (collapsing it restores this width).
+  // window restores the user's saved choice; without one, the default tracks the
+  // viewport. Deliberately clamped WITHOUT `reservedPx`: the store holds the
+  // preferred width, and the reserve is applied at render time, so an open
+  // sidebar's squeeze is never written in (collapsing it restores this width).
   useEffect(() => {
     function onResize() {
-      setStoredWidth((prev) => {
-        const base = preferredWidth ?? prev;
-        return base !== null
-          ? clamp(base, minWidthRef.current, 0, chatMinRef.current)
-          : defaultWidthPx();
-      });
+      setStoredWidthRaw(
+        preferredWidth !== null
+          ? clamp(preferredWidth, minWidthRef.current, 0, chatMinRef.current)
+          : null,
+      );
       // Force a re-render even when the stored width is unchanged, so the
       // render-time reserve clamp re-runs against the new viewport.
       bumpViewport();
@@ -365,7 +364,7 @@ export function useResizableInlinePanel(
   );
 
   // Read when the panel opens, so a window resized since the last render is measured.
-  // The store also holds viewport-derived defaults, so read only the user's own choice.
+  // The store holds the choice clamped to this viewport; a wider window can fit all of it.
   const widthInWiderWindow = useCallback(() => {
     const chosen = sessionId === currentSessionId ? preferredWidth : effectiveRaw;
     return Math.max(minWidthPx, chosen ?? defaultWidthInWiderWindowPx());
