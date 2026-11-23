@@ -36,6 +36,13 @@ function defaultWidthPx(): number {
   return Math.max(DEFAULT_MIN_PX, Math.min(DEFAULT_MAX_PX, candidate));
 }
 
+/** The default width once the window grows by it, which keeps the chat's width unchanged. */
+function defaultWidthInWiderWindowPx(): number {
+  if (typeof window === "undefined") return DEFAULT_SSR_PX;
+  const candidate = Math.round((window.innerWidth * DEFAULT_RATIO) / (1 - DEFAULT_RATIO));
+  return Math.max(DEFAULT_MIN_PX, Math.min(DEFAULT_MAX_PX, candidate));
+}
+
 // Width the panel may not eat into: the sidebar when it's open. Passed down
 // from AppShell so opening the sidebar tightens the ceiling instead of
 // squeezing the chat.
@@ -357,10 +364,17 @@ export function useResizableInlinePanel(
     [onMouseDown, onKeyDown, persistEnabled],
   );
 
+  // Read when the panel opens, so a window resized since the last render is measured.
+  // The store also holds viewport-derived defaults, so read only the user's own choice.
+  const widthInWiderWindow = useCallback(() => {
+    const chosen = sessionId === currentSessionId ? preferredWidth : effectiveRaw;
+    return Math.max(minWidthPx, chosen ?? defaultWidthInWiderWindowPx());
+  }, [sessionId, effectiveRaw, minWidthPx]);
+
   return {
     panelWidth: resolvedWidth,
-    /** The user's width for the panel before the viewport clamp. */
-    preferredWidth: preferredPanelWidth,
+    /** How much wider the window must get for the panel to leave the chat its width. */
+    widthInWiderWindow,
     preferredContentWidth: preferredPanelWidth + chatMinWidthPx + GAP_PX,
     handleProps,
     isDragging,

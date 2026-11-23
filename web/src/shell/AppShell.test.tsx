@@ -3458,7 +3458,7 @@ describe("Right workspace card visibility", () => {
       expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
       fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
-      // The shell gets the remembered width, not the width clamped to this window.
+      // The shell gets the remembered width, not the width clamped to this narrow window.
       expect(rightSidebarWindow.opened).toHaveBeenCalledExactlyOnceWith(450);
       fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
       expect(rightSidebarWindow.closed).toHaveBeenCalledOnce();
