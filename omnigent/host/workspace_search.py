@@ -451,11 +451,11 @@ async def _search_fuzzy(search: _FuzzySearch) -> SearchFilesResponse:
             entries, truncated = await run_sync_on_thread(
                 _first_files, ranked, search.limit, describe
             )
-            # Matches deleted since Git listed them leave gaps; rank further to fill them.
-            if truncated or len(entries) == search.limit or not more:
+            # Matches deleted since Git listed them neither fill the limit nor say more
+            # matched; rank further until a live file past the limit does, or none are left.
+            if truncated or not more:
                 break
             wanted *= 4
-        truncated = truncated or more
     else:
         ordered = heapq.merge(*(corpus.paths for corpus in corpora))
         entries, truncated = await run_sync_on_thread(

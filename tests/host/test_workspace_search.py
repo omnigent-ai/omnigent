@@ -755,6 +755,23 @@ async def test_fuzzy_mode_keeps_ranking_past_many_deleted_files(tmp_path: Path) 
     assert not response.truncated
 
 
+@pytest.mark.parametrize(("kept", "truncated"), [((0,), False), ((0, 33), True)])
+async def test_a_filled_limit_says_more_matched_only_for_a_file_still_there(
+    tmp_path: Path, kept: tuple[int, ...], truncated: bool
+) -> None:
+    root = _repository(tmp_path / "repo")
+    for index in range(34):
+        (root / f"report{index:02}.md").write_text("x")
+    _git(root, "add", ".")
+    for index in set(range(34)) - set(kept):
+        (root / f"report{index:02}.md").unlink()  # still in the index, gone from disk
+
+    response = await _fuzzy(root, "report", maximum_results=1)
+
+    assert _paths(response) == ["report00.md"]
+    assert response.truncated is truncated
+
+
 async def test_a_walk_that_runs_out_of_budget_says_the_list_is_incomplete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
