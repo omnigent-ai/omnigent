@@ -55,6 +55,7 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
     origin,
     reload,
     cookieImport,
+    openInBrowser,
   }) {
     if (!parent || parent.isDestroyed() || signal.aborted) return Promise.resolve("dismiss");
     if (kind === "security-key" && parent.webContents.isLoadingMainFrame?.()) {
@@ -140,7 +141,12 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
       }
       const info =
         kind === "security-key"
-          ? { kind, origin, cookieImport: Boolean(cookieImport) }
+          ? {
+              kind,
+              origin,
+              cookieImport: Boolean(cookieImport),
+              openInBrowser: Boolean(openInBrowser),
+            }
           : { kind, origin, reload: Boolean(reload) };
       prompts.set(parent, { window: popup, kind, info, finish });
       signal.addEventListener("abort", close, { once: true });
