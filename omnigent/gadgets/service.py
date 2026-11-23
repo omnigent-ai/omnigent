@@ -366,6 +366,23 @@ def _page_limit(value: Any, most: int) -> int:
     return value
 
 
+# Shelf lists keep their order in one document, so a page cursor is a position in it.
+_POSITION_CURSOR = re.compile(r"p([0-9]{1,4})")
+
+
+def _position_cursor(value: Any) -> int:
+    if value is None:
+        return 0
+    match = _POSITION_CURSOR.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        raise InvalidInput("Invalid cursor")
+    return int(match.group(1))
+
+
+def _encode_position(position: int) -> str:
+    return f"p{position}"
+
+
 def _epoch(timestamp: str) -> float:
     return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
 
@@ -606,14 +623,23 @@ class GadgetService:
     def _owns_any(self) -> bool:
         return self.store.owns_any(self.viewer.user_id, owner_generation=self.viewer.generation)
 
-    def shelf(self) -> dict:
-        """The viewer's pinned gadgets, and whether they own any, for the sidebar."""
+    def shelf(self, limit: Any = MAX_PINNED_GADGETS, cursor: Any = None) -> dict:
+        """One page of the viewer's pinned gadgets, and whether they own any, for the sidebar.
+
+        :returns: ``{"pinned", "has_owned", "next_cursor"}``; only the page's gadgets are
+            looked up. A page can be short (pins the viewer can no longer read are left
+            out) and still continue.
+        """
         _, pins = self._pins()
-        readable = self._readable_pins(pins)
-        ids = [pin["id"] for pin in pins if pin.get("id") in readable]
+        start = _position_cursor(cursor)
+        page = pins[start : start + _page_limit(limit, MAX_PINNED_GADGETS)]
+        readable = self._readable_pins(page)
+        ids = [pin["id"] for pin in page if pin.get("id") in readable]
+        following = start + len(page)
         return {
             "pinned": [{"id": app_id, "name": readable[app_id].name} for app_id in ids],
             "has_owned": self._owns_any(),
+            "next_cursor": _encode_position(following) if following < len(pins) else None,
         }
 
     def pin(self, app_id: str, body: dict) -> dict:
@@ -636,19 +662,30 @@ class GadgetService:
             self._save_shelf("pins", "all", current, {"items": others})
         return self.shelf()
 
-    def session_gadgets(self, session_id: str) -> dict:
-        """The gadgets shown beside a session, skipping any the viewer can no longer read."""
+    def session_gadgets(
+        self, session_id: str, limit: Any = MAX_SESSION_GADGETS, cursor: Any = None
+    ) -> dict:
+        """One page of the gadgets shown beside a session, skipping any the viewer can no
+        longer read: ``{"session_id", "items", "next_cursor"}``."""
         session_id = _session_id(session_id)
         current = self._shelf.get("sessions", self._session_key(session_id))
         ids = current.value.get("gadgets") if current is not None else None
+        shown = ids if isinstance(ids, list) else []
+        start = _position_cursor(cursor)
+        page = shown[start : start + _page_limit(limit, MAX_SESSION_GADGETS)]
         items = []
-        for app_id in ids if isinstance(ids, list) else []:
+        for app_id in page:
             try:
                 gadget, permissions = self._resolve(app_id)
             except (NotFound, CorruptData):
                 continue
             items.append(self._app(gadget, permissions))
-        return {"session_id": session_id, "items": items}
+        following = start + len(page)
+        return {
+            "session_id": session_id,
+            "items": items,
+            "next_cursor": _encode_position(following) if following < len(shown) else None,
+        }
 
     def _require_session(self, session_id: str) -> None:
         """Refuses a session the viewer cannot read, or one that is gone or archived.

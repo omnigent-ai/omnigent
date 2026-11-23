@@ -343,15 +343,33 @@ def create_gadgets_router(
         limit, cursor = _page(request, 100)
         return _json(await run(request, lambda service: service.shared(limit, cursor)))
 
-    @router.get("/gadgets/shelf")
-    async def shelf(request: Request) -> Response:
-        """``{"pinned": [{"id", "name"}], "has_owned"}`` for the sidebar."""
-        return _json(await run(request, lambda service: service.shelf()))
+    _SHELF_PARAMETERS = [
+        {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 50}},
+        {"name": "cursor", "in": "query", "schema": _STRING},
+    ]
 
-    @router.get("/gadgets/sessions/{session_id}")
+    @router.get("/gadgets/shelf", openapi_extra={"parameters": _SHELF_PARAMETERS})
+    async def shelf(request: Request) -> Response:
+        """A page of the caller's pins, ``{"pinned": [{"id", "name"}], "has_owned",
+        "next_cursor"}``, for the sidebar."""
+        limit, cursor = _page(request, 50)
+        return _json(await run(request, lambda service: service.shelf(limit, cursor)))
+
+    _SESSION_GADGETS_PARAMETERS = [
+        {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 20}},
+        {"name": "cursor", "in": "query", "schema": _STRING},
+    ]
+
+    @router.get(
+        "/gadgets/sessions/{session_id}", openapi_extra={"parameters": _SESSION_GADGETS_PARAMETERS}
+    )
     async def session_gadgets(session_id: str, request: Request) -> Response:
-        """The gadgets shown beside one of the caller's sessions."""
-        return _json(await run(request, lambda service: service.session_gadgets(session_id)))
+        """A page of the gadgets shown beside one of the caller's sessions, ``{"session_id",
+        "items", "next_cursor"}``."""
+        limit, cursor = _page(request, 20)
+        return _json(
+            await run(request, lambda service: service.session_gadgets(session_id, limit, cursor))
+        )
 
     @router.put("/gadgets/{app_id}/pin")
     async def pin(app_id: str, request: Request) -> Response:

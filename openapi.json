@@ -18235,7 +18235,7 @@
     },
     "/v1/gadgets/sessions/{session_id}": {
       "get": {
-        "description": "The gadgets shown beside one of the caller's sessions.",
+        "description": "A page of the gadgets shown beside one of the caller's sessions, `{\"session_id\", \"items\", \"next_cursor\"}`.",
         "operationId": "session_gadgets_v1_gadgets_sessions__session_id__get",
         "parameters": [
           {
@@ -18244,6 +18244,21 @@
             "required": true,
             "schema": {
               "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 20,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "schema": {
               "type": "string"
             }
           }
@@ -18313,8 +18328,25 @@
     },
     "/v1/gadgets/shelf": {
       "get": {
-        "description": "`{\"pinned\": [{\"id\", \"name\"}], \"has_owned\"}` for the sidebar.",
+        "description": "A page of the caller's pins, `{\"pinned\": [{\"id\", \"name\"}], \"has_owned\", \"next_cursor\"}`, for the sidebar.",
         "operationId": "shelf_v1_gadgets_shelf_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 50,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {

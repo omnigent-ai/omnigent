@@ -225,7 +225,11 @@ async def test_an_owner_builds_publishes_and_uses_a_gadget(
     assert marked.json()["status"] == "addressed"
 
     pinned = await client.put(f"{base}/pin", json={"pinned": True}, headers=_as(ALICE))
-    assert pinned.json() == {"pinned": [{"id": gadget["id"], "name": "Board"}], "has_owned": True}
+    assert pinned.json() == {
+        "pinned": [{"id": gadget["id"], "name": "Board"}],
+        "has_owned": True,
+        "next_cursor": None,
+    }
     linked = await client.put(
         f"{base}/sessions/{other}", json={"linked": True}, headers=_as(ALICE)
     )
@@ -428,7 +432,7 @@ async def test_a_revoked_viewers_shelf_drops_the_gadget_and_its_new_name(
     await client.delete(f"{base}/permissions/{BOB}", headers=_as(ALICE))
     await client.patch(base, json={"name": "Synthetic secret plan"}, headers=_as(ALICE))
     shelf = await client.get("/v1/gadgets/shelf", headers=_as(BOB))
-    assert shelf.json() == {"pinned": [], "has_owned": False}
+    assert shelf.json() == {"pinned": [], "has_owned": False, "next_cursor": None}
     assert "Synthetic secret plan" not in shelf.text
 
 
@@ -654,19 +658,23 @@ def test_a_session_id_that_is_not_a_uuid_is_left_to_the_permission_store(
     assert not can_read(ALICE, "102717306144392", None, convs)
 
 
-async def _every_page(client: httpx.AsyncClient, path: str, user: str) -> list[list[str]]:
+async def _every_page(
+    client: httpx.AsyncClient, path: str, user: str, key: str = "items"
+) -> list[list[str]]:
     pages: list[list[str]] = []
     cursor = None
     while True:
         params = {"limit": "1", **({"cursor": cursor} if cursor else {})}
         body = (await client.get(path, params=params, headers=_as(user))).json()
-        pages.append([item["id"] for item in body["items"]])
+        pages.append([item["id"] for item in body[key]])
         cursor = body["next_cursor"]
         if cursor is None:
             return pages
 
 
-async def test_own_and_shared_lists_page_with_a_cursor(client: httpx.AsyncClient) -> None:
+async def test_own_and_shared_lists_page_with_a_cursor(
+    client: httpx.AsyncClient, stores: SimpleNamespace
+) -> None:
     made = []
     for n in range(3):
         created = await client.post("/v1/gadgets", json={"name": f"Board {n}"}, headers=_as(ALICE))
@@ -685,3 +693,23 @@ async def test_own_and_shared_lists_page_with_a_cursor(client: httpx.AsyncClient
     assert sorted([item for page in shared for item in page]) == sorted(made)
     bad = await client.get("/v1/gadgets", params={"limit": "nope"}, headers=_as(ALICE))
     assert bad.status_code == 400
+
+    # The pins and the gadgets shown beside a session page the same way, in their order.
+    session = _own_session(stores, ALICE)
+    for gadget_id in made:
+        pinned = await client.put(
+            f"/v1/gadgets/{gadget_id}/pin", json={"pinned": True}, headers=_as(ALICE)
+        )
+        assert pinned.status_code == 200, pinned.text
+        linked = await client.put(
+            f"/v1/gadgets/{gadget_id}/sessions/{session}", json={"linked": True}, headers=_as(ALICE)
+        )
+        assert linked.status_code == 200, linked.text
+    pins = await _every_page(client, "/v1/gadgets/shelf", ALICE, key="pinned")
+    assert pins == [[gadget_id] for gadget_id in made]
+    beside = await _every_page(client, f"/v1/gadgets/sessions/{session}", ALICE)
+    assert beside == [[gadget_id] for gadget_id in made]
+    bad_cursor = await client.get(
+        "/v1/gadgets/shelf", params={"cursor": "nope"}, headers=_as(ALICE)
+    )
+    assert bad_cursor.status_code == 400

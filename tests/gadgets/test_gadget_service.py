@@ -1150,13 +1150,13 @@ def test_shelf_pins_own_and_shared_gadgets_per_viewer(gadgets: Fixture) -> None:
     mine, shared = owner.create("Mine"), owner.create("Shared")
     gadgets.access.share(shared, 2, READ)
     viewer = gadgets.service(2)
-    assert viewer.shelf() == {"pinned": [], "has_owned": False}
+    assert viewer.shelf() == {"pinned": [], "has_owned": False, "next_cursor": None}
 
     assert viewer.pin(shared["id"], {"pinned": True})["pinned"] == [
         {"id": shared["id"], "name": "Shared"}
     ]
     # Pins are the viewer's own: the owner's shelf and gadget list do not change.
-    assert owner.shelf() == {"pinned": [], "has_owned": True}
+    assert owner.shelf() == {"pinned": [], "has_owned": True, "next_cursor": None}
     assert [item["id"] for item in viewer.list_owned()["items"]] == []
     with pytest.raises(NotFound):
         viewer.pin(mine["id"], {"pinned": True})

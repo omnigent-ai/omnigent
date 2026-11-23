@@ -6,6 +6,8 @@ import { ApiError } from "@/lib/sessionsApi";
 import {
   GadgetApiError,
   getGadget,
+  getGadgetShelf,
+  getSessionGadgets,
   grantGadgetPermission,
   listGadgetComments,
   listGadgets,
@@ -124,6 +126,36 @@ describe("gadget API", () => {
       "/v1/gadgets?limit=100&cursor=c",
     ]);
     expect(gadgets.map((gadget) => gadget.id)).toEqual(["d", "b"]);
+  });
+
+  it("follows every page of the pins and of the gadgets shown beside a session", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        json({ pinned: [{ id: "a", name: "A" }], has_owned: true, next_cursor: "p1" }),
+      )
+      .mockResolvedValueOnce(
+        json({ pinned: [{ id: "b", name: "B" }], has_owned: true, next_cursor: null }),
+      )
+      .mockResolvedValueOnce(json({ items: [{ ...WIRE_GADGET, id: "a" }], next_cursor: "p1" }))
+      .mockResolvedValueOnce(json({ items: [{ ...WIRE_GADGET, id: "b" }], next_cursor: null }));
+
+    const shelf = await getGadgetShelf();
+    const beside = await getSessionGadgets("conv_1");
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "/v1/gadgets/shelf?limit=50",
+      "/v1/gadgets/shelf?limit=50&cursor=p1",
+      "/v1/gadgets/sessions/conv_1?limit=20",
+      "/v1/gadgets/sessions/conv_1?limit=20&cursor=p1",
+    ]);
+    expect(shelf).toEqual({
+      pinned: [
+        { id: "a", name: "A" },
+        { id: "b", name: "B" },
+      ],
+      hasOwned: true,
+    });
+    expect(beside.map((gadget) => gadget.id)).toEqual(["a", "b"]);
   });
 
   it("reads comments past a short page and sorts them by time", async () => {

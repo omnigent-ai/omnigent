@@ -255,21 +255,23 @@ async function everyPage(
   query: Record<string, string>,
   signal: AbortSignal | undefined,
   what: string,
+  { key = "items", limit = LIST_PAGE_SIZE }: { key?: string; limit?: number } = {},
 ): Promise<{ items: unknown[]; first: Record<string, unknown> | null }> {
   const items: unknown[] = [];
   let first: Record<string, unknown> | null = null;
   let cursor: string | null = null;
   for (let page = 0; page < MAX_LIST_PAGES; page++) {
-    const params = new URLSearchParams({ ...query, limit: String(LIST_PAGE_SIZE) });
+    const params = new URLSearchParams({ ...query, limit: String(limit) });
     if (cursor !== null) params.set("cursor", cursor);
     // Each page needs the previous page's cursor.
     // oxlint-disable-next-line no-await-in-loop
     const body = await gadgetRequest(`${path}?${params}`, { signal });
-    if (!isRecord(body) || !Array.isArray(body.items)) {
+    const pageItems = isRecord(body) ? body[key] : undefined;
+    if (!isRecord(body) || !Array.isArray(pageItems)) {
       throw malformed(what);
     }
     first ??= body;
-    items.push(...body.items);
+    items.push(...pageItems);
     cursor = typeof body.next_cursor === "string" ? body.next_cursor : null;
     if (cursor === null) return { items, first };
   }
@@ -612,19 +614,28 @@ function parseShelf(value: unknown): GadgetShelf {
   };
 }
 
-/** The viewer's pinned gadgets, for the sidebar. */
+// The most pins, and gadgets shown beside a session, one page holds.
+const SHELF_PAGE_SIZE = 50;
+const SESSION_GADGETS_PAGE_SIZE = 20;
+
+/** The viewer's pinned gadgets, for the sidebar, every page of them. */
 export async function getGadgetShelf(signal?: AbortSignal): Promise<GadgetShelf> {
-  return parseShelf(await gadgetRequest(`${GADGETS_PATH}/shelf`, { signal }));
+  const { items, first } = await everyPage(`${GADGETS_PATH}/shelf`, {}, signal, "gadget shelf", {
+    key: "pinned",
+    limit: SHELF_PAGE_SIZE,
+  });
+  return parseShelf({ pinned: items, has_owned: first?.has_owned });
 }
 
 /** Pins or unpins a gadget for the viewer only. */
 export async function pinGadget(appId: string, pinned: boolean): Promise<GadgetShelf> {
-  return parseShelf(
-    await gadgetRequest(appPath(appId, "/pin"), {
-      method: "PUT",
-      body: JSON.stringify({ pinned }),
-    }),
-  );
+  const body = await gadgetRequest(appPath(appId, "/pin"), {
+    method: "PUT",
+    body: JSON.stringify({ pinned }),
+  });
+  // The answer is the shelf's first page; read the rest when there is more.
+  if (isRecord(body) && typeof body.next_cursor === "string") return getGadgetShelf();
+  return parseShelf(body);
 }
 
 function parseSessionGadgets(value: unknown): Gadget[] {
@@ -639,9 +650,14 @@ export async function getSessionGadgets(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<Gadget[]> {
-  return parseSessionGadgets(
-    await gadgetRequest(`${GADGETS_PATH}/sessions/${encodeURIComponent(sessionId)}`, { signal }),
+  const { items } = await everyPage(
+    `${GADGETS_PATH}/sessions/${encodeURIComponent(sessionId)}`,
+    {},
+    signal,
+    "session gadgets",
+    { limit: SESSION_GADGETS_PAGE_SIZE },
   );
+  return items.map(parseGadget);
 }
 
 /**
@@ -657,12 +673,15 @@ export async function linkGadgetToSession(
   // Showing a gadget beside a session also sends it the gadget's actions, unless the session
   // is only one the gadget points to.
   const body = handlesActions ? { linked } : { linked, handles_actions: false };
-  return parseSessionGadgets(
-    await gadgetRequest(appPath(appId, `/sessions/${encodeURIComponent(sessionId)}`), {
-      method: "PUT",
-      body: JSON.stringify(body),
-    }),
+  const answer = await gadgetRequest(
+    appPath(appId, `/sessions/${encodeURIComponent(sessionId)}`),
+    { method: "PUT", body: JSON.stringify(body) },
   );
+  // The answer is the first page of the session's gadgets; read the rest when there is more.
+  if (isRecord(answer) && typeof answer.next_cursor === "string") {
+    return getSessionGadgets(sessionId);
+  }
+  return parseSessionGadgets(answer);
 }
 
 /** Where a comment points in the gadget's page: the selected text and, if set, its record. */
