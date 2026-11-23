@@ -55,8 +55,10 @@ the header menu), and each place is a separate entry point.
 - `search`: the sidebar's Search or ⌘K / Ctrl+K opens the command palette.
   Sessions whose title matches list under **Sessions**, then sessions matching
   only in chat content under **In messages** with a snippet; each group has its
-  own Show more. Archived sessions match too, marked **Archived**; the recent
-  sessions shown before typing leave them out. Results show project and parent
+  own Show more. Archived sessions match too, marked **Archived**. Before typing,
+  ⌘K lists the five most recently updated sessions, archived ones included and
+  marked, so a just-archived session leads the list; Find a session by name
+  (⌘⌥S / Ctrl+Alt+S) lists active sessions only. Results show project and parent
   session breadcrumbs when available, including when the parent did not match
   the search. Desktop and mobile search use the same context.
 - `palette-session-commands`: ⌘K lists the open session's header-menu actions
