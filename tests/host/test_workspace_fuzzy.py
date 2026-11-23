@@ -89,6 +89,17 @@ def test_highlights_count_utf16_code_units_in_the_name_when_it_matches() -> None
     assert hits[0].matched_indices == [4, 5, 6]
 
 
+def test_matched_non_ascii_characters_are_highlighted_at_their_utf16_index() -> None:
+    corpus = PathCorpus(["src/été.md", "src/a😀b.txt"])
+
+    accented, _ = rank([corpus], "été", 10)
+    emoji, _ = rank([corpus], "😀b", 10)
+
+    # The matcher reports UTF-8 offsets; "é" is one code unit, "😀" two, starting at 5.
+    assert [(hit.path, hit.matched_indices) for hit in accented] == [("src/été.md", [4, 5, 6])]
+    assert [(hit.path, hit.matched_indices) for hit in emoji] == [("src/a😀b.txt", [5, 7])]
+
+
 def test_highlights_fall_back_to_the_path_when_the_name_alone_doesnt_match() -> None:
     hits, _ = rank([PathCorpus(["src/lib/app.ts"])], "srclib", 10)
 
