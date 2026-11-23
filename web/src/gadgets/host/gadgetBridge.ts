@@ -651,6 +651,8 @@ export function startGadgetBridge(options: StartGadgetBridgeOptions): GadgetBrid
 
   async function run(message: GadgetRequestMessage, controller: AbortController): Promise<void> {
     const timer = setTimeout(() => controller.abort(), message.deadlineMs);
+    // Whether this call still owns its ID: cancelling it frees the ID for a new call.
+    const stillCurrent = () => inFlight.get(message.id) === controller;
     try {
       if (isGadgetNavigationMethod(message.method)) {
         const request = toPageRequest(message.method, message.params);
@@ -675,7 +677,7 @@ export function startGadgetBridge(options: StartGadgetBridgeOptions): GadgetBrid
           throw new BridgeError("UNSUPPORTED", "This host cannot run gadget actions.");
         }
         const outcome = await requestAction(actionRequest);
-        if (inFlight.has(message.id)) {
+        if (stillCurrent()) {
           respond({
             v: GADGET_PROTOCOL_VERSION,
             kind: "response",
@@ -704,7 +706,7 @@ export function startGadgetBridge(options: StartGadgetBridgeOptions): GadgetBrid
           throw new BridgeError("UNSUPPORTED", "This host cannot read gadget action progress.");
         }
         const items = await actionProgress(actionIds, controller.signal);
-        if (inFlight.has(message.id)) {
+        if (stillCurrent()) {
           respond({
             v: GADGET_PROTOCOL_VERSION,
             kind: "response",
@@ -723,7 +725,7 @@ export function startGadgetBridge(options: StartGadgetBridgeOptions): GadgetBrid
             "The viewer did not allow this gadget to see their sessions.",
           );
         }
-        if (inFlight.has(message.id)) {
+        if (stillCurrent()) {
           respond({
             v: GADGET_PROTOCOL_VERSION,
             kind: "response",
@@ -748,7 +750,7 @@ export function startGadgetBridge(options: StartGadgetBridgeOptions): GadgetBrid
         throw new BridgeError("CANCELLED", "The call was cancelled.");
       }
       const result = await callRpc(message.method, rpcParams, controller.signal);
-      if (!inFlight.has(message.id)) {
+      if (!stillCurrent()) {
         return;
       }
       respond({
@@ -759,7 +761,7 @@ export function startGadgetBridge(options: StartGadgetBridgeOptions): GadgetBrid
         result: toSdkResult(message.method, result),
       });
     } catch (error) {
-      if (!inFlight.has(message.id)) {
+      if (!stillCurrent()) {
         return;
       }
       const wireError =
@@ -776,7 +778,8 @@ export function startGadgetBridge(options: StartGadgetBridgeOptions): GadgetBrid
       }
     } finally {
       clearTimeout(timer);
-      inFlight.delete(message.id);
+      // A cancelled call's ID can be reused by a new one: leave that one's entry alone.
+      if (stillCurrent()) inFlight.delete(message.id);
     }
   }
 

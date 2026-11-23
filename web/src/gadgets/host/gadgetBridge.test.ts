@@ -240,6 +240,35 @@ describe("startGadgetBridge", () => {
     expect(port.responseFor("r1")).toBeUndefined();
   });
 
+  it("answers a new call that reuses a cancelled call's ID with its own result", async () => {
+    const finish: ((value: unknown) => void)[] = [];
+    // Each call ignores its abort and settles when the test says, as a slow server would.
+    const callRpc = vi.fn<CallRpc>().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish.push(resolve);
+        }),
+    );
+    const { port } = start({ callRpc });
+
+    port.fromFrame(request("r1", "data.v1.get", { collection: "cards", id: "c1" }));
+    port.fromFrame({ v: 1, kind: "cancel", id: "r1" });
+    port.fromFrame(request("r1", "data.v1.get", { collection: "cards", id: "c2" }));
+    await waitFor(() => expect(finish).toHaveLength(2));
+
+    // The cancelled call settles while the new one is still waiting: it answers nothing.
+    finish[0]({ id: "c1", value: { n: 1 }, version: "v1" });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(port.responseFor("r1")).toBeUndefined();
+
+    finish[1]({ id: "c2", value: { n: 2 }, version: "v2" });
+    await waitFor(() =>
+      expect(port.responseFor("r1")).toMatchObject({ ok: true, result: { id: "c2" } }),
+    );
+  });
+
   it("reports a published revision change once and refuses later calls", async () => {
     const onRevisionChanged = vi.fn<() => void>();
     const callRpc = vi.fn<CallRpc>().mockRejectedValue(
