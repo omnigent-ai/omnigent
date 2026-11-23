@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ComponentProps } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
@@ -687,6 +687,11 @@ describe("ChatHeader — the switch in the chat pane's strip", () => {
     const spot = document.createElement("span");
     document.body.append(spot);
     act(() => claimChatPaneViewToggleHost("sess-1", spot));
+    // The claim is module-wide: let it go even when an assertion below fails.
+    onTestFinished(() => {
+      releaseChatPaneViewToggleHost("sess-1", spot);
+      spot.remove();
+    });
     expect(switchIn(header)).toBeNull();
     expect(switchIn(spot)).toHaveAttribute("data-variant", "pane");
     // One switch, so its chord stays bound once.
@@ -696,7 +701,6 @@ describe("ChatHeader — the switch in the chat pane's strip", () => {
 
     act(() => releaseChatPaneViewToggleHost("sess-1", spot));
     expect(switchIn(header)).toHaveAttribute("data-variant", "header");
-    spot.remove();
   });
 });
 

@@ -234,11 +234,14 @@ def test_a_full_screen_workspace_sits_on_the_sidebars_backdrop(
           .querySelector('aside[aria-label="Workspace"] [data-workspace-panel-content]')
           .getBoundingClientRect().left"""
     )
-    # Full screen puts the left sidebar away, so the backdrop runs from the window's edge.
+    # Full screen puts the left sidebar away, so the backdrop runs from the window's edge to the
+    # content: a strip that must be wide enough to read, or the check would pass on nothing.
     sidebar_right = max(0, round(_geometry(page)["sidebarRight"]))
     image = _capture(page, f"floating-panes-{scheme}-full-screen")
     x_from = max(0, sidebar_right - 24)
-    step, at = _largest_step(image, 860, x_from, round(body) - 1)
+    x_to = round(body) - 1
+    assert x_to - x_from >= 2 * _SPAN, (x_from, x_to)
+    step, at = _largest_step(image, 860, x_from, x_to)
     assert step <= _MAX_STEP, f"step of {step} at x={x_from + at}"
 
 
@@ -359,7 +362,7 @@ _DRAG_PX = 80
 
 def _workspace_width(page: Page) -> float:
     """The workspace sidebar's width once its slide open, or a resize, has finished."""
-    page.wait_for_timeout(600)  # custom-lint: disable=sleep-then-assert -- the slide's length
+    _settle(page)
     return page.locator(_WORKSPACE).evaluate("(el) => el.getBoundingClientRect().width")
 
 
@@ -535,7 +538,7 @@ def test_the_mac_top_row_is_the_title_bar_beside_the_window_buttons(
             expect(page.locator('aside[aria-label="Conversations"]')).to_have_attribute(
                 "data-collapsed", "true"
             )
-            page.wait_for_timeout(500)  # custom-lint: disable=sleep-then-assert -- the slide
+            _settle(page)
         zoom_name = "older-preload" if zoom is None else f"zoom-{round(zoom * 100)}"
         _capture(page, f"mac-top-row-{zoom_name}-{scheme}-sidebar-{sidebar}")
         row = page.evaluate(_TOP_ROW_JS)
