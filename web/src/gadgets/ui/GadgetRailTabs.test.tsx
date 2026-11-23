@@ -15,6 +15,7 @@ import {
 } from "@/lib/gadgetRailTabs";
 import {
   createGadget,
+  deleteGadget,
   getSessionGadgets,
   getGadget,
   getGadgetShelf,
@@ -44,6 +45,7 @@ vi.mock("@/gadgets/api/gadgetApi", async (importOriginal) => ({
   getGadgetShelf: vi.fn(),
   getGadgetGadgetSession: vi.fn(),
   createGadget: vi.fn(),
+  deleteGadget: vi.fn(),
 }));
 vi.mock("@/gadgets/host/gadgetSession", async (importOriginal) => ({
   ...(await importOriginal<typeof GadgetSessionModule>()),
@@ -344,6 +346,48 @@ describe("New gadget tab", () => {
     );
     expect(screen.queryByRole("tab", { name: "New gadget" })).toBeNull();
   });
+
+  it.each(["link", "send"] as const)(
+    "tries a build whose %s failed again with the gadget it already made",
+    async (failing) => {
+      const created = gadgetFixture({
+        id: "3",
+        name: "Incident tracker",
+        published_revision: null,
+      });
+      vi.mocked(createGadget).mockResolvedValue(created);
+      vi.mocked(deleteGadget).mockResolvedValue(undefined);
+      vi.mocked(linkGadgetToSession).mockResolvedValue([BOARD, REPORT, created]);
+      vi.mocked(openGadgetSession).mockResolvedValue("sent");
+      if (failing === "link") {
+        vi.mocked(linkGadgetToSession).mockRejectedValueOnce(new Error("Link failed"));
+      } else {
+        vi.mocked(openGadgetSession).mockRejectedValueOnce(new Error("Send failed"));
+      }
+      renderWithGadgets(<Rail conversationId="conv_1" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Gadget" }));
+      const content = await screen.findByRole("region", { name: "content" });
+      fireEvent.change(within(content).getByRole("textbox", { name: "Describe the gadget" }), {
+        target: { value: "An incident tracker for my team" },
+      });
+      fireEvent.click(within(content).getByRole("button", { name: "Build" }));
+      expect(
+        await within(content).findByText(failing === "link" ? "Link failed" : "Send failed"),
+      ).toBeVisible();
+
+      fireEvent.click(within(content).getByRole("button", { name: "Build" }));
+      await waitFor(() =>
+        expect(screen.getByRole("tab", { name: "Incident tracker" })).toHaveAttribute(
+          "aria-selected",
+          "true",
+        ),
+      );
+      // One gadget, finished on the second try; nothing left behind to delete.
+      expect(createGadget).toHaveBeenCalledTimes(1);
+      expect(deleteGadget).not.toHaveBeenCalled();
+    },
+  );
 
   it("closes without building on Cancel", async () => {
     renderWithGadgets(<Rail conversationId="conv_1" />);

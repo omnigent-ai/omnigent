@@ -29,7 +29,12 @@ import { cn } from "@/lib/utils";
 import { MobilePanelDrawer, useMobilePanelHeaderTarget } from "@/shell/MobilePanelDrawer";
 import { SidebarOpenButton } from "@/shell/SidebarOpenButton";
 import { scrollTabIntoView } from "@/shell/WorkspaceTabsScroller";
-import { type Gadget, type GadgetContent, createGadget } from "@/gadgets/api/gadgetApi";
+import {
+  type Gadget,
+  type GadgetContent,
+  createGadget,
+  deleteGadget,
+} from "@/gadgets/api/gadgetApi";
 import { composeGadgetBuildPrompt, gadgetNameFrom } from "@/gadgets/host/gadgetBuild";
 import { GADGET_START_PARAM } from "@/gadgets/host/gadgetPages";
 import {
@@ -174,14 +179,26 @@ function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetT
   };
   const show = (gadget: Gadget) =>
     showInSession.mutateAsync({ gadgetId: gadget.id, sessionId, shown: true });
+  // A build that failed after creating its gadget: Try again continues with that gadget
+  // rather than leave it behind and make another.
+  const unfinished = useRef<{ description: string; gadget: Gadget } | null>(null);
   const build = async (description: string) => {
-    const gadget = await createGadget(gadgetNameFrom(description));
+    let gadget = unfinished.current?.description === description ? unfinished.current.gadget : null;
+    if (gadget === null) {
+      // The description changed since the failed try: its gadget is not this one.
+      const abandoned = unfinished.current?.gadget;
+      unfinished.current = null;
+      if (abandoned) void deleteGadget(abandoned.id).catch(() => undefined);
+      gadget = await createGadget(gadgetNameFrom(description));
+      unfinished.current = { description, gadget };
+    }
     await show(gadget);
     await openGadgetSession(gadget, composeGadgetBuildPrompt(gadget, description), navigate, {
       deliver: true,
       reveal: false,
       railSessionId: sessionId,
     });
+    unfinished.current = null;
     openGadgetTab(gadget);
   };
   return (
