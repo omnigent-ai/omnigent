@@ -20,22 +20,13 @@ function page(extra = {}) {
 
 const message = { text: "Fix the build", skill: null, files: [] };
 
-test("an offer reaches only a page that subscribed, and forgetting one stops it", (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout"] });
-  const offers = createFloatingLaunchOffers();
-  const subscribed = page();
-  assert.equal(offers.isTaker(subscribed), false);
-  offers.addTaker(subscribed);
-  assert.equal(offers.isTaker(subscribed), true);
-  offers.forgetTaker(subscribed);
-  assert.equal(offers.isTaker(subscribed), false);
-});
-
 test("a taker takes the message once, then its confirm settles the offer as sent", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const offers = createFloatingLaunchOffers();
   const taker = page();
+  assert.equal(offers.isTaker(taker), false, "an unsubscribed page takes no offers");
   offers.addTaker(taker);
+  assert.equal(offers.isTaker(taker), true);
   const confirmed = offers.offer(taker, { sessionId: "conv_1", message });
   const [channel, { offerId, sessionId }] = taker.sent[0];
   assert.equal(channel, FLOATING_LAUNCH_OFFER_CHANNEL);
@@ -96,7 +87,9 @@ test("a page that goes or unsubscribes ends its outstanding offers at once", asy
   const confirmed = offers.offer(taker, { sessionId: "conv_1", message });
   const { offerId } = taker.sent[0][1];
   offers.take(taker, offerId);
+  assert.equal(offers.isTaker(taker), true);
   offers.forgetTaker(taker);
+  assert.equal(offers.isTaker(taker), false, "forgetting a page stops its offers");
   assert.equal(await confirmed, false);
   assert.equal(offers.confirm(taker, offerId), false);
 });

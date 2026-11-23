@@ -66,6 +66,8 @@ function floatingComposerLaunchMessage(message) {
     ) {
       return null;
     }
+    // The page's store drops a blank prompt, so a blank skill launch can't be sent.
+    if (text.trim() === "") return null;
     return { text, skill: { name: skill.name, args: skill.args }, files: [] };
   }
   if (!Array.isArray(message.files)) return null;

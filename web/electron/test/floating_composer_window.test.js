@@ -394,6 +394,11 @@ test("a launch's first message is rebuilt from its checked fields, and capped in
     }),
     { text: "/review 1", skill: { name: "review", args: "1" }, files: [] },
   );
+  // A blank skill launch has nothing a page could send, so it is never offered.
+  assert.equal(
+    floatingComposerLaunchMessage({ text: " ", skill: { name: "review", args: "" }, files: [] }),
+    null,
+  );
   const cap = 25 * 1024 * 1024;
   assert.notEqual(
     floatingComposerLaunchMessage({ text: "x", skill: null, files: [file(cap)] }),

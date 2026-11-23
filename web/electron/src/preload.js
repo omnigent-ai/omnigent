@@ -72,8 +72,6 @@ function bannerSafe(status) {
 // boundary.
 // Annotate and Draw (designTools.js): open and stop a tool's overlay on a view, and its page
 // operations and captures. A test run can leave them out, to stand in for an older shell.
-// Each live onLaunchOffer subscription; the shell hears when the first one comes and the last goes.
-const launchOfferSubscriptions = new Set();
 const designTools =
   process.env?.OMNIGENT_DESKTOP_LEGACY_DESIGN_MODE === "1"
     ? {}
@@ -86,6 +84,31 @@ const designTools =
           return () => ipcRenderer.removeListener("browser-design-tools-event", listener);
         },
       };
+
+/**
+ * The floating panel's launch-offer subscriptions in a main window. The shell hears the first
+ * subscriber come and the last one go; each subscription's unsubscribe runs once.
+ */
+function launchOfferSubscriber() {
+  const subscriptions = new Set();
+  return (callback) => {
+    if (typeof callback !== "function") return () => {};
+    const subscription = {};
+    const listener = (_event, offer) => callback(offer);
+    ipcRenderer.on("omnigent:floating-composer:launch-offer", listener);
+    subscriptions.add(subscription);
+    if (subscriptions.size === 1) {
+      ipcRenderer.send("omnigent:floating-composer:launch-takers", true);
+    }
+    return () => {
+      if (!subscriptions.delete(subscription)) return;
+      ipcRenderer.removeListener("omnigent:floating-composer:launch-offer", listener);
+      if (subscriptions.size === 0) {
+        ipcRenderer.send("omnigent:floating-composer:launch-takers", false);
+      }
+    };
+  };
+}
 
 contextBridge.exposeInMainWorld("omnigentDesktop", {
   kind: "electron",
@@ -323,23 +346,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
      * From a main window: this document takes launches' first messages, so main offers them
      * here. Returns an unsubscribe function, which tells main it no longer takes them.
      */
-    onLaunchOffer: (callback) => {
-      if (typeof callback !== "function") return () => {};
-      const subscription = {};
-      const listener = (_event, offer) => callback(offer);
-      ipcRenderer.on("omnigent:floating-composer:launch-offer", listener);
-      launchOfferSubscriptions.add(subscription);
-      if (launchOfferSubscriptions.size === 1) {
-        ipcRenderer.send("omnigent:floating-composer:launch-takers", true);
-      }
-      return () => {
-        if (!launchOfferSubscriptions.delete(subscription)) return;
-        ipcRenderer.removeListener("omnigent:floating-composer:launch-offer", listener);
-        if (launchOfferSubscriptions.size === 0) {
-          ipcRenderer.send("omnigent:floating-composer:launch-takers", false);
-        }
-      };
-    },
+    onLaunchOffer: launchOfferSubscriber(),
     /** From a main window: take the message of a launch offered to this document, once. */
     takeLaunchOffer: (offerId) =>
       ipcRenderer.invoke("omnigent:floating-composer:launch-take", offerId),

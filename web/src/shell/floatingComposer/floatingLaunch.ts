@@ -11,6 +11,7 @@ import { ApiError, fetchSessionItemsPage, postEvent } from "@/lib/sessionsApi";
 import { sendVerdictFromServer } from "@/lib/userInputDelivery";
 import type { FloatingLaunchRequest } from "@/shell/composerPresentation";
 import {
+  isListeningForInitialPrompt,
   setPendingInitialPrompt,
   type PendingInitialPrompt,
   uploadFileBlocks,
@@ -41,9 +42,17 @@ export const LAUNCH_MESSAGE_MAX_BYTES = 25 * 1024 * 1024;
 export async function launchFromPanel(request: FloatingLaunchRequest): Promise<LaunchOutcome> {
   const bridge = floatingComposerBridge();
   const message = await launchMessageForShell(bridge, request);
-  const opened = await Promise.resolve()
+  const opening = await Promise.resolve()
     .then(() => bridge?.openInMainWindow(`/c/${request.sessionId}`, message))
-    .catch(() => null);
+    .then(
+      (result) => ({ result: result ?? null, rejected: false }),
+      () => ({ result: null, rejected: true }),
+    );
+  // A rejected open with a message in hand may already have been confirmed, so it isn't resent.
+  if (opening.rejected && message !== null) {
+    return { error: SEND_UNKNOWN_ERROR, freshComposer: false };
+  }
+  const opened = opening.result;
   const handedOff = opened?.ok === true && opened.delivery === "page";
   const delivery: Delivery =
     request.inputAccepted || handedOff
@@ -79,7 +88,8 @@ async function launchMessageForShell(
         })),
       ),
     };
-  } catch {
+  } catch (err) {
+    console.warn("[floatingComposer] couldn't prepare a launch's attachments:", err);
     return null;
   }
 }
@@ -103,10 +113,13 @@ export async function acceptLaunchOffer({
       skill: message.skill,
       files: message.files.map(({ name, type, bytes }) => new File([bytes], name, { type })),
     };
+    // No page shows the session to send it, so the panel delivers instead.
+    if (!isListeningForInitialPrompt(sessionId)) return;
     if (!(await bridge.confirmLaunchOffer(offerId))) return;
     setPendingInitialPrompt(sessionId, prompt);
-  } catch {
+  } catch (err) {
     // The offer ends unconfirmed, so the panel delivers the message.
+    console.warn("[floatingComposer] couldn't take a launch's message:", err);
   }
 }
 

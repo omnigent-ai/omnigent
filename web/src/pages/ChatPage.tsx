@@ -108,6 +108,7 @@ import {
   holdsInitialDraft,
   isStaleTempConvId,
   onPendingInitialPrompt,
+  setPendingInitialPrompt,
   isTempConvId,
   retryConversationLoad,
   type ChatState,
@@ -455,40 +456,6 @@ export function ChatPage() {
   const { pathname, search } = useLocation();
   const rebasePath = useRebasePath();
   const appName = useAppName();
-  // Optional first message handed off by the landing composer through the
-  // shared chatStore (keyed by conversation id), not router state — router state
-  // doesn't survive the embed's host-provided routing. Consumed read-once
-  // in the effect below so a refresh/back can't replay it, then held here
-  // so the auto-send effect re-runs once it's resolved.
-  // Bundled with the conversation id it was consumed for so the auto-send
-  // gate can reject a prompt that no longer matches the active session (the
-  // session-switch leak — see shouldSendInitialPrompt). `null` until the
-  // consume effect runs (or when no prompt was carried).
-  const [initialPrompt, setInitialPrompt] = useState<{
-    conversationId: string;
-    prompt: PendingInitialPrompt;
-  } | null>(null);
-  // The conversation id we already auto-sent an initial prompt for, or
-  // null. NOT a bare boolean: ChatPage stays mounted across `/c/:a` →
-  // `/c/:b` (no route `key`), so a boolean once-guard would latch true
-  // after the first auto-send and silently drop the prompt for every
-  // subsequent new chat created without a full page reload. Keying the
-  // guard by conversation id resets it per session while still covering
-  // StrictMode's double-invoke and re-renders within one session.
-  const initialPromptSentForConvRef = useRef<string | null>(null);
-  // Caches the consumed prompt keyed by conversation id so the consume
-  // effect is idempotent under StrictMode's setup→cleanup→setup
-  // double-invoke. `consumePendingInitialPrompt` is destructive (get +
-  // delete): the first invocation drains the store map, so a naive second
-  // invocation would read null and last-write-wins would settle
-  // `initialPrompt` to null — silently dropping the prompt in dev. By
-  // memoizing the first result per conv id, the second invocation reuses
-  // it. Keyed by id (not a bare value) so it still re-consumes for the
-  // next conversation when ChatPage stays mounted across `/c/:a` → `/c/:b`.
-  const consumedInitialPromptRef = useRef<{
-    conversationId: string;
-    prompt: PendingInitialPrompt | null;
-  } | null>(null);
   const {
     data: agents,
     error: agentsError,
@@ -535,41 +502,6 @@ export function ChatPage() {
   }, [urlConvId, navigate, pathname, search, rebasePath]);
 
   useConversationRedirect(urlConvId);
-
-  // Pull the first message the landing composer stashed for this conversation,
-  // if any. Read-once (consume deletes), so a refresh/back can't replay
-  // it. Runs in an effect (not render) because consume mutates the store
-  // map — calling it during render would double-consume under StrictMode.
-  // The per-conv-id cache (consumedInitialPromptRef) makes the consume
-  // idempotent across StrictMode's double-invoke: the first run drains the
-  // map and caches the result; the second run reuses the cache instead of
-  // re-consuming (which would read null and drop the prompt). Resetting to
-  // null when no prompt is pending clears a prior conversation's value
-  // when ChatPage stays mounted across `/c/:a` → `/c/:b`.
-  useEffect(() => {
-    if (!urlConvId) {
-      setInitialPrompt(null);
-      return;
-    }
-    const cached = consumedInitialPromptRef.current;
-    const prompt =
-      cached?.conversationId === urlConvId ? cached.prompt : consumePendingInitialPrompt(urlConvId);
-    consumedInitialPromptRef.current = { conversationId: urlConvId, prompt };
-    setInitialPrompt(prompt === null ? null : { conversationId: urlConvId, prompt });
-  }, [urlConvId]);
-
-  // A prompt stashed for this conversation after the page mounted, such as a floating-panel launch
-  // whose route arrived first. The send effect below then sends it as it does a New Chat prompt.
-  useEffect(() => {
-    if (!urlConvId) return;
-    return onPendingInitialPrompt((conversationId) => {
-      if (conversationId !== urlConvId) return;
-      const prompt = consumePendingInitialPrompt(urlConvId);
-      if (prompt === null) return;
-      consumedInitialPromptRef.current = { conversationId: urlConvId, prompt };
-      setInitialPrompt({ conversationId: urlConvId, prompt });
-    });
-  }, [urlConvId]);
 
   // Subscribe to the bits of store state we render. Each is a
   // primitive selector so re-renders fire only when that specific
@@ -639,52 +571,18 @@ export function ChatPage() {
     }
   }, [boundAgentId, agents, refetchAgents]);
 
-  // Auto-send the first message the landing composer stashed in the chatStore,
-  // exactly once per conversation. Wait until the session is hydrated
-  // (stream bound) — sending before bindStream connects would lose the
-  // turn's events on the no-replay live-tail stream ("no response"). We do
-  // NOT wait for the runner to be online: chatStore.send pushes the
-  // optimistic bubble synchronously, so it renders the instant the stream
-  // binds, and the server's POST /events handler holds the request open
-  // while a host-bound runner spins up (connect grace + relaunch), 503ing
-  // only if no runner ever appears. So a slow runner shows the bubble
-  // immediately and resolves when it connects; a genuinely dead host
-  // surfaces a failed send instead of a silently-dropped prompt on an
-  // empty composer. Posting through chatStore.send is
-  // agent-agnostic: event agents run a turn; native terminal agents
-  // (Claude Code / Codex) have the runner inject the text into their
-  // CLI. The consume effect above already read-once-deleted the prompt
-  // from the store, so a refresh/back has nothing to replay. The ref
-  // guard (set synchronously before send, keyed by conversation id) also
-  // covers StrictMode's setup→cleanup→setup double-invoke: it persists
-  // across the remount, so the second setup short-circuits and the prompt
-  // sends once — while still resetting for the next conversation, since
-  // ChatPage stays mounted across `/c/:a` → `/c/:b`.
-  // The agent list isn't fetched on a session route, so a session opened from elsewhere may have none.
-  // Its bound agent sends then; send() ignores the argument for a bound session.
+  // The agent list isn't fetched on a session route; the bound agent sends when it's missing.
   const sendAgentId = agentId ?? boundAgentId;
-  useEffect(() => {
-    if (
-      !shouldSendInitialPrompt({
-        initialPrompt: initialPrompt?.prompt.text ?? null,
-        initialPromptFileCount: initialPrompt?.prompt.files?.length ?? 0,
-        promptConversationId: initialPrompt?.conversationId ?? null,
-        sentForConversationId: initialPromptSentForConvRef.current,
-        conversationId: urlConvId,
-        loadingConversation,
-        agentId: sendAgentId,
-      })
-    ) {
-      return;
-    }
-    // TypeScript can't see through the predicate's boolean return, so
-    // re-check to narrow the types for send()/the template literal. The
-    // predicate already guarantees these, so this never fires at runtime.
-    if (initialPrompt === null || !sendAgentId || !urlConvId) return;
-    initialPromptSentForConvRef.current = urlConvId;
+  const dispatchFirstMessage = useCallback((prompt: PendingInitialPrompt, agent: string) => {
     const { send, sendSlashCommand } = useChatStore.getState();
-    dispatchInitialPrompt(initialPrompt.prompt, sendAgentId, send, sendSlashCommand);
-  }, [initialPrompt, urlConvId, loadingConversation, sendAgentId]);
+    dispatchInitialPrompt(prompt, agent, send, sendSlashCommand);
+  }, []);
+  useInitialPromptDispatch({
+    conversationId: urlConvId,
+    agentId: sendAgentId,
+    loadingConversation,
+    dispatch: dispatchFirstMessage,
+  });
 
   // Open state owned here (not inside MainAgentSurface) so the dialog
   // survives a re-mount of the chat surface. Declared BEFORE the
@@ -5189,6 +5087,79 @@ export function dispatchInitialPrompt(
   } else {
     void send(prompt.text, agentId, prompt.files ?? []);
   }
+}
+
+/**
+ * Sends the first message a landing composer or a floating-panel launch stashed for
+ * `conversationId`, exactly once. It waits for the session to load, because a send before the
+ * stream binds loses the turn's events; it doesn't wait for the runner, since the server holds the
+ * POST while a host-bound runner starts. A page that lets go of the prompt before sending, by
+ * navigating away or unmounting, returns it to the store, so coming back sends it.
+ */
+export function useInitialPromptDispatch({
+  conversationId,
+  agentId,
+  loadingConversation,
+  dispatch,
+}: {
+  conversationId: string | null | undefined;
+  agentId: string | null;
+  loadingConversation: boolean;
+  dispatch: (prompt: PendingInitialPrompt, agentId: string) => void;
+}): void {
+  // The prompt consumed for this page but not yet sent. The ref mirrors it for cleanup.
+  const [held, setHeld] = useState<{
+    conversationId: string;
+    prompt: PendingInitialPrompt;
+  } | null>(null);
+  const heldRef = useRef<typeof held>(null);
+  // The conversation whose prompt was sent. Keyed by id so a later conversation in the same
+  // mounted page can still send; StrictMode's remount sees it and doesn't resend.
+  const sentForRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!conversationId) return;
+    const hold = () => {
+      const prompt = consumePendingInitialPrompt(conversationId);
+      if (prompt === null) return;
+      heldRef.current = { conversationId, prompt };
+      setHeld(heldRef.current);
+    };
+    hold();
+    const stopListening = onPendingInitialPrompt(conversationId, hold);
+    return () => {
+      stopListening();
+      const unsent = heldRef.current;
+      heldRef.current = null;
+      setHeld(null);
+      // Stopped listening first, so the put-back doesn't consume itself again.
+      if (unsent?.conversationId === conversationId && sentForRef.current !== conversationId) {
+        setPendingInitialPrompt(conversationId, unsent.prompt);
+      }
+    };
+  }, [conversationId]);
+
+  useEffect(() => {
+    if (
+      !shouldSendInitialPrompt({
+        initialPrompt: held?.prompt.text ?? null,
+        initialPromptFileCount: held?.prompt.files?.length ?? 0,
+        promptConversationId: held?.conversationId ?? null,
+        sentForConversationId: sentForRef.current,
+        conversationId,
+        loadingConversation,
+        agentId,
+      })
+    ) {
+      return;
+    }
+    // The predicate guarantees these; the re-check narrows the types for dispatch().
+    if (held === null || !agentId || !conversationId) return;
+    sentForRef.current = conversationId;
+    heldRef.current = null;
+    setHeld(null);
+    dispatch(held.prompt, agentId);
+  }, [held, conversationId, loadingConversation, agentId, dispatch]);
 }
 
 /**

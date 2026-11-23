@@ -8,6 +8,7 @@ const PRELOAD = fs.readFileSync(path.join(__dirname, "../src/preload.js"), "utf8
 
 function loadPreload({ platform = "linux", fullScreen = false } = {}) {
   const exposed = new Map();
+  // Each channel's listeners, as ipcRenderer keeps them: several can share a channel.
   const listeners = new Map();
   const windowListeners = new Map();
   const invokes = [];
@@ -22,10 +23,11 @@ function loadPreload({ platform = "linux", fullScreen = false } = {}) {
       return null;
     },
     send: (channel, args) => sends.push({ channel, args }),
-    on: (channel, listener) => listeners.set(channel, listener),
-    removeListener: (channel, listener) => {
-      if (listeners.get(channel) === listener) listeners.delete(channel);
+    on: (channel, listener) => {
+      if (!listeners.has(channel)) listeners.set(channel, new Set());
+      listeners.get(channel).add(listener);
     },
+    removeListener: (channel, listener) => listeners.get(channel)?.delete(listener),
   };
   vm.runInNewContext(PRELOAD, {
     console,
@@ -57,14 +59,62 @@ function loadPreload({ platform = "linux", fullScreen = false } = {}) {
     setStatus: (status) => {
       updateStatus = status;
     },
-    emit: (channel, payload) => listeners.get(channel)?.({}, payload),
+    emit: (channel, payload) => {
+      for (const listener of listeners.get(channel) ?? []) listener({}, payload);
+    },
     emitWindow: (name) => windowListeners.get(name)?.(),
     hasAttribute: (name) => attributes.has(name),
-    hasListener: (channel) => listeners.has(channel),
+    hasListener: (channel) => (listeners.get(channel)?.size ?? 0) > 0,
     invokes,
     sends,
   };
 }
+
+describe("floating panel launch offers", () => {
+  const OFFER = "omnigent:floating-composer:launch-offer";
+  const TAKERS = "omnigent:floating-composer:launch-takers";
+  const takerSignals = (h) =>
+    h.sends.filter((send) => send.channel === TAKERS).map((send) => send.args);
+
+  it("tells the shell when the first subscriber comes and the last one goes, once each", () => {
+    const h = loadPreload();
+    const first = h.desktop.floatingComposer.onLaunchOffer(() => {});
+    const second = h.desktop.floatingComposer.onLaunchOffer(() => {});
+    assert.deepEqual(takerSignals(h), [true]);
+    first();
+    first();
+    assert.deepEqual(takerSignals(h), [true], "a second unsubscribe changes nothing");
+    assert.equal(h.hasListener(OFFER), true, "the second subscriber still hears offers");
+    second();
+    second();
+    assert.deepEqual(takerSignals(h), [true, false]);
+    assert.equal(h.hasListener(OFFER), false);
+  });
+
+  it("hands each offer to every live subscriber, and none to one that has left", () => {
+    const h = loadPreload();
+    const heard = [];
+    const stopFirst = h.desktop.floatingComposer.onLaunchOffer((offer) =>
+      heard.push(["first", offer]),
+    );
+    h.desktop.floatingComposer.onLaunchOffer((offer) => heard.push(["second", offer]));
+    h.emit(OFFER, { offerId: 1, sessionId: "conv_1" });
+    stopFirst();
+    h.emit(OFFER, { offerId: 2, sessionId: "conv_2" });
+    assert.deepEqual(heard, [
+      ["first", { offerId: 1, sessionId: "conv_1" }],
+      ["second", { offerId: 1, sessionId: "conv_1" }],
+      ["second", { offerId: 2, sessionId: "conv_2" }],
+    ]);
+  });
+
+  it("subscribes nothing without a callback, and tells the shell nothing", () => {
+    const h = loadPreload();
+    const stop = h.desktop.floatingComposer.onLaunchOffer(undefined);
+    stop();
+    assert.deepEqual(takerSignals(h), []);
+  });
+});
 
 describe("macOS fullscreen titlebar bridge", () => {
   it("tracks native fullscreen state on initial load and shell events", async () => {

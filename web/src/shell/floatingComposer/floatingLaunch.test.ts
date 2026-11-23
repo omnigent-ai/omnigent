@@ -21,11 +21,16 @@ vi.mock("@/lib/userInputDelivery", () => ({ sendVerdictFromServer: vi.fn() }));
 vi.mock("@/store/chatStore", () => ({
   uploadFileBlocks: vi.fn(),
   setPendingInitialPrompt: vi.fn(),
+  isListeningForInitialPrompt: vi.fn(() => true),
 }));
 
 import { ApiError, fetchSessionItemsPage, postEvent } from "@/lib/sessionsApi";
 import { sendVerdictFromServer } from "@/lib/userInputDelivery";
-import { setPendingInitialPrompt, uploadFileBlocks } from "@/store/chatStore";
+import {
+  isListeningForInitialPrompt,
+  setPendingInitialPrompt,
+  uploadFileBlocks,
+} from "@/store/chatStore";
 import type { FloatingLaunchRequest } from "@/shell/composerPresentation";
 import {
   acceptLaunchOffer,
@@ -94,6 +99,7 @@ describe("launchFromPanel", () => {
     const outcome = await launchFromPanel(request({ inputAccepted: true }));
 
     expect(bridge.openInMainWindow).toHaveBeenCalledWith("/c/conv_1", null);
+    expect(bridge.canHandOffLaunch).not.toHaveBeenCalled();
     expect(postEvent).not.toHaveBeenCalled();
     expect(outcome).toEqual(delivered);
   });
@@ -304,6 +310,7 @@ describe("launchFromPanel", () => {
     });
 
     it("keeps the panel's own files when an attachment can't be read", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       const file = new File(["x"], "a.txt");
       vi.spyOn(file, "arrayBuffer").mockRejectedValue(new Error("unreadable"));
       bridge.canHandOffLaunch.mockResolvedValue(true);
@@ -314,12 +321,21 @@ describe("launchFromPanel", () => {
       expect(bridge.openInMainWindow).toHaveBeenCalledWith("/c/conv_1", null);
       expect(uploadFileBlocks).toHaveBeenCalledWith("conv_1", [file]);
       expect(postEvent).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        "[floatingComposer] couldn't prepare a launch's attachments:",
+        expect.any(Error),
+      );
+      warn.mockRestore();
     });
 
-    it("never asks the shell about a message the create already carried", async () => {
-      await launchFromPanel(request({ inputAccepted: true }));
+    it("reports unknown, not a resend, when opening rejects after the message was handed over", async () => {
+      bridge.canHandOffLaunch.mockResolvedValue(true);
+      bridge.openInMainWindow.mockRejectedValue(new Error("reply lost"));
 
-      expect(bridge.canHandOffLaunch).not.toHaveBeenCalled();
+      const outcome = await launchFromPanel(request());
+
+      expect(postEvent).not.toHaveBeenCalled();
+      expect(outcome).toEqual(unknown);
     });
   });
 });
@@ -334,12 +350,20 @@ describe("acceptLaunchOffer", () => {
 
   it("queues the rebuilt message for its session only after the shell confirms it", async () => {
     bridge.takeLaunchOffer.mockResolvedValue(message);
-    bridge.confirmLaunchOffer.mockResolvedValue(true);
+    let confirm: (value: boolean) => void = () => {};
+    bridge.confirmLaunchOffer.mockReturnValue(
+      new Promise<boolean>((resolve) => {
+        confirm = resolve;
+      }),
+    );
 
-    await acceptLaunchOffer(offer);
+    const accepted = acceptLaunchOffer(offer);
+    await vi.waitFor(() => expect(bridge.confirmLaunchOffer).toHaveBeenCalledWith(7));
+    expect(setPendingInitialPrompt).not.toHaveBeenCalled();
+    confirm(true);
+    await accepted;
 
     expect(bridge.takeLaunchOffer).toHaveBeenCalledWith(7);
-    expect(bridge.confirmLaunchOffer).toHaveBeenCalledWith(7);
     expect(setPendingInitialPrompt).toHaveBeenCalledTimes(1);
     const [sessionId, prompt] = vi.mocked(setPendingInitialPrompt).mock.calls[0]!;
     expect(sessionId).toBe("conv_1");
@@ -348,9 +372,47 @@ describe("acceptLaunchOffer", () => {
     const [file] = prompt.files!;
     expect(file).toBeInstanceOf(File);
     expect(file).toMatchObject({ name: "a.txt", type: "text/plain", size: 2 });
+    expect(new TextDecoder().decode(new Uint8Array(await file!.arrayBuffer()))).toBe("hi");
     expect(vi.mocked(setPendingInitialPrompt).mock.invocationCallOrder[0]!).toBeGreaterThan(
       bridge.confirmLaunchOffer.mock.invocationCallOrder[0]!,
     );
+  });
+
+  it("confirms nothing and queues nothing when an attachment can't be rebuilt", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const broken = {
+      text: "Fix the build",
+      skill: null,
+      files: [{ name: "a.txt", type: "text/plain", bytes: new Uint8Array([1]) }],
+    };
+    // A rebuild that throws part way through, as a corrupt attachment would.
+    Object.defineProperty(broken.files[0], "bytes", {
+      get() {
+        throw new Error("corrupt");
+      },
+    });
+    bridge.takeLaunchOffer.mockResolvedValue(broken);
+
+    await acceptLaunchOffer(offer);
+
+    expect(bridge.confirmLaunchOffer).not.toHaveBeenCalled();
+    expect(setPendingInitialPrompt).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      "[floatingComposer] couldn't take a launch's message:",
+      expect.any(Error),
+    );
+    warn.mockRestore();
+  });
+
+  it("confirms nothing when no page is showing the session to send it", async () => {
+    bridge.takeLaunchOffer.mockResolvedValue(message);
+    vi.mocked(isListeningForInitialPrompt).mockReturnValueOnce(false);
+
+    await acceptLaunchOffer(offer);
+
+    expect(isListeningForInitialPrompt).toHaveBeenCalledWith("conv_1");
+    expect(bridge.confirmLaunchOffer).not.toHaveBeenCalled();
+    expect(setPendingInitialPrompt).not.toHaveBeenCalled();
   });
 
   it("queues nothing when the shell refuses the confirm", async () => {
@@ -372,9 +434,15 @@ describe("acceptLaunchOffer", () => {
   });
 
   it("leaves the message to the panel when taking it fails, and never throws", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     bridge.takeLaunchOffer.mockRejectedValue(new Error("reply lost"));
 
     await expect(acceptLaunchOffer(offer)).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(
+      "[floatingComposer] couldn't take a launch's message:",
+      expect.any(Error),
+    );
+    warn.mockRestore();
 
     expect(bridge.confirmLaunchOffer).not.toHaveBeenCalled();
     expect(setPendingInitialPrompt).not.toHaveBeenCalled();

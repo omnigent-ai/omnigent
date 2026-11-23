@@ -2258,7 +2258,8 @@ export interface PendingInitialPrompt {
 // state through navigate() → useLocation()). Both surfaces share this
 // module-level singleton, so it works identically standalone and embedded.
 const pendingInitialPrompts = new Map<string, PendingInitialPrompt>();
-const pendingInitialPromptListeners = new Set<(conversationId: string) => void>();
+// Pages showing a conversation, each listening for prompts stashed for it.
+const initialPromptListeners = new Map<string, Set<() => void>>();
 
 /**
  * Stash the first message for a freshly created conversation so ChatPage
@@ -2280,20 +2281,30 @@ export function setPendingInitialPrompt(
 ): void {
   if (!prompt.text && !prompt.files?.length) return;
   pendingInitialPrompts.set(conversationId, prompt);
-  for (const listener of pendingInitialPromptListeners) listener(conversationId);
+  for (const listener of initialPromptListeners.get(conversationId) ?? []) listener();
 }
 
 /**
- * Hear each prompt stashed by `setPendingInitialPrompt`, for a page already showing its
- * conversation, such as a floating-panel launch that arrives after the route.
+ * Hear each prompt stashed for `conversationId` while the listener is subscribed, so a page
+ * already showing the session takes a floating-panel launch that arrives after its route.
  *
  * @returns An unsubscribe function.
  */
-export function onPendingInitialPrompt(listener: (conversationId: string) => void): () => void {
-  pendingInitialPromptListeners.add(listener);
+export function onPendingInitialPrompt(conversationId: string, listener: () => void): () => void {
+  const listeners = initialPromptListeners.get(conversationId) ?? new Set<() => void>();
+  listeners.add(listener);
+  initialPromptListeners.set(conversationId, listeners);
   return () => {
-    pendingInitialPromptListeners.delete(listener);
+    listeners.delete(listener);
+    if (listeners.size === 0 && initialPromptListeners.get(conversationId) === listeners) {
+      initialPromptListeners.delete(conversationId);
+    }
   };
+}
+
+/** Whether a page is showing `conversationId` and would take a prompt stashed for it now. */
+export function isListeningForInitialPrompt(conversationId: string): boolean {
+  return (initialPromptListeners.get(conversationId)?.size ?? 0) > 0;
 }
 
 /**
