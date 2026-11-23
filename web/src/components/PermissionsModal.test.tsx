@@ -2156,21 +2156,24 @@ describe("PermissionsModal", () => {
       await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
     });
 
-    it("warns instead of lowering a grant from the add form", async () => {
-      listGadgetMock.mockResolvedValue(grantList([grantee("bob@example.com", 3, "Bob")]));
-      render(<PermissionsModal gadget={gadget} open onOpenChange={() => {}} />, {
-        wrapper: createInfoWrapper({ features: { gadgets: true } }),
-      });
-      await screen.findByText("Bob");
-      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
-        target: { value: "bob@example.com" },
-      });
-      fireEvent.click(screen.getByRole("button", { name: /grant/i }));
-      expect(
-        await screen.findByText("Bob already has Can manage. Change it in the list above."),
-      ).toBeInTheDocument();
-      expect(grantShareMock).not.toHaveBeenCalled();
-    });
+    it.each(["bob@example.com", "Bob@Example.com"])(
+      "warns instead of lowering a grant from the add form (%s)",
+      async (typed) => {
+        listGadgetMock.mockResolvedValue(grantList([grantee("bob@example.com", 3, "Bob")]));
+        render(<PermissionsModal gadget={gadget} open onOpenChange={() => {}} />, {
+          wrapper: createInfoWrapper({ features: { gadgets: true } }),
+        });
+        await screen.findByText("Bob");
+        fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+          target: { value: typed },
+        });
+        fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+        expect(
+          await screen.findByText("Bob already has Can manage. Change it in the list above."),
+        ).toBeInTheDocument();
+        expect(grantShareMock).not.toHaveBeenCalled();
+      },
+    );
 
     it("still lists and removes grants while sharing is off", async () => {
       listGadgetMock.mockResolvedValue(grantList([grantee("bob@example.com", 2, "Bob")]));

@@ -1,16 +1,6 @@
-// New session opened from a gadget carries the gadget's ID in its URL (`gadget_start`). The
-// session this tab creates from there, after the viewer opened it, is linked to the gadget and
-// shows it in its side panel. That happens when the creation is recorded, whatever page the
-// viewer is on by then: sending Build and then going elsewhere still links the session. Opening
-// an existing session instead leaves the gadget unlinked, as leaving New session does, and so
-// does a session this tab created before New session opened. A host whose navigation keeps the
-// query brings `gadget_start` along to the session's page; it is dropped from the URL there, so
-// a reload does not adopt it again.
-//
-// A gadget that Build (or the blank template) just created exists only to be built by that
-// session. Leaving New session without starting it deletes the gadget again, while it has nothing
-// published and no session, so abandoned attempts don't pile up in the viewer's list. Once the
-// session is being created (its temporary ID shows), the gadget is kept for it.
+// Links a gadget to the session this tab creates from its New session (`gadget_start`), and
+// only that one: an existing session, or one created before New session opened, stays unlinked.
+// A gadget made only to be built there is deleted again if New session is left unsent.
 import { useEffect } from "react";
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 

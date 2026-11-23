@@ -263,13 +263,7 @@ class ToolManager:
             self._tools[tool_class.name()] = tool_class()
 
     def _register_gadget_tools(self) -> None:
-        """
-        Auto-register the ``sys_gadget_*`` tools.
-
-        ``tool_groups.gadgets: false`` drops them, and the runner drops them
-        unless the server enables gadgets. The runner dispatches them via the
-        server's ``/v1/gadgets`` routes.
-        """
+        """Register the runner-dispatched gadget tools when enabled."""
         if not self._spec.tool_groups.gadgets:
             return
         from omnigent.tools.builtins.gadgets import GADGET_TOOLS

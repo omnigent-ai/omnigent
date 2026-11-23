@@ -10,7 +10,9 @@ their sessions).
 The default implementation keeps everything under ``<data_dir>/gadgets``
 (:class:`~omnigent.stores.gadget_store.local.LocalGadgetStore`). A deployment
 can pass another implementation to ``create_app(gadget_store=...)``, for example
-one backed by a database table of ``(scope, path, value)`` rows: ``create_json``
+one backed by a database table of ``(scope, path, value)`` rows (a value larger than
+a payload column allows, 16,383 bytes in the database guide, goes to artifact storage
+with the row keeping its reference): ``create_json``
 then maps to an insert that fails on a duplicate key, ``list_paths`` to a
 prefix query, :meth:`GadgetFiles.delete_tree` to a delete of the rows under a
 path, and ``delete`` to a delete of every row under the gadget's scope.
