@@ -10,6 +10,9 @@ import {
 import { conversationPage } from "@/test/sidebarMockHelpers";
 import { renderSidebar } from "@/test/sidebarTestHelpers";
 
+import type * as BulkModel from "./sessionCommands/bulkModel";
+import { bulkSessionCommands } from "./sessionCommands/bulkModel";
+
 // With quick_pick_palette on, ⌘K offers the sidebar's selection: Select all, Deselect all,
 // and the selection bar's actions, listed and greyed exactly as the bar's buttons are.
 
@@ -26,6 +29,10 @@ vi.mock("@/hooks/useConversations", async () => {
   };
 });
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+vi.mock("./sessionCommands/bulkModel", async (importOriginal) => {
+  const original = await importOriginal<typeof BulkModel>();
+  return { ...original, bulkSessionCommands: vi.fn(original.bulkSessionCommands) };
+});
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 
@@ -100,12 +107,13 @@ function expectCommandsMatchBar() {
 }
 
 describe("Sidebar selection in ⌘K", () => {
-  it("offers nothing with quick_pick_palette off", async () => {
+  it("offers nothing with quick_pick_palette off, and builds no commands", async () => {
     renderSidebar({ features: {} });
     await screen.findByRole("link", { name: /Alpha/ });
     startSelecting();
     fireEvent.click(screen.getByRole("link", { name: /Alpha/ }));
     expect(selectionCommands()).toEqual([]);
+    expect(bulkSessionCommands).not.toHaveBeenCalled();
   });
 
   it("selects and deselects every listed session", async () => {

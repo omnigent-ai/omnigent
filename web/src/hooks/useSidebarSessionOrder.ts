@@ -19,22 +19,26 @@ export const useSidebarSessionOrderStore = create<SidebarSessionOrderState>(() =
   activeSessionId: null,
 }));
 
-/** Publishes the sidebar's rows while it's mounted, and clears them once it unmounts. */
+/**
+ * Publishes the sidebar's rows while it's mounted and `enabled`, and clears them once it
+ * unmounts or stops publishing. Only ⌘K's QuickPick reads them.
+ */
 export function usePublishSidebarSessionOrder(
   orderedSessionIds: readonly string[],
   activeSessionId: string | null,
+  enabled: boolean,
 ): void {
   useEffect(() => {
-    useSidebarSessionOrderStore.setState({ orderedSessionIds, activeSessionId });
-  }, [orderedSessionIds, activeSessionId]);
-  useEffect(
-    () => () =>
+    if (enabled) useSidebarSessionOrderStore.setState({ orderedSessionIds, activeSessionId });
+  }, [enabled, orderedSessionIds, activeSessionId]);
+  useEffect(() => {
+    if (!enabled) return;
+    return () =>
       useSidebarSessionOrderStore.setState({
         orderedSessionIds: NO_SESSIONS,
         activeSessionId: null,
-      }),
-    [],
-  );
+      });
+  }, [enabled]);
 }
 
 /** One step down (1) or up (-1) the sidebar. */

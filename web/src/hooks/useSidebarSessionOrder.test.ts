@@ -32,7 +32,7 @@ describe("steppedSessionId", () => {
 
 describe("usePublishSidebarSessionOrder", () => {
   it("publishes the sidebar's rows while mounted and clears them once it unmounts", () => {
-    const view = renderHook(() => usePublishSidebarSessionOrder(["a", "b"], "b"));
+    const view = renderHook(() => usePublishSidebarSessionOrder(["a", "b"], "b", true));
     expect(useSidebarSessionOrderStore.getState()).toEqual({
       orderedSessionIds: ["a", "b"],
       activeSessionId: "b",
@@ -42,5 +42,15 @@ describe("usePublishSidebarSessionOrder", () => {
       orderedSessionIds: [],
       activeSessionId: null,
     });
+  });
+});
+
+describe("usePublishSidebarSessionOrder, not enabled", () => {
+  it("leaves the store alone, as it does once publishing stops", () => {
+    useSidebarSessionOrderStore.setState({ orderedSessionIds: ["x"], activeSessionId: "x" });
+    const view = renderHook(() => usePublishSidebarSessionOrder(["a", "b"], "b", false));
+    expect(useSidebarSessionOrderStore.getState().orderedSessionIds).toEqual(["x"]);
+    view.unmount();
+    expect(useSidebarSessionOrderStore.getState().orderedSessionIds).toEqual(["x"]);
   });
 });

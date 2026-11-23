@@ -106,10 +106,16 @@ afterEach(() => {
 
 describe("Sidebar session order", () => {
   it("publishes its rows top to bottom for ⌘K's Next and Previous session", async () => {
-    const view = renderSidebar();
+    const view = renderSidebar({ features: { quick_pick_palette: true } });
     await waitFor(() => expect(renderedRowIds()).toHaveLength(5));
     expect(useSidebarSessionOrderStore.getState().orderedSessionIds).toEqual(renderedRowIds());
     view.unmount();
+    expect(useSidebarSessionOrderStore.getState().orderedSessionIds).toEqual([]);
+  });
+
+  it("publishes nothing without quick_pick_palette", async () => {
+    renderSidebar({ features: {} });
+    await waitFor(() => expect(renderedRowIds()).toHaveLength(5));
     expect(useSidebarSessionOrderStore.getState().orderedSessionIds).toEqual([]);
   });
 });

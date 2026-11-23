@@ -21,7 +21,10 @@ import {
   type PaletteCommand,
 } from "@/store/paletteCommands";
 
-import { useQuickPickPaletteCommands } from "../screenCommands/useQuickPickPaletteCommands";
+import {
+  useQuickPickPaletteCommands,
+  useQuickPickPaletteEnabled,
+} from "../screenCommands/useQuickPickPaletteCommands";
 import { type BulkSessionCommandId, type BulkSessionFacts, bulkSessionCommands } from "./bulkModel";
 
 const ICONS: Record<BulkSessionCommandId, LucideIcon> = {
@@ -73,9 +76,12 @@ export function useBulkSessionPaletteCommands(actions: BulkSessionActions): void
   latest.current = actions;
   const { facts, selection, projects } = actions;
   const key = selectionKey(selection);
-  // Rebuilt when a label, availability or project changes, not on every bar render.
-  const signature = JSON.stringify([facts, projects]);
+  // Built only for ⌘K's QuickPick, and then rebuilt when a label, availability or project
+  // changes, not on every bar render.
+  const enabled = useQuickPickPaletteEnabled();
+  const signature = enabled ? JSON.stringify([facts, projects]) : null;
   const commands = useMemo<PaletteCommand[]>(() => {
+    if (signature === null) return [];
     const current = latest.current;
     // A row accepted after the selection changed, or once its action stopped applying, does nothing.
     const stillApplies = (id: BulkSessionCommandId): boolean => {
@@ -112,7 +118,6 @@ export function useBulkSessionPaletteCommands(actions: BulkSessionActions): void
       },
     }));
     // `signature` stands in for the facts and projects read through `latest`.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key, signature]);
   useQuickPickPaletteCommands("sidebar.selection", "Selection", commands);
 }

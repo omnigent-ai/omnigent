@@ -273,6 +273,7 @@ import { useSidebarSwipeToOpen } from "@/hooks/useSidebarSwipeToOpen";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
 import { usePublishSidebarSessionOrder } from "@/hooks/useSidebarSessionOrder";
+import { useQuickPickPaletteEnabled } from "./screenCommands/useQuickPickPaletteCommands";
 import { useCommandHoldStore, useCommandHoldTracking } from "@/hooks/useCommandHold";
 import { type DesktopCommand, useAvailableDesktopCommands } from "@/lib/desktopCommands";
 import {
@@ -3403,12 +3404,13 @@ function ConversationList({
     [orderedConversationIds],
   );
   useSessionNumberHotkeys(numberedSessionIds, activeId);
-  // ⌘K's Next and Previous session step through the same rows.
+  // ⌘K's Next and Previous session step through the same rows, with its QuickPick on.
+  const publishesSessionOrder = useQuickPickPaletteEnabled();
   const listedSessionIds = useMemo(
-    () => [...new Set(orderedConversationIds)],
-    [orderedConversationIds],
+    () => (publishesSessionOrder ? [...new Set(orderedConversationIds)] : []),
+    [publishesSessionOrder, orderedConversationIds],
   );
-  usePublishSidebarSessionOrder(listedSessionIds, resolvedActiveId);
+  usePublishSidebarSessionOrder(listedSessionIds, resolvedActiveId, publishesSessionOrder);
   // Holding the command modifier shows each numbered row's jump number. The slots
   // come from the hotkey's own list, so a badge exists only where the key works.
   useCommandHoldTracking();
