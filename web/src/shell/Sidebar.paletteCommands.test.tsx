@@ -1,5 +1,5 @@
-// The sidebar's project list and selection actions in ⌘K: registered by the sidebar itself
-// from the same models its headers and menus render, running the same handlers.
+// The sidebar's view, project list and selection actions in ⌘K: registered by the sidebar
+// itself from the same models its headers and menus render, running the same handlers.
 
 import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,6 +7,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as ProjectsApiModule from "@/lib/projectsApi";
 import { type PaletteCommand, usePaletteCommandsStore } from "@/store/paletteCommands";
+import {
+  chooseSettingValue,
+  expectSetting,
+  settingIn,
+  settingValues,
+} from "@/test/paletteCommands";
 import { conversation, conversationPage } from "@/test/sidebarMockHelpers";
 import { renderSidebar } from "@/test/sidebarTestHelpers";
 
@@ -68,6 +74,66 @@ const settingValue = (label: string) => {
   const setting = commands().find((command) => command.label === label)?.setting;
   return setting?.choices.find((choice) => choice.value === setting.current)?.label;
 };
+
+const viewCommands = (): readonly PaletteCommand[] =>
+  usePaletteCommandsStore.getState().groups["sidebar-view"]?.commands ?? [];
+const chooseView = (setting: string, value: string) =>
+  act(() => void chooseSettingValue(settingIn(viewCommands(), setting), value));
+
+describe("the session list's view in ⌘K", () => {
+  it("shows the display as a setting, and choosing a value updates the menu", async () => {
+    renderSidebar({ features: QUICK_PICK });
+    await waitFor(() =>
+      expect(settingValues(viewCommands())["Session List: Display"]).toBe("My sessions"),
+    );
+
+    chooseView("Session List: Display", "Archived sessions");
+    await waitFor(() =>
+      expect(settingValues(viewCommands())["Session List: Display"]).toBe("Archived sessions"),
+    );
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), { button: 0 });
+    expect(await screen.findByTestId("session-filter-archived")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+  });
+
+  it("offers grouping, ordering and fields with sidebar_grouping_ui, and regroups the list", async () => {
+    renderSidebar({ features: { ...QUICK_PICK, sidebar_grouping_ui: true } });
+    await waitFor(() =>
+      expect(settingValues(viewCommands())["Session List: Group by"]).toBe("Default"),
+    );
+    expectSetting(viewCommands(), "Session List: Group by", {
+      current: "Default",
+      choices: ["Default", "Status", "Harness", "Created", "Updated"],
+    });
+    expectSetting(viewCommands(), "Session List: Display", { current: "My sessions" });
+    expectSetting(viewCommands(), "Session List: Sort by", {
+      choices: ["Updated", "Created", "Custom"],
+    });
+    const onOff = { choices: ["On", "Off"] };
+    expectSetting(viewCommands(), "Session List: Show Last Updated Time", onOff);
+    expectSetting(viewCommands(), "Session List: Show Environment", onOff);
+    expectSetting(viewCommands(), "Session List: Show Repo", onOff);
+    expectSetting(viewCommands(), "Session List: Show Branch", onOff);
+
+    chooseView("Session List: Group by", "Harness");
+    await waitFor(() => expect(screen.queryByTestId("project-list-actions")).toBeNull());
+    expect(labels()).not.toContain("Sort Projects");
+  });
+
+  it("offers only Display without sidebar_grouping_ui, and nothing with the flag off", async () => {
+    const { unmount } = renderSidebar({ features: QUICK_PICK });
+    await waitFor(() =>
+      expect(Object.keys(settingValues(viewCommands()))).toEqual(["Session List: Display"]),
+    );
+    unmount();
+    usePaletteCommandsStore.setState({ groups: {} });
+    renderSidebar({ features: {} });
+    await screen.findByText("Alpha");
+    expect(viewCommands()).toEqual([]);
+  });
+});
 
 describe("the project list in ⌘K", () => {
   it("shows the project sort as a setting, and Expand All while some are collapsed", async () => {

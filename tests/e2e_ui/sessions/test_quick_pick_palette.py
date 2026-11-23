@@ -457,6 +457,26 @@ def test_quick_pick_deletes_the_project_a_new_session_starts_in(
     assert name not in _project_names(base_url)
 
 
+def test_quick_pick_switches_the_session_lists_display(
+    request: pytest.FixtureRequest, seeded_session_pair: tuple[str, str, str]
+) -> None:
+    """⌘K's Session List: Display lists archived sessions, as the filter menu's choice does."""
+    base_url, open_id, archived_id = seeded_session_pair
+    patch_session(base_url, archived_id, title="Heron archive", archived=True)
+    page: Page = request.getfixturevalue("page")
+    enable_quick_pick_palette(page)
+    page.goto(f"{base_url}/c/{open_id}")
+    archived_row = page.locator(f'li[data-sidebar-session-id="{archived_id}"]')
+    expect(page.locator(f'li[data-sidebar-session-id="{open_id}"]').first).to_be_visible(
+        timeout=30_000
+    )
+    expect(archived_row).to_have_count(0)
+
+    run_palette_command(page, "session list display", "Session List: Display")
+    page.get_by_role("dialog").get_by_role("option", name="Archived sessions").click()
+    expect(archived_row.first).to_be_visible(timeout=10_000)
+
+
 def _folder_names(page: Page) -> list[str]:
     """Project folder header texts in the sidebar, in render order."""
     return page.locator('button[data-slot="context-menu-trigger"]').all_inner_texts()

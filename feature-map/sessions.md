@@ -316,6 +316,12 @@ the header menu), and each place is a separate entry point.
   (Updated / Created / Custom) and Show (Updated / Environment / Repo / Branch) submenus,
   saved per device. On phone layouts a submenu replaces the menu's list under a
   back row with its name, and reopening the menu starts at the main list.
+  With `quick_pick_palette` on, ⌘K offers each submenu as a setting showing its
+  choice ("Session List: Group by", "Session List: Display", "Session List: Sort
+  by", and "Session List: Show …" for each field), running the menu's handlers;
+  without the grouping flag only Display is offered
+  (`web/src/shell/Sidebar.paletteCommands.test.tsx`,
+  `tests/e2e_ui/sessions/test_quick_pick_palette.py::test_quick_pick_switches_the_session_lists_display`).
   Created ordering keeps sessions newest-created first as messages
   arrive;
   requests, pagination, and project folders use that order too. Switching order
