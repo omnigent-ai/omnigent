@@ -12,8 +12,10 @@ tests (``revealActiveFile``, ``FilesPageTree``).
 from __future__ import annotations
 
 import shutil
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -28,9 +30,11 @@ _FILLER_FOLDERS = 400
 _TARGET_FOLDER = "packages/widgets"
 _TARGET = f"{_TARGET_FOLDER}/OWNERS"
 
+# `packages` must not exist yet: the journey owns it, so its cleanup can remove all of it.
 _SEED_SCRIPT = f"""
 set -e
-mkdir -p {_TARGET_FOLDER}
+mkdir packages
+mkdir {_TARGET_FOLDER}
 seq -w 0 {_FILLER_FOLDERS - 1} | while read n; do
   mkdir -p "packages/d$n"
   : > "packages/d$n/BUILD"
@@ -40,23 +44,37 @@ pwd
 """
 
 
+@contextmanager
+def seeded_large_tree(run_shell: Callable[[str], Mapping[str, Any]]) -> Iterator[Path]:
+    """Seed a new ``packages/`` through ``run_shell``, and remove it after; yields the workspace.
+
+    A workspace that already has ``packages/`` fails to seed, so nothing of its own is removed.
+    """
+    result = run_shell(_SEED_SCRIPT)
+    assert result["exit_code"] == 0, result
+    workspace = Path(result["stdout"].strip().splitlines()[-1])
+    try:
+        yield workspace
+    finally:
+        shutil.rmtree(workspace / "packages", ignore_errors=True)
+
+
 @pytest.fixture
 def large_tree_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
     """Seed ``packages/`` with hundreds of folders and the target file after them."""
     base_url, session_id = seeded_session
-    response = httpx.post(
-        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/shell",
-        json={"command": _SEED_SCRIPT, "timeout": 300},
-        timeout=330,
-    )
-    response.raise_for_status()
-    result = response.json()
-    assert result["exit_code"] == 0, result
-    workspace = Path(result["stdout"].strip().splitlines()[-1])
-    try:
+
+    def run_shell(command: str) -> Mapping[str, Any]:
+        response = httpx.post(
+            f"{base_url}/v1/sessions/{session_id}/resources/environments/default/shell",
+            json={"command": command, "timeout": 300},
+            timeout=330,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    with seeded_large_tree(run_shell):
         yield (base_url, session_id)
-    finally:
-        shutil.rmtree(workspace / "packages", ignore_errors=True)
 
 
 def _row(container: Locator, name: str) -> Locator:
