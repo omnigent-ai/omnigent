@@ -28,9 +28,9 @@ import { clientRoutingKey, SLICE_KEY_HEADER } from "./routingKey";
 import {
   clearHostKeyless,
   getSessionHost,
+  getSessionHostRouting,
   isHostKeyless,
   markHostKeyless,
-  sessionHostOwner,
   setSessionHost,
   updatesRoutingKey,
 } from "@/lib/sessionHost";
@@ -719,7 +719,7 @@ export async function authenticatedFetch(
     }
   }
   const recoverySessionId = sessionIdForRecovery(url, init?.method);
-  const sentHost = recoverySessionId === null ? null : getSessionHost(recoverySessionId);
+  const sentRouting = recoverySessionId === null ? null : getSessionHostRouting(recoverySessionId);
   // Bypass the browser HTTP cache for all API calls. Session
   // endpoints (GET /v1/sessions/{id}) carry volatile in-memory state
   // (pending_elicitations) that changes between fetches without any
@@ -748,16 +748,22 @@ export async function authenticatedFetch(
       : null;
   const sentKey = unkeyed ? null : headers.get(SLICE_KEY_HEADER);
   if (recoverySessionId !== null && resendKey !== null && resendKey !== sentKey) {
-    // A child's refusal names its ancestor's host, so correct the entry it routes by,
-    // unless a newer record replaced it while this request was in flight.
-    if (getSessionHost(recoverySessionId) === sentHost) {
-      setSessionHost(sessionHostOwner(recoverySessionId) ?? recoverySessionId, resendKey);
+    init?.signal?.throwIfAborted();
+    // Correct only the original owner, preserving newer host and ancestry observations.
+    const currentRouting = getSessionHostRouting(recoverySessionId);
+    if (
+      sentRouting !== null &&
+      currentRouting.revision === sentRouting.revision &&
+      currentRouting.ownerId === sentRouting.ownerId
+    ) {
+      setSessionHost(sentRouting.ownerId ?? recoverySessionId, resendKey);
     }
     // A keyless miss shows the default replica doesn't hold this host; don't retry it.
     if (sentKey === null) clearHostKeyless(resendKey);
     const keyedHeaders = new Headers(headers);
     keyedHeaders.set(SLICE_KEY_HEADER, resendKey);
     res = await hostFetch(url, { ...init, headers: keyedHeaders, cache: "no-store" });
+    if (res.ok) clearHostKeyless(resendKey);
     derivedHostId = resendKey;
     stampedSliceKey = sentKey !== null;
     unkeyed = false;
