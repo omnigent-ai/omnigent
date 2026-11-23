@@ -615,6 +615,8 @@ def test_files_shows_a_folder_chain_as_one_row_through_the_workspace_api(
     _open_session(page, base_url, session_id, "desktop")
     open_right_rail(page)
     sidebar = page.get_by_role("complementary", name="Workspace")
+    # The tabs sidebar loads lazily; a cold start can outlast the click's default timeout.
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
     _open_app(page, sidebar, "Files")
 
     merged = sidebar.get_by_role("treeitem", name="com / example / app", exact=True)
