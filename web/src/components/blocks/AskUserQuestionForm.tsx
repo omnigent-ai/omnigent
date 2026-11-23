@@ -7,7 +7,7 @@
 // Unsent answers are restored on remount (see ``@/lib/askUserQuestionDrafts``).
 
 import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { ENTER_KEY } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
@@ -152,6 +152,13 @@ export function AskUserQuestionForm({
   const rootRef = useRef<HTMLDivElement>(null);
   const questionRef = useRef<HTMLFieldSetElement>(null);
   const customInputRef = useRef<ComposerTextTarget | null>(null);
+  // The textarea's caret and focus, carried into the prompt editor that replaces it.
+  const textareaHandoffRef = useRef<{
+    key: string;
+    focused: boolean;
+    start: number;
+    end: number;
+  } | null>(null);
   // Set by a keystroke inside the form that moves to another question, so focus
   // follows the question instead of dropping to the page.
   const focusQuestionOnMoveRef = useRef(false);
@@ -196,6 +203,14 @@ export function AskUserQuestionForm({
   const mention = typedMention?.key === questionKeyNow ? typedMention.state : null;
   const setMention = (next: MentionState | null) =>
     setTypedMention(next ? { key: questionKeyNow, state: next } : null);
+  const rememberTextareaCaret = (element: HTMLTextAreaElement) => {
+    textareaHandoffRef.current = {
+      key: questionKeyNow,
+      focused: document.activeElement === element,
+      start: element.selectionStart,
+      end: element.selectionEnd,
+    };
+  };
   const debouncedMentionQuery = useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS);
   const sessionEntries = useSessionMentionEntries({
     mention,
@@ -217,6 +232,15 @@ export function AskUserQuestionForm({
     segments: questions.map((q) => customInputs[questionKey(q)] ?? ""),
   });
   const mentionedSessions = mentionBrowser.mentionedSessions;
+  // After the editor replaces the textarea, the user's caret and focus go with it.
+  useLayoutEffect(() => {
+    const snapshot = textareaHandoffRef.current;
+    textareaHandoffRef.current = null;
+    const editor = customInputRef.current;
+    if (engine !== "codemirror" || !snapshot || snapshot.key !== questionKeyNow || !editor) return;
+    editor.setSelectionRange(snapshot.start, snapshot.end);
+    if (snapshot.focused) editor.focus();
+  }, [engine, questionKeyNow]);
 
   useEffect(() => {
     const answers = {
@@ -647,7 +671,13 @@ export function AskUserQuestionForm({
                   rows={1}
                   placeholder="Type something"
                   value={customRowValue}
-                  onChange={(e) => handleCustomInput(currentKey, e.target.value)}
+                  onChange={(e) => {
+                    handleCustomInput(currentKey, e.target.value);
+                    rememberTextareaCaret(e.currentTarget);
+                  }}
+                  onFocus={(e) => rememberTextareaCaret(e.currentTarget)}
+                  onSelect={(e) => rememberTextareaCaret(e.currentTarget)}
+                  onBlur={(e) => rememberTextareaCaret(e.currentTarget)}
                   data-testid="ask-user-question-custom-input"
                   aria-label="Custom answer"
                   className="mobile-touch-target mobile-app:min-w-0 mobile-app:py-3 field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"

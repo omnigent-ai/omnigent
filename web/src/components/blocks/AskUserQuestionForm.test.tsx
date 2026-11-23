@@ -1000,6 +1000,27 @@ describe("AskUserQuestionForm — prompt editor", () => {
     expect(draft?.sessionMentions).toEqual([]);
   });
 
+  it("keeps the caret and focus when the editor replaces the textarea", async () => {
+    let finishLoad = () => {};
+    const loaded = new Promise<typeof CodeMirrorModule>((resolve) => {
+      finishLoad = () => resolve(CodeMirrorModule);
+    });
+    resetCodeMirrorComposerLoadForTests(() => loaded);
+    renderForm([framework], { codeMirror: true });
+    const textarea = screen.getByTestId("ask-user-question-custom-input") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "Ramen soup" } });
+    textarea.focus();
+    textarea.setSelectionRange(0, 5);
+    fireEvent.select(textarea);
+
+    act(() => finishLoad());
+    const editor = await promptEditor();
+    expect(document.activeElement).toBe(editor);
+    const target = composerTargetOf(editor)!;
+    expect([target.selectionStart, target.selectionEnd]).toEqual([0, 5]);
+    expect(target.value).toBe("Ramen soup");
+  });
+
   it("keeps a tagged session when the card remounts with its draft", async () => {
     sessionList.loaded = [sessionRow("s_ci", "Fix CI")];
     const elicitationId = nextElicitationId();
