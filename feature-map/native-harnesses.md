@@ -158,10 +158,11 @@ implements them separately, so a fix for one harness does not reach the others.
     system error that Codex reports outside a turn; during a turn, the turn's
     own outcome decides.
   - Background work shows the working spinner with the tooltip "Working in the
-    background". The composer lists running Claude background shells and Codex
-    background terminals as "1 background task" with each one's command. Claude's
-    list changes when a turn ends; Codex's changes within a few seconds of a
-    terminal starting or stopping.
+    background". Output from the ended turn that the viewer hasn't seen shows the
+    unread dot instead until the session is opened. The composer lists running
+    Claude background shells and Codex background terminals as "1 background
+    task" with each one's command. Claude's list changes when a turn ends;
+    Codex's changes within a few seconds of a terminal starting or stopping.
   - Answering a prompt in Chat or the Inbox clears "Needs response" from the
     row, its status group, the dock badge and the Inbox count at once. If the
     answer fails to send, the prompt shows again. A session the sidebar had not

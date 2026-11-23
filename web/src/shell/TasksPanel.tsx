@@ -27,6 +27,7 @@ import {
 } from "lucide-react";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
+import { RunWorkflowMenu } from "@/components/composer/RunWorkflowMenu";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -245,7 +246,7 @@ function stepDetail(item: StepProgress, failedNames: readonly string[] = []): Re
       );
     case "stopped":
       if (!item.status) return item.activeForm;
-      return [stepStatusLabel("started", item.status.created_at, false), text]
+      return [stepStatusLabel("started", item.startedAt ?? item.status.created_at, false), text]
         .filter(Boolean)
         .join(" · ");
     default:
@@ -660,7 +661,7 @@ function statusLine(
       );
     case "stopped":
       return status
-        ? `Stopped · ${stepStatusLabel("started", status.created_at, false).toLowerCase()}`
+        ? `Stopped · ${stepStatusLabel("started", startedAt ?? status.created_at, false).toLowerCase()}`
         : "Stopped";
     case "done":
       return ended ? `Done · ${ended}` : "Done";
@@ -1354,16 +1355,17 @@ export function TasksPanel({
                 <>
                   {" "}
                   or you{" "}
-                  <button
-                    type="button"
-                    className="cursor-pointer font-medium text-link hover:underline focus-visible:underline focus-visible:outline-none"
-                    onClick={() => {
+                  <RunWorkflowMenu
+                    // A new one for each session, so a pending check opens nothing in the next.
+                    key={conversationId}
+                    className="cursor-pointer font-medium text-link hover:underline focus-visible:underline focus-visible:outline-none data-[state=open]:underline"
+                    onStart={(...choice) => {
                       onStartWorkflow?.();
-                      startWorkflow();
+                      startWorkflow(...choice);
                     }}
                   >
                     run a workflow
-                  </button>
+                  </RunWorkflowMenu>
                 </>
               )}
               .

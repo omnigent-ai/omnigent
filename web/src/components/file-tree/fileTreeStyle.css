@@ -1,0 +1,25 @@
+/* Counts keep their width; the name gives way, down to room for its start and extension. */
+.workspace-file-tree[data-file-tree] [data-item-section="decoration"] {
+  flex: none;
+  padding-left: 6px;
+}
+
+.workspace-file-tree[data-file-tree] [data-item-section="content"] {
+  flex: 1 1 0;
+  min-width: 4em;
+}
+
+/* Very deep rows stop stepping in at a share of the row, so siblings still line up; the
+ * deepest guides clip and the outer ones stay put. A row short of even that gives way more. */
+.workspace-file-tree[data-file-tree] [data-item-section="spacing"] {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 40%;
+  overflow: hidden;
+  justify-content: flex-start;
+}
+
+/* Below the second level, each level steps in by its guide line alone. */
+.workspace-file-tree[data-file-tree] [data-item-section="spacing-item"]:nth-child(n + 3) {
+  margin-right: 0;
+}

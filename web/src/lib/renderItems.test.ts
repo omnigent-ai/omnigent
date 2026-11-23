@@ -413,6 +413,78 @@ describe("sub-agent timeline events", () => {
     expect(bubble).toMatchObject({ workedForS: 30, lastActivityAtS: 130, createdAtS: 130 });
   });
 
+  it("stamps each task marker with how far into the turn's work it landed", () => {
+    const taskMarker: AnyBlock = {
+      type: "native_tool",
+      ctx: ctx({ itemId: "marker_1", responseId: "journal_marker_1" }),
+      toolType: "subagent_activity",
+      label: "Task",
+      data: {
+        type: "resource_event",
+        event_type: "session.journal.task",
+        resource_type: "journal",
+        resource_id: "explain",
+        resource: { name: "Explain", status: "started", text: null, entry_id: "e1", native: false },
+      },
+    };
+    const at = (block: AnyBlock, stamps: Partial<BlockContext>): AnyBlock => ({
+      ...block,
+      ctx: { ...block.ctx, ...stamps },
+    });
+    const markerElapsed = (blocks: AnyBlock[]) =>
+      (buildBubbles(blocks, null)[0] as Extract<Bubble, { kind: "assistant" }>).items.flatMap(
+        (item) => (item.kind === "subagent_activity" ? [item.turnElapsedS] : []),
+      );
+
+    // Reloaded history uses the server's stamps, a live turn the page clock.
+    expect(
+      markerElapsed([
+        at(work, { createdAtS: 100 }),
+        at(taskMarker, { createdAtS: 136 }),
+        at(answer, { createdAtS: 250 }),
+      ]),
+    ).toEqual([36]);
+    expect(
+      markerElapsed([
+        at(work, { timestamp: 10 }),
+        at(taskMarker, { timestamp: 46.5 }),
+        at(answer, { timestamp: 160 }),
+      ]),
+    ).toEqual([36.5]);
+    // A marker recorded just before the call it marks counts from the turn's start.
+    expect(
+      markerElapsed([
+        at(taskMarker, { createdAtS: 95 }),
+        at(work, { createdAtS: 100 }),
+        at(answer, { createdAtS: 250 }),
+      ]),
+    ).toEqual([0]);
+    // Clocks that differ (a page loaded mid-turn) can't place the marker.
+    expect(
+      markerElapsed([
+        at(work, { createdAtS: 100 }),
+        at(taskMarker, { timestamp: 46.5 }),
+        at(answer, { timestamp: 160 }),
+      ]),
+    ).toEqual([undefined]);
+    // Only the clock that spans the turn places a marker, even when another one could.
+    expect(
+      markerElapsed([
+        at(work, { timestamp: 10, createdAtS: 100 }),
+        at(taskMarker, { createdAtS: 136 }),
+        at(answer, { timestamp: 160, createdAtS: 250 }),
+      ]),
+    ).toEqual([undefined]);
+    // A sub-agent's notice doesn't split the turn's time.
+    expect(
+      markerElapsed([
+        at(work, { createdAtS: 100 }),
+        at(notice(), { createdAtS: 136 }),
+        at(answer, { createdAtS: 250 }),
+      ]),
+    ).toEqual([undefined]);
+  });
+
   it("never looks past an unconfirmed user message for the next turn", () => {
     const sent: AnyBlock = {
       type: "user_message",

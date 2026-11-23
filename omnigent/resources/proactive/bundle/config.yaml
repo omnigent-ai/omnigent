@@ -54,6 +54,17 @@ guardrails:
         arguments:
           gate_pushes: true
           risky_action: DENY
+    # Denies the session file tools; runners released before `tool_groups.files` reject it.
+    no_session_files:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.policies.function.make_fixed_action_callable
+        arguments:
+          action: deny
+          reason: The proactive agent does not share or read session files.
+          on_phases: [tool_call]
+          on_tools: [sys_files_upload, sys_files_list, sys_files_download]
 
 prompt: |
   You are the user's proactive assistant. You run on a schedule, without the

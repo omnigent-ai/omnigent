@@ -19,6 +19,7 @@
 // and must be set on the scope root instead. Standalone `getStyleRoot()` IS the
 // document root, so behavior is unchanged.
 
+import { keepsDesktopLayout } from "./desktopAppLayout";
 import { getStyleRoot } from "./host";
 
 const STORAGE_KEY = "omnigent:ui-font-size";
@@ -44,6 +45,7 @@ function defaultUiFontSizePx(): number {
   if (
     typeof window !== "undefined" &&
     typeof window.matchMedia === "function" &&
+    !keepsDesktopLayout() &&
     window.matchMedia(UI_FONT_SIZE_MOBILE_QUERY).matches
   ) {
     return UI_FONT_SIZE_MOBILE_DEFAULT;

@@ -6,7 +6,8 @@ import type { GlobalShortcutSaveResult, GlobalShortcutStatus } from "@/lib/nativ
 import { GlobalShortcutControl } from "./GlobalShortcutControl";
 
 const SWITCH_NAME = "Show Omnigent from anywhere";
-const renderControl = () => render(<GlobalShortcutControl />, { wrapper: MemoryRouter });
+const renderControl = (props: Parameters<typeof GlobalShortcutControl>[0] = {}) =>
+  render(<GlobalShortcutControl {...props} />, { wrapper: MemoryRouter });
 const RECORDER_TEST_ID = "global-shortcut-recorder";
 
 /** Installs a fake Electron preload with the shortcut calls; `saveResult` is what a save resolves to. */
@@ -36,6 +37,25 @@ describe("GlobalShortcutControl", () => {
     await act(async () => {});
     expect(container).toBeEmptyDOMElement();
   });
+
+  it.each([
+    ["show", "global-shortcut", {}],
+    ["floatingComposer", "floating-composer-shortcut", { floatingComposerShortcut: true }],
+  ] as const)(
+    "marks the %s shortcut system-wide, since it works from any app",
+    async (shortcutId, prefix, features) => {
+      (window as unknown as Record<string, unknown>).omnigentDesktop = {
+        ...installBridge(),
+        getDesktopFeatures: vi.fn().mockResolvedValue(features),
+      };
+      renderControl({ shortcutId });
+
+      expect(await screen.findByTestId(`${prefix}-system-wide`)).toHaveTextContent("System-wide");
+      expect(screen.getByTestId(`${prefix}-recorder`)).toHaveAccessibleDescription(
+        /system-wide shortcut.*any app.*background/i,
+      );
+    },
+  );
 
   it("saves Alt+Space when the switch is turned on", async () => {
     const bridge = installBridge();
@@ -222,6 +242,74 @@ describe("GlobalShortcutControl", () => {
     renderControl();
     expect(await screen.findByRole("alert")).toHaveTextContent("This shortcut isn't working.");
     expect(screen.getByRole("switch", { name: SWITCH_NAME })).toBeChecked();
+  });
+
+  it("names no id for the show shortcut, so the call is the one every shell takes", async () => {
+    const bridge = installBridge();
+    const recordGlobalShortcut = vi.fn().mockResolvedValue(null);
+    Object.assign(bridge, { recordGlobalShortcut, cancelGlobalShortcutRecording: vi.fn() });
+    renderControl();
+
+    fireEvent.click(await screen.findByTestId(RECORDER_TEST_ID));
+
+    await waitFor(() => expect(recordGlobalShortcut).toHaveBeenCalledExactlyOnceWith());
+    expect(bridge.getGlobalShortcut).toHaveBeenCalledExactlyOnceWith();
+  });
+
+  it("reads and saves the New Agent shortcut by its id, once the shell says it takes ids", async () => {
+    const bridge = {
+      ...installBridge({ enabled: true, accelerator: "CommandOrControl+Shift+Space" }),
+      getDesktopFeatures: vi.fn().mockResolvedValue({ floatingComposerShortcut: true }),
+    };
+    (window as unknown as Record<string, unknown>).omnigentDesktop = bridge;
+    renderControl({ shortcutId: "floatingComposer" });
+    const toggle = await screen.findByRole("switch", { name: "Open New Agent from anywhere" });
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => expect(toggle).not.toBeChecked());
+    expect(bridge.getGlobalShortcut).toHaveBeenCalledExactlyOnceWith("floatingComposer");
+    expect(bridge.setGlobalShortcut).toHaveBeenCalledExactlyOnceWith(
+      { enabled: false },
+      "floatingComposer",
+    );
+    expect(screen.getByTestId("floating-composer-shortcut-recorder")).toBeInTheDocument();
+  });
+
+  it("renders no New Agent row on a shell that would read the show shortcut instead", async () => {
+    const bridge = {
+      ...installBridge(),
+      getDesktopFeatures: vi.fn().mockResolvedValue({ floatingComposer: true }),
+    };
+    (window as unknown as Record<string, unknown>).omnigentDesktop = bridge;
+    const { container } = renderControl({ shortcutId: "floatingComposer" });
+    await act(async () => {});
+
+    expect(container).toBeEmptyDOMElement();
+    expect(bridge.getGlobalShortcut).not.toHaveBeenCalled();
+  });
+
+  it("records the New Agent chord in the shell by id, and shows why a taken one is refused", async () => {
+    const error = "Another Omnigent shortcut already uses that chord. Choose a different one.";
+    const bridge = {
+      ...installBridge(
+        { enabled: true, accelerator: "CommandOrControl+Shift+Space" },
+        { ok: false, error },
+      ),
+      getDesktopFeatures: vi.fn().mockResolvedValue({ floatingComposerShortcut: true }),
+      recordGlobalShortcut: vi.fn().mockResolvedValue("Alt+Space"),
+    };
+    (window as unknown as Record<string, unknown>).omnigentDesktop = bridge;
+    renderControl({ shortcutId: "floatingComposer" });
+
+    fireEvent.click(await screen.findByTestId("floating-composer-shortcut-recorder"));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(error);
+    expect(bridge.recordGlobalShortcut).toHaveBeenCalledExactlyOnceWith("floatingComposer");
+    expect(bridge.setGlobalShortcut).toHaveBeenCalledExactlyOnceWith(
+      { enabled: true, accelerator: "Alt+Space" },
+      "floatingComposer",
+    );
   });
 
   it("shows the shell's error and keeps the saved chord when the save is refused", async () => {

@@ -46,10 +46,12 @@ function Harness({
   engine,
   initial = "",
   dictating = false,
+  autoFocus = false,
 }: {
   engine: ComposerInputEngine;
   initial?: string;
   dictating?: boolean;
+  autoFocus?: boolean;
 }) {
   const [value, setValue] = useState(initial);
   return (
@@ -60,10 +62,27 @@ function Harness({
       input={{
         "aria-label": "Message the agent",
         value,
+        autoFocus,
         onChange: (event) => setValue(event.currentTarget.value),
       }}
       actions={{ leading: null, trailing: null }}
     />
+  );
+}
+
+/** A composer beside another control, which takes focus away from the composer. */
+function ComposerBesideButton({
+  engine,
+  autoFocus,
+}: {
+  engine: ComposerInputEngine;
+  autoFocus: boolean;
+}) {
+  return (
+    <>
+      <Harness engine={engine} autoFocus={autoFocus} initial="draft" />
+      <button type="button">Elsewhere</button>
+    </>
   );
 }
 
@@ -83,6 +102,28 @@ afterEach(() => {
   resetCodeMirrorComposerLoadForTests();
   vi.restoreAllMocks();
   document.body.replaceChildren();
+});
+
+describe("ChatComposer's panel appearance", () => {
+  it.each([
+    ["panel", "none"],
+    ["default", "180px"],
+  ] as const)("sizes the editor for the %s appearance", async (appearance, maxHeight) => {
+    await loadedCodeMirror();
+    render(
+      <ChatComposer
+        appearance={appearance}
+        engine="codemirror"
+        keyboard={KEYBOARD}
+        input={{ "aria-label": "Message the agent", value: "", onChange: () => {} }}
+        actions={{ leading: null, trailing: null }}
+      />,
+    );
+
+    // A panel's editor grows with the draft; its prompt area scrolls instead.
+    await waitFor(() => expect(document.querySelector(".cm-scroller")).not.toBeNull());
+    expect(getComputedStyle(document.querySelector(".cm-scroller")!).maxHeight).toBe(maxHeight);
+  });
 });
 
 describe("effectiveComposerEngine", () => {
@@ -236,6 +277,48 @@ describe("switching a mounted composer's engine", () => {
     render(<Harness engine="codemirror" initial="draft" />);
     expect(engineOf(composerInput())).toBe("textarea");
     expect((composerInput() as HTMLTextAreaElement).disabled).toBe(false);
+  });
+});
+
+describe("autofocus across an engine switch", () => {
+  it.each(["textarea", "codemirror"] as const)(
+    "focuses the first %s input when asked",
+    async (engine) => {
+      await loadedCodeMirror();
+      render(<Harness engine={engine} autoFocus />);
+      expect(document.activeElement).toBe(composerInput());
+    },
+  );
+
+  it("keeps focus on another control when the deferred editor loads", async () => {
+    let finishLoad: (module: typeof CodeMirrorModule) => void = () => {};
+    const moduleLoaded = new Promise<typeof CodeMirrorModule>((resolve) => {
+      finishLoad = resolve;
+    });
+    resetCodeMirrorComposerLoadForTests(() => moduleLoaded);
+    render(<ComposerBesideButton engine="codemirror" autoFocus />);
+    expect(document.activeElement).toBe(screen.getByRole("textbox"));
+
+    const elsewhere = screen.getByRole("button", { name: "Elsewhere" });
+    act(() => elsewhere.focus());
+    act(() => loadCodeMirrorComposer());
+    await act(async () => finishLoad(CodeMirrorModule));
+
+    await waitFor(() => expect(engineOf(composerInput())).toBe("codemirror"));
+    expect(document.activeElement).toBe(elsewhere);
+  });
+
+  it("keeps focus on another control when the editor hands back to the textarea", async () => {
+    await loadedCodeMirror();
+    const { rerender } = render(<ComposerBesideButton engine="codemirror" autoFocus />);
+    expect(document.activeElement).toBe(composerInput());
+
+    const elsewhere = screen.getByRole("button", { name: "Elsewhere" });
+    act(() => elsewhere.focus());
+    rerender(<ComposerBesideButton engine="textarea" autoFocus />);
+
+    expect(engineOf(composerInput())).toBe("textarea");
+    expect(document.activeElement).toBe(elsewhere);
   });
 });
 

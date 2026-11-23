@@ -50,6 +50,7 @@ import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isIndentedSibling, isSessionPinned } from "@/lib/sessionFamilies";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
+import { canFlagUnread } from "@/lib/sessionMute";
 import { exportSessionTranscript } from "@/lib/sessionsApi";
 import { triggerBrowserDownload } from "@/hooks/useFileContent";
 import {
@@ -67,6 +68,7 @@ import {
   automationDeletedWith,
   useDeleteSourceAutomations,
 } from "@/lib/automationFromSession";
+import { type OpenSessionCommandId, useOpenSessionPaletteCommands } from "./openSessionCommands";
 import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
@@ -289,6 +291,63 @@ export function HeaderConversationMenu({
   useDesktopCommand("archive-session", archiveConversation, { active: isArchived });
   useDesktopCommand("fork-session", canFork && !forkDisabledReason ? onFork : null);
   const desktopShortcuts = supportsDesktopCommands();
+  const runOpenSessionCommand = (id: OpenSessionCommandId) => {
+    switch (id) {
+      case "add-nested-agent":
+        navigate(addAgentPath);
+        return;
+      case "pin":
+      case "unpin":
+        togglePin();
+        return;
+      case "share":
+        onShare();
+        return;
+      case "fork":
+        onFork();
+        return;
+      case "export":
+        void exportConversation();
+        return;
+      case "rename":
+        setRenameOpen(true);
+        return;
+      case "mark-unread":
+        markConversationUnread(conversation.id, conversation.updated_at);
+        return;
+      case "create-automation":
+        setAutomationOpen(true);
+        return;
+      case "archive":
+      case "unarchive":
+        archiveConversation();
+        return;
+      case "delete":
+        setDeleteOpen(true);
+        return;
+    }
+  };
+  // ⌘K offers these same items for the session shown here.
+  useOpenSessionPaletteCommands({
+    conversationId: conversation.id,
+    facts: {
+      canAddAgent: canAddAgent === true,
+      pinnable: canPin,
+      pinned: isPinned,
+      pinSaving,
+      canShare,
+      shareDisabledReason: shareDisabled
+        ? (shareDisabledReason ?? "Sharing is unavailable.")
+        : undefined,
+      canFork,
+      forkDisabledReason,
+      canMarkUnread: canFlagUnread(conversation),
+      canCreateAutomation,
+      archived: isArchived,
+      desktopShortcuts,
+    },
+    onRun: runOpenSessionCommand,
+  });
 
   const mainItems = (
     <>
@@ -387,14 +446,17 @@ export function HeaderConversationMenu({
         <PencilIcon className="size-3.5" />
         Rename
       </DropdownMenuItem>
-      <DropdownMenuItem
-        data-testid="header-mark-unread-conversation"
-        className={itemClass}
-        onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
-      >
-        <MailIcon className="size-3.5" />
-        Mark as unread
-      </DropdownMenuItem>
+      {/* A muted session can't be flagged unread, matching its row menu. */}
+      {canFlagUnread(conversation) && (
+        <DropdownMenuItem
+          data-testid="header-mark-unread-conversation"
+          className={itemClass}
+          onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
+        >
+          <MailIcon className="size-3.5" />
+          Mark as unread
+        </DropdownMenuItem>
+      )}
       {canCreateAutomation && (
         <DropdownMenuItem
           data-testid="header-create-automation"

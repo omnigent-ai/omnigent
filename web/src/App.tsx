@@ -12,6 +12,8 @@ import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useProjectKanbanBoardPreference } from "@/lib/projectKanbanPreferences";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
+import { FLOATING_COMPOSER_PATH } from "@/lib/floatingComposer/floatingComposerRoute";
+import { isElectronShell } from "@/lib/nativeBridge";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 
 // Bind a page component to its analytics page-view id. Declaring the id here,
@@ -51,6 +53,14 @@ const ApprovePage = withPageView(
   "approve",
   lazy(() => import("@/pages/ApprovePage").then((m) => ({ default: m.ApprovePage }))),
 );
+const FloatingComposerPage = withPageView(
+  "floating_composer",
+  lazy(() =>
+    import("@/shell/floatingComposer/FloatingComposerPage").then((m) => ({
+      default: m.FloatingComposerPage,
+    })),
+  ),
+);
 const InboxPage = withPageView(
   "inbox",
   lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage }))),
@@ -86,9 +96,18 @@ const SettingsPage = lazy(() =>
 // A release-feature route stays registered so a hard load never falls through
 // to the catch-all "Page not found" while the /v1/info probe is in flight; the
 // gate is decided inside once the probe resolves.
-function FeatureGatedPage({ feature, children }: { feature: FeatureKey; children: ReactNode }) {
+function FeatureGatedPage({
+  feature,
+  children,
+  loading,
+}: {
+  feature: FeatureKey;
+  children: ReactNode;
+  loading?: ReactNode;
+}) {
   const info = useServerInfo();
   if (info === "loading") {
+    if (loading !== undefined) return loading;
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center">
         <Spinner className="size-5 text-muted-foreground" aria-label="Loading" />
@@ -202,6 +221,25 @@ function AppRoutes({ basename }: AppProps) {
           </>
         )}
         <Route path={`${prefix}/approve/:sessionId/:elicitationId`} element={<ApprovePage />} />
+        {/* The desktop's floating New Agent panel: the composer alone, without the shell. */}
+        <Route
+          path={`${prefix}${FLOATING_COMPOSER_PATH}`}
+          element={
+            <FeatureGatedPage
+              feature="floating_composer"
+              loading={isElectronShell() ? <PageLoading quiet /> : undefined}
+            >
+              {isElectronShell() ? (
+                // The panel boots out of sight, so it shows no loading screen of its own.
+                <Suspense fallback={<PageLoading quiet />}>
+                  <FloatingComposerPage />
+                </Suspense>
+              ) : (
+                <NotFoundPage />
+              )}
+            </FeatureGatedPage>
+          }
+        />
         <Route element={<AppShell />}>
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />

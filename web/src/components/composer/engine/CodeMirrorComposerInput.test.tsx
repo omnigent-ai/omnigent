@@ -1,10 +1,19 @@
-import { redo, undo } from "@codemirror/commands";
+import {
+  cursorCharLeft,
+  cursorCharRight,
+  deleteCharBackward,
+  redo,
+  selectCharRight,
+  undo,
+} from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
-import { act, fireEvent, render } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, waitFor } from "@testing-library/react";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
+import { MENTION_TOKEN_CLASS } from "@/components/composer/MentionTokenOverlay";
 import { insertComposerText } from "@/lib/composerText";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
-import { COMPOSER_EDITING_KEYMAP } from "./CodeMirrorComposerInput";
+import { COMPOSER_EDITING_KEYMAP, leadingCommandSpan } from "./CodeMirrorComposerInput";
 import {
   isComposerInput,
   isHistoryInput,
@@ -126,6 +135,47 @@ describe("CodeMirrorComposerInput", () => {
     expect(content.getAttribute("autocapitalize")).toBe("sentences");
   });
 
+  it("locks while an ancestor fieldset is disabled, as a textarea does", async () => {
+    const box: { target: ComposerTextTarget | null } = { target: null };
+    const input = (fieldsetDisabled: boolean) => (
+      <fieldset disabled={fieldsetDisabled}>
+        <CodeMirrorComposerInput
+          aria-label="Message the agent"
+          defaultValue="draft"
+          ref={(target) => {
+            box.target = target;
+          }}
+        />
+      </fieldset>
+    );
+    const { container, rerender } = render(input(true));
+    const content = container.querySelector<HTMLElement>(".cm-content")!;
+    expect(content.getAttribute("aria-disabled")).toBe("true");
+    expect(insertComposerText(box.target!, "x", 0, 0)).toBe(false);
+    expect(box.target!.value).toBe("draft");
+
+    rerender(input(false));
+    await waitFor(() => expect(content.getAttribute("aria-disabled")).toBe("false"));
+    expect(insertComposerText(box.target!, "x", 0, 0)).toBe(true);
+    expect(box.target!.value).toBe("xdraft");
+
+    rerender(input(true));
+    await waitFor(() => expect(content.getAttribute("aria-disabled")).toBe("true"));
+    expect(insertComposerText(box.target!, "y", 0, 0)).toBe(false);
+    expect(box.target!.value).toBe("xdraft");
+  });
+
+  it("stays editable inside a disabled fieldset's first legend, as a textarea does", () => {
+    const { container } = render(
+      <fieldset disabled>
+        <legend>
+          <CodeMirrorComposerInput aria-label="Message the agent" defaultValue="draft" />
+        </legend>
+      </fieldset>,
+    );
+    expect(container.querySelector(".cm-content")!.getAttribute("aria-disabled")).toBe("false");
+  });
+
   it("takes a caller's text size in place of the composer's own", () => {
     const host = (className?: string) => {
       const { container, unmount } = mount({ className });
@@ -142,6 +192,22 @@ describe("CodeMirrorComposerInput", () => {
 });
 
 describe("CodeMirrorComposerInput change events", () => {
+  it.each([undefined, { separateUndo: true }])(
+    "makes a programmatic insert (%o) its own undo step apart from typing",
+    (options) => {
+      const { content, target } = mount({ value: "" });
+      const editor = EditorView.findFromDOM(content)!;
+      act(
+        () =>
+          void editor.dispatch({ changes: { from: 0, insert: "typed" }, userEvent: "input.type" }),
+      );
+      act(() => insertComposerText(target(), " inserted", 5, 5, options));
+      expect(target().value).toBe("typed inserted");
+      act(() => void undo(editor));
+      expect(target().value).toBe("typed");
+    },
+  );
+
   it("says when an undo or redo made the change", () => {
     const onChange = vi.fn((event: ComposerInputEvent) => isHistoryInput(event));
     const { content, target } = mount({ onChange });
@@ -152,6 +218,22 @@ describe("CodeMirrorComposerInput change events", () => {
     act(() => void undo(editor));
     act(() => void redo(editor));
     expect(onChange.mock.results.map((result) => result.value)).toEqual([false, true, true]);
+  });
+
+  it("reports an undo as 'undo' and a redo as 'redo', and an ordinary edit with no direction", () => {
+    const onChange = vi.fn<(event: ComposerInputEvent) => void>();
+    const { content, target } = mount({ onChange });
+    act(() => {
+      insertComposerText(target(), "draft", 0, 0);
+    });
+    const editor = EditorView.findFromDOM(content)!;
+    act(() => void undo(editor));
+    act(() => void redo(editor));
+    expect(onChange.mock.calls.map(([event]) => event.historyDirection)).toEqual([
+      undefined,
+      "undo",
+      "redo",
+    ]);
   });
 
   it("takes a controlled value without reporting it or making it undoable", () => {
@@ -302,5 +384,210 @@ describe("COMPOSER_EDITING_KEYMAP", () => {
     );
     expect(keys).not.toContain("Enter");
     expect(keys.filter((key) => /Ctrl-/.test(key) && /Alt-/.test(key))).toEqual([]);
+  });
+});
+
+describe("CodeMirrorComposerInput readline keys off macOS", () => {
+  it("leaves ⌃W unclaimed, so the caret and draft stay put", () => {
+    const { content, target } = mount({ value: "git push origin" });
+    act(() => target().setSelectionRange(15, 15));
+
+    const notClaimed = fireEvent.keyDown(content, { key: "w", code: "KeyW", ctrlKey: true });
+
+    expect(notClaimed).toBe(true);
+    expect(target().value).toBe("git push origin");
+    expect(target().selectionStart).toBe(15);
+  });
+
+  it("keeps ⌃A as Select All, its platform meaning, instead of the line start", () => {
+    const { content, target } = mount({ value: "git push origin" });
+    act(() => target().setSelectionRange(15, 15));
+
+    fireEvent.keyDown(content, { key: "a", code: "KeyA", ctrlKey: true });
+
+    expect(target().selectionStart).toBe(0);
+    expect(target().selectionEnd).toBe("git push origin".length);
+  });
+});
+
+describe("CodeMirrorComposerInput mention tokens", () => {
+  const tokenMarks = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll('[data-testid="composer-mention-token"]')).map(
+      (token) => [token.textContent, token.className],
+    );
+
+  it("paints each tagged token with the mention class, and no other text", () => {
+    const { container } = mount({
+      value: "see @a.ts and @a.ts:2-4 then a@b.ts",
+      mentionTokens: ["@a.ts", "@a.ts:2-4"],
+    });
+    expect(tokenMarks(container)).toEqual([
+      ["@a.ts", MENTION_TOKEN_CLASS],
+      ["@a.ts:2-4", MENTION_TOKEN_CLASS],
+    ]);
+  });
+
+  it("refreshes the marks when the tokens change without a text edit", () => {
+    const view = mount({ value: "see @a.ts", mentionTokens: ["@a.ts"] });
+    expect(tokenMarks(view.container)).toHaveLength(1);
+
+    view.rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value="see @a.ts"
+        mentionTokens={[]}
+      />,
+    );
+    expect(tokenMarks(view.container)).toEqual([]);
+  });
+
+  it("marks a token typed after mount, and drops it once the text no longer matches", () => {
+    const { container, target } = mount({ mentionTokens: ["@a.ts"] });
+    expect(tokenMarks(container)).toEqual([]);
+
+    act(() => {
+      insertComposerText(target(), "@a.ts", 0, 0);
+    });
+    expect(tokenMarks(container)).toHaveLength(1);
+
+    act(() => {
+      insertComposerText(target(), "x", "@a.ts".length, "@a.ts".length);
+    });
+    expect(tokenMarks(container)).toEqual([]);
+  });
+});
+
+describe("CodeMirrorComposerInput mention tokens move as one character", () => {
+  // CodeMirror measures text for caret motion; jsdom has no layout.
+  const originalRangeRects = {
+    getClientRects: Range.prototype.getClientRects,
+    getBoundingClientRect: Range.prototype.getBoundingClientRect,
+  };
+  beforeAll(() => {
+    Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
+    Range.prototype.getBoundingClientRect = () => new DOMRect();
+  });
+  afterAll(() => Object.assign(Range.prototype, originalRangeRects));
+
+  const draft = "Read @readme.md now";
+  const tokenStart = "Read ".length;
+  const tokenEnd = "Read @readme.md".length;
+  function mountDraft() {
+    const mounted = mount({ value: draft, mentionTokens: ["@readme.md"] });
+    return { ...mounted, editor: EditorView.findFromDOM(mounted.content)! };
+  }
+  const caretAt = (editor: EditorView, offset: number) =>
+    act(() => editor.dispatch({ selection: { anchor: offset } }));
+
+  it("steps the caret over a token in one move, in both directions", () => {
+    const { editor } = mountDraft();
+    caretAt(editor, tokenEnd);
+    act(() => void cursorCharLeft(editor));
+    expect(editor.state.selection.main.head).toBe(tokenStart);
+    act(() => void cursorCharRight(editor));
+    expect(editor.state.selection.main.head).toBe(tokenEnd);
+  });
+
+  it("extends a selection over the whole token", () => {
+    const { editor } = mountDraft();
+    caretAt(editor, tokenStart);
+    act(() => void selectCharRight(editor));
+    expect(editor.state.selection.main).toMatchObject({ from: tokenStart, to: tokenEnd });
+  });
+
+  it("Backspace after a token removes the whole token", () => {
+    const { editor, target } = mountDraft();
+    caretAt(editor, tokenEnd);
+    act(() => void deleteCharBackward(editor));
+    expect(target().value).toBe("Read  now");
+  });
+
+  it("leaves plain text around a token to move one character at a time", () => {
+    const { editor } = mountDraft();
+    caretAt(editor, tokenEnd + 2);
+    act(() => void cursorCharLeft(editor));
+    expect(editor.state.selection.main.head).toBe(tokenEnd + 1);
+  });
+});
+
+describe("CodeMirrorComposerInput command token", () => {
+  const commandMarks = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll('[data-testid="composer-command-token"]')).map(
+      (token) => [token.textContent, token.className],
+    );
+
+  it("tints the leading command like the textarea's mirror, leaving its arguments plain", () => {
+    const { container } = mount({ value: "  /context review this", commandToken: "/context" });
+    expect(commandMarks(container)).toEqual([["/context", COMMAND_TOKEN_CLASS]]);
+  });
+
+  it("follows the token as it changes, and marks nothing for prose", () => {
+    const view = mount({ value: "/context", commandToken: "/context" });
+    view.rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value="/context"
+        commandToken={null}
+      />,
+    );
+    expect(commandMarks(view.container)).toEqual([]);
+    view.rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value="/review"
+        commandToken="/review"
+      />,
+    );
+    expect(commandMarks(view.container)).toEqual([["/review", COMMAND_TOKEN_CLASS]]);
+  });
+
+  it("tints a placed `!` behind a control character, with its command right after it", () => {
+    const { container } = mount({ value: "\x01!pwd", commandToken: { token: "!", start: 1 } });
+    expect(commandMarks(container)).toEqual([["!", COMMAND_TOKEN_CLASS]]);
+  });
+
+  it("places a token by the value's offset when the editor folds its CRLF line breaks", () => {
+    const view = mount({ value: "\r\n!ls", commandToken: { token: "!", start: 2 } });
+    expect(commandMarks(view.container)).toEqual([["!", COMMAND_TOKEN_CLASS]]);
+
+    // A new value and token reconfigure the mark through the same offset mapping.
+    view.rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value={"\r\n\r\n!ls"}
+        commandToken={{ token: "!", start: 4 }}
+      />,
+    );
+    expect(commandMarks(view.container)).toEqual([["!", COMMAND_TOKEN_CLASS]]);
+    expect(view.container.querySelector(".cm-content")?.textContent).toBe("!ls");
+  });
+
+  it("never marks text the token no longer leads, even before the token prop catches up", () => {
+    const { container, target } = mount({ value: "/context", commandToken: "/context" });
+    act(() => {
+      insertComposerText(target(), "s", "/context".length, "/context".length);
+    });
+    expect(commandMarks(container)).toEqual([]);
+  });
+});
+
+describe("leadingCommandSpan", () => {
+  it("finds the token after leading whitespace, and only as a whole leading word", () => {
+    expect(leadingCommandSpan("/context", "/context")).toEqual({ start: 0, end: 8 });
+    expect(leadingCommandSpan("\n  /context now", "/context")).toEqual({ start: 3, end: 11 });
+    // A known command's full name may hold a space.
+    expect(leadingCommandSpan("/review pr now", "/review pr")).toEqual({ start: 0, end: 10 });
+    expect(leadingCommandSpan("/contexts", "/context")).toBeNull();
+    expect(leadingCommandSpan("say /context", "/context")).toBeNull();
+    expect(leadingCommandSpan("/context", null)).toBeNull();
+  });
+
+  it("places a positioned token only where the text still holds it", () => {
+    expect(leadingCommandSpan("!ls", { token: "!", start: 0 })).toEqual({ start: 0, end: 1 });
+    expect(leadingCommandSpan("\x01!ls", { token: "!", start: 1 })).toEqual({ start: 1, end: 2 });
+    expect(leadingCommandSpan("ls", { token: "!", start: 0 })).toBeNull();
+    // The bare-string rule would refuse both: no word break after `!`, and \x01 isn't whitespace.
+    expect(leadingCommandSpan("!ls", "!")).toBeNull();
+    expect(leadingCommandSpan("\x01! ls", "!")).toBeNull();
   });
 });
