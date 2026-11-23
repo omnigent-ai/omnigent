@@ -608,6 +608,39 @@ describe("useWorkspaceAllFiles gating", () => {
   });
 });
 
+describe("useWorkspaceAllFiles while ignored files are toggled", () => {
+  it("keeps the root's rows up, but never under another session or folder", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockImplementation(async () => environmentResponse());
+    const pending = new Promise<never>(() => {});
+    // Only the first listing answers; every later one is still on its way.
+    vi.mocked(listDirectoryViaWorkspaceApi).mockImplementation(
+      async (session, path, _max, _signal, options) =>
+        session === "conv_root" && path === "" && !options?.hideIgnored
+          ? apiListing(["README.md"])
+          : pending,
+    );
+
+    const { result, rerender } = renderHook(
+      ({ id, location, hideIgnored }: { id: string; location: string; hideIgnored: boolean }) =>
+        useWorkspaceAllFiles(id, { hideIgnored }, location),
+      {
+        wrapper: stableWrapper(),
+        initialProps: { id: "conv_root", location: "", hideIgnored: false },
+      },
+    );
+    await waitFor(() => expect(result.current.data?.data).toHaveLength(1));
+
+    rerender({ id: "conv_root", location: "", hideIgnored: true });
+    expect(result.current.data?.data.map((file) => file.path)).toEqual(["README.md"]);
+
+    rerender({ id: "conv_root", location: "docs", hideIgnored: true });
+    expect(result.current.data).toBeUndefined();
+    rerender({ id: "conv_other", location: "", hideIgnored: true });
+    expect(result.current.data).toBeUndefined();
+  });
+});
+
 describe("useWorkspaceAllFiles without what Git ignores", () => {
   it.each([
     ["says so when the host left ignored files out", { ignoredHidden: true as const }, true],
