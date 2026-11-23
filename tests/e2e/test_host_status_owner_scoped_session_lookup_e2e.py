@@ -36,14 +36,13 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 
+from omnigent.server.auth import LEVEL_READ
 from tests._helpers.live_server import isolated_local_server, upload_agent
 from tests.e2e.conftest import lookup_agent_id
 from tests.e2e.test_host_e2e import _spawn_host_daemon, _wait_for_host_online
 
 pytestmark = pytest.mark.timeout(300)
 
-# Mirrored from omnigent/server/auth.py so a renumbering fails loudly.
-_LEVEL_READ = 1
 # A uvicorn access line for a session list sent by the CLI, e.g.
 # ``"GET /v1/sessions?limit=1000&... HTTP/1.1" 200 OK 6.0ms rid=... ua="omnigent-cli/..."``.
 _CLI_SESSION_LIST_REQUEST = re.compile(
@@ -105,7 +104,7 @@ def _share_another_users_session(base_url: str, tmp_path: Path) -> str:
         (session_id,) = _listed_ids(bob, visibility="mine")
         grant = bob.put(
             f"/v1/sessions/{session_id}/permissions",
-            json={"user_id": "local", "level": _LEVEL_READ},
+            json={"user_id": "local", "level": LEVEL_READ},
         )
         assert grant.status_code == 200, grant.text
     return session_id
