@@ -196,7 +196,7 @@ def test_grants_and_account_cleanup_work_for_a_store_without_uuid_ids(
     assert [item.gadget.id for item in access.shared_with(BOB).items] == [board.id]
 
     # Deleting Alice's account removes her gadgets and every grant on them.
-    DeletedAccountGadgets(store, access).delete_owned(ALICE)
+    DeletedAccountGadgets(store, access).delete_owned(ALICE, None)
     assert store.get(board.id) is None and store.get(report.id) is None
     assert grants.list_for_gadget(board.id) == ([], None)
     assert grants.resolve_gadget_access([CAROL], report.id) is None

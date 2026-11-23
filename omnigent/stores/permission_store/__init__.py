@@ -325,6 +325,20 @@ class PermissionStore(ABC):
         """
         return set()
 
+    def account_registrations(self, user_ids: Sequence[str]) -> dict[str, str]:  # noqa: ARG002
+        """Name the current registration of each live account among *user_ids*, in one batch.
+
+        A registration (:func:`omnigent.db.account_authority.account_registration`) outlives
+        password changes and ends with the account, so a username registered again gets a
+        new one. Gadgets belong to a registration. IDs with no live account row, or a row
+        without a registration (an SSO-supplied identity), are left out. The default knows
+        of none, so every owner is the same ``None`` registration.
+
+        :param user_ids: User IDs, e.g. a viewer and the owners of a page of gadgets.
+        :returns: e.g. ``{"alice": "r1767225600"}``.
+        """
+        return {}
+
     @abstractmethod
     def user_exists(self, user_id: str) -> bool:
         """Check whether a user row exists, without creating it.

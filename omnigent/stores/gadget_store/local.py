@@ -11,7 +11,7 @@ Layout under ``storage_location`` (by default ``<data_dir>/gadgets``)::
     .trash/                          # deleted scopes being removed; emptied on start
 
 Owner and user keys are SHA-256 prefixes of the user ID and, for an account with a
-generation, that generation, so any ID is a safe directory name and a username
+registration, that registration, so any ID is a safe directory name and a username
 registered again starts with nothing. Owner markers fill numbered segments of about
 :data:`_OWNER_SEGMENT_SIZE` in creation order (the gadget's metadata names its
 segment), and ``head.json`` names the first and newest segments, so a page of a user's
@@ -67,8 +67,8 @@ _METADATA_KIND = "omnigent.gadget.v1"
 _ORPHAN_AGE_S = 60 * 60
 
 
-def _user_key(user_id: str, generation: str | None = None) -> str:
-    material = user_id if generation is None else f"{user_id}\n{generation}"
+def _user_key(user_id: str, registration: str | None = None) -> str:
+    material = user_id if registration is None else f"{user_id}\n{registration}"
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
@@ -284,8 +284,8 @@ class LocalGadgetStore(GadgetStore):
     def _gadget_dir(self, gadget_id: str) -> Path:
         return self._root / "gadgets" / gadget_id
 
-    def _owner_dir(self, owner_id: str, generation: str | None = None) -> Path:
-        return self._root / "owners" / _user_key(owner_id, generation)
+    def _owner_dir(self, owner_id: str, registration: str | None = None) -> Path:
+        return self._root / "owners" / _user_key(owner_id, registration)
 
     def _read_metadata(self, gadget_id: str) -> Gadget | None:
         found = self._read_record(gadget_id)
@@ -301,7 +301,7 @@ class LocalGadgetStore(GadgetStore):
         except NotFound:
             return None
         owner, name, created_at = raw.get("owner_id"), raw.get("name"), raw.get("created_at")
-        segment, generation = raw.get("owner_segment"), raw.get("owner_generation")
+        segment, registration = raw.get("owner_segment"), raw.get("owner_registration")
         if (
             raw.get("kind") != _METADATA_KIND
             or raw.get("id") != gadget_id
@@ -310,7 +310,7 @@ class LocalGadgetStore(GadgetStore):
             or not isinstance(created_at, int | float)
             or not isinstance(segment, str)
             or _OWNER_SEGMENT.fullmatch(segment) is None
-            or not (generation is None or isinstance(generation, str))
+            or not (registration is None or isinstance(registration, str))
         ):
             raise CorruptData("Invalid gadget metadata")
         gadget = Gadget(
@@ -318,7 +318,7 @@ class LocalGadgetStore(GadgetStore):
             owner_id=owner,
             name=name,
             created_at=float(created_at),
-            owner_generation=generation,
+            owner_registration=registration,
         )
         return gadget, segment
 
@@ -331,7 +331,7 @@ class LocalGadgetStore(GadgetStore):
             "name": gadget.name,
             "created_at": gadget.created_at,
             "owner_segment": segment,
-            "owner_generation": gadget.owner_generation,
+            "owner_registration": gadget.owner_registration,
         }
 
     def _new_id(self) -> str:
@@ -375,15 +375,15 @@ class LocalGadgetStore(GadgetStore):
         self._write_head(owner_dir, first, last + 1)
         return self._segment_name(last + 1)
 
-    def create(self, owner_id: str, name: str, *, owner_generation: str | None = None) -> Gadget:
+    def create(self, owner_id: str, name: str, *, owner_registration: str | None = None) -> Gadget:
         gadget = Gadget(
             id=self._new_id(),
             owner_id=owner_id,
             name=name,
             created_at=time.time(),
-            owner_generation=owner_generation,
+            owner_registration=owner_registration,
         )
-        owner_dir = self._owner_dir(owner_id, owner_generation)
+        owner_dir = self._owner_dir(owner_id, owner_registration)
         with self._owner_lock:
             segment = self._segment_with_room(owner_dir)
             (owner_dir / segment).mkdir(parents=True, exist_ok=True)
@@ -425,11 +425,11 @@ class LocalGadgetStore(GadgetStore):
         *,
         limit: int,
         after: str | None = None,
-        owner_generation: str | None = None,
+        owner_registration: str | None = None,
     ) -> tuple[list[Gadget], str | None]:
         if type(limit) is not int or not 1 <= limit <= MAX_OWNED_PAGE_SIZE:
             raise InvalidInput(f"limit must be an integer in 1..{MAX_OWNED_PAGE_SIZE}")
-        owner_dir = self._owner_dir(owner_id, owner_generation)
+        owner_dir = self._owner_dir(owner_id, owner_registration)
         first, last = self._read_head(owner_dir)
         start_number, start_id = first, ""
         if after is not None:
@@ -467,7 +467,7 @@ class LocalGadgetStore(GadgetStore):
                 if (
                     gadget is not None
                     and gadget.owner_id == owner_id
-                    and gadget.owner_generation == owner_generation
+                    and gadget.owner_registration == owner_registration
                 ):
                     owned.append(gadget)
                 else:
@@ -484,7 +484,7 @@ class LocalGadgetStore(GadgetStore):
                 return None
             current, segment = found
             renamed = Gadget(
-                current.id, current.owner_id, name, current.created_at, current.owner_generation
+                current.id, current.owner_id, name, current.created_at, current.owner_registration
             )
             try:
                 _replace_file(
@@ -511,7 +511,7 @@ class LocalGadgetStore(GadgetStore):
                 os.replace(self._gadget_dir(gadget_id), trash)
             except FileNotFoundError:
                 return False
-        owner_dir = self._owner_dir(gadget.owner_id, gadget.owner_generation)
+        owner_dir = self._owner_dir(gadget.owner_id, gadget.owner_registration)
         with contextlib.suppress(FileNotFoundError):
             (owner_dir / segment / gadget_id).unlink()
         with contextlib.suppress(OSError):
@@ -527,18 +527,18 @@ class LocalGadgetStore(GadgetStore):
             self._gadget_dir(gadget_id) / "files", self._tmp_dir, create_root=False
         )
 
-    def _user_dir(self, user_id: str, generation: str | None = None) -> Path:
-        return self._root / "users" / _user_key(user_id, generation)
+    def _user_dir(self, user_id: str, registration: str | None = None) -> Path:
+        return self._root / "users" / _user_key(user_id, registration)
 
-    def user_files(self, user_id: str, *, owner_generation: str | None = None) -> GadgetFiles:
-        return LocalGadgetFiles(self._user_dir(user_id, owner_generation), self._tmp_dir)
+    def user_files(self, user_id: str, *, owner_registration: str | None = None) -> GadgetFiles:
+        return LocalGadgetFiles(self._user_dir(user_id, owner_registration), self._tmp_dir)
 
-    def delete_user_files(self, user_id: str, *, owner_generation: str | None = None) -> None:
-        key = _user_key(user_id, owner_generation)
+    def delete_user_files(self, user_id: str, *, owner_registration: str | None = None) -> None:
+        key = _user_key(user_id, owner_registration)
         trash = self._root / ".trash" / f"user-{key}-{uuid.uuid4().hex}"
         trash.parent.mkdir(parents=True, exist_ok=True)
         try:
-            os.replace(self._user_dir(user_id, owner_generation), trash)
+            os.replace(self._user_dir(user_id, owner_registration), trash)
         except FileNotFoundError:
             return
         shutil.rmtree(trash, ignore_errors=True)

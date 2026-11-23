@@ -161,12 +161,13 @@ class GadgetViewer:
     """The caller.
 
     :param user_id: e.g. ``"alice@example.com"``; ``"local"`` in single-user mode.
-    :param generation: The account's generation on a server with built-in accounts,
-        else ``None``; the viewer owns only the gadgets created under it.
+    :param registration: The account's registration on a server with built-in accounts
+        (:meth:`PermissionStore.account_registrations`), else ``None``; the viewer owns
+        only the gadgets created under it.
     """
 
     user_id: str
-    generation: str | None = None
+    registration: str | None = None
 
     @property
     def key(self) -> str:
@@ -479,7 +480,7 @@ class GadgetService:
 
     def create(self, name: Any) -> dict:
         gadget = self.store.create(
-            self.viewer.user_id, _gadget_name(name), owner_generation=self.viewer.generation
+            self.viewer.user_id, _gadget_name(name), owner_registration=self.viewer.registration
         )
         return self._app(gadget, self.access.permissions(self.viewer.user_id, gadget))
 
@@ -492,7 +493,7 @@ class GadgetService:
             self.viewer.user_id,
             limit=_page_limit(limit, MAX_OWNED_PAGE_SIZE),
             after=cursor,
-            owner_generation=self.viewer.generation,
+            owner_registration=self.viewer.registration,
         )
         return {
             "items": [
@@ -518,7 +519,7 @@ class GadgetService:
         names = self._display_names(owners) if self._display_names and owners else {}
         items = []
         for item in shared:
-            if owned_by(item.gadget, self.viewer.user_id, self.viewer.generation):
+            if owned_by(item.gadget, self.viewer.user_id, self.viewer.registration):
                 continue
             permissions = self.access.permissions(self.viewer.user_id, item.gadget)
             if not permissions.read:
@@ -578,7 +579,9 @@ class GadgetService:
     @property
     def _shelf(self) -> ImmutableDocumentStore:
         return ImmutableDocumentStore(
-            self.store.user_files(self.viewer.user_id, owner_generation=self.viewer.generation),
+            self.store.user_files(
+                self.viewer.user_id, owner_registration=self.viewer.registration
+            ),
             SHELF_ROOT,
             limits=_STATE_STORE_LIMITS,
         )
@@ -621,7 +624,9 @@ class GadgetService:
         }
 
     def _owns_any(self) -> bool:
-        return self.store.owns_any(self.viewer.user_id, owner_generation=self.viewer.generation)
+        return self.store.owns_any(
+            self.viewer.user_id, owner_registration=self.viewer.registration
+        )
 
     def shelf(self, limit: Any = MAX_PINNED_GADGETS, cursor: Any = None) -> dict:
         """One page of the viewer's pinned gadgets, and whether they own any, for the sidebar.

@@ -408,14 +408,14 @@ def test_emptied_segments_and_markers_a_deletion_left_dont_count_as_owned(
     assert store.owns_any(ALICE) is True
 
 
-def test_an_owner_generation_is_its_own_account(store: LocalGadgetStore) -> None:
-    old = store.create(ALICE, "Old", owner_generation="g1")
-    store.user_files(ALICE, owner_generation="g1").mkdirs("shelf")
-    new = store.create(ALICE, "New", owner_generation="g2")
+def test_an_owner_registration_is_its_own_account(store: LocalGadgetStore) -> None:
+    old = store.create(ALICE, "Old", owner_registration="g1")
+    store.user_files(ALICE, owner_registration="g1").mkdirs("shelf")
+    new = store.create(ALICE, "New", owner_registration="g2")
 
-    assert [g.id for g in store.iter_owned(ALICE, owner_generation="g2")] == [new.id]
-    assert store.get(old.id).owner_generation == "g1"
+    assert [g.id for g in store.iter_owned(ALICE, owner_registration="g2")] == [new.id]
+    assert store.get(old.id).owner_registration == "g1"
     with pytest.raises(NotFound):
-        store.user_files(ALICE, owner_generation="g2").list_paths("shelf")
-    store.delete_user_files(ALICE, owner_generation="g2")
-    assert store.user_files(ALICE, owner_generation="g1").list_paths("shelf") == []
+        store.user_files(ALICE, owner_registration="g2").list_paths("shelf")
+    store.delete_user_files(ALICE, owner_registration="g2")
+    assert store.user_files(ALICE, owner_registration="g1").list_paths("shelf") == []

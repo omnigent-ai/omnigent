@@ -4639,7 +4639,9 @@ def create_app(
         # Deleting an account deletes its gadgets, which live outside the database.
         if account_store is not None and hasattr(account_store, "attach_gadgets"):
             account_store.attach_gadgets(
-                DeletedAccountGadgets(gadget_store, resolved_gadget_access)
+                DeletedAccountGadgets(
+                    gadget_store, resolved_gadget_access, enabled=app.state.gadgets_available
+                )
             )
         app.include_router(
             gadgets.create_gadgets_router(

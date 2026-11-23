@@ -24,13 +24,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from starlette.responses import JSONResponse, Response
 
-from omnigent.db.account_authority import account_generation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.gadgets.access import GadgetAccess
 from omnigent.gadgets.actions import ACTION_STATES
 from omnigent.gadgets.constraints import ConstraintViolation
 from omnigent.gadgets.progress import SessionStateReader
-from omnigent.gadgets.registration import gadget_registration
 from omnigent.gadgets.service import GadgetError, GadgetService, GadgetViewer, canonical_bytes
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags
@@ -262,10 +260,11 @@ def create_gadgets_router(
 
     def _viewer(request: Request) -> GadgetViewer:
         user_id = require_user(request, auth_provider) or RESERVED_USER_LOCAL
-        # A password change rotates the generation; the gadgets stay the registration's.
-        return GadgetViewer(
-            user_id, gadget_registration(gadget_store, user_id, account_generation(user_id))
+        # Gadgets belong to the account's registration, which a password change keeps.
+        registrations = (
+            permission_store.account_registrations([user_id]) if permission_store else {}
         )
+        return GadgetViewer(user_id, registrations.get(user_id))
 
     def _sessions(user_id: str) -> SessionStateReader:
         def can_read(session_id: str) -> bool:

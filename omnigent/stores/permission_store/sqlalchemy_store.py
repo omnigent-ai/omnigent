@@ -19,7 +19,12 @@ from sqlalchemy.orm import InstrumentedAttribute, Session
 from sqlalchemy.sql.dml import Insert
 from sqlalchemy.sql.elements import ColumnElement
 
-from omnigent.db.account_authority import account_generation, lock_account, require_active_account
+from omnigent.db.account_authority import (
+    account_generation,
+    account_registration,
+    lock_account,
+    require_active_account,
+)
 from omnigent.db.db_models import (
     SqlGadgetShare,
     SqlScheduledTask,
@@ -1121,6 +1126,32 @@ class SqlAlchemyPermissionStore(PermissionStore):
         with self._session("read_deleted_accounts") as session:
             deleted = session.execute(select(*probes)).one()
         return {user_id for user_id, gone in zip(wanted, deleted, strict=True) if gone}
+
+    def account_registrations(self, user_ids: Sequence[str]) -> dict[str, str]:
+        """Name each live account's registration. See base class.
+
+        One primary-key probe per ID in a single statement, so each comes back as given.
+        """
+        wanted = sorted(set(user_ids))
+        if not wanted:
+            return {}
+        probes = [
+            select(SqlUser.created_at)
+            .where(
+                SqlUser.workspace_id == current_workspace_id(),
+                SqlUser.id == user_id,
+                SqlUser.deleted_at.is_(None),
+            )
+            .scalar_subquery()
+            for user_id in wanted
+        ]
+        with self._session("read_account_registrations") as session:
+            created = session.execute(select(*probes)).one()
+        found = {
+            user_id: account_registration(created_at)
+            for user_id, created_at in zip(wanted, created, strict=True)
+        }
+        return {user_id: name for user_id, name in found.items() if name is not None}
 
     def user_exists(self, user_id: str) -> bool:
         """Check for a user row. See base class for contract."""

@@ -1561,12 +1561,13 @@ def test_prompt_write_rechecks_the_admin_under_its_lock(db_uri: str) -> None:
 
 def _gadgets(db_uri: str, tmp_path, accounts: SqlAlchemyAccountStore):
     from omnigent.gadgets.access import PermissionStoreGadgetAccess
-    from omnigent.gadgets.accounts import DeletedAccountGadgets, gadget_registration
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
     from omnigent.gadgets.service import GadgetService, GadgetViewer
     from omnigent.stores.gadget_store.local import LocalGadgetStore
 
     store = LocalGadgetStore(str(tmp_path / "gadgets"))
-    access = PermissionStoreGadgetAccess(store, SqlAlchemyPermissionStore(db_uri))
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    access = PermissionStoreGadgetAccess(store, permissions)
     accounts.attach_gadgets(DeletedAccountGadgets(store, access))
 
     class AsAccount:
@@ -1577,7 +1578,8 @@ def _gadgets(db_uri: str, tmp_path, accounts: SqlAlchemyAccountStore):
             self.generation = account.account_generation if account is not None else None
             self.user = user
             # As the gadget routes resolve a request's viewer.
-            viewer = GadgetViewer(user, gadget_registration(store, user, self.generation))
+            self.registration = permissions.account_registrations([user]).get(user)
+            viewer = GadgetViewer(user, self.registration)
             self.service = GadgetService(store, access, viewer)
 
         def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
@@ -1608,7 +1610,7 @@ def test_deletion_removes_the_accounts_gadgets_and_who_they_were_shared_with(
     alice.pin(kept["id"], {"pinned": True})
 
     assert accounts.delete_user("alice") is True
-    assert list(store.iter_owned("alice", owner_generation=alice.generation)) == []
+    assert list(store.iter_owned("alice", owner_registration=alice.registration)) == []
     assert store.get(board["id"]) is None
     assert permissions.list_for_gadget(board["id"]) == ([], None)
     assert access.shared_with("bob").items == []
@@ -1637,10 +1639,65 @@ def test_a_password_change_keeps_the_accounts_gadgets_and_pins(db_uri: str, tmp_
         accounts.update_password("alice", f"hash-{round_}", revoke_sessions=True)
     after = service("alice")
     assert after.generation != before.generation
+    assert after.registration == before.registration
     assert [item["id"] for item in after.list_owned()["items"]] == [board["id"]]
     assert [pin["id"] for pin in after.shelf()["pinned"]] == [board["id"]]
     assert after.get(board["id"])["id"] == board["id"]
     assert [item.gadget.id for item in access.shared_with("bob").items] == [board["id"]]
+
+
+@pytest.mark.parametrize("failure", ["corrupt", "unwritable"])
+def test_a_password_change_needs_nothing_from_the_gadget_store(
+    db_uri: str, tmp_path, monkeypatch, failure: str
+) -> None:
+    from omnigent.stores.gadget_store import CorruptData
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    store, _, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    before = service("alice")
+    board = before.create("Synthetic board")
+    before.pin(board["id"], {"pinned": True})
+
+    error = CorruptData("Invalid file") if failure == "corrupt" else PermissionError("read-only")
+
+    def broken(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise error
+
+    # The gadget store is broken while the password changes: it is never asked.
+    for name in ("user_files", "create", "get", "iter_owned", "delete_user_files"):
+        monkeypatch.setattr(store, name, broken)
+    generation = accounts.update_password("alice", "hash-1", revoke_sessions=True)
+    assert generation is not None and generation != before.generation
+    assert not accounts.accepts_generation("alice", before.generation)
+    monkeypatch.undo()
+
+    after = service("alice")
+    assert [item["id"] for item in after.list_owned()["items"]] == [board["id"]]
+    assert [pin["id"] for pin in after.shelf()["pinned"]] == [board["id"]]
+
+
+def test_with_gadgets_off_deleting_an_account_leaves_the_gadget_store_alone(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    from omnigent.gadgets.access import PermissionStoreGadgetAccess
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    access = PermissionStoreGadgetAccess(store, SqlAlchemyPermissionStore(db_uri))
+    accounts.attach_gadgets(DeletedAccountGadgets(store, access, enabled=lambda: False))
+
+    def untouched(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("the gadget store was used")
+
+    for name in ("user_files", "iter_owned", "delete", "delete_user_files"):
+        monkeypatch.setattr(store, name, untouched)
+    accounts.create_user_with_password("alice", "alice-hash")
+    accounts.update_password("alice", "hash-1", revoke_sessions=True)
+    assert accounts.delete_user("alice") is True
+    assert accounts.create_user_with_password("alice", "replacement-hash").id == "alice"
 
 
 def test_deleting_an_account_after_password_changes_removes_its_gadgets_for_good(
@@ -1695,30 +1752,40 @@ def test_reregistration_finishes_removing_the_gadget_grants_a_deleted_account_he
     assert service("alice").shared() == {"items": [], "next_cursor": None}
 
 
-def test_reregistration_waits_until_the_deleted_accounts_gadgets_are_gone(
+def test_a_name_registered_again_before_the_gadget_cleanup_inherits_nothing(
     db_uri: str, tmp_path, monkeypatch
 ) -> None:
     accounts = SqlAlchemyAccountStore(db_uri)
-    store, _, service = _gadgets(db_uri, tmp_path, accounts)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    store, access, service = _gadgets(db_uri, tmp_path, accounts)
     accounts.create_user_with_password("alice", "alice-hash")
-    board = service("alice").create("Synthetic board")
+    permissions.ensure_user("bob")
+    old_alice = service("alice")
+    board = old_alice.create("Synthetic board")
+    permissions.grant_for_gadget("bob", board["id"], 1)
     original = store.delete
-    # The gadget store is unavailable while the account is deleted and re-registered.
+    # The gadget store can't delete while the account is deleted and registered again.
     monkeypatch.setattr(store, "delete", lambda gadget_id: False)
+    monkeypatch.setattr(
+        accounts_module, "delete_deleted_account_gadget_grants", lambda *args, **kwargs: 0
+    )
     assert accounts.delete_user("alice") is True
-    assert store.get(board["id"]) is not None
-    with pytest.raises(OmnigentError) as refused:
-        accounts.create_user_with_password("alice", "replacement-hash")
-    assert refused.value.code == ErrorCode.CONFLICT
-    assert "gadgets" in refused.value.message
-    assert accounts.get_user("alice") is None
-
-    monkeypatch.setattr(store, "delete", original)
     assert accounts.create_user_with_password("alice", "replacement-hash").id == "alice"
+
+    # The old gadget is still stored, but neither the new Alice nor Bob reaches it.
+    assert store.get(board["id"]) is not None
+    alice = service("alice")
+    assert alice.list_owned() == {"items": [], "next_cursor": None}
+    assert access.permissions("alice", store.get(board["id"])).read is False
+    assert access.permissions("bob", store.get(board["id"])).read is False
+    assert access.shared_with("bob").items == []
+
+    # A later cleanup removes it, and never the new account's gadgets.
+    mine = alice.create("New board")
+    assert alice.registration != old_alice.registration
+    monkeypatch.setattr(store, "delete", original)
+    accounts._gadgets.delete_owned("alice", old_alice.registration)
     assert store.get(board["id"]) is None
-    # A live account's gadgets are never touched by a late cleanup.
-    mine = service("alice").create("New board")
-    accounts._delete_deleted_gadgets("alice")
     assert store.get(mine["id"]) is not None
 
 
@@ -1771,11 +1838,12 @@ def test_a_username_registered_again_cannot_reach_a_copy_of_the_old_accounts_gad
     root_a = LocalGadgetStore(str(tmp_path / "a"))
     root_b, _, _ = _gadgets(db_uri, tmp_path / "b", accounts)
     old = accounts.create_user_with_password("alice", "alice-hash")
+    old_registration = permissions.account_registrations(["alice"])["alice"]
     with account_authority_scope("alice", old.account_generation):
         board = GadgetService(
             root_a,
             PermissionStoreGadgetAccess(root_a, permissions),
-            GadgetViewer("alice", old.account_generation),
+            GadgetViewer("alice", old_registration),
         ).create("Synthetic board")
 
     # Deleted and registered again through server B, which never had the gadget.
@@ -1783,7 +1851,9 @@ def test_a_username_registered_again_cannot_reach_a_copy_of_the_old_accounts_gad
     new = accounts.create_user_with_password("alice", "replacement-hash")
 
     access_a = PermissionStoreGadgetAccess(root_a, permissions)
-    service_a = GadgetService(root_a, access_a, GadgetViewer("alice", new.account_generation))
+    new_registration = permissions.account_registrations(["alice"])["alice"]
+    assert new_registration != old_registration
+    service_a = GadgetService(root_a, access_a, GadgetViewer("alice", new_registration))
     with account_authority_scope("alice", new.account_generation):
         with pytest.raises(StoreNotFound):
             service_a.get(board["id"])

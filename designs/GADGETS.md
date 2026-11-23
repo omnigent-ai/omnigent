@@ -54,7 +54,9 @@ A deployment can replace three pieces without forking:
 | Frame | sandboxed `srcdoc` iframe | the web host config's gadget frame, for hosts that serve gadgets from an isolated origin |
 
 `create_app(gadget_store=..., gadget_access=...)` takes custom implementations; the CLI passes
-the defaults.
+the defaults. Grants live in the server's shared database, but the default store is a local
+directory: replicas that serve the same gadgets need one shared directory that supports its
+atomic file operations (create-only `link`, `rename`), or a shared custom store.
 
 ### Why a document store, not the relational stores
 
@@ -136,11 +138,13 @@ What a gadget keeps, and how long:
 | Can edit (`LEVEL_EDIT`) | yes | yes | yes | |
 | Can manage (`LEVEL_MANAGE`), owner | yes | yes | yes | yes |
 
-Only those who may publish read unpublished revisions. Deleting an account deletes the gadgets
-it owns, with their grants and its shelf, and its username cannot be registered again until
-they are gone, as for workflows. A password change or reset revokes the account's sessions but
-not its gadgets: gadgets and the shelf belong to the registration, and each new generation is
-linked to it, while a username registered again starts with none.
+Only those who may publish read unpublished revisions. Gadgets and the shelf belong to the
+account's registration, named by its account row's creation time: a password change or reset
+revokes the account's sessions but keeps the registration, so nothing in the gadget store
+changes, while a username registered again gets a new registration and starts with nothing.
+Deleting an account deletes its registration's gadgets, with their grants and its shelf, once
+the deletion commits; until that cleanup finishes, they are shared with no one, even if the
+username is registered again meanwhile.
 
 The frame's write and action controls follow these: the SDK disables controls marked
 `data-omnigent-requires="write"` or `"action"` for viewers without that access.
@@ -163,6 +167,24 @@ When the frame loads a second document, the web app closes its port at once, sto
 and tells the viewer, who can reload it; it does not reload it on its own. A gadget is written by
 an agent working for someone who can publish it, so the risk is a page that an agent was
 manipulated into writing; review a gadget before granting it session access.
+
+## Actions need a gesture
+
+A frame call that acts for the viewer (an action request, a navigation) is allowed only right
+after a real gesture inside the gadget. The gadget's own script runs in the frame and can call
+the SDK at any time, so the web app (`gadgetGestureGate.ts`) reads only host-side state:
+
+- Transient user activation (`navigator.userActivation.isActive`). A click anywhere in the page
+  sets it for a few seconds, so alone it proves nothing; without the API, the frame gets the same
+  few seconds from the moment it took focus, so a gadget left focused can't act later.
+- The frame is the focused element. A click or Tab into the frame focuses it, a click elsewhere
+  moves focus away, and a cross-origin frame cannot take focus by script without a gesture.
+- No gesture reached Omnigent's own document since the frame took focus, because some host
+  controls keep focus where it was on mousedown.
+- The gesture is unused. The host can't see clicks inside the frame, so after each decision it
+  moves focus to the frame's container (Tab goes back in), and the next gesture inside focuses the
+  frame again. A frame that refocuses itself needs its own activation, and calls are spaced at
+  least a second apart, which bounds what one click can start.
 
 ## Not in scope
 

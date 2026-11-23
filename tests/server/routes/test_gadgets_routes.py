@@ -614,8 +614,9 @@ async def test_store_conflicts_carry_their_reason_and_busy_ones_are_retryable() 
     assert error["details"] == {"reason": "busy", "retryable": True}
 
 
-async def test_the_app_has_account_deletion_remove_gadgets(
-    stores: SimpleNamespace, tmp_path: Path
+@pytest.mark.parametrize("features", ["gadgets", ""])
+async def test_the_app_has_account_deletion_remove_gadgets_only_with_the_feature(
+    stores: SimpleNamespace, tmp_path: Path, features: str
 ) -> None:
     from omnigent.gadgets.accounts import DeletedAccountGadgets
     from omnigent.server.accounts_store import SqlAlchemyAccountStore
@@ -623,6 +624,7 @@ async def test_the_app_has_account_deletion_remove_gadgets(
     accounts = SqlAlchemyAccountStore(stores.db_uri)
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
     create_app(
+        feature_flags=resolve_feature_flags({"OMNIGENT_FEATURES": features}),
         agent_store=SqlAlchemyAgentStore(stores.db_uri),
         file_store=SqlAlchemyFileStore(stores.db_uri),
         conversation_store=stores.conversations,
@@ -634,6 +636,8 @@ async def test_the_app_has_account_deletion_remove_gadgets(
         gadget_store=stores.gadgets,
     )
     assert isinstance(accounts._gadgets, DeletedAccountGadgets)
+    # With gadgets off, deleting an account doesn't touch the gadget store.
+    assert accounts._gadgets._enabled() is bool(features)
 
 
 def test_a_session_id_that_is_not_a_uuid_is_left_to_the_permission_store(

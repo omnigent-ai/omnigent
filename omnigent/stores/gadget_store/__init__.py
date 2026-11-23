@@ -154,16 +154,16 @@ class Gadget:
     :param owner_id: The owner's user ID, e.g. ``"alice@example.com"``.
     :param name: Display name, 1 to :data:`MAX_GADGET_NAME_CHARS` characters.
     :param created_at: Epoch seconds.
-    :param owner_generation: The owner account's generation when it was created, for a
-        server with built-in accounts, or ``None``. A username registered again gets a new
-        generation, so the new account never owns the old one's gadgets.
+    :param owner_registration: The owner's account registration, for a server with built-in
+        accounts, or ``None``. A password change keeps it; a username registered again gets
+        a new one, so the new account never owns the old one's gadgets.
     """
 
     id: str
     owner_id: str
     name: str
     created_at: float
-    owner_generation: str | None = None
+    owner_registration: str | None = None
 
 
 class GadgetFiles(ABC):
@@ -264,12 +264,12 @@ class GadgetStore(ABC):
         self.storage_location = storage_location
 
     @abstractmethod
-    def create(self, owner_id: str, name: str, *, owner_generation: str | None = None) -> Gadget:
+    def create(self, owner_id: str, name: str, *, owner_registration: str | None = None) -> Gadget:
         """Create a gadget with a new ID (see :data:`GADGET_ID_PATTERN`), owned by *owner_id*.
 
         IDs are never reused, even after a delete: grants and cleanup rely on that.
 
-        :param owner_generation: See :attr:`Gadget.owner_generation`.
+        :param owner_registration: See :attr:`Gadget.owner_registration`.
         """
 
     @abstractmethod
@@ -295,11 +295,11 @@ class GadgetStore(ABC):
         *,
         limit: int,
         after: str | None = None,
-        owner_generation: str | None = None,
+        owner_registration: str | None = None,
     ) -> tuple[list[Gadget], str | None]:
         """One page of the gadgets *owner_id* owns, in an order the store keeps stable.
 
-        Only gadgets created with *owner_generation* count as that owner's.
+        Only gadgets created with *owner_registration* count as that owner's.
 
         Each page must cost bounded work, whatever the owner's count (an ordered index,
         not a scan of every gadget they own).
@@ -312,7 +312,7 @@ class GadgetStore(ABC):
         """
 
     def iter_owned(
-        self, owner_id: str, *, owner_generation: str | None = None
+        self, owner_id: str, *, owner_registration: str | None = None
     ) -> Iterator[Gadget]:
         """Every gadget *owner_id* owns, read one page at a time as the caller goes.
 
@@ -325,13 +325,13 @@ class GadgetStore(ABC):
                 owner_id,
                 limit=MAX_OWNED_PAGE_SIZE,
                 after=cursor,
-                owner_generation=owner_generation,
+                owner_registration=owner_registration,
             )
             yield from page
             if cursor is None:
                 return
 
-    def owns_any(self, owner_id: str, *, owner_generation: str | None = None) -> bool:
+    def owns_any(self, owner_id: str, *, owner_registration: str | None = None) -> bool:
         """Whether *owner_id* still owns a gadget, for registering a deleted username again.
 
         Bounded per call: pages that hold no live gadget (stale index entries) are passed
@@ -342,7 +342,7 @@ class GadgetStore(ABC):
         cursor: str | None = None
         for _ in range(OWNS_ANY_PAGES):
             page, cursor = self.list_owned_page(
-                owner_id, limit=1, after=cursor, owner_generation=owner_generation
+                owner_id, limit=1, after=cursor, owner_registration=owner_registration
             )
             if page:
                 return True
@@ -369,9 +369,9 @@ class GadgetStore(ABC):
         """The file scope of an existing gadget."""
 
     @abstractmethod
-    def user_files(self, user_id: str, *, owner_generation: str | None = None) -> GadgetFiles:
-        """One user's own file scope, for their shelf; one per account generation."""
+    def user_files(self, user_id: str, *, owner_registration: str | None = None) -> GadgetFiles:
+        """One user's own file scope, for their shelf; one per account registration."""
 
     @abstractmethod
-    def delete_user_files(self, user_id: str, *, owner_generation: str | None = None) -> None:
+    def delete_user_files(self, user_id: str, *, owner_registration: str | None = None) -> None:
         """Delete every file in one user's scope, as when their account is deleted."""

@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import (
     account_authority_scope,
+    account_registration,
     current_account_user,
     lock_account,
     require_active_account,
@@ -71,16 +72,16 @@ _logger = logging.getLogger(__name__)
 
 
 class DeletedAccountResources(Protocol):
-    """An account's resources kept outside this database (its gadgets)."""
+    """An account's resources kept outside this database (its gadgets).
 
-    def delete_owned(self, user_id: str, generation: str | None = None) -> None:
-        """Delete everything the deleted account *user_id* (*generation*) owns there."""
+    They belong to one registration of the username (see :func:`account_registration`),
+    which a password change keeps and a new registration replaces, so nothing outside the
+    database has to change when credentials rotate, and a username registered again never
+    reaches what the deleted registration left behind.
+    """
 
-    def owns_any(self, user_id: str, generation: str | None = None) -> bool:
-        """Whether anything the deleted account *user_id* (*generation*) owns is left there."""
-
-    def carry(self, user_id: str, old: str, new: str) -> None:
-        """Keep what the account owns there when its generation rotates from *old* to *new*."""
+    def delete_owned(self, user_id: str, registration: str | None) -> None:
+        """Delete everything the deleted registration *registration* of *user_id* owns there."""
 
 
 _HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
@@ -297,8 +298,8 @@ class SqlAlchemyAccountStore:
         :returns: The created :class:`Account`.
         :raises ValueError: If a user with this id already exists.
         :raises OmnigentError: ``CONFLICT`` while a deleted account's automation or
-            workflow or gadget grants, workflows, Inbox items or gadgets under this name
-            remain; retrying can succeed.
+            workflow or gadget grants, workflows or Inbox items under this name remain;
+            retrying can succeed.
         """
         now = int(time.time())
         # Finish any held-grant cleanup a deletion left, so the name inherits nothing.
@@ -313,7 +314,11 @@ class SqlAlchemyAccountStore:
         )
         self._delete_deleted_workflows(user_id)
         self._delete_deleted_inbox_items(user_id)
-        self._delete_deleted_gadgets(user_id)
+        try:
+            # Best effort: the new registration never reaches the deleted one's gadgets.
+            self._delete_deleted_gadgets(user_id)
+        except Exception:
+            _logger.exception("Gadget cleanup deferred for a deleted account")
 
         def write(session: Session) -> Account:
             existing = lock_account(session, user_id)
@@ -344,19 +349,13 @@ class SqlAlchemyAccountStore:
                     "A deleted account's Inbox items are still being removed. Try again.",
                     code=ErrorCode.CONFLICT,
                 )
-            if (
-                existing is not None
-                and self._gadgets is not None
-                and self._gadgets.owns_any(user_id, existing.account_generation)
-            ):
-                raise OmnigentError(
-                    "A deleted account's gadgets are still being removed. Try again.",
-                    code=ErrorCode.CONFLICT,
-                )
             row = existing or SqlUser(id=user_id)
             row.is_admin = is_admin
             row.password_hash = password_hash
-            row.created_at = now
+            # The creation second names this registration (account_registration), so it must
+            # differ from the deleted one's even when the name is registered again at once.
+            previous = existing.created_at if existing is not None else None
+            row.created_at = now if previous is None else max(now, previous + 1)
             row.last_login_at = None
             row.deleted_at = None
             row.account_generation = uuid.uuid4().hex
@@ -651,17 +650,17 @@ class SqlAlchemyAccountStore:
     def _delete_deleted_gadgets(self, user_id: str) -> None:
         """Delete a tombstoned account's gadgets and shelf, which live in the gadget store.
 
-        Deletes only the gadgets of the tombstoned account's generation, so a cleanup that
-        resumes after the username was registered again never deletes the new account's.
+        Deletes only the tombstoned registration's gadgets, so a cleanup that resumes after
+        the username was registered again never deletes the new account's.
         """
         if self._gadgets is None:
             return
         with self._session("select_user_by_id") as session:
             row = session.get(SqlUser, (current_workspace_id(), user_id))
             tombstoned = row is not None and row.deleted_at is not None
-            generation = row.account_generation if row is not None else None
+            registration = account_registration(row.created_at) if row is not None else None
         if tombstoned:
-            self._gadgets.delete_owned(user_id, generation)
+            self._gadgets.delete_owned(user_id, registration)
 
     def _owned_workflow_ids(
         self, session: Session, user_id: str, *, limit: int, lock: bool = False
@@ -860,9 +859,6 @@ class SqlAlchemyAccountStore:
                 new_generation = uuid.uuid4().hex
                 if generation is not None:
                     _carry_registration_work(session, user_id, old=generation, new=new_generation)
-                    if self._gadgets is not None:
-                        # Before the commit: a failed one leaves only an unused link.
-                        self._gadgets.carry(user_id, generation, new_generation)
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(

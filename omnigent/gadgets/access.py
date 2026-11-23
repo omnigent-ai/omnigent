@@ -16,8 +16,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from omnigent.db.account_authority import account_generation
-from omnigent.gadgets.registration import gadget_registration
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.stores.gadget_store import Gadget, GadgetStore
 from omnigent.stores.permission_store import MAX_SHARED_GADGETS_PAGE_SIZE, PermissionStore
@@ -68,14 +66,15 @@ def permissions_for_level(level: int | None) -> GadgetPermissions:
     return GadgetPermissions(read=True)
 
 
-def owned_by(gadget: Gadget, user_id: str, generation: str | None) -> bool:
-    """Whether the account *user_id* (*generation*) owns *gadget*.
+def owned_by(gadget: Gadget, user_id: str, registration: str | None) -> bool:
+    """Whether *user_id*'s registration *registration* owns *gadget*.
 
-    The generation tells a username registered again from the deleted account that held
-    it before, so the new account never reaches the old one's gadgets, even where a copy
-    of them survived (another server's gadget directory).
+    The registration (:meth:`PermissionStore.account_registrations`) tells a username
+    registered again from the deleted account that held it before, so the new account never
+    reaches the old one's gadgets, even where a copy of them survived (another server's
+    gadget directory), while a password change keeps them.
     """
-    return gadget.owner_id == user_id and gadget.owner_generation == generation
+    return gadget.owner_id == user_id and gadget.owner_registration == registration
 
 
 @dataclass(frozen=True)
@@ -131,6 +130,12 @@ class GadgetAccess(ABC):
         """Drop any sharing state kept for a deleted gadget. The default keeps none."""
 
 
+def _current(gadget: Gadget, registrations: dict[str, str]) -> bool:
+    """Whether *gadget*'s owner registration is still its owner's: a username deleted and
+    registered again leaves the old registration's gadgets shared with no one."""
+    return gadget.owner_registration == registrations.get(gadget.owner_id)
+
+
 class PermissionStoreGadgetAccess(GadgetAccess):
     """Owner plus gadget grants in the :class:`PermissionStore` (see module docstring)."""
 
@@ -143,6 +148,10 @@ class PermissionStoreGadgetAccess(GadgetAccess):
         self._store = store
         self._permission_store = permission_store
 
+    def _registrations(self, user_ids: Sequence[str]) -> dict[str, str]:
+        store = self._permission_store
+        return store.account_registrations(user_ids) if store is not None else {}
+
     def _grants(self) -> PermissionStore | None:
         store = self._permission_store
         return store if store is not None and store.supports_gadget_grants else None
@@ -153,9 +162,10 @@ class PermissionStoreGadgetAccess(GadgetAccess):
     def permissions_many(
         self, viewer_id: str, gadgets: Sequence[Gadget]
     ) -> dict[str, GadgetPermissions]:
-        generation = gadget_registration(self._store, viewer_id, account_generation(viewer_id))
+        registrations = self._registrations([viewer_id, *(gadget.owner_id for gadget in gadgets)])
+        mine = registrations.get(viewer_id)
         result = {
-            gadget.id: FULL_ACCESS for gadget in gadgets if owned_by(gadget, viewer_id, generation)
+            gadget.id: FULL_ACCESS for gadget in gadgets if owned_by(gadget, viewer_id, mine)
         }
         others = [gadget for gadget in gadgets if gadget.id not in result]
         grants = self._grants()
@@ -165,7 +175,7 @@ class PermissionStoreGadgetAccess(GadgetAccess):
         deleted = grants.deleted_accounts(sorted({gadget.owner_id for gadget in others}))
         principals = grants.caller_principals(viewer_id)
         for gadget in others:
-            if gadget.owner_id in deleted:
+            if gadget.owner_id in deleted or not _current(gadget, registrations):
                 result[gadget.id] = NO_ACCESS
             else:
                 level = grants.resolve_gadget_access(principals, gadget.id)
@@ -179,20 +189,24 @@ class PermissionStoreGadgetAccess(GadgetAccess):
         if grants is None or viewer_id == RESERVED_USER_LOCAL:
             return SharedPage([], None)
         principals = grants.caller_principals(viewer_id)
-        # One page of grants per call. A grant whose gadget this store doesn't have is passed
-        # over, so a page can come back short and still continue; it is not deleted, as the
-        # gadget may live on (in another server's directory sharing this permission store).
-        # Deleting a gadget, or its owner's account, removes its grants.
+        # Skip, but do not delete, grants for gadgets absent from this store; a page can come
+        # back short and still continue.
         ids, next_cursor = grants.list_gadgets_shared_with(
             principals, limit=limit, after_gadget_id=cursor
         )
         found = self._store.get_many(ids)
         owners = sorted({gadget.owner_id for gadget in found.values()})
         deleted = grants.deleted_accounts(owners) if owners else set()
+        registrations = self._registrations(owners)
         shared: list[SharedGadget] = []
         for gadget_id in ids:
             gadget = found.get(gadget_id)
-            if gadget is None or gadget.owner_id == viewer_id or gadget.owner_id in deleted:
+            if (
+                gadget is None
+                or gadget.owner_id == viewer_id
+                or gadget.owner_id in deleted
+                or not _current(gadget, registrations)
+            ):
                 continue
             direct = grants.resolve_gadget_access([viewer_id], gadget_id) is not None
             shared.append(SharedGadget(gadget, "user" if direct else "group"))
