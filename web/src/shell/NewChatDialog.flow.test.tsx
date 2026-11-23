@@ -485,6 +485,34 @@ describe("NewChatLandingScreen in the floating panel", () => {
     };
   }
 
+  it("keeps the keyboard in the prompt when the CodeMirror editor arrives after the panel took it", async () => {
+    let loaded: (() => void) | undefined;
+    resetCodeMirrorComposerLoadForTests(
+      () =>
+        new Promise((resolve) => {
+          loaded = () => resolve(CodeMirrorModule);
+        }),
+    );
+    onTestFinished(() => resetCodeMirrorComposerLoadForTests());
+    const panel = floatingPanel();
+    renderLanding([], { features: { chat_composer_codemirror: true } }, panel);
+    // The editor is still loading, so the textarea stands in and takes the keyboard.
+    typeMessage("early words");
+    panel.shown();
+    expect(document.activeElement).toBe(screen.getByTestId("new-chat-landing-input"));
+
+    // The import starts a moment after the flag asks for it.
+    await waitFor(() => expect(loaded).toBeTypeOf("function"));
+    await act(async () => loaded!());
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    const editor = composerTargetOf(screen.getByTestId("new-chat-landing-input"))!;
+    expect(isComposerTargetFocused(editor)).toBe(true);
+    expect(editor.value).toBe("early words");
+    expect([editor.selectionStart, editor.selectionEnd]).toEqual([11, 11]);
+  });
+
   for (const engine of ["textarea", "codemirror"] as const) {
     it(`gives the ${engine} prompt the keyboard each time the panel takes it, after the kept draft`, async () => {
       if (engine === "codemirror") {
@@ -523,7 +551,6 @@ describe("NewChatLandingScreen in the floating panel", () => {
       act(() => other.focus());
       if (engine === "codemirror") act(() => insertComposerText(target(), "!"));
       else typeMessage("half a thought!");
-      act(() => other.focus());
       expect(document.activeElement).toBe(other);
       panel.shown();
       expect(isComposerTargetFocused(target())).toBe(true);
