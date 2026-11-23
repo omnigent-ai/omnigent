@@ -3276,7 +3276,7 @@ describe("ForkSessionDialog", () => {
         );
       });
 
-      it("drops a host's model pick, but not its permission pick, when the fork moves to a sandbox", async () => {
+      it("drops a host's model and effort picks, but not its permission pick, when the fork moves to a sandbox", async () => {
         useHostModelOptionsMock.mockReturnValue({
           data: [{ id: "host-model", displayName: "Host model" }],
           isLoading: false,
@@ -3286,10 +3286,13 @@ describe("ForkSessionDialog", () => {
 
         openModelSelect();
         fireEvent.click(screen.getByRole("option", { name: "Host model" }));
+        fireEvent.click(screen.getByLabelText("Reasoning effort"));
+        fireEvent.click(screen.getByRole("option", { name: "High" }));
         fireEvent.click(screen.getByTestId("fork-session-config-permission"));
         fireEvent.click(screen.getByRole("option", { name: "Plan" }));
         selectSandbox();
         expect(screen.getByTestId("fork-session-config-model")).toHaveTextContent("Default");
+        expect(screen.getByLabelText("Reasoning effort")).toHaveTextContent("Default");
         expect(screen.getByTestId("fork-session-config-permission")).toHaveTextContent("Plan");
         fireEvent.click(screen.getByTestId("fork-session-submit"));
 
