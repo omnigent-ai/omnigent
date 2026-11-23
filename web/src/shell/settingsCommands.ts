@@ -4,7 +4,14 @@
 
 import { useMemo } from "react";
 import { useTheme } from "next-themes";
-import { FoldVerticalIcon, type LucideIcon, MonitorIcon, SendIcon } from "lucide-react";
+import {
+  FoldVerticalIcon,
+  type LucideIcon,
+  MonitorIcon,
+  PanelsTopLeftIcon,
+  SendIcon,
+  SquareIcon,
+} from "lucide-react";
 
 import { normalizeThemeMode, type ThemeMode } from "@/components/theme/themeMode";
 import {
@@ -14,6 +21,13 @@ import {
 } from "@/components/theme/themeModeOptions";
 import { useTerminalThemeMode } from "@/components/theme/useTerminalIsDark";
 import { useAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import {
+  isPaneCornersChoice,
+  PANE_CORNERS_CHOICES,
+  PANE_CORNERS_LABELS,
+  type PaneCornersChoice,
+  paneCornersPreference,
+} from "@/lib/paneCornersPreference";
 import { useHostTheme } from "@/lib/embedded";
 import {
   useFoldAssistantNarration,
@@ -26,11 +40,14 @@ import {
 } from "@/lib/terminalThemePreferences";
 import { ALWAYS_STEER_ENTRY } from "@/pages/settings/search/catalog/general";
 import {
+  PANE_CORNERS_ENTRY,
   SHOW_FINAL_ANSWER_ENTRY,
   TERMINAL_THEME_ENTRY,
 } from "@/pages/settings/search/catalog/appearance";
-import type { PaletteCommand } from "@/store/paletteCommands";
+import { HIDDEN, type PaletteCommand } from "@/store/paletteCommands";
 import { booleanSetting, type PaletteSetting, settingCommand } from "@/store/paletteSettings";
+
+import { type PaneCornersState, usePaneCorners } from "./useFloatingPanes";
 
 /** An on/off setting, named as Settings shows it. */
 interface SettingSwitch {
@@ -106,6 +123,41 @@ export function settingSwitchSetting(
   return booleanSetting({ ...setting, owner: "app", enabled, write });
 }
 
+/**
+ * Floating panes or sharp corners on this device. Automatic follows the server's policy and
+ * names what it gives now; the row shows only where the floating design exists.
+ */
+export function paneCornersSetting(
+  { available, choice, policyFloating, floating }: PaneCornersState,
+  write: (choice: PaneCornersChoice) => void = (next) => paneCornersPreference.write(next),
+): PaletteSetting {
+  return {
+    id: PANE_CORNERS_ENTRY.id,
+    owner: "app",
+    label: PANE_CORNERS_ENTRY.label,
+    icon: floating ? PanelsTopLeftIcon : SquareIcon,
+    keywords: PANE_CORNERS_ENTRY.keywords,
+    current: choice,
+    availability: available ? undefined : HIDDEN,
+    choices: PANE_CORNERS_CHOICES.map((value) => ({
+      value,
+      label:
+        value === "automatic"
+          ? `Automatic (${PANE_CORNERS_LABELS[policyFloating ? "floating" : "sharp"]})`
+          : PANE_CORNERS_LABELS[value],
+      description:
+        value === "automatic"
+          ? "Follows this server's default for floating panes."
+          : value === "floating"
+            ? "Show the chat and workspace sidebar as rounded cards."
+            : "Show the chat and workspace sidebar edge to edge.",
+    })),
+    choose: (value) => {
+      if (isPaneCornersChoice(value)) write(value);
+    },
+  };
+}
+
 /** Every setting row above, current as the settings change here or in another window. */
 export function useSettingsCommands(): PaletteCommand[] {
   const { theme, setTheme } = useTheme();
@@ -114,6 +166,7 @@ export function useSettingsCommands(): PaletteCommand[] {
   const terminalTheme = useTerminalThemeMode();
   const showFinalAnswer = useFoldAssistantNarration();
   const alwaysSteer = useAlwaysSteer();
+  const paneCorners = usePaneCorners();
   return useMemo(
     () => [
       settingCommand(appearanceModeSetting(mode, followsHost, setTheme)),
@@ -126,7 +179,8 @@ export function useSettingsCommands(): PaletteCommand[] {
         ),
       ),
       settingCommand(settingSwitchSetting(ALWAYS_STEER_SETTING, alwaysSteer, writeAlwaysSteer)),
+      settingCommand(paneCornersSetting(paneCorners)),
     ],
-    [mode, followsHost, setTheme, terminalTheme, showFinalAnswer, alwaysSteer],
+    [mode, followsHost, setTheme, terminalTheme, showFinalAnswer, alwaysSteer, paneCorners],
   );
 }

@@ -62,6 +62,7 @@ const SHOWN: SettingsAvailability = {
   integrationProviders: { github: true, databricks: true },
   projectKanban: true,
   sessionTitleInstructions: true,
+  floatingPanes: true,
   proactiveAgent: true,
 };
 const HIDDEN: SettingsAvailability = {
@@ -77,6 +78,7 @@ const HIDDEN: SettingsAvailability = {
   integrationProviders: { github: false, databricks: false },
   projectKanban: false,
   sessionTitleInstructions: false,
+  floatingPanes: false,
   proactiveAgent: false,
 };
 

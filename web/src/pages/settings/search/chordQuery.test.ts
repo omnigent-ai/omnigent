@@ -295,6 +295,7 @@ const SHOWN: SettingsAvailability = {
   integrationProviders: { github: true, databricks: true },
   projectKanban: true,
   sessionTitleInstructions: true,
+  floatingPanes: true,
   proactiveAgent: true,
 };
 

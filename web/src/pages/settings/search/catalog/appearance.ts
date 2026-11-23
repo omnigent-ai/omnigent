@@ -24,6 +24,17 @@ export const TERMINAL_THEME_ENTRY = settingsEntry({
   choices: ["Match app", "Light", "Dark"],
 });
 
+export const PANE_CORNERS_ENTRY = settingsEntry({
+  id: "pane-corners",
+  section: "appearance",
+  label: "Pane corners",
+  description: "Show the chat and workspace sidebar as rounded cards, or edge to edge.",
+  keywords: ["floating panes", "sharp corners", "rounded", "cards", "layout"],
+  // As the select names them; Automatic adds what it gives now, e.g. "Automatic (Floating panes)".
+  choices: ["Automatic", "Floating panes", "Sharp corners"],
+  available: (availability) => availability.floatingPanes,
+});
+
 export const COLOR_THEME_ENTRY = settingsEntry({
   id: "color-theme",
   section: "appearance",
@@ -259,6 +270,7 @@ export const APPEARANCE_SETTINGS = [
   THEME_MODE_ENTRY,
   TERMINAL_THEME_ENTRY,
   COLOR_THEME_ENTRY,
+  PANE_CORNERS_ENTRY,
   UI_FONT_SIZE_ENTRY,
   UI_FONT_FAMILY_ENTRY,
   CODE_FONT_SIZE_ENTRY,
