@@ -34,6 +34,33 @@ const { agentInputInFlight } = require("./browserInput");
 // Each view is a separate renderer process; the cap bounds memory per window.
 const DEFAULT_CAP = 20;
 
+// Microsoft Entra decides FIDO and passkey support from the User-Agent header
+// and hides it when the header carries an `Electron/<version>` token. Drop only
+// that token, only for these sign-in hosts, so navigator.userAgent and every
+// other site keep Electron's default User-Agent.
+const ELECTRON_UA_HOSTS = new Set([
+  "login.microsoftonline.com",
+  "login.microsoft.com",
+  "login.live.com",
+]);
+
+// Returns the same object when nothing changes.
+function withoutElectronToken(url, requestHeaders) {
+  let hostname;
+  try {
+    hostname = new URL(url).hostname;
+  } catch {
+    return requestHeaders;
+  }
+  if (!ELECTRON_UA_HOSTS.has(hostname)) return requestHeaders;
+  const name = Object.keys(requestHeaders ?? {}).find((key) => key.toLowerCase() === "user-agent");
+  if (name === undefined) return requestHeaders;
+  const stripped = String(requestHeaders[name]).replace(/\s*\bElectron\/\S+/, "");
+  return stripped === requestHeaders[name]
+    ? requestHeaders
+    : { ...requestHeaders, [name]: stripped };
+}
+
 // Map WebSocket handshakes onto the HTTP URL rules.
 function httpUrlForWebSocket(url) {
   return url.replace(/^ws(s?):/, "http$1:");
@@ -531,11 +558,16 @@ function createBrowserViewRegistry({
 
   // Cache hits can omit the connected IP, so guarded HTTP requests bypass
   // cache reads with no-cache while preserving the page's existing directives.
-  function agentRequestHeaders({ webContentsId, requestHeaders }, partition) {
-    if (!requestPolicyFor(webContentsId, partition)) return {};
+  // Every request on a pane partition also passes through
+  // withoutElectronToken, whether or not the navigation policy is enforced.
+  function agentRequestHeaders({ webContentsId, url, requestHeaders }, partition) {
+    const cleaned = withoutElectronToken(url, requestHeaders);
+    if (!requestPolicyFor(webContentsId, partition)) {
+      return cleaned === requestHeaders ? {} : { requestHeaders: cleaned };
+    }
     const headers = {};
     const directives = new Map(); // lowercased → as sent, keeping e.g. no-store
-    for (const [name, value] of Object.entries(requestHeaders ?? {})) {
+    for (const [name, value] of Object.entries(cleaned ?? {})) {
       if (name.toLowerCase() !== "cache-control") {
         headers[name] = value;
         continue;

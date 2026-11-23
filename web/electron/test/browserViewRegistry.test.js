@@ -1323,6 +1323,63 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     );
   });
 
+  it("strips the Electron token from the User-Agent for Microsoft sign-in hosts only", () => {
+    const { registry, idOf } = makeNetworkGuardRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    registry.openOrNavigate("browser-tab:conv_1:t1", "https://example.com/");
+    const electronUa =
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " +
+      "Omnigent/1.0.0 Chrome/140.0.0.0 Electron/45.2.1 Safari/537.36";
+    const cleanUa = electronUa.replace(" Electron/45.2.1", "");
+    const send = (url, headers, id = idOf("conv_1")) =>
+      registry.agentRequestHeaders({ webContentsId: id, url, requestHeaders: headers });
+    for (const host of ["login.microsoftonline.com", "login.microsoft.com", "login.live.com"]) {
+      assert.equal(
+        send(`https://${host}/common/oauth2/authorize`, { "User-Agent": electronUa })
+          .requestHeaders["User-Agent"],
+        cleanUa,
+        host,
+      );
+    }
+    // The strip also applies on a pane tab whose navigation policy is not enforced.
+    assert.deepEqual(
+      send(
+        "https://login.microsoftonline.com/",
+        { Accept: "text/html", "User-Agent": electronUa },
+        idOf("browser-tab:conv_1:t1"),
+      ),
+      { requestHeaders: { Accept: "text/html", "User-Agent": cleanUa } },
+    );
+    // Header names match case-insensitively and keep the casing Chromium sent.
+    assert.deepEqual(
+      send("https://login.microsoftonline.com/", { "user-agent": electronUa }).requestHeaders,
+      { "user-agent": cleanUa, "Cache-Control": "no-cache" },
+    );
+    // Other hosts, look-alike hosts and a UA without the token are left alone.
+    for (const url of [
+      "https://example.com/",
+      "https://login.microsoftonline.com.evil.example/",
+      "https://evil.example/login.microsoftonline.com",
+    ]) {
+      assert.equal(
+        send(url, { "User-Agent": electronUa }).requestHeaders["User-Agent"],
+        electronUa,
+      );
+    }
+    assert.equal(
+      send("https://login.live.com/", { "User-Agent": cleanUa }).requestHeaders["User-Agent"],
+      cleanUa,
+    );
+    assert.deepEqual(
+      registry.agentRequestHeaders({
+        webContentsId: idOf("browser-tab:conv_1:t1"),
+        url: "https://login.live.com/",
+        requestHeaders: { "User-Agent": cleanUa },
+      }),
+      {},
+    );
+  });
+
   it("leaves direct unenforced views and unattributed requests without a partition alone", async () => {
     const { registry, lookups, idOf } = makeNetworkGuardRegistry();
     registry.openOrNavigate("conv_1", "http://intranet.example/", undefined, { force: true });
