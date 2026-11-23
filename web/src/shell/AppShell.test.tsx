@@ -24,7 +24,7 @@ import { gadgetFixture } from "@/gadgets/ui/testUtils";
 import { IN_APP_GADGET_OPEN } from "@/gadgets/ui/gadgetNavigation";
 import { resetGadgetTabOrders } from "@/gadgets/ui/GadgetRailTabs";
 
-import { useCallback, useContext, useLayoutEffect, useState } from "react";
+import { lazy, useCallback, useContext, useLayoutEffect, useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
@@ -855,6 +855,20 @@ describe("AppShell header", () => {
     mockConversations([]);
     renderShell("/");
     expect(screen.getByRole("button", { name: /sidebar/i })).toBeInTheDocument();
+  });
+
+  it("keeps the sidebar while a lazy page's chunk loads", () => {
+    mockConversations([]);
+    const PendingChunkPage = lazy(() => new Promise<never>(() => {}));
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(shellTree(qc, "/inbox", <Route path="inbox" element={<PendingChunkPage />} />));
+
+    fireEvent.click(screen.getByRole("button", { name: "Open sidebar" }));
+
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    expect(
+      within(screen.getByRole("main")).getByRole("status", { name: "Loading" }),
+    ).toBeInTheDocument();
   });
 
   it("does not fetch child sessions for a temp id in debug mode", () => {

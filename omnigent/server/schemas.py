@@ -6464,11 +6464,14 @@ class SessionProjectSummary(BaseModel):
     :param icon: The project's chosen emoji icon (a unicode grapheme), read
         from its ``config``; ``None`` when unset or for a label-only folder,
         so the sidebar falls back to the default folder glyph.
+    :param muted: Whether the owner muted notifications for every session in
+        the project, read from its ``config``; ``False`` for a label-only folder.
     """
 
     id: str | None = None
     name: str
     icon: str | None = None
+    muted: bool = False
 
 
 class CreateProjectRequest(BaseModel):

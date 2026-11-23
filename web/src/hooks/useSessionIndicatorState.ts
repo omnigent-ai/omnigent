@@ -6,7 +6,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import { useSessionBadgeStates } from "@/hooks/useSessionBadgeStates";
 import { type SessionState, withUnreadState } from "@/hooks/useSessionState";
 import { useConversationReadState } from "@/hooks/useUnseenConversations";
-import { isConversationMuted, showsUnreadFor } from "@/lib/sessionMute";
+import { isConversationMuted, showsUnreadFor, useMutedProjects } from "@/lib/sessionMute";
 import { useChatStore } from "@/store/chatStore";
 
 export interface SessionIndicatorState {
@@ -39,6 +39,8 @@ export function useSessionIndicatorState(
   );
   // Explicit unread overrides active-row suppression; running turns remain
   // hidden through readState.unseen. Muting hides the dot without marking read.
+  // Subscribes so a project's mute or unmute re-renders the row.
+  useMutedProjects();
   const isMuted = isConversationMuted(conversation);
   const unread = readState.unseen && (!isActive || readState.explicitlyUnread);
   const hasUnseenMessages = showsUnreadFor(conversation, unread);

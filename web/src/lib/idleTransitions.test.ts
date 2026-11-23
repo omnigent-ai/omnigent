@@ -1,6 +1,6 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
-import { MUTED_LABEL_KEY } from "@/lib/sessionMute";
+import { clearSessionMuteState, MUTED_LABEL_KEY, setMutedProjects } from "@/lib/sessionMute";
 import {
   buildElicitationMap,
   buildStatusMap,
@@ -9,6 +9,10 @@ import {
   detectNewElicitations,
   type ConversationStatus,
 } from "./idleTransitions";
+
+afterEach(() => {
+  clearSessionMuteState();
+});
 
 function conv(id: string, status?: Conversation["status"]): Conversation {
   return {
@@ -83,6 +87,19 @@ describe("detectIdleTransitions", () => {
     const prev = statusMap({ a: "running" });
     const muted = { ...conv("a", "idle"), labels: { [MUTED_LABEL_KEY]: "1" } };
     expect(detectIdleTransitions(prev, [muted])).toEqual([]);
+  });
+
+  it("ignores a finished conversation in a muted project, but not one outside it", () => {
+    setMutedProjects([{ id: "factory", name: "Factory", muted: true }], null);
+    const prev = statusMap({ worker: "running", coordinator: "running" });
+    const worker = { ...conv("worker", "idle"), project_id: "factory" };
+    const coordinator = conv("coordinator", "idle");
+    expect(detectIdleTransitions(prev, [worker, coordinator]).map((c) => c.id)).toEqual([
+      "coordinator",
+    ]);
+    expect(computeUnreadBadgeIds([worker, coordinator], undefined, true, () => true)).toEqual(
+      new Set(["coordinator"]),
+    );
   });
 
   it("returns only the newly-finished conversations from a mixed list", () => {
