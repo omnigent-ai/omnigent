@@ -154,6 +154,42 @@ describe("useRecentPullRequestFacts", () => {
     expect(result.current.details.get(URL_338)).toMatchObject({ author: "jane-doe" });
   });
 
+  it("keeps the later read when the session's info and the PR's own query both hold its details", async () => {
+    const earlier = Date.UTC(2026, 0, 1, 10, 0);
+    const later = Date.UTC(2026, 0, 1, 11, 0);
+    const read = (state: "OPEN" | "MERGED") =>
+      ({ url: URL_338, number: 338, title: "Show authors", author: "jane-doe", state }) as const;
+    const readBoth = (session: number, own: number) => {
+      const { client, result, unmount } = setup({ conversationId: "conv", urls: [URL_338] });
+      act(() => {
+        client.setQueryData(
+          ["github-info", "conv"],
+          { ...sessionInfo([]), pr: read(session > own ? "MERGED" : "OPEN") as PullRequest },
+          { updatedAt: session },
+        );
+        client.setQueryData(
+          ["github-info", "conv", URL_338],
+          detailInfo(read(own > session ? "MERGED" : "OPEN")),
+          { updatedAt: own },
+        );
+      });
+      return { result, unmount };
+    };
+
+    // The session's info read the merge after the PR's own query last ran.
+    const sessionLater = readBoth(later, earlier);
+    await waitFor(() =>
+      expect(sessionLater.result.current.details.get(URL_338)?.state).toBe("MERGED"),
+    );
+    expect(sessionLater.result.current.detailsUpdatedAt?.get(URL_338)).toBe(later);
+    sessionLater.unmount();
+
+    // And the other way round.
+    const ownLater = readBoth(earlier, later);
+    await waitFor(() => expect(ownLater.result.current.details.get(URL_338)?.state).toBe("MERGED"));
+    expect(ownLater.result.current.detailsUpdatedAt?.get(URL_338)).toBe(later);
+  });
+
   it("drops details cached for another session", async () => {
     const { client, result, rerender } = setup({ conversationId: "conv", urls: [URL_338] });
     act(() => {

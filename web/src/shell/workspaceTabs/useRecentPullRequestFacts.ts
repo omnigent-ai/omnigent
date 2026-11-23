@@ -38,11 +38,15 @@ export function useRecentPullRequestFacts(
     details.set(info.data.pr.url, info.data.pr);
     detailsUpdatedAt.set(info.data.pr.url, info.dataUpdatedAt);
   }
+  // The PR's own query and the session's may both hold a PR's details; the later read wins.
   keys.forEach((key, index) => {
     const pr = client.getQueryData<PullRequestInfo>(key)?.pr;
     if (!pr) return;
-    details.set(urls[index]!, pr);
-    detailsUpdatedAt.set(urls[index]!, client.getQueryState(key)?.dataUpdatedAt ?? 0);
+    const url = urls[index]!;
+    const readAt = client.getQueryState(key)?.dataUpdatedAt ?? 0;
+    if (readAt < (detailsUpdatedAt.get(url) ?? 0)) return;
+    details.set(url, pr);
+    detailsUpdatedAt.set(url, readAt);
   });
   const linked = linkedPullRequests(info.data, stored.data);
   return { linked, details, detailsUpdatedAt };
