@@ -64,10 +64,14 @@ export function useShortcutPageGroups(): ShortcutPageGroup[] {
 
 export function KeyboardShortcutsList({
   variant = "compact",
+  groups: shownGroups,
 }: {
   variant?: "compact" | "settings";
+  /** The groups to list, such as the Settings page's filtered ones; every group otherwise. */
+  groups?: readonly ShortcutPageGroup[];
 }) {
-  const groups = useShortcutPageGroups();
+  const allGroups = useShortcutPageGroups();
+  const groups = shownGroups ?? allGroups;
   const settings = variant === "settings";
   return (
     <div className={settings ? "flex flex-col gap-10" : undefined}>
