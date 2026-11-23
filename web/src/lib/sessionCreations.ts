@@ -3,14 +3,55 @@
 // lands on is the one it created, not one the viewer navigated to instead, and which of
 // its requests that first message carried. Each creation gets a sequence number, so a page
 // can tell a session created after it began waiting from one created earlier.
+//
+// A create is an attempt: `beginSessionCreation` numbers it before its request goes out,
+// and it ends either as a created session (`noteSessionCreatedHere` with that number, once
+// the session took its first message) or as a failure (`noteSessionCreationFailed`). A page
+// can bind its work to the attempt it saw begin, so another create, or a failed one, is
+// never taken for it.
+type CreatedListener = (
+  sessionId: string,
+  firstMessage: string | null,
+  seq: number,
+  attempt: number | null,
+) => void;
 const created = new Map<string, { firstMessage: string | null; seq: number }>();
-const listeners = new Set<(sessionId: string, firstMessage: string | null, seq: number) => void>();
+const listeners = new Set<CreatedListener>();
+const attemptListeners = new Set<(attempt: number, outcome: "begun" | "failed") => void>();
 let lastSeq = 0;
+let lastAttempt = 0;
 // Enough for any session a page in this tab is still waiting on.
 const MAX_REMEMBERED = 50;
 
-/** Records that this tab created `sessionId`, with its first message when it had one. */
-export function noteSessionCreatedHere(sessionId: string, firstMessage: string | null): void {
+/** Numbers a create this tab is about to send, and tells the attempt listeners it began. */
+export function beginSessionCreation(): number {
+  const attempt = ++lastAttempt;
+  for (const listener of [...attemptListeners]) listener(attempt, "begun");
+  return attempt;
+}
+
+/** Records that the create numbered `attempt` made no session that took its first message. */
+export function noteSessionCreationFailed(attempt: number): void {
+  for (const listener of [...attemptListeners]) listener(attempt, "failed");
+}
+
+/** Calls `listener` as creates begin and fail. Returns an unsubscribe. */
+export function onSessionCreationAttempt(
+  listener: (attempt: number, outcome: "begun" | "failed") => void,
+): () => void {
+  attemptListeners.add(listener);
+  return () => attemptListeners.delete(listener);
+}
+
+/**
+ * Records that this tab created `sessionId`, with its first message when it had one, as the
+ * create numbered `attempt` when it was begun with {@link beginSessionCreation}.
+ */
+export function noteSessionCreatedHere(
+  sessionId: string,
+  firstMessage: string | null,
+  attempt: number | null = null,
+): void {
   const known = created.get(sessionId);
   created.delete(sessionId);
   const record = {
@@ -24,7 +65,9 @@ export function noteSessionCreatedHere(sessionId: string, firstMessage: string |
     created.delete(oldest);
   }
   if (known === undefined) {
-    for (const listener of [...listeners]) listener(sessionId, record.firstMessage, record.seq);
+    for (const listener of [...listeners]) {
+      listener(sessionId, record.firstMessage, record.seq, attempt);
+    }
   }
 }
 
@@ -41,9 +84,7 @@ export function latestSessionCreation(): number {
 }
 
 /** Calls `listener` for each session this tab creates from now on. Returns an unsubscribe. */
-export function onSessionCreatedHere(
-  listener: (sessionId: string, firstMessage: string | null, seq: number) => void,
-): () => void {
+export function onSessionCreatedHere(listener: CreatedListener): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
 }
@@ -52,4 +93,5 @@ export function onSessionCreatedHere(
 export function resetSessionCreations(): void {
   created.clear();
   lastSeq = 0;
+  lastAttempt = 0;
 }

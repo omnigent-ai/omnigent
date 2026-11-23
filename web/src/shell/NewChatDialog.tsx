@@ -209,7 +209,11 @@ import {
   setPendingInitialPrompt,
 } from "@/store/chatStore";
 import { markSessionCreated } from "@/store/interactionTelemetry";
-import { noteSessionCreatedHere } from "@/lib/sessionCreations";
+import {
+  beginSessionCreation,
+  noteSessionCreatedHere,
+  noteSessionCreationFailed,
+} from "@/lib/sessionCreations";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { DesktopWindowContext, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { MODEL_PICKER_KEYS, useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
@@ -6263,6 +6267,10 @@ function NewChatLandingContent({
       createToken: string;
     } | null = null;
     let createdSessionId: string | undefined;
+    // A page waiting on this create (a gadget's New session) learns of the session only once
+    // it took its first message; any other end of this call reports the attempt failed.
+    const creationAttempt = beginSessionCreation();
+    let creationNoted = false;
     let undeliveredPrompt: PendingInitialPrompt | null = null;
     // Single teardown for EVERY create-failure exit (the `catch` and the
     // `"error" in created` early return): drop the client-only conversation and,
@@ -6546,10 +6554,13 @@ function NewChatLandingContent({
         // otherwise both sandbox and computer bundled creates emit nothing. Split
         // by the picked host; interactionTelemetry completes/settles the span.
         markSessionCreated(data.id, sandboxSelected ? "sandbox" : "computer");
-        noteSessionCreatedHere(data.id, initialPrompt);
         if (!siblingSourceId && !sandboxSelected && selectedHostId && workspaceTrimmed) {
           await launchRunner(selectedHostId, data.id, workspaceTrimmed, bundledGitOptions);
         }
+        // Only now did the session take its first message: a runner that failed to launch
+        // leaves the draft with the viewer, and nothing counts it delivered.
+        noteSessionCreatedHere(data.id, initialPrompt, creationAttempt);
+        creationNoted = true;
         // Clear pending agent after successful creation.
         setPendingAgent(null);
       } else {
@@ -6773,7 +6784,8 @@ function NewChatLandingContent({
         // New Chat is the only create path that can produce a managed sandbox;
         // interactionTelemetry completes/settles the span once the session runs.
         markSessionCreated(created.id, sandboxSelected ? "sandbox" : "computer");
-        noteSessionCreatedHere(created.id, initialPrompt);
+        noteSessionCreatedHere(created.id, initialPrompt, creationAttempt);
+        creationNoted = true;
         if (sandboxSelected) {
           const launchedRow = sandboxCatalog?.find((row) => row.id === normalizedModelOverride);
           markSandboxLaunch(created.id, {
@@ -6973,6 +6985,7 @@ function NewChatLandingContent({
       if (localConv !== null) showToast(msg);
       else setCreateError(msg);
     } finally {
+      if (!creationNoted) noteSessionCreationFailed(creationAttempt);
       if (createAttemptRef.current === createAttempt) {
         createAttemptRef.current = null;
         setCreating(false);

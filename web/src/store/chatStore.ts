@@ -200,7 +200,11 @@ import {
   onResponseEnd,
   onResponseStart,
 } from "./interactionTelemetry";
-import { noteSessionCreatedHere } from "@/lib/sessionCreations";
+import {
+  beginSessionCreation,
+  noteSessionCreatedHere,
+  noteSessionCreationFailed,
+} from "@/lib/sessionCreations";
 import { getSessionHost, subscribeSessionHostChanges } from "@/lib/sessionHost";
 import {
   isClaudeAgentMessageContent,
@@ -4952,14 +4956,21 @@ async function ensureBoundSession(
     // initial_items dispatch synchronously inside create_session,
     // before we can subscribe to /stream, so early events can be
     // missed). Bind the stream FIRST, then post the first message.
-    const session = await createSession(agentId, []);
+    const creationAttempt = beginSessionCreation();
+    let session: Awaited<ReturnType<typeof createSession>>;
+    try {
+      session = await createSession(agentId, []);
+    } catch (error) {
+      noteSessionCreationFailed(creationAttempt);
+      throw error;
+    }
     sessionId = session.id;
     // Register the create_session span (see interactionTelemetry). This path
     // sends no host params, so the server always makes an external ("computer")
     // session — managed sandboxes are created by the New Chat dialog, which
     // registers itself.
     markSessionCreated(sessionId, "computer");
-    noteSessionCreatedHere(sessionId, firstMessage ?? null);
+    noteSessionCreatedHere(sessionId, firstMessage ?? null, creationAttempt);
     // Claim the send chain for this id NOW, while it is still private to this
     // call. Everything below publishes it (the store write, the navigate
     // callback, the sidebar invalidation) and awaits network work, so a send

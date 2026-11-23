@@ -1,5 +1,7 @@
 // Links a gadget to the session this tab creates from its New session (`gadget_start`), and
-// only that one: an existing session, or one created before New session opened, stays unlinked.
+// only that one: the create that begins while that New session is open is the gadget's
+// attempt, and only the session it makes, once that session took its first message, is linked.
+// An existing session, a session another create made, or a create that failed stays unlinked.
 // A gadget made only to be built there is deleted again if New session is left unsent.
 import { useEffect } from "react";
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
@@ -13,22 +15,22 @@ import {
   isStartedSessionId,
   gadgetRailKey,
 } from "@/gadgets/host/gadgetSession";
-import {
-  latestSessionCreation,
-  onSessionCreatedHere,
-  sessionCreatedHere,
-} from "@/lib/sessionCreations";
+import { onSessionCreatedHere, onSessionCreationAttempt } from "@/lib/sessionCreations";
 import { invalidateGadgets, useGadgetsEnabled } from "./gadgetQueries";
 
-// The gadget whose New session this tab is on, until it starts a session or goes elsewhere, and
-// the latest session creation before it opened: only a later one is the gadget's.
-let starting: { gadgetId: string; after: number } | null = null;
-// Gadgets whose session is being created, by gadget ID: the next creation links them, whatever
-// page the viewer is on by then.
-const submitted = new Map<string, { after: number; fullScreen: boolean; at: number }>();
-// How long a sent Build waits for its session to be created.
-const SUBMITTED_TTL_MS = 10 * 60_000;
-// Gadget and session pairs already linked, so a page that sees the session again does nothing.
+// The gadget whose New session this tab is on, until it starts a session or goes elsewhere.
+let starting: { gadgetId: string } | null = null;
+// Creates that began on a gadget's New session, by attempt number: the session each makes is
+// that gadget's, whatever page the viewer is on by then.
+const attempts = new Map<number, { gadgetId: string; fullScreen: boolean }>();
+// Sessions an attempt made for a gadget, by session ID, until linking them succeeds; a page
+// that shows the session again retries a link that failed.
+const madeFor = new Map<
+  string,
+  { gadgetId: string; firstMessage: string | null; fullScreen: boolean }
+>();
+// Gadget and session pairs linked or being linked, so a page that sees the session again does
+// nothing.
 const adopted = new Set<string>();
 // Gadgets this tab created for New session to build, until a session adopts them.
 const unbuilt = new Set<string>();
@@ -48,8 +50,14 @@ export function rememberUnbuiltGadget(gadgetId: string): void {
   unbuilt.add(gadgetId);
 }
 
+function creating(gadgetId: string): boolean {
+  for (const attempt of attempts.values()) if (attempt.gadgetId === gadgetId) return true;
+  return false;
+}
+
 async function discardIfUnbuilt(gadgetId: string, queryClient: QueryClient): Promise<void> {
-  if (!unbuilt.delete(gadgetId)) return;
+  // A sent Build whose session is still being created keeps its gadget.
+  if (creating(gadgetId) || !unbuilt.delete(gadgetId)) return;
   try {
     const gadget = await getGadget(gadgetId);
     if (gadget.published_revision !== null || !gadget.permissions.manage) return;
@@ -74,7 +82,8 @@ export function leaveGadgetStart(gadgetId: string, queryClient: QueryClient): vo
 /** Forgets every started gadget; for tests. */
 export function resetGadgetStarts(): void {
   starting = null;
-  submitted.clear();
+  attempts.clear();
+  madeFor.clear();
   adopted.clear();
   unbuilt.clear();
   fullScreenStarts.clear();
@@ -83,15 +92,22 @@ export function resetGadgetStarts(): void {
 function beginGadgetStart(gadgetId: string, queryClient: QueryClient): void {
   if (starting?.gadgetId === gadgetId) return;
   if (starting !== null) leaveGadgetStart(starting.gadgetId, queryClient);
-  starting = { gadgetId, after: latestSessionCreation() };
+  starting = { gadgetId };
 }
 
-// Build was sent: keep the gadget for the session being created, even if the viewer leaves.
-function claimGadgetStart(gadgetId: string): void {
-  if (submitted.has(gadgetId)) return;
-  for (const pair of adopted) if (pair.startsWith(`${gadgetId}\n`)) return;
-  const after = starting?.gadgetId === gadgetId ? starting.after : latestSessionCreation();
-  submitted.set(gadgetId, { after, fullScreen: fullScreenStarts.has(gadgetId), at: Date.now() });
+// A create began, or failed. One that begins while a gadget's New session is open is that
+// gadget's; a failed one links nothing, and the gadget waits for the next attempt.
+function onAttempt(attempt: number, outcome: "begun" | "failed"): void {
+  if (outcome === "failed") {
+    const failed = attempts.get(attempt);
+    attempts.delete(attempt);
+    // Build's gadget stays unbuilt: leaving New session deletes it as if Build was never sent.
+    if (failed !== undefined) unbuilt.add(failed.gadgetId);
+    return;
+  }
+  if (starting === null) return;
+  const gadgetId = starting.gadgetId;
+  attempts.set(attempt, { gadgetId, fullScreen: fullScreenStarts.has(gadgetId) });
   unbuilt.delete(gadgetId);
 }
 
@@ -105,40 +121,37 @@ function adopt(
   if (adopted.has(pair)) return;
   adopted.add(pair);
   if (starting?.gadgetId === gadgetId) starting = null;
-  submitted.delete(gadgetId);
   unbuilt.delete(gadgetId);
   fullScreenStarts.delete(gadgetId);
+  madeFor.set(sessionId, { gadgetId, firstMessage, fullScreen });
   adoptStartedGadgetSession(gadgetId, sessionId, firstMessage)
     .then(() => {
+      madeFor.delete(sessionId);
       const key = gadgetRailKey(gadgetId);
       // Started beside a full screen gadget: it stays full screen, the sidebar as it was.
       if (fullScreen) requestGadgetRailTab(sessionId, key, { maximize: true, keepSidebar: true });
       else requestGadgetRailTab(sessionId, key);
     })
-    // The session still runs; the gadget stays on its own page.
+    // The session still runs; the gadget stays on its own page until a later visit to the
+    // session links it again.
     .catch(() => {
+      adopted.delete(pair);
       if (fullScreen) noteGadgetStartFailed(gadgetId);
     });
 }
 
-// The gadget a session this tab just created belongs to: the oldest sent Build waiting for one,
-// else the gadget whose New session is open, when the session was created after it opened.
-function onCreated(sessionId: string, firstMessage: string | null, seq: number): void {
-  if (!isStartedSessionId(sessionId)) return;
-  const now = Date.now();
-  for (const [gadgetId, claim] of submitted) {
-    if (now - claim.at > SUBMITTED_TTL_MS) {
-      submitted.delete(gadgetId);
-      continue;
-    }
-    if (seq > claim.after) {
-      adopt(gadgetId, sessionId, firstMessage, claim.fullScreen);
-      return;
-    }
-  }
-  if (starting !== null && seq > starting.after) {
-    adopt(starting.gadgetId, sessionId, firstMessage, fullScreenStarts.has(starting.gadgetId));
-  }
+// A session this tab created: the gadget's when the create that made it was the gadget's.
+function onCreated(
+  sessionId: string,
+  firstMessage: string | null,
+  _seq: number,
+  attempt: number | null,
+): void {
+  if (attempt === null || !isStartedSessionId(sessionId)) return;
+  const claim = attempts.get(attempt);
+  if (claim === undefined) return;
+  attempts.delete(attempt);
+  adopt(claim.gadgetId, sessionId, firstMessage, claim.fullScreen);
 }
 
 export function useAdoptStartedGadgetSession(): void {
@@ -154,6 +167,7 @@ export function useAdoptStartedGadgetSession(): void {
     if (!listening) {
       listening = true;
       onSessionCreatedHere(onCreated);
+      onSessionCreationAttempt(onAttempt);
     }
     const params = new URLSearchParams(search);
     const marked = params.get(GADGET_START_PARAM);
@@ -166,32 +180,23 @@ export function useAdoptStartedGadgetSession(): void {
       else if (starting !== null) leaveGadgetStart(starting.gadgetId, queryClient);
       return;
     }
-    const gadgetId = marked ?? starting?.gadgetId ?? null;
-    if (!isStartedSessionId(sessionId)) {
-      // The temporary ID while the session is created: Build was sent.
-      if (gadgetId !== null) claimGadgetStart(gadgetId);
-      return;
-    }
+    // The temporary ID while the session is created: Build was sent, and its attempt waits.
+    if (!isStartedSessionId(sessionId)) return;
     if (marked) {
       params.delete(GADGET_START_PARAM);
       replaceSearchParams(params);
     }
-    if (gadgetId === null || adopted.has(`${gadgetId}\n${sessionId}`)) return;
-    const creation = sessionCreatedHere(sessionId);
-    const claim = submitted.get(gadgetId);
-    const after = claim?.after ?? (starting?.gadgetId === gadgetId ? starting.after : null);
-    if (creation !== undefined && after !== null && creation.seq > after) {
-      adopt(
-        gadgetId,
-        sessionId,
-        creation.firstMessage,
-        claim?.fullScreen ?? fullScreenStarts.has(gadgetId),
-      );
+    const made = madeFor.get(sessionId);
+    if (made !== undefined) {
+      // A link that failed earlier: try it again now the session shows.
+      adopt(made.gadgetId, sessionId, made.firstMessage, made.fullScreen);
       return;
     }
+    const gadgetId = marked ?? starting?.gadgetId ?? null;
+    if (gadgetId === null || adopted.has(`${gadgetId}\n${sessionId}`)) return;
     // An existing session the viewer opened instead never got the gadget's requests. A sent
     // Build still waits for its own session.
-    if (claim === undefined) leaveGadgetStart(gadgetId, queryClient);
+    if (!creating(gadgetId)) leaveGadgetStart(gadgetId, queryClient);
     else if (starting?.gadgetId === gadgetId) starting = null;
   }, [enabled, pathname, queryClient, search, sessionPrefix, replaceSearchParams]);
 }

@@ -16,6 +16,7 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
   })),
 }));
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { onSessionCreatedHere, onSessionCreationAttempt } from "@/lib/sessionCreations";
 import { REVIEW_PLAN_FIRST } from "@/lib/workflow";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
@@ -652,6 +653,39 @@ describe("NewChatLandingScreen in the floating panel", () => {
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toMatchObject({ host_id: "host_1" });
     expect(onOpenSession).not.toHaveBeenCalled();
+  });
+
+  it("tells a gadget's Create session its create failed, and names no session", async () => {
+    vi.mocked(authenticatedFetch).mockRejectedValueOnce(new Error("offline"));
+    const panel = floatingPanel();
+    const outcomes: string[] = [];
+    const stopAttempts = onSessionCreationAttempt((attempt, outcome) =>
+      outcomes.push(`${outcome}:${attempt}`),
+    );
+    const stopCreated = onSessionCreatedHere((sessionId) => outcomes.push(`created:${sessionId}`));
+    try {
+      renderLanding(
+        [],
+        {},
+        panel,
+        <GadgetOpenSessionButton sessionId={null} onOpenSession={vi.fn()} />,
+      );
+      await waitForWorkspaceSeed();
+      typeMessage("inspect the repo");
+      act(() => {
+        requestGadgetCreateSessionMenu();
+      });
+      const create = await screen.findByTestId("gadget-create-session");
+      await waitFor(() => expect(create).toBeEnabled());
+      fireEvent.click(create);
+      // The gadget's requests stay undelivered: its attempt fails and no session is noted.
+      await waitFor(() => expect(outcomes.some((o) => o.startsWith("failed:"))).toBe(true));
+      expect(outcomes.filter((o) => o.startsWith("created:"))).toEqual([]);
+      expect(panel.launch).not.toHaveBeenCalled();
+    } finally {
+      stopAttempts();
+      stopCreated();
+    }
   });
 
   // The panel keeps the prompt when delivery fails, and remounts the composer when it succeeds.

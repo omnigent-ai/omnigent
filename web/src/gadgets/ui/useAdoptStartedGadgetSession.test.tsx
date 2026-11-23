@@ -15,7 +15,12 @@ import {
   resetGadgetStarts,
   useAdoptStartedGadgetSession,
 } from "./useAdoptStartedGadgetSession";
-import { noteSessionCreatedHere, resetSessionCreations } from "@/lib/sessionCreations";
+import {
+  beginSessionCreation,
+  noteSessionCreatedHere,
+  noteSessionCreationFailed,
+  resetSessionCreations,
+} from "@/lib/sessionCreations";
 import { GADGETS_INFO, gadgetFixture } from "./testUtils";
 import type * as GadgetApiModule from "@/gadgets/api/gadgetApi";
 import type * as GadgetSessionModule from "@/gadgets/host/gadgetSession";
@@ -31,6 +36,15 @@ vi.mock("@/gadgets/api/gadgetApi", async (importOriginal) => ({
   deleteGadget: vi.fn(),
 }));
 
+// The create the Creating button began, which Created then finishes.
+let pendingAttempt: number | null = null;
+
+function finishCreate(sessionId: string, firstMessage: string): void {
+  const attempt = pendingAttempt ?? beginSessionCreation();
+  pendingAttempt = null;
+  noteSessionCreatedHere(sessionId, firstMessage, attempt);
+}
+
 function Shell() {
   useAdoptStartedGadgetSession();
   const navigate = useNavigate();
@@ -41,20 +55,27 @@ function Shell() {
       <button
         type="button"
         onClick={() => {
-          noteSessionCreatedHere("conv_9", "Build");
+          finishCreate("conv_9", "Build");
           navigate("/c/conv_9?o=1&gadget_start=board");
         }}
       >
         Created, query kept
       </button>
-      <button type="button" onClick={() => navigate("/c/temp:abc")}>
+      <button
+        type="button"
+        onClick={() => {
+          // Build is sent: New session begins the create and shows the temporary session.
+          pendingAttempt = beginSessionCreation();
+          navigate("/c/temp:abc");
+        }}
+      >
         Creating
       </button>
       <button
         type="button"
         onClick={() => {
           // New session creates conv_9, then shows its page.
-          noteSessionCreatedHere("conv_9", "Build");
+          finishCreate("conv_9", "Build");
           navigate("/c/conv_9");
         }}
       >
@@ -84,6 +105,7 @@ function renderShell(info: ServerInfo = GADGETS_INFO) {
 }
 
 afterEach(() => {
+  pendingAttempt = null;
   resetGadgetRailRequests();
   resetGadgetStarts();
   resetSessionCreations();
@@ -198,7 +220,7 @@ describe("a session started beside a gadget", () => {
     expect(deleteGadget).not.toHaveBeenCalled();
 
     // The create finishes while the viewer is on another page.
-    noteSessionCreatedHere("conv_9", "Build");
+    finishCreate("conv_9", "Build");
     expect(adoptStartedGadgetSession).toHaveBeenCalledWith("board", "conv_9", "Build");
     await waitFor(() =>
       expect(useGadgetRailRequest.getState().requested).toMatchObject({
@@ -206,6 +228,52 @@ describe("a session started beside a gadget", () => {
         key: "gadget:board",
       }),
     );
+  });
+
+  it("doesn't take a session another create makes after the gadget's create failed", async () => {
+    vi.mocked(getGadget).mockResolvedValue(
+      gadgetFixture({ id: "board", published_revision: null }),
+    );
+    vi.mocked(getGadgetGadgetSession).mockResolvedValue(null);
+    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    rememberUnbuiltGadget("board");
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Creating" }));
+    // The create fails (a runner that didn't launch, say): the draft goes back to the viewer.
+    noteSessionCreationFailed(pendingAttempt!);
+    pendingAttempt = null;
+    fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
+    // A plain session the viewer creates later is not the gadget's, and Build's gadget goes.
+    noteSessionCreatedHere("conv_plain", "Other work", beginSessionCreation());
+    expect(adoptStartedGadgetSession).not.toHaveBeenCalled();
+    await waitFor(() => expect(deleteGadget).toHaveBeenCalledWith("board"));
+  });
+
+  it("links the session its own create makes, when another create finishes first", () => {
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Creating" }));
+    const gadgets = pendingAttempt!;
+    pendingAttempt = null;
+    fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
+    const other = beginSessionCreation();
+    noteSessionCreatedHere("conv_other", "Other work", other);
+    expect(adoptStartedGadgetSession).not.toHaveBeenCalled();
+    noteSessionCreatedHere("conv_9", "Build", gadgets);
+    expect(adoptStartedGadgetSession).toHaveBeenCalledTimes(1);
+    expect(adoptStartedGadgetSession).toHaveBeenCalledWith("board", "conv_9", "Build");
+  });
+
+  it("links the gadget again when its session shows after a link that failed", async () => {
+    vi.mocked(adoptStartedGadgetSession).mockRejectedValueOnce(new Error("offline"));
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Created" }));
+    expect(adoptStartedGadgetSession).toHaveBeenCalledTimes(1);
+    await Promise.resolve();
+    await Promise.resolve();
+    fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
+    fireEvent.click(screen.getByRole("button", { name: "Created, query kept" }));
+    await waitFor(() => expect(adoptStartedGadgetSession).toHaveBeenCalledTimes(2));
+    expect(adoptStartedGadgetSession).toHaveBeenLastCalledWith("board", "conv_9", "Build");
   });
 
   it("deletes a gadget Build made when New session is left without sending it", async () => {
