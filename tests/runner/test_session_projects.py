@@ -260,12 +260,20 @@ async def test_organizing_writes_need_the_organize_source_check(execute, args):
     assert [(r.method, r.url.path) for r in requests] == [("GET", "/v1/info")]
 
 
-def _organize_server(requests: list[httpx.Request], snapshot: dict, info: dict = ORGANIZE_INFO):
+def _organize_server(
+    requests: list[httpx.Request],
+    snapshot: dict,
+    info: dict = ORGANIZE_INFO,
+    *,
+    source_snapshot: dict | None = None,
+):
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         if request.url.path == "/v1/info":
             return httpx.Response(200, json=info)
         if request.method == "GET":
+            if source_snapshot is not None and request.url.path == f"/v1/sessions/{SOURCE}":
+                return httpx.Response(200, json=source_snapshot)
             return httpx.Response(200, json=snapshot)
         return httpx.Response(200, json={})
 
@@ -919,27 +927,36 @@ async def test_update_archives_and_closes_a_sub_agent_on_the_callers_runner(titl
 
 
 @pytest.mark.parametrize("capability", [False, None], ids=["false", "omitted"])
-async def test_update_refuses_a_sub_agent_on_the_callers_runner_without_the_server_check(
+@pytest.mark.parametrize(
+    "runner_id", ["runner-1", "runner-2"], ids=["same-runner", "other-runner"]
+)
+async def test_update_refuses_a_sub_agent_without_the_server_check(
     capability,
+    runner_id,
 ):
     requests: list[httpx.Request] = []
-    # An older server cannot tell whether the sub-agent owns the shared runner.
+    # Older servers lack both shared-runner protection and inherited-host archive routing.
     info = {k: v for k, v in ORGANIZE_INFO.items() if k != "session_archive_runner_checks"}
     if capability is not None:
         info["session_archive_runner_checks"] = capability
     snapshot = {
         "id": SUB_AGENT,
         "parent_session_id": PARENT,
-        "runner_id": "runner-1",
+        "runner_id": runner_id,
+        "host_id": None,
         "labels": {},
     }
-    async with _client(_organize_server(requests, snapshot, info)) as client:
+    async with _client(
+        _organize_server(
+            requests, snapshot, info, source_snapshot={"id": SOURCE, "runner_id": "runner-1"}
+        )
+    ) as client:
         result = json.loads(
             await execute_session_update(
                 {"session_id": SUB_AGENT, "archived": True}, client, SOURCE
             )
         )
-    assert "shares the calling session's runner" in result["error"]
+    assert "cannot safely archive sub-agent sessions" in result["error"]
     assert not [r for r in requests if r.method == "PATCH"]
 
 
@@ -962,11 +979,10 @@ async def test_update_tombstones_a_label_only_closed_sub_agent(archived):
     assert result["status"] == "updated" and result["closed"] is True
     (patch,) = [r for r in requests if r.method == "PATCH"]
     expected = {
+        "archived": True,
         "title": f"researcher:auth:closed:{SUB_AGENT}",
         "labels": {"omnigent.closed": "true"},
     }
-    if not archived:
-        expected["archived"] = True
     assert json.loads(patch.content) == expected
 
 

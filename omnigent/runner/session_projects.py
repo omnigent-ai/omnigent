@@ -426,6 +426,8 @@ def _close_sub_agent(current: dict[str, Any], payload: dict[str, Any]) -> dict[s
     # Snapshots hide title tombstones, and a closed label alone does not free the name.
     closed = {
         **payload,
+        # Repeated closes still need the server's archive guards and teardown.
+        "archived": True,
         "labels": {**payload.get("labels", {}), CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
     }
     title = current.get("title")
@@ -604,12 +606,19 @@ async def execute_session_update(
                 "runs it closes it",
             }
         )
-    # A sub-agent's archive leaves an ancestor's runner up, and a server with the
-    # runner check refuses one whose runner it owns, so it is not checked here.
+    # Sub-agent archives need both runner ownership checks and inherited-host routing.
+    if sub_agent and not await _server_checks_source(client, _ARCHIVE_RUNNER_CHECKS):
+        return json.dumps(
+            {
+                "session_id": session_id,
+                "error": "this Omnigent server cannot safely archive sub-agent sessions; "
+                "upgrade the server",
+            }
+        )
     if (
         changes.get("archived") is True
         and not archives_itself
-        and not (sub_agent and await _server_checks_source(client, _ARCHIVE_RUNNER_CHECKS))
+        and not sub_agent
         and await _shares_runner(client, current, source_id)
     ):
         return json.dumps(

@@ -438,8 +438,8 @@ class ServerInfoResponse(BaseModel):
     # Every other agent-tool organizing write checks it too: session title, pin
     # and archive, and project rename, icon and delete.
     session_organize_source_checks: bool = False
-    # An agent-tool archive is refused when the caller shares a runner the target owns;
-    # older servers lack the check, so the runner tool makes it for sub-agents too.
+    # Sub-agent archives check runner ownership and route through inherited hosts;
+    # runner tools require this capability before archiving a sub-agent.
     session_archive_runner_checks: bool = False
     # An agent's create that names a project other than its source's project makes a
     # standalone session; older servers refuse it while sibling sessions are on.

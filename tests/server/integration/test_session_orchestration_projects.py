@@ -652,13 +652,20 @@ async def test_the_tool_archives_sub_agents_in_any_of_the_owners_trees(
     store = SqlAlchemyConversationStore(db_uri)
     # One sub-agent in another tree, and one of the caller's own on its runner.
     other_tree_child = store.create_conversation(
-        agent_id=source["agent_id"], parent_conversation_id=target["id"], title="researcher:auth"
+        kind="sub_agent",
+        agent_id=source["agent_id"],
+        parent_conversation_id=target["id"],
+        title="researcher:auth",
     )
     own_child = store.create_conversation(
-        agent_id=source["agent_id"], parent_conversation_id=source["id"], title="Worker"
+        kind="sub_agent",
+        agent_id=source["agent_id"],
+        parent_conversation_id=source["id"],
+        title="Worker",
     )
     # Stopping a native side chat closes it without releasing its title.
     closed_child = store.create_conversation(
+        kind="sub_agent",
         agent_id=source["agent_id"],
         parent_conversation_id=target["id"],
         title="Stopped worker",
@@ -704,6 +711,7 @@ async def test_the_tool_archives_sub_agents_in_any_of_the_owners_trees(
         assert shown["title"] == title
         # The parent can start a new sub-agent under the freed name.
         store.create_conversation(
+            kind="sub_agent",
             agent_id=source["agent_id"],
             parent_conversation_id=saved.parent_conversation_id,
             title=title,
@@ -713,6 +721,7 @@ async def test_the_tool_archives_sub_agents_in_any_of_the_owners_trees(
     repeated = await _project_tool(
         auth_client, source, "sys_session_update", session_id=closed_child.id, archived=True
     )
+    await asyncio.gather(*list(orchestration._detached_stop_tasks))
     assert repeated["closed"] is True and repeated["archived"] is True
     assert store.get_conversation(closed_child.id).title == (
         f"Stopped worker:closed:{closed_child.id}"
@@ -720,35 +729,69 @@ async def test_the_tool_archives_sub_agents_in_any_of_the_owners_trees(
 
     # A grandchild cannot archive its sub-agent parent: the server's lineage guard refuses.
     lead = store.create_conversation(
-        agent_id=source["agent_id"], parent_conversation_id=source["id"], title="Lead"
+        kind="sub_agent",
+        agent_id=source["agent_id"],
+        parent_conversation_id=source["id"],
+        title="Lead",
     )
     grandchild = store.create_conversation(
-        agent_id=source["agent_id"], parent_conversation_id=lead.id, title="Helper"
+        kind="sub_agent",
+        agent_id=source["agent_id"],
+        parent_conversation_id=lead.id,
+        title="Helper",
     )
     for session_id in (lead.id, grandchild.id):
         assert store.set_runner_id(session_id, runner_id) is True
-    refused = json.loads(
-        await execute_tool(
-            tool_name="sys_session_update",
-            arguments=json.dumps({"session_id": lead.id, "archived": True}),
-            server_client=auth_client,
-            conversation_id=grandchild.id,
-        )
-    )
-    assert "cannot archive a session it runs under" in refused["error"], refused
-    unchanged = store.get_conversation(lead.id)
-    assert unchanged.archived is not True and unchanged.title == "Lead"
-    assert "omnigent.closed" not in unchanged.labels
+
+    async def undo_after_snapshot(response):
+        if response.request.method == "GET" and response.request.url.path == (
+            f"/v1/sessions/{lead.id}"
+        ):
+            await response.aread()
+            assert response.json()["archived"] is True
+            restored = await auth_client.patch(f"/v1/sessions/{lead.id}", json={"archived": False})
+            assert restored.status_code == 200, restored.text
+
+    for archived_snapshot in (False, True):
+        store.update_conversation(lead.id, archived=archived_snapshot)
+        with monkeypatch.context() as patch:
+            if archived_snapshot:
+                # Undo after the read keeps source validation from masking the lineage guard.
+                patch.setitem(
+                    auth_client.event_hooks,
+                    "response",
+                    [*auth_client.event_hooks["response"], undo_after_snapshot],
+                )
+            refused = await _project_tool(
+                auth_client,
+                {"id": grandchild.id},
+                "sys_session_update",
+                session_id=lead.id,
+                archived=True,
+            )
+        assert "cannot archive a session it runs under" in refused["error"], refused
+        unchanged = store.get_conversation(lead.id)
+        assert unchanged.archived is not True and unchanged.title == "Lead"
+        assert "omnigent.closed" not in unchanged.labels
     # Siblings left on the caller's runner after their parent was rebound: the
     # host-bound one owns it, so archiving it would stop the caller; it is refused.
     rebound = store.create_conversation(
-        agent_id=source["agent_id"], parent_conversation_id=target["id"], title="Rebound"
+        kind="sub_agent",
+        agent_id=source["agent_id"],
+        parent_conversation_id=target["id"],
+        title="Rebound",
     )
     owner = store.create_conversation(
-        agent_id=source["agent_id"], parent_conversation_id=rebound.id, title="Owner"
+        kind="sub_agent",
+        agent_id=source["agent_id"],
+        parent_conversation_id=rebound.id,
+        title="Owner",
     )
     sibling = store.create_conversation(
-        agent_id=source["agent_id"], parent_conversation_id=rebound.id, title="Sibling"
+        kind="sub_agent",
+        agent_id=source["agent_id"],
+        parent_conversation_id=rebound.id,
+        title="Sibling",
     )
     assert store.set_runner_id(rebound.id, "rebound-runner") is True
     store.set_host_id(owner.id, "c1b2c3d4e5f61234567890abcdef0123", workspace="/tmp/ws")
