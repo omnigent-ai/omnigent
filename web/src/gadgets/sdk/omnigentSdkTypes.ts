@@ -158,7 +158,10 @@ export interface OmnigentNavigation {
     params?: { prompt?: string; display?: OmnigentNavigationDisplay },
     options?: OmnigentCallOptions,
   ) => Promise<{ opened: true }>;
-  /** Opens a session. A viewer without access to it sees Omnigent's usual message. */
+  /**
+   * Opens a session. A viewer without access to it sees Omnigent's usual message. In a `panel`
+   * the gadget shows beside that session; its actions still go to the viewer's gadget session.
+   */
   openSession: (
     sessionId: string,
     options?: OmnigentCallOptions & { display?: OmnigentNavigationDisplay },

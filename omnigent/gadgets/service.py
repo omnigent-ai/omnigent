@@ -653,13 +653,17 @@ class GadgetService:
         """Shows a gadget beside one of the viewer's sessions, or stops showing it there.
 
         Showing it there also makes that session the viewer's gadget session when they
-        may register one, so actions requested from the gadget's own page reach it. Only
-        a session the viewer can read can show it.
+        may register one, so actions requested from the gadget's own page reach it,
+        unless *body* says ``"handles_actions": false`` (a session the gadget only cites).
+        Only a session the viewer can read can show it.
         """
         session_id = _session_id(session_id)
         linked = body.get("linked")
         if not isinstance(linked, bool):
             raise InvalidInput("linked must be true or false")
+        handles_actions = body.get("handles_actions", True)
+        if not isinstance(handles_actions, bool):
+            raise InvalidInput("handles_actions must be true or false")
         key = self._session_key(session_id)
         current = self._shelf.get("sessions", key)
         ids = current.value.get("gadgets") if current is not None else None
@@ -672,7 +676,7 @@ class GadgetService:
                 shown.append(app_id)
             if len(shown) > MAX_SESSION_GADGETS:
                 raise CapacityExceeded(f"A session can show at most {MAX_SESSION_GADGETS} gadgets")
-            if permissions.publish:
+            if permissions.publish and handles_actions:
                 self._register_gadget_session(gadget, session_id)
         else:
             shown = [value for value in shown if value != app_id]

@@ -652,11 +652,15 @@ export async function linkGadgetToSession(
   appId: string,
   sessionId: string,
   linked: boolean,
+  { handlesActions = true }: { handlesActions?: boolean } = {},
 ): Promise<Gadget[]> {
+  // Showing a gadget beside a session also sends it the gadget's actions, unless the session
+  // is only one the gadget points to.
+  const body = handlesActions ? { linked } : { linked, handles_actions: false };
   return parseSessionGadgets(
     await gadgetRequest(appPath(appId, `/sessions/${encodeURIComponent(sessionId)}`), {
       method: "PUT",
-      body: JSON.stringify({ linked }),
+      body: JSON.stringify(body),
     }),
   );
 }

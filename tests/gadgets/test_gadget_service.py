@@ -1115,6 +1115,12 @@ def test_session_links_show_readable_gadgets_and_route_actions(gadgets: Fixture)
     assert owner.get_gadget_session(first["id"])["session_id"] == "Session_B2"
     owner.link_session(first["id"], session, {"linked": True})
     assert owner.get_gadget_session(first["id"])["session_id"] == session
+    # A session the gadget only cites shows it without taking its actions.
+    cited = owner.link_session(first["id"], "Cited_C3", {"linked": True, "handles_actions": False})
+    assert [item["id"] for item in cited["items"]] == [first["id"]]
+    assert owner.get_gadget_session(first["id"])["session_id"] == session
+    with pytest.raises(InvalidInput):
+        owner.link_session(first["id"], "Cited_C3", {"linked": True, "handles_actions": "no"})
     assert owner.session_gadgets("other")["items"] == []
 
     # A reader may show a shared gadget beside their own session, without becoming its handler.

@@ -72,20 +72,28 @@ export function onSessionGadgetsChanged(listener: SessionGadgetsListener): () =>
   return () => sessionGadgetsListeners.delete(listener);
 }
 
-async function showGadgetInSession(appId: string, sessionId: string): Promise<void> {
-  const apps = await linkGadgetToSession(appId, sessionId, true);
+async function showGadgetInSession(
+  appId: string,
+  sessionId: string,
+  options: { handlesActions?: boolean } = {},
+): Promise<void> {
+  const apps = await linkGadgetToSession(appId, sessionId, true, options);
   sessionGadgetsListeners.forEach((listener) => listener(sessionId, apps));
 }
 
-/** Opens the session with the gadget shown in its side panel. */
+/**
+ * Opens the session with the gadget shown in its side panel. A session the gadget only points
+ * to (`handlesActions: false`, such as one its page cites) shows it without taking its actions.
+ */
 export async function openGadgetInSession(
   appId: string,
   sessionId: string,
   navigate: GadgetNavigate,
+  options: { handlesActions?: boolean } = {},
 ): Promise<void> {
   // The side panel lists only the gadgets linked to the session, so link it first. A failed link
   // still opens the session; the gadget stays on its own page.
-  await showGadgetInSession(appId, sessionId).catch(() => undefined);
+  await showGadgetInSession(appId, sessionId, options).catch(() => undefined);
   requestGadgetRailTab(sessionId, gadgetRailKey(appId));
   navigate(gadgetSessionUrl(sessionId));
 }

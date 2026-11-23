@@ -261,6 +261,8 @@ interface ActionProgress {
 }
 
 // Each opens a page after a click inside the app; display "tab" (default), "panel" or "page".
+// openSession with "panel" shows the gadget beside that session; its actions still go to the
+// viewer's gadget session.
 interface Navigation {
   newSession(params?: { prompt?: string; display?: string }): Promise<{ opened: true }>;
   openSession(sessionId: string, options?: { display?: string }): Promise<{ opened: true }>;

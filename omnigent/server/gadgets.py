@@ -359,7 +359,11 @@ def create_gadgets_router(
 
     @router.put("/gadgets/{app_id}/sessions/{session_id}")
     async def link_session(app_id: str, session_id: str, request: Request) -> Response:
-        """Show a gadget beside a session (``{"linked": bool}``); answers its gadgets."""
+        """Show a gadget beside a session (``{"linked": bool}``); answers its gadgets.
+
+        Showing it there also sends the caller's actions from the gadget's page to that
+        session, unless the body has ``"handles_actions": false``.
+        """
         body = await _body(request)
         return _json(
             await run(request, lambda service: service.link_session(app_id, session_id, body))

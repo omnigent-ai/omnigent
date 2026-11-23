@@ -253,6 +253,80 @@ describe("GadgetFrame", () => {
     });
   });
 
+  describe("pages the gadget opens", () => {
+    beforeEach(() => {
+      Object.defineProperty(navigator, "userActivation", {
+        value: { isActive: true },
+        configurable: true,
+      });
+    });
+    afterEach(() => {
+      Reflect.deleteProperty(navigator, "userActivation");
+      delete window.__OMNIGENT_BASE_PATH__;
+    });
+
+    function connectAndClick() {
+      const view = renderFrame();
+      const frameWindow = view.frame().contentWindow as Window;
+      vi.spyOn(frameWindow, "postMessage").mockImplementation(() => {});
+      greet(frameWindow, { type: GADGET_HELLO_MESSAGE_TYPE, ...mountOf(view.frame()) });
+      const port = FakeMessageChannel.created[0].port1;
+      const onMessage = port.addEventListener.mock.calls[0][1] as (event: MessageEvent) => void;
+      // A click inside the gadget lets it open one page.
+      act(() => view.frame().focus());
+      const call = (method: string, params: Record<string, unknown>) =>
+        act(() => {
+          onMessage(
+            new MessageEvent("message", {
+              data: { v: 1, kind: "request", id: "n1", method, params, deadlineMs: 5_000 },
+            }),
+          );
+        });
+      return { ...view, call };
+    }
+
+    it("shows the gadget beside a session it opens in the panel, without sending it actions", async () => {
+      const fetchMock = vi.fn(
+        async () =>
+          new Response(JSON.stringify({ items: [] }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const { call } = connectAndClick();
+
+      call("navigation.v1.openSession", { sessionId: "s2", display: "panel" });
+
+      // Linked to the session first, so its side panel lists the gadget to show.
+      await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(String(url)).toContain("/v1/gadgets/app-1/sessions/s2");
+      expect(init.method).toBe("PUT");
+      expect(JSON.parse(String(init.body))).toEqual({ linked: true, handles_actions: false });
+      await waitFor(() =>
+        expect(useGadgetRailRequest.getState().requested).toMatchObject({
+          conversationId: "s2",
+          key: "gadget:app-1",
+        }),
+      );
+    });
+
+    it("opens a page in a new tab under the deployment's base path", () => {
+      window.__OMNIGENT_BASE_PATH__ = "/app";
+      const opened = vi.spyOn(window, "open").mockImplementation(() => null);
+      const { call } = connectAndClick();
+
+      call("navigation.v1.openSession", { sessionId: "s2", display: "tab" });
+
+      expect(opened).toHaveBeenCalledWith(
+        `${window.location.origin}/app/c/s2`,
+        "_blank",
+        "noopener,noreferrer",
+      );
+    });
+  });
+
   it("stops a frame that navigates and says so, then reloads it on request", () => {
     const { frame } = renderFrame();
     const first = mountOf(frame());

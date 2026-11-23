@@ -12,13 +12,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { withBasePath } from "@/lib/basePath";
 import { getOmnigentGadgetFrame } from "@/lib/host";
 import { randomUUID } from "@/lib/randomUUID";
 import { useNavigate, useRebasePath } from "@/lib/routing";
 import {
   noteGadgetFrameConnected,
   requestGadgetCreateSessionMenu,
-  requestGadgetRailTab,
   gadgetFillsScreen,
 } from "@/lib/gadgetRailTabs";
 
@@ -40,9 +40,9 @@ import { createPreviewRpc } from "./previewRpc";
 import type { GadgetGestureGate } from "./gadgetGestureGate";
 import { createGadgetGestureGate } from "./gadgetGestureGate";
 import {
+  openGadgetInSession,
   quoteInGadgetSession,
   requestGadgetAction,
-  gadgetRailKey,
   gadgetSelectionQuote,
 } from "./gadgetSession";
 import type { Gadget, GadgetContent } from "../api/gadgetApi";
@@ -296,16 +296,25 @@ export function GadgetFrame({
           });
           break;
         case "openSession":
-          path = gadgetSessionUrl(request.sessionId);
           if (request.display === "panel") {
-            // The session opens with this gadget in its side panel.
-            requestGadgetRailTab(request.sessionId, gadgetRailKey(current.id));
+            // The session opens with this gadget in its side panel, linked there first (the
+            // panel lists only linked gadgets). A cited session does not take the gadget's
+            // actions; those keep going to the viewer's gadget session.
+            void openGadgetInSession(
+              current.id,
+              request.sessionId,
+              navigationRef.current.navigate,
+              { handlesActions: false },
+            );
+            return true;
           }
+          path = gadgetSessionUrl(request.sessionId);
           break;
       }
       if (request.display === "tab") {
-        const url = new URL(navigationRef.current.rebasePath(path), window.location.origin);
-        window.open(url.href, "_blank", "noopener,noreferrer");
+        // Under the deployment's base path too, which a new tab does not get from the router.
+        const href = withBasePath(navigationRef.current.rebasePath(path));
+        window.open(new URL(href, window.location.origin).href, "_blank", "noopener,noreferrer");
       } else {
         navigationRef.current.navigate(path);
         if (createSessionMenu) requestGadgetCreateSessionMenu();
