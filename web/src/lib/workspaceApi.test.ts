@@ -423,6 +423,39 @@ describe("readFileViaWorkspaceApi", () => {
     expect(methodCalls("ListDirectory")).toHaveLength(requests);
   });
 
+  it.each([
+    ["hides what Git ignores when asked", { hideIgnored: true }, true],
+    ["lists everything by default", undefined, false],
+  ])("%s, and marks the ignored entries it lists", async (_case, options, asked) => {
+    enable("workspace_api_server_access");
+    const sent: boolean[] = [];
+    vi.mocked(authenticatedFetch).mockImplementation(async (_input, init) => {
+      sent.push(fromBinary(ListDirectoryRequestSchema, init!.body as Uint8Array).hideIgnored);
+      const page = create(ListDirectoryResponseSchema, {
+        entries: [
+          { name: "build", path: "build", type: EntryType.DIRECTORY, ignored: true },
+          { name: "main.py", path: "main.py", type: EntryType.FILE },
+        ],
+      });
+      return new Response(toBinary(ListDirectoryResponseSchema, page), { headers: PROTO_HEADERS });
+    });
+
+    const listed = await listDirectoryViaWorkspaceApi(
+      `s-ignored-${asked}`,
+      "",
+      1000,
+      undefined,
+      options,
+    );
+
+    expect(sent).toEqual([asked]);
+    expect(listed?.data.map(({ path, ignored }) => ({ path, ignored }))).toEqual([
+      { path: "build", ignored: true },
+      { path: "main.py", ignored: undefined },
+    ]);
+    expect(listed?.data[1]).not.toHaveProperty("ignored");
+  });
+
   it("leaves a listing the host answers with an error to REST, and keeps the route for reads", async () => {
     enable("workspace_api_server_access");
     vi.mocked(authenticatedFetch).mockImplementation(async (input) =>

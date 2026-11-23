@@ -19,6 +19,10 @@ export interface FilesPageTreeProps {
   showHidden: boolean;
   /** Shows hidden files, for a workspace whose every file is hidden. */
   onShowHidden?: () => void;
+  /** List what Git ignores, marked as ignored; otherwise leave it out. */
+  showIgnored: boolean;
+  /** Shows ignored files, for a workspace where Git ignores every file. */
+  onShowIgnored?: () => void;
   /** `newTab` for a ⌘-click (Ctrl-click off macOS) or a middle click, which want the file in its own tab. */
   onFileSelect: (path: string, options?: { newTab: true }) => void;
 }
@@ -42,9 +46,11 @@ export function FilesPageTree({
   sort,
   showHidden,
   onShowHidden,
+  showIgnored,
+  onShowIgnored,
   onFileSelect,
 }: FilesPageTreeProps) {
-  const files = useWorkspaceAllFiles(conversationId);
+  const files = useWorkspaceAllFiles(conversationId, { hideIgnored: !showIgnored });
   const changes = useWorkspaceChangedFiles(conversationId);
   if (files.isPending) return <TreeMessage>Loading files…</TreeMessage>;
   if (files.isError) {
@@ -56,6 +62,25 @@ export function FilesPageTree({
   }
   if (!files.data.available) return <TreeMessage>This session has no workspace files.</TreeMessage>;
   const entries = files.data.data;
+  if (entries.length === 0 && !showIgnored) {
+    // The host left out what Git ignores, so the workspace may hold only that.
+    return (
+      <div className="flex flex-col items-start gap-2 pb-2">
+        <TreeMessage>No files here, apart from any that Git ignores.</TreeMessage>
+        {onShowIgnored ? (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="mx-3"
+            onClick={onShowIgnored}
+          >
+            Show git-ignored files
+          </Button>
+        ) : null}
+      </div>
+    );
+  }
   if (entries.length === 0) return <TreeMessage>No files in the workspace.</TreeMessage>;
   if (visibleEntries(entries, showHidden).length === 0) {
     return (
@@ -78,6 +103,7 @@ export function FilesPageTree({
       changedFiles={changes.data?.available ? changes.data.data : []}
       sort={sort}
       showHidden={showHidden}
+      showIgnored={showIgnored}
       refreshToken={0}
       onFileSelect={onFileSelect}
       reveal={null}

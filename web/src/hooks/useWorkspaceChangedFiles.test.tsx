@@ -39,6 +39,7 @@ import {
   useSessionActive,
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
+  useWorkspaceDirectories,
   useWorkspaceDirectory,
   useWorkspaceEnvironment,
   useWorkspaceFileExists,
@@ -761,8 +762,71 @@ describe("useWorkspaceDirectory gating", () => {
       undefined,
       "src/inner/lib/deep",
     ]);
-    expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith("conv_api", "src/inner", 1000);
+    expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith(
+      "conv_api",
+      "src/inner",
+      1000,
+      undefined,
+      {
+        hideIgnored: false,
+      },
+    );
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("lists a folder without what Git ignores apart from its full listing, marking ignored entries", async () => {
+    onlineMock.mockReturnValue(true);
+    vi.mocked(listDirectoryViaWorkspaceApi).mockImplementation(
+      async (_session, _path, _max, _signal, options) => ({
+        data: [
+          ...(options?.hideIgnored
+            ? []
+            : [
+                {
+                  id: "src/build",
+                  name: "build",
+                  path: "src/build",
+                  type: "directory" as const,
+                  bytes: null,
+                  modified_at: 1,
+                  ignored: true as const,
+                },
+              ]),
+          {
+            id: "src/main.py",
+            name: "main.py",
+            path: "src/main.py",
+            type: "file" as const,
+            bytes: 1,
+            modified_at: 1,
+          },
+        ],
+        hasMore: false,
+      }),
+    );
+
+    const { result } = renderHook(
+      () => ({
+        all: useWorkspaceDirectories("conv_ignored", ["src"]),
+        hidden: useWorkspaceDirectories("conv_ignored", ["src"], "", 0, true),
+      }),
+      { wrapper: Wrap },
+    );
+
+    await waitFor(() => {
+      expect(result.current.all.get("src")?.data).toBeDefined();
+      expect(result.current.hidden.get("src")?.data).toBeDefined();
+    });
+    expect(result.current.all.get("src")?.data).toEqual([
+      expect.objectContaining({ path: "src/build", ignored: true }),
+      expect.not.objectContaining({ ignored: expect.anything() }),
+    ]);
+    expect(result.current.hidden.get("src")?.data?.map((file) => file.path)).toEqual([
+      "src/main.py",
+    ]);
+    expect(vi.mocked(listDirectoryViaWorkspaceApi).mock.calls.map((call) => call[4])).toEqual(
+      expect.arrayContaining([{ hideIgnored: false }, { hideIgnored: true }]),
+    );
   });
 
   it("does not fetch when path is null (pre-existing gate)", async () => {
@@ -1332,7 +1396,15 @@ describe("useWorkspaceFileExists", () => {
 
     await waitFor(() => expect(found.at(-1)).toEqual({ exists: true, settled: true }));
     expect(missing.at(-1)).toEqual({ exists: false, settled: false });
-    expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith("conv_api", "docs", 10_000);
+    expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith(
+      "conv_api",
+      "docs",
+      10_000,
+      undefined,
+      {
+        hideIgnored: false,
+      },
+    );
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -1979,7 +2051,15 @@ describe("browse-location listings normalize to paths relative to the location",
     await waitFor(() => expect(onPaths).toHaveBeenCalled());
 
     expect(onPaths).toHaveBeenLastCalledWith(["summary.md", "q3.csv"]);
-    expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith("conv_rel_api", "reports", 1000);
+    expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith(
+      "conv_rel_api",
+      "reports",
+      1000,
+      undefined,
+      {
+        hideIgnored: false,
+      },
+    );
   });
 
   it("leaves an absolute location's already-bare paths alone", async () => {

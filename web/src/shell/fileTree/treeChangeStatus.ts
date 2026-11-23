@@ -1,9 +1,10 @@
 // The Files tree's change marks: each changed file's own status, and for each
 // folder the strongest status of anything inside it (created, then modified,
-// then deleted), in the shape the file tree draws.
+// then deleted), in the shape the file tree draws. Listed entries Git ignores
+// are marked too; the tree dims them and everything inside an ignored folder.
 
 import type { GitStatusEntry } from "@/components/file-tree/vendored";
-import type { WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
+import type { WorkspaceChangedFile, WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 
 type ChangeStatus = WorkspaceChangedFile["status"];
 
@@ -34,4 +35,17 @@ export function treeChangeStatuses(
   }
   for (const [path, status] of folders) entries.push({ path, status: TREE_STATUS[status] });
   return entries;
+}
+
+/** Status entries for the listed entries Git ignores. Folders are tree paths, ending in "/". */
+export function treeIgnoredStatuses(entries: Iterable<WorkspaceFile>): GitStatusEntry[] {
+  const statuses: GitStatusEntry[] = [];
+  for (const entry of entries) {
+    if (!entry.ignored) continue;
+    statuses.push({
+      path: entry.type === "directory" ? `${entry.path}/` : entry.path,
+      status: "ignored",
+    });
+  }
+  return statuses;
 }
