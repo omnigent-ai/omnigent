@@ -3186,6 +3186,56 @@ describe("useMoveToNest", () => {
       expect(queryClient.getQueryData(backfillKey)).toEqual(removed ? null : row);
     },
   );
+
+  it.each([false, true])(
+    "shows a standalone destination leading the new nest until the move settles (rejected=%s)",
+    async (rejected) => {
+      const row = conversation({ id: "moved" });
+      const head = conversation({ id: "head", title: "Head" });
+      const family = {
+        id: "head",
+        representative_id: "head",
+        representative_title: "Head",
+        pinned: false,
+        pinned_at: null,
+      };
+      let respond!: (response: Response) => void;
+      fetchMock.mockReturnValue(
+        new Promise<Response>((done) => {
+          respond = done;
+        }),
+      );
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      const key = ["conversations", "", false];
+      const original = infinitePage([head, row]);
+      queryClient.setQueryData(key, original);
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useMoveToNest(), { wrapper });
+      result.current.mutate({ id: row.id, destination: head });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+      expect(queryClient.getQueryData<ConversationsInfiniteData>(key)?.pages[0].data).toMatchObject(
+        [
+          { id: "head", family },
+          { id: "moved", family },
+        ],
+      );
+      expect(withMoveTombstone(head)).toMatchObject({ family });
+      respond(
+        rejected
+          ? mockResponse(
+              { detail: "Only the owner of every session can change the family" },
+              { ok: false, status: 403 },
+            )
+          : mockResponse({ ...row, family }),
+      );
+      await waitFor(() => expect(result.current.isIdle || result.current.isPending).toBe(false));
+      expect(result.current.isError).toBe(rejected);
+      if (rejected) expect(queryClient.getQueryData(key)).toEqual(original);
+      expect(withMoveTombstone(head)).toEqual(head);
+      expect(withMoveTombstone(row)).toEqual(row);
+    },
+  );
 });
 
 describe("useMoveToProject", () => {

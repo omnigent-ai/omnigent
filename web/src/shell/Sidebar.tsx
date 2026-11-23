@@ -10,6 +10,7 @@ import {
   orderSessionFamilies,
   isIndentedSibling,
   isSessionPinned,
+  nestFamilyUnder,
   sessionFamilyGroups,
 } from "@/lib/sessionFamilies";
 import { filterSessionScope } from "@/lib/sessionVisibility";
@@ -135,7 +136,7 @@ import {
 } from "@dnd-kit/sortable";
 import { useProjectOrder, useSaveProjectOrder } from "@/hooks/useProjectOrder";
 import { useIsMutating, useQueries, useQueryClient } from "@tanstack/react-query";
-import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
+import { PIN_WRITE_MUTATION_KEY, SIDE_CHAT_LABEL_KEY } from "@/lib/sessionListCache";
 import {
   canFlagUnread,
   isConversationMuted,
@@ -481,6 +482,21 @@ const NestMoveContext = createContext<{
   canJoin: boolean;
   saving: boolean;
 } | null>(null);
+
+/**
+ * Whether the viewer can nest sessions under `row`: an owned, active, top-level
+ * session. A standalone one then leads a new nest; a nest member stands for its nest.
+ */
+function isNestDestination(row: Conversation, viewerId: string | null): boolean {
+  return (
+    !row.archived &&
+    !row.provisional &&
+    !row.nested_draft_source_id &&
+    !row.parent_session_id &&
+    row.labels[SIDE_CHAT_LABEL_KEY] === undefined &&
+    isOwnedByViewer(row, viewerId)
+  );
+}
 // Moves a session into another row's slot in the Custom order (row menu Move up/down).
 const SessionReorderContext = createContext<(fromId: string, toId: string) => void>(() => {});
 
@@ -3006,10 +3022,9 @@ function ConversationList({
   const nestMovesSupported = serverInfo !== "loading" && serverInfo.session_nest_moves === true;
   const moveNest = useStableCallback((id: string, destination: Conversation | null) => {
     if (moveToNest.isPending) return;
-    if (destination?.family) {
-      setCollapsedFamilies(
-        (previous) => new Set([...previous].filter((key) => key !== destination.family!.id)),
-      );
+    if (destination) {
+      const familyId = nestFamilyUnder(destination).id;
+      setCollapsedFamilies((previous) => new Set([...previous].filter((key) => key !== familyId)));
       const project =
         projects.find((p) => p.id === destination.project_id)?.name ??
         destination.labels[PROJECT_LABEL_KEY];
@@ -3022,9 +3037,7 @@ function ConversationList({
     () =>
       nestMovesSupported
         ? {
-            destinations: allConversations.filter(
-              (row) => row.family && !row.archived && isOwnedByViewer(row, viewerId),
-            ),
+            destinations: allConversations.filter((row) => isNestDestination(row, viewerId)),
             move: moveNest,
             canJoin: canJoinNests,
             saving: moveToNest.isPending,
@@ -3614,7 +3627,11 @@ function ConversationList({
             });
             if (nest) {
               const destination = nest.data?.droppableContainer.data.current?.destination;
-              return destination.family?.id === source?.familyId ? [] : [nest];
+              // A drop into the session's own nest, or onto itself, moves nothing.
+              const sameNest = destination.family
+                ? destination.family.id === source?.familyId
+                : destination.id === args.active.id;
+              return sameNest ? [] : [nest];
             }
             const detachToList = collisions.find(
               (hit) => hit.data?.droppableContainer.data.current?.type === "detach-nest",
@@ -6318,7 +6335,7 @@ function ConversationRowImpl({
   const { setNodeRef: setNestNodeRef, isOver: isNestTarget } = useDroppable({
     id: `nest:${conversation.id}`,
     data: { type: "session-nest", destination: conversation },
-    disabled: !canMoveNest || !conversation.family,
+    disabled: !canMoveNest || !isNestDestination(conversation, viewerId),
   });
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
@@ -7786,6 +7803,9 @@ function NestPickerMenu({
   });
   const label = (row: Conversation) =>
     row.family?.representative_title ?? conversationDisplayLabel(row);
+  // One entry per nest, plus one per standalone session that would lead a new nest.
+  const nestKey = (row: Conversation) =>
+    row.family ? `family:${row.family.id}` : `session:${row.id}`;
   const destinations = [
     ...new Map(
       [
@@ -7797,13 +7817,11 @@ function NestPickerMenu({
         .filter(
           (row) =>
             nests.canJoin &&
-            row.family &&
-            row.family.id !== conversation.family?.id &&
+            isNestDestination(row, viewerId) &&
             row.id !== conversation.id &&
-            !row.archived &&
-            isOwnedByViewer(row, viewerId),
+            (!row.family || row.family.id !== conversation.family?.id),
         )
-        .map((row) => [row.family!.id, row]),
+        .map((row) => [nestKey(row), row]),
     ).values(),
   ];
   const select = (destination: Conversation | null) => {
@@ -7826,7 +7844,7 @@ function NestPickerMenu({
       <div className="max-h-48 overflow-y-auto">
         {destinations.map((row) => (
           <C.Item
-            key={row.family!.id}
+            key={nestKey(row)}
             disabled={nests.saving}
             textValue={label(row)}
             onSelect={() => select(row)}

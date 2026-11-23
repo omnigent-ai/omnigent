@@ -49,7 +49,10 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 import { useConversations } from "@/hooks/useConversations";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
-import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "./sidebarNav";
+import {
+  EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
+  PINNED_CONVERSATION_IDS_STORAGE_KEY,
+} from "./sidebarNav";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 
 const ROW_HEIGHT = 30;
@@ -136,9 +139,10 @@ it("joins at a nest's center and detaches into the session list or footer", asyn
   const family = { id: "conv_d", representative_id: "conv_d", pinned: false };
   const otherFamily = { id: "conv_other", representative_id: "conv_other", pinned: false };
   const destination = conv("conv_d", { family });
+  const standalone = conv("conv_c");
   vi.mocked(useConversations).mockReturnValue(
     conversationPage([
-      conv("conv_c"),
+      standalone,
       destination,
       conv("conv_other", { family: otherFamily }),
       conv("conv_member", { family: otherFamily }),
@@ -176,10 +180,12 @@ it("joins at a nest's center and detaches into the session list or footer", asyn
     expectTarget: false,
     offsetY: ROW_HEIGHT / 2 + 2,
   });
-  await dropOnto("conv_member", "conv_c", { expectTarget: false });
-  expect(mocks.moveNest).toHaveBeenCalledTimes(3);
+  expect(mocks.moveNest).toHaveBeenCalledTimes(2);
   for (const [move] of mocks.moveNest.mock.calls)
     expect(move).toEqual({ id: "conv_member", destination: null });
+  // A standalone row's center nests the member under it, in a new nest.
+  await dropOnto("conv_member", "conv_c", { expectTarget: false });
+  expect(mocks.moveNest).toHaveBeenLastCalledWith({ id: "conv_member", destination: standalone });
   await dropOnto("conv_member", "conv_d", { expectTarget: false });
   expect(mocks.moveNest).toHaveBeenLastCalledWith({ id: "conv_member", destination });
   expect(mocks.moveProject).not.toHaveBeenCalled();
@@ -211,10 +217,12 @@ it("joins at a nest's center and detaches into the session list or footer", asyn
     conv("conv_member", { family, project_id: "project" }),
   ];
   vi.mocked(useConversations).mockReturnValue(conversationPage([]));
+  // Open the folder through storage: for 50 ms after a drag ends, dnd-kit swallows
+  // document clicks, so clicking the folder header here would race the last drop.
+  localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Demo"]));
   renderSidebar({
     info: { ...FALLBACK_SERVER_INFO, sibling_sessions: true, session_nest_moves: true },
   });
-  fireEvent.click(screen.getByRole("button", { name: "Demo" }));
   const head = document.querySelector('li[data-sidebar-session-id="conv_d"]')!;
   const headStart = rowCenter("conv_d");
   fireEvent.mouseDown(head, { button: 0, ...headStart });
@@ -229,6 +237,19 @@ it("joins at a nest's center and detaches into the session list or footer", asyn
   });
   expect(mocks.moveProject).toHaveBeenLastCalledWith({ id: "conv_d", project: "" });
 }, 15_000);
+
+it("starts a nest at a standalone row's center, but not over the dragged row itself", async () => {
+  const head = conv("conv_d");
+  vi.mocked(useConversations).mockReturnValue(conversationPage([conv("conv_c"), head]));
+  renderSidebar({
+    info: { ...FALLBACK_SERVER_INFO, sibling_sessions: true, session_nest_moves: true },
+  });
+  await dropOnto("conv_c", "conv_c", { expectTarget: false });
+  await dropOnto("conv_c", "conv_d", { expectTarget: false, offsetY: ROW_HEIGHT / 2 - 2 });
+  expect(mocks.moveNest).not.toHaveBeenCalled();
+  await dropOnto("conv_c", "conv_d", { expectTarget: false });
+  expect(mocks.moveNest).toHaveBeenCalledExactlyOnceWith({ id: "conv_c", destination: head });
+});
 
 describe("dropping an unpinned session onto a pinned row", () => {
   it("pins it into that slot and renumbers the existing pins", async () => {

@@ -1,5 +1,22 @@
 import type { Conversation } from "@/hooks/useConversations";
 import { PINNED_LABEL_KEY } from "./sessionListCache";
+import type { SessionFamily } from "./types";
+
+/**
+ * The family a session joins when nested under `head`: `head`'s nest, or for a
+ * standalone `head` the new nest the server keys by `head`'s id with `head` leading.
+ */
+export function nestFamilyUnder(head: Conversation): SessionFamily {
+  return (
+    head.family ?? {
+      id: head.id,
+      representative_id: head.id,
+      representative_title: head.title,
+      pinned: isSessionPinned(head),
+      pinned_at: head.labels?.[PINNED_LABEL_KEY] ?? null,
+    }
+  );
+}
 
 /** Legacy personal pins do not detach members from their family. */
 export function isSessionPinned(row: Conversation, pinnedIds?: ReadonlySet<string>): boolean {

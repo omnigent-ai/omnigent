@@ -1640,7 +1640,15 @@ class ConversationStore(ABC):
     def set_session_nest(
         self, session_id: str, source_id: str | None, *, user_id: str | None
     ) -> None:
-        """Move one independent session into a nest, or detach it with ``None``."""
+        """
+        Move one independent session into a nest, or detach it with ``None``.
+
+        :param session_id: The session to move, e.g. ``"conv_b"``.
+        :param source_id: Any session of the destination nest, or a standalone session
+            that then heads a new nest, e.g. ``"conv_a"``; ``None`` detaches.
+        :param user_id: The caller whose family pin labels move with the session.
+        :raises OmnigentError: ``INVALID_INPUT`` when ``source_id`` is ``session_id``.
+        """
         raise NotImplementedError
 
     def get_session_family(self, session_id: str) -> list[Conversation]:

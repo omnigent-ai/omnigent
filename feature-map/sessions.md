@@ -21,8 +21,11 @@ the header menu), and each place is a separate entry point.
   replaces it. Navigate away and click the draft row to resume its text, attachments,
   and settings during the same page load. Right-click the draft row and choose
   **Delete draft** to remove it.
-  Owned active sessions can move into an existing nest by dragging onto its center
-  or choosing **Move session → Nests** in the sidebar menu. Choose a searchable
+  Owned active sessions can move into an existing nest, or nest under any other
+  owned active session, by dragging onto that row's center or choosing
+  **Move session → Nests** in the sidebar menu. A standalone destination leads the
+  new nest, and the moved session takes its project. Nests are one level deep, so
+  dropping onto a nested member joins its nest. Choose a searchable
   destination, or **Remove from nest** to detach just that session. Dragging a
   nested member into the session list above or below a nest removes it; a floating
   **Remove from nest** target is also available without shifting rows.
@@ -412,7 +415,7 @@ the automation's page for the automations list. With automations off for the
 caller, the session is deleted alone and its automation pauses at its next run.
 
 **Move session:** choose **Projects** or **Nests**, each with its own search.
-Nests also offers **Remove from nest**. Drag onto a nest row's center to join;
+Nests also offers **Remove from nest**. Drag onto a row's center to nest under it;
 drop a nested session into the session list above or below a nest to remove it.
 Other rows retain pin/custom ordering. Removal targets appear over the sidebar
 footer, keeping session rows in place and available as drop targets.
@@ -977,9 +980,12 @@ plain `uv run pytest`, which starts a private server for the test.
   Repeat from the header menu's Add to project by hand and expect the row to
   regroup under that project.
 - **`siblings`, moving existing sessions:** use an owned active session and nest.
-  Drag into the nest, then onto **Remove from nest** in the footer. Repeat through
-  the sidebar kebab and right-click **Move session → Nests**, search by a nest or
-  member title, and reload to confirm membership. **Projects** retains its own search.
+  Drag into the nest, then onto **Remove from nest** in the footer. Drag one
+  standalone session onto another's center and expect the target to lead a new nest.
+  Repeat through the sidebar kebab and right-click **Move session → Nests**, search
+  by a nest or member title, and reload to confirm membership. **Projects** retains
+  its own search. Automated drag coverage:
+  `tests/e2e_ui/sessions/test_move_to_project.py::test_drag_nests_a_session_under_a_standalone_session`.
 - **`siblings`, collapsed project folder:** component coverage at phone and
   desktop widths in `web/src/shell/Sidebar.heldFamily.test.tsx`. Open a nested
   session's parent while its project folder is collapsed and expect its nested

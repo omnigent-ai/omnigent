@@ -87,6 +87,7 @@ import {
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
 import { releaseConversation, useChatStore } from "@/store/chatStore";
+import { nestFamilyUnder } from "@/lib/sessionFamilies";
 import type { Session, SessionFamily } from "@/lib/types";
 import type { SessionPullRequestSummary } from "@/hooks/useSessionPullRequests";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
@@ -2658,10 +2659,16 @@ export function useMoveToNest() {
         project,
         projectId,
         projectLabel,
-        family: destination?.family ?? null,
+        family: destination ? nestFamilyUnder(destination) : null,
       };
       markSessionMoving(id, move);
+      // A standalone destination starts leading the nest, so its row shows the family too.
+      const headId = destination && !destination.family ? destination.id : null;
+      if (headId) markSessionMoving(headId, move);
       const moved = withMoveTombstone(row);
+      const head = headId ? findCachedConversationRow(queryClient, headId) : undefined;
+      const tombstoned = new Map([[id, moved]]);
+      if (head) tombstoned.set(head.id, withMoveTombstone(head));
       const queries = ["conversations", "project-sessions"].flatMap((key) =>
         queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: [key] }),
       );
@@ -2689,24 +2696,24 @@ export function useMoveToNest() {
         const filters = inProject
           ? filtersFromProjectQueryKey(key)
           : filtersFromConversationQueryKey(key);
-        const items = new Map([[id, moved]]);
-        let next = mergeItemsIntoPages(data, items, filters).data;
+        let next = mergeItemsIntoPages(data, tombstoned, filters).data;
         if (inProject && key[1] === project && !globallyVisible)
-          next = insertNewRowsIntoPages(next, items, filters).data;
+          next = insertNewRowsIntoPages(next, new Map([[id, moved]]), filters).data;
         if (next !== data) queryClient.setQueryData(key, next);
       }
       queryClient.setQueryData(["conversation-backfill", id], backfill ? moved : backfill);
       if (pins)
         queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, {
           ...pins,
-          conversations: pins.conversations.map((c) => (c.id === id ? moved : c)),
+          conversations: pins.conversations.map((c) => tombstoned.get(c.id) ?? c),
         });
-      return { queries, backfill, pins, move };
+      return { queries, backfill, pins, move, headId };
     },
     onError: (error, { id }, previous) => {
       showToast(error.message);
       if (!previous) return;
       unmarkSessionMoving(id, previous.move);
+      if (previous.headId) unmarkSessionMoving(previous.headId, previous.move);
       for (const [key, data] of previous.queries) if (data) queryClient.setQueryData(key, data);
       restoreOpenSessionRow(queryClient, id, previous.backfill);
       queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, previous.pins);
@@ -2733,7 +2740,9 @@ export function useMoveToNest() {
           PINNED_CONVERSATIONS_KEY,
         ].map((queryKey) => queryClient.invalidateQueries({ queryKey })),
       );
-      if (previous) unmarkSessionMoving(id, previous.move);
+      if (!previous) return;
+      unmarkSessionMoving(id, previous.move);
+      if (previous.headId) unmarkSessionMoving(previous.headId, previous.move);
     },
   });
 }

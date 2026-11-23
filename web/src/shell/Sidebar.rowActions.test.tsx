@@ -1137,9 +1137,12 @@ describe("two-step move menu", () => {
         representative_title: "Destination nest",
       },
     };
+    const standalone = { ...CONV, id: "standalone", title: "Standalone session" };
     mockConversations([
       { ...CONV, family: { id: "current", representative_id: CONV.id, pinned: false } },
       destination,
+      standalone,
+      { ...CONV, id: "shared", title: "Standalone shared", owner: "someone-else" },
     ]);
     const view = renderSidebar(
       undefined,
@@ -1170,6 +1173,10 @@ describe("two-step move menu", () => {
     expect(screen.queryByRole("menuitem", { name: "Destination nest" })).toBeNull();
     fireEvent.change(search, { target: { value: "Destination" } });
     expect(screen.getByRole("menuitem", { name: "Destination nest" })).toBeInTheDocument();
+    // A standalone session the viewer owns is a destination: it would lead the new nest.
+    fireEvent.change(search, { target: { value: "Standalone" } });
+    expect(screen.getByRole("menuitem", { name: "Standalone session" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Standalone shared" })).toBeNull();
     const remote = {
       ...destination,
       id: "remote",
@@ -1181,9 +1188,12 @@ describe("two-step move menu", () => {
         representative_title: "Remote nest",
       },
     };
-    mocks.searchRows = [remote];
+    const subAgent = { ...CONV, id: "child", title: "Member child", parent_session_id: "remote" };
+    mocks.searchRows = [remote, subAgent];
     fireEvent.change(search, { target: { value: "Member" } });
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Remote nest" }));
+    const remoteItem = await screen.findByRole("menuitem", { name: "Remote nest" });
+    expect(screen.queryByRole("menuitem", { name: "Member child" })).toBeNull();
+    fireEvent.click(remoteItem);
     expect(mocks.moveToNest.mutate).toHaveBeenCalledWith({ id: CONV.id, destination: remote });
     view.unmount();
     renderSidebar(undefined, serverInfo({ sibling_sessions: true, session_nest_moves: true }));
