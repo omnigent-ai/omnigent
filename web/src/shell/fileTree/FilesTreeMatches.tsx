@@ -1,11 +1,13 @@
 // A name filter's matches as a tree: each match under its folders, all open, so the
-// reader sees where every match lives. Choosing a file opens it.
+// reader sees where every match lives. Choosing a file opens it, as in the full tree.
 
 import { useEffect, useRef } from "react";
 import { FileTree, useFileTree } from "@/components/file-tree/vendored";
 import { FILE_TREE_THEME, WORKSPACE_FILE_TREE_CLASS } from "@/components/file-tree/fileTreeStyle";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import { folderTreePath } from "../breadcrumbPaths";
+import { SingleSelection } from "./treeSelection";
+import { useTreeRowInput } from "./useTreeRowInput";
 
 /** The tree paths for `matches`: their folders, then each match, folders marked with "/". */
 export function matchTreePaths(matches: readonly WorkspaceFile[]): string[] {
@@ -25,7 +27,8 @@ export interface FilesTreeMatchesProps {
   matches: readonly WorkspaceFile[];
   /** The viewed file, relative to the browsed folder, selected when it matches. */
   activeFile: string | null;
-  onFileSelect: (path: string) => void;
+  /** `newTab` for a ⌘-click (Ctrl-click off macOS) or a middle click, which want the file in its own tab. */
+  onFileSelect: (path: string, options?: { newTab: true }) => void;
   label: string;
   dark: boolean;
 }
@@ -43,36 +46,37 @@ function MatchesTree({
   label,
   dark,
 }: FilesTreeMatchesProps & { paths: string[] }) {
-  const onFileSelectRef = useRef(onFileSelect);
-  onFileSelectRef.current = onFileSelect;
-  // The viewed file is the selection: picking it again opens nothing, any other file opens.
+  // The viewed file is the selection; a file opens only from the input that chose it.
   const shownMatch = activeFile && paths.includes(activeFile) ? activeFile : null;
-  const shownMatchRef = useRef(shownMatch);
-  shownMatchRef.current = shownMatch;
+  const selectionRef = useRef<SingleSelection | null>(null);
   const { model } = useFileTree({
     paths,
     flattenEmptyDirectories: true,
     initialExpansion: "open",
     initialSelectedPaths: shownMatch ? [shownMatch] : undefined,
-    onSelectionChange: (selected) => {
-      const path = selected.at(-1);
-      if (!path || path.endsWith("/") || path === shownMatchRef.current) return;
-      onFileSelectRef.current(path);
-    },
+    onSelectionChange: () => selectionRef.current?.normalize(),
+  });
+  selectionRef.current ??= new SingleSelection(model);
+  const selection = selectionRef.current;
+  const containerRef = useRef<HTMLDivElement>(null);
+  useTreeRowInput(containerRef, selection, (path, newTab) => {
+    if (path.endsWith("/")) return;
+    if (newTab) onFileSelect(path, { newTab: true });
+    else onFileSelect(path);
   });
   // A file opened elsewhere, as from the breadcrumbs, moves the selection to it.
   useEffect(() => {
-    for (const path of model.getSelectedPaths()) {
-      if (path !== shownMatch) model.deselectPath(path);
-    }
-    if (shownMatch) model.selectPath(shownMatch);
-  }, [model, shownMatch]);
+    if (shownMatch) selection.selectWithoutFocus(shownMatch);
+    else selection.clear();
+  }, [selection, shownMatch]);
   return (
-    <FileTree
-      model={model}
-      aria-label={label}
-      className={WORKSPACE_FILE_TREE_CLASS}
-      style={{ ...FILE_TREE_THEME, flex: 1, minHeight: 0, colorScheme: dark ? "dark" : "light" }}
-    />
+    <div ref={containerRef} className="flex min-h-0 flex-1 flex-col">
+      <FileTree
+        model={model}
+        aria-label={label}
+        className={WORKSPACE_FILE_TREE_CLASS}
+        style={{ ...FILE_TREE_THEME, flex: 1, minHeight: 0, colorScheme: dark ? "dark" : "light" }}
+      />
+    </div>
   );
 }

@@ -9,7 +9,6 @@ import {
   type FileTreeDirectoryHandle,
   type FileTreeItemHandle,
   type FileTreeModel,
-  FILE_TREE_ROOT_SELECTOR,
   useFileTree,
 } from "@/components/file-tree/vendored";
 import { FILE_TREE_THEME, WORKSPACE_FILE_TREE_CLASS } from "@/components/file-tree/fileTreeStyle";
@@ -31,10 +30,11 @@ import {
   withChangedFiles,
 } from "./filesTreeListings";
 import { treeChangeStatuses, treeIgnoredStatuses } from "./treeChangeStatus";
-import { SingleSelection, opensRow, rowClickAction, rowKeyAction } from "./treeSelection";
+import { SingleSelection } from "./treeSelection";
 import { treeComparator, treeOrderSignature } from "./treeSort";
 import { scrollRowIntoView } from "./revealScroll";
 import { rowPathOf } from "./treeRowPath";
+import { treeRoot, useTreeRowInput } from "./useTreeRowInput";
 import { initialFolderTree, useLazyFolderTree } from "./useLazyFolderTree";
 
 /** A folder to reveal, asked for again with a new `key`. */
@@ -96,9 +96,6 @@ const parentFolder = (path: string) => {
   return slash < 0 ? "" : trimmed.slice(0, slash);
 };
 const trimFolder = (path: string) => (path.endsWith("/") ? path.slice(0, -1) : path);
-/** The rendered tree inside `container`, if it has rendered. */
-const treeRoot = (container: ParentNode | null | undefined): HTMLElement | null =>
-  container?.querySelector<HTMLElement>(FILE_TREE_ROOT_SELECTOR) ?? null;
 /** Whether keyboard focus is on the tree or one of its rows. */
 const hasFocusWithin = (host: HTMLElement | null): boolean =>
   host !== null && host.contains(document.activeElement);
@@ -341,44 +338,11 @@ export function FilesTree(props: FilesTreeProps) {
     },
   });
 
-  // Input the tree would handle differently from the panel, caught on its root first.
+  useTreeRowInput(containerRef, selectionRef.current, activate);
+  // A double-click roots the panel on a folder; focus prefetches the row and names it.
   useEffect(() => {
     const host = treeRoot(containerRef.current);
-    const selection = selectionRef.current;
-    if (!host || !selection) return;
-    // A file opens once per click, Enter or Space on it, as that input happens. Rows are
-    // native buttons, so a key that opens one holds back the button's own click.
-    const onKeyDown = (event: KeyboardEvent) => {
-      const path = rowPathOf(event);
-      if (path === null) return;
-      if (selection.apply(rowKeyAction(event)).consumed) {
-        event.preventDefault();
-        event.stopPropagation();
-        return;
-      }
-      if (!opensRow(event) || path.endsWith("/")) return;
-      event.preventDefault();
-      selection.selectOnly(path);
-      activate(path);
-    };
-    const onClick = (event: globalThis.MouseEvent) => {
-      const path = rowPathOf(event);
-      const result = selection.apply(rowClickAction(event, path));
-      if (!result.consumed) {
-        if (path) activate(path);
-        return;
-      }
-      event.preventDefault();
-      event.stopPropagation();
-      if (result.activate) activate(result.activate, result.newTab);
-    };
-    // A middle click opens a file in its own tab, as in a browser.
-    const onAuxClick = (event: globalThis.MouseEvent) => {
-      const path = rowPathOf(event);
-      if (event.button !== 1 || !path || path.endsWith("/")) return;
-      event.preventDefault();
-      activate(path, true);
-    };
+    if (!host) return;
     const onDoubleClick = (event: globalThis.MouseEvent) => {
       const path = rowPathOf(event);
       if (path?.endsWith("/")) latest.current.onNavigateDir?.(trimFolder(path));
@@ -389,15 +353,9 @@ export function FilesTree(props: FilesTreeProps) {
       setFocusTick((tick) => tick + 1);
       if (path) prefetch.intend(prefetchTarget(path));
     };
-    host.addEventListener("keydown", onKeyDown, true);
-    host.addEventListener("click", onClick, true);
-    host.addEventListener("auxclick", onAuxClick);
     host.addEventListener("dblclick", onDoubleClick);
     host.addEventListener("focusin", onFocusIn);
     return () => {
-      host.removeEventListener("keydown", onKeyDown, true);
-      host.removeEventListener("click", onClick, true);
-      host.removeEventListener("auxclick", onAuxClick);
       host.removeEventListener("dblclick", onDoubleClick);
       host.removeEventListener("focusin", onFocusIn);
     };

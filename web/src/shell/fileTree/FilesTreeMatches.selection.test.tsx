@@ -1,55 +1,10 @@
-// Picking matches in a filtered Files tree: the selection follows the viewed file, picking
-// it opens nothing, and any other match opens, including after a file opened elsewhere.
-import { act, cleanup, render } from "@testing-library/react";
+// Picking matches in a filtered Files tree, on the real tree: a file opens from the input
+// that chose it, as in the full tree, and the selection follows the viewed file.
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
-
-/** The tree's selection, reporting each change as the vendored model does. */
-class FakeModel {
-  selected: string[];
-  private readonly onChange: (selected: readonly string[]) => void;
-  constructor(initial: string[] | undefined, onChange: (selected: readonly string[]) => void) {
-    this.selected = initial ?? [];
-    this.onChange = onChange;
-  }
-  getSelectedPaths = () => [...this.selected];
-  selectPath = (path: string) => {
-    if (this.selected.includes(path)) return;
-    this.selected = [...this.selected, path];
-    this.onChange(this.selected);
-  };
-  deselectPath = (path: string) => {
-    if (!this.selected.includes(path)) return;
-    this.selected = this.selected.filter((selected) => selected !== path);
-    this.onChange(this.selected);
-  };
-  /** A click on a row: it becomes the only selection. */
-  click = (path: string) => {
-    if (this.selected.length === 1 && this.selected[0] === path) return;
-    this.selected = [path];
-    this.onChange(this.selected);
-  };
-}
-
-const tree = vi.hoisted(() => ({ model: null as FakeModel | null }));
-
-vi.mock("@/components/file-tree/vendored", async () => {
-  const { useState } = await import("react");
-  return {
-    useFileTree: (options: {
-      initialSelectedPaths?: string[];
-      onSelectionChange: (selected: readonly string[]) => void;
-    }) => {
-      const [model] = useState(
-        () => new FakeModel(options.initialSelectedPaths, options.onSelectionChange),
-      );
-      tree.model = model;
-      return { model };
-    },
-    FileTree: () => <div data-testid="matches-tree" />,
-  };
-});
+import { isMacPlatform } from "@/lib/hotkeys";
 
 import { FilesTreeMatches } from "./FilesTreeMatches";
 
@@ -60,64 +15,89 @@ const file = (path: string): WorkspaceFile => ({
   bytes: 1,
   modified_at: null,
 });
-const MATCHES = [file("src/a.ts"), file("src/b.ts")];
+const MATCHES = [file("src/a.ts"), file("src/b.ts"), file("src/c.ts")];
 
-function renderMatches(activeFile: string | null, onFileSelect = vi.fn()) {
-  const view = render(
+function renderMatches(activeFile: string | null) {
+  const onFileSelect = vi.fn();
+  const matches = (viewed: string | null) => (
     <FilesTreeMatches
       matches={MATCHES}
-      activeFile={activeFile}
+      activeFile={viewed}
       onFileSelect={onFileSelect}
       label="Matching workspace files"
       dark={false}
-    />,
+    />
   );
-  const viewing = (path: string | null) =>
-    view.rerender(
-      <FilesTreeMatches
-        matches={MATCHES}
-        activeFile={path}
-        onFileSelect={onFileSelect}
-        label="Matching workspace files"
-        dark={false}
-      />,
-    );
-  return { onFileSelect, viewing };
+  const view = render(matches(activeFile));
+  return { onFileSelect, viewing: (path: string | null) => view.rerender(matches(path)) };
 }
 
-afterEach(() => {
-  cleanup();
-  tree.model = null;
-});
+const row = (name: string) =>
+  screen.findByRole("treeitem", { name: new RegExp(`^${name.replace(".", "\\.")}`) });
+const selected = () =>
+  screen
+    .queryAllByRole("treeitem")
+    .filter((item) => item.getAttribute("aria-selected") === "true")
+    .map((item) => item.getAttribute("data-item-path"));
+
+afterEach(cleanup);
 
 describe("FilesTreeMatches selection", () => {
-  it("starts on the viewed file, and opens another match, then the first again", () => {
-    const { onFileSelect, viewing } = renderMatches("src/a.ts");
-    expect(tree.model?.selected).toEqual(["src/a.ts"]);
+  it("starts on the viewed file and opens the matches a person clicks, not their folders", async () => {
+    const { onFileSelect } = renderMatches("src/a.ts");
+    await row("b.ts");
+    expect(selected()).toEqual(["src/a.ts"]);
+    expect(onFileSelect).not.toHaveBeenCalled();
 
-    act(() => tree.model?.click("src/b.ts"));
-    viewing("src/b.ts");
-    act(() => tree.model?.click("src/a.ts"));
+    fireEvent.click(await row("b.ts"));
+    fireEvent.click(await row("a.ts"));
+    // A click on a folder only closes it.
+    fireEvent.click(await row("src"));
+
     expect(onFileSelect.mock.calls).toEqual([["src/b.ts"], ["src/a.ts"]]);
-    // A folder opens nothing.
-    act(() => tree.model?.click("src/"));
-    expect(onFileSelect).toHaveBeenCalledTimes(2);
   });
 
-  it("follows a file opened elsewhere, so the one viewed before opens from the tree", () => {
-    const { onFileSelect, viewing } = renderMatches("src/a.ts");
+  it("opens a match in a new tab on ⌘-click (Ctrl-click off macOS) or a middle click", async () => {
+    const { onFileSelect } = renderMatches(null);
+    const command = isMacPlatform() ? { metaKey: true } : { ctrlKey: true };
+    fireEvent.click(await row("b.ts"), command);
+    fireEvent(
+      await row("c.ts"),
+      new MouseEvent("auxclick", { bubbles: true, cancelable: true, composed: true, button: 1 }),
+    );
 
-    // The breadcrumbs open b.ts: the tree selects it, and that opens nothing.
-    viewing("src/b.ts");
-    expect(tree.model?.selected).toEqual(["src/b.ts"]);
+    expect(onFileSelect.mock.calls).toEqual([
+      ["src/b.ts", { newTab: true }],
+      ["src/c.ts", { newTab: true }],
+    ]);
+  });
+
+  it("opens the focused match on Enter, and nothing on select-all", async () => {
+    const { onFileSelect } = renderMatches("src/a.ts");
+    const b = await row("b.ts");
+    b.focus();
+    const command = isMacPlatform() ? { metaKey: true } : { ctrlKey: true };
+    fireEvent.keyDown(b, { key: "a", ...command });
     expect(onFileSelect).not.toHaveBeenCalled();
-    act(() => tree.model?.click("src/a.ts"));
-    expect(onFileSelect.mock.calls).toEqual([["src/a.ts"]]);
+    expect(selected()).toEqual(["src/a.ts"]);
 
+    fireEvent.keyDown(b, { key: "Enter" });
+    expect(onFileSelect.mock.calls).toEqual([["src/b.ts"]]);
+  });
+
+  it("follows a file opened elsewhere without opening anything, so the one before opens again", async () => {
+    const { onFileSelect, viewing } = renderMatches("src/a.ts");
+    await row("a.ts");
+
+    // The breadcrumbs open b.ts: the tree selects it alone, and that opens nothing.
+    viewing("src/b.ts");
+    expect(selected()).toEqual(["src/b.ts"]);
     // A viewed file outside the matches leaves nothing selected.
     viewing("README.md");
-    expect(tree.model?.selected).toEqual([]);
-    act(() => tree.model?.click("src/b.ts"));
-    expect(onFileSelect.mock.calls).toEqual([["src/a.ts"], ["src/b.ts"]]);
+    expect(selected()).toEqual([]);
+    expect(onFileSelect).not.toHaveBeenCalled();
+
+    fireEvent.click(await row("a.ts"));
+    expect(onFileSelect.mock.calls).toEqual([["src/a.ts"]]);
   });
 });

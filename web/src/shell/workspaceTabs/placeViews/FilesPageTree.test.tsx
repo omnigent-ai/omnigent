@@ -45,11 +45,19 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
 vi.mock("@/shell/fileTree/FilesTreeMatches", () => ({
   FilesTreeMatches: (props: {
     matches: { path: string }[];
-    onFileSelect: (path: string) => void;
+    onFileSelect: (path: string, options?: { newTab: true }) => void;
   }) => (
     <div data-testid="files-tree-matches">
       {props.matches.map((match) => (
-        <button key={match.path} type="button" onClick={() => props.onFileSelect(match.path)}>
+        <button
+          key={match.path}
+          type="button"
+          onClick={(event) =>
+            event.metaKey
+              ? props.onFileSelect(match.path, { newTab: true })
+              : props.onFileSelect(match.path)
+          }
+        >
           {match.path}
         </button>
       ))}
@@ -347,6 +355,9 @@ describe("FilesPageTree", () => {
       expect(screen.queryByRole("button", { name: ".hidden/button.ts" })).toBeNull();
       fireEvent.click(screen.getByRole("button", { name: "lib/button.ts" }));
       expect(onFileSelect).toHaveBeenCalledWith("src/lib/button.ts");
+      // A match the reader wants in its own tab opens there.
+      fireEvent.click(screen.getByRole("button", { name: "lib/button.ts" }), { metaKey: true });
+      expect(onFileSelect).toHaveBeenLastCalledWith("src/lib/button.ts", { newTab: true });
       expect(paletteLabels()).toContain("Clear Files Tree Filter");
     });
 

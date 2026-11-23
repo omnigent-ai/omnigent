@@ -335,7 +335,11 @@ export function FilesPageTree({
             <FilesTreeMatches
               matches={matches}
               activeFile={activeFileTreePath(activePath, location, workspaceRoot)}
-              onFileSelect={(path) => onFileSelect(joinBrowseLocation(location, path))}
+              onFileSelect={(path, options) =>
+                options
+                  ? onFileSelect(joinBrowseLocation(location, path), options)
+                  : onFileSelect(joinBrowseLocation(location, path))
+              }
               label="Matching workspace files"
               dark={dark}
             />
