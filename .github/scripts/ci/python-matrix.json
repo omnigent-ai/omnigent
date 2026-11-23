@@ -82,7 +82,7 @@
   },
   {
     "group": "databricks",
-    "paths": "tests/db tests/deploy tests/server/test_smart_routing.py",
+    "paths": "tests/db tests/deploy tests/server/test_smart_routing.py tests/stores",
     "extra": "databricks",
     "markexpr": "databricks"
   },
