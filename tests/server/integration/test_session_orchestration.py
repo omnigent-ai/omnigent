@@ -1923,7 +1923,7 @@ async def test_added_agent_and_independent_worker_inheritance(
     async def launch(**kwargs):
         pass
 
-    # An independent worker isn't a sub-agent, so it keeps its agent's default.
+    # An independent worker on another harness than its creator keeps its agent's default.
     monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
     result = json.loads(
         await execute_tool(
