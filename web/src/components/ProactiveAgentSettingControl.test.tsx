@@ -115,6 +115,33 @@ describe("ProactiveAgentSettingControl", () => {
     expect(screen.queryByRole("switch")).toBeNull();
   });
 
+  it.each([
+    ["loading", false],
+    ["failed", true],
+  ] as const)("keeps an edit in the row's other controls once %s settings load", (_s, isError) => {
+    mocks.settings = undefined;
+    mocks.query.isError = isError;
+    const control = () => (
+      <ProactiveAgentSettingControl scope="workspace" entry={PROACTIVE_AGENT_WORKSPACE_ENTRY}>
+        <textarea aria-label="Prompt" defaultValue="Saved prompt" />
+      </ProactiveAgentSettingControl>
+    );
+    const view = render(control());
+    const prompt = screen.getByRole("textbox", { name: "Prompt" });
+    fireEvent.change(prompt, { target: { value: "Edited prompt" } });
+
+    mocks.settings = settings({ can_manage_workspace: true });
+    mocks.query.isError = false;
+    view.rerender(
+      <MemoryRouter>
+        <QueryClientProvider client={new QueryClient()}>{control()}</QueryClientProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole("switch")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Prompt" })).toBe(prompt);
+    expect(prompt).toHaveValue("Edited prompt");
+  });
+
   it("turns the viewer's own setting off", () => {
     render(<ProactiveAgentSettingControl scope="me" entry={PROACTIVE_AGENT_ENTRY} />);
     const toggle = screen.getByRole("switch", { name: "Omni Advisor" });

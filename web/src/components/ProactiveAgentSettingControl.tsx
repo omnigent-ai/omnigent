@@ -1,4 +1,4 @@
-import { type ReactNode, useState } from "react";
+import { Fragment, type ReactNode, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -10,6 +10,9 @@ import { PROACTIVE_AGENT_DISPLAY_NAME, PROACTIVE_AGENT_SCOPE_COPY } from "@/lib/
 import type { SettingsEntry } from "@/pages/settings/search/catalog/types";
 import { SettingsEntryLabel, SettingsItem } from "@/pages/settings/search/SettingsItem";
 import { settingsControlProps } from "@/pages/settings/search/settingsControl";
+
+// The row's other controls keep one identity as the settings load, so an edit in progress survives.
+const ROW_CONTROLS_KEY = "row-controls";
 
 /**
  * One scope's switch; `entry` is that scope's Settings row, e.g. the Omni Advisor row. `children`
@@ -56,7 +59,7 @@ export function ProactiveAgentSettingControl({
           ) : (
             loading
           )}
-          {children}
+          <Fragment key={ROW_CONTROLS_KEY}>{children}</Fragment>
         </SettingsItem>
       );
     }
@@ -99,7 +102,7 @@ export function ProactiveAgentSettingControl({
           {error}
         </p>
       )}
-      {children}
+      <Fragment key={ROW_CONTROLS_KEY}>{children}</Fragment>
     </SettingsItem>
   );
 }
