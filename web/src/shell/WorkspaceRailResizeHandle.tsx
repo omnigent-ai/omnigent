@@ -9,6 +9,8 @@ type ResizeHandleProps = HTMLAttributes<HTMLDivElement> & { tabIndex: number };
 
 /** How far the gutter band reaches into the rail, matching the left sidebar's. */
 const GUTTER_HANDLE_OVERLAP_PX = 5;
+/** The gap between floating panes and the rail, where the page's styles don't set one. */
+const PANE_GAP = "var(--pane-gap, 5px)";
 
 /** A pending rail keeps its handle on screen but doesn't resize or take focus. */
 export function workspaceRailHandleProps(
@@ -78,11 +80,14 @@ export function WorkspaceRailGutterHandle({
       onMouseDown={pending || !shown ? undefined : onMouseDown}
       data-workspace-rail-gutter-handle=""
       className={cn(
-        "absolute inset-y-0 z-50 hidden w-[calc(var(--pane-gap)+5px)]",
+        "absolute inset-y-0 z-50 hidden",
         shown && "md:min-[48rem]:block",
         pending ? "cursor-default" : "cursor-col-resize",
       )}
-      style={{ right: Math.max(0, railWidth - GUTTER_HANDLE_OVERLAP_PX) }}
+      style={{
+        right: Math.max(0, railWidth - GUTTER_HANDLE_OVERLAP_PX),
+        width: `calc(${PANE_GAP} + ${GUTTER_HANDLE_OVERLAP_PX}px)`,
+      }}
     />
   );
 }

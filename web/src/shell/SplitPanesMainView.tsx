@@ -437,9 +437,10 @@ function MainSplitPanes({
         // Floating panes' styling places a lone pane in the chat's card by this class.
         "split-panes-main-view flex min-h-0 flex-1 flex-col",
         BELOW_SESSION_HEADER,
-        // A split's cards float on the shell's backdrop, a small margin from the column's edges.
+        // A split's cards float on the shell's backdrop, a small margin from the column's edges;
+        // the gaps fall back to the panes' own where the page's styles don't set them.
         splitCards &&
-          "pr-[calc(var(--pane-gap)-var(--pane-cell-gap))] pb-[calc(var(--pane-gap)-var(--pane-cell-gap))] pl-[var(--pane-gap-start,var(--pane-gap))]",
+          "pr-[calc(var(--pane-gap,5px)-var(--pane-cell-gap,3px))] pb-[calc(var(--pane-gap,5px)-var(--pane-cell-gap,3px))] pl-[var(--pane-gap-start,var(--pane-gap,5px))]",
         className,
       )}
     >

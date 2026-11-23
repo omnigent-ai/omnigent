@@ -56,6 +56,8 @@ describe("the workspace rail's resize handle beside floating panes", () => {
     fireEvent.mouseDown(gutter);
     expect(props.onMouseDown).toHaveBeenCalledTimes(1);
     expect(gutter.style.right).toBe("395px");
+    // Wide enough to grab even where the page's styles set no gap.
+    expect(gutter.style.width).toBe("calc(var(--pane-gap, 5px) + 5px)");
   });
 
   it("neither drags nor takes focus while the session is created", () => {
