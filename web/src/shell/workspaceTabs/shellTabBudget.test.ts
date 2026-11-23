@@ -24,6 +24,20 @@ describe("mountedShellKeys", () => {
     ).toEqual(["a", "b", "c"]);
   });
 
+  it("mounts all of a selected split larger than the limit, and no hidden tab beside it", () => {
+    const members = ["a", "b", "c", "d"];
+    expect(
+      mountedShellKeys({
+        recent: ["e"],
+        open: [...members, "e"],
+        selected: "a",
+        shown: true,
+        unitOf: (key) => (members.includes(key) ? members : [key]),
+        limit: 3,
+      }),
+    ).toEqual(members);
+  });
+
   it("leaves out shells whose tabs closed, and the selected one counts only once", () => {
     expect(
       mountedShellKeys({

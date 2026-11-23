@@ -3,7 +3,10 @@
 
 import { useEffect, useState } from "react";
 
-/** Shells one sidebar keeps attached, the selected tab's included, a split's members each counted. */
+/**
+ * Shells one sidebar keeps attached, a split's members each counted. The shown tab's shells all
+ * mount, even past it; the limit caps the hidden tabs kept beside them.
+ */
 export const MOUNTED_SHELL_TAB_LIMIT = 8;
 
 /** `recent` with `key` moved to the front: the most recently shown shell first. */
