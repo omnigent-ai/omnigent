@@ -960,7 +960,9 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
         return True
     return (
         True
-        if harness_cli_logged_in(install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S)
+        if harness_cli_logged_in(
+            install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S, via_launcher=True
+        )
         else "needs-auth"
     )
 
