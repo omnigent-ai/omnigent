@@ -72,7 +72,10 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { useRequestedComposerEngine } from "@/components/composer/engine/composerEnginePolicy";
-import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
+import {
+  isComposerTextarea,
+  type ComposerTextTarget,
+} from "@/components/composer/engine/composerInput";
 import {
   SHELL_MENTION_REFUSAL,
   useComposerHighlight,
@@ -291,7 +294,6 @@ import {
   smartRoutingUnavailableReason,
   type SmartRoutingUnavailableCause,
 } from "@/lib/smartRoutingAvailability";
-import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
   partitionAgentsByKind,
   partitionPickerEntries,
@@ -330,12 +332,14 @@ import {
 import { CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY } from "@/lib/codexPlanMode";
 import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import {
-  previewIsUnsupported,
   sandboxModelOptionsKey,
-  useSandboxModelOptions,
   useSandboxUnsupportedAgents,
 } from "@/hooks/useSandboxModelOptions";
-import { useSavedSandboxSessionCatalog } from "@/hooks/useSandboxSessionCatalog";
+import {
+  newSandboxModelOptions,
+  noReachableModelsMessage,
+  useNewSandboxModelCatalog,
+} from "@/hooks/useNewSandboxModelCatalog";
 import { markSandboxLaunch } from "@/hooks/useSandboxLaunchSelectionCheck";
 import { useSkills } from "@/hooks/useSkills";
 import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
@@ -1221,10 +1225,6 @@ function NewChatPickerLoading({
       <Spinner className="size-4" aria-hidden="true" />
     </span>
   );
-}
-
-function noReachableModelsMessage(name: string | undefined): string {
-  return `No models are available for ${name ?? "this harness"}. Ask an admin to enable model access.`;
 }
 
 /**
@@ -2761,6 +2761,20 @@ function NewChatLandingContent({
     initialFiles: handoff?.files ?? restoredDraft?.files ?? [],
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // The panel's prompt takes the keyboard each time the panel does, after any kept draft.
+  useEffect(() => {
+    if (!floating) return;
+    return floating.subscribeShown(() => {
+      const input = textareaRef.current;
+      if (!input) return;
+      const end = input.value.length;
+      input.setSelectionRange(end, end);
+      input.focus({ preventScroll: true });
+      // Setting the caret doesn't scroll, so a long draft shows its end where typing goes.
+      if (isComposerTextarea(input)) input.scrollTop = input.scrollHeight;
+      else input.revealCaret();
+    });
+  }, [floating]);
   // A cancelled native picker fires `cancel`, which React has no prop for.
   useEffect(() => {
     const input = fileInputRef.current;
@@ -3762,26 +3776,24 @@ function NewChatLandingContent({
   const previewHarness = selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null;
   const previewSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
-  const sandboxModelCapabilities =
-    info !== "loading" && previewSandboxProvider !== null
-      ? info.sandbox_provider_capabilities?.[previewSandboxProvider]
-      : undefined;
-  const sandboxDefaultModelsOffered =
-    sandboxSelected &&
-    sandboxModelCapabilities?.default_models === true &&
-    sandboxModelCapabilities.inference_models !== true;
-  const sandboxPreviewsOffered =
-    sandboxSelected &&
-    previewSandboxProvider !== null &&
-    info !== "loading" &&
-    (sandboxModelCapabilities?.inference_models === true || sandboxDefaultModelsOffered);
-  const sandboxPreviewEnabled = sandboxPreviewsOffered && previewHarness !== null;
-  const sandboxModels = useSandboxModelOptions(
+  const {
+    preview: sandboxModels,
+    previewsOffered: sandboxPreviewsOffered,
+    previewEnabled: sandboxPreviewEnabled,
+    defaultModelsEnabled: sandboxDefaultModelsEnabled,
+    sessionCatalog: sandboxSessionCatalog,
+    inferenceConfigured: sandboxInferenceConfigured,
+    pending: sandboxCatalogPending,
+    unsupported: sandboxSelectedUnsupported,
+    boundCatalogError: sandboxBoundCatalogError,
+    defaultCatalogError: sandboxDefaultCatalogError,
+    catalog: sandboxCatalog,
+  } = useNewSandboxModelCatalog(
     previewSandboxProvider,
     previewHarness,
     effectiveAgentId,
     cacheUser,
-    sandboxPreviewEnabled,
+    sandboxSelected,
   );
   // Only harness rows gray out; agents can switch brains, so the submit check blocks them.
   const sandboxPreviewEntries = useMemo(
@@ -3810,62 +3822,14 @@ function NewChatLandingContent({
       ),
     [sandboxUnsupportedAgents, harnessEntries],
   );
-  // A harness the default catalog cannot serve keeps its ordinary picker.
-  const sandboxDefaultModelsEnabled =
-    sandboxDefaultModelsOffered && sandboxModels.data?.status !== "unconfigured";
-  // The agent's last sandbox session catalog is more accurate than the gateway preview.
-  const savedSandboxCatalog = useSavedSandboxSessionCatalog(
-    sandboxDefaultModelsOffered ? previewSandboxProvider : null,
-    previewHarness,
-    effectiveAgentId,
-  );
-  const sandboxSessionCatalog =
-    sandboxDefaultModelsEnabled && sandboxModels.data?.status !== "unsupported"
-      ? savedSandboxCatalog
-      : undefined;
-  const sandboxInferenceConfigured =
-    sandboxPreviewEnabled && sandboxModels.data?.configured === true;
   const sandboxHasModelCatalog = sandboxInferenceConfigured || sandboxDefaultModelsEnabled;
-  const sandboxCatalogPending =
-    sandboxPreviewEnabled && sandboxModels.data === undefined && sandboxModels.isLoading;
-  // Advisory catalogs never block launch; only a provider's certain "unsupported" does.
-  const sandboxSelectedUnsupported = sandboxPreviewEnabled && previewIsUnsupported(sandboxModels);
   const sandboxBlockedName =
     selectedNativeHarness === null && pickedHarness !== null
       ? (brainHarnessLabelsAll[pickedHarness] ?? pickedHarness)
       : selectedAgent?.display_name;
   const sandboxCatalogError = sandboxSelectedUnsupported
     ? (sandboxModels.data?.error ?? noReachableModelsMessage(sandboxBlockedName))
-    : sandboxPreviewEnabled && !sandboxDefaultModelsEnabled
-      ? (sandboxModels.error?.message ??
-        (sandboxModels.data?.configured && sandboxModels.data.status !== "ready"
-          ? (sandboxModels.data.error ?? "No usable models are available for this harness.")
-          : null))
-      : null;
-  const sandboxDefaultCatalogError =
-    sandboxDefaultModelsEnabled && sandboxSessionCatalog === undefined
-      ? (sandboxModels.error?.message ??
-        (sandboxModels.data !== undefined &&
-        ["unavailable", "empty"].includes(sandboxModels.data.status)
-          ? (sandboxModels.data.error ?? "Could not load AI Gateway models.")
-          : null))
-      : null;
-  const sandboxCatalog = useMemo(
-    () =>
-      sandboxDefaultModelsEnabled
-        ? (sandboxSessionCatalog ??
-          (sandboxDefaultCatalogError ? [] : (sandboxModels.data?.models ?? [])))
-        : sandboxInferenceConfigured
-          ? sandboxModels.data!.models
-          : undefined,
-    [
-      sandboxDefaultModelsEnabled,
-      sandboxSessionCatalog,
-      sandboxDefaultCatalogError,
-      sandboxInferenceConfigured,
-      sandboxModels.data,
-    ],
-  );
+    : sandboxBoundCatalogError;
   // Saved session rows keep the harness's in-session effort ladder.
   const sandboxEffortLevels = useCallback(
     (models: readonly NativeModelOption[], model: string | null | undefined): readonly string[] =>
@@ -3883,10 +3847,11 @@ function NewChatLandingContent({
   const claudeModelOptions = useMemo(
     () =>
       sandboxSelected
-        ? (sandboxCatalog ??
-          (sandboxCatalogPending || sandboxCatalogError
-            ? []
-            : CLAUDE_NATIVE_MODELS.map((model) => ({ id: model.id, displayName: model.id }))))
+        ? newSandboxModelOptions(
+            "claude-native",
+            sandboxCatalog,
+            sandboxCatalogPending || Boolean(sandboxCatalogError),
+          )
         : (availableClaudeModels ?? []).map((option) => ({
             id: option.id,
             model: option.model,
@@ -5643,13 +5608,13 @@ function NewChatLandingContent({
     mentionOpen,
     sessionMenu,
     mentionedItems,
-    setMentionedItems,
     attachMention,
     openMentionDir,
     mentionedSessions,
-    setMentionedSessions,
     attachSession,
     mentionTokens,
+    resetMentions,
+    noteTextChange: noteMentionTextChange,
     handleTokenBackspace,
     handleKeyDown: handleMentionKeyDown,
     dismiss: dismissMention,
@@ -5663,10 +5628,7 @@ function NewChatLandingContent({
     textareaRef,
     initialMentions: restoresDraftText ? restoredDraft?.mentions : undefined,
   });
-  clearTaggedMentionsRef.current = () => {
-    setMentionedItems([]);
-    setMentionedSessions([]);
-  };
+  clearTaggedMentionsRef.current = resetMentions;
   // The draft snapshot is built above the hook; add the tags it owns.
   draftRef.current.mentions = { files: mentionedItems, sessions: mentionedSessions };
   const skillCommandNames = useMemo(() => Object.keys(skillCommands), [skillCommands]);
@@ -6250,10 +6212,7 @@ function NewChatLandingContent({
       // they come back verbatim rather than through a re-validating replace.
       restoreFiles(returnedDraft.files);
       // Merged tags, so recovered tokens still expand to their own targets.
-      if (returnedDraft.mentions) {
-        setMentionedItems(returnedDraft.mentions.files);
-        setMentionedSessions(returnedDraft.mentions.sessions);
-      }
+      if (returnedDraft.mentions) resetMentions(returnedDraft.mentions);
     } else {
       writeLandingDraft(draftState, returnedDraft);
     }
@@ -7652,6 +7611,7 @@ function NewChatLandingContent({
                 mentionTokens,
                 onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
                 onChange: (e) => {
+                  noteMentionTextChange(e);
                   slashCompletion.onSelectionChange(e.currentTarget);
                   setMessage(e.currentTarget.value);
                   // A rejected attachment is never added, so there's no chip to

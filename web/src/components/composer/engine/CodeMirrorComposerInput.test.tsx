@@ -192,6 +192,22 @@ describe("CodeMirrorComposerInput", () => {
 });
 
 describe("CodeMirrorComposerInput change events", () => {
+  it.each([undefined, { separateUndo: true }])(
+    "makes a programmatic insert (%o) its own undo step apart from typing",
+    (options) => {
+      const { content, target } = mount({ value: "" });
+      const editor = EditorView.findFromDOM(content)!;
+      act(
+        () =>
+          void editor.dispatch({ changes: { from: 0, insert: "typed" }, userEvent: "input.type" }),
+      );
+      act(() => insertComposerText(target(), " inserted", 5, 5, options));
+      expect(target().value).toBe("typed inserted");
+      act(() => void undo(editor));
+      expect(target().value).toBe("typed");
+    },
+  );
+
   it("says when an undo or redo made the change", () => {
     const onChange = vi.fn((event: ComposerInputEvent) => isHistoryInput(event));
     const { content, target } = mount({ onChange });
@@ -202,6 +218,22 @@ describe("CodeMirrorComposerInput change events", () => {
     act(() => void undo(editor));
     act(() => void redo(editor));
     expect(onChange.mock.results.map((result) => result.value)).toEqual([false, true, true]);
+  });
+
+  it("reports an undo as 'undo' and a redo as 'redo', and an ordinary edit with no direction", () => {
+    const onChange = vi.fn<(event: ComposerInputEvent) => void>();
+    const { content, target } = mount({ onChange });
+    act(() => {
+      insertComposerText(target(), "draft", 0, 0);
+    });
+    const editor = EditorView.findFromDOM(content)!;
+    act(() => void undo(editor));
+    act(() => void redo(editor));
+    expect(onChange.mock.calls.map(([event]) => event.historyDirection)).toEqual([
+      undefined,
+      "undo",
+      "redo",
+    ]);
   });
 
   it("takes a controlled value without reporting it or making it undoable", () => {

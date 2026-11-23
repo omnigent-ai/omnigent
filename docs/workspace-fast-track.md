@@ -52,7 +52,7 @@ when it can:
 | Method | Needs | Notes |
 |---|---|---|
 | `StatPath`, `ReadLinkText` | nothing | A link's own text is returned even when it points outside the workspace; a path whose parent leads outside is refused |
-| `SearchFiles` | `git` | Substring mode only (`search_files.substring`), as the REST file search answers it |
+| `SearchFiles` | `git` | Substring mode (`search_files.substring`), as the REST file search answers it. Where the host can rank paths, also fuzzy mode (`search_files.fuzzy`), best first with matched characters, and a blank fuzzy query that lists files in path order (`search_files.browse`) |
 | `SearchText` | `rg` | The REST content search's ripgrep script, streamed in batches of 100 |
 | `ResolveWorkingCopyBase`, `ListWorkingCopyChanges`, `ReadBaseFile`, `ListRepositoryRefs`, `ListBranchCommits` | `git` | With `revision_comparison` and `branch_commits`. Changes and base reads stay inside the workspace when it is a subfolder of a larger repository; refs and commits are repository-wide |
 | `ResolveRepositoryContext` | `git` | Remotes leave only as host, owner and repository |

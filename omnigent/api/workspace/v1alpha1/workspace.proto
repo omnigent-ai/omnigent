@@ -211,7 +211,9 @@ message StatPathResponse {
 enum FileSearchMode {
   // The default: FILE_SEARCH_MODE_FUZZY.
   FILE_SEARCH_MODE_UNSPECIFIED = 0;
-  // Ranked fuzzy match over file paths, best first. Feature "search_files.fuzzy".
+  // Ranked fuzzy match over file paths, best first; every whitespace-separated
+  // word must match, ignoring case unless the query has a capital letter.
+  // Feature "search_files.fuzzy".
   FILE_SEARCH_MODE_FUZZY = 1;
   // Files and directories whose path contains the query, ignoring case,
   // sorted by path, as the REST file search returns them. Feature
@@ -220,7 +222,9 @@ enum FileSearchMode {
 }
 
 message SearchFilesRequest {
-  // A blank query returns nothing.
+  // A blank query returns nothing in substring mode. In fuzzy mode it returns
+  // files in path order, so a picker can show them before anything is typed.
+  // Feature "search_files.browse".
   string query = 1;
 
   FileSearchMode mode = 2;

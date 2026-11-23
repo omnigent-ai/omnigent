@@ -140,6 +140,8 @@ export function AskUserQuestionForm({
   const showKeyHints = !preventsKeyboardSubmit;
   // The window listener is registered once and calls the latest handler through this ref.
   const handleKeyRef = useRef<(event: KeyboardEvent) => void>(() => {});
+  // Arrow keys check each radio they pass, which doesn't mean the custom row was chosen.
+  const radioArrowKeyRef = useRef(false);
   const isEmbedded = useIsEmbedded();
 
   // Currently-visible question (carousel index).
@@ -460,6 +462,14 @@ export function AskUserQuestionForm({
         tabIndex={-1}
         className="flex flex-col gap-2 mb-2 focus:outline-none"
         data-testid="ask-user-question-section"
+        onKeyDown={(event) => {
+          if (!event.key.startsWith("Arrow")) return;
+          radioArrowKeyRef.current = true;
+          // The radio changes in this keydown's default action, before the timeout runs.
+          setTimeout(() => {
+            radioArrowKeyRef.current = false;
+          });
+        }}
       >
         <legend className="text-foreground text-ui font-medium flex items-center gap-2 mb-2">
           {current.question}
@@ -540,11 +550,14 @@ export function AskUserQuestionForm({
                   id={customRowId}
                   name={current.multiSelect ? undefined : currentKey}
                   checked={customRowChecked}
-                  onChange={() =>
-                    current.multiSelect
-                      ? handleCustomToggleMulti(currentKey)
-                      : handleCustomToggleSingle(currentKey)
-                  }
+                  onChange={() => {
+                    if (current.multiSelect) handleCustomToggleMulti(currentKey);
+                    else handleCustomToggleSingle(currentKey);
+                    // Choosing the custom row means its answer is typed next.
+                    if (!customRowChecked && !radioArrowKeyRef.current) {
+                      customInputRef.current?.focus();
+                    }
+                  }}
                   aria-label="Select custom answer"
                   className="mt-1 mobile-app:mt-0"
                   data-testid="ask-user-question-custom-toggle"

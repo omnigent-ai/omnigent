@@ -13,6 +13,7 @@ import { usePaletteCommandsStore } from "@/store/paletteCommands";
 import {
   PANE_COMMANDS_HEADING,
   resetPanePaletteOwnerForTests,
+  usePaneCommandsListed,
   useTerminalPaneHotkeys,
 } from "./useTerminalPaneHotkeys";
 
@@ -229,5 +230,16 @@ describe("useTerminalPaneHotkeys", () => {
     expect(read()?.layout).toEqual({ axis: "columns", ratio: 0.5, children: ["b", "a"] });
     hook.rerender({ split: undefined });
     expect(hook.result.current("a")).toBeNull();
+  });
+});
+
+describe("usePaneCommandsListed", () => {
+  it("lists only the default view's commands before any panes have had the keyboard", () => {
+    expect(renderHook(() => usePaneCommandsListed("main", true, true)).result.current).toBe(true);
+    expect(renderHook(() => usePaneCommandsListed("side", true, false)).result.current).toBe(false);
+  });
+
+  it("lists nothing for a view that's turned off, even the default one", () => {
+    expect(renderHook(() => usePaneCommandsListed("main", false, true)).result.current).toBe(false);
   });
 });

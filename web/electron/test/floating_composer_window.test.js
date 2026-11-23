@@ -3,7 +3,11 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const {
+  FLOATING_COMPOSER_PRELOAD_DELAY_MS,
+  FLOATING_COMPOSER_READY_FALLBACK_MS,
+  FLOATING_COMPOSER_SHOWN_CHANNEL,
   createFloatingComposerController,
+  createFloatingComposerPreloader,
   fadeInFloatingComposer,
   floatingComposerAppPagePath,
   floatingComposerSessionPath,
@@ -20,6 +24,8 @@ class FakePanel extends EventEmitter {
     this.bounds = { x: 0, y: 0, width: 620, height: 360 };
     this.webContents = Object.assign(new EventEmitter(), {
       focus: () => this.calls.push("webContents.focus"),
+      send: (channel) => this.calls.push(`send:${channel}`),
+      isDestroyed: () => this.destroyed,
     });
   }
   isDestroyed() {
@@ -75,7 +81,7 @@ class FakePanel extends EventEmitter {
 const laptop = { id: 1, workArea: { x: 0, y: 25, width: 1512, height: 920 } };
 const external = { id: 2, workArea: { x: 1512, y: 0, width: 2560, height: 1415 } };
 
-function setup({ present, quitting = () => false, saveFrames, loadFrames } = {}) {
+function setup({ present, quitting = () => false, saveFrames, loadFrames, autoReady = true } = {}) {
   const created = [];
   const stale = new Set();
   let frames = {};
@@ -100,6 +106,16 @@ function setup({ present, quitting = () => false, saveFrames, loadFrames } = {})
     quitting,
     ...(present ? { present } : {}),
   });
+  if (autoReady) {
+    // These panels' pages have loaded: the one just opened says it's ready as soon as it exists.
+    const show = controller.show;
+    controller.show = (serverUrl) => {
+      const result = show(serverUrl);
+      const opened = created.findLast((panel) => panel.serverUrl === serverUrl && !panel.destroyed);
+      if (opened) controller.markReady(opened);
+      return result;
+    };
+  }
   return { controller, created, stale, frames: () => frames };
 }
 
@@ -146,7 +162,8 @@ test("a hidden panel comes on screen through present; showing a visible one focu
   assert.ok(panel.calls.includes("showInactive"));
   panel.calls.length = 0;
   assert.equal(controller.show("https://a.example"), "focused");
-  assert.deepEqual(panel.calls, ["moveTop", "focus", "webContents.focus"]);
+  // Taking the keyboard back is the same call as on open, never one that activates the app.
+  assert.deepEqual(panel.calls, ["webContents.focus", `send:${FLOATING_COMPOSER_SHOWN_CHANNEL}`]);
   assert.equal(presented.length, 1);
   assert.equal(panel.visible, true, "a second press never closes the panel");
 });
@@ -464,4 +481,256 @@ test("Reduce motion stops a fade still running from an earlier show", () => {
   fadeInFloatingComposer(panel, () => {}, { reduceMotion: true, ...clock });
   for (let step = 0; step < 20 && clock.pending() > 0; step += 1) clock.advance(10);
   assert.deepEqual(panel.opacities.slice(before), [1]);
+});
+
+test("an open waits for a loading page to say it's ready, then shows it", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { controller, created } = setup({ autoReady: false });
+  assert.equal(controller.show("https://a.example"), "shown");
+  const [panel] = created;
+  assert.equal(panel.visible, false, "its page is still loading");
+  // A second press while it waits doesn't queue another open.
+  assert.equal(controller.show("https://a.example"), "shown");
+  controller.markReady(panel);
+  assert.equal(panel.visible, true);
+  assert.equal(panel.calls.filter((call) => call === "showInactive").length, 1);
+  t.mock.timers.tick(FLOATING_COMPOSER_READY_FALLBACK_MS);
+  assert.equal(panel.calls.filter((call) => call === "showInactive").length, 1);
+});
+
+test("a page that never says it's ready still shows after a moment, then reopens at once", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { controller, created } = setup({ autoReady: false });
+  controller.show("https://a.example");
+  t.mock.timers.tick(FLOATING_COMPOSER_READY_FALLBACK_MS - 1);
+  assert.equal(created[0].visible, false);
+  t.mock.timers.tick(1);
+  assert.equal(created[0].visible, true);
+  // That document has been on screen; hiding and reopening it needs no wait.
+  controller.hide(created[0]);
+  controller.show("https://a.example");
+  assert.equal(created[0].visible, true);
+});
+
+test("an open takes a preloaded panel out of the pool a release or another preload may drop", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { controller, created } = setup({ autoReady: false });
+  controller.preload("https://a.example");
+  controller.show("https://a.example");
+  controller.releaseUnshown("https://a.example");
+  controller.preload("https://b.example");
+  assert.equal(created[0].destroyed, false, "the user is waiting for this one");
+  controller.markReady(created[0]);
+  assert.equal(created[0].visible, true);
+});
+
+test("opening another server calls off an open still waiting on its page", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { controller, created } = setup({ autoReady: false });
+  controller.show("https://a.example");
+  controller.preload("https://b.example");
+  controller.markReady(created[1]);
+  controller.show("https://b.example");
+  assert.equal(created[1].visible, true);
+  // A's page answering late, or its fallback, must not pop it up over B.
+  controller.markReady(created[0]);
+  t.mock.timers.tick(FLOATING_COMPOSER_READY_FALLBACK_MS);
+  assert.equal(created[0].visible, false);
+  // A's open is over too: once B goes, a press doesn't go back to A.
+  controller.hide(created[1]);
+  assert.equal(controller.openServerUrl(), null);
+});
+
+test("opening one server lets go of another server's panel built ahead", () => {
+  const { controller, created } = setup({ autoReady: false });
+  controller.preload("https://a.example");
+  controller.show("https://b.example");
+  assert.equal(created[0].destroyed, true);
+  assert.equal(created[1].destroyed, false);
+});
+
+test("a ready panel shows at once, and readiness ends with its document", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { controller, created } = setup({ autoReady: false });
+  controller.preload("https://a.example");
+  const [panel] = created;
+  controller.markReady(panel);
+  controller.show("https://a.example");
+  assert.equal(panel.visible, true, "a ready page needs no wait");
+  for (const event of ["did-navigate", "render-process-gone"]) {
+    controller.hide(panel);
+    controller.markReady(panel);
+    panel.webContents.emit(event);
+    controller.show("https://a.example");
+    assert.equal(panel.visible, false, `after ${event} the new document must say it again`);
+    controller.markReady(panel);
+    assert.equal(panel.visible, true);
+  }
+});
+
+for (const [how, end] of [
+  ["putting it away", (controller, panel) => controller.hide(panel)],
+  ["closing it", (controller, panel) => controller.close(panel)],
+]) {
+  test(`${how} drops an open still waiting on its page`, (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const { controller, created } = setup({ autoReady: false });
+    controller.show("https://a.example");
+    const [panel] = created;
+    end(controller, panel);
+    controller.markReady(panel);
+    t.mock.timers.tick(FLOATING_COMPOSER_READY_FALLBACK_MS);
+    assert.equal(panel.calls.includes("showInactive"), false);
+    assert.equal(panel.calls.includes("webContents.focus"), false);
+    // Nor is its page told it took the keyboard.
+    assert.equal(
+      panel.calls.some((call) => call.startsWith("send:")),
+      false,
+    );
+  });
+}
+
+test("focusing an Omnigent window drops an open still waiting on its page", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { controller, created } = setup({ autoReady: false });
+  controller.show("https://a.example");
+  controller.mainWindowFocused();
+  controller.markReady(created[0]);
+  t.mock.timers.tick(FLOATING_COMPOSER_READY_FALLBACK_MS);
+  assert.equal(created[0].visible, false);
+});
+
+test("preloading builds the panel hidden; the next open reuses it", () => {
+  const { controller, created } = setup({ autoReady: false });
+  controller.preload("https://a.example");
+  assert.equal(created.length, 1);
+  assert.equal(created[0].visible, false);
+  controller.preload("https://a.example");
+  assert.equal(created.length, 1, "a current panel isn't built twice");
+  controller.markReady(created[0]);
+  controller.show("https://a.example");
+  assert.equal(created.length, 1);
+  assert.equal(created[0].visible, true);
+});
+
+test("at most one panel waits unshown: preloading another server lets the first go", () => {
+  const { controller, created } = setup({ autoReady: false });
+  controller.preload("https://a.example");
+  controller.preload("https://b.example");
+  assert.equal(created[0].destroyed, true);
+  assert.equal(created[1].destroyed, false);
+  // A panel that was shown keeps its draft when another server preloads.
+  controller.markReady(created[1]);
+  controller.show("https://b.example");
+  controller.preload("https://c.example");
+  assert.equal(created[1].destroyed, false);
+});
+
+test("releasing a server lets go of its unshown panel, never one that was shown", () => {
+  const { controller, created } = setup({ autoReady: false });
+  controller.preload("https://a.example");
+  controller.releaseUnshown("https://a.example");
+  assert.equal(created[0].destroyed, true);
+  controller.preload("https://b.example");
+  controller.markReady(created[1]);
+  controller.show("https://b.example");
+  controller.releaseUnshown("https://b.example");
+  assert.equal(created[1].destroyed, false, "a shown panel holds the user's draft");
+});
+
+test("the preloader builds for the current target once the app is quiet", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const built = [];
+  let target = "https://a.example";
+  const preloader = createFloatingComposerPreloader({
+    target: () => target,
+    preload: (serverUrl) => built.push(serverUrl),
+  });
+  preloader.schedule();
+  t.mock.timers.tick(FLOATING_COMPOSER_PRELOAD_DELAY_MS - 1);
+  // Another page loading restarts the wait.
+  preloader.schedule();
+  t.mock.timers.tick(FLOATING_COMPOSER_PRELOAD_DELAY_MS - 1);
+  assert.deepEqual(built, []);
+  t.mock.timers.tick(1);
+  assert.deepEqual(built, ["https://a.example"]);
+  // A press before the wait ends builds the panel itself.
+  preloader.schedule();
+  preloader.cancel();
+  t.mock.timers.tick(FLOATING_COMPOSER_PRELOAD_DELAY_MS);
+  assert.deepEqual(built, ["https://a.example"]);
+  // The target is read when the wait ends: a page that stopped supporting it meanwhile builds nothing.
+  preloader.schedule();
+  target = null;
+  t.mock.timers.tick(FLOATING_COMPOSER_PRELOAD_DELAY_MS);
+  assert.deepEqual(built, ["https://a.example"]);
+});
+
+test("every open takes the keyboard the same way, and none of them activates the app", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { controller, created } = setup({ autoReady: false });
+  const activating = (panel) =>
+    panel.calls.filter((call) => ["show", "focus", "moveTop"].includes(call));
+  // Ready at once (built ahead).
+  controller.preload("https://a.example");
+  controller.markReady(created[0]);
+  controller.show("https://a.example");
+  // Waiting for the page, then ready.
+  controller.show("https://b.example");
+  controller.markReady(created[1]);
+  // Waiting for a page that never says so.
+  controller.show("https://c.example");
+  t.mock.timers.tick(FLOATING_COMPOSER_READY_FALLBACK_MS);
+  // A second press while it's up.
+  controller.show("https://c.example");
+  for (const panel of created) {
+    assert.equal(panel.visible, true);
+    assert.deepEqual(activating(panel), [], `${panel.serverUrl} must not activate the app`);
+    assert.ok(panel.calls.includes("webContents.focus"));
+  }
+});
+
+test("a press while a panel is open goes back to it, until the open ends", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { controller, created } = setup({ autoReady: false });
+  assert.equal(controller.openServerUrl(), null);
+  controller.show("https://a.example");
+  assert.equal(controller.openServerUrl(), "https://a.example", "waiting for its page counts");
+  controller.markReady(created[0]);
+  assert.equal(controller.openServerUrl(), "https://a.example");
+  // Each exit ends the open: putting it away, launching, clicking an Omnigent window.
+  for (const end of [
+    () => controller.hide(created[0]),
+    () => controller.hide(created[0], { resetFrame: true }),
+    () => controller.mainWindowFocused(),
+  ]) {
+    controller.show("https://a.example");
+    end();
+    assert.equal(controller.openServerUrl(), null);
+  }
+});
+
+test("each way the panel takes the keyboard tells its page right after, once", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { controller, created } = setup({ autoReady: false });
+  const shown = `send:${FLOATING_COMPOSER_SHOWN_CHANNEL}`;
+  // Ready at once, after ready, by fallback, and a second press.
+  controller.preload("https://a.example");
+  controller.markReady(created[0]);
+  controller.show("https://a.example");
+  controller.show("https://b.example");
+  controller.markReady(created[1]);
+  controller.show("https://c.example");
+  t.mock.timers.tick(FLOATING_COMPOSER_READY_FALLBACK_MS);
+  controller.show("https://c.example");
+  for (const [panel, opens] of [
+    [created[0], 1],
+    [created[1], 1],
+    [created[2], 2],
+  ]) {
+    assert.equal(panel.calls.filter((call) => call === shown).length, opens, panel.serverUrl);
+    panel.calls.forEach((call, index) => {
+      if (call === shown) assert.equal(panel.calls[index - 1], "webContents.focus");
+    });
+  }
 });

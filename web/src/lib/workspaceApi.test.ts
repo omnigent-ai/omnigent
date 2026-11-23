@@ -14,6 +14,7 @@ import {
   SearchTextResponseSchema,
   ComparisonKind,
   FileSearchMode,
+  SearchOrder,
   ListWorkingCopyChangesRequestSchema,
   ListWorkingCopyChangesResponseSchema,
   ReadBaseFileResponseSchema,
@@ -27,6 +28,7 @@ import {
   readFileViaWorkspaceApi,
   listBranchCommitsViaWorkspaceApi,
   listWorkingCopyChangesViaWorkspaceApi,
+  rankFilesViaWorkspaceApi,
   readBaseFileViaWorkspaceApi,
   resolveRepositoryContextViaWorkspaceApi,
   resolveWorkingCopyBaseViaWorkspaceApi,
@@ -847,6 +849,137 @@ const match = (line: number) => ({
 });
 const TEXT_OPTIONS = { caseSensitive: true, regex: false, include: "src/**", exclude: "" };
 
+const RANKED_OPTIONS = { path: "", limit: 200, includeGitIgnored: false };
+const rankedFiles = new Uint8Array(
+  toBinary(
+    SearchFilesResponseSchema,
+    create(SearchFilesResponseSchema, {
+      results: [
+        {
+          entry: {
+            name: "workspaceFastTrack.ts",
+            path: "src/workspaceFastTrack.ts",
+            type: EntryType.FILE,
+          },
+          score: 180,
+          matchedIndices: [4, 5, 13, 17],
+        },
+      ],
+      truncated: true,
+    }),
+  ),
+);
+
+describe("rankFilesViaWorkspaceApi", () => {
+  it("asks for fuzzy matches and keeps their scores and highlights", async () => {
+    enable("workspace_api_server_access");
+    const requests: unknown[] = [];
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("SearchFiles", "search_files.fuzzy"), {
+          headers: PROTO_HEADERS,
+        }),
+      SearchFiles: (body) => {
+        requests.push(fromBinary(SearchFilesRequestSchema, body));
+        return new Response(rankedFiles, { headers: PROTO_HEADERS });
+      },
+    });
+
+    const ranked = await rankFilesViaWorkspaceApi("s-rank", "wsft", RANKED_OPTIONS);
+
+    expect(requests).toEqual([
+      expect.objectContaining({
+        query: "wsft",
+        mode: FileSearchMode.FUZZY,
+        maximumResults: 200,
+        path: "",
+        includeGitIgnored: false,
+      }),
+    ]);
+    expect(ranked).toEqual({
+      files: [
+        {
+          entry: expect.objectContaining({ path: "src/workspaceFastTrack.ts", type: "file" }),
+          score: 180,
+          matchedIndices: [4, 5, 13, 17],
+        },
+      ],
+      hasMore: true,
+      truncated: false,
+    });
+  });
+
+  it.each([
+    ["a typed query, without fuzzy ranking", "wsft", ["SearchFiles", "search_files.substring"]],
+    ["a blank query, without the file list", " ", ["SearchFiles", "search_files.fuzzy"]],
+  ])("leaves %s to another route", async (_case, query, listed) => {
+    enable("workspace_api_server_access");
+    serveMethods({
+      GetCapabilities: () => new Response(capabilitiesBody(...listed), { headers: PROTO_HEADERS }),
+    });
+
+    const sessionId = `s-older-host-${query.trim() || "blank"}`;
+    expect(await rankFilesViaWorkspaceApi(sessionId, query, RANKED_OPTIONS)).toBeNull();
+    expect(methodCalls("SearchFiles")).toHaveLength(0);
+  });
+
+  it("lists files for a blank query where the host offers the file list", async () => {
+    enable("workspace_api_server_access");
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("SearchFiles", "search_files.fuzzy", "search_files.browse"), {
+          headers: PROTO_HEADERS,
+        }),
+      SearchFiles: () => new Response(rankedFiles, { headers: PROTO_HEADERS }),
+    });
+
+    const listed = await rankFilesViaWorkspaceApi("s-browse", "", RANKED_OPTIONS);
+
+    expect(listed?.files.map((file) => file.entry.path)).toEqual(["src/workspaceFastTrack.ts"]);
+  });
+
+  it("leaves the search to another route while the host's file list is being built", async () => {
+    enable("workspace_api_server_access");
+    const refreshing = create(SearchFilesResponseSchema, { refreshing: true });
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("SearchFiles", "search_files.fuzzy"), {
+          headers: PROTO_HEADERS,
+        }),
+      SearchFiles: () =>
+        new Response(toBinary(SearchFilesResponseSchema, refreshing), { headers: PROTO_HEADERS }),
+    });
+
+    expect(await rankFilesViaWorkspaceApi("s-rank-refreshing", "wsft", RANKED_OPTIONS)).toBeNull();
+    expect(methodCalls("SearchFiles")).toHaveLength(1);
+  });
+
+  it.each([
+    ["the walk ran out of budget", { indexIncomplete: true }],
+    ["the untracked files couldn't be listed", { untrackedUnavailable: true }],
+  ])("keeps the files but says some weren't searched when %s", async (_case, status) => {
+    enable("workspace_api_server_access");
+    const incomplete = create(SearchFilesResponseSchema, {
+      results: [{ entry: { name: "a.ts", path: "src/a.ts", type: EntryType.FILE }, score: 9 }],
+      ...status,
+    });
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("SearchFiles", "search_files.fuzzy"), {
+          headers: PROTO_HEADERS,
+        }),
+      SearchFiles: () =>
+        new Response(toBinary(SearchFilesResponseSchema, incomplete), { headers: PROTO_HEADERS }),
+    });
+
+    const sessionId = `s-rank-incomplete-${Object.keys(status)[0]}`;
+    const ranked = await rankFilesViaWorkspaceApi(sessionId, "a", RANKED_OPTIONS);
+
+    expect(ranked?.files.map((file) => file.entry.path)).toEqual(["src/a.ts"]);
+    expect(ranked).toMatchObject({ hasMore: false, truncated: true });
+  });
+});
+
 describe("searchTextViaWorkspaceApi", () => {
   it("collects the streamed matches in the REST content search's shape", async () => {
     enable("workspace_api_server_access", "workspace_content_search");
@@ -869,7 +1002,14 @@ describe("searchTextViaWorkspaceApi", () => {
     const found = await searchTextViaWorkspaceApi("s-text", "needle", TEXT_OPTIONS);
 
     expect(requests).toEqual([
-      expect.objectContaining({ query: "needle", caseSensitive: true, include: "src/**" }),
+      expect.objectContaining({
+        query: "needle",
+        caseSensitive: true,
+        include: "src/**",
+        // Walk order unless the caller asks for priority.
+        order: SearchOrder.UNSPECIFIED,
+        focusedPaths: [],
+      }),
     ]);
     expect(found).toEqual({
       matches: [1, 2, 3].map((line) => ({
@@ -883,6 +1023,38 @@ describe("searchTextViaWorkspaceApi", () => {
       truncated: true,
       warning: "Search stopped.",
     });
+  });
+
+  it.each([
+    ["a host that searches in priority order", ["SearchText", "text_search_priority"]],
+    ["an older host, which searches in walk order instead", ["SearchText"]],
+  ])("sends the priority order to %s", async (_case, listed) => {
+    enable("workspace_api_server_access", "workspace_content_search");
+    const requests: object[] = [];
+    serveMethods({
+      GetCapabilities: () => new Response(capabilitiesBody(...listed), { headers: PROTO_HEADERS }),
+      SearchText: (body) => {
+        requests.push(fromBinary(SearchTextRequestSchema, envelopePayload(body)));
+        return new Response(textMatches({ matches: [match(1)], done: true }), {
+          headers: CONNECT_HEADERS,
+        });
+      },
+    });
+
+    const priority = { focusedPaths: ["src/a.ts"], changedAgainst: ComparisonKind.BRANCH_POINT };
+    const found = await searchTextViaWorkspaceApi(`s-text-priority-${listed.length}`, "needle", {
+      ...TEXT_OPTIONS,
+      priority,
+    });
+
+    expect(requests).toEqual([
+      expect.objectContaining({
+        order: SearchOrder.PRIORITY,
+        focusedPaths: ["src/a.ts"],
+        changedAgainst: ComparisonKind.BRANCH_POINT,
+      }),
+    ]);
+    expect(found?.matches).toHaveLength(1);
   });
 
   it("leaves a stream that ends without its last message to REST, then stops asking", async () => {

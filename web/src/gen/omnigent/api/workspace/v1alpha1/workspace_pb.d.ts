@@ -336,7 +336,9 @@ export declare const StatPathResponseSchema: GenMessage<StatPathResponse>;
  */
 export declare type SearchFilesRequest = Message<"omnigent.api.workspace.v1alpha1.SearchFilesRequest"> & {
   /**
-   * A blank query returns nothing.
+   * A blank query returns nothing in substring mode. In fuzzy mode it returns
+   * files in path order, so a picker can show them before anything is typed.
+   * Feature "search_files.browse".
    *
    * @generated from field: string query = 1;
    */
@@ -1529,7 +1531,9 @@ export enum FileSearchMode {
   UNSPECIFIED = 0,
 
   /**
-   * Ranked fuzzy match over file paths, best first. Feature "search_files.fuzzy".
+   * Ranked fuzzy match over file paths, best first; every whitespace-separated
+   * word must match, ignoring case unless the query has a capital letter.
+   * Feature "search_files.fuzzy".
    *
    * @generated from enum value: FILE_SEARCH_MODE_FUZZY = 1;
    */

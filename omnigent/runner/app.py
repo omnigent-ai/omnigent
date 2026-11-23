@@ -222,6 +222,7 @@ from omnigent.runner.subagent_work import (
     unregister_subagent_work_for_session,
     wrapper_label_from_labels,
 )
+from omnigent.runtime import routing_stamp, set_remote_routing_available
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
     build_instructions,
@@ -1091,6 +1092,15 @@ def _response_failed_event(
     return f"event: response.failed\ndata: {payload}\n\n".encode()
 
 
+def _is_mcp_tool_schema(schema: object) -> bool:
+    """Whether *schema* is an MCP tool, whose name is namespaced ``server__tool``."""
+    return (
+        isinstance(schema, dict)
+        and isinstance(schema.get("name"), str)
+        and "__" in cast(str, schema.get("name"))
+    )
+
+
 def _inject_mcp_schemas(
     event_body: _JsonObject,
     mcp_schemas: list[_JsonObject],
@@ -1625,6 +1635,8 @@ def create_runner_app(
     # warns again for the new pair rather than inheriting the old one's silence.
     _instruction_delivery_warned: dict[str, set[tuple[str, InstructionDelivery]]] = {}
     _session_tool_schemas: dict[str, list[_JsonObject]] = {}  # session_id → cached tool schemas
+    # session_id → the routing availability its built-in schemas were built under.
+    _session_tool_schemas_routing: dict[str, bool] = {}
     _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
     _session_comment_relays: dict[str, _CommentRelayBinding] = {}
 
@@ -2856,6 +2868,7 @@ def create_runner_app(
         global _server_version, _server_accepts_inferred_status
         global _server_accepts_input_only_failures
         _server_version = envelope.server_version
+        set_remote_routing_available(envelope.smart_routing_available)
         _server_accepts_inferred_status = envelope.accepts_inferred_status
         _server_accepts_input_only_failures = envelope.accepts_input_only_failures
         if _server_accepts_input_only_failures:
@@ -4333,6 +4346,7 @@ def create_runner_app(
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
+        _session_tool_schemas_routing.pop(session_id, None)
         _instruction_delivery_warned.pop(session_id, None)
         _session_sub_agent_resolved.pop(session_id, None)
         if _binding := _session_comment_relays.pop(session_id, None):
@@ -5945,6 +5959,7 @@ def create_runner_app(
             current is not None
             and current.spec_entry is spec_entry
             and current.workflows_enabled == workflows_enabled
+            and current.routing_available == routing_stamp()
             and known_bridge_dir is None
         ):
             return
@@ -5967,6 +5982,7 @@ def create_runner_app(
             current is not None
             and current.spec_entry is spec_entry
             and current.workflows_enabled == workflows_enabled
+            and current.routing_available == routing_stamp()
             and current.bridge_dir == bridge_dir
         ):
             return
@@ -5977,6 +5993,7 @@ def create_runner_app(
         )
 
         relay_spec = _unwrap_spec_entry(spec_entry)
+        relay_routing = routing_stamp()
         relay_schemas: list[_JsonObject] = filter_workflow_tool_schemas(
             build_native_relay_tool_schemas(relay_spec),
             enabled=workflows_enabled,
@@ -6005,6 +6022,7 @@ def create_runner_app(
                 current is not None
                 and current.spec_entry is spec_entry
                 and current.workflows_enabled == workflows_enabled
+                and current.routing_available == routing_stamp()
                 and current.bridge_dir == bridge_dir
             ):
                 return
@@ -6150,6 +6168,7 @@ def create_runner_app(
             spec_entry=spec_entry,
             bridge_dir=bridge_dir,
             workflows_enabled=workflows_enabled,
+            routing_available=relay_routing,
         )
         # Close last: the new advertisement is already written, and
         # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
@@ -6567,7 +6586,22 @@ def create_runner_app(
         if instructions:
             harness_body["instructions"] = instructions
 
-        if conv not in _session_tool_schemas:
+        # Built-in schemas depend on this process's routing answer, which a later
+        # session-init envelope can change. Rebuild only this session's built-ins
+        # when the answer it was built under has moved, keeping its MCP entries and
+        # hash so discovery is not repeated. Nothing shared is cleared, so another
+        # session's in-flight MCP discovery is never disturbed.
+        routing_now = routing_stamp()
+        routing_stale = (
+            conv in _session_tool_schemas
+            and _session_tool_schemas_routing.get(conv) != routing_now
+        )
+        if conv not in _session_tool_schemas or routing_stale:
+            kept_mcp = (
+                [t for t in _session_tool_schemas.get(conv, []) if _is_mcp_tool_schema(t)]
+                if routing_stale
+                else []
+            )
             all_tools: list[_JsonObject] = []
             if cached_spec is not None:
                 try:
@@ -6592,7 +6626,9 @@ def create_runner_app(
                         exc_info=True,
                         extra={"session_id": conv},
                     )
-            _session_tool_schemas[conv] = all_tools
+            # Stamped before the MCP await below, so a flip during discovery is seen next turn.
+            _session_tool_schemas[conv] = all_tools + kept_mcp
+            _session_tool_schemas_routing[conv] = routing_now
 
         if cached_spec and cached_spec.mcp_servers:
             from omnigent.runner.mcp_manager import compute_spec_hash
@@ -6612,11 +6648,7 @@ def create_runner_app(
                     _builtin_tools = [
                         t
                         for t in _session_tool_schemas.get(conv, [])
-                        if not (
-                            isinstance(t, dict)
-                            and isinstance(t.get("name"), str)
-                            and "__" in cast(str, t.get("name"))
-                        )
+                        if not _is_mcp_tool_schema(t)
                     ]
                     _session_tool_schemas[conv] = _builtin_tools + list(mcp_result.schemas)
                     _session_mcp_spec_hash[conv] = _mcp_hash
@@ -9412,6 +9444,7 @@ def create_runner_app(
         _session_cursor_model_names.pop(session_id, None)
         _drop_session_claude_launch_config(session_id)
         _session_tool_schemas.pop(session_id, None)
+        _session_tool_schemas_routing.pop(session_id, None)
         _session_mcp_spec_hash.pop(session_id, None)
         _instruction_delivery_warned.pop(session_id, None)
         _session_sub_agent_resolved.pop(session_id, None)

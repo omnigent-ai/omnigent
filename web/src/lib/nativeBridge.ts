@@ -335,8 +335,23 @@ interface ElectronDesktopApi extends NativeShellApi {
   cancelGlobalShortcutRecording?: () => Promise<boolean>;
   /** The attached browser page's view id if it has keyboard focus; absent on older shells. */
   browserFocusedView?: () => Promise<string | null>;
+  /** "Widen window when opening the right sidebar"; absent on shells predating it. */
+  rightSidebarWindow?: RightSidebarWindowBridge;
   /** The floating New Agent panel; absent on shells predating it. */
   floatingComposer?: FloatingComposerBridge;
+}
+
+/** The shell's setting that widens the window for the right sidebar, and the page's reports. */
+export interface RightSidebarWindowBridge {
+  getWidensWindow: () => Promise<boolean>;
+  /** Resolves false when the shell couldn't save it. */
+  setWidensWindow: (enabled: boolean) => Promise<boolean>;
+  /** The user opened the right sidebar, `width` CSS px wide. */
+  opened: (width: number) => void;
+  /** The user closed the right sidebar. */
+  closed: () => void;
+  /** Forget the previous session's growth without resizing; absent on older shells. */
+  reset?: () => void;
 }
 
 /** Why the shell didn't open a path from the floating panel in a main window. */
@@ -354,6 +369,10 @@ export interface FloatingComposerBridge {
   ) => Promise<{ ok: true } | { ok: false; error: FloatingComposerOpenError }>;
   /** From the panel: its native file picker opened or closed. */
   filePicker: (state: "open" | "closed") => void;
+  /** From the panel: its composer rendered, so the shell shows it without a loading state. Newer shells only. */
+  ready?: () => void;
+  /** To the panel: it came on screen or took the keyboard again. Returns an unsubscribe. Newer shells only. */
+  onShown?: (callback: () => void) => () => void;
 }
 
 /** Native menu commands the desktop shell hands to the page (see lib/desktopCommands). */
@@ -1024,6 +1043,60 @@ export function cancelGlobalShortcutRecording(): void {
   void electronApi()
     ?.cancelGlobalShortcutRecording?.()
     .catch(() => {});
+}
+
+/** Whether the shell can widen the window when the right sidebar opens. */
+export function supportsWidenWindowForRightSidebar(): boolean {
+  const bridge = electronApi()?.rightSidebarWindow;
+  return (
+    typeof bridge?.getWidensWindow === "function" &&
+    typeof bridge.setWidensWindow === "function" &&
+    typeof bridge.opened === "function" &&
+    typeof bridge.closed === "function"
+  );
+}
+
+/** Whether "Widen window when opening the right sidebar" is on; null outside the shell or on failure. */
+export async function getWidenWindowForRightSidebar(): Promise<boolean | null> {
+  if (!supportsWidenWindowForRightSidebar()) return null;
+  try {
+    return (await electronApi()?.rightSidebarWindow?.getWidensWindow()) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] electron getWidensWindow failed:", err);
+    return null;
+  }
+}
+
+/** Saves the setting; resolves false when the shell is absent or couldn't save it. */
+export async function setWidenWindowForRightSidebar(enabled: boolean): Promise<boolean> {
+  if (!supportsWidenWindowForRightSidebar()) return false;
+  try {
+    return (await electronApi()?.rightSidebarWindow?.setWidensWindow(enabled)) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] electron setWidensWindow failed:", err);
+    return false;
+  }
+}
+
+/** A session switch starts fresh window-growth tracking without resizing the window. */
+export function resetRightSidebarWindowTracking(): void {
+  try {
+    electronApi()?.rightSidebarWindow?.reset?.();
+  } catch (err) {
+    console.warn("[nativeBridge] electron right sidebar reset failed:", err);
+  }
+}
+
+/** Tell a supporting shell the user opened (`width` CSS px) or closed the right sidebar. */
+export function reportRightSidebarVisibility(open: boolean, width: number): void {
+  if (!supportsWidenWindowForRightSidebar()) return;
+  const bridge = electronApi()?.rightSidebarWindow;
+  try {
+    if (open) bridge?.opened(width);
+    else bridge?.closed();
+  } catch (err) {
+    console.warn("[nativeBridge] electron right sidebar report failed:", err);
+  }
 }
 
 /** The browser page (its view id) that has keyboard focus in this window, if any. */

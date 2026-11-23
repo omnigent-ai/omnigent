@@ -79,6 +79,7 @@ export type FeatureKey =
   | "floating_composer"
   | "workspace_sidebar_v2"
   | "sidebar_saved_views"
+  | "floating_panes"
   | "gadgets";
 
 /** Deployment-wide release-feature values advertised by the server. */

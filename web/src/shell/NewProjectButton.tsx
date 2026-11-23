@@ -1,5 +1,13 @@
 import { type CSSProperties, useEffect, useRef, useState } from "react";
-import { ChevronRightIcon, FolderOpenIcon, PlusIcon, SmilePlusIcon } from "lucide-react";
+import {
+  ChevronRightIcon,
+  FolderIcon,
+  FolderOpenIcon,
+  GitBranchIcon,
+  PlusIcon,
+  SmilePlusIcon,
+} from "lucide-react";
+import { CardRadioGroup, type CardRadioOption } from "@/components/theme/CardRadioGroup";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -46,6 +54,31 @@ interface WorkspaceSelection {
 
 /** "Run on" value while no target is chosen; Radix Select items can't hold an empty value. */
 const NO_RUN_ON_TARGET = "__none__";
+
+type ProjectSource = "folder" | "repository";
+
+const PROJECT_SOURCE_OPTIONS: readonly CardRadioOption<ProjectSource>[] = [
+  {
+    value: "folder",
+    testId: "new-project-source-folder",
+    body: (
+      <>
+        <FolderIcon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+        <span className="text-ui font-normal md:font-medium">Folder</span>
+      </>
+    ),
+  },
+  {
+    value: "repository",
+    testId: "new-project-source-repository",
+    body: (
+      <>
+        <GitBranchIcon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+        <span className="text-ui font-normal md:font-medium">Repository</span>
+      </>
+    ),
+  },
+];
 
 function isSinglePathComponent(name: string): boolean {
   return (
@@ -170,7 +203,7 @@ export function NewProjectButton({
   const [runOn, setRunOn] = useState<string | null>(null);
   // A host the user picked, as opposed to the default: only a pick is saved for a name-only project.
   const runOnPicked = useRef(false);
-  const [sourceMode, setSourceMode] = useState<"folder" | "repository">("folder");
+  const [sourceMode, setSourceMode] = useState<ProjectSource>("folder");
   const [workspace, setWorkspace] = useState<WorkspaceSelection | null>(null);
   const [createdWorkspace, setCreatedWorkspace] = useState<
     | (WorkspaceSelection & {
@@ -554,35 +587,24 @@ export function NewProjectButton({
             </div>
           )}
           {repositoryCreation && !runsOnSandbox && hostTarget !== null && (
-            <div role="radiogroup" aria-label="Project source" className="flex gap-4 text-ui">
-              <label className="flex cursor-pointer items-center gap-2">
-                <input
-                  type="radio"
-                  name="new-project-source"
-                  value="folder"
-                  checked={sourceMode === "folder"}
-                  onChange={() => {
-                    submissionGeneration.current += 1;
-                    setSourceMode("folder");
-                    setSubmitError(null);
-                  }}
-                />
-                Folder
-              </label>
-              <label className="flex cursor-pointer items-center gap-2">
-                <input
-                  type="radio"
-                  name="new-project-source"
-                  value="repository"
-                  checked={sourceMode === "repository"}
-                  onChange={() => {
-                    submissionGeneration.current += 1;
-                    setSourceMode("repository");
-                    setSubmitError(null);
-                  }}
-                />
-                Repository
-              </label>
+            <div>
+              <span id="new-project-source-label" className="sr-only">
+                Project source
+              </span>
+              <CardRadioGroup<ProjectSource>
+                compact
+                labelledBy="new-project-source-label"
+                value={sourceMode}
+                onSelect={(next) => {
+                  // Re-picking the current source must not abandon a submission in flight.
+                  if (next === sourceMode) return;
+                  submissionGeneration.current += 1;
+                  setSourceMode(next);
+                  setSubmitError(null);
+                }}
+                className="flex gap-2"
+                items={PROJECT_SOURCE_OPTIONS}
+              />
             </div>
           )}
           {repositoryMode && (

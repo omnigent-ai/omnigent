@@ -9920,7 +9920,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         isFirstPlan(event.entry) &&
         event.conversationId === useChatStore.getState().conversationId
       ) {
-        showTasksTabBesideChat(event.conversationId);
+        showTasksTabBesideChat(event.conversationId, "first-plan");
       }
       return;
     case "session_changed_files_invalidated":

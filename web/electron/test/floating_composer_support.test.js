@@ -18,6 +18,17 @@ test("support belongs to one document of one server", () => {
   assert.equal(support.supports(2, "https://host.example/a"), false);
 });
 
+test("a server is served while any of its documents can render the panel", () => {
+  const support = createFloatingComposerSupport();
+  support.announce(1, "https://host.example/a");
+  support.announce(2, "https://host.example/a");
+  support.revoke(1);
+  assert.equal(support.serves("https://host.example/a"), true);
+  support.revoke(2);
+  assert.equal(support.serves("https://host.example/a"), false);
+  assert.equal(support.serves("https://host.example/b"), false);
+});
+
 test("a replaced document loses support until it announces again", () => {
   const support = createFloatingComposerSupport();
   support.announce(1, "https://local.example");
