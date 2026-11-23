@@ -9,7 +9,13 @@ import {
   useSensor,
   useSensors,
 } from "@dnd-kit/core";
-import { MessageSquareIcon, PlusIcon, XIcon } from "lucide-react";
+import {
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  MessageSquareIcon,
+  PlusIcon,
+  XIcon,
+} from "lucide-react";
 import { RunningDot } from "@/components/RunningDot";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
@@ -33,6 +39,36 @@ import {
 } from "./useProjectTickets";
 
 const NO_TICKET_FILTER: string[] = [];
+
+function collapsedStageKey(projectId: string, stageId: string) {
+  return `omnigent.ticketBoard.collapsed.${projectId}.${stageId}`;
+}
+
+/** The completed stage starts collapsed; the choice is remembered per project. */
+function useStageCollapsed(projectId: string | null, stage: TicketStage) {
+  const read = () => {
+    if (!stage.is_complete) return false;
+    if (!projectId) return true;
+    try {
+      return window.localStorage.getItem(collapsedStageKey(projectId, stage.id)) !== "0";
+    } catch {
+      return true;
+    }
+  };
+  const [collapsed, setCollapsed] = useState(read);
+  useEffect(() => setCollapsed(read()), [projectId, stage.id, stage.is_complete]); // eslint-disable-line react-hooks/exhaustive-deps
+  const toggle = () => {
+    const next = !collapsed;
+    setCollapsed(next);
+    if (!projectId) return;
+    try {
+      window.localStorage.setItem(collapsedStageKey(projectId, stage.id), next ? "1" : "0");
+    } catch {
+      // Storage may be unavailable; the toggle still applies for this view.
+    }
+  };
+  return [collapsed, toggle] as const;
+}
 
 export function ProjectTicketBoard({
   projectName,
@@ -237,6 +273,42 @@ function TicketColumn({
   const tickets = filteredTickets ?? query.data?.pages.flatMap((page) => page.data) ?? [];
   const hasNextPage = filteredTickets === undefined && query.hasNextPage;
   const { setNodeRef, isOver } = useDroppable({ id: stage.id, disabled });
+  const [collapsedPreference, toggleCollapsed] = useStageCollapsed(projectId, stage);
+  const collapsed = collapsedPreference && !filteredTickets?.length;
+  if (collapsed) {
+    return (
+      <section
+        ref={setNodeRef}
+        aria-label={stage.name}
+        className={cn(
+          "flex w-12 shrink-0 flex-col items-center gap-3 rounded-xl border border-transparent bg-muted/30 py-2 transition-colors",
+          dragging && "border-dashed border-muted-foreground/50",
+          dragging && isOver && "border-primary bg-primary/10",
+        )}
+      >
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label={`Expand ${stage.name}`}
+          title={`Expand ${stage.name}`}
+          onClick={toggleCollapsed}
+        >
+          <ChevronLeftIcon />
+        </Button>
+        <span className="text-sm font-medium text-muted-foreground tabular-nums">
+          {tickets.length}
+          {hasNextPage ? "+" : ""}
+        </span>
+        <button
+          type="button"
+          onClick={toggleCollapsed}
+          className="text-sm font-medium text-muted-foreground [writing-mode:vertical-rl]"
+        >
+          {stage.name}
+        </button>
+      </section>
+    );
+  }
   return (
     <section
       ref={setNodeRef}
@@ -249,9 +321,21 @@ function TicketColumn({
     >
       <h2 className="flex shrink-0 items-center justify-between px-1.5 pt-1.5 pb-3 text-sm font-medium text-muted-foreground">
         <TicketStageBadge stage={stage} showInstructionsOnHover />
-        <span className="tabular-nums">
+        <span className="flex items-center gap-1 tabular-nums">
           {tickets.length}
           {hasNextPage ? "+" : ""}
+          {stage.is_complete && (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-6"
+              aria-label={`Collapse ${stage.name}`}
+              title={`Collapse ${stage.name}`}
+              onClick={toggleCollapsed}
+            >
+              <ChevronRightIcon />
+            </Button>
+          )}
         </span>
       </h2>
       <div

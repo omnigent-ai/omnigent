@@ -18,7 +18,7 @@ header, new-session composer, session quick view and side chat, and UI primitive
 ## Requirements
 
 - R1: Tickets belong to a project and exist independently of sessions.
-- R3: Projects own ordered stages, defaulting to Open → Planning → Working → Review → Done.
+- R3: Projects own ordered stages, defaulting to Open → Working → Review → Done.
   The first stage starts new tickets; the last means complete. Rename, reorder,
   add and remove stages without changing their stable IDs. Occupied removals
   require a surviving destination; moves and configuration commit together.

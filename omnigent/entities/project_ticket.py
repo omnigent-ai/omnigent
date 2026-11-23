@@ -27,9 +27,8 @@ TicketStageIcon = Literal[
 ]
 TicketEventKind = Literal["created", "updated", "comment", "execution", "output"]
 LEGACY_STATUS_CODES = {"open": 0, "in_progress": 1, "done": 2, "planning": 3, "review": 4}
-LEGACY_STATUS_LABELS = {
+DEFAULT_STAGE_NAMES = {
     "open": "Open",
-    "planning": "Planning",
     "in_progress": "Working",
     "review": "Review",
     "done": "Done",
@@ -115,7 +114,7 @@ class UpdateTicketStages(TicketStages):
 def default_ticket_stages() -> TicketStages:
     return TicketStages(
         stages=[
-            TicketStage(id=stage_id, name=name) for stage_id, name in LEGACY_STATUS_LABELS.items()
+            TicketStage(id=stage_id, name=name) for stage_id, name in DEFAULT_STAGE_NAMES.items()
         ],
     )
 

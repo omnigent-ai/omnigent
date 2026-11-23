@@ -979,7 +979,7 @@ class SqlProjectTicket(OmnigentBase):
     title: Mapped[str] = mapped_column(EnvelopedText(1024), nullable=False)
     description: Mapped[str] = mapped_column(EnvelopedText(16383), nullable=False)
     status: Mapped[int] = mapped_column(SmallInteger, nullable=False)
-    # NULL retains the original numeric status until a stage-aware writer moves the ticket.
+    # Always set by writers; rows created before stages were backfilled by migration.
     stage_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     labels: Mapped[list[dict[str, str]]] = mapped_column(
         "tags", EnvelopedJSON(4096), nullable=False
@@ -1003,15 +1003,6 @@ class SqlProjectTicket(OmnigentBase):
             "workspace_id",
             "project_id",
             "stage_id",
-            "created_at",
-            "id",
-        ),
-        Index(
-            "ix_project_tickets_legacy_stage",
-            "workspace_id",
-            "project_id",
-            "stage_id",
-            "status",
             "created_at",
             "id",
         ),

@@ -42,14 +42,17 @@ const LEGACY_STATUS_LABELS: Record<string, string> = {
   review: "Review",
   done: "Done",
 };
+const DEFAULT_STAGE_IDS = ["open", "in_progress", "review", "done"];
 /** Defaults only for label-only projects and servers predating customizable stages. */
 export const DEFAULT_TICKET_STAGES: TicketStages = {
-  stages: Object.entries(LEGACY_STATUS_LABELS).map(([id, name]) => ({
-    id,
-    name,
-    instructions: "",
-    is_complete: id === "done",
-  })),
+  stages: DEFAULT_STAGE_IDS.map((id) => [id, LEGACY_STATUS_LABELS[id]] as const).map(
+    ([id, name]) => ({
+      id,
+      name,
+      instructions: "",
+      is_complete: id === "done",
+    }),
+  ),
   initial_stage_id: "open",
 };
 export interface TicketLabel {

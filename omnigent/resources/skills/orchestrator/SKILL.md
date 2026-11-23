@@ -65,7 +65,7 @@ the edit and moves commit together without deleting history. Use this for
 authorized workflow changes, not to disguise stalled work or bypass acceptance.
 Use `sys_ticket_update` for an individual ticket's progress.
 
-The defaults are **Open → Planning → Working → Review → Done**, but projects
+The defaults are **Open → Working → Review → Done**, but projects
 can rename, reorder, add or remove them. A project might instead use
 New → Investigating → Mitigating → Verifying → Resolved. Stages describe work,
 not whether a session is running. `needs-human` is an independent label, meaningful

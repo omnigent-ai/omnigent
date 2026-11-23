@@ -5,7 +5,6 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useMemo } from "react";
 import { useProjects } from "@/hooks/useConversations";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { createProject } from "@/lib/projectsApi";
@@ -49,16 +48,7 @@ export function useTicketStagesEnabled() {
 
 export function useTicketStages(projectId: string | null, includeUsage = false) {
   const supported = useTicketStagesEnabled();
-  const lifecycle = useTicketLifecycleEnabled();
-  const defaults = useMemo(
-    () => ({
-      ...DEFAULT_TICKET_STAGES,
-      stages: DEFAULT_TICKET_STAGES.stages.filter(
-        (stage) => lifecycle || !["planning", "review"].includes(stage.id),
-      ),
-    }),
-    [lifecycle],
-  );
+  const defaults = DEFAULT_TICKET_STAGES;
   const query = useQuery({
     queryKey: ["project-tickets", projectId, "stages", includeUsage],
     queryFn: () => getTicketStages(projectId!, includeUsage),

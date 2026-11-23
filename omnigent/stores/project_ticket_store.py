@@ -72,9 +72,7 @@ def _identifier(value: str) -> str:
 
 
 def _stage_id(row: SqlProjectTicket) -> str:
-    return row.stage_id or next(
-        key for key, value in LEGACY_STATUS_CODES.items() if value == row.status
-    )
+    return row.stage_id or "open"
 
 
 def _stages(project: SqlProject) -> TicketStages:
@@ -288,14 +286,14 @@ class ProjectTicketStore:
     def summary(self, project_id: str, *, user_id: str | None) -> dict[str, Any]:
         with self._session("ticket_response_summary") as session:
             project = self._project(session, project_id, user_id)
-            # Labels are encrypted; bound the read and report partial counts explicitly.
+            # Labels are encrypted; bound the read to the newest tickets and report partial counts.
             labels = session.scalars(
                 select(SqlProjectTicket.labels)
                 .where(
                     SqlProjectTicket.workspace_id == project.workspace_id,
                     SqlProjectTicket.project_id == project.id,
                 )
-                .order_by(SqlProjectTicket.created_at, SqlProjectTicket.id)
+                .order_by(SqlProjectTicket.created_at.desc(), SqlProjectTicket.id.desc())
                 .limit(TICKET_SUMMARY_SCAN_MAX + 1)
             ).all()
             return {
@@ -316,6 +314,8 @@ class ProjectTicketStore:
         after: SqlProjectTicket | None = None,
         write: bool = False,
     ) -> builtins.list[SqlProjectTicket]:
+        # The completed stage only grows, so it lists the most recently created first.
+        descending = stage_id is not None and _stages(project).stages[-1].id == stage_id
         stmt = select(SqlProjectTicket).where(
             SqlProjectTicket.workspace_id == project.workspace_id,
             SqlProjectTicket.project_id == project.id,
@@ -326,35 +326,21 @@ class ProjectTicketStore:
                     self._dialect_name,
                     (SqlProjectTicket.created_at, SqlProjectTicket.id),
                     (after.created_at, after.id),
+                    descending=descending,
                 )
             )
-        stmt = stmt.order_by(SqlProjectTicket.created_at, SqlProjectTicket.id).limit(limit)
+        order = (SqlProjectTicket.created_at, SqlProjectTicket.id)
+        stmt = stmt.order_by(*(column.desc() for column in order) if descending else order)
+        stmt = stmt.limit(limit)
         if write:
             stmt = stmt.with_for_update()
-        queries = [(stmt, "ix_project_tickets_created")]
+        index = "ix_project_tickets_created"
         if stage_id is not None:
-            queries = [
-                (stmt.where(SqlProjectTicket.stage_id == stage_id), "ix_project_tickets_stage")
-            ]
-            if stage_id in LEGACY_STATUS_CODES:
-                queries.append(
-                    (
-                        stmt.where(
-                            SqlProjectTicket.stage_id.is_(None),
-                            SqlProjectTicket.status == LEGACY_STATUS_CODES[stage_id],
-                        ),
-                        "ix_project_tickets_legacy_stage",
-                    )
-                )
-        # Merge disjoint indexed streams, avoiding COALESCE or a project scan.
-        rows = [
-            row
-            for query, index in queries
-            for row in session.scalars(
-                query.with_hint(SqlProjectTicket, f"FORCE INDEX ({index})", "mysql")
-            )
-        ]
-        return sorted(rows, key=lambda row: (row.created_at, row.id))[:limit]
+            stmt = stmt.where(SqlProjectTicket.stage_id == stage_id)
+            index = "ix_project_tickets_stage"
+        return builtins.list(
+            session.scalars(stmt.with_hint(SqlProjectTicket, f"FORCE INDEX ({index})", "mysql"))
+        )
 
     def activity_sessions(
         self, project_id: str, ticket_ids: builtins.list[str], *, user_id: str | None

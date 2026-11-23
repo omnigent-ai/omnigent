@@ -121,7 +121,8 @@ class SysTicketListTool(_TicketTool):
         "(IDs, names, instructions, appearance, and derived start/completion metadata). "
         "Colors and icons are visual only. "
         "The first stage starts new tickets; the last means complete. Read these before choosing "
-        "a stage; do not assume fixed names. Use last_id as after while has_more is true."
+        "a stage; do not assume fixed names. Filtering by the last stage lists newest first. "
+        "Use last_id as after while has_more is true."
     )
     arguments = ListTickets
 
