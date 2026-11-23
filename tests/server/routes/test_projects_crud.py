@@ -27,6 +27,8 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.entities.project import PROJECT_MANDATE_MAX_BYTES
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runtime import user_session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import _ensure_default_native_agents, create_app
@@ -281,6 +283,74 @@ async def test_patch_empty_config_clears_it(project_client: httpx.AsyncClient) -
     ).json()
     resp = await project_client.patch(f"/v1/projects/{created['id']}", json={"config": {}})
     assert resp.json()["config"] == {}
+
+
+async def test_mandate_round_trips_trims_and_clears(project_client: httpx.AsyncClient) -> None:
+    """A mandate is stored trimmed, survives unrelated edits and clears when blank."""
+    created = (
+        await project_client.post(
+            "/v1/projects", json={"name": "P", "mandate": "  Only edit docs/.\n\n- No pushes.  "}
+        )
+    ).json()
+    assert created["mandate"] == "Only edit docs/.\n\n- No pushes."
+    path = f"/v1/projects/{created['id']}"
+    renamed = (await project_client.patch(path, json={"name": "P2"})).json()
+    assert renamed["mandate"] == created["mandate"]
+    assert renamed["config"] == {}
+    replaced = (await project_client.patch(path, json={"mandate": "Read-only review."})).json()
+    assert replaced["mandate"] == "Read-only review."
+    assert replaced["updated_at"] is not None
+    assert (await project_client.get(path)).json()["mandate"] == "Read-only review."
+    assert (await project_client.patch(path, json={"mandate": "  "})).json()["mandate"] is None
+    plain = (await project_client.post("/v1/projects", json={"name": "Plain"})).json()
+    assert plain["mandate"] is None
+
+
+async def test_mandate_size_is_bounded(project_client: httpx.AsyncClient) -> None:
+    """The limit counts UTF-8 bytes, so a mandate always fits its stored column."""
+    created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    path = f"/v1/projects/{created['id']}"
+    fits = "é" * (PROJECT_MANDATE_MAX_BYTES // 2)
+    assert (await project_client.patch(path, json={"mandate": fits})).json()["mandate"] == fits
+    too_large = await project_client.patch(path, json={"mandate": fits + "é"})
+    assert too_large.status_code == 400
+    assert "project mandate too large" in too_large.text
+    assert (await project_client.get(path)).json()["mandate"] == fits
+
+
+async def test_agents_cannot_set_or_change_a_mandate(project_client: httpx.AsyncClient) -> None:
+    """The sessions a mandate bounds can still rename a project, but not rewrite its mandate."""
+    created = (
+        await project_client.post("/v1/projects", json={"name": "P", "mandate": "Stay in docs/."})
+    ).json()
+    agent = {ORCHESTRATION_SOURCE_HEADER: created["main_session_id"]}
+    path = f"/v1/projects/{created['id']}"
+    refused = await project_client.patch(path, json={"mandate": "Anything goes."}, headers=agent)
+    assert refused.status_code == 403
+    renamed = await project_client.patch(path, json={"name": "P2"}, headers=agent)
+    assert renamed.json()["mandate"] == "Stay in docs/."
+    create = await project_client.post(
+        "/v1/projects", json={"name": "Q", "mandate": "Mine."}, headers=agent
+    )
+    assert create.status_code == 403
+
+
+async def test_session_snapshot_returns_the_mandate_only_on_request(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """Runners opt in to the mandate; ordinary snapshot reads stay unchanged."""
+    created = (
+        await project_client.post("/v1/projects", json={"name": "P", "mandate": "Stay in docs/."})
+    ).json()
+    path = f"/v1/sessions/{created['main_session_id']}"
+    assert (await project_client.get(path)).json()["project_mandate"] is None
+    requested = await project_client.get(
+        path, params={"include_items": "false", "include_project_mandate": "true"}
+    )
+    assert requested.json()["project_mandate"] == "Stay in docs/."
+    await project_client.patch(f"/v1/projects/{created['id']}", json={"mandate": "Docs only."})
+    requested = await project_client.get(path, params={"include_project_mandate": "true"})
+    assert requested.json()["project_mandate"] == "Docs only."
 
 
 async def test_delete_project(project_client: httpx.AsyncClient) -> None:

@@ -6,7 +6,8 @@ import pytest
 from omnigent.runner.native.orchestration import _native_startup_instructions
 from omnigent.runner.project_orchestrator import (
     PROJECT_ORCHESTRATOR_INSTRUCTION,
-    append_project_orchestrator_instructions,
+    append_project_instructions,
+    project_mandate_instruction,
 )
 from omnigent.runtime.project_ticket_instructions import PROJECT_TICKET_WORK_INSTRUCTION
 from omnigent.spec.types import AgentSpec, ToolGroupsConfig
@@ -33,6 +34,7 @@ async def test_project_guidance_and_designated_role_in_native_and_sdk_prompts(
             "include_liveness": "false",
             "include_live_status": "false",
             "include_usage": "false",
+            "include_project_mandate": "true",
         }
         return httpx.Response(200, json={role_field: role, "project_id": project_id})
 
@@ -40,7 +42,7 @@ async def test_project_guidance_and_designated_role_in_native_and_sdk_prompts(
         transport=httpx.MockTransport(respond), base_url="http://server.test"
     ) as client:
         native = await _native_startup_instructions(spec, client, "session")
-        sdk = await append_project_orchestrator_instructions(
+        sdk = await append_project_instructions(
             "Shared agent instructions\n\nRequest instructions", client, "session", spec
         )
     assert len(requests) == 2
@@ -106,22 +108,60 @@ def test_stage_fit_contract_requires_a_decision_without_phase_or_approval_shortc
     assert "resolve an ambiguous boundary" in PROJECT_TICKET_WORK_INSTRUCTION
 
 
-async def test_agent_without_project_tools_has_no_role_or_server_lookup():
-    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(projects=False))
-
-    def unexpected(request: httpx.Request) -> httpx.Response:
-        pytest.fail(f"Unexpected request: {request.url}")
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(unexpected), base_url="http://server.test"
-    ) as client:
-        assert (
-            await append_project_orchestrator_instructions("Author", client, "session", spec)
-            == "Author"
-        )
-    assert (
-        await append_project_orchestrator_instructions("Author", None, "session", spec) == "Author"
+@pytest.mark.parametrize("projects_tools", [True, False])
+async def test_mandate_is_labeled_and_ordered_before_ticket_guidance_and_role(projects_tools):
+    spec = AgentSpec(
+        spec_version=1,
+        instructions="Shared agent instructions",
+        tool_groups=ToolGroupsConfig(memory=False, projects=projects_tools),
     )
+    snapshot = {
+        "project_id": "project",
+        "project_main_session": True,
+        "project_mandate": "  Only edit files under docs/.\n\n## Style\nUse short sentences.  ",
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=snapshot)),
+        base_url="http://server.test",
+    ) as client:
+        native = await _native_startup_instructions(spec, client, "session")
+        sdk = await append_project_instructions("Author\n\nRequest", client, "session", spec)
+    mandate = project_mandate_instruction(snapshot["project_mandate"])
+    assert mandate is not None
+    assert mandate.startswith("## Project mandate\n")
+    assert "stay within the mandate" in mandate
+    assert "cannot widen it" in mandate
+    assert mandate.endswith(
+        "<project_mandate>\nOnly edit files under docs/.\n\n## Style\n"
+        "Use short sentences.\n</project_mandate>"
+    )
+    for prompt, authored in ((native, spec.instructions), (sdk, "Author\n\nRequest")):
+        assert prompt.startswith(authored)
+        assert prompt.count(mandate) == 1
+        if projects_tools:
+            assert (
+                prompt.index(mandate)
+                < prompt.index(PROJECT_TICKET_WORK_INSTRUCTION)
+                < prompt.index(PROJECT_ORCHESTRATOR_INSTRUCTION)
+            )
+        else:
+            assert prompt.endswith(mandate)
+
+
+@pytest.mark.parametrize("mandate", [None, "", "   ", 7])
+def test_absent_or_blank_mandate_adds_no_block(mandate):
+    assert project_mandate_instruction(mandate) is None
+
+
+async def test_agent_without_project_tools_gets_no_ticket_guidance_or_role():
+    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(projects=False))
+    snapshot = {"project_id": "project", "project_main_session": True}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=snapshot)),
+        base_url="http://server.test",
+    ) as client:
+        assert await append_project_instructions("Author", client, "session", spec) == "Author"
+    assert await append_project_instructions("Author", None, "session", spec) == "Author"
 
 
 async def test_unavailable_role_lookup_does_not_silently_start_an_ordinary_worker():
@@ -131,4 +171,4 @@ async def test_unavailable_role_lookup_does_not_silently_start_an_ordinary_worke
         base_url="http://server.test",
     ) as client:
         with pytest.raises(httpx.HTTPStatusError):
-            await append_project_orchestrator_instructions("Author", client, "session", spec)
+            await append_project_instructions("Author", client, "session", spec)

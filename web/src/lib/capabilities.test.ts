@@ -588,6 +588,12 @@ describe("custom ticket stages capability", () => {
   });
 });
 
+describe("project mandate capability", () => {
+  it.each([undefined, false, "true", true])("requires explicit support: %s", async (supported) => {
+    expect((await probe({ project_mandate: supported })).project_mandate).toBe(supported === true);
+  });
+});
+
 describe("ticket response summary capability", () => {
   it.each([undefined, false, "true", true])("requires explicit support: %s", async (supported) => {
     expect((await probe({ project_ticket_summary: supported })).project_ticket_summary).toBe(

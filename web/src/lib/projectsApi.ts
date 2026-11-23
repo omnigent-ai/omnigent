@@ -81,7 +81,12 @@ export interface Project {
   updated_at?: number | null;
   /** Stored default session settings; `{}` when the project has none. */
   config?: ProjectConfig;
+  /** Owner-written guidance loaded into every project session; `null` when unset. */
+  mandate?: string | null;
 }
+
+/** Most UTF-8 bytes a mandate may hold; mirrors `PROJECT_MANDATE_MAX_BYTES` on the server. */
+export const PROJECT_MANDATE_MAX_BYTES = 12_000;
 
 interface ProjectListResponse {
   object: "list";
@@ -154,6 +159,17 @@ export async function updateProjectConfig(id: string, config: ProjectConfig): Pr
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ config }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return (await res.json()) as Project;
+}
+
+/** Replace a project's mandate; blank text clears it. Only `mandate` is sent. */
+export async function updateProjectMandate(id: string, mandate: string): Promise<Project> {
+  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mandate }),
   });
   if (!res.ok) throw new Error(await readError(res));
   return (await res.json()) as Project;

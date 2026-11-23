@@ -1844,6 +1844,39 @@
         "title": "Comment",
         "type": "object"
       },
+      "CommentOnTicket": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "default": "comment",
+            "enum": [
+              "comment",
+              "execution"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "outputs": {
+            "items": {
+              "$ref": "#/components/schemas/TicketOutput"
+            },
+            "maxItems": 10,
+            "title": "Outputs",
+            "type": "array"
+          },
+          "text": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "CommentOnTicket",
+        "type": "object"
+      },
       "CommentPage": {
         "description": "A bounded comment page; filtered pages can be empty and still have a cursor.",
         "properties": {
@@ -2440,6 +2473,18 @@
             "title": "Config",
             "type": "object"
           },
+          "mandate": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional guidance loaded into every agent session in the project. Trimmed; at most 12,000 UTF-8 bytes; blank stores none.",
+            "title": "Mandate"
+          },
           "name": {
             "description": "Human-readable project name. Trimmed; must be non-empty and at most 100 characters; unique among the caller's projects.",
             "title": "Name",
@@ -2688,6 +2733,36 @@
           "handler"
         ],
         "title": "CreateSessionPolicyRequest",
+        "type": "object"
+      },
+      "CreateTicket": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 3000,
+            "title": "Description",
+            "type": "string"
+          },
+          "labels": {
+            "items": {
+              "$ref": "#/components/schemas/TicketLabel"
+            },
+            "maxItems": 20,
+            "title": "Labels",
+            "type": "array"
+          },
+          "title": {
+            "maxLength": 160,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "title": "CreateTicket",
         "type": "object"
       },
       "CreateWorkflowRequest": {
@@ -4634,6 +4709,65 @@
           "workspace"
         ],
         "title": "LaunchRunnerRequest",
+        "type": "object"
+      },
+      "LinkRelatedTicket": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "default": "attach",
+            "enum": [
+              "attach",
+              "remove"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "related_ticket_id": {
+            "title": "Related Ticket Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "related_ticket_id"
+        ],
+        "title": "LinkRelatedTicket",
+        "type": "object"
+      },
+      "LinkTicketSession": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "default": "attach",
+            "enum": [
+              "attach",
+              "remove"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "involvement": {
+            "anyOf": [
+              {
+                "maxLength": 300,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Brief contribution to this ticket. Omit to retain it; empty clears it.",
+            "title": "Involvement"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "LinkTicketSession",
         "type": "object"
       },
       "LiveMCPServerStatus": {
@@ -6588,6 +6722,18 @@
             "default": null,
             "title": "Cost Control Mode Override"
           },
+          "expected_main_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expected Main Session Id"
+          },
           "git": {
             "anyOf": [
               {
@@ -6727,6 +6873,11 @@
             ],
             "default": null,
             "title": "Project Id"
+          },
+          "project_main_session": {
+            "default": false,
+            "title": "Project Main Session",
+            "type": "boolean"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -8107,6 +8258,36 @@
             "title": "Proactive Agent Available",
             "type": "boolean"
           },
+          "project_mandate": {
+            "default": false,
+            "title": "Project Mandate",
+            "type": "boolean"
+          },
+          "project_ticket_agent_involvement": {
+            "default": false,
+            "title": "Project Ticket Agent Involvement",
+            "type": "boolean"
+          },
+          "project_ticket_lifecycle": {
+            "default": false,
+            "title": "Project Ticket Lifecycle",
+            "type": "boolean"
+          },
+          "project_ticket_stages": {
+            "default": false,
+            "title": "Project Ticket Stages",
+            "type": "boolean"
+          },
+          "project_ticket_summary": {
+            "default": false,
+            "title": "Project Ticket Summary",
+            "type": "boolean"
+          },
+          "project_tickets": {
+            "default": false,
+            "title": "Project Tickets",
+            "type": "boolean"
+          },
           "public_sharing_enabled": {
             "title": "Public Sharing Enabled",
             "type": "boolean"
@@ -9104,6 +9285,18 @@
         "additionalProperties": false,
         "description": "Metadata JSON part for multipart `POST /v1/sessions`.\n\nThe uploaded agent tarball supplies the agent spec. This JSON\npart carries only session-level metadata so request metadata\ncannot disagree with the agent bundle.",
         "properties": {
+          "expected_main_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expected Main Session Id"
+          },
           "git": {
             "anyOf": [
               {
@@ -9216,6 +9409,11 @@
             ],
             "default": null,
             "title": "Project Id"
+          },
+          "project_main_session": {
+            "default": false,
+            "title": "Project Main Session",
+            "type": "boolean"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -9365,6 +9563,18 @@
             "default": null,
             "title": "Cost Control Mode Override"
           },
+          "expected_main_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expected Main Session Id"
+          },
           "git": {
             "anyOf": [
               {
@@ -9504,6 +9714,11 @@
             ],
             "default": null,
             "title": "Project Id"
+          },
+          "project_main_session": {
+            "default": false,
+            "title": "Project Main Session",
+            "type": "boolean"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -13118,6 +13333,27 @@
             ],
             "title": "Project Id"
           },
+          "project_main_session": {
+            "default": false,
+            "title": "Project Main Session",
+            "type": "boolean"
+          },
+          "project_mandate": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Mandate"
+          },
+          "project_orchestrator": {
+            "default": false,
+            "title": "Project Orchestrator",
+            "type": "boolean"
+          },
           "reasoning_effort": {
             "anyOf": [
               {
@@ -15215,6 +15451,143 @@
         "title": "TerminalCommandData",
         "type": "object"
       },
+      "TicketLabel": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Key",
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "title": "TicketLabel",
+        "type": "object"
+      },
+      "TicketOutput": {
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "enum": [
+              "pull_request",
+              "link"
+            ],
+            "title": "Type",
+            "type": "string"
+          },
+          "url": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "url"
+        ],
+        "title": "TicketOutput",
+        "type": "object"
+      },
+      "TicketStage": {
+        "additionalProperties": false,
+        "properties": {
+          "color": {
+            "anyOf": [
+              {
+                "enum": [
+                  "gray",
+                  "blue",
+                  "purple",
+                  "pink",
+                  "red",
+                  "orange",
+                  "amber",
+                  "green"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Visual color only; null uses the default appearance.",
+            "title": "Color"
+          },
+          "icon": {
+            "anyOf": [
+              {
+                "enum": [
+                  "circle-dashed",
+                  "circle",
+                  "circle-dot",
+                  "circle-check",
+                  "clipboard-list",
+                  "eye",
+                  "clock",
+                  "pause",
+                  "search",
+                  "flag",
+                  "wrench",
+                  "rocket"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Visual icon only; null uses the default appearance.",
+            "title": "Icon"
+          },
+          "id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9_-]*$",
+            "title": "Id",
+            "type": "string"
+          },
+          "instructions": {
+            "default": "",
+            "maxLength": 500,
+            "title": "Instructions",
+            "type": "string"
+          },
+          "is_complete": {
+            "default": false,
+            "description": "Derived from the final stage's position.",
+            "title": "Is Complete",
+            "type": "boolean"
+          },
+          "name": {
+            "maxLength": 60,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "TicketStage",
+        "type": "object"
+      },
       "ToolOutputDeltaEvent": {
         "description": "Incremental output from an in-progress function call.",
         "properties": {
@@ -15615,6 +15988,40 @@
             ],
             "description": "New config object to replace the stored one. `None` leaves it unchanged; an empty object `{}` clears the stored defaults.",
             "title": "Config"
+          },
+          "expected_main_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Main Session Id"
+          },
+          "main_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Main Session Id"
+          },
+          "mandate": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "New mandate text. `None` leaves it unchanged; blank text clears it. Trimmed; at most 12,000 UTF-8 bytes.",
+            "title": "Mandate"
           },
           "name": {
             "anyOf": [
@@ -16115,6 +16522,132 @@
           }
         },
         "title": "UpdateSessionRequest",
+        "type": "object"
+      },
+      "UpdateTicket": {
+        "additionalProperties": false,
+        "properties": {
+          "comment": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Comment"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 3000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "labels": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/TicketLabel"
+                },
+                "maxItems": 20,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Labels"
+          },
+          "stage_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "pattern": "^[a-z][a-z0-9_-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A stage ID from this project's ticket list or stage definitions.",
+            "title": "Stage Id"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "title": "UpdateTicket",
+        "type": "object"
+      },
+      "UpdateTicketStages": {
+        "additionalProperties": false,
+        "properties": {
+          "initial_stage_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "pattern": "^[a-z][a-z0-9_-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Derived from the first stage; supplied values are ignored.",
+            "title": "Initial Stage Id"
+          },
+          "moves": {
+            "maxProperties": 20,
+            "patternProperties": {
+              "^[a-z][a-z0-9_-]*$": {
+                "maxLength": 64,
+                "minLength": 1,
+                "pattern": "^[a-z][a-z0-9_-]*$",
+                "type": "string"
+              }
+            },
+            "propertyNames": {
+              "maxLength": 64,
+              "minLength": 1
+            },
+            "title": "Moves",
+            "type": "object"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/components/schemas/TicketStage"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "Stages",
+            "type": "array"
+          }
+        },
+        "required": [
+          "stages"
+        ],
+        "title": "UpdateTicketStages",
         "type": "object"
       },
       "UpdateWorkflowRequest": {
@@ -20450,7 +20983,7 @@
         ]
       },
       "post": {
-        "description": "Create a new, empty project owned by the caller.\n\n**Parameters**\n\n- `body` \u2014 Project payload (name).\n\n**Returns:** The created project as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 409 if the caller already has a project with this name.",
+        "description": "Create a project and its ordinary main session for the caller.\n\n**Parameters**\n\n- `body` \u2014 Project payload (name).\n\n**Returns:** The created project as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 409 if the caller already has a project with this name.",
         "operationId": "create_project_v1_projects_post",
         "requestBody": {
           "content": {
@@ -20695,6 +21228,859 @@
         "summary": "Update Project",
         "tags": [
           "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/tickets": {
+      "get": {
+        "operationId": "list_tickets_v1_projects__project_id__tickets_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "stage_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "minLength": 1,
+                  "pattern": "^[a-z][a-z0-9_-]*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Stage Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Tickets V1 Projects  Project Id  Tickets Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Tickets",
+        "tags": [
+          "project tickets"
+        ]
+      },
+      "post": {
+        "operationId": "create_ticket_v1_projects__project_id__tickets_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTicket"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Ticket V1 Projects  Project Id  Tickets Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Ticket",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/tickets/stages": {
+      "get": {
+        "operationId": "ticket_stages_v1_projects__project_id__tickets_stages_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_usage",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Usage",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Ticket Stages V1 Projects  Project Id  Tickets Stages Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ticket Stages",
+        "tags": [
+          "project tickets"
+        ]
+      },
+      "put": {
+        "operationId": "update_ticket_stages_v1_projects__project_id__tickets_stages_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTicketStages"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Ticket Stages V1 Projects  Project Id  Tickets Stages Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Ticket Stages",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/tickets/summary": {
+      "get": {
+        "operationId": "ticket_summary_v1_projects__project_id__tickets_summary_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Ticket Summary V1 Projects  Project Id  Tickets Summary Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ticket Summary",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/tickets/{ticket_id}": {
+      "get": {
+        "operationId": "get_ticket_v1_projects__project_id__tickets__ticket_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "title": "Ticket Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Ticket V1 Projects  Project Id  Tickets  Ticket Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Ticket",
+        "tags": [
+          "project tickets"
+        ]
+      },
+      "patch": {
+        "operationId": "update_ticket_v1_projects__project_id__tickets__ticket_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "title": "Ticket Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTicket"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Ticket V1 Projects  Project Id  Tickets  Ticket Id  Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Ticket",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/tickets/{ticket_id}/comments": {
+      "post": {
+        "operationId": "comment_v1_projects__project_id__tickets__ticket_id__comments_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "title": "Ticket Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommentOnTicket"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Comment V1 Projects  Project Id  Tickets  Ticket Id  Comments Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Comment",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/tickets/{ticket_id}/events": {
+      "get": {
+        "operationId": "events_v1_projects__project_id__tickets__ticket_id__events_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "title": "Ticket Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "default": -1,
+              "minimum": -1,
+              "title": "After",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "created",
+                    "updated",
+                    "comment",
+                    "execution",
+                    "output"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Events V1 Projects  Project Id  Tickets  Ticket Id  Events Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Events",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/tickets/{ticket_id}/related": {
+      "get": {
+        "operationId": "related_tickets_v1_projects__project_id__tickets__ticket_id__related_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "title": "Ticket Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Related Tickets V1 Projects  Project Id  Tickets  Ticket Id  Related Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Related Tickets",
+        "tags": [
+          "project tickets"
+        ]
+      },
+      "post": {
+        "operationId": "link_related_ticket_v1_projects__project_id__tickets__ticket_id__related_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "title": "Ticket Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkRelatedTicket"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Link Related Ticket V1 Projects  Project Id  Tickets  Ticket Id  Related Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Link Related Ticket",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/tickets/{ticket_id}/sessions": {
+      "get": {
+        "operationId": "sessions_v1_projects__project_id__tickets__ticket_id__sessions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "title": "Ticket Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Sessions V1 Projects  Project Id  Tickets  Ticket Id  Sessions Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sessions",
+        "tags": [
+          "project tickets"
+        ]
+      },
+      "post": {
+        "operationId": "link_session_v1_projects__project_id__tickets__ticket_id__sessions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "title": "Ticket Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkTicketSession"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Link Session V1 Projects  Project Id  Tickets  Ticket Id  Sessions Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Link Session",
+        "tags": [
+          "project tickets"
         ]
       }
     },
@@ -22429,6 +23815,17 @@
             "schema": {
               "default": true,
               "title": "Include Usage",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "When `True`, return the session's project mandate as `project_mandate`. Runners request it to compose startup instructions; other clients read it from the project.",
+            "in": "query",
+            "name": "include_project_mandate",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Project Mandate",
               "type": "boolean"
             }
           }

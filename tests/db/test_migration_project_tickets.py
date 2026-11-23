@@ -72,6 +72,8 @@ def test_schema_paths_agree_on_keys_bounds_defaults_and_indexes(ticket_engine):
     assert project["main_session_id"]["nullable"] is True
     assert project["ticket_stages"]["nullable"] is True
     assert project["ticket_stages"]["default"] is None
+    assert project["mandate"]["nullable"] is True
+    assert project["mandate"]["default"] is None
     # SQLite ignores VARCHAR lengths, so the migration and metadata enforce a byte cap.
     event_table = sa.Table("project_ticket_events", sa.MetaData(), autoload_with=ticket_engine)
     with pytest.raises(sa.exc.DBAPIError), ticket_engine.begin() as connection:

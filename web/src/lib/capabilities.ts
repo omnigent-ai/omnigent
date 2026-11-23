@@ -138,6 +138,8 @@ export interface ServerInfo {
   project_ticket_stages?: boolean;
   /** Bounded project-wide counts of tickets needing a response. */
   project_ticket_summary?: boolean;
+  /** Projects store a mandate loaded into every project session. */
+  project_mandate?: boolean;
   /**
    * Short name of the backing sandbox provider (e.g. ``"modal"``,
    * ``"lakebox"``) used to label the new-session sandbox option per
@@ -701,6 +703,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           project_ticket_agent_involvement: data.project_ticket_agent_involvement === true,
           project_ticket_stages: data.project_ticket_stages === true,
           project_ticket_summary: data.project_ticket_summary === true,
+          project_mandate: data.project_mandate === true,
           sandbox_provider:
             typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
           sandbox_providers: Array.isArray(data.sandbox_providers)

@@ -2665,6 +2665,7 @@ def register_core_routes(
         include_live_status: bool = Query(default=True),
         refresh_state: bool = Query(default=False),
         include_usage: bool = Query(default=True),
+        include_project_mandate: bool = Query(default=False),
     ) -> SessionResponse:
         """
         Return a session snapshot: identity, status, and committed
@@ -2695,6 +2696,9 @@ def register_core_routes(
             clients can independently request this route with
             ``include_usage=true``, ``include_items=false``,
             ``include_liveness=false``, and ``refresh_state=false``.
+        :param include_project_mandate: When ``True``, return the session's
+            project mandate as ``project_mandate``. Runners request it to
+            compose startup instructions; other clients read it from the project.
         :param refresh_state: When ``True``, refresh runner-derived
             snapshot overlays from the live session instead of serving
             stale AP-process caches. Browser reload/bind requests use
@@ -2747,6 +2751,8 @@ def register_core_routes(
                 project is not None and project.main_session_id == conv.id and not conv.archived
             )
             snapshot.project_orchestrator = snapshot.project_main_session
+            if include_project_mandate and project is not None:
+                snapshot.project_mandate = project.mandate
         return snapshot
 
     @router.get(

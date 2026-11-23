@@ -919,6 +919,8 @@ class SqlProject(OmnigentBase):
     ticket_stages: Mapped[dict[str, Any] | None] = mapped_column(
         EnvelopedJSON(16383), nullable=True
     )
+    # Owner-written guidance loaded into every project session; NULL means none.
+    mandate: Mapped[str | None] = mapped_column(EnvelopedText(16383), nullable=True)
 
     __table_args__ = (
         # "list my projects" — prefix scan on (workspace_id, user_id) with

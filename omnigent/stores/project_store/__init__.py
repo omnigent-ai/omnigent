@@ -49,6 +49,7 @@ class ProjectStore(ABC):
         name: str,
         user_id: str | None,
         config: dict[str, Any] | None = None,
+        mandate: str | None = None,
     ) -> Project:
         """
         Insert a new, empty project.
@@ -59,6 +60,8 @@ class ProjectStore(ABC):
         :param user_id: Owning user, or ``None`` in single-user mode.
         :param config: Optional default session settings (opaque JSON object);
             ``None`` or empty stores no defaults.
+        :param mandate: Optional guidance loaded into every project session;
+            trimmed, and blank stores none.
         :returns: The newly created :class:`Project`.
         :raises OmnigentError: ``ALREADY_EXISTS`` if the owner already has a
             project with this name.
@@ -112,6 +115,7 @@ class ProjectStore(ABC):
         config: dict[str, Any] | None = None,
         main_session_id: str | None = None,
         expected_main_session_id: str | None = None,
+        mandate: str | None = None,
     ) -> Project | None:
         """
         Update mutable fields of an owned project.
@@ -125,6 +129,8 @@ class ProjectStore(ABC):
             non-empty, unique among the owner's projects.
         :param config: New config object to replace the stored one, or ``None``
             to leave it unchanged. An empty dict clears the stored defaults.
+        :param mandate: New mandate text, or ``None`` to leave it unchanged.
+            Trimmed; blank text clears it.
         :returns: The updated :class:`Project`, or ``None`` if not found.
         :raises OmnigentError: ``ALREADY_EXISTS`` if the new name collides with
             another of the owner's projects.

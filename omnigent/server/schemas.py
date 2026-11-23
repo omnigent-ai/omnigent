@@ -2708,6 +2708,8 @@ class SessionResponse(BaseModel):
     project_main_session: bool = False
     # Deprecated response alias; remove in 0.25.0.
     project_orchestrator: bool = False
+    # The project's mandate, only when requested with ``include_project_mandate``.
+    project_mandate: str | None = None
 
 
 class UpdateSessionRequest(BaseModel):
@@ -6421,6 +6423,8 @@ class ProjectObject(BaseModel):
         when the project stores no defaults. The key vocabulary is owned by the
         client; the server persists and returns it whole. Values are hints the
         new-chat dialog pre-fills, not enforced requirements.
+    :param mandate: Owner-written guidance (markdown) loaded into every agent
+        session in the project to set its bounds, or ``None`` when unset.
     """
 
     id: str
@@ -6429,6 +6433,7 @@ class ProjectObject(BaseModel):
     created_at: int
     updated_at: int | None = None
     config: dict[str, Any] = Field(default_factory=dict)
+    mandate: str | None = None
     main_session_id: str | None = None
     main_session_state: Literal["absent", "missing", "archived", "active", "unavailable"] = (
         "absent"
@@ -6475,12 +6480,15 @@ class CreateProjectRequest(BaseModel):
         at most 100 characters; unique among the caller's projects.
     :param config: Optional default session settings (opaque JSON object).
         Omitted / empty stores no defaults.
+    :param mandate: Optional guidance loaded into every agent session in the
+        project. Trimmed; at most 12,000 UTF-8 bytes; blank stores none.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
     config: dict[str, Any] = Field(default_factory=dict)
+    mandate: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -6509,12 +6517,15 @@ class UpdateProjectRequest(BaseModel):
         trimmed, non-empty, at most 100 characters.
     :param config: New config object to replace the stored one. ``None`` leaves
         it unchanged; an empty object ``{}`` clears the stored defaults.
+    :param mandate: New mandate text. ``None`` leaves it unchanged; blank text
+        clears it. Trimmed; at most 12,000 UTF-8 bytes.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str | None = None
     config: dict[str, Any] | None = None
+    mandate: str | None = None
     main_session_id: str | None = None
     expected_main_session_id: str | None = None
 

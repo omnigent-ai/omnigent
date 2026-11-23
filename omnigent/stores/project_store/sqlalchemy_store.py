@@ -22,6 +22,7 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import Project
+from omnigent.entities.project import PROJECT_MANDATE_MAX_BYTES
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore
@@ -75,6 +76,24 @@ def _decode_config(raw: str | None) -> dict[str, Any]:
     return decoded if isinstance(decoded, dict) else {}
 
 
+def _normalize_mandate(mandate: str) -> str | None:
+    """Trim a project mandate to its stored form; blank text clears it.
+
+    :param mandate: Owner-written markdown, e.g. ``"Only touch the docs/ tree."``.
+    :returns: The trimmed text, or ``None`` when it is blank.
+    :raises OmnigentError: ``INVALID_INPUT`` if it exceeds
+        :data:`PROJECT_MANDATE_MAX_BYTES` UTF-8 bytes.
+    """
+    trimmed = mandate.strip()
+    size = len(trimmed.encode("utf-8"))
+    if size > PROJECT_MANDATE_MAX_BYTES:
+        raise OmnigentError(
+            f"project mandate too large ({size} bytes; max {PROJECT_MANDATE_MAX_BYTES})",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return trimmed or None
+
+
 def _to_entity(row: SqlProject) -> Project:
     """
     Convert a :class:`SqlProject` ORM row to a :class:`Project`.
@@ -90,6 +109,7 @@ def _to_entity(row: SqlProject) -> Project:
         updated_at=row.updated_at,
         config=_decode_config(row.config),
         main_session_id=row.main_session_id or row.legacy_orchestrator_session_id,
+        mandate=row.mandate,
     )
 
 
@@ -205,6 +225,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         name: str,
         user_id: str | None,
         config: dict[str, Any] | None = None,
+        mandate: str | None = None,
     ) -> Project:
         """Insert a new, empty project.
 
@@ -215,6 +236,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         """
         created_at = now_epoch()
         encoded_config = _encode_config(config)
+        stored_mandate = _normalize_mandate(mandate) if mandate is not None else None
 
         def write(session: Session) -> Project:
             require_active_account(session, user_id)
@@ -230,6 +252,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                 created_at=created_at,
                 updated_at=None,
                 config=encoded_config,
+                mandate=stored_mandate,
             )
             session.add(row)
             session.flush()
@@ -289,18 +312,21 @@ class SqlAlchemyProjectStore(ProjectStore):
         config: dict[str, Any] | None = None,
         main_session_id: str | None = None,
         expected_main_session_id: str | None = None,
+        mandate: str | None = None,
     ) -> Project | None:
         """Update mutable fields of an owned project.
 
         ``None`` leaves a field unchanged. Returns ``None`` if the project does
         not exist or is not owned by ``user_id``. A ``config`` of ``{}`` clears
-        the stored defaults (distinct from ``None`` = leave unchanged).
+        the stored defaults (distinct from ``None`` = leave unchanged), and a
+        blank ``mandate`` clears the stored mandate.
 
         A rename re-checks ``_name_taken``, which — as on ``create`` — is the
         only uniqueness guard, so concurrent renames to the same name can both
         land.
         """
         encoded_config = _encode_config(config) if config is not None else None
+        stored_mandate = _normalize_mandate(mandate) if mandate is not None else None
         updated_at = now_epoch()
 
         def write(session: Session) -> Project | None:
@@ -331,6 +357,9 @@ class SqlAlchemyProjectStore(ProjectStore):
                 if row.config != encoded_config:
                     row.config = encoded_config
                     changed = True
+            if mandate is not None and row.mandate != stored_mandate:
+                row.mandate = stored_mandate
+                changed = True
             if changed:
                 row.updated_at = updated_at
             session.flush()

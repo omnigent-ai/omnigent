@@ -24,6 +24,7 @@ from sqlalchemy.exc import IntegrityError
 
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server.auth import AuthProvider
 from omnigent.server.project_main_session import (
     ProjectSessionCreator,
@@ -64,10 +65,26 @@ def _to_response(project: Project) -> dict[str, Any]:
         "created_at": project.created_at,
         "updated_at": project.updated_at,
         "config": project.config,
+        "mandate": project.mandate,
         "main_session_id": project.main_session_id,
         # Deprecated response alias; remove in 0.25.0.
         "orchestrator_session_id": project.main_session_id,
     }
+
+
+def _refuse_agent_mandate_write(request: Request, mandate: str | None) -> None:
+    """Keep the mandate owner-written: agents it bounds may not set or change it.
+
+    :param request: The incoming request; agent tools mark theirs with
+        :data:`ORCHESTRATION_SOURCE_HEADER`.
+    :param mandate: The requested mandate, or ``None`` when unchanged.
+    :raises OmnigentError: 403 for an agent-originated mandate write.
+    """
+    if mandate is not None and ORCHESTRATION_SOURCE_HEADER in request.headers:
+        raise OmnigentError(
+            "Only the project owner can change a project's mandate",
+            code=ErrorCode.FORBIDDEN,
+        )
 
 
 def create_projects_router(
@@ -122,6 +139,7 @@ def create_projects_router(
         """
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
+        _refuse_agent_mandate_write(request, body.mandate)
         key = creation_key(request) if "Idempotency-Key" in request.headers else None
         project_id = creation_id("project", user_id, key) if key else uuid.uuid4().hex
         project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
@@ -129,7 +147,12 @@ def create_projects_router(
         if project is None:
             try:
                 project = await asyncio.to_thread(
-                    project_store.create, project_id, body.name, user_id, body.config
+                    project_store.create,
+                    project_id,
+                    body.name,
+                    user_id,
+                    body.config,
+                    body.mandate,
                 )
                 created_here = True
             except (IntegrityError, OmnigentError) as exc:
@@ -267,6 +290,7 @@ def create_projects_router(
         """
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
+        _refuse_agent_mandate_write(request, body.mandate)
         session_id = None
         if body.main_session_id is not None:
             current = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
@@ -281,6 +305,7 @@ def create_projects_router(
             user_id=user_id,
             name=body.name,
             config=body.config,
+            mandate=body.mandate,
             main_session_id=session_id,
             expected_main_session_id=expected_main_id(body.expected_main_session_id),
         )

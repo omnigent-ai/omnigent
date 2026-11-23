@@ -32,6 +32,9 @@ class Project:
         empty dict when none are stored. The key vocabulary is owned by the
         client; the store persists and returns it whole. These are hints the
         new-chat dialog pre-fills, not enforced requirements.
+    :param main_session_id: The project's Orchestrator session, or ``None``.
+    :param mandate: Owner-written guidance (markdown) loaded into every agent
+        session in the project to set its bounds, or ``None`` when unset.
     """
 
     id: str
@@ -41,3 +44,9 @@ class Project:
     updated_at: int | None = None
     config: dict[str, Any] = field(default_factory=dict)
     main_session_id: str | None = None
+    mandate: str | None = None
+
+
+# Most UTF-8 bytes a project mandate may hold. It is added to every project
+# session's instructions, so it stays well inside the stored column's bound.
+PROJECT_MANDATE_MAX_BYTES = 12_000

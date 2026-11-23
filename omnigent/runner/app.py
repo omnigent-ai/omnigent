@@ -162,7 +162,7 @@ from omnigent.runner.native import orchestration as _native_runtime
 from omnigent.runner.native.interrupt import NativeInterruptRunner
 from omnigent.runner.native_controls import build_native_controls
 from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
-from omnigent.runner.project_orchestrator import append_project_orchestrator_instructions
+from omnigent.runner.project_orchestrator import append_project_instructions
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
@@ -6341,7 +6341,7 @@ def create_runner_app(
                             extra={"session_id": conv},
                         )
 
-        instructions = await append_project_orchestrator_instructions(
+        instructions = await append_project_instructions(
             instructions, server_client, conv, cached_spec
         )
         ctx = TurnDispatch(
@@ -7062,7 +7062,7 @@ def create_runner_app(
                                         _ds_delivery.value,
                                         extra={"session_id": conv_id},
                                     )
-                _role_instructions = await append_project_orchestrator_instructions(
+                _role_instructions = await append_project_instructions(
                     cast(str | None, _instr_body.get("instructions")),
                     server_client,
                     conv_id,

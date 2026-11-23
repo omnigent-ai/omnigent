@@ -1,6 +1,7 @@
 import {
   Columns3Icon,
   MessageCirclePlusIcon,
+  ScrollTextIcon,
   MoreHorizontalIcon,
   PencilIcon,
   SearchIcon,
@@ -23,6 +24,7 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useProjectConfig, useProjects } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useNavigate } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { MobileHeaderButton } from "@/shell/MobileHeaderButton";
@@ -32,6 +34,7 @@ import { useProjectFolderMenu } from "@/shell/Sidebar";
 import { projectHomePath } from "./projectHomeNavigation";
 import { useProjectTicketsEnabled, useTicketStagesEnabled } from "./useProjectTickets";
 import { ProjectBoardActions } from "./ProjectBoardActions";
+import { ProjectMandateDialog } from "./ProjectMandateDialog";
 import { ProjectTicketStagesDialog } from "./ProjectTicketStagesDialog";
 
 interface ProjectComposerState {
@@ -113,7 +116,10 @@ export function ProjectHomeHeaderActions({ projectName }: { projectName: string 
 /** Project settings, plus an overflow menu to rename or delete the project. */
 function ProjectHomeActions({ projectName }: { projectName: string }) {
   const stagesEnabled = useTicketStagesEnabled();
+  const info = useServerInfo();
+  const mandateEnabled = info !== "loading" && info.project_mandate === true;
   const [editingStages, setEditingStages] = useState(false);
+  const [editingMandate, setEditingMandate] = useState(false);
   const menuTrigger = useRef<HTMLButtonElement>(null);
   const isMobile = useIsMobileViewport();
   const navigate = useNavigate();
@@ -177,20 +183,28 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
             isMobile && "w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)]",
           )}
           onCloseAutoFocus={(event) => {
-            if (editingStages) event.preventDefault();
+            if (editingStages || editingMandate) event.preventDefault();
             else actions.onCloseAutoFocus(event);
           }}
         >
           {isMobile && <SessionMenuHeader title={projectName} />}
           {stagesEnabled && (
-            <>
-              <DropdownMenuItem className={itemClass} onSelect={() => setEditingStages(true)}>
-                <Columns3Icon className="size-3.5" />
-                Edit stages
-              </DropdownMenuItem>
-              <DropdownMenuSeparator />
-            </>
+            <DropdownMenuItem className={itemClass} onSelect={() => setEditingStages(true)}>
+              <Columns3Icon className="size-3.5" />
+              Edit stages
+            </DropdownMenuItem>
           )}
+          {mandateEnabled && (
+            <DropdownMenuItem
+              className={itemClass}
+              data-testid="project-edit-mandate"
+              onSelect={() => setEditingMandate(true)}
+            >
+              <ScrollTextIcon className="size-3.5" />
+              Edit mandate
+            </DropdownMenuItem>
+          )}
+          {(stagesEnabled || mandateEnabled) && <DropdownMenuSeparator />}
           <DropdownMenuItem className={itemClass} onSelect={actions.openRename}>
             <PencilIcon className="size-3.5" />
             Rename project
@@ -207,6 +221,16 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
         </DropdownMenuContent>
       </DropdownMenu>
       {dialogs}
+      {editingMandate && (
+        <ProjectMandateDialog
+          projectName={projectName}
+          onClose={() => setEditingMandate(false)}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            menuTrigger.current?.focus();
+          }}
+        />
+      )}
       {editingStages && (
         <ProjectTicketStagesDialog
           projectName={projectName}

@@ -294,6 +294,8 @@ class ServerInfoResponse(BaseModel):
     project_ticket_agent_involvement: bool = False
     project_ticket_stages: bool = False
     project_ticket_summary: bool = False
+    # Projects store an owner-written mandate loaded into every project session.
+    project_mandate: bool = False
     sandbox_provider: str | None
     sandbox_providers: list[str]
     # UI-relevant capability flags per launchable provider, e.g.
@@ -4161,6 +4163,7 @@ def create_app(
                 "project_ticket_agent_involvement": ticket_store is not None,
                 "project_ticket_stages": ticket_store is not None,
                 "project_ticket_summary": ticket_store is not None,
+                "project_mandate": project_store is not None,
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
