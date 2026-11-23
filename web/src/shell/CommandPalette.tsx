@@ -8,6 +8,7 @@ import { XIcon } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { closingDialogFocus } from "@/lib/automaticFocus";
+import { useDialogOpeningKey } from "@/lib/dialogOpenings";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { CompactShortcutKeys } from "@/components/KeyboardShortcut";
@@ -133,13 +134,25 @@ export function CommandPalette({
   const featureCommands = useFeaturePaletteCommands(open && !sessionsOnly);
   // Opened from a shortcut, the palette has no trigger for Radix to return focus to.
   const openerRef = useRef<HTMLElement | null>(null);
+  // Each opening mounts fresh content, so reopening during the exit animation focuses the
+  // search field again, even after a click on a row left focus on the list.
+  const openingKey = useDialogOpeningKey(open);
+  const contentRef = useRef<HTMLElement | null>(null);
   useLayoutEffect(() => {
     if (!open) return;
     const active = document.activeElement;
+    // Reopened before the last close finished, whose content the remount took focus from:
+    // keep that opening's opener.
+    if ((active === null || active === document.body) && openerRef.current !== null) return;
     openerRef.current =
       active instanceof HTMLElement && !active.closest(COMMAND_PALETTE_SELECTOR) ? active : null;
   }, [open]);
   const returnFocus = (event: Event) => {
+    // Removed by a reopening during its exit: focus belongs to the new content.
+    if (event.currentTarget !== contentRef.current) {
+      event.preventDefault();
+      return;
+    }
     const { movedOn, restore } = closingDialogFocus(openerRef.current, COMMAND_PALETTE_SELECTOR);
     openerRef.current = null;
     event.preventDefault();
@@ -272,6 +285,10 @@ export function CommandPalette({
             : undefined
         }
         showCloseButton={false}
+        key={openingKey}
+        onOpenAutoFocus={(event) => {
+          contentRef.current = event.currentTarget as HTMLElement;
+        }}
         onCloseAutoFocus={returnFocus}
         data-command-palette=""
       >

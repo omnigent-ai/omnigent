@@ -10,6 +10,7 @@ import {
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
 import { closingDialogFocus } from "@/lib/automaticFocus";
+import { useDialogOpeningKey } from "@/lib/dialogOpenings";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { isIOSShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
@@ -223,8 +224,7 @@ export function QuickPickDialog<Value>({
   }, [open]);
   // Each opening mounts its own content, even one during the last one's exit, so Radix stacks
   // its focus scope over a picker it replaces and autofocuses it as on any opening.
-  const [openings, setOpenings] = useState({ open, count: 0 });
-  if (openings.open !== open) setOpenings({ open, count: openings.count + (open ? 1 : 0) });
+  const openingKey = useDialogOpeningKey(open);
   // The content of the latest opening; an earlier one's late close autofocus is stale.
   const contentRef = useRef<HTMLElement | null>(null);
   /** Close for `token`'s result, unless another acceptance, a cancel or a reopen took over. */
@@ -292,7 +292,7 @@ export function QuickPickDialog<Value>({
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
-        key={openings.count}
+        key={openingKey}
         data-quick-pick-dialog=""
         showCloseButton={false}
         overlayClassName={overlayClassName}
