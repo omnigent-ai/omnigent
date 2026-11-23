@@ -54,7 +54,7 @@ from omnigent.host.workspace_git.runner import (
     start_owned_process,
     trusted_search_path,
 )
-from omnigent.host.workspace_text_priority import SearchRun, priority_runs
+from omnigent.host.workspace_text_priority import SearchRun, beneath, priority_runs
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
@@ -95,11 +95,6 @@ _SPARE_RANKED = 32
 _corpora = CorpusCache()
 
 
-def _beneath(path: str, directory: str) -> bool:
-    """Whether ``path`` is ``directory`` or inside it, by whole components."""
-    return not directory or path == directory or path.startswith(directory + "/")
-
-
 def _validated(path: str, field: str) -> str:
     try:
         return _validate_path(path) if path else ""
@@ -111,7 +106,7 @@ def _outermost(directories: Sequence[str]) -> tuple[str, ...]:
     """Drop directories inside another of ``directories``, and duplicates."""
     kept: list[str] = []
     for directory in sorted(set(directories), key=lambda d: (d.count("/"), d)):
-        if not any(_beneath(directory, outer) for outer in kept):
+        if not any(beneath(directory, outer) for outer in kept):
             kept.append(directory)
     return tuple(sorted(kept))
 
@@ -166,16 +161,16 @@ class DirectoryScope:
 
     def allows(self, path: str) -> bool:
         """Whether a result at ``path`` is in scope."""
-        if any(_beneath(path, excluded) for excluded in self.excludes):
+        if any(beneath(path, excluded) for excluded in self.excludes):
             return False
-        return not self.includes or any(_beneath(path, included) for included in self.includes)
+        return not self.includes or any(beneath(path, included) for included in self.includes)
 
     def may_enter(self, directory: str) -> bool:
         """Whether a walk must enter ``directory`` to reach in-scope results."""
-        if any(_beneath(directory, excluded) for excluded in self.excludes):
+        if any(beneath(directory, excluded) for excluded in self.excludes):
             return False
         return not self.includes or any(
-            _beneath(directory, included) or _beneath(included, directory)
+            beneath(directory, included) or beneath(included, directory)
             for included in self.includes
         )
 

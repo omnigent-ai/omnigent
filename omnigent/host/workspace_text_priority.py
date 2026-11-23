@@ -61,8 +61,9 @@ class SearchRun:
     in_order: bool = False
 
 
-def _beneath(path: str, directory: str) -> bool:
-    return path == directory or path.startswith(directory + "/")
+def beneath(path: str, directory: str) -> bool:
+    """Whether ``path`` is ``directory`` or inside it, by whole components; all are in ``""``."""
+    return not directory or path == directory or path.startswith(directory + "/")
 
 
 def _parent(path: str) -> str:
@@ -73,7 +74,7 @@ def ordered_directories(directories: Sequence[str], earlier: Sequence[str]) -> l
     """Keep ``directories`` in order, without the root or any at or beneath an earlier one."""
     kept: list[str] = []
     for directory in directories:
-        if directory and not any(_beneath(directory, listed) for listed in [*earlier, *kept]):
+        if directory and not any(beneath(directory, listed) for listed in [*earlier, *kept]):
             kept.append(directory)
     return kept
 
@@ -128,8 +129,8 @@ def _changes_task(root: Path, kind: ComparisonKind) -> _ChangesTask:
 def _start_of(path: str, start_paths: Sequence[str]) -> str | None:
     """The walk's start folder that ``path`` is at or beneath, ``""`` for the root."""
     starts = ["" if start == "." else start.removeprefix("./") for start in start_paths]
-    beneath = [start for start in starts if not start or _beneath(path, start)]
-    return max(beneath, key=len) if beneath else None
+    containing = [start for start in starts if beneath(path, start)]
+    return max(containing, key=len) if containing else None
 
 
 def _only_towards(parent: str, name: str) -> list[str]:
@@ -303,7 +304,7 @@ async def priority_runs(
     rest = [
         start
         for start in start_paths
-        if start == "." or not any(_beneath(start[2:], directory) for directory in searched)
+        if start == "." or not any(beneath(start[2:], directory) for directory in searched)
     ]
     if rest:
         yield SearchRun(list(rest), focused, list(searched))
