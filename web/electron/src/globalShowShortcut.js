@@ -456,8 +456,9 @@ function acceleratorLabel(accelerator, isMac) {
     );
   const typed = accelerator.split("+").pop().trim();
   const alias = KEY_ALIASES.get(typed.toLowerCase());
-  const key =
-    alias !== undefined ? capitalized(alias) : typed.length === 1 ? typed.toUpperCase() : typed;
+  let key = typed;
+  if (alias !== undefined) key = capitalized(alias);
+  else if (typed.length === 1) key = typed.toUpperCase();
   return isMac ? [...modifiers, key].join("") : [...modifiers, key].join("+");
 }
 

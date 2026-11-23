@@ -89,7 +89,7 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
   const [suggestion, setSuggestion] = useState<{ accelerator: string; enabled: boolean } | null>(
     null,
   );
-  // A save is waiting on the shell's approval; another one now would race it.
+  // A save is waiting on the shell's approval; the row's controls wait with it.
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
 
@@ -219,6 +219,7 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
               runtime: recording ? RECORDING_PROMPT : formatAccelerator(setting.accelerator),
             })}
             data-testid={`${ids.testIdPrefix}-recorder`}
+            disabled={saving}
             onClick={startRecording}
             onBlur={stopRecording}
           >
@@ -234,6 +235,7 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
               )
             }
             data-testid={`${ids.testIdPrefix}-toggle`}
+            disabled={saving}
             componentId={ids.componentId}
           />
         </div>

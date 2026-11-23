@@ -398,10 +398,11 @@ describe("GlobalShortcutControl", () => {
 
     fireEvent.click(proposal);
     fireEvent.click(proposal);
-    // Turning it off meanwhile waits too, so a late approval can't undo it.
-    fireEvent.click(screen.getByRole("switch", { name: SWITCH_NAME }));
 
+    // The whole row waits for the pending approval, so nothing it shows is dropped.
     expect(proposal).toBeDisabled();
+    expect(screen.getByRole("switch", { name: SWITCH_NAME })).toBeDisabled();
+    expect(screen.getByTestId(RECORDER_TEST_ID)).toBeDisabled();
     expect(bridge.setGlobalShortcut).toHaveBeenCalledTimes(1);
     await act(async () => {
       finish?.({ ok: true, setting: { enabled: true, accelerator: "Control+Alt+Shift+Space" } });

@@ -215,7 +215,7 @@ describe("createGlobalShowShortcut", () => {
       assert.equal(result.ok, false);
       assert.match(result.error, /already in use/);
       assert.equal(result.suggestion, "Control+Alt+Shift+Space");
-      // The saved chord is never released, so another app can't take it meanwhile.
+      // Only the probed replacement is released; the saved chord stays held so no other app takes it.
       assert.deepEqual(h.calls.unregistered, ["Control+Alt+Shift+Space"]);
       assert.deepEqual(h.registered(), ["Alt+Space"]);
       assert.deepEqual(h.calls.saved, []);
