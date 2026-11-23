@@ -744,6 +744,13 @@ screen** link opens the sub-agent's own page. Claude Code sub-agents and closed
 sub-agents other than Codex side chats are read-only there too. Closing a
 sub-agent tab only hides it; the sub-agent keeps running. Covered by
 `tests/e2e_ui/agents/test_subagent_side_panel.py`.
+In the desktop app, Settings → General → Desktop app → **Widen window when
+opening the right sidebar** (off by default) widens the window by the sidebar's
+width when the session's Workspace panel opens, so the chat keeps its width, and
+shrinks it back on close. It moves left or caps at the screen edge, leaves
+maximized and full-screen windows alone (closing there shrinks once restored),
+and does not apply to the grid's shared panel. Covered by
+`web/electron/e2e/desktop_right_sidebar_widens_window.e2e.js`.
 While a side chat works, typing a follow-up turns Interrupt into Send, which
 queues or steers it as the main composer does; Escape still interrupts. Its queue
 strip offers edit, steer, reorder and delete, and Mod+Enter steers them all.

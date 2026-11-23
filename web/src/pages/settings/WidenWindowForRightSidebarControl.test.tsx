@@ -9,10 +9,10 @@ vi.mock("sonner", () => ({ toast: { error: toastError } }));
 
 const SWITCH_NAME = "Widen window when opening the right sidebar";
 
-function installBridge(saved: boolean, saves = true) {
+function installBridge(saved: boolean) {
   const rightSidebarWindow = {
     getWidensWindow: vi.fn().mockResolvedValue(saved),
-    setWidensWindow: vi.fn().mockResolvedValue(saves),
+    setWidensWindow: vi.fn().mockResolvedValue(true),
     opened: vi.fn(),
     closed: vi.fn(),
   };
@@ -59,7 +59,7 @@ describe("WidenWindowForRightSidebarControl", () => {
     expect(toastError).not.toHaveBeenCalled();
   });
 
-  it("disables the switch until the shell answers a save", async () => {
+  it("disables the switch during a save and reverts with an error when it fails", async () => {
     const bridge = installBridge(false);
     let finishSave: (saved: boolean) => void = () => {};
     bridge.setWidensWindow.mockReturnValue(
@@ -78,17 +78,16 @@ describe("WidenWindowForRightSidebarControl", () => {
     await act(async () => finishSave(false));
     expect(toggle).not.toBeChecked();
     expect(toggle).toBeEnabled();
+    expect(toastError).toHaveBeenCalledWith("Couldn't save this setting. Try again.");
   });
 
-  it("reverts and says so when the shell can't save it", async () => {
-    installBridge(false, false);
+  it("stays disabled with an error when the shell can't read the setting", async () => {
+    const bridge = installBridge(false);
+    bridge.getWidensWindow.mockRejectedValue(new Error("no handler"));
     renderControl();
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Couldn't load this setting."));
     const toggle = screen.getByRole("switch", { name: SWITCH_NAME });
-    await waitFor(() => expect(toggle).toBeEnabled());
-
-    await act(async () => fireEvent.click(toggle));
-
+    expect(toggle).toBeDisabled();
     expect(toggle).not.toBeChecked();
-    expect(toastError).toHaveBeenCalledWith("Couldn't save this setting. Try again.");
   });
 });

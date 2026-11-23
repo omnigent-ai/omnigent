@@ -9,7 +9,7 @@ import { settingsControlProps } from "./search/settingsControl";
 
 /** The desktop shell's opt-in to widen the window when the right sidebar opens. */
 export function WidenWindowForRightSidebarControl() {
-  // Null until the shell answers; the switch stays off and disabled meanwhile.
+  // Null until the shell answers, or if it can't; the switch stays disabled meanwhile.
   const [enabled, setEnabled] = useState<boolean | null>(null);
   // One save at a time, so a failed save always rolls back to the shell's value.
   const [saving, setSaving] = useState(false);
@@ -17,7 +17,9 @@ export function WidenWindowForRightSidebarControl() {
   useEffect(() => {
     let cancelled = false;
     void getWidenWindowForRightSidebar().then((saved) => {
-      if (!cancelled) setEnabled(saved ?? false);
+      if (cancelled) return;
+      if (saved === null) toast.error("Couldn't load this setting.");
+      else setEnabled(saved);
     });
     return () => {
       cancelled = true;

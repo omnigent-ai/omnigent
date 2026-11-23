@@ -234,12 +234,8 @@ export function useResizableInlinePanel(
     loadSession(sessionId);
   }, [sessionId]);
 
-  // Re-clamp on viewport resize so the panel can't overflow a shrunken window.
-  // Re-derive the effective width from the persisted preference so widening the
-  // window restores the user's saved choice; without one, the default tracks the
-  // viewport. Deliberately clamped WITHOUT `reservedPx`: the store holds the
-  // preferred width, and the reserve is applied at render time, so an open
-  // sidebar's squeeze is never written in (collapsing it restores this width).
+  // Re-clamp the saved choice to the new viewport (without one, the default tracks it).
+  // No `reservedPx` here: the sidebar's squeeze is applied at render time only.
   useEffect(() => {
     function onResize() {
       setStoredWidthRaw(

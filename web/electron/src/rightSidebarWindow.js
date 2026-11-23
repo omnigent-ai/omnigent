@@ -51,8 +51,8 @@ function canResize(win) {
 function createRightSidebarWindow({ loadSettings, saveSettings, workAreaFor, animate = false }) {
   /** What each window grew by for its sidebar, until the sidebar closes. */
   const growths = new WeakMap();
-  /** Windows whose sidebar closed while they couldn't resize, to shrink once they can. */
-  const pendingCloses = new WeakSet();
+  /** Bounds to restore a window to whose sidebar closed while it was maximized or full screen. */
+  const pendingCloses = new WeakMap();
 
   function enabled() {
     return widenWindowForRightSidebarEnabled(loadSettings());
@@ -98,34 +98,35 @@ function createRightSidebarWindow({ loadSettings, saveSettings, workAreaFor, ani
   function closed(win) {
     const growth = growths.get(win);
     if (!growth) return false;
+    const [minWidth = 0] = win.getMinimumSize();
     if (!canResize(win)) {
-      pendingCloses.add(win);
+      // The normal bounds are reliable while the window is still maximized or full screen.
+      const normal = win.getNormalBounds();
+      pendingCloses.set(win, narrowedBounds(normal, workAreaFor(normal), growth, minWidth));
       return false;
     }
-    return shrink(win, growth);
-  }
-
-  /** The window may have left full screen or maximize; applies a close made meanwhile. */
-  function restored(win) {
-    const growth = growths.get(win);
-    if (!growth || !pendingCloses.has(win) || !canResize(win)) return false;
+    forget(win);
     const bounds = win.getBounds();
-    const workArea = workAreaFor(bounds);
-    // Some window systems report the restored bounds after the state change; wait for them.
-    if (bounds.width >= workArea.width && bounds.height >= workArea.height) return false;
-    return shrink(win, growth);
-  }
-
-  function shrink(win, growth) {
-    growths.delete(win);
-    pendingCloses.delete(win);
-    const bounds = win.getBounds();
-    const [minWidth = 0] = win.getMinimumSize();
     win.setBounds(narrowedBounds(bounds, workAreaFor(bounds), growth, minWidth), animate);
     return true;
   }
 
-  return { enabled, setEnabled, opened, closed, restored };
+  /** The window may have left full screen or maximize; applies a close made meanwhile. */
+  function restored(win) {
+    const target = pendingCloses.get(win);
+    if (!target || !canResize(win)) return false;
+    forget(win);
+    win.setBounds(target, animate);
+    return true;
+  }
+
+  /** Drops a window's growth, e.g. when a new page that doesn't know about it loads. */
+  function forget(win) {
+    growths.delete(win);
+    pendingCloses.delete(win);
+  }
+
+  return { enabled, setEnabled, opened, closed, restored, forget };
 }
 
 module.exports = {

@@ -3009,6 +3009,11 @@ function createWindow(targetUrl, opts = {}) {
   win.on("leave-full-screen", restoreRightSidebarWindow);
   win.on("unmaximize", restoreRightSidebarWindow);
   win.on("resize", restoreRightSidebarWindow);
+  // A new page doesn't know about the window's growth, so it mustn't shrink by it later.
+  win.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) rightSidebarWindow.forget(win);
+  });
+  win.webContents.on("render-process-gone", () => rightSidebarWindow.forget(win));
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
   // CLI config stores the API mount; Electron boots the browser-facing SPA.

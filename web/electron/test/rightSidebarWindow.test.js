@@ -25,7 +25,9 @@ function fakeWindow({
     isMaximized: () => state.maximized,
     isFullScreen: () => state.fullScreen,
     isSimpleFullScreen: () => false,
-    getBounds: () => ({ ...state.bounds }),
+    // Maximized and full-screen windows cover the work area; the normal bounds are kept apart.
+    getBounds: () => ({ ...(state.maximized || state.fullScreen ? WORK_AREA : state.bounds) }),
+    getNormalBounds: () => ({ ...state.bounds }),
     getMinimumSize: () => [minWidth, 600],
     setBounds: (next, animate) => {
       state.setBounds.push({ bounds: { ...next }, animate });
@@ -213,18 +215,35 @@ describe("createRightSidebarWindow", () => {
     assert.equal(win.getBounds().width, 800);
   });
 
-  it("waits for a restored window's bounds to leave the full work area", () => {
+  it("restores a widened window that filled the work area to its normal bounds", () => {
     const { controller } = harness();
-    const win = fakeWindow();
+    const win = fakeWindow({ bounds: { x: 0, y: 25, width: 1420, height: 1055 } });
     controller.opened(win, 500);
+    assert.deepEqual(win.getBounds(), WORK_AREA);
     win.state.maximized = true;
     controller.closed(win);
     win.state.maximized = false;
-    win.state.bounds = { ...WORK_AREA };
-    assert.equal(controller.restored(win), false);
-    win.state.bounds = { x: 100, y: 50, width: 1300, height: 700 };
     assert.equal(controller.restored(win), true);
-    assert.equal(win.getBounds().width, 800);
+    assert.deepEqual(win.getBounds(), { x: 0, y: 25, width: 1420, height: 1055 });
+  });
+
+  it("forgets a window's growth so a new page can't shrink it", () => {
+    const { controller } = harness();
+    for (const fullScreenClose of [false, true]) {
+      const win = fakeWindow();
+      controller.opened(win, 500);
+      if (fullScreenClose) {
+        win.state.fullScreen = true;
+        controller.closed(win);
+        win.state.fullScreen = false;
+      }
+      controller.forget(win);
+      assert.equal(controller.restored(win), false);
+      assert.equal(controller.closed(win), false);
+      assert.equal(win.getBounds().width, 1300);
+      // The new page's first open widens the window again.
+      assert.equal(controller.opened(win, 500), true);
+    }
   });
 
   it("ignores restores while the sidebar is open", () => {
