@@ -639,11 +639,17 @@ export interface GlobalShortcutSaveResult {
   ok: boolean;
   setting?: GlobalShortcutSetting;
   error?: string;
+  /** A free chord to offer in place of the one the shell couldn't register. */
+  suggestion?: string;
 }
 
-/** The saved shortcut, with `error` while it is on but the shell couldn't register it. */
+/**
+ * The saved shortcut, with `error` while it is on but the shell couldn't register it, and a
+ * `suggestion` free chord when there is one.
+ */
 export interface GlobalShortcutStatus extends GlobalShortcutSetting {
   error?: string;
+  suggestion?: string;
 }
 
 export type UpdateMode = "none" | "manual" | "start" | "default";

@@ -5412,7 +5412,10 @@ function registerIpc() {
     if (!isPinnedOriginSender(event)) {
       throw new Error("get-global-shortcut is only available to a connected server page");
     }
-    return requireSettingsShortcut(id).current();
+    const shortcut = requireSettingsShortcut(id);
+    // Retries a chord the shell doesn't hold, in case another app has since released it.
+    shortcut.refresh();
+    return shortcut.current();
   });
   ipcMain.handle("omnigent:set-global-shortcut", (event, setting, id = "show") => {
     if (!isPinnedOriginSender(event)) {

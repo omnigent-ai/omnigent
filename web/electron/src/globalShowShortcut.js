@@ -19,12 +19,18 @@ const GLOBAL_SHORTCUTS = Object.freeze({
     defaultEnabled: true,
   }),
 });
-const UNAVAILABLE_ERROR =
-  "Couldn't use that shortcut. It may be invalid or already in use by another app.";
+/** Each names the chord, so the row says which shortcut clashes. */
+const unavailableError = (label) =>
+  `Couldn't use ${label}. It may be invalid or already in use by another app.`;
+const notWorkingError = (label) => `${label} isn't working. Another app may be using it.`;
 const CLAIMED_ERROR = "Another Omnigent shortcut already uses that chord. Choose a different one.";
-const NOT_WORKING_ERROR =
-  "This shortcut isn't working. Another app may be using it, so choose a different one.";
 const SAVE_ERROR = "Couldn't save the shortcut. Try again.";
+
+/**
+ * Replacements offered for a taken chord, in order. Registering can't see the macOS Space
+ * defaults (⌘, ⌥⌘, ⌃, ⌃⌥ Space), so these avoid them.
+ */
+const ALTERNATIVE_CHORDS = ["Control+Alt+Shift+Space", "Control+Alt+Shift+K"];
 
 const NAMED_KEYS = new Map([
   ["Space", "Space"],
@@ -138,9 +144,9 @@ function createGlobalShowShortcut({
   const definition = GLOBAL_SHORTCUTS[id];
   /** @type {string | null} */
   let registeredAccelerator = null;
-  // Why the saved shortcut is on but its chord didn't register at launch, else null.
-  /** @type {string | null} */
-  let launchError = null;
+  // Why the saved shortcut is on but its chord didn't register, else null.
+  /** @type {{ error: string, suggestion?: string } | null} */
+  let launchFailure = null;
 
   /** @returns {{ enabled: boolean, accelerator: string }} */
   function saved() {
@@ -174,14 +180,15 @@ function createGlobalShowShortcut({
   }
 
   /**
-   * The saved setting, with an error while it is on but not registered.
+   * The saved setting, with an error while it is on but not registered, and a replacement
+   * chord when one is free.
    *
-   * @returns {{ enabled: boolean, accelerator: string, error?: string }}
+   * @returns {{ enabled: boolean, accelerator: string, error?: string, suggestion?: string }}
    */
   function current() {
     const setting = saved();
-    if (launchError === null || !setting.enabled) return setting;
-    return { ...setting, error: launchError };
+    if (launchFailure === null || !setting.enabled) return setting;
+    return { ...setting, ...launchFailure };
   }
 
   function unregister() {
@@ -205,13 +212,41 @@ function createGlobalShowShortcut({
     return true;
   }
 
+  /** Whether Electron takes `accelerator` now, releasing it straight away. */
+  function probeFree(accelerator) {
+    if (!tryRegister(accelerator)) return false;
+    globalShortcut.unregister(accelerator);
+    return true;
+  }
+
+  /** `{ suggestion }` for the first free replacement to `taken`, else `{}`. */
+  function suggestionFor(taken) {
+    const suggestion = ALTERNATIVE_CHORDS.find(
+      (candidate) =>
+        !sameChord(candidate, taken) &&
+        !sameChord(candidate, registeredAccelerator) &&
+        !claimedElsewhere(candidate) &&
+        probeFree(candidate),
+    );
+    return suggestion === undefined ? {} : { suggestion };
+  }
+
   /** Makes the registered chord match the saved setting. */
   function apply() {
     unregister();
     const { enabled, accelerator } = saved();
-    if (!enabled || !active()) launchError = null;
-    else if (outranked(accelerator)) launchError = CLAIMED_ERROR;
-    else launchError = register(accelerator) ? null : NOT_WORKING_ERROR;
+    if (!enabled || !active()) launchFailure = null;
+    else if (outranked(accelerator)) launchFailure = { error: CLAIMED_ERROR };
+    else if (register(accelerator)) launchFailure = null;
+    else {
+      const label = acceleratorLabel(accelerator, isMac);
+      launchFailure = { error: notWorkingError(label), ...suggestionFor(accelerator) };
+    }
+  }
+
+  /** Retries the saved chord when it isn't held, in case another app has since released it. */
+  function refresh() {
+    if (registeredAccelerator === null) apply();
   }
 
   /**
@@ -245,7 +280,10 @@ function createGlobalShowShortcut({
     if (candidate && !needsApproval) return { ok: false, error: "The shortcut wasn't changed." };
     const previous = registeredAccelerator;
     // A new chord registers beside the previous one, which stays until the save succeeds.
-    if (candidate && !tryRegister(accelerator)) return { ok: false, error: UNAVAILABLE_ERROR };
+    if (candidate && !tryRegister(accelerator)) {
+      const label = acceleratorLabel(accelerator, isMac);
+      return { ok: false, error: unavailableError(label), ...suggestionFor(accelerator) };
+    }
     const setting = { enabled: on, accelerator };
     if (!store(setting)) {
       if (candidate) globalShortcut.unregister(accelerator);
@@ -256,7 +294,7 @@ function createGlobalShowShortcut({
     // was only tried, and `apply()` registers it once the shortcut is active.
     if (on && candidate && active()) registeredAccelerator = accelerator;
     else if (candidate) globalShortcut.unregister(accelerator);
-    launchError = null;
+    launchFailure = null;
     return { ok: true, setting };
   }
 
@@ -268,7 +306,7 @@ function createGlobalShowShortcut({
     const setting = { enabled: false, accelerator: saved().accelerator };
     if (!store(setting)) return { ok: false, error: SAVE_ERROR };
     unregister();
-    launchError = null;
+    launchFailure = null;
     return { ok: true, setting };
   }
 
@@ -339,7 +377,7 @@ function createGlobalShowShortcut({
     stopRecording?.();
   }
 
-  return { current, apply, set, record, cancelRecording, uses, savedOn };
+  return { current, apply, refresh, set, record, cancelRecording, uses, savedOn };
 }
 
 /**

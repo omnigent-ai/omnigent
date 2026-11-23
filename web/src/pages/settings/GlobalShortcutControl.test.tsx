@@ -329,4 +329,43 @@ describe("GlobalShortcutControl", () => {
     expect(toggle).not.toBeChecked();
     expect(screen.getByTestId(RECORDER_TEST_ID)).toHaveTextContent("Alt+Space");
   });
+
+  it("offers the free chord the shell proposed, and saves it on one click", async () => {
+    const bridge = installBridge({
+      enabled: true,
+      accelerator: "Alt+Space",
+      error: "Alt+Space isn't working. Another app may be using it.",
+      suggestion: "Control+Alt+Shift+Space",
+    });
+    renderControl();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Alt+Space isn't working.");
+
+    fireEvent.click(screen.getByRole("button", { name: /^Use .+ instead$/ }));
+
+    await waitFor(() =>
+      expect(bridge.setGlobalShortcut).toHaveBeenCalledExactlyOnceWith({
+        enabled: true,
+        accelerator: "Control+Alt+Shift+Space",
+      }),
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Use .+ instead$/ })).toBeNull();
+  });
+
+  it("offers a proposed chord when the shell refuses the one that was just turned on", async () => {
+    installBridge(
+      { enabled: false, accelerator: "Alt+Space" },
+      {
+        ok: false,
+        error: "Couldn't use Alt+Space. It may be invalid or already in use by another app.",
+        suggestion: "Control+Alt+Shift+Space",
+      },
+    );
+    renderControl();
+
+    fireEvent.click(await screen.findByRole("switch", { name: SWITCH_NAME }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("already in use by another app");
+    expect(screen.getByRole("button", { name: /^Use .+ instead$/ })).toBeInTheDocument();
+  });
 });

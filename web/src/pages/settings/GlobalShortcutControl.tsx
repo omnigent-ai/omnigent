@@ -85,6 +85,8 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
   const [setting, setSetting] = useState<GlobalShortcutSetting | null>(null);
   const [recording, setRecording] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // A free chord the shell proposes in place of the one it couldn't register.
+  const [suggestion, setSuggestion] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -99,8 +101,11 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
       const saved = await getGlobalShortcut(shortcutId);
       if (cancelled) return;
       setSetting(saved);
-      // On, but the shell couldn't register it at launch.
-      if (saved?.error) setError(saved.error);
+      // On, but the shell couldn't register it.
+      if (saved?.error) {
+        setError(saved.error);
+        setSuggestion(saved.suggestion ?? null);
+      }
     })();
     return () => {
       cancelled = true;
@@ -116,8 +121,10 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
           (current) => result.setting ?? { accelerator: current?.accelerator ?? "", ...next },
         );
         setError(null);
+        setSuggestion(null);
       } else {
         setError(result.error ?? "Couldn't save the shortcut.");
+        setSuggestion(result.suggestion ?? null);
       }
     },
     [shortcutId],
@@ -217,6 +224,17 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
         <p role="alert" className="text-sm text-destructive">
           {error}
         </p>
+      )}
+      {suggestion && (
+        <Button
+          variant="outline"
+          size="sm"
+          className="self-start"
+          data-testid={`${ids.testIdPrefix}-suggestion`}
+          onClick={() => void save({ enabled: setting.enabled, accelerator: suggestion })}
+        >
+          Use {formatAccelerator(suggestion)} instead
+        </Button>
       )}
     </SettingsItem>
   );
