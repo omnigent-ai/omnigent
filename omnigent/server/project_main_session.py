@@ -1,4 +1,4 @@
-"""Project main-chat selection using ordinary sessions and launch settings."""
+"""Project orchestrator selection using ordinary sessions and launch settings."""
 
 from __future__ import annotations
 
@@ -6,13 +6,16 @@ import asyncio
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from fastapi import Request
 
 from omnigent.db.db_models import current_workspace_id
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harness_aliases import canonicalize_harness
+from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.server.routes._session_create_validation import _authorize_host_for_workspace
@@ -21,12 +24,49 @@ from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.util.uuid import normalize_uuid
 
-MAESTRO_AGENT_NAME = "maestro"
+if TYPE_CHECKING:
+    from omnigent.server.schemas import SessionCreateInput, SessionCreateMetadata
+
 MainSessionState = Literal["absent", "missing", "archived", "active", "unavailable"]
 ProjectSessionCreator = Callable[
     [Request, str | None, dict[str, Any], Callable[[str], Awaitable[None]] | None], Awaitable[Any]
 ]
 _CREATION_NAMESPACE = uuid.UUID("21c45865-5a68-480b-a332-8f2a4b47f162")
+# Keep aligned with projectOrchestratorPermissionMode in the web composer.
+_ORCHESTRATOR_PERMISSION_MODES = {
+    "claude-native": "bypassPermissions",
+    "codex-native": "bypass",
+    "cursor-native": "yolo",
+    "antigravity-native": "skip",
+    "devin-native": "dangerous",
+}
+
+
+def seed_orchestrator_access(
+    request: Request, body: SessionCreateInput | SessionCreateMetadata, harness: str | None
+) -> None:
+    """Default user-created orchestrators to their harness's highest access mode.
+
+    Explicit selections win. Agent-originated creates use creator-mode inheritance.
+    """
+    if (
+        not body.project_main_session
+        or ORCHESTRATION_SOURCE_HEADER in request.headers
+        or getattr(request.state, "project_main_explicit_access", False)
+    ):
+        return
+    harness = canonicalize_harness(harness)
+    mode = _ORCHESTRATOR_PERMISSION_MODES.get(harness or "")
+    if harness is None or mode is None:
+        return
+    from omnigent.server.scheduled.harness_settings import permission_mode_launch_options
+
+    options = permission_mode_launch_options(harness, mode)
+    if options is None:
+        return
+    args, labels = options
+    body.terminal_launch_args = args or []
+    body.labels = {**(body.labels or {}), **labels}
 
 
 def creation_key(request: Request, *, fallback: str | None = None) -> str:
@@ -103,15 +143,27 @@ async def validate_main_assignment(
     return conversation.id
 
 
-async def maestro_agent_id(request: Request, agents: AgentStore | None) -> str:
-    agent = await asyncio.to_thread(agents.get_by_name, MAESTRO_AGENT_NAME) if agents else None
+async def default_project_agent_id(
+    request: Request, agents: AgentStore | None, host_id: str | None = None
+) -> str:
+    """Choose the first registered native agent the selected host can run."""
     suppressed = getattr(request.app.state, "suppressed_agent_names", ())
-    if agent is None or not agent.operator_authored or agent.name in suppressed:
-        raise OmnigentError(
-            "Maestro is unavailable; choose an available project agent",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    return agent.id
+    registry = getattr(request.app.state, "host_registry", None)
+    host = registry.get(host_id) if registry and host_id else None
+    readiness = (host.configured_harnesses or {}) if host else {}
+    for native in NATIVE_CODING_AGENTS:
+        if native.agent_name in suppressed:
+            continue
+        available = readiness.get(native.harness)
+        if available is not None and available not in (True, "cli-unresponsive"):
+            continue
+        agent = await asyncio.to_thread(agents.get_by_name, native.agent_name) if agents else None
+        if agent is not None and agent.operator_authored:
+            return agent.id
+    raise OmnigentError(
+        "No native agent is available; choose an available project agent",
+        code=ErrorCode.INVALID_INPUT,
+    )
 
 
 @dataclass(frozen=True)
@@ -152,16 +204,16 @@ async def prepare_main_creation(
         return MainSessionCreation(project, session_id, expected_id, replay=True)
     if project.main_session_id != expected_id:
         raise OmnigentError(
-            "The project's main session changed; reload the project", code=ErrorCode.CONFLICT
+            "The project's orchestrator changed; reload the project", code=ErrorCode.CONFLICT
         )
     if await asyncio.to_thread(conversations.get_conversation, session_id) is not None:
         raise OmnigentError(
-            "Main-chat creation is in progress; retry this submission", code=ErrorCode.CONFLICT
+            "Orchestrator creation is in progress; retry this submission", code=ErrorCode.CONFLICT
         )
     state = await main_session_state(project, conversations, permissions)
     if state not in ("absent", "missing", "archived"):
         raise OmnigentError(
-            "The project already has an active or unavailable main session",
+            "The project already has an active or unavailable orchestrator",
             code=ErrorCode.CONFLICT,
         )
     return MainSessionCreation(project, session_id, expected_id)
@@ -172,7 +224,6 @@ async def create_initial_main_session(
     project: Project,
     *,
     projects: ProjectStore,
-    agents: AgentStore | None,
     create_session: ProjectSessionCreator | None,
 ) -> Project:
     """Project creation uses the same session-create pipeline as the composer."""
@@ -181,11 +232,10 @@ async def create_initial_main_session(
     if create_session is None:
         return project
     config = project.config
-    agent_id = config.get("agent_id") or await maestro_agent_id(request, agents)
     payload: dict[str, Any] = {
         "project_id": project.id,
-        "title": "Main",
-        "agent_id": agent_id,
+        "title": "Orchestrator",
+        "agent_id": config.get("agent_id"),
         "project_main_session": True,
         "expected_main_session_id": None,
     }

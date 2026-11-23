@@ -5,7 +5,6 @@ import { ProjectHomePage } from "./ProjectHomePage";
 import { resetSharedWidthStoreForTesting } from "@/hooks/useResizablePanel";
 import { writePanelSizePreference } from "@/lib/panelSizePreferences";
 import { useProjectComposerStore } from "@/projectHome/ProjectHomeHeader";
-import { TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const mocks = vi.hoisted(() => ({ isMobile: false, ticketsEnabled: false }));
 const originalInnerWidth = window.innerWidth;
@@ -31,16 +30,17 @@ vi.mock("@/shell/NewChatDialog", () => ({
 vi.mock("@/projectHome/useProjectTickets", () => ({
   useProjectTicketsEnabled: () => mocks.ticketsEnabled,
 }));
-vi.mock("@/projectHome/ProjectViewNavigation", () => ({
-  ProjectViewNavigation: () => (
-    <TabsList aria-label="Project views">
-      <TabsTrigger value="chat">Chat</TabsTrigger>
-      <TabsTrigger value="board">Board</TabsTrigger>
-    </TabsList>
+vi.mock("@/projectHome/ProjectOrchestrator", () => ({
+  ProjectOrchestrator: ({ onClose }: { onClose?: () => void }) => (
+    <>
+      <output data-testid="project-orchestrator">Open saved session</output>
+      {onClose && (
+        <button type="button" onClick={onClose}>
+          Close orchestrator
+        </button>
+      )}
+    </>
   ),
-}));
-vi.mock("@/projectHome/ProjectChat", () => ({
-  ProjectChat: () => <div data-testid="project-chat">Maestro conversation</div>,
 }));
 vi.mock("@/projectHome/ProjectTicketBoard", () => ({
   ProjectTicketBoard: () => (
@@ -111,6 +111,10 @@ function renderPage(entry: string) {
     <MemoryRouter initialEntries={[entry]}>
       <Routes>
         <Route path="/projects/:projectName" element={<ProjectHomePage />} />
+        <Route
+          path="/projects/:projectName/orchestrator"
+          element={<ProjectHomePage orchestrator />}
+        />
         <Route path="/c/:sessionId" element={<output data-testid="full-session">Session</output>} />
       </Routes>
       <LocationProbe />
@@ -128,39 +132,69 @@ beforeEach(() => {
 });
 
 describe("ProjectHomePage tickets", () => {
-  it.each(["", "?orchestrator=1"])(
-    "opens the project conversation for %s and switches to Board",
-    (search) => {
+  it.each(["", "?view=board"])("opens the board by default for %s", (search) => {
+    mocks.ticketsEnabled = true;
+    renderPage(`/projects/Payments${search}`);
+    expect(screen.getByTestId("ticket-board")).toBeVisible();
+    expect(screen.queryByRole("tablist")).toBeNull();
+    expect(screen.queryByTestId("project-orchestrator")).toBeNull();
+    expect(screen.queryByRole("complementary")).toBeNull();
+  });
+
+  it.each(["?orchestrator=1", "?view=chat", "?agent=primary"])(
+    "resolves the saved orchestrator rather than embedding chat for %s",
+    (target) => {
       mocks.ticketsEnabled = true;
-      renderPage(`/projects/Payments${search}`);
-      expect(screen.getByTestId("project-chat")).toBeVisible();
-      expect(screen.getByRole("tab", { name: "Chat" })).toHaveAttribute("aria-selected", "true");
-      expect(screen.queryByRole("complementary")).toBeNull();
-      fireEvent.mouseDown(screen.getByRole("tab", { name: "Board" }), { button: 0 });
-      expect(screen.getByTestId("ticket-board")).toBeVisible();
-      expect(screen.getByTestId("location")).toHaveTextContent("?view=board");
-      fireEvent.mouseDown(screen.getByRole("tab", { name: "Chat" }), { button: 0 });
-      expect(screen.getByTestId("project-chat")).toBeVisible();
-      expect(screen.getByTestId("location")).toHaveTextContent("?view=chat");
+      renderPage(`/projects/Payments${target}`);
+      expect(screen.getByTestId("project-orchestrator")).toBeVisible();
+      expect(screen.queryByTestId("ticket-board")).toBeNull();
+      expect(screen.queryByRole("tablist")).toBeNull();
     },
   );
 
-  it("opens a ticket's main-chat context without mounting a duplicate conversation", () => {
+  it.each(["button", "Escape"])(
+    "opens a resizable Orchestrator beside the board and closes it with %s",
+    (close) => {
+      mocks.ticketsEnabled = true;
+      renderPage("/projects/Payments/orchestrator?tickets=one");
+      const panel = screen.getByRole("complementary", { name: "Orchestrator side chat" });
+      expect(screen.getByTestId("ticket-board")).toBeVisible();
+      expect(screen.getByTestId("project-orchestrator")).toBeVisible();
+      expect(screen.queryByRole("tablist")).toBeNull();
+      const width = panel.style.width;
+      fireEvent.keyDown(screen.getByRole("separator"), { key: "ArrowLeft" });
+      expect(panel.style.width).not.toBe(width);
+      if (close === "button")
+        fireEvent.click(screen.getByRole("button", { name: "Close orchestrator" }));
+      else fireEvent.keyDown(window, { key: "Escape" });
+      expect(screen.getByTestId("location")).toHaveTextContent(
+        /^\/projects\/Payments\?tickets=one$/,
+      );
+      expect(screen.queryByRole("complementary")).toBeNull();
+      expect(screen.getByTestId("ticket-board")).toBeVisible();
+    },
+  );
+
+  it("replaces the Orchestrator panel with ticket details when a board card is opened", () => {
     mocks.ticketsEnabled = true;
-    renderPage("/projects/Payments?view=chat&ticket=ticket-1");
-    expect(screen.queryByTestId("project-chat")).toBeNull();
+    renderPage("/projects/Payments/orchestrator");
+    fireEvent.click(screen.getByRole("link", { name: "Open ticket ticket-1" }));
     expect(screen.getByRole("complementary", { name: "Ticket details" })).toBeVisible();
+    expect(screen.queryByTestId("project-orchestrator")).toBeNull();
+    expect(screen.getByTestId("ticket-board")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Close ticket ticket-1" }));
+    expect(screen.queryByRole("complementary")).toBeNull();
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/projects\/Payments$/);
   });
 
-  it.each(["", "agent=primary", "orchestrator=1"])(
-    "does not mount a second lead conversation behind a ticket's %s chat",
+  it.each(["view=chat", "agent=primary", "orchestrator=1"])(
+    "preserves legacy ticket context without mounting a second session for %s",
     (target) => {
       mocks.ticketsEnabled = true;
-      renderPage(`/projects/Payments?view=chat&ticket=ticket-1&${target}`);
-      expect(screen.queryByTestId("project-chat")).toBeNull();
-      expect(screen.getByRole("complementary", { name: "Ticket details" })).toHaveStyle({
-        width: "100%",
-      });
+      renderPage(`/projects/Payments?ticket=ticket-1&${target}`);
+      expect(screen.queryByTestId("project-orchestrator")).toBeNull();
+      expect(screen.getByTestId("ticket-board")).toBeVisible();
+      expect(screen.getByRole("complementary", { name: "Ticket details" })).toBeVisible();
     },
   );
   it.each(["ticket-1", "new"])(
@@ -229,11 +263,14 @@ describe("ProjectHomePage tickets", () => {
     expect(screen.getByTestId("ticket-board")).toBeVisible();
   });
 
-  it("keeps mobile tickets full width without a redundant expansion control", () => {
+  it.each([
+    ["?ticket=ticket-1", "Ticket details"],
+    ["/orchestrator", "Orchestrator side chat"],
+  ])("keeps the mobile %s panel full width", (target, panel) => {
     mocks.ticketsEnabled = true;
     mocks.isMobile = true;
-    renderPage("/projects/Payments?ticket=ticket-1");
-    expect(screen.getByRole("complementary", { name: "Ticket details" })).toHaveStyle({
+    renderPage(`/projects/Payments${target}`);
+    expect(screen.getByRole("complementary", { name: panel })).toHaveStyle({
       width: "100%",
     });
     expect(screen.getByTestId("ticket-board")).not.toBeVisible();
@@ -241,22 +278,23 @@ describe("ProjectHomePage tickets", () => {
     expect(screen.queryByRole("separator")).toBeNull();
   });
 
-  it.each([["ticket=ticket-1", "Ticket details", "Close ticket ticket-1"]])(
+  it.each([
+    ["?ticket=ticket-1", "Ticket details", "Close ticket ticket-1"],
+    ["/orchestrator", "Orchestrator side chat", "Close orchestrator"],
+  ])(
     "opens %s beside the board and preserves the normal New session composer",
     (search, panel, close) => {
       mocks.ticketsEnabled = true;
-      renderPage(`/projects/Payments?${search}`);
+      renderPage(`/projects/Payments${search}`);
       expect(screen.getByTestId("ticket-board")).toBeInTheDocument();
       expect(screen.getByRole("complementary", { name: panel })).toBeInTheDocument();
       act(() => useProjectComposerStore.getState().setOpen(true));
       fireEvent.click(screen.getByRole("button", { name: "Start session in Payments" }));
       expect(screen.queryByTestId("project-floating-composer")).toBeNull();
-      expect(screen.getByTestId("location")).toHaveTextContent(`/projects/Payments?${search}`);
+      expect(screen.getByTestId("location")).toHaveTextContent(`/projects/Payments${search}`);
       fireEvent.click(screen.getByRole("button", { name: close }));
       expect(screen.queryByRole("complementary")).toBeNull();
-      expect(screen.getByTestId("location")).toHaveTextContent(
-        /^\/projects\/Payments\?view=board$/,
-      );
+      expect(screen.getByTestId("location")).toHaveTextContent(/^\/projects\/Payments$/);
     },
   );
 });

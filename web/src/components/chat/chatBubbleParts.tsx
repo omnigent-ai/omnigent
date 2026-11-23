@@ -1534,15 +1534,6 @@ function AssistantBubble({
             flashing && "animate-message-highlight rounded-lg",
           )}
         >
-          {!foldOnly && !errorOnly && presentation.identity && (
-            <div
-              data-testid="assistant-name"
-              className="mb-2 flex items-center gap-2 text-sm font-medium text-foreground"
-            >
-              {presentation.identity.icon}
-              <span>{presentation.identity.name}</span>
-            </div>
-          )}
           <BlockRenderer
             items={mainItems}
             sessionStatus={sessionStatus}

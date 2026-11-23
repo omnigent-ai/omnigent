@@ -105,8 +105,8 @@ const namedResponsePresentation = {
   extras: new Map([["work", <div key="tickets">Ticket batch</div>]]),
 };
 
-describe("named assistant response blocks", () => {
-  it("adds one header per action-bearing block, not per output or work fold", () => {
+describe("assistant response blocks", () => {
+  it("keeps response content and supplements without repeating the agent identity", () => {
     const answer: Extract<Bubble, { kind: "assistant" }> = {
       kind: "assistant",
       responseId: "answer",
@@ -142,8 +142,8 @@ describe("named assistant response blocks", () => {
         </AssistantPresentationContext.Provider>
       </QueryClientProvider>,
     );
-    expect(screen.getAllByTestId("assistant-name")).toHaveLength(1);
-    expect(screen.getByTestId("assistant-name")).toHaveTextContent("Maestro");
+    expect(screen.queryByTestId("assistant-name")).toBeNull();
+    expect(screen.queryByText("Maestro")).toBeNull();
     expect(screen.getByText(/First output/)).toBeVisible();
     expect(screen.getByText(/Second output/)).toBeVisible();
     expect(screen.getByText("Ticket batch")).toBeVisible();

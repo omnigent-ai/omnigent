@@ -4,14 +4,21 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { ticketResponseSession, type ProjectTicket } from "@/lib/projectTicketsApi";
 import { useProjectAgentSession } from "./useProjectAgentSession";
-import { Link, useSearchParams } from "@/lib/routing";
-import { projectViewSearch } from "./projectHomeNavigation";
+import { Link } from "@/lib/routing";
+import { projectOrchestratorPath } from "./projectHomeNavigation";
 import { TicketError } from "./TicketControls";
 import { TicketSessionLink } from "./TicketSessionLink";
 import { useTicketEvents, useTicketSessions } from "./useProjectTickets";
 
-export function TicketAgents({ projectId, ticket }: { projectId: string; ticket: ProjectTicket }) {
-  const [search] = useSearchParams();
+export function TicketAgents({
+  projectId,
+  projectName,
+  ticket,
+}: {
+  projectId: string;
+  projectName: string;
+  ticket: ProjectTicket;
+}) {
   const project = useProjectAgentSession(projectId);
   const query = useTicketSessions(projectId, ticket.id);
   const activity = useTicketEvents(projectId, ticket.id);
@@ -45,13 +52,13 @@ export function TicketAgents({ projectId, ticket }: { projectId: string; ticket:
             />
           ) : (
             <Link
-              to={projectViewSearch("chat", search)}
-              aria-label="Open project chat"
+              to={projectOrchestratorPath(projectName)}
+              aria-label="Open orchestrator"
               className="flex items-center gap-3 rounded-sm p-3 text-sm hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
             >
               <MessageSquareIcon aria-hidden className="size-4 text-muted-foreground" />
               <span className="min-w-0 flex-1">
-                <span className="block font-medium">Chat</span>
+                <span className="block font-medium">Orchestrator</span>
                 <span className="block text-muted-foreground">
                   Coordinates work and handles questions
                 </span>

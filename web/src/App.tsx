@@ -99,14 +99,15 @@ function FeatureGatedPage({ feature, children }: { feature: FeatureKey; children
 }
 
 // With the board turned off in Settings, a project link opens that project's composer.
-function ProjectHomeRoute() {
+function ProjectHomeRoute({ orchestrator = false }: { orchestrator?: boolean }) {
   const boardEnabled = useProjectKanbanBoardPreference();
   const { projectName = "" } = useParams<{ projectName: string }>();
   const navigate = useNavigate();
   useEffect(() => {
-    if (!boardEnabled) navigate(`/?project=${encodeURIComponent(projectName)}`, { replace: true });
-  }, [boardEnabled, navigate, projectName]);
-  return boardEnabled ? <ProjectHomePage /> : null;
+    if (!boardEnabled && !orchestrator)
+      navigate(`/?project=${encodeURIComponent(projectName)}`, { replace: true });
+  }, [boardEnabled, navigate, projectName, orchestrator]);
+  return boardEnabled || orchestrator ? <ProjectHomePage orchestrator={orchestrator} /> : null;
 }
 
 function AppRedirect({ to }: { to: string }) {
@@ -219,6 +220,14 @@ function AppRoutes({ basename }: AppProps) {
             element={
               <FeatureGatedPage feature="project_kanban">
                 <ProjectHomeRoute />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/projects/:projectName/orchestrator`}
+            element={
+              <FeatureGatedPage feature="project_kanban">
+                <ProjectHomeRoute orchestrator />
               </FeatureGatedPage>
             }
           />

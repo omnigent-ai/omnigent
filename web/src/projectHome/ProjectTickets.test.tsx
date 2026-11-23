@@ -39,8 +39,8 @@ vi.mock("@/hooks/useConversations", () => ({
     error: null,
   }),
 }));
-vi.mock("./ProjectChat", () => ({
-  ProjectChat: () => <output aria-label="Main chat composer" />,
+vi.mock("@/shell/NewChatDialog", () => ({
+  NewChatLandingScreen: () => <output aria-label="Orchestrator composer" />,
 }));
 vi.mock("@/hooks/useOpenSessionRow", () => ({ fetchConversationById: vi.fn() }));
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: vi.fn(() => false) }));
@@ -1822,7 +1822,7 @@ describe("Legacy project chat panel", () => {
     expect(projectsApi.createProject).not.toHaveBeenCalled();
   });
 
-  it("uses project Chat's normal composer when Main is missing", async () => {
+  it("uses the normal composer when the orchestrator is missing", async () => {
     vi.mocked(projectsApi.getProject).mockResolvedValue({
       id: "project",
       name: "Shipping",
@@ -1830,7 +1830,7 @@ describe("Legacy project chat panel", () => {
       main_session_state: "missing",
     });
     renderBoard(<ProjectOrchestratorPanel projectName="Shipping" onClose={vi.fn()} />);
-    expect(await screen.findByLabelText("Main chat composer")).toBeInTheDocument();
+    expect(await screen.findByLabelText("Orchestrator composer")).toBeInTheDocument();
     expect(projectsApi.createProject).not.toHaveBeenCalled();
   });
 });

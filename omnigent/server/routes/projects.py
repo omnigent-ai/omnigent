@@ -43,7 +43,6 @@ from omnigent.server.schemas import (
     UpdateProjectRequest,
 )
 from omnigent.server.session_orchestration import require_named_source_private
-from omnigent.stores.agent_store import AgentStore
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore, apply_project_order
@@ -76,7 +75,6 @@ def create_projects_router(
     auth_provider: AuthProvider | None = None,
     conversation_store: ConversationStore | None = None,
     permission_store: PermissionStore | None = None,
-    agent_store: AgentStore | None = None,
     create_session: ProjectSessionCreator | None = None,
 ) -> APIRouter:
     """Build the projects router (``/v1/projects``).
@@ -146,7 +144,6 @@ def create_projects_router(
                 request,
                 project,
                 projects=project_store,
-                agents=agent_store,
                 create_session=create_session,
             )
         except Exception as exc:

@@ -22,17 +22,13 @@ import {
   nativeModelLabel,
   normalizeEffortLabel,
 } from "@/lib/composerModelLabel";
-import { readLastHarness } from "@/lib/harnessPreferences";
 import { harnessReadinessOnHost } from "@/lib/harnessSetup";
 import { readHarnessOptions } from "@/lib/modePreferences";
-import { NATIVE_CODING_AGENTS, nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
+import { nativeCodingAgentForAvailableAgent } from "@/lib/nativeCodingAgents";
 import type { ProjectConfig } from "@/lib/projectsApi";
+import { firstAvailableNativeAgent } from "@/projectHome/projectAgentDefaults";
 
-const PROJECT_HARNESSES = [...NATIVE_CODING_AGENTS].sort(
-  (left, right) => left.sortRank - right.sortRank,
-);
-
-export function useProjectChatChoices(
+export function useProjectOrchestratorChoices(
   enabled: boolean,
   host: Host | undefined,
   sandbox: boolean,
@@ -43,17 +39,15 @@ export function useProjectChatChoices(
   const agents = selectableSessionAgents(
     catalog.data ?? [],
     pickerCuration(info).restrictToAgentNames,
-  );
-  const [choice, setChoice] = useState<Pick<ProjectConfig, "harness" | "model" | "effort">>({});
+  ).filter((agent) => nativeCodingAgentForAvailableAgent(agent));
+  const [choice, setChoice] = useState<Pick<ProjectConfig, "agent_id" | "model" | "effort">>({});
   useEffect(() => {
     if (!enabled) setChoice({});
   }, [enabled]);
-  const selected = agents.find((agent) => agent.name === "maestro");
-  const harness =
-    nativeCodingAgentForHarness(choice.harness)?.harness ??
-    nativeCodingAgentForHarness(readLastHarness(selected?.id))?.harness ??
-    nativeCodingAgentForHarness(selected?.harness)?.harness ??
-    PROJECT_HARNESSES[0].harness;
+  const selected = choice.agent_id
+    ? agents.find((agent) => agent.id === choice.agent_id)
+    : firstAvailableNativeAgent(agents, sandbox ? undefined : host);
+  const harness = nativeCodingAgentForAvailableAgent(selected)?.harness ?? null;
   const remembered = readHarnessOptions(harness);
   const model = choice.model ?? remembered.model ?? "";
   const effort = choice.effort ?? remembered.effort ?? "";
@@ -66,7 +60,7 @@ export function useProjectChatChoices(
     model,
     enabled: enabled && !!selected,
   });
-  const selectHarness = (nextHarness: string) => setChoice({ harness: nextHarness });
+  const selectAgent = (agentId: string) => setChoice({ agent_id: agentId });
   const selectModel = (nextModel: string) =>
     setChoice((previous) => ({
       ...previous,
@@ -78,19 +72,19 @@ export function useProjectChatChoices(
   const selectEffort = (nextEffort: string) =>
     setChoice((previous) => ({ ...previous, effort: nextEffort }));
   return {
+    agents,
     selected,
     harness,
     model,
     effort,
     options,
-    selectHarness,
+    selectAgent,
     selectModel,
     selectEffort,
     loading: catalog.isLoading,
     unavailable: !sandbox && !!host && !harnessReadinessOnHost(harness, host).selectable,
     config: {
       agent_id: selected?.id,
-      ...(harness ? { harness } : {}),
       ...(model ? { model } : {}),
       ...(effort ? { effort } : {}),
     },
@@ -165,40 +159,41 @@ function ProjectLaunchControl({
   );
 }
 
-export function ProjectChatLaunchPicker({
+export function ProjectOrchestratorPicker({
   choices,
   host,
   sandbox,
   onOpenChange,
 }: {
-  choices: ReturnType<typeof useProjectChatChoices>;
+  choices: ReturnType<typeof useProjectOrchestratorChoices>;
   host?: Host;
   sandbox: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
   const disabled = choices.loading || !choices.selected;
-  const harnesses: ComposerConfigSection = {
-    testId: "project-main-harnesses",
-    header: "Harness",
-    choices: PROJECT_HARNESSES.map((harness) => {
-      const readiness = !sandbox && host ? harnessReadinessOnHost(harness.harness, host) : null;
+  const agents: ComposerConfigSection = {
+    testId: "project-orchestrator-agents",
+    header: "Agent",
+    choices: choices.agents.map((agent) => {
+      const harness = nativeCodingAgentForAvailableAgent(agent)?.harness;
+      const readiness = !sandbox && host ? harnessReadinessOnHost(harness, host) : null;
       return {
-        key: harness.harness,
+        key: agent.id,
         label: (
           <span className="flex min-w-0 items-center gap-2">
-            <ComposerAgentIcon agent={{ name: harness.agentName, harness: harness.harness }} />
-            <span className="truncate">{harness.displayName}</span>
+            <ComposerAgentIcon agent={agent} />
+            <span className="truncate">{agent.display_name}</span>
           </span>
         ),
-        checked: choices.harness === harness.harness,
+        checked: choices.selected?.id === agent.id,
         disabled: readiness !== null && !readiness.selectable,
         title: readiness?.explanation?.description,
-        onSelect: () => choices.selectHarness(harness.harness),
+        onSelect: () => choices.selectAgent(agent.id),
       };
     }),
   };
   const models: ComposerConfigSection = {
-    testId: "project-chat-models",
+    testId: "project-orchestrator-models",
     header: "Models",
     leading:
       choices.options.models.length === 0 ? (
@@ -224,7 +219,7 @@ export function ProjectChatLaunchPicker({
   };
   const efforts: ComposerConfigSection | undefined = choices.options.efforts.length
     ? {
-        testId: "project-chat-efforts",
+        testId: "project-orchestrator-efforts",
         header: "Effort",
         choices: [
           {
@@ -243,19 +238,14 @@ export function ProjectChatLaunchPicker({
       }
     : undefined;
   const model = choices.options.models.find((option) => option.id === choices.model);
-  const harness = nativeCodingAgentForHarness(choices.harness);
   return (
     <div className="space-y-3">
       <ProjectLaunchControl
-        label="Harness"
-        value={harness?.displayName ?? "Select harness"}
-        icon={
-          harness && (
-            <ComposerAgentIcon agent={{ name: harness.agentName, harness: harness.harness }} />
-          )
-        }
-        section={harnesses}
-        disabled={disabled}
+        label="Agent"
+        value={choices.selected?.display_name ?? "Select agent"}
+        icon={choices.selected && <ComposerAgentIcon agent={choices.selected} />}
+        section={agents}
+        disabled={choices.loading || choices.agents.length === 0}
         onOpenChange={onOpenChange}
       />
       <ProjectLaunchControl
@@ -281,7 +271,7 @@ export function ProjectChatLaunchPicker({
       )}
       {!choices.loading && !choices.selected && (
         <p className="text-sm text-destructive" role="alert">
-          Maestro is unavailable.
+          No native agent is available.
         </p>
       )}
     </div>

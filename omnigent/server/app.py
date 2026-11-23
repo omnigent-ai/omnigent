@@ -72,7 +72,6 @@ from omnigent.harness_plugins import (
 )
 from omnigent.host.launch_audit import request_client_audit_attributes
 from omnigent.resources import examples as _examples_resources
-from omnigent.resources import maestro as _maestro_resources
 from omnigent.resources import proactive as _proactive_resources
 from omnigent.runtime import (
     get_terminal_registry,
@@ -742,7 +741,6 @@ WELL_KNOWN_MANIFEST_VERSION = 1
 _WEB_UI_GZIP_MINIMUM_SIZE = 1024
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
-_MAESTRO_AGENT_NAME = "maestro"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 
@@ -839,7 +837,6 @@ def _wrong_replica_error_body(request: Request, exc: WrongReplicaError) -> dict[
 # Windows checkout (where Git leaves it as a stub text file); a no-op elsewhere.
 _DEBBY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "debby")
 _POLLY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "polly")
-_MAESTRO_BUNDLE_SOURCE = Path(_maestro_resources.__file__).parent / "bundle"
 # Kept out of the package directory so __init__.py and bytecode never enter the bundle hash.
 _PROACTIVE_BUNDLE_SOURCE = Path(_proactive_resources.__file__).parent / "bundle"
 
@@ -1329,7 +1326,6 @@ def _ensure_default_agents(
         | _ensure_default_acp_agents(agent_store, artifact_store, agent_cache, allowlist)
         | _ensure_default_debby_agent(agent_store, artifact_store, agent_cache, allowlist)
         | _ensure_default_polly_agent(agent_store, artifact_store, agent_cache, allowlist)
-        | _ensure_default_maestro_agent(agent_store, artifact_store, agent_cache, allowlist)
     )
     extras = _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
     # Outside the allowlist: only hidden tasks run it, and GET /v1/agents never lists it.
@@ -1876,35 +1872,6 @@ def _ensure_default_polly_agent(
         agent_cache,
         name=_POLLY_AGENT_NAME,
         bundle_bytes=_build_polly_bundle(),
-    )
-    return owned
-
-
-def _build_maestro_bundle() -> bytes:
-    import tempfile
-
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        bundle_dir = materialize_bundle(_MAESTRO_BUNDLE_SOURCE, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_maestro_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-    allowlist: frozenset[str] | None = None,
-) -> frozenset[str]:
-    owned = frozenset({_MAESTRO_AGENT_NAME})
-    if not seeded_agent_allowed(_MAESTRO_AGENT_NAME, allowlist):
-        return owned
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_MAESTRO_AGENT_NAME,
-        bundle_bytes=_build_maestro_bundle(),
     )
     return owned
 
@@ -4661,7 +4628,6 @@ def create_app(
                 auth_provider=auth_provider,
                 conversation_store=conversation_store,
                 permission_store=permission_store,
-                agent_store=agent_store,
                 create_session=app.state.project_session_create,
             ),
             prefix="/v1",

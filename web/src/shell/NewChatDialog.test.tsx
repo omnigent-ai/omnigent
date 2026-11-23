@@ -1533,7 +1533,7 @@ function landingInfo(infoOverrides: Partial<ServerInfo>): ServerInfo {
   };
 }
 
-describe("NewChatLandingScreen project Main", () => {
+describe("NewChatLandingScreen project Orchestrator", () => {
   const refreshProject = vi.fn();
   const main = { projectId: "project-main", expectedMainSessionId: "old-main" };
   const sdkModels = {
@@ -1562,8 +1562,8 @@ describe("NewChatLandingScreen project Main", () => {
     vi.mocked(setPendingInitialPrompt).mockClear();
     mockAgents([
       ...DEFAULT_LANDING_AGENTS,
-      testAgent("maestro-id", "maestro", {
-        display_name: "Maestro",
+      testAgent("planner-id", "planner", {
+        display_name: "Planner",
         harness: "claude-sdk",
         builtin: true,
         description: "Coordinates the project.",
@@ -1578,7 +1578,7 @@ describe("NewChatLandingScreen project Main", () => {
       data: {
         host_id: "host_1",
         workspace: "/work/project",
-        agent_id: "maestro-id",
+        agent_id: "planner-id",
         harness: "codex",
       },
     });
@@ -1598,7 +1598,7 @@ describe("NewChatLandingScreen project Main", () => {
   function renderMain(info: Partial<ServerInfo> = {}) {
     return renderLanding(
       info,
-      "/projects/Shipping?view=chat",
+      "/projects/Shipping/orchestrator",
       undefined,
       false,
       reactRouterRouting,
@@ -1606,17 +1606,77 @@ describe("NewChatLandingScreen project Main", () => {
     );
   }
 
-  it("prefills changeable Maestro without a write, then submits explicit SDK choices and the old pointer", async () => {
+  it.each([
+    ["a1", "claude-native", "Bypass permissions", ["--permission-mode", "bypassPermissions"]],
+    ["a2", "codex-native", "Bypass approvals & sandbox", []],
+  ] as const)(
+    "defaults %s Orchestrator to full access without changing ordinary-session preferences",
+    async (agentId, harness, label, args) => {
+      localStorage.setItem(
+        "omnigent:last-mode-by-harness",
+        JSON.stringify({ [harness]: { mode: "default" } }),
+      );
+      renderMain();
+      selectAgent(agentId);
+      expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+        `Permission mode: ${label}`,
+      );
+      expect(readHarnessOptions(harness).mode).toBe("default");
+      const { body } = await submitAndReadBody();
+      expect(body.terminal_launch_args).toEqual(args);
+      expect((body.labels as Record<string, string>)["omnigent.codex_native.bypass_sandbox"]).toBe(
+        harness === "codex-native" ? "1" : undefined,
+      );
+      await waitFor(() => expect(refreshProject).toHaveBeenCalledOnce());
+      expect(readHarnessOptions(harness).mode).toBe("default");
+
+      remountLanding();
+      selectAgent(agentId);
+      expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+        `Permission mode: ${harness === "claude-native" ? "Manual" : "Default"}`,
+      );
+    },
+  );
+
+  it.each([
+    ["a1", "default", "Manual", []],
+    ["a1", "plan", "Plan", ["--permission-mode", "plan"]],
+    ["a2", "default", "Default", []],
+  ] as const)(
+    "keeps an explicit %s %s choice across a restored Orchestrator draft",
+    async (agentId, mode, label, args) => {
+      const chat = renderMain();
+      selectAgent(agentId);
+      pickPermissionOption(mode);
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Keep these permissions" },
+      });
+      chat.unmount();
+      renderMain();
+      expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+        `Permission mode: ${label}`,
+      );
+      const { body } = await submitAndReadBody();
+      expect(body.terminal_launch_args).toEqual(args);
+      expect(body.labels).not.toHaveProperty("omnigent.codex_native.bypass_sandbox");
+    },
+  );
+
+  it("defaults to a native agent without writing, then submits the selected model and effort", async () => {
     localStorage.setItem("omnigent:last-agent-id", "a2");
+    mockModelQueries((harness) =>
+      harness === "codex-native" ? sdkModels : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
     renderMain();
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
-        /Maestro, SDK Codex/,
+        /Claude Code/,
       ),
     );
-    expect(screen.getByRole("button", { name: "About Maestro" })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Claude Code" })).toBeInTheDocument();
     expect(createCalls()).toHaveLength(0);
-    openAgentModels("maestro-id");
+    selectAgent("a2");
+    openAgentModels("a2");
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Model A" }));
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-high"));
     closeMenu();
@@ -1625,14 +1685,14 @@ describe("NewChatLandingScreen project Main", () => {
       project_id: main.projectId,
       project_main_session: true,
       expected_main_session_id: "old-main",
-      title: "Main",
-      agent_id: "maestro-id",
-      harness_override: "codex",
+      title: "Orchestrator",
+      agent_id: "a2",
       model_override: "model-a",
       reasoning_effort: "high",
       host_id: "host_1",
     });
-    expect(body).not.toHaveProperty("workspace"); // Unedited project defaults are filled server-side.
+    expect(body).not.toHaveProperty("harness_override");
+    expect(body).not.toHaveProperty("workspace");
     expect(body).not.toHaveProperty("initial_input");
     expect(new Headers(createCalls()[0][1]?.headers).get("Idempotency-Key")).toMatch(
       /^[0-9a-f-]{36}$/,
@@ -1643,10 +1703,12 @@ describe("NewChatLandingScreen project Main", () => {
       expect.objectContaining({ text: "ship it" }),
     );
     expect(screen.getByTestId("landing-location")).toHaveTextContent(
-      "/projects/Shipping?view=chat",
+      "/projects/Shipping/orchestrator",
     );
     expect(localStorage.getItem("omnigent:last-agent-id")).toBe("a2");
-    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex", true);
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex-native", true, {
+      poll: true,
+    });
   });
 
   it("uses a selected native alternative without an SDK harness override", async () => {
@@ -1655,7 +1717,7 @@ describe("NewChatLandingScreen project Main", () => {
     const { body } = await submitAndReadBody();
     expect(body).toMatchObject({ agent_id: "a2", project_main_session: true });
     expect(body).not.toHaveProperty("harness_override");
-    expect(screen.queryByRole("button", { name: "About Maestro" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "About Planner" })).toBeNull();
   });
 
   it.each([false, true])(
@@ -1684,7 +1746,7 @@ describe("NewChatLandingScreen project Main", () => {
         project_id: main.projectId,
         project_main_session: true,
         expected_main_session_id: "old-main",
-        title: "Main",
+        title: "Orchestrator",
         host_type: "managed",
         workspace: null,
         git: null,
@@ -1701,7 +1763,7 @@ describe("NewChatLandingScreen project Main", () => {
       await waitFor(() => expect(refreshProject).toHaveBeenCalledOnce());
       expect(setPendingInitialPrompt).not.toHaveBeenCalled();
       expect(screen.getByTestId("landing-location")).toHaveTextContent(
-        "/projects/Shipping?view=chat",
+        "/projects/Shipping/orchestrator",
       );
     },
   );
@@ -1747,7 +1809,7 @@ describe("NewChatLandingScreen project Main", () => {
     expect(setPendingInitialPrompt).not.toHaveBeenCalled();
   });
 
-  it("preserves the replacement draft across leaving and reopening the project", () => {
+  it("preserves the replacement draft and default access across leaving and reopening the project", () => {
     const chat = renderMain();
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "Unsent project question" },
@@ -1755,6 +1817,9 @@ describe("NewChatLandingScreen project Main", () => {
     chat.unmount();
     renderMain();
     expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Unsent project question");
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Permission mode: Bypass permissions",
+    );
     expect(createCalls()).toHaveLength(0);
   });
 
@@ -1769,7 +1834,7 @@ describe("NewChatLandingScreen project Main", () => {
       const onMainSessionConflict = vi.fn().mockResolvedValue(recovered);
       const chat = renderLanding(
         {},
-        "/projects/Shipping?view=chat",
+        "/projects/Shipping/orchestrator",
         undefined,
         false,
         reactRouterRouting,
@@ -1810,11 +1875,13 @@ describe("NewChatLandingScreen project Main", () => {
           }
         : CODEX_MODEL_OPTIONS_RESULT,
     );
+    localStorage.setItem(LAST_HARNESS_KEY, JSON.stringify({ "planner-id": "codex" }));
     renderMain();
+    selectAgent("planner-id");
     expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
       /Model unavailable/,
     );
-    openAgentModels("maestro-id");
+    openAgentModels("planner-id");
     expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent(
       "Catalog unavailable",
     );
@@ -1853,7 +1920,7 @@ describe("NewChatLandingScreen project Main", () => {
       project_id: main.projectId,
       project_main_session: true,
       expected_main_session_id: "old-main",
-      title: "Main",
+      title: "Orchestrator",
     });
     expect(JSON.parse(form.get("metadata") as string)).not.toHaveProperty("harness_override");
     expect(form.get("bundle")).toBe(bundle);

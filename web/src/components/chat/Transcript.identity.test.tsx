@@ -47,7 +47,7 @@ it.each([
   ["claude-native-ui", "Claude Code", "data-harness-icon", "claude"],
   ["codex-native-ui", "Codex", "data-harness-icon", "codex"],
 ])(
-  "uses %s's orb and one name per response block in the full transcript",
+  "keeps %s's orb without repeating its identity above response blocks",
   async (name, displayName, attribute, icon) => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     clients.push(client);
@@ -103,8 +103,8 @@ it.each([
       ],
     });
     render(view(true));
-    expect(screen.getAllByTestId("assistant-name")).toHaveLength(1);
-    expect(screen.getByTestId("assistant-name")).toHaveTextContent(displayName);
+    expect(screen.queryByTestId("assistant-name")).toBeNull();
+    expect(screen.queryByText(displayName)).toBeNull();
     expect(screen.getByText("First output")).toBeVisible();
     expect(screen.getByText("Second output")).toBeVisible();
     expect(screen.getAllByRole("button", { name: "Copy" })).toHaveLength(1);

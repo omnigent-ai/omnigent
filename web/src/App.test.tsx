@@ -35,7 +35,9 @@ vi.mock("@/pages/ChatPage", async () => {
   };
 });
 vi.mock("@/pages/ProjectHomePage", () => ({
-  ProjectHomePage: () => <div>project home page</div>,
+  ProjectHomePage: ({ orchestrator }: { orchestrator?: boolean }) => (
+    <div>{orchestrator ? "project orchestrator" : "project home page"}</div>
+  ),
 }));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
@@ -300,6 +302,20 @@ describe("Project home route", () => {
     expect(await screen.findByTestId("chat-location")).toHaveTextContent("/?project=My%20Project");
     expect(screen.queryByText("project home page")).toBeNull();
   });
+
+  it.each(["true", "false"])(
+    "resolves the orchestrator with board preference %s",
+    async (enabled) => {
+      localStorage.setItem(PROJECT_KANBAN_BOARD_STORAGE_KEY, enabled);
+      renderRoute("/projects/My%20Project/orchestrator", { project_kanban: true });
+      expect(await screen.findByText("project orchestrator")).toBeInTheDocument();
+      expect(screen.queryByTestId("chat-location")).toBeNull();
+      cleanup();
+
+      renderRoute("/projects/My%20Project/orchestrator", { project_kanban: false });
+      expect(await screen.findByText("not found")).toBeInTheDocument();
+    },
+  );
 });
 
 describe("Canvas route", () => {

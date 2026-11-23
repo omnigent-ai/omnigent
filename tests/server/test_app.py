@@ -2205,9 +2205,8 @@ def test_ensure_default_debby_agent_skips_when_bundle_absent(
     [
         server_app._ensure_default_polly_agent,
         server_app._ensure_default_debby_agent,
-        server_app._ensure_default_maestro_agent,
     ],
-    ids=["polly", "debby", "maestro"],
+    ids=["polly", "debby"],
 )
 def test_bundle_agent_seeders_skip_when_not_allowlisted(
     seed_stores: _SeedStores, seeder: Callable[..., frozenset[str]]
@@ -2353,7 +2352,8 @@ def test_ensure_default_agents_allowlist_recognizes_every_packaged_name(
     stores = (seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache)
     monkeypatch.setenv(SEEDED_AGENTS_ENV, "")
     packaged = server_app._ensure_default_agents(*stores)
-    assert "maestro" in packaged
+    assert "claude-native-ui" in packaged
+    assert "maestro" not in packaged
 
     def seeded() -> set[str]:
         # The proactive agent is seeded outside the allowlist and never listed.
@@ -2361,6 +2361,7 @@ def test_ensure_default_agents_allowlist_recognizes_every_packaged_name(
         return {a.name for a in rows} - {PROACTIVE_AGENT_NAME}
 
     assert seeded() <= packaged
+    assert seed_stores.agent_store.get_by_name("maestro") is None
 
     monkeypatch.setenv(SEEDED_AGENTS_ENV, ",".join(sorted(packaged)))
     assert server_app._ensure_default_agents(*stores) == frozenset()

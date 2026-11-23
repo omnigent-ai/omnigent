@@ -46,6 +46,8 @@ import {
 } from "@/lib/hostPreferences";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import type { ProjectConfig } from "@/lib/projectsApi";
+import { useNavigate } from "@/lib/routing";
+import { projectOrchestratorPath } from "@/projectHome/projectHomeNavigation";
 import { ApiError } from "@/lib/sessionsApi";
 import { reuseCreationAttempt, type CreationAttempt } from "@/lib/creationAttempt";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
@@ -57,7 +59,10 @@ import { joinPath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { HostOption } from "./NewChatDialog";
 import { RecentWorkspaceList } from "./RecentWorkspaceList";
-import { ProjectChatLaunchPicker, useProjectChatChoices } from "./ProjectChatLaunchPicker";
+import {
+  ProjectOrchestratorPicker,
+  useProjectOrchestratorChoices,
+} from "./ProjectOrchestratorPicker";
 
 const PROJECT_CONTROL_CLASS = "h-10 rounded-lg px-3 text-ui mobile-app:h-11";
 
@@ -164,7 +169,7 @@ function friendlyCloneError(error: unknown): string {
 
 /**
  * "New project" control in the Projects group header. Opens a dialog that
- * creates a first-class project and its Main conversation (`POST /v1/projects`).
+ * creates a project and its Orchestrator session (`POST /v1/projects`).
  *
  * When the server supports project repositories, the dialog also takes a
  * "Run on" target: a connected host (a folder, or a repository cloned onto it
@@ -182,6 +187,7 @@ export function NewProjectButton({
   hosts: Host[];
   hostsLoading: boolean;
 }) {
+  const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const [icon, setIcon] = useState<string | undefined>(undefined);
@@ -254,7 +260,12 @@ export function NewProjectButton({
   const hostTarget = runOn !== null && !runsOnSandbox ? runOn : null;
   const selectedHost = hosts.find((host) => host.host_id === hostTarget);
   const hostName = selectedHost?.name ?? "Choose host";
-  const chat = useProjectChatChoices(open, selectedHost, runsOnSandbox, sandboxProvider ?? null);
+  const orchestrator = useProjectOrchestratorChoices(
+    open,
+    selectedHost,
+    runsOnSandbox,
+    sandboxProvider ?? null,
+  );
   const { recent, addRecent } = useRecentWorkspaces(hostTarget);
   // Folder UI applies to host targets (and the legacy folder-only dialog).
   const folderMode = !runsOnSandbox && (!repositoryCreation || sourceMode === "folder");
@@ -293,8 +304,8 @@ export function NewProjectButton({
     if (trimmed === "" || isPending || repositorySubmitting) return;
     const submission = ++submissionGeneration.current;
     setSubmitError(null);
-    if (!chat.selected || chat.loading) {
-      setSubmitError("Maestro is unavailable.");
+    if (!orchestrator.selected || orchestrator.loading) {
+      setSubmitError("No native agent is available.");
       return;
     }
     if (runOn === null) {
@@ -305,7 +316,7 @@ export function NewProjectButton({
       setSubmitError("The host is offline. Reconnect it and try again.");
       return;
     }
-    if (chat.unavailable || chat.options.unsupported) {
+    if (orchestrator.unavailable || orchestrator.options.unsupported) {
       setSubmitError("This harness is unavailable on the selected host.");
       return;
     }
@@ -402,7 +413,7 @@ export function NewProjectButton({
       }
     }
 
-    const config: ProjectConfig = { ...chat.config };
+    const config: ProjectConfig = { ...orchestrator.config };
     if (icon) config.icon = icon;
     if (runsOnSandbox) {
       config.host_id = SANDBOX_HOST_CHOICE;
@@ -450,6 +461,13 @@ export function NewProjectButton({
           setRepositorySubmitting(false);
           setSubmitError(null);
           onCreated(project.name);
+          if (
+            serverInfo !== "loading" &&
+            serverInfo.project_tickets === true &&
+            isFeatureEnabled(serverInfo, "project_kanban")
+          ) {
+            navigate(projectOrchestratorPath(project.name));
+          }
         },
         onError: (error) => {
           if (submission !== submissionGeneration.current) return;
@@ -874,10 +892,10 @@ export function NewProjectButton({
               </Collapsible>
             )}
           </section>
-          <section aria-label="Main Agent" className="space-y-3 border-t pt-4">
-            <h3 className="text-xs font-medium text-muted-foreground">Main Agent</h3>
-            <ProjectChatLaunchPicker
-              choices={chat}
+          <section aria-label="Orchestrator" className="space-y-3 border-t pt-4">
+            <h3 className="text-xs font-medium text-muted-foreground">Orchestrator</h3>
+            <ProjectOrchestratorPicker
+              choices={orchestrator}
               host={selectedHost}
               sandbox={runsOnSandbox}
               onOpenChange={onDropdownOpenChange}
@@ -908,8 +926,8 @@ export function NewProjectButton({
               name.trim() === "" ||
               isPending ||
               repositorySubmitting ||
-              chat.loading ||
-              !chat.selected
+              orchestrator.loading ||
+              !orchestrator.selected
             }
             onClick={() => void submit()}
           >

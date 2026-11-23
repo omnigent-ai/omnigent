@@ -16,7 +16,7 @@ import { apiErrorFromResponse } from "./sessionsApi";
 /**
  * Default session settings a project stores, pre-filled into the new-chat
  * composer. All fields optional — an unset key means "no default for this
- * slot". Creation uses these choices for Main; later sessions prefill from them.
+ * slot". Creation uses these choices for Orchestrator; later sessions prefill from them.
  */
 export interface ProjectConfig {
   /** Default host id, or the sandbox sentinel. */

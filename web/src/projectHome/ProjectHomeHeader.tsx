@@ -1,4 +1,5 @@
 import {
+  Columns3Icon,
   MessageCirclePlusIcon,
   MoreHorizontalIcon,
   PencilIcon,
@@ -7,7 +8,7 @@ import {
   Trash2Icon,
   XIcon,
 } from "lucide-react";
-import { useCallback, useRef } from "react";
+import { useRef, useState } from "react";
 import { create } from "zustand";
 import { ProjectLandingIcon } from "@/components/ProjectIconPicker";
 import { Button } from "@/components/ui/button";
@@ -29,7 +30,9 @@ import { MOBILE_GLASS_SURFACE } from "@/shell/mobileGlass";
 import { SessionMenuHeader } from "@/shell/SessionMenuHeader";
 import { useProjectFolderMenu } from "@/shell/Sidebar";
 import { projectHomePath } from "./projectHomeNavigation";
-import { useProjectTicketsEnabled } from "./useProjectTickets";
+import { useProjectTicketsEnabled, useTicketStagesEnabled } from "./useProjectTickets";
+import { ProjectBoardActions } from "./ProjectBoardActions";
+import { ProjectTicketStagesDialog } from "./ProjectTicketStagesDialog";
 
 interface ProjectComposerState {
   open: boolean;
@@ -53,11 +56,6 @@ export const useProjectBoardSearchStore = create<ProjectBoardSearchState>((set) 
   setQuery: (query) => set({ query }),
 }));
 
-/** The title-row destination for navigation that retains the page's Tabs context. */
-export const useProjectViewNavigationTarget = create<{
-  target: { projectName: string; element: HTMLDivElement } | null;
-}>(() => ({ target: null }));
-
 function useProjectHomeConfig(projectName: string) {
   const { data: projects, isLoading: projectsLoading, error: projectsError } = useProjects();
   const projectId = projects?.find((project) => project.name === projectName)?.id ?? null;
@@ -72,20 +70,7 @@ function useProjectHomeConfig(projectName: string) {
  */
 export function ProjectHomeTitle({ projectName }: { projectName: string }) {
   const isMobile = useIsMobileViewport();
-  const tickets = useProjectTicketsEnabled();
   const { projectId, config, projectsLoading } = useProjectHomeConfig(projectName);
-  const navigationSlot = useRef<HTMLDivElement | null>(null);
-  const registerNavigationTarget = useCallback(
-    (element: HTMLDivElement | null) => {
-      const previous = navigationSlot.current;
-      navigationSlot.current = element;
-      useProjectViewNavigationTarget.setState((state) => {
-        if (element) return { target: { projectName, element } };
-        return state.target?.element === previous ? { target: null } : state;
-      });
-    },
-    [projectName],
-  );
   if (isMobile) return <h1 className="sr-only">{projectName}</h1>;
   return (
     <div className="flex min-w-0 items-center gap-2.5">
@@ -100,13 +85,6 @@ export function ProjectHomeTitle({ projectName }: { projectName: string }) {
       />
       <h1 className="min-w-0 truncate text-lg font-medium text-foreground">{projectName}</h1>
       <ProjectHomeActions projectName={projectName} />
-      {tickets && (
-        <div
-          ref={registerNavigationTarget}
-          data-orientation="horizontal"
-          className="group/tabs no-drag ml-2 flex shrink-0 items-center empty:hidden"
-        />
-      )}
     </div>
   );
 }
@@ -117,8 +95,16 @@ export function ProjectHomeHeaderActions({ projectName }: { projectName: string 
   const tickets = useProjectTicketsEnabled();
   return (
     <>
-      {!tickets && <ProjectBoardSearch />}
-      {!tickets && <ProjectNewSessionButton projectName={projectName} />}
+      {tickets ? (
+        <ProjectBoardActions projectName={projectName}>
+          <ProjectNewSessionButton projectName={projectName} />
+        </ProjectBoardActions>
+      ) : (
+        <>
+          <ProjectBoardSearch />
+          <ProjectNewSessionButton projectName={projectName} />
+        </>
+      )}
       {isMobile && <ProjectHomeActions projectName={projectName} />}
     </>
   );
@@ -126,7 +112,9 @@ export function ProjectHomeHeaderActions({ projectName }: { projectName: string 
 
 /** Project settings, plus an overflow menu to rename or delete the project. */
 function ProjectHomeActions({ projectName }: { projectName: string }) {
-  const tickets = useProjectTicketsEnabled();
+  const stagesEnabled = useTicketStagesEnabled();
+  const [editingStages, setEditingStages] = useState(false);
+  const menuTrigger = useRef<HTMLButtonElement>(null);
   const isMobile = useIsMobileViewport();
   const navigate = useNavigate();
   const { projectId, config } = useProjectHomeConfig(projectName);
@@ -158,58 +146,77 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
         </TooltipTrigger>
         <TooltipContent side="bottom">Project settings</TooltipContent>
       </Tooltip>
-      {tickets && <ProjectNewSessionButton projectName={projectName} compact />}
       {/* Non-modal on phones, as in the session header: a modal menu leaves itself the only touch target. */}
-      {/* Ticket projects keep rename/delete in the sidebar's existing project menu. */}
-      {!tickets && (
-        <DropdownMenu
-          modal={!isMobile}
-          onOpenChange={(open) => {
-            if (open) {
-              actions.onMenuOpen();
-            } else actions.onMenuClose();
+      <DropdownMenu
+        modal={!isMobile}
+        onOpenChange={(open) => {
+          if (open) {
+            actions.onMenuOpen();
+          } else actions.onMenuClose();
+        }}
+      >
+        <DropdownMenuTrigger asChild>
+          <MobileHeaderButton
+            ref={menuTrigger}
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label={`Project actions for ${projectName}`}
+            data-testid="project-home-actions"
+            className={buttonClass}
+          >
+            <MoreHorizontalIcon className={iconClass} />
+          </MobileHeaderButton>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent
+          align={isMobile ? "end" : "start"}
+          collisionPadding={isMobile ? 16 : undefined}
+          className={cn(
+            "min-w-40",
+            MOBILE_GLASS_SURFACE,
+            isMobile && "w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)]",
+          )}
+          onCloseAutoFocus={(event) => {
+            if (editingStages) event.preventDefault();
+            else actions.onCloseAutoFocus(event);
           }}
         >
-          <DropdownMenuTrigger asChild>
-            <MobileHeaderButton
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              aria-label={`Project actions for ${projectName}`}
-              data-testid="project-home-actions"
-              className={buttonClass}
-            >
-              <MoreHorizontalIcon className={iconClass} />
-            </MobileHeaderButton>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent
-            align={isMobile ? "end" : "start"}
-            collisionPadding={isMobile ? 16 : undefined}
-            className={cn(
-              "min-w-40",
-              MOBILE_GLASS_SURFACE,
-              isMobile && "w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)]",
-            )}
-            onCloseAutoFocus={actions.onCloseAutoFocus}
+          {isMobile && <SessionMenuHeader title={projectName} />}
+          {stagesEnabled && (
+            <>
+              <DropdownMenuItem className={itemClass} onSelect={() => setEditingStages(true)}>
+                <Columns3Icon className="size-3.5" />
+                Edit stages
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+            </>
+          )}
+          <DropdownMenuItem className={itemClass} onSelect={actions.openRename}>
+            <PencilIcon className="size-3.5" />
+            Rename project
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            className={itemClass}
+            variant="destructive"
+            onSelect={actions.openDelete}
           >
-            {isMobile && <SessionMenuHeader title={projectName} />}
-            <DropdownMenuItem className={itemClass} onSelect={actions.openRename}>
-              <PencilIcon className="size-3.5" />
-              Rename project
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              className={itemClass}
-              variant="destructive"
-              onSelect={actions.openDelete}
-            >
-              <Trash2Icon className="size-3.5" />
-              Delete project
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      )}
+            <Trash2Icon className="size-3.5" />
+            Delete project
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
       {dialogs}
+      {editingStages && (
+        <ProjectTicketStagesDialog
+          projectName={projectName}
+          onClose={() => setEditingStages(false)}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            menuTrigger.current?.focus();
+          }}
+        />
+      )}
     </div>
   );
 }

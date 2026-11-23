@@ -16,7 +16,7 @@ from omnigent.db.utils import builtin_agent_id
 from omnigent.errors import OmnigentError
 from omnigent.native._native_supersession import clear_replacement_create_body
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.app import _ensure_default_maestro_agent, create_app
+from omnigent.server.app import _ensure_default_native_agents, create_app
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.managed_hosts import parse_sandbox_config
 from omnigent.server.routes._session_create_validation import (
@@ -60,7 +60,7 @@ def project_create_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastA
         f"{BUILTIN_AGENT_ID}/bundle",
     )
     agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache")
-    _ensure_default_maestro_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_native_agents(agent_store, artifact_store, agent_cache)
     return create_app(
         agent_store=agent_store,
         file_store=SqlAlchemyFileStore(db_uri),

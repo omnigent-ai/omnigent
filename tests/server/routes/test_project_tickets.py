@@ -14,6 +14,8 @@ from omnigent.host.frames import (
     HostStatFrame,
     decode_host_frame,
 )
+from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runtime.project_ticket_instructions import PROJECT_TICKET_WORK_INSTRUCTION
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, RESERVED_USER_PUBLIC
@@ -22,7 +24,10 @@ from omnigent.server.project_ticket_notifications import ProjectTicketNotificati
 from omnigent.server.routes import project_tickets as ticket_routes
 from omnigent.server.routes.sessions import routes_core
 from omnigent.server.sharing_settings import DefaultPublicSessions
-from omnigent.stores.conversation_store import SessionActivity
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    SessionActivity,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
@@ -50,10 +55,11 @@ async def test_project_creation_has_one_normal_main_session(project_client, db_u
     ).json()
     session_id = project["main_session_id"]
     session = (await project_client.get(f"/v1/sessions/{session_id}")).json()
-    assert session["title"] == "Main"
+    assert session["title"] == "Orchestrator"
     assert session["project_id"] == project["id"]
     assert session["project_main_session"] is True
-    assert session["agent_name"] == "maestro"
+    assert session["agent_name"] == "claude-native-ui"
+    assert session["harness"] == "claude-native"
     assert session["project_orchestrator"] is True  # Compatibility alias through 0.25.0.
     assert project["main_session_state"] == "active"
     assert session["status"] == "idle"
@@ -66,7 +72,9 @@ async def test_project_creation_has_one_normal_main_session(project_client, db_u
     assert greeting["data"]["content"] == [
         {"type": "output_text", "text": "Hello, what would you like to work on?"}
     ]
-    assert SqlAlchemyConversationStore(db_uri).get_conversation(session_id).kind == "default"
+    stored = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert stored.kind == "default"
+    assert stored.terminal_launch_args == ["--permission-mode", "bypassPermissions"]
     again = await project_client.post("/v1/projects", json={"name": "Shipping"}, headers=headers)
     assert again.json()["main_session_id"] == session_id
     assert (
@@ -85,9 +93,9 @@ async def test_project_creation_has_one_normal_main_session(project_client, db_u
         await project_client.post(
             "/v1/sessions",
             json={
-                "agent_id": PROJECT_AGENT_ID,
+                "agent_id": session["agent_id"],
                 "project_id": project["id"],
-                "title": "Main",
+                "title": "Orchestrator",
             },
         )
     ).json()
@@ -95,6 +103,11 @@ async def test_project_creation_has_one_normal_main_session(project_client, db_u
     assert worker["project_id"] == project["id"]
     assert worker["project_main_session"] is False
     assert worker["items"] == []
+    assert (
+        SqlAlchemyConversationStore(db_uri).get_conversation(worker["id"]).terminal_launch_args
+        is None
+    )
+    assert CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY not in worker["labels"]
 
 
 async def test_ticket_response_summary_is_owner_private(multi_user_client, db_uri):
@@ -140,10 +153,17 @@ async def test_orchestrator_inherits_defaults_but_not_public_sharing(
     ).status_code == 404
 
 
-async def test_missing_maestro_requires_explicit_agent_and_is_retryable(
-    project_client, project_agents, db_uri
+@pytest.mark.parametrize("unavailable", ["missing", "suppressed"])
+async def test_unavailable_native_agents_requires_explicit_agent_and_is_retryable(
+    project_client, project_app, project_agents, db_uri, unavailable
 ):
-    project_agents.delete(project_agents.get_by_name("maestro").id)
+    if unavailable == "suppressed":
+        project_app.state.suppressed_agent_names = {
+            native.agent_name for native in NATIVE_CODING_AGENTS
+        }
+    else:
+        for native in NATIVE_CODING_AGENTS:
+            project_agents.delete(project_agents.get_by_name(native.agent_name).id)
     headers = {"Idempotency-Key": str(uuid4())}
     response = await project_client.post(
         "/v1/projects", json={"name": "Unconfigured"}, headers=headers
@@ -165,26 +185,72 @@ async def test_missing_maestro_requires_explicit_agent_and_is_retryable(
     assert session["agent_name"] == "project-agent"
 
 
-async def test_existing_project_initializes_main_through_ordinary_sessions(project_client, db_uri):
+@pytest.mark.parametrize("bundled", [False, True])
+@pytest.mark.parametrize(
+    ("harness", "access", "expected_args", "bypass"),
+    [
+        ("claude-native", {}, ["--permission-mode", "bypassPermissions"], False),
+        ("codex-native", {}, [], True),
+        ("claude-native", {"terminal_launch_args": []}, [], False),
+        ("codex-native", {"terminal_launch_args": []}, [], False),
+        ("claude-native", {"terminal_launch_args": None}, None, False),
+        ("codex-native", {"labels": {CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "0"}}, None, False),
+        (
+            "claude-native",
+            {"terminal_launch_args": ["--permission-mode", "plan"]},
+            ["--permission-mode", "plan"],
+            False,
+        ),
+        (
+            "codex-native",
+            {"terminal_launch_args": PERMISSION_LAUNCH_ARGS["codex-native"]["read-only"]},
+            PERMISSION_LAUNCH_ARGS["codex-native"]["read-only"],
+            False,
+        ),
+    ],
+)
+async def test_existing_project_initializes_main_through_ordinary_sessions(
+    project_client, project_agents, db_uri, bundled, harness, access, expected_args, bypass
+):
     project = SqlAlchemyProjectStore(db_uri).create(uuid4().hex, "Existing", None)
     headers = {"Idempotency-Key": str(uuid4())}
     body = {
         "project_id": project.id,
         "project_main_session": True,
         "expected_main_session_id": None,
+        **access,
     }
     before = (await project_client.get(f"/v1/projects/{project.id}")).json()
     assert before["main_session_id"] is None and before["main_session_state"] == "absent"
-    first = await project_client.post("/v1/sessions", json=body, headers=headers)
-    second = await project_client.post("/v1/sessions", json=body, headers=headers)
+
+    async def submit():
+        if bundled:
+            return await post_session_bundle(
+                project_client.post,
+                "/v1/sessions",
+                build_agent_bundle("custom-conductor", executor={"config": {"harness": harness}}),
+                metadata=body,
+                headers=headers,
+            )
+        agent = project_agents.get_by_name(f"{harness}-ui")
+        return await project_client.post(
+            "/v1/sessions", json={**body, "agent_id": agent.id}, headers=headers
+        )
+
+    first = await submit()
+    second = await submit()
     assert first.status_code == second.status_code == 201
-    assert first.json()["id"] == second.json()["id"]
-    session_id = first.json()["id"]
+    id_key = "session_id" if bundled else "id"
+    assert first.json()[id_key] == second.json()[id_key]
+    session_id = first.json()[id_key]
+    stored = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert stored.terminal_launch_args == expected_args
+    assert (stored.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1") is bypass
     assert (await project_client.get(f"/v1/projects/{project.id}")).json()[
         "main_session_id"
     ] == session_id
     session = (await project_client.get(f"/v1/sessions/{session_id}")).json()
-    assert session["title"] == "Main"
+    assert session["title"] == "Orchestrator"
     assert len(session["items"]) == 1
     assert session["items"][0]["data"]["content"][0]["text"] == (
         "Hello, what would you like to work on?"
@@ -577,23 +643,25 @@ async def test_project_main_assignment_validates_target_and_cas(multi_user_clien
     assert projects.get(project.id, user_id=ALICE).main_session_id == valid.id
 
 
-async def test_maestro_session_choices_are_independent_and_do_not_change_agent(
+async def test_orchestrator_session_choices_are_independent_and_do_not_change_agent(
     project_client, project_agents, db_uri
 ):
-    agent = project_agents.get_by_name("maestro")
     choices = [
-        ("codex", "gpt-5.4-mini", "high"),
-        ("claude-sdk", "claude-sonnet-4-6", "medium"),
-        ("claude-native", "claude-sonnet-4-6", "high"),
-        ("codex-native", "gpt-5.4-mini", "high"),
+        ("project-agent", "codex", "gpt-5.4-mini", "high"),
+        ("project-agent", "claude-sdk", "claude-sonnet-4-6", "medium"),
+        ("claude-native-ui", "claude-native", "claude-sonnet-4-6", "high"),
+        ("codex-native-ui", "codex-native", "gpt-5.4-mini", "high"),
     ]
-    for harness, model, effort in choices:
+    for agent_name, harness, model, effort in choices:
+        agent = project_agents.get_by_name(agent_name)
+        override = harness if agent_name == "project-agent" else None
         response = await project_client.post(
             "/v1/projects",
             json={
                 "name": harness,
                 "config": {
-                    "harness": harness,
+                    "agent_id": agent.id,
+                    **({"harness": override} if override else {}),
                     "model": model,
                     "effort": effort,
                     "workspace": "/work/project",
@@ -609,9 +677,20 @@ async def test_maestro_session_choices_are_independent_and_do_not_change_agent(
             stored.harness_override,
             stored.model_override,
             stored.reasoning_effort,
-        ) == (agent.id, harness, model, effort)
+        ) == (agent.id, override, model, effort)
+        expected_args = (
+            ["--permission-mode", "bypassPermissions"]
+            if harness == "claude-native"
+            else []
+            if harness == "codex-native"
+            else None
+        )
+        assert stored.terminal_launch_args == expected_args
+        assert (stored.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1") is (
+            harness == "codex-native"
+        )
         snapshot = (await project_client.get(f"/v1/sessions/{session_id}")).json()
-        assert snapshot["harness"] == harness and snapshot["agent_name"] == "maestro"
+        assert snapshot["harness"] == harness and snapshot["agent_name"] == agent_name
         await project_client.patch(
             f"/v1/projects/{response.json()['id']}",
             json={"config": {"harness": "pi", "effort": "low"}},
@@ -621,19 +700,26 @@ async def test_maestro_session_choices_are_independent_and_do_not_change_agent(
             unchanged.harness_override,
             unchanged.model_override,
             unchanged.reasoning_effort,
-        ) == (harness, model, effort)
-    assert project_agents.get(agent.id).bundle_location == agent.bundle_location
+        ) == (override, model, effort)
+        assert unchanged.terminal_launch_args == stored.terminal_launch_args
+        assert unchanged.labels == stored.labels
+        assert project_agents.get(agent.id).bundle_location == agent.bundle_location
 
 
 @pytest.mark.parametrize("explicit_host", [False, True])
 async def test_name_only_project_uses_owned_host_home_and_normal_launch(
-    multi_user_client, multi_user_app, db_uri, monkeypatch, explicit_host
+    multi_user_client, multi_user_app, project_agents, db_uri, monkeypatch, explicit_host
 ):
     app = multi_user_app
     app.state.host_store = HostStore(db_uri)
     foreign_host, own_host = uuid4().hex, uuid4().hex
     _register_online_host(app, foreign_host, BOB)
     _register_online_host(app, own_host, ALICE)
+    app.state.host_registry.get(own_host).configured_harnesses = {
+        "claude-native": explicit_host,
+        "codex-native": True,
+    }
+    agent = project_agents.get_by_name("codex-native-ui")
     launches = []
 
     def answer_host(connection, payload):
@@ -656,13 +742,13 @@ async def test_name_only_project_uses_owned_host_home_and_normal_launch(
             assert len(items) == 1 and items[0].type == "message"
             assert isinstance(items[0].data, MessageData)
             assert items[0].data.role == "assistant"
-            assert frame.harness == ("codex" if explicit_host else "claude-sdk")
+            assert frame.harness == "codex-native"
             if explicit_host:
                 assert (
                     conversation.harness_override,
                     conversation.model_override,
                     conversation.reasoning_effort,
-                ) == ("codex", "gpt-5.4-mini", "high")
+                ) == (None, "gpt-5.4-mini", "high")
             launches.append(frame)
             connection.pending_launches[frame.request_id].set_result({"status": "launched"})
         else:
@@ -675,7 +761,7 @@ async def test_name_only_project_uses_owned_host_home_and_normal_launch(
             "name": "Home board",
             "config": {
                 "host_id": own_host,
-                "harness": "codex",
+                "agent_id": agent.id,
                 "model": "gpt-5.4-mini",
                 "effort": "high",
             }

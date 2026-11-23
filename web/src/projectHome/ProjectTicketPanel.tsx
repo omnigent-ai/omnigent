@@ -34,8 +34,7 @@ import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { Link, useSearchParams, useReplaceSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
-import { useProjectChatSession } from "./useProjectAgentSession";
-import { ProjectChat } from "./ProjectChat";
+import { ProjectOrchestrator } from "./ProjectOrchestrator";
 import {
   createTicket,
   ticketOutputs,
@@ -135,20 +134,13 @@ function Panel({
 
 export function ProjectOrchestratorPanel({
   projectName,
-  onClose,
   ticket,
 }: {
   projectName: string;
   onClose: () => void;
   ticket?: { id: string; title: string };
 }) {
-  const { sessionId } = useProjectChatSession(projectName);
-  if (sessionId) return <ProjectSessionPanel sessionId={sessionId} />;
-  return (
-    <Panel title="Chat" onClose={onClose}>
-      <ProjectChat projectName={projectName} ticket={ticket} />
-    </Panel>
-  );
+  return <ProjectOrchestrator projectName={projectName} ticket={ticket} />;
 }
 
 export function ProjectTicketPanel({
@@ -426,7 +418,7 @@ function TicketDetails({
                 />
               </div>
               <TicketError error={configuration.error} />
-              <TicketAgents projectId={projectId} ticket={ticket} />
+              <TicketAgents projectId={projectId} projectName={projectName} ticket={ticket} />
               <section aria-label="Description" className="space-y-2">
                 <h3 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Description</h3>
                 {ticket.description ? (

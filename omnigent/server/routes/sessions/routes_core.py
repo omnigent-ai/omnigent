@@ -119,9 +119,10 @@ from omnigent.server.proactive_agent import (
 )
 from omnigent.server.project_main_session import (
     MainSessionCreation,
-    maestro_agent_id,
+    default_project_agent_id,
     main_session_state,
     prepare_main_creation,
+    seed_orchestrator_access,
 )
 from omnigent.server.routes._auth_helpers import SessionAccess
 from omnigent.server.routes._auth_helpers import (
@@ -1406,7 +1407,7 @@ def register_core_routes(
             )
             if getattr(request.state, "project_main_bound_session_id", None) == session_id:
                 raise OmnigentError(
-                    launch_result.get("error") or "Host could not start the main chat",
+                    launch_result.get("error") or "Host could not start the orchestrator",
                     code=launch_result.get("error_code") or ErrorCode.RUNNER_UNAVAILABLE,
                 )
         return runner_id, launch_failed
@@ -1512,7 +1513,7 @@ def register_core_routes(
         payload_override: dict[str, Any] | None = None,
         before_launch: Callable[[str], Awaitable[None]] | None = None,
     ) -> SessionResponse | CreatedSessionResponse:
-        """Keep a bound main chat visible when its launch fails."""
+        """Keep a bound orchestrator visible when its launch fails."""
         request.state.project_main_creation = None
         request.state.project_main_bound_session_id = None
         request.state.project_main_bundled = False
@@ -1526,7 +1527,7 @@ def register_core_routes(
                     code=exc.code if isinstance(exc, OmnigentError) else "session_launch_failed",
                     message=str(exc)
                     if isinstance(exc, OmnigentError)
-                    else "Main chat was saved, but could not start. Retry from the chat.",
+                    else "Orchestrator was saved, but could not start. Retry from the session.",
                 )
                 await _persist_session_status_error_labels(bound_id, error, conversation_store)
                 await asyncio.to_thread(
@@ -1557,7 +1558,7 @@ def register_core_routes(
                     return await _main_creation_response(request, creation.session_id)
                 if isinstance(exc, (IntegrityError, ConversationAlreadyExistsError)):
                     raise OmnigentError(
-                        "Main-chat creation is in progress; retry this submission",
+                        "Orchestrator creation is in progress; retry this submission",
                         code=ErrorCode.CONFLICT,
                     ) from exc
             raise
@@ -1608,8 +1609,12 @@ def register_core_routes(
             initial_project=initial_project,
         )
         request.state.project_main_creation = creation
+        request.state.project_main_explicit_access = bool(
+            {"terminal_launch_args", "permission_mode"} & body.model_fields_set
+            or _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY in (body.labels or {})
+        )
         if body.title is None:
-            body.title = "Main"
+            body.title = "Orchestrator"
         return creation
 
     async def _bind_main(
@@ -1630,7 +1635,7 @@ def register_core_routes(
             )
             if state not in ("absent", "missing", "archived"):
                 raise OmnigentError(
-                    "The main chat is no longer replaceable; reload the project",
+                    "The orchestrator is no longer replaceable; reload the project",
                     code=ErrorCode.CONFLICT,
                 )
             await asyncio.to_thread(
@@ -1743,7 +1748,7 @@ def register_core_routes(
             if main_creation.replay:
                 return await _main_creation_response(request, main_creation.session_id)
             if body.agent_id is None:
-                body.agent_id = await maestro_agent_id(request, agent_store)
+                body.agent_id = await default_project_agent_id(request, agent_store, body.host_id)
         explicit_host = request.url.path.endswith("/sessions/orchestrated/host")
         if explicit_host and (
             body.host_type != "external" or not body.host_id or not body.workspace
@@ -2359,6 +2364,7 @@ def register_core_routes(
             validate_create_harness_readiness,
         )
 
+        seed_orchestrator_access(request, parsed_metadata, spec_harness(spec))
         await validate_create_harness_readiness(
             harness=spec_harness(spec),
             host_id=parsed_metadata.host_id,

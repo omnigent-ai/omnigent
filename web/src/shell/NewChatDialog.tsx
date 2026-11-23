@@ -234,6 +234,10 @@ import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import { reuseCreationAttempt, type CreationAttempt } from "@/lib/creationAttempt";
 import type { ProjectTicket } from "@/lib/projectTicketsApi";
 import { AgentChatIdentity } from "@/components/chat/AgentChatIdentity";
+import {
+  firstAvailableNativeAgent,
+  projectOrchestratorPermissionMode,
+} from "@/projectHome/projectAgentDefaults";
 import { useLaunchModelOptions } from "@/hooks/useLaunchModelOptions";
 import {
   onProjectLaunchDefaultsCleared,
@@ -2540,7 +2544,7 @@ function NewChatLandingContent({
         }
       : {};
     const resolved = withProjectLaunchDefaults(stored, projectLaunch);
-    // Main always starts with a changeable Maestro pick, not the general last agent.
+    // A replacement defaults to an available native agent, not the general last agent.
     return projectMainSession
       ? { ...resolved, agentId: undefined, launchAgentId: undefined }
       : resolved;
@@ -2616,9 +2620,6 @@ function NewChatLandingContent({
       ),
     [agents, agentsLoading, cachedPickerOptions, curation.restrictToAgentNames],
   );
-  const mainDefaultAgent = projectMainSession
-    ? agentList.find((agent) => agent.name === "maestro")
-    : undefined;
 
   // Split the picker into "Harnesses" (harness-backed picks — the native
   // terminal CLIs plus generic-ACP harness agents like Grok / Devin / Kilocode)
@@ -3601,6 +3602,9 @@ function NewChatLandingContent({
     pickedAgentId !== PENDING_AGENT_ID &&
     !agentList.some((a) => a.id === pickedAgentId);
   const selectedHost = allHosts.find((host) => host.host_id === selectedHostId);
+  const mainDefaultAgent = projectMainSession
+    ? firstAvailableNativeAgent(agentList, sandboxSelected ? undefined : selectedHost)
+    : undefined;
   // Readiness is meaningful only for a connected host; managed sandboxes
   // provision their own tooling and should not drive fallback warnings.
   const harnessWarningHost = !sandboxSelected ? selectedHost : undefined;
@@ -4879,8 +4883,28 @@ function NewChatLandingContent({
       pickerEdits?.agentId === effectiveAgentId && pickerEdits.harness === selectedNativeHarness
         ? pickerEdits.options
         : {};
-    const stored = {
+    const draftModes: Record<string, string> = restoredDraft
+      ? {
+          "claude-native": restoredDraft.permissionMode,
+          "codex-native": restoredDraft.bypassSandbox
+            ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE
+            : restoredDraft.approvalMode,
+          "cursor-native": restoredDraft.cursorExecMode,
+          "antigravity-native": restoredDraft.agySkipMode,
+          "devin-native": restoredDraft.devinPermissionMode,
+        }
+      : {};
+    const orchestratorMode =
+      (restoredDraft?.pickedAgentId === effectiveAgentId
+        ? draftModes[selectedNativeHarness]
+        : undefined) ?? projectOrchestratorPermissionMode(selectedNativeHarness);
+    const stored: HarnessOptions = {
       ...readRememberedHarnessOptions(selectedNativeHarness),
+      ...(projectMainSession &&
+      orchestratorMode !== undefined &&
+      !pickedOptionKeysRef.current.get(selectedNativeHarness)?.has("mode")
+        ? { mode: orchestratorMode }
+        : {}),
       ...editedOptions,
     };
     // Resolve the mode to the stored value when it's still valid for this
@@ -5018,6 +5042,8 @@ function NewChatLandingContent({
     piModelOptions,
     projectDefaultModel,
     projectDefaultEffort,
+    projectMainSession,
+    restoredDraft,
     readRememberedHarnessOptions,
   ]);
   useEffect(() => {
@@ -6643,9 +6669,28 @@ function NewChatLandingContent({
             project_id: projectMainSession.projectId,
             project_main_session: true,
             expected_main_session_id: projectMainSession.expectedMainSessionId,
-            title: "Main",
+            title: "Orchestrator",
           }
         : {};
+      // Preserve an explicit Default in Orchestrator's composer with an empty list.
+      const terminalLaunchArgs = smartRoutingHarnessSelected
+        ? undefined
+        : agentSupportsPermissionMode && permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
+          ? ["--permission-mode", permissionMode]
+          : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
+            ? (CODEX_NATIVE_APPROVAL_MODES.find((mode) => mode.value === approvalMode)?.args ?? [])
+            : agentSupportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
+              ? (CURSOR_NATIVE_EXEC_MODES.find((mode) => mode.value === cursorExecMode)?.args ?? [])
+              : agentSupportsAgySkip && agySkipMode !== AGY_NATIVE_DEFAULT_SKIP_MODE
+                ? (AGY_NATIVE_SKIP_MODES.find((mode) => mode.value === agySkipMode)?.args ?? [])
+                : agentSupportsDevinPermission &&
+                    devinPermissionMode !== DEVIN_NATIVE_DEFAULT_PERMISSION_MODE
+                  ? (DEVIN_NATIVE_PERMISSION_MODES.find(
+                      (mode) => mode.value === devinPermissionMode,
+                    )?.args ?? [])
+                  : projectMainSession && selectedNativeHarness !== null
+                    ? []
+                    : undefined;
       let data: { id: string };
       // The agent the create ran; a custom agent's id comes back from its create.
       let launchedAgentId = effectiveAgentId;
@@ -6677,6 +6722,7 @@ function NewChatLandingContent({
             ? {
                 model_override: normalizedModelOverride ?? undefined,
                 reasoning_effort: normalizedReasoningEffort ?? undefined,
+                terminal_launch_args: terminalLaunchArgs,
               }
             : {}),
         };
@@ -6859,22 +6905,7 @@ function NewChatLandingContent({
           },
           // Permission / approval / cursor mode → CLI flag pair, persisted as
           // terminal_launch_args. Omitted for the default and non-native agents.
-          terminal_launch_args: smartRoutingHarnessSelected
-            ? undefined
-            : agentSupportsPermissionMode &&
-                permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
-              ? ["--permission-mode", permissionMode]
-              : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
-                ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
-                : agentSupportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
-                  ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
-                  : agentSupportsAgySkip && agySkipMode !== AGY_NATIVE_DEFAULT_SKIP_MODE
-                    ? (AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.args ?? [])
-                    : agentSupportsDevinPermission &&
-                        devinPermissionMode !== DEVIN_NATIVE_DEFAULT_PERMISSION_MODE
-                      ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === devinPermissionMode)
-                          ?.args ?? [])
-                      : undefined,
+          terminal_launch_args: terminalLaunchArgs,
           // Model + reasoning effort, persisted on the session row before
           // the runner launches. An unselected ("") knob is omitted so the
           // harness keeps its own configured/default value.
@@ -7016,6 +7047,14 @@ function NewChatLandingContent({
           costControlMode,
         });
         if (launchedOptions !== null) {
+          if (
+            projectMainSession &&
+            !pickedOptionKeysRef.current.get(selectedNativeHarness ?? "")?.has("mode")
+          ) {
+            // The Orchestrator default must not become the default for ordinary sessions.
+            const { mode: _mode, ...otherOptions } = launchedOptions;
+            launchedOptions = otherOptions;
+          }
           writeHarnessOption(selectedNativeHarness, launchedOptions);
         }
       }
@@ -7127,7 +7166,7 @@ function NewChatLandingContent({
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
         if (!serverOwnsInitialInput)
           setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
-        // Main's embedded composer also delivers the exact-session pending prompt.
+        // Project replacement resolves the saved session after its pointer refresh.
         if (
           (!onProjectHome || (!serverOwnsInitialInput && !projectMainSession)) &&
           onScreenRef.current &&

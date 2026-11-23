@@ -1,12 +1,12 @@
-import { useSyncExternalStore } from "react";
+import { useSyncExternalStore, type ComponentProps } from "react";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import type { ChatPresentation } from "@/components/chat/assistantPresentation";
+import { FullSessionChat } from "@/components/chat/FullSessionChat";
+import { useSessionAgent } from "@/hooks/useAgents";
 import type { Session } from "@/lib/types";
-import type * as AgentsModule from "@/hooks/useAgents";
 import type * as SessionsModule from "@/lib/sessionsApi";
 import * as projectsApi from "@/lib/projectsApi";
 import { ApiError, getSessionSlim } from "@/lib/sessionsApi";
@@ -19,20 +19,12 @@ import {
 } from "@/lib/sessionDrafts";
 import { addTicketToSessionDraft } from "./projectTicketDraft";
 import { restoreReplyDraft } from "@/lib/replyDraft";
-import { ProjectAgentChat, ProjectChat } from "./ProjectChat";
+import { ProjectOrchestrator } from "./ProjectOrchestrator";
 
 const fixture = vi.hoisted(() => ({
   session: {} as Session,
-  agent: { name: "codex-native-ui", description: "A reusable coding agent" },
   conflictDraft: { text: "", files: [] } as SessionDraft,
   conflictRecovery: vi.fn(),
-  state: {
-    sessionHarness: "codex-native" as string | null,
-    llmModel: "model-a" as string | null,
-    sessionModelOverride: null,
-    sessionReasoningEffort: "high" as string | null,
-    codexModelOptions: [],
-  },
 }));
 vi.mock("@/hooks/useConversations", () => ({
   useProjects: () => ({
@@ -41,14 +33,6 @@ vi.mock("@/hooks/useConversations", () => ({
     error: null,
   }),
 }));
-vi.mock("@/hooks/useSession", () => ({ useSession: () => ({ session: fixture.session }) }));
-vi.mock("@/hooks/useConversationEntryState", () => ({
-  useConversationEntryState: () => fixture.state,
-}));
-vi.mock("@/hooks/useAgents", async (importOriginal) => ({
-  ...(await importOriginal<typeof AgentsModule>()),
-  useSessionAgent: () => ({ data: fixture.agent, isError: false }),
-}));
 vi.mock("@/lib/projectsApi", () => ({
   getProject: vi.fn(),
   createProject: vi.fn(),
@@ -56,6 +40,17 @@ vi.mock("@/lib/projectsApi", () => ({
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof SessionsModule>()),
   getSessionSlim: vi.fn(),
+}));
+vi.mock("@/hooks/useAgents", () => ({
+  useSessionAgent: vi.fn(() => ({
+    data: { name: "codex-native-ui", harness: "codex-native", description: "Coding agent" },
+    isError: false,
+  })),
+}));
+vi.mock("@/components/chat/FullSessionChat", () => ({
+  FullSessionChat: vi.fn(({ sessionId }: ComponentProps<typeof FullSessionChat>) => (
+    <SessionView sessionId={sessionId} />
+  )),
 }));
 vi.mock("@/shell/NewChatDialog", () => ({
   NewChatLandingScreen: ({
@@ -78,41 +73,34 @@ vi.mock("@/shell/NewChatDialog", () => ({
     </>
   ),
 }));
-vi.mock("@/components/chat/FullSessionChat", () => ({
-  FullSessionChat: ({
-    sessionId,
-    sessionComposer,
-    presentation,
-  }: {
-    sessionId: string;
-    sessionComposer?: boolean;
-    presentation?: ChatPresentation;
-  }) => {
-    const draft = useSyncExternalStore(subscribeSessionDrafts, () => getSessionDraft(sessionId));
-    return (
-      <>
-        {presentation?.header?.(false)}
-        <span data-testid="assistant-icon">{presentation?.assistant?.icon}</span>
-        <output aria-label="Existing session" data-shared-composer={sessionComposer}>
-          {sessionId}
-        </output>
-        <textarea aria-label="Session draft" readOnly value={draft?.text ?? ""} />
-        <output aria-label="Draft attachments">
-          {draft?.files.map((file) => file.name).join(", ")}
-        </output>
-      </>
-    );
-  },
-}));
+function SessionView({ sessionId: suppliedSessionId }: { sessionId?: string }) {
+  const params = useParams();
+  const sessionId = suppliedSessionId ?? params.sessionId ?? "";
+  const draft = useSyncExternalStore(subscribeSessionDrafts, () => getSessionDraft(sessionId));
+  return (
+    <>
+      <output aria-label="Existing session">{sessionId}</output>
+      <textarea aria-label="Session draft" readOnly value={draft?.text ?? ""} />
+      <output aria-label="Draft attachments">
+        {draft?.files.map((file) => file.name).join(", ")}
+      </output>
+    </>
+  );
+}
 
 const clients: QueryClient[] = [];
-function renderChat(element = <ProjectChat projectName="Shipping" />) {
+function renderOrchestrator(element = <ProjectOrchestrator projectName="Shipping" />) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   clients.push(client);
   return render(
     <QueryClientProvider client={client}>
       <TooltipProvider>
-        <MemoryRouter>{element}</MemoryRouter>
+        <MemoryRouter initialEntries={["/projects/Shipping/orchestrator"]}>
+          <Routes>
+            <Route path="/projects/:projectName/orchestrator" element={element} />
+            <Route path="/c/:sessionId" element={<SessionView />} />
+          </Routes>
+        </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
   );
@@ -137,10 +125,6 @@ beforeEach(() => {
     kind: "default",
     projectId: "project",
   };
-  fixture.state.sessionHarness = "codex-native";
-  fixture.state.llmModel = "model-a";
-  fixture.state.sessionReasoningEffort = "high";
-  fixture.agent = { name: "codex-native-ui", description: "A reusable coding agent" };
   vi.mocked(projectsApi.getProject).mockResolvedValue({
     id: "project",
     name: "Shipping",
@@ -155,60 +139,49 @@ afterEach(() => {
   clearSessionDrafts();
 });
 
-describe("project Chat", () => {
-  it("only reads the saved lead session and uses its shared composer", async () => {
-    renderChat();
+describe("project Orchestrator navigation", () => {
+  it("uses the saved session and shared composer in a closable panel with a full-session link", async () => {
+    const onClose = vi.fn();
+    setSessionDraft("lead", { text: "Keep my draft", files: [] });
+    renderOrchestrator(<ProjectOrchestrator projectName="Shipping" onClose={onClose} />);
     expect(await screen.findByLabelText("Existing session")).toHaveTextContent("lead");
-    expect(screen.getByLabelText("Existing session")).toHaveAttribute(
-      "data-shared-composer",
-      "true",
+    expect(screen.getByRole("region", { name: "Orchestrator chat" })).toBeVisible();
+    expect(screen.getByLabelText("Session draft")).toHaveValue("Keep my draft");
+    expect(useSessionAgent).toHaveBeenCalledWith("lead");
+    expect(vi.mocked(FullSessionChat).mock.calls.at(-1)?.[0]).toEqual(
+      expect.objectContaining({
+        sessionId: "lead",
+        sessionComposer: true,
+        evenComposerPadding: true,
+        presentation: expect.objectContaining({
+          assistant: expect.objectContaining({ name: "Codex" }),
+        }),
+      }),
     );
-    expect(screen.queryByRole("link", { name: "Open full session" })).toBeNull();
-    expect(projectsApi.createProject).not.toHaveBeenCalled();
     expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith("lead");
-    expect(screen.getByRole("button", { name: "About Codex" })).toHaveTextContent("");
-    expect(screen.queryByText("Maestro")).toBeNull();
-    expect(
-      screen
-        .getByRole("button", { name: "About Codex" })
-        .querySelector('[data-agent-icon="maestro"]'),
-    ).toBeNull();
-    expect(
-      screen.getByTestId("assistant-icon").querySelector('[data-agent-icon="maestro"]'),
-    ).toBeNull();
-    expect(screen.queryByText("model-a")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "About Codex" }));
-    expect(await screen.findByRole("region", { name: "About Codex" })).toHaveTextContent(
-      fixture.agent.description,
-    );
-    expect(screen.queryByText("model-a")).toBeNull();
-    expect(screen.queryByText("Harness")).toBeNull();
-    expect(screen.queryByText("Effort")).toBeNull();
-    expect(screen.queryByText("Role")).toBeNull();
-    expect(screen.queryByText("Project Lead")).toBeNull();
+    expect(projectsApi.createProject).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Close orchestrator" }));
+    expect(onClose).toHaveBeenCalledOnce();
+    const expand = screen.getByRole("link", { name: "Open orchestrator in full session" });
+    expect(expand).toHaveAttribute("href", "/c/lead");
+    fireEvent.click(expand);
+    expect(screen.queryByRole("region", { name: "Orchestrator chat" })).toBeNull();
+    expect(screen.getByLabelText("Existing session")).toHaveTextContent("lead");
+    expect(screen.getByLabelText("Session draft")).toHaveValue("Keep my draft");
   });
 
-  it("uses a registered Maestro's description without displaying its execution configuration", async () => {
-    fixture.session = { ...fixture.session, agentName: "team-agent", harness: "pi" };
-    fixture.state.sessionHarness = "pi";
-    fixture.agent = {
-      name: "maestro (fork session-a)",
-      description: "Coordinates this project's agents.",
-    };
-    renderChat();
-    fireEvent.focus(await screen.findByRole("button", { name: "About Maestro" }));
-    expect(await screen.findByRole("region", { name: "About Maestro" })).toHaveTextContent(
-      fixture.agent.description,
-    );
-    expect(
-      screen.getByTestId("assistant-icon").querySelector('[data-agent-icon="maestro"]'),
-    ).not.toBeNull();
-    expect(screen.queryByText("Model")).toBeNull();
-    expect(screen.queryByText("Effort")).toBeNull();
+  it("opens the saved session in the normal view without creating or forking", async () => {
+    setSessionDraft("lead", { text: "Keep my draft", files: [] });
+    renderOrchestrator();
+    expect(await screen.findByLabelText("Existing session")).toHaveTextContent("lead");
+    expect(screen.getByLabelText("Session draft")).toHaveValue("Keep my draft");
+    expect(screen.queryByLabelText("Replacement composer")).toBeNull();
+    expect(projectsApi.createProject).not.toHaveBeenCalled();
+    expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith("lead");
   });
 
   it.each(["absent", "missing", "archived"] as const)(
-    "shows the existing composer for %s Main without writing",
+    "shows the existing composer for %s Orchestrator without writing",
     async (state) => {
       const oldId = state === "absent" ? null : "old-main";
       vi.mocked(projectsApi.getProject).mockResolvedValue({
@@ -217,7 +190,7 @@ describe("project Chat", () => {
         main_session_id: oldId,
         main_session_state: state,
       });
-      renderChat();
+      renderOrchestrator(<ProjectOrchestrator projectName="Shipping" onClose={vi.fn()} />);
       expect(await screen.findByLabelText("Replacement composer")).toHaveTextContent(
         JSON.stringify({
           projectId: "project",
@@ -226,19 +199,21 @@ describe("project Chat", () => {
       );
       expect(getSessionSlim).not.toHaveBeenCalled();
       expect(projectsApi.createProject).not.toHaveBeenCalled();
+      expect(screen.getByRole("region", { name: "Orchestrator chat" })).toBeVisible();
+      expect(screen.queryByRole("link", { name: "Open orchestrator in full session" })).toBeNull();
     },
   );
 
-  it("does not offer replacement for an unavailable or foreign-project Main", async () => {
+  it("does not offer replacement for an unavailable or foreign-project Orchestrator", async () => {
     fixture.session = { ...fixture.session, projectId: "another-project" };
-    renderChat();
-    expect(await screen.findByRole("alert")).toHaveTextContent("Main chat is unavailable.");
+    renderOrchestrator();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Orchestrator is unavailable.");
     expect(screen.queryByLabelText("Replacement composer")).toBeNull();
   });
 
-  it("keeps an offline Main in the existing chat", async () => {
+  it("keeps an offline Orchestrator in the normal session view", async () => {
     fixture.session = { ...fixture.session, runnerOnline: false };
-    renderChat();
+    renderOrchestrator();
     expect(await screen.findByLabelText("Existing session")).toHaveTextContent("lead");
     expect(screen.queryByLabelText("Replacement composer")).toBeNull();
   });
@@ -263,7 +238,7 @@ describe("project Chat", () => {
       main_session_id: "old-main",
       main_session_state: "archived",
     });
-    renderChat();
+    renderOrchestrator();
     fireEvent.click(await screen.findByRole("button", { name: "Submit replacement" }));
     expect(await screen.findByLabelText("Existing session")).toHaveTextContent("lead");
     await waitFor(() => expect(fixture.conflictRecovery).toHaveBeenCalledWith(true));
@@ -297,7 +272,7 @@ describe("project Chat", () => {
           main_session_state: "unavailable",
         });
       else vi.mocked(projectsApi.getProject).mockRejectedValue(new Error("Connection lost"));
-      renderChat();
+      renderOrchestrator();
       fireEvent.click(await screen.findByRole("button", { name: "Submit replacement" }));
       await waitFor(() => expect(fixture.conflictRecovery).toHaveBeenCalledWith(false));
       expect(getSessionDraft("old-main")).toBeUndefined();
@@ -320,7 +295,7 @@ describe("project Chat", () => {
         main_session_id: "lead",
         main_session_state: "missing",
       });
-    renderChat();
+    renderOrchestrator();
     await screen.findByLabelText("Replacement composer");
     expect(projectsApi.getProject).toHaveBeenCalledTimes(2);
     expect(projectsApi.createProject).not.toHaveBeenCalled();
@@ -332,7 +307,7 @@ describe("project Chat", () => {
       vi.mocked(getSessionSlim).mockRejectedValue(
         new ApiError("Chat could not be loaded", status, null),
       );
-      renderChat();
+      renderOrchestrator();
       expect(await screen.findByRole("alert")).toHaveTextContent("Chat could not be loaded");
       await waitFor(() =>
         expect(projectsApi.getProject).toHaveBeenCalledTimes(status === 404 ? 2 : 1),
@@ -341,30 +316,17 @@ describe("project Chat", () => {
     },
   );
 
-  it("carries ticket context without replacing a draft or re-adding it after sending", () => {
+  it("carries legacy ticket context to the normal session without replacing its draft", async () => {
     setSessionDraft("lead", { text: "My question", files: [] });
-    const ticket = { id: "ticket-a", title: "Ship it" };
-    const chat = renderChat(
-      <ProjectAgentChat sessionId="lead" projectId="project" ticket={ticket} />,
+    renderOrchestrator(
+      <ProjectOrchestrator projectName="Shipping" ticket={{ id: "ticket-a", title: "Ship it" }} />,
     );
+    await screen.findByLabelText("Existing session");
     expect(getSessionDraft("lead")?.text).toContain("My question");
     expect(getSessionDraft("lead")?.text).toContain("Ticket ID: ticket-a");
     expect(screen.queryByRole("link", { name: "Back to ticket" })).toBeNull();
     setSessionDraft("lead", { text: "", files: [] });
-    // The current ticket may refresh while this chat remains open.
-    chat.rerender(
-      <QueryClientProvider client={clients.at(-1)!}>
-        <TooltipProvider>
-          <MemoryRouter>
-            <ProjectAgentChat
-              sessionId="lead"
-              projectId="project"
-              ticket={{ ...ticket, title: "New title" }}
-            />
-          </MemoryRouter>
-        </TooltipProvider>
-      </QueryClientProvider>,
-    );
+    await waitFor(() => expect(screen.getByLabelText("Session draft")).toHaveValue(""));
     expect(getSessionDraft("lead")).toBeUndefined();
   });
 });

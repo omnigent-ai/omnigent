@@ -25,7 +25,7 @@ export function useProjectAgentSession(projectId: string | null) {
   };
 }
 
-export function useProjectChatSession(projectName: string) {
+export function useProjectOrchestratorSession(projectName: string) {
   const { projectId, projects } = useTicketProject(projectName);
   const project = useProjectAgentSession(projectId);
   const session = useQuery({
@@ -52,12 +52,13 @@ export function useProjectChatSession(projectName: string) {
     canReplace: projectId !== null && canReplace && !project.isError,
     isLoading:
       projects.isLoading ||
+      (projectId === null && projects.isFetching) ||
       (projectId !== null && project.isPending) ||
       (project.sessionId !== null && session.isPending),
     error:
       projects.error ??
       project.error ??
-      (unavailable ? new Error("Main chat is unavailable.") : canReplace ? null : session.error),
+      (unavailable ? new Error("Orchestrator is unavailable.") : canReplace ? null : session.error),
     refresh: refetch,
   };
 }
