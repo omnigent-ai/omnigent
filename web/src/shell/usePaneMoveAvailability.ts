@@ -19,7 +19,7 @@ export interface PaneMoveAvailabilityOptions {
   sizing: () => PaneSizing | null;
   /**
    * The element the panes are laid out in, watched for size changes and terminals fitting. Read
-   * as the effect runs, since on the first mount it's attached only after this render.
+   * after each commit, so one that attaches later or is replaced is watched in its turn.
    */
   rootRef: RefObject<HTMLElement | null>;
 }
@@ -45,6 +45,11 @@ export function usePaneMoveAvailability({
   const [measured, setMeasured] = useState(measure);
   const movable = paneMoveLayout(layout, zoomedKey);
   const shape = movable === null ? null : JSON.stringify(movable);
+  // The ref's element as of the last commit; setting the same one again renders nothing.
+  const [root, setRoot] = useState<HTMLElement | null>(null);
+  // After every commit, since nothing tells the hook when the ref's element changes.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useLayoutEffect(() => setRoot(rootRef.current));
   useLayoutEffect(() => {
     if (shape === null) return;
     const update = () =>
@@ -53,7 +58,6 @@ export function usePaneMoveAvailability({
         return sameAvailability(previous, next) ? previous : next;
       });
     update();
-    const root = rootRef.current;
     if (!root) return;
     const resizes = new ResizeObserver(update);
     resizes.observe(root);
@@ -65,7 +69,7 @@ export function usePaneMoveAvailability({
       resizes.disconnect();
       fits.disconnect();
     };
-  }, [shape, paneKey, rootRef]);
+  }, [shape, paneKey, root]);
   // Not offered at all, as for a lone or maximized pane, at once; room is what's measured.
   if (movable === null) return null;
   return measured;

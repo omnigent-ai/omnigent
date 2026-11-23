@@ -22,7 +22,7 @@ const sizingAt = (width: () => number): PaneSizing => ({
 
 let latest: CommandAvailability | null = null;
 
-function Panes({ width }: { width: () => number }) {
+function Panes({ width, attached = true }: { width: () => number; attached?: boolean }) {
   const rootRef = useRef<HTMLDivElement>(null);
   latest = usePaneMoveAvailability({
     layout: SIDE_BY_SIDE,
@@ -31,6 +31,8 @@ function Panes({ width }: { width: () => number }) {
     sizing: () => sizingAt(width),
     rootRef,
   });
+  // An owner can render its panes' element later, such as once it has a pane to show.
+  if (!attached) return null;
   return (
     <div ref={rootRef}>
       <div data-terminal-pane="a" data-terminal-cols="80" />
@@ -59,6 +61,16 @@ describe("usePaneMoveAvailability", () => {
     width = 800;
     resize(width);
     expect(latest).toEqual({ available: true });
+  });
+
+  it("watches the panes' element once it attaches after the first render", () => {
+    let width = 800;
+    const resize = installResizableWidth(width);
+    const view = render(<Panes width={() => width} attached={false} />);
+    view.rerender(<Panes width={() => width} />);
+    width = 200;
+    resize(width);
+    expect(latest).toEqual({ available: false, reason: NO_ROOM_TO_MOVE_REASON });
   });
 
   it("measures again as a terminal fits, and stops watching once unmounted", async () => {
