@@ -133,6 +133,7 @@ const {
   settingsMenuItem,
 } = require("./settingsNavigation");
 const { createQuitConfirmation } = require("./quitConfirmation");
+const { createRightSidebarWindow } = require("./rightSidebarWindow");
 const { acceleratorLabel, createGlobalShortcuts } = require("./globalShowShortcut");
 const {
   FLOATING_COMPOSER_PATH,
@@ -1842,6 +1843,14 @@ const quitConfirmation = createQuitConfirmation({
   quit: () => app.quit(),
 });
 
+// Settings → "Widen window when opening the right sidebar" (opt-in).
+const rightSidebarWindow = createRightSidebarWindow({
+  loadSettings,
+  saveSettings,
+  workAreaFor: (bounds) => screen.getDisplayMatching(bounds).workArea,
+  animate: process.platform === "darwin",
+});
+
 // Main-window documents that can render the floating New Agent panel (see registerIpc).
 const floatingComposerSupport = createFloatingComposerSupport();
 
@@ -2995,6 +3004,16 @@ function createWindow(targetUrl, opts = {}) {
   };
   win.on("enter-full-screen", sendFullScreenState);
   win.on("leave-full-screen", sendFullScreenState);
+  // A right sidebar closed while full screen or maximized shrinks the window once it's restored.
+  const restoreRightSidebarWindow = () => rightSidebarWindow.restored(win);
+  win.on("leave-full-screen", restoreRightSidebarWindow);
+  win.on("unmaximize", restoreRightSidebarWindow);
+  win.on("resize", restoreRightSidebarWindow);
+  // A new page doesn't know about the window's growth, so it mustn't shrink by it later.
+  win.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) rightSidebarWindow.forget(win);
+  });
+  win.webContents.on("render-process-gone", () => rightSidebarWindow.forget(win));
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
   // CLI config stores the API mount; Electron boots the browser-facing SPA.
@@ -5378,6 +5397,34 @@ function registerIpc() {
     if (!isPinnedOriginSender(event)) return false;
     for (const shortcut of Object.values(globalShortcuts)) shortcut.cancelRecording();
     return true;
+  });
+
+  // Settings → "Widen window when opening the right sidebar", and the page's reports of that
+  // sidebar opening and closing, which resize only the reporting window.
+  ipcMain.handle("omnigent:get-right-sidebar-widens-window", (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error(
+        "get-right-sidebar-widens-window is only available to a connected server page",
+      );
+    }
+    return rightSidebarWindow.enabled();
+  });
+  ipcMain.handle("omnigent:set-right-sidebar-widens-window", (event, enabled) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error(
+        "set-right-sidebar-widens-window is only available to a connected server page",
+      );
+    }
+    return rightSidebarWindow.setEnabled(enabled === true);
+  });
+  ipcMain.on("omnigent:right-sidebar-visibility", (event, report) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!isPinnedOriginSender(event) || !isMainWindow(win)) return;
+    // Only the window's own page speaks for its sidebar, not a frame inside it.
+    if (event.senderFrame !== event.sender.mainFrame) return;
+    if (report?.reset === true) rightSidebarWindow.forget(win);
+    else if (report?.open === true) rightSidebarWindow.opened(win, report.width);
+    else if (report?.open === false) rightSidebarWindow.closed(win);
   });
 
   // A main window's document can render the floating panel for its server, until it's replaced.

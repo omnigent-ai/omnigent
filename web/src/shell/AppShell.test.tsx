@@ -3433,8 +3433,72 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
   });
 
+  it.each([false, true])(
+    "resets desktop growth on session switches with the next rail open=%s",
+    async (nextOpen) => {
+      const rightSidebarWindow = {
+        getWidensWindow: vi.fn().mockResolvedValue(true),
+        setWidensWindow: vi.fn().mockResolvedValue(true),
+        opened: vi.fn(),
+        closed: vi.fn(),
+        reset: vi.fn(),
+      };
+      vi.stubGlobal("omnigentDesktop", { kind: "electron", rightSidebarWindow });
+      writeWorkspacePanelDefault("collapsed");
+      writeSessionWorkspaceState("conv_widen", { widthPx: 450 });
+      writeSessionWorkspaceState("conv_widen_other", { open: nextOpen, widthPx: 520 });
+      useEnvironmentMock.mockReturnValue({
+        data: { available: true, root: null, home: null },
+        isLoading: false,
+      } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+      mockConversations([
+        { id: "conv_widen", permission_level: null },
+        { id: "conv_widen_other", permission_level: null },
+      ]);
+
+      try {
+        renderShell("/c/conv_widen", undefined, { sessionNavTo: "/c/conv_widen_other" });
+        expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+        expect(rightSidebarWindow.reset).toHaveBeenCalledOnce();
+
+        fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+        // The shell gets the remembered width, not the width clamped to this narrow window.
+        expect(rightSidebarWindow.opened).toHaveBeenCalledExactlyOnceWith(450);
+        fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+        expect(rightSidebarWindow.closed).toHaveBeenCalledOnce();
+        fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+        expect(rightSidebarWindow.opened).toHaveBeenCalledTimes(2);
+        expect(rightSidebarWindow.reset).toHaveBeenCalledOnce();
+
+        // Leave while the first rail is open: restoring the next session only drops its growth.
+        fireEvent.click(screen.getByTestId("nav-session"));
+        await waitFor(() => expect(rightSidebarWindow.reset).toHaveBeenCalledTimes(2));
+        expect(Boolean(screen.queryByRole("complementary", { name: "Workspace" }))).toBe(nextOpen);
+        expect(rightSidebarWindow.opened).toHaveBeenCalledTimes(2);
+        expect(rightSidebarWindow.closed).toHaveBeenCalledOnce();
+
+        if (!nextOpen) {
+          fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+          expect(rightSidebarWindow.opened).toHaveBeenCalledTimes(3);
+          expect(rightSidebarWindow.opened).toHaveBeenLastCalledWith(520);
+        }
+        fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+        expect(rightSidebarWindow.closed).toHaveBeenCalledTimes(2);
+      } finally {
+        cleanup();
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
   it("reveals a collapsed workspace when New Browser Tab opens a tab", async () => {
     writeWorkspacePanelDefault("collapsed");
+    const rightSidebarWindow = {
+      getWidensWindow: vi.fn().mockResolvedValue(true),
+      setWidensWindow: vi.fn().mockResolvedValue(true),
+      opened: vi.fn(),
+      closed: vi.fn(),
+    };
     let sendCommand: (event: {
       command: string;
       browserViewId: string | null;
@@ -3449,6 +3513,7 @@ describe("Right workspace card visibility", () => {
         return () => {};
       },
       setDesktopCommandState: () => {},
+      rightSidebarWindow,
     });
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
@@ -3469,6 +3534,8 @@ describe("Right workspace card visibility", () => {
         "true",
       );
       expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+      // A reveal opens the sidebar too, so the desktop shell can widen the window for it.
+      expect(rightSidebarWindow.opened).toHaveBeenCalledOnce();
     } finally {
       cleanup();
       vi.unstubAllGlobals();

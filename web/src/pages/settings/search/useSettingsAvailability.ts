@@ -6,7 +6,12 @@ import { useEffect, useMemo, useState } from "react";
 import { useAdminViewSwitchShown } from "@/hooks/useAdminViewSwitchShown";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
-import { getDesktopFeatures, supportsBrowser, supportsGlobalShortcut } from "@/lib/nativeBridge";
+import {
+  getDesktopFeatures,
+  supportsBrowser,
+  supportsGlobalShortcut,
+  supportsWidenWindowForRightSidebar,
+} from "@/lib/nativeBridge";
 
 import type { SettingsAvailability } from "./catalog/types";
 
@@ -30,6 +35,7 @@ export function useSettingsAvailability(): SettingsAvailability {
   }, [globalShortcut, floatingComposerFlag]);
   const floatingComposerShortcut =
     globalShortcut && floatingComposerFlag && shellTakesPanelShortcut;
+  const widenWindowForRightSidebar = supportsWidenWindowForRightSidebar();
   const inAppBrowser = supportsBrowser();
   const adminView = useAdminViewSwitchShown();
   const accountsEnabled = loaded?.accounts_enabled === true;
@@ -44,6 +50,7 @@ export function useSettingsAvailability(): SettingsAvailability {
     () => ({
       globalShortcut,
       floatingComposerShortcut,
+      widenWindowForRightSidebar,
       inAppBrowser,
       adminView,
       accountsEnabled,
@@ -57,6 +64,7 @@ export function useSettingsAvailability(): SettingsAvailability {
     [
       globalShortcut,
       floatingComposerShortcut,
+      widenWindowForRightSidebar,
       inAppBrowser,
       adminView,
       accountsEnabled,
