@@ -38,13 +38,26 @@ function Shell() {
   return (
     <>
       <span aria-label="location">{location.pathname + location.search}</span>
-      <button type="button" onClick={() => navigate("/c/conv_9?o=1&gadget_start=board")}>
+      <button
+        type="button"
+        onClick={() => {
+          noteSessionCreatedHere("conv_9", "Build");
+          navigate("/c/conv_9?o=1&gadget_start=board");
+        }}
+      >
         Created, query kept
       </button>
       <button type="button" onClick={() => navigate("/c/temp:abc")}>
         Creating
       </button>
-      <button type="button" onClick={() => navigate("/c/conv_9")}>
+      <button
+        type="button"
+        onClick={() => {
+          // New session creates conv_9, then shows its page.
+          noteSessionCreatedHere("conv_9", "Build");
+          navigate("/c/conv_9");
+        }}
+      >
         Created
       </button>
       <button type="button" onClick={() => navigate("/tasks")}>
@@ -59,7 +72,6 @@ function Shell() {
 
 function renderShell(info: ServerInfo = GADGETS_INFO) {
   // New session creates conv_9 in these tests; conv_old is a session the viewer already had.
-  noteSessionCreatedHere("conv_9", "Build");
   render(
     <QueryClientProvider client={new QueryClient()}>
       <CapabilitiesProvider info={info}>
@@ -160,6 +172,40 @@ describe("a session started beside a gadget", () => {
     // A session created later from a plain New session isn't the gadget's either.
     fireEvent.click(screen.getByRole("button", { name: "Created" }));
     expect(adoptStartedGadgetSession).not.toHaveBeenCalled();
+  });
+
+  it("doesn't take a session this tab created before the gadget's New session opened", async () => {
+    vi.mocked(getGadget).mockResolvedValue(
+      gadgetFixture({ id: "board", published_revision: null }),
+    );
+    vi.mocked(getGadgetGadgetSession).mockResolvedValue(null);
+    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    noteSessionCreatedHere("conv_old", "Earlier work");
+    rememberUnbuiltGadget("board");
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Existing session" }));
+    expect(adoptStartedGadgetSession).not.toHaveBeenCalled();
+    await waitFor(() => expect(deleteGadget).toHaveBeenCalledWith("board"));
+  });
+
+  it("keeps and links the gadget when Build was sent and the viewer left before the session existed", async () => {
+    rememberUnbuiltGadget("board");
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Creating" }));
+    fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
+    await Promise.resolve();
+    expect(getGadget).not.toHaveBeenCalled();
+    expect(deleteGadget).not.toHaveBeenCalled();
+
+    // The create finishes while the viewer is on another page.
+    noteSessionCreatedHere("conv_9", "Build");
+    expect(adoptStartedGadgetSession).toHaveBeenCalledWith("board", "conv_9", "Build");
+    await waitFor(() =>
+      expect(useGadgetRailRequest.getState().requested).toMatchObject({
+        conversationId: "conv_9",
+        key: "gadget:board",
+      }),
+    );
   });
 
   it("deletes a gadget Build made when New session is left without sending it", async () => {
