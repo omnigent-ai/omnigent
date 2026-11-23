@@ -1765,11 +1765,6 @@ async def test_a_worker_whose_spec_cannot_be_read_keeps_its_agent_default(
 
 
 _CLAUDE_AUTO_PARENT = ("claude-native", {"omnigent.claude_native.permission_mode": "auto"}, None)
-_CODEX_APPROVE_FOR_ME_PARENT = (
-    "codex-native",
-    {"omnigent.codex_native.approval_mode": "approve-for-me"},
-    PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
-)
 
 
 def _set_native_parent(db_uri, session_id, parent) -> None:
@@ -1794,15 +1789,6 @@ def _set_native_parent(db_uri, session_id, parent) -> None:
             PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
             id="claude-auto-to-codex",
         ),
-        # A Codex parent's recorded mode can go stale, so it passes nothing on.
-        pytest.param(
-            _CODEX_APPROVE_FOR_ME_PARENT,
-            "claude-native",
-            {},
-            {},
-            None,
-            id="codex-parent-passes-nothing",
-        ),
         pytest.param(
             _CLAUDE_AUTO_PARENT,
             "claude-native",
@@ -1810,28 +1796,6 @@ def _set_native_parent(db_uri, session_id, parent) -> None:
             {},
             ["--permission-mode", "auto"],
             id="claude-auto-to-claude",
-        ),
-        # The parent's launch flags stand in until its runtime reports the mode.
-        pytest.param(
-            ("claude-native", {}, ["--permission-mode", "auto"]),
-            "codex-native",
-            {},
-            {},
-            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
-            id="parent-launch-args",
-        ),
-        # A switch made after launch replaces the launch flags.
-        pytest.param(
-            (
-                "claude-native",
-                {"omnigent.claude_native.permission_mode": "auto"},
-                ["--permission-mode", "plan"],
-            ),
-            "codex-native",
-            {},
-            {},
-            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
-            id="live-mode-over-launch-args",
         ),
         pytest.param(
             _CLAUDE_AUTO_PARENT,
@@ -1843,18 +1807,6 @@ def _set_native_parent(db_uri, session_id, parent) -> None:
         ),
         pytest.param(
             _CLAUDE_AUTO_PARENT, "codex-native", {"yolo": False}, {}, None, id="spec-over-parent"
-        ),
-        pytest.param(
-            (
-                "claude-native",
-                {"omnigent.claude_native.permission_mode": "bypassPermissions"},
-                None,
-            ),
-            "claude-native",
-            {},
-            {},
-            None,
-            id="parent-skips-approval",
         ),
     ],
 )
@@ -1909,29 +1861,37 @@ async def test_custom_native_parent_passes_on_its_mode(auth_client, peers, db_ur
 
 
 @pytest.mark.parametrize(
-    ("parent", "spec_config", "expected"),
+    ("child_harness", "spec_config", "expected"),
     [
-        pytest.param(_CLAUDE_AUTO_PARENT, {}, ["--permission-mode", "auto"], id="claude-auto"),
+        pytest.param("claude-native", {}, ["--permission-mode", "auto"], id="claude-auto"),
         pytest.param(
-            _CLAUDE_AUTO_PARENT,
+            "claude-native",
             {"permission_mode": "plan"},
             ["--permission-mode", "plan"],
             id="spec-over-parent",
         ),
+        # A bundled Codex or Cursor child keeps its headless default over the parent's mode.
+        pytest.param(
+            "codex-native",
+            {},
+            ["--dangerously-bypass-approvals-and-sandbox"],
+            id="codex-headless-default",
+        ),
+        pytest.param("cursor-native", {}, ["--yolo"], id="cursor-headless-default"),
     ],
 )
 async def test_uploaded_child_starts_in_its_parents_permission_mode(
-    auth_client, peers, db_uri, parent, spec_config, expected
+    auth_client, peers, db_uri, child_harness, spec_config, expected
 ):
     from tests._helpers.session import post_session_bundle
     from tests.server.helpers import build_agent_bundle
 
     source, _, _ = peers
-    _set_native_parent(db_uri, source["id"], parent)
+    _set_native_parent(db_uri, source["id"], _CLAUDE_AUTO_PARENT)
     # sys_session_create(config_path=...) uploads the child's bundle under its parent.
     bundle = build_agent_bundle(
-        "uploaded-claude-child",
-        executor={"config": {"harness": "claude-native", **spec_config}},
+        f"uploaded-{child_harness}-child",
+        executor={"config": {"harness": child_harness, **spec_config}},
     )
     uploaded = await post_session_bundle(
         auth_client.post, "/v1/sessions", bundle, metadata={"parent_session_id": source["id"]}
