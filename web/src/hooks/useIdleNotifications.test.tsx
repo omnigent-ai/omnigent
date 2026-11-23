@@ -59,6 +59,7 @@ import {
 } from "@/lib/browserNotifications";
 import { isNativeShell, onNativeNotificationActivated, setBadgeCount } from "@/lib/nativeBridge";
 import { fetchLastAssistantText } from "@/lib/lastAssistantText";
+import { clearSessionMuteState, setMutedProjects } from "@/lib/sessionMute";
 import {
   resetReadStateForTests,
   markConversationSeen,
@@ -161,6 +162,7 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.restoreAllMocks();
+  clearSessionMuteState();
 });
 
 describe("useIdleNotifications turn-end transitions", () => {
@@ -306,6 +308,42 @@ describe("useIdleNotifications turn-end transitions", () => {
     await settle();
     expect(showMock).toHaveBeenCalledOnce();
   });
+
+  it.each(["its cue settles", "its preview loads"] as const)(
+    "stays silent when the session's project is muted while %s",
+    async (phase) => {
+      let resolvePreview: (text: string) => void = () => {};
+      fetchPreviewMock.mockReturnValue(
+        new Promise<string>((resolve) => {
+          resolvePreview = resolve;
+        }),
+      );
+      const filed = (status: Conversation["status"]) => ({ ...conv("a", status), project_id: "p" });
+      setConversations([filed("running")]);
+      const { rerender } = renderHook(() => useIdleNotifications());
+      // Stable rows, as the real list serves them between polls.
+      const idle = [filed("idle")];
+      serverRowsOverride.rows = idle;
+      setConversations(idle);
+      rerender();
+
+      // Muting a project changes no row, so no poll lands before delivery.
+      const muteProject = () =>
+        act(() => setMutedProjects([{ id: "p", name: "Factory", muted: true }], null));
+      if (phase === "its cue settles") muteProject();
+      await settle();
+      if (phase === "its preview loads") {
+        expect(fetchPreviewMock).toHaveBeenCalledWith("a");
+        muteProject();
+      }
+      await act(async () => {
+        resolvePreview("Finished the worker task.");
+        await Promise.resolve();
+      });
+
+      expect(showMock).not.toHaveBeenCalled();
+    },
+  );
 
   it("cancels the deferred cue when the agent resumes (a step, not the end)", async () => {
     setConversations([conv("a", "running")]);

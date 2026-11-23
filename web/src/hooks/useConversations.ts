@@ -2468,7 +2468,8 @@ export function useSyncMutedProjects(): void {
   const { data } = useProjects();
   const viewerId = useViewerId();
   useEffect(() => {
-    if (data) setMutedProjects(data, viewerId);
+    // Mounted at the app root, so an unexpected reply must not throw.
+    if (Array.isArray(data)) setMutedProjects(data, viewerId);
   }, [data, viewerId]);
 }
 

@@ -5208,8 +5208,9 @@ export function ConversationMenuItems({
   const info = useServerInfo();
   useMutedProjects();
   const isMuted = isSessionMuted(conversation);
-  // Only the project's own menu can lift a mute that comes from the project.
-  const mutedByProject = !isMuted && isInMutedProject(conversation);
+  // Only the project's own menu can lift a mute that comes from the project, and
+  // while it applies the session's own toggle would change nothing visible.
+  const mutedByProject = isInMutedProject(conversation);
   const setMuted = useSetConversationMuted();
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);

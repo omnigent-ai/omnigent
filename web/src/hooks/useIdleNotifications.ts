@@ -61,7 +61,7 @@ import {
 } from "@/lib/idleTransitions";
 import { isConversationUnseen, useUnseenTick } from "@/hooks/useUnseenConversations";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
-import { isConversationMuted, useMutedProjects } from "@/lib/sessionMute";
+import { isConversationMuted, isInMutedProject, useMutedProjects } from "@/lib/sessionMute";
 
 const IDLE_BODY = "Agent finished and is ready for your input.";
 const ELICITATION_BODY = "Agent is asking for your input.";
@@ -363,8 +363,9 @@ export function useIdleNotifications(activeConversationId?: string): void {
             timers.delete(id);
             // Re-check suppression at fire time — the user may have opened the
             // session (or refocused the window), or muted it, during the settle window.
+            // A project mute changes no row, so it's read live rather than from a poll.
             if (windowFocusedRef.current && id === activeIdRef.current) return;
-            const mutedNow = () => mutedSessions.current.has(id);
+            const mutedNow = () => mutedSessions.current.has(id) || isInMutedProject(conversation);
             if (mutedNow()) return;
             // Mark it beeped so a later finish stays silent until the user has
             // viewed this session.

@@ -1,5 +1,5 @@
 import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "@/shell/sidebarNav";
-import { conversationPage } from "@/test/sidebarMockHelpers";
+import { conversationPage, setConversationMutedMock } from "@/test/sidebarMockHelpers";
 import { renderSidebar } from "@/test/sidebarTestHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -65,7 +65,7 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
-import { clearSessionMuteState, setMutedProjects } from "@/lib/sessionMute";
+import { clearSessionMuteState, MUTED_LABEL_KEY, setMutedProjects } from "@/lib/sessionMute";
 
 const useConversationsMock = vi.mocked(useConversations);
 
@@ -534,20 +534,30 @@ describe("project mute", () => {
     );
   });
 
-  it("points a member session's own Mute at the project that muted it", () => {
-    act(() => setMutedProjects([{ id: PROJECT_ID, name: PROJECT_NAME, muted: true }], null));
-    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify([PROJECT_NAME]));
-    renderSidebar({ info: MUTE_SERVER });
+  it.each([false, true])(
+    "points a member session's own Mute at the project that muted it, own mute=%s",
+    (ownMute) => {
+      if (ownMute) {
+        mockConversations([{ ...FILED_CONVERSATION, labels: { [MUTED_LABEL_KEY]: "1" } }]);
+      }
+      act(() => setMutedProjects([{ id: PROJECT_ID, name: PROJECT_NAME, muted: true }], null));
+      localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify([PROJECT_NAME]));
+      renderSidebar({ info: MUTE_SERVER });
 
-    const row = screen.getByRole("link", { name: /My Session/ }).closest("li") as HTMLElement;
-    expect(row.querySelector('[data-testid="conversation-muted-icon"]')).not.toBeNull();
-    fireEvent.pointerDown(row.querySelector('[data-testid="conversation-actions"]')!, {
-      button: 0,
-    });
-    expect(screen.getByRole("menuitem", { name: "Muted with project" })).toHaveAttribute(
-      "data-disabled",
-    );
-  });
+      const row = screen.getByRole("link", { name: /My Session/ }).closest("li") as HTMLElement;
+      expect(row.querySelector('[data-testid="conversation-muted-icon"]')).not.toBeNull();
+      fireEvent.pointerDown(row.querySelector('[data-testid="conversation-actions"]')!, {
+        button: 0,
+      });
+      // A session Unmute would leave the row muted, so the item says why instead.
+      const item = screen.getByRole("menuitem", { name: "Muted with project" });
+      expect(item).toHaveAttribute("data-disabled");
+      expect(screen.queryByRole("menuitem", { name: "Unmute" })).toBeNull();
+      // The session's own preference survives for when the project is unmuted.
+      fireEvent.click(item);
+      expect(setConversationMutedMock).not.toHaveBeenCalled();
+    },
+  );
 
   it("offers no project mute on a server that can't read it back", () => {
     renderSidebar({ info: { ...MUTE_SERVER, project_mute: false } });

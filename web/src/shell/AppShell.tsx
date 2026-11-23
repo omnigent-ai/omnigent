@@ -773,11 +773,12 @@ function AppShellImpl() {
   // Reuse sidebar rows; the active-session snapshot covers sessions outside its cache.
   const { data: conversationsData, isLoading: conversationsLoading } = useLoadedConversations();
   const optimisticConversationTitle = useOptimisticTitle(conversationId ?? "");
+  // Mirror muted projects into the store that notifications and rows read.
+  useSyncMutedProjects();
   // Surface sessions needing attention as OS notifications + a dock badge.
   // Mounted here (inside the Router) so it can navigate on click and knows
   // the active conversation id, which suppresses the notification/badge for
   // the session the user is actively viewing.
-  useSyncMutedProjects();
   useIdleNotifications(conversationId);
   // Seed the per-user read-state (unread/seen) mirror from the conversation
   // list, so the sidebar dots reflect what the user did on any device.
