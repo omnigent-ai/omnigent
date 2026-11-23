@@ -632,6 +632,27 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
         open: () => userEvent.click(screen.getByRole("combobox", { name: "Harness" })),
         witness: { option: "Claude SDK" },
       },
+      {
+        name: "a server's transport list",
+        origin: "custom-agent-create:serverTransport",
+        prepare: () => userEvent.click(screen.getByRole("button", { name: "Add server" })),
+        open: () =>
+          userEvent.click(screen.getByRole("combobox", { name: "Transport for server 1" })),
+        witness: { option: "http" },
+        states: { "custom-agent-create": ["has servers", "stdio server"] },
+      },
+    ],
+    inlineActions: [
+      {
+        name: "an HTTP server",
+        open: async () => {
+          await userEvent.click(screen.getByRole("combobox", { name: "Transport for server 1" }));
+          await userEvent.click(await screen.findByRole("option", { name: "http" }));
+        },
+        witness: { label: "URL for server 1" },
+        states: { "custom-agent-create": ["has servers", "http server"] },
+        close: () => userEvent.click(screen.getByRole("button", { name: "Remove server 1" })),
+      },
     ],
   },
   {

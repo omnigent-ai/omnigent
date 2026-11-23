@@ -142,7 +142,9 @@ def test_each_mcp_servers_fields_are_named_after_their_own_server(
             api.delete(f"/v1/agents/{installed_id}")
 
 
-def test_on_the_create_page_a_link_reaches_its_field(page: Page, live_server: str) -> None:
+def test_on_the_create_page_a_link_reaches_its_field_and_servers_are_named_by_their_name(
+    page: Page, live_server: str
+) -> None:
     page.goto(f"{live_server}/settings/custom-agents/new")
     row = page.locator('[data-settings-item="custom-agent-create"]')
     instructions = row.get_by_role("textbox", name="System instructions", exact=True)
@@ -153,7 +155,11 @@ def test_on_the_create_page_a_link_reaches_its_field(page: Page, live_server: st
     expect(instructions).to_be_focused(timeout=10_000)
 
     row.get_by_role("button", name="Add server").click()
-    server_name = row.get_by_role("textbox", name="Server name", exact=True)
-    expect(row.get_by_role("textbox", name="Command", exact=True)).to_be_visible()
-    row.get_by_role("button", name="Remove server").click()
+    server_name = row.get_by_role("textbox", name="Name for server 1", exact=True)
+    expect(row.get_by_role("textbox", name="Command for server 1", exact=True)).to_be_visible()
+    server_name.fill("docs")
+    # The name field keeps its own label; the server's other fields follow its name.
+    expect(server_name).to_have_value("docs")
+    expect(row.get_by_role("textbox", name="Command for docs", exact=True)).to_be_visible()
+    row.get_by_role("button", name="Remove docs").click()
     expect(server_name).to_have_count(0)
