@@ -134,6 +134,7 @@ from omnigent.server.preference_requests import DEFAULT_PREFERENCE_POLICY, Prefe
 from omnigent.server.proactive_agent import PROACTIVE_AGENT_NAME, ProactiveProvisioner
 from omnigent.server.routes._host_launch import routed_slice_key
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
+from omnigent.server.routes.chrome_browser_attach import create_chrome_browser_attach_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.dictation import create_dictation_router
@@ -4478,6 +4479,16 @@ def create_app(
         prefix="/v1",
         tags=["terminals"],
     )
+    if resolved_feature_flags.enabled(Feature.CHROME_BROWSER):
+        app.include_router(
+            create_chrome_browser_attach_router(
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+                conversation_store=conversation_store,
+            ),
+            prefix="/v1",
+            tags=["chrome-browser"],
+        )
     app.include_router(
         create_session_mcp_servers_router(
             conversation_store,

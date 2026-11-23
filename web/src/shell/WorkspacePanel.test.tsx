@@ -96,6 +96,19 @@ vi.mock("./ContentSearchPanel", () => ({
     return <input data-testid="content-search-stub" ref={inputRef} />;
   },
 }));
+vi.mock("@/components/ChromeBrowserPane/ChromeBrowserPane", () => ({
+  ChromeBrowserPane: ({
+    conversationId,
+    readOnly,
+  }: {
+    conversationId: string;
+    readOnly: boolean;
+  }) => (
+    <div data-testid="chrome-browser-pane-stub" data-read-only={String(readOnly)}>
+      {conversationId}
+    </div>
+  ),
+}));
 vi.mock("@/components/BrowserPane/BrowserPane", () => ({
   BrowserPane: ({
     conversationId,
@@ -243,6 +256,7 @@ function renderWorkspace(
     showContentSearch?: boolean;
     showFilesPanel?: boolean;
     showBrowserTab?: boolean;
+    showChromeBrowser?: boolean;
     openTerminals?: string[];
     selectedTerminalKey?: string | null;
     maximized?: boolean;
@@ -301,6 +315,7 @@ function renderWorkspace(
         showContentSearch={overrides.showContentSearch}
         showGithubTab={overrides.showGithubTab ?? false}
         showBrowserTab={overrides.showBrowserTab ?? false}
+        showChromeBrowser={overrides.showChromeBrowser}
         onReveal={onReveal}
         onHide={overrides.withHide === false ? undefined : onHide}
         changedCount={overrides.changedCount ?? 0}
@@ -1083,6 +1098,48 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     // No declared terminals (default mock: data undefined) → nothing to open.
     renderWorkspace({ showBrowserTab: false });
     expect(screen.queryByRole("button", { name: "Open new" })).toBeNull();
+  });
+
+  it("leaves the Chrome browser out of the menu where the server doesn't offer it", async () => {
+    declaresShell();
+    renderWorkspace({});
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    await screen.findByRole("menuitem", { name: /shell \(zsh\)/i });
+
+    expect(screen.queryByRole("menuitem", { name: "Chrome browser" })).toBeNull();
+  });
+
+  it("opens the Chrome browser as a tab from the menu", async () => {
+    const { onRightRailTabChange } = renderWorkspace({ showChromeBrowser: true });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Chrome browser" }));
+
+    expect(onRightRailTabChange).toHaveBeenCalledWith("chrome-browser");
+    expect(await screen.findByRole("tab", { name: "Chrome browser" })).toBeInTheDocument();
+  });
+
+  it("shows the Chrome browser read-only to non-owners, and closes its tab", async () => {
+    writeSessionWorkspaceState("conv_ws", { chromeBrowserOpen: true });
+    const { onRightRailTabChange } = renderWorkspace({
+      showChromeBrowser: true,
+      rightRailTab: "chrome-browser",
+      permissionLevel: 1,
+    });
+
+    expect(screen.getByTestId("chrome-browser-pane-stub")).toHaveAttribute(
+      "data-read-only",
+      "true",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Close Chrome browser" }));
+
+    await waitFor(() =>
+      expect(screen.queryByRole("tab", { name: "Chrome browser" })).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("chrome-browser-pane-stub")).toBeNull();
+    expect(onRightRailTabChange).toHaveBeenCalledWith("files");
   });
 
   it("shows the Shell shortcut, and no Browser chord without the desktop menu's ⌘T", async () => {

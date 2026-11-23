@@ -70,6 +70,24 @@ describe("resolveWorkspaceActiveView", () => {
       "files",
     ],
     ["the browser mode with no browser selected", { rightRailTab: "browser" }, {}, "files"],
+    [
+      "the Chrome browser",
+      { rightRailTab: "chrome-browser", chromeBrowserOpen: true },
+      { showChromeBrowser: true },
+      "chrome-browser",
+    ],
+    [
+      "the Chrome browser where the server doesn't offer it",
+      { rightRailTab: "chrome-browser", chromeBrowserOpen: true },
+      {},
+      "files",
+    ],
+    [
+      "the Chrome browser mode with its tab closed",
+      { rightRailTab: "chrome-browser" },
+      { showChromeBrowser: true },
+      "files",
+    ],
     ["a side chat", { rightRailTab: "sidechat", selectedSideChatId: "c1" }, {}, "sidechat"],
     [
       "a side chat on a phone, which shows it in a drawer",

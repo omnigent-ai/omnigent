@@ -65,6 +65,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "workspace_api_server_access": False,
         "floating_composer": False,
         "sidebar_saved_views": False,
+        "chrome_browser": False,
     }
 
 

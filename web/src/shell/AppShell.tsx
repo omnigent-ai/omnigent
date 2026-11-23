@@ -1233,6 +1233,7 @@ function AppShellImpl() {
         // WebContentsView. Plain web and older desktop builds hide the "+"
         // option entirely so they never surface a dead tab whose calls no-op.
         browser: supportsBrowser(),
+        "chrome-browser": isFeatureEnabled(serverInfo, "chrome_browser"),
         // Agents tab is unconditional: the panel always lists at least
         // the main agent (its "main" row), so there's never a dead end.
         subagents: true,
@@ -1704,6 +1705,7 @@ function AppShellImpl() {
       if (tab === null) return fallbackTab;
       if (tab === "sidechat") return tab;
       if (tab === "content-search" && serverInfo === "loading") return tab;
+      if (tab === "chrome-browser" && serverInfo === "loading") return tab;
       if (railTabsAvailable[tab]) return tab;
       return fallbackTab;
     });
@@ -3620,6 +3622,7 @@ function AppShellImpl() {
                     showTasksTab={railTabsAvailable.tasks}
                     showContentSearch={railTabsAvailable["content-search"]}
                     showBrowserTab={railTabsAvailable.browser}
+                    showChromeBrowser={railTabsAvailable["chrome-browser"]}
                     onReveal={revealRightPanel}
                     onHide={rightPanelOpen ? toggleRightPanel : undefined}
                     changedCount={changedCount}

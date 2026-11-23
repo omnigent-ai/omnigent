@@ -112,6 +112,7 @@ from omnigent.runner.background_titles import (
 )
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.background_work_reports import BackgroundWorkReporter
+from omnigent.runner.chrome_browser import register_chrome_browser_routes
 from omnigent.runner.codex.goal import CodexGoalRunner
 from omnigent.runner.journal_tools import (
     answer_arrives_as_message,
@@ -9215,6 +9216,7 @@ def create_runner_app(
         server_client=server_client,
         terminal_registry=terminal_registry,
     )
+    register_chrome_browser_routes(app)
     _ensure_native_terminal_for_turn = _resource_routes.ensure_native_terminal_for_turn
     _require_os_env = _resource_routes.require_os_env
     _resolve_conversation_id = _resource_routes.resolve_conversation_id
