@@ -5816,6 +5816,7 @@ def create_runner_app(
         only_if_work_id: str | None = None,
         confirmed_completion: bool = False,
         confirmed_cancellation: bool = False,
+        assumed: bool = False,
     ) -> _SubagentDeliveryAck:
         ack = mark_subagent_work_terminal(
             child_session_id,
@@ -5824,6 +5825,7 @@ def create_runner_app(
             only_if_work_id=only_if_work_id,
             confirmed_completion=confirmed_completion,
             confirmed_cancellation=confirmed_cancellation,
+            assumed=assumed,
         )
         if ack.entry is not None and ack.delivered_now:
             _schedule_subagent_wake(ack.entry)
@@ -8321,7 +8323,6 @@ def create_runner_app(
                             "detail": "Message already queued or running.",
                         },
                     )
-                note_subagent_child_messaged(conversation_id)
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
                     message_body["content"] = await _resolve_forwarded_message_content(
@@ -8329,6 +8330,7 @@ def create_runner_app(
                         session_id=conversation_id,
                         server_client=server_client,
                     )
+                note_subagent_child_messaged(conversation_id)
 
                 if conversation_id in _active_turns:
                     _native = _is_native_harness(conversation_id)
