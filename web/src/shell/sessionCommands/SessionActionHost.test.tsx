@@ -83,13 +83,13 @@ function Location() {
   return <output data-testid="location">{useLocation().pathname}</output>;
 }
 
-/** On the open session's page; `remountHost` mounts the host again in the same app. */
 /** Publishes the open session as the app shell does; its root comes from `ui.viewing`. */
 function OpenSessionShell() {
   usePublishOpenSession(ui.viewing);
   return null;
 }
 
+/** On the open session's page; `remountHost` mounts the host again in the same app. */
 function renderHost(queryClient = new QueryClient()) {
   const app = (hostMounted: boolean) => (
     <QueryClientProvider client={queryClient}>
@@ -318,10 +318,20 @@ describe("SessionActionHost", () => {
       expect(writes.pin).not.toHaveBeenCalled();
     });
 
-    it("does nothing once a listed session has left every list", () => {
-      renderHost(cachedSessions());
-      act(() => requestSessionAction(SESSION, "pin", { listed: true }));
-      expect(writes.pin).not.toHaveBeenCalled();
+    it("does nothing once a listed session has left every list, even after it returns", () => {
+      const other: Conversation = { ...SESSION, id: "c2" };
+      const queryClient = cachedSessions();
+      const { remountHost } = renderHost(queryClient);
+      act(() => requestSessionAction(other, "mark-unread", { listed: true }));
+      expect(readMarks.unread).not.toHaveBeenCalled();
+
+      // A refetch lists it again before the host mounts once more.
+      queryClient.setQueryData(["conversations", "sidebar"], {
+        pages: [{ data: [other] }],
+        pageParams: [undefined],
+      });
+      remountHost();
+      expect(readMarks.unread).not.toHaveBeenCalled();
     });
 
     it("checks the current owner, not the one the row showed", () => {

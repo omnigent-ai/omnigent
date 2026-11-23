@@ -41,9 +41,12 @@ export function SessionActionHost() {
 /** Looks the session up as the action starts; one gone since does nothing. */
 function SessionActionResolver({ request }: { request: SessionActionRequest }) {
   const queryClient = useQueryClient();
-  const [conversation] = useState(() =>
-    currentSessionRow(queryClient, request.conversation, request.listed),
-  );
+  const [conversation] = useState(() => {
+    const row = currentSessionRow(queryClient, request.conversation, request.listed);
+    // A request for a session gone by now is spent, so it can't run if the session returns.
+    if (!row) startSessionAction(request.key);
+    return row;
+  });
   return conversation ? (
     <SessionActionRunner conversation={conversation} request={request} />
   ) : null;
