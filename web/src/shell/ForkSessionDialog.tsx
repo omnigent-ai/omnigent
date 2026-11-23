@@ -62,6 +62,7 @@ import {
   noReachableModelsMessage,
   useNewSandboxModelCatalog,
 } from "@/hooks/useNewSandboxModelCatalog";
+import { markSandboxLaunch } from "@/hooks/useSandboxLaunchSelectionCheck";
 import { getCurrentUserId } from "@/lib/identity";
 import {
   nativeAgentHasCapability,
@@ -304,6 +305,8 @@ export interface ForkRunConfigValue {
  *   leaves it on Default until a host is chosen.
  * @param modelCatalog - Models to offer instead of the host's, e.g. a new
  *   sandbox's, and why none are listed; omitted to list the selected host's.
+ * @param modelCatalogKey - Where the model list comes from; when it changes,
+ *   the model and effort picks start over.
  * @param remembered - Settings to start on in place of the source's, e.g. the
  *   last ones used for a new session. With it, every shown control reports its
  *   value, changed or not: a new session has no source to inherit from.
@@ -317,6 +320,7 @@ export function ForkRunConfig({
   sameAgentAsSource,
   selectedHostId,
   modelCatalog,
+  modelCatalogKey,
   remembered,
   onChange,
 }: {
@@ -327,6 +331,7 @@ export function ForkRunConfig({
   sameAgentAsSource: boolean;
   selectedHostId: string | null;
   modelCatalog?: { options: NativeModelOption[]; loading: boolean; emptyReason?: string | null };
+  modelCatalogKey?: string;
   remembered?: ForkRunConfigValue;
   onChange: (value: ForkRunConfigValue) => void;
 }) {
@@ -509,6 +514,15 @@ export function ForkRunConfig({
     setTouched((t) => ({ ...t, mode: true }));
     setMode(v);
   };
+
+  // A model picked from another destination's list, and the effort that goes
+  // with it, starts over rather than naming a model this list may lack.
+  const catalogKeyRef = useRef(modelCatalogKey);
+  useEffect(() => {
+    if (catalogKeyRef.current === modelCatalogKey) return;
+    catalogKeyRef.current = modelCatalogKey;
+    setTouched((t) => ({ ...t, model: false, effort: false }));
+  }, [modelCatalogKey]);
 
   // Re-seed whenever the seeding basis changes (agent switch, source load), but
   // never clobber a control the user already touched — a catalog refetch that
@@ -1350,11 +1364,8 @@ function SupportedForkSessionForm({
   // picked yet) and whether it clones several repos.
   const forkEffectiveProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
-  // A sandbox the fork will create has no host to list models, so offer its
-  // provider's catalog, as the new-session picker does. A fork keeps the
-  // source's saved inference settings, which the server checks the model
-  // against, and doesn't take on a destination's bound profile, so only an
-  // unbound catalog offered to a source without saved settings applies.
+  // A new sandbox has no host to list models, so offer its provider's catalog as
+  // New Chat does. Forks keep saved inference settings and skip bound profiles.
   const sourceInferenceConfigured = sourceSession?.inferenceConfigured === true;
   const destinationBindsInference =
     info !== "loading" &&
@@ -1407,8 +1418,7 @@ function SupportedForkSessionForm({
     newSandbox.defaultCatalogError,
     sandboxUnsupportedReason,
   ]);
-  // Each destination lists its own models, so the run settings start over when
-  // it changes rather than keep a pick the new list may not offer.
+  // Each destination lists its own models.
   const modelCatalogSource = sandboxSelected
     ? `sandbox:${forkEffectiveProvider ?? ""}`
     : (selectedHostId ?? "");
@@ -1718,6 +1728,22 @@ function SupportedForkSessionForm({
             }
           : undefined,
       });
+      // As after New Chat, the fork's page resets a pick the live sandbox lacks.
+      if (sandboxSelected) {
+        const model =
+          runConfig.modelOverride && runConfig.modelOverride !== "default"
+            ? runConfig.modelOverride
+            : null;
+        const pickedRow = sandboxModelCatalog?.options.find((row) => row.id === model);
+        markSandboxLaunch(fork.id, {
+          model,
+          effort:
+            runConfig.reasoningEffort && runConfig.reasoningEffort !== "default"
+              ? runConfig.reasoningEffort
+              : null,
+          modelLabel: pickedRow ? nativeModelLabel(pickedRow) : null,
+        });
+      }
       // Coding fork: launch the runner in the BACKGROUND, then navigate
       // into the (already-created, unbound) clone immediately — awaiting the
       // launch would block the modal for a worktree create (up to minutes)
@@ -2082,14 +2108,13 @@ function SupportedForkSessionForm({
         {/* Run config (native targets only): model / effort / permission mode.
               Seeds from the source on a same-harness fork, else from the target
               harness's defaults. Renders nothing for a non-native target.
-              The key remounts on any agent or destination switch so the pickers'
+              key=agentChoice remounts on any agent switch so the pickers'
               touched-state and values reset and re-seed from scratch — otherwise
-              a model picked for one harness or destination would leak onto the
-              next, defeating the backend's cross-family reset or naming a model
-              the new destination doesn't offer. */}
+              a model picked for one harness would leak onto the next and defeat
+              the backend's cross-family reset. */}
         {targetAgent !== null && (
           <ForkRunConfig
-            key={`${agentChoice}:${modelCatalogSource}`}
+            key={agentChoice}
             targetHarness={targetHarness}
             targetAgent={targetAgent}
             sourceSession={sourceSession}
@@ -2097,6 +2122,7 @@ function SupportedForkSessionForm({
             sameAgentAsSource={sameAgentAsSource}
             selectedHostId={isCodingSource ? selectedHostId : (sourceHostId ?? null)}
             modelCatalog={sandboxModelCatalog}
+            modelCatalogKey={modelCatalogSource}
             onChange={setRunConfig}
           />
         )}

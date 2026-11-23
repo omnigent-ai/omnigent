@@ -40,6 +40,8 @@ import {
   hostDirectoryMissing,
   useHostFilesystem,
 } from "@/hooks/useHostFilesystem";
+import { markSandboxLaunch } from "@/hooks/useSandboxLaunchSelectionCheck";
+import type * as SandboxLaunchModule from "@/hooks/useSandboxLaunchSelectionCheck";
 import { toast } from "sonner";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
@@ -78,6 +80,11 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   checkHostDirectory: vi.fn(),
   hostDirectoryMissing: vi.fn(),
 }));
+// The chat page consumes the registration; these tests check what a fork registers.
+vi.mock("@/hooks/useSandboxLaunchSelectionCheck", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxLaunchModule>()),
+  markSandboxLaunch: vi.fn(),
+}));
 // The tree browser only mounts when browsing; coding-fork tests rely on the
 // directory being prefilled from the source, so the real picker never opens —
 // stub it anyway to keep its filesystem fetch out of the test. Its "Select"
@@ -113,6 +120,7 @@ const checkHostDirectoryMock = vi.mocked(checkHostDirectory);
 const hostDirectoryMissingMock = vi.mocked(hostDirectoryMissing);
 const prefetchAvailableAgentDetailsMock = vi.mocked(prefetchAvailableAgentDetails);
 const toastMock = vi.mocked(toast);
+const markSandboxLaunchMock = vi.mocked(markSandboxLaunch);
 
 function host(overrides: Partial<Host> = {}): Host {
   return {
@@ -3175,6 +3183,7 @@ describe("ForkSessionDialog", () => {
           });
         });
         vi.stubGlobal("fetch", fetchMock);
+        markSandboxLaunchMock.mockReset();
         useSessionAgentMock.mockReturnValue({
           data: { id: "ag_claude_native", name: "claude-native-ui", harness: "claude-native" },
         } as unknown as ReturnType<typeof useSessionAgent>);
@@ -3214,6 +3223,12 @@ describe("ForkSessionDialog", () => {
           `/v1/sandbox-providers/modal/harnesses/${harness}/model-options?agent_id=${agentId}`,
           expect.anything(),
         );
+        // The fork's page resets this pick if the live sandbox doesn't offer it.
+        expect(markSandboxLaunchMock).toHaveBeenCalledExactlyOnceWith("conv_fork", {
+          model: `gateway/${harness}`,
+          effort: null,
+          modelLabel: `Gateway ${harness}`,
+        });
       });
 
       it("lists the sandbox's models in place of a previously picked host's", async () => {
@@ -3261,7 +3276,7 @@ describe("ForkSessionDialog", () => {
         );
       });
 
-      it("drops a host's model pick when the fork moves to a sandbox", async () => {
+      it("drops a host's model pick, but not its permission pick, when the fork moves to a sandbox", async () => {
         useHostModelOptionsMock.mockReturnValue({
           data: [{ id: "host-model", displayName: "Host model" }],
           isLoading: false,
@@ -3271,12 +3286,17 @@ describe("ForkSessionDialog", () => {
 
         openModelSelect();
         fireEvent.click(screen.getByRole("option", { name: "Host model" }));
+        fireEvent.click(screen.getByTestId("fork-session-config-permission"));
+        fireEvent.click(screen.getByRole("option", { name: "Plan" }));
         selectSandbox();
         expect(screen.getByTestId("fork-session-config-model")).toHaveTextContent("Default");
+        expect(screen.getByTestId("fork-session-config-permission")).toHaveTextContent("Plan");
         fireEvent.click(screen.getByTestId("fork-session-submit"));
 
         await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
-        expect(forkSessionMock.mock.calls[0]![1]?.config).toEqual({});
+        expect(forkSessionMock.mock.calls[0]![1]?.config).toEqual({
+          terminalLaunchArgs: ["--permission-mode", "plan"],
+        });
       });
 
       function previewReturns(status: string, error: string): void {

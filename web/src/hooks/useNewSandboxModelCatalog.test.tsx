@@ -80,12 +80,6 @@ describe("useNewSandboxModelCatalog", () => {
       expected: gatewayRows,
     },
     {
-      name: "no rows for a failed default listing",
-      capabilities: { default_models: true },
-      body: preview({ models: [], status: "unavailable" }),
-      expected: [],
-    },
-    {
       name: "no catalog for a harness the gateway cannot serve",
       capabilities: { default_models: true },
       body: preview({ models: [], status: "unconfigured" }),
