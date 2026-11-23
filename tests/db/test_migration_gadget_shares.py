@@ -1,7 +1,7 @@
 """The ``gadget_shares`` table migration (e4c7a91b2d3f) and the model it must match.
 
 Checks both schema paths (the migration and the ORM metadata) for the table's
-columns, primary key, user index and SQLite-family checks, that it has no
+columns, primary key, indexes and SQLite-family checks, that it has no
 database-level foreign key (schema Rule R032), and that its downgrade drops it.
 """
 
@@ -9,13 +9,19 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from importlib import import_module
+from io import StringIO
 from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.schema import CreateIndex
 
 from omnigent.db.db_models import SqlGadgetShare
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache, get_or_create_engine
@@ -23,6 +29,7 @@ from omnigent.db.utils import _build_alembic_config, clear_engine_cache, get_or_
 _PREVIOUS = "bf30d7cbda61"
 _REVISION = "e4c7a91b2d3f"
 _TABLE = "gadget_shares"
+_LOWER_INDEX = "ix_gadget_shares_gadget_user_lower"
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -55,7 +62,7 @@ def db_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[Engine
 
 
 def _share(shares: sa.Table, **values: object) -> sa.Insert:
-    row = {"workspace_id": 1, "gadget_id": b"a" * 16, "user_id": "alice", "level": 1}
+    row = {"workspace_id": 1, "gadget_id": "board-1", "user_id": "alice", "level": 1}
     return shares.insert().values(**{**row, **values})
 
 
@@ -69,6 +76,8 @@ def test_columns_primary_key_and_index(db_engine: Engine) -> None:
     assert all(column["nullable"] is False for column in columns.values())
     assert all(column["default"] is None for column in columns.values())
     assert columns["user_id"]["type"].length == 128
+    # The gadget store's own ID, which need not be a UUID.
+    assert columns["gadget_id"]["type"].length == 64
     if db_engine.dialect.name == "cockroachdb":
         # CockroachDB reflects INT2 as INTEGER and drops the width, so read the stored type.
         with db_engine.connect() as conn:
@@ -117,6 +126,22 @@ def test_rows_are_unique_per_grantee_and_bounded(db_engine: Engine) -> None:
         conn.execute(_share(shares, user_id="😀" * 128))
 
 
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_gadget_ids_are_the_stores_own_and_bounded(db_engine: Engine) -> None:
+    """A UUID-hex, decimal or slug gadget ID is stored as given; a 65th character is
+    refused, by the column width or, on SQLite and D1, by the byte check."""
+    shares = sa.Table(_TABLE, sa.MetaData(), autoload_with=db_engine)
+    ids = ["0123456789abcdef0123456789abcdef", "102717306144392", "b" * 64]
+    with db_engine.begin() as conn:
+        for gadget_id in ids:
+            conn.execute(_share(shares, gadget_id=gadget_id))
+    with db_engine.connect() as conn:
+        stored = conn.execute(sa.select(shares.c.gadget_id)).scalars().all()
+    assert sorted(stored) == sorted(ids)
+    with pytest.raises(DBAPIError), db_engine.begin() as conn:
+        conn.execute(_share(shares, gadget_id="c" * 65))
+
+
 @pytest.mark.parametrize("column", ["workspace_id", "level"])
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_non_integer_codes_are_refused(db_engine: Engine, column: str) -> None:
@@ -144,3 +169,34 @@ def test_downgrade_drops_the_table_and_upgrade_restores_it(tmp_path: Path) -> No
 
     engine.dispose()
     clear_engine_cache()
+
+
+# MySQL needs an expression key part in its own parentheses; the trailing user_id
+# completes the primary key, which lower(user_id) alone does not.
+_LOWER_INDEX_DDL = {
+    "sqlite": "(workspace_id, gadget_id, lower(user_id), user_id)",
+    "postgresql": "(workspace_id, gadget_id, lower(user_id), user_id)",
+    "mysql": "(workspace_id, gadget_id, (lower(user_id)), user_id)",
+}
+_DIALECTS = {"sqlite": sqlite.dialect, "postgresql": postgresql.dialect, "mysql": mysql.dialect}
+
+
+@pytest.mark.parametrize("dialect_name", sorted(_LOWER_INDEX_DDL))
+def test_case_insensitive_index_ddl_on_each_backend(dialect_name: str) -> None:
+    """The migration and the model emit the same, valid lower(user_id) index on every backend."""
+    dialect = _DIALECTS[dialect_name]()
+    expected = f"CREATE INDEX {_LOWER_INDEX} ON {_TABLE} {_LOWER_INDEX_DDL[dialect_name]}"
+
+    (index,) = [i for i in SqlGadgetShare.__table__.indexes if i.name == _LOWER_INDEX]
+    assert str(CreateIndex(index).compile(dialect=dialect)).strip() == expected
+
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect=dialect, opts={"as_sql": True, "output_buffer": output}
+    )
+    migration = import_module(
+        "omnigent.db.migrations.versions.e4c7a91b2d3f_add_gadget_shares_table"
+    )
+    with Operations.context(context):
+        migration.upgrade()
+    assert expected in output.getvalue()
