@@ -238,6 +238,11 @@ export function supportsNativeShellInput(harness: string | null | undefined): bo
   return harness === "claude-native" || harness === "codex-native";
 }
 
+/** Whether *harness* is a native Claude Code spelling (tmux-backed `claude` CLI). */
+export function isNativeClaudeHarness(harness: string): boolean {
+  return harness === "claude-native" || harness === "native-claude";
+}
+
 export function isNativeCursorHarness(harness: string): boolean {
   return harness === "cursor-native" || harness === "native-cursor";
 }

@@ -7230,6 +7230,18 @@ describe("NewChatLandingScreen", () => {
         "then check again. If Omnigent still can't find it, quit and reopen the Omnigent app.",
     },
     {
+      id: "a_claude",
+      name: "claude-native-ui",
+      displayName: "Claude",
+      harness: "claude-native",
+      readiness: "needs-auth",
+      badgeName: "needs auth",
+      warning:
+        "Claude: Claude Code isn't signed in on machine-1 — run claude auth login on that machine, " +
+        "or if Claude starts through a launcher (OMNIGENT_CLAUDE_PATH), run <launcher> auth status " +
+        "there to see why it fails.",
+    },
+    {
       id: "a_polly",
       name: "polly",
       displayName: "Polly",
