@@ -72,13 +72,19 @@ export function QuickPickShortcutHost() {
         .find((command) => command !== undefined);
     };
     const handler = (event: globalThis.KeyboardEvent): void => {
-      if (event.defaultPrevented || event.repeat || event.isComposing) return;
+      if (event.defaultPrevented || event.isComposing) return;
       const shortcut = HOSTED_SHORTCUT_IDS.find((id) => matchesShortcut(event, id));
       if (!shortcut) return;
       const embedRoot = getEmbedRoot();
       if (isEmbedded && (!embedRoot || !event.composedPath().includes(embedRoot))) return;
       const focused = document.activeElement;
       if (focused instanceof Element && focused.closest(KEY_OWNING_SURFACES)) return;
+      // A held chord runs once, but keeps its repeats from listeners that read it too.
+      if (event.repeat) {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
       const command = commandFor(shortcut);
       if (!command || !isCommandAvailable(command.availability)) return;
       event.preventDefault();

@@ -108,6 +108,19 @@ describe("QuickPickShortcutHost", () => {
     expect(pageListener).not.toHaveBeenCalled();
   });
 
+  it("keeps a held chord's repeats from that listener, stepping only once", () => {
+    shell.mac = false;
+    render(<QuickPickShortcutHost />);
+    const pageListener = vi.fn();
+    window.addEventListener("keydown", pageListener);
+    press(NEXT);
+    press({ ...NEXT, repeat: true });
+    press({ ...NEXT, repeat: true });
+    window.removeEventListener("keydown", pageListener);
+    expect(navigate.mock.calls).toEqual([["/c/c"]]);
+    expect(pageListener).not.toHaveBeenCalled();
+  });
+
   it("stops listening once unmounted", () => {
     const { unmount } = render(<QuickPickShortcutHost />);
     unmount();
