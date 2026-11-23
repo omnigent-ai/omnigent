@@ -71,13 +71,11 @@ import {
 import { type OpenSessionCommandId, useOpenSessionPaletteCommands } from "./openSessionCommands";
 import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
+import { useAddSiblingSessionHotkey } from "@/hooks/useAddSiblingSessionHotkey";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useDesktopCommand } from "@/lib/desktopCommands";
 import { supportsDesktopCommands } from "@/lib/nativeBridge";
-import { useIsEmbedded } from "@/lib/embedded";
-import { getEmbedRoot } from "@/lib/host";
-import { hasCommandModifier, isFocusInDialogOrMenu } from "@/lib/hotkeys";
 import { useNavigate } from "@/lib/routing";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { navigateAfterArchiving, newSessionPathFor } from "./sessionCommands/archiveNavigation";
@@ -133,7 +131,6 @@ export function HeaderConversationMenu({
   const info = useServerInfo();
   const queryClient = useQueryClient();
   const isMobile = useIsMobileViewport();
-  const isEmbedded = useIsEmbedded();
   const { trackClick } = useOmnigentAnalytics();
   const togglePinned = useTogglePinnedConversation();
   // Pin writes don't overlap, so Pin/Unpin is disabled while one is saving.
@@ -187,32 +184,7 @@ export function HeaderConversationMenu({
     setAutomationOpen(false);
   }, [conversation.id]);
 
-  useEffect(() => {
-    if (!canAddAgent) return;
-    const handleAddAgent = (event: globalThis.KeyboardEvent) => {
-      if (
-        event.defaultPrevented ||
-        event.repeat ||
-        event.isComposing ||
-        !hasCommandModifier(event) ||
-        !event.altKey ||
-        event.shiftKey ||
-        event.getModifierState("AltGraph") ||
-        event.code !== "KeyA"
-      ) {
-        return;
-      }
-      const embedRoot = getEmbedRoot();
-      if (isEmbedded && (!embedRoot || !event.composedPath().includes(embedRoot))) return;
-      if (isFocusInDialogOrMenu() || document.activeElement?.closest(".xterm, .monaco-editor"))
-        return;
-      event.preventDefault();
-      event.stopPropagation();
-      navigate(addAgentPath);
-    };
-    window.addEventListener("keydown", handleAddAgent);
-    return () => window.removeEventListener("keydown", handleAddAgent);
-  }, [addAgentPath, canAddAgent, isEmbedded, navigate]);
+  useAddSiblingSessionHotkey(() => navigate(addAgentPath), !!canAddAgent);
 
   const closeMenu = () => {
     setMenuOpen(false);
