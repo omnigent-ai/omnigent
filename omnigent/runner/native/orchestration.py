@@ -89,7 +89,11 @@ from omnigent.native.native_dispatch import resolve_hook
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.identity import runner_mcp_disabled_servers_active_harnesses
-from omnigent.runner.memory_guidance import claude_memory_import_note, memory_startup_guidance
+from omnigent.runner.memory_guidance import (
+    claude_memory_import_note,
+    codex_memory_import_note,
+    memory_startup_guidance,
+)
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -5947,8 +5951,17 @@ async def _auto_create_codex_terminal(
         from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
 
         _codex_routing_note = smart_routing_spawn_note("codex-native")
+    # Decided before the instructions are composed, since the offer goes into them.
+    _codex_memory_overrides, _codex_memory_import = await _codex_own_memory_launch(
+        agent_spec, server_client
+    )
     _codex_developer_instructions = await _native_startup_instructions(
-        agent_spec, server_client, session_id, _codex_routing_note, workspace=workspace
+        agent_spec,
+        server_client,
+        session_id,
+        _codex_routing_note,
+        _codex_memory_import,
+        workspace=workspace,
     )
     # SDK initialization can block on DNS/auth before model discovery times out.
     # Keep it off the runner loop so heartbeats and other sessions can progress.
@@ -5961,7 +5974,11 @@ async def _auto_create_codex_terminal(
         cwd=Path(workspace),
         model=_codex_launch.model,
         profile=_codex_launch.profile,
-        extra_config_overrides=[*_codex_launch.config_overrides, *mcp_overrides],
+        extra_config_overrides=[
+            *_codex_launch.config_overrides,
+            *mcp_overrides,
+            *_codex_memory_overrides,
+        ],
         bridge_dir=bridge_dir,
         ap_server_url=launch_config.policy_server_url,
         ap_auth_headers=policy_headers,
@@ -7974,8 +7991,36 @@ async def _native_startup_instructions(
 
 # Claude Code's own setting for its machine-local auto memory.
 _CLAUDE_AUTO_MEMORY_OFF_ENV = "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
+# Codex's own setting for its machine-local memory, as a config override.
+_CODEX_OWN_MEMORY_OFF_OVERRIDE = "features.memories=false"
 # A slow server must not delay the launch.
-_CLAUDE_AUTO_MEMORY_CHECK_SECONDS = 5.0
+_OMNIGENT_MEMORY_CHECK_SECONDS = 5.0
+
+
+async def _session_has_omnigent_memory(
+    agent_spec: AgentSpec | ResolvedSpec | None, server_client: httpx.AsyncClient | None
+) -> bool:
+    """
+    Whether the agent has the memory tools and the server confirms memory is on.
+
+    A harness's own memory is switched off only when both hold, so a session
+    never loses both. An unreachable server counts as no memory.
+
+    :param agent_spec: The session's agent spec, or ``None``.
+    :param server_client: The runner's client for the Omnigent server.
+    """
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if spec is None or not spec.tool_groups.memory or server_client is None:
+        return False
+    from omnigent.runner.tool_dispatch import _server_has_memory
+
+    try:
+        return await asyncio.wait_for(
+            _server_has_memory(server_client), timeout=_OMNIGENT_MEMORY_CHECK_SECONDS
+        )
+    except Exception:
+        _logger.debug("memory availability unknown; the harness keeps its own", exc_info=True)
+        return False
 
 
 async def _claude_auto_memory_env(
@@ -7985,34 +8030,41 @@ async def _claude_auto_memory_env(
     Turn Claude Code's own auto memory off when the session has Omnigent memory.
 
     Two memory systems would keep separate, possibly conflicting notes, and
-    Claude Code's stays on the host, so a sandboxed session would lose it. It is
-    turned off only when the agent has the memory tools and the server confirms
-    memory is on, so a session never loses both. A value already set in the
-    runner's environment is kept.
+    Claude Code's stays on the host, so a sandboxed session would lose it. A
+    value already set in the runner's environment is kept.
 
     :param agent_spec: The session's agent spec, or ``None``.
     :param server_client: The runner's client for the Omnigent server.
     :returns: ``{"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}`` when Omnigent memory
         is on, otherwise ``{}``.
     """
-    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
-    if (
-        spec is None
-        or not spec.tool_groups.memory
-        or server_client is None
-        or _CLAUDE_AUTO_MEMORY_OFF_ENV in os.environ
-    ):
+    if _CLAUDE_AUTO_MEMORY_OFF_ENV in os.environ:
         return {}
-    from omnigent.runner.tool_dispatch import _server_has_memory
-
-    try:
-        has_memory = await asyncio.wait_for(
-            _server_has_memory(server_client), timeout=_CLAUDE_AUTO_MEMORY_CHECK_SECONDS
-        )
-    except Exception:
-        _logger.debug("memory availability unknown; leaving Claude auto memory on", exc_info=True)
-        return {}
+    has_memory = await _session_has_omnigent_memory(agent_spec, server_client)
     return {_CLAUDE_AUTO_MEMORY_OFF_ENV: "1"} if has_memory else {}
+
+
+async def _codex_own_memory_launch(
+    agent_spec: AgentSpec | ResolvedSpec | None, server_client: httpx.AsyncClient | None
+) -> tuple[list[str], str | None]:
+    """
+    Turn Codex's own memory off when the session has Omnigent memory, and offer its notes.
+
+    The same rule as :func:`_claude_auto_memory_env`. Codex's memory is off unless
+    the user enabled it, so the override changes nothing for most launches.
+
+    :param agent_spec: The session's agent spec, or ``None``.
+    :param server_client: The runner's client for the Omnigent server.
+    :returns: The launch's extra config overrides and the one-time import offer,
+        e.g. ``(["features.memories=false"], None)``; ``([], None)`` without
+        Omnigent memory.
+    """
+    if not await _session_has_omnigent_memory(agent_spec, server_client):
+        return [], None
+    from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+
+    offer = await codex_memory_import_note(_codex_home_config_source_from_env())
+    return [_CODEX_OWN_MEMORY_OFF_OVERRIDE], offer
 
 
 def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:

@@ -103,7 +103,7 @@ def test_memory_import_skill_loads_only_with_the_memory_tool_group(
     )
 
     if memory_on:
-        assert "# Import Claude Code's memory" in result
+        assert "# Import Claude Code's or Codex's memory" in result
     else:
         assert "not found" in result
 

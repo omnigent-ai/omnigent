@@ -70,7 +70,10 @@ from omnigent.runner.app import (
     _publish_terminal_pending,
     _terminal_lookup_miss_log_state,
 )
-from omnigent.runner.native.orchestration import _build_pi_native_args
+from omnigent.runner.native.orchestration import (
+    _build_pi_native_args,
+    _codex_own_memory_launch,
+)
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     KIRO_NATIVE_TERMINAL_ROLE,
@@ -2645,6 +2648,45 @@ async def test_auto_create_claude_terminal_offers_its_own_notes_on_the_first_lau
 
     offers = [("Claude Code's own memory" in prompt) for prompt in prompts]
     assert offers == ([True, False] if offered else [False, False])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_memory", "spec_memory", "overrides"),
+    [(True, True, ["features.memories=false"]), (False, True, []), (True, False, [])],
+    ids=["memory-on", "server-memory-off", "agent-memory-off"],
+)
+async def test_codex_launch_turns_its_own_memory_off_and_offers_its_notes_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server_memory: bool,
+    spec_memory: bool,
+    overrides: list[str],
+) -> None:
+    """Codex's own memory goes off, and its notes are offered, only with Omnigent memory on."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
+    notes = tmp_path / "codex-home" / "memories" / "MEMORY.md"
+    notes.parent.mkdir(parents=True)
+    notes.write_text("# Task Group: repo\n")
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"memory": server_memory})
+        ),
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="codex-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+        tool_groups=ToolGroupsConfig(memory=spec_memory),
+    )
+
+    launches = [await _codex_own_memory_launch(agent_spec, fake_client) for _ in range(2)]
+
+    assert [launch[0] for launch in launches] == [overrides, overrides]
+    offers = ["Codex's own memory" in (launch[1] or "") for launch in launches]
+    assert offers == ([True, False] if overrides else [False, False])
 
 
 @pytest.mark.asyncio

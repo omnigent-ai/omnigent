@@ -12,7 +12,9 @@ import pytest
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.memory_guidance import (
     claude_memory_import_note,
+    codex_memory_import_note,
     count_claude_memory_notes,
+    count_codex_memory_notes,
     format_memory_guidance,
     memory_guidance,
     memory_startup_guidance,
@@ -510,3 +512,93 @@ async def test_a_failing_probe_yields_no_offer(
 
     assert await claude_memory_import_note(tmp_path) is None
     assert not (tmp_path / "omnigent-data").exists()
+
+
+# ─── Codex's own notes ──────────────────────────────
+
+
+def _codex_note(codex_home: Path, name: str, text: str = "v1\nNotes.\n") -> None:
+    """Write one file into *codex_home*'s memory directory."""
+    memories = codex_home / "memories"
+    memories.mkdir(parents=True, exist_ok=True)
+    (memories / name).write_text(text)
+
+
+@pytest.fixture
+def codex_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The user's Codex home, with the runner's own data dir kept under tmp_path."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
+    return tmp_path / "codex-home"
+
+
+async def test_codex_offer_names_the_notes_directory_and_is_made_once_per_home(
+    codex_home: Path, tmp_path: Path
+) -> None:
+    _codex_note(codex_home, "MEMORY.md")
+    _codex_note(codex_home, "memory_summary.md")
+
+    text = await codex_memory_import_note(codex_home)
+
+    assert text is not None
+    assert "Codex's own memory is off in this session" in text
+    assert json.dumps(str(codex_home / "memories")) in text
+    assert "import-memory skill" in text
+    assert "do not ask again" in text
+    assert await codex_memory_import_note(codex_home) is None
+    # The offer is keyed by the Codex home, so another home with notes is offered too.
+    other = tmp_path / "other-codex-home"
+    _codex_note(other, "memory_summary.md")
+    assert await codex_memory_import_note(other) is not None
+
+
+@pytest.mark.parametrize(
+    "layout", ["no-memories", "empty-notes", "working-material-only", "memories-is-a-file"]
+)
+async def test_no_offer_without_codex_notes_and_no_marker_is_written(
+    codex_home: Path, tmp_path: Path, layout: str
+) -> None:
+    if layout == "empty-notes":
+        _codex_note(codex_home, "MEMORY.md", "")
+        _codex_note(codex_home, "memory_summary.md", "")
+    elif layout == "working-material-only":
+        _codex_note(codex_home, "raw_memories.md")
+        (codex_home / "memories" / "rollout_summaries").mkdir()
+        (codex_home / "memories" / "MEMORY.md").mkdir()
+    elif layout == "memories-is-a-file":
+        codex_home.mkdir()
+        (codex_home / "memories").write_text("not a directory\n")
+
+    assert count_codex_memory_notes(codex_home) == 0
+    assert await codex_memory_import_note(codex_home) is None
+    assert not (tmp_path / "omnigent-data").exists()
+
+
+async def test_a_failing_codex_probe_yields_no_offer(
+    codex_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _probe_fails(_codex_home: Path) -> int:
+        raise PermissionError("unreadable")
+
+    monkeypatch.setattr("omnigent.runner.memory_guidance.count_codex_memory_notes", _probe_fails)
+    _codex_note(codex_home, "MEMORY.md")
+
+    assert await codex_memory_import_note(codex_home) is None
+    assert not (tmp_path / "omnigent-data").exists()
+
+
+async def test_both_harnesses_record_their_offers_in_one_runner_directory(
+    claude_config: Path, tmp_path: Path
+) -> None:
+    """A host keeps one directory to stop both offers repeating; nothing sits beside the notes."""
+    codex_home = tmp_path / "codex-home"
+    _claude_note(claude_config, "-home-me-repo", "role.md")
+    _codex_note(codex_home, "MEMORY.md")
+
+    assert await claude_memory_import_note(tmp_path) is not None
+    assert await codex_memory_import_note(codex_home) is not None
+
+    offers = tmp_path / "omnigent-data" / "runners" / "memory-import-offers"
+    assert sorted(marker.name.split("-")[0] for marker in offers.iterdir()) == ["claude", "codex"]
+    # Codex versions its memory directory, so a marker there would reach its own consolidation.
+    assert [path.name for path in (codex_home / "memories").iterdir()] == ["MEMORY.md"]
+    assert [path.name for path in (claude_config / "projects").iterdir()] == ["-home-me-repo"]
