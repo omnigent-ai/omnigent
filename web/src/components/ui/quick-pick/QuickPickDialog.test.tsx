@@ -663,6 +663,35 @@ describe("QuickPickDialog kept open by its owner", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(afterClose).not.toHaveBeenCalled();
   });
+
+  it("drops an accepted row's action when its owner kept it open, then the user cancelled", async () => {
+    const afterClose = vi.fn();
+    function KeptOpen() {
+      const [open, setOpen] = useState(true);
+      const [cancelled, setCancelled] = useState(false);
+      return (
+        <QuickPickDialog
+          open={open && !cancelled}
+          // The owner ignores the accept's close, and closes only on the cancel.
+          onOpenChange={() => setOpen(true)}
+          onCancel={() => setCancelled(true)}
+          label="Pick"
+          segments={commands}
+          query=""
+          onQueryChange={() => undefined}
+          emptyMessage="No results found"
+          onAccept={() => ({ afterClose })}
+        />
+      );
+    }
+    render(<KeptOpen />);
+    await screen.findByRole("combobox", { name: "Pick" });
+    await userEvent.keyboard("{Enter}");
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(afterClose).not.toHaveBeenCalled();
+  });
 });
 
 describe("QuickPickDialog deferred accepts", () => {
