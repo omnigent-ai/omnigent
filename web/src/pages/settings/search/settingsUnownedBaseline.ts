@@ -17,18 +17,6 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     count: 1,
     reason: 'Model field\'s combobox; its accessible name includes "*".',
   },
-  "src/components/ProactiveAgentAdminControls.tsx › ProactiveAgentAdminControls › Button": {
-    count: 3,
-    reason: "added after the Settings catalog; no section entry yet",
-  },
-  "src/components/ProactiveAgentAdminControls.tsx › ProactiveAgentAdminControls › Input": {
-    count: 1,
-    reason: "added after the Settings catalog; no section entry yet",
-  },
-  "src/components/ProactiveAgentAdminControls.tsx › ProactiveAgentAdminControls › Textarea": {
-    count: 1,
-    reason: "added after the Settings catalog; no section entry yet",
-  },
   "src/components/theme/ThemeColorPicker.tsx › ThemeColorPicker › button": {
     count: 1,
     reason: "Theme color picker popover internals, not named by a row.",

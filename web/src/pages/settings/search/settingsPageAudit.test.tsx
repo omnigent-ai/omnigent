@@ -388,6 +388,20 @@ const PROJECT_KANBAN_OFF =
   "Shows only when the server turns on project kanban, which no scenario does.";
 const PROACTIVE_AGENT_OFF =
   "Shows only where the server offers the proactive agent, which no scenario sets up yet.";
+const OMNI_ADVISOR_OFF = "The server doesn't offer Omni Advisor.";
+const OMNI_ADVISOR_SETTINGS: SettingsRoute = {
+  url: "/v1/proactive-agent/settings",
+  body: { workspace_enabled: true, user_enabled: true, enabled: true, can_manage_workspace: true },
+};
+const OMNI_ADVISOR_SETTINGS_FAIL: SettingsRoute = {
+  url: "/v1/proactive-agent/settings",
+  status: 500,
+  body: { detail: "Try again." },
+};
+const OMNI_ADVISOR_PROMPT: SettingsRoute = {
+  url: "/v1/proactive-agent/prompt",
+  body: { prompt: "Be useful.", default_prompt: "Be useful.", overridden: false },
+};
 const GENERAL_WEB_HIDES = {
   "open-links-in-app": DESKTOP_ONLY,
   "global-shortcut": DESKTOP_ONLY,
@@ -798,7 +812,28 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
       },
     ],
   },
-  { section: "admin", scenario: "web", ready: [{ row: "nested-agent-destinations" }] },
+  {
+    section: "admin",
+    scenario: "web",
+    ready: [{ row: "nested-agent-destinations" }],
+    hides: { "proactive-agent-workspace": OMNI_ADVISOR_OFF },
+  },
+  {
+    section: "admin",
+    scenario: "web › Omni Advisor offered",
+    info: { proactive_agent_available: true },
+    routes: [OMNI_ADVISOR_SETTINGS, OMNI_ADVISOR_PROMPT],
+    ready: [{ row: "nested-agent-destinations" }],
+    states: { "proactive-agent-workspace": ["prompt loaded", "settings loaded"] },
+  },
+  {
+    section: "admin",
+    scenario: "web › Omni Advisor failed to load",
+    info: { proactive_agent_available: true },
+    routes: [OMNI_ADVISOR_SETTINGS_FAIL],
+    ready: [{ row: "nested-agent-destinations" }],
+    states: { "proactive-agent-workspace": ["load failed"] },
+  },
   {
     section: "archived",
     scenario: "web",
