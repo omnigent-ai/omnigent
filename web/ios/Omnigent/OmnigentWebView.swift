@@ -1685,6 +1685,8 @@ struct OmnigentWebView: UIViewRepresentable {
       if let saved = downloadFiles.removeValue(forKey: download) {
         try? FileManager.default.removeItem(at: saved.directory)
       }
+      guard let webView, isCurrent(webView), (error as NSError).code != NSURLErrorCancelled
+      else { return }
       let alert = UIAlertController(
         title: "Download failed", message: error.localizedDescription, preferredStyle: .alert)
       alert.addAction(UIAlertAction(title: "OK", style: .default))
