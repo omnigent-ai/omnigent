@@ -1887,3 +1887,47 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return result
 
         return run_write_transaction(self._session_immediate, "finish_startup", write)
+
+    def hand_back_timer_firing(
+        self, run: ScheduledTaskRun, *, now: Callable[[], float], host_id: str
+    ) -> ScheduledTaskRun | None:
+        """Lock the task, then the run, as finishing a startup does. See protocol."""
+        if run.workspace_id != current_workspace_id():
+            return None
+
+        def write(session: Session) -> ScheduledTaskRun | None:
+            task = session.get(
+                SqlScheduledTask, (run.workspace_id, run.scheduled_task_id), with_for_update=True
+            )
+            row = session.get(
+                SqlScheduledTaskRun, (run.workspace_id, run.id), with_for_update=True
+            )
+            timestamp = int(now())
+            if (
+                row is None
+                or row.status != encode_scheduled_task_run_status("starting")
+                or row.lease_expires_at != run.lease_expires_at
+                or row.lease_expires_at is None
+                or row.lease_expires_at <= timestamp
+            ):
+                return None
+            row.status = encode_scheduled_task_run_status("skipped")
+            row.lease_expires_at = None
+            row.finished_at = timestamp
+            if task is None or task.state == encode_scheduled_task_state("deleted"):
+                row.error = "the timer was cancelled before this firing went out"
+                row.error_code = "timer_cancelled"
+                result = _run_to_entity(row)
+                _purge_finished_deleted_task(session, task, row)
+                return result
+            row.error = f"the timer's session moved to host {host_id}"
+            row.error_code = "timer_host_moved"
+            task.host_id = host_id
+            # Later than the claimed occurrence, so the next claim gets its own trigger key.
+            task.next_run_at = timestamp + 1
+            if task.state == encode_scheduled_task_state("completed"):
+                task.state = encode_scheduled_task_state("active")
+            task.updated_at = timestamp
+            return _run_to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "hand_back_timer_firing", write)

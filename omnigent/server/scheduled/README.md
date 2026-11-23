@@ -471,15 +471,19 @@ instead of saving.
   no one can answer, skips that firing (`timer_policy_denied`). A runner that can't
   be reached or declines the wake fails the firing (`launch_failed`), which is not
   retried.
+- **Hosts.** The replica that owns a timer's saved host claims its firings. When the
+  session has since moved to another host, or got one after the timer was saved, that
+  replica records the firing `skipped` (`timer_host_moved`) without sending it, saves
+  the session's host on the timer and makes it due a second later, so the replica
+  that owns the new host claims it at its next poll. A one-shot reopens for that.
 - **History.** A timer claims one firing at a time and keeps only its newest run. It
   never stamps `last_run_at`, and a spent one-shot is deleted. The automations list
   (unless `kind=all`) and the Inbox leave timers out, and PATCH, Run now, clone and
   sharing refuse them.
 - **Limits.** A cancel can't stop a firing already claimed, and recovery marks an
-  expired startup `failed` without resending. On several replicas, a session that
-  moves to a host another replica owns gets failed firings. Every server on the
-  database must read timer rows before the feature is turned on; turning it off
-  stops new timers, while existing ones keep firing and can still be cancelled.
+  expired startup `failed` without resending. Every server on the database must read
+  timer rows before the feature is turned on; turning it off stops new timers, while
+  existing ones keep firing and can still be cancelled.
 
 ## Custom callbacks
 
