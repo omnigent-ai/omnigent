@@ -9,7 +9,7 @@ export const PASTE_ATTACHMENT_THRESHOLD = { lines: 40, characters: 4000 } as con
 /** The `.txt` attachment a large plain-text paste becomes, or `null` when it stays inline. */
 export function largePasteAsFile(data: Pick<DataTransfer, "getData">): File | null {
   const text = data.getData("text/plain").replace(/\r\n?/g, "\n");
-  const lines = text.split("\n").length;
+  const lines = text.replace(/\n$/, "").split("\n").length;
   if (
     text.length < PASTE_ATTACHMENT_THRESHOLD.characters &&
     lines < PASTE_ATTACHMENT_THRESHOLD.lines

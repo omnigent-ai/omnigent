@@ -145,6 +145,38 @@ describe("session drafts", () => {
     expect(getSessionDraft("conversation")).toBeUndefined();
   });
 
+  it("keeps a draft's pasted chips in memory when they are its only tags", async () => {
+    const { getSessionDraft, setSessionDraft, setSessionMentions } =
+      await import("./sessionDrafts");
+    setSessionDraft("conversation", { text: "@a.png", files: [] });
+    const file = new File(["x"], "a.png", { type: "image/png" });
+    setSessionMentions("conversation", {
+      files: [],
+      sessions: [],
+      attachments: [{ token: "@a.png", file }],
+    });
+    expect(getSessionDraft("conversation")?.mentions?.attachments).toEqual([
+      { token: "@a.png", file },
+    ]);
+  });
+
+  it("keeps a pasted chip's text but not its file across a reload, as tray files are", async () => {
+    const { setSessionDraft } = await import("./sessionDrafts");
+    const file = new File(["x"], "pasted-text.txt", { type: "text/plain" });
+    setSessionDraft("conversation", {
+      text: "Read @pasted-text.txt",
+      files: [],
+      mentions: { files: [], sessions: [], attachments: [{ token: "@pasted-text.txt", file }] },
+    });
+    expect(sessionStorage.getItem(key)).not.toContain("attachments");
+    vi.resetModules();
+    const { getSessionDraft } = await import("./sessionDrafts");
+    expect(getSessionDraft("conversation")).toEqual({
+      text: "Read @pasted-text.txt",
+      files: [],
+    });
+  });
+
   it("keeps plain drafts backwards-compatible and removes empty drafts", async () => {
     const { setSessionDraft, hasSessionDraft } = await import("./sessionDrafts");
     setSessionDraft("conversation", { text: "> typed\ncontinued\n", files: [] });
@@ -216,11 +248,7 @@ describe("session drafts", () => {
       "temp:clash",
     );
 
-    const inline = composerInlineMentions(
-      recovered.mentions!.files,
-      recovered.mentions!.sessions,
-      "claude-native",
-    );
+    const inline = composerInlineMentions(recovered.mentions!, "claude-native");
     const sent = expandMentionTokens(recovered.message, inline);
     expect(sent).toBe(
       'read [Session: "Plan" id=s_aaaaaaaa subagent=no]\n\n' +

@@ -139,13 +139,20 @@ export function useComposerAttachments({
   const onPaste = useCallback(
     (e: ComposerPasteEvent) => {
       const insertChips = onPasteChipsRef.current;
-      let pasted = clipboardFiles(e.clipboardData);
-      if (pasted.length === 0 && insertChips) {
-        const largeText = largePasteAsFile(e.clipboardData);
-        if (largeText) pasted = [largeText];
-      }
+      const pasted = clipboardFiles(e.clipboardData);
       if (pasted.length === 0) {
-        insertPastedText(e);
+        // A large text the file policy rejects stays inline, so the text is never lost.
+        const largeText = insertChips ? largePasteAsFile(e.clipboardData) : null;
+        if (
+          insertChips === undefined ||
+          largeText === null ||
+          validateAttachments([largeText], policyRef.current).errors.length > 0
+        ) {
+          insertPastedText(e);
+          return;
+        }
+        e.preventDefault();
+        insertChips([largeText], e.currentTarget);
         return;
       }
       e.preventDefault();

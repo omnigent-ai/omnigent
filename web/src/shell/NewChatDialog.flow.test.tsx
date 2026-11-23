@@ -1750,6 +1750,68 @@ describe("NewChatLandingScreen create flow", () => {
     },
   );
 
+  it("sends a pasted chip's file once after its create fails and the prompt is resubmitted", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    onTestFinished(() => resetCodeMirrorComposerLoadForTests());
+    const tempConvId = "temp:cccccccccccccccccccccccccccccccc";
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }) as ReturnType<typeof authenticatedFetch>,
+    );
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId,
+      pendingMsgTempId: "pend_chip",
+      createToken: "cccccccccccccccccccccccccccccccc",
+    });
+    renderLanding([], { features: { chat_composer_codemirror: true } });
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    await waitForWorkspaceSeed();
+    const shot = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    fireEvent.paste(screen.getByTestId("new-chat-landing-input"), {
+      clipboardData: {
+        items: [{ kind: "file", type: "image/png", getAsFile: () => shot }],
+        getData: () => "",
+      },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    cleanup();
+
+    // Stop leaves the submitted message as the temporary draft, its file in the tray.
+    setSessionDraft(tempConvId, { text: "@shot.png", files: [shot] });
+    hasPendingLocalMessageMock.mockReturnValue(false);
+    await act(async () => {
+      resolveCreate({
+        ok: false,
+        status: 503,
+        json: async () => ({ detail: "host unavailable" }),
+      } as unknown as Response);
+    });
+    await waitFor(() => expect(removeLocalConversationMock).toHaveBeenCalledWith(tempConvId));
+
+    renderLanding([], { features: { chat_composer_codemirror: true } });
+    await waitForWorkspaceSeed();
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId: "temp:dddddddddddddddddddddddddddddddd",
+      pendingMsgTempId: "pend_retry",
+      createToken: "dddddddddddddddddddddddddddddddd",
+    });
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_retry" }),
+    } as unknown as Response);
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(hydrateLocalConversationMock).toHaveBeenCalled());
+    // The first message's files, as the retried create hands them to the session.
+    const sentFiles = hydrateLocalConversationMock.mock.calls.at(-1)![4] as File[];
+    expect(sentFiles).toHaveLength(1);
+    expect(sentFiles[0]).toBe(shot);
+  });
+
   it("does not restore a submitted prompt while creation is pending", async () => {
     const tempConvId = "temp:dddddddddddddddddddddddddddddddd";
     let resolveCreate!: (response: Response) => void;

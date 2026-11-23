@@ -2800,7 +2800,8 @@ function ComposerImpl(
   // Attachments — same hook as the landing composer; the live composer's
   // own side effects (dirty tracking, desktop refocus) stay in the
   // callbacks so the hook never learns about sessions or focus.
-  // The chip inserter comes from useMentionBrowser, set up further down.
+
+  // Filled in once useMentionBrowser is set up below.
   const attachPastedFilesRef = useRef<(files: File[], target: ComposerTextTarget) => void>(
     () => {},
   );
@@ -3175,11 +3176,14 @@ function ComposerImpl(
   // Tagged items whose token is still in the draft; deleting a token untags it.
   const liveMentions = useMemo(
     () =>
-      presentMentions(composerInlineMentions(mentionedItems, mentionedSessions, sessionHarness), [
-        draft.text,
-        ...draft.quotes.map((quote) => quote.before),
-      ]),
-    [mentionedItems, mentionedSessions, sessionHarness, draft],
+      presentMentions(
+        composerInlineMentions(
+          { files: mentionedItems, sessions: mentionedSessions, attachments: mentionedAttachments },
+          sessionHarness,
+        ),
+        [draft.text, ...draft.quotes.map((quote) => quote.before)],
+      ),
+    [mentionedItems, mentionedSessions, mentionedAttachments, sessionHarness, draft],
   );
   const hasMentions = liveMentions.length > 0;
   attachPastedFilesRef.current = attachPastedFiles;

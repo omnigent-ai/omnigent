@@ -1470,6 +1470,28 @@ describe("Composer pasted chips", () => {
     expect(sentFiles(onSend)!.map((file) => file.name)).toEqual(["shot.png"]);
   });
 
+  it("keeps a large text paste inline when its .txt file is over the upload limit", async () => {
+    await renderCodeMirrorComposer();
+    const oversized = "x".repeat(10 * 1024 * 1024 + 1);
+    paste({ text: oversized });
+    expect(valueOf()).toBe(oversized);
+    expect(tokens()).toEqual([]);
+    expect(screen.queryByText(/is too large/)).toBeNull();
+  });
+
+  it("sends a pasted file whose name starts with a session's title as written", async () => {
+    sessions.loaded = [sessionRow("s_plan", "Plan")];
+    const onSend = await renderCodeMirrorComposer();
+    typeAt("Ask @Pl");
+    fireEvent.click(screen.getByTitle("Tag session Plan"));
+    paste({ files: [new File(["p"], "Plan.png", { type: "image/png" })] });
+
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(onSend.mock.calls[0]![0]).toBe(
+      `Ask [Session: "Plan" id=s_plan subagent=no] @Plan.png\n\n${SESSION_MENTION_HINT}`,
+    );
+  });
+
   it("leaves a large text paste inline on the textarea engine", () => {
     render(<Composer {...composerProps()} />);
     const log = "line\n".repeat(49) + "line";

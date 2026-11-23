@@ -5654,10 +5654,13 @@ function NewChatLandingContent({
   const taggedMentions = useMemo(
     () =>
       presentMentions(
-        composerInlineMentions(mentionedItems, mentionedSessions, selectedAgent?.harness ?? null),
+        composerInlineMentions(
+          { files: mentionedItems, sessions: mentionedSessions, attachments: mentionedAttachments },
+          selectedAgent?.harness ?? null,
+        ),
         [message],
       ),
-    [mentionedItems, mentionedSessions, selectedAgent?.harness, message],
+    [mentionedItems, mentionedSessions, mentionedAttachments, selectedAgent?.harness, message],
   );
   const highlight = useComposerHighlight({
     value: message,
@@ -6220,9 +6223,18 @@ function NewChatLandingContent({
       addNestedSessionDraft(queryClient, provisional.id, siblingSource, clearNestedDraft);
       if (onScreenRef.current) setNestedProvisional(provisional);
     }
+    // The relinquished message's pasted chips go with its tray files: the temporary draft holds the same Files.
     const originalDraft =
       temporaryConversationId && !hasPendingLocalMessage(temporaryConversationId)
-        ? { ...draftRef.current, message: "", files: [] }
+        ? {
+            ...draftRef.current,
+            message: "",
+            files: [],
+            mentions: draftRef.current.mentions && {
+              ...draftRef.current.mentions,
+              attachments: [],
+            },
+          }
         : draftRef.current;
     const returnedDraft = recoverFailedSessionDraft(originalDraft, temporaryConversationId);
     if (onScreenRef.current) {

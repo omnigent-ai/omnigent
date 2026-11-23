@@ -243,20 +243,27 @@ export interface InlineMention {
   marker: string;
 }
 
-/** Tokens and markers for everything tagged in a composer. */
+/**
+ * Tokens and markers for everything tagged in a composer. A pasted chip's marker is its own
+ * token: its file is sent with the message, so its text stays as typed and still takes part
+ * in the longest-token scan, which keeps a shorter token from splitting it.
+ */
 export function composerInlineMentions(
-  items: readonly MentionItem[],
-  sessions: readonly SessionMention[],
+  tags: TaggedMentions,
   harness: string | null,
 ): InlineMention[] {
   return [
-    ...items.map((item) => ({
+    ...tags.files.map((item) => ({
       token: fileMentionToken(item),
       marker: mentionMarkerFor(harness, mentionItemPath(item)),
     })),
-    ...sessions.map((session) => ({
+    ...tags.sessions.map((session) => ({
       token: session.token ?? `@${cleanSessionTitle(session.title)}`,
       marker: sessionMentionMarker(session),
+    })),
+    ...attachmentsOf(tags).map((attachment) => ({
+      token: attachment.token,
+      marker: attachment.token,
     })),
   ];
 }
@@ -320,14 +327,23 @@ export function presentTaggedMentions(
   texts: readonly string[],
 ): TaggedMentions | undefined {
   if (!mentions) return undefined;
-  const inline = composerInlineMentions(mentions.files, mentions.sessions, null);
+  const inline = composerInlineMentions(mentions, null);
   const present = new Set(presentMentions(inline, texts).map((mention) => mention.token));
   const fileCount = mentions.files.length;
+  const sessionCount = mentions.sessions.length;
   const files = mentions.files.filter((_, index) => present.has(inline[index]!.token));
   const sessions = mentions.sessions.filter((_, index) =>
     present.has(inline[fileCount + index]!.token),
   );
-  return files.length > 0 || sessions.length > 0 ? { files, sessions } : undefined;
+  const attachments = attachmentsOf(mentions).filter((_, index) =>
+    present.has(inline[fileCount + sessionCount + index]!.token),
+  );
+  if (files.length === 0 && sessions.length === 0 && attachments.length === 0) return undefined;
+  return attachments.length > 0 ? { files, sessions, attachments } : { files, sessions };
+}
+
+function attachmentsOf(tags: TaggedMentions): PastedAttachment[] {
+  return tags.attachments ?? [];
 }
 
 /** Replace each token in ``text`` with its marker, in place. */
@@ -580,6 +596,12 @@ export function mergeTaggedDrafts(
   }
   for (const attachment of second.mentions.attachments ?? []) {
     const token = attachment.token;
+    // The same File is the same attachment, so it keeps its token rather than doubling up.
+    const same = attachments.find((it) => it.file === attachment.file);
+    if (same) {
+      claim(token, same.token);
+      continue;
+    }
     // A renamed chip's file takes the new name too, so the sent filename still matches its token.
     const next = taken.includes(token)
       ? `@${uniqueAttachmentName(token.slice(1), avoid(token))}`

@@ -11,6 +11,10 @@ describe("largePasteAsFile", () => {
     expect(largePasteAsFile(clipboard("x".repeat(3999)))).toBeNull();
   });
 
+  it("does not count a trailing newline as a line", () => {
+    expect(largePasteAsFile(clipboard("line\n".repeat(39)))).toBeNull();
+  });
+
   it("turns a paste of 40 lines or 4000 characters into a .txt file", () => {
     const byLines = largePasteAsFile(clipboard("line\n".repeat(39) + "line"));
     expect(byLines?.name).toBe("pasted-text.txt");

@@ -65,8 +65,10 @@ describe("unique tokens across files and sessions", () => {
     const fileToken = newFileMentionToken(readmeFile, [sessionToken]);
     expect([sessionToken, fileToken]).toEqual(["@README.md", "@README.md (file)"]);
     const mentions = composerInlineMentions(
-      [{ ...readmeFile, token: fileToken }],
-      [{ ...readmeSession, token: sessionToken }],
+      {
+        files: [{ ...readmeFile, token: fileToken }],
+        sessions: [{ ...readmeSession, token: sessionToken }],
+      },
       null,
     );
     expect(targets(`compare ${sessionToken} with ${fileToken}`, mentions)).toEqual([
@@ -80,8 +82,10 @@ describe("unique tokens across files and sessions", () => {
     const sessionToken = sessionMentionToken(readmeSession, [fileToken]);
     expect([fileToken, sessionToken]).toEqual(["@README.md", "@README.md (s_read)"]);
     const mentions = composerInlineMentions(
-      [{ ...readmeFile, token: fileToken }],
-      [{ ...readmeSession, token: sessionToken }],
+      {
+        files: [{ ...readmeFile, token: fileToken }],
+        sessions: [{ ...readmeSession, token: sessionToken }],
+      },
       null,
     );
     expect(targets(`compare ${fileToken} with ${sessionToken}`, mentions)).toEqual([
@@ -103,18 +107,38 @@ describe("unique tokens across files and sessions", () => {
       return { ...session, token };
     });
     expect(taken).toEqual(["@Fix", "@Fix (abcdef)", "@Fix (abcdef111111)"]);
-    const mentions = composerInlineMentions([], tagged, null);
+    const mentions = composerInlineMentions({ files: [], sessions: tagged }, null);
     expect(targets(taken.join(" and "), mentions)).toEqual(sessions.map((s) => s.id));
+  });
+});
+
+describe("pasted chips in the token scan", () => {
+  it("keeps a pasted chip whole when a session token is a prefix of its name", () => {
+    const file = new File(["p"], "Plan.png", { type: "image/png" });
+    const tags = {
+      files: [],
+      sessions: [{ id: "s_plan", title: "Plan", isSubagent: false, token: "@Plan" }],
+      attachments: [{ token: "@Plan.png", file }],
+    };
+    const mentions = composerInlineMentions(tags, null);
+    expect(expandMentionTokens("Ask @Plan @Plan.png", mentions)).toBe(
+      'Ask [Session: "Plan" id=s_plan subagent=no] @Plan.png',
+    );
+    expect(presentTaggedMentions(tags, ["Ask @Plan @Plan.png"])?.attachments).toEqual([
+      { token: "@Plan.png", file },
+    ]);
   });
 });
 
 describe("expanding composer text", () => {
   const mentions = composerInlineMentions(
-    [{ path: "src/a.ts", isDir: false }],
-    [
-      { ...child, token: "@auth" },
-      { ...alpha, token: "@Alpha planning" },
-    ],
+    {
+      files: [{ path: "src/a.ts", isDir: false }],
+      sessions: [
+        { ...child, token: "@auth" },
+        { ...alpha, token: "@Alpha planning" },
+      ],
+    },
     "codex-native",
   );
 

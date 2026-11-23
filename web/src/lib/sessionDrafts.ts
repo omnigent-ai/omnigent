@@ -67,7 +67,7 @@ function saveDraftsToStorage(): void {
     const entries: Record<string, StoredDraft> = {};
     for (const [id, draft] of sessionDrafts) {
       if (!draft.text && !draft.reviewComments?.length) continue;
-      // Pasted chips hold Files, which the JSON storage cannot keep, so only the tags it can.
+      // Pasted chips hold Files, which JSON can't store; persist only file/session tags.
       const tagged =
         draft.mentions && (draft.mentions.files.length > 0 || draft.mentions.sessions.length > 0)
           ? { files: draft.mentions.files, sessions: draft.mentions.sessions }
@@ -130,7 +130,11 @@ export function setSessionMentions(
   conversationId: string,
   mentions: TaggedMentions | undefined,
 ): void {
-  const tagged = mentions && (mentions.files.length > 0 || mentions.sessions.length > 0);
+  const tagged =
+    mentions &&
+    (mentions.files.length > 0 ||
+      mentions.sessions.length > 0 ||
+      (mentions.attachments?.length ?? 0) > 0);
   const draft = sessionDrafts.get(conversationId) ?? { text: "", files: [] };
   setSessionDraft(conversationId, { ...draft, mentions: tagged ? mentions : undefined });
 }
