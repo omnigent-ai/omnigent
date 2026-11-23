@@ -1559,7 +1559,7 @@ function SideChatComposer({
         onActiveInputChange={rebindActiveInput}
         hasContent={!pending && files.length > 0}
         data-side-chat="true"
-        {...pickListInputProps(slashCompletion.open)}
+        {...pickListInputProps(slashCompletion.menuShown)}
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
         className={highlight.cardClassName}
         input={{

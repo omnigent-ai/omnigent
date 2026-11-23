@@ -7643,7 +7643,7 @@ function NewChatLandingContent({
               keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
               className={cn(isDragActive && "ring-2 ring-ring ring-inset", highlight.cardClassName)}
               data-testid="new-chat-landing-composer"
-              {...pickListInputProps(slashCompletion.open || mentionOpen)}
+              {...pickListInputProps(slashCompletion.menuShown || mentionOpen)}
               input={{
                 ref: bindTextarea,
                 value: message,

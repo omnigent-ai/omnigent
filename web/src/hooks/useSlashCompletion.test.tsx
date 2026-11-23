@@ -166,14 +166,26 @@ describe("useSlashCompletion highlight retention", () => {
     expect(view.result.current.handleKey(keyEvent("n"), NO_PREFERENCE)).toBe(false);
   });
 
-  it("holds Ctrl-N/Ctrl-P in an open menu with no matches, leaving arrows and the index alone", () => {
-    const { view } = setup({ text: "/zzz" });
-    expect(view.result.current.open).toBe(true);
+  it("holds Ctrl-N/Ctrl-P in a shown menu with no matches, leaving arrows and the index alone", () => {
+    const { view } = setup({ text: "/zzz", status: "ready" });
+    expect(view.result.current.menuShown).toBe(true);
     const ctrlP = { ...keyEvent("p"), code: "KeyP", ctrlKey: true };
     expect(view.result.current.handleKey(ctrlP, NO_PREFERENCE)).toBe(true);
     expect(ctrlP.preventDefault).toHaveBeenCalledOnce();
     expect(view.result.current.index).toBe(-1);
     expect(view.result.current.handleKey(keyEvent("ArrowUp"), NO_PREFERENCE)).toBe(false);
+  });
+
+  it("leaves Ctrl-N/Ctrl-P to the text when an open menu shows nothing", () => {
+    // No matches and no skills state: SlashCommandMenu renders nothing.
+    const { view } = setup({ text: "/zzz" });
+    expect(view.result.current.open).toBe(true);
+    expect(view.result.current.menuShown).toBe(false);
+    for (const letter of ["n", "p"]) {
+      const press = { ...keyEvent(letter), code: `Key${letter.toUpperCase()}`, ctrlKey: true };
+      expect(view.result.current.handleKey(press, NO_PREFERENCE)).toBe(false);
+      expect(press.preventDefault).not.toHaveBeenCalled();
+    }
   });
 
   it("resets to -1 when the query has no matches", () => {

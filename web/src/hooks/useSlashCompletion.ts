@@ -111,6 +111,11 @@ export interface UseSlashCompletionResult {
   complete: (cmd: string) => { text: string; caret: number };
   /** Whether the suggestions menu is open. */
   open: boolean;
+  /**
+   * Whether the open menu shows anything: matches, or skills' loading or error state. Open with
+   * neither, it renders nothing, so its keys, Ctrl-N/Ctrl-P included, stay with the text.
+   */
+  menuShown: boolean;
   /** The text typed after the prefix while open, else "". */
   query: string;
   /** Ranked match names while open, else []. */
@@ -192,6 +197,8 @@ export function useSlashCompletion({
     : [];
   const query = open ? baseQuery : "";
   const matches = open ? baseMatches : [];
+  // As SlashCommandMenu decides whether to render anything.
+  const menuShown = open && (matches.length > 0 || status != null);
   const pendingCompletion =
     baseOpen && !inline && !isDismissed && status === "loading" && baseMatches.length === 0;
 
@@ -243,7 +250,7 @@ export function useSlashCompletion({
       return true;
     }
     // An empty or loading menu still owns Ctrl-N/Ctrl-P; arrows keep falling through.
-    if (open && matches.length === 0 && holdReadlineStep(e)) return true;
+    if (menuShown && matches.length === 0 && holdReadlineStep(e)) return true;
     if (open && matches.length > 0) {
       if (pressed("slash.next")) {
         e.preventDefault();
@@ -296,6 +303,7 @@ export function useSlashCompletion({
 
   return {
     open,
+    menuShown,
     query,
     matches,
     index,

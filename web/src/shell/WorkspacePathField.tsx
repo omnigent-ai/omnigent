@@ -181,6 +181,8 @@ export function WorkspacePathField({
   const items = [...filteredRecent, ...matches];
   const showLoading = dropdownOpen && isLoading && matches.length === 0;
   const hasContent = filteredRecent.length > 0 || matches.length > 0 || showLoading;
+  // Open with nothing to list, the dropdown isn't drawn, so its keys stay with the field.
+  const listShown = dropdownOpen && hasContent;
 
   // DOM id of the highlighted row, for aria-activedescendant. The
   // first filteredRecent.length items are "recent", the rest "match"
@@ -221,7 +223,7 @@ export function WorkspacePathField({
 
   function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     // Ctrl-N/Ctrl-P step an open list only; closed, they stay text editing.
-    const readlineStep = dropdownOpen ? readlineListStep(e) : null;
+    const readlineStep = listShown ? readlineListStep(e) : null;
     if (readlineStep === "next") {
       e.preventDefault();
       setHighlight((h) => Math.min(h + 1, items.length - 1));
@@ -288,7 +290,7 @@ export function WorkspacePathField({
           aria-label="Working directory path"
           aria-autocomplete="list"
           aria-expanded={dropdownOpen}
-          {...pickListInputProps(dropdownOpen)}
+          {...pickListInputProps(listShown)}
           aria-controls="workspace-path-listbox"
           aria-activedescendant={dropdownOpen ? activeDescendantId : undefined}
           aria-invalid={invalid || undefined}

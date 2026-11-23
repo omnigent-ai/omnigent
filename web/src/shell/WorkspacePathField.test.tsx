@@ -235,6 +235,39 @@ describe("WorkspacePathField", () => {
     expect(onChange).toHaveBeenCalledWith("/Users/corey/projects");
   });
 
+  it.each([
+    ["an empty folder", () => mockListing([])],
+    ["no entry matching the typed prefix", () => mockListing(ENTRIES)],
+    [
+      "a listing that failed",
+      () =>
+        useHostFilesystemMock.mockReturnValue({
+          data: undefined,
+          isLoading: false,
+          isError: true,
+        } as unknown as ReturnType<typeof useHostFilesystem>),
+    ],
+  ])("leaves Ctrl-N/Ctrl-P to the field when the open list shows nothing (%s)", (_case, mock) => {
+    mock();
+    render(
+      <WorkspacePathField
+        hostId="host_1"
+        value="/Users/corey/zzz-no-match"
+        onChange={vi.fn()}
+        onBrowse={vi.fn()}
+        recent={[]}
+      />,
+    );
+    const input = screen.getByTestId("workspace-path-input");
+    fireEvent.focus(input);
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(input).not.toHaveAttribute("data-pick-list-input");
+    for (const letter of ["n", "p"]) {
+      const press = { key: letter, code: `Key${letter.toUpperCase()}`, ctrlKey: true };
+      expect(fireEvent.keyDown(input, press)).toBe(true);
+    }
+  });
+
   it("commits the typed absolute path on Enter when no row is highlighted", () => {
     // The regression: typing a full path and pressing Enter (without
     // arrowing into the dropdown) did nothing. Enter on an absolute

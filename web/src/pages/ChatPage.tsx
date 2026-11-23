@@ -4551,7 +4551,7 @@ function ComposerImpl(
         draftKey={conversationId ?? null}
         activeInputId={activeTextId ?? COMPOSER_TAIL_INPUT_ID}
         onActiveInputChange={rebindActiveInput}
-        {...pickListInputProps(slashCompletion.open || mentionOpen)}
+        {...pickListInputProps(slashCompletion.menuShown || mentionOpen)}
         input={{
           ref: bindTailTextarea,
           value: draft.text,
