@@ -87,6 +87,7 @@ consistently can forge history.
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
 import hashlib
 import json
@@ -746,6 +747,12 @@ class ImmutableDocumentStore:
                 self._segment_of(number) > 1
                 and (number - 1) % self._limits.revisions_per_segment == 0
             ):
+                # mkdirs makes missing ancestors: never let it recreate a record that a
+                # reclaim removed after this writer read it.
+                if not self._still_chained(ref, number, prev_digest):
+                    raise Conflict(
+                        "document was removed while it was written", reason="concurrent_write"
+                    )
                 self._files.mkdirs(self._segment_directory(ref, self._segment_of(number)))
             if kind == _CREATE:
                 generation, created_at, created_by = previous.generation + 1, now, actor
@@ -775,13 +782,45 @@ class ImmutableDocumentStore:
         body["digest"] = compute_envelope_digest(body)
         if head is None:
             self._files.mkdirs(ref.directory)
+        path = self._revision_path(ref, number)
         try:
-            self._files.create_json(self._revision_path(ref, number), copy.deepcopy(body))
+            self._files.create_json(path, copy.deepcopy(body))
         except Conflict:
             return self._resolve_collision(ref, operation_id, digest)
+        except NotFound:
+            raise Conflict(
+                "document was removed while it was written", reason="concurrent_write"
+            ) from None
+        if prev_digest is not None and not self._still_chained(ref, number, prev_digest):
+            # The slot was free because the record this writer read was removed (a purge
+            # revision would otherwise hold it): the write landed in an emptied or new
+            # record. Take it back before anyone counts it, and report the conflict.
+            self._take_back(ref, number, path)
+            raise Conflict("document was removed while it was written", reason="concurrent_write")
         if kind == _CREATE:
             self._index_create(ref, operation_id, number)
         return self._result(ref, self._parse_revision(ref, body, number))
+
+    def _still_chained(self, ref: _Ref, number: int, prev_digest: str) -> bool:
+        """Whether revision ``number - 1`` is still the one with *prev_digest*."""
+        try:
+            raw = self._files.read_json(self._revision_path(ref, number - 1))
+        except (NotFound, CorruptData):
+            return False
+        return isinstance(raw, dict) and raw.get("digest") == prev_digest
+
+    def _take_back(self, ref: _Ref, number: int, path: str) -> None:
+        """Remove a revision written into a record that was removed meanwhile, and the
+        segment directory it needed when that is now empty."""
+        if not self._files.supports_delete:
+            return  # Such a store never reclaims records, so this cannot happen there.
+        self._files.delete_tree(path)
+        segment = self._segment_of(number)
+        if segment > 1:
+            directory = self._segment_directory(ref, segment)
+            with contextlib.suppress(NotFound):
+                if not self._files.list_paths(directory):
+                    self._files.delete_tree(directory)
 
     def _create_index_path(self, ref: _Ref, operation_id: str) -> str:
         key = hashlib.sha256(operation_id.encode()).hexdigest()[:32]

@@ -209,6 +209,48 @@ def test_a_removed_record_can_be_created_again_from_scratch(env: Env) -> None:
     assert again.value == {"n": 2}
 
 
+def _tombstone_ending_a_segment(env: Env) -> None:
+    """Record ``a`` with three revisions, a full first segment, the last a tombstone."""
+    a = env.docs.create("cards", "a", {"n": 1}, "op-a", ACTOR)
+    a = env.docs.replace("cards", "a", {"n": 2}, a.version, "op-a-2", ACTOR)
+    env.docs.delete("cards", "a", a.version, "del-a", ACTOR)
+    env.clock.advance(61)
+
+
+@pytest.mark.parametrize("pause", ["before_segment", "after_check"])
+def test_a_stale_writer_never_revives_a_record_reclaimed_meanwhile(
+    env: Env, monkeypatch: pytest.MonkeyPatch, pause: str
+) -> None:
+    _tombstone_ending_a_segment(env)
+    ref = env.docs._ref("cards", "a")
+    stale = env.docs._load_head(ref)
+    assert stale is not None and stale.count == 3
+    if pause == "after_check":
+        # The race the check alone can't close: the reclaim runs after the writer checked
+        # the record and before it makes the next segment's directory.
+        real_mkdirs = type(env.files).mkdirs
+
+        def mkdirs_after_a_reclaim(self, path: str) -> None:
+            if path.endswith("cards/a/s00000002"):
+                monkeypatch.setattr(type(env.files), "mkdirs", real_mkdirs)
+                env.docs._purge(ref, env.docs._load_head(ref))
+            real_mkdirs(self, path)
+
+        monkeypatch.setattr(type(env.files), "mkdirs", mkdirs_after_a_reclaim)
+    else:
+        # The writer read the tombstone, then paused while another create reclaimed it.
+        env.docs._purge(ref, stale)
+    assert pause == "after_check" or env.docs.verify_record("cards", "a") is None
+    with pytest.raises(Conflict):
+        env.docs._append(ref, stale, "create", {"n": 9}, "op-stale", ACTOR, "d" * 64)
+    # Nothing acknowledged is left unreadable, and the record starts again from scratch.
+    assert env.docs.verify_record("cards", "a") is None
+    assert not (env.root / "cards" / "a" / "s00000002").exists()
+    again = env.docs.create("cards", "a", {"n": 3}, "op-a3", ACTOR)
+    assert env.docs.get("cards", "a") == again
+    assert env.docs.verify_record("cards", "a").revisions == 1  # type: ignore[union-attr]
+
+
 def test_a_late_remover_never_deletes_the_record_created_again(env: Env) -> None:
     a = env.docs.create("cards", "a", {"n": 1}, "op-a", ACTOR)
     env.docs.delete("cards", "a", a.version, "del-a", ACTOR)
