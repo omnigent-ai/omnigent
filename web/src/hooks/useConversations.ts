@@ -304,8 +304,8 @@ export interface Conversation {
   viewer_unread?: boolean;
   /**
    * Epoch seconds the session last needed its owner's eyes: a person-started
-   * turn ended, or it asked for human input. `null` = never; absent on older
-   * servers. The Inbox lists only sessions whose attention is unseen.
+   * turn ended, or it asked for human input. `0` = never. The Inbox lists
+   * only sessions whose attention is unseen (see `session_attention`).
    */
   attention_at?: number | null;
   /**

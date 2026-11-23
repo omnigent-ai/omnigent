@@ -77,8 +77,8 @@ export interface UnreadInboxItem {
  * free of the read-state store). A session qualifies only when its
  * `attention_at` (a person-started turn ended, or it asked for human input)
  * is unseen, so automatic orchestrator and worker turns stay out of the Inbox
- * and its badge; one the viewer marked unread still counts. Older servers
- * without `attention_at` fall back to any unseen output.
+ * and its badge; one the viewer marked unread still counts. When the server
+ * lacks the `session_attention` capability, any unseen output qualifies.
  * Rows with pending approvals are skipped — they're already listed as
  * approval items, and one session shouldn't appear twice.
  */
@@ -86,11 +86,13 @@ export function collectUnreadInboxItems(
   rows: Conversation[],
   isUnseen: (id: string, updatedAt: number, status: string | undefined) => boolean,
   isMarkedUnread: (id: string) => boolean = () => false,
+  attentionSupported = false,
 ): UnreadInboxItem[] {
+  // A row without a stamp (0, null, or built client-side) never needed the viewer.
   const needsViewer = (row: Conversation) =>
-    row.attention_at === undefined ||
+    !attentionSupported ||
     isMarkedUnread(row.id) ||
-    (row.attention_at !== null && isUnseen(row.id, row.attention_at, row.status));
+    (!!row.attention_at && isUnseen(row.id, row.attention_at, row.status));
   return rows
     .filter(
       (row) =>

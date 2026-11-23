@@ -45,7 +45,7 @@
 import type { AutomationFailure } from "@/lib/scheduledTasksApi";
 import { describeRunFailure } from "@/lib/scheduleText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled } from "@/lib/capabilities";
+import { attentionSupported, isFeatureEnabled } from "@/lib/capabilities";
 import type { Query } from "@tanstack/react-query";
 import type { Session } from "@/lib/types";
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
@@ -251,7 +251,8 @@ export function InboxPage() {
     identityReady,
   } = useSidebarData();
   const navigate = useNavigate();
-  const taskDetailsEnabled = isFeatureEnabled(useServerInfo(), "automations_v2");
+  const serverInfo = useServerInfo();
+  const taskDetailsEnabled = isFeatureEnabled(serverInfo, "automations_v2");
   const [storedFilter, setFilter] = useState<InboxFilter>(readInboxFilter);
   const {
     available: advisorAvailable,
@@ -343,6 +344,7 @@ export function InboxPage() {
     allRows,
     isConversationUnseen,
     isExplicitlyUnread,
+    attentionSupported(serverInfo),
   );
   const showApprovals = filter === "all" || filter === "awaiting";
   // Unread sessions, file comments, and automation results.

@@ -3921,8 +3921,8 @@ class SessionListItem(BaseModel):
     viewer_last_seen: int | None = None
     viewer_unread: bool = False
     # Epoch seconds the session last needed its owner's eyes (a person-started
-    # turn ended, or it asked for human input); the Inbox lists only those.
-    attention_at: int | None = None
+    # turn ended, or it asked for human input); 0 = never. Always sent.
+    attention_at: int = 0
     search_snippet: str | None = None
     parent_session_id: str | None = None
     # First-class project this session is filed under, or ``None`` when

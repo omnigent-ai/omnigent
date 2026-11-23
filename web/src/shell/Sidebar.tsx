@@ -201,7 +201,12 @@ import { isOwnerLevel } from "@/lib/permissionsApi";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSingleUserMode, SHARING_OFF_REASON } from "@/lib/capabilities";
+import {
+  attentionSupported,
+  isFeatureEnabled,
+  isSingleUserMode,
+  SHARING_OFF_REASON,
+} from "@/lib/capabilities";
 import { useProjectKanbanEnabled } from "@/lib/projectKanbanPreferences";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
@@ -907,6 +912,7 @@ function SidebarImpl({
           isConversationUnseen(id, updatedAt, status) &&
           (id !== activeConversationId || isExplicitlyUnread(id)),
         isExplicitlyUnread,
+        attentionSupported(serverInfo),
       ).length,
   );
   const inboxCount = sidebarData.inboxCount + unreadInboxCount;

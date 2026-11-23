@@ -422,6 +422,8 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_projects: bool = False
     # Bounded latest-failure feed for the Inbox.
     scheduled_task_inbox: bool = False
+    # Session rows carry ``attention_at``; the Inbox lists only sessions needing the user.
+    session_attention: bool = False
     # Grants can be added through ``/v1/scheduled-tasks/{id}/permissions``: needs
     # ``automations_v2`` and a store that keeps them. Listing and removing need only the
     # store, through the API; the automation pages need the flag.
@@ -4216,6 +4218,7 @@ def create_app(
                 },
                 "scheduled_task_projects": automations_enabled and project_store is not None,
                 "scheduled_task_inbox": automations_enabled,
+                "session_attention": True,
                 "scheduled_task_one_time": automations_enabled
                 and bool(app.state.one_time_automations_enabled),
                 "scheduled_task_sharing": automation_sharing,

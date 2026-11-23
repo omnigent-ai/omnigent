@@ -379,6 +379,8 @@ export interface ServerInfo {
   scheduled_task_projects?: boolean;
   /** Latest sessionless automation failures can be listed for Inbox. */
   scheduled_task_inbox?: boolean;
+  /** Session rows carry `attention_at`; absent on older servers (off). */
+  session_attention?: boolean;
   /**
    * Owners can share automations (``/v1/scheduled-tasks/{id}/permissions``);
    * absent on older servers (off).
@@ -594,6 +596,11 @@ export function isFeatureEnabled(info: ServerInfo | "loading", feature: FeatureK
   return info !== "loading" && info.features?.[feature] === true;
 }
 
+/** Whether session rows carry `attention_at`; assumed while loading so the badge doesn't flash. */
+export function attentionSupported(info: ServerInfo | "loading"): boolean {
+  return info === "loading" || info.session_attention === true;
+}
+
 export function sandboxProfilesEnabled(info: ServerInfo | "loading"): boolean {
   return (
     isFeatureEnabled(info, "sandbox_profiles") &&
@@ -781,6 +788,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
+          session_attention: data.session_attention === true,
           scheduled_task_sharing: data.scheduled_task_sharing === true,
           inbox_items_available: data.inbox_items_available === true,
           scheduled_task_shared_with_me: data.scheduled_task_shared_with_me === true,

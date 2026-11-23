@@ -297,10 +297,14 @@ describe("collectUnreadInboxItems", () => {
       makeRow({ id: "automatic", status: "idle", updated_at: 3_000, attention_at: 900 }),
       makeRow({ id: "never", status: "idle", updated_at: 3_000, attention_at: null }),
       makeRow({ id: "flagged", status: "idle", updated_at: 3_000, attention_at: null }),
-      makeRow({ id: "legacy", status: "idle", updated_at: 3_000 }),
+      makeRow({ id: "unstamped", status: "idle", updated_at: 3_000, attention_at: 0 }),
+      makeRow({ id: "client-built", status: "idle", updated_at: 3_000 }),
     ];
-    const items = collectUnreadInboxItems(rows, unseenAfter(1_000), (id) => id === "flagged");
-    expect(items.map((i) => i.row.id).sort()).toEqual(["asked", "flagged", "legacy"]);
+    const marked = (id: string) => id === "flagged";
+    const items = collectUnreadInboxItems(rows, unseenAfter(1_000), marked, true);
+    expect(items.map((i) => i.row.id).sort()).toEqual(["asked", "flagged"]);
+    // A server without the capability lists every unseen session.
+    expect(collectUnreadInboxItems(rows, unseenAfter(1_000), marked, false)).toHaveLength(6);
   });
 
   it("skips archived rows and rows already listed as approvals", () => {
