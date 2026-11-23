@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import hashlib
 import json
 import math
@@ -2169,11 +2170,31 @@ def _subagent_costs_from_report(data: dict[str, Any]) -> dict[str, float]:
     return costs
 
 
+def _displayed_usage(usage: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    Copy the parts of a session's own usage that displayed usage sums.
+
+    A ``session.usage`` event's ``total_cost_usd`` and ``usage_by_model`` are
+    subtree sums of exactly these two fields, so a report that leaves them
+    unchanged leaves every displayed subtree total unchanged too.
+
+    :param usage: A conversation's ``session_usage`` dict, e.g.
+        ``{"total_cost_usd": 0.42, "policy_cost_usd": 0.5, "by_model":
+        {"claude-sonnet-4-6": {"total_cost_usd": 0.42}}}``.
+    :returns: A deep copy of ``total_cost_usd`` and ``by_model``, safe to
+        compare after *usage* is mutated in place.
+    """
+    return {
+        "total_cost_usd": usage.get("total_cost_usd"),
+        "by_model": copy.deepcopy(usage.get("by_model")),
+    }
+
+
 def _persist_native_cumulative_usage(
     session_id: str,
     data: dict[str, Any],
     conversation_store: ConversationStore,
-) -> float | None:
+) -> bool:
     """
     Persist cumulative cost / token usage reported by a native harness.
 
@@ -2233,10 +2254,10 @@ def _persist_native_cumulative_usage(
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
     :param data: The ``external_session_usage`` event ``data`` dict.
     :param conversation_store: Store for reading and writing ``session_usage``.
-    :returns: The session's cumulative priced cost in USD after this
-        update (for the caller to broadcast on a ``session.usage``
-        event), or ``None`` when the session is unpriced or no
-        cumulative field was present.
+    :returns: Whether this report changed what the session's displayed usage
+        sums (:func:`_displayed_usage`). ``False`` when no cumulative field was
+        present, or when the report only moved ``policy_cost_usd``, flat token
+        totals the display does not read, or a total the monotonic clamp held.
     :raises OmnigentError: When a cumulative field is the wrong type.
     """
     cost = _coerce_cumulative_field(data, "cumulative_cost_usd", numeric=True)
@@ -2246,7 +2267,7 @@ def _persist_native_cumulative_usage(
     ccache = _coerce_cumulative_field(data, "cumulative_cache_read_input_tokens", numeric=False)
     subagent_costs = _subagent_costs_from_report(data)
     if cost is None and policy_cost is None and cin is None and cout is None:
-        return None
+        return False
 
     # Deliberately a FRESH read — never a caller-supplied row. This row is the
     # baseline for the monotonic clamps and the daily-rollup delta below, and
@@ -2255,6 +2276,7 @@ def _persist_native_cumulative_usage(
     # overwrite a concurrent report's growth with stale state.
     conv = conversation_store.get_conversation(session_id)
     current: dict[str, Any] = dict(conv.session_usage) if conv and conv.session_usage else {}
+    displayed_before = _displayed_usage(current)
     # Native usage is cumulative (SET semantics), so the per-turn delta
     # for the daily rollup is new_total - old_total. Capture the old
     # cumulative + enforcement costs before the fields below overwrite them.
@@ -2413,7 +2435,7 @@ def _persist_native_cumulative_usage(
     # Non-negative by the monotonic clamp above; ``max(0.0, ...)`` keeps the
     # daily rollup from ever being clawed back even if that invariant changes.
     _record_daily_cost(conv, max(0.0, new_cost - old_cost), conversation_store)
-    return _priced_cost_for_display(current)
+    return _displayed_usage(current) != displayed_before
 
 
 async def _persist_external_session_usage(
@@ -2430,6 +2452,10 @@ async def _persist_external_session_usage(
     At least one of ``data.context_tokens`` (non-negative int),
     ``data.context_window`` (positive int), or a cumulative usage field
     (:func:`_persist_native_cumulative_usage`) must be present.
+
+    The subtree cost roll-up loads the session's whole spawn tree, so it runs
+    only when the report changed what displayed usage sums; otherwise the
+    broadcast carries just the context fields and no ancestor is re-published.
 
     :param session_id: Session/conversation identifier.
     :param body: External session-usage event body.
@@ -2481,9 +2507,8 @@ async def _persist_external_session_usage(
 
     # Native harnesses report cumulative cost / tokens (SET semantics) — distinct
     # from the Omnigent relay's per-response accumulation. Persist this session's
-    # own cumulative usage (its priced own-cost return is unused — the badge shows
-    # the subtree total computed below, not own cost).
-    await asyncio.to_thread(
+    # own cumulative usage and learn whether the badge's inputs moved.
+    displayed_usage_changed = await asyncio.to_thread(
         _persist_native_cumulative_usage,
         session_id,
         body.data,
@@ -2528,14 +2553,6 @@ async def _persist_external_session_usage(
     # oscillate own ⇄ subtree). For a childless session the subtree is just
     # itself, so this equals own cost — one indexed tree query per flush. The
     # caller's row supplies the root so the tree scan needs no extra row read.
-    subtree_usage, tree = await asyncio.to_thread(
-        load_session_usage_and_tree,
-        session_id,
-        conversation_store,
-        root_conversation_id=conv.root_conversation_id if conv is not None else None,
-    )
-    subtree_cost = _priced_cost_for_display(subtree_usage)
-    usage_by_model = _usage_by_model_for_display(subtree_usage)
     # Only include fields that were sent; the client treats absent
     # fields as "no change" so a window-only update doesn't zero tokens.
     # ``total_cost_usd`` is included only when the subtree is priced
@@ -2549,20 +2566,33 @@ async def _persist_external_session_usage(
         event_payload["context_tokens"] = raw_tokens
     if raw_window is not None:
         event_payload["context_window"] = raw_window
-    if subtree_cost is not None:
-        event_payload["total_cost_usd"] = subtree_cost
     if cost_display_hidden():
         event_payload["cost_hidden"] = True
-    if usage_by_model is not None:
-        event_payload["usage_by_model"] = usage_by_model
+    # Context-window reports and enforcement-only cost reports leave every
+    # subtree total where it was, so they skip the whole-tree load.
+    tree: list[Conversation] | None = None
+    if displayed_usage_changed:
+        subtree_usage, tree = await asyncio.to_thread(
+            load_session_usage_and_tree,
+            session_id,
+            conversation_store,
+            root_conversation_id=conv.root_conversation_id if conv is not None else None,
+        )
+        subtree_cost = _priced_cost_for_display(subtree_usage)
+        if subtree_cost is not None:
+            event_payload["total_cost_usd"] = subtree_cost
+        usage_by_model = _usage_by_model_for_display(subtree_usage)
+        if usage_by_model is not None:
+            event_payload["usage_by_model"] = usage_by_model
     event = SessionUsageEvent(**event_payload)
     session_stream.publish(session_id, event.model_dump(exclude_none=True))
-    # This session's usage also moves its ANCESTORS' subtree cost (its spend
-    # rolls up into every ancestor), so re-publish each ancestor's subtree cost
-    # too — otherwise a grandparent's badge wouldn't reflect a deep descendant.
-    # Reuses the tree summed above, so a flush loads it once. No-op for a
-    # top-level session (no ancestors). Threaded: it sums the tree per ancestor.
-    await asyncio.to_thread(_publish_ancestor_subtree_costs, tree, session_id)
+    if tree is not None:
+        # This session's usage also moves its ANCESTORS' subtree cost (its spend
+        # rolls up into every ancestor), so re-publish each ancestor's subtree
+        # cost too — otherwise a grandparent's badge wouldn't reflect a deep
+        # descendant. Reuses the tree summed above, so a flush loads it once.
+        # No-op for a top-level session. Threaded: it sums the tree per ancestor.
+        await asyncio.to_thread(_publish_ancestor_subtree_costs, tree, session_id)
     return raw_tokens
 
 
