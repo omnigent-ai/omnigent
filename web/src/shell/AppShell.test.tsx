@@ -17,7 +17,15 @@ import type * as UseWorkspaceModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
-import { useCallback, useContext, useLayoutEffect, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useState,
+} from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
@@ -825,6 +833,32 @@ afterEach(() => {
   toast.dismiss();
   cleanup();
   vi.useRealTimers();
+});
+
+describe("AppShell page loading", () => {
+  const PendingPage = lazy(() => new Promise<never>(() => {}));
+
+  function PageAfterGate() {
+    const [ready, setReady] = useState(false);
+    useEffect(() => setReady(true), []);
+    return ready ? <PendingPage /> : <div>gate</div>;
+  }
+
+  it.each([
+    { when: "on its first render", Page: PendingPage },
+    { when: "after an update outside a navigation", Page: PageAfterGate },
+  ])("keeps the sidebar while a page's code loads $when", async ({ Page }) => {
+    mockConversations([]);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <Suspense fallback={<div>app loading</div>}>
+        {shellTree(client, "/page", <Route path="page" element={<Page />} />)}
+      </Suspense>,
+    );
+    expect(await screen.findByRole("status", { name: "Loading" })).toBeVisible();
+    expect(screen.getByTestId("sidebar")).toBeVisible();
+    expect(screen.queryByText("app loading")).toBeNull();
+  });
 });
 
 describe("AppShell header", () => {
