@@ -26,19 +26,28 @@ import { PageScroll } from "@/components/PageScroll";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { showToast } from "@/components/ui/toast";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
+import { AutomationListPaletteCommands } from "@/components/scheduled/automationListPaletteCommands";
 import { AutomationsIntro } from "@/components/scheduled/AutomationsIntro";
 import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
 import { AUTOMATION_TEMPLATES } from "@/components/scheduled/automationTemplates";
 import { SESSION_LINK_ID_PLACEHOLDER } from "@/components/scheduled/triggerTemplates";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSharingOff, SHARING_OFF_REASON } from "@/lib/capabilities";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { useNavigate, useRebasePath, useSearchParams } from "@/lib/routing";
 import { getShareableSessionLink } from "@/lib/shareLink";
 import {
+  useCloneScheduledTask,
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
   useScheduledTasks,
@@ -47,8 +56,17 @@ import {
 } from "@/hooks/useScheduledTasks";
 import { useNow } from "@/hooks/useNow";
 import { useViewerId } from "@/hooks/useViewerId";
-import { canShareAutomation, sharedAutomationsListed } from "@/lib/permissionsApi";
-import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
+import {
+  automationShareDisabledReason,
+  canShareAutomation,
+  sharedAutomationsListed,
+} from "@/lib/permissionsApi";
+import {
+  cloneCreatedMessage,
+  cloneFailedMessage,
+  ScheduledTaskApiError,
+  type ScheduledTask,
+} from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
 
@@ -60,9 +78,17 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
   { value: "paused", label: "Paused" },
 ];
 
+type SortOrder = "next_run" | "name";
+
+const SORT_OPTIONS: { value: SortOrder; label: string }[] = [
+  { value: "next_run", label: "Next run" },
+  { value: "name", label: "Name" },
+];
+
 /**
- * The tasks matching the search and Active/Paused filter: ACTIVE first by soonest
- * next run, PAUSED last by name. The server's next run is authoritative (it counts
+ * The tasks matching the search and Active/Paused filter. Sorted by `name`, every
+ * row is alphabetical regardless of state. Sorted by `next_run` (the default):
+ * ACTIVE first by soonest next run, PAUSED last by name. The server's next run is authoritative (it counts
  * COUNT from the task's creation, which the client can't); the local estimate is
  * only a fallback. Active rows with no computable next run sort after the rest.
  */
@@ -70,6 +96,7 @@ function filterAndSortTasks(
   tasks: ScheduledTask[],
   search: string,
   filter: FilterTab,
+  sort: SortOrder = "next_run",
 ): ScheduledTask[] {
   const q = search.trim().toLowerCase();
   const matches = tasks.filter((t) => {
@@ -78,6 +105,9 @@ function filterAndSortTasks(
     if (q && !t.name.toLowerCase().includes(q)) return false;
     return true;
   });
+  if (sort === "name") {
+    return matches.slice().sort((a, b) => a.name.localeCompare(b.name));
+  }
   const nextRunByTaskId = new Map(
     matches
       .filter((t) => t.state === "active")
@@ -115,9 +145,11 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
   const runNowMutation = useRunScheduledTaskNow();
+  const cloneMutation = useCloneScheduledTask();
 
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<FilterTab>("all");
+  const [sort, setSort] = useState<SortOrder>("next_run");
   const [manualOpen, setManualOpen] = useState(false);
   const [editingTask, setEditingTask] = useState<ScheduledTask | null>(null);
   // Kept after closing so the dialog can animate out.
@@ -202,16 +234,16 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   }
 
   const filtered = useMemo(
-    () => filterAndSortTasks(tasks ?? [], search, filter),
-    [tasks, search, filter],
+    () => filterAndSortTasks(tasks ?? [], search, filter, sort),
+    [tasks, search, filter, sort],
   );
   const sharedTasks = useMemo(
     () => sharedQuery.data?.pages.flatMap((page) => page.tasks) ?? [],
     [sharedQuery.data],
   );
   const sharedFiltered = useMemo(
-    () => filterAndSortTasks(sharedTasks, search, filter),
-    [sharedTasks, search, filter],
+    () => filterAndSortTasks(sharedTasks, search, filter, sort),
+    [sharedTasks, search, filter, sort],
   );
   const {
     hasNextPage: sharedHasMore,
@@ -243,7 +275,9 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
         ? (deleteMutation.variables as string | undefined)
         : runNowMutation.isPending
           ? (runNowMutation.variables as string | undefined)
-          : undefined;
+          : cloneMutation.isPending
+            ? cloneMutation.variables?.id
+            : undefined;
 
   function handlePauseToggle(task: ScheduledTask) {
     updateMutation.mutate({
@@ -273,6 +307,21 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
     });
   }
 
+  const cloneAvailable = info !== "loading" && info.scheduled_task_clone === true;
+
+  function handleClone(task: ScheduledTask) {
+    cloneMutation.mutate(task, {
+      onSuccess: (clone) => {
+        showToast(cloneCreatedMessage(clone));
+        // Without detail pages the copy stays here, on the refreshed list.
+        if (isFeatureEnabled(info, "automations_v2")) {
+          navigate(`/tasks/${encodeURIComponent(clone.id)}`);
+        }
+      },
+      onError: (err) => showToast(cloneFailedMessage(err)),
+    });
+  }
+
   function handleEdit(task: ScheduledTask) {
     setTemplateId(null);
     setEditingTask(task);
@@ -295,6 +344,8 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
         trackClick(`tasks.filter_${value}`, "button");
         setFilter(value);
       }}
+      sort={sort}
+      onSortChange={setSort}
       showFilters={hasAny}
     />
   );
@@ -447,7 +498,8 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
                   onShare={
                     canShareAutomation(info, viewerId, task.ownerUserId) ? handleShare : undefined
                   }
-                  shareDisabledReason={isSharingOff(info) ? SHARING_OFF_REASON : undefined}
+                  shareDisabledReason={automationShareDisabledReason(info, task)}
+                  onClone={cloneAvailable ? handleClone : undefined}
                 />
               ))}
             </div>
@@ -498,6 +550,8 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
                   onPauseToggle={handlePauseToggle}
                   onRunNow={handleRunNow}
                   onDelete={handleDelete}
+                  // Shown disabled: only the owner can clone it.
+                  onClone={cloneAvailable ? handleClone : undefined}
                 />
               ))}
             </div>
@@ -536,22 +590,50 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
           onOpenChange={setShareOpen}
         />
       )}
+      {isFeatureEnabled(info, "quick_pick_palette") && (
+        <AutomationListPaletteCommands
+          view={view}
+          tasks={tasks}
+          loadFailed={isError}
+          filter={filter}
+          busyTaskId={busyId}
+          canShare={(task) => canShareAutomation(info, viewerId, task.ownerUserId)}
+          shareDisabledReason={(task) => automationShareDisabledReason(info, task)}
+          cloneAvailable={cloneAvailable}
+          handlers={{
+            newAutomation: openManual,
+            changeFilter: setFilter,
+            runNow: handleRunNow,
+            edit: handleEdit,
+            share: handleShare,
+            clone: handleClone,
+            pauseToggle: handlePauseToggle,
+          }}
+        />
+      )}
     </PageScroll>
   );
 }
 
-/** The search box and, once there are tasks, the All / Active / Paused filter. */
+/**
+ * The search box and, once there are tasks, the All / Active / Paused filter and
+ * the Next run / Name sort order.
+ */
 function TaskListControls({
   search,
   onSearchChange,
   filter,
   onFilterChange,
+  sort,
+  onSortChange,
   showFilters,
 }: {
   search: string;
   onSearchChange: (value: string) => void;
   filter: FilterTab;
   onFilterChange: (value: FilterTab) => void;
+  sort: SortOrder;
+  onSortChange: (value: SortOrder) => void;
   showFilters: boolean;
 }) {
   return (
@@ -568,24 +650,48 @@ function TaskListControls({
         />
       </div>
       {showFilters && (
-        <div aria-label="Filter automations" className="flex items-center gap-1">
-          {FILTER_TABS.map((tab) => (
-            <button
-              key={tab.value}
-              type="button"
-              aria-pressed={filter === tab.value}
-              data-testid={`tasks-filter-${tab.value}`}
-              onClick={() => onFilterChange(tab.value)}
-              className={cn(
-                "rounded-md px-3 py-1 text-ui font-medium transition-colors",
-                filter === tab.value
-                  ? "bg-muted text-foreground"
-                  : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
-              )}
-            >
-              {tab.label}
-            </button>
-          ))}
+        <div className="flex items-center justify-between gap-2">
+          <div aria-label="Filter automations" className="flex items-center gap-1">
+            {FILTER_TABS.map((tab) => (
+              <button
+                key={tab.value}
+                type="button"
+                aria-pressed={filter === tab.value}
+                data-testid={`tasks-filter-${tab.value}`}
+                onClick={() => onFilterChange(tab.value)}
+                className={cn(
+                  "rounded-md px-3 py-1 text-ui font-medium transition-colors",
+                  filter === tab.value
+                    ? "bg-muted text-foreground"
+                    : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+                )}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+          <Select
+            value={sort}
+            onValueChange={(value) => onSortChange(value as SortOrder)}
+            componentId="tasks.sort"
+            valueHasNoPii
+          >
+            <SelectTrigger size="sm" aria-label="Sort automations" data-testid="tasks-sort">
+              <span className="text-muted-foreground">Sort:</span>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent align="end" position="popper">
+              {SORT_OPTIONS.map((option) => (
+                <SelectItem
+                  key={option.value}
+                  value={option.value}
+                  data-testid={`tasks-sort-${option.value}`}
+                >
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
       )}
     </div>

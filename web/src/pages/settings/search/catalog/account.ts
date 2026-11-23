@@ -2,6 +2,7 @@ import { settingsEntry } from "./types";
 
 export const ACCOUNT_PASSWORD_ENTRY = settingsEntry({
   id: "account-password",
+  available: (availability) => availability.accountsEnabled,
   section: "account",
   label: "Change password",
   description: "Change the password you sign in to Omnigent with.",

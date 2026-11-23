@@ -38,11 +38,9 @@ import {
   Suspense,
   useCallback,
   useEffect,
-  useId,
   useMemo,
   useRef,
   useState,
-  useSyncExternalStore,
 } from "react";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useProactiveAgentSettings } from "@/hooks/useProactiveAgentSettings";
@@ -63,13 +61,10 @@ import {
   FoldVerticalIcon,
   MessagesSquareIcon,
   MinusIcon,
-  MonitorIcon,
-  MoonIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
   PinIcon,
   PlusIcon,
-  SunIcon,
   SquareCheckIcon,
   SquareIcon,
   TerminalIcon,
@@ -93,7 +88,6 @@ import {
 } from "@/pages/settings/search/catalog/updates";
 import { SettingsEntryLabel, SettingsItem } from "@/pages/settings/search/SettingsItem";
 import {
-  type SettingsControlProps,
   settingsControlProps,
   settingsFileInputProps,
   settingsDescriptionId,
@@ -106,15 +100,20 @@ import {
 import {
   SettingsDataRegion,
   SettingsOwner,
+  useSettingsOwnership,
   settingsOverlayProps,
   settingsRowOverlayProps,
   settingsRuntimeChoiceProps,
 } from "@/pages/settings/search/settingsOwnership";
 import {
+  ADMIN_VIEW_ENTRY,
   ALWAYS_STEER_ENTRY,
   BACKGROUND_SESSION_TITLES_ENTRY,
+  OPEN_LINKS_IN_APP_ENTRY,
   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
+  PROJECT_KANBAN_BOARD_ENTRY,
   SUBMIT_WITH_MOD_ENTER_ENTRY,
+  TERMINAL_CLIPBOARD_ENTRY,
 } from "@/pages/settings/search/catalog/general";
 import {
   APPEARANCE_DATA_ENTRY,
@@ -194,10 +193,11 @@ import {
 } from "@/lib/databricksIntegration";
 import {
   getCurrentIsAdmin,
-  getCurrentAdminEligibility,
+  getCurrentUserId,
   resolveIdentity,
   subscribeIdentity,
 } from "@/lib/identity";
+import { useAdminViewSwitchShown } from "@/hooks/useAdminViewSwitchShown";
 import { isAdminViewEnabled, setAdminViewEnabled } from "@/lib/adminView";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -257,7 +257,6 @@ import {
   writeCodeBlockWordWrap,
 } from "@/lib/codeWrapPreferences";
 import {
-  readTerminalThemeMode,
   TERMINAL_THEME_DEFAULT,
   writeTerminalThemeMode,
   type TerminalThemeMode,
@@ -323,7 +322,13 @@ import {
   type DefaultWorkspaceTab,
 } from "@/lib/workspaceTabPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
-import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { useAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import {
+  THEME_MODE_OPTIONS,
+  TERMINAL_THEME_OPTIONS,
+  themeModeLabel,
+} from "@/components/theme/themeModeOptions";
+import { useTerminalThemeMode } from "@/components/theme/useTerminalIsDark";
 import {
   readOpenSubagentsInPanel,
   writeOpenSubagentsInPanel,
@@ -356,14 +361,16 @@ import {
   notifyHiddenPickerAgentsChanged,
 } from "@/lib/pickerEntryVisibility";
 import {
-  applyThemePalette,
   DEFAULT_PALETTE,
   isThemeSelection,
   PALETTES,
-  readThemePalette,
   type ThemeSelection,
-  writeThemePalette,
 } from "@/lib/themePalette";
+import {
+  commitThemePalette,
+  reloadThemePalette,
+  useThemePaletteSelection,
+} from "@/store/themePalette";
 import {
   applyCustomTheme,
   createCustomThemeFromPalette,
@@ -374,7 +381,7 @@ import {
   writeCustomTheme,
 } from "@/lib/customTheme";
 import { useHostTheme } from "@/lib/embedded";
-import { getOmnigentThemeSettingsUrl, isDatabricksWorkspace } from "@/lib/host";
+import { getOmnigentThemeSettingsUrl } from "@/lib/host";
 import {
   applyImportedSettings,
   collectSettings,
@@ -527,18 +534,6 @@ function Section({
   );
 }
 
-const themeCards: { mode: ThemeMode; label: string; icon: typeof SunIcon }[] = [
-  { mode: "system", label: "System", icon: MonitorIcon },
-  { mode: "light", label: "Light", icon: SunIcon },
-  { mode: "dark", label: "Dark", icon: MoonIcon },
-];
-
-const terminalThemeCards: { mode: TerminalThemeMode; label: string; icon: typeof SunIcon }[] = [
-  { mode: "auto", label: "Match app", icon: MonitorIcon },
-  { mode: "light", label: "Light", icon: SunIcon },
-  { mode: "dark", label: "Dark", icon: MoonIcon },
-];
-
 const transcriptViewCards: {
   value: TranscriptViewDefault;
   label: string;
@@ -659,11 +654,11 @@ function ModeControl() {
           value={mode}
           onSelect={(next) => setTheme(next)}
           componentId="settings.appearance.theme_mode"
-          items={themeCards.map((card) => ({
-            value: card.mode,
-            testId: `theme-${card.mode}`,
-            label: card.mode === "system" && followsHost ? "Use Databricks setting" : card.label,
-            icon: card.icon,
+          items={THEME_MODE_OPTIONS.map((option) => ({
+            value: option.mode,
+            testId: `theme-${option.mode}`,
+            label: themeModeLabel(option.mode, followsHost),
+            icon: option.icon,
           }))}
         />
       </SettingsOwner>
@@ -673,11 +668,7 @@ function ModeControl() {
 
 /** Terminal light/dark/match-app theme — its own section. */
 function TerminalThemeControl() {
-  const [mode, setMode] = useState(() => readTerminalThemeMode());
-  const choose = useCallback((next: TerminalThemeMode) => {
-    setMode(next);
-    writeTerminalThemeMode(next);
-  }, []);
+  const mode = useTerminalThemeMode();
   return (
     <SettingsItem entry={TERMINAL_THEME_ENTRY} className="flex items-center justify-between gap-4">
       <SettingsEntryLabel entry={TERMINAL_THEME_ENTRY} className="flex-1" />
@@ -685,13 +676,13 @@ function TerminalThemeControl() {
         <IconSegmentedControl<TerminalThemeMode>
           labelledBy={settingsLabelId(TERMINAL_THEME_ENTRY)}
           value={mode}
-          onSelect={choose}
+          onSelect={writeTerminalThemeMode}
           componentId="settings.appearance.terminal_theme"
-          items={terminalThemeCards.map((card) => ({
-            value: card.mode,
-            testId: `terminal-theme-${card.mode}`,
-            label: card.label,
-            icon: card.icon,
+          items={TERMINAL_THEME_OPTIONS.map((option) => ({
+            value: option.mode,
+            testId: `terminal-theme-${option.mode}`,
+            label: option.label,
+            icon: option.icon,
           }))}
         />
       </SettingsOwner>
@@ -898,15 +889,14 @@ function ColorThemeControl() {
   // Render each chip in the currently-resolved mode so it matches the app now
   // (honoring the embed's forced theme, not just next-themes' resolvedTheme).
   const isDark = useResolvedThemeMode() === "dark";
-  const [selection, setSelection] = useState<ThemeSelection>(() => readThemePalette());
+  // Shared with the theme picker, so a palette chosen there shows here.
+  const selection = useThemePaletteSelection();
   const [customTheme, setCustomTheme] = useState<CustomTheme>(() => readCustomTheme());
 
   const choose = useCallback(
     (next: ThemeSelection) => {
       if (next === "custom") applyCustomTheme(customTheme);
-      setSelection(next);
-      writeThemePalette(next);
-      applyThemePalette(next);
+      commitThemePalette(next);
     },
     [customTheme],
   );
@@ -932,9 +922,7 @@ function ColorThemeControl() {
       setCustomTheme(next);
       writeCustomTheme(next);
       applyCustomTheme(next);
-      setSelection("custom");
-      writeThemePalette("custom");
-      applyThemePalette("custom");
+      commitThemePalette("custom");
     },
     [customTheme, selection],
   );
@@ -1246,8 +1234,7 @@ function AppearanceSection() {
 
     writeTerminalThemeMode(TERMINAL_THEME_DEFAULT);
 
-    writeThemePalette(DEFAULT_PALETTE);
-    applyThemePalette(DEFAULT_PALETTE);
+    commitThemePalette(DEFAULT_PALETTE);
     writeCustomTheme(DEFAULT_CUSTOM_THEME);
     applyCustomTheme(DEFAULT_CUSTOM_THEME);
 
@@ -1336,7 +1323,7 @@ function AppearanceSection() {
       if (themeMode && isThemeMode(themeMode)) setTheme(themeMode);
       applyStoredUiFontSize();
       applyUiFontFamily(readUiFontFamily());
-      applyThemePalette(readThemePalette());
+      reloadThemePalette();
       applyCustomTheme(readCustomTheme());
 
       setIsImportDialogOpen(false);
@@ -1457,7 +1444,9 @@ function AppearanceSection() {
                 </DialogHeader>
                 <DialogFooter>
                   <DialogClose asChild>
-                    <Button variant="outline">Cancel</Button>
+                    <Button data-settings-dialog-action="Cancel" variant="outline">
+                      Cancel
+                    </Button>
                   </DialogClose>
                   <Button
                     variant="default"
@@ -1471,23 +1460,23 @@ function AppearanceSection() {
                 </DialogFooter>
               </DialogContent>
             </Dialog>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json"
+              hidden
+              {...settingsFileInputProps(APPEARANCE_DATA_ENTRY, "chooseFile")}
+              data-testid="import-settings-file-input"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) void handleImportFile(file);
+                e.target.value = "";
+              }}
+            />
           </SettingsItem>
         </SettingsGroup>
       </div>
 
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept=".json"
-        className="hidden"
-        {...settingsFileInputProps(APPEARANCE_DATA_ENTRY, "chooseFile")}
-        data-testid="import-settings-file-input"
-        onChange={(e) => {
-          const file = e.target.files?.[0];
-          if (file) void handleImportFile(file);
-          e.target.value = "";
-        }}
-      />
       <Dialog open={isImportDialogOpen} onOpenChange={setIsImportDialogOpen}>
         <DialogContent {...settingsOverlayProps(APPEARANCE_DATA_ENTRY, "import")}>
           <DialogHeader>
@@ -1507,7 +1496,9 @@ function AppearanceSection() {
           )}
           <DialogFooter>
             <DialogClose asChild>
-              <Button variant="outline">Cancel</Button>
+              <Button data-settings-dialog-action="Cancel" variant="outline">
+                Cancel
+              </Button>
             </DialogClose>
             <Button
               variant="default"
@@ -1922,18 +1913,14 @@ function DatabricksIntegrationControl() {
  * Dispatch for messages sent while the agent is working (on by default).
  */
 function AlwaysSteerControl() {
-  const [value, setValue] = useState(() => readAlwaysSteer());
-  const toggle = useCallback((next: boolean) => {
-    setValue(next);
-    writeAlwaysSteer(next);
-  }, []);
+  const value = useAlwaysSteer();
   return (
     <SettingsItem entry={ALWAYS_STEER_ENTRY} className="flex items-start justify-between gap-6">
       <SettingsEntryLabel entry={ALWAYS_STEER_ENTRY} className="flex-1" />
       <Switch
         {...settingsControlProps(ALWAYS_STEER_ENTRY)}
         checked={value}
-        onCheckedChange={toggle}
+        onCheckedChange={writeAlwaysSteer}
         data-testid="always-steer-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.always_steer"
@@ -1979,27 +1966,21 @@ function ComposerSendShortcutControl() {
 /** On by default: clicking a project opens its sessions board. */
 function ProjectKanbanBoardControl() {
   const enabled = useProjectKanbanBoardPreference();
-  const labelId = useId();
-  const descriptionId = useId();
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Kanban board views"
-        labelId={labelId}
-        descriptionId={descriptionId}
-        className="flex-1"
-        description="Monitor a project's agents in one view and respond the moment one needs you."
-      />
+    <SettingsItem
+      entry={PROJECT_KANBAN_BOARD_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={PROJECT_KANBAN_BOARD_ENTRY} className="flex-1" />
       <Switch
-        aria-labelledby={labelId}
-        aria-describedby={descriptionId}
+        {...settingsControlProps(PROJECT_KANBAN_BOARD_ENTRY)}
         checked={enabled}
         onCheckedChange={writeProjectKanbanBoard}
         data-testid="project-kanban-board-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.project_kanban_board"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2011,32 +1992,26 @@ function ProjectKanbanBoardControl() {
  */
 function OpenLinksInAppControl() {
   const [enabled, setEnabled] = useState(readOpenLinksInApp);
-  const labelId = useId();
-  const descriptionId = useId();
   const toggle = useCallback((next: boolean) => {
     setEnabled(next);
     writeOpenLinksInApp(next);
   }, []);
 
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Open links in the in-app browser"
-        labelId={labelId}
-        descriptionId={descriptionId}
-        className="flex-1"
-        description={`Open chat links in-app, reusing matching tabs. ${MOD_KEY}+click also opens in-app; Shift+click opens your default browser.`}
-      />
+    <SettingsItem
+      entry={OPEN_LINKS_IN_APP_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={OPEN_LINKS_IN_APP_ENTRY} className="flex-1" />
       <Switch
-        aria-labelledby={labelId}
-        aria-describedby={descriptionId}
+        {...settingsControlProps(OPEN_LINKS_IN_APP_ENTRY)}
         checked={enabled}
         onCheckedChange={toggle}
         data-testid="open-links-in-app-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.open_links_in_app"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2094,8 +2069,6 @@ function OpenSubagentsInPanelControl() {
 }
 
 function TerminalClipboardControl() {
-  const labelId = useId();
-  const descriptionId = useId();
   const canRemember = canRememberTerminalClipboardPreference();
   const [preference, setPreference] = useState<TerminalClipboardPreference>(
     readTerminalClipboardPreference,
@@ -2120,12 +2093,13 @@ function TerminalClipboardControl() {
   };
 
   return (
-    <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
+    <SettingsItem
+      entry={TERMINAL_CLIPBOARD_ENTRY}
+      className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3"
+    >
       <div className="min-w-0 flex-1">
-        <SettingsLabel
-          label="Copying from terminals"
-          labelId={labelId}
-          descriptionId={descriptionId}
+        <SettingsEntryLabel
+          entry={TERMINAL_CLIPBOARD_ENTRY}
           description={
             canRemember
               ? "Control copying from all sessions and terminals on this server, in this browser or app. Allowing it lets terminal programs silently replace your clipboard with unwanted text or commands."
@@ -2147,44 +2121,30 @@ function TerminalClipboardControl() {
         valueHasNoPii
       >
         <SelectTrigger
-          aria-labelledby={labelId}
-          aria-describedby={descriptionId}
+          {...settingsControlProps(TERMINAL_CLIPBOARD_ENTRY)}
           data-testid="terminal-clipboard-preference-select"
           className="w-48 shrink-0"
         >
           <SelectValue />
         </SelectTrigger>
-        <SelectContent>
+        <SelectContent {...settingsOverlayProps(TERMINAL_CLIPBOARD_ENTRY)}>
           <SelectItem value="ask">Ask before copying</SelectItem>
           <SelectItem value="allow">Allow copying</SelectItem>
           <SelectItem value="block">Block copying</SelectItem>
         </SelectContent>
       </Select>
-    </div>
+    </SettingsItem>
   );
 }
 
 function AdminViewControl() {
-  const eligible = useSyncExternalStore(subscribeIdentity, getCurrentAdminEligibility, () => false);
-  const info = useServerInfo();
-  // Failed discovery has no capability flag; keep an existing off cookie recoverable.
-  if (
-    !eligible ||
-    info === "loading" ||
-    isBootFallbackInfo(info) ||
-    info.admin_view === false ||
-    (isAdminViewEnabled() && (!info.admin_view || info.single_user || isDatabricksWorkspace()))
-  )
-    return null;
+  if (!useAdminViewSwitchShown()) return null;
   return (
     <SettingsGroup title="Administration">
-      <div className="flex items-center justify-between gap-4">
-        <SettingsLabel
-          label="Admin view"
-          description="Turn off to use your normal session access."
-        />
+      <SettingsItem entry={ADMIN_VIEW_ENTRY} className="flex items-center justify-between gap-4">
+        <SettingsEntryLabel entry={ADMIN_VIEW_ENTRY} />
         <Switch
-          aria-label="Admin view"
+          {...settingsControlProps(ADMIN_VIEW_ENTRY)}
           checked={isAdminViewEnabled()}
           onCheckedChange={(enabled) => {
             try {
@@ -2195,7 +2155,7 @@ function AdminViewControl() {
           }}
           componentId="settings.general.admin_view"
         />
-      </div>
+      </SettingsItem>
     </SettingsGroup>
   );
 }
@@ -2253,6 +2213,12 @@ function GeneralSection() {
         {supportsGlobalShortcut() && (
           <SettingsGroup title="Desktop app" testId="settings-group-desktop-app">
             <GlobalShortcutControl />
+            {isFeatureEnabled(info, "floating_composer") && (
+              // Empty, and hidden, unless the shell can change the panel's shortcut by id.
+              <div className="mt-4 border-t border-border pt-4 empty:hidden">
+                <GlobalShortcutControl shortcutId="floatingComposer" />
+              </div>
+            )}
           </SettingsGroup>
         )}
         <AdminViewControl />
@@ -2369,15 +2335,16 @@ function UiFontSizeControl() {
           "focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
         )}
       >
-        <StepperButton
-          control={settingsControlProps(UI_FONT_SIZE_ENTRY, "decrease")}
-          testId="ui-font-size-dec"
-          disabled={atMin}
-          onClick={() => commit(px - UI_FONT_SIZE_STEP)}
-          componentId="settings.appearance.ui_font_decrease"
-        >
-          <MinusIcon className="ui-icon" />
-        </StepperButton>
+        <SettingsOwner entry={UI_FONT_SIZE_ENTRY} part="decrease">
+          <StepperButton
+            testId="ui-font-size-dec"
+            disabled={atMin}
+            onClick={() => commit(px - UI_FONT_SIZE_STEP)}
+            componentId="settings.appearance.ui_font_decrease"
+          >
+            <MinusIcon className="ui-icon" />
+          </StepperButton>
+        </SettingsOwner>
         <div className="flex items-center border-x border-input px-2 tabular-nums">
           <input
             type="number"
@@ -2396,15 +2363,16 @@ function UiFontSizeControl() {
             }}
           />
         </div>
-        <StepperButton
-          control={settingsControlProps(UI_FONT_SIZE_ENTRY, "increase")}
-          testId="ui-font-size-inc"
-          disabled={atMax}
-          onClick={() => commit(px + UI_FONT_SIZE_STEP)}
-          componentId="settings.appearance.ui_font_increase"
-        >
-          <PlusIcon className="ui-icon" />
-        </StepperButton>
+        <SettingsOwner entry={UI_FONT_SIZE_ENTRY} part="increase">
+          <StepperButton
+            testId="ui-font-size-inc"
+            disabled={atMax}
+            onClick={() => commit(px + UI_FONT_SIZE_STEP)}
+            componentId="settings.appearance.ui_font_increase"
+          >
+            <PlusIcon className="ui-icon" />
+          </StepperButton>
+        </SettingsOwner>
       </div>
     </SettingsItem>
   );
@@ -2524,15 +2492,16 @@ function UiCodeFontSizeControl() {
           "focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
         )}
       >
-        <StepperButton
-          control={settingsControlProps(CODE_FONT_SIZE_ENTRY, "decrease")}
-          testId="code-font-size-dec"
-          disabled={atMin}
-          onClick={() => commit(px - CODE_FONT_SIZE_STEP)}
-          componentId="settings.appearance.code_font_decrease"
-        >
-          <MinusIcon className="ui-icon" />
-        </StepperButton>
+        <SettingsOwner entry={CODE_FONT_SIZE_ENTRY} part="decrease">
+          <StepperButton
+            testId="code-font-size-dec"
+            disabled={atMin}
+            onClick={() => commit(px - CODE_FONT_SIZE_STEP)}
+            componentId="settings.appearance.code_font_decrease"
+          >
+            <MinusIcon className="ui-icon" />
+          </StepperButton>
+        </SettingsOwner>
         <div className="flex items-center border-x border-input px-2 tabular-nums">
           <input
             type="number"
@@ -2551,15 +2520,16 @@ function UiCodeFontSizeControl() {
             }}
           />
         </div>
-        <StepperButton
-          control={settingsControlProps(CODE_FONT_SIZE_ENTRY, "increase")}
-          testId="code-font-size-inc"
-          disabled={atMax}
-          onClick={() => commit(px + CODE_FONT_SIZE_STEP)}
-          componentId="settings.appearance.code_font_increase"
-        >
-          <PlusIcon className="ui-icon" />
-        </StepperButton>
+        <SettingsOwner entry={CODE_FONT_SIZE_ENTRY} part="increase">
+          <StepperButton
+            testId="code-font-size-inc"
+            disabled={atMax}
+            onClick={() => commit(px + CODE_FONT_SIZE_STEP)}
+            componentId="settings.appearance.code_font_increase"
+          >
+            <PlusIcon className="ui-icon" />
+          </StepperButton>
+        </SettingsOwner>
       </div>
     </SettingsItem>
   );
@@ -2648,14 +2618,12 @@ function UiCodeFontWeightControl() {
 
 /** Flanking +/- segment of the font-size pill: square, ghost-hover, no border. */
 function StepperButton({
-  control,
   testId,
   disabled,
   onClick,
   componentId,
   children,
 }: {
-  control: SettingsControlProps;
   testId: string;
   disabled: boolean;
   onClick: () => void;
@@ -2663,10 +2631,11 @@ function StepperButton({
   children: ReactNode;
 }) {
   const { trackClick } = useOmnigentAnalytics();
+  const owned = useSettingsOwnership();
   return (
     <button
       type="button"
-      {...control}
+      {...owned.control()}
       data-testid={testId}
       disabled={disabled}
       onClick={() => {
@@ -3006,10 +2975,17 @@ function AccountSection() {
 
   useEffect(() => {
     if (capabilitiesLoading) return;
-    void (async () => {
-      const userId = await resolveIdentity();
+    let active = true;
+    const update = (userId: string | null) => {
+      if (!active) return;
       setMe(userId === null ? null : { id: userId, is_admin: getCurrentIsAdmin() });
-    })();
+    };
+    const unsubscribe = subscribeIdentity(() => update(getCurrentUserId()));
+    void resolveIdentity().then(update);
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, [capabilitiesLoading]);
 
   const onSignOut = useCallback(() => signOutOfBrowserSession(accountsEnabled), [accountsEnabled]);

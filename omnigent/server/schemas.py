@@ -2440,6 +2440,12 @@ class SessionResponse(BaseModel):
         family instead of inferring it from the model string (which
         is wrong when the agent declares no model). ``None`` when
         the agent cannot be looked up.
+    :param permission_mode: The permission mode the session is in, in its
+        harness's vocabulary, e.g. ``"auto"`` or ``"approve-for-me"`` (the
+        names ``sys_session_create`` takes). Follows a switch made while it
+        runs to a mode that keeps approval; a mode that skips approval shows
+        only when the session's launch settings select it. ``None`` when the
+        harness has no permission modes or the mode cannot be told.
     :param model_override: Per-session LLM model override,
         e.g. ``"claude-opus-4-7"``. ``None`` means no override is
         active (the agent's ``llm_model`` applies). Set via
@@ -2486,6 +2492,9 @@ class SessionResponse(BaseModel):
         seed their cost indicator on resume without waiting for the
         next ``session.usage`` SSE event.
         Also ``None`` when ``usage_included`` is ``False``.
+    :param cost_hidden: ``True`` when the operator set ``OMNIGENT_HIDE_COST``;
+        clients then clear any cached cost instead of keeping it. ``None``
+        otherwise.
     :param usage_by_model: Per-model breakdown of the same subtree usage,
         keyed by the raw harness model id, e.g.
         ``{"claude-sonnet-4-6": ModelUsage(input_tokens=12000, ...)}``.
@@ -2499,9 +2508,10 @@ class SessionResponse(BaseModel):
         them with a separate ``GET /v1/sessions/{id}`` using
         ``include_usage=true``, ``include_items=false``,
         ``include_liveness=false``, and ``refresh_state=false``.
-    :param native_usage_baseline: Own cumulative token baseline for Pi and Codex
-        side chats, excluding descendants. Available even when display usage
-        aggregation is skipped; ``None`` for other harnesses or older servers.
+    :param native_usage_baseline: Own cumulative usage baseline for Pi, Claude
+        native and Codex side chats, excluding descendants. Available even when
+        display usage aggregation is skipped; ``None`` for other harnesses or
+        older servers.
     :param last_task_error: Error details from the most recently
         failed task. Only present when ``status == "failed"`` and
         the task stored an error. Lets clients display the failure
@@ -2629,6 +2639,7 @@ class SessionResponse(BaseModel):
     root_conversation_id: str | None = None
     llm_model: str | None = None
     harness: str | None = None
+    permission_mode: str | None = None
     model_override: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
@@ -2636,6 +2647,7 @@ class SessionResponse(BaseModel):
     context_window: int | None = None
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
+    cost_hidden: bool | None = None
     usage_by_model: dict[str, ModelUsage] | None = None
     usage_included: bool = True
     native_usage_baseline: NativeUsageBaseline | None = None
@@ -2797,6 +2809,7 @@ class UpdateSessionRequest(BaseModel):
 
     runner_id: str | None = None
     family_pinned: bool | None = None
+    nest_source_id: str | None = None
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] | None = None
     reasoning_effort: str | None = None
@@ -3454,13 +3467,19 @@ class WorkflowSummary(BaseModel):
     """
     A saved workflow as a list page returns it, without its steps.
 
-    :param id: Workflow ID, a bare 32-character hex UUID.
+    :param id: Workflow ID, bare 32-character hex.
     :param object: Discriminator; always ``"workflow"``.
     :param name: One line, unique among the owner's workflows.
     :param description: What the workflow is for.
     :param created_at: Unix epoch seconds when it was saved.
     :param updated_at: Unix epoch seconds of the last write.
     :param is_draft: Derived from whether the saved plan has no steps.
+    :param viewer_role: ``"owner"``, or ``"viewer"`` for someone it is shared with, who
+        may view, run and copy it but not change it.
+    :param owner_display_name: The owner's name for a viewer; ``None`` for the owner.
+    :param shareable: Whether the workflow itself can be shared where the server shares
+        workflows (``/v1/info`` ``workflow_sharing``); ``False`` for one whose grants
+        the server cannot keep.
     """
 
     id: str
@@ -3470,6 +3489,9 @@ class WorkflowSummary(BaseModel):
     created_at: int
     updated_at: int
     is_draft: bool = False
+    viewer_role: Literal["owner", "viewer"] = "owner"
+    owner_display_name: str | None = None
+    shareable: bool = True
 
 
 class WorkflowObject(WorkflowSummary):
@@ -3507,6 +3529,23 @@ class WorkflowList(BaseModel):
     last_id: str | None = None
     next_cursor: str | None = None
     has_more: bool = False
+
+
+class SharedWorkflowList(BaseModel):
+    """
+    One page of the workflows other people shared with the caller, for
+    ``GET /v1/workflows/shared``, ordered by ID.
+
+    :param object: Discriminator; always ``"list"``.
+    :param data: The page's workflows, without their steps, each with ``viewer_role``
+        ``"viewer"`` and its owner's ``owner_display_name``.
+    :param next_cursor: Pass it as ``after`` for the next page; ``None`` on the last
+        page. A page can be short, even empty, while it is set.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[WorkflowSummary] = Field(default_factory=list)
+    next_cursor: str | None = None
 
 
 class WorkflowRunProgress(BaseModel):
@@ -4470,6 +4509,8 @@ class SessionUsageEvent(_SSEEventBase):
         so the client keeps its prior value (the snapshot seeds the
         initial "—" for an unpriced session). Once a session is priced
         the total only grows, so it never reverts to unpriced.
+    :param cost_hidden: ``True`` when the operator set ``OMNIGENT_HIDE_COST``,
+        telling the client to clear a cached cost rather than keep it.
     :param usage_by_model: Per-model breakdown of the same subtree usage
         after this update, keyed by raw harness model id, e.g.
         ``{"claude-sonnet-4-6": ModelUsage(input_tokens=12000, ...)}``.
@@ -4487,6 +4528,7 @@ class SessionUsageEvent(_SSEEventBase):
     context_tokens: int | None = None
     context_window: int | None = None
     total_cost_usd: float | None = None
+    cost_hidden: bool | None = None
     usage_by_model: dict[str, ModelUsage] | None = None
 
 

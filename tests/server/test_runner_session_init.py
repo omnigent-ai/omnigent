@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -293,6 +294,47 @@ def test_reconnect_init_envelope_carries_fork_history_directives(db_uri: str) ->
     metadata = _claude_launch_metadata_from_envelope(envelope)
     assert metadata.fork_carry_history is True
     assert metadata.fork_source_external_id == "src-claude-sid"
+
+
+def test_init_envelope_carries_the_sessions_own_cost(db_uri: str) -> None:
+    """The runner restores a cold-resumed Claude's running cost from the envelope.
+
+    Drives the real store so the value is the one ``session_usage`` persists.
+    """
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    agent = agent_store.create(generate_agent_id(), "claude-native-ui", "bundle/loc")
+    session = conversation_store.create_conversation(agent_id=agent.id, workspace="/tmp/ws")
+    conversation_store.set_session_usage(session.id, {"total_cost_usd": 1.25})
+    stored = conversation_store.get_conversation(session.id)
+    assert stored is not None
+
+    envelope = parse_runner_session_init_envelope(
+        build_runner_session_init_payload(stored, server_version="0.6.0.dev0")
+    )
+
+    assert envelope is not None
+    assert envelope.snapshot.own_cost_usd == 1.25
+    from omnigent.runner.app import _claude_launch_metadata_from_envelope
+
+    assert _claude_launch_metadata_from_envelope(envelope).resume_cost_usd == 1.25
+
+
+@pytest.mark.parametrize(
+    "session_usage",
+    [{}, {"total_cost_usd": 0}, {"total_cost_usd": 10**400}],
+    ids=["absent", "zero", "overflow"],
+)
+def test_init_envelope_omits_a_cost_it_cannot_restore(session_usage: dict[str, Any]) -> None:
+    """Only a positive cost that fits a float is restored into Claude."""
+    envelope = parse_runner_session_init_envelope(
+        build_runner_session_init_payload(
+            replace(_conversation(), session_usage=session_usage), server_version="0.6.0.dev0"
+        )
+    )
+
+    assert envelope is not None
+    assert envelope.snapshot.own_cost_usd is None
 
 
 @pytest.mark.asyncio

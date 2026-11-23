@@ -478,6 +478,26 @@ function makeEventCapturingRegistry(extra = {}) {
 }
 
 describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every hop)", () => {
+  it("invalidates continuations on page-initiated navigation, but not redirects", () => {
+    const { registry, fire, windowOpen, loaded } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv", "https://example.com", undefined, { agent: true });
+    const pending = registry.beginAgentNavigation("conv");
+    fire("will-redirect", "https://example.com/redirect");
+    assert.equal(pending(), true);
+    fire("will-navigate", "https://example.com/newer");
+    assert.equal(pending(), false);
+    assert.equal(registry.beginAgentNavigation("conv", pending.retryToken), null);
+
+    const popupPending = registry.beginAgentNavigation("conv");
+    registry.setOpenTabSupported(true);
+    windowOpen("https://example.com/background", "background-tab");
+    assert.equal(popupPending(), true, "a separate tab does not supersede this view");
+    windowOpen("https://example.com/popup", "foreground-tab");
+    assert.equal(loaded.at(-1), "https://example.com/popup");
+    assert.equal(popupPending(), false);
+    assert.equal(registry.beginAgentNavigation("conv", popupPending.retryToken), null);
+  });
+
   it("uses the same live Arca context for initial URL, redirect, frame and popup", () => {
     let eligible = true;
     const context = { serverTarget: "selected-server", sourceHostId: "actual-host" };

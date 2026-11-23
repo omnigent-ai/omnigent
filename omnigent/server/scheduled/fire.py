@@ -80,7 +80,7 @@ from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import Headers
 
-from omnigent.db.account_authority import account_authority_scope
+from omnigent.db.account_authority import account_authority_scope, account_checks_enabled
 from omnigent.db.db_models import workspace_scope
 from omnigent.debug_logging import set_current_session_id
 from omnigent.entities import Conversation, ScheduledTask, ScheduledTaskRun
@@ -118,6 +118,7 @@ from omnigent.server.scheduled.dispatch_scheduler import (
 from omnigent.server.scheduled.harness_settings import (
     forget_unrecorded_legacy_run_session,
     inherited_approval_skipping_problem,
+    launch_args_contain,
     note_unrecorded_legacy_run_session,
     permission_mode_launch_options,
     scheduled_agent_harness,
@@ -1030,6 +1031,11 @@ async def _disable_for_deleted_owner(
         task.user_id,
     )
     await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="deleted")
+    scheduler = getattr(deps.app_state, "scheduled_task_scheduler", None)
+    if scheduler is not None and not getattr(
+        deps.app_state, "scheduled_task_dispatch_enabled", False
+    ):
+        scheduler.remove(task.id)
     await delete_task_grants(deps.permission_store, task.id)
     await recorder.finish(
         "failed",
@@ -1284,6 +1290,7 @@ def _recovery_hint(task: ScheduledTask) -> str:
 
 
 UNATTENDED_PERMISSION_ERROR_CODE = "permission_mode_not_allowed"
+CONTEXT_FULL_ERROR_CODE = "continued_session_context_full"
 
 # Launch flags that start a native CLI without an approval gate, for sessions whose
 # live mode has no label; Codex's full bypass is what spec-derived args emit for ``yolo``.
@@ -1300,11 +1307,6 @@ _APPROVAL_SKIPPING_LAUNCH_ARGS: tuple[tuple[str, ...], ...] = (
 )
 
 
-def _contains_args(args: list[str], needle: tuple[str, ...]) -> bool:
-    width = len(needle)
-    return any(tuple(args[i : i + width]) == needle for i in range(len(args) - width + 1))
-
-
 def session_approval_skipping_mode(conv: Conversation) -> str | None:
     """The approval-skipping permission mode *conv* is running in, or ``None``.
 
@@ -1318,7 +1320,7 @@ def session_approval_skipping_mode(conv: Conversation) -> str | None:
         return "bypass"
     launch_args = list(getattr(conv, "terminal_launch_args", None) or [])
     for needle in _APPROVAL_SKIPPING_LAUNCH_ARGS:
-        if _contains_args(launch_args, needle):
+        if launch_args_contain(launch_args, needle):
             return " ".join(needle)
     return None
 
@@ -1353,7 +1355,8 @@ async def continued_session_problem(
     """Why ``conv`` cannot take *task*'s prompts, with an error code, or ``None`` if it can.
 
     Checked when the owner picks a session and again on every firing, since the
-    session and the task can both change in between.
+    session and the task can both change in between. A session whose last turn
+    overflowed its context window cannot take prompts until it is compacted.
     """
     if conv is None:
         return "the session no longer exists", "continued_session_missing"
@@ -1439,6 +1442,17 @@ async def continued_session_problem(
                 f"the session runs {where}, unlike the automation's execution target",
                 "continued_session_incompatible",
             )
+    from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
+
+    # Classify the stored error as the session's snapshot does. Another prompt
+    # would fail the same way and only add to the full history.
+    last_error = _last_task_error_from_labels(conv.labels)
+    if last_error is not None and last_error["code"] == "context_length_exceeded":
+        return (
+            "the session's context window is full, so every prompt fails until /compact "
+            "runs in it",
+            CONTEXT_FULL_ERROR_CODE,
+        )
     return None
 
 
@@ -1602,7 +1616,12 @@ async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask) -> bool:
     if task.user_id is None or deps.permission_store is None:
         return False
     owner = await asyncio.to_thread(deps.permission_store.get_user, task.user_id)
-    return owner is None or owner.account_generation != task.account_generation
+    if owner is None:
+        return True
+    # External auth does not capture a generation; accounts mode stays strict.
+    if task.account_generation is None and not account_checks_enabled():
+        return False
+    return owner.account_generation != task.account_generation
 
 
 async def _resolve_effective_task(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:

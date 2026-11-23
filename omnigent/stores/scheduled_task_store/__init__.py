@@ -161,6 +161,7 @@ class ScheduledTaskStore(ABC):
         delegation_ref: str | None = None,
         first_run_at: int | None = None,
         kind: str = "automation",
+        schedule_anchor: int | None = None,
     ) -> ScheduledTask:
         """
         Insert a new scheduled task.
@@ -203,6 +204,10 @@ class ScheduledTaskStore(ABC):
             the same write. ``None`` skips the check.
         :param kind: ``"automation"`` (default), or ``"reminder"`` for a one-time
             (``COUNT=1``) task that continues ``session_id``.
+        :param schedule_anchor: Epoch seconds recorded as the task's creation
+            timestamp, which anchors its interval phase and ``COUNT``; ``None`` uses
+            now. A copy passes its original's so it runs on the same occurrences.
+            The first run is still the next occurrence after now.
         :returns: The newly created :class:`ScheduledTask`.
         :raises ScheduledTaskFirstRunMismatchError: If ``first_run_at`` is set and
             the first run differs; nothing is saved.
@@ -427,6 +432,26 @@ class ScheduledTaskStore(ABC):
         :returns: ``True`` if newly deleted; ``False`` if missing or already deleted.
         """
         ...
+
+    def get_default_timezone(self, user_id: str | None) -> str | None:
+        """
+        Return the IANA timezone a user's clients last reported.
+
+        :param user_id: The owner; ``None`` in single-user mode.
+        :returns: The recorded zone, or ``None`` when unsupported, unset, or invalid.
+        """
+        del user_id
+        return None
+
+    def set_default_timezone(self, user_id: str | None, timezone: str) -> None:
+        """
+        Record the IANA timezone used when a new task explicitly requests the default.
+
+        :param user_id: The owner; ``None`` in single-user mode.
+        :param timezone: A validated IANA timezone name.
+        :raises NotImplementedError: If this store does not persist timezone preferences.
+        """
+        raise NotImplementedError("this store does not persist timezone preferences")
 
     # ── Runs ─────────────────────────────────────────────────────
 

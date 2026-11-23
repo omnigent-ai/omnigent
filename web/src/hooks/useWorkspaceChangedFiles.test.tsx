@@ -7,6 +7,7 @@ import type { ReactNode } from "react";
 vi.mock(import("@/lib/workspaceApi"), async (original) => ({
   ...(await original()),
   listDirectoryViaWorkspaceApi: vi.fn(async () => null),
+  searchFilesViaWorkspaceApi: vi.fn(async () => null),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
@@ -43,11 +44,12 @@ import {
   useWorkspaceFileExists,
   useWorkspaceFileSearch,
   useWorkspaceServeable,
+  workspaceDirectoryQuery,
 } from "./useWorkspaceChangedFiles";
 import { goToFileSearchState, goToFileStatusMessage } from "@/shell/goToFileSearchStatus";
 
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { listDirectoryViaWorkspaceApi } from "@/lib/workspaceApi";
+import { listDirectoryViaWorkspaceApi, searchFilesViaWorkspaceApi } from "@/lib/workspaceApi";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { conversationRegistry } from "@/store/conversationRegistry";
 
@@ -222,24 +224,6 @@ function AllFilesPathsProbe({
   const query = useWorkspaceAllFiles(id, {}, location);
   useEffect(() => {
     if (query.isSuccess) onPaths(query.data.data.map((f) => f.path));
-  }, [query.isSuccess, query.data, onPaths]);
-  return null;
-}
-
-function DirectoryPathsProbe({
-  id,
-  path,
-  location,
-  onPaths,
-}: {
-  id: string;
-  path: string;
-  location: string;
-  onPaths: (paths: string[]) => void;
-}) {
-  const query = useWorkspaceDirectory(id, path, location);
-  useEffect(() => {
-    if (query.isSuccess) onPaths(query.data.map((f) => f.path));
   }, [query.isSuccess, query.data, onPaths]);
   return null;
 }
@@ -750,6 +734,15 @@ describe("useWorkspaceDirectory gating", () => {
           bytes: 3,
           modified_at: 1,
         },
+        {
+          id: "src/inner/lib",
+          name: "lib",
+          path: "src/inner/lib",
+          type: "directory",
+          bytes: null,
+          modified_at: 1,
+          leaf_directory_path: "src/inner/lib/deep",
+        },
       ],
       hasMore: false,
     });
@@ -759,7 +752,15 @@ describe("useWorkspaceDirectory gating", () => {
     });
 
     await waitFor(() => expect(result.current.data).toBeDefined());
-    expect(result.current.data?.map((file) => file.path)).toEqual(["src/inner/a.ts"]);
+    expect(result.current.data?.map((file) => file.path)).toEqual([
+      "src/inner/a.ts",
+      "src/inner/lib",
+    ]);
+    // A single-child chain's end carries over; a file has none.
+    expect(result.current.data?.map((file) => file.leaf_directory_path)).toEqual([
+      undefined,
+      "src/inner/lib/deep",
+    ]);
     expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith("conv_api", "src/inner", 1000);
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -775,6 +776,25 @@ describe("useWorkspaceDirectory gating", () => {
     await flushMicrotasks();
 
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("workspaceDirectoryQuery", () => {
+  it("keys a listing as the directory hooks do, adding a refresh token only once set", () => {
+    expect(workspaceDirectoryQuery("conv", "src").queryKey).toEqual([
+      "workspace-dir",
+      "conv",
+      "src",
+      "",
+    ]);
+    expect(workspaceDirectoryQuery("conv", "src", "remote", 2).queryKey).toEqual([
+      "workspace-dir",
+      "conv",
+      "src",
+      "remote",
+      2,
+    ]);
+    expect(workspaceDirectoryQuery("conv", "src").staleTime).toBe(5_000);
   });
 });
 
@@ -811,6 +831,102 @@ describe("useWorkspaceFileSearch gating", () => {
     expect(fetchMock.mock.calls[0][0]).toBe(
       "/v1/sessions/conv_live/resources/environments/default/search?limit=500&q=main&include=*.ts&exclude=**%2Fnode_modules",
     );
+  });
+});
+
+describe("useWorkspaceFileSearch through the workspace API", () => {
+  function SearchPathsProbe({ location }: { location: string }) {
+    const { data } = useWorkspaceFileSearch("conv_live", " main ", " *.ts ", "", {}, location);
+    return (
+      <>
+        <output data-testid="paths">{data?.files.map((file) => file.path).join(",")}</output>
+        <output data-testid="truncated">{String(data?.truncated)}</output>
+      </>
+    );
+  }
+
+  it("uses the API's answer, relative to the searched folder, without REST", async () => {
+    onlineMock.mockReturnValue(true);
+    // src/src/util.ts in the workspace: a nested folder named like the searched one.
+    vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValueOnce({
+      data: [
+        {
+          id: "src/util.ts",
+          name: "util.ts",
+          path: "src/util.ts",
+          type: "file",
+          bytes: 1,
+          modified_at: 1,
+        },
+      ],
+      hasMore: false,
+      truncated: true,
+    });
+
+    render(
+      <Wrap>
+        <SearchPathsProbe location="src" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("paths").textContent).toBe("src/util.ts"));
+    expect(screen.getByTestId("truncated")).toHaveTextContent("true");
+    expect(searchFilesViaWorkspaceApi).toHaveBeenCalledWith(
+      "conv_live",
+      "main",
+      { path: "src", include: "*.ts", exclude: "", limit: 500 },
+      expect.any(AbortSignal),
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("falls back to REST when the workspace API declines a folder search", async () => {
+    onlineMock.mockReturnValue(true);
+    vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValueOnce(null);
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        data: [
+          {
+            id: "src/b.ts",
+            name: "b.ts",
+            path: "src/b.ts",
+            type: "file",
+            bytes: 1,
+            modified_at: 1,
+          },
+        ],
+        has_more: false,
+      }),
+    );
+
+    render(
+      <Wrap>
+        <SearchPathsProbe location="src" />
+      </Wrap>,
+    );
+
+    // REST echoes the searched folder, which the hook strips.
+    await waitFor(() => expect(screen.getByTestId("paths").textContent).toBe("b.ts"));
+    expect(searchFilesViaWorkspaceApi).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/search/src?"),
+      expect.anything(),
+    );
+  });
+
+  it("searches a folder outside the workspace through REST only", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(jsonResponse({ object: "list", data: [], has_more: false }));
+
+    render(
+      <Wrap>
+        <SearchPathsProbe location="/etc" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(searchFilesViaWorkspaceApi).not.toHaveBeenCalled();
   });
 });
 
@@ -1884,24 +2000,47 @@ describe("browse-location listings normalize to paths relative to the location",
   });
 
   it.each([
-    ["reports", "reports/quarterly/q3.csv", "a relative location echoes the whole target"],
-    ["/elsewhere/reports", "q3.csv", "an absolute one lists bare"],
-  ])("roots a lazily-expanded directory's children under it (%s)", async (location, wirePath) => {
-    // Children address themselves relative to the tree's root, not to the
-    // directory that was listed -- otherwise expanding one level deeper
-    // would request the wrong path.
-    fetchMock.mockResolvedValueOnce(entries(wirePath));
-    const onPaths = vi.fn();
+    ["reports", "REST", "reports/quarterly/"],
+    ["/elsewhere/reports", "REST", ""],
+    ["reports", "the workspace API", "reports/quarterly/"],
+  ])(
+    "roots a lazily-expanded directory's children and chain ends under it (%s, through %s)",
+    async (location, route, wirePrefix) => {
+      // Children address themselves relative to the tree's root, not to the directory that
+      // was listed; a relative location echoes the whole target, an absolute one lists bare.
+      const listing = [
+        { id: "q3.csv", name: "q3.csv", type: "file" as const, bytes: 1, leaf: undefined },
+        { id: "2026", name: "2026", type: "directory" as const, bytes: null, leaf: "2026/q3" },
+      ].map(({ id, leaf, ...entry }) => ({
+        ...entry,
+        id: `${wirePrefix}${id}`,
+        path: `${wirePrefix}${id}`,
+        modified_at: null,
+        ...(leaf ? { leaf_directory_path: `${wirePrefix}${leaf}` } : {}),
+      }));
+      if (route === "REST") {
+        fetchMock.mockResolvedValueOnce(
+          jsonResponse({ object: "list", data: listing, has_more: false }),
+        );
+      } else {
+        vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce({
+          data: listing,
+          hasMore: false,
+        });
+      }
 
-    render(
-      <Wrap>
-        <DirectoryPathsProbe id="conv_dir" path="quarterly" location={location} onPaths={onPaths} />
-      </Wrap>,
-    );
-    await waitFor(() => expect(onPaths).toHaveBeenCalled());
+      const { result } = renderHook(
+        () => useWorkspaceDirectory("conv_dir", "quarterly", location),
+        { wrapper: Wrap },
+      );
 
-    expect(onPaths).toHaveBeenLastCalledWith(["quarterly/q3.csv"]);
-  });
+      await waitFor(() => expect(result.current.data).toBeDefined());
+      expect(result.current.data?.map((file) => [file.path, file.leaf_directory_path])).toEqual([
+        ["quarterly/q3.csv", undefined],
+        ["quarterly/2026", "quarterly/2026/q3"],
+      ]);
+    },
+  );
 });
 
 describe("browse-location wire form (survives a slash-merging proxy)", () => {

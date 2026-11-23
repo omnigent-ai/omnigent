@@ -6,10 +6,13 @@ import {
   useTerminals,
 } from "@/hooks/useTerminals";
 import {
+  type WorkspaceChangedFile,
   useWorkspaceChangedFiles,
   useWorkspaceEnvironment,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { isEditorLevel } from "@/lib/permissionsApi";
+
+const NO_CHANGED_FILES: readonly WorkspaceChangedFile[] = [];
 
 /** Shared discovery for the full-session shell and grid workspaces. */
 export function useWorkspaceResources({
@@ -46,6 +49,7 @@ export function useWorkspaceResources({
     environmentQuery,
     showFilesPanel: canBrowseWorkspace && environmentQuery.data?.available !== false,
     changedCount: changedFiles.data?.data.length ?? 0,
+    changedFiles: changedFiles.data?.data ?? NO_CHANGED_FILES,
     isChangedPath,
     terminals,
     agentTerminal,

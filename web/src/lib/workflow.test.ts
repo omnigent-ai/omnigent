@@ -10,6 +10,7 @@ import {
   continuePlanMessage,
   createWorkflowPrompt,
   editWorkflowPlanPrompt,
+  isStopPlanMessage,
   runSavedWorkflowPrompt,
   offersSaveWorkflow,
   offersWorkflow,
@@ -64,6 +65,14 @@ describe("stopPlanMessage", () => {
       expect(message).toContain("until I explicitly tell you to continue");
     },
   );
+
+  it("is recognized whatever plan it names, and nothing else is", () => {
+    expect(isStopPlanMessage(stopPlanMessage(null))).toBe(true);
+    expect(isStopPlanMessage(`${stopPlanMessage('Fix "the" tests')}\n`)).toBe(true);
+    expect(isStopPlanMessage(continuePlanMessage(null))).toBe(false);
+    expect(isStopPlanMessage(`Please don't. ${stopPlanMessage(null)}`)).toBe(false);
+    expect(isStopPlanMessage("Stop the plan now.")).toBe(false);
+  });
 });
 
 describe("taskActionMessage", () => {

@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/command";
 import { type ActionCommand, filterAppCommands, useAppCommands } from "./appCommands";
 import { PaletteSessionContext } from "./PaletteSessionContext";
+import { type FeaturePaletteRow, useFeaturePaletteCommands } from "./useFeaturePaletteCommands";
 import { type PaletteSession, usePaletteSessionSearch } from "./usePaletteSessionSearch";
 
 export interface CommandPaletteProps {
@@ -34,6 +35,8 @@ export interface CommandPaletteProps {
   onToggleRightSidebar: () => void;
   /** False on grid routes, where ⌘⌥] belongs to the grid's own workspace. */
   rightSidebarShortcutEnabled?: boolean;
+  /** Switches ⌘K to searching sessions only, as its session chord opens it; QuickPick offers it. */
+  onGoToSession?: () => void;
 }
 
 /** Split `text` on case-insensitive occurrences of `query`, bolding the matches
@@ -62,6 +65,19 @@ function HighlightedText({ text, query }: { text: string; query: string }): Reac
       part
     );
   });
+}
+
+/** Rows under their feature's heading, in the order the features offered them. */
+function groupByHeading(
+  rows: readonly FeaturePaletteRow[],
+): [heading: string, rows: FeaturePaletteRow[]][] {
+  const groups = new Map<string, FeaturePaletteRow[]>();
+  for (const row of rows) {
+    const group = groups.get(row.heading);
+    if (group) group.push(row);
+    else groups.set(row.heading, [row]);
+  }
+  return [...groups];
 }
 
 /** Keys that move cmdk's selection; see `userMovedSelection`. */
@@ -110,14 +126,24 @@ export function CommandPalette({
     () => (sessionsOnly ? [] : filterAppCommands(actions, query)),
     [actions, query, sessionsOnly],
   );
+  const featureCommands = useFeaturePaletteCommands(open && !sessionsOnly);
+  const filteredFeatureGroups = useMemo(
+    () => groupByHeading(filterAppCommands(featureCommands.rows, query)),
+    [featureCommands.rows, query],
+  );
 
   // The two search groups resolve independently, so a title match can render
   // above an already-highlighted content match. Keep the top row selected
   // until the user moves the selection for this query.
+  // A feature row that can't run takes no Enter, so the first one that can is selected.
+  const firstRunnableFeature = filteredFeatureGroups
+    .flatMap(([, rows]) => rows)
+    .find((row) => row.disabledReason === undefined);
   const firstItemValue =
     visibleSessions[0]?.id ??
     contentSessions[0]?.id ??
-    (filteredActions[0] ? `action:${filteredActions[0].id}` : "");
+    (filteredActions[0] ? `action:${filteredActions[0].id}` : undefined) ??
+    (firstRunnableFeature ? `feature:${firstRunnableFeature.id}` : "");
   const [selectedValue, setSelectedValue] = useState("");
   const userMovedSelection = useRef(false);
   useEffect(() => {
@@ -226,6 +252,7 @@ export function CommandPalette({
             : undefined
         }
         showCloseButton={false}
+        onCloseAutoFocus={featureCommands.onCloseAutoFocus}
       >
         <DialogTitle className="sr-only">{paletteLabel}</DialogTitle>
         {/* shouldFilter=false: the server filters sessions and we filter actions
@@ -346,6 +373,27 @@ export function CommandPalette({
                 })}
               </CommandGroup>
             )}
+            {filteredFeatureGroups.map(([heading, rows]) => (
+              <CommandGroup key={heading} heading={heading}>
+                {rows.map((row) => (
+                  <CommandItem
+                    key={row.id}
+                    value={`feature:${row.id}`}
+                    disabled={row.disabledReason !== undefined}
+                    onSelect={() => featureCommands.accept(row, close)}
+                  >
+                    <row.icon />
+                    <span className="flex-1 truncate text-left">{row.label}</span>
+                    {row.disabledReason && (
+                      <span className="truncate text-xs text-muted-foreground">
+                        {row.disabledReason}
+                      </span>
+                    )}
+                    {row.shortcut && <CompactShortcutKeys keys={row.shortcut} />}
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            ))}
           </CommandList>
         </Command>
       </DialogContent>

@@ -294,6 +294,18 @@ def test_invalid_or_oversized_workflows_are_refused(store: WorkflowStore) -> Non
     assert store.list_page(user_id=ALICE, limit=10) == ([], False)
 
 
+def test_get_many_reads_workflows_whoever_owns_them(store: WorkflowStore) -> None:
+    """For callers that checked a grant: each found once, missing and malformed IDs skipped."""
+    alices, bobs = _save(store, "a"), _save(store, "b", user_id=BOB)
+    missing = "0" * 31 + "1"
+    assert store.get_many([bobs.id, alices.id.upper(), missing, "not-an-id", bobs.id]) == {
+        alices.id: alices,
+        bobs.id: bobs,
+    }
+    assert store.get_many([]) == {}
+    assert store.get_many(["not-an-id"]) == {}
+
+
 class _AllocatingWorkflows(WorkflowStore):
     """A deployment's store that allocates workflow IDs and is told which go unused."""
 

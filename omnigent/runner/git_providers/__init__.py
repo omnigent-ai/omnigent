@@ -57,6 +57,12 @@ Additive fields:
 - ``auth``: a :class:`PullRequestAuth`; null when ``available`` is false.
 - ``capabilities``: :meth:`ProviderCapabilities.to_json`; null for an unsupported remote.
 - ``remote_host``: only with ``reason: "unsupported_remote"``.
+- ``repo.host``: the host of the repository's forge instance, e.g. ``"github.com"``;
+  omitted when the provider doesn't know it.
+- ``workspace_repo``: ``{name_with_owner, host}`` of the workspace checkout's own
+  repository, whichever PR ``repo`` describes. Omitted on explicit PR reads and when
+  the preferred remote (gh's resolved base, else origin) isn't recognized on that
+  host; with no remotes, the provider's answer (e.g. from ``GH_REPO``) stands.
 - PR associations in ``prs`` carry ``provider``.
 - The dispatcher adds descriptor ``provider_display`` to info and associations.
 - ``checks`` may also count ``cancelled`` and ``skipped`` jobs, with matching ``runs``
@@ -707,6 +713,40 @@ class PullRequestFacet(Protocol):
             ``tool_name`` is not one of this provider's PR tools.
         """
         ...
+
+
+def offered_capabilities(facet: PullRequestFacet, host: str | None) -> ProviderCapabilities:
+    """Return the capabilities *facet* offers for a pull request or workspace on *host*.
+
+    Every panel step that checks a capability, and every info payload, asks here, so
+    one place decides what a code host offers. Today that is the facet's own
+    :attr:`PullRequestFacet.capabilities` on every host.
+
+    :param facet: The provider's pull request facet.
+    :param host: The pull request's host, else the workspace remote's host; ``None``
+        when neither is known.
+    """
+    del host  # Every host gets the facet's own capabilities.
+    return facet.capabilities
+
+
+def with_offered_capabilities(
+    info: dict[str, Any], facet: PullRequestFacet, host: str | None
+) -> dict[str, Any]:
+    """Return *info* with its ``capabilities`` narrowed to :func:`offered_capabilities`.
+
+    A capability the payload reports stays on only when *facet* offers it on *host*;
+    nothing is turned on, and a payload without ``capabilities`` is returned as is.
+    """
+    reported = info.get("capabilities")
+    if not isinstance(reported, dict):
+        return info
+    offered = offered_capabilities(facet, host).to_json()
+    info["capabilities"] = {
+        name: (value and offered[name]) if name in offered else value
+        for name, value in reported.items()
+    }
+    return info
 
 
 def unsupported_remote_info(host: str) -> dict[str, Any]:

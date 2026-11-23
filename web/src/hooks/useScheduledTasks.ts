@@ -20,6 +20,7 @@ import { useEffect, useRef } from "react";
 import { invalidateSessionGrants } from "@/hooks/usePermissions";
 import { LIST_ROW_QUERY_ROOTS } from "@/lib/sessionListCache";
 import {
+  cloneScheduledTask,
   createScheduledTask,
   deleteScheduledTask,
   getScheduledTask,
@@ -360,6 +361,18 @@ export function useCreateScheduledTask() {
     mutationFn: (input: CreateScheduledTaskInput) => createScheduledTask(input),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
+    },
+  });
+}
+
+/** Clone an automation, then refresh the list and any session lists its source copy joins. */
+export function useCloneScheduledTask() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (task: Pick<ScheduledTask, "id" | "hostId">) => cloneScheduledTask(task),
+    onSuccess: (clone) => {
+      void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
+      if (clone.sourceSessionId) refreshAutomationSourceSession(queryClient, clone.sourceSessionId);
     },
   });
 }

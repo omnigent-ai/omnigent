@@ -34,6 +34,7 @@ import {
   isMacPlatform,
   isTextEntry,
 } from "@/lib/hotkeys";
+import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import type { AnyBlock, ElicitationBlock } from "@/lib/blocks";
 import { matchesShortcut, shortcutKeys } from "@/lib/shortcuts/registry";
 import { useChatStore } from "@/store/chatStore";
@@ -42,6 +43,15 @@ import { useChatStore } from "@/store/chatStore";
 export const APPROVE_KEYS = shortcutKeys("approval.accept");
 /** Glyph for the key that declines; shown on the Reject button it would press. */
 export const DECLINE_KEYS = shortcutKeys("approval.decline");
+
+/**
+ * Marks an element that binds ⌘↵ (Ctrl+↵ off macOS) itself, such as a row that opens
+ * in a new tab: with it focused, the chord is its own, never a prompt's accept.
+ */
+export const OWNS_COMMAND_ENTER_ATTRIBUTE = "data-owns-command-enter";
+
+/** Elements marked as owning ⌘↵, such as the file editor, which inserts a line below with it. */
+const COMMAND_ENTER_OWNERS = `[${OWNS_COMMAND_ENTER_ATTRIBUTE}]`;
 
 /**
  * Whether Esc belongs to something else: an open dialog or modal, menu, composer
@@ -124,6 +134,9 @@ export function isDraftingTarget(target: EventTarget | null): boolean {
   // Complete send intent (text OR attachments OR mentions), as declared by
   // the field itself — a bare value check can't see non-text drafts.
   if (target.dataset.hasDraft === "true") return true;
+  // A composer input of any engine, textarea included.
+  const composer = composerTargetOf(target);
+  if (composer) return composer.value.length > 0;
   if (target instanceof HTMLTextAreaElement) return target.value.length > 0;
   if (target instanceof HTMLInputElement) {
     // Only text-like inputs carry a typed draft; a checkbox/radio value is a
@@ -161,6 +174,9 @@ export function useApproveHotkey(isMac = isMacPlatform()): void {
       // verdict. Leave the event for the composer's own handler (whose
       // send path is separately gated while a prompt is pending).
       if (isDraftingTarget(e.target)) return;
+      // A marked owner of ⌘↵ keeps it. The chat composer is a CodeMirror editor too, but an
+      // empty one still answers the prompt, so being an editor alone isn't enough.
+      if (e.target instanceof Element && e.target.closest(COMMAND_ENTER_OWNERS)) return;
 
       const { blocks, submitApproval } = useChatStore.getState();
       const target = approveHotkeyTarget(blocks);

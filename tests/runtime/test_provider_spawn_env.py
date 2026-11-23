@@ -34,7 +34,12 @@ from unittest.mock import patch
 import pytest
 import yaml as _yaml
 
-from omnigent.errors import OmnigentError
+from omnigent.errors import (
+    CodexSignerConfigurationError,
+    ErrorCode,
+    HarnessConfigurationError,
+    OmnigentError,
+)
 from omnigent.inner.codex_worker import BROKERED_CODEX_AUTH_COMMAND
 from omnigent.inner.datamodel import (
     CredentialProxyEntry,
@@ -399,6 +404,32 @@ def _brokered_codex_spec(
     return spec, sandbox, binding
 
 
+@pytest.mark.parametrize("broker_gateway", [None, False], ids=["absent", "disabled"])
+def test_codex_nonbrokered_credentials_rejected_before_provider_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    broker_gateway: bool | None,
+) -> None:
+    from unittest.mock import Mock
+
+    from omnigent.runtime import workflow
+
+    spec, _, binding = _brokered_codex_spec(
+        CredentialSourceSpec(kind="unix_socket", path="/private/model-token.sock"),
+        host="openai.example.com",
+        response_path="/v1/responses",
+    )
+    if broker_gateway is None:
+        spec.executor.config.pop("broker_gateway")
+    else:
+        spec.executor.config["broker_gateway"] = broker_gateway
+    binding.inject_env = ["UNRELATED_TOKEN"]
+    resolve_provider = Mock()
+    monkeypatch.setattr(workflow, "_resolve_provider_for_build", resolve_provider)
+    with pytest.raises(OmnigentError, match="credential_proxy"):
+        _build_codex_spawn_env(spec)
+    resolve_provider.assert_not_called()
+
+
 def test_codex_gateway_binding_uses_only_placeholder_auth(config_home: Path) -> None:
     _write_config(config_home, _openai_default_config())
     spec, _, binding = _brokered_codex_spec(
@@ -416,15 +447,9 @@ def test_codex_gateway_binding_uses_only_placeholder_auth(config_home: Path) -> 
     assert env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] == "true"
     assert "/private/model-token.sock" not in env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"]
 
-    spec.executor.config.pop("broker_gateway")
-    with pytest.raises(OmnigentError, match=r"requires executor\.config\.broker_gateway: true"):
-        _build_codex_spawn_env(spec)
-    spec.executor.config["broker_gateway"] = False
-    with pytest.raises(OmnigentError, match=r"requires executor\.config\.broker_gateway: true"):
-        _build_codex_spawn_env(spec)
     for value in (None, 0, 1, "true", "false"):
         spec.executor.config["broker_gateway"] = value
-        with pytest.raises(OmnigentError, match="broker_gateway must be a boolean"):
+        with pytest.raises(HarnessConfigurationError, match="broker_gateway must be a boolean"):
             _build_codex_spawn_env(spec)
     spec.executor.config["broker_gateway"] = True
 
@@ -574,7 +599,6 @@ def test_codex_gateway_without_proxy_retains_ordinary_auth(
     spec.executor.config.update(settings)
 
     env = _build_codex_spawn_env(spec)
-
     assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == "printf %s sk-oai-secret"
     assert "HARNESS_CODEX_BROKERED_GATEWAY" not in env
     assert {
@@ -1273,8 +1297,10 @@ def test_named_provider_auth_missing_provider_fails_loud(config_home: Path) -> N
     _write_config(config_home, _anthropic_default_config())
     spec = _make_spec(harness="claude-sdk", auth=ProviderAuth(name="does-not-exist"))
 
-    with pytest.raises(Exception, match="does-not-exist"):
+    with pytest.raises(HarnessConfigurationError, match="does-not-exist") as raised:
         _build_claude_sdk_spawn_env(spec, workdir=None)
+    assert "executor.auth.name" in raised.value.client_message
+    assert "does-not-exist" not in raised.value.client_message
 
 
 def test_named_provider_auth_survives_inference_config_overlay(
@@ -1801,8 +1827,47 @@ def test_codex_legacy_databricks_profile_fails_without_broker_policy(
     _write_config(config_home, {})
     spec = _make_spec(harness="codex", model="some-model", profile="legacy-profile")
 
-    with pytest.raises(OmnigentError, match="ucode Codex state"):
+    with pytest.raises(OmnigentError, match="configured provider state"):
         _build_codex_spawn_env(spec, workdir=None)
+
+
+@pytest.mark.parametrize(
+    "failure_kind,repair",
+    [
+        ("auth_command", "remove that environment override"),
+        ("worker_egress", "use model_egress"),
+        ("profile", "Set the Databricks provider's 'profile'"),
+        ("state", "Codex setup"),
+    ],
+)
+def test_codex_signer_configuration_failures_keep_fixed_repair_guidance(
+    monkeypatch: pytest.MonkeyPatch, failure_kind: str, repair: str
+) -> None:
+    from omnigent.onboarding.provider_config import ProviderEntry
+    from omnigent.runtime import workflow
+
+    monkeypatch.delenv("HARNESS_CODEX_GATEWAY_AUTH_COMMAND", raising=False)
+    monkeypatch.setattr(workflow, "get_workspace_url_for_profile", lambda profile: None)
+    policy = OSEnvSandboxSpec(type="linux_bwrap")
+    spec = _make_spec(harness="codex", os_env=OSEnvSpec(sandbox=policy))
+    provider = ProviderEntry(
+        name="test-provider",
+        kind="databricks",
+        profile=None if failure_kind == "profile" else "test-profile",
+    )
+    if failure_kind == "auth_command":
+        monkeypatch.setenv("HARNESS_CODEX_GATEWAY_AUTH_COMMAND", "private-command")
+    elif failure_kind == "worker_egress":
+        policy.egress_rules = ["POST provider.example.test/**"]
+
+    with pytest.raises(CodexSignerConfigurationError) as raised:
+        _apply_codex_provider_env({}, spec, provider)
+    assert raised.value.code == ErrorCode.INVALID_INPUT
+    assert raised.value.http_status == 400
+    assert str(raised.value) == raised.value.client_message
+    assert repair in raised.value.client_message
+    assert "provider.example.test" not in raised.value.client_message
+    assert "private-command" not in raised.value.client_message
 
 
 def test_legacy_profile_still_suppresses_global_default_provider(config_home: Path) -> None:
@@ -1817,7 +1882,7 @@ def test_legacy_profile_still_suppresses_global_default_provider(config_home: Pa
     _write_config(config_home, _openai_default_config())  # global default exists
     spec = _make_spec(harness="codex", model="some-model", profile="legacy-profile")
 
-    with pytest.raises(OmnigentError, match="ucode Codex state"):
+    with pytest.raises(OmnigentError, match="configured provider state"):
         _build_codex_spawn_env(spec, workdir=None)
 
 
@@ -1866,9 +1931,23 @@ def test_codex_spec_databricks_auth_routes_via_synthesized_provider(
                     )
                 },
             ),
-        ),
+        ) as read_provider_state,
     ):
         env = _build_codex_spawn_env(spec, workdir=None)
+        read_provider_state.return_value = SimpleNamespace(
+            workspace_host="https://provider.example.test",
+            agent=lambda name: SimpleNamespace(
+                base_url="https://provider.example.test/private-route"
+            ),
+        )
+        with pytest.raises(
+            CodexSignerConfigurationError, match="supported trusted model endpoint"
+        ) as raised:
+            _build_codex_spawn_env(spec, workdir=None)
+        assert isinstance(raised.value.__cause__, ValueError)
+        assert "Codex setup" in raised.value.client_message
+        assert "provider.example.test" not in raised.value.client_message
+        assert "private-route" not in raised.value.client_message
 
     assert env["HARNESS_CODEX_DATABRICKS_PROFILE"] == "test-dbx-ws"
     assert env["HARNESS_CODEX_SIGNER_PROVIDER"] == "databricks-ucode-v1"
@@ -2332,13 +2411,13 @@ def test_kimi_declared_auth_raises(
     ``--mcp-config-file``), so declared auth can't be threaded. Silently
     launching against whatever ambient ``~/.kimi-code/config.toml`` resolves to
     would be a confused-deputy / mis-attribution risk, so the builder raises
-    instead. Regression guard for the originally-dead ``OmnigentError``."""
-    from omnigent.errors import OmnigentError
+    instead. The typed error allows only this fixed guidance through to clients."""
+    from omnigent.errors import KimiAuthConfigurationError
 
     _write_config(config_home, {"providers": {}})
     spec = _make_spec(harness="kimi", auth=auth)
 
-    with pytest.raises(OmnigentError, match=r"kimi.*does not support"):
+    with pytest.raises(KimiAuthConfigurationError, match=r"kimi.*does not support"):
         _build_kimi_spawn_env(spec, cwd=None)
 
 
