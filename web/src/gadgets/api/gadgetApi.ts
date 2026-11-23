@@ -30,6 +30,8 @@ export interface Gadget {
   published_revision: string | null;
   version: string | null;
   permissions: GadgetPermissions;
+  /** Epoch seconds; older servers omit it. */
+  created_at?: number;
 }
 
 export interface GadgetContent {
@@ -189,6 +191,7 @@ function parseGadget(value: unknown): Gadget {
     throw malformed("app");
   }
   const { id, name, owner_id, viewer_id, viewer_principal_id, published_revision, version } = value;
+  const createdAt = typeof value.created_at === "number" ? { created_at: value.created_at } : {};
   const permissions = value.permissions;
   if (
     typeof id !== "string" ||
@@ -214,6 +217,7 @@ function parseGadget(value: unknown): Gadget {
       publish: permissions.publish === true,
       manage: permissions.manage === true,
     },
+    ...createdAt,
   };
 }
 
@@ -241,9 +245,43 @@ function appPath(appId: string, suffix = ""): string {
   return `${GADGETS_PATH}/${encodeURIComponent(appId)}${suffix}`;
 }
 
+// Lists page with a cursor and a page can be short; this many pages is far past any real list.
+const MAX_LIST_PAGES = 100;
+const LIST_PAGE_SIZE = 100;
+
+/** Every page of a cursor-paged list, with each page's raw body for its other fields. */
+async function everyPage(
+  path: string,
+  query: Record<string, string>,
+  signal: AbortSignal | undefined,
+  what: string,
+): Promise<{ items: unknown[]; first: Record<string, unknown> | null }> {
+  const items: unknown[] = [];
+  let first: Record<string, unknown> | null = null;
+  let cursor: string | null = null;
+  for (let page = 0; page < MAX_LIST_PAGES; page++) {
+    const params = new URLSearchParams({ ...query, limit: String(LIST_PAGE_SIZE) });
+    if (cursor !== null) params.set("cursor", cursor);
+    // Each page needs the previous page's cursor.
+    // oxlint-disable-next-line no-await-in-loop
+    const body = await gadgetRequest(`${path}?${params}`, { signal });
+    if (!isRecord(body) || !Array.isArray(body.items)) {
+      throw malformed(what);
+    }
+    first ??= body;
+    items.push(...body.items);
+    cursor = typeof body.next_cursor === "string" ? body.next_cursor : null;
+    if (cursor === null) return { items, first };
+  }
+  throw malformed(what);
+}
+
+/** The viewer's own gadgets, oldest first. */
 export async function listGadgets(signal?: AbortSignal): Promise<Gadget[]> {
-  const body = await gadgetRequest(GADGETS_PATH, { signal });
-  return isRecord(body) && Array.isArray(body.items) ? body.items.map(parseGadget) : [];
+  const { items } = await everyPage(GADGETS_PATH, {}, signal, "app list");
+  return items
+    .map(parseGadget)
+    .sort((a, b) => (a.created_at ?? 0) - (b.created_at ?? 0) || a.id.localeCompare(b.id));
 }
 
 /** Someone else's gadget that reaches the caller through their own grant or a group's. */
@@ -268,8 +306,8 @@ function parseSharedGadget(value: unknown): SharedGadget {
  * leaves out gadgets the viewer reads only as an administrator.
  */
 export async function listSharedGadgets(signal?: AbortSignal): Promise<SharedGadget[]> {
-  const body = await gadgetRequest(`${GADGETS_PATH}/shared`, { signal });
-  return isRecord(body) && Array.isArray(body.items) ? body.items.map(parseSharedGadget) : [];
+  const { items } = await everyPage(`${GADGETS_PATH}/shared`, {}, signal, "shared app list");
+  return items.map(parseSharedGadget);
 }
 
 export async function getGadget(appId: string, signal?: AbortSignal): Promise<Gadget> {
@@ -674,11 +712,13 @@ export async function listGadgetComments(
   appId: string,
   signal?: AbortSignal,
 ): Promise<{ items: GadgetComment[]; canComment: boolean }> {
-  const body = await gadgetRequest(appPath(appId, "/comments"), { signal });
-  if (!isRecord(body) || !Array.isArray(body.items)) {
-    throw malformed("comment list");
-  }
-  return { items: body.items.map(parseComment), canComment: body.can_comment === true };
+  const { items, first } = await everyPage(appPath(appId, "/comments"), {}, signal, "comment list");
+  return {
+    items: items
+      .map(parseComment)
+      .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id)),
+    canComment: first?.can_comment === true,
+  };
 }
 
 export async function createGadgetComment(

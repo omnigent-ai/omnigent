@@ -21,10 +21,8 @@ from omnigent.stores.gadget_store import Gadget, GadgetStore
 from omnigent.stores.permission_store import MAX_SHARED_GADGETS_PAGE_SIZE, PermissionStore
 
 SharedVia = Literal["user", "group"]
-# The most shared gadgets a viewer's list reads.
-MAX_SHARED_GADGETS = 200
-# Grant pages read to fill that list, bounding the work when many grants are dead.
-MAX_SHARED_GADGET_PAGES = 10
+# The most shared gadgets one page of a viewer's list holds.
+MAX_SHARED_GADGETS = MAX_SHARED_GADGETS_PAGE_SIZE
 
 
 @dataclass(frozen=True)
@@ -76,6 +74,18 @@ class SharedGadget:
     shared_via: SharedVia
 
 
+@dataclass(frozen=True)
+class SharedPage:
+    """One page of the gadgets shared with a viewer.
+
+    :param next_cursor: Where the next page starts, or ``None`` after the last. A page
+        can be short, or empty, and still continue.
+    """
+
+    items: list[SharedGadget]
+    next_cursor: str | None
+
+
 class GadgetAccess(ABC):
     """A deployment's access rules for gadgets. Blocking; called off the event loop."""
 
@@ -93,11 +103,16 @@ class GadgetAccess(ABC):
         return {gadget.id: self.permissions(viewer_id, gadget) for gadget in gadgets}
 
     @abstractmethod
-    def shared_with(self, viewer_id: str) -> list[SharedGadget]:
-        """Other people's gadgets *viewer_id* can read, at most :data:`MAX_SHARED_GADGETS`.
+    def shared_with(
+        self, viewer_id: str, *, limit: int = MAX_SHARED_GADGETS, cursor: str | None = None
+    ) -> SharedPage:
+        """One page of other people's gadgets *viewer_id* can read.
 
         Leaves out the viewer's own gadgets and those they reach only through a
         role that reads everything, such as an administrator's.
+
+        :param limit: The most gadgets on the page, 1 to :data:`MAX_SHARED_GADGETS`.
+        :param cursor: The previous page's ``next_cursor``, or ``None`` to start.
         """
 
     def forget(self, gadget_id: str) -> None:  # noqa: B027 - optional hook
@@ -142,36 +157,32 @@ class PermissionStoreGadgetAccess(GadgetAccess):
                 result[gadget.id] = permissions_for_level(level)
         return result
 
-    def shared_with(self, viewer_id: str) -> list[SharedGadget]:
+    def shared_with(
+        self, viewer_id: str, *, limit: int = MAX_SHARED_GADGETS, cursor: str | None = None
+    ) -> SharedPage:
         grants = self._grants()
         if grants is None or viewer_id == RESERVED_USER_LOCAL:
-            return []
+            return SharedPage([], None)
         principals = grants.caller_principals(viewer_id)
+        # One page of grants per call; grants whose gadget is gone (one that raced its
+        # deletion) are dropped, so a page can come back short and still continue.
+        ids, next_cursor = grants.list_gadgets_shared_with(
+            principals, limit=limit, after_gadget_id=cursor
+        )
+        found = self._store.get_many(ids)
+        for gadget_id in ids:
+            if gadget_id not in found:
+                grants.delete_for_gadget(gadget_id)
+        owners = sorted({gadget.owner_id for gadget in found.values()})
+        deleted = grants.deleted_accounts(owners) if owners else set()
         shared: list[SharedGadget] = []
-        cursor: str | None = None
-        # Grants whose gadget is gone (a grant that raced its deletion) are skipped and
-        # dropped, so they never take a live gadget's place under the limit.
-        for _ in range(MAX_SHARED_GADGET_PAGES):
-            ids, cursor = grants.list_gadgets_shared_with(
-                principals, limit=MAX_SHARED_GADGETS_PAGE_SIZE, after_gadget_id=cursor
-            )
-            found = self._store.get_many(ids)
-            for gadget_id in ids:
-                if gadget_id not in found:
-                    grants.delete_for_gadget(gadget_id)
-            owners = sorted({gadget.owner_id for gadget in found.values()})
-            deleted = grants.deleted_accounts(owners) if owners else set()
-            for gadget_id in ids:
-                gadget = found.get(gadget_id)
-                if gadget is None or gadget.owner_id == viewer_id or gadget.owner_id in deleted:
-                    continue
-                direct = grants.resolve_gadget_access([viewer_id], gadget_id) is not None
-                shared.append(SharedGadget(gadget, "user" if direct else "group"))
-                if len(shared) >= MAX_SHARED_GADGETS:
-                    return shared
-            if cursor is None:
-                break
-        return shared
+        for gadget_id in ids:
+            gadget = found.get(gadget_id)
+            if gadget is None or gadget.owner_id == viewer_id or gadget.owner_id in deleted:
+                continue
+            direct = grants.resolve_gadget_access([viewer_id], gadget_id) is not None
+            shared.append(SharedGadget(gadget, "user" if direct else "group"))
+        return SharedPage(shared, next_cursor)
 
     def forget(self, gadget_id: str) -> None:
         grants = self._grants()

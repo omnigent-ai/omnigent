@@ -166,7 +166,8 @@ async def _run(
     call_id: str | None,
 ) -> Any:
     if tool_name == "sys_gadget_list":
-        return await server.call("GET", "")
+        query = {"limit": args.get("limit"), "cursor": args.get("cursor")}
+        return await server.call("GET", "", params=query)
     if tool_name == "sys_gadget_create":
         created = await server.call("POST", "", body={"name": args.get("name")})
         session_id = args.get("session_id", conversation_id)
@@ -205,7 +206,12 @@ async def _run(
         action = _segment(args.get("id"), "id")
         return await server.call("PATCH", f"{path}/actions/{action}", body=body)
     if tool_name == "sys_gadget_comment_list":
-        return await server.call("GET", f"{path}/comments", params={"status": args.get("status")})
+        query = {
+            "status": args.get("status"),
+            "limit": args.get("limit"),
+            "cursor": args.get("cursor"),
+        }
+        return await server.call("GET", f"{path}/comments", params=query)
     if tool_name == "sys_gadget_comment_update":
         comment = _segment(args.get("id"), "id")
         return await server.call(

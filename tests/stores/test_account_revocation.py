@@ -1588,13 +1588,13 @@ def test_deletion_removes_the_accounts_gadgets_and_who_they_were_shared_with(
     assert accounts.delete_user("alice") is True
     assert store.list_owned("alice") == [] and store.get(board["id"]) is None
     assert permissions.list_for_gadget(board["id"]) == ([], None)
-    assert access.shared_with("bob") == []
+    assert access.shared_with("bob").items == []
 
     # The name starts over: no gadgets, shares or pins come back with it.
     accounts.create_user_with_password("alice", "replacement-hash")
-    assert service("alice").list_owned() == {"items": []}
+    assert service("alice").list_owned() == {"items": [], "next_cursor": None}
     assert service("alice").shelf()["pinned"] == []
-    assert service("alice").shared() == {"items": []}
+    assert service("alice").shared() == {"items": [], "next_cursor": None}
     assert store.get(kept["id"]) is not None
 
 

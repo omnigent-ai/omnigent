@@ -982,7 +982,7 @@ def test_only_a_manager_deletes_a_gadget_and_it_is_gone_for_everyone(gadgets: Fi
     for viewer in (owner, editor):
         with pytest.raises(NotFound):
             viewer.get(app["id"])
-    assert owner.list_owned() == {"items": []}
+    assert owner.list_owned() == {"items": [], "next_cursor": None}
 
 
 def test_a_gadget_is_renamed_for_everyone_by_someone_who_can_edit_it(gadgets: Fixture) -> None:
@@ -1134,7 +1134,7 @@ def test_shared_lists_only_other_peoples_readable_gadgets(gadgets: Fixture) -> N
     ]
     assert items[0]["permissions"]["manage"] is False
     assert unshared["id"] not in {item["id"] for item in items}
-    assert owner.shared() == {"items": []}
+    assert owner.shared() == {"items": [], "next_cursor": None}
 
 
 # --- Bug bash regressions ------------------------------------------------------------------------
@@ -1341,3 +1341,53 @@ def test_derived_revisions_need_their_base_and_keep_the_size_limit(gadgets: Fixt
                 "edits": [{"old": "x", "new": "y" * (service_module.MAX_HTML_BYTES + 1)}],
             },
         )
+
+
+def _every_page(read, **params) -> list[list[dict]]:
+    pages, cursor = [], None
+    while True:
+        page = read(cursor=cursor, **params)
+        pages.append(page["items"])
+        cursor = page["next_cursor"]
+        if cursor is None:
+            return pages
+
+
+def test_comments_page_with_their_filter_and_reach_a_draft_past_the_first_page(
+    gadgets: Fixture,
+) -> None:
+    owner = gadgets.service()
+    app = publish_board(owner)
+    created = [
+        owner.create_comment(
+            app["id"], {"body": f"Note {n}", "anchor": {"text": "x"}, "operation_id": f"n{n}"}
+        )
+        for n in range(5)
+    ]
+    # The one draft left is the comment with the last ID, so it is on the last page.
+    draft = max(created, key=lambda comment: comment["id"])
+    for comment in created:
+        if comment is not draft:
+            owner.update_comment(app["id"], comment["id"], {"status": "addressed"})
+
+    pages = _every_page(lambda **kw: owner.list_comments(app["id"], **kw), status="draft", limit=2)
+    assert [item["id"] for page in pages for item in page] == [draft["id"]]
+    assert len(pages) == 3 and pages[0] == []
+    every = [
+        item
+        for page in _every_page(lambda **kw: owner.list_comments(app["id"], **kw), limit=2)
+        for item in page
+    ]
+    assert sorted(item["id"] for item in every) == sorted(comment["id"] for comment in created)
+    with pytest.raises(InvalidInput):
+        owner.list_comments(app["id"], limit=0)
+
+
+def test_the_viewers_own_gadgets_page_in_id_order(gadgets: Fixture) -> None:
+    owner = gadgets.service()
+    made = [owner.create(f"Board {n}")["id"] for n in range(5)]
+    pages = _every_page(owner.list_owned, limit=2)
+    assert [len(page) for page in pages] == [2, 2, 1]
+    assert [item["id"] for item in [item for page in pages for item in page]] == sorted(made)
+    assert owner.shelf()["has_owned"] is True
+    assert gadgets.service(2).shelf()["has_owned"] is False

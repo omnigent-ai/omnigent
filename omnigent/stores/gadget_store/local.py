@@ -17,6 +17,7 @@ written file, so the data directory must support hard links.
 
 from __future__ import annotations
 
+import bisect
 import contextlib
 import hashlib
 import json
@@ -31,6 +32,7 @@ from pathlib import Path
 
 from omnigent.stores.gadget_store import (
     MAX_FILE_BYTES,
+    MAX_OWNED_PAGE_SIZE,
     CapacityExceeded,
     Conflict,
     CorruptData,
@@ -293,18 +295,33 @@ class LocalGadgetStore(GadgetStore):
     def get(self, gadget_id: str) -> Gadget | None:
         return self._read_metadata(gadget_id)
 
-    def list_owned(self, owner_id: str) -> list[Gadget]:
+    def list_owned_page(
+        self, owner_id: str, *, limit: int, after: str | None = None
+    ) -> tuple[list[Gadget], str | None]:
+        if type(limit) is not int or not 1 <= limit <= MAX_OWNED_PAGE_SIZE:
+            raise InvalidInput(f"limit must be an integer in 1..{MAX_OWNED_PAGE_SIZE}")
+        if after is not None and (
+            not isinstance(after, str) or _GADGET_ID.fullmatch(after) is None
+        ):
+            raise InvalidInput("Invalid cursor")
         try:
-            names = os.listdir(self._owner_dir(owner_id))
+            names = sorted(
+                name
+                for name in os.listdir(self._owner_dir(owner_id))
+                if _GADGET_ID.fullmatch(name)
+            )
         except FileNotFoundError:
-            return []
-        owned = []
-        for name in names:
-            gadget = self._read_metadata(name)
-            # The marker can outlive a deletion that stopped half-way.
+            return [], None
+        start = bisect.bisect_right(names, after) if after is not None else 0
+        owned: list[Gadget] = []
+        position = start
+        # Markers can outlive a deletion that stopped half-way; they cost a read but no slot.
+        while position < len(names) and len(owned) < limit and position - start < 2 * limit:
+            gadget = self._read_metadata(names[position])
+            position += 1
             if gadget is not None and gadget.owner_id == owner_id:
                 owned.append(gadget)
-        return sorted(owned, key=lambda gadget: (gadget.created_at, gadget.id))
+        return owned, names[position - 1] if position < len(names) else None
 
     def rename(self, gadget_id: str, name: str) -> Gadget | None:
         with self._metadata_lock:

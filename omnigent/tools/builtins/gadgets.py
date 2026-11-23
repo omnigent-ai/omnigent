@@ -98,8 +98,11 @@ SysGadgetCreateTool = _gadget_tool(
 )
 SysGadgetListTool = _gadget_tool(
     "sys_gadget_list",
-    "List the gadgets your user owns.",
-    {},
+    "List a page of the gadgets your user owns.",
+    {
+        "limit": {"type": "integer", "minimum": 1, "maximum": GADGET_LIST_PAGE_MAX},
+        "cursor": _STRING,
+    },
     [],
 )
 SysGadgetGetTool = _gadget_tool(
@@ -142,9 +145,14 @@ SysGadgetActionUpdateTool = _gadget_tool(
 )
 SysGadgetCommentListTool = _gadget_tool(
     "sys_gadget_comment_list",
-    "Read the comments people left on parts of a gadget's page, each with the commented text "
-    "(anchor) and status.",
-    {"gadget_id": _ID, "status": {"type": "string", "enum": ["draft", "addressed"]}},
+    "Read a page of the comments on parts of a gadget's page, each with the commented text "
+    "(anchor) and status; follow `next_cursor` until null, pages can be short.",
+    {
+        "gadget_id": _ID,
+        "status": {"type": "string", "enum": ["draft", "addressed"]},
+        "limit": {"type": "integer", "minimum": 1, "maximum": GADGET_LIST_PAGE_MAX},
+        "cursor": _STRING,
+    },
     ["gadget_id"],
 )
 SysGadgetCommentUpdateTool = _gadget_tool(

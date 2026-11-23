@@ -274,7 +274,7 @@ async def test_sharing_follows_the_grant_levels(client: httpx.AsyncClient) -> No
     gadget = await _published(client)
     base = f"/v1/gadgets/{gadget['id']}"
     assert (await client.get(base, headers=_as(BOB))).status_code == 404
-    assert (await client.get("/v1/gadgets/shared", headers=_as(BOB))).json() == {"items": []}
+    assert (await client.get("/v1/gadgets/shared", headers=_as(BOB))).json()["items"] == []
 
     granted = await client.put(
         f"{base}/permissions", json={"user_id": BOB, "level": 1}, headers=_as(ALICE)
@@ -645,3 +645,36 @@ def test_a_session_id_that_is_not_a_uuid_is_left_to_the_permission_store(
     # Single-user mode has no permission store and takes any well-formed ID.
     assert can_read(ALICE, "0" * 32, None, convs)
     assert not can_read(ALICE, "102717306144392", None, convs)
+
+
+async def _every_page(client: httpx.AsyncClient, path: str, user: str) -> list[list[str]]:
+    pages: list[list[str]] = []
+    cursor = None
+    while True:
+        params = {"limit": "1", **({"cursor": cursor} if cursor else {})}
+        body = (await client.get(path, params=params, headers=_as(user))).json()
+        pages.append([item["id"] for item in body["items"]])
+        cursor = body["next_cursor"]
+        if cursor is None:
+            return pages
+
+
+async def test_own_and_shared_lists_page_with_a_cursor(client: httpx.AsyncClient) -> None:
+    made = []
+    for n in range(3):
+        created = await client.post("/v1/gadgets", json={"name": f"Board {n}"}, headers=_as(ALICE))
+        made.append(created.json()["id"])
+        granted = await client.put(
+            f"/v1/gadgets/{made[-1]}/permissions",
+            json={"user_id": BOB, "level": 1},
+            headers=_as(ALICE),
+        )
+        assert granted.status_code == 200, granted.text
+    owned = await _every_page(client, "/v1/gadgets", ALICE)
+    assert [len(page) for page in owned] == [1, 1, 1] and [
+        item for page in owned for item in page
+    ] == sorted(made)
+    shared = await _every_page(client, "/v1/gadgets/shared", BOB)
+    assert sorted([item for page in shared for item in page]) == sorted(made)
+    bad = await client.get("/v1/gadgets", params={"limit": "nope"}, headers=_as(ALICE))
+    assert bad.status_code == 400

@@ -32,6 +32,7 @@ __all__ = [
     "GADGET_ID_PATTERN",
     "MAX_FILE_BYTES",
     "MAX_GADGET_NAME_CHARS",
+    "MAX_OWNED_PAGE_SIZE",
     "CapacityExceeded",
     "Conflict",
     "CorruptData",
@@ -48,6 +49,8 @@ __all__ = [
 # The largest JSON file a gadget keeps; a revision's HTML is the largest one.
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_GADGET_NAME_CHARS = 120
+# The most gadgets one page of a user's own gadgets holds.
+MAX_OWNED_PAGE_SIZE = 200
 
 
 # ---------------------------------------------------------------------------
@@ -257,8 +260,29 @@ class GadgetStore(ABC):
         return found
 
     @abstractmethod
+    def list_owned_page(
+        self, owner_id: str, *, limit: int, after: str | None = None
+    ) -> tuple[list[Gadget], str | None]:
+        """One page of the gadgets *owner_id* owns, in ID order.
+
+        :param limit: The most gadgets to return, 1 to :data:`MAX_OWNED_PAGE_SIZE`.
+        :param after: The previous page's cursor (a gadget ID), or ``None`` to start.
+        :returns: The page and the cursor of the next one, or ``None`` after the last.
+            A page can hold fewer than *limit* gadgets, or none, and still continue.
+        """
+
     def list_owned(self, owner_id: str) -> list[Gadget]:
-        """Every gadget *owner_id* owns, oldest first."""
+        """Every gadget *owner_id* owns, oldest first, read a page at a time.
+
+        For work that needs them all, such as deleting an account; requests page instead.
+        """
+        owned: list[Gadget] = []
+        cursor: str | None = None
+        while True:
+            page, cursor = self.list_owned_page(owner_id, limit=MAX_OWNED_PAGE_SIZE, after=cursor)
+            owned.extend(page)
+            if cursor is None:
+                return sorted(owned, key=lambda gadget: (gadget.created_at, gadget.id))
 
     @abstractmethod
     def rename(self, gadget_id: str, name: str) -> Gadget | None:

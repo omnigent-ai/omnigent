@@ -32,7 +32,12 @@ from typing import Any, cast
 
 import jsonschema
 
-from omnigent.gadgets.access import NO_ACCESS, GadgetAccess, GadgetPermissions
+from omnigent.gadgets.access import (
+    MAX_SHARED_GADGETS,
+    NO_ACCESS,
+    GadgetAccess,
+    GadgetPermissions,
+)
 from omnigent.gadgets.actions import (
     validate_actions,
     validate_request,
@@ -60,6 +65,7 @@ from omnigent.gadgets.progress import (
 )
 from omnigent.stores.gadget_store import (
     MAX_GADGET_NAME_CHARS,
+    MAX_OWNED_PAGE_SIZE,
     Gadget,
     GadgetFiles,
     GadgetStore,
@@ -86,7 +92,6 @@ MAX_PINNED_GADGETS = 50
 MAX_SESSION_GADGETS = 20
 COMMENT_STATUSES = frozenset({"draft", "addressed"})
 MAX_COMMENT_CHARS = 4000
-MAX_GADGET_COMMENTS = 1000
 _KNOWN_CAPABILITIES = frozenset({"data.read", "data.write", "sessions.read", "sessions.create"})
 # The web app answers session reads with the viewer's own session list after asking
 # them; publishing a revision that requests new ones still needs manage permission.
@@ -351,6 +356,12 @@ def _apply_edits(html: str, edits: Any) -> str:
     return html
 
 
+def _page_limit(value: Any, most: int) -> int:
+    if type(value) is not int or not 1 <= value <= most:
+        raise InvalidInput(f"limit must be an integer in 1..{most}")
+    return value
+
+
 def _epoch(timestamp: str) -> float:
     return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
 
@@ -435,6 +446,7 @@ class GadgetService:
             "name": gadget.name,
             "browse_url": f"/gadget/{gadget.id}",
             "owner_id": gadget.owner_id,
+            "created_at": gadget.created_at,
             "viewer_id": self.viewer.user_id,
             "viewer_principal_id": self.viewer.key,
             "published_revision": publication["value"]["revision_id"] if publication else None,
@@ -448,22 +460,31 @@ class GadgetService:
         gadget = self.store.create(self.viewer.user_id, _gadget_name(name))
         return self._app(gadget, self.access.permissions(self.viewer.user_id, gadget))
 
-    def list_owned(self) -> dict:
-        """The viewer's own gadgets."""
-        owned = self.store.list_owned(self.viewer.user_id)
+    def list_owned(self, limit: Any = 100, cursor: Any = None) -> dict:
+        """One page of the viewer's own gadgets, in ID order: ``{"items", "next_cursor"}``."""
+        owned, next_cursor = self.store.list_owned_page(
+            self.viewer.user_id, limit=_page_limit(limit, MAX_OWNED_PAGE_SIZE), after=cursor
+        )
         return {
             "items": [
                 self._app(gadget, self.access.permissions(self.viewer.user_id, gadget))
                 for gadget in owned
-            ]
+            ],
+            "next_cursor": next_cursor,
         }
 
     def get(self, app_id: str) -> dict:
         return self._app(*self._resolve(app_id))
 
-    def shared(self) -> dict:
-        """Other people's gadgets that reach the viewer through their own grant or a group's."""
-        shared = self.access.shared_with(self.viewer.user_id)
+    def shared(self, limit: Any = MAX_SHARED_GADGETS, cursor: Any = None) -> dict:
+        """One page of other people's gadgets that reach the viewer through their own grant
+        or a group's: ``{"items", "next_cursor"}``."""
+        if cursor is not None and not isinstance(cursor, str):
+            raise InvalidInput("Invalid cursor")
+        page = self.access.shared_with(
+            self.viewer.user_id, limit=_page_limit(limit, MAX_SHARED_GADGETS), cursor=cursor
+        )
+        shared = page.items
         owners = sorted({item.gadget.owner_id for item in shared})
         names = self._display_names(owners) if self._display_names and owners else {}
         items = []
@@ -480,7 +501,7 @@ class GadgetService:
                     "owner_email": names.get(item.gadget.owner_id, item.gadget.owner_id),
                 }
             )
-        return {"items": items}
+        return {"items": items, "next_cursor": page.next_cursor}
 
     def rename(self, app_id: str, body: dict) -> dict:
         """Renames the gadget for everyone; needs the same access as publishing it."""
@@ -568,6 +589,10 @@ class GadgetService:
             if permissions.get(app_id, NO_ACCESS).read
         }
 
+    def _owns_any(self) -> bool:
+        page, cursor = self.store.list_owned_page(self.viewer.user_id, limit=1)
+        return bool(page) or cursor is not None
+
     def shelf(self) -> dict:
         """The viewer's pinned gadgets, and whether they own any, for the sidebar."""
         _, pins = self._pins()
@@ -575,7 +600,7 @@ class GadgetService:
         ids = [pin["id"] for pin in pins if pin.get("id") in readable]
         return {
             "pinned": [{"id": app_id, "name": readable[app_id].name} for app_id in ids],
-            "has_owned": bool(self.store.list_owned(self.viewer.user_id)),
+            "has_owned": self._owns_any(),
         }
 
     def pin(self, app_id: str, body: dict) -> dict:
@@ -676,22 +701,25 @@ class GadgetService:
             "updated_at": _epoch(document.updated_at),
         }
 
-    def list_comments(self, app_id: str, status: Any = None) -> dict:
+    def list_comments(
+        self, app_id: str, status: Any = None, limit: Any = 100, cursor: Any = None
+    ) -> dict:
+        """One page of the gadget's comments in ID order, optionally only one *status*:
+        ``{"items", "next_cursor", "can_comment"}``.
+
+        The filter applies while paging, so a short or empty page can still continue;
+        follow ``next_cursor`` to the end before sorting comments by time.
+        """
         if status is not None and status not in COMMENT_STATUSES:
             raise InvalidInput("status must be draft or addressed")
         gadget, permissions = self._resolve(app_id)
-        store = self._comments(gadget)
-        items: list[dict] = []
-        cursor = None
-        while len(items) < MAX_GADGET_COMMENTS:
-            page = store.list("comments", limit=200, cursor=cursor)
-            items.extend(self._comment(app_id, document) for document in page.items)
-            cursor = page.next_cursor
-            if cursor is None:
-                break
-        items = [item for item in items if status is None or item["status"] == status]
-        items.sort(key=lambda item: (item["created_at"], item["id"]))
-        return {"items": items, "can_comment": permissions.write_data}
+        page = self._comments(gadget).list("comments", _page_limit(limit, 200), cursor)
+        items = [self._comment(app_id, document) for document in page.items]
+        return {
+            "items": [item for item in items if status is None or item["status"] == status],
+            "next_cursor": page.next_cursor,
+            "can_comment": permissions.write_data,
+        }
 
     def create_comment(self, app_id: str, body: dict) -> dict:
         gadget, permissions = self._resolve(app_id)

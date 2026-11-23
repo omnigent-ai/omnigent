@@ -305,10 +305,22 @@ def create_gadgets_router(
     def _json(value: Any, status_code: int = 200) -> JSONResponse:
         return JSONResponse(value, status_code=status_code, headers=_NO_STORE)
 
-    @router.get("/gadgets")
+    def _page(request: Request, default: int) -> tuple[int, str | None]:
+        limit = request.query_params.get("limit", str(default))
+        if not limit.isdecimal():
+            raise InvalidInput("limit must be an integer")
+        return int(limit), request.query_params.get("cursor")
+
+    _PAGE_PARAMETERS = [
+        {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100}},
+        {"name": "cursor", "in": "query", "schema": _STRING},
+    ]
+
+    @router.get("/gadgets", openapi_extra={"parameters": _PAGE_PARAMETERS})
     async def list_gadgets(request: Request) -> Response:
-        """The caller's own gadgets: ``{"items": [gadget, ...]}``."""
-        return _json(await run(request, lambda service: service.list_owned()))
+        """A page of the caller's own gadgets in ID order: ``{"items", "next_cursor"}``."""
+        limit, cursor = _page(request, 100)
+        return _json(await run(request, lambda service: service.list_owned(limit, cursor)))
 
     @router.post("/gadgets")
     async def create_gadget(request: Request) -> Response:
@@ -318,11 +330,13 @@ def create_gadgets_router(
         return _json(result, 201)
 
     # Before ``/gadgets/{app_id}``, which would otherwise match these.
-    @router.get("/gadgets/shared")
+    @router.get("/gadgets/shared", openapi_extra={"parameters": _PAGE_PARAMETERS})
     async def shared_gadgets(request: Request) -> Response:
-        """Other people's gadgets shared with the caller, each with ``shared_via``
-        (``"user"`` or ``"group"``) and ``owner_email`` (the owner's display name)."""
-        return _json(await run(request, lambda service: service.shared()))
+        """A page of other people's gadgets shared with the caller, ``{"items",
+        "next_cursor"}``, each with ``shared_via`` (``"user"`` or ``"group"``) and
+        ``owner_email`` (the owner's display name). A page can be short and continue."""
+        limit, cursor = _page(request, 100)
+        return _json(await run(request, lambda service: service.shared(limit, cursor)))
 
     @router.get("/gadgets/shelf")
     async def shelf(request: Request) -> Response:
@@ -395,11 +409,29 @@ def create_gadgets_router(
         body = await _body(request)
         return _json(await run(request, lambda service: service.publish(app_id, body)))
 
-    @router.get("/gadgets/{app_id}/comments")
+    @router.get(
+        "/gadgets/{app_id}/comments",
+        openapi_extra={
+            "parameters": [
+                {
+                    "name": "status",
+                    "in": "query",
+                    "schema": {"type": "string", "enum": ["draft", "addressed"]},
+                },
+                *_PAGE_PARAMETERS,
+            ]
+        },
+    )
     async def list_comments(app_id: str, request: Request) -> Response:
-        """``{"items": [comment, ...], "can_comment"}``, optionally ``?status=``."""
+        """A page of comments in ID order, ``{"items", "next_cursor", "can_comment"}``,
+        optionally only ``?status=``; a page can be short and still continue."""
         status = request.query_params.get("status")
-        return _json(await run(request, lambda service: service.list_comments(app_id, status)))
+        limit, cursor = _page(request, 100)
+        return _json(
+            await run(
+                request, lambda service: service.list_comments(app_id, status, limit, cursor)
+            )
+        )
 
     @router.post("/gadgets/{app_id}/comments")
     async def create_comment(app_id: str, request: Request) -> Response:

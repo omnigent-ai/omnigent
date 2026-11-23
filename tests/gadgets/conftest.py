@@ -13,6 +13,7 @@ from omnigent.gadgets.access import (
     GadgetAccess,
     GadgetPermissions,
     SharedGadget,
+    SharedPage,
 )
 from omnigent.gadgets.progress import SessionStateReader
 from omnigent.gadgets.service import GadgetService, GadgetViewer
@@ -43,9 +44,16 @@ class GrantedAccess(GadgetAccess):
             return FULL_ACCESS
         return self.grants.get((viewer_id, gadget.id), NO_ACCESS)
 
-    def shared_with(self, viewer_id: str) -> list[SharedGadget]:
-        found = self.store.get_many(app for user, app in self.grants if user == viewer_id)
-        return [SharedGadget(gadget, "user") for gadget in found.values()]
+    def shared_with(
+        self, viewer_id: str, *, limit: int = 100, cursor: str | None = None
+    ) -> SharedPage:
+        ids = sorted(app for user, app in self.grants if user == viewer_id)
+        ids = [app for app in ids if cursor is None or app > cursor]
+        found = self.store.get_many(ids[:limit])
+        more = ids[limit - 1] if len(ids) > limit else None
+        return SharedPage(
+            [SharedGadget(found[app], "user") for app in ids[:limit] if app in found], more
+        )
 
     def forget(self, gadget_id: str) -> None:
         self.grants = {key: value for key, value in self.grants.items() if key[1] != gadget_id}

@@ -38,4 +38,5 @@ class DeletedAccountGadgets:
 
     def owns_any(self, user_id: str) -> bool:
         """Whether *user_id* still owns a gadget."""
-        return bool(self._store.list_owned(user_id))
+        page, cursor = self._store.list_owned_page(user_id, limit=1)
+        return bool(page) or cursor is not None

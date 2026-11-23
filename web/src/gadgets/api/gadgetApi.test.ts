@@ -7,6 +7,8 @@ import {
   GadgetApiError,
   getGadget,
   grantGadgetPermission,
+  listGadgetComments,
+  listGadgets,
   listSharedGadgets,
   listGadgetPermissions,
   revokeGadgetPermission,
@@ -97,11 +99,54 @@ describe("gadget API", () => {
 
     const shared = await listSharedGadgets();
 
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/gadgets/shared");
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/gadgets/shared?limit=100");
     expect(fetchMock.mock.calls[0][1]?.method).toBeUndefined();
     expect(shared).toEqual([
       { ...WIRE_GADGET, shared_via: "group", owner_email: "owner@example.com" },
     ]);
+  });
+
+  it("follows every page of the viewer's gadgets and lists them oldest first", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        json({ items: [{ ...WIRE_GADGET, id: "b", created_at: 20 }], next_cursor: "b" }),
+      )
+      .mockResolvedValueOnce(json({ items: [], next_cursor: "c" }))
+      .mockResolvedValueOnce(
+        json({ items: [{ ...WIRE_GADGET, id: "d", created_at: 10 }], next_cursor: null }),
+      );
+
+    const gadgets = await listGadgets();
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "/v1/gadgets?limit=100",
+      "/v1/gadgets?limit=100&cursor=b",
+      "/v1/gadgets?limit=100&cursor=c",
+    ]);
+    expect(gadgets.map((gadget) => gadget.id)).toEqual(["d", "b"]);
+  });
+
+  it("reads comments past a short page and sorts them by time", async () => {
+    const comment = (id: string, createdAt: number) => ({
+      id,
+      body: id,
+      status: "draft",
+      anchor: { text: "x" },
+      created_by: "a@example.com",
+      created_at: createdAt,
+      updated_at: createdAt,
+    });
+    fetchMock
+      .mockResolvedValueOnce(json({ items: [], next_cursor: "k", can_comment: true }))
+      .mockResolvedValueOnce(
+        json({ items: [comment("z", 1), comment("a", 2)], next_cursor: null, can_comment: true }),
+      );
+
+    const listed = await listGadgetComments("app-1");
+
+    expect(fetchMock.mock.calls[1][0]).toBe("/v1/gadgets/app-1/comments?limit=100&cursor=k");
+    expect(listed.items.map((item) => item.id)).toEqual(["z", "a"]);
+    expect(listed.canComment).toBe(true);
   });
 
   it("follows every page of a gadget's grants", async () => {

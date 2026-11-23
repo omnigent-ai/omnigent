@@ -18180,8 +18180,25 @@
     },
     "/v1/gadgets": {
       "get": {
-        "description": "The caller's own gadgets: `{\"items\": [gadget, ...]}`.",
+        "description": "A page of the caller's own gadgets in ID order: `{\"items\", \"next_cursor\"}`.",
         "operationId": "list_gadgets_v1_gadgets_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 100,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -18259,8 +18276,25 @@
     },
     "/v1/gadgets/shared": {
       "get": {
-        "description": "Other people's gadgets shared with the caller, each with `shared_via`\n(`\"user\"` or `\"group\"`) and `owner_email` (the owner's display name).",
+        "description": "A page of other people's gadgets shared with the caller, `{\"items\", \"next_cursor\"}`, each with `shared_via` (`\"user\"` or `\"group\"`) and\n`owner_email` (the owner's display name). A page can be short and continue.",
         "operationId": "shared_gadgets_v1_gadgets_shared_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 100,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -18738,7 +18772,7 @@
     },
     "/v1/gadgets/{app_id}/comments": {
       "get": {
-        "description": "`{\"items\": [comment, ...], \"can_comment\"}`, optionally `?status=`.",
+        "description": "A page of comments in ID order, `{\"items\", \"next_cursor\", \"can_comment\"}`,\noptionally only `?status=`; a page can be short and still continue.",
         "operationId": "list_comments_v1_gadgets__app_id__comments_get",
         "parameters": [
           {
@@ -18747,6 +18781,32 @@
             "required": true,
             "schema": {
               "title": "App Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "schema": {
+              "enum": [
+                "draft",
+                "addressed"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 100,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "schema": {
               "type": "string"
             }
           }

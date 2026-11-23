@@ -312,3 +312,30 @@ def test_delete_tree_removes_a_file_or_a_directory_at_once(store: LocalGadgetSto
     files.mkdirs("data/cards/c1")
     files.create_json("data/cards/c1/00000001.json", {"n": 2})
     assert files.read_json("data/cards/c1/00000001.json") == {"n": 2}
+
+
+def test_owned_gadgets_page_by_id_and_skip_markers_left_by_a_deletion(
+    store: LocalGadgetStore, tmp_path: Path
+) -> None:
+    made = sorted(store.create(ALICE, f"Board {n}").id for n in range(5))
+    # A deletion that stopped before removing its owner marker.
+    stale = made[1]
+    store.delete(stale)
+    owners = tmp_path / "gadgets" / "owners"
+    (next(owners.iterdir()) / stale).touch()
+    seen: list[str] = []
+    cursor = None
+    while True:
+        page, cursor = store.list_owned_page(ALICE, limit=2, after=cursor)
+        seen.extend(gadget.id for gadget in page)
+        if cursor is None:
+            break
+    assert seen == [gadget_id for gadget_id in made if gadget_id != stale]
+    assert [gadget.id for gadget in store.list_owned(ALICE)] == sorted(
+        seen,
+        key=lambda gadget_id: store.get(gadget_id).created_at,  # type: ignore[union-attr]
+    )
+    with pytest.raises(InvalidInput):
+        store.list_owned_page(ALICE, limit=0)
+    with pytest.raises(InvalidInput):
+        store.list_owned_page(ALICE, limit=2, after="../x")
