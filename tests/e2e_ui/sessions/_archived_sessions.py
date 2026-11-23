@@ -37,13 +37,12 @@ def seed_archived_session(base_url: str, *, title: str, project: str | None) -> 
     body: dict[str, object] = {"title": title, "archived": True}
     if project is not None:
         body["labels"] = {_PROJECT_LABEL_KEY: project}
-    patch_resp = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json=body,
-        timeout=10.0,
-    )
     try:
-        patch_resp.raise_for_status()
+        httpx.patch(
+            f"{base_url}/v1/sessions/{session_id}",
+            json=body,
+            timeout=10.0,
+        ).raise_for_status()
     except httpx.HTTPError:
         # The caller never gets the id, so it can't clean the session up itself.
         delete_sessions(base_url, [session_id])
