@@ -43,6 +43,8 @@ class _TurnMessage(dict[str, Any]):
     def __init__(self, body: _JsonObject, scheduled_run: ScheduledRunLogContext | None) -> None:
         super().__init__(body)
         self.scheduled_run = scheduled_run
+        # Set when the message claims a turn of a child whose result reached its parent.
+        self.holds_child_turn = False
 
 
 def _message_scheduled_run(body: Mapping[str, Any] | None) -> ScheduledRunLogContext | None:
