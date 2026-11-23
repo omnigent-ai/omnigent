@@ -1,5 +1,6 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
+import { PaneLoading } from "@/components/PageLoading";
 import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContext";
 import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
@@ -3515,7 +3516,10 @@ function AppShellImpl() {
                   <SubagentPanelOpenerContext.Provider value={openSubagentInPanel}>
                     <RenderErrorBoundary name="this page" resetKey={location.pathname}>
                       <ShellCommandContext.Provider value={shellCommandAction}>
-                        <Outlet />
+                        {/* A lazy page loading its chunk must not suspend the whole shell. */}
+                        <Suspense fallback={<PaneLoading />}>
+                          <Outlet />
+                        </Suspense>
                       </ShellCommandContext.Provider>
                     </RenderErrorBoundary>
                   </SubagentPanelOpenerContext.Provider>
