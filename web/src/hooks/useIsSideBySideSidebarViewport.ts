@@ -1,6 +1,7 @@
 // Reactive "should the open sidebar sit beside the chat?" hook for the mobile layout.
 
 import { useSyncExternalStore } from "react";
+import { keepsDesktopLayout } from "@/lib/desktopAppLayout";
 import { MOBILE_BREAKPOINT_PX } from "./useIsMobileViewport";
 
 // Wide mobile viewports (an unfolded foldable, a small phone in landscape) are
@@ -21,12 +22,13 @@ function subscribeSideBySide(callback: () => void): () => void {
 /** Non-reactive read of {@link useIsSideBySideSidebarViewport}, for event handlers. */
 export function isSideBySideSidebarViewport(): boolean {
   if (typeof window === "undefined" || !window.matchMedia) return false;
-  return window.matchMedia(SIDE_BY_SIDE_QUERY).matches;
+  return !keepsDesktopLayout() && window.matchMedia(SIDE_BY_SIDE_QUERY).matches;
 }
 
 /**
  * True on a mobile-layout viewport wide enough that the open sidebar pushes the
- * chat aside rather than covering it, so both stay usable at once.
+ * chat aside rather than covering it, so both stay usable at once. Always false
+ * in the desktop app, which never uses the mobile layout.
  */
 export function useIsSideBySideSidebarViewport(): boolean {
   return useSyncExternalStore(subscribeSideBySide, isSideBySideSidebarViewport, () => false);

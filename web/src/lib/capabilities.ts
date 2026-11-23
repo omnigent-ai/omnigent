@@ -75,7 +75,10 @@ export type FeatureKey =
   | "project_repository_creation"
   | "workspace_direct_access"
   | "workspace_api_server_access"
-  | "quick_pick_palette";
+  | "quick_pick_palette"
+  | "floating_composer"
+  | "workspace_sidebar_v2"
+  | "sidebar_saved_views";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;

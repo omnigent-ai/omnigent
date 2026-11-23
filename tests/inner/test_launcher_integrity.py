@@ -1034,12 +1034,14 @@ def test_reexec_preserves_isolation_and_env_overrides(
         scratch.append(environ[sb._LAUNCHER_PRIVATE_TMPDIR_ENV])
         assert environ["XDG_RUNTIME_DIR"] == scratch[0]
         assert environ["TMPDIR"] == scratch[0]
-        return argv
+        return ["test-sandbox-wrap", *argv]
 
     class Reexecuted(Exception):
         pass
 
     def execute(_file, argv):
+        assert argv[0] == "test-sandbox-wrap"
+        argv = argv[1:]
         assert argv[:3] == [sys.executable, "-I", "-c"]
         assert all(value not in "\0".join(argv) for value in overrides.values())
         assert sb._encode_json_arg(overrides) not in "\0".join(argv)

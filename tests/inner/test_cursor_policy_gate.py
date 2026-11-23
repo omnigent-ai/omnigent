@@ -26,7 +26,6 @@ from tests.inner.cursor_sdk_fake import install_fake_cursor_sdk
 _SHELL_REQUEST = json.dumps({"tool_name": "Shell", "tool_input": {"command": "printf hello"}})
 _SHELL_CALL = ("PHASE_TOOL_CALL", {"name": "Shell", "arguments": {"command": "printf hello"}})
 
-_PLATFORM_SANDBOX = "darwin_seatbelt" if sys.platform == "darwin" else "linux_bwrap"
 _STDLIB = Path(os.__file__).resolve().parent
 
 requires_policy_gate = pytest.mark.skipif(
@@ -441,20 +440,9 @@ async def test_missing_api_key_fails_before_creating_the_policy_home(
 @pytest.mark.parametrize(
     ("tool", "sandbox", "message"),
     [
-        ("sys_os_shell", OSEnvSandboxSpec(type="none"), "active sandbox"),
+        ("sys_os_shell", OSEnvSandboxSpec(type="none"), "cannot isolate bridged OS tools"),
+        ("sys_os_shell", None, "cannot isolate bridged OS tools"),
         ("sys_terminal_launch", None, "terminal tools"),
-        # The home directory granted as a writable "file".
-        (
-            "sys_os_shell",
-            OSEnvSandboxSpec(type=_PLATFORM_SANDBOX, write_files=["~"]),
-            "policy home",
-        ),
-        # The standard library the hook imports from.
-        (
-            "sys_os_shell",
-            OSEnvSandboxSpec(type=_PLATFORM_SANDBOX, write_paths=[str(_STDLIB)]),
-            "policy hook's Python",
-        ),
     ],
 )
 async def test_bridged_tools_that_could_reach_the_policy_home_are_rejected(
@@ -469,20 +457,6 @@ async def test_bridged_tools_that_could_reach_the_policy_home_are_rejected(
         await executor._ensure_session(
             _CursorSessionState(), model="auto-smart", tools=[{"name": tool}]
         )
-
-
-@requires_policy_gate
-def test_os_tools_confined_to_the_workspace_are_accepted(
-    home_and_workspace: tuple[Path, Path],
-) -> None:
-    _, workspace = home_and_workspace
-    os_env = OSEnvSpec(
-        type="caller_process",
-        cwd=str(workspace),
-        sandbox=OSEnvSandboxSpec(type=_PLATFORM_SANDBOX, write_paths=["."]),
-    )
-    executor = CursorExecutor(cwd=str(workspace), os_env=os_env, api_key="test-key")
-    executor._check_bridged_tool_isolation([{"name": "sys_os_shell"}], str(workspace))
 
 
 @pytest.mark.asyncio

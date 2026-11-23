@@ -1,4 +1,4 @@
-"""Unit tests for the upload_file built-in tool."""
+"""Unit tests for the sys_files_upload tool."""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ def test_upload_file_stores_and_returns_file_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    ``upload_file`` reads a file from the workspace, stores it
+    ``sys_files_upload`` reads a file from the workspace, stores it
     in the file store + artifact store, and returns a JSON
     result with ``file_id``, ``filename``, and ``content_type``.
     """

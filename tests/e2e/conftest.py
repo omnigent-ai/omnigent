@@ -405,7 +405,10 @@ def configure_mock_llm(
         agent spec. Defaults to ``"default"`` (matches any model
         not assigned to a more specific queue).
     :param required_tools: Advertised tools required to consume this queue,
-        isolating agent turns from background generation and review.
+        isolating agent turns from background generation and review. Serve
+        the queue only to requests advertising all of these tools, so a
+        tool-less request (a title generation) cannot consume a scripted tool
+        call meant for the agent's own turn.
     :param match: Optional content-routing token. When set, the queue is
         selected if this token appears in the request's user input,
         regardless of ``model``. Use a deliberately-unique token (the
@@ -1066,7 +1069,7 @@ def register_inline_agent(
         block into the executor so the harness hits the mock server
         instead of ``api.openai.com``.
     :param builtin_tools: When set, add a ``tools.builtins`` list to
-        the agent spec, e.g. ``["list_files", "upload_file"]``.
+        the agent spec, e.g. ``["web_search"]``.
     :param extra_config: When set, top-level keys shallow-merged into
         the agent YAML before upload (e.g. ``tools`` and ``policies``).
         ``name``/``prompt``/``executor`` stay helper-controlled.

@@ -45,6 +45,7 @@ class Feature(StrEnum):
     AUTOMATIONS = "automations"
     AUTOMATIONS_V2 = "automations_v2"
     ONE_TIME_AUTOMATIONS = "one_time_automations"
+    SESSION_TIMERS = "session_timers"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
     CHAT_COMPOSER_CODEMIRROR = "chat_composer_codemirror"
@@ -59,6 +60,9 @@ class Feature(StrEnum):
     PI_CLAUDE_PLUGINS = "pi_claude_plugins"
     MEMORY = "memory"
     QUICK_PICK_PALETTE = "quick_pick_palette"
+    FLOATING_COMPOSER = "floating_composer"
+    WORKSPACE_SIDEBAR_V2 = "workspace_sidebar_v2"
+    SIDEBAR_SAVED_VIEWS = "sidebar_saved_views"
 
 
 @dataclass(frozen=True)
@@ -102,6 +106,7 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         owner="server",
         review_by_release="0.24.0",
         frontend_visible=False,
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.SIBLING_SESSIONS,
@@ -147,6 +152,18 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         ),
         owner="server",
         review_by_release="0.24.0",
+        frontend_visible=False,
+    ),
+    FeatureDefinition(
+        feature=Feature.SESSION_TIMERS,
+        description=(
+            "Save sys_timer_set timers on the server as scheduled tasks of kind 3. Enable it "
+            "only once every server sharing the database runs a release that reads them; an "
+            "older one fails to decode the rows. Turning it off stops new timers, not "
+            "existing ones"
+        ),
+        owner="server",
+        review_by_release="0.26.0",
         frontend_visible=False,
     ),
     FeatureDefinition(
@@ -325,6 +342,24 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Run the ⌘K command palette on the fuzzy-matching QuickPick list",
         owner="web",
         review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.FLOATING_COMPOSER,
+        description="The desktop app's floating New Agent panel, opened with Shift+Cmd+Space",
+        owner="web",
+        review_by_release="0.27.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.WORKSPACE_SIDEBAR_V2,
+        description="Show the workspace sidebar as tabs: Files, Changes and pull request pages",
+        owner="web",
+        review_by_release="0.26.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.SIDEBAR_SAVED_VIEWS,
+        description="Filter the sidebar's sessions by their pull request, and save views",
+        owner="web",
+        review_by_release="0.28.0",
     ),
 )
 

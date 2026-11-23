@@ -60,6 +60,15 @@ def normalize_status_payload(payload: dict[str, object]) -> dict[str, object] | 
             and total_cost >= 0
         ):
             record["total_cost_usd"] = float(total_cost)
+        # Zero until the process makes its first API call, so the forwarder can
+        # tell a resumed total that was restored from one that was billed.
+        api_duration = cost.get("total_api_duration_ms")
+        if (
+            isinstance(api_duration, (int, float))
+            and not isinstance(api_duration, bool)
+            and api_duration >= 0
+        ):
+            record["total_api_duration_ms"] = float(api_duration)
     # The active model, rewritten on every render — including right after an
     # in-pane ``/model`` switch — so gates see the switch before the next turn.
     model = payload.get("model")

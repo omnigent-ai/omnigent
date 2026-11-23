@@ -256,6 +256,110 @@ describe("Databricks browser session lifecycle", () => {
     assert.deepEqual(h.calls.load, []);
     assert.equal(h.timers.size, 0);
   });
+  it("checks a window's session in place and reports a refused renewal unless a newer page replaced it", async (t) => {
+    let blocked = false;
+    const h = harness({
+      ensureSession: async () => {
+        if (blocked) {
+          throw Object.assign(new Error("blocked"), { status: 403, errorCode: IP_ACL_BLOCKED });
+        }
+        return ORIGIN;
+      },
+    });
+    t.after(() => h.auth.dispose());
+    const win = h.window();
+    assert.equal(h.auth.checkSession(win, "test"), null);
+    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+    assert.equal(await h.auth.checkSession(win, "test"), true);
+    blocked = true;
+    assert.equal(await h.auth.checkSession(win, "test", () => true), true);
+    assert.deepEqual(h.calls.errors, []);
+    assert.equal(h.timers.size, 1);
+    assert.equal(await h.auth.checkSession(win, "test"), false);
+    assert.equal(h.calls.renew.length, 3);
+    assert.deepEqual(h.calls.load, []);
+    assert.deepEqual(
+      h.calls.errors.map(({ url, error }) => [url, error.errorCode]),
+      [[`${ORIGIN}/omnigent`, IP_ACL_BLOCKED]],
+    );
+  });
+  it("keeps a newer page when a superseded check cannot reschedule after cookie removal", async (t) => {
+    let refuse;
+    const h = harness({
+      ensureSession: () =>
+        new Promise((_resolve, reject) => {
+          refuse = () =>
+            reject(Object.assign(new Error("blocked"), { status: 403, errorCode: IP_ACL_BLOCKED }));
+        }),
+    });
+    t.after(() => h.auth.dispose());
+    const win = h.window();
+    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+    let superseded = false;
+    const checked = h.auth.checkSession(win, "test", () => superseded);
+    await drain();
+    superseded = true;
+    h.removeCookie();
+    refuse();
+
+    assert.equal(await checked, true);
+    assert.deepEqual(h.calls.errors, []);
+    assert.deepEqual(h.calls.load, []);
+    assert.equal(h.calls.renew.length, 1);
+  });
+  it("reports a refused renewal that a blocked login joined after a superseded check", async (t) => {
+    let refuse;
+    const h = harness({
+      ensureSession: () =>
+        new Promise((_resolve, reject) => {
+          refuse = () =>
+            reject(Object.assign(new Error("blocked"), { status: 403, errorCode: IP_ACL_BLOCKED }));
+        }),
+    });
+    t.after(() => h.auth.dispose());
+    const win = h.window();
+    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+    const checked = h.auth.checkSession(win, "test", () => true);
+    h.request(win, `${ORIGIN}/login`);
+    await drain();
+    refuse();
+    assert.equal(await checked, false);
+    assert.equal(h.calls.renew.length, 1);
+    assert.deepEqual(
+      h.calls.errors.map(({ error }) => error.errorCode),
+      [IP_ACL_BLOCKED],
+    );
+  });
+  for (const cookiePresent of [true, false]) {
+    it(`reports the refused renewal to a caller joining rescheduling with cookie ${cookiePresent ? "present" : "missing"}`, async (t) => {
+      const h = harness({
+        ensureSession: async () => {
+          throw Object.assign(new Error("blocked"), { status: 403, errorCode: IP_ACL_BLOCKED });
+        },
+      });
+      t.after(() => h.auth.dispose());
+      const win = h.window();
+      await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+      const readCookies = h.session.cookies.get;
+      let releaseCookies;
+      h.session.cookies.get = (...args) =>
+        new Promise((resolve) => {
+          releaseCookies = () => resolve(readCookies(...args));
+        });
+      const checked = h.auth.checkSession(win, "test", () => true);
+      await drain();
+      h.request(win, `${ORIGIN}/login`);
+      if (!cookiePresent) h.removeCookie();
+      releaseCookies();
+      assert.equal(await checked, false);
+      assert.equal(h.calls.renew.length, 1);
+      assert.deepEqual(
+        h.calls.errors.map(({ error }) => error.errorCode),
+        [IP_ACL_BLOCKED],
+      );
+      assert.equal(isTransientRenewalError(h.calls.errors[0].error), true);
+    });
+  }
   it("keeps a rejected window blocked after unpinning until a new connection begins", async (t) => {
     const h = harness({
       ensureSession: async () => {

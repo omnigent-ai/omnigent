@@ -11,6 +11,7 @@
 
 import type { GitProviderDisplay } from "./gitProviders";
 import { authenticatedFetch } from "./identity";
+import { resolvedLocalTimezone } from "./timezones";
 import type { JournalEntry, JournalPlanStep } from "./sessionJournal";
 import { startTimedInteraction } from "./analyticsEmit";
 import { browserAgentToolsRequestHeaders } from "@/components/BrowserPane/agentTools/preferences";
@@ -46,8 +47,11 @@ export interface ScheduledTask {
   id: string;
   name: string;
   prompt: string;
-  /** RFC-5545 recurrence rule, e.g. `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0`. */
-  rrule: string;
+  /**
+   * RFC-5545 recurrence rule, e.g. `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0`.
+   * Null for a trigger automation when the server decides when it polls (automations v2).
+   */
+  rrule: string | null;
   /** Owning user, or `null` in single-user / auth-disabled deployments. */
   ownerUserId: string | null;
   agentId: string;
@@ -258,7 +262,7 @@ interface ScheduledTaskWire {
   id: string;
   name: string;
   prompt: string;
-  rrule: string;
+  rrule: string | null;
   owner_user_id: string | null;
   agent_id: string;
   timezone: string;
@@ -614,6 +618,25 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   } catch (error) {
     interaction.fail();
     throw error;
+  }
+}
+
+/**
+ * Record the browser's IANA zone as the caller's default for tasks created
+ * with an explicit default-zone request. Skipped when the zone is unknown, so a
+ * UTC fallback never replaces another device's zone. Failures are ignored.
+ */
+export async function reportLocalTimezone(): Promise<void> {
+  const timezone = resolvedLocalTimezone();
+  if (timezone === null) return;
+  try {
+    await authenticatedFetch("/v1/scheduled-tasks/default-timezone", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ timezone }),
+    });
+  } catch {
+    // The next app load retries.
   }
 }
 

@@ -31,6 +31,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
             Feature.PEER_SESSION_MESSAGING,
             Feature.PROJECT_KANBAN,
             Feature.PROJECT_REPOSITORY_CREATION,
+            Feature.SCRIPTED_SESSIONS,
             Feature.SESSION_ORCHESTRATION,
             Feature.SIBLING_SESSIONS,
             Feature.SIDEBAR_GROUPING_UI,
@@ -56,11 +57,14 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "project_kanban": True,
         "project_repository_creation": True,
         "quick_pick_palette": False,
+        "workspace_sidebar_v2": False,
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,
         "workspace_direct_access": False,
         "workspace_api_server_access": False,
+        "floating_composer": False,
+        "sidebar_saved_views": False,
     }
 
 
@@ -79,6 +83,7 @@ def test_resolves_comma_separated_enabled_set() -> None:
         "peer_session_messaging",
         "project_kanban",
         "project_repository_creation",
+        "scripted_sessions",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
@@ -106,6 +111,7 @@ def test_resolves_comma_separated_enabled_set() -> None:
         "peer_session_messaging",
         "project_kanban",
         "project_repository_creation",
+        "scripted_sessions",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
@@ -126,6 +132,7 @@ def test_explicit_disable_wins_and_preserves_other_features(override: str, featu
         "peer_session_messaging",
         "project_kanban",
         "project_repository_creation",
+        "scripted_sessions",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
@@ -148,6 +155,7 @@ def test_default_off_features_can_also_be_explicitly_disabled(feature: str) -> N
         "peer_session_messaging",
         "project_kanban",
         "project_repository_creation",
+        "scripted_sessions",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
@@ -193,12 +201,19 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
         "peer_session_messaging",
         "project_kanban",
         "project_repository_creation",
+        "scripted_sessions",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
         "user_inbox",
         "workspace_content_search",
     )
+
+
+def test_floating_composer_is_a_frontend_visible_feature() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "floating_composer"})
+    assert flags.enabled(Feature.FLOATING_COMPOSER)
+    assert flags.frontend_dict()["floating_composer"] is True
 
 
 def test_chat_composer_codemirror_is_an_opt_in_frontend_feature() -> None:
@@ -208,6 +223,25 @@ def test_chat_composer_codemirror_is_an_opt_in_frontend_feature() -> None:
 
     assert flags.enabled(Feature.CHAT_COMPOSER_CODEMIRROR)
     assert flags.frontend_dict()["chat_composer_codemirror"] is True
+
+
+def test_workspace_sidebar_v2_is_an_opt_in_frontend_feature() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.WORKSPACE_SIDEBAR_V2)
+    assert resolve_feature_flags({}).frontend_dict()["workspace_sidebar_v2"] is False
+
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "workspace_sidebar_v2"})
+
+    assert flags.enabled(Feature.WORKSPACE_SIDEBAR_V2)
+    assert flags.frontend_dict()["workspace_sidebar_v2"] is True
+
+
+def test_sidebar_saved_views_is_an_opt_in_frontend_feature() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.SIDEBAR_SAVED_VIEWS)
+
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "sidebar_saved_views"})
+
+    assert flags.enabled(Feature.SIDEBAR_SAVED_VIEWS)
+    assert flags.frontend_dict()["sidebar_saved_views"] is True
 
 
 def test_sibling_sessions_explicit_enable_preserves_default_features() -> None:

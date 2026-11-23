@@ -390,6 +390,11 @@ describe("ApprovalCard — binary approve/reject", () => {
       `Approve and remember commands starting with ${prefix}`,
     );
     expectOneLinePrefixButton(remember, prefix);
+    // A long command scrolls inside the card instead of stretching the transcript.
+    expect(screen.getByText(/print\(json\.dumps/, { selector: "pre" })).toHaveClass(
+      "max-h-64",
+      "overflow-auto",
+    );
     fireEvent.click(remember);
     expect(submitSpy).toHaveBeenCalledWith("elic_cmd_long", "accept", {
       remember: true,
@@ -418,10 +423,15 @@ describe("ApprovalCard — binary approve/reject", () => {
     );
 
     expect(screen.getByText("Approved and remembered")).toBeVisible();
+    // A long command and prefix scroll inside the card instead of stretching the transcript.
+    expect(screen.getByText(".venv/bin/python -m pytest -q", { selector: "pre" })).toHaveClass(
+      "max-h-64",
+      "overflow-auto",
+    );
     const prefix = screen.getByText('[".venv/bin/python","-m","pytest"]');
     expect(prefix).toBeVisible();
     // The compact JSON has no spaces, so without break-all a long prefix overflows the card.
-    expect(prefix).toHaveClass("break-all");
+    expect(prefix).toHaveClass("break-all", "max-h-64", "overflow-y-auto");
   });
 });
 
@@ -2808,17 +2818,19 @@ describe("question custom selection and editing", () => {
       expect(toggle).not.toBeChecked();
       await user.click(selectionLabel);
       expect(toggle).toBeChecked();
-      expect(editor).not.toHaveFocus();
+      expect(editor).toHaveFocus();
       if (multiSelect) {
         await user.click(selectionLabel);
         expect(toggle).not.toBeChecked();
+        expect(editor).not.toHaveFocus();
         await user.click(selectionLabel);
         expect(toggle).toBeChecked();
       }
+      await user.keyboard("Custom text");
+      expect(editor).toHaveValue("Custom text");
       await user.click(editor);
       expect(editor).toHaveFocus();
       expect(toggle).toBeChecked();
-      await user.type(editor, "Custom text");
       expect(submit).not.toHaveBeenCalled();
       await user.click(screen.getByRole("button", { name: "Next" }));
       expect(screen.getByLabelText("Done")).toBeChecked();

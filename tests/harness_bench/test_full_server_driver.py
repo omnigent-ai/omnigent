@@ -1,11 +1,18 @@
-"""Unit tests for full-server session polling."""
+"""Unit tests for full-server session polling and the bench agent's spec."""
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
+import pytest
+import yaml
+
+from omnigent.spec import load
+from omnigent.tools.manager import ToolManager
 from tests.harness_bench.driver import TurnResult
+from tests.harness_bench.full_server import _TOOL_NAME, _build_bench_agent_config
 from tests.harness_bench.full_server_driver import FullServerDriver
 from tests.harness_bench.profile import BenchProfile
 
@@ -83,7 +90,7 @@ def _driver(
 
 def test_poll_session_collects_terminal_snapshot_once(monkeypatch) -> None:
     monkeypatch.setattr("tests.harness_bench.full_server_driver.time.sleep", lambda _: None)
-    call = {"type": "function_call", "data": {"call_id": "c1", "name": "list_files"}}
+    call = {"type": "function_call", "data": {"call_id": "c1", "name": "sys_files_list"}}
     output = {"type": "function_call_output", "data": {"output": "ok"}}
     driver = _driver(
         [
@@ -99,7 +106,7 @@ def test_poll_session_collects_terminal_snapshot_once(monkeypatch) -> None:
 
     assert result.completed
     assert result.text == "done"
-    assert result.tool_calls == [{"call_id": "c1", "name": "list_files", "arguments": None}]
+    assert result.tool_calls == [{"call_id": "c1", "name": "sys_files_list", "arguments": None}]
     assert result.tool_call_allowed
 
 
@@ -174,3 +181,21 @@ def test_reasoning_probe_requests_high_effort(monkeypatch) -> None:
         "/v1/sessions/source",
         {"reasoning_effort": "high"},
     )
+
+
+@pytest.mark.parametrize("policy_action", [None, "deny"])
+def test_bench_agent_registers_the_probe_tool(tmp_path: Path, policy_action: str | None) -> None:
+    """
+    The tool and policy probes ask the model to call ``_TOOL_NAME``, a file
+    tool, so the bench agent has to turn the files group on to be offered it.
+    """
+    profile = BenchProfile(
+        harness="openai-agents", model="m", env_prefix="HARNESS_OPENAI_AGENTS_", marker="MARK"
+    )
+    config = _build_bench_agent_config(profile, None, policy_action=policy_action)
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config))
+    manager = ToolManager(load(tmp_path, expand_env=False))
+    try:
+        assert _TOOL_NAME in manager.get_tool_names()
+    finally:
+        manager.shutdown()

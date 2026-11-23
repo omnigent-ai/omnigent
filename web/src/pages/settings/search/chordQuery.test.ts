@@ -284,12 +284,17 @@ const PAGE_CONTEXT: ShortcutPageContext = {
 
 const SHOWN: SettingsAvailability = {
   globalShortcut: true,
+  floatingComposerShortcut: true,
+  widenWindowForRightSidebar: true,
   inAppBrowser: true,
   adminView: true,
   accountsEnabled: true,
   archiveWorktreeCleanup: true,
   mcpServices: true,
   integrationProviders: { github: true, databricks: true },
+  projectKanban: true,
+  sessionTitleInstructions: true,
+  proactiveAgent: true,
 };
 
 describe("chord results in Settings search", () => {

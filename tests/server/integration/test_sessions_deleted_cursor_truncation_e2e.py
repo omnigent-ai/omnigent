@@ -29,10 +29,8 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.runtime.policies.builder import (
-    _SUBTREE_USAGE_PAGE_SIZE,
-    load_session_usage,
-)
+from omnigent.runtime.policies import builder
+from omnigent.runtime.policies.builder import load_session_usage
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -148,6 +146,7 @@ class _DeleteCursorBetweenPages:
 
 def test_policy_usage_seed_not_silently_truncated_by_concurrent_delete(
     db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A concurrent delete must not silently under-count the spend seed.
 
@@ -163,7 +162,9 @@ def test_policy_usage_seed_not_silently_truncated_by_concurrent_delete(
     store = SqlAlchemyConversationStore(db_uri)
     root = store.create_conversation(title="usage-root")
     store.set_session_usage(root.id, {"total_cost_usd": 1.0})
-    n_children = _SUBTREE_USAGE_PAGE_SIZE + 4
+    # Small pages keep the tree a couple of pages long without thousands of rows.
+    monkeypatch.setattr(builder, "_SUBTREE_USAGE_PAGE_SIZE", 25)
+    n_children = builder._SUBTREE_USAGE_PAGE_SIZE + 4
     for i in range(n_children):
         child = store.create_conversation(
             kind="sub_agent",

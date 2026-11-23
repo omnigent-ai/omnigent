@@ -272,7 +272,7 @@ describe("chromeCookieStore — Electron cookie mapping", () => {
 });
 
 describe("chromeCookieStore — system binaries", () => {
-  it("runs sqlite3 and security by absolute path", async () => {
+  it("runs sqlite3 by absolute path", async () => {
     const calls = [];
     const failing = async (command) => {
       calls.push(command);
@@ -300,65 +300,145 @@ describe("chromeCookieStore — system binaries", () => {
         return true;
       },
     );
-    calls.length = 0;
-    const password = await store.readSafeStoragePassword({
-      run: async (command) => {
-        calls.push(command);
-        return { stdout: "secret\n" };
-      },
-    });
-    assert.equal(password, "secret");
-    assert.deepEqual(calls, ["/usr/bin/security"]);
+    // Only a missing column may fall back to an older column set.
+    assert.deepEqual(calls, ["/usr/bin/sqlite3"]);
   });
 });
 
 describe("chromeCookieStore — Keychain", () => {
-  it("returns the password without its trailing newline", async () => {
+  /** A Keychain binding whose one entry answers with `getPassword`. */
+  function keychainBinding(getPassword, created = []) {
+    return () => ({
+      AsyncEntry: class {
+        constructor(service, account) {
+          created.push([service, account]);
+        }
+
+        getPassword() {
+          return getPassword();
+        }
+      },
+    });
+  }
+
+  // Probe like the store does: a checkout without the desktop app's packages has no binding.
+  const hasKeychainBinding = (() => {
+    try {
+      require.resolve("@napi-rs/keyring");
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+
+  it(
+    "ships a Keychain binding with the entry API the store calls",
+    { skip: !hasKeychainBinding },
+    () => {
+      const { AsyncEntry } = require("@napi-rs/keyring");
+      assert.equal(typeof AsyncEntry.prototype.getPassword, "function");
+    },
+  );
+
+  it("reads Chrome's own Keychain item in this process", async () => {
+    const created = [];
     const password = await store.readSafeStoragePassword({
-      run: async () => ({ stdout: "horse-battery\n" }),
+      loadBinding: keychainBinding(async () => "horse-battery", created),
     });
     assert.equal(password, "horse-battery");
+    assert.deepEqual(created, [["Chrome Safe Storage", "Chrome"]]);
+  });
+
+  it("never starts a helper process, so the grant can't go to a shared tool", async () => {
+    const childProcess = require("node:child_process");
+    const storePath = require.resolve("../src/chromeCookieStore");
+    const launchers = [
+      "execFile",
+      "execFileSync",
+      "spawn",
+      "spawnSync",
+      "exec",
+      "execSync",
+      "fork",
+    ];
+    const originals = launchers.map((name) => childProcess[name]);
+    const spawned = [];
+    for (const name of launchers) {
+      childProcess[name] = (...args) => {
+        spawned.push([name, args[0]]);
+        throw new Error(`unexpected child process: ${name}`);
+      };
+    }
+    // The store captures `execFile` when it loads, so load a fresh copy over the stubs.
+    const cached = require.cache[storePath];
+    Reflect.deleteProperty(require.cache, storePath);
+    try {
+      const isolated = require("../src/chromeCookieStore");
+      assert.notEqual(isolated, store);
+      const password = await isolated.readSafeStoragePassword({
+        loadBinding: keychainBinding(async () => "secret"),
+      });
+      assert.equal(password, "secret");
+      // A binding that can't load fails the read; it must not fall back to /usr/bin/security.
+      await assert.rejects(
+        isolated.readSafeStoragePassword({
+          loadBinding: () => {
+            throw new Error("Cannot find module '@napi-rs/keyring-darwin-arm64'");
+          },
+        }),
+        (err) => {
+          assert.match(err.message, /can't read the Keychain/);
+          assert.doesNotMatch(err.message, /napi-rs|module/);
+          return true;
+        },
+      );
+    } finally {
+      launchers.forEach((name, index) => {
+        childProcess[name] = originals[index];
+      });
+      require.cache[storePath] = cached;
+    }
+    assert.deepEqual(spawned, []);
   });
 
   it("explains a missing Keychain item", async () => {
     await assert.rejects(
-      store.readSafeStoragePassword({
-        run: async () => {
-          throw Object.assign(new Error("item not found"), { code: 44 });
-        },
-      }),
+      store.readSafeStoragePassword({ loadBinding: keychainBinding(async () => null) }),
       /isn't in your login Keychain/,
     );
   });
 
-  it("explains a dismissed/timed-out approval prompt", async () => {
+  it("explains an empty Keychain item", async () => {
+    await assert.rejects(
+      store.readSafeStoragePassword({ loadBinding: keychainBinding(async () => "") }),
+      /Keychain item is empty/,
+    );
+  });
+
+  it("explains an approval prompt left unanswered", async () => {
     await assert.rejects(
       store.readSafeStoragePassword({
-        run: async () => {
-          throw Object.assign(new Error("killed"), { killed: true, signal: "SIGTERM" });
-        },
+        // The native read stays blocked for as long as the system dialog is up.
+        loadBinding: keychainBinding(() => new Promise(() => {})),
+        timeoutMs: 5,
       }),
       /Timed out waiting for Keychain access/,
     );
   });
 
-  it("never echoes the security(1) error text", async () => {
+  it("never echoes the platform's error text", async () => {
     await assert.rejects(
       store.readSafeStoragePassword({
-        run: async () => {
+        loadBinding: keychainBinding(async () => {
           throw Object.assign(
-            new Error(
-              "security: SecKeychainSearchCopyNext: The user name or passphrase you entered is not correct.",
-            ),
-            {
-              code: 51,
-            },
+            new Error("Couldn't access platform storage: SecKeychainFindGenericPassword -128"),
+            { code: "GenericFailure" },
           );
-        },
+        }),
       }),
       (err) => {
         assert.match(err.message, /Couldn't read Chrome's cookie key/);
-        assert.doesNotMatch(err.message, /SecKeychain/);
+        assert.doesNotMatch(err.message, /SecKeychain|platform storage/);
         return true;
       },
     );
@@ -543,9 +623,9 @@ describe("chromeCookieStore — sqlite3 reader", { skip: !hasSqlite3 }, () => {
         is_persistent INTEGER NOT NULL DEFAULT 1, top_frame_site_key TEXT NOT NULL DEFAULT ''
       );`,
       ...entries.map(
-        ([hostKey, name, partitionKey]) =>
-          `INSERT INTO cookies (host_key, name, path, top_frame_site_key)
-            VALUES ('${hostKey}', '${name}', '/', '${partitionKey ?? ""}');`,
+        ([hostKey, name, partitionKey, expiresUtc, value]) =>
+          `INSERT INTO cookies (host_key, name, path, top_frame_site_key, expires_utc, value)
+            VALUES ('${hostKey}', '${name}', '/', '${partitionKey ?? ""}', ${expiresUtc ?? 0}, '${value ?? ""}');`,
       ),
     ];
     execFileSync("sqlite3", [databasePath], { input: statements.join("\n") });
@@ -844,6 +924,165 @@ describe("chromeCookieStore — sqlite3 reader", { skip: !hasSqlite3 }, () => {
       });
       assert.equal(result.ok, false);
       assert.match(result.error, /wasn't found/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("counts every website's importable cookies per profile for the preview", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-chrome-all-preview-"));
+    try {
+      for (const dir of ["Default", "Profile 2", "Profile 3", "Profile 4"]) {
+        fs.mkdirSync(path.join(root, dir));
+      }
+      makeScopeDb(path.join(root, "Default", "Cookies"), [
+        [".example.com", "shared"],
+        ["other.test", "session"],
+        // Left out, as in a site import: partitioned, and already expired.
+        ["other.test", "partitioned", "https://top.example"],
+        ["old.test", "expired", "", chromeExpiresUtc(1_600_000_000)],
+      ]);
+      // A legacy schema has no partition column; its cookies still count.
+      makeCookieDb(path.join(root, "Profile 2", "Cookies"), { legacyColumns: true });
+      // No cookies at all, and an unreadable database: neither is offered.
+      makeScopeDb(path.join(root, "Profile 3", "Cookies"), []);
+      fs.writeFileSync(path.join(root, "Profile 4", "Cookies"), "not a database");
+      fs.writeFileSync(
+        path.join(root, "Local State"),
+        JSON.stringify({
+          profile: {
+            last_used: "Profile 2",
+            info_cache: {
+              Default: { name: "Work" },
+              "Profile 2": { name: "Personal" },
+              "Profile 3": { name: "Empty" },
+              "Profile 4": { name: "Broken" },
+            },
+          },
+        }),
+      );
+      const preview = await store.previewAllSitesCookies({
+        rootDir: root,
+        nowMs: 1_700_000_000_000,
+      });
+      assert.deepEqual(preview, {
+        ok: true,
+        profiles: [
+          { id: "Profile 2", name: "Personal", cookieCount: 4 },
+          { id: "Default", name: "Work", cookieCount: 2 },
+        ],
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("imports every website's cookies and reports the same count as the preview", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-chrome-all-import-"));
+    try {
+      fs.mkdirSync(path.join(root, "Default"));
+      makeCookieDb(path.join(root, "Default", "Cookies"));
+      const preview = await store.previewAllSitesCookies({ rootDir: root });
+      const written = [];
+      const result = await store.importAllSitesCookies({
+        profileId: "Default",
+        cookiesApi: { set: async (cookie) => written.push(cookie) },
+        rootDir: root,
+        readPassword: async () => "test-password",
+      });
+      assert.deepEqual(result, {
+        ok: true,
+        scope: store.ALL_SITES_SCOPE,
+        profileId: "Default",
+        profileName: "Default",
+        found: 4,
+        imported: 4,
+        skipped: 0,
+        failed: 0,
+      });
+      assert.equal(preview.profiles[0].cookieCount, result.found);
+      // Unlike a site import, the unrelated site's cookie comes along.
+      assert.deepEqual(written.map((cookie) => [cookie.name, cookie.value, cookie.domain]).sort(), [
+        ["SID", "sid-value", ".example.com"],
+        ["hostonly", "host-value", undefined],
+        ["nope", "other", ".unrelated.test"],
+        ["parentonly", "parent-value", undefined],
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("imports a profile too large for one sqlite3 run, still without partitioned cookies", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-chrome-all-large-"));
+    try {
+      fs.mkdirSync(path.join(root, "Default"));
+      // Over 4 MB of values: several batches, each past execFile's default 1 MiB output cap.
+      const value = "v".repeat(3000);
+      const expires = chromeExpiresUtc(1_900_000_000);
+      const row = (index, partitionKey) => [
+        `site${index}.test`,
+        `c${index}`,
+        partitionKey,
+        expires,
+        value,
+      ];
+      makeScopeDb(path.join(root, "Default", "Cookies"), [
+        ...Array.from({ length: 1200 }, (_, index) => row(index, "")),
+        ...Array.from({ length: 300 }, (_, index) => row(1200 + index, "https://top.example")),
+      ]);
+      const preview = await store.previewAllSitesCookies({ rootDir: root });
+      assert.equal(preview.profiles[0].cookieCount, 1200);
+      const written = [];
+      const result = await store.importAllSitesCookies({
+        profileId: "Default",
+        cookiesApi: { set: async (cookie) => written.push(cookie) },
+        rootDir: root,
+        readPassword: async () => "test-password",
+      });
+      assert.equal(result.found, 1200);
+      assert.equal(result.imported, 1200);
+      assert.equal(written.length, 1200);
+      assert.equal(new Set(written.map((cookie) => cookie.name)).size, 1200);
+      assert.ok(written.every((cookie) => Number(cookie.name.slice(1)) < 1200));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("writes nothing for every website when the profile, key or database fails", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-chrome-all-fail-"));
+    try {
+      fs.mkdirSync(path.join(root, "Default"));
+      makeCookieDb(path.join(root, "Default", "Cookies"));
+      fs.mkdirSync(path.join(root, "Profile 2"));
+      fs.writeFileSync(path.join(root, "Profile 2", "Cookies"), "not a database");
+      const written = [];
+      const importAll = (overrides) =>
+        store.importAllSitesCookies({
+          profileId: "Default",
+          cookiesApi: { set: async (cookie) => written.push(cookie) },
+          rootDir: root,
+          readPassword: async () => "test-password",
+          ...overrides,
+        });
+
+      const unknown = await importAll({ profileId: "Profile 9" });
+      assert.equal(unknown.ok, false);
+      assert.match(unknown.error, /wasn't found/);
+
+      const locked = await importAll({
+        readPassword: async () => {
+          throw new Error("Timed out waiting for Keychain access.");
+        },
+      });
+      assert.deepEqual(locked, { ok: false, error: "Timed out waiting for Keychain access." });
+
+      await assert.rejects(importAll({ profileId: "Profile 2" }), (err) => {
+        assert.equal(err.message, "Could not read Chrome's cookie database.");
+        return true;
+      });
+      assert.deepEqual(written, []);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

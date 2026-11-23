@@ -127,6 +127,34 @@ def test_private_manager_launch_send_read_and_sharing(
                     )
                     assert response.status_code == 202, response.text
 
+                def wait_for_omnigent_tools(session, label):
+                    # Codex can take a turn before its omnigent MCP tools are listed. The probe
+                    # has no mock queue, so it cannot shadow later scripted matches.
+                    if harness != "codex-native":
+                        return
+                    probe = f"OMNIGENT_TOOLS_PROBE_{label}"
+                    send(session, probe)
+                    seen_requests = 0
+
+                    def tools_ready():
+                        nonlocal seen_requests
+                        snapshot = client.get(f"/v1/sessions/{session}").json()
+                        if snapshot["status"] != "idle" or snapshot.get("pending_inputs"):
+                            return False
+                        requests = [r for r in get_mock_requests(mock) if probe in json.dumps(r)]
+                        if any(
+                            t.get("name") == "mcp__omnigent"
+                            for r in requests
+                            for t in r.get("tools", [])
+                        ):
+                            return True
+                        if len(requests) > seen_requests:
+                            seen_requests = len(requests)
+                            send(session, probe)
+                        return False
+
+                    poll_until(tools_ready, timeout_s=90)
+
                 sessions = []
                 for title in ("Manager", "Worker"):
                     metadata = {
@@ -173,6 +201,8 @@ def test_private_manager_launch_send_read_and_sharing(
                         created = response.json()
                     sessions.append(created["session_id"])
                 manager, worker = sessions
+                wait_for_omnigent_tools(manager, "MANAGER")
+                wait_for_omnigent_tools(worker, "WORKER")
                 if not orchestration_enabled:
                     configure("BEFORE_SWITCH_TASK", [{"text": "BEFORE_SWITCH_RESULT"}])
                     configure(
