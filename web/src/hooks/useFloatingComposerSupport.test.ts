@@ -84,6 +84,22 @@ describe("useFloatingComposerSupport", () => {
     expect(onLaunch).not.toHaveBeenCalled();
   });
 
+  it("still announces with the flag on in a shell that can't hand over launches", async () => {
+    stubShell({
+      kind: "electron",
+      getDesktopFeatures,
+      floatingComposer: {
+        announceSupport,
+        dismiss: vi.fn(),
+        openInMainWindow: vi.fn(),
+        filePicker: vi.fn(),
+      },
+    });
+    const { unmount } = renderHook(() => useFloatingComposerSupport());
+    await waitFor(() => expect(announceSupport).toHaveBeenCalledWith(1));
+    expect(() => unmount()).not.toThrow();
+  });
+
   it("opens a session the panel launched with its first message, as New Chat does", async () => {
     let launch: (launch: Launch) => void = () => {};
     const stopListening = vi.fn();
@@ -106,11 +122,7 @@ describe("useFloatingComposerSupport", () => {
         },
       ],
     };
-    // Only a session's route takes a first message.
-    launch({ path: "/settings/general", firstMessage });
-    expect(setPendingInitialPrompt).not.toHaveBeenCalled();
-    expect(navigate).not.toHaveBeenCalled();
-
+    // The shell handed over a session's launch whose message this page took.
     launch({ path: "/c/conv_1", firstMessage });
     const [sessionId, prompt] = vi.mocked(setPendingInitialPrompt).mock.calls[0]!;
     expect(sessionId).toBe("conv_1");

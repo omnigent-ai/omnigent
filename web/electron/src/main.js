@@ -138,6 +138,7 @@ const { acceleratorLabel, createGlobalShortcuts } = require("./globalShowShortcu
 const {
   FLOATING_COMPOSER_PATH,
   FRAME_SETTINGS_KEY,
+  FLOATING_COMPOSER_LAUNCH_TAKE_MS,
   FLOATING_COMPOSER_PRELOAD_DELAY_MS,
   createFloatingComposerController,
   createFloatingComposerPreloader,
@@ -1863,6 +1864,9 @@ const floatingComposerSupport = createFloatingComposerSupport();
 // Main-window documents that send a launched session's first message themselves: webContents
 // id → the cleanup that forgets it when that document goes.
 const floatingComposerLaunchListeners = new Map();
+// Launches offered to a main window, waiting for it to take the first message: id → launch.
+const floatingComposerLaunches = new Map();
+let floatingComposerLaunchCount = 0;
 
 // "Show Omnigent from anywhere" (opt-in). macOS needs app-level activation to
 // come forward from another app. The floating panel's ⇧⌘Space is held only while a
@@ -5541,6 +5545,17 @@ function registerIpc() {
     floatingComposerLaunchListeners.set(contents.id, forget);
   });
 
+  // From a main window's page: take the first message of a launch offered to it, once. Null
+  // once the launch expired or was taken, or for any page it wasn't offered to.
+  ipcMain.handle("omnigent:floating-composer:take-launch", (event, id) => {
+    const launch = floatingComposerLaunches.get(id);
+    if (!launch || !isPinnedOriginSender(event)) return null;
+    if (event.senderFrame !== event.sender.mainFrame || event.sender.id !== launch.contentsId) {
+      return null;
+    }
+    return launch.take();
+  });
+
   // From the panel: put it away, keeping its draft; the keyboard goes back to the app it had.
   ipcMain.on("omnigent:floating-composer:dismiss", (event) => {
     const panel = BrowserWindow.fromWebContents(event.sender);
@@ -5558,44 +5573,49 @@ function registerIpc() {
 
   // From the panel: a session it launched, or an app page it links to, in a main window of
   // its server. The panel then hides.
-  ipcMain.handle("omnigent:floating-composer:open-in-main-window", (event, routePath, message) => {
-    const panel = BrowserWindow.fromWebContents(event.sender);
-    if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) {
-      return { ok: false, error: "not-composer" };
-    }
-    const sessionPath = floatingComposerSessionPath(routePath);
-    const openPath = sessionPath ?? floatingComposerAppPagePath(routePath);
-    if (openPath === null) return { ok: false, error: "bad-path" };
-    // Bound by main when it built the panel; never taken from the page.
-    const serverUrl = floatingComposerController.serverUrlFor(panel);
-    // Only a window showing its server's app hears the route, not one on setup or sign-in.
-    const target = mainWindowsByRecency(mainWindowFocusOrder, mainWindows()).find(
-      (win) => windows.get(win)?.serverUrl === serverUrl && serverPageShown(win) === "app",
-    );
-    // A window still connecting would drop the route when its page loads; the panel stays.
-    if (target && connectionAttempts.get(target)?.pending === true) {
-      return { ok: false, error: "window-loading" };
-    }
-    // A window that sends first messages takes the launch's, as if typed there.
-    const firstMessage =
-      sessionPath !== null && target && floatingComposerLaunchListeners.has(target.webContents.id)
-        ? floatingComposerFirstMessage(message)
-        : null;
-    let handedOff = false;
-    // A launched session or a linked page comes forward, over the app the user was in.
-    if (target) {
-      if (firstMessage) handedOff = sendFloatingComposerLaunch(target, openPath, firstMessage);
-      else sendOpenPath(target, openPath);
-      focusAndRestore(target);
-    } else {
-      // shortcut: a new window can't take the first message yet, so the panel still sends it.
-      createWindow(undefined, { serverUrl, path: openPath });
-    }
-    app.focus({ steal: true });
-    // After a launch the next open starts at the default placement again.
-    floatingComposerController.hide(panel, { resetFrame: sessionPath !== null });
-    return handedOff ? { ok: true, handedOff: true } : { ok: true };
-  });
+  ipcMain.handle(
+    "omnigent:floating-composer:open-in-main-window",
+    async (event, routePath, message) => {
+      const panel = BrowserWindow.fromWebContents(event.sender);
+      if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) {
+        return { ok: false, error: "not-composer" };
+      }
+      const sessionPath = floatingComposerSessionPath(routePath);
+      const openPath = sessionPath ?? floatingComposerAppPagePath(routePath);
+      if (openPath === null) return { ok: false, error: "bad-path" };
+      // Bound by main when it built the panel; never taken from the page.
+      const serverUrl = floatingComposerController.serverUrlFor(panel);
+      // Only a window showing its server's app hears the route, not one on setup or sign-in.
+      const target = mainWindowsByRecency(mainWindowFocusOrder, mainWindows()).find(
+        (win) => windows.get(win)?.serverUrl === serverUrl && serverPageShown(win) === "app",
+      );
+      // A window still connecting would drop the route when its page loads; the panel stays.
+      if (target && connectionAttempts.get(target)?.pending === true) {
+        return { ok: false, error: "window-loading" };
+      }
+      // A window that sends first messages takes the launch's, as if typed there.
+      const firstMessage =
+        sessionPath !== null && target && floatingComposerLaunchListeners.has(target.webContents.id)
+          ? floatingComposerFirstMessage(message)
+          : null;
+      // The message is the page's only once it takes it; until then the panel still sends it.
+      const handedOff = firstMessage
+        ? await offerFloatingComposerLaunch(target, openPath, firstMessage)
+        : false;
+      // A launched session or a linked page comes forward, over the app the user was in.
+      if (target) {
+        if (!handedOff) sendOpenPath(target, openPath);
+        focusAndRestore(target);
+      } else {
+        // A new window has no launch listener yet, so the panel sends the first message.
+        createWindow(undefined, { serverUrl, path: openPath });
+      }
+      app.focus({ steal: true });
+      // After a launch the next open starts at the default placement again.
+      floatingComposerController.hide(panel, { resetFrame: sessionPath !== null });
+      return handedOff ? { ok: true, handedOff: true } : { ok: true };
+    },
+  );
 
   // Dock/taskbar badge. Each window's SPA reports ITS unread count; the
   // app-wide badge shown is the sum across windows (see updateBadge), so two
@@ -6586,15 +6606,33 @@ function focusAppAndSend(command) {
   sendDesktopCommand(target, command, { browserViewId });
 }
 
-/** Hand a main window a launched session to open and its first message to send. */
-function sendFloatingComposerLaunch(win, routePath, firstMessage) {
-  try {
-    win.webContents.send("omnigent:floating-composer:launch", { path: routePath, firstMessage });
-    return true;
-  } catch {
-    // Torn down mid-send: the panel then sends the message itself.
-    return false;
-  }
+/**
+ * Offer a main window a launched session; its page opens it once it takes the first message.
+ * Resolves whether it did within FLOATING_COMPOSER_LAUNCH_TAKE_MS; after that a take gets null.
+ */
+function offerFloatingComposerLaunch(win, routePath, firstMessage) {
+  const id = ++floatingComposerLaunchCount;
+  return new Promise((resolve) => {
+    const settle = (taken) => {
+      clearTimeout(timer);
+      floatingComposerLaunches.delete(id);
+      resolve(taken);
+    };
+    const timer = setTimeout(() => settle(false), FLOATING_COMPOSER_LAUNCH_TAKE_MS);
+    floatingComposerLaunches.set(id, {
+      contentsId: win.webContents.id,
+      take: () => {
+        settle(true);
+        return firstMessage;
+      },
+    });
+    try {
+      // The message itself goes only to the page that takes it.
+      win.webContents.send("omnigent:floating-composer:launch", { id, path: routePath });
+    } catch {
+      settle(false);
+    }
+  });
 }
 
 /**

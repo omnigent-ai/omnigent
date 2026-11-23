@@ -13,8 +13,6 @@ import { setPendingInitialPrompt } from "@/store/chatStore";
 /** The panel version this bundle renders at `/compose/floating`; the shell accepts only it. */
 const FLOATING_COMPOSER_VERSION = 1;
 
-const SESSION_PATH = /^\/c\/([A-Za-z0-9_-]{1,128})$/;
-
 /**
  * Tells the desktop shell that this main window's page can render the floating New Agent
  * panel, so ⇧⌘Space opens it, when `floating_composer` is on and the shell supports it.
@@ -48,14 +46,15 @@ export function useFloatingComposerSupport(): void {
   }, [enabled]);
 }
 
-/** Open the launched session with its first message, as this window's own New Chat does. */
+/**
+ * Open the launched session with its first message, as this window's own New Chat does. The
+ * message was taken from the shell for a `/c/<id>` path, so it's this page's to send.
+ */
 function sendLaunchedFirstMessage(
   { path, firstMessage }: { path: string; firstMessage: FloatingComposerFirstMessage },
   navigate: (to: string) => void,
 ): void {
-  const sessionId = SESSION_PATH.exec(path)?.[1];
-  if (sessionId === undefined) return;
-  setPendingInitialPrompt(sessionId, {
+  setPendingInitialPrompt(path.slice("/c/".length), {
     text: firstMessage.text,
     skill: firstMessage.skill,
     files: firstMessage.files.map(

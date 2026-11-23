@@ -24,6 +24,7 @@ const moduleLoader = require("node:module");
 const path = require("node:path");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
+const { FLOATING_COMPOSER_LAUNCH_TAKE_MS } = require("../src/floating_composer_window");
 
 const { createRequire } = moduleLoader;
 const electronStub = {
@@ -4143,24 +4144,84 @@ describe("floating panel wiring", () => {
     )),
   });
 
-  it("hands a launched session and its first message to a main window that sends it", async (t) => {
+  /** A main window's document asks to take launch `id`, from its top frame or a subframe. */
+  const take = (h, main, id, { subframe = false } = {}) => {
+    const frame = { url: main.url };
+    main.webContents.mainFrame = subframe ? { url: "top" } : frame;
+    return h.ipc.get("omnigent:floating-composer:take-launch")(
+      { sender: main.webContents, senderFrame: frame },
+      id,
+    );
+  };
+
+  it("hands a launched session to a main window, and its first message once that page takes it", async (t) => {
     const h = loadNavigationHarness({ platform: "darwin" });
     t.after(h.cleanup);
     h.api.registerIpc();
     const panel = openPanel(h);
     const main = addMain(h);
     listenForLaunches(h, main);
-    assert.deepEqual(await launchFromPanel(h), { ok: true, handedOff: true });
+    const result = launchFromPanel(h);
     assert.equal(main.sent.length, 1);
     const [channel, launch] = main.sent[0];
     assert.equal(channel, "omnigent:floating-composer:launch");
     assert.equal(launch.path, "/c/abc");
-    assert.equal(launch.firstMessage.text, "Fix the build");
-    assert.equal(launch.firstMessage.files[0].name, "notes.txt");
-    assert.equal(launch.firstMessage.files[0].data[0], 120);
+    assert.equal(launch.firstMessage, undefined, "the message goes only to the page that takes it");
+    assert.equal(panel.visible, true, "the panel waits for the page");
+
+    const taken = await take(h, main, launch.id);
+    assert.equal(taken.text, "Fix the build");
+    assert.equal(taken.files[0].name, "notes.txt");
+    assert.equal(taken.files[0].data[0], 120);
+    assert.equal(await take(h, main, launch.id), null, "a message is taken once");
+    assert.deepEqual(await result, { ok: true, handedOff: true });
+    assert.equal(main.sent.length, 1, "the page opens the session itself");
     assert.equal(main.focused, 1);
     assert.equal(panel.visible, false);
   });
+
+  it("opens the session without its first message when the page doesn't take it in time", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const panel = openPanel(h);
+    const main = addMain(h);
+    listenForLaunches(h, main);
+    const result = launchFromPanel(h);
+    const [, launch] = main.sent[0];
+    t.mock.timers.tick(FLOATING_COMPOSER_LAUNCH_TAKE_MS - 1);
+    assert.equal(panel.visible, true);
+    t.mock.timers.tick(1);
+    // The panel sends the message, so a late take gets nothing and it's sent once.
+    assert.deepEqual(await result, { ok: true });
+    assert.deepEqual(main.sent.at(-1), ["omnigent:open-path", "/c/abc"]);
+    assert.equal(await take(h, main, launch.id), null);
+    assert.equal(panel.visible, false);
+  });
+
+  for (const [who, takeAs] of [
+    ["another window", (h, main, other, id) => take(h, other, id)],
+    ["a subframe of that window", (h, main, _other, id) => take(h, main, id, { subframe: true })],
+  ]) {
+    it(`keeps a launch's first message from ${who}`, async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const h = loadNavigationHarness({ platform: "darwin" });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      openPanel(h);
+      const main = addMain(h);
+      const other = addMain(h);
+      listenForLaunches(h, main);
+      listenForLaunches(h, other);
+      const result = launchFromPanel(h);
+      const [, launch] = main.sent[0];
+      assert.equal(await takeAs(h, main, other, launch.id), null);
+      assert.deepEqual(other.sent, []);
+      t.mock.timers.tick(FLOATING_COMPOSER_LAUNCH_TAKE_MS);
+      assert.deepEqual(await result, { ok: true });
+    });
+  }
 
   for (const [what, arrange, message] of [
     ["never said it sends them", () => {}, firstMessage],

@@ -33,8 +33,9 @@ off by default.
   the next prompt.
 - `launch-failure`: when that window can't deliver the first message, it keeps it
   in that chat, as New Chat does. When the session opens in a new window instead,
-  the panel sends the message itself and, if that fails (the server never stored
-  it, or the runner refused it), keeps the prompt and says why.
+  or its window doesn't take the message within two seconds, the panel sends it
+  itself and, if that fails (the server never stored it, or the runner refused
+  it), keeps the prompt and says why.
 - `locations`: the panel offers only This Mac and a new sandbox. Remote hosts,
   the import prompt and the page heading are hidden.
 - `links`: links in the panel to Settings pages open in an Omnigent window, which
@@ -119,5 +120,3 @@ Component and unit coverage for each part:
 - The panel's draft lives in that panel's page: it survives hiding, but not
   quitting the app or a rebuilt panel.
 - A panel that needs to sign in again closes instead of signing in inside the panel.
-- A second ⇧⌘Space on a visible panel that lost focus may not bring keyboard
-  focus back to it; click the panel.

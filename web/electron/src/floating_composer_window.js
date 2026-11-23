@@ -86,6 +86,8 @@ function floatingComposerFirstMessage(message) {
   };
 }
 
+/** How long a main window has to take a launch's first message before the panel sends it. */
+const FLOATING_COMPOSER_LAUNCH_TAKE_MS = 2000;
 /** How long the panel takes to fade in when it opens; closing is instant. */
 const FLOATING_COMPOSER_FADE_MS = 120;
 /** How long an open waits for a page still loading to say it's ready before showing anyway. */
@@ -525,6 +527,7 @@ function createFloatingComposerPreloader(deps) {
 
 module.exports = {
   FLOATING_COMPOSER_FADE_MS,
+  FLOATING_COMPOSER_LAUNCH_TAKE_MS,
   FLOATING_COMPOSER_PRELOAD_DELAY_MS,
   FLOATING_COMPOSER_READY_FALLBACK_MS,
   FLOATING_COMPOSER_PATH,

@@ -378,7 +378,10 @@ export interface FloatingComposerBridge {
     path: string,
     firstMessage?: FloatingComposerFirstMessage,
   ) => Promise<{ ok: true; handedOff?: boolean } | { ok: false; error: FloatingComposerOpenError }>;
-  /** In a main window: hear a session the panel launched, and send its first message. Newer shells only. */
+  /**
+   * In a main window: hear a session the panel launched at `/c/<id>`, with a first message this
+   * page took from the shell and now must send. Newer shells only.
+   */
   onLaunch?: (
     callback: (launch: { path: string; firstMessage: FloatingComposerFirstMessage }) => void,
   ) => () => void;
