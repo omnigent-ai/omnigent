@@ -870,12 +870,23 @@ describe("browser IPC localhost previews from hosts reached over SSH", () => {
     );
   });
 
-  it("doesn't ask about a page the policy allowed", async () => {
-    const { state, navigate } = previewSetup({ request: () => assert.fail("must not ask") });
-    state.allowed = true;
-    assert.equal((await navigate({ sourceHostId: "host-1" })).ok, true);
-    assert.deepEqual(state.calls, ["allowed", "navigate"]);
+  it("doesn't request new localhost consent to restore a saved page", async () => {
+    const { state, navigate } = previewSetup({ request: () => true });
+    const result = await navigate({ sourceHostId: "host-1", restore: true });
+    assert.deepEqual(result, { ok: false, created: false, error: "blocked" });
+    assert.deepEqual(state.calls, ["denied"]);
+    assert.deepEqual(state.loaded, []);
   });
+
+  for (const restore of [false, true]) {
+    it(`doesn't ask about a page the policy allowed (restore: ${restore})`, async () => {
+      const { state, navigate } = previewSetup({ request: () => assert.fail("must not ask") });
+      state.allowed = true;
+      assert.equal((await navigate({ sourceHostId: "host-1", restore })).ok, true);
+      assert.deepEqual(state.calls, ["allowed", "navigate"]);
+      assert.deepEqual(state.loaded, ["http://127.0.0.1:8787/"]);
+    });
+  }
 
   for (const protocol of [undefined, 0, 2]) {
     it(`doesn't ask when the renderer's host protocol is ${protocol}`, async () => {

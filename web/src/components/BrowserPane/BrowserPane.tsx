@@ -52,7 +52,6 @@ import { useDesktopCommand } from "@/lib/desktopCommands";
 import {
   CHROME_COOKIE_ALL_SITES_SCOPE,
   getDesktopFeatures,
-  navigationHostOptions,
   supportsBrowser,
   supportsDesktopCommands,
   type BrowserHostOptions,
@@ -340,9 +339,11 @@ export function BrowserPane({
         if (features?.browserPageRestore !== true || superseded()) return;
         const hostId = await fetchSessionHostId(browserViewOwnerId(conversationId));
         if (superseded()) return;
+        const options = await previewHostOptions(hostId, saved.url);
+        if (superseded()) return;
         // The shell refuses a restore once the tab has, or is getting, another page.
         const result = await openOrNavigate(conversationId, saved.url, undefined, {
-          ...navigationHostOptions(hostId),
+          ...options,
           restore: true,
         });
         // This reopen's own view creation sets viewChanged, so only newer intent counts now.

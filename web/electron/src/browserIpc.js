@@ -555,11 +555,12 @@ function registerBrowserIpc({
         recovered = false;
       }
     }
-    // Typed URLs and links reach here too; the question names the session's host, not the page.
+    // Restores may reuse authorization, but only intentional navigation can request consent.
     let previewAllowed = false;
     if (
       !r.ok &&
       r.localhostBlocked === true &&
+      opts?.restore !== true &&
       opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
       opts?.sshPreviewProtocol === SSH_PREVIEW_PROTOCOL &&
       !recovered &&

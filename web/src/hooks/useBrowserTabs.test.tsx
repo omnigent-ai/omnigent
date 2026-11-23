@@ -14,6 +14,7 @@ import {
 import { getSessionSlim } from "@/lib/sessionsApi";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import type * as Identity from "@/lib/identity";
+import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import type { Session } from "@/lib/types";
 import { writeBrowserAgentToolsEnabled } from "@/components/BrowserPane/agentTools/preferences";
 import { loadTabs } from "@/components/BrowserPane/agentTools/tabStore";
@@ -32,7 +33,8 @@ vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
 vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn(async () => []) }));
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof Identity>()),
-  getCurrentUserId: () => "user-a",
+  getCurrentUserId: vi.fn(() => "user-a"),
+  resolveIdentity: vi.fn(async () => "user-a"),
 }));
 
 // Unknown hosts stay public-only unless a test gives the session one.
@@ -48,6 +50,8 @@ afterEach(() => {
   localStorage.clear();
   Reflect.deleteProperty(window, "omnigentDesktop");
   vi.mocked(getSessionSlim).mockReset();
+  vi.mocked(getCurrentUserId).mockReset();
+  vi.mocked(resolveIdentity).mockReset();
   vi.mocked(toast.error).mockClear();
 });
 
@@ -93,20 +97,58 @@ describe("browser tab titles", () => {
     await waitFor(() => expect(result.current.labelFor("known", 1)).toBe(label));
   });
 
-  it("labels a tab whose view is gone from its saved page", async () => {
-    openBrowserTab("session-a", "restored");
-    writeSessionWorkspaceState("session-a", {
-      browserPages: {
-        restored: { url: "https://docs.example/guide", title: "Guide", owner: "user-a" },
-      },
-    });
-    Object.assign(window, {
-      omnigentDesktop: { browserHasView: vi.fn().mockResolvedValue({ exists: false }) },
-    });
-    const { result } = renderHook(() => useBrowserTabs("session-a"));
-    await waitFor(() => expect(result.current.labelFor("restored", 0)).toBe("Guide"));
-    expect(await result.current.pageUrl("restored")).toBe("https://docs.example/guide");
-  });
+  it.each(["ready", "delayed", "delayed with a live update"] as const)(
+    "labels a tab whose view is gone with identity %s",
+    async (identityState) => {
+      let finishIdentity!: (userId: string) => void;
+      const pendingIdentity = new Promise<string>((resolve) => {
+        finishIdentity = resolve;
+      });
+      if (identityState !== "ready") {
+        vi.mocked(getCurrentUserId).mockReturnValue(null);
+        vi.mocked(resolveIdentity).mockReturnValue(pendingIdentity);
+      }
+      openBrowserTab("session-a", "restored");
+      writeSessionWorkspaceState("session-a", {
+        browserPages: {
+          restored: { url: "https://docs.example/guide", title: "Guide", owner: "user-a" },
+        },
+      });
+      const onBrowserUrlChanged = vi.fn<(listener: Listener) => () => void>(() => () => {});
+      Object.assign(window, {
+        omnigentDesktop: {
+          browserHasView: vi.fn().mockResolvedValue({ exists: false }),
+          onBrowserUrlChanged,
+        },
+      });
+      const { result } = renderHook(() => useBrowserTabs("session-a"));
+      const live = identityState === "delayed with a live update";
+      if (identityState !== "ready") {
+        await waitFor(() => expect(resolveIdentity).toHaveBeenCalled());
+        expect(result.current.labelFor("restored", 0)).toBe("Browser 1");
+        if (live) {
+          act(() =>
+            onBrowserUrlChanged.mock.calls.at(-1)![0]({
+              conversationId: browserViewId("session-a", "restored"),
+              url: "https://docs.example/live",
+              title: "Live guide",
+            }),
+          );
+        }
+      }
+      await act(async () => {
+        vi.mocked(getCurrentUserId).mockReturnValue("user-a");
+        finishIdentity("user-a");
+        await pendingIdentity;
+      });
+      await waitFor(() =>
+        expect(result.current.labelFor("restored", 0)).toBe(live ? "Live guide" : "Guide"),
+      );
+      expect(await result.current.pageUrl("restored")).toBe(
+        live ? "https://docs.example/live" : "https://docs.example/guide",
+      );
+    },
+  );
 
   it("saves the page a live view already shows when its tab is added", async () => {
     openBrowserTab("session-a", "opened");

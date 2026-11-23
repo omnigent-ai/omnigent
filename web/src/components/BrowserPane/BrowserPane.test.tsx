@@ -46,6 +46,8 @@ vi.mock("@/lib/fetchSessionHostId", async (importOriginal) => {
 vi.mock("@/lib/sessionsApi", () => ({
   getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
 }));
+// Host discovery is external; these tests exercise the pane's navigation requests.
+vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn(async () => []) }));
 
 // Desktop menu commands (Reload, Focus Address Bar); off unless a test turns them on.
 const desktop = vi.hoisted(() => ({
@@ -173,10 +175,10 @@ describe("BrowserPane cold-start (no view yet)", () => {
     expect(bridge.browserSetActive).toHaveBeenLastCalledWith(null);
   });
 
-  const savedReport = (owner = "user-a") =>
+  const savedReport = (owner = "user-a", url = "https://example.com/report") =>
     writeSessionWorkspaceState("conv_a", {
       openBrowsers: ["two"],
-      browserPages: { two: { url: "https://example.com/report", title: "Report", owner } },
+      browserPages: { two: { url, title: "Report", owner } },
     });
   // Waits for promises the pane awaited, after the pane has handled them.
   const handled = (promises: unknown[]) =>
@@ -199,21 +201,32 @@ describe("BrowserPane cold-start (no view yet)", () => {
       });
   };
 
-  it("reopens a tab's saved page when the shell no longer has its view", async () => {
+  it.each([
+    ["https://example.com/report", false],
+    ["http://localhost:5273/preview", true],
+    ["http://localhost:5273/preview", undefined],
+  ] as const)("reopens saved %s with SSH preview support %s", async (url, sshLocalhostPreview) => {
     getSessionSlim.mockResolvedValue({ id: "conv_a", hostId: "local-host", parentSessionId: null });
-    savedReport();
-    const bridge = installBridge();
+    savedReport("user-a", url);
+    const bridge = installBridge({
+      getDesktopFeatures: vi
+        .fn()
+        .mockResolvedValue({ browserPageRestore: true, sshLocalhostPreview }),
+    });
     render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
 
-    expect(await screen.findByRole("textbox", { name: "Address bar" })).toHaveValue(
-      "https://example.com/report",
-    );
+    expect(await screen.findByRole("textbox", { name: "Address bar" })).toHaveValue(url);
     await waitFor(() =>
       expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
         "browser-tab:conv_a:two",
-        "https://example.com/report",
+        url,
         undefined,
-        { sourceHostId: "local-host", sessionHostProtocol: 1, restore: true },
+        {
+          sourceHostId: "local-host",
+          sessionHostProtocol: 1,
+          ...(sshLocalhostPreview ? { sshPreviewProtocol: 1 } : {}),
+          restore: true,
+        },
       ),
     );
   });
