@@ -107,6 +107,7 @@ import {
   consumePendingInitialPrompt,
   holdsInitialDraft,
   isStaleTempConvId,
+  onPendingInitialPrompt,
   isTempConvId,
   retryConversationLoad,
   type ChatState,
@@ -557,6 +558,19 @@ export function ChatPage() {
     setInitialPrompt(prompt === null ? null : { conversationId: urlConvId, prompt });
   }, [urlConvId]);
 
+  // A prompt stashed for this conversation after the page mounted, such as a floating-panel launch
+  // whose route arrived first. The send effect below then sends it as it does a New Chat prompt.
+  useEffect(() => {
+    if (!urlConvId) return;
+    return onPendingInitialPrompt((conversationId) => {
+      if (conversationId !== urlConvId) return;
+      const prompt = consumePendingInitialPrompt(urlConvId);
+      if (prompt === null) return;
+      consumedInitialPromptRef.current = { conversationId: urlConvId, prompt };
+      setInitialPrompt({ conversationId: urlConvId, prompt });
+    });
+  }, [urlConvId]);
+
   // Subscribe to the bits of store state we render. Each is a
   // primitive selector so re-renders fire only when that specific
   // field changes — no `useShallow` needed.
@@ -646,6 +660,9 @@ export function ChatPage() {
   // across the remount, so the second setup short-circuits and the prompt
   // sends once — while still resetting for the next conversation, since
   // ChatPage stays mounted across `/c/:a` → `/c/:b`.
+  // The agent list isn't fetched on a session route, so a session opened from elsewhere may have none.
+  // Its bound agent sends then; send() ignores the argument for a bound session.
+  const sendAgentId = agentId ?? boundAgentId;
   useEffect(() => {
     if (
       !shouldSendInitialPrompt({
@@ -655,7 +672,7 @@ export function ChatPage() {
         sentForConversationId: initialPromptSentForConvRef.current,
         conversationId: urlConvId,
         loadingConversation,
-        agentId,
+        agentId: sendAgentId,
       })
     ) {
       return;
@@ -663,11 +680,11 @@ export function ChatPage() {
     // TypeScript can't see through the predicate's boolean return, so
     // re-check to narrow the types for send()/the template literal. The
     // predicate already guarantees these, so this never fires at runtime.
-    if (initialPrompt === null || !agentId || !urlConvId) return;
+    if (initialPrompt === null || !sendAgentId || !urlConvId) return;
     initialPromptSentForConvRef.current = urlConvId;
     const { send, sendSlashCommand } = useChatStore.getState();
-    dispatchInitialPrompt(initialPrompt.prompt, agentId, send, sendSlashCommand);
-  }, [initialPrompt, urlConvId, loadingConversation, agentId]);
+    dispatchInitialPrompt(initialPrompt.prompt, sendAgentId, send, sendSlashCommand);
+  }, [initialPrompt, urlConvId, loadingConversation, sendAgentId]);
 
   // Open state owned here (not inside MainAgentSurface) so the dialog
   // survives a re-mount of the chat surface. Declared BEFORE the

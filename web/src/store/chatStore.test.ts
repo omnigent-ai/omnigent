@@ -128,6 +128,7 @@ import {
   SESSION_READ_TIMEOUT_MS,
   SSE_MAX_STREAM_AGE_MS,
   SSE_STALE_RECYCLE_MS,
+  onPendingInitialPrompt,
   setPendingInitialPrompt,
   startStreamPump,
   useChatStore,
@@ -19352,6 +19353,17 @@ describe("pending initial prompt transport", () => {
 
   it("returns null for a conversation with no pending prompt", () => {
     expect(consumePendingInitialPrompt("conv_never_set")).toBeNull();
+  });
+
+  it("tells a listener about each prompt stashed after it subscribed, until it unsubscribes", () => {
+    const heard: string[] = [];
+    const stop = onPendingInitialPrompt((conversationId) => heard.push(conversationId));
+    setPendingInitialPrompt("conv_listened", { text: "first", skill: null });
+    stop();
+    setPendingInitialPrompt("conv_unheard", { text: "second", skill: null });
+    expect(heard).toEqual(["conv_listened"]);
+    expect(consumePendingInitialPrompt("conv_listened")).toEqual({ text: "first", skill: null });
+    expect(consumePendingInitialPrompt("conv_unheard")).toEqual({ text: "second", skill: null });
   });
 
   it("ignores a blank prompt so a blank message never auto-sends", () => {

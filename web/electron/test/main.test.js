@@ -4115,8 +4115,12 @@ describe("floating panel wiring", () => {
     assert.equal(panel.destroyed, true);
   });
 
-  const openFromPanel = async (h, routePath) => ({
-    ...(await h.ipc.get("omnigent:floating-composer:open-in-main-window")(fromPanel(h), routePath)),
+  const openFromPanel = async (h, routePath, launchMessage) => ({
+    ...(await h.ipc.get("omnigent:floating-composer:open-in-main-window")(
+      fromPanel(h),
+      routePath,
+      launchMessage,
+    )),
   });
 
   for (const routePath of ["/c/abc", "/settings/import"]) {
@@ -4198,6 +4202,157 @@ describe("floating panel wiring", () => {
     assert.deepEqual(await openFromPanel(h, "/c/abc"), { ok: false, error: "window-loading" });
     assert.deepEqual(main.sent, []);
     assert.equal(panel.visible, true);
+  });
+
+  /** A main window's top document, announced as able to show the panel. */
+  const announceMain = (h, main) => {
+    const frame = { url: main.url };
+    main.webContents.mainFrame = frame;
+    const event = { sender: main.webContents, senderFrame: frame };
+    h.ipc.get("omnigent:floating-composer:announce")(event, 1);
+    return event;
+  };
+  /** The same document, also subscribed to launch offers. */
+  const subscribeMain = (h, main) => {
+    const event = announceMain(h, main);
+    h.ipc.get("omnigent:floating-composer:launch-takers")(event, true);
+    return event;
+  };
+  const launchMessage = (overrides = {}) => ({
+    text: "Fix the build",
+    skill: null,
+    files: [],
+    ...overrides,
+  });
+  const offerTo = (main) =>
+    main.sent.findLast(([channel]) => channel === "omnigent:floating-composer:launch-offer")?.[1];
+  const confirmOffer = (h, event, offerId) =>
+    h.ipc.get("omnigent:floating-composer:launch-confirm")(event, offerId);
+
+  it("offers a launch's message to the subscribed window it routes to, and resolves once that window confirms", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addMain(h);
+    const event = subscribeMain(h, main);
+    const bytes = new Uint8Array([1, 2]);
+    const opened = openFromPanel(
+      h,
+      "/c/abc",
+      launchMessage({ files: [{ name: "notes.txt", type: "text/plain", bytes }] }),
+    );
+    // Routed first, so the page can navigate before it takes the message.
+    assert.deepEqual(main.sent[0], ["omnigent:open-path", "/c/abc"]);
+    const offer = offerTo(main);
+    assert.deepEqual(offer, { offerId: offer.offerId, sessionId: "abc" });
+    const taken = await h.ipc.get("omnigent:floating-composer:launch-take")(event, offer.offerId);
+    assert.deepEqual(taken, {
+      text: "Fix the build",
+      skill: null,
+      files: [{ name: "notes.txt", type: "text/plain", bytes }],
+    });
+    assert.equal(await confirmOffer(h, event, offer.offerId), true);
+    assert.deepEqual(await opened, { ok: true, delivery: "page" });
+  });
+
+  it("gives a window that only announced, without subscribing, the route but no offer", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addMain(h);
+    announceMain(h, main);
+    assert.deepEqual(await openFromPanel(h, "/c/abc", launchMessage()), { ok: true });
+    assert.deepEqual(main.sent, [["omnigent:open-path", "/c/abc"]]);
+  });
+
+  it("refuses to take a window that subscribes without announcing support", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addMain(h);
+    const frame = { url: main.url };
+    main.webContents.mainFrame = frame;
+    h.ipc.get("omnigent:floating-composer:launch-takers")(
+      { sender: main.webContents, senderFrame: frame },
+      true,
+    );
+    assert.deepEqual(await openFromPanel(h, "/c/abc", launchMessage()), { ok: true });
+    assert.deepEqual(main.sent, [["omnigent:open-path", "/c/abc"]]);
+  });
+
+  it("delivers the message itself when the offered window doesn't confirm in time, and refuses its late confirm", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addMain(h);
+    const event = subscribeMain(h, main);
+    const opened = openFromPanel(h, "/c/abc", launchMessage());
+    const offer = offerTo(main);
+    t.mock.timers.tick(1999);
+    const taken = h.ipc.get("omnigent:floating-composer:launch-take")(event, offer.offerId);
+    assert.notEqual(taken, null, "still open a tick before the timeout");
+    t.mock.timers.tick(1);
+    assert.deepEqual(await opened, { ok: true });
+    assert.equal(await confirmOffer(h, event, offer.offerId), false);
+  });
+
+  it("ends an offer at once when its document goes or its page unsubscribes, without waiting", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addMain(h);
+    subscribeMain(h, main);
+    const gone = openFromPanel(h, "/c/abc", launchMessage());
+    main.webContents.emit("did-navigate");
+    assert.deepEqual(await gone, { ok: true });
+
+    // The reloaded document announces and subscribes again, then unsubscribes.
+    const event = subscribeMain(h, main);
+    const unsubscribed = openFromPanel(h, "/c/def", launchMessage());
+    assert.equal(offerTo(main).sessionId, "def");
+    h.ipc.get("omnigent:floating-composer:launch-takers")(event, false);
+    assert.deepEqual(await unsubscribed, { ok: true });
+  });
+
+  it("tells the panel whether the window it would route to can take a launch", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const probe = () => h.ipc.get("omnigent:floating-composer:can-hand-off")(fromPanel(h));
+    const main = addMain(h);
+    assert.equal(await probe(), false);
+    subscribeMain(h, main);
+    assert.equal(await probe(), true);
+  });
+
+  it("never offers a message that fails the shell's checks, or a page that isn't a session", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addMain(h);
+    subscribeMain(h, main);
+    assert.deepEqual(await openFromPanel(h, "/c/abc", launchMessage({ files: "notes" })), {
+      ok: true,
+    });
+    assert.deepEqual(await openFromPanel(h, "/settings/import", launchMessage()), { ok: true });
+    assert.deepEqual(main.sent, [
+      ["omnigent:open-path", "/c/abc"],
+      ["omnigent:open-path", "/settings/import"],
+    ]);
   });
 
   it("skips a more recent window that isn't showing the app for one that is", async (t) => {

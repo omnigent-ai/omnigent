@@ -128,9 +128,51 @@ describe("useFloatingComposerSupport", () => {
     renderHook(() => useFloatingComposerSupport());
     await waitFor(() =>
       expect(warn).toHaveBeenCalledWith(
-        "[floatingComposer] couldn't announce support:",
+        "[floatingComposer] couldn't announce support or take launches:",
         expect.any(Error),
       ),
     );
+  });
+
+  it("subscribes to launch offers only after announcing, and unsubscribes on unmount", async () => {
+    const order: string[] = [];
+    announceSupport.mockImplementation(() => order.push("announce"));
+    const unsubscribe = vi.fn();
+    const onLaunchOffer = vi.fn(() => {
+      order.push("subscribe");
+      return unsubscribe;
+    });
+    stubShell({
+      kind: "electron",
+      getDesktopFeatures,
+      floatingComposer: { announceSupport, onLaunchOffer },
+    });
+    const { unmount } = renderHook(() => useFloatingComposerSupport());
+    await waitFor(() => expect(onLaunchOffer).toHaveBeenCalledTimes(1));
+    expect(order).toEqual(["announce", "subscribe"]);
+    unmount();
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it("takes an offered launch's message to send it, through the shell's take", async () => {
+    const onLaunchOffer = vi.fn(() => vi.fn());
+    const takeLaunchOffer = vi.fn().mockResolvedValue(null);
+    stubShell({
+      kind: "electron",
+      getDesktopFeatures,
+      floatingComposer: {
+        announceSupport,
+        onLaunchOffer,
+        takeLaunchOffer,
+        confirmLaunchOffer: vi.fn(),
+      },
+    });
+    renderHook(() => useFloatingComposerSupport());
+    await waitFor(() => expect(onLaunchOffer).toHaveBeenCalledTimes(1));
+    const [deliverOffer] = onLaunchOffer.mock.calls[0] as unknown as [
+      (offer: { offerId: number; sessionId: string }) => void,
+    ];
+    deliverOffer({ offerId: 3, sessionId: "conv_1" });
+    await waitFor(() => expect(takeLaunchOffer).toHaveBeenCalledWith(3));
   });
 });

@@ -72,6 +72,8 @@ function bannerSafe(status) {
 // boundary.
 // Annotate and Draw (designTools.js): open and stop a tool's overlay on a view, and its page
 // operations and captures. A test run can leave them out, to stand in for an older shell.
+// Each live onLaunchOffer subscription; the shell hears when the first one comes and the last goes.
+const launchOfferSubscriptions = new Set();
 const designTools =
   process.env?.OMNIGENT_DESKTOP_LEGACY_DESIGN_MODE === "1"
     ? {}
@@ -305,12 +307,45 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
       return () => ipcRenderer.removeListener("omnigent:floating-composer:shown", listener);
     },
     /**
+     * From the panel: whether a launch's first message can go to a main window that sends it.
+     * Read the attachments only after this says yes.
+     */
+    canHandOffLaunch: () => ipcRenderer.invoke("omnigent:floating-composer:can-hand-off"),
+    /**
      * From the panel: open `/c/<id>` or a page it links to in a main window of its server,
-     * then hide. Resolves `{ ok: true }` or
+     * then hide. A launch passes its first message as `message`, or null. Resolves
+     * `{ ok: true, delivery: "page" }` when that window sent the message, `{ ok: true }`, or
      * `{ ok: false, error: "not-composer" | "bad-path" | "window-loading" }`.
      */
-    openInMainWindow: (path) =>
-      ipcRenderer.invoke("omnigent:floating-composer:open-in-main-window", path),
+    openInMainWindow: (path, message) =>
+      ipcRenderer.invoke("omnigent:floating-composer:open-in-main-window", path, message ?? null),
+    /**
+     * From a main window: this document takes launches' first messages, so main offers them
+     * here. Returns an unsubscribe function, which tells main it no longer takes them.
+     */
+    onLaunchOffer: (callback) => {
+      if (typeof callback !== "function") return () => {};
+      const subscription = {};
+      const listener = (_event, offer) => callback(offer);
+      ipcRenderer.on("omnigent:floating-composer:launch-offer", listener);
+      launchOfferSubscriptions.add(subscription);
+      if (launchOfferSubscriptions.size === 1) {
+        ipcRenderer.send("omnigent:floating-composer:launch-takers", true);
+      }
+      return () => {
+        if (!launchOfferSubscriptions.delete(subscription)) return;
+        ipcRenderer.removeListener("omnigent:floating-composer:launch-offer", listener);
+        if (launchOfferSubscriptions.size === 0) {
+          ipcRenderer.send("omnigent:floating-composer:launch-takers", false);
+        }
+      };
+    },
+    /** From a main window: take the message of a launch offered to this document, once. */
+    takeLaunchOffer: (offerId) =>
+      ipcRenderer.invoke("omnigent:floating-composer:launch-take", offerId),
+    /** From a main window: confirms the rebuilt offer; resolves whether it's still ours. */
+    confirmLaunchOffer: (offerId) =>
+      ipcRenderer.invoke("omnigent:floating-composer:launch-confirm", offerId),
     /** From the panel: its native file picker opened or closed. */
     filePicker: (state) =>
       ipcRenderer.send(

@@ -2258,6 +2258,7 @@ export interface PendingInitialPrompt {
 // state through navigate() → useLocation()). Both surfaces share this
 // module-level singleton, so it works identically standalone and embedded.
 const pendingInitialPrompts = new Map<string, PendingInitialPrompt>();
+const pendingInitialPromptListeners = new Set<(conversationId: string) => void>();
 
 /**
  * Stash the first message for a freshly created conversation so ChatPage
@@ -2279,6 +2280,20 @@ export function setPendingInitialPrompt(
 ): void {
   if (!prompt.text && !prompt.files?.length) return;
   pendingInitialPrompts.set(conversationId, prompt);
+  for (const listener of pendingInitialPromptListeners) listener(conversationId);
+}
+
+/**
+ * Hear each prompt stashed by `setPendingInitialPrompt`, for a page already showing its
+ * conversation, such as a floating-panel launch that arrives after the route.
+ *
+ * @returns An unsubscribe function.
+ */
+export function onPendingInitialPrompt(listener: (conversationId: string) => void): () => void {
+  pendingInitialPromptListeners.add(listener);
+  return () => {
+    pendingInitialPromptListeners.delete(listener);
+  };
 }
 
 /**
