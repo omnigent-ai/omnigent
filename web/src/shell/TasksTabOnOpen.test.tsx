@@ -49,6 +49,20 @@ describe("TasksTabOnOpen", () => {
     });
   });
 
+  it("keeps a click's request for the session it opens", () => {
+    const click = {
+      tasksTabToOpen: "a",
+      taskToShow: { conversationId: "a", stepId: "step-1" },
+      tasksTabRequestedBy: "click",
+    } as const;
+    useSessionTasksActions.setState(click);
+    Object.assign(sessionTasks, { progress: tasks(1), loading: false });
+    Object.assign(chat, { conversationId: "a", loadingConversation: false });
+    render(<TasksTabOnOpen conversationId="a" skip={false} />);
+
+    expect(useSessionTasksActions.getState()).toMatchObject(click);
+  });
+
   it("leaves a session without tasks alone, even when tasks come later", () => {
     Object.assign(sessionTasks, { progress: [], loading: false });
     Object.assign(chat, { conversationId: "a", loadingConversation: false });

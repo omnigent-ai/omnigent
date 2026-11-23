@@ -3387,6 +3387,24 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
   });
 
+  it("opens a collapsed rail on the Tasks tab for a click that navigates to its session", async () => {
+    writeWorkspacePanelDefault("collapsed");
+    bindSessionWithTasks();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <CapabilitiesProvider info={serverInfo()}>
+        {sessionShellTree(client, "/c/conv_other", <Link to="/c/conv_tasks">Chat with tasks</Link>)}
+      </CapabilitiesProvider>,
+    );
+    const link = await screen.findByRole("link", { name: "Chat with tasks" });
+
+    act(() => openTasksTab("conv_tasks"));
+    fireEvent.click(link);
+
+    await waitFor(() => expect(workspaceRail()).toBeInTheDocument());
+    expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
+  });
+
   it.each([
     ["the session opening", "closed", () => showTasksTabBesideChat("conv_tasks", "session-open")],
     ["the agent's first plan", "closed", () => showTasksTabBesideChat("conv_tasks", "first-plan")],

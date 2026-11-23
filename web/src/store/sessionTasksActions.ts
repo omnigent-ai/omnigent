@@ -138,14 +138,15 @@ export function openTasksTab(conversationId: string, stepId?: string): void {
 /**
  * Show a session's Tasks tab beside the chat, not over it on a phone: open it for
  * the agent's first plan, or select it when a session with tasks opens.
+ * A session opening keeps a request already waiting for it, e.g. a click that navigated there.
  */
 export function showTasksTabBesideChat(
   conversationId: string,
   requestedBy: "first-plan" | "session-open",
 ): void {
-  useSessionTasksActions.setState({
-    tasksTabToOpen: conversationId,
-    taskToShow: null,
-    tasksTabRequestedBy: requestedBy,
-  });
+  useSessionTasksActions.setState((state) =>
+    requestedBy === "session-open" && state.tasksTabToOpen === conversationId
+      ? state
+      : { tasksTabToOpen: conversationId, taskToShow: null, tasksTabRequestedBy: requestedBy },
+  );
 }
