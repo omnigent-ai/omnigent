@@ -443,7 +443,7 @@ describe("Automation routes", () => {
 
   it("waits for server info before loading automations", () => {
     renderRoute("/tasks", {}, "loading");
-    expect(screen.getByRole("status")).toHaveTextContent("Loading Omnigent");
+    expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
     expect(screen.queryByText("not found")).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
   });
