@@ -667,7 +667,7 @@ async def search_text(
         batch: list[TextSearchMatch] = []
         found = 0
         truncated = False
-        warning = ""
+        warnings: list[str] = []
         async with contextlib.aclosing(runs) as passes:
             while (run := await budget.timed(anext(passes, None))) is not None:
                 left = budget.left()
@@ -683,20 +683,24 @@ async def search_text(
                 async with contextlib.aclosing(records) as stream:
                     while (record := await budget.timed(anext(stream, None))) is not None:
                         if "match" not in record:
-                            truncated = bool(record["truncated"])
-                            warning = warning or str(record["warning"] or "")
+                            # Files a pass couldn't read leave its results incomplete, but
+                            # later passes still run while results and time are left.
+                            truncated = truncated or bool(record["truncated"])
+                            note = str(record["warning"] or "")
+                            if note and note not in warnings:
+                                warnings.append(note)
                             break
                         batch.append(TextSearchMatch(**record["match"]))  # type: ignore[arg-type]
                         found += 1
                         if len(batch) == _TEXT_MATCH_BATCH:
                             yield SearchTextResponse(matches=batch)
                             batch = []
-                if truncated:
-                    break
                 if batch and request.order == SEARCH_ORDER_PRIORITY:
                     # A pass's matches go out before the next pass starts.
                     yield SearchTextResponse(matches=batch)
                     batch = []
-        yield SearchTextResponse(matches=batch, done=True, truncated=truncated, warning=warning)
+        yield SearchTextResponse(
+            matches=batch, done=True, truncated=truncated, warning=" ".join(warnings)
+        )
     except ContentSearchError as exc:
         raise ConnectError(Code.INVALID_ARGUMENT, exc.message) from exc

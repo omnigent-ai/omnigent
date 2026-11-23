@@ -1101,6 +1101,28 @@ async def test_a_later_pass_out_of_time_ends_the_search_as_truncated(
 
 
 @needs_rg
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads files without permission")
+async def test_a_file_an_early_pass_cant_read_doesnt_stop_the_later_passes(
+    tmp_path: Path,
+) -> None:
+    root = _priority_workspace(tmp_path / "repo")
+    locked = root / "focus" / "deep" / "locked.txt"
+    locked.write_text("needle\n")
+    locked.chmod(0)
+
+    try:
+        responses = await _search_text(
+            root, "needle", order=SEARCH_ORDER_PRIORITY, focused_paths=["focus/deep/open.txt"]
+        )
+    finally:
+        locked.chmod(0o644)
+
+    assert {"aaa/first.txt", "zzz/last.txt"} <= set(_paths_in_order(responses))
+    assert responses[-1].done and responses[-1].truncated
+    assert "could not be read" in responses[-1].warning
+
+
+@needs_rg
 async def test_waiting_for_the_change_list_stops_at_the_end_of_the_search_time(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
