@@ -473,31 +473,8 @@ def test_read_pending_reads_a_backlog_in_bounded_batches(
 def test_read_pending_keeps_reported_calls_while_catching_up(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A partial poll keeps an open card and surfaces new calls only once caught up."""
-    monkeypatch.setattr(cnp, "_PENDING_SCAN_BATCH_ROWS", 2)
-    monkeypatch.setattr(cnp, "_PENDING_SCAN_MAX_BATCHES", 1)
-    store = tmp_path / "store.db"
-    _write_store(
-        store, [_framed(_pending_tool_call_obj("call_shown\nfc", "Delete", {"path": "/a"}))]
-    )
-    assert [call.tool_name for call in read_cursor_pending_tool_calls(store)] == ["Delete"]
-    _append_blobs(
-        store,
-        [
-            _framed(_pending_tool_call_obj("call_next\nfc", "Write", {"path": "/b"})),
-            _filler_blob(0),
-            _json.dumps(_tool_result_obj("call_shown\nfc")).encode("utf-8"),
-        ],
-    )
-
-    assert [call.tool_name for call in read_cursor_pending_tool_calls(store)] == ["Delete"]
-    assert [call.tool_name for call in read_cursor_pending_tool_calls(store)] == ["Write"]
-
-
-def test_read_pending_keeps_a_caller_scan_while_other_stores_are_polled(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A caller's own scan keeps its progress while other stores churn the shared cache."""
+    """A partial poll keeps an open card and surfaces new calls only once caught up,
+    even while polls of other stores evict the shared cache."""
     monkeypatch.setattr(cnp, "_PENDING_SCAN_BATCH_ROWS", 2)
     monkeypatch.setattr(cnp, "_PENDING_SCAN_MAX_BATCHES", 1)
     monkeypatch.setattr(cnp, "_PENDING_SCANS_MAX_STORES", 1)
@@ -521,11 +498,12 @@ def test_read_pending_keeps_a_caller_scan_while_other_stores_are_polled(
         store,
         [
             _framed(_pending_tool_call_obj("call_next\nfc", "Write", {"path": "/b"})),
-            *[_filler_blob(index) for index in range(3)],
+            _filler_blob(0),
+            _json.dumps(_tool_result_obj("call_shown\nfc")).encode("utf-8"),
         ],
     )
 
-    assert [poll() for _ in range(3)] == [["Delete"], ["Delete", "Write"], ["Delete", "Write"]]
+    assert [poll() for _ in range(2)] == [["Delete"], ["Write"]]
 
 
 def test_read_pending_reclassifies_a_replaced_or_shrunken_store(tmp_path: Path) -> None:
