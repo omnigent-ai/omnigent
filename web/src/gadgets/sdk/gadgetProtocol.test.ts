@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { GADGET_LIMITS, isJsonDocumentValue, parseFrameMessage } from "./gadgetProtocol";
 
@@ -98,6 +98,30 @@ describe("parseFrameMessage", () => {
         }),
       ),
     ).toEqual({ ok: false, reason: "document value is not supported JSON", requestId: "r1_abc" });
+  });
+
+  it("rejects shared references that would expand when serialized, without serializing", () => {
+    // 40 levels, each holding its predecessor twice: a few dozen objects that would serialize
+    // to 2^40 copies of the innermost value.
+    let shared: unknown = { leaf: "x" };
+    for (let level = 0; level < 40; level += 1) {
+      shared = { a: shared, b: shared };
+    }
+    const stringify = vi.spyOn(JSON, "stringify");
+    try {
+      expect(
+        parseFrameMessage(request({ params: { collection: "cards", extra: shared } })),
+      ).toEqual({ ok: false, reason: "message exceeds the size budget", requestId: "r1_abc" });
+      expect(stringify).not.toHaveBeenCalled();
+    } finally {
+      stringify.mockRestore();
+    }
+  });
+
+  it("rejects a message nested deeper than any document could make it", () => {
+    expect(
+      parseFrameMessage(request({ params: { collection: "cards", extra: nestedArrays(200) } })),
+    ).toEqual({ ok: false, reason: "message exceeds the size budget", requestId: "r1_abc" });
   });
 
   it("rejects a message larger than the size budget", () => {

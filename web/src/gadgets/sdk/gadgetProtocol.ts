@@ -315,6 +315,44 @@ export function serializedByteLength(value: unknown): number | undefined {
   return new TextEncoder().encode(json).length;
 }
 
+/** Levels a request envelope may add around a document of `maxJsonDepth`. */
+const ENVELOPE_DEPTH = 8;
+
+/**
+ * Whether `value` is plain JSON whose encoding could fit in `maxBytes`, checked without
+ * serializing it. Every value counts each time it is reached, so a shared reference costs as
+ * much as its copies would, and each node, string and key adds to a lower bound on the encoded
+ * size: a small message whose repeated references would expand when serialized stops here
+ * after at most about `maxBytes` steps, before `JSON.stringify` builds anything.
+ */
+function fitsMessageBudget(value: unknown, maxBytes: number): boolean {
+  let bytes = 0;
+  function visit(entry: unknown, depth: number): boolean {
+    bytes += 1;
+    if (bytes > maxBytes || depth > GADGET_LIMITS.maxJsonDepth + ENVELOPE_DEPTH) return false;
+    if (entry === null || typeof entry === "number" || typeof entry === "boolean") return true;
+    if (typeof entry === "string") {
+      // A UTF-8 encoding is never shorter than the string's UTF-16 length.
+      bytes += entry.length;
+      return bytes <= maxBytes;
+    }
+    if (Array.isArray(entry)) {
+      for (let index = 0; index < entry.length; index += 1) {
+        if (!visit(entry[index], depth + 1)) return false;
+      }
+      return true;
+    }
+    if (!isPlainObject(entry)) return false;
+    for (const key in entry) {
+      if (!Object.hasOwn(entry, key)) continue;
+      bytes += key.length + 1;
+      if (!visit(entry[key], depth + 1)) return false;
+    }
+    return true;
+  }
+  return visit(value, 0);
+}
+
 export type FrameMessageParseResult =
   { ok: true; message: GadgetFrameMessage } | { ok: false; reason: string; requestId?: string };
 
@@ -328,7 +366,10 @@ export function parseFrameMessage(data: unknown): FrameMessageParseResult {
   if (data.v !== GADGET_PROTOCOL_VERSION) {
     return { ok: false, reason: "unsupported protocol version", requestId };
   }
-  const size = serializedByteLength(data);
+  // A message from the frame is untrusted: bound the work before serializing it.
+  const size = fitsMessageBudget(data, GADGET_LIMITS.maxMessageBytes)
+    ? serializedByteLength(data)
+    : undefined;
   if (size === undefined || size > GADGET_LIMITS.maxMessageBytes) {
     return { ok: false, reason: "message exceeds the size budget", requestId };
   }
