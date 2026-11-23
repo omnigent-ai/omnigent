@@ -40,6 +40,14 @@ function TreeMessage({ children, alert = false }: { children: string; alert?: bo
   );
 }
 
+/** Why a listing shows nothing: everything left is hidden, or Git ignores the rest. */
+function hiddenListingMessage(listed: number, ignoredHidden: boolean): string {
+  if (listed === 0) return "No files here, apart from any that Git ignores.";
+  return ignoredHidden
+    ? "Every file here is hidden or ignored by Git."
+    : "Every file here is hidden.";
+}
+
 export function FilesPageTree({
   conversationId,
   activePath,
@@ -62,35 +70,28 @@ export function FilesPageTree({
   }
   if (!files.data.available) return <TreeMessage>This session has no workspace files.</TreeMessage>;
   const entries = files.data.data;
-  if (entries.length === 0 && !showIgnored) {
-    // The host left out what Git ignores, so the workspace may hold only that.
-    return (
-      <div className="flex flex-col items-start gap-2 pb-2">
-        <TreeMessage>No files here, apart from any that Git ignores.</TreeMessage>
-        {onShowIgnored ? (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="mx-3"
-            onClick={onShowIgnored}
-          >
-            Show git-ignored files
-          </Button>
-        ) : null}
-      </div>
-    );
+  // Only a host that left out what Git ignores can be hiding more than this listing shows.
+  const ignoredHidden = files.data.ignoredHidden === true;
+  const hidden = visibleEntries(entries, showHidden).length === 0;
+  if (entries.length === 0 && !ignoredHidden) {
+    return <TreeMessage>No files in the workspace.</TreeMessage>;
   }
-  if (entries.length === 0) return <TreeMessage>No files in the workspace.</TreeMessage>;
-  if (visibleEntries(entries, showHidden).length === 0) {
+  if (hidden) {
     return (
       <div className="flex flex-col items-start gap-2 pb-2">
-        <TreeMessage>Every file here is hidden.</TreeMessage>
-        {onShowHidden ? (
-          <Button type="button" variant="outline" size="sm" className="mx-3" onClick={onShowHidden}>
-            Show hidden files
-          </Button>
-        ) : null}
+        <TreeMessage>{hiddenListingMessage(entries.length, ignoredHidden)}</TreeMessage>
+        <div className="mx-3 flex flex-wrap gap-2">
+          {entries.length > 0 && onShowHidden ? (
+            <Button type="button" variant="outline" size="sm" onClick={onShowHidden}>
+              Show hidden files
+            </Button>
+          ) : null}
+          {ignoredHidden && onShowIgnored ? (
+            <Button type="button" variant="outline" size="sm" onClick={onShowIgnored}>
+              Show git-ignored files
+            </Button>
+          ) : null}
+        </div>
       </div>
     );
   }

@@ -386,6 +386,8 @@ export interface ListDirectoryOptions {
 const LIST_PAGE_SIZE = 1000;
 /** The ListDirectory feature that fills each entry's `leaf_directory_path`. */
 const DIRECTORY_CHAINS = "list_directory.collapse_single_child_directories";
+/** The ListDirectory feature that marks, and can leave out, what Git ignores. */
+const IGNORED_FEATURE = "gitignore";
 
 async function listDirectory(
   client: WorkspaceClient,
@@ -521,8 +523,8 @@ async function viaWorkspaceApi<T>(
  * :param path: Workspace-relative directory, ``""`` for the root.
  * :param maxEntries: Stop after this many entries, e.g. ``1000``; must be positive.
  * :param options: ``hideIgnored`` leaves out what Git ignores, where the host can tell.
- * :returns: The entries and whether more remain, or null when the caller
- *     should list through REST (see :func:`readFileViaWorkspaceApi`).
+ * :returns: The entries, whether more remain and whether Git-ignored ones were left
+ *     out, or null when the caller should list through REST (see :func:`readFileViaWorkspaceApi`).
  */
 export function listDirectoryViaWorkspaceApi(
   sessionId: string,
@@ -530,19 +532,23 @@ export function listDirectoryViaWorkspaceApi(
   maxEntries: number,
   signal?: AbortSignal,
   { hideIgnored = false }: Omit<ListDirectoryOptions, "signal"> = {},
-): Promise<{ data: ListedEntry[]; hasMore: boolean } | null> {
+): Promise<{ data: ListedEntry[]; hasMore: boolean; ignoredHidden?: true } | null> {
   // The host reads a page size of 0 as its default, so a 0 limit would still return entries.
   if (!(maxEntries > 0)) return Promise.reject(new RangeError("maxEntries must be positive"));
   return viaWorkspaceApi(
     sessionId,
     "listDirectory",
-    (client, served) =>
-      listDirectory(client, path, maxEntries, {
+    async (client, served) => {
+      // Only a host offering the feature leaves ignored entries out; others list them all.
+      const ignoredHidden = hideIgnored && served.has(IGNORED_FEATURE);
+      const listed = await listDirectory(client, path, maxEntries, {
         signal,
-        hideIgnored,
+        hideIgnored: ignoredHidden,
         collapseSingleChildDirectories: served.has(DIRECTORY_CHAINS),
-      }),
-    { signal, usesFeatures: [DIRECTORY_CHAINS] },
+      });
+      return ignoredHidden ? { ...listed, ignoredHidden: true as const } : listed;
+    },
+    { signal, usesFeatures: [DIRECTORY_CHAINS, ...(hideIgnored ? [IGNORED_FEATURE] : [])] },
   );
 }
 

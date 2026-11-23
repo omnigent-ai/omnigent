@@ -424,31 +424,54 @@ describe("readFileViaWorkspaceApi", () => {
   });
 
   it.each([
-    ["hides what Git ignores when asked", { hideIgnored: true }, true],
-    ["lists everything by default", undefined, false],
-  ])("%s, and marks the ignored entries it lists", async (_case, options, asked) => {
+    [
+      "hides what Git ignores when asked",
+      { hideIgnored: true },
+      ["ListDirectory", "gitignore"],
+      true,
+    ],
+    [
+      "lists everything from a host that can't tell",
+      { hideIgnored: true },
+      ["ListDirectory"],
+      false,
+    ],
+    ["lists everything by default", undefined, null, false],
+  ])("%s, and marks the ignored entries it lists", async (_case, options, served, hidden) => {
     enable("workspace_api_server_access");
     const sent: boolean[] = [];
-    vi.mocked(authenticatedFetch).mockImplementation(async (_input, init) => {
-      sent.push(fromBinary(ListDirectoryRequestSchema, init!.body as Uint8Array).hideIgnored);
-      const page = create(ListDirectoryResponseSchema, {
-        entries: [
-          { name: "build", path: "build", type: EntryType.DIRECTORY, ignored: true },
-          { name: "main.py", path: "main.py", type: EntryType.FILE },
-        ],
-      });
-      return new Response(toBinary(ListDirectoryResponseSchema, page), { headers: PROTO_HEADERS });
+    serveMethods({
+      ...(served && {
+        GetCapabilities: () =>
+          new Response(capabilitiesBody(...served), { headers: PROTO_HEADERS }),
+      }),
+      ListDirectory: (body) => {
+        sent.push(fromBinary(ListDirectoryRequestSchema, body).hideIgnored);
+        const page = create(ListDirectoryResponseSchema, {
+          entries: [
+            { name: "build", path: "build", type: EntryType.DIRECTORY, ignored: true },
+            { name: "main.py", path: "main.py", type: EntryType.FILE },
+          ],
+        });
+        return new Response(toBinary(ListDirectoryResponseSchema, page), {
+          headers: PROTO_HEADERS,
+        });
+      },
     });
 
     const listed = await listDirectoryViaWorkspaceApi(
-      `s-ignored-${asked}`,
+      `s-ignored-${_case}`,
       "",
       1000,
       undefined,
       options,
     );
 
-    expect(sent).toEqual([asked]);
+    // Only a host offering the feature is asked to leave ignored entries out.
+    expect(sent).toEqual([hidden]);
+    expect(listed?.ignoredHidden).toBe(hidden || undefined);
+    // Every listing reads the route's capabilities once, for folder chains too.
+    expect(methodCalls("GetCapabilities")).toHaveLength(1);
     expect(listed?.data.map(({ path, ignored }) => ({ path, ignored }))).toEqual([
       { path: "build", ignored: true },
       { path: "main.py", ignored: undefined },

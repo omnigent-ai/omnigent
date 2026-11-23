@@ -363,6 +363,8 @@ export interface WorkspaceFile {
 export interface WorkspaceAllFilesResult {
   available: boolean;
   data: WorkspaceFile[];
+  /** The host left out what Git ignores; without it, `data` lists everything. */
+  ignoredHidden?: true;
 }
 
 interface FilesystemListResponse {
@@ -427,7 +429,7 @@ async function listViaWorkspaceApi(
   location: string,
   maxEntries: number,
   hideIgnored = false,
-): Promise<FilesystemListResponse | null> {
+): Promise<(FilesystemListResponse & { ignoredHidden?: true }) | null> {
   // The workspace API only lists inside the workspace.
   if (browseLocationBase(location)) return null;
   const listed = await listDirectoryViaWorkspaceApi(
@@ -439,7 +441,14 @@ async function listViaWorkspaceApi(
       hideIgnored,
     },
   );
-  return listed && { object: "list", data: listed.data, has_more: listed.hasMore };
+  return (
+    listed && {
+      object: "list",
+      data: listed.data,
+      has_more: listed.hasMore,
+      ...(listed.ignoredHidden && { ignoredHidden: true as const }),
+    }
+  );
 }
 
 async function fetchWorkspaceAllFiles(
@@ -448,7 +457,12 @@ async function fetchWorkspaceAllFiles(
   hideIgnored = false,
 ): Promise<WorkspaceAllFilesResult> {
   const viaApi = await listViaWorkspaceApi(conversationId, location, 1000, hideIgnored);
-  if (viaApi) return { available: true, data: mapFilesystemEntries(viaApi, location) };
+  if (viaApi) {
+    const data = mapFilesystemEntries(viaApi, location);
+    return viaApi.ignoredHidden
+      ? { available: true, data, ignoredHidden: true }
+      : { available: true, data };
+  }
   const segment = browseLocationSegment(location);
   const params = new URLSearchParams({ limit: "1000", order: "asc" });
   const base = browseLocationBase(location);
@@ -518,11 +532,9 @@ export function useWorkspaceAllFiles(
     // Keep the tree warm on revisits: within staleTime a return to a
     // previously-loaded conversation/location paints its cached tree with no
     // loading flash. Freshness on turn-completion is still handled by
-    // useTrailingInvalidate above. No cross-key placeholderData — carrying the
-    // previous conversation's tree under a new conversation's key fed stale
-    // files into the folder tree's default-expansion cache; virtualization
-    // already keeps the per-switch render cheap, so the warm-carry isn't needed.
-    // Showing or hiding ignored files keeps the same session's tree up meanwhile.
+    // useTrailingInvalidate above. Never carry another conversation's tree under
+    // this key: stale files fed the folder tree's default-expansion cache. Only
+    // showing or hiding ignored files keeps this session's tree up meanwhile.
     placeholderData: (previous, previousQuery) =>
       previousQuery?.queryKey[1] === conversationId && previousQuery?.queryKey[2] === location
         ? previous
@@ -1216,6 +1228,7 @@ export function useWorkspaceDirectories(
 ): Map<string, DirectoryResult> {
   const serveable = useWorkspaceServeable(conversationId);
   const enabled = !!conversationId && serveable !== false;
+  const queryClient = useQueryClient();
   // `combine` lets TanStack memoize the assembled Map. Its recompute gate is a
   // reference check on the combine fn (`combine !== lastCombine`), so the
   // callback must be stable — an inline closure is a fresh fn every render and
@@ -1245,6 +1258,18 @@ export function useWorkspaceDirectories(
         refreshToken,
         hideIgnored,
       ),
+      // useQueries starts a fresh observer per key, so the folder's other listing comes from
+      // the cache: showing or hiding ignored files keeps its rows up meanwhile.
+      placeholderData: () =>
+        queryClient.getQueryData<WorkspaceFile[]>(
+          workspaceDirectoryQuery(
+            conversationId ?? "",
+            dirPath,
+            location,
+            refreshToken,
+            !hideIgnored,
+          ).queryKey,
+        ),
       enabled,
     })),
     combine,

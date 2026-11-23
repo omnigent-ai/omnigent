@@ -120,6 +120,13 @@ function Wrap({ children }: { children: ReactNode }) {
   return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
 }
 
+function stableWrapper() {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });
+  return ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+  );
+}
+
 function ChangedFilesProbe({ id }: { id: string | undefined }) {
   useWorkspaceChangedFiles(id);
   return null;
@@ -601,6 +608,28 @@ describe("useWorkspaceAllFiles gating", () => {
   });
 });
 
+describe("useWorkspaceAllFiles without what Git ignores", () => {
+  it.each([
+    ["says so when the host left ignored files out", { ignoredHidden: true as const }, true],
+    ["says nothing when the host listed everything", {}, undefined],
+  ])("%s", async (_case, reported, expected) => {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValueOnce(environmentResponse());
+    vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce({
+      ...apiListing(["README.md"]),
+      ...reported,
+    });
+
+    const { result } = renderHook(
+      () => useWorkspaceAllFiles(`conv_hidden_${expected}`, { hideIgnored: true }),
+      { wrapper: Wrap },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.ignoredHidden).toBe(expected);
+  });
+});
+
 describe("useWorkspaceEnvironment gating", () => {
   it("fetches the default environment when the runner is online", async () => {
     onlineMock.mockReturnValue(true);
@@ -827,6 +856,43 @@ describe("useWorkspaceDirectory gating", () => {
     expect(vi.mocked(listDirectoryViaWorkspaceApi).mock.calls.map((call) => call[4])).toEqual(
       expect.arrayContaining([{ hideIgnored: false }, { hideIgnored: true }]),
     );
+  });
+
+  it("keeps a folder's rows up while ignored files are toggled, but not under another folder", async () => {
+    onlineMock.mockReturnValue(true);
+    const pending = new Promise<never>(() => {});
+    vi.mocked(listDirectoryViaWorkspaceApi).mockImplementation(
+      async (_session, path, _max, _signal, options) => {
+        if (options?.hideIgnored || path !== "src") return pending;
+        return {
+          data: [
+            {
+              id: "src/main.py",
+              name: "main.py",
+              path: "src/main.py",
+              type: "file" as const,
+              bytes: 1,
+              modified_at: 1,
+            },
+          ],
+          hasMore: false,
+        };
+      },
+    );
+
+    const { result, rerender } = renderHook(
+      ({ paths, hideIgnored }: { paths: string[]; hideIgnored: boolean }) =>
+        useWorkspaceDirectories("conv_toggle", paths, "", 0, hideIgnored),
+      // One client across rerenders, so the folder's first listing stays cached.
+      { wrapper: stableWrapper(), initialProps: { paths: ["src"], hideIgnored: false } },
+    );
+    await waitFor(() => expect(result.current.get("src")?.data).toBeDefined());
+
+    rerender({ paths: ["src", "docs"], hideIgnored: true });
+
+    // The hidden listing is still on its way: `src` keeps its rows, `docs` borrows nothing.
+    expect(result.current.get("src")?.data?.map((file) => file.path)).toEqual(["src/main.py"]);
+    expect(result.current.get("docs")?.data).toBeUndefined();
   });
 
   it("does not fetch when path is null (pre-existing gate)", async () => {
