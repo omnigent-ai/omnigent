@@ -9,6 +9,7 @@ import {
   ClockPlusIcon,
   FolderInputIcon,
   GitForkIcon,
+  ListChevronsUpDownIcon,
   type LucideIcon,
   MailIcon,
   MailOpenIcon,
@@ -35,6 +36,8 @@ export const SESSION_COMMAND_ICONS: Record<SessionCommandId, LucideIcon> = {
   "mark-read": MailOpenIcon,
   "create-automation": ClockPlusIcon,
   "move-to-project": FolderInputIcon,
+  // The row menu's Nests submenu.
+  "move-to-nest": ListChevronsUpDownIcon,
   stop: CircleStopIcon,
   archive: ArchiveIcon,
   unarchive: ArchiveRestoreIcon,

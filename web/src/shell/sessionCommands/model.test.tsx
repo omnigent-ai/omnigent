@@ -47,6 +47,7 @@ const FACTS: SessionCommandFacts = {
   muted: false,
   canCreateAutomation: true,
   currentProject: null,
+  nestable: false,
   stoppable: true,
   server: { singleUser: false, sharingOff: false, siblingSessions: true, sessionMute: true },
 };
@@ -162,6 +163,18 @@ describe("sessionCommands", () => {
     expect(listed(solo)).not.toContain("Share");
     expect(listed(solo)).not.toContain("Leave session");
     expect(listed(solo)).toContain("Delete");
+  });
+
+  it("offers Move to nest on the owner's top-level session where the server moves nests", () => {
+    const nestable = { ...FACTS, nestable: true };
+    expect(listed(nestable)).toContain("Move to nest");
+    expect(listed(nestable).indexOf("Move to nest")).toBe(
+      listed(nestable).indexOf("Add to project") + 1,
+    );
+    expect(sessionCommand(nestable, "move-to-nest").opensDialog).toBe(true);
+    // Moving is the owner's, as the row menu offers it.
+    expect(listed({ ...nestable, owner: false })).not.toContain("Move to nest");
+    expect(listed(FACTS)).not.toContain("Move to nest");
   });
 
   it("marks only Stop, Delete and Leave as destructive, and the dialogs as moving focus", () => {

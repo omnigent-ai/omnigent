@@ -74,6 +74,11 @@ export function useSessionCommandFacts(
         isOwner: owner,
       }),
       currentProject,
+      nestable:
+        serverInfo !== "loading" &&
+        serverInfo.session_nest_moves === true &&
+        conversation.archived !== true &&
+        conversation.parent_session_id == null,
       stoppable:
         isSessionStoppable({
           labels: conversation.labels,

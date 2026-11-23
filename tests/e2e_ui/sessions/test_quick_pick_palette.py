@@ -28,7 +28,7 @@ from urllib.parse import quote
 
 import httpx
 import pytest
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import Locator, Page, Route, expect
 
 from tests._helpers.compat import (
     COMPAT_SERVER_VERSION_ENV,
@@ -51,6 +51,7 @@ from tests.e2e_ui.conftest import (
     _REPO_ROOT,
     _ensure_runner_online,
     _server_state,
+    fetch_with_retry,
 )
 from tests.e2e_ui.sessions._sidebar_helpers import patch_session, session_archived
 from tests.e2e_ui.sessions.test_pinned_session_hotkeys import _pin, _pinned_slot_ids
@@ -357,6 +358,80 @@ def test_quick_pick_archives_a_session_picked_after_the_verb(
     poll_until(lambda: session_archived(base_url, other_id), timeout_s=15.0)
     # The open session stays open; only the picked one was archived.
     expect(page).to_have_url(f"{base_url}/c/{open_id}")
+
+
+def _report_nest_moves(page: Page, nest_id: str, title: str) -> None:
+    """Report QuickPick and nest moves from ``/v1/info``, and list ``nest_id`` as a nest.
+
+    The live server runs without nested agents, so the nest only exists in the browser's view.
+    """
+
+    def info(route: Route) -> None:
+        response = fetch_with_retry(route)
+        body = response.json()
+        body["features"] = {**(body.get("features") or {}), "quick_pick_palette": True}
+        body |= {"sibling_sessions": True, "session_nest_moves": True}
+        route.fulfill(response=response, body=json.dumps(body))
+
+    def sessions(route: Route) -> None:
+        if route.request.method != "GET":
+            route.continue_()
+            return
+        response = fetch_with_retry(route)
+        body = response.json()
+        family = {"id": "nest-1", "representative_id": nest_id, "representative_title": title}
+        for row in body.get("data") or []:
+            if isinstance(row, dict) and row.get("id") == nest_id:
+                row["family"] = {**family, "pinned": False}
+        route.fulfill(response=response, body=json.dumps(body))
+
+    page.route("**/v1/info", info)
+    page.route(re.compile(r"/v1/sessions(\?|$)"), sessions)
+
+
+def test_quick_pick_moves_a_session_into_a_nest(
+    request: pytest.FixtureRequest, seeded_session_pair: tuple[str, str, str]
+) -> None:
+    """Move a Session to a Nest… picks the session, then the nest, and the server moves it."""
+    base_url, open_id, other_id = seeded_session_pair
+    patch_session(base_url, open_id, title="Osprey notes")
+    patch_session(base_url, other_id, title="Kestrel notes")
+    page: Page = request.getfixturevalue("page")
+    _report_nest_moves(page, other_id, "Kestrel notes")
+    moves: list[object] = []
+
+    def move(route: Route) -> None:
+        if route.request.method != "PATCH":
+            route.continue_()
+            return
+        moves.append(route.request.post_data_json)
+        # The live server has no nested agents, so answer with the session as it is.
+        row = httpx.get(f"{base_url}/v1/sessions/{open_id}", timeout=10.0)
+        route.fulfill(status=200, json=row.json())
+
+    page.route(f"**/v1/sessions/{open_id}", move)
+    page.goto(f"{base_url}/c/{open_id}")
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible(timeout=30_000)
+
+    palette_input = open_quick_pick_palette(page)
+    palette_input.fill("move a session to a nest")
+    dialog = page.get_by_role("dialog")
+    dialog.get_by_role("option", name=re.compile(r"^Move a Session to a Nest…")).click()
+    heading = dialog.locator('[data-slot="quick-pick-heading"]')
+    expect(heading).to_have_text("Move which session to a nest?", timeout=10_000)
+    picker = dialog.get_by_role("combobox", name="Pick a session")
+    picker.fill("osprey")
+    expect(dialog.get_by_role("option").first).to_contain_text("Osprey notes")
+    page.keyboard.press("Enter")
+    expect(heading).to_have_text("Actions for “Osprey notes”", timeout=10_000)
+    page.keyboard.press("Enter")
+
+    nests = page.get_by_role("combobox", name="Move session to a nest")
+    expect(nests).to_be_focused(timeout=10_000)
+    nests.fill("kestrel")
+    expect(page.get_by_role("dialog").get_by_role("option").first).to_contain_text("Kestrel notes")
+    page.keyboard.press("Enter")
+    poll_until(lambda: moves == [{"nest_source_id": other_id}], timeout_s=10.0)
 
 
 def _create_project(base_url: str, name: str) -> str:
