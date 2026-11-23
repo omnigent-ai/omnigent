@@ -246,6 +246,7 @@ import {
   navigateAfterArchiving,
   newSessionPathFor,
 } from "./sessionCommands/archiveNavigation";
+import { nestDestinations, nestLabel } from "./nestDestinations";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchivePrompt } from "./ArchivePrompt";
 import { useSessionActions } from "./useSessionActions";
@@ -7841,28 +7842,16 @@ function NestPickerMenu({
     includeArchived: false,
     limit: 20,
   });
-  const label = (row: Conversation) =>
-    row.family?.representative_title ?? conversationDisplayLabel(row);
-  const destinations = [
-    ...new Map(
-      [
-        ...nests.destinations.filter((row) =>
-          label(row).toLowerCase().includes(search.trim().toLowerCase()),
-        ),
-        ...(query === search.trim() ? (result.data?.pages.flatMap((p) => p.data) ?? []) : []),
-      ]
-        .filter(
-          (row) =>
-            nests.canJoin &&
-            row.family &&
-            row.family.id !== conversation.family?.id &&
-            row.id !== conversation.id &&
-            !row.archived &&
-            isOwnedByViewer(row, viewerId),
-        )
-        .map((row) => [row.family!.id, row]),
-    ).values(),
-  ];
+  const destinations = nests.canJoin
+    ? nestDestinations({
+        conversation,
+        loaded: nests.destinations,
+        searchHits:
+          query === search.trim() ? (result.data?.pages.flatMap((p) => p.data) ?? []) : [],
+        search,
+        viewerId,
+      })
+    : [];
   const select = (destination: Conversation | null) => {
     nests.move(conversation.id, destination);
     close();
@@ -7885,11 +7874,11 @@ function NestPickerMenu({
           <C.Item
             key={row.family!.id}
             disabled={nests.saving}
-            textValue={label(row)}
+            textValue={nestLabel(row)}
             onSelect={() => select(row)}
           >
             <GitBranchIcon className="size-3.5" />
-            {label(row)}
+            {nestLabel(row)}
           </C.Item>
         ))}
         {!destinations.length && !result.isFetching && query === search.trim() && (
