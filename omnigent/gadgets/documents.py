@@ -39,8 +39,9 @@ Guarantees
   absent, or the head still equals ``if_version``) holds, so a retry is never
   applied twice. Retries that arrive after other writers advanced the record are
   answered from the ``StoreLimits.idempotency_window`` most recent revisions;
-  older ones fail closed with :class:`Conflict`. Re-creating a tombstoned record
-  scans the full chain for the same reason.
+  older ones fail closed with :class:`Conflict`. Re-creating a tombstoned record also
+  checks an index of the record's creates (``.creates``), so a late retry of a create
+  cannot bring a deleted record back, without reading its history.
 * Tombstones are revisions, so creation can never reset a record's history, a
   stale ``if_version`` from a deleted generation cannot touch a re-created
   record, and a stale ``create`` retry cannot resurrect a deleted record.
@@ -70,7 +71,9 @@ Limits (see :class:`StoreLimits`; nothing is silently truncated)
   ``[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}``.
 * At most 10 million revisions per record (in segments of 1000) and 10000
   record IDs per collection, enforced by create-only slots under ``.capacity``
-  even with concurrent creates; removed records free their slots. A page
+  even with concurrent creates; a new record probes a short run of slots, so a
+  collection can report full a little before every slot is taken, and removed
+  records free their slots. A page
   limit of 1..200 with at most 500 records examined per ``list`` call and at
   most 48 KiB per page; when a budget runs out ``list`` returns the items found
   so far with a ``next_cursor``, so an empty page with a cursor is possible and a
@@ -153,6 +156,10 @@ _MAX_ROOT_PATH_LENGTH: Final = 1024
 _MAX_JSON_INTEGER: Final = 2**53 - 1
 # Bytes reserved for the page wrapper and a cursor when sizing a page.
 _PAGE_OVERHEAD_BYTES: Final = 320
+# Capacity slots one new record probes; enough that a collection fills nearly to its limit.
+_CAPACITY_PROBES: Final = 64
+# The characters a record ID starts with, in sort order; reclaim starts its search at one.
+_ID_ALPHABET: Final = "0123456789abcdefghijklmnopqrstuvwxyz"
 _REVISION_DIGITS: Final = 8
 _MAX_REVISION_NUMBER: Final = 10**_REVISION_DIGITS - 1
 
@@ -464,40 +471,64 @@ class ImmutableDocumentStore:
         return None if revision.kind in _GONE else self._document(ref, revision)
 
     def list(self, collection: str, limit: int = 100, cursor: str | None = None) -> DocumentPage:
-        """One page of live documents ordered by id; not a snapshot across records."""
+        """One page of live documents ordered by id; not a snapshot across records.
+
+        Reads the collection directory a page at a time (``GadgetFiles.list_page``) and
+        examines at most ``max_scan_per_list`` records, so a page costs bounded work however
+        many records, or deleted ones, the collection holds.
+        """
         _validate_identifier(collection, "collection")
         if type(limit) is not int or not 1 <= limit <= self._limits.max_list_limit:
             raise InvalidInput(f"limit must be an integer in 1..{self._limits.max_list_limit}")
         after = self._decode_cursor(cursor, collection) if cursor is not None else None
-        ids = self._list_ids(collection)
-        position = bisect.bisect_right(ids, after) if after is not None else 0
-        first = position
+        directory = f"{self._root}/{collection}"
         items: list[Document] = []
         scanned = 0
         page_bytes = _PAGE_OVERHEAD_BYTES
-        while (
-            position < len(ids) and len(items) < limit and scanned < self._limits.max_scan_per_list
-        ):
-            ref = self._ref(collection, ids[position])
-            position += 1
-            scanned += 1
-            head = self._load_head(ref)
-            if head is None or head.latest.kind in _GONE:
-                continue
-            document = self._document(ref, head.latest)
-            item_bytes = _encoded_size(document.to_dict()) + 1  # +1 for the separating comma
-            if page_bytes + item_bytes > self._limits.max_page_bytes:
-                if not items:
-                    raise CapacityExceeded("a single document does not fit in max_page_bytes")
-                position -= 1  # leave it for the next page; the cursor stops before it
+        last: str | None = after
+        more = True
+        while more and len(items) < limit and scanned < self._limits.max_scan_per_list:
+            chunk = min(limit - len(items), self._limits.max_scan_per_list - scanned)
+            try:
+                names, more = self._files.list_page(directory, after=last, limit=chunk)
+            except NotFound:
+                names, more = [], False
+            stop = False
+            for name in names:
+                record_id = self._record_name(collection, name)
+                ref = self._ref(collection, record_id)
+                scanned += 1
+                head = self._load_head(ref)
+                if head is not None and head.latest.kind not in _GONE:
+                    document = self._document(ref, head.latest)
+                    item_bytes = _encoded_size(document.to_dict()) + 1  # +1 for the comma
+                    if page_bytes + item_bytes > self._limits.max_page_bytes:
+                        if not items:
+                            raise CapacityExceeded(
+                                "a single document does not fit in max_page_bytes"
+                            )
+                        # Leave it for the next page; the cursor stops before it.
+                        more, stop = True, True
+                        break
+                    page_bytes += item_bytes
+                    items.append(document)
+                last = record_id
+            if stop:
                 break
-            page_bytes += item_bytes
-            items.append(document)
-        more = position > first and position < len(ids)
+            if not names:
+                more = False
         return DocumentPage(
             items=tuple(items),
-            next_cursor=self._encode_cursor(collection, ids[position - 1]) if more else None,
+            next_cursor=self._encode_cursor(collection, last) if more and last is not None else None,
         )
+
+    def _record_name(self, collection: str, name: str) -> str:
+        name = posixpath.basename(str(name).rstrip("/"))
+        if _IDENTIFIER_RE.fullmatch(name) is None:
+            raise CorruptData(
+                f"{collection}: unexpected entry in collection directory", collection=collection
+            )
+        return name
 
     def verify_record(self, collection: str, id: str) -> RecordSummary | None:
         """Verify every revision and link of one record; ``None`` if it has no revisions."""
@@ -562,9 +593,11 @@ class ImmutableDocumentStore:
                     reason="already_exists",
                     current_version=self._version_of(ref, head.latest),
                 )
-            # Re-creating over a tombstone: the same operation may have created
-            # an earlier generation, so look through the whole chain.
-            replay = self._find_operation(ref, head, operation_id, head.count)
+            # Re-creating over a tombstone: the same operation may have created an earlier
+            # generation, which the record's index of creates finds in one read.
+            replay = self._find_operation(
+                ref, head, operation_id, self._limits.idempotency_window
+            ) or self._indexed_create(ref, head, operation_id)
             if replay is not None:
                 return _expect_document(self._replay(ref, replay, digest))
         return _expect_document(
@@ -620,6 +653,35 @@ class ImmutableDocumentStore:
                 "delete resolved to a non-delete revision", collection=collection, doc_id=id
             )
         return result
+
+    def retire(self, collection: str, id: str, actor: str) -> bool:
+        """Delete a record and remove it at once, giving its capacity back.
+
+        For bookkeeping records nobody writes any more (a sealed rule epoch), which need no
+        retention for retries. Uses the same fenced removal as reclaiming, so a writer racing
+        it collides on the purge revision. Returns whether the record is gone; ``False``
+        when the files cannot be deleted or another writer changed the record meanwhile.
+        """
+        if not self._files.supports_delete:
+            return False
+        ref = self._ref(collection, id)
+        head = self._load_head(ref)
+        if head is None:
+            return True
+        try:
+            if head.latest.kind not in _GONE:
+                version = self._version_of(ref, head.latest)
+                self.delete(collection, id, version, f"retire.{head.latest.digest[:32]}", actor)
+                head = self._load_head(ref)
+                if head is None:
+                    return True
+            if head.latest.kind == _DELETE:
+                self._purge(ref, head)
+            elif head.latest.kind == _PURGE:
+                self._finish_purge(ref, head.latest)
+        except (Conflict, NotFound):
+            return False
+        return self._load_head(ref) is None
 
     # -- mutation core ------------------------------------------------------
 
@@ -716,7 +778,34 @@ class ImmutableDocumentStore:
             self._files.create_json(self._revision_path(ref, number), copy.deepcopy(body))
         except Conflict:
             return self._resolve_collision(ref, operation_id, digest)
+        if kind == _CREATE:
+            self._index_create(ref, operation_id, number)
         return self._result(ref, self._parse_revision(ref, body, number))
+
+    def _create_index_path(self, ref: _Ref, operation_id: str) -> str:
+        key = hashlib.sha256(operation_id.encode()).hexdigest()[:32]
+        return f"{self._root}/.creates/{ref.collection}/{ref.doc_id}/{key}.json"
+
+    def _index_create(self, ref: _Ref, operation_id: str, number: int) -> None:
+        """Note which revision *operation_id* created, so a late retry of that create finds
+        it after a delete without reading the record's history."""
+        path = self._create_index_path(ref, operation_id)
+        try:
+            self._files.mkdirs(posixpath.dirname(path))
+            self._files.create_json(path, {"revision": number})
+        except (Conflict, NotFound):
+            pass  # Already noted, or the record is being removed.
+
+    def _indexed_create(self, ref: _Ref, head: _Head, operation_id: str) -> _Revision | None:
+        try:
+            noted = self._files.read_json(self._create_index_path(ref, operation_id))
+        except NotFound:
+            return None
+        number = noted.get("revision")
+        if type(number) is not int or not 1 <= number <= head.count:
+            return None
+        revision = self._read_revision(ref, number)
+        return revision if revision.operation_id == operation_id else None
 
     def _resolve_collision(
         self, ref: _Ref, operation_id: str, digest: str
@@ -973,27 +1062,6 @@ class ImmutableDocumentStore:
                 ref, f"revision {current.revision} is inconsistent with its predecessor"
             )
 
-    def _list_ids(self, collection: str) -> _StrList:
-        directory = f"{self._root}/{collection}"
-        try:
-            entries = self._files.list_paths(directory)
-        except NotFound:
-            return []
-        if len(entries) > self._limits.max_list_entries:
-            raise CapacityExceeded(
-                f"collection has more than {self._limits.max_list_entries} entries"
-            )
-        ids: set[str] = set()
-        for entry in entries:
-            name = posixpath.basename(str(entry).rstrip("/"))
-            if _IDENTIFIER_RE.fullmatch(name) is None:
-                raise CorruptData(
-                    f"{collection}: unexpected entry in collection directory",
-                    collection=collection,
-                )
-            ids.add(name)
-        return sorted(ids)
-
     def _ensure_record_capacity(self, collection: str, doc_id: str) -> None:
         try:
             self._claim_capacity(collection, doc_id)
@@ -1002,32 +1070,33 @@ class ImmutableDocumentStore:
                 raise
             self._claim_capacity(collection, doc_id)
 
-    def _claim_capacity(self, collection: str, doc_id: str) -> None:
+    def _probe_slots(self, collection: str, doc_id: str) -> list[str]:
+        """The capacity slots *doc_id* may claim: a short run from its hash, in order."""
         capacity = self._limits.max_records_per_collection
-        try:
-            entries = self._files.list_paths(f"{self._root}/{collection}")
-        except NotFound:
-            entries = []
-        if len(entries) >= capacity:
-            if any(posixpath.basename(entry.rstrip("/")) == doc_id for entry in entries):
-                return
-            raise CapacityExceeded(f"collection already has {capacity} records")
-        # A count check alone races: an admitted create must never make listing impossible.
-        # Claims survive failed appends and tombstones, and a retry of that ID reuses its claim.
+        directory = f"{self._root}/.capacity/{collection}"
+        start = int(hashlib.sha256(doc_id.encode()).hexdigest(), 16) % capacity
+        probes = min(capacity, _CAPACITY_PROBES)
+        return [f"{directory}/{(start + offset) % capacity:08d}.json" for offset in range(probes)]
+
+    def _claim_capacity(self, collection: str, doc_id: str) -> None:
+        """Claim one of the collection's record slots for *doc_id*, or find its claim.
+
+        Slots are create-only files in a table of ``max_records_per_collection``, so admitted
+        records never exceed it, and a record probes only a short run of slots from its
+        hash: a create costs bounded work, and a collection may fill up a little before
+        every slot is taken. Claims survive failed appends and tombstones, and a retry of
+        that ID reuses its claim.
+        """
         directory = f"{self._root}/.capacity/{collection}"
         self._files.mkdirs(directory)
         claim = {"collection": collection, "id": doc_id}
-        start = int(hashlib.sha256(doc_id.encode()).hexdigest(), 16) % capacity
-        for offset in range(capacity):
-            path = f"{directory}/{(start + offset) % capacity:08d}.json"
+        free: list[str] = []
+        for path in self._probe_slots(collection, doc_id):
             try:
                 owner = self._files.read_json(path)
             except NotFound:
-                try:
-                    self._files.create_json(path, claim)
-                    return
-                except Conflict:
-                    owner = self._files.read_json(path)
+                free.append(path)
+                continue
             if owner == claim:
                 return
             if (
@@ -1038,16 +1107,22 @@ class ImmutableDocumentStore:
                 or _IDENTIFIER_RE.fullmatch(owner["id"]) is None
             ):
                 raise CorruptData("Invalid record capacity claim", collection=collection)
-        raise CapacityExceeded(f"collection has reserved all {capacity} record slots")
+        for path in free:
+            try:
+                self._files.create_json(path, claim)
+                return
+            except Conflict:
+                if self._files.read_json(path) == claim:
+                    return
+        raise CapacityExceeded(
+            f"collection is full: it holds at most {self._limits.max_records_per_collection} "
+            "records"
+        )
 
     def _claim_path(self, collection: str, doc_id: str) -> str | None:
         """The capacity slot *doc_id* holds, or ``None`` if it holds none."""
-        capacity = self._limits.max_records_per_collection
-        directory = f"{self._root}/.capacity/{collection}"
-        start = int(hashlib.sha256(doc_id.encode()).hexdigest(), 16) % capacity
         claim = {"collection": collection, "id": doc_id}
-        for offset in range(capacity):
-            path = f"{directory}/{(start + offset) % capacity:08d}.json"
+        for path in self._probe_slots(collection, doc_id):
             try:
                 owner = self._files.read_json(path)
             except NotFound:
@@ -1070,16 +1145,31 @@ class ImmutableDocumentStore:
         return self._seconds_since(revision.updated_at) >= seconds
 
     def _reclaim(self, collection: str, doc_id: str) -> bool:
-        """Remove some records deleted longer than the retention ago; whether any went."""
+        """Remove some records deleted longer than the retention ago; whether any went.
+
+        Looks at most ``max_scan_per_list`` records, starting at a point derived from
+        *doc_id* and wrapping around once, so creates spread their search over the
+        collection and each costs bounded work.
+        """
         if not self._files.supports_delete:
             return False
-        ids = self._list_ids(collection)
-        if not ids:
-            return False
-        start = int(hashlib.sha256(doc_id.encode()).hexdigest(), 16) % len(ids)
+        directory = f"{self._root}/{collection}"
+        start = _ID_ALPHABET[int(hashlib.sha256(doc_id.encode()).hexdigest(), 16) % len(_ID_ALPHABET)]
+        budget = self._limits.max_scan_per_list
+        candidates: list[str] = []
+        for after in (start, None):
+            if budget <= 0:
+                break
+            try:
+                names, _ = self._files.list_page(directory, after=after, limit=budget)
+            except NotFound:
+                return False
+            if after is None:
+                names = [name for name in names if name <= start]
+            candidates.extend(self._record_name(collection, name) for name in names)
+            budget -= len(names)
         removed = 0
-        for offset in range(min(len(ids), self._limits.max_scan_per_list)):
-            candidate = ids[(start + offset) % len(ids)]
+        for candidate in candidates:
             if candidate == doc_id:
                 continue
             ref = self._ref(collection, candidate)
@@ -1139,7 +1229,8 @@ class ImmutableDocumentStore:
         if ticket is None:
             return
         claim = self._claim_path(ref.collection, ref.doc_id)
-        for path in (claim, ref.directory):
+        creates = f"{self._root}/.creates/{ref.collection}/{ref.doc_id}"
+        for path in (claim, creates, ref.directory):
             if path is None:
                 continue
             if not self._still_removing(ref, marker, tickets, ticket):

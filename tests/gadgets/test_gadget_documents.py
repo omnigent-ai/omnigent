@@ -302,3 +302,153 @@ def test_a_store_that_cannot_delete_keeps_the_fixed_capacity(env: Env) -> None:
     with pytest.raises(CapacityExceeded):
         docs.create("cards", "c", {"n": 1}, "op-c", ACTOR)
     assert (env.root / "cards" / "a").exists()
+
+
+class CountingFiles(GadgetFiles):
+    """Wraps a scope and counts the entries each read examines."""
+
+    def __init__(self, inner: GadgetFiles) -> None:
+        self.inner = inner
+        self.supports_delete = inner.supports_delete
+        self.examined = 0
+        self.reads = 0
+        self.full_listings: list[str] = []
+
+    def reset(self) -> None:
+        self.examined = 0
+        self.reads = 0
+        self.full_listings = []
+
+    def read_json(self, path: str) -> dict:
+        self.examined += 1
+        self.reads += 1
+        return self.inner.read_json(path)
+
+    def create_json(self, path: str, value: dict) -> None:
+        self.inner.create_json(path, value)
+
+    def list_paths(self, path: str) -> list[str]:
+        names = self.inner.list_paths(path)
+        self.full_listings.append(path)
+        self.examined += len(names)
+        return names
+
+    def list_page(self, path: str, *, after: str | None, limit: int) -> tuple[list[str], bool]:
+        names, more = self.inner.list_page(path, after=after, limit=limit)
+        self.examined += len(names)
+        return names, more
+
+    def mkdirs(self, path: str) -> None:
+        self.inner.mkdirs(path)
+
+    def delete_tree(self, path: str) -> None:
+        self.inner.delete_tree(path)
+
+
+WIDE = StoreLimits(
+    max_records_per_collection=1000,
+    max_list_entries=1000,
+    max_scan_per_list=20,
+    idempotency_window=2,
+    tombstone_retention_s=60,
+    purge_abandon_s=30,
+)
+
+
+def _counting(tmp_path: Path, limits: StoreLimits = WIDE) -> tuple[CountingFiles, ImmutableDocumentStore, Clock]:
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    files = CountingFiles(store.gadget_files(store.create(ACTOR, "Board").id))
+    clock = Clock()
+    return files, ImmutableDocumentStore(files, "data", limits=limits, clock=clock), clock
+
+
+def test_a_page_examines_a_bounded_number_of_records_however_many_were_deleted(
+    tmp_path: Path,
+) -> None:
+    files, docs, _clock = _counting(tmp_path)
+    for n in range(200):
+        version = docs.create("cards", f"c{n:03d}", {"n": n}, f"create-{n}", ACTOR).version
+        if n < 190:
+            docs.delete("cards", f"c{n:03d}", version, f"delete-{n}", ACTOR)
+    files.reset()
+
+    page = docs.list("cards", limit=5)
+
+    # Twenty records looked at (the scan budget), each its directory plus two revisions.
+    assert page.items == () and page.next_cursor is not None
+    assert not any(path.endswith("/cards") for path in files.full_listings)
+    assert files.examined <= WIDE.max_scan_per_list * 6
+    # Following the cursor reaches the live records.
+    seen: list[str] = []
+    cursor: str | None = None
+    while True:
+        page = docs.list("cards", limit=5, cursor=cursor)
+        seen.extend(item.id for item in page.items)
+        cursor = page.next_cursor
+        if cursor is None:
+            break
+    assert seen == [f"c{n:03d}" for n in range(190, 200)]
+
+
+def test_a_late_create_retry_after_a_delete_is_answered_without_reading_the_history(
+    tmp_path: Path,
+) -> None:
+    files, docs, _clock = _counting(tmp_path)
+    version = docs.create("cards", "c1", {"n": 0}, "create-once", ACTOR).version
+    for n in range(1, 40):
+        version = docs.replace("cards", "c1", {"n": n}, version, f"replace-{n}", ACTOR).version
+    docs.delete("cards", "c1", version, "delete-1", ACTOR)
+    files.reset()
+
+    # A retry of the first create, long after: answered, and the record stays deleted.
+    replay = docs.create("cards", "c1", {"n": 0}, "create-once", ACTOR)
+
+    assert replay.value == {"n": 0}
+    assert docs.get("cards", "c1") is None
+    # The record's directory is listed to find its newest revision; of its 41 revisions,
+    # only the newest few and the one the index names are read.
+    assert files.reads < 10
+
+
+def test_a_create_probes_a_bounded_run_of_capacity_slots(tmp_path: Path) -> None:
+    files, docs, _clock = _counting(tmp_path)
+    for n in range(300):
+        docs.create("cards", f"c{n:03d}", {"n": n}, f"create-{n}", ACTOR)
+    files.reset()
+
+    docs.create("cards", "fresh", {"n": 1}, "create-fresh", ACTOR)
+
+    assert not any(path.endswith("/cards") for path in files.full_listings)
+    assert files.examined <= 80
+
+
+def test_reclaiming_capacity_looks_at_a_bounded_number_of_records(tmp_path: Path) -> None:
+    limits = StoreLimits(
+        max_records_per_collection=64,
+        max_list_entries=64,
+        max_scan_per_list=10,
+        idempotency_window=2,
+        tombstone_retention_s=60,
+        purge_abandon_s=30,
+        max_reclaim_per_create=2,
+    )
+    files, docs, clock = _counting(tmp_path, limits)
+    created = 0
+    with pytest.raises(CapacityExceeded):
+        while True:
+            docs.create("cards", f"c{created:03d}", {"n": created}, f"create-{created}", ACTOR)
+            created += 1
+    for n in range(created):
+        record = docs.get("cards", f"c{n:03d}")
+        assert record is not None
+        docs.delete("cards", f"c{n:03d}", record.version, f"delete-{n}", ACTOR)
+    clock.advance(61)
+    files.reset()
+
+    docs.create("cards", "fresh", {"n": 1}, "create-fresh", ACTOR)
+
+    assert docs.get("cards", "fresh") is not None
+    assert not any(path.endswith("/cards") for path in files.full_listings)
+    # Ten candidates looked at, two removed (each probing at most 64 slots for its claim),
+    # and the new slot claimed: a fixed budget, whatever the collection holds.
+    assert files.examined <= 10 * 6 + 2 * 90 + 70

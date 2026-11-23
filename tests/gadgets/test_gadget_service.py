@@ -21,6 +21,7 @@ from omnigent.stores.gadget_store import (
     InvalidInput,
     NotFound,
 )
+from omnigent.stores.gadget_store.local import LocalGadgetFiles
 from tests.gadgets.conftest import DATA_EDIT, EDIT, READ, Fixture, person
 
 CARDS = {
@@ -685,6 +686,60 @@ def test_a_reference_rule_checks_targets_and_applies_its_delete_rule(
     assert rpc(service, app, "get", collection="runs", id="r2")["value"] == {"state": "done"}
 
 
+def test_deleting_a_referenced_record_reads_only_the_records_that_name_it(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = gadgets.service()
+    rule = {
+        "name": "run_card",
+        "kind": "reference",
+        "collection": "runs",
+        "field": "cardId",
+        "target": "cards",
+        "on_delete": "cascade",
+    }
+    app = publish_ruled_board(service, [rule])
+    busy = card(service, app, "busy", "doing")
+    quiet = card(service, app, "quiet", "doing")
+    for index in range(60):
+        rpc(
+            service,
+            app,
+            "create",
+            collection="runs",
+            id=f"r{index:03d}",
+            value={"cardId": "busy", "state": "done"},
+            operation_id=f"r{index}",
+        )
+    rpc(
+        service,
+        app,
+        "create",
+        collection="runs",
+        id="r-quiet",
+        value={"cardId": "quiet", "state": "done"},
+        operation_id="r-quiet",
+    )
+    listed: list[str] = []
+    for name in ("list_paths", "list_page"):
+        original = getattr(LocalGadgetFiles, name)
+
+        def counting(self, path, *args, _original=original, **kwargs):  # type: ignore[no-untyped-def]
+            listed.append(path)
+            return _original(self, path, *args, **kwargs)
+
+        monkeypatch.setattr(LocalGadgetFiles, name, counting)
+
+    rpc(service, app, "delete", id="quiet", if_version=quiet["version"], operation_id="d-q")
+
+    assert rpc(service, app, "get", collection="runs", id="r-quiet") is None
+    # The 60 runs naming the other card are never listed or read.
+    assert not any(path.rstrip("/").endswith("/runs") for path in listed)
+    # More dependents than one change may touch are refused, not cut short.
+    with pytest.raises(CapacityExceeded):
+        rpc(service, app, "delete", id="busy", if_version=busy["version"], operation_id="d-b")
+
+
 @pytest.mark.parametrize(
     ("second", "deleted"),
     [("restrict", False), ("unset", True), ("cascade", True)],
@@ -761,16 +816,28 @@ def test_a_change_left_half_done_is_finished_by_the_next_writer(
 def test_the_rule_state_rotates_without_losing_counts(
     gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Room for three epoch records, and a new epoch every three writes: the writes below
+    # need many more epochs than that, so old ones must be retired as the state rotates.
     monkeypatch.setattr(constraints_module, "EPOCH_WRITES", 3)
+    monkeypatch.setattr(
+        constraints_module,
+        "GUARD_LIMITS",
+        StoreLimits(max_records_per_collection=3, max_list_entries=3),
+    )
     service = gadgets.service()
     app = publish_ruled_board(service, [{**WIP_LIMIT, "max": 3}])
     todo = [card(service, app, name, "todo") for name in ("a", "b", "c", "d")]
+    for round_number in range(4):
+        for index, document in enumerate(todo[:3]):
+            document = move(service, app, document, "doing", f"m-{round_number}-{index}")
+            todo[index] = move(service, app, document, "todo", f"b-{round_number}-{index}")
     for index, document in enumerate(todo[:3]):
-        move(service, app, document, "doing", f"m-{index}")
+        todo[index] = move(service, app, document, "doing", f"m-last-{index}")
     with pytest.raises(ConstraintViolation):
         move(service, app, todo[3], "doing", "m-3")
     epochs = gadgets.store.gadget_files(app["id"]).list_paths("data/_guard/epochs")
-    assert len(epochs) > 2
+    assert 1 <= len(epochs) <= 3
+    assert max(int(name[1:]) for name in epochs) > 3
 
 
 @pytest.mark.parametrize(

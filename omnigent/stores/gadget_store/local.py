@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import heapq
 import json
 import os
 import re
@@ -195,6 +196,21 @@ class LocalGadgetFiles(GadgetFiles):
                 return sorted(entry.name for entry in entries)
         except (FileNotFoundError, NotADirectoryError):
             raise NotFound("Gadget directory not found") from None
+
+    def list_page(self, path: str, *, after: str | None, limit: int) -> tuple[list[str], bool]:
+        # One pass over the directory, keeping only the next *limit* names: memory stays
+        # bounded by the page. The file system reads the directory to seek; a database store
+        # seeks with its index instead.
+        target = self._resolve(path)
+        try:
+            with os.scandir(target) as entries:
+                wanted = heapq.nsmallest(
+                    limit + 1,
+                    (entry.name for entry in entries if after is None or entry.name > after),
+                )
+        except (FileNotFoundError, NotADirectoryError):
+            raise NotFound("Gadget directory not found") from None
+        return wanted[:limit], len(wanted) > limit
 
     def mkdirs(self, path: str) -> None:
         self._resolve(path)

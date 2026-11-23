@@ -22,6 +22,7 @@ Paths given to :class:`GadgetFiles` are relative POSIX paths such as
 
 from __future__ import annotations
 
+import bisect
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator
@@ -205,6 +206,20 @@ class GadgetFiles(ABC):
         :raises NotFound: When the directory does not exist.
         :raises CapacityExceeded: Rather than return a truncated listing.
         """
+
+    def list_page(self, path: str, *, after: str | None, limit: int) -> tuple[list[str], bool]:
+        """Up to *limit* of a directory's child names that sort after *after*, in order.
+
+        :returns: The names and whether more follow. Callers page through a directory with
+            this instead of :meth:`list_paths`, so a database store answers each page with a
+            bounded index range scan. The default reads the whole listing; a store that can
+            seek should override it.
+        :raises NotFound: When the directory does not exist.
+        """
+        names = self.list_paths(path)
+        start = 0 if after is None else bisect.bisect_right(names, after)
+        page = names[start : start + limit]
+        return page, start + limit < len(names)
 
     @abstractmethod
     def mkdirs(self, path: str) -> None:

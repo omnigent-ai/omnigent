@@ -21,10 +21,19 @@ broken. A rule only refuses writes that make it worse, so data that predates a
 rule stays editable.
 
 The guard record rotates every ``EPOCH_WRITES`` writes because a record holds a
-bounded number of revisions. Its state, with a change in flight, must fit in
-``MAX_GUARD_BYTES``: each unique key costs its digest plus the holding record's
-ID, so how many records a ``unique`` rule allows depends on their IDs and on the
-size of the record being written, not only on the collection's record limit.
+bounded number of revisions; an epoch two behind the current one is retired (deleted
+and removed through the document store's fenced removal), so a gadget keeps at most
+a few epoch records however many writes it takes. Its state, with a change in flight,
+must fit in ``MAX_GUARD_BYTES``: each unique key costs its digest plus the holding
+record's ID, so how many records a ``unique`` rule allows depends on their IDs and on
+the size of the record being written, not only on the collection's record limit.
+
+Each ``reference`` rule keeps an index of the records naming each target
+(``refs/<rule>/<target>/<record>``), written as part of every guarded change, so
+deleting a target reads only the records that name it. Entries a change left behind
+are checked against the record and dropped. When the rules change, or a write fails
+half-way, the derived state is rebuilt a page at a time, with its progress saved in
+the guard, so each step costs bounded work and a stopped rebuild resumes.
 """
 
 from __future__ import annotations
@@ -40,6 +49,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from omnigent.gadgets.documents import (
+    DEFAULT_LIMITS,
     CapacityExceeded,
     Conflict,
     CorruptData,
@@ -47,6 +57,7 @@ from omnigent.gadgets.documents import (
     ImmutableDocumentStore,
     InvalidInput,
     NotFound,
+    StoreLimits,
 )
 from omnigent.stores.gadget_store import GadgetFiles
 
@@ -68,9 +79,16 @@ GUARD_BACKOFF_S = 0.01
 GUARD_BACKOFF_MAX_S = 0.4
 _ON_DELETE = ("restrict", "cascade", "unset")
 _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
-_EPOCH = re.compile(r"^e[0-9]{6}$")
+_EPOCH = re.compile(r"^e[0-9]{6,12}$")
 _GUARD_COLLECTION = "epochs"
 _STALE = "stale"
+# The guard's own records; tests shrink it.
+GUARD_LIMITS: StoreLimits = DEFAULT_LIMITS
+# Records one rebuild step reads, and the steps one write may take before giving up as busy.
+REBUILD_PAGE = 200
+REBUILD_STEPS_PER_WRITE = 64
+# Bumped when the derived state gains something a rebuild must fill in (the reference index).
+_STATE_FORMAT = 2
 
 
 class ConstraintViolation(Conflict):
@@ -244,11 +262,11 @@ class ConstraintGuard:
     ) -> None:
         self.files = files
         self.guard_root = guard_root
-        self.guard = ImmutableDocumentStore(files, guard_root)
+        self.guard = ImmutableDocumentStore(files, guard_root, limits=GUARD_LIMITS)
         self.data = data
         self.rules = rules
         self.actor = actor
-        self.digest = _digest(rules)
+        self.digest = _digest({"rules": rules, "format": _STATE_FORMAT})
         self.collections = {rule["collection"] for rule in rules} | {
             rule["target"] for rule in rules if rule["kind"] == "reference"
         }
@@ -268,18 +286,27 @@ class ConstraintGuard:
         operation_id: str,
     ) -> dict:
         lost = 0
-        for _ in range(GUARD_ATTEMPTS):
+        attempts = 0
+        rebuild_steps = 0
+        while attempts < GUARD_ATTEMPTS:
             epoch, state = self._current()
             current = state.value
             if current.get("sealed"):
+                attempts += 1
                 self._advance(epoch, current)
                 continue
             if current.get("pending") is not None:
+                attempts += 1
                 self._finish(epoch, state)
                 continue
             if current.get("rules") != self.digest:
-                self._rebuild(epoch, state)
+                # Each step reads one page; a write helps finish the rebuild before its own.
+                rebuild_steps += 1
+                if rebuild_steps > REBUILD_STEPS_PER_WRITE:
+                    break
+                self._rebuild_step(epoch, state)
                 continue
+            attempts += 1
             if current.get("writes", 0) >= EPOCH_WRITES:
                 self._seal(epoch, state)
                 continue
@@ -348,8 +375,10 @@ class ConstraintGuard:
         gone: set[tuple[str, str]] = {(collection, record_id)} if after is None else set()
         planned: dict[tuple[str, str], tuple[dict, Any]] = {}
         queue: list[tuple[str, str, Any, Any]] = [(collection, record_id, before, after)]
+        changes: list[tuple[str, str, Any, Any]] = []
         while queue:
             changed_collection, changed_id, old, new = queue.pop(0)
+            changes.append((changed_collection, changed_id, old, new))
             for rule in self.rules:
                 if rule["collection"] == changed_collection:
                     self._check(rule, plan, changed_id, old, new)
@@ -397,7 +426,37 @@ class ConstraintGuard:
                     raise CapacityExceeded(
                         f"This change would update more than {MAX_PLAN_OPERATIONS} records"
                     )
+        plan.operations.extend(self._index_operations(changes))
         return plan
+
+    def _index_operations(self, changes: list[tuple[str, str, Any, Any]]) -> list[dict]:
+        """The reference index entries a change adds and drops, after its record writes."""
+        operations: list[dict] = []
+        for changed_collection, changed_id, old, new in changes:
+            for rule in self.rules:
+                if rule["kind"] != "reference" or rule["collection"] != changed_collection:
+                    continue
+                before = self._reference_of(rule, old)
+                after = self._reference_of(rule, new)
+                if before == after:
+                    continue
+                for kind, target in (("ref_remove", before), ("ref_add", after)):
+                    if target is not None:
+                        operations.append(
+                            {"kind": kind, "path": self._index_path(rule, target, changed_id)}
+                        )
+        return operations
+
+    @staticmethod
+    def _reference_of(rule: dict, value: Any) -> str | None:
+        target = value.get(rule["field"]) if isinstance(value, dict) else None
+        return target if isinstance(target, str) and _IDENTIFIER.fullmatch(target) else None
+
+    def _index_directory(self, rule: dict, target_id: str) -> str:
+        return f"{self.guard_root}/refs/{_digest(rule, 16)}/{target_id}"
+
+    def _index_path(self, rule: dict, target_id: str, record_id: str) -> str:
+        return f"{self._index_directory(rule, target_id)}/{record_id}"
 
     def _check(self, rule: dict, plan: _Plan, record_id: str, old: Any, new: Any) -> None:
         kind = rule["kind"]
@@ -443,26 +502,50 @@ class ConstraintGuard:
             return None
         return _digest([value[name] for name in rule["fields"]], 24)
 
-    def _records(self, collection: str) -> list[Document]:
-        records: list[Document] = []
-        cursor = None
-        while True:
-            page = self.data.list(collection, 200, cursor)
-            records.extend(page.items)
-            cursor = page.next_cursor
-            if cursor is None:
-                return records
-
     def _dependents(self, rule: dict, target_id: str) -> list[Document]:
-        return [
-            record
-            for record in self._records(rule["collection"])
-            if record.value.get(rule["field"]) == target_id
-        ]
+        """The live records whose *rule* field names *target_id*, read from the rule's index.
+
+        Stops after one more than a change may touch, which is enough to refuse or cap the
+        change. Entries for records that no longer name the target are dropped as found.
+        """
+        directory = self._index_directory(rule, target_id)
+        found: list[Document] = []
+        after: str | None = None
+        while len(found) <= MAX_PLAN_OPERATIONS:
+            try:
+                names, more = self.files.list_page(
+                    directory, after=after, limit=MAX_PLAN_OPERATIONS + 1
+                )
+            except NotFound:
+                return found
+            for name in names:
+                after = name
+                record = (
+                    self.data.get(rule["collection"], name) if _IDENTIFIER.fullmatch(name) else None
+                )
+                if record is not None and record.value.get(rule["field"]) == target_id:
+                    found.append(record)
+                elif self.files.supports_delete:
+                    with contextlib.suppress(NotFound):
+                        self.files.delete_tree(f"{directory}/{name}")
+            if not more:
+                return found
+        return found
 
     # -- applying ---------------------------------------------------------------
 
     def _apply(self, operation: dict) -> dict:
+        if operation["kind"] == "ref_add":
+            path = operation["path"]
+            self.files.mkdirs(path.rsplit("/", 1)[0])
+            with contextlib.suppress(Conflict):  # Already there.
+                self.files.create_json(path, {})
+            return {}
+        if operation["kind"] == "ref_remove":
+            # A store that cannot delete keeps the entry; lookups check it against the record.
+            if self.files.supports_delete:
+                self.files.delete_tree(operation["path"])
+            return {}
         kind, collection, record_id = operation["kind"], operation["collection"], operation["id"]
         actor, operation_id = operation["actor"], operation["operation_id"]
         if kind == "create":
@@ -541,37 +624,99 @@ class ConstraintGuard:
 
     # -- derived state and rotation -------------------------------------------
 
-    def _derived_state(self) -> dict:
-        counts: dict[str, int] = {}
-        unique: dict[str, dict[str, str]] = {}
-        cache: dict[str, list[Document]] = {}
-        for rule in self.rules:
-            if rule["kind"] not in {"max_records", "unique"}:
-                continue
-            records = cache.setdefault(rule["collection"], self._records(rule["collection"]))
-            if rule["kind"] == "max_records":
-                counts[rule["name"]] = sum(self._matches(rule, record.value) for record in records)
-            else:
-                keys: dict[str, str] = {}
-                for record in records:
-                    key = self._unique_key(rule, record.value)
-                    if key is not None:
-                        keys.setdefault(key, record.id)
-                unique[rule["name"]] = keys
-        return {"rules": self.digest, "counts": counts, "unique": unique}
+    def _rebuild_step(self, epoch: str, state: Document) -> None:
+        """Rebuild the derived state by one page of records, saving the progress.
 
-    def _current(self) -> tuple[str, Document]:
+        Counts, unique keys and the reference index are rebuilt from the records, one
+        collection and one page at a time. Writers wait (helping) until it is done.
+        """
+        value = state.value
+        progress = value.get("rebuild")
+        if not isinstance(progress, dict) or progress.get("digest") != self.digest:
+            progress = {
+                "digest": self.digest,
+                "todo": sorted({rule["collection"] for rule in self.rules}),
+                "cursor": None,
+                "counts": {r["name"]: 0 for r in self.rules if r["kind"] == "max_records"},
+                "unique": {r["name"]: {} for r in self.rules if r["kind"] == "unique"},
+            }
+        else:
+            progress = {
+                **progress,
+                "todo": list(progress["todo"]),
+                "counts": dict(progress["counts"]),
+                "unique": {name: dict(keys) for name, keys in progress["unique"].items()},
+            }
+            if progress["todo"]:
+                collection = progress["todo"][0]
+                page = self.data.list(collection, REBUILD_PAGE, progress["cursor"])
+                for record in page.items:
+                    self._rebuild_record(progress, collection, record)
+                if page.next_cursor is not None:
+                    progress["cursor"] = page.next_cursor
+                else:
+                    progress["todo"].pop(0)
+                    progress["cursor"] = None
+        writes = value.get("writes", 0) + 1
+        if progress["todo"]:
+            updated = {**value, "rebuild": progress, "writes": writes}
+        else:
+            updated = {
+                **value,
+                "rules": self.digest,
+                "counts": progress["counts"],
+                "unique": progress["unique"],
+                "rebuild": None,
+                "pending": None,
+                "writes": writes,
+            }
+        if len(_canonical(updated)) > MAX_GUARD_BYTES:
+            raise CapacityExceeded("The gadget's unique keys exceed their storage limit")
+        with contextlib.suppress(Conflict):  # Another writer took the step.
+            self.guard.replace(
+                _GUARD_COLLECTION,
+                epoch,
+                updated,
+                state.version,
+                self._guard_operation(state, "rebuild"),
+                self.actor,
+            )
+
+    def _rebuild_record(self, progress: dict, collection: str, record: Document) -> None:
+        for rule in self.rules:
+            if rule["collection"] != collection:
+                continue
+            if rule["kind"] == "max_records" and self._matches(rule, record.value):
+                progress["counts"][rule["name"]] += 1
+            elif rule["kind"] == "unique":
+                key = self._unique_key(rule, record.value)
+                if key is not None:
+                    progress["unique"][rule["name"]].setdefault(key, record.id)
+            elif rule["kind"] == "reference":
+                target = self._reference_of(rule, record.value)
+                if target is not None:
+                    self._apply(
+                        {"kind": "ref_add", "path": self._index_path(rule, target, record.id)}
+                    )
+
+    def _epochs(self) -> list[str]:
         try:
             paths = self.files.list_paths(f"{self.guard_root}/{_GUARD_COLLECTION}")
         except NotFound:
             paths = []
-        epochs = sorted(
-            name for name in (path.rsplit("/", 1)[-1] for path in paths) if _EPOCH.fullmatch(name)
-        )
+        names = (path.rsplit("/", 1)[-1] for path in paths)
+        return sorted((name for name in names if _EPOCH.fullmatch(name)), key=lambda n: int(n[1:]))
+
+    def _current(self) -> tuple[str, Document]:
+        epochs = self._epochs()
         if not epochs:
-            initial = {**self._derived_state(), "pending": None, "writes": 0}
+            initial = {"rules": _STALE, "counts": {}, "unique": {}, "pending": None, "writes": 0}
             self._create_epoch("e000001", initial)
             return self._current()
+        # Sealed epochs two behind the current one have no readers left: retire a couple per
+        # call, so the guard keeps a few records however many writes the gadget takes.
+        for old in epochs[:-2][:2]:
+            self.guard.retire(_GUARD_COLLECTION, old, "omnigent-gadget-rules")
         epoch = epochs[-1]
         state = self.guard.get(_GUARD_COLLECTION, epoch)
         if state is None or not isinstance(state.value, dict):
@@ -584,25 +729,6 @@ class ConstraintGuard:
         with contextlib.suppress(Conflict):  # Another writer created it.
             self.guard.create(
                 _GUARD_COLLECTION, epoch, value, f"g-epoch-{epoch}", "omnigent-gadget-rules"
-            )
-
-    def _rebuild(self, epoch: str, state: Document) -> None:
-        value = {
-            **state.value,
-            **self._derived_state(),
-            "pending": None,
-            "writes": state.value.get("writes", 0) + 1,
-        }
-        if len(_canonical(value)) > MAX_GUARD_BYTES:
-            raise CapacityExceeded("The gadget's unique keys exceed their storage limit")
-        with contextlib.suppress(Conflict):
-            self.guard.replace(
-                _GUARD_COLLECTION,
-                epoch,
-                value,
-                state.version,
-                self._guard_operation(state, "rebuild"),
-                self.actor,
             )
 
     def _seal(self, epoch: str, state: Document) -> None:
