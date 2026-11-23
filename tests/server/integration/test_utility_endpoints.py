@@ -106,6 +106,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "project_repository_creation": True,
         "quick_pick_palette": False,
         "workspace_sidebar_v2": False,
+        # Off: it follows workspace_sidebar_v2 while no deployment names it.
+        "floating_panes": False,
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,
