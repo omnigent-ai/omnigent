@@ -8184,7 +8184,10 @@ function BulkActionBar({
         leavingIds,
         source: "bulk",
         navigate,
-        newSessionPath: newSessionPathFor(toArchive.find((c) => c.id === activeId) ?? toArchive[0]),
+        newSessionPath: newSessionPathFor(
+          queryClient,
+          toArchive.find((c) => c.id === activeId) ?? toArchive[0],
+        ),
         queryClient,
       });
     }
