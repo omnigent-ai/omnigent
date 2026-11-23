@@ -3696,6 +3696,9 @@ async def _persist_external_conversation_item_unlocked(
         # Before the queue entry settles, so a side chat fork that saw it pending
         # finds the request it became.
         _record_turn_request(session_id, persisted.id)
+        # A web message that starts a turn is in flight until the turn's next status edge.
+        if drained is not None and not drained.queued_during_turn and item.type == "message":
+            _session_dispatched_turns.add(session_id)
     # Landed: the drained entries are settled (uncertain ones leave without a
     # record — their mirror may already have been attributed by position);
     # older messages a slash command jumped over are still on their way and

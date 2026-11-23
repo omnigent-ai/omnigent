@@ -8694,7 +8694,7 @@ async def _dispatch_skill_slash_command_to_runner(
     )
     visible = persisted_items[0]
     if not visible.deduplicated:
-        _record_sent_request(session_id, visible.id, runner_item_id=persisted_items[1].id)
+        _record_sent_request(session_id, visible.id)
 
     # Mirror the plain-message path's title seeding: a session whose FIRST
     # message is a skill invocation (web landing composer, REPL) would
@@ -8727,6 +8727,8 @@ async def _dispatch_skill_slash_command_to_runner(
         # Hand the runner that id so a cold-cache reload drops the
         # right persisted copy (see _forward_event_to_runner).
         "persisted_item_id": persisted_items[1].id,
+        # The runner names the turn by the item a side chat cuts before: the visible command.
+        "request_item_id": visible.id,
     }
     effective_runner_override = (
         body.model_override if body.model_override is not None else conv.model_override
