@@ -8272,7 +8272,12 @@ function BulkActionBar({
     // session they switched to meanwhile. Mirrors handleDelete.
     const leavingIds = toArchive.map((c) => c.id);
     // An open sub-agent leaves with its selected ancestor, so New session follows that row.
-    const leavingOpenRow = leavingRowOfOpenSession(queryClient, activeId, leavingIds);
+    // Without ⌘K's QuickPick, only archiving the open session itself leaves its view, as before.
+    const leavingOpenRow = isFeatureEnabled(serverInfo, "quick_pick_palette")
+      ? leavingRowOfOpenSession(queryClient, activeId, leavingIds)
+      : activeId && leavingIds.includes(activeId)
+        ? activeId
+        : null;
     const openRow = toArchive.find((c) => c.id === leavingOpenRow);
     if (openRow) {
       navigateAfterArchiving({

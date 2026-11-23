@@ -370,11 +370,17 @@ describe("archiving the open session", () => {
   }
 
   // On a session route, so the sidebar knows which session is open.
-  function renderOnSession(sessionId: string) {
+  function renderOnSession(sessionId: string, { quickPick = false } = {}) {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const info = quickPick
+      ? {
+          ...FALLBACK_SERVER_INFO,
+          features: { ...FALLBACK_SERVER_INFO.features, quick_pick_palette: true },
+        }
+      : FALLBACK_SERVER_INFO;
     render(
       <QueryClientProvider client={qc}>
-        <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+        <CapabilitiesProvider info={info}>
           <SidebarDataProvider>
             <TooltipProvider>
               <MemoryRouter initialEntries={[`/c/${sessionId}`]}>
@@ -461,7 +467,7 @@ describe("archiving the open session", () => {
     });
     // The open sub-agent isn't a sidebar row; its root is.
     setSessionParent("child", "conv_c");
-    renderOnSession("child");
+    renderOnSession("child", { quickPick: true });
     fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
     fireEvent.click(screen.getByRole("link", { name: /Alpha/ }));
     fireEvent.click(screen.getByRole("link", { name: /Charlie/ }));
@@ -471,6 +477,20 @@ describe("archiving the open session", () => {
     // Another project's session comes first, so the first selected row would pick its project.
     expect(mocks.bulkArchive.mutate.mock.calls[0][0].ids).toEqual(["conv_a", "conv_c"]);
     expect(location()).toBe("/?project=Zephyr");
+  });
+
+  it("stays on an open sub-agent whose root a bulk archive takes, without quick_pick_palette", () => {
+    const root = { ...CONV, id: "conv_c", title: "Charlie" };
+    mockConversations([{ ...CONV, id: "conv_a", title: "Alpha" }, root]);
+    setSessionParent("child", "conv_c");
+    renderOnSession("child");
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+    fireEvent.click(screen.getByRole("link", { name: /Alpha/ }));
+    fireEvent.click(screen.getByRole("link", { name: /Charlie/ }));
+    fireEvent.click(screen.getByTestId("bulk-archive"));
+
+    expect(mocks.bulkArchive.mutate).toHaveBeenCalledTimes(1);
+    expect(location()).toBe("/c/child");
   });
 
   it("goes home, as before, without quick_pick_palette's recent-session host", () => {
