@@ -673,6 +673,23 @@ describe("split groups of shells", () => {
     expect(ended).toEqual(["k1"]);
   });
 
+  it("stops when another shell starts running in the update that drops a closing one", async () => {
+    const { store } = makeStore({ initial: initial(shells, "F") });
+    store.setTerminalInventory({ status: "loaded", keys: ["k1", "k2"] });
+    await store.open({ place: { kind: "terminal", key: "k3" } }, { opener: "user" });
+    const ended: string[] = [];
+    const result = await store.closeTerminalGroup(["T1", "T2"], {
+      teardownFor: async (key) => {
+        ended.push(key);
+        // One list both drops the shell this close ended and shows the other one running.
+        store.setTerminalInventory({ status: "loaded", keys: ["k2", "k3"] });
+        return true;
+      },
+    });
+    expect(result).toEqual({ ok: false, stale: true });
+    expect(ended).toEqual(["k1"]);
+  });
+
   it("refuses a second close of the same shells while the first is ending them", async () => {
     const { store } = makeStore({ initial: initial(shells, "F") });
     const first = deferred<boolean>();

@@ -1121,11 +1121,13 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
   function setTerminalInventory(inventory: TerminalInventory) {
     // Only a change a shell tab shows counts as a revision, so an unrelated list
     // doesn't overturn an action the user is confirming.
-    const shellStates = () =>
+    const shellStates = (except: ReadonlySet<string> = new Set()) =>
       knownTabs()
+        .filter((tab) => !(tab.binding?.kind === "terminal" && except.has(tab.binding.key)))
         .map((tab) => (tab.binding?.kind === "terminal" ? resourceState(tab.id) : ""))
         .join();
     const before = shellStates();
+    const othersBefore = shellStates(closingTerminals);
     let removed = false;
     let removedOther = false;
     terminalInventory = inventory;
@@ -1147,8 +1149,11 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     }
     if (!removed && shellStates() === before) return;
     commit();
-    // Only the shells a group close is ending went: that close stays current.
-    if (removed && !removedOther && closingTerminals.size > 0) excusedChanges += 1;
+    // Only the shells a group close is ending went, and nothing else changed: that close stays
+    // current.
+    const othersChanged = shellStates(closingTerminals) !== othersBefore;
+    if (removed && !removedOther && !othersChanged && closingTerminals.size > 0)
+      excusedChanges += 1;
   }
 
   /** The first send created the side chat: fill in its ID, once. */
