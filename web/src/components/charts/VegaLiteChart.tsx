@@ -1,9 +1,10 @@
 import { Button } from "@/components/ui/button";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { triggerBrowserDownload } from "@/hooks/useFileContent";
+import { getThemeRoots } from "@/lib/host";
 import { cn } from "@/lib/utils";
 import { ChartColumnIcon, CodeIcon, DownloadIcon } from "lucide-react";
-import type { ReactNode } from "react";
+import type { ReactNode, RefObject } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
@@ -19,16 +20,28 @@ function messageOf(error: unknown): string {
 }
 
 /**
- * A number that changes when the page's theme classes or palette change, so a
- * chart redraws in the new colors. The mode alone misses palette switches.
+ * A number that changes when the colors around *plotRef* change, so a chart
+ * redraws in them. The mode alone misses palette and custom theme edits, which
+ * embedded land on the embed's theme roots rather than `<html>`.
  */
-function useThemeAttributesVersion(): number {
+function useThemeColorsVersion(plotRef: RefObject<HTMLElement | null>): number {
   const [version, setVersion] = useState(0);
   useEffect(() => {
-    const observer = new MutationObserver(() => setVersion((current) => current + 1));
-    observer.observe(document.documentElement, { attributeFilter: ["class", "data-theme"] });
+    const colorsKey = () =>
+      plotRef.current ? JSON.stringify(readChartColors(plotRef.current, false)) : "";
+    let drawnColors = colorsKey();
+    // Unrelated root style writes (e.g. native insets) leave the colors alone.
+    const observer = new MutationObserver(() => {
+      const colors = colorsKey();
+      if (colors === drawnColors) return;
+      drawnColors = colors;
+      setVersion((current) => current + 1);
+    });
+    for (const root of getThemeRoots()) {
+      observer.observe(root, { attributeFilter: ["class", "data-theme", "style"] });
+    }
     return () => observer.disconnect();
-  }, []);
+  }, [plotRef]);
   return version;
 }
 
@@ -59,8 +72,8 @@ export function VegaLiteChart({
 }) {
   const parsed = useMemo(() => parseVegaLiteSpec(spec), [spec]);
   const themeMode = useResolvedThemeMode();
-  const themeVersion = useThemeAttributesVersion();
   const plotRef = useRef<HTMLDivElement>(null);
+  const themeVersion = useThemeColorsVersion(plotRef);
   const chartRef = useRef<RenderedChart | null>(null);
   const [drawState, setDrawState] = useState<DrawState>({ status: "drawing" });
   const [showsSource, setShowsSource] = useState(false);

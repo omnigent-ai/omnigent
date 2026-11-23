@@ -1,6 +1,8 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { CSSProperties } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { setEmbedRoot, setEmbedScopeRoot } from "@/lib/host";
+import { applyThemePalette } from "@/lib/themePalette";
 import { VegaLiteChart } from "./VegaLiteChart";
 
 let resolvedTheme = "light";
@@ -82,6 +84,43 @@ describe("VegaLiteChart", () => {
     } finally {
       root.classList.remove("dark");
       root.style.removeProperty("--foreground");
+    }
+
+    // Embedded, palettes and custom themes land on the embed's roots, not <html>.
+    cleanup();
+    const scopeRoot = document.body.appendChild(document.createElement("div"));
+    const embedRoot = scopeRoot.appendChild(document.createElement("div"));
+    const surroundings = embedRoot.appendChild(document.createElement("div"));
+    setEmbedRoot(embedRoot);
+    setEmbedScopeRoot(scopeRoot);
+    try {
+      surroundings.style.setProperty("--foreground", "#222222");
+      render(<VegaLiteChart spec={BAR_SPEC} />, { container: surroundings });
+      const plot = await drawnChart();
+      const axisTitle = () => plot.querySelector("g.role-axis-title text");
+      expect(axisTitle()).toHaveAttribute("fill", "#222222");
+
+      // A root style write that leaves the colors alone keeps the drawn chart.
+      const drawnTitle = axisTitle();
+      await act(async () => {
+        scopeRoot.style.setProperty("--omnigent-native-top-bar", "20px");
+      });
+      expect(axisTitle()).toBe(drawnTitle);
+      expect(drawnTitle?.isConnected).toBe(true);
+
+      // The chart's surroundings change unobserved; the palette switch must redraw.
+      surroundings.style.setProperty("--foreground", "#333333");
+      applyThemePalette("dracula");
+      await waitFor(() => expect(axisTitle()).toHaveAttribute("fill", "#333333"));
+
+      surroundings.style.removeProperty("--foreground");
+      scopeRoot.style.setProperty("--foreground", "#444444");
+      await waitFor(() => expect(axisTitle()).toHaveAttribute("fill", "#444444"));
+    } finally {
+      cleanup();
+      setEmbedScopeRoot(null);
+      setEmbedRoot(null);
+      scopeRoot.remove();
     }
   });
 
