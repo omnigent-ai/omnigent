@@ -67,6 +67,7 @@ const {
   sanitizeServerName,
 } = require("./url");
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy, acceptCliDeepLink } = require("./deepLink");
+const { startDesktopOpenServer } = require("./desktopOpenServer");
 const {
   parseServerLabels,
   serverLabel,
@@ -5556,7 +5557,8 @@ function registerIpc() {
     } else {
       createWindow(undefined, { serverUrl, path: openPath });
     }
-    app.focus({ steal: true });
+    // focusAndRestore already brought the app forward on macOS.
+    if (!target || process.platform !== "darwin") app.focus({ steal: true });
     // After a launch the next open starts at the default placement again.
     floatingComposerController.hide(panel, { resetFrame: sessionPath !== null });
     return { ok: true };
@@ -6411,14 +6413,18 @@ function rememberServerUrl(serverUrl) {
 }
 
 /**
- * Restore (if minimized) and focus a window. No-op when absent/destroyed.
+ * Restore (if minimized) and bring a window in front of other apps. No-op when
+ * absent/destroyed.
  *
  * @param {BrowserWindow | null | undefined} win
  */
 function focusAndRestore(win) {
   if (!win || win.isDestroyed()) return;
   if (win.isMinimized()) win.restore();
+  win.show();
   win.focus();
+  // A request from a browser page doesn't activate the app the way an OS link does.
+  if (process.platform === "darwin") app.focus({ steal: true });
 }
 
 /**
@@ -6607,6 +6613,32 @@ async function confirmOpenDeepLink(parent, targetOrigin) {
     noLink: true,
   });
   return response === 1;
+}
+
+/**
+ * The loopback listener a server's web page uses to hand a conversation to this
+ * app (see README "Opening a conversation from the browser"); null until ready,
+ * and when every port is taken.
+ *
+ * @type {{ port: number, close: () => Promise<void> } | null}
+ */
+let desktopOpenServer = null;
+
+/**
+ * Listen for conversations handed over by the web page of a server the user
+ * has connected this app to. Other origins are refused, so a page can never
+ * make the app connect to a new server or show a prompt.
+ */
+async function startDesktopOpenListener() {
+  desktopOpenServer = await startDesktopOpenServer({
+    isKnownOrigin: (origin) => knownOrigins().includes(origin) || isPinnedServerUrl(origin),
+    openLink: enqueueDeepLink,
+  });
+  console.log(
+    desktopOpenServer
+      ? `[omnigent] desktop-open: listening on 127.0.0.1:${desktopOpenServer.port}`
+      : "[omnigent] desktop-open: no free port; pages can't hand conversations to this app",
+  );
 }
 
 /** Deep links awaiting handling, in arrival order. */
@@ -6855,6 +6887,7 @@ if (!gotLock) {
     // (`electron .`) clicks route to the running dev instance too. No-op
     // (returns false) when another app is already the default handler.
     app.setAsDefaultProtocolClient("omnigent");
+    void startDesktopOpenListener();
     // If a deep link arrived before ready (macOS open-url, or Windows/Linux
     // argv), open it instead of the default launch window; the drain's
     // fallback opens a default window if a consent is cancelled. Otherwise
@@ -6892,6 +6925,7 @@ if (!gotLock) {
 
   app.on("will-quit", () => {
     globalShortcut.unregisterAll();
+    void desktopOpenServer?.close();
     workspaceSshForwards.closeAll();
   });
   app.on("window-all-closed", () => {

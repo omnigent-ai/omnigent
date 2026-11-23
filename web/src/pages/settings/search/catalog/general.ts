@@ -84,6 +84,16 @@ export const OPEN_LINKS_IN_APP_ENTRY = settingsEntry({
   keywords: ["links", "browser", "in-app", "tabs", "click"],
 });
 
+export const OPEN_IN_DESKTOP_APP_ENTRY = settingsEntry({
+  id: "open-in-desktop-app",
+  available: (availability) => availability.desktopAppHandoff,
+  section: "general",
+  label: "Open conversations in the desktop app",
+  description:
+    "When a conversation link opens in this browser and the Omnigent desktop app is running, open it there. Your browser may ask once to let this site reach apps on this device.",
+  keywords: ["desktop", "app", "links", "browser", "open", "conversation", "hand off"],
+});
+
 export const ADMIN_VIEW_ENTRY = settingsEntry({
   id: "admin-view",
   available: (availability) => availability.adminView,
@@ -199,6 +209,7 @@ export const GENERAL_SETTINGS = [
   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
   TERMINAL_CLIPBOARD_ENTRY,
   OPEN_LINKS_IN_APP_ENTRY,
+  OPEN_IN_DESKTOP_APP_ENTRY,
   ADMIN_VIEW_ENTRY,
   PROJECT_KANBAN_BOARD_ENTRY,
   BROWSER_AGENT_TOOLS_ENTRY,

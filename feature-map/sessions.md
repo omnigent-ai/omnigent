@@ -337,6 +337,14 @@ the header menu), and each place is a separate entry point.
   Server admins configure the available targets under Settings → Admin → General →
   **Nested agent destinations**.
 
+- To move a conversation from the browser to the desktop app, open its link
+  (`/c/<id>`) in a desktop browser while the app is running and connected to
+  that server. The first time, a toast asks **Open conversations in the
+  Omnigent desktop app?**; **Open in app** opens it there and makes later links
+  move on their own. Turn it on or off under Settings → General → Conversation
+  links → **Open conversations in the desktop app**. Links to a file or to
+  Canvas stay in the browser.
+
 **Session grids (desktop only):** with `grid_sessions_display_ui` on (the default), open a
 session, and drag another sidebar row over it. Hover **Split left/right/top/bottom**
 to preview, then drop. Split a remaining full-width or full-height pane again
