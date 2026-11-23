@@ -32,7 +32,7 @@ export const AllPathsOffered: Story = {
   args: {
     harness: "codex",
     label: "Codex",
-    subscription: <HarnessSubscriptionSignIn command="codex login" hostName="example-host" />,
+    subscription: <HarnessSubscriptionSignIn command="codex login" hostName={host.name} />,
   },
   decorators: [
     (Story) => (

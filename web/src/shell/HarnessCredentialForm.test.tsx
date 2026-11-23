@@ -334,13 +334,7 @@ describe("HarnessCredentialForm", () => {
       }),
     );
     render(
-      <HarnessCredentialForm
-        harness="codex-native"
-        label="Codex"
-        host={HOST}
-
-        onDone={vi.fn()}
-      />,
+      <HarnessCredentialForm harness="codex-native" label="Codex" host={HOST} onDone={vi.fn()} />,
     );
     fireEvent.change(screen.getByTestId("harness-credential-key"), { target: { value: "sk-x" } });
     fireEvent.click(screen.getByTestId("harness-credential-save"));
