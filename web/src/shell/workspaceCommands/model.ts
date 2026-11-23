@@ -110,7 +110,12 @@ export type WorkspaceTabAction =
   | "move-left"
   | "move-right"
   | "toggle-pin"
-  | "search-tabs";
+  | "search-tabs"
+  | WorkspaceTabGroupCloseAction;
+
+/** Closing a kind of tab at once, from the all-tabs list's headings and ⌘K. */
+export type WorkspaceTabGroupCloseAction =
+  "close-merged-pull-requests" | "close-pull-request-tabs" | "close-file-tabs" | "close-page-tabs";
 export type WorkspaceTabActionCommand = Extract<WorkspaceCommand, { kind: "tab-action" }>;
 
 export type WorkspaceShellCommand = Extract<WorkspaceCommand, { kind: "shell" }>;
@@ -370,6 +375,11 @@ export interface WorkspaceTabListFacts {
   selectedPinned?: boolean;
   /** Why the selected tab can't be pinned, such as a split; absent when it can. */
   selectedPinRefusal?: string;
+  /**
+   * How many tabs each group close would close, for a sidebar whose tab list groups its tabs;
+   * absent offers none of them.
+   */
+  groupCloseCounts?: Readonly<Record<WorkspaceTabGroupCloseAction, number>>;
 }
 
 export const SIDEBAR_CLOSED_REASON = "The workspace sidebar is closed.";
@@ -383,6 +393,37 @@ export const TAB_NOT_CLOSABLE_REASON = "You need edit access to close this shell
 export const NO_TABS_REASON = "No workspace tabs are open.";
 export const SEARCH_TABS_LABEL = "Search tabs…";
 export const PINNED_EDGE_REASON = "Pinned tabs stay before the other tabs.";
+
+/** Each group close: its ⌘K label, its heading's label, and why it can't run with none to close. */
+const GROUP_CLOSES: Record<
+  WorkspaceTabGroupCloseAction,
+  { label: string; menuLabel: (count: number) => string; keywords: string[]; none: string }
+> = {
+  "close-merged-pull-requests": {
+    label: "Close merged pull request tabs",
+    menuLabel: (count) => `Close merged (${count})`,
+    keywords: ["close", "merged", "pull request", "pr", "done"],
+    none: "No tab shows a merged pull request.",
+  },
+  "close-pull-request-tabs": {
+    label: "Close all pull request tabs",
+    menuLabel: () => "Close all",
+    keywords: ["close", "all", "pull request", "pr"],
+    none: "No pull request tabs can close.",
+  },
+  "close-file-tabs": {
+    label: "Close all file tabs",
+    menuLabel: () => "Close all",
+    keywords: ["close", "all", "file", "editor", "changes"],
+    none: "No file tabs can close.",
+  },
+  "close-page-tabs": {
+    label: "Close all page tabs",
+    menuLabel: () => "Close all",
+    keywords: ["close", "all", "page", "browser", "web"],
+    none: "No page tabs can close.",
+  },
+};
 
 /**
  * New tab, reopen, close others, move left or right, and search the open tabs, for "+"'s menu,
@@ -501,6 +542,17 @@ export function workspaceTabActionCommands(
       ["search", "find", "switch", "go to", "list", "all tabs", "open tabs"],
       onScreen(facts.tabCount > 0 ? AVAILABLE : unavailableBecause(NO_TABS_REASON)),
     ),
+    // Pinned tabs and shells stay, so each count is only what the close takes.
+    ...Object.entries(facts.groupCloseCounts ?? {}).map(([action, count]) => {
+      const close = GROUP_CLOSES[action as WorkspaceTabGroupCloseAction];
+      return command(
+        action as WorkspaceTabGroupCloseAction,
+        close.label,
+        close.menuLabel(count),
+        close.keywords,
+        onScreen(count > 0 ? AVAILABLE : unavailableBecause(close.none)),
+      );
+    }),
   ];
 }
 

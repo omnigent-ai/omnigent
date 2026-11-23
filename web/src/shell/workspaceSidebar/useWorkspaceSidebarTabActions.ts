@@ -12,6 +12,7 @@ import {
   tabActionCommandFor,
   type WorkspaceTabAction,
   type WorkspaceTabActionCommand,
+  type WorkspaceTabGroupCloseAction,
   type WorkspaceTabListFacts,
   workspaceTabActionCommands,
 } from "../workspaceCommands/model";
@@ -25,11 +26,16 @@ import {
 } from "../workspaceTabs/keepSidebarFocus";
 import type { TabStripWidth } from "../workspaceTabs/useTabStripWidth";
 import { isPinnedTab } from "../workspaceTabs/pinnedTabs";
+import { groupClosesOf, type TabGroupId } from "../workspaceTabs/tabGroups";
 import { useWorkspaceTabStepping } from "../workspaceTabs/useWorkspaceTabStepping";
 import type { StripTabMenuItem } from "../workspaceTabs/WorkspaceStripTab";
 import type { TabId } from "../workspaceTabs/workspacePlace";
-import type { WorkspaceTab } from "../workspaceTabs/workspaceTab";
-import { isOnlyEmptyNewTab, type WorkspaceTabsStore } from "../workspaceTabs/workspaceTabsStore";
+import { isUnknownTab, type WorkspaceTab } from "../workspaceTabs/workspaceTab";
+import {
+  isBatchClosable,
+  isOnlyEmptyNewTab,
+  type WorkspaceTabsStore,
+} from "../workspaceTabs/workspaceTabsStore";
 
 /** Chords only the focused strip handles, so their ⌘K rows carry none; the menu still shows them. */
 const STRIP_TAB_SHORTCUTS: Partial<Record<WorkspaceTabAction, ShortcutId>> = {
@@ -65,6 +71,14 @@ export interface WorkspaceSidebarTabActionsOptions {
   offers?: { newTab?: () => void; searchTabs?: () => void };
   /** Offers Pin and Unpin, for a strip that shows pinned tabs; `refusalFor` says why a tab can't. */
   pinning?: { refusalFor?: (tabId: TabId) => string | undefined };
+  /**
+   * Offers closing a group of tabs at once, for a tab list that groups them: the group each
+   * tab is listed under, and whether a pull request tab's PR has merged.
+   */
+  tabGroups?: {
+    groupOf: (tab: WorkspaceTab) => TabGroupId;
+    merged: (tab: WorkspaceTab) => boolean;
+  };
   /** Puts the sidebar on screen, as reopening a tab does. */
   onReveal?: () => void;
 }
@@ -88,6 +102,7 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
     releaseFor,
     offers = {},
     pinning,
+    tabGroups,
     onReveal,
   } = options;
   const { tabs, selectedTabId, canReopen } = store.snapshot();
@@ -132,6 +147,29 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
   const reopenClosedTab = () => {
     if (store.reopenClosed() !== null) onReveal?.();
   };
+  // What each group close takes: the tabs shown here that this user may close and that close
+  // as a group, so pinned tabs and shells stay.
+  const groupCloseTargets = (() => {
+    if (!tabGroups) return undefined;
+    const targets: Record<WorkspaceTabGroupCloseAction, TabId[]> = {
+      "close-merged-pull-requests": [],
+      "close-pull-request-tabs": [],
+      "close-file-tabs": [],
+      "close-page-tabs": [],
+    };
+    for (const tab of tabs) {
+      if (isUnknownTab(tab) || !isBatchClosable(tab) || !canClose(tab)) continue;
+      for (const action of groupClosesOf(tabGroups.groupOf(tab), tabGroups.merged(tab))) {
+        targets[action].push(tab.id);
+      }
+    }
+    return targets;
+  })();
+  const closeGroup = (action: WorkspaceTabGroupCloseAction) => {
+    const targetIds = groupCloseTargets?.[action];
+    if (!targetIds?.length) return;
+    void store.closeMany(targetIds, releaseFor ?? (() => undefined));
+  };
 
   const selectedIndex =
     selectedTabId === null ? -1 : tabs.findIndex((tab) => tab.id === selectedTabId);
@@ -147,6 +185,13 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
     selectedCloseRefusal: selectedTabId === null ? undefined : closeRefusalFor?.(selectedTabId),
     selectedIsOnlyEmptyNewTab: selectedTabId !== null && isOnlyEmptyNewTab(tabs, selectedTabId),
     selectedLabel,
+    ...(groupCloseTargets
+      ? {
+          groupCloseCounts: Object.fromEntries(
+            Object.entries(groupCloseTargets).map(([action, ids]) => [action, ids.length]),
+          ) as Record<WorkspaceTabGroupCloseAction, number>,
+        }
+      : {}),
   };
   const commands = workspaceTabActionCommands(facts).filter(
     (command) =>
@@ -186,6 +231,12 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
         return;
       case "search-tabs":
         offers.searchTabs?.();
+        return;
+      case "close-merged-pull-requests":
+      case "close-pull-request-tabs":
+      case "close-file-tabs":
+      case "close-page-tabs":
+        closeGroup(command.action);
         return;
     }
   };
