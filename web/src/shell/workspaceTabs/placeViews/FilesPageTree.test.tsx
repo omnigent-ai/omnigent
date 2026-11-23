@@ -358,7 +358,14 @@ describe("FilesPageTree", () => {
       // A match the reader wants in its own tab opens there.
       fireEvent.click(screen.getByRole("button", { name: "lib/button.ts" }), { metaKey: true });
       expect(onFileSelect).toHaveBeenLastCalledWith("src/lib/button.ts", { newTab: true });
-      expect(paletteLabels()).toContain("Clear Files Tree Filter");
+      // ⌘K's Clear Files Tree Filter empties the fields and brings back the whole tree.
+      const clear = Object.values(usePaletteCommandsStore.getState().groups)
+        .flatMap((group) => group.commands)
+        .find((command) => command.label === "Clear Files Tree Filter");
+      act(() => void clear!.run());
+      expect(nameField()).toHaveValue("");
+      expect(screen.getByTestId("files-tree")).toBeInTheDocument();
+      expect(paletteLabels()).not.toContain("Clear Files Tree Filter");
     });
 
     it("ends the filter for the header's Reveal, so the whole tree shows the viewed file", () => {
