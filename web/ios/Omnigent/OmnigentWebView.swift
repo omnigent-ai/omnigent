@@ -1646,6 +1646,8 @@ struct OmnigentWebView: UIViewRepresentable {
       do {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
       } catch {
+        // WebKit reports the refused destination as a cancellation, which stays quiet.
+        showDownloadFailure(error)
         completionHandler(nil)
         return
       }
@@ -1663,8 +1665,9 @@ struct OmnigentWebView: UIViewRepresentable {
     /// Hands the saved file to the share sheet, which offers Save to Files, AirDrop and Print.
     func downloadDidFinish(_ download: WKDownload) {
       guard let saved = downloadFiles.removeValue(forKey: download) else { return }
-      // A download that outlives its web view (e.g. a server switch) has nowhere to show.
-      guard let webView, isCurrent(webView), let presenter = topViewController() else {
+      // The web view's window still presents while the app is inactive or backgrounded; a
+      // download that outlives its web view (e.g. a server switch) has nowhere to show.
+      guard let webView, isCurrent(webView), let presenter = downloadPresenter else {
         try? FileManager.default.removeItem(at: saved.directory)
         return
       }
@@ -1687,10 +1690,18 @@ struct OmnigentWebView: UIViewRepresentable {
       }
       guard let webView, isCurrent(webView), (error as NSError).code != NSURLErrorCancelled
       else { return }
+      showDownloadFailure(error)
+    }
+
+    private var downloadPresenter: UIViewController? {
+      webView?.window?.rootViewController?.omnigentTopViewController
+    }
+
+    private func showDownloadFailure(_ error: Error) {
       let alert = UIAlertController(
         title: "Download failed", message: error.localizedDescription, preferredStyle: .alert)
       alert.addAction(UIAlertAction(title: "OK", style: .default))
-      topViewController()?.present(alert, animated: true)
+      downloadPresenter?.present(alert, animated: true)
     }
 
     func webView(
