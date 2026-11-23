@@ -82,7 +82,7 @@ const MAX_BROWSER_TITLE_LENGTH = 512;
 const CREDENTIAL_PARAM_PART = new RegExp(
   [
     "token|secret|passw|signature|credential|verifier|api[-_]?key|session[-_]?id",
-    "saml(request|response)",
+    "saml(request|response|art)",
     "(access|auth|login|pass|private|secure|signing)[-_.]?(code|key|pwd|sig|ticket)",
   ].join("|"),
   "i",
@@ -247,8 +247,21 @@ function writeStore(store: Store): boolean {
   try {
     window.localStorage.setItem(SESSION_WORKSPACE_STATE_KEY, JSON.stringify(store));
     return true;
+  } catch (error) {
+    if (
+      !(error instanceof DOMException) ||
+      error.name !== "QuotaExceededError" ||
+      !store.some(({ state }) => state.browserPages)
+    ) {
+      return false;
+    }
+  }
+  // Page metadata is expendable when it prevents workspace settings from being saved.
+  for (const { state } of store) delete state.browserPages;
+  try {
+    window.localStorage.setItem(SESSION_WORKSPACE_STATE_KEY, JSON.stringify(store));
+    return true;
   } catch {
-    // Storage quota/access errors must not break panel interactions.
     return false;
   }
 }

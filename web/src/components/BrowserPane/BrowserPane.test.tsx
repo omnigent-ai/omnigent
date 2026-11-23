@@ -91,6 +91,7 @@ vi.mock("sonner", () => ({ toast }));
 function installBridge(overrides: Record<string, unknown> = {}) {
   const noopUnsub = () => {};
   const bridge = {
+    getDesktopFeatures: vi.fn().mockResolvedValue({ browserPageRestore: true }),
     browserHasView: vi.fn().mockResolvedValue({ exists: false }),
     onBrowserViewCreated: vi.fn().mockReturnValue(noopUnsub),
     onBrowserHostActiveChanged: vi.fn().mockReturnValue(noopUnsub),
@@ -213,6 +214,35 @@ describe("BrowserPane cold-start (no view yet)", () => {
         "https://example.com/report",
         undefined,
         { sourceHostId: "local-host", sessionHostProtocol: 1, restore: true },
+      ),
+    );
+  });
+
+  it.each([
+    ["no feature method", undefined],
+    ["no restore capability", {}],
+    ["restore disabled", { browserPageRestore: false }],
+  ])("leaves a saved URL for manual navigation with %s", async (_name, features) => {
+    savedReport();
+    const bridge = installBridge({
+      getDesktopFeatures: features === undefined ? undefined : vi.fn().mockResolvedValue(features),
+    });
+    await act(async () => {
+      render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
+    });
+
+    const bar = screen.getByRole("textbox", { name: "Address bar" });
+    expect(bar).toHaveValue("https://example.com/report");
+    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    fireEvent.keyDown(bar, { key: "Enter" });
+    await waitFor(() =>
+      expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+        "browser-tab:conv_a:two",
+        "https://example.com/report",
+        undefined,
+        expect.objectContaining({ force: true }),
       ),
     );
   });

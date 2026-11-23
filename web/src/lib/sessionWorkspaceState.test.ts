@@ -179,6 +179,47 @@ describe("sessionWorkspaceState", () => {
     expect(readSessionWorkspaceState("conv_a")).toEqual({ open: true });
   });
 
+  it("discards saved pages when they prevent workspace settings from persisting", () => {
+    for (const id of ["conv_a", "conv_b"]) {
+      writeSessionWorkspaceState(id, {
+        open: true,
+        openBrowsers: ["tab"],
+        browserPages: { tab: { url: "https://docs.example/", owner: "user-a" } },
+      });
+    }
+    const setItem = Storage.prototype.setItem;
+    // Simulate a quota that fits the workspace settings, but not the page metadata.
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (this: Storage, key, value) {
+      if (value.length > 200) throw new DOMException("Quota exceeded", "QuotaExceededError");
+      setItem.call(this, key, value);
+    });
+
+    expect(saveSessionWorkspaceState("conv_a", { widthPx: 480 })).toBe(true);
+    expect(readSessionWorkspaceState("conv_a")).toEqual({
+      open: true,
+      openBrowsers: ["tab"],
+      widthPx: 480,
+    });
+    expect(readSessionWorkspaceState("conv_b")).toEqual({ open: true, openBrowsers: ["tab"] });
+  });
+
+  it.each(["QuotaExceededError", "SecurityError"])(
+    "preserves stored pages when saving still fails with %s",
+    (name) => {
+      const state = {
+        open: true,
+        browserPages: { tab: { url: "https://docs.example/", owner: "user-a" } },
+      };
+      writeSessionWorkspaceState("conv_a", state);
+      vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+        throw new DOMException("Storage unavailable", name);
+      });
+
+      expect(saveSessionWorkspaceState("conv_a", { open: false })).toBe(false);
+      expect(readSessionWorkspaceState("conv_a")).toEqual(state);
+    },
+  );
+
   it("prunes the least-recently-touched session past the cap (numeric ids)", () => {
     // Seed exactly MAX_SESSIONS sessions with purely numeric ids ("1".."100").
     // Numeric-string keys are the case a plain object store gets wrong: V8
@@ -245,6 +286,7 @@ describe("sessionWorkspaceState", () => {
         "tab-4":{"url":"https://unowned.example/"},
         "tab-5":{"url":"https://app.example/?token=abc","owner":"user-a"},
         "tab-6":{"url":"https://app.example/#/callback?code=abc","owner":"user-a"},
+        "tab-7":{"url":"https://app.example/consume?SAMLart=abc","owner":"user-a"},
         "__proto__":{"url":"https://proto.example/","owner":"user-a"}
       }}}]`,
     );

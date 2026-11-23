@@ -117,6 +117,9 @@ describe("saved browser pages", () => {
       "https://files.example/report#/route?authkey=abc",
       "https://app.example/verify?passcode=abc",
       "https://app.example/export?PrivateKey=abc",
+      "https://app.example/consume?SAMLart=abc",
+      "https://app.example/#samlart=abc",
+      "https://app.example/#/consume?SAMLart=abc",
     ]) {
       saveBrowserPage(userTab, url);
     }

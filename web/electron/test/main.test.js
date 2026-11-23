@@ -885,6 +885,7 @@ describe("Arca extend IPC", () => {
         canExtendArca: true,
         canRefreshDbcert: true,
         arcaPreviewRecovery: true,
+        browserPageRestore: true,
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
         sshLocalhostPreview: true,
@@ -5232,6 +5233,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         canExtendArca: true,
         canRefreshDbcert: true,
         arcaPreviewRecovery: true,
+        browserPageRestore: true,
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
         sshLocalhostPreview: true,

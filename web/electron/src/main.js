@@ -5853,6 +5853,7 @@ function registerIpc() {
       canExtendArca: enabled,
       canRefreshDbcert: enabled,
       arcaPreviewRecovery: true,
+      browserPageRestore: true,
       // Importing local Chrome cookies is wired for macOS only (Keychain-decrypted
       // v10 values); the SPA hides the toolbar button everywhere else.
       chromeCookieImport: process.platform === "darwin",

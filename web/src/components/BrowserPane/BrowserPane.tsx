@@ -52,6 +52,7 @@ import { useDesktopCommand } from "@/lib/desktopCommands";
 import {
   CHROME_COOKIE_ALL_SITES_SCOPE,
   getDesktopFeatures,
+  navigationHostOptions,
   supportsBrowser,
   supportsDesktopCommands,
   type BrowserHostOptions,
@@ -334,6 +335,9 @@ export function BrowserPane({
         const saved = readSavedBrowserPage(conversationId, await resolveIdentity());
         if (!saved || superseded()) return;
         if (!urlEditingRef.current) setCurrentUrl(saved.url);
+        // Older shells ignore `restore` and could cancel a pending agent navigation.
+        const features = await getDesktopFeatures();
+        if (features?.browserPageRestore !== true || superseded()) return;
         const hostId = await fetchSessionHostId(browserViewOwnerId(conversationId));
         if (superseded()) return;
         // The shell refuses a restore once the tab has, or is getting, another page.
