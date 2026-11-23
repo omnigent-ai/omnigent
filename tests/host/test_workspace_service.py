@@ -366,7 +366,8 @@ async def test_list_directory_lists_plainly_where_git_cant_run(
     async def unusable_runner(*_args: object) -> None:
         raise AttributeError("module 'os' has no attribute 'killpg'")
 
-    monkeypatch.setattr("omnigent.host.workspace_service.runs_on_this_host", lambda: False)
+    # No POSIX process groups, and discovery fails as it does there.
+    monkeypatch.delattr(os, "killpg")
     monkeypatch.setattr(DirectoryIgnores, "for_directory", unusable_runner)
     client = client_for(_ignoring_workspace(tmp_path / "repo"))
 
