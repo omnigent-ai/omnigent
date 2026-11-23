@@ -328,6 +328,30 @@ async def test_output_past_its_cap_is_refused_or_kept_partially(
     assert b"".join(chunks) == partial.stdout
 
 
+async def test_a_sink_that_fails_ends_git_and_raises_its_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pids = tmp_path / "pids"
+    root = _fake_git(
+        tmp_path,
+        monkeypatch,
+        f"echo $$ >> {pids}\nsleep 60 & echo $! >> {pids}\necho a.txt\nwait\n",
+    )
+    repository = await _discover(root)
+
+    def refuse(_chunk: bytes) -> None:
+        raise RuntimeError("the reader refused the output")
+
+    with pytest.raises(RuntimeError, match="the reader refused the output"):
+        await repository.run_unchecked(
+            ["ls-files"], deadline=Deadline(10), allow_partial=True, stdout_sink=refuse
+        )
+
+    leftover = [int(pid) for pid in pids.read_text().split()]
+    assert len(leftover) == 2
+    assert not any(_alive(pid) for pid in leftover)
+
+
 async def test_failures_summarize_gits_last_error_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
