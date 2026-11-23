@@ -50,10 +50,13 @@ function DialogContent({
   className,
   children,
   showCloseButton = true,
+  overlayClassName,
   style,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean;
+  /** Classes for the backdrop, such as a clear one over a live preview. */
+  overlayClassName?: string;
 }) {
   // On the iOS shell the layout viewport stays full-height when the soft
   // keyboard opens (the native shell keeps the WKWebView full via
@@ -76,7 +79,7 @@ function DialogContent({
     : {};
   return (
     <DialogPortal>
-      <DialogOverlay />
+      <DialogOverlay className={overlayClassName} />
       {/* A single minmax(0,1fr) column keeps unbreakable content, such as a
           long URL in a field, from widening the grid past the panel. */}
       <DialogPrimitive.Content

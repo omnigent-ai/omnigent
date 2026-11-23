@@ -1,7 +1,9 @@
-// Previous / Next Sidebar Tab (⇧⌘[ / ⇧⌘]) in the workspace sidebar, which the page handles
-// except in a code editor, where those keys fold and unfold.
+// Previous / Next Sidebar Tab (⇧⌘[ / ⇧⌘]) in the workspace sidebar. The page steps on the chord
+// and keeps it from the Go menu; the menu gets the keys the page didn't handle, such as from a
+// browser page with focus. A code editor keeps them where these keys are folding shortcuts.
 import { useEffect, useRef } from "react";
 
+import { useDesktopCommand } from "@/lib/desktopCommands";
 import { TAB_KEY_OWNING_DIALOG_OR_MENU } from "@/lib/hotkeys";
 import { matchesShortcut } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
 
@@ -23,11 +25,16 @@ export function adjacentStripEntry<Id>(
   return entryIds[(index + direction + entryIds.length) % entryIds.length]!;
 }
 
-/** Run `onStep` for Previous / Next Sidebar Tab, except in a code editor, which folds on them. */
+/**
+ * Run `onStep` for Previous / Next Sidebar Tab: from the chord, which the page then keeps from
+ * the desktop menu, or from the menu for a key the page didn't handle.
+ */
 export function useWorkspaceTabStepChords(onStep: ((direction: -1 | 1) => void) | null): void {
   const latest = useRef(onStep);
   latest.current = onStep;
   const enabled = onStep !== null;
+  useDesktopCommand("previous-tab", enabled ? () => latest.current?.(-1) : null);
+  useDesktopCommand("next-tab", enabled ? () => latest.current?.(1) : null);
   useEffect(() => {
     if (!enabled) return;
     const handler = (event: KeyboardEvent) => {
@@ -36,11 +43,12 @@ export function useWorkspaceTabStepChords(onStep: ((direction: -1 | 1) => void) 
         : matchesShortcut(event, "workspace.nextTab")
           ? 1
           : 0;
-      if (direction === 0 || event.repeat) return;
+      if (direction === 0) return;
       const active = document.activeElement;
       if (active?.closest(FOLDING_EDITORS) || active?.closest(TAB_KEY_OWNING_DIALOG_OR_MENU)) {
         return;
       }
+      // A handled key never reaches the shell's menu, so a press steps once.
       event.preventDefault();
       event.stopPropagation();
       latest.current?.(direction);

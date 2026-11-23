@@ -1784,6 +1784,50 @@ async def test_native_relay_updates_workflow_tools_after_server_reconnect(
 
 
 @pytest.mark.asyncio
+async def test_native_relay_follows_a_routing_flip_in_both_directions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A routing change from a session-init envelope reaches an existing relay.
+
+    The spec is unchanged, so the relay is reused unless its binding records the
+    routing answer it was built under. Each relaunch must advertise the advisor
+    exactly while the server routes, in both directions.
+    """
+    from omnigent.runtime import _globals, set_remote_routing_available
+    from omnigent.runtime.caps import RuntimeCaps
+
+    monkeypatch.setattr(_globals, "_caps", RuntimeCaps())
+    agent_id = "ag_routing_relay"
+    server_client = _SwitchableServerClient(agent_id)
+    app = _switch_app(
+        tmp_path,
+        server_client,
+        {agent_id: AgentSpec(spec_version=1, name="agent-routing", spawn=True)},
+    )
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            try:
+                for routes in (False, True, False):
+                    # The envelope handler's only write to routing state; the
+                    # envelope round-trip is covered by the session-init tests.
+                    set_remote_routing_available(routes)
+                    await _launch_bridged(client, session_id)
+                    names = _relay_tool_names(relay_file)
+                    assert "list_comments" in names
+                    assert ("sys_advise_models" in names) is routes, sorted(names)
+            finally:
+                await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
 async def test_agent_switch_replaces_relay_in_same_bridge_dir(
     tmp_path: Path,
     terminal_registry_singleton: None,
@@ -2695,7 +2739,13 @@ async def test_settings_route_publishes_before_cancelled_admission_release(
         {"settings-agent": _spec_without_terminals()},
         resource_registry=registry,
     )
-    terminal = Mock(running=True, socket_path=tmp_path / "terminal.sock", tmux_target="claude:0.0")
+    terminal = Mock(
+        running=True,
+        socket_path=tmp_path / "terminal.sock",
+        tmux_target="claude:0.0",
+        private_dir=tmp_path / "terminal-private",
+        sandbox_policy=None,
+    )
     registry.terminal_registry = Mock()
     registry.terminal_registry.get.return_value = terminal
     callbacks: list[Callable[[], None]] = []
@@ -2760,6 +2810,7 @@ async def test_settings_route_publishes_before_cancelled_admission_release(
                 "tmux_target": "claude:0.0",
             }
             assert len(callbacks) == len(retained) == 1
+            terminal.add_process_lifetime_lease.assert_called_once()
             for _attempt in range(3):
                 task.cancel()
                 checkpoint = loop.create_future()
@@ -2780,7 +2831,8 @@ async def test_settings_route_publishes_before_cancelled_admission_release(
             assert baseline.read_bytes() == baseline_bytes
             await asyncio.to_thread(callbacks[0])
             assert retained[0]._fd is None
-            assert not list(bridge_dir.glob("claude-settings-*"))
+            assert baseline.read_bytes() == baseline_bytes
+            assert list(bridge_dir.glob("claude-settings-*.unconfirmed.owner"))
         finally:
             release_close.set()
             if not task.done():

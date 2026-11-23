@@ -66,20 +66,34 @@ import {
   type ShownReviewFiles,
 } from "@/lib/reviewFileLinks";
 import type { ChangedSort } from "@/lib/changedSort";
+import type { ComparisonChoice } from "@/lib/comparisonChoice";
 import { useLocalComparison } from "./useLocalComparison";
+import { useVisitComparison, type VisitComparisonOptions } from "./useVisitComparison";
 import type { CommentSelectionRequest } from "./commentSelectionHandoff";
 import { actionsOnlyCommentContext } from "./useReviewCommentLayer";
 import { unrepresentableNote, WorkingCopyDiffReviewBody } from "./WorkingCopyDiffReview";
 import { useLastInteractedSurface } from "./useLastInteractedSurface";
 
-// The reference design has no wrap button; ⌘K still offers wrapping.
-const WITHOUT_WRAP = ["toggle-wrap"] as const;
 const REVIEW_METADATA_KEYS = [BRANCH_COMMITS_KEY, REPOSITORY_REFS_KEY] as const;
 /** A commit's review toolbar: how its diff shows, with nothing about the session's comparison. */
 function renderCommitToolbar(toolbar: DiffReviewToolbarProps) {
-  return <DiffReviewToolbar {...toolbar} omit={WITHOUT_WRAP} />;
+  return <DiffReviewToolbar {...toolbar} />;
 }
 const NO_ACTIONS: readonly { label: string; run: () => void; primary?: boolean }[] = [];
+
+const NO_VISIT: VisitComparisonOptions["onShown"] = () => {};
+
+const SAVED_BASE_NAMES = {
+  automatic: "Automatic",
+  head: "Uncommitted changes",
+  "branch-point": "All branch changes",
+} as const;
+
+/** A comparison in plain words, as the menu names it. */
+function comparisonChoiceName(choice: ComparisonChoice): string {
+  if (choice.kind === "saved") return SAVED_BASE_NAMES[choice.intent];
+  return `“${choice.base}” with “${choice.head || "Working Copy"}”`;
+}
 
 export interface ChangesReviewProps {
   conversationId: string;
@@ -87,8 +101,14 @@ export interface ChangesReviewProps {
   revealPath?: string;
   /** A cited line in `revealPath` to bring into view; each new object is one request. */
   revealPosition?: FilePosition;
-  /** A base and head this view can't compare yet, from a link. */
+  /** A base and head a link asked for; compared as the session's own where typed ones can be. */
   requestedRange?: { base: string; head: string };
+  /** The comparison this visit showed, which showing it again applies to the session. */
+  comparison?: ComparisonChoice;
+  /** Records a comparison the session shows on the visit; without it, visits keep none. */
+  onComparisonShown?: VisitComparisonOptions["onShown"];
+  /** How the tab last landed on the visit, which applies the visit's comparison once. */
+  landing?: VisitComparisonOptions["landing"];
   /** The tab is selected and the sidebar is open. */
   active: boolean;
   /** Shows a file itself, in a Files tab. */
@@ -450,7 +470,10 @@ export function ChangesReview({
   conversationId,
   revealPath,
   revealPosition,
-  requestedRange,
+  requestedRange: linkedRange,
+  comparison: visitComparison,
+  onComparisonShown,
+  landing,
   active,
   onViewFile,
   onShowAllChanges,
@@ -459,13 +482,25 @@ export function ChangesReview({
   onOpenFileInNewTab,
   sort,
 }: ChangesReviewProps) {
-  const { changes, view: sessionView } = useLocalComparison(conversationId, { active });
+  const { changes, view: sessionView, choice } = useLocalComparison(conversationId, { active });
+  // Where typed comparisons work, a linked base and head is the visit's comparison instead.
+  const comparesTyped = ["available", "checking"].includes(changes.revisionSupport.kind);
+  const requestedRange = comparesTyped ? undefined : linkedRange;
+  const pendingVisit = useVisitComparison({
+    // A linked range the host can't compare keeps its visit until it can.
+    active: active && onComparisonShown !== undefined && requestedRange === undefined,
+    visit: visitComparison,
+    landing,
+    session: choice,
+    choices: changes.choices,
+    onShown: onComparisonShown ?? NO_VISIT,
+  });
   // While on screen, links to the files it shows stay in this review. A requested base and
   // head it can't compare show none, whatever the session's own comparison lists.
   const comparisonBase = changes.comparison.base;
   const changedList = changes.data;
   const listFailed = changes.isError;
-  const comparesRequestedRange = requestedRange !== undefined;
+  const comparesRequestedRange = requestedRange !== undefined || pendingVisit !== null;
   const reviewFiles = useMemo(
     (): ShownReviewFiles =>
       comparesRequestedRange
@@ -714,7 +749,7 @@ export function ChangesReview({
     (toolbar: DiffReviewToolbarProps) => (
       <>
         {/* The compared revisions sit in the header above; this row is how the diff shows. */}
-        <DiffReviewToolbar {...toolbar} omit={WITHOUT_WRAP} />
+        <DiffReviewToolbar {...toolbar} />
         <ComparisonNotes view={view} comparison={changes.comparison} asleep={sandboxAsleep} />
       </>
     ),
@@ -895,6 +930,36 @@ export function ChangesReview({
       setPickerOpen(true);
     },
   };
+  if (pendingVisit && "waiting" in pendingVisit) {
+    // Not the session's files: they aren't the comparison the visit asked for.
+    return frame(
+      <ToolbarSkeleton fileCount={null} />,
+      <ReviewMessage
+        busy
+        title="Comparing"
+        message={`Comparing ${comparisonChoiceName(pendingVisit.waiting)}…`}
+      />,
+    );
+  }
+  if (pendingVisit) {
+    // The visit's own comparison stays asked for; the session's is a step away.
+    const { choice: asked, reason } = pendingVisit.unavailable;
+    return frame(
+      <ToolbarSkeleton fileCount={null} />,
+      <ReviewMessage
+        alert
+        title="Comparison Unavailable"
+        message={`${comparisonChoiceName(asked)} can't be compared here. ${reason}`}
+        actions={[
+          {
+            label: "Show Default Comparison",
+            run: () => onComparisonShown?.(choice.shown, { step: true }),
+            primary: true,
+          },
+        ]}
+      />,
+    );
+  }
   if (requestedRange) {
     // The range's own toolbar: no file count or notes from the session's comparison.
     return frame(

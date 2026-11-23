@@ -219,6 +219,21 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.invoke("omnigent:record-global-shortcut", shortcutId(id)),
   cancelGlobalShortcutRecording: () =>
     ipcRenderer.invoke("omnigent:cancel-global-shortcut-recording"),
+  /** The opt-in "widen window for the right sidebar" setting and the page's sidebar reports. */
+  rightSidebarWindow: {
+    /** Resolves whether the setting is on. */
+    getWidensWindow: () => ipcRenderer.invoke("omnigent:get-right-sidebar-widens-window"),
+    /** Resolves false when the shell couldn't save it. */
+    setWidensWindow: (enabled) =>
+      ipcRenderer.invoke("omnigent:set-right-sidebar-widens-window", enabled === true),
+    /** The user opened the right sidebar, `width` CSS px wide. Fire-and-forget. */
+    opened: (width) =>
+      ipcRenderer.send("omnigent:right-sidebar-visibility", { open: true, width: Number(width) }),
+    /** The user closed the right sidebar. Fire-and-forget. */
+    closed: () => ipcRenderer.send("omnigent:right-sidebar-visibility", { open: false }),
+    /** Forget the previous session's growth without resizing the window. */
+    reset: () => ipcRenderer.send("omnigent:right-sidebar-visibility", { reset: true }),
+  },
   /** The runner picked during onboarding for this server ("local" |
    *  "remote"), returned once, else null. */
   takeOnboardingRunner: () => ipcRenderer.invoke("omnigent:take-onboarding-runner"),
@@ -277,6 +292,18 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     announceSupport: (version) => ipcRenderer.send("omnigent:floating-composer:announce", version),
     /** From the panel: hide it, keeping its draft. */
     dismiss: () => ipcRenderer.send("omnigent:floating-composer:dismiss"),
+    /** From the panel: its composer rendered, so the shell can show it without a loading state. */
+    ready: () => ipcRenderer.send("omnigent:floating-composer:ready"),
+    /**
+     * To the panel: it came on screen or took the keyboard again, so its prompt should too.
+     * Returns an unsubscribe function.
+     */
+    onShown: (callback) => {
+      if (typeof callback !== "function") return () => {};
+      const listener = () => callback();
+      ipcRenderer.on("omnigent:floating-composer:shown", listener);
+      return () => ipcRenderer.removeListener("omnigent:floating-composer:shown", listener);
+    },
     /**
      * From the panel: open `/c/<id>` or a page it links to in a main window of its server,
      * then hide. Resolves `{ ok: true }` or

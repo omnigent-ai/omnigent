@@ -1,10 +1,13 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { type ReactNode, useSyncExternalStore } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type { DiffReviewCommand } from "@/components/diff-review/diffReviewCommands";
+import type { DiffReviewToolbarProps } from "@/components/diff-review/DiffReviewToolbar";
+import { DEFAULT_DIFF_REVIEW_FILTERS } from "@/components/diff-review/diffReviewModel";
 import type * as WorkingCopyChangesModule from "@/hooks/useWorkingCopyChanges";
 import type { WorkingCopyChanges } from "@/hooks/useWorkingCopyChanges";
 import type { inMemoryCustomComparisons } from "@/lib/commitComparisons";
@@ -15,6 +18,8 @@ import type * as BranchCommitsModule from "@/lib/branchCommits";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { openFindForActiveSurface } from "@/lib/findRouting";
 import { resetShownReviewsForTests, shownReview } from "@/lib/reviewFileLinks";
+import { comparisonChoiceOf } from "@/lib/comparisonChoice";
+import type { ComparisonAvailability } from "@/shell/useVisitComparison";
 import { localComparisonView, type LocalComparisonInput } from "@/lib/localComparison";
 import { invalidateWorkingCopyChanges } from "@/lib/workingCopyComparisons";
 import type { EffectiveComparison } from "@/lib/workingCopyComparison";
@@ -121,6 +126,7 @@ function changes(overrides: Partial<WorkingCopyChanges> = {}): WorkingCopyChange
     generation: 1,
     permitted: true,
     accessEpoch: 0,
+    choices: 0,
     readable: true,
     ...overrides,
   };
@@ -170,7 +176,13 @@ function source(shared: WorkingCopyChanges, overrides: Partial<LocalComparisonIn
     actions,
     ...overrides,
   });
-  return { changes: shared, view, actions };
+  const choice = {
+    shown: comparisonChoiceOf(overrides.intent ?? "head", shared.custom),
+    settled: shared.workspace !== null,
+    availability: (): ComparisonAvailability => "now",
+    choose: vi.fn(),
+  };
+  return { changes: shared, view, actions, choice };
 }
 
 let client = new QueryClient();
@@ -309,7 +321,7 @@ describe("ChangesReview", () => {
       },
     });
     const { view, actions } = source(shared, { intent: "branch-point" });
-    mocks.source.mockReturnValue({ changes: shared, view, actions });
+    mocks.source.mockReturnValue({ ...source(shared), view, actions });
     renderReview();
     expect(screen.queryByTestId("review-body")).toBeNull();
     const trigger = screen.getByRole("button", { name: "Change compared revisions" });
@@ -403,6 +415,81 @@ describe("ChangesReview", () => {
     expect(screen.getByText(/Comparing “v1.2” with “Working Copy”/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Show Default Comparison" }));
     expect(props.onShowDefaultComparison).toHaveBeenCalledOnce();
+  });
+
+  it("compares a linked base and head as the session's own where typed comparisons work", () => {
+    const typedWorks = changes({
+      revisionSupport: { kind: "available" },
+      workspace: { hostId: "host", root: "/repo" },
+    });
+    const data = source(typedWorks);
+    mocks.source.mockReturnValue(data);
+    const onComparisonShown = vi.fn();
+    renderReview({
+      requestedRange: { base: "v1.2", head: "Working Copy" },
+      comparison: { kind: "typed", base: "v1.2", head: "" },
+      onComparisonShown,
+      landing: { settled: false, choices: 0 },
+    });
+    expect(screen.queryByText(/isn't available here yet/)).toBeNull();
+    expect(data.choice.choose).toHaveBeenCalledWith({ kind: "typed", base: "v1.2", head: "" });
+    // Until the session shows it, none of its previous files show in its place.
+    expect(screen.getByText("Comparing “v1.2” with “Working Copy”…")).toBeInTheDocument();
+    expect(onComparisonShown).not.toHaveBeenCalled();
+  });
+
+  it("keeps a linked comparison this host can't show, says why, and offers the session's own as a step", () => {
+    const data = source(changes({ workspace: { hostId: "host", root: "/repo" } }));
+    data.choice.availability = () => ({ unavailable: "This host doesn't compare branches." });
+    mocks.source.mockReturnValue(data);
+    const onComparisonShown = vi.fn();
+    renderReview({
+      comparison: { kind: "saved", intent: "branch-point" },
+      landing: { settled: false, choices: 0 },
+      onComparisonShown,
+    });
+    expect(
+      screen.getByText(
+        "All branch changes can't be compared here. This host doesn't compare branches.",
+      ),
+    ).toBeInTheDocument();
+    expect(data.choice.choose).not.toHaveBeenCalled();
+    expect(onComparisonShown).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Show Default Comparison" }));
+    expect(onComparisonShown).toHaveBeenCalledWith(
+      { kind: "saved", intent: "head" },
+      { step: true },
+    );
+  });
+
+  it("shows a linked comparison as on its way while the host checks, with none of the session's files", () => {
+    const data = source(changes({ workspace: { hostId: "host", root: "/repo" } }));
+    data.choice.availability = () => "later";
+    mocks.source.mockReturnValue(data);
+    renderReview({
+      comparison: { kind: "typed", base: "v1.2", head: "feature" },
+      landing: { settled: false, choices: 0 },
+      onComparisonShown: vi.fn(),
+    });
+    expect(screen.getByText("Comparing “v1.2” with “feature”…")).toBeInTheDocument();
+    expect(screen.queryByTestId("review-body")).toBeNull();
+    expect(shownReview("s1")).toEqual({ state: "unavailable" });
+  });
+
+  it("records the comparison it shows on its visit, and keeps none without a visit to record on", () => {
+    const settledChanges = changes({ workspace: { hostId: "host", root: "/repo" } });
+    mocks.source.mockReturnValue(source(settledChanges));
+    const onComparisonShown = vi.fn();
+    renderReview({ onComparisonShown });
+    expect(onComparisonShown).toHaveBeenCalledWith(
+      { kind: "saved", intent: "head" },
+      { step: false },
+    );
+    cleanup();
+    const data = source(settledChanges);
+    mocks.source.mockReturnValue(data);
+    renderReview({ comparison: { kind: "saved", intent: "automatic" } });
+    expect(data.choice.choose).not.toHaveBeenCalled();
   });
 
   it("publishes the files it shows for links, none for a linked range it can't compare", () => {
@@ -675,6 +762,57 @@ describe("the Commits and Changes tabs", () => {
       base: `${SHOWN_COMMIT}~1`,
       head: SHOWN_COMMIT,
     });
+  });
+
+  it("offers Wrap long lines in the Diff options of the changes' and a commit's toolbar", async () => {
+    reviewWithCommits();
+    renderReview();
+    const wrap = vi.fn();
+    const toolbarProps: DiffReviewToolbarProps = {
+      commands: [
+        {
+          id: "toggle-wrap",
+          label: "Wrap lines",
+          icon: () => null,
+          keywords: [],
+          pressed: false,
+          run: wrap,
+        } as unknown as DiffReviewCommand,
+      ],
+      fileCount: 1,
+      filters: DEFAULT_DIFF_REVIEW_FILTERS,
+      dispatchFilter: () => {},
+      languages: [],
+      testCount: 0,
+      generatedCount: 0,
+      filtersOpen: false,
+      setFiltersOpen: () => {},
+      breakdown: {
+        totals: { files: 1, additions: 1, deletions: 0 },
+        notViewed: { files: 1, additions: 1, deletions: 0 },
+        languages: [],
+      },
+      languagesOpen: false,
+      setLanguagesOpen: () => {},
+    };
+    const wrapsFrom = async (props: WorkingCopyDiffReviewBodyProps) => {
+      const toolbar = render(
+        <TooltipProvider>{props.presentation!.toolbar!(toolbarProps)}</TooltipProvider>,
+      );
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Diff options" }), { button: 0 });
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Wrap long lines" }));
+      toolbar.unmount();
+    };
+    const lastBody = () => mocks.body.mock.lastCall![0] as WorkingCopyDiffReviewBodyProps;
+    await wrapsFrom(lastBody());
+    expect(wrap).toHaveBeenCalledTimes(1);
+
+    // A commit's review has its own toolbar, which offers the same.
+    await userEvent.click(tab("Commits"));
+    await userEvent.click(await screen.findByRole("option", { name: /Fix the build/ }));
+    await vi.waitFor(() => expect(lastBody().showComparisonNotes).toBe(false));
+    await wrapsFrom(lastBody());
+    expect(wrap).toHaveBeenCalledTimes(2);
   });
 
   it("compares a root commit with the empty tree, since it has no parent", async () => {

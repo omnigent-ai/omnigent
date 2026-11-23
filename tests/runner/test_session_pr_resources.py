@@ -64,6 +64,8 @@ def test_explicit_repo_is_used_for_all_pr_reads(
     monkeypatch.setattr(pr_resource, "_git_output", forbidden_git)
     info = github.github_info(tracked, session_id="session", pr_url=B)
     assert info["pr"]["title"] == "Second repository"
+    # Explicit PR reads omit the workspace repo.
+    assert "workspace_repo" not in info
     assert {pr["url"] for pr in info["prs"]} == {A, B}
     assert (
         github.github_changed_files(tracked, session_id="session", pr_url=B)["data"][0]["path"]

@@ -4678,6 +4678,24 @@ def test_augment_claude_args_disables_auto_mode_setup_offer(
     assert settings.get("skillOverrides") == {"auto-mode-setup": "off"}
 
 
+def test_augment_claude_args_keeps_auto_compaction_on(tmp_path: Path) -> None:
+    """
+    Every launch turns Claude's automatic compaction on in the settings sidecar.
+
+    A user setting of ``autoCompactEnabled: false`` makes Claude refuse each turn
+    with "Prompt is too long" once the context fills, until someone types
+    ``/compact``. Flag settings outrank user settings, so the sidecar value wins.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = _load_invocation_settings(args)
+    assert settings.get("autoCompactEnabled") is True
+
+
 @pytest.mark.parametrize(
     ("launch_args", "default_mode"),
     [
@@ -20760,3 +20778,35 @@ def test_a_sandboxed_helper_accepts_the_bridge_under_its_read_only_pinned_tmpdir
             bridge._trusted_parent_for_bridge_dir(pinned / "elsewhere")
     finally:
         pinned.chmod(0o700)
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"claude_session_id": "", "cost_usd": 1.0, "restored": None},
+        {"claude_session_id": "sid", "cost_usd": 0, "restored": None},
+        {"claude_session_id": "sid", "cost_usd": float("nan"), "restored": None},
+        {"claude_session_id": "sid", "cost_usd": 10**400, "restored": None},
+        {"claude_session_id": "sid", "cost_usd": True, "restored": None},
+        {"claude_session_id": "sid", "cost_usd": "1.0", "restored": None},
+        {"claude_session_id": "sid", "cost_usd": 1.0, "restored": "yes"},
+        ["sid", 1.0],
+    ],
+    ids=[
+        "no-session",
+        "zero",
+        "nan",
+        "overflow",
+        "bool",
+        "string",
+        "bad-decision",
+        "not-an-object",
+    ],
+)
+def test_read_resume_cost_baseline_ignores_a_malformed_record(
+    tmp_path: Path, record: object
+) -> None:
+    """A malformed record seeds nothing rather than a wrong cost."""
+    (tmp_path / "resume_cost_baseline.json").write_text(json.dumps(record), encoding="utf-8")
+
+    assert claude_native_bridge.read_resume_cost_baseline(tmp_path) is None

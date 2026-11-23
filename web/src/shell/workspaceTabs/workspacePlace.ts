@@ -2,6 +2,8 @@
 // history visits that record them. Pure types plus the reuse key, so the link
 // parser, the tab store and the history store all share one definition.
 
+import type { ComparisonChoice } from "@/lib/comparisonChoice";
+
 /** A workspace tab's stable ID, unique within its session. */
 export type TabId = string;
 
@@ -36,6 +38,8 @@ export type WorkspacePlace =
       line?: LineRange;
       comment?: string;
       range?: ExplicitRange;
+      /** The session's comparison this visit showed; showing the visit again applies it. */
+      comparison?: ComparisonChoice;
       fileTab?: true;
     }
   | { kind: "pulls" }

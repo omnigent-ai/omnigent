@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import types
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
@@ -19,9 +20,15 @@ from omnigent.git_providers import (
     ParsedPullRequest,
     ParsedRemote,
     host_of,
+    load_facet,
     reset_for_tests,
 )
 from omnigent.runner import github_resource, pr_resource
+from omnigent.runner.git_providers import (
+    ProviderCapabilities,
+    offered_capabilities,
+    with_offered_capabilities,
+)
 from omnigent.runner.pr_resource import ProviderResolution
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from tests.budgets import budget
@@ -198,6 +205,75 @@ def test_tracked_github_pr_info_carries_the_provider_fields(
     assert [pr["provider"] for pr in info["prs"]] == ["github"]
 
 
+def test_a_tracked_enterprise_pr_reports_the_same_github_capabilities(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GH_HOST", "ghe.example.test")
+    url = "https://ghe.example.test/acme/repo/pull/7"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
+
+    info = pr_resource.pr_info(str(repo), session_id="session")
+
+    assert info["selected_pr_url"] == url
+    assert (info["provider"], info["capabilities"]) == ("github", GITHUB_CAPABILITIES)
+
+
+@pytest.mark.parametrize("host", ["github.com", "ghe.example.test", "gitlab.example.test", None])
+@pytest.mark.parametrize("provider_id", ["github", "gitlab", "azure_devops"])
+def test_every_host_is_offered_its_providers_own_capabilities(
+    provider_id: str, host: str | None
+) -> None:
+    facet = load_facet(provider_id, "pull_requests")
+
+    assert facet is not None
+    assert offered_capabilities(facet, host) is facet.capabilities
+
+
+def test_offered_capabilities_only_narrow_what_a_payload_reports() -> None:
+    nothing = types.SimpleNamespace(capabilities=ProviderCapabilities(False, False, False, False))
+    everything = types.SimpleNamespace(
+        capabilities=ProviderCapabilities(**dict.fromkeys(GITHUB_CAPABILITIES, True))
+    )
+    reported = {**dict.fromkeys(GITHUB_CAPABILITIES, True), "newer_capability": True}
+
+    narrowed = with_offered_capabilities({"capabilities": dict(reported)}, nothing, None)
+    kept = with_offered_capabilities({"capabilities": dict(reported)}, everything, None)
+    nothing_on = with_offered_capabilities(
+        {"capabilities": dict.fromkeys(GITHUB_CAPABILITIES, False)}, everything, None
+    )
+    unavailable = {"capabilities": None}
+
+    assert narrowed["capabilities"] == {
+        **dict.fromkeys(GITHUB_CAPABILITIES, False),
+        "newer_capability": True,
+    }
+    assert kept["capabilities"] == reported
+    assert nothing_on["capabilities"] == dict.fromkeys(GITHUB_CAPABILITIES, False)
+    assert with_offered_capabilities(unavailable, everything, None) is unavailable
+    assert unavailable == {"capabilities": None}
+
+
+def test_attaching_a_pr_keeps_the_workspace_repo(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bare references keep resolving against the same repo as PRs come and go."""
+    _git(repo, "remote", "add", "origin", GITHUB_FORK)
+    _git(repo, "remote", "add", "upstream", "https://github.com/owner/app.git")
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(github_resource, "_verify_pr_access", lambda _root, _ref: None)
+    upstream = {"name_with_owner": "owner/app", "host": "github.com"}
+    url = "https://github.com/me/app/pull/7"
+
+    assert pr_resource.pr_info(str(repo), session_id="session")["workspace_repo"] == upstream
+    pr_resource.update_session_pr(str(repo), "session", url, "attach")
+    assert pr_resource.pr_info(str(repo), session_id="session")["workspace_repo"] == upstream
+    removed = pr_resource.update_session_pr(str(repo), "session", url, "remove")
+    assert removed["workspace_repo"] == upstream
+
+
 def test_without_remotes_the_provider_names_the_workspace_repo(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -210,28 +286,20 @@ def test_without_remotes_the_provider_names_the_workspace_repo(
     assert info["workspace_repo"] == {"name_with_owner": "owner/app", "host": "github.com"}
 
 
-def test_an_explicit_pr_read_names_no_workspace_repo(
+def test_a_session_base_read_names_the_workspace_repo(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An explicit PR read must not touch local git; chat reads the base query instead."""
+    """A session with a tracked PR still names the checkout's repo on the base read."""
     _git(repo, "remote", "add", "origin", "https://github.com/owner/app.git")
-    url = "https://github.com/owner/app/pull/7"
     SessionPrRegistry("session").record(
-        [PullRequestRef.from_url(url)], relationship="created", source="test"
+        [PullRequestRef.from_url("https://github.com/owner/app/pull/7")],
+        relationship="created",
+        source="test",
     )
     monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
-    calls: list[str] = []
-    original = pr_resource._add_workspace_repo
-    monkeypatch.setattr(
-        pr_resource,
-        "_add_workspace_repo",
-        lambda root, info: (calls.append(root), original(root, info))[1],
-    )
 
-    explicit = pr_resource.pr_info(str(repo), session_id="session", pr_url=url)
-    assert (calls, "workspace_repo" in explicit) == ([], False)
     base = pr_resource.pr_info(str(repo), session_id="session")
-    assert (calls, base["workspace_repo"]["host"]) == ([str(repo)], "github.com")
+    assert base["workspace_repo"] == {"name_with_owner": "owner/app", "host": "github.com"}
 
 
 GITHUB_FORK = "https://github.com/me/app.git"
@@ -239,37 +307,42 @@ ENTERPRISE_ORIGIN = "https://ghe.example.com/owner/app.git"
 
 
 @pytest.mark.parametrize(
-    ("origin", "gh_resolved", "tracked_repo", "workspace_repo"),
+    ("origin", "second_remote", "gh_resolved", "tracked_repo", "workspace_repo"),
     [
         # A fork checkout: gh resolves bare refs against upstream, not the fork.
-        (GITHUB_FORK, "upstream", "owner/app", ("owner/app", "github.com")),
-        (GITHUB_FORK, "upstream", "owner/other", ("owner/app", "github.com")),
+        (GITHUB_FORK, "upstream", "upstream", "owner/app", ("owner/app", "github.com")),
+        (GITHUB_FORK, "upstream", "upstream", "owner/other", ("owner/app", "github.com")),
         # gh's resolved base wins over a remote of the tracked repo.
-        (GITHUB_FORK, "origin", "owner/app", ("me/app", "github.com")),
-        (GITHUB_FORK, None, "owner/app", ("owner/app", "github.com")),
-        # Without one, gh ranks remotes upstream > github > origin on origin's host.
-        (GITHUB_FORK, None, "owner/other", ("owner/app", "github.com")),
-        # A PR tracked in the fork itself outranks that order.
-        (GITHUB_FORK, None, "me/app", ("me/app", "github.com")),
+        (GITHUB_FORK, "upstream", "origin", "owner/app", ("me/app", "github.com")),
+        # Without one, gh ranks remotes upstream > github > origin on origin's host,
+        # whichever repo the tracked PR is in.
+        (GITHUB_FORK, "upstream", None, "owner/app", ("owner/app", "github.com")),
+        (GITHUB_FORK, "upstream", None, "owner/other", ("owner/app", "github.com")),
+        (GITHUB_FORK, "upstream", None, "me/app", ("owner/app", "github.com")),
         # A public mirror of the tracked repo must not move bare refs off Enterprise.
-        (ENTERPRISE_ORIGIN, None, "owner/app", ("owner/app", "ghe.example.com")),
+        (ENTERPRISE_ORIGIN, "upstream", None, "owner/app", ("owner/app", "ghe.example.com")),
         # ``repo`` stays the tracked PR's; ``workspace_repo`` names the checkout's own.
-        (ENTERPRISE_ORIGIN, None, "owner/other", ("owner/app", "ghe.example.com")),
+        (ENTERPRISE_ORIGIN, "upstream", None, "owner/other", ("owner/app", "ghe.example.com")),
+        # An origin-only checkout names origin; a `github` remote outranks origin.
+        (GITHUB_FORK, None, None, "owner/other", ("me/app", "github.com")),
+        (GITHUB_FORK, "github", None, "owner/other", ("owner/app", "github.com")),
         # gh's own choice still wins on any host.
-        (ENTERPRISE_ORIGIN, "upstream", "owner/app", ("owner/app", "github.com")),
+        (ENTERPRISE_ORIGIN, "upstream", "upstream", "owner/app", ("owner/app", "github.com")),
     ],
 )
 def test_tracked_pr_info_picks_the_workspace_remote_like_gh(
     repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     origin: str,
+    second_remote: str | None,
     gh_resolved: str | None,
     tracked_repo: str,
     workspace_repo: tuple[str, str],
 ) -> None:
     monkeypatch.setenv("GH_HOST", "ghe.example.com")
     _git(repo, "remote", "add", "origin", origin)
-    _git(repo, "remote", "add", "upstream", "https://github.com/owner/app.git")
+    if second_remote is not None:
+        _git(repo, "remote", "add", second_remote, "https://github.com/owner/app.git")
     if gh_resolved is not None:
         _git(repo, "config", f"remote.{gh_resolved}.gh-resolved", "base")
     url = f"https://github.com/{tracked_repo}/pull/7"

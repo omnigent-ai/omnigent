@@ -46,7 +46,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useSyncExternalStore } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 import {
   appendReviewReply,
   type ReviewComment,
@@ -445,9 +445,11 @@ export function pullRequestNotFoundReason(
 export async function fetchPullRequestInfo(
   conversationId: string,
   prUrl?: string,
+  signal?: AbortSignal,
 ): Promise<PullRequestInfo> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github${prQuery(prUrl)}`,
+    { signal },
   );
   if (res.status === 404) {
     // Preserve the server's message so an outdated host (no github route) is
@@ -551,13 +553,137 @@ export function pullRequestInfoQueryKey(conversationId: string | undefined, prUr
   return ["github-info", conversationId, ...(prUrl ? [prUrl] : [])];
 }
 
+/** Background reads of individual pull requests in flight at once, across every session. */
+const PULL_REQUEST_READ_CONCURRENCY = 2;
+
+interface QueuedPullRequestRead {
+  key: string;
+  start: () => void;
+}
+
+/**
+ * Runs reads of individual pull requests a few at a time, oldest first.
+ *
+ * The composer and the panel's list poll one read per linked PR, and each read
+ * asks the host's git provider. Unqueued, a session that links dozens of PRs
+ * keeps enough requests open to use up the browser's concurrent requests to
+ * the server, so sends and streams in every session wait behind them. Queued,
+ * those statuses fill in gradually.
+ *
+ * A prioritized PR, the one open in a details view, goes first and may use one
+ * more slot, so it doesn't wait behind background reads. That slot is shared:
+ * a read the user has moved away from keeps it until it settles, so moving
+ * between PRs faster than they load can't add more requests.
+ */
+class PullRequestReadQueue {
+  private running = 0;
+  private readonly waiting: QueuedPullRequestRead[] = [];
+  private readonly prioritized = new Map<string, number>();
+
+  async run<T>(key: string, signal: AbortSignal, read: () => Promise<T>): Promise<T> {
+    signal.throwIfAborted();
+    const release = await this.waitForTurn(key, signal);
+    try {
+      // Closing a session frees its running reads' slots before it cancels the waiting ones,
+      // so a read can be handed a slot just as it's cancelled; it must not start then.
+      signal.throwIfAborted();
+      return await read();
+    } finally {
+      release();
+    }
+  }
+
+  /** Reads `key` ahead of the queue until the returned function is called. */
+  prioritize(key: string): () => void {
+    this.prioritized.set(key, (this.prioritized.get(key) ?? 0) + 1);
+    this.drain();
+    return () => {
+      const remaining = (this.prioritized.get(key) ?? 1) - 1;
+      if (remaining > 0) this.prioritized.set(key, remaining);
+      else this.prioritized.delete(key);
+    };
+  }
+
+  /** Resolves, once `key` may start, with a function that frees its slot. */
+  private waitForTurn(key: string, signal: AbortSignal): Promise<() => void> {
+    return new Promise((resolve, reject) => {
+      const entry: QueuedPullRequestRead = {
+        key,
+        start: () => {
+          signal.removeEventListener("abort", abandon);
+          this.running += 1;
+          let holding = true;
+          const release = () => {
+            if (!holding) return;
+            holding = false;
+            signal.removeEventListener("abort", release);
+            this.running -= 1;
+            this.drain();
+          };
+          // A read that outlives its cancelled query must not keep its slot.
+          signal.addEventListener("abort", release, { once: true });
+          resolve(release);
+        },
+      };
+      // A cancelled query, such as one whose session closed, gives up its place.
+      const abandon = () => {
+        this.waiting.splice(this.waiting.indexOf(entry), 1);
+        reject(signal.reason);
+      };
+      signal.addEventListener("abort", abandon, { once: true });
+      this.waiting.push(entry);
+      this.drain();
+    });
+  }
+
+  private drain() {
+    for (;;) {
+      const viewed = this.waiting.findIndex((entry) => this.prioritized.has(entry.key));
+      if (viewed >= 0 && this.running < PULL_REQUEST_READ_CONCURRENCY + 1) {
+        this.waiting.splice(viewed, 1)[0]!.start();
+      } else if (this.waiting.length > 0 && this.running < PULL_REQUEST_READ_CONCURRENCY) {
+        this.waiting.shift()!.start();
+      } else {
+        return;
+      }
+    }
+  }
+}
+
+const pullRequestReads = new PullRequestReadQueue();
+
+function pullRequestReadKey(conversationId: string, prUrl: string): string {
+  return JSON.stringify([conversationId, prUrl]);
+}
+
+/**
+ * Reads `prUrl` ahead of the session's other PRs while the caller shows it, so the
+ * request the user opened never waits behind background status reads.
+ */
+export function usePullRequestReadPriority(
+  rawConversationId: string | undefined,
+  prUrl: string | undefined,
+): void {
+  const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
+  useEffect(() => {
+    if (!conversationId || !prUrl) return undefined;
+    return pullRequestReads.prioritize(pullRequestReadKey(conversationId, prUrl));
+  }, [conversationId, prUrl]);
+}
+
 function pullRequestInfoQueryOptions(
   { conversationId, enabled, retry }: ReturnType<typeof usePullRequestQueryContext>,
   options?: { poll?: boolean | "list" | "linked"; prUrl?: string },
 ) {
+  const prUrl = options?.prUrl;
   return queryOptions({
-    queryKey: pullRequestInfoQueryKey(conversationId, options?.prUrl),
-    queryFn: () => fetchPullRequestInfo(conversationId!, options?.prUrl),
+    queryKey: pullRequestInfoQueryKey(conversationId, prUrl),
+    queryFn: prUrl
+      ? ({ signal }) =>
+          pullRequestReads.run(pullRequestReadKey(conversationId!, prUrl), signal, () =>
+            fetchPullRequestInfo(conversationId!, prUrl, signal),
+          )
+      : () => fetchPullRequestInfo(conversationId!),
     enabled,
     retry,
     retryDelay: runnerOfflineRetryDelay,

@@ -572,6 +572,8 @@ describe("Custom session order", () => {
 
       cleanup();
       renderGrouping();
+      expect(rowOrder()).toEqual(["conv_d", ...familyRows]);
+      if (collapsed) fireEvent.click(screen.getByRole("button", { name: "Expand session family" }));
       expect(rowOrder()).toEqual(["conv_d", "conv_c", "conv_peer"]);
       fireEvent.contextMenu(link("conv_peer"));
       expect(screen.queryByTestId("move-session-up")).toBeNull();

@@ -549,18 +549,20 @@ class ListBranchCommitsRequest(_message.Message):
     def __init__(self, base_revision: _Optional[str] = ...) -> None: ...
 
 class BranchCommit(_message.Message):
-    __slots__ = ("object", "subject", "author_name", "author_time_unix", "root")
+    __slots__ = ("object", "subject", "author_name", "author_time_unix", "root", "body")
     OBJECT_FIELD_NUMBER: _ClassVar[int]
     SUBJECT_FIELD_NUMBER: _ClassVar[int]
     AUTHOR_NAME_FIELD_NUMBER: _ClassVar[int]
     AUTHOR_TIME_UNIX_FIELD_NUMBER: _ClassVar[int]
     ROOT_FIELD_NUMBER: _ClassVar[int]
+    BODY_FIELD_NUMBER: _ClassVar[int]
     object: str
     subject: str
     author_name: str
     author_time_unix: int
     root: bool
-    def __init__(self, object: _Optional[str] = ..., subject: _Optional[str] = ..., author_name: _Optional[str] = ..., author_time_unix: _Optional[int] = ..., root: _Optional[bool] = ...) -> None: ...
+    body: str
+    def __init__(self, object: _Optional[str] = ..., subject: _Optional[str] = ..., author_name: _Optional[str] = ..., author_time_unix: _Optional[int] = ..., root: _Optional[bool] = ..., body: _Optional[str] = ...) -> None: ...
 
 class ListBranchCommitsResponse(_message.Message):
     __slots__ = ("base", "commits", "truncated")

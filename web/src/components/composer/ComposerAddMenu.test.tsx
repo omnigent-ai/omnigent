@@ -45,6 +45,17 @@ describe("ComposerAddMenu's Run a workflow", () => {
     await waitFor(() => expect(onWorkflow).toHaveBeenCalledWith());
   });
 
+  it("opens the description dialog when every saved workflow is a draft, which can't run", async () => {
+    const { onWorkflow } = renderMenu({
+      savedWorkflows: [
+        { id: "c".repeat(32), name: "Unfinished workflow", description: "", is_draft: true },
+      ],
+    });
+    runAWorkflow();
+    await waitFor(() => expect(onWorkflow).toHaveBeenCalledWith());
+    expect(screen.queryByTestId("composer-workflow-picker")).toBeNull();
+  });
+
   it("names the owner of a workflow shared with the user, which runs like the user's own", async () => {
     const shared = {
       id: "d".repeat(32),
@@ -119,6 +130,22 @@ describe("ComposerAddMenu's Run a workflow", () => {
     expect(screen.getByText("No matching workflows")).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("composer-describe-workflow"));
     await waitFor(() => expect(onWorkflow).toHaveBeenCalledWith("Bump deps"));
+  });
+
+  it("moves between the search and the list with the arrow keys", async () => {
+    const { onRunSavedWorkflow } = renderMenu({ savedWorkflows });
+    runAWorkflow();
+    const search = screen.getByLabelText("Search workflows");
+    fireEvent.change(search, { target: { value: "release" } });
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    const row = screen.getByTestId("composer-saved-workflow");
+    expect(row).toHaveFocus();
+    fireEvent.keyDown(row, { key: "ArrowUp" });
+    expect(search).toHaveFocus();
+
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    fireEvent.keyDown(row, { key: "Enter" });
+    await waitFor(() => expect(onRunSavedWorkflow).toHaveBeenCalledWith(savedWorkflows[1]));
   });
 });
 

@@ -1,5 +1,5 @@
-// Pure presentation for QuickPick: turns segments of items and the query into
-// the ordered rows the list renders, plus keyboard navigation over them.
+// Pure presentation for QuickPick: turns segments of items, the query and the
+// recently picked items into the ordered rows the list renders, plus keyboard navigation.
 
 import type { MatchRange } from "./match";
 import {
@@ -8,6 +8,7 @@ import {
   itemQueryTokens,
   type ItemMatch,
   matchItem,
+  MatchTier,
 } from "./itemRanking";
 import type {
   QuickPickHeadingRow,
@@ -17,25 +18,50 @@ import type {
   QuickPickRow,
 } from "./model";
 
+/**
+ * With a query: `source` keeps each group together, in the order the items list
+ * them; `match` ranks rows across groups, each naming its group, so a group
+ * never holds a better match below weaker ones.
+ */
+export type QuickPickGroupOrder = "source" | "match";
+
 /** One run of items that rank together, such as commands or one group of search results. */
 export interface QuickPickSegment<Value> {
   sourceId: string;
   ranking: QuickPickRanking;
   /** Defaults to "fuzzy". */
   fuzzyMatching?: FuzzyMatching;
+  /** Defaults to "source". */
+  groupOrder?: QuickPickGroupOrder;
+  /** `source` for a segment an async source loaded, which `sourcesFirst` moves ahead. */
+  origin?: "items" | "source";
   items: readonly QuickPickItem<Value>[];
 }
 
 export interface QuickPickPresentationInput<Value> {
   segments: readonly QuickPickSegment<Value>[];
   query: string;
+  /** Item IDs, most recent first. */
+  recentIds?: readonly string[];
+  /** The row made from the typed query, listed first. */
+  freeTextItem?: QuickPickItem<Value> | null;
+  /**
+   * Async sources' rows lead the other segments, unless an item matches the whole query from
+   * a word's start, such as a typed command name, which keeps the items first.
+   */
+  sourcesFirst?: boolean;
 }
+
+export const RECENT_HEADING_LABEL = "Recent";
+// Recency only breaks ties between equal-quality matches; beyond this it stops mattering.
+const RECENCY_TIEBREAK_LIMIT = 50;
 
 const NO_RANGES: readonly MatchRange[] = [];
 
 function itemRow<Value>(
   item: QuickPickItem<Value>,
   ranges?: Record<string, MatchRange[]>,
+  { isFreeText = false, sectionLabel }: { isFreeText?: boolean; sectionLabel?: string } = {},
 ): QuickPickItemRow<Value> {
   // Client ranges replace provider highlights, so a field the query missed stays plain.
   const source = ranges ?? item.highlights;
@@ -45,6 +71,8 @@ function itemRow<Value>(
     item,
     labelRanges: source?.label ?? NO_RANGES,
     descriptionRanges: source?.description ?? NO_RANGES,
+    isFreeText,
+    ...(sectionLabel !== undefined ? { sectionLabel } : {}),
   };
 }
 
@@ -78,15 +106,16 @@ function groupedRows<Value>(
   }
   const rows: QuickPickRow<Value>[] = [];
   for (const group of groupOrder) {
+    const heading = group === undefined ? undefined : headingRow(sourceId, group);
     const groupRows: QuickPickRow<Value>[] = [];
     for (const item of itemsByGroup.get(group) ?? []) {
       const row = rowsByItem.get(item);
       if (!row || seen.has(item.id)) continue;
       seen.add(item.id);
-      groupRows.push(row);
+      groupRows.push(heading ? { ...row, headingKey: heading.key } : row);
     }
     if (groupRows.length === 0) continue;
-    if (group !== undefined) rows.push(headingRow(sourceId, group));
+    if (heading) rows.push(heading);
     rows.push(...groupRows);
   }
   return rows;
@@ -95,24 +124,43 @@ function groupedRows<Value>(
 interface RankedItem<Value> {
   item: QuickPickItem<Value>;
   match: ItemMatch;
+  recency: number;
   sourceIndex: number;
+}
+
+function compareRanked<Value>(first: RankedItem<Value>, second: RankedItem<Value>): number {
+  return (
+    compareItemMatches(first.match, second.match) ||
+    Math.min(first.recency, RECENCY_TIEBREAK_LIMIT) -
+      Math.min(second.recency, RECENCY_TIEBREAK_LIMIT) ||
+    first.sourceIndex - second.sourceIndex
+  );
 }
 
 function rankSegment<Value>(
   segment: QuickPickSegment<Value>,
   query: string,
+  recency: ReadonlyMap<string, number>,
   seen: Set<string>,
 ): QuickPickRow<Value>[] {
   const tokens = itemQueryTokens(query);
   const ranked: RankedItem<Value>[] = [];
   segment.items.forEach((item, sourceIndex) => {
     const match = matchItem(tokens, item, segment.fuzzyMatching);
-    if (match) ranked.push({ item, match, sourceIndex });
+    if (match) {
+      const itemRecency = recency.get(item.id) ?? Number.POSITIVE_INFINITY;
+      ranked.push({ item, match, recency: itemRecency, sourceIndex });
+    }
   });
-  ranked.sort(
-    (first, second) =>
-      compareItemMatches(first.match, second.match) || first.sourceIndex - second.sourceIndex,
-  );
+  ranked.sort(compareRanked);
+  if (segment.groupOrder === "match") {
+    // Without headings, each row names its group in their place.
+    return ranked.flatMap(({ item, match }) => {
+      if (seen.has(item.id)) return [];
+      seen.add(item.id);
+      return [itemRow(item, match.candidate.ranges, { sectionLabel: item.group })];
+    });
+  }
   const rowsByItem = new Map(
     ranked.map(({ item, match }) => [item, itemRow(item, match.candidate.ranges)]),
   );
@@ -133,22 +181,93 @@ function unrankedSegment<Value>(
   return groupedRows(segment.sourceId, segment.items, rowsByItem, segment.items, seen);
 }
 
+/** Whether an item's label in `segment` matches the whole query from a word's start. */
+function hasLeadingMatch<Value>(segment: QuickPickSegment<Value>, query: string): boolean {
+  const tokens = itemQueryTokens(query);
+  return segment.items.some((item) => {
+    if (item.leadsSources === false) return false;
+    const match = matchItem(tokens, item, segment.fuzzyMatching);
+    if (!match || match.tier > MatchTier.labelWordPrefix) return false;
+    return tokens.length === 1 || match.candidate.wholeQuery;
+  });
+}
+
+function orderSegments<Value>(
+  segments: readonly QuickPickSegment<Value>[],
+  searching: boolean,
+  query: string,
+): readonly QuickPickSegment<Value>[] {
+  const fromSources = segments.filter((segment) => segment.origin === "source");
+  const others = segments.filter((segment) => segment.origin !== "source");
+  const itemsLead = searching && others.some((segment) => hasLeadingMatch(segment, query));
+  return itemsLead ? [...others, ...fromSources] : [...fromSources, ...others];
+}
+
+// Recently picked items of the client-ranked segments, most recent first, under one heading.
+function recentRows<Value>(
+  segments: readonly QuickPickSegment<Value>[],
+  recency: ReadonlyMap<string, number>,
+  seen: Set<string>,
+): QuickPickRow<Value>[] {
+  const recentItems = segments
+    .filter((segment) => segment.ranking === "client")
+    .flatMap((segment) =>
+      segment.items.filter((item) => recency.has(item.id) && item.rememberInHistory !== false),
+    )
+    .sort((first, second) => (recency.get(first.id) ?? 0) - (recency.get(second.id) ?? 0));
+  const heading: QuickPickHeadingRow = {
+    kind: "heading",
+    key: "heading:recent",
+    label: RECENT_HEADING_LABEL,
+  };
+  const rows: QuickPickRow<Value>[] = [];
+  for (const item of recentItems) {
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    rows.push({ ...itemRow(item), headingKey: heading.key });
+  }
+  return rows.length === 0 ? rows : [heading, ...rows];
+}
+
 /**
- * Without a query, every segment in source order. With one, client-ranked
- * segments keep only matching items, best first within each group.
+ * Without a query, recently picked items first and then every segment in source
+ * order. With one, client-ranked segments keep only matching items, best first
+ * within each group, with recency breaking ties.
  */
 export function buildQuickPickRows<Value>({
-  segments,
+  segments: givenSegments,
   query,
+  recentIds = [],
+  freeTextItem = null,
+  sourcesFirst = false,
 }: QuickPickPresentationInput<Value>): QuickPickRow<Value>[] {
   const searching = query.trim().length > 0;
   // The first row for an ID wins, such as a session two searches both return.
   const seen = new Set<string>();
-  return segments.flatMap((segment) =>
-    searching && segment.ranking === "client"
-      ? rankSegment(segment, query, seen)
-      : unrankedSegment(segment, seen),
-  );
+  const rows: QuickPickRow<Value>[] = [];
+  if (freeTextItem) {
+    seen.add(freeTextItem.id);
+    rows.push(itemRow(freeTextItem, undefined, { isFreeText: true }));
+  }
+  const segments = sourcesFirst ? orderSegments(givenSegments, searching, query) : givenSegments;
+  const recency = new Map(recentIds.map((id, index) => [id, index]));
+  if (searching) {
+    for (const segment of segments) {
+      rows.push(
+        ...(segment.ranking === "client"
+          ? rankSegment(segment, query, recency, seen)
+          : unrankedSegment(segment, seen)),
+      );
+    }
+    return rows;
+  }
+  // Sources that lead stay ahead of the recently picked items too.
+  const leading = sourcesFirst ? segments.filter((segment) => segment.origin === "source") : [];
+  for (const segment of leading) rows.push(...unrankedSegment(segment, seen));
+  const rest = segments.filter((segment) => !leading.includes(segment));
+  rows.push(...recentRows(rest, recency, seen));
+  for (const segment of rest) rows.push(...unrankedSegment(segment, seen));
+  return rows;
 }
 
 export function selectableIndices(rows: readonly QuickPickRow<unknown>[]): number[] {
@@ -181,14 +300,14 @@ export interface QuickPickNavigationOptions {
  */
 function owningHeadings(rows: readonly QuickPickRow<unknown>[]): number[] {
   let heading = -1;
-  let label: string | undefined;
+  let key: string | undefined;
   return rows.map((row, index) => {
     if (row.kind === "heading") {
       heading = index;
-      label = row.label;
+      key = row.key;
       return index;
     }
-    if (heading !== -1 && row.item.group === label) return heading;
+    if (heading !== -1 && row.headingKey === key) return heading;
     heading = -1;
     return -1;
   });

@@ -104,16 +104,13 @@ def inert_launcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     )
 
 
-def _bootstrap(*, wrapped: bool = False) -> dict[str, str]:
-    environment = {
+def _bootstrap() -> dict[str, str]:
+    return {
         "PATH": "/usr/bin:/bin",
         "KEEP": "bootstrap",
         "REMOVE": "discard",
         "HOME": "/home",
     }
-    if wrapped:
-        environment[sb._LAUNCHER_WRAPPED_ENV] = "1"
-    return environment
 
 
 @pytest.mark.parametrize("active", [False, True])
@@ -123,15 +120,17 @@ def test_target_environment_is_read_after_activation_for_final_spawn(
     tmp_path: Path, inert_launcher, active: bool, inherit: bool, launch_overrides: bool
 ) -> None:
     payload = _payload(tmp_path, inherit=inherit)
-    bootstrap = _bootstrap(wrapped=active)
+    bootstrap = _bootstrap()
     with patch.dict(inert_launcher.environment, bootstrap, clear=True):
         assert (
             sb.run_launcher(
                 _encoded(_policy(active)),
                 _TARGET,
                 ["doctor"],
+                cwd="/fixture/workspace",
                 target_environment_path=str(payload),
                 env_overrides={"KEEP": "snapshot"} if launch_overrides else None,
+                _spawn_wrapped=active,
             )
             == 0
         )
@@ -139,6 +138,7 @@ def test_target_environment_is_read_after_activation_for_final_spawn(
     assert inert_launcher.events == ["activate", "payload-read", "target-spawn", "cleanup"]
     call = inert_launcher.run.call_args
     assert call.args == ([_TARGET, "doctor"],)
+    assert call.kwargs["cwd"] == "/fixture/workspace"
     environment = call.kwargs["env"]
     assert environment["EXAMPLE_TARGET_ONLY"] == _SENTINEL
     assert environment["HOME"] == str(tmp_path / "owned-home")
@@ -159,7 +159,12 @@ def test_reexec_transports_payload_path_without_reading_values(
     with patch.dict(inert_launcher.environment, _bootstrap(), clear=True):
         with pytest.raises(SystemExit, match="inert re-exec boundary"):
             sb.run_launcher(
-                _encoded(policy), _TARGET, ["doctor"], target_environment_path=str(payload)
+                _encoded(policy),
+                _TARGET,
+                ["doctor"],
+                cwd="/fixture/workspace",
+                target_environment_path=str(payload),
+                process_lifetime="inert-lifetime",
             )
     inert_launcher.run.assert_not_called()
     assert "payload-read" not in inert_launcher.events
@@ -177,16 +182,28 @@ def test_reexec_transports_payload_path_without_reading_values(
     )
     keywords = {item.arg: ast.literal_eval(item.value) for item in call.keywords}
     assert keywords["target_environment_path"] == str(payload)
+    assert keywords["process_lifetime"] == "inert-lifetime"
+    assert keywords["cwd"] == "/fixture/workspace"
+    assert keywords["_spawn_wrapped"] is True
     assert _SENTINEL not in json.dumps(inert_launcher.execute.call_args.args)
     inert_launcher.cleanup.assert_called_once_with(inert_launcher.scratch)
 
 
 @pytest.mark.parametrize("active", [False, True])
 def test_default_launcher_keeps_inherited_environment_call(inert_launcher, active: bool) -> None:
-    with patch.dict(inert_launcher.environment, _bootstrap(wrapped=active), clear=True):
-        assert sb.run_launcher(_encoded(_policy(active)), _TARGET, ["doctor"]) == 0
+    with patch.dict(inert_launcher.environment, _bootstrap(), clear=True):
+        assert (
+            sb.run_launcher(
+                _encoded(_policy(active)),
+                _TARGET,
+                ["doctor"],
+                cwd="/fixture/workspace",
+                _spawn_wrapped=active,
+            )
+            == 0
+        )
     assert inert_launcher.run.call_args.args == ([_TARGET, "doctor"],)
-    assert inert_launcher.run.call_args.kwargs == {}
+    assert inert_launcher.run.call_args.kwargs == {"cwd": "/fixture/workspace"}
     assert "payload-read" not in inert_launcher.events
     source = sb._launcher_inline_source(_TARGET, _policy(False), cwd="/fixture")
     assert "target_environment_path" not in source
@@ -282,10 +299,14 @@ def test_target_failure_cleans_owned_launcher_scratch(
         path.unlink()
     else:
         inert_launcher.run.side_effect = OSError("inert target failure")
-    with patch.dict(inert_launcher.environment, _bootstrap(wrapped=True), clear=True):
+    with patch.dict(inert_launcher.environment, _bootstrap(), clear=True):
         with pytest.raises(OSError):
             sb.run_launcher(
-                _encoded(_policy(True)), _TARGET, ["doctor"], target_environment_path=str(path)
+                _encoded(_policy(True)),
+                _TARGET,
+                ["doctor"],
+                target_environment_path=str(path),
+                _spawn_wrapped=True,
             )
     inert_launcher.cleanup.assert_called_once_with(inert_launcher.scratch)
 
@@ -300,9 +321,13 @@ def test_target_payload_cannot_restore_runner_secrets(
     data["variables"][SHARED_ENVIRONMENT_VAR] = _SENTINEL
     data["variables"][sb.HOST_SANDBOX_BACKEND_ENV] = "inert-backend-hint"
     path.write_text(json.dumps(data))
-    with patch.dict(inert_launcher.environment, _bootstrap(wrapped=active), clear=True):
+    with patch.dict(inert_launcher.environment, _bootstrap(), clear=True):
         sb.run_launcher(
-            _encoded(_policy(active)), _TARGET, ["doctor"], target_environment_path=str(path)
+            _encoded(_policy(active)),
+            _TARGET,
+            ["doctor"],
+            target_environment_path=str(path),
+            _spawn_wrapped=active,
         )
     environment = inert_launcher.run.call_args.kwargs["env"]
     assert not set(RUNNER_AUTH_SECRET_ENV_VARS).intersection(environment)
@@ -329,7 +354,8 @@ def test_process_lifetime_is_acquired_only_after_containment_and_inherited_by_ta
     )
     inherited = []
 
-    def target(_command, *, env, pass_fds):
+    def target(_command, *, cwd, env, pass_fds):
+        assert cwd == "/fixture/workspace"
         assert inert_launcher.events == [
             "activate",
             *(["payload-read"] if with_environment else []),
@@ -345,14 +371,16 @@ def test_process_lifetime_is_acquired_only_after_containment_and_inherited_by_ta
 
     inert_launcher.run.side_effect = target
     payload = _payload(tmp_path) if with_environment else None
-    with patch.dict(inert_launcher.environment, _bootstrap(wrapped=True), clear=True):
+    with patch.dict(inert_launcher.environment, _bootstrap(), clear=True):
         assert (
             sb.run_launcher(
                 _encoded(_policy(True)),
                 _TARGET,
                 ["doctor"],
+                cwd="/fixture/workspace",
                 target_environment_path=str(payload) if payload is not None else None,
                 process_lifetime=encode_process_leases([lease]),
+                _spawn_wrapped=True,
             )
             == 0
         )

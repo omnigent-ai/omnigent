@@ -286,6 +286,8 @@ _EXPECTED_CLOSE_FILE = "expected_close"
 _OMNIGENT_KILL_FILE = "omnigent_kill"
 _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
+# The cost a cold resume seeded into the next Claude process; see ResumeCostBaseline.
+_RESUME_COST_BASELINE_FILE = "resume_cost_baseline.json"
 _USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 _MCP_SERVER_NAME = "omnigent"
 # Read by the static relay entry in an enterprise managed-mcp.json; see
@@ -2691,7 +2693,9 @@ def build_hook_settings(
     server (``enableAllProjectMcpServers``): the "New MCP server found"
     dialog is another unhookable startup gate that a host-spawned terminal
     can never answer. It also turns off auto mode's post-turn
-    environment-setup offer (``skillOverrides``) for the same reason.
+    environment-setup offer (``skillOverrides``) for the same reason, and keeps
+    automatic compaction on (``autoCompactEnabled``) so a full context compacts
+    instead of refusing every turn until someone types ``/compact``.
 
     :param bridge_dir: Bridge directory path.
     :param python_executable: Python executable to run, e.g.
@@ -3037,6 +3041,10 @@ def build_hook_settings(
     # only the terminal can answer it, so web-UI messages stall behind it. This
     # Claude Code switch turns off that offer and its /auto-mode-setup wizard.
     settings["skillOverrides"] = {"auto-mode-setup": "off"}
+    # With auto-compaction off, a full context refuses every turn until someone
+    # types /compact, which an unattended run never does. This outranks the
+    # user's setting; DISABLE_AUTO_COMPACT and managed policy still win.
+    settings["autoCompactEnabled"] = True
     if launch_effort and launch_effort in CLAUDE_EFFORTS:
         settings["effortLevel"] = launch_effort
     if api_key_helper:
@@ -3359,6 +3367,29 @@ def _args_request_bypass_permissions(args: tuple[str, ...]) -> bool:
     return "--dangerously-skip-permissions" in args or (
         _arg_value(args, "--permission-mode") == "bypassPermissions"
     )
+
+
+_CLAUDE_LAUNCH_PERMISSION_MODES = frozenset(
+    {"default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}
+)
+
+
+def claude_launch_permission_mode(args: Sequence[str] | None) -> str | None:
+    """Return the known permission mode Claude Code launches in with ``args``.
+
+    The bypass flag wins over any ``--permission-mode``; otherwise the last one does.
+    Everything from an ``--`` option terminator on is positional text.
+
+    :param args: Claude CLI args, e.g. ``["--permission-mode=plan"]``.
+    :returns: The mode, e.g. ``"plan"``, or ``None`` when absent or unknown.
+    """
+    launch_args = tuple(args or ())
+    if "--" in launch_args:
+        launch_args = launch_args[: launch_args.index("--")]
+    if _args_request_bypass_permissions(launch_args):
+        return "bypassPermissions"
+    candidate = _arg_value(launch_args, "--permission-mode")
+    return candidate if candidate in _CLAUDE_LAUNCH_PERMISSION_MODES else None
 
 
 def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
@@ -10577,6 +10608,110 @@ def read_claude_status_model(bridge_dir: Path) -> str | None:
         return None
     model = parsed.get("model")
     return model if isinstance(model, str) and model else None
+
+
+@dataclass(frozen=True)
+class ResumeCostBaseline:
+    """
+    The session cost a cold resume seeded into a resumed Claude process.
+
+    :param claude_session_id: Claude session id the process resumed, e.g.
+        ``"02857840-6362-408f-b41f-309e396ed7c6"``. The baseline applies only
+        while the forwarded transcript belongs to that session.
+    :param cost_usd: Cost written into the transcript's ``cost-state`` record,
+        e.g. ``1.25``.
+    :param restored: Whether the process reported that cost back, or ``None``
+        until its first non-zero statusLine cost is seen.
+    """
+
+    claude_session_id: str
+    cost_usd: float
+    restored: bool | None = None
+
+
+def record_resume_cost_baseline(
+    bridge_dir: Path, *, claude_session_id: str, cost_usd: float
+) -> None:
+    """
+    Record the cost a cold resume seeds into the next Claude process.
+
+    Also removes the previous process's statusLine snapshot, so the first
+    cost the forwarder reads comes from the resumed process.
+
+    :param bridge_dir: Bridge directory shared with the forwarder.
+    :param claude_session_id: Claude session id passed to ``--resume``, e.g.
+        ``"02857840-6362-408f-b41f-309e396ed7c6"``.
+    :param cost_usd: Cost written into the ``cost-state`` record, e.g.
+        ``1.25``.
+    :raises OSError: When the snapshot can't be removed or the record written.
+    :raises RuntimeError: When the bridge dir fails its ownership check.
+    """
+    for name in (_CONTEXT_FILE, CONTEXT_RAW_FILE):
+        with contextlib.suppress(FileNotFoundError):
+            (bridge_dir / name).unlink()
+    write_resume_cost_baseline(
+        bridge_dir,
+        ResumeCostBaseline(claude_session_id=claude_session_id, cost_usd=cost_usd),
+    )
+
+
+def write_resume_cost_baseline(bridge_dir: Path, baseline: ResumeCostBaseline) -> None:
+    """
+    Persist *baseline*, so a restarted forwarder keeps its restore decision.
+
+    :param bridge_dir: Bridge directory shared with the forwarder.
+    :param baseline: Baseline to store.
+    :raises OSError: When the record can't be written.
+    :raises RuntimeError: When the bridge dir fails its ownership check.
+    """
+    _write_json_file(
+        bridge_dir / _RESUME_COST_BASELINE_FILE,
+        {
+            "claude_session_id": baseline.claude_session_id,
+            "cost_usd": baseline.cost_usd,
+            "restored": baseline.restored,
+        },
+    )
+
+
+def clear_resume_cost_baseline(bridge_dir: Path) -> None:
+    """
+    Forget any seeded cost, e.g. before a launch that seeds none.
+
+    :param bridge_dir: Bridge directory shared with the forwarder.
+    :raises OSError: When an existing record can't be removed.
+    """
+    with contextlib.suppress(FileNotFoundError):
+        (bridge_dir / _RESUME_COST_BASELINE_FILE).unlink()
+
+
+def read_resume_cost_baseline(bridge_dir: Path) -> ResumeCostBaseline | None:
+    """
+    Read the cost the last cold resume seeded into Claude.
+
+    :param bridge_dir: Bridge directory shared with the forwarder.
+    :returns: The baseline, or ``None`` when absent or malformed.
+    :raises OSError: When an existing record can't be read.
+    """
+    payload = _read_json_file(bridge_dir / _RESUME_COST_BASELINE_FILE)
+    claude_session_id = payload.get("claude_session_id")
+    cost_usd = payload.get("cost_usd")
+    restored = payload.get("restored")
+    if not isinstance(claude_session_id, str) or not claude_session_id:
+        return None
+    if isinstance(cost_usd, bool) or not isinstance(cost_usd, (int, float)):
+        return None
+    try:
+        cost = float(cost_usd)
+    except OverflowError:  # an integer too large for a float
+        return None
+    if not math.isfinite(cost) or cost <= 0:
+        return None
+    if restored is not None and not isinstance(restored, bool):
+        return None
+    return ResumeCostBaseline(
+        claude_session_id=claude_session_id, cost_usd=cost, restored=restored
+    )
 
 
 def read_user_status_line_command() -> str | None:

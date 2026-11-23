@@ -102,6 +102,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { workspaceSocketBridge } from "@/lib/nativeBridge";
 import { isVideoFile } from "@/lib/video";
+import type { ComparisonFileDiff } from "@/hooks/useComparisonFileDiff";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { useInertRef } from "@/hooks/useInertRef";
 import {
@@ -357,6 +358,8 @@ interface PendingLeave {
 
 interface FileViewerProps {
   syncUrl?: boolean;
+  /** A comment whose thread opens with the file, as a `?comment=` link asks for. */
+  linkedCommentId?: string;
   agentId?: string | null;
   position?: FilePosition;
   open: boolean;
@@ -377,6 +380,11 @@ interface FileViewerProps {
    * single-user mode (no restrictions enforced).
    */
   permissionLevel?: number | null;
+  /**
+   * The file's diff under the session's chosen comparison, for a viewer that shows what the
+   * Changes review shows. Without it, the diff is against the last commit, as it always was.
+   */
+  comparisonDiff?: ComparisonFileDiff;
   /**
    * Frameless mode: renders as a flex-1 div filling the parent instead
    * of a push-panel aside with its own width and slide animation. Used
@@ -430,6 +438,7 @@ export function FileViewer(props: FileViewerProps) {
 
 function FileViewerBody({
   syncUrl = true,
+  linkedCommentId,
   position,
   open,
   mediaActive = true,
@@ -443,6 +452,7 @@ function FileViewerBody({
   onShare,
   shareDisabledReason,
   permissionLevel,
+  comparisonDiff,
   frameless,
   mobileOverlay = false,
   viewport,
@@ -465,7 +475,9 @@ function FileViewerBody({
   // param writes to re-run the initialization logic.
   const initialDiffRef = useRef(syncUrl && searchParams.get("diff") === "1");
   const linkedFileRef = useRef(initialDiffRef.current ? { conversationId, path } : null);
-  const initialCommentIdRef = useRef(syncUrl ? searchParams.get("comment") : null);
+  const initialCommentIdRef = useRef(
+    linkedCommentId ?? (syncUrl ? searchParams.get("comment") : null),
+  );
   // Seeded from the parent's persisted state on remount (e.g. returning to a
   // tab); defaults closed on a fresh open. The linked-comment / fresh-open
   // effects below only force it open, never closed, so a restored-open value
@@ -491,8 +503,15 @@ function FileViewerBody({
   const keyboardInset = useIOSNativeKeyboardInset((!frameless || mobileOverlay) && open);
   const onScreen = open && isActiveViewport && mediaActive;
   const changedFiles = useWorkspaceChangedFiles(conversationId);
+  // A chosen comparison's listing says which files changed; otherwise the last commit's does.
+  const comparisonListing = comparisonDiff?.base === "comparison" ? comparisonDiff : null;
+  // Whether the file is gone from the workspace, so there's nothing to read or open. A
+  // comparison ending at a commit can delete a file that's still here, so only one ending at
+  // the working copy answers that; otherwise the last commit's listing does.
   const isDeletedFile =
-    changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
+    comparisonListing?.headIsWorkingCopy === true
+      ? comparisonListing.deleted
+      : (changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false);
   const serverInfo = useServerInfo();
   // The host's SSH alias lets the desktop read a host on another machine directly.
   const directReads =
@@ -952,7 +971,9 @@ function FileViewerBody({
     !isVideo &&
     !isModel &&
     !isSpreadsheet &&
-    (changedFiles.data?.data.some((f) => f.path === path) ?? false);
+    (comparisonListing
+      ? comparisonListing.changed
+      : (changedFiles.data?.data.some((f) => f.path === path) ?? false));
   const revealTarget = useRevealTarget(path);
   const openInActions = useOpenInActions(isDeletedFile ? null : path);
 
@@ -971,7 +992,9 @@ function FileViewerBody({
   const [diffActive, setDiffActive] = useState(
     () => initialDiffRef.current || persistedPrefsRef.current.diffActive,
   );
-  const effectiveDiffActive = diffActive || isDeletedFile;
+  // A comment link shows the file its thread is on, this visit only; the saved preference stays.
+  const [commentLinkFileView, setCommentLinkFileView] = useState(linkedCommentId !== undefined);
+  const effectiveDiffActive = (diffActive && !commentLinkFileView) || isDeletedFile;
   const requestedDiff =
     open && isActiveViewport && effectiveDiffActive && !isImage && !isPdf && !isVideo && !isModel;
   // A saved preference also applies to unchanged files; only explicit links skip discovery.
@@ -979,7 +1002,10 @@ function FileViewerBody({
     requestedDiff &&
     linkedFileRef.current?.conversationId === conversationId &&
     linkedFileRef.current?.path === path;
-  const diffQuery = useFileDiff(conversationId, isVideo ? null : path, { requested: linkedDiff });
+  const lastCommitDiff = useFileDiff(conversationId, isVideo || comparisonListing ? null : path, {
+    requested: linkedDiff,
+  });
+  const diffQuery = comparisonListing ? comparisonListing.query : lastCommitDiff;
   const prepareDiff =
     requestedDiff &&
     (isDiffAvailable || (linkedDiff && changedFiles.data === undefined && !changedFiles.isError));
@@ -1271,7 +1297,7 @@ function FileViewerBody({
   // so stale searchParams seen here could emit a navigate("?") that strips it).
   useEffect(() => {
     if (!syncUrl || !open || !isActiveViewport) return;
-    const wantDiff = diffActive && isDiffAvailable;
+    const wantDiff = diffActive && !commentLinkFileView && isDiffAvailable;
     const hasDiff = searchParams.has("diff");
     if (wantDiff === hasDiff) return; // already in sync — no navigate needed
     setSearchParams(
@@ -1286,7 +1312,16 @@ function FileViewerBody({
       },
       { replace: true },
     );
-  }, [syncUrl, diffActive, isDiffAvailable, open, isActiveViewport, searchParams, setSearchParams]);
+  }, [
+    syncUrl,
+    diffActive,
+    commentLinkFileView,
+    isDiffAvailable,
+    open,
+    isActiveViewport,
+    searchParams,
+    setSearchParams,
+  ]);
 
   // Toolbar actions, declared once and rendered two ways: inline icon buttons
   // when there's room, or rows in an overflow ("⋯") menu when there isn't.
@@ -1490,6 +1525,7 @@ function FileViewerBody({
         guardDirty(() => {
           dismissFilePosition(position);
           setDismissedPosition(position);
+          setCommentLinkFileView(false);
           setDiffActive(viewMode !== "diff");
         }),
     });
@@ -2109,6 +2145,7 @@ function FileViewerBody({
                       onSetActiveSelection={handleSetActiveSelection}
                       pendingBodyRef={pendingBodyRef}
                       attachToAgent={attachToAgent}
+                      commentable={comparisonListing?.headIsWorkingCopy ?? true}
                       searchOpen={searchOpen}
                       searchFocusNonce={searchFocusNonce}
                       onSearchHandled={handleSearchHandled}

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   MAX_SAVED_SESSIONS,
+  parsePlace,
   readWorkspaceTabsSession,
   saveWorkspaceTabsSession,
   WORKSPACE_TABS_STORAGE_KEY,
@@ -96,6 +97,24 @@ describe("workspace tab storage", () => {
     expect(
       read.status === "saved" && read.state.tabs.map((tab) => "place" in tab && tab.place),
     ).toEqual([{ kind: "changes", path: "a.go" }, fileTab, { kind: "changes" }]);
+  });
+
+  it("keeps a Changes visit's comparison, and drops one this app can't read", () => {
+    const typed = { kind: "typed", base: "v1", head: "" } as const;
+    expect(parsePlace({ kind: "changes", comparison: typed })).toEqual({
+      kind: "changes",
+      comparison: typed,
+    });
+    expect(parsePlace({ kind: "changes", comparison: { kind: "saved", intent: "head" } })).toEqual({
+      kind: "changes",
+      comparison: { kind: "saved", intent: "head" },
+    });
+    expect(
+      parsePlace({ kind: "changes", comparison: { kind: "saved", intent: "sideways" } }),
+    ).toEqual({ kind: "changes" });
+    expect(parsePlace({ kind: "changes", comparison: { kind: "typed", base: "" } })).toEqual({
+      kind: "changes",
+    });
   });
 
   it("drops malformed fields one by one and keeps the rest", () => {

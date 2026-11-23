@@ -121,7 +121,7 @@ jobs:
       # Tests that exercise a real harness CLI skip without it; install the
       # pinned CLI only in the lanes that run them.
       - name: Install Codex CLI
-        if: matrix.group == 'misc' || matrix.group == 'harnesses'
+        if: matrix.group == 'misc' || matrix.group == 'harnesses' || matrix.group == 'inner-rest'
         uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
         with:
           harness: codex
@@ -468,6 +468,7 @@ jobs:
             -n 4 \
             --dist=loadfile \
             --timeout=300 \
+            --durations=30 \
             --junitxml=artifacts/pytest-stores-crdb-${{ matrix.crdb_version }}.xml
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9

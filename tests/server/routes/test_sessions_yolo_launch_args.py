@@ -28,7 +28,11 @@ from __future__ import annotations
 
 import pytest
 
+from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
+from omnigent.entities import Conversation
+from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
+from omnigent.server.routes._sessions.helpers import _inherited_parent_permission_launch_args
 from omnigent.server.routes.sessions import _derive_terminal_launch_args_from_spec
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
@@ -435,3 +439,66 @@ def test_codex_native_unsupported_permission_mode_keeps_existing_behavior(
         _derive_terminal_launch_args_from_spec(spec, headless_defaults=headless_defaults)
         == expected
     )
+
+
+_CLAUDE_MODE_LABEL = "omnigent.claude_native.permission_mode"
+
+
+@pytest.mark.parametrize(
+    ("parent_harness", "parent_labels", "parent_launch_args", "child_harness", "expected"),
+    [
+        # A Codex parent's recorded mode can go stale, so it passes nothing on.
+        pytest.param(
+            "codex-native",
+            {"omnigent.codex_native.approval_mode": "approve-for-me"},
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            "claude-native",
+            None,
+            id="codex-parent-passes-nothing",
+        ),
+        # The launch flags stand in until the parent's runtime reports its mode.
+        pytest.param(
+            "claude-native",
+            {},
+            ["--permission-mode", "auto"],
+            "codex-native",
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="parent-launch-args",
+        ),
+        # A switch made after launch replaces the launch flags.
+        pytest.param(
+            "claude-native",
+            {_CLAUDE_MODE_LABEL: "auto"},
+            ["--permission-mode", "plan"],
+            "codex-native",
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="live-mode-over-launch-args",
+        ),
+        pytest.param(
+            "claude-native",
+            {_CLAUDE_MODE_LABEL: "bypassPermissions"},
+            None,
+            "claude-native",
+            None,
+            id="parent-skips-approval",
+        ),
+    ],
+)
+def test_sub_agent_inherits_its_parents_current_permission_mode(
+    parent_harness: str,
+    parent_labels: dict[str, str],
+    parent_launch_args: list[str] | None,
+    child_harness: str,
+    expected: list[str] | None,
+) -> None:
+    """A child with no mode of its own starts in its Claude Code parent's current mode."""
+    wrapper = native_coding_agent_for_harness(parent_harness).wrapper_label
+    parent = Conversation(
+        id="parent",
+        created_at=0,
+        updated_at=0,
+        root_conversation_id="parent",
+        labels={WRAPPER_LABEL_KEY: wrapper, **parent_labels},
+        terminal_launch_args=parent_launch_args,
+    )
+    assert _inherited_parent_permission_launch_args(parent, child_harness, None) == expected

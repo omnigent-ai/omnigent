@@ -362,7 +362,9 @@ defaults delete ai.omnigent.desktop DeveloperMode
 
 Development (`pnpm --dir web/electron dev`) builds keep Developer Tools enabled
 without this preference. The override is intentionally macOS-only and does not
-relax production update security checks.
+relax production update security checks. It covers the windows only: the
+production app's main process accepts no debugger (see
+[What a packaged app refuses to run](#what-a-packaged-app-refuses-to-run)).
 
 The native enhancements live on the web side in
 [`../src/lib/nativeBridge.ts`](../src/lib/nativeBridge.ts). It detects the
@@ -535,6 +537,36 @@ apply.
 Hide/reopen the Workspace or switch tabs to retain a page without reloading.
 Closing the tab destroys it. User-created Browser tabs are separate from the
 session's agent browser view and are not targeted by the agent relay.
+
+### Previews from hosts reached over SSH
+
+A session on a remote host can open localhost previews after the desktop
+proves the host's SSH destination and the user grants access. Existing
+destinations from **Connect over SSH** or token-checked file access can be
+used directly. For a new destination, the web app supplies a route hint from
+the host list, and the consent dialog explains the read-only SSH check.
+Only after **Allow** does main run `omnigent host status --server ... --json`
+over SSH. It requires one online daemon with the session's exact host ID and
+selected server/workspace before recording the destination. It never starts
+a daemon or signs in (`src/sshPreviewIdentity.js`, `src/sshPreviewHosts.js`).
+
+When such a session first opens a localhost page (address bar, link, or
+agent), a shell-owned dialog names the destination and asks whether its
+sessions may access this computer's localhost ports, including forwarded ones.
+**Allow** opens the page after any required verification; **Not now** keeps
+that host's localhost pages blocked until Omnigent restarts. The answer lasts
+for this app run and only while the host's recorded destination is unchanged
+(`src/sshPreviewHosts.js`). Failed verification also stays blocked until restart.
+Agent screenshots, snapshots, clicks, and typing revalidate the session host;
+moving the session to a different host revokes the old page's privileged access.
+
+`localhost` still names this computer, so forward the app's port first, for
+example with `ssh -N -L 127.0.0.1:5173:127.0.0.1:5173 <destination>`.
+This grants access to all permitted loopback ports, not only the forwarded
+port; it does not establish forwarding or prove the local endpoint's owner.
+The loopback rules above still apply. This path is available on macOS and
+Linux. New web bundles check the optional `sshLocalhostPreview` capability;
+older shells keep their existing behavior.
 
 ### Agent previews on Arca
 
@@ -863,18 +895,26 @@ picks how much:
 - Values are decrypted with `v10`/`v11` (AES-128-CBC, key from the login
   Keychain's "Chrome Safe Storage" item) and never shown, logged, or persisted.
   App-bound `v20` values and non-macOS platforms are refused with a message, not
-  guessed at. The Keychain prompt is attributed to `security`; choose **Allow**
-  rather than **Always Allow**, because Always Allow adds `/usr/bin/security` to
-  the item's ACL, and any local process can then read Chrome's key without a
-  prompt. Partitioned (CHIPS) cookies are skipped rather than replayed
+  guessed at. Partitioned (CHIPS) cookies are skipped rather than replayed
   unpartitioned, which would widen the site they were scoped to.
+- The app reads that Keychain item in its own process, through the native
+  `@napi-rs/keyring` binding, so the macOS prompt names the app and **Always
+  Allow** is recorded against the app's signature. It never asks a helper such
+  as `/usr/bin/security` for the key, and does not fall back to one when the
+  binding can't load: a grant to a shared tool lets any local process run that
+  tool and read the key without a prompt. That grant is only as narrow as the
+  signed binary, so the packaged app restricts its main process to the app's
+  own sealed code (see [What a packaged app refuses to run](#what-a-packaged-app-refuses-to-run)).
+  Builds before this change did read the key through `security`; if
+  you chose Always Allow in one, remove `security` from the "Chrome Safe
+  Storage" item's Access Control list in Keychain Access.
 - Reading never touches Chrome's live database: `Cookies` (plus any
   `Cookies-wal` / `Cookies-journal`) is copied into a private temp directory and
   `sqlite3` only opens that copy, so Chrome's file is never locked or rewritten.
-  `sqlite3` and `security` are spawned by absolute path (`/usr/bin/...`, the
-  macOS system copies) instead of being resolved through `PATH`, so nothing on
-  the user's path can intercept Chrome's key or jar. Failures surface as a fixed
-  message, never the command line.
+  `sqlite3` is spawned by absolute path (`/usr/bin/sqlite3`, the macOS system
+  copy) instead of being resolved through `PATH`, so nothing on the user's path
+  can intercept Chrome's jar. Failures surface as a fixed message, never the
+  command line.
 - Cookies land in the conversation's existing in-memory partition, so they
   disappear when the app quits; nothing is written back to Chrome, and there is
   no background sync.
@@ -983,6 +1023,36 @@ install production desktop updates. `build:mac:release` retains
 `ai.omnigent.desktop`, **Omnigent**, and `electron/dist/`. For the full
 cross-platform publishing and update-feed checklist, see [the desktop release
 runbook](RELEASING.md).
+
+### What a packaged app refuses to run
+
+macOS records a Keychain **Always Allow** against the app's signature, not
+against the code that asked. A packaged app therefore turns off, through
+Electron fuses (`build.electronFuses` in `package.json`), the ways to run other
+JavaScript in the signed binary:
+
+| Fuse                                          | Effect in a packaged app                                                                                       |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `runAsNode: false`                            | `ELECTRON_RUN_AS_NODE` is ignored, so the binary can't be used as a plain Node.js to run someone's script.     |
+| `enableNodeCliInspectArguments: false`        | `--inspect` and `SIGUSR1` don't open a debugger on the main process.                                           |
+| `enableNodeOptionsEnvironmentVariable: false` | `NODE_OPTIONS` and `NODE_EXTRA_CA_CERTS` are ignored.                                                          |
+| `enableEmbeddedAsarIntegrityValidation: true` | On macOS and Windows the app checks `app.asar` against the hash sealed at build time, and exits if it differs. |
+| `onlyLoadAppFromAsar: true`                   | The app loads its code from `app.asar` only, never from an `app/` folder placed beside it.                     |
+
+Two consequences to know about:
+
+- `NODE_EXTRA_CA_CERTS` no longer adds a certificate authority to the main
+  process's own requests (sign-in, server checks). Pages in the app's windows
+  never used that variable.
+- Local **Omnigent Dev** packages (`pnpm run build`, `build:mac`, `build:linux`,
+  `build:win`) keep `--inspect`, which Playwright needs to drive a packaged
+  binary. They are a different app (`ai.omnigent.desktop-dev`), so a grant made
+  to the release app never covers them. A grant made to Omnigent Dev itself is
+  open to anyone who can attach that debugger, so choose **Allow**, not
+  **Always Allow**, in Omnigent Dev. Every other fuse is the same.
+
+Unpackaged development (`pnpm start`) runs the stock Electron binary and is not
+affected.
 
 macOS apps, including unpackaged development, default to V2 onboarding for both
 new and existing profiles. Windows/Linux keep the legacy default. The setup-page

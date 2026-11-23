@@ -46,6 +46,7 @@ import type {
   ScheduledTaskRunSteps,
 } from "@/lib/scheduledTasksApi";
 import { conversation, conversationPage } from "@/test/sidebarMockHelpers";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
 import { usePlanStops } from "@/store/planStops";
 
 const navigate = vi.fn();
@@ -94,9 +95,12 @@ const showToast = vi.fn();
 vi.mock("@/components/ui/toast", () => ({ showToast: (...args: unknown[]) => showToast(...args) }));
 
 // A session-based automation names the session copy its runs start from.
+const defaultSessionSnapshot = (sessionId: string | null | undefined) =>
+  sessionId ? { title: "Weekly rubric copy" } : null;
+const sessionSnapshot = vi.fn(defaultSessionSnapshot);
 vi.mock("@/hooks/useSession", () => ({
-  useSession: () => ({
-    session: { title: "Weekly rubric copy" },
+  useSession: (sessionId: string | null | undefined) => ({
+    session: sessionSnapshot(sessionId),
     isLoading: false,
     error: null,
   }),
@@ -279,6 +283,7 @@ beforeEach(() => {
   vi.mocked(useViewerId).mockReturnValue(null);
   vi.mocked(useOptionalLoadedConversations).mockReturnValue(undefined);
   useAvailableAgents.mockImplementation(defaultAgentCatalog);
+  sessionSnapshot.mockImplementation(defaultSessionSnapshot);
   navigate.mockReset();
   updateMutate.mockReset();
   deleteMutate.mockReset();
@@ -929,6 +934,21 @@ describe("header actions", () => {
     },
   );
 
+  it("offers the header's actions in ⌘K with quick_pick_palette on, running the same handlers", () => {
+    setTask(task({ state: "active" }));
+    const info = { ...SERVER_INFO_OFFLINE_FALLBACK, features: { quick_pick_palette: true } };
+    render(<CapabilitiesProvider info={info}>{pageTree()}</CapabilitiesProvider>);
+    const command = (label: string) =>
+      Object.values(usePaletteCommandsStore.getState().groups)
+        .flatMap((group) => group.commands)
+        .find((candidate) => candidate.label === label)!;
+    act(() => command("Pause automation").run());
+    expect(updateMutate).toHaveBeenCalledWith({ id: "st_1", input: { state: "paused" } });
+    act(() => command("Edit automation…").run());
+    expect(screen.getByTestId("edit-dialog-open")).toHaveAttribute("data-editing-id", "st_1");
+    usePaletteCommandsStore.setState({ groups: {} });
+  });
+
   it("edit opens the reused create dialog in edit mode", () => {
     setTask(task());
     renderPage();
@@ -1106,6 +1126,24 @@ describe("an automation shared with the viewer", () => {
     expect(screen.queryByTestId("task-detail-project")).toBeNull();
   });
 
+  it("groups runs in the owner's continued session without its title or cost", () => {
+    setRuns([
+      run({ id: "run_2", conversationId: "c_owner", conversationStatus: null }),
+      run({ id: "run_1", conversationId: "c_owner", conversationStatus: null }),
+    ]);
+    renderShared(sharedTask({ sessionMode: "continue", sessionId: "c_owner" }));
+    const header = screen.getByTestId("run-session-group-open");
+    expect(header).toHaveAttribute("href", "/c/c_owner");
+    expect(header).toHaveTextContent("Continued session");
+    expect(header).not.toHaveTextContent("Weekly rubric copy");
+    expect(screen.queryByTestId("run-session-group-cost")).toBeNull();
+    expect(
+      within(screen.getByRole("list", { name: "Runs in Continued session" })).getAllByTestId(
+        "task-detail-run",
+      ),
+    ).toHaveLength(2);
+  });
+
   it("lists each run's outcome without its session's data or tasks", () => {
     const steps: ScheduledTaskRunSteps = {
       runId: "run_1",
@@ -1175,7 +1213,6 @@ describe("an automation shared with the viewer", () => {
     ]) {
       expect(screen.queryByTestId(testId)).toBeNull();
     }
-    expect(screen.queryByText(/Session cost is each session/)).toBeNull();
 
     // The owner's same row shows its tasks and their controls.
     cleanup();
@@ -1202,31 +1239,95 @@ describe("run history", () => {
     [0, "$0.00"],
     [0.001, "<$0.01"],
     [null, null],
-  ])("renders reported session cost %s without inventing missing costs", (cost, label) => {
+  ])(
+    "renders the cost %s of a run's own session without inventing missing costs",
+    (cost, label) => {
+      setTask(task());
+      setRuns([run({ conversationId: "c_1", sessionCostUsd: cost })]);
+      renderPage();
+      expect(screen.getByTestId("run-duration")).toHaveTextContent("1m 42s");
+      if (label === null) expect(screen.queryByTestId("run-cost")).toBeNull();
+      else expect(screen.getByTestId("run-cost").textContent).toBe(label);
+      expect(screen.queryByTestId("run-session-group")).toBeNull();
+    },
+  );
+
+  it("says a running run's own session cost is still growing", () => {
     setTask(task());
-    setRuns([run({ conversationId: "c_1", sessionCostUsd: cost })]);
+    setRuns([
+      run({ status: "running", conversationId: "c_1", finishedAt: null, sessionCostUsd: 0.84 }),
+    ]);
     renderPage();
-    expect(screen.getByTestId("run-duration")).toHaveTextContent("1m 42s");
-    if (label === null) expect(screen.queryByTestId("run-cost")).toBeNull();
-    else expect(screen.getByTestId("run-cost")).toHaveTextContent(`Session cost ${label}`);
+    expect(screen.getByTestId("run-cost").textContent).toBe("$0.84 so far");
+    expect(screen.getByTestId("run-status-label")).toHaveTextContent("Running");
   });
 
-  it("explains shared totals while preserving costs for different sessions", () => {
-    setTask(task({ sessionMode: "continue" }));
+  it("lists runs sharing a session under it, with the session's total once", () => {
+    setTask(task({ sessionMode: "continue", sessionId: "c_1" }));
     setRuns([
-      run({ conversationId: "c_1", sessionCostUsd: 2 }),
-      run({ id: "run_2", conversationId: "c_1", sessionCostUsd: 2 }),
-      run({ id: "run_3", conversationId: "c_2", sessionCostUsd: 3 }),
+      run({
+        id: "run_3",
+        conversationId: "c_1",
+        conversationStatus: "running",
+        sessionCostUsd: 66.24,
+      }),
+      run({ id: "run_2", conversationId: "c_2", sessionCostUsd: 3 }),
+      run({
+        id: "run_1",
+        status: "failed",
+        errorCode: "launch_failed",
+        conversationId: "c_1",
+        conversationStatus: null,
+        sessionCostUsd: 66.24,
+      }),
     ]);
     renderPage();
-    expect(screen.getAllByTestId("run-cost").map((element) => element.textContent)).toEqual([
-      "Session cost $2.00",
-      "Session cost $2.00",
-      "Session cost $3.00",
-    ]);
-    expect(screen.getByText(/Runs sharing a session show the same total/)).toBeInTheDocument();
-    expect(screen.getByText(/Separate sub-agent sessions are excluded/)).toBeInTheDocument();
+
+    // The group takes its newest run's place, ahead of the older run with its own session.
+    const [group, ownSession] = Array.from(screen.getByTestId("task-detail-runs").children);
+    expect(group).toHaveAttribute("data-testid", "run-session-group");
+    const header = within(group as HTMLElement).getByTestId("run-session-group-open");
+    expect(header).toHaveAttribute("href", "/c/c_1");
+    expect(header).toHaveTextContent("Weekly rubric copy");
+    expect(screen.getByTestId("run-session-group-cost").textContent).toBe("$66.24 total");
+    const grouped = within(screen.getByRole("list", { name: "Runs in Weekly rubric copy" }));
+    expect(
+      grouped.getAllByTestId("task-detail-run").map((row) => row.getAttribute("data-run-status")),
+    ).toEqual(["succeeded", "failed"]);
+    expect(grouped.getByTestId("run-status-label")).toHaveTextContent("Session running");
+    // The session's runs, the failed one included, show no total of their own.
+    expect(grouped.queryByTestId("run-cost")).toBeNull();
+    expect(ownSession).toHaveAttribute("data-testid", "task-detail-run");
+    expect(within(ownSession as HTMLElement).getByTestId("run-cost").textContent).toBe("$3.00");
+    expect(screen.queryByText(/Runs sharing a session/)).toBeNull();
   });
+
+  it("keeps a session's runs usable when its snapshot and cost are unavailable", () => {
+    sessionSnapshot.mockReturnValue(null);
+    setTask(task({ sessionMode: "continue", sessionId: "c_1" }));
+    setRuns([
+      run({ id: "run_2", conversationId: "c_1" }),
+      run({ id: "run_1", status: "failed", errorCode: "launch_failed", conversationId: "c_1" }),
+    ]);
+    renderPage();
+
+    const header = screen.getByTestId("run-session-group-open");
+    expect(header).toHaveAttribute("href", "/c/c_1");
+    expect(header).toHaveTextContent("Continued session");
+    expect(screen.queryByTestId("run-session-group-cost")).toBeNull();
+    const rows = within(
+      screen.getByRole("list", { name: "Runs in Continued session" }),
+    ).getAllByTestId("task-detail-run");
+    expect(rows.map((row) => within(row).getByTestId("run-open").getAttribute("href"))).toEqual([
+      "/c/c_1",
+      "/c/c_1",
+    ]);
+    expect(within(rows[1]!).getByTestId("run-failure")).toHaveTextContent(
+      "Launch · The agent session failed to launch.",
+    );
+    expect(screen.queryByTestId("run-cost")).toBeNull();
+  });
+
   it("renders the empty state when there are no runs", () => {
     setTask(task());
     setRuns([]);

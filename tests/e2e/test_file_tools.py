@@ -2,9 +2,9 @@
 
 ``test_markdown_file_attachment`` runs against the mock LLM server.
 ``test_list_files_finds_uploaded_file`` and
-``test_download_file_retrieves_content`` require a real LLM (the
-bundled archer agent declares ``tools.builtins`` which the omnigent
-single-file YAML format does not support for inline agents).
+``test_download_file_retrieves_content`` require a real LLM: the model
+must choose to call the ``sys_files_list`` / ``sys_files_download`` tools
+the bundled archer agent turns on with ``tool_groups.files: true``.
 
 Usage::
 
@@ -96,7 +96,7 @@ def test_markdown_file_attachment(
     assert text.strip(), f"Agent produced no text. Output: {body.get('output', [])}"
 
 
-# ── Real-LLM tests (require archer_agent with tools.builtins) ──
+# ── Real-LLM tests (archer_agent, which turns the file tools on) ──
 
 
 def _has_tool_call(body: dict[str, Any], name: str) -> bool:
@@ -130,12 +130,12 @@ def test_list_files_finds_uploaded_file(
     live_runner_id: str,
     using_mock_llm: bool,
 ) -> None:
-    """A session-uploaded file is visible to list_files.
+    """A session-uploaded file is visible to sys_files_list.
 
-    Requires real LLM — archer agent with ``tools.builtins``.
+    Requires real LLM — the model must choose the tool.
     """
     if using_mock_llm:
-        pytest.skip("requires real LLM (spec-level builtin tools)")
+        pytest.skip("requires real LLM (model-driven tool call)")
 
     session_id = create_runner_bound_session(
         http_client, agent_name=archer_agent, runner_id=live_runner_id
@@ -151,8 +151,8 @@ def test_list_files_finds_uploaded_file(
         http_client,
         session_id=session_id,
         content=(
-            "Use the list_files tool to show me all uploaded "
-            "files. Only use list_files, nothing else."
+            "Use the sys_files_list tool to show me all uploaded "
+            "files. Only use sys_files_list, nothing else."
         ),
     )
     body = poll_session_until_terminal(
@@ -160,9 +160,9 @@ def test_list_files_finds_uploaded_file(
     )
     assert body["status"] == "completed", f"Turn failed: {body.get('error')}"
 
-    assert _has_tool_call(body, "list_files"), "Agent didn't call list_files"
-    assert any("test_data.txt" in output for output in _tool_outputs(body, "list_files")), (
-        f"list_files didn't return uploaded file. Output: {body.get('output', [])}"
+    assert _has_tool_call(body, "sys_files_list"), "Agent didn't call sys_files_list"
+    assert any("test_data.txt" in output for output in _tool_outputs(body, "sys_files_list")), (
+        f"sys_files_list didn't return uploaded file. Output: {body.get('output', [])}"
     )
 
 
@@ -172,12 +172,12 @@ def test_download_file_retrieves_content(
     live_runner_id: str,
     using_mock_llm: bool,
 ) -> None:
-    """download_file retrieves a session-uploaded file by ID.
+    """sys_files_download retrieves a session-uploaded file by ID.
 
-    Requires real LLM — archer agent with ``tools.builtins``.
+    Requires real LLM — the model must choose the tool.
     """
     if using_mock_llm:
-        pytest.skip("requires real LLM (spec-level builtin tools)")
+        pytest.skip("requires real LLM (model-driven tool call)")
 
     session_id = create_runner_bound_session(
         http_client, agent_name=archer_agent, runner_id=live_runner_id
@@ -194,7 +194,7 @@ def test_download_file_retrieves_content(
         http_client,
         session_id=session_id,
         content=(
-            f"Use download_file with file_id {file_id}. Do not call "
+            f"Use sys_files_download with file_id {file_id}. Do not call "
             "sys_os_shell, sys_os_read, or any other filesystem tool. "
             "Report the JSON result."
         ),
@@ -204,9 +204,9 @@ def test_download_file_retrieves_content(
     )
     assert body["status"] == "completed", f"Turn failed: {body.get('error')}"
 
-    assert _has_tool_call(body, "download_file"), "Agent didn't call download_file"
-    outputs = _tool_outputs(body, "download_file")
-    assert outputs, f"download_file returned no tool output. Output: {body.get('output', [])}"
+    assert _has_tool_call(body, "sys_files_download"), "Agent didn't call sys_files_download"
+    outputs = _tool_outputs(body, "sys_files_download")
+    assert outputs, f"sys_files_download returned no tool output. Output: {body.get('output', [])}"
     assert any("HELLO_WORLD" in output for output in outputs), (
-        f"download_file didn't return expected content. Tool outputs: {outputs}"
+        f"sys_files_download didn't return expected content. Tool outputs: {outputs}"
     )

@@ -15,6 +15,7 @@ import {
   mergeItemsIntoPages,
   nullsToUndefined,
   overlayArchivedIntoCaches,
+  settleUpdatedAtIntoCaches,
   overlayTitleIntoCaches,
   recentlyCreatedSessions,
   removeIdsFromPages,
@@ -607,6 +608,26 @@ describe("overlayArchivedIntoCaches", () => {
       false,
     ])!;
     expect(folder.pages[0].data.map((c) => c.id)).toEqual([]);
+  });
+});
+
+describe("settleUpdatedAtIntoCaches", () => {
+  it("writes the confirmed updated_at over an older one and keeps a newer one", () => {
+    const qc = new QueryClient();
+    qc.setQueryData(["conversations", "", true], data([conv("a", { updated_at: 5 })]));
+    qc.setQueryData(["conversations", "", false], data([conv("a", { updated_at: 30 })]));
+    qc.setQueryData(
+      ["project-sessions", "proj", "updated_at", true],
+      data([conv("a", { archived: true, updated_at: 5 })]),
+    );
+
+    settleUpdatedAtIntoCaches(qc, "a", 20);
+
+    const updatedAt = (key: unknown[]) =>
+      qc.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data[0].updated_at;
+    expect(updatedAt(["conversations", "", true])).toBe(20);
+    expect(updatedAt(["conversations", "", false])).toBe(30);
+    expect(updatedAt(["project-sessions", "proj", "updated_at", true])).toBe(20);
   });
 });
 

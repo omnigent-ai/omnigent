@@ -20,7 +20,8 @@ import { pickListInputProps, readlineListStep } from "@/lib/listNavigationKeys";
 const ENABLED_ITEMS =
   ':is([role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"]):not([data-disabled])';
 
-function enabledItems(within: Element | null): HTMLElement[] {
+/** The enabled items, in order, of the Radix menu that `within` sits in. */
+export function enabledItems(within: Element | null): HTMLElement[] {
   const content = within?.closest<HTMLElement>("[data-radix-menu-content]");
   return [...(content?.querySelectorAll<HTMLElement>(ENABLED_ITEMS) ?? [])];
 }

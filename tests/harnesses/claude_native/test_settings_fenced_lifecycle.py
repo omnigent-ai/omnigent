@@ -913,7 +913,7 @@ async def test_terminal_launch_wires_process_guard_after_private_manifest_is_wri
         cwd_option = command.index("-c", new_session)
         inner = shlex.split(command[cwd_option + 2])
         if sandboxed:
-            assert launcher_options == [{"cwd": None, "process_lifetime": encoded}]
+            assert launcher_options == [{"cwd": str(tmp_path), "process_lifetime": encoded}]
             assert inner == [str(private / "inert-launcher"), *instance.args]
         else:
             assert launcher_options == []

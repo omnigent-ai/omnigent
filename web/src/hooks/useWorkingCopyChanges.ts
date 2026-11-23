@@ -70,6 +70,8 @@ export interface WorkingCopyChanges {
   permitted: boolean;
   /** Changes when the app verified the session's access again; refused reads retry then. */
   accessEpoch: number;
+  /** Changes each time the person chooses a comparison for this session here. */
+  choices: number;
   /** Whether new reads may start now: permitted, and the workspace can be reached. */
   readable: boolean;
 }
@@ -164,6 +166,7 @@ export function useWorkingCopyChanges(
     refetch,
     permitted,
     accessEpoch: snapshot.accessEpoch,
+    choices: snapshot.choices,
     readable,
   };
 

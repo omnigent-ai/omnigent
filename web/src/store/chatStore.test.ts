@@ -18058,6 +18058,76 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("keeps one row per tool call when a backfill re-reads calls the stream showed", async () => {
+    // The stream names tool items by provisional ids; the saved items carry their own.
+    const before = userMessage("resp_tool_gap_pre", "brief the worker");
+    seedSession("conv_tool_gap", [before]);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_tool_gap",
+      abortController: controller,
+      blocks: itemsToBlocks([before]),
+    });
+
+    const loop = startStreamPump("conv_tool_gap", controller, setState, getState);
+    await drainAsync();
+    const name = "sys_session_message";
+    const args = '{"session_id":"s_worker","message":"Reproduce the bug."}';
+    const live = sinks[0]!;
+    live.push(sse("response.created", { id: "resp_tool_gap", status: "in_progress", output: [] }));
+    live.push(
+      sse("response.output_item.done", {
+        item: { id: "fc_live", type: "function_call", call_id: "call_send", name, arguments: args },
+      }),
+    );
+    live.push(
+      sse("response.output_item.done", {
+        item: {
+          id: "fco_live",
+          type: "function_call_output",
+          response_id: "resp_tool_gap",
+          call_id: "call_send",
+          output: '{"queued": true}',
+        },
+      }),
+    );
+    live.push(sse("response.completed", { id: "resp_tool_gap", status: "completed", output: [] }));
+    await drainAsync();
+
+    const savedCall: ConversationItem = {
+      id: "item_call",
+      response_id: "resp_tool_gap",
+      type: "function_call",
+      status: "completed",
+      name,
+      arguments: args,
+      call_id: "call_send",
+    };
+    const savedOutput: ConversationItem = {
+      id: "item_output",
+      response_id: "resp_tool_gap",
+      type: "function_call_output",
+      status: "completed",
+      call_id: "call_send",
+      output: '{"queued": true}',
+    };
+    seedSessionItems("conv_tool_gap", [before, savedCall, savedOutput]);
+    live.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    const blocks = useChatStore.getState().blocks;
+    expect(blocks.filter((b) => b.type === "tool_group")).toHaveLength(1);
+    expect(blocks.filter((b) => b.type === "tool_result")).toHaveLength(1);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
   it("re-hydrates the window when the gap outruns the backfill page cap", async () => {
     const preGap = Array.from({ length: 30 }, (_, i) => gapUser("pre", i));
     const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);

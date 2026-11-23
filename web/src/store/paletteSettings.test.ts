@@ -85,7 +85,8 @@ describe("booleanSetting", () => {
     expect(setting.choices.map((choice) => choice.label)).toEqual(["On", "Off"]);
     expect(currentChoiceLabel(setting)).toBe("On");
     void setting.choose("off");
-    expect(write).toHaveBeenCalledWith(false);
+    void setting.choose("on");
+    expect(write.mock.calls).toEqual([[false], [true]]);
   });
 });
 

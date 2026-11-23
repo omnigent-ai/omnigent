@@ -81,13 +81,15 @@ const widthOf = (spec: PaneWidthSpec) =>
 const handleOf = (spec: PaneWidthSpec) => screen.getByRole("separator", { name: spec.label });
 
 describe("clampPaneWidth for the Files tree", () => {
-  it("keeps the tree between its narrowest and widest, and under half the page", () => {
+  it("keeps the tree above its narrowest and under half the page, however wide", () => {
     expect(clampPaneWidth(FILES_TREE_WIDTH, 100, 1600)).toBe(FILES_TREE_MIN_WIDTH);
-    expect(clampPaneWidth(FILES_TREE_WIDTH, 2000, 1600)).toBe(FILES_TREE_MAX_WIDTH);
+    // 48% of a 1600px page: a full-size page's room alone limits the tree.
+    expect(clampPaneWidth(FILES_TREE_WIDTH, 2000, 1600)).toBe(768);
+    // Before the page is measured, the tree stops at its widest.
+    expect(clampPaneWidth(FILES_TREE_WIDTH, 2000, null)).toBe(FILES_TREE_MAX_WIDTH);
     // 48% of a 600px page.
     expect(clampPaneWidth(FILES_TREE_WIDTH, 360, 600)).toBe(288);
     expect(clampPaneWidth(FILES_TREE_WIDTH, 360, 200)).toBe(FILES_TREE_MIN_WIDTH);
-    expect(clampPaneWidth(FILES_TREE_WIDTH, 2000, null)).toBe(FILES_TREE_MAX_WIDTH);
   });
 });
 
@@ -329,8 +331,9 @@ describe("a tree that keeps its share of the panel", () => {
     // A fractional page width rounds to whole pixels.
     view.rerender(<Pane spec={FILES} containerWidth={777.5} />);
     expect(widthOf(FILES)).toBe(276);
+    // A full-size page widens it in proportion.
     view.rerender(<Pane spec={FILES} containerWidth={1400} />);
-    expect(widthOf(FILES)).toBe(FILES_TREE_MAX_WIDTH);
+    expect(widthOf(FILES)).toBe(498);
     view.rerender(<Pane spec={FILES} containerWidth={720} />);
     expect(widthOf(FILES)).toBe(FILES_TREE_DEFAULT_WIDTH);
     // Following the page is not a choice.
@@ -359,7 +362,7 @@ describe("a tree that keeps its share of the panel", () => {
     view.rerender(<Pane spec={FILES} containerWidth={640} />);
     expect(widthOf(FILES)).toBe(240);
     view.rerender(<Pane spec={FILES} containerWidth={1600} />);
-    expect(widthOf(FILES)).toBe(FILES_TREE_MAX_WIDTH);
+    expect(widthOf(FILES)).toBe(600);
     expect(readPanelSharePreference("filesTreeShare")).toBe(0.375);
   });
 
@@ -403,8 +406,9 @@ describe("a tree that keeps its share of the panel", () => {
     writePanelSizePreference("filesTreeWidthPx", 9000);
     resetRememberedPaneWidthForTesting(FILES);
     render(<Pane spec={FILES} containerWidth={800} />);
-    expect(widthOf(FILES)).toBe(FILES_TREE_MAX_WIDTH);
-    expect(readPanelSharePreference("filesTreeShare")).toBe(0.45);
+    // 48% of the page is as wide as it draws.
+    expect(widthOf(FILES)).toBe(384);
+    expect(readPanelSharePreference("filesTreeShare")).toBe(0.48);
   });
 
   it("prefers a remembered share over an old pixel width", () => {

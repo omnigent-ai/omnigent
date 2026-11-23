@@ -8282,6 +8282,11 @@
             "title": "Server Version",
             "type": "string"
           },
+          "session_archive_runner_checks": {
+            "default": false,
+            "title": "Session Archive Runner Checks",
+            "type": "boolean"
+          },
           "session_bundle_model_override": {
             "default": true,
             "title": "Session Bundle Model Override",
@@ -8369,6 +8374,11 @@
           "session_search_scope": {
             "default": true,
             "title": "Session Search Scope",
+            "type": "boolean"
+          },
+          "session_timers": {
+            "default": false,
+            "title": "Session Timers",
             "type": "boolean"
           },
           "session_title_instructions": {
@@ -13125,7 +13135,7 @@
                 "type": "null"
               }
             ],
-            "description": "Own cumulative token baseline for Pi and Codex side chats, excluding descendants. Available even when display usage aggregation is skipped; `None` for other harnesses or older servers."
+            "description": "Own cumulative usage baseline for Pi, Claude native and Codex side chats, excluding descendants. Available even when display usage aggregation is skipped; `None` for other harnesses or older servers."
           },
           "parent_session_id": {
             "anyOf": [
@@ -13169,6 +13179,18 @@
             ],
             "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage. `None` when permissions are disabled (single-user mode without a permission store).",
             "title": "Permission Level"
+          },
+          "permission_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The permission mode the session is in, in its harness's vocabulary, e.g. `\"auto\"` or `\"approve-for-me\"` (the names `sys_session_create` takes). Follows a switch made while it runs to a mode that keeps approval; a mode that skips approval shows only when the session's launch settings select it. `None` when the harness has no permission modes or the mode cannot be told.",
+            "title": "Permission Mode"
           },
           "project_id": {
             "anyOf": [
@@ -21269,7 +21291,7 @@
     },
     "/v1/scheduled-tasks": {
       "get": {
-        "description": "List the caller's scheduled tasks.\n\nLists automations unless *kind* is `all`, so the reminders agents set for\ntheir own sessions stay off the Automations page. There is no reminders-only\nview: this list reads every task the owner has, and a selective filter needs\nan indexed, paginated query first.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
+        "description": "List the caller's scheduled tasks.\n\nLists automations unless *kind* is `all`, so the reminders and timers agents\nset for their own sessions stay off the Automations page. The kind filter runs\nin the query, so listing automations never reads an agent's timers. There is no\nreminders-only view; a selective view needs an indexed, paginated query first.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
         "operationId": "list_scheduled_tasks_v1_scheduled_tasks_get",
         "parameters": [
           {
