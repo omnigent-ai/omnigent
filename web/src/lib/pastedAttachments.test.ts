@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { largePasteAsFile, uniqueAttachmentName } from "./pastedAttachments";
 
+/** A name predicate over `@`-prefixed tokens, as the composer's allocation builds it. */
+function takenFrom(takenTokens: readonly string[]) {
+  return (candidate: string) => takenTokens.includes(`@${candidate}`);
+}
+
 function clipboard(text: string) {
   return { getData: (type: string) => (type === "text/plain" ? text : "") };
 }
@@ -31,17 +36,17 @@ describe("largePasteAsFile", () => {
 
 describe("uniqueAttachmentName", () => {
   it("keeps a name no token uses", () => {
-    expect(uniqueAttachmentName("image.png", ["@readme.md"])).toBe("image.png");
+    expect(uniqueAttachmentName("image.png", takenFrom(["@readme.md"]))).toBe("image.png");
   });
 
   it("suffixes a repeat before the extension", () => {
-    expect(uniqueAttachmentName("image.png", ["@image.png"])).toBe("image (2).png");
-    expect(uniqueAttachmentName("image.png", ["@image.png", "@image (2).png"])).toBe(
+    expect(uniqueAttachmentName("image.png", takenFrom(["@image.png"]))).toBe("image (2).png");
+    expect(uniqueAttachmentName("image.png", takenFrom(["@image.png", "@image (2).png"]))).toBe(
       "image (3).png",
     );
   });
 
   it("suffixes an extensionless name at its end", () => {
-    expect(uniqueAttachmentName("notes", ["@notes"])).toBe("notes (2)");
+    expect(uniqueAttachmentName("notes", takenFrom(["@notes"]))).toBe("notes (2)");
   });
 });

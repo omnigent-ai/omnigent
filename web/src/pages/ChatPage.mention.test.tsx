@@ -1492,6 +1492,33 @@ describe("Composer pasted chips", () => {
     );
   });
 
+  it("names a re-pasted file apart from a literal spelling and tray file it repeats", async () => {
+    const onSend = await renderCodeMirrorComposer();
+    const shot = new File(["a"], "shot.png", { type: "image/png" });
+    // A failed send restores its text as literal spellings, with its files back in the tray.
+    act(() =>
+      useChatStore.setState({
+        rewindPrefill: {
+          conversationId: useChatStore.getState().conversationId!,
+          text: "Look @shot.png",
+          files: [shot],
+          replyDraft: undefined,
+        },
+      }),
+    );
+    await waitFor(() => expect(valueOf()).toBe("Look @shot.png"));
+    caretAt(valueOf().length);
+    paste({ files: [new File(["b"], "shot.png", { type: "image/png" })] });
+    expect(tokens()).toEqual(["@shot (2).png"]);
+
+    caretAt("Look @shot.png @shot (2).png".length);
+    fireEvent.keyDown(composerInput(), { key: "Backspace" });
+    expect(tokens()).toEqual([]);
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(sentFiles(onSend)).toHaveLength(1);
+    expect(sentFiles(onSend)![0]).toBe(shot);
+  });
+
   it("leaves a large text paste inline on the textarea engine", () => {
     render(<Composer {...composerProps()} />);
     const log = "line\n".repeat(49) + "line";

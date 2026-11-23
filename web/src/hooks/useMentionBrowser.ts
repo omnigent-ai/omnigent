@@ -161,7 +161,11 @@ export interface MentionBrowser {
   /** Tag a session, replacing the typed ``@query`` with its token. */
   attachSession: (session: SessionMention) => void;
   /** Pasted files, each inserted as a chip at its input's selection. Files are validated already. */
-  attachPastedFiles: (files: readonly File[], target: ComposerTextTarget) => void;
+  attachPastedFiles: (
+    files: readonly File[],
+    target: ComposerTextTarget,
+    trayFiles: readonly File[],
+  ) => void;
   /** The pasted-file chips in the draft, released ones excluded. */
   mentionedAttachments: PastedAttachment[];
   /** Tokens of everything tagged so far, for highlighting and Backspace. */
@@ -492,16 +496,27 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     return true;
   };
 
-  const attachPastedFiles = (files: readonly File[], target: ComposerTextTarget) => {
-    const taken = ownedMentionTokens();
+  const attachPastedFiles = (
+    files: readonly File[],
+    target: ComposerTextTarget,
+    trayFiles: readonly File[],
+  ) => {
+    const owned = ownedMentionTokens();
+    const trayNames = trayFiles.map(attachmentFilename);
     const added: PastedAttachment[] = [];
     for (const file of files) {
+      // A name is taken by a tag, a spelling already typed or pasted as text, or a tray file.
+      // Each new chip is checked against the text as it grows, so names stay apart.
+      const isTaken = (candidate: string) =>
+        owned.includes(`@${candidate}`) ||
+        trayNames.includes(candidate) ||
+        added.some((it) => it.token === `@${candidate}`) ||
+        findMentionTokens(draftSegments.join("\n"), [`@${candidate}`]).length > 0;
       // The chip's name is the filename the attachment is sent with, so it is also its token.
-      const name = uniqueAttachmentName(attachmentFilename(file), taken);
+      const name = uniqueAttachmentName(attachmentFilename(file), isTaken);
       const token = `@${name}`;
       const named = name === file.name ? file : new File([file], name, { type: file.type });
       if (!insertTokenAt(target, target.selectionStart, target.selectionEnd, token)) break;
-      taken.push(token);
       added.push({ token, file: named });
     }
     if (added.length === 0) return;

@@ -20,11 +20,13 @@ export function largePasteAsFile(data: Pick<DataTransfer, "getData">): File | nu
 }
 
 /**
- * `name` as a chip token's name, with a ` (n)` suffix before its extension when another token
- * already uses it, e.g. `image (2).png`. `takenTokens` are the draft's `@`-prefixed tokens.
+ * `name` as a chip token's name, with a ` (n)` suffix before its extension when `isTaken` says a
+ * spelling is already in use, e.g. `image (2).png`.
  */
-export function uniqueAttachmentName(name: string, takenTokens: readonly string[]): string {
-  const isTaken = (candidate: string) => takenTokens.includes(`@${candidate}`);
+export function uniqueAttachmentName(
+  name: string,
+  isTaken: (candidate: string) => boolean,
+): string {
   if (!isTaken(name)) return name;
   const dot = name.lastIndexOf(".");
   const stem = dot > 0 ? name.slice(0, dot) : name;

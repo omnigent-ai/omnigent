@@ -604,7 +604,7 @@ export function mergeTaggedDrafts(
     }
     // A renamed chip's file takes the new name too, so the sent filename still matches its token.
     const next = taken.includes(token)
-      ? `@${uniqueAttachmentName(token.slice(1), avoid(token))}`
+      ? `@${uniqueAttachmentName(token.slice(1), (candidate) => avoid(token).includes(`@${candidate}`))}`
       : token;
     const file =
       next === token

@@ -1747,6 +1747,36 @@ describe("grid cell composer shares its session's draft", () => {
     expect(useChatStore.getState().sideChatComposers[gridCellComposerKey(childId)]).toBeUndefined();
   });
 
+  it("sends a pasted chip's file with the cell's message, directly and when queued", () => {
+    writeAlwaysSteer(false);
+    const shot = new File(["a"], "shot.png", { type: "image/png" });
+    const text = "Look at @shot.png";
+    const sharedDraft = {
+      text,
+      files: [],
+      mentions: { files: [], sessions: [], attachments: [{ token: "@shot.png", file: shot }] },
+    };
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+    bridgedCell(sharedDraft);
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    const queued = useChatStore.getState().queuedMessages[0]!;
+    expect(queued.files).toHaveLength(1);
+    expect(queued.files![0]).toBe(shot);
+
+    act(() => conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" }));
+    cleanup();
+    setSessionDraft(childId, sharedDraft);
+    useChatStore.setState({ queuedMessages: [] });
+    gridCell();
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      text,
+      "agent_side",
+      [shot],
+      expect.objectContaining({ pinnedConversationId: childId }),
+    );
+  });
+
   it("sends a tagged skill command as an ordinary message, not as a local command", () => {
     conversationRegistry
       .acquire(childId)

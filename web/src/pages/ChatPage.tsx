@@ -2802,9 +2802,9 @@ function ComposerImpl(
   // callbacks so the hook never learns about sessions or focus.
 
   // Filled in once useMentionBrowser is set up below.
-  const attachPastedFilesRef = useRef<(files: File[], target: ComposerTextTarget) => void>(
-    () => {},
-  );
+  const attachPastedFilesRef = useRef<
+    (files: File[], target: ComposerTextTarget, trayFiles: File[]) => void
+  >(() => {});
   const {
     files,
     attachmentError,
@@ -2828,7 +2828,7 @@ function ComposerImpl(
     },
     onPasteChips:
       composerEngine === "codemirror"
-        ? (pasted, target) => attachPastedFilesRef.current(pasted, target)
+        ? (pasted, target, trayFiles) => attachPastedFilesRef.current(pasted, target, trayFiles)
         : undefined,
   });
   const filesRef = useRef(files);

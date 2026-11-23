@@ -27,7 +27,7 @@ export interface UseComposerAttachmentsOptions {
    * only validated files; a large plain-text paste arrives as one `.txt` file. Without it, pastes
    * attach to the tray as before.
    */
-  onPasteChips?: (files: File[], target: ComposerTextTarget) => void;
+  onPasteChips?: (files: File[], target: ComposerTextTarget, trayFiles: File[]) => void;
 }
 
 export interface ComposerAttachmentsApi {
@@ -152,13 +152,13 @@ export function useComposerAttachments({
           return;
         }
         e.preventDefault();
-        insertChips([largeText], e.currentTarget);
+        insertChips([largeText], e.currentTarget, filesRef.current);
         return;
       }
       e.preventDefault();
       if (insertChips) {
         const accepted = validateIncoming(pasted);
-        if (accepted.length > 0) insertChips(accepted, e.currentTarget);
+        if (accepted.length > 0) insertChips(accepted, e.currentTarget, filesRef.current);
         return;
       }
       addFiles(pasted);

@@ -2748,9 +2748,9 @@ function NewChatLandingContent({
   // navigated into, where the first turn's 415 strands the typed message in
   // a session the user never wanted.
   // The chip inserter comes from useMentionBrowser, set up further down.
-  const attachPastedFilesRef = useRef<(files: File[], target: ComposerTextTarget) => void>(
-    () => {},
-  );
+  const attachPastedFilesRef = useRef<
+    (files: File[], target: ComposerTextTarget, trayFiles: File[]) => void
+  >(() => {});
   const {
     files,
     attachmentError,
@@ -2764,7 +2764,7 @@ function NewChatLandingContent({
     initialFiles: handoff?.files ?? restoredDraft?.files ?? [],
     onPasteChips:
       composerEngine === "codemirror"
-        ? (pasted, target) => attachPastedFilesRef.current(pasted, target)
+        ? (pasted, target, trayFiles) => attachPastedFilesRef.current(pasted, target, trayFiles)
         : undefined,
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
