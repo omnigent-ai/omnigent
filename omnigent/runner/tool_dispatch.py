@@ -1185,10 +1185,9 @@ def _granted_tool_names(agent_spec: AgentSpec, harness: str | None = None) -> fr
     :raises Exception: Propagates ``ToolManager`` construction failures so
         callers can fail closed instead of guessing at the surface.
     """
-    from omnigent.runtime import get_caps
-    from omnigent.server.routing_backend import routing_available
+    from omnigent.runtime import routing_stamp
 
-    cache_key = (id(agent_spec), harness, routing_available(get_caps()))
+    cache_key = (id(agent_spec), harness, routing_stamp())
     cached = _granted_tool_names_cache.get(cache_key)
     if cached is not None and cached[0]() is agent_spec:
         return cached[1]

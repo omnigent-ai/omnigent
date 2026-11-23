@@ -112,10 +112,9 @@ def build_runner_session_init_payload(
     if conversation.agent_id is None:
         raise ValueError("runner session initialization requires an agent_id")
     if smart_routing_available is None:
-        from omnigent.runtime import get_caps
-        from omnigent.server.routing_backend import routing_available
+        from omnigent.runtime import routing_stamp
 
-        smart_routing_available = routing_available(get_caps())
+        smart_routing_available = routing_stamp()
     envelope = RunnerSessionInitEnvelope(
         protocol_version=SESSION_INIT_PROTOCOL_VERSION,
         server_version=server_version,

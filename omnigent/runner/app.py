@@ -222,7 +222,7 @@ from omnigent.runner.subagent_work import (
     unregister_subagent_work_for_session,
     wrapper_label_from_labels,
 )
-from omnigent.runtime import get_caps, set_remote_routing_available
+from omnigent.runtime import routing_stamp, set_remote_routing_available
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
     build_instructions,
@@ -5959,6 +5959,7 @@ def create_runner_app(
             current is not None
             and current.spec_entry is spec_entry
             and current.workflows_enabled == workflows_enabled
+            and current.routing_available == routing_stamp()
             and known_bridge_dir is None
         ):
             return
@@ -5981,6 +5982,7 @@ def create_runner_app(
             current is not None
             and current.spec_entry is spec_entry
             and current.workflows_enabled == workflows_enabled
+            and current.routing_available == routing_stamp()
             and current.bridge_dir == bridge_dir
         ):
             return
@@ -5991,6 +5993,7 @@ def create_runner_app(
         )
 
         relay_spec = _unwrap_spec_entry(spec_entry)
+        relay_routing = routing_stamp()
         relay_schemas: list[_JsonObject] = filter_workflow_tool_schemas(
             build_native_relay_tool_schemas(relay_spec),
             enabled=workflows_enabled,
@@ -6019,6 +6022,7 @@ def create_runner_app(
                 current is not None
                 and current.spec_entry is spec_entry
                 and current.workflows_enabled == workflows_enabled
+                and current.routing_available == routing_stamp()
                 and current.bridge_dir == bridge_dir
             ):
                 return
@@ -6164,6 +6168,7 @@ def create_runner_app(
             spec_entry=spec_entry,
             bridge_dir=bridge_dir,
             workflows_enabled=workflows_enabled,
+            routing_available=relay_routing,
         )
         # Close last: the new advertisement is already written, and
         # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
@@ -6586,9 +6591,7 @@ def create_runner_app(
         # when the answer it was built under has moved, keeping its MCP entries and
         # hash so discovery is not repeated. Nothing shared is cleared, so another
         # session's in-flight MCP discovery is never disturbed.
-        from omnigent.server.routing_backend import routing_available
-
-        routing_now = routing_available(get_caps())
+        routing_now = routing_stamp()
         routing_stale = (
             conv in _session_tool_schemas
             and _session_tool_schemas_routing.get(conv) != routing_now
