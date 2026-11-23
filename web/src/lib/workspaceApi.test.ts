@@ -498,6 +498,88 @@ describe("readFileViaWorkspaceApi", () => {
     expect(listed?.data.map((entry) => entry.path)).toEqual(["com"]);
   });
 
+  it("asks a host whose GetCapabilities fails only once in a while, and lists meanwhile", async () => {
+    enable("workspace_api_server_access");
+    serveMethods({
+      GetCapabilities: () => Response.json({ code: "internal", message: "down" }, { status: 500 }),
+      ListDirectory: () => listedPage({ name: "com", path: "com", type: EntryType.DIRECTORY }),
+    });
+
+    await listDirectoryViaWorkspaceApi("s-capabilities-fail", "", 1000);
+    const listed = await listDirectoryViaWorkspaceApi("s-capabilities-fail", "", 1000);
+
+    expect(listed?.data.map((entry) => entry.path)).toEqual(["com"]);
+    expect(methodCalls("GetCapabilities")).toHaveLength(1);
+  });
+
+  it("lists on the server when the direct route can't answer GetCapabilities", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    socket.mockRejectedValue(new Error("the SSH connection closed"));
+    serveMethods({
+      "direct-access": () => Response.json(DIRECT_GRANT),
+      ListDirectory: () => listedPage({ name: "a.ts", path: "a.ts", type: EntryType.FILE }),
+    });
+
+    const first = await listDirectoryViaWorkspaceApi("s-direct-down", "", 1000);
+    const second = await listDirectoryViaWorkspaceApi("s-direct-down", "", 1000);
+
+    expect(first?.data.map((entry) => entry.path)).toEqual(["a.ts"]);
+    expect(second?.data.map((entry) => entry.path)).toEqual(["a.ts"]);
+    // The direct route was asked once, never listed on, and skipped afterwards.
+    expect(
+      socket.mock.calls.map(([request]) => methodOf((request as { path: string }).path)),
+    ).toEqual(["GetCapabilities"]);
+    expect(methodCalls("ListDirectory")).toHaveLength(2);
+  });
+
+  it("starts over without chains when a route that lists them fails part way", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    let socketListings = 0;
+    socket.mockImplementation(async (request) => {
+      if (methodOf((request as { path: string }).path) === "GetCapabilities") {
+        return fromSocket(
+          capabilitiesBody("ListDirectory", "list_directory.collapse_single_child_directories"),
+        );
+      }
+      socketListings += 1;
+      if (socketListings > 1) throw new Error("the SSH connection closed");
+      const page = create(ListDirectoryResponseSchema, {
+        entries: [
+          { name: "com", path: "com", type: EntryType.DIRECTORY, leafDirectoryPath: "com/a/b" },
+        ],
+        nextPageToken: "com",
+      });
+      return {
+        status: 200,
+        headers: PROTO_HEADERS,
+        body: toBinary(ListDirectoryResponseSchema, page),
+      };
+    });
+    const serverAsked: boolean[] = [];
+    serveMethods({
+      "direct-access": () => Response.json(DIRECT_GRANT),
+      ListDirectory: (body) => {
+        serverAsked.push(
+          fromBinary(ListDirectoryRequestSchema, body).collapseSingleChildDirectories,
+        );
+        return listedPage(
+          { name: "com", path: "com", type: EntryType.DIRECTORY },
+          { name: "net", path: "net", type: EntryType.DIRECTORY },
+        );
+      },
+    });
+
+    const listed = await listDirectoryViaWorkspaceApi("s-chains-partial", "", 1000);
+
+    // Only the server's listing is kept, so no entry carries the failed route's chain.
+    expect(serverAsked).toEqual([false]);
+    expect(listed?.data).toEqual([
+      expect.not.objectContaining({ leaf_directory_path: expect.anything() }),
+      expect.not.objectContaining({ leaf_directory_path: expect.anything() }),
+    ]);
+    expect(listed?.data.map((entry) => entry.path)).toEqual(["com", "net"]);
+  });
+
   it.each([
     ["answers", ["src/b.ts"]],
     ["fails too", null],
@@ -561,6 +643,19 @@ const capabilitiesBody = (...methods: string[]): Uint8Array<ArrayBuffer> =>
   ) as Uint8Array<ArrayBuffer>;
 const unimplemented = (): Response =>
   Response.json({ code: "unimplemented", message: "no such method" }, { status: 501 });
+const DIRECT_GRANT = {
+  host_id: "host-1",
+  socket_path: "/tmp/omnigent-workspace-x/workspace.sock",
+  token: "tok",
+  expires_at: Date.now() / 1000 + 300,
+};
+const listedPage = (
+  ...entries: NonNullable<MessageInitShape<typeof ListDirectoryResponseSchema>["entries"]>
+) =>
+  new Response(
+    toBinary(ListDirectoryResponseSchema, create(ListDirectoryResponseSchema, { entries })),
+    { headers: PROTO_HEADERS },
+  );
 const methodOf = (input: unknown): string => String(input).split("/").at(-1)!;
 const methodCalls = (method: string) =>
   vi.mocked(authenticatedFetch).mock.calls.filter(([input]) => methodOf(input) === method);

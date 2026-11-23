@@ -287,10 +287,20 @@ function routeCapabilities(
 }
 
 const NO_CAPABILITIES: ReadonlySet<string> = new Set();
+// Failures of the route that carried GetCapabilities, not answers from its host.
+const ROUTE_FAILURE_CODES: ReadonlySet<Code> = new Set([
+  Code.Unavailable,
+  Code.Canceled,
+  Code.DeadlineExceeded,
+  Code.Unauthenticated,
+  Code.Unknown,
+]);
 
 /**
  * A route's capabilities for a baseline method that only uses optional features: a host
- * that can't answer GetCapabilities still serves the method, just without them.
+ * that answers GetCapabilities with an error still serves the method, just without them,
+ * for as long as an Unimplemented answer would be kept. A route that can't be reached
+ * fails, so the caller moves on to the next one.
  */
 async function optionalCapabilities(
   route: Route,
@@ -300,8 +310,13 @@ async function optionalCapabilities(
 ): Promise<ReadonlySet<string>> {
   try {
     return await abortable(routeCapabilities(route, sessionId, sshTarget), signal);
-  } catch {
+  } catch (error) {
     signal?.throwIfAborted();
+    if (!(error instanceof ConnectError) || ROUTE_FAILURE_CODES.has(error.code)) throw error;
+    capabilities.set(routeKey(route, sessionId, sshTarget), {
+      pending: Promise.resolve(NO_CAPABILITIES),
+      expiresAtMs: Date.now() + ROUTE_RETRY_MS,
+    });
     return NO_CAPABILITIES;
   }
 }
