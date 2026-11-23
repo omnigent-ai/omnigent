@@ -236,6 +236,16 @@ async def test_fuzzy_queries_rank_files_best_first_with_highlights(tmp_path: Pat
     assert response.indexed_paths == 5 and not response.truncated
 
 
+async def test_a_fuzzy_query_past_the_longest_a_search_takes_is_refused(tmp_path: Path) -> None:
+    root = _project(tmp_path / "repo")
+
+    assert _paths(await _fuzzy(root, "w" * 4096)) == []
+    with pytest.raises(ConnectError) as refused:
+        await _fuzzy(root, "w" * 4097)
+
+    assert refused.value.code == Code.INVALID_ARGUMENT
+
+
 async def test_a_blank_fuzzy_query_lists_files_in_path_order(tmp_path: Path) -> None:
     root = _project(tmp_path / "repo")
 

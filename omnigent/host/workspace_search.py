@@ -67,6 +67,7 @@ from omnigent.runner.environment_filesystem import (
 )
 from omnigent.workspace_content_search import (
     MAX_MATCHES,
+    MAX_QUERY_LENGTH,
     MAX_SCRIPT_OUTPUT,
     SCRIPT_TIMEOUT_S,
     ContentSearchError,
@@ -251,6 +252,10 @@ async def search_files(root: Path, request: SearchFilesRequest) -> SearchFilesRe
         raise ConnectError(Code.NOT_FOUND, f"Directory {base!r} not found")
     scope = DirectoryScope.parse(root, request.include_directories, request.exclude_directories)
     query = request.query.strip() if fuzzy else request.query.strip().lower()
+    if fuzzy and len(query) > MAX_QUERY_LENGTH:
+        raise ConnectError(
+            Code.INVALID_ARGUMENT, f"Enter a query of at most {MAX_QUERY_LENGTH} characters"
+        )
     if not query and not fuzzy:
         return SearchFilesResponse()
     limit = min(request.maximum_results or _DEFAULT_FILE_RESULTS, _MAX_FILE_RESULTS)
