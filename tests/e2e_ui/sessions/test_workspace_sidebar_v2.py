@@ -253,8 +253,8 @@ def test_tabs_sidebar_files_history_and_pull_request(
 def test_all_tabs_groups_the_tabs_and_closes_them_by_row_and_by_group(
     page: Page, workspace_session: tuple[str, str]
 ) -> None:
-    """A file tab, a PR tab, then a new tab → All tabs lists the new tab first and the others
-    under Files and Pull requests → ⌘⌫ closes the file → Close all closes the PR's tab.
+    """A file tab, a PR tab, then a new tab → All tabs lists them under Pull requests, Files
+    and Other, the new one marked Current → ⌘⌫ closes the file → Close all closes the PR's tab.
     """
     base_url, session_id = workspace_session
     _stub_github(page)
@@ -277,7 +277,8 @@ def test_all_tabs_groups_the_tabs_and_closes_them_by_row_and_by_group(
 
     sidebar.get_by_role("button", name="All tabs").click()
     tab_list = page.get_by_role("listbox", name="Search tabs")
-    expect(tab_list.get_by_role("option").first).to_contain_text("Current")
+    other = tab_list.get_by_role("group", name=re.compile(r"^Other"))
+    expect(other.get_by_role("option", name=re.compile("Current"))).to_have_count(1)
     files = tab_list.get_by_role("group", name=re.compile(r"^Files 1"))
     file_row = files.get_by_role("option", name=re.compile(re.escape(_FILE)))
     expect(file_row).to_be_visible()
@@ -296,8 +297,8 @@ def test_all_tabs_groups_the_tabs_and_closes_them_by_row_and_by_group(
     page.get_by_role("button", name="Close all pull request tabs").click()
     expect(pr_tab).to_have_count(0)
     expect(pulls).to_have_count(0)
-    # The list stays open on what's left: the new tab on screen.
-    expect(tab_list.get_by_role("option").first).to_contain_text("Current")
+    # The list stays open on what's left, with the new tab on screen.
+    expect(other.get_by_role("option", name=re.compile("Current"))).to_have_count(1)
 
 
 def test_files_menu_copies_the_path_and_a_link_to_the_file(

@@ -64,13 +64,13 @@ const ENTRIES: TabSearchEntry[] = [
 afterEach(cleanup);
 
 describe("tabSearchItems", () => {
-  it("lists the tab on screen first, then each kind of tab in strip order, then Reopen", () => {
+  it("lists each kind of tab in strip order, the one on screen in its own, then Reopen", () => {
     const items = tabSearchItems(ENTRIES, { label: "Reopen closed tab" });
     expect(items.map((item) => [item.label, item.group])).toEqual([
-      ["zsh", undefined],
       ["#12 Fix the login form", "Pull requests"],
       ["main.go", "Files"],
       ["domain.go", "Files"],
+      ["zsh", "Shells"],
       ["Reopen closed tab", TAB_ACTIONS_GROUP],
     ]);
   });
@@ -219,7 +219,13 @@ describe("WorkspaceTabSearch", () => {
     expect(screen.getByRole("group", { name: "Pull requests 1" })).toHaveTextContent("Merged");
     const files = screen.getByRole("group", { name: "Files 2" });
     expect(within(files).getByRole("img", { name: "Unsaved changes" })).toBeTruthy();
-    expect(screen.queryByRole("group", { name: /^Shells/ })).toBeNull();
+    // The tab on screen counts in its own group, which the list opens on.
+    const shells = screen.getByRole("group", { name: "Shells 1" });
+    expect(within(shells).getByRole("option", { name: /zsh/ })).toHaveTextContent("Current");
+    const field = screen.getByRole("combobox", { name: "Search tabs" });
+    expect(document.getElementById(field.getAttribute("aria-activedescendant")!)).toHaveTextContent(
+      "zsh",
+    );
   });
 
   it("closes a tab from its row by click or chord, keeping the list open", async () => {
@@ -254,7 +260,8 @@ describe("WorkspaceTabSearch", () => {
     await userEvent.click(screen.getByRole("button", { name: "All tabs" }));
     const field = screen.getByRole("combobox", { name: "Search tabs" });
     const active = () => document.getElementById(field.getAttribute("aria-activedescendant")!);
-    await userEvent.keyboard("{ArrowDown}");
+    expect(active()).toHaveTextContent("zsh");
+    await userEvent.keyboard("{ArrowUp}{ArrowUp}{ArrowUp}");
     expect(active()).toHaveTextContent("Fix the login form");
     await userEvent.keyboard("{Control>}{Backspace}{/Control}");
     expect(active()).toHaveTextContent("main.go");

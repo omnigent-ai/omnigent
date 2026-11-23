@@ -1,5 +1,5 @@
-// The strip's tab list: the open workspace tabs grouped by kind, the one on screen first, with
-// a fuzzy search over them. Each row closes its tab, and a group's heading closes the group.
+// The strip's tab list: the open workspace tabs grouped by kind, opened on the one on screen,
+// with a fuzzy search over them. Each row closes its tab, and a group's heading closes the group.
 // It opens from the layers button after ‹ › or from ⌘K's "Search tabs…", which share one command.
 
 import { LayersIcon, type LucideIcon, RotateCcwIcon, XIcon } from "lucide-react";
@@ -96,8 +96,9 @@ function TabRowAccessory({ entry }: { entry: TabSearchEntry }) {
 }
 
 /**
- * The tab on screen first, then a group per kind of tab in `TAB_GROUPS` order, each in strip
- * order, then the list's own action when it can run. `onClose` gives each closable row Close.
+ * A group per kind of tab in `TAB_GROUPS` order, each in strip order, then the list's own action
+ * when it can run. The tab on screen stays in its group, so a heading counts and closes what it
+ * lists. `onClose` gives each closable row Close.
  */
 export function tabSearchItems(
   entries: readonly TabSearchEntry[],
@@ -116,8 +117,7 @@ export function tabSearchItems(
       ...(pullRequest ? { keywords: [entry.label, entry.tooltip] } : {}),
       icon: entry.filePath !== undefined ? <FileTypeIcon path={entry.filePath} /> : <entry.icon />,
       accessory: <TabRowAccessory entry={entry} />,
-      // The tab on screen leads the list on its own, outside its group.
-      ...(entry.selected ? {} : { group: tabGroup(entry.group).label }),
+      group: tabGroup(entry.group).label,
       ...(onClose && entry.closable
         ? {
             actions: [
@@ -134,11 +134,9 @@ export function tabSearchItems(
       value: { kind: "tab", tabId: entry.tabId },
     };
   };
-  const current = entries.filter((entry) => entry.selected);
-  const grouped = TAB_GROUPS.flatMap((group) =>
-    entries.filter((entry) => !entry.selected && entry.group === group.id),
-  );
-  const tabs = [...current, ...grouped].map(item);
+  const tabs = TAB_GROUPS.flatMap((group) =>
+    entries.filter((entry) => entry.group === group.id),
+  ).map(item);
   if (!reopen) return tabs;
   return [
     ...tabs,
