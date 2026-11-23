@@ -300,9 +300,7 @@ export async function openGadgetSession(
     onDelivered?: (sessionId: string) => void;
   },
 ): Promise<"sent" | "starting"> {
-  // An action goes only to the viewer's gadget session. Beside a session that only cites the
-  // gadget, it goes there without leaving the page; with no gadget session, New session starts
-  // one. A failed lookup sends nothing, so no other session can receive the request.
+  // Only the viewer's gadget session gets an action; a failed lookup sends nothing.
   let target = railSessionId;
   let show = reveal;
   let registered: string | null | undefined;

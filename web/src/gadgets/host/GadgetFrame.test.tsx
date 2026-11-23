@@ -396,6 +396,48 @@ describe("GadgetFrame", () => {
       expect(screen.queryByText("Let this gadget see your sessions?")).toBeNull();
     });
 
+    it("asks again after a frame it stopped for navigating is reloaded", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async () =>
+            new Response(JSON.stringify({ data: [], has_more: false }), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            }),
+        ),
+      );
+      const { list, responseFor } = connectWithSessions();
+      list("r1");
+      fireEvent.click(await screen.findByRole("button", { name: "Allow" }));
+      await waitFor(() => expect(responseFor("r1")).toMatchObject({ ok: true }));
+
+      const frame = () => document.querySelector("iframe") as HTMLIFrameElement;
+      // Loads until the gadget's document leaves its page and the frame is stopped.
+      while (frame() !== null) fireEvent.load(frame());
+      fireEvent.click(screen.getByRole("button", { name: "Reload gadget" }));
+      const frameWindow = frame().contentWindow as Window;
+      vi.spyOn(frameWindow, "postMessage").mockImplementation(() => {});
+      greet(frameWindow, { type: GADGET_HELLO_MESSAGE_TYPE, ...mountOf(frame()) });
+      const port = FakeMessageChannel.created.at(-1)!.port1;
+      const onMessage = port.addEventListener.mock.calls[0][1] as (event: MessageEvent) => void;
+      act(() => {
+        onMessage(
+          new MessageEvent("message", {
+            data: {
+              v: 1,
+              kind: "request",
+              id: "r2",
+              method: "sessions.v1.list",
+              params: {},
+              deadlineMs: 5_000,
+            },
+          }),
+        );
+      });
+      expect(await screen.findByText("Let this gadget see your sessions?")).toBeVisible();
+    });
+
     it("refuses the list, and reads nothing, when the viewer does not allow it", async () => {
       const fetchMock = vi.fn();
       vi.stubGlobal("fetch", fetchMock);

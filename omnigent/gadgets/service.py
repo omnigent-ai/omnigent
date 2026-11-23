@@ -592,9 +592,7 @@ class GadgetService:
         }
 
     # -- the viewer's shelf: pinned gadgets and the gadgets each session shows -----
-    # It is the viewer's own state, also about gadgets shared with them, so it lives
-    # in their files rather than in any gadget's. One document each keeps a sidebar
-    # load to a few reads.
+    # The viewer's own state, so it lives in their files, not any gadget's.
 
     @property
     def _shelf(self) -> ImmutableDocumentStore:

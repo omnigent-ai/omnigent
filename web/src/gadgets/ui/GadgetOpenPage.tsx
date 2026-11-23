@@ -1,12 +1,7 @@
 /**
- * A gadget's link (`/gadget/:gadgetId`): opens the gadget filling the screen in the viewer's
- * gadget session, or beside New session when they have none, so leaving full screen shows the
- * session behind it. Opened from inside Omnigent (a pinned row, the Gadget page), the sidebar stays
- * as it was; a link opened fresh closes it.
- *
- * The page replaces itself with where the gadget opens, and that URL names the gadget filling
- * the screen (`?gadget=`), so Back returns to the page before the link and Forward opens the
- * gadget full screen again.
+ * A gadget's link (`/gadget/:gadgetId`). It replaces itself with the gadget filling the screen
+ * where it opens (`?gadget=`), keeping the sidebar for an open from inside Omnigent and closing it
+ * for a link opened fresh.
  */
 import { useCallback, useEffect, useState } from "react";
 import { Loader2Icon } from "lucide-react";

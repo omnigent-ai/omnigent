@@ -1,12 +1,5 @@
-// Decides whether a frame call that acts for the viewer (an action request or a navigation)
-// follows a real gesture inside the gadget, from host-side state only. A call is allowed when:
-// - the browser reports transient user activation, or, without that API, the frame took focus in
-//   the last few seconds;
-// - the gadget's frame is the focused element, and no gesture reached Omnigent's own document
-//   since it took focus;
-// - the gesture has not been used: after each decision focus moves to the frame's container, and
-//   calls are at least `MIN_CALL_INTERVAL_MS` apart.
-// designs/GADGETS.md explains why each condition is needed.
+// Decides from host-side state alone whether a frame call that acts for the viewer follows a
+// real, unused gesture inside the gadget. designs/GADGETS.md explains each condition.
 
 const MIN_CALL_INTERVAL_MS = 1000;
 // About how long browsers keep transient activation after a click.

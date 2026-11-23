@@ -490,6 +490,9 @@ export function GadgetFrame({
         // every load would otherwise keep sending what it can read.
         bridgeRef.current?.dispose();
         bridgeRef.current = null;
+        // The reloaded gadget asks again before it reads the viewer's sessions.
+        sessionsAccessRef.current = null;
+        setSessionsAccess(null);
         setClosedReason("navigated");
         return;
       }
@@ -559,9 +562,8 @@ export function GadgetFrame({
           <AlertTitle>This gadget tried to leave its page, so Omnigent stopped it</AlertTitle>
           <AlertDescription>
             <p>
-              A gadget can’t reach the network, but leaving its page sends one request, which can
-              carry what the gadget could read. Ask its session to fix the page if you didn’t expect
-              this.
+              Leaving its page can send what the gadget could read to another site. Ask its session
+              to fix the page if you didn’t expect this.
             </p>
             <Button
               size="sm"
