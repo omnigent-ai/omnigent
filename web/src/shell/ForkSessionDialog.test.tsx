@@ -12,6 +12,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { SANDBOX_REPO_LABEL_KEY } from "./NewChatDialog";
 import { ForkSessionDialog, ForkSessionForm } from "./ForkSessionDialog";
 import { beginClone, cloneKey, pendingClones } from "./cloneRequests";
@@ -3143,6 +3144,122 @@ describe("ForkSessionDialog", () => {
         "Enter a repository URL",
       );
       expect(forkSessionMock).not.toHaveBeenCalled();
+    });
+
+    describe("model choices", () => {
+      const GATEWAY_SANDBOX = {
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "modal",
+        sandbox_provider_capabilities: { modal: { default_models: true } },
+      };
+      const fetchMock = vi.fn<typeof fetch>();
+
+      function openModelSelect(): void {
+        fireEvent.click(screen.getByTestId("fork-session-config-model"));
+      }
+
+      beforeEach(() => {
+        // The provider's gateway preview lists one model per harness.
+        fetchMock.mockReset().mockImplementation(async (input) => {
+          const harness = /\/sandbox-providers\/modal\/harnesses\/([^/]+)\/model-options/.exec(
+            String(input),
+          )?.[1];
+          if (harness === undefined) return new Response(null, { status: 404 });
+          return Response.json({
+            configured: false,
+            status: "ready",
+            models: [{ id: `gateway/${harness}`, displayName: `Gateway ${harness}` }],
+            configuration_revision: null,
+            provider_label: "AI Gateway",
+            default_model: null,
+          });
+        });
+        vi.stubGlobal("fetch", fetchMock);
+        useSessionAgentMock.mockReturnValue({
+          data: { id: "ag_claude_native", name: "claude-native-ui", harness: "claude-native" },
+        } as unknown as ReturnType<typeof useSessionAgent>);
+        forkSessionMock.mockResolvedValue({ id: "conv_fork" } as ForkResponse);
+      });
+
+      afterEach(() => {
+        vi.unstubAllGlobals();
+      });
+
+      it.each([
+        { agent: "Claude Code", harness: "claude-native", agentId: "ag_claude_native" },
+        { agent: "Codex", harness: "codex-native", agentId: "ag_codex_native" },
+      ])("offers the gateway's $agent models for a new sandbox", async ({ harness, agentId }) => {
+        // A sandbox source clones onto a fresh sandbox, which has no host yet.
+        setHosts([host(), host({ host_id: "sandbox_src", sandbox_provider: "modal" })]);
+        renderDialog({ ...CODING, sourceHostId: "sandbox_src", info: GATEWAY_SANDBOX });
+        expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Modal Sandbox");
+        if (agentId !== "ag_claude_native") {
+          openAgentSelect();
+          fireEvent.click(screen.getByTestId(`fork-session-agent-option-${agentId}`));
+        }
+
+        openModelSelect();
+        const gatewayModel = await screen.findByRole("option", { name: `Gateway ${harness}` });
+        expect(screen.getByRole("option", { name: "Default" })).toBeInTheDocument();
+        expect(screen.queryByText("Select a host to list models")).not.toBeInTheDocument();
+        fireEvent.click(gatewayModel);
+        fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+        expect(forkSessionMock.mock.calls[0]![1]).toMatchObject({
+          config: { modelOverride: `gateway/${harness}` },
+          sandbox: { provider: "modal" },
+        });
+        expect(fetchMock).toHaveBeenCalledWith(
+          `/v1/sandbox-providers/modal/harnesses/${harness}/model-options?agent_id=${agentId}`,
+          expect.anything(),
+        );
+      });
+
+      it("lists the sandbox's models in place of a previously picked host's", async () => {
+        useHostModelOptionsMock.mockReturnValue({
+          data: [{ id: "host-model", displayName: "Host model" }],
+          isLoading: false,
+          error: null,
+        } as unknown as ReturnType<typeof useHostModelOptions>);
+        renderDialog({ ...CODING, info: GATEWAY_SANDBOX });
+
+        openModelSelect();
+        expect(screen.getByRole("option", { name: "Host model" })).toBeInTheDocument();
+        fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
+        selectSandbox();
+        openModelSelect();
+        expect(
+          await screen.findByRole("option", { name: "Gateway claude-native" }),
+        ).toBeInTheDocument();
+        expect(screen.queryByRole("option", { name: "Host model" })).not.toBeInTheDocument();
+        fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
+
+        openHostSelect();
+        fireEvent.click(screen.getByTestId("fork-session-host-option-host_1"));
+        openModelSelect();
+        expect(screen.getByRole("option", { name: "Host model" })).toBeInTheDocument();
+        expect(
+          screen.queryByRole("option", { name: "Gateway claude-native" }),
+        ).not.toBeInTheDocument();
+      });
+
+      it("lists Claude Code's built-in models on a sandbox without a catalog", () => {
+        renderDialog({
+          ...CODING,
+          info: { managed_sandboxes_enabled: true, sandbox_provider: "modal" },
+        });
+
+        selectSandbox();
+        openModelSelect();
+        for (const model of CLAUDE_NATIVE_MODELS) {
+          expect(screen.getByRole("option", { name: model.id })).toBeInTheDocument();
+        }
+        expect(fetchMock).not.toHaveBeenCalledWith(
+          expect.stringContaining("/model-options"),
+          expect.anything(),
+        );
+      });
     });
   });
 });

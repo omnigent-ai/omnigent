@@ -58,6 +58,11 @@ import { useSession } from "@/hooks/useSession";
 import type { NativeModelOption, Session } from "@/lib/types";
 import { useHosts, useHostModelOptions, type Host } from "@/hooks/useHosts";
 import {
+  newSandboxModelOptions,
+  useNewSandboxModelCatalog,
+} from "@/hooks/useNewSandboxModelCatalog";
+import { getCurrentUserId } from "@/lib/identity";
+import {
   nativeAgentHasCapability,
   nativeCodingAgentForAvailableAgent,
   nativeCodingAgentForSession,
@@ -1342,6 +1347,36 @@ function SupportedForkSessionForm({
   // picked yet) and whether it clones several repos.
   const forkEffectiveProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
+  // A sandbox the fork will create has no host to list models, so offer its
+  // provider's catalog, as the new-session picker does.
+  const newSandbox = useNewSandboxModelCatalog(
+    forkEffectiveProvider,
+    targetHarness,
+    switching ? agentChoice : (sourceAgent?.id ?? null),
+    getCurrentUserId(),
+    sandboxSelected,
+  );
+  const sandboxModelCatalog = useMemo(
+    () =>
+      sandboxSelected
+        ? {
+            options: newSandboxModelOptions(
+              targetHarness,
+              newSandbox.catalog,
+              newSandbox.pending || newSandbox.unsupported || newSandbox.boundCatalogError !== null,
+            ),
+            loading: newSandbox.pending,
+          }
+        : undefined,
+    [
+      sandboxSelected,
+      targetHarness,
+      newSandbox.catalog,
+      newSandbox.pending,
+      newSandbox.unsupported,
+      newSandbox.boundCatalogError,
+    ],
+  );
   const {
     launchError: sandboxProfileError,
     selection: selectedSandboxProfile,
@@ -2021,6 +2056,7 @@ function SupportedForkSessionForm({
             sameFamilyAsSource={sameFamilyAsSource}
             sameAgentAsSource={sameAgentAsSource}
             selectedHostId={isCodingSource ? selectedHostId : (sourceHostId ?? null)}
+            modelCatalog={sandboxModelCatalog}
             onChange={setRunConfig}
           />
         )}
