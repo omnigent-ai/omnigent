@@ -1,8 +1,8 @@
 """Authenticated REST client for Databricks Managed Memory.
 
-The client uses the Databricks SDK's unified authentication and raw API client.
-Credentials stay in the server's SDK configuration, where OAuth tokens can be
-renewed for long-running processes. MemoryStore adaptation and user-to-actor
+The client uses generated AgentKit methods with Databricks unified authentication.
+Raw GET requests cover effective permissions and page-preserving listing, which
+the generated surface does not expose. MemoryStore adaptation and user-to-actor
 mapping live above this transport layer.
 """
 
@@ -13,6 +13,12 @@ from urllib.parse import quote
 
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
+    from databricks.sdk.service.agentkit import (
+        ManagedMemoryEntry,
+        ManagedMemoryEntrySearchResult,
+        ManagedMemoryEntryView,
+        ManagedMemoryStore,
+    )
 
 
 def _ensure_databricks_sdk() -> None:
@@ -88,39 +94,39 @@ class DatabricksManagedMemoryClient:
             )
 
         self._workspace_client = workspace_client
-        self._store_path = f"/api/2.0/agents/memory-stores/{encoded_store_id}"
+        self._store_name = f"memory-stores/{encoded_store_id}"
+        self._store_path = f"/api/2.0/agents/{self._store_name}"
 
-    def get_store(self) -> dict[str, object]:
+    def get_store(self) -> ManagedMemoryStore:
         """Return configured store metadata and fail if it is unavailable."""
-        return self._request("GET", self._store_path)
+        return self._workspace_client.agent_kit.get_memory_store(self._store_name)
 
     def get_effective_permission(self) -> dict[str, object]:
         """Return this credential's effective permission on the store."""
-        return self._request("GET", f"{self._store_path}/permissions/self")
+        return self._get(f"{self._store_path}/permissions/self")
 
     def create_entry(
         self,
-        entry: dict[str, object],
+        entry: ManagedMemoryEntry,
         *,
         entry_id: str | None = None,
-    ) -> dict[str, object]:
+    ) -> ManagedMemoryEntry:
         """Create an entry, optionally using a caller-selected entry ID."""
-        query: dict[str, object] | None = None
         if entry_id is not None:
-            query = {"managed_memory_entry_id": _required_string(entry_id, name="entry_id")}
-        return self._request(
-            "POST",
-            f"{self._store_path}/entries",
-            query=query,
-            body=entry,
+            _required_string(entry_id, name="entry_id")
+        return self._workspace_client.agent_kit.create_memory(
+            self._store_name,
+            entry,
+            managed_memory_entry_id=entry_id,
         )
 
-    def get_entry(self, entry_id: str, *, view: str | None = None) -> dict[str, object]:
+    def get_entry(
+        self, entry_id: str, *, view: ManagedMemoryEntryView | None = None
+    ) -> ManagedMemoryEntry:
         """Read one entry by its ID."""
-        return self._request(
-            "GET",
-            self._entry_path(entry_id),
-            query=_without_none({"view": view}),
+        return self._workspace_client.agent_kit.get_memory(
+            self._entry_name(entry_id),
+            view=view,
         )
 
     def list_entries(
@@ -132,11 +138,11 @@ class DatabricksManagedMemoryClient:
         session_id: str | None = None,
         page_size: int | None = None,
         page_token: str | None = None,
-        view: str | None = None,
+        view: ManagedMemoryEntryView | None = None,
     ) -> dict[str, object]:
         """List entries for one actor using canonical pagination fields."""
-        return self._request(
-            "GET",
+        # The generated iterator hides next_page_token and has no exact-path filter.
+        return self._get(
             f"{self._store_path}/entries",
             query=_without_none(
                 {
@@ -146,7 +152,7 @@ class DatabricksManagedMemoryClient:
                     "session_id": session_id,
                     "page_size": page_size,
                     "page_token": page_token,
-                    "view": view,
+                    "view": view.value if view is not None else None,
                 }
             ),
         )
@@ -159,63 +165,64 @@ class DatabricksManagedMemoryClient:
         path_prefix: str | None = None,
         session_id: str | None = None,
         page_size: int | None = None,
-        view: str | None = None,
-    ) -> dict[str, object]:
+        view: ManagedMemoryEntryView | None = None,
+    ) -> list[ManagedMemoryEntrySearchResult]:
         """Search one actor's entries and return ranked results."""
-        body = _without_none(
-            {
-                "actor_id": actor_id,
-                "query": query,
-                "path_prefix": path_prefix,
-                "session_id": session_id,
-                "page_size": page_size,
-                "view": view,
-            }
-        )
-        return self._request(
-            "POST",
-            f"{self._store_path}/entries:search",
-            body=body,
+        return list(
+            self._workspace_client.agent_kit.search_memories(
+                self._store_name,
+                actor_id,
+                query,
+                path_prefix=path_prefix,
+                session_id=session_id,
+                page_size=page_size,
+                view=view,
+            )
         )
 
     def update_entry(
         self,
         entry_id: str,
-        entry: dict[str, object],
+        entry: ManagedMemoryEntry,
         *,
         update_mask: str,
-    ) -> dict[str, object]:
+    ) -> ManagedMemoryEntry:
         """Update selected mutable fields on one entry."""
         if not update_mask.strip():
             raise ValueError("update_mask is required")
-        return self._request(
-            "PATCH",
-            self._entry_path(entry_id),
-            query={"update_mask": update_mask},
-            body=entry,
+        from databricks.sdk.common.types.fieldmask import FieldMask
+
+        mask = FieldMask()
+        mask.FromJsonString(update_mask)
+        return self._workspace_client.agent_kit.update_memory(
+            self._entry_name(entry_id),
+            entry,
+            mask,
         )
 
     def delete_entry(self, entry_id: str) -> None:
         """Delete one entry by its ID."""
-        self._request("DELETE", self._entry_path(entry_id))
+        self._workspace_client.agent_kit.delete_memory(self._entry_name(entry_id))
 
-    def _entry_path(self, entry_id: str) -> str:
+    def _entry_name(self, entry_id: str) -> str:
         encoded_entry_id = _path_segment(entry_id, name="entry_id")
-        return f"{self._store_path}/entries/{encoded_entry_id}"
+        return f"{self._store_name}/entries/{encoded_entry_id}"
 
-    def _request(
+    def _get(
         self,
-        method: str,
         path: str,
         *,
         query: dict[str, object] | None = None,
-        body: dict[str, object] | None = None,
     ) -> dict[str, object]:
+        headers = {"Accept": "application/json"}
+        workspace_id = self._workspace_client.config.workspace_id
+        if workspace_id:
+            headers["X-Databricks-Workspace-Id"] = workspace_id
         response = self._workspace_client.api_client.do(
-            method,
+            "GET",
             path,
             query=query,
-            body=body,
+            headers=headers,
         )
         if not isinstance(response, dict):
             raise RuntimeError("Databricks Managed Memory returned a non-object response")

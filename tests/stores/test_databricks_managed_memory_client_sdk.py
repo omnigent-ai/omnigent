@@ -12,6 +12,12 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from databricks.sdk.errors import NotFound, PermissionDenied, Unauthenticated
+from databricks.sdk.service.agentkit import (
+    ManagedMemoryEntry,
+    ManagedMemoryEntrySearchResult,
+    ManagedMemoryEntryView,
+    ManagedMemoryStore,
+)
 
 from omnigent.stores.memory_store.databricks_client import (
     DatabricksManagedMemoryClient,
@@ -32,6 +38,7 @@ class _ManagedMemoryServer(ThreadingHTTPServer):
         self.managed_status = 200
         self.managed_error_code = "PERMISSION_DENIED"
         self.managed_error_message = "credential lacks access to the memory store"
+        self.managed_response: dict[str, object] | None = None
 
     @property
     def base_url(self) -> str:
@@ -69,11 +76,37 @@ class _ManagedMemoryHandler(BaseHTTPRequestHandler):
                 "query": parse_qs(parsed.query, keep_blank_values=True),
                 "authorization": self.headers.get("Authorization"),
                 "user_agent": self.headers.get("User-Agent"),
+                "accept": self.headers.get("Accept"),
+                "content_type": self.headers.get("Content-Type"),
+                "workspace_id": self.headers.get("X-Databricks-Workspace-Id"),
                 "body": self._request_body(),
             }
         )
         if self.managed_server.managed_status == 200:
-            self._send_json(200, {"ok": True})
+            if self.command == "DELETE":
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            response = self.managed_server.managed_response
+            if response is None:
+                entry: dict[str, object] = {
+                    "actor_id": "alice@example.test",
+                    "path": "/preferences",
+                    "content": "Concise",
+                    "name": "memory-stores/support-memory/entries/entry-one",
+                }
+                if parsed.path.endswith("/permissions/self"):
+                    response = {"permission_level": "WRITE"}
+                elif parsed.path.endswith("/entries:search"):
+                    response = {"results": [{"managed_memory_entry": entry, "score": 0.75}]}
+                elif parsed.path.endswith("/entries") and self.command == "GET":
+                    response = {"managed_memory_entries": [entry], "next_page_token": "next"}
+                elif "/entries" in parsed.path:
+                    response = entry
+                else:
+                    response = {"name": "memory-stores/support-memory"}
+            self._send_json(200, response)
         else:
             self._send_json(
                 self.managed_server.managed_status,
@@ -259,27 +292,29 @@ def test_real_sdk_preserves_canonical_http_shapes_and_encodes_resource_ids(
     )
 
     client.get_effective_permission()
-    client.create_entry(
-        {"actor_id": "alice@example.test", "path": "/preferences", "content": "Concise"},
+    created = client.create_entry(
+        ManagedMemoryEntry(actor_id="alice@example.test", path="/preferences", content="Concise"),
         entry_id="entry one/part",
     )
-    client.get_entry("entry one/part", view="MANAGED_MEMORY_ENTRY_VIEW_BASIC")
+    fetched = client.get_entry(
+        "entry one/part", view=ManagedMemoryEntryView.MANAGED_MEMORY_ENTRY_VIEW_BASIC
+    )
     client.list_entries(
         "alice@example.test",
         path="/preferences",
         page_size=25,
         page_token="next token",
-        view="MANAGED_MEMORY_ENTRY_VIEW_BASIC",
+        view=ManagedMemoryEntryView.MANAGED_MEMORY_ENTRY_VIEW_BASIC,
     )
-    client.search_entries(
+    hits = client.search_entries(
         "alice@example.test",
         "response style",
         path_prefix="/preferences",
         page_size=10,
     )
-    client.update_entry(
+    updated = client.update_entry(
         "entry one/part",
-        {"content": "Very concise", "description": "Response style"},
+        ManagedMemoryEntry.from_dict({"content": "Very concise", "description": "Response style"}),
         update_mask="content,description",
     )
     client.delete_entry("entry one/part")
@@ -322,6 +357,107 @@ def test_real_sdk_preserves_canonical_http_shapes_and_encodes_resource_ids(
     }
     assert all(request["authorization"] == "Bearer token-1" for request in requests)
     assert all("omnigent/" in str(request["user_agent"]) for request in requests)
+    assert all(request["accept"] == "application/json" for request in requests)
+    assert all(request["workspace_id"] == "1234567890" for request in requests)
+    assert all(requests[index]["content_type"] == "application/json" for index in (1, 4, 5))
+    assert all(isinstance(entry, ManagedMemoryEntry) for entry in (created, fetched, updated))
+    assert isinstance(hits[0], ManagedMemoryEntrySearchResult)
+    assert hits[0].score == 0.75
+    assert hits[0].managed_memory_entry is not None
+    assert hits[0].managed_memory_entry.actor_id == "alice@example.test"
+
+
+def test_real_sdk_preserves_store_and_entry_response_fields(
+    managed_memory_server: _ManagedMemoryServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _m2m_client(managed_memory_server, monkeypatch)
+    managed_memory_server.managed_response = {
+        "name": "memory-stores/support-memory",
+        "description": "Agent memory",
+        "workspace_id": 1234567890,
+    }
+
+    store = client.get_store()
+
+    assert isinstance(store, ManagedMemoryStore)
+    assert store.name == "memory-stores/support-memory"
+    assert store.description == "Agent memory"
+    assert store.workspace_id == 1234567890
+
+    payload = {
+        "name": "memory-stores/support-memory/entries/entry-one",
+        "actor_id": "alice@example.test",
+        "path": "/preferences",
+        "content": "Concise",
+        "description": "Response style",
+        "create_time": "2026-01-02T03:04:05Z",
+        "update_time": "2026-01-02T03:04:06Z",
+        "source_type": "MANAGED_MEMORY_ENTRY_SOURCE_TYPE_AGENT",
+    }
+    managed_memory_server.managed_response = payload
+
+    entry = client.get_entry("entry-one")
+
+    assert isinstance(entry, ManagedMemoryEntry)
+    assert entry.as_dict() == payload
+
+
+def test_raw_listing_returns_one_page_and_preserves_continuation_tokens(
+    managed_memory_server: _ManagedMemoryServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _m2m_client(managed_memory_server, monkeypatch)
+    first_response: dict[str, object] = {
+        "managed_memory_entries": [{"actor_id": "alice", "path": "/preferences"}],
+        "next_page_token": "opaque next token",
+    }
+    managed_memory_server.managed_response = first_response
+
+    first_page = client.list_entries("alice", path="/preferences", page_size=1)
+
+    assert first_page == first_response
+    assert len(managed_memory_server.managed_requests) == 1
+    managed_memory_server.managed_response = {"managed_memory_entries": []}
+
+    last_page = client.list_entries(
+        "alice", path="/preferences", page_size=1, page_token="opaque next token"
+    )
+
+    assert last_page == {"managed_memory_entries": []}
+    assert len(managed_memory_server.managed_requests) == 2
+    assert managed_memory_server.managed_requests[1]["query"] == {
+        "actor_id": ["alice"],
+        "path": ["/preferences"],
+        "page_size": ["1"],
+        "page_token": ["opaque next token"],
+    }
+
+
+@pytest.mark.parametrize("results", [[], [{"score": 0.9}, {"score": 0.2}]])
+def test_real_sdk_search_preserves_ranked_and_empty_results(
+    managed_memory_server: _ManagedMemoryServer,
+    monkeypatch: pytest.MonkeyPatch,
+    results: list[dict[str, object]],
+) -> None:
+    managed_memory_server.managed_response = {"results": results}
+    client = _m2m_client(managed_memory_server, monkeypatch)
+
+    hits = client.search_entries(
+        "alice",
+        "response style",
+        session_id="session-one",
+        view=ManagedMemoryEntryView.MANAGED_MEMORY_ENTRY_VIEW_BASIC,
+    )
+
+    assert [hit.score for hit in hits] == [result["score"] for result in results]
+    assert len(managed_memory_server.managed_requests) == 1
+    assert managed_memory_server.managed_requests[0]["body"] == {
+        "actor_id": "alice",
+        "query": "response style",
+        "session_id": "session-one",
+        "view": "MANAGED_MEMORY_ENTRY_VIEW_BASIC",
+    }
 
 
 @pytest.mark.parametrize(
@@ -332,20 +468,36 @@ def test_real_sdk_preserves_canonical_http_shapes_and_encodes_resource_ids(
         (404, "NOT_FOUND", NotFound),
     ],
 )
+@pytest.mark.parametrize(
+    "operation", ["store", "permission", "create", "get", "list", "search", "update", "delete"]
+)
 def test_real_sdk_api_errors_remain_typed_and_explicit(
     managed_memory_server: _ManagedMemoryServer,
     monkeypatch: pytest.MonkeyPatch,
     status: int,
     error_code: str,
     exception_type: type[Exception],
+    operation: str,
 ) -> None:
     managed_memory_server.managed_status = status
     managed_memory_server.managed_error_code = error_code
     managed_memory_server.managed_error_message = "forced memory-store failure"
     client = _m2m_client(managed_memory_server, monkeypatch)
 
+    entry = ManagedMemoryEntry(actor_id="alice", path="/preferences", content="Concise")
+    operations = {
+        "store": client.get_store,
+        "permission": client.get_effective_permission,
+        "create": lambda: client.create_entry(entry),
+        "get": lambda: client.get_entry("entry-one"),
+        "list": lambda: client.list_entries("alice"),
+        "search": lambda: client.search_entries("alice", "response style"),
+        "update": lambda: client.update_entry("entry-one", entry, update_mask="content"),
+        "delete": lambda: client.delete_entry("entry-one"),
+    }
+
     with pytest.raises(exception_type, match="forced memory-store failure"):
-        client.get_store()
+        operations[operation]()
 
     assert len(managed_memory_server.managed_requests) == 1
 

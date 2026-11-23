@@ -16,6 +16,7 @@ from omnigent.stores.memory_store.databricks_client import (
 
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
+    from databricks.sdk.service.agentkit import ManagedMemoryEntry
 
 
 class _RecordingApiClient:
@@ -29,14 +30,14 @@ class _RecordingApiClient:
         path: str,
         *,
         query: dict[str, object] | None = None,
-        body: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> object:
         self.calls.append(
             {
                 "method": method,
                 "path": path,
                 "query": query,
-                "body": body,
+                "headers": headers,
             }
         )
         return self.response
@@ -45,6 +46,10 @@ class _RecordingApiClient:
 class _RecordingWorkspaceClient:
     def __init__(self) -> None:
         self.api_client = _RecordingApiClient()
+        self.config = types.SimpleNamespace(workspace_id="1234567890")
+        self.agent_kit = types.SimpleNamespace(
+            get_memory_store=lambda name: types.SimpleNamespace(name=name)
+        )
 
 
 @pytest.fixture()
@@ -62,21 +67,18 @@ def test_store_and_permission_requests_use_canonical_paths(
 ) -> None:
     client, api_client = client_and_api_client
 
-    assert client.get_store() == {"ok": True}
+    assert client.get_store().name == "memory-stores/support-memory"
     assert client.get_effective_permission() == {"ok": True}
 
     assert api_client.calls == [
         {
             "method": "GET",
-            "path": "/api/2.0/agents/memory-stores/support-memory",
-            "query": None,
-            "body": None,
-        },
-        {
-            "method": "GET",
             "path": "/api/2.0/agents/memory-stores/support-memory/permissions/self",
             "query": None,
-            "body": None,
+            "headers": {
+                "Accept": "application/json",
+                "X-Databricks-Workspace-Id": "1234567890",
+            },
         },
     ]
 
@@ -86,50 +88,24 @@ def test_entry_requests_use_canonical_shapes(
 ) -> None:
     client, api_client = client_and_api_client
 
-    client.create_entry(
-        {"actor_id": "alice", "path": "/preferences", "content": "Concise"},
-        entry_id="entry one",
-    )
-    client.get_entry("entry one", view="MANAGED_MEMORY_ENTRY_VIEW_BASIC")
     client.list_entries(
         "alice",
         path_prefix="/preferences",
         page_size=25,
         page_token="next",
-        view="MANAGED_MEMORY_ENTRY_VIEW_BASIC",
+        session_id="session-one",
     )
-    client.search_entries(
+    client.list_entries(
         "alice",
-        "response style",
-        path_prefix="/preferences",
-        page_size=10,
+        path="/preferences",
     )
-    client.update_entry(
-        "entry one",
-        {"content": "Very concise", "description": "Response style"},
-        update_mask="content,description",
-    )
-    client.delete_entry("entry one")
 
     base = "/api/2.0/agents/memory-stores/support-memory/entries"
-    entry_path = f"{base}/entry%20one"
+    headers = {
+        "Accept": "application/json",
+        "X-Databricks-Workspace-Id": "1234567890",
+    }
     assert api_client.calls == [
-        {
-            "method": "POST",
-            "path": base,
-            "query": {"managed_memory_entry_id": "entry one"},
-            "body": {
-                "actor_id": "alice",
-                "path": "/preferences",
-                "content": "Concise",
-            },
-        },
-        {
-            "method": "GET",
-            "path": entry_path,
-            "query": {"view": "MANAGED_MEMORY_ENTRY_VIEW_BASIC"},
-            "body": None,
-        },
         {
             "method": "GET",
             "path": base,
@@ -138,32 +114,18 @@ def test_entry_requests_use_canonical_shapes(
                 "path_prefix": "/preferences",
                 "page_size": 25,
                 "page_token": "next",
-                "view": "MANAGED_MEMORY_ENTRY_VIEW_BASIC",
+                "session_id": "session-one",
             },
-            "body": None,
+            "headers": headers,
         },
         {
-            "method": "POST",
-            "path": f"{base}:search",
-            "query": None,
-            "body": {
+            "method": "GET",
+            "path": base,
+            "query": {
                 "actor_id": "alice",
-                "query": "response style",
-                "path_prefix": "/preferences",
-                "page_size": 10,
+                "path": "/preferences",
             },
-        },
-        {
-            "method": "PATCH",
-            "path": entry_path,
-            "query": {"update_mask": "content,description"},
-            "body": {"content": "Very concise", "description": "Response style"},
-        },
-        {
-            "method": "DELETE",
-            "path": entry_path,
-            "query": None,
-            "body": None,
+            "headers": headers,
         },
     ]
 
@@ -198,7 +160,7 @@ def test_unified_auth_selectors_are_forwarded_to_workspace_client(
         "auth_type": "oauth-m2m",
         "product": "omnigent",
     }
-    assert client.get_store() == {"ok": True}
+    assert client.get_store().name == "memory-stores/support-memory"
 
 
 def test_injected_client_cannot_be_combined_with_auth_selectors() -> None:
@@ -252,7 +214,7 @@ def test_injected_client_does_not_require_optional_sdk(monkeypatch: pytest.Monke
         workspace_client=cast("WorkspaceClient", workspace_client),
     )
 
-    assert client.get_store() == {"ok": True}
+    assert client.get_store().name == "memory-stores/support-memory"
 
 
 @pytest.mark.parametrize("store_id", ["", "   "])
@@ -269,7 +231,7 @@ def test_update_mask_is_required(
 ) -> None:
     client, _ = client_and_api_client
     with pytest.raises(ValueError, match="update_mask is required"):
-        client.update_entry("entry", {"content": "new"}, update_mask=" ")
+        client.update_entry("entry", cast("ManagedMemoryEntry", object()), update_mask=" ")
 
 
 def test_sdk_errors_are_not_replaced(
@@ -288,7 +250,7 @@ def test_sdk_errors_are_not_replaced(
     api_client.do = raise_permission_denied  # type: ignore[method-assign]
 
     with pytest.raises(PermissionDeniedError) as raised:
-        client.create_entry({"actor_id": "alice", "path": "/preferences", "content": "Concise"})
+        client.get_effective_permission()
     assert raised.value is error
 
 
@@ -299,4 +261,16 @@ def test_non_object_response_fails_explicitly(
     api_client.response = []
 
     with pytest.raises(RuntimeError, match="non-object response"):
-        client.get_store()
+        client.get_effective_permission()
+
+
+def test_raw_requests_allow_an_unset_workspace_id() -> None:
+    workspace_client = _RecordingWorkspaceClient()
+    workspace_client.config.workspace_id = None
+    client = DatabricksManagedMemoryClient(
+        "support-memory", workspace_client=cast("WorkspaceClient", workspace_client)
+    )
+
+    client.get_effective_permission()
+
+    assert workspace_client.api_client.calls[0]["headers"] == {"Accept": "application/json"}
