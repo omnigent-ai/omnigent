@@ -4,7 +4,9 @@
 layout of a prompt the trigger form in web/src/components/scheduled/triggerTemplates.ts
 saves when its instructions run a saved workflow: the opening, then the instructions
 between their headings, which is what the server reads. A web test keeps the file in
-step with the form.
+step with the form. ``fixtures/saved_workflow_run_openings.json`` holds prompts the form
+and the server must read alike: some open like a saved workflow's run off its exact
+message, the others don't.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.server.scheduled.workflow_automations import (
+    CONTINUED_SESSION_INEXACT_MESSAGE,
     CONTINUED_SESSION_MESSAGE,
     TASK_SESSION_MESSAGE,
     _workflow_reading,
@@ -24,6 +27,9 @@ from omnigent.server.scheduled.workflow_automations import (
 
 PROMPTS: dict[str, str] = json.loads(
     (Path(__file__).parent / "fixtures" / "workflow_trigger_prompts.json").read_text()
+)
+OPENINGS: dict[str, dict[str, str]] = json.loads(
+    (Path(__file__).parent / "fixtures" / "saved_workflow_run_openings.json").read_text()
 )
 WORKFLOW_RUN = '/workflow Run the saved workflow "Triage" (ID 0123456789abcdef0123456789abcdef).'
 SOURCES = ["jira", "slack", "github", "linear", "pagerduty"]
@@ -55,18 +61,26 @@ def test_a_schedule_that_runs_a_saved_workflow_cant_continue_a_session(
 
 
 @pytest.mark.parametrize(
+    "prompt", list(OPENINGS["inexactRuns"].values()), ids=list(OPENINGS["inexactRuns"])
+)
+def test_a_schedule_whose_prompt_opens_like_a_workflow_run_cant_continue_a_session(
+    prompt: str,
+) -> None:
+    # The agent still runs the workflow; only the exact message starts each run as a run.
+    assert workflow_session_reuse_error(prompt, "continue") == CONTINUED_SESSION_INEXACT_MESSAGE
+    assert workflow_session_reuse_error(prompt, "new") is None
+    assert saved_workflow_id(prompt) is None
+
+
+@pytest.mark.parametrize(
     "prompt",
     [
-        "Summarize overnight activity",
-        "/workflow Add retries",
         f"Please {WORKFLOW_RUN}",
-        WORKFLOW_RUN.replace("0123456789abcdef0123456789abcdef", "0123"),
-        f"{WORKFLOW_RUN}\nOnly bugs",
-        # As in JavaScript, a name never spans lines, and only JavaScript's whitespace trims.
-        WORKFLOW_RUN.replace('"Triage"', '"Tri\N{LINE SEPARATOR}age"'),
+        # Only JavaScript's whitespace trims.
         f"\x1c{WORKFLOW_RUN}",
         # Only the prompt below a trigger header runs.
         f"{_header(instructions=WORKFLOW_RUN)}Summarize overnight activity",
+        *OPENINGS["notRuns"].values(),
     ],
 )
 def test_other_prompts_can_continue_a_session(prompt: str) -> None:
@@ -85,6 +99,9 @@ def test_a_workflow_trigger_cant_send_every_match_to_one_task_session(
     for prompt in (task_session, _header(source=source) + task_session):
         assert _workflow_reading(prompt) == (True, True)
         assert workflow_session_reuse_error(prompt, session_mode) == TASK_SESSION_MESSAGE
+    # Instructions off the exact message still run the workflow.
+    inexact = task_session.replace(WORKFLOW_RUN, WORKFLOW_RUN.lower())
+    assert workflow_session_reuse_error(inexact, session_mode) == TASK_SESSION_MESSAGE
     # Its polling session continues, and each match gets its own session.
     for prompt in (per_match, _header(source=source) + per_match):
         assert _workflow_reading(prompt) == (True, False)
@@ -100,6 +117,7 @@ def test_reads_instructions_that_keep_the_prompt_from_splitting() -> None:
     assert workflow_session_reuse_error(prompt, "continue") == TASK_SESSION_MESSAGE
     # The same layout with other instructions runs no saved workflow.
     assert _workflow_reading(prompt.replace(WORKFLOW_RUN, "Triage the ticket.")) == (False, True)
+    assert _workflow_reading(prompt.replace(WORKFLOW_RUN, WORKFLOW_RUN.lower())) == (True, True)
 
 
 @pytest.mark.parametrize(

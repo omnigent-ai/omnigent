@@ -47,6 +47,7 @@ from omnigent.server.scheduled.dispatch_scheduler import (
     ScheduledTaskDispatchHooks,
 )
 from omnigent.server.scheduled.workflow_automations import (
+    CONTINUED_SESSION_INEXACT_MESSAGE,
     CONTINUED_SESSION_MESSAGE,
     TASK_SESSION_MESSAGE,
 )
@@ -4355,6 +4356,24 @@ async def test_a_workflow_automation_starts_each_run_in_a_new_session(
     )
     assert switched.status_code == 200, switched.text
     assert switched.json()["session_mode"] == "new"
+
+
+async def test_a_prompt_off_the_exact_message_still_starts_each_run_in_a_new_session(
+    workflows_client: httpx.AsyncClient, workflow_prompt: str
+) -> None:
+    """An update that only switches the session mode reads the prompt the task keeps."""
+    prompt = f"{workflow_prompt}\nOnly bugs"
+    created = await workflows_client.post(
+        "/v1/scheduled-tasks", json=_create_body(prompt=prompt), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    continuing = await workflows_client.patch(
+        f"/v1/scheduled-tasks/{created.json()['id']}",
+        json={"session_mode": "continue"},
+        headers=_headers(),
+    )
+    assert continuing.status_code == 400, continuing.text
+    assert continuing.json()["error"]["message"] == CONTINUED_SESSION_INEXACT_MESSAGE
 
 
 async def test_a_workflow_trigger_starts_a_session_for_each_match(

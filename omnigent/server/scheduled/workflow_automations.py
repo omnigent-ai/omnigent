@@ -1,8 +1,10 @@
 """Keep an automation that runs a saved workflow from reusing a session.
 
 It reads the prompt a run sends, below any trigger header: a header can disagree with
-that prompt, and only the prompt runs. It also reads which saved workflow a message
-runs, so a session that opens with one is titled for it.
+that prompt, and only the prompt runs. Instructions that open like a saved workflow's
+run count even off the exact message that starts one, since the agent still runs the
+workflow. It also reads which saved workflow a message runs, so a session that opens
+with one is titled for it.
 """
 
 from __future__ import annotations
@@ -18,6 +20,12 @@ from omnigent.server.scheduled.schedule import (
 CONTINUED_SESSION_MESSAGE = (
     "an automation that runs a saved workflow starts each run in a new session; "
     "session_mode must be 'new'"
+)
+# Off the exact message, the agent still runs the workflow, but no run starts as one.
+CONTINUED_SESSION_INEXACT_MESSAGE = (
+    f"{CONTINUED_SESSION_MESSAGE}. Each run starts as a run of the workflow only when the "
+    "prompt is exactly '/workflow Run the saved workflow \"<name>\" (ID <workflow ID>).', "
+    "optionally followed by a blank line and the run's details"
 )
 TASK_SESSION_MESSAGE = (
     "a trigger that runs a saved workflow starts a new session for each match, "
@@ -35,6 +43,11 @@ _SAVED_WORKFLOW_RUN = re.compile(_WORKFLOW_RUN_OPENING + r"(?:\n\n[\s\S]*)?")
 # A run's first line, for instructions whose end the prompt doesn't mark. Keep in sync
 # with SAVED_WORKFLOW_RUN_OPENING in web/src/lib/savedWorkflowRun.ts.
 _SAVED_WORKFLOW_RUN_START = re.compile(_WORKFLOW_RUN_OPENING + r"(?:\n|\Z)")
+# How any request to run a saved workflow opens, exact or not. ASCII-only case folding, like
+# JavaScript's "i" flag. Keep in sync with SAVED_WORKFLOW_RUN_LIKE_OPENING in savedWorkflowRun.ts.
+_SAVED_WORKFLOW_RUN_LIKE_OPENING = re.compile(
+    r"(?:[/$]workflow )?run the saved workflow", re.IGNORECASE | re.ASCII
+)
 # What JavaScript's String.prototype.trim removes.
 _JS_WHITESPACE = "\t\n\v\f\r \xa0" + "".join(
     map(chr, (0x1680, *range(0x2000, 0x200B), 0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF))
@@ -76,7 +89,11 @@ def workflow_session_reuse_error(prompt: str, session_mode: str) -> str | None:
         return None
     if is_trigger_prompt(prompt):
         return TASK_SESSION_MESSAGE if task_session else None
-    return CONTINUED_SESSION_MESSAGE if session_mode == "continue" else None
+    if session_mode != "continue":
+        return None
+    if saved_workflow_id(prompt) is None:
+        return CONTINUED_SESSION_INEXACT_MESSAGE
+    return CONTINUED_SESSION_MESSAGE
 
 
 def saved_workflow_id(prompt: str) -> str | None:
@@ -109,22 +126,26 @@ def saved_workflow_run_name(text: str) -> str | None:
 
 
 def _workflow_reading(prompt: str) -> tuple[bool, bool]:
-    """Whether the prompt a run sends runs a saved workflow, and whether it sends every
-    trigger match to one task session."""
+    """Whether the prompt a run sends could run a saved workflow, and whether it sends
+    every trigger match to one task session."""
     body = strip_trigger_header(prompt)
     instructions = _trigger_instructions(body)
     if instructions is None:
         runs_workflow = _instructions_may_start_with_saved_workflow_run(body)
     else:
-        runs_workflow = (
-            _SAVED_WORKFLOW_RUN.fullmatch(instructions.strip(_JS_WHITESPACE)) is not None
-        )
+        runs_workflow = _opens_like_saved_workflow_run(instructions)
     return runs_workflow, _is_task_session_prompt(body)
+
+
+def _opens_like_saved_workflow_run(text: str) -> bool:
+    """``opensLikeSavedWorkflowRun``: whether *text* opens with ``Run the saved workflow``,
+    with or without the skill prefix, in any letter case."""
+    return _SAVED_WORKFLOW_RUN_LIKE_OPENING.match(text.lstrip(_JS_WHITESPACE)) is not None
 
 
 def _instructions_may_start_with_saved_workflow_run(prompt: str) -> bool:
     """Whether a template prompt that won't split could have instructions that run a
-    saved workflow: one opens after any of its instructions headings.
+    saved workflow: one opens like a run after any of its instructions headings.
 
     The form reads such a prompt's instructions from its header, which can disagree with
     the prompt that runs, so this reads every place the instructions could start, as
@@ -132,7 +153,7 @@ def _instructions_may_start_with_saved_workflow_run(prompt: str) -> bool:
     """
     instructions_heading, _ = _headings(prompt)
     return any(
-        _SAVED_WORKFLOW_RUN_START.match(section.lstrip(_JS_WHITESPACE)) is not None
+        _opens_like_saved_workflow_run(section)
         for section in prompt.split(instructions_heading)[1:]
     )
 

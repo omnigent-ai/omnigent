@@ -16,9 +16,17 @@ export function savedWorkflowRunOpening(text: string): { id: string; name: strin
   return match ? { id: match[2], name: match[1] } : null;
 }
 
-/** Whether *text* opens with a saved workflow's run, whatever follows that first line. */
-export function opensWithSavedWorkflowRun(text: string): boolean {
-  return savedWorkflowRunOpening(text) !== null;
+// How any request to run a saved workflow opens, exact or not. Keep in sync with
+// _SAVED_WORKFLOW_RUN_LIKE_OPENING in omnigent/server/scheduled/workflow_automations.py.
+const SAVED_WORKFLOW_RUN_LIKE_OPENING = /^(?:[/$]workflow )?run the saved workflow/i;
+
+/**
+ * Whether *text* opens with `Run the saved workflow`, with or without the skill prefix, in
+ * any letter case. The agent runs the workflow even when the rest isn't the exact message
+ * {@link parseSavedWorkflowRun} reads, so such a run still needs its own session.
+ */
+export function opensLikeSavedWorkflowRun(text: string): boolean {
+  return SAVED_WORKFLOW_RUN_LIKE_OPENING.test(text.trimStart());
 }
 
 /**

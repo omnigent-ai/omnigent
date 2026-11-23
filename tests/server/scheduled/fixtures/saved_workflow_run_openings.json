@@ -1,0 +1,21 @@
+{
+  "inexactRuns": {
+    "no closing period": "/workflow Run the saved workflow \"Triage\" (ID 0123456789abcdef0123456789abcdef)",
+    "details on the next line": "/workflow Run the saved workflow \"Triage\" (ID 0123456789abcdef0123456789abcdef).\nOnly bugs",
+    "a short ID": "/workflow Run the saved workflow \"Triage\" (ID 0123).",
+    "a dashed ID": "/workflow Run the saved workflow \"Triage\" (ID 01234567-89ab-cdef-0123-456789abcdef).",
+    "no ID": "/workflow Run the saved workflow \"Triage\".",
+    "no skill prefix": "Run the saved workflow \"Triage\" (ID 0123456789abcdef0123456789abcdef).",
+    "a lowercase request": "/workflow run the saved workflow \"Triage\" (ID 0123456789abcdef0123456789abcdef).",
+    "an uppercase request": "$WORKFLOW RUN THE SAVED WORKFLOW \"TRIAGE\".",
+    "a name across lines": "/workflow Run the saved workflow \"Tri age\" (ID 0123456789abcdef0123456789abcdef).",
+    "whitespace JavaScript trims first": "﻿ run the saved workflow \"Triage\""
+  },
+  "notRuns": {
+    "other instructions": "Summarize overnight activity",
+    "a workflow that isn't saved": "/workflow Add retries",
+    "a character JavaScript doesn't trim first": "\u001cRun the saved workflow \"Triage\".",
+    "a long s, which only Unicode case folding reads as s": "Run the ſaved workflow \"Triage\".",
+    "a Kelvin sign, which only Unicode case folding reads as k": "/worKflow Run the saved workflow \"Triage\"."
+  }
+}

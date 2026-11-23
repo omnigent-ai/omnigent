@@ -1,4 +1,7 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { parseSavedWorkflowRun } from "@/lib/savedWorkflowRun";
 import {
   combineTriggerPrompt,
   compileGithubQuery,
@@ -50,6 +53,17 @@ const CTX: TriggerPromptContext = {
   placement: "same_host",
   sessionLink: "https://omni.example.com/c/CONVERSATION_ID",
 };
+
+// Prompts the server reads alike, in tests/server/scheduled/test_workflow_automations.py.
+const RUN_OPENINGS: Record<"inexactRuns" | "notRuns", Record<string, string>> = JSON.parse(
+  readFileSync(
+    resolve(
+      __dirname,
+      "../../../../tests/server/scheduled/fixtures/saved_workflow_run_openings.json",
+    ),
+    "utf8",
+  ),
+);
 
 const LABEL_OMNIGENT: TriggerCondition = { field: "label", operator: "is", value: "omnigent" };
 
@@ -142,7 +156,25 @@ describe("saved trigger prompts", () => {
     ).toBe(false);
     expect(promptMayRunSavedWorkflow(WORKFLOW_RUN)).toBe(true);
     expect(promptMayRunSavedWorkflow("Summarize overnight activity")).toBe(false);
+    // Instructions off the exact message still run the workflow.
+    expect(promptMayRunSavedWorkflow(render(WORKFLOW_RUN.toLowerCase()))).toBe(true);
   });
+
+  it.each(Object.entries(RUN_OPENINGS.inexactRuns))(
+    "reads a prompt with %s as a saved workflow's run, as the server does",
+    (_case, prompt) => {
+      expect(promptMayRunSavedWorkflow(prompt)).toBe(true);
+      // Only the exact message fills the Workflow field and starts runs as workflow runs.
+      expect(parseSavedWorkflowRun(prompt)).toBeNull();
+    },
+  );
+
+  it.each(Object.entries(RUN_OPENINGS.notRuns))(
+    "reads a prompt with %s as no saved workflow's run, as the server does",
+    (_case, prompt) => {
+      expect(promptMayRunSavedWorkflow(prompt)).toBe(false);
+    },
+  );
 
   it("keeps a prompt's creation call on the workflow its instructions now run", () => {
     const supported = { ...CTX, workflowIdSupported: true };

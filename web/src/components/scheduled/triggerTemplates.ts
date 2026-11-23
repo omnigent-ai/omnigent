@@ -9,7 +9,7 @@ import {
   SlackIcon,
 } from "@/components/icons/IntegrationIcons";
 import {
-  opensWithSavedWorkflowRun,
+  opensLikeSavedWorkflowRun,
   parseSavedWorkflowRun,
   savedWorkflowRunOpening,
 } from "@/lib/savedWorkflowRun";
@@ -733,18 +733,19 @@ export function splitTriggerPrompt(prompt: string): {
  * Whether the prompt an automation's runs send could run a saved workflow, read as the
  * server reads it (omnigent/server/scheduled/workflow_automations.py): a trigger's
  * instructions when its prompt splits, otherwise every place its instructions could start.
+ * Instructions count when they open like a saved workflow's run, exact or not.
  */
 export function promptMayRunSavedWorkflow(prompt: string): boolean {
   const body = stripTriggerHeader(prompt);
   const parts = splitTriggerPrompt(body);
   if (parts.systemPrompt !== null || !startsLikeTemplatePrompt(body)) {
-    return parseSavedWorkflowRun(parts.userPrompt) !== null;
+    return opensLikeSavedWorkflowRun(parts.userPrompt);
   }
   // Instructions that repeat a heading, for example, keep the prompt from splitting.
   return body
     .split(triggerPromptHeadings(body).instructions)
     .slice(1)
-    .some((section) => opensWithSavedWorkflowRun(section));
+    .some((section) => opensLikeSavedWorkflowRun(section));
 }
 
 /** Keep existing template prompts byte-for-byte when neither part changed. */

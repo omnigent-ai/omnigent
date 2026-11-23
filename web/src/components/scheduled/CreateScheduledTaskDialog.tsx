@@ -66,7 +66,7 @@ import {
 } from "@/components/scheduled/WorkflowField";
 import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
-import { parseSavedWorkflowRun } from "@/lib/savedWorkflowRun";
+import { opensLikeSavedWorkflowRun } from "@/lib/savedWorkflowRun";
 import { parseSavedWorkflowMessage, savedWorkflowMessage } from "@/lib/workflow";
 import {
   TriggerWorkerHarnessField,
@@ -1155,7 +1155,7 @@ export function CreateScheduledTaskDialog({
       }),
     );
   } else {
-    runsSavedWorkflow = parseSavedWorkflowRun(promptTriggerFields.instructions) !== null;
+    runsSavedWorkflow = opensLikeSavedWorkflowRun(promptTriggerFields.instructions);
   }
   // A trigger keeps its one polling session; only its matches start new ones.
   const workflowNeedsNewSessions =

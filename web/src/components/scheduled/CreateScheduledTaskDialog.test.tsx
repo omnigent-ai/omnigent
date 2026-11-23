@@ -7547,17 +7547,27 @@ describe("CreateScheduledTaskDialog workflow", () => {
   );
 
   it.each([
-    ["picked in the Workflow field", { features: { automations_v2: true, workflows: true } }],
-    ["typed while workflows are off", {}],
+    [
+      "picked in the Workflow field",
+      { features: { automations_v2: true, workflows: true } },
+      run("The upload tests"),
+    ],
+    ["typed while workflows are off", {}, run("The upload tests")],
+    // It leaves the Workflow field empty, but the agent still runs the workflow.
+    [
+      "typed off its exact message",
+      { features: { automations_v2: true, workflows: true } },
+      `${run("")}\nThe upload tests`,
+    ],
   ])(
     "saves an automation that continues a session with a workflow %s as new sessions",
-    async (_label, features) => {
+    async (_label, features, prompt) => {
       render(
         <CreateScheduledTaskDialog
           open
           onOpenChange={vi.fn()}
           editingTask={scheduledTask({
-            prompt: run("The upload tests"),
+            prompt,
             sessionMode: "continue",
             sessionId: "conv_1",
           })}
@@ -7571,7 +7581,7 @@ describe("CreateScheduledTaskDialog workflow", () => {
 
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
       expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
-        prompt: run("The upload tests"),
+        prompt,
         sessionMode: "new",
       });
     },
