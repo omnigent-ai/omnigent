@@ -303,6 +303,12 @@ def test_a_followed_feature_needs_a_definition_and_no_cycle() -> None:
     )
     with pytest.raises(ValueError, match="follows itself"):
         resolve_effective_features(cycle, {})
+    # An explicit intent doesn't read what the feature follows, so it settles either case.
+    on = {Feature.FLOATING_PANES: FeatureIntent.ON}
+    missing = (definition(Feature.FLOATING_PANES, Feature.CANVAS),)
+    assert resolve_effective_features(missing, on) == {Feature.FLOATING_PANES}
+    off = {Feature.WORKSPACE_SIDEBAR_V2: FeatureIntent.OFF}
+    assert resolve_effective_features(cycle, off) == frozenset()
 
 
 def test_sibling_sessions_explicit_enable_preserves_default_features() -> None:

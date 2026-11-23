@@ -519,7 +519,8 @@ def resolve_effective_features(
     A feature on Automatic takes the resolved value of the feature it ``follows``, else its
     ``default_enabled``.
 
-    :raises ValueError: If a feature follows one without a definition, or follows form a cycle.
+    :raises ValueError: If a feature on Automatic follows one without a definition, or its follows
+        form a cycle. A feature with an explicit intent doesn't read what it follows.
     """
     by_feature = {definition.feature: definition for definition in definitions}
     resolved: dict[Feature, bool] = {}
