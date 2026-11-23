@@ -33,19 +33,18 @@ struct ConnectView: View {
           .contentShape(Rectangle())
           .onTapGesture { isFieldFocused = false }
 
-        // The title, field and Connect stay put and only the server lists scroll,
-        // except at compact height, where the header alone can exceed the space
-        // above the keyboard.
-        if verticalSizeClass != .compact {
-          header
-            .frame(maxWidth: 384)
-            .padding(.horizontal, 16)
-        }
-
         ScrollView {
-          VStack(spacing: 0) {
-            if verticalSizeClass == .compact { header }
-            serverLists
+          // The header is pinned so only the server lists scroll, except at compact
+          // height, where it alone can exceed the space above the keyboard. One
+          // position for both keeps the field's identity (and focus) across rotation.
+          LazyVStack(
+            spacing: 0, pinnedViews: verticalSizeClass == .compact ? [] : [.sectionHeaders]
+          ) {
+            Section {
+              serverLists
+            } header: {
+              header.background(DesignTokens.wizardBackground(colorScheme))
+            }
           }
           .frame(maxWidth: 384)
           .padding(.horizontal, 16)

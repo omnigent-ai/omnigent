@@ -57,7 +57,12 @@ final class ManagedServersUITests: XCTestCase {
     XCTAssertTrue(app.buttons["https://team8.example.com"].isHittable)
     XCTAssertTrue(field.isHittable, "The URL field must stay visible while the list scrolls.")
 
+    // Rotating flips the size class; the field must keep focus across it.
     field.tap()
+    XCUIDevice.shared.orientation = .landscapeLeft
+    XCTAssertEqual(field.value(forKey: "hasKeyboardFocus") as? Bool, true)
+    XCUIDevice.shared.orientation = .portrait
+
     let hideKeyboard = app.buttons["Hide Keyboard"]
     XCTAssertTrue(hideKeyboard.waitForExistence(timeout: 5))
     hideKeyboard.tap()
