@@ -840,7 +840,9 @@ describe("AppShell header", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(shellTree(qc, "/inbox", <Route path="inbox" element={<PendingChunkPage />} />));
 
-    expect(screen.getByRole("button", { name: /sidebar/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open sidebar" }));
+
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
     expect(
       within(screen.getByRole("main")).getByRole("status", { name: "Loading" }),
     ).toBeInTheDocument();
