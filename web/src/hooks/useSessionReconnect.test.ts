@@ -8,6 +8,7 @@ import type { Host } from "@/hooks/useHosts";
 import { refreshRunnerHealth } from "@/hooks/useRunnerHealth";
 import type { SessionLiveness } from "@/hooks/useRunnerHealth";
 import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
+import { getCliServerUrl } from "@/lib/host";
 import {
   connectArcaHost,
   controlHost,
@@ -21,6 +22,7 @@ import type { PostEventResponse } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import {
+  LOCAL_HOST_ONLINE_WAIT_MS,
   SANDBOX_WAKE_ONLINE_GRACE_POLLS,
   SANDBOX_WAKE_STAGE_LIMIT_MS,
   useSandboxStarting,
@@ -67,6 +69,9 @@ const asleepSandbox = {
 function hostRow(hostId: string, status: Host["status"]): Host {
   return { host_id: hostId, name: hostId, owner: "e2e", status };
 }
+
+/** The server's host list once this machine's host has connected. */
+const thisMachineOnline = [hostRow("this-mac", "online")];
 
 /** Finishes `count` `/health` polls that report `sessionId`'s host as `hostOnline`. */
 function finishHealthPolls(
@@ -134,6 +139,7 @@ afterEach(async () => {
 
 describe("useSessionReconnect", () => {
   it("starts the local host on the first action without opening the dialog", async () => {
+    vi.mocked(fetchHosts).mockResolvedValue(thisMachineOnline);
     const pending = deferred<HostActionResult>();
     vi.mocked(controlHost).mockReturnValue(pending.promise);
     const { result } = renderHook(() => useSessionReconnect(localSession));
@@ -158,7 +164,70 @@ describe("useSessionReconnect", () => {
     expect(toast.dismiss).toHaveBeenCalledWith("progress");
   });
 
+  it("reports this machine back only once the server lists its host online", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(fetchHosts)
+        .mockResolvedValueOnce([hostRow("this-mac", "offline")])
+        .mockResolvedValueOnce([hostRow("this-mac", "online")]);
+      const { result } = renderHook(() => useSessionReconnect(localSession));
+      let reconnect!: Promise<void>;
+      await act(async () => {
+        reconnect = result.current.reconnect();
+      });
+      expect(fetchHosts).toHaveBeenCalledOnce();
+      expect(result.current.localReconnect?.reconnecting).toBe(true);
+      expect(toast.success).not.toHaveBeenCalled();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+        await reconnect;
+      });
+      expect(fetchHosts).toHaveBeenCalledTimes(2);
+      expect(result.current.dialogOpen).toBe(false);
+      expect(toast.success).toHaveBeenCalledExactlyOnceWith("This machine is back online.");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    {
+      label: "a running host whose connection stays down",
+      readHosts: () => Promise.resolve([hostRow("this-mac", "offline")]),
+      message: () =>
+        "This machine's host is running but still isn't connected to the server. " +
+        `If its sign-in expired, run \`omnigent login ${getCliServerUrl()}\`. Otherwise ` +
+        `restart it with \`omnigent host stop --server ${getCliServerUrl()}\`, then reconnect.`,
+    },
+    {
+      label: "an unreadable host list",
+      readHosts: () => Promise.reject(new Error("503 Service Unavailable")),
+      message: () => "Couldn't check whether this machine is back online. Try again.",
+    },
+  ])("opens recovery instead of reporting $label as back online", async (scenario) => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(fetchHosts).mockImplementation(scenario.readHosts);
+      const { result } = renderHook(() => useSessionReconnect(localSession));
+      await act(async () => {
+        const reconnect = result.current.reconnect();
+        await vi.advanceTimersByTimeAsync(LOCAL_HOST_ONLINE_WAIT_MS);
+        await reconnect;
+      });
+      expect(controlHost).toHaveBeenCalledExactlyOnceWith("start");
+      expect(fetchHosts).toHaveBeenCalledTimes(LOCAL_HOST_ONLINE_WAIT_MS / 1_000 + 1);
+      expect(result.current.dialogOpen).toBe(true);
+      expect(result.current.localReconnect?.reconnecting).toBe(false);
+      expect(result.current.localReconnect?.error).toBe(scenario.message());
+      expect(toast.success).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("ignores repeated clicks during both identity lookup and host startup", async () => {
+    vi.mocked(fetchHosts).mockResolvedValue(thisMachineOnline);
     const identity = deferred<HostIdentity>();
     const start = deferred<HostActionResult>();
     vi.mocked(getHostIdentity).mockReturnValue(identity.promise);
@@ -1037,6 +1106,7 @@ describe("useSessionReconnect", () => {
   ])(
     "opens recovery on failure and lets a retry succeed: $failure",
     async ({ failure, message }) => {
+      vi.mocked(fetchHosts).mockResolvedValue(thisMachineOnline);
       vi.mocked(controlHost).mockResolvedValueOnce(failure);
       const { result } = renderHook(() => useSessionReconnect(localSession));
       await act(async () => {
@@ -1114,6 +1184,7 @@ describe("useSessionReconnect", () => {
   });
 
   it("does not let an old reconnect clear a newer session's progress or lock", async () => {
+    vi.mocked(fetchHosts).mockResolvedValue(thisMachineOnline);
     const oldStart = deferred<HostActionResult>();
     const newStart = deferred<HostActionResult>();
     vi.mocked(controlHost)
