@@ -393,6 +393,21 @@ describe("FilesPageTree", () => {
       expect(captured.tree?.activeReveal).toMatchObject({ file: "src/a.ts" });
     });
 
+    it("keeps a name typed while a reveal waits behind a listing that failed", () => {
+      vi.useFakeTimers();
+      renderTree({
+        isPending: false,
+        isError: true,
+        error: new Error("permission denied"),
+      } as never);
+      // No tree mounts to take the reveal up, so it stays pending.
+      fireEvent.click(screen.getByRole("button", { name: "Reveal Active File" }));
+      fireEvent.click(filterButton());
+      typeName("button");
+      expect(nameField()).toHaveValue("button");
+      expect(searches().at(-1)).toEqual(["conv_1", "button", "", "", { enabled: true }, ""]);
+    });
+
     it("narrows the search with globs, which do nothing until a name is set", () => {
       vi.useFakeTimers();
       renderTree(listed([entry("src")]));

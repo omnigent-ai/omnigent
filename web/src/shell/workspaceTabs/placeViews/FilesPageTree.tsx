@@ -207,13 +207,17 @@ export function FilesPageTree({
   };
   useTreeNameFilterRequests(active ? conversationId : undefined, openFilter);
   // A reveal shows the file in the whole tree, so it ends a name filter, even one still
-  // waiting to apply; the matches never take a reveal.
-  const revealPending = reveal.activeReveal !== null;
+  // waiting to apply; the matches never take a reveal. Once per request, so a name typed
+  // while a reveal waits, as behind a listing that failed, stays.
+  const revealKey = reveal.activeReveal?.key ?? null;
+  const filterEndedFor = useRef<number | null>(null);
   const filterName = filters.applied.nameContains || filters.edited.nameContains;
   const { clearNameContains } = filters;
   useEffect(() => {
-    if (revealPending && filterName) clearNameContains();
-  }, [revealPending, filterName, clearNameContains]);
+    if (revealKey === null || filterEndedFor.current === revealKey) return;
+    filterEndedFor.current = revealKey;
+    if (filterName) clearNameContains();
+  }, [revealKey, filterName, clearNameContains]);
   const clearCommands = useMemo(
     () =>
       active && summary.active
