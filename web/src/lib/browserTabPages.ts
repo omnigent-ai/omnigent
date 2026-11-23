@@ -6,6 +6,7 @@ import { mainBrowserTabs } from "@/components/BrowserPane/agentTools/tabStore";
 import { parseBrowserViewId } from "./browserTabs";
 import { getCurrentUserId, resolveIdentity, subscribeIdentity } from "./identity";
 import {
+  isPersistableBrowserUrl,
   readSessionWorkspaceState,
   sanitizeSavedBrowserPage,
   writeSessionWorkspaceState,
@@ -79,7 +80,7 @@ export function startSavingBrowserPages(): () => void {
     .then(savePending)
     .catch(() => {});
   const unsubscribe = bridge.onBrowserUrlChanged((change) => {
-    if (!active) return;
+    if (!active || !isPersistableBrowserUrl(change.url)) return;
     if (!getCurrentUserId()) {
       const previous = pending.get(change.conversationId);
       pending.set(change.conversationId, {

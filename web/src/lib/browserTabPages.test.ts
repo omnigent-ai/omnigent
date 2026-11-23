@@ -204,63 +204,76 @@ describe("saved browser pages", () => {
     });
   });
 
-  it.each(["ready", "recovered", "newer", "closed", "replaced", "tab removed", "stopped"])(
-    "saves navigations from the shell's URL event with identity %s",
-    async (scenario) => {
-      writeSessionWorkspaceState("conv_a", { openBrowsers: ["tab-1"] });
-      saveBrowserPage(userTab, "https://docs.example/previous");
-      if (scenario !== "ready") identity.userId = null;
-      let listener:
-        ((change: { conversationId: string; url: string; title?: string }) => void) | null = null;
-      let closed!: (view: { conversationId: string }) => void;
-      const unsubscribe = vi.fn();
-      const unsubscribeClosed = vi.fn();
-      Object.assign(window, {
-        omnigentDesktop: {
-          onBrowserUrlChanged: (callback: typeof listener) => {
-            listener = callback;
-            return unsubscribe;
-          },
-          onBrowserViewClosed: (callback: typeof closed) => {
-            closed = callback;
-            return unsubscribeClosed;
-          },
+  it.each([
+    "ready",
+    "recovered",
+    "rejected",
+    "rejected after identity",
+    "newer",
+    "closed",
+    "replaced",
+    "tab removed",
+    "stopped",
+  ])("saves navigations from the shell's URL event with identity %s", async (scenario) => {
+    writeSessionWorkspaceState("conv_a", { openBrowsers: ["tab-1"] });
+    saveBrowserPage(userTab, "https://docs.example/previous");
+    if (scenario !== "ready") identity.userId = null;
+    let listener:
+      ((change: { conversationId: string; url: string; title?: string }) => void) | null = null;
+    let closed!: (view: { conversationId: string }) => void;
+    const unsubscribe = vi.fn();
+    const unsubscribeClosed = vi.fn();
+    Object.assign(window, {
+      omnigentDesktop: {
+        onBrowserUrlChanged: (callback: typeof listener) => {
+          listener = callback;
+          return unsubscribe;
         },
-      });
+        onBrowserViewClosed: (callback: typeof closed) => {
+          closed = callback;
+          return unsubscribeClosed;
+        },
+      },
+    });
 
-      const stop = startSavingBrowserPages();
-      listener!({ conversationId: userTab, url: "https://docs.example/", title: "Docs" });
-      listener!({ conversationId: userTab, url: "https://docs.example/", title: "" });
-      await Promise.resolve();
-      if (scenario !== "ready") {
-        expect(readSavedBrowserPage(userTab, "user-a")).toEqual({
-          url: "https://docs.example/previous",
-        });
+    const stop = startSavingBrowserPages();
+    listener!({ conversationId: userTab, url: "https://docs.example/", title: "Docs" });
+    listener!({ conversationId: userTab, url: "https://docs.example/", title: "" });
+    if (scenario === "rejected after identity") identity.userId = "user-a";
+    if (scenario.startsWith("rejected")) {
+      for (const url of ["https://app.example/?sid=synthetic", "about:blank"]) {
+        listener!({ conversationId: userTab, url, title: "Rejected" });
       }
-      if (scenario === "closed" || scenario === "replaced") closed({ conversationId: userTab });
-      if (scenario === "tab removed") writeSessionWorkspaceState("conv_a", { openBrowsers: [] });
-      if (scenario === "stopped") stop();
-      if (scenario === "newer") identity.userId = "user-a";
-      if (scenario === "newer" || scenario === "replaced" || scenario === "stopped") {
-        listener!({ conversationId: userTab, url: "https://docs.example/newer", title: "Newer" });
-      }
-      identity.userId = "user-a";
-      for (const onIdentity of identity.listeners) onIdentity();
-      expect(readSavedBrowserPage(userTab)).toEqual(
-        scenario === "tab removed"
-          ? null
-          : scenario === "closed" || scenario === "stopped"
-            ? { url: "https://docs.example/previous" }
-            : scenario === "newer" || scenario === "replaced"
-              ? { url: "https://docs.example/newer", title: "Newer" }
-              : { url: "https://docs.example/", title: "Docs" },
-      );
-      if (scenario !== "stopped") stop();
-      expect(identity.listeners.size).toBe(0);
-      expect(unsubscribe).toHaveBeenCalledOnce();
-      expect(unsubscribeClosed).toHaveBeenCalledOnce();
-    },
-  );
+    }
+    await Promise.resolve();
+    if (scenario !== "ready" && scenario !== "rejected after identity") {
+      expect(readSavedBrowserPage(userTab, "user-a")).toEqual({
+        url: "https://docs.example/previous",
+      });
+    }
+    if (scenario === "closed" || scenario === "replaced") closed({ conversationId: userTab });
+    if (scenario === "tab removed") writeSessionWorkspaceState("conv_a", { openBrowsers: [] });
+    if (scenario === "stopped") stop();
+    if (scenario === "newer") identity.userId = "user-a";
+    if (scenario === "newer" || scenario === "replaced" || scenario === "stopped") {
+      listener!({ conversationId: userTab, url: "https://docs.example/newer", title: "Newer" });
+    }
+    identity.userId = "user-a";
+    for (const onIdentity of identity.listeners) onIdentity();
+    expect(readSavedBrowserPage(userTab)).toEqual(
+      scenario === "tab removed"
+        ? null
+        : scenario === "closed" || scenario === "stopped"
+          ? { url: "https://docs.example/previous" }
+          : scenario === "newer" || scenario === "replaced"
+            ? { url: "https://docs.example/newer", title: "Newer" }
+            : { url: "https://docs.example/", title: "Docs" },
+    );
+    if (scenario !== "stopped") stop();
+    expect(identity.listeners.size).toBe(0);
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    expect(unsubscribeClosed).toHaveBeenCalledOnce();
+  });
 
   it("is a no-op on a shell without the URL event", () => {
     Object.assign(window, { omnigentDesktop: {} });

@@ -9,7 +9,11 @@ import { resolveIdentity, subscribeIdentity } from "@/lib/identity";
 import type { BrowserHostOptions } from "@/lib/nativeBridge";
 import { previewHostOptions, withPreviewHostRetry } from "@/lib/previewHostOptions";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
-import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import {
+  isPersistableBrowserUrl,
+  readSessionWorkspaceState,
+  writeSessionWorkspaceState,
+} from "@/lib/sessionWorkspaceState";
 import {
   startRailClose,
   useBrowserTabsChanged,
@@ -48,7 +52,7 @@ interface BrowserTabsBridge {
   ) => Promise<{ ok: boolean; error?: string }>;
   browserHasView?: (
     viewId: string,
-  ) => Promise<BrowserPage & { exists: boolean; elsewhere?: boolean; pendingUrl?: string }>;
+  ) => Promise<BrowserPage & { exists: boolean; pendingUrl?: string }>;
   onBrowserUrlChanged?: (
     callback: (page: BrowserPage & { conversationId: string }) => void,
   ) => () => void;
@@ -276,7 +280,7 @@ export function useBrowserTabs(conversationId: string) {
   // The session on screen, so a late async update for another one only persists.
   const shownConversationRef = useRef(conversationId);
   shownConversationRef.current = conversationId;
-  const [pages, setPages] = useState<Record<string, BrowserPage>>({});
+  const [pages, setPages] = useState<Record<string, BrowserPage & { fromStorage: boolean }>>({});
   const viewIdsKey = JSON.stringify(
     state.tabs.map((tabId) => browserViewId(conversationId, tabId)),
   );
@@ -308,14 +312,14 @@ export function useBrowserTabs(conversationId: string) {
     let active = true;
     const updated = new Set<string>();
     const snapshots = new Map<string, BrowserPage | null>();
-    const setPage = (viewId: string, page: BrowserPage) => {
-      setPages((current) => ({ ...current, [viewId]: page }));
+    const setPage = (viewId: string, page: BrowserPage, fromStorage = false) => {
+      setPages((current) => ({ ...current, [viewId]: { ...page, fromStorage } }));
     };
     const syncSavedPage = (viewId: string) => {
-      if (!active || updated.has(viewId)) return;
+      if (!active) return;
       const page = snapshots.get(viewId);
       if (page) saveBrowserPage(viewId, page.url, page.title);
-      else setPage(viewId, readSavedBrowserPage(viewId) ?? {});
+      else if (!updated.has(viewId)) setPage(viewId, readSavedBrowserPage(viewId) ?? {}, true);
     };
     const unsubscribeIdentity = subscribeIdentity(() => {
       for (const viewId of snapshots.keys()) syncSavedPage(viewId);
@@ -323,10 +327,18 @@ export function useBrowserTabs(conversationId: string) {
     const unsubscribe = bridge.onBrowserUrlChanged?.((page) => {
       if (!active || !viewIds.has(page.conversationId)) return;
       updated.add(page.conversationId);
+      if (isPersistableBrowserUrl(page.url)) {
+        const previous = snapshots.get(page.conversationId);
+        snapshots.set(page.conversationId, {
+          url: page.url,
+          title: page.title || (previous?.url === page.url ? previous.title : undefined),
+        });
+      }
       setPage(page.conversationId, { url: page.url, title: page.title });
     });
     const unsubscribeClosed = bridge.onBrowserViewClosed?.(({ conversationId: viewId }) => {
       if (viewIds.has(viewId)) updated.add(viewId);
+      snapshots.delete(viewId);
     });
     const restore = async (viewId: string) => {
       try {
@@ -334,11 +346,6 @@ export function useBrowserTabs(conversationId: string) {
         // Live updates take precedence over an earlier restore snapshot.
         if (!active || updated.has(viewId) || !page) return;
         if (!page.exists) {
-          // The owning window's navigations do not update this window's page cache.
-          if (page.elsewhere) {
-            setPage(viewId, {});
-            return;
-          }
           // A tab whose view the shell destroyed keeps its saved page's label.
           snapshots.set(viewId, null);
           await resolveIdentity();
@@ -429,9 +436,9 @@ export function useBrowserTabs(conversationId: string) {
    */
   const pageUrl = async (tabId: string): Promise<string | undefined> => {
     const viewId = browserViewId(conversationId, tabId);
-    // A snapshot without a URL (the view didn't exist yet when the strip looked) asks again.
-    const known = pages[viewId]?.url;
-    if (known) return known;
+    // Stored metadata can be stale if a view opened in this or another window since restoration.
+    const cached = pages[viewId];
+    if (cached?.url && !cached.fromStorage) return cached.url;
     const page = await browserTabsBridge()
       ?.browserHasView?.(viewId)
       .catch(() => undefined);

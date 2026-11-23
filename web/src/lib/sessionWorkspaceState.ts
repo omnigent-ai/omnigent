@@ -146,19 +146,24 @@ function carriesCredential({ username, password, pathname, search, hash }: URL):
   return params.some(isCredentialParam);
 }
 
+/** Whether an address may be retained for saving once its owner is known. */
+export function isPersistableBrowserUrl(url: unknown): url is string {
+  if (typeof url !== "string" || url.length > MAX_BROWSER_URL_LENGTH) return false;
+  try {
+    const parsed = new URL(url);
+    return (
+      (parsed.protocol === "http:" || parsed.protocol === "https:") && !carriesCredential(parsed)
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** A saved page, or null without an owner or for an invalid URL or recognized credential. */
 export function sanitizeSavedBrowserPage(value: unknown): SavedBrowserPage | null {
   if (typeof value !== "object" || value === null) return null;
   const { url, title, owner } = value as Record<string, unknown>;
-  if (typeof owner !== "string" || owner === "") return null;
-  if (typeof url !== "string" || url.length > MAX_BROWSER_URL_LENGTH) return null;
-  try {
-    const parsed = new URL(url);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
-    if (carriesCredential(parsed)) return null;
-  } catch {
-    return null;
-  }
+  if (typeof owner !== "string" || owner === "" || !isPersistableBrowserUrl(url)) return null;
   const page: SavedBrowserPage = { url, owner };
   if (typeof title === "string" && title.trim() !== "") {
     page.title = title.slice(0, MAX_BROWSER_TITLE_LENGTH);

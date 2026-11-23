@@ -112,6 +112,7 @@ describe("browser tab titles", () => {
     "retried",
     "retried with a live update",
     "another window",
+    "another window opened later",
   ] as const)("labels a tab whose view is gone with identity %s", async (identityState) => {
     let finishIdentity!: (userId: string) => void;
     const pendingIdentity = new Promise<string>((resolve) => {
@@ -119,7 +120,8 @@ describe("browser tab titles", () => {
     });
     const retried = identityState.startsWith("retried");
     const elsewhere = identityState === "another window";
-    if (identityState !== "ready" && !elsewhere) {
+    const anotherWindow = identityState.startsWith("another window");
+    if (identityState !== "ready" && !anotherWindow) {
       vi.mocked(getCurrentUserId).mockReturnValue(null);
       vi.mocked(resolveIdentity).mockReturnValue(retried ? Promise.resolve(null) : pendingIdentity);
     }
@@ -138,10 +140,9 @@ describe("browser tab titles", () => {
     });
     const { result } = renderHook(() => useBrowserTabs("session-a"));
     const live = identityState.endsWith("with a live update");
-    if (elsewhere) {
+    if (anotherWindow) {
+      await waitFor(() => expect(result.current.labelFor("restored", 0)).toBe("Guide"));
       // The other window saves its new address without emitting a local URL event.
-      await act(async () => {});
-      expect(result.current.labelFor("restored", 0)).toBe("Browser 1");
       act(() =>
         writeSessionWorkspaceState("session-a", {
           browserPages: {
@@ -179,7 +180,7 @@ describe("browser tab titles", () => {
     );
   });
 
-  it.each(["ready", "recovered", "newer", "closed", "unmounted"])(
+  it.each(["ready", "recovered", "newer", "rejected", "closed", "unmounted"])(
     "saves the initial live-view page with identity %s",
     async (scenario) => {
       if (scenario !== "ready") {
@@ -215,6 +216,8 @@ describe("browser tab titles", () => {
       act(() => {
         const conversationId = browserViewId("session-a", "opened");
         if (scenario === "newer") changed({ conversationId, url: "https://docs.example/newer" });
+        if (scenario === "rejected")
+          changed({ conversationId, url: "https://app.example/?sid=synthetic" });
         if (scenario === "closed") closed({ conversationId });
         if (scenario === "unmounted") unmount();
         vi.mocked(getCurrentUserId).mockReturnValue("user-a");
@@ -222,11 +225,13 @@ describe("browser tab titles", () => {
       });
       await waitFor(() =>
         expect(readSessionWorkspaceState("session-a").browserPages).toEqual(
-          scenario === "ready" || scenario === "recovered"
+          scenario === "ready" || scenario === "recovered" || scenario === "rejected"
             ? {
                 opened: { url: "https://docs.example/guide", owner: "user-a" },
               }
-            : undefined,
+            : scenario === "newer"
+              ? { opened: { url: "https://docs.example/newer", owner: "user-a" } }
+              : undefined,
         ),
       );
     },
