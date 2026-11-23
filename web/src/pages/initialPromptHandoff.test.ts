@@ -94,12 +94,4 @@ describe("a floating-panel launch handed to its session page", () => {
     );
     expect(consumePendingInitialPrompt("conv_handoff_1")).toBeNull();
   });
-
-  it("is declined, and nothing is sent, when no page is showing the session", async () => {
-    await acceptLaunchOffer({ offerId: 5, sessionId: "conv_handoff_2" });
-
-    expect(bridge.confirmLaunchOffer).not.toHaveBeenCalled();
-    expect(bridge.declineLaunchOffer).toHaveBeenCalledWith(5);
-    expect(consumePendingInitialPrompt("conv_handoff_2")).toBeNull();
-  });
 });

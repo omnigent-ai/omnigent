@@ -4375,10 +4375,6 @@ describe("floating panel wiring", () => {
         event: { sender: foreign.webContents, senderFrame: foreignFrame },
       },
       { label: "a subframe", event: { sender: main.webContents, senderFrame: { url: main.url } } },
-      {
-        label: "another origin",
-        event: { sender: main.webContents, senderFrame: { url: "https://evil.example/" } },
-      },
     ];
     const answers = await Promise.all(
       refused.map(async ({ label, event: foreignEvent }) => ({
@@ -4392,6 +4388,22 @@ describe("floating panel wiring", () => {
       assert.equal(took, null, label);
       assert.equal(confirmed, false, label);
       assert.equal(declined, false, label);
+    }
+    // A top frame on another origin, from the offered window: only the origin check refuses it,
+    // since the window, the frame and the registry all match the offer.
+    const realFrame = main.webContents.mainFrame;
+    const realUrl = main.url;
+    const otherOriginFrame = { url: "https://evil.example/" };
+    main.webContents.mainFrame = otherOriginFrame;
+    main.url = otherOriginFrame.url;
+    const otherOrigin = { sender: main.webContents, senderFrame: otherOriginFrame };
+    try {
+      assert.equal(await take(otherOrigin, offer.offerId), null, "another origin");
+      assert.equal(await confirmOffer(h, otherOrigin, offer.offerId), false, "another origin");
+      assert.equal(await decline(otherOrigin, offer.offerId), false, "another origin");
+    } finally {
+      main.webContents.mainFrame = realFrame;
+      main.url = realUrl;
     }
     // Refusals leave the offer open for the page it was made to.
     assert.deepEqual(await take(event, offer.offerId), {

@@ -5007,11 +5007,6 @@ export function computeShowsWorking(
  *   consumed for, or ``null``. Must equal ``conversationId`` — a mismatch
  *   means the user switched sessions before the auto-send fired, so the
  *   prompt would leak into the now-active session.
- * @param params.sentForConversationId The conversation id the guard ref
- *   already auto-sent for, or ``null``. When it equals ``conversationId``
- *   the prompt was already dispatched for this session and must not
- *   resend; a different id (a later new chat reusing the mounted
- *   ChatPage) does not block.
  * @param params.conversationId Active session id from the URL, or
  *   ``null``/``undefined`` on the new-chat landing, e.g. ``"conv_abc"``.
  * @param params.loadingConversation ``true`` while the snapshot hydrates.
@@ -5023,7 +5018,6 @@ export function shouldSendInitialPrompt(params: {
   initialPrompt: string | null;
   initialPromptFileCount: number;
   promptConversationId: string | null;
-  sentForConversationId: string | null;
   conversationId: string | null | undefined;
   loadingConversation: boolean;
   agentId: string | null;
@@ -5042,10 +5036,6 @@ export function shouldSendInitialPrompt(params: {
   // :b) and the prompt leaks into the other session. Pinning the prompt to
   // the conversation it was consumed for closes that window.
   if (params.promptConversationId !== params.conversationId) return false;
-  // Already dispatched for THIS conversation — don't resend. A different
-  // (or null) id means a later new chat reusing the mounted ChatPage, so
-  // it falls through and sends.
-  if (params.sentForConversationId === params.conversationId) return false;
   if (!params.conversationId || params.loadingConversation || !params.agentId) {
     return false;
   }
@@ -5110,11 +5100,8 @@ interface HeldPrompt {
 }
 
 /**
- * Sends the first message a landing composer or a floating-panel launch stashed for
- * `conversationId`, exactly once. It waits for the session to load, because a send before the
- * stream binds loses the turn's events; it doesn't wait for the runner, since the server holds the
- * POST while a host-bound runner starts. A page that lets go of the prompt before sending, by
- * navigating away or unmounting, returns it to the store, so coming back sends it.
+ * Dispatches a stashed first message once after the session hydrates; a prompt not yet sent when
+ * the page leaves goes back to the store.
  */
 export function useInitialPromptDispatch({
   conversationId,
@@ -5164,7 +5151,6 @@ export function useInitialPromptDispatch({
         initialPrompt: held.prompt.text,
         initialPromptFileCount: held.prompt.files?.length ?? 0,
         promptConversationId: held.conversationId,
-        sentForConversationId: null,
         conversationId,
         loadingConversation,
         agentId,

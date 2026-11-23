@@ -1794,7 +1794,6 @@ describe("shouldSendInitialPrompt", () => {
     initialPrompt: "read the README",
     initialPromptFileCount: 0,
     promptConversationId: "conv_abc",
-    sentForConversationId: null,
     conversationId: "conv_abc",
     loadingConversation: false,
     agentId: "ag_abc123",
@@ -1834,29 +1833,6 @@ describe("shouldSendInitialPrompt", () => {
     expect(shouldSendInitialPrompt({ ...ready, initialPrompt, initialPromptFileCount: 1 })).toBe(
       true,
     );
-  });
-
-  it("does not send twice for the same conversation (once-guard)", () => {
-    // sentForConversationId mirrors the effect's ref after the first
-    // dispatch for this session. A failure means a re-render (e.g. runner
-    // re-poll) would resend into the same conversation.
-    expect(shouldSendInitialPrompt({ ...ready, sentForConversationId: "conv_abc" })).toBe(false);
-  });
-
-  it("sends again for a different conversation (per-session reset)", () => {
-    // ChatPage stays mounted across `/c/:a` → `/c/:b` (no route key), so a
-    // bare boolean once-guard would latch true after the first auto-send and
-    // silently drop the prompt for every later new chat. Keying the guard by
-    // conversation id resets it: a prompt consumed for conv_xyz still sends
-    // even though conv_abc was already dispatched.
-    expect(
-      shouldSendInitialPrompt({
-        ...ready,
-        promptConversationId: "conv_xyz",
-        sentForConversationId: "conv_abc",
-        conversationId: "conv_xyz",
-      }),
-    ).toBe(true);
   });
 
   it("waits while the conversation is still hydrating", () => {

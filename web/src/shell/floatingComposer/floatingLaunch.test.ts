@@ -288,15 +288,21 @@ describe("launchFromPanel", () => {
     });
 
     it.each([
-      ["says it can't take the message", () => bridge.canHandOffLaunch.mockResolvedValue(false)],
+      [
+        "says it can't take the message",
+        (_cause: Error) => bridge.canHandOffLaunch.mockResolvedValue(false),
+        false,
+      ],
       [
         "has no way to ask",
-        () => bridgeOf.mockReturnValue({ ...bridge, canHandOffLaunch: undefined }),
+        (_cause: Error) => bridgeOf.mockReturnValue({ ...bridge, canHandOffLaunch: undefined }),
+        false,
       ],
-      ["fails to answer", () => bridge.canHandOffLaunch.mockRejectedValue(new Error("shell gone"))],
-    ])("reads no attachment bytes when the shell %s", async (_case, setUp) => {
+      ["fails to answer", (cause: Error) => bridge.canHandOffLaunch.mockRejectedValue(cause), true],
+    ])("reads no attachment bytes when the shell %s", async (_case, setUp, logged) => {
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-      setUp();
+      const cause = new Error("shell gone");
+      setUp(cause);
       const file = new File(["x"], "a.txt");
       const read = vi.spyOn(file, "arrayBuffer");
 
@@ -304,6 +310,14 @@ describe("launchFromPanel", () => {
 
       expect(read).not.toHaveBeenCalled();
       expect(bridge.openInMainWindow).toHaveBeenCalledWith("/c/conv_1", null);
+      if (logged) {
+        expect(warn).toHaveBeenCalledWith(
+          "[floatingComposer] couldn't prepare a launch's message:",
+          cause,
+        );
+      } else {
+        expect(warn).not.toHaveBeenCalled();
+      }
       warn.mockRestore();
     });
 
@@ -335,21 +349,6 @@ describe("launchFromPanel", () => {
       expect(warn).toHaveBeenCalledWith(
         "[floatingComposer] couldn't prepare a launch's message:",
         expect.any(Error),
-      );
-      warn.mockRestore();
-    });
-
-    it("logs, and hands nothing over, when the shell fails to answer the probe", async () => {
-      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-      const cause = new Error("shell gone");
-      bridge.canHandOffLaunch.mockRejectedValue(cause);
-
-      await launchFromPanel(request());
-
-      expect(bridge.openInMainWindow).toHaveBeenCalledWith("/c/conv_1", null);
-      expect(warn).toHaveBeenCalledWith(
-        "[floatingComposer] couldn't prepare a launch's message:",
-        cause,
       );
       warn.mockRestore();
     });
