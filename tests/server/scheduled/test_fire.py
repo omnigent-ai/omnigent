@@ -101,6 +101,7 @@ class _FakeConversation:
     parent_conversation_id: str | None = None
     root_conversation_id: str = ""
     terminal_launch_args: list[str] | None = None
+    title: str | None = None
 
     def __post_init__(self) -> None:
         self.root_conversation_id = self.root_conversation_id or self.id
@@ -468,6 +469,9 @@ class FakePermissionStore:
 
     def check_access(self, user_id: str | None, conversation_id: str, required_level: int) -> bool:
         return conversation_id not in self.unowned
+
+    def is_admin(self, user_id: str) -> bool:
+        return False
 
     def grant(self, user_id: str, conversation_id: str, level: int) -> Any:
         self.grant_workspace_ids.append(current_workspace_id())

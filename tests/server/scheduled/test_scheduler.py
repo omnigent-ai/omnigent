@@ -36,6 +36,7 @@ class _FakeTask:
     workspace_id: int = 0
     session_mode: str = "new"
     execution_target: str = "connected_host"
+    kind: str = "automation"
 
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
@@ -197,6 +198,21 @@ async def test_start_skips_paused_tasks() -> None:
     )
     await scheduler.start()
     assert scheduler.job_count == 1
+
+
+async def test_start_leaves_agent_timers_to_the_database_scheduler() -> None:
+    # An hourly timer passes the legacy rule check, but only the database scheduler fires one.
+    timer = _FakeTask(
+        id="timer",
+        rrule="FREQ=SECONDLY;INTERVAL=3600",
+        timezone="UTC",
+        state="active",
+        kind="timer",
+    )
+    scheduler, _clock, _seam, _fired = _make([_task("a"), timer])
+    await scheduler.start()
+    assert scheduler.job_count == 1
+    assert scheduler.next_run_at("timer") is None
 
 
 async def test_start_skips_bad_rrule_without_crashing() -> None:
