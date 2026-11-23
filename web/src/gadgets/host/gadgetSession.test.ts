@@ -551,6 +551,10 @@ describe("gadget session", () => {
   it("sends actions and quotes to the session the gadget is shown beside", async () => {
     server.use(
       rest.post(`${API}/app-1/actions`, (_req, res, ctx) => res(ctx.status(201), ctx.json(ENTRY))),
+      // The session beside the gadget is the viewer's gadget session.
+      rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
+        res(ctx.json({ session_id: "s_rail", version: "v" })),
+      ),
       rest.post(`${API}/app-1/actions/act1/delivery`, (_req, res, ctx) =>
         res(ctx.json({ items: [] })),
       ),
@@ -604,6 +608,44 @@ describe("gadget session", () => {
     );
     expect(await (await delivered).json()).toEqual({ session_id: "s_actions" });
     // The viewer stays on the session they are reading.
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("starts a gadget session instead of sending to a cited session when there is none", async () => {
+    server.use(
+      rest.post(`${API}/app-1/actions`, (_req, res, ctx) => res(ctx.status(201), ctx.json(ENTRY))),
+      rest.get(`${API}/app-1/session`, (_req, res, ctx) => res(ctx.json({ session_id: null }))),
+    );
+
+    const receipt = await requestGadgetAction(
+      EDITOR,
+      { action: "run_card", params: { cardId: "c1" } },
+      navigate,
+      "s_cited",
+    );
+
+    expect(receipt).toMatchObject({ delivery: "starting" });
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    expect(parse(navigate.mock.calls[0][0]).pathname).toBe("/");
+  });
+
+  it("sends nothing when the gadget session can't be looked up beside a cited session", async () => {
+    server.use(
+      rest.post(`${API}/app-1/actions`, (_req, res, ctx) => res(ctx.status(201), ctx.json(ENTRY))),
+      rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
+        res(ctx.status(503), ctx.json({ error: { code: "unavailable", message: "Try later" } })),
+      ),
+    );
+
+    await expect(
+      requestGadgetAction(
+        EDITOR,
+        { action: "run_card", params: { cardId: "c1" } },
+        navigate,
+        "s_cited",
+      ),
+    ).rejects.toMatchObject({ code: "UNAVAILABLE" });
+    expect(sendUserMessage).not.toHaveBeenCalled();
     expect(navigate).not.toHaveBeenCalled();
   });
 

@@ -300,20 +300,30 @@ export async function openGadgetSession(
     onDelivered?: (sessionId: string) => void;
   },
 ): Promise<"sent" | "starting"> {
-  // Beside a session that only cites the gadget, its actions still go to the viewer's gadget
-  // session, and the viewer stays on the session they are reading.
+  // An action goes only to the viewer's gadget session. Beside a session that only cites the
+  // gadget, it goes there without leaving the page; with no gadget session, New session starts
+  // one. A failed lookup sends nothing, so no other session can receive the request.
+  let target = railSessionId;
+  let show = reveal;
   let registered: string | null | undefined;
-  if (railSessionId !== undefined && deliver && actionId !== undefined) {
-    registered = await getGadgetGadgetSession(app.id).catch(() => null);
-    if (registered !== null && registered !== railSessionId) {
-      railSessionId = undefined;
-      reveal = false;
+  if (target !== undefined && deliver && actionId !== undefined) {
+    try {
+      registered = await getGadgetGadgetSession(app.id);
+    } catch (error) {
+      throw new BridgeError(
+        "UNAVAILABLE",
+        `Couldn't find your gadget session: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (registered !== target) {
+      target = undefined;
+      show = false;
     }
   }
-  if (railSessionId !== undefined) {
+  if (target !== undefined) {
     if (deliver) {
       try {
-        await deliverMessage(app.id, railSessionId, message, actionId);
+        await deliverMessage(app.id, target, message, actionId);
       } catch (error) {
         throw new BridgeError(
           "UNAVAILABLE",
@@ -323,13 +333,13 @@ export async function openGadgetSession(
     }
     return "sent";
   }
-  const sessionId = registered ?? (await getGadgetGadgetSession(app.id));
+  const sessionId = registered !== undefined ? registered : await getGadgetGadgetSession(app.id);
   if (sessionId !== null) {
     try {
       if (deliver) {
         await deliverMessage(app.id, sessionId, message, actionId);
       }
-      if (reveal) {
+      if (show) {
         await openGadgetInSession(app.id, sessionId, navigate);
       }
       return "sent";
