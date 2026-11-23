@@ -74,3 +74,56 @@ describe("useMentionBrowser with tags held by a session draft", () => {
     });
   });
 });
+
+describe("useMentionBrowser while the listing loads", () => {
+  function press(key: string, ctrlKey = true) {
+    const nativeEvent = new KeyboardEvent("keydown", { key, ctrlKey });
+    let prevented = false;
+    const event = {
+      key,
+      code: `Key${key.toUpperCase()}`,
+      altKey: false,
+      ctrlKey,
+      metaKey: false,
+      shiftKey: false,
+      repeat: false,
+      defaultPrevented: false,
+      nativeEvent,
+      currentTarget: {} as never,
+      preventDefault: () => {
+        prevented = true;
+      },
+      stopPropagation: () => {},
+    };
+    return { event, prevented: () => prevented };
+  }
+
+  function renderLoadingBrowser(listingPending: boolean) {
+    return renderHook(() =>
+      useMentionBrowser({
+        mention: { query: "", start: 0, end: 1 },
+        setMention: () => {},
+        mentionEntries: [],
+        text: "@",
+        setText: () => {},
+        textareaRef: { current: null },
+        listingPending,
+      }),
+    );
+  }
+
+  it.each(["n", "p"])("holds Ctrl-%s while only the loading row shows", (letter) => {
+    const { result } = renderLoadingBrowser(true);
+    expect(result.current.mentionOpen).toBe(false);
+    const { event, prevented } = press(letter);
+    expect(result.current.handleKeyDown(event)).toBe(true);
+    expect(prevented()).toBe(true);
+  });
+
+  it("leaves other keys, and Ctrl-N once nothing is loading, to the composer", () => {
+    const loading = renderLoadingBrowser(true);
+    expect(loading.result.current.handleKeyDown(press("a", false).event)).toBe(false);
+    const idle = renderLoadingBrowser(false);
+    expect(idle.result.current.handleKeyDown(press("n").event)).toBe(false);
+  });
+});

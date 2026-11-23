@@ -46,6 +46,11 @@ export interface MentionBrowserParams {
   textareaRef: RefObject<ComposerTextTarget | null>;
   /** On mobile, Enter inserts a newline rather than acting on the menu. */
   isMobile?: boolean;
+  /**
+   * The listing behind the menu is still loading, so the menu shows only that while it
+   * has no rows; it still owns Ctrl-N/Ctrl-P, which have nowhere to step yet.
+   */
+  listingPending?: boolean;
   /** Tags restored with a saved draft, used for the first render only. */
   initialMentions?: TaggedMentions;
   /**
@@ -326,7 +331,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   };
 
   const handleKeyDown = (e: ComposerKeyboardEvent): boolean => {
-    if (!mentionOpen) return false;
+    if (!mentionOpen) return params.listingPending === true && holdReadlineStep(e);
     if (e.key === "Escape" && level !== null) {
       e.preventDefault();
       goBack();

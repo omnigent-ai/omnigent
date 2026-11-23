@@ -738,6 +738,20 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
+  it("keeps Ctrl-N/Ctrl-P with the loading menu, so they neither edit text nor reach New Session", () => {
+    ws.rootLoading = true;
+    ws.rootEntries = [];
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@comp");
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
+    const ta = textarea();
+    expect(ta.closest("[data-pick-list-input]")).not.toBeNull();
+    for (const letter of ["n", "p"]) {
+      const press = { key: letter, code: `Key${letter.toUpperCase()}`, ctrlKey: true };
+      expect(fireEvent.keyDown(ta, press)).toBe(false);
+    }
+  });
+
   it("still sends a settled zero-match token literally (not gated)", () => {
     // WHY (M1 boundary): the gate is for the *loading* window only. A token
     // that simply matches no file ("@nomatch") is the user's literal text and

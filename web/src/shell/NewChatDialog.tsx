@@ -5661,6 +5661,7 @@ function NewChatLandingContent({
     text: message,
     setText: setMessage,
     textareaRef,
+    listingPending: mentionListingPending,
     initialMentions: restoresDraftText ? restoredDraft?.mentions : undefined,
   });
   clearTaggedMentionsRef.current = () => {
@@ -7643,7 +7644,9 @@ function NewChatLandingContent({
               keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
               className={cn(isDragActive && "ring-2 ring-ring ring-inset", highlight.cardClassName)}
               data-testid="new-chat-landing-composer"
-              {...pickListInputProps(slashCompletion.menuShown || mentionOpen)}
+              {...pickListInputProps(
+                slashCompletion.menuShown || mentionOpen || mentionListingPending,
+              )}
               input={{
                 ref: bindTextarea,
                 value: message,

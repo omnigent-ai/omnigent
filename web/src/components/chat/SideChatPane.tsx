@@ -1238,6 +1238,7 @@ function SideChatComposer({
     setText,
     textareaRef,
     isMobile,
+    listingPending: mentionListingPending,
     tags: gridCell
       ? {
           mentions: sessionMentions ?? NO_TAGGED_MENTIONS,
@@ -1559,7 +1560,7 @@ function SideChatComposer({
         onActiveInputChange={rebindActiveInput}
         hasContent={!pending && files.length > 0}
         data-side-chat="true"
-        {...pickListInputProps(slashCompletion.menuShown)}
+        {...pickListInputProps(slashCompletion.menuShown || mentionMenuOpen)}
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
         className={highlight.cardClassName}
         input={{

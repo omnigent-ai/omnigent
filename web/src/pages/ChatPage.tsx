@@ -3227,6 +3227,7 @@ function ComposerImpl(
     },
     textareaRef,
     isMobile,
+    listingPending: mentionListingPending,
     segments: [draft.text, ...draft.quotes.map((quote) => quote.before)],
   });
 
@@ -4551,7 +4552,7 @@ function ComposerImpl(
         draftKey={conversationId ?? null}
         activeInputId={activeTextId ?? COMPOSER_TAIL_INPUT_ID}
         onActiveInputChange={rebindActiveInput}
-        {...pickListInputProps(slashCompletion.menuShown || mentionOpen)}
+        {...pickListInputProps(slashCompletion.menuShown || mentionOpen || mentionListingPending)}
         input={{
           ref: bindTailTextarea,
           value: draft.text,
