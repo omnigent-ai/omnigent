@@ -56,7 +56,9 @@ def stores(db_uri: str, tmp_path: Path) -> SimpleNamespace:
     )
 
 
-def _app(stores: SimpleNamespace, tmp_path: Path, *, features: str = "gadgets") -> FastAPI:
+def _app(
+    stores: SimpleNamespace, tmp_path: Path, *, features: str = "gadgets", with_store: bool = True
+) -> FastAPI:
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
     return create_app(
         agent_store=SqlAlchemyAgentStore(stores.db_uri),
@@ -67,7 +69,7 @@ def _app(stores: SimpleNamespace, tmp_path: Path, *, features: str = "gadgets") 
         permission_store=stores.permissions,
         auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
         feature_flags=resolve_feature_flags({"OMNIGENT_FEATURES": features}),
-        gadget_store=stores.gadgets,
+        gadget_store=stores.gadgets if with_store else None,
     )
 
 
@@ -122,17 +124,22 @@ def _rpc(gadget: dict, method: str, revision: str | None = None, **params: Any) 
     }
 
 
+@pytest.mark.parametrize(
+    ("features", "with_store"), [("-gadgets", True), ("gadgets", False)], ids=["off", "no-store"]
+)
 async def test_a_disabled_server_hides_every_route_before_reading_the_body(
-    stores: SimpleNamespace, tmp_path: Path
+    stores: SimpleNamespace, tmp_path: Path, features: str, with_store: bool
 ) -> None:
-    async for client in _client(_app(stores, tmp_path, features="-gadgets")):
+    # Turning the flag on without a store mounts no routes, so the web must not offer gadgets.
+    async for client in _client(_app(stores, tmp_path, features=features, with_store=with_store)):
         response = await client.post(
             "/v1/gadgets",
             content="{bad",
             headers={**_as(ALICE), "Content-Type": "application/json"},
         )
         assert response.status_code == 404
-        assert response.json()["error"]["code"] == "NOT_FOUND"
+        # Without a store the routes aren't mounted, and the app's own 404 answers.
+        assert response.json()["error"]["code"].upper() == "NOT_FOUND"
         assert (await client.get("/v1/gadgets/shared", headers=_as(ALICE))).status_code == 404
         info = (await client.get("/v1/info", headers=_as(ALICE))).json()
         assert info["features"]["gadgets"] is False

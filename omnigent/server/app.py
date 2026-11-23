@@ -4148,6 +4148,8 @@ def create_app(
         current_harness_install_enabled = harness_install_enabled(app.state.harness_install)
         frontend_features = app.state.feature_flags.frontend_dict()
         frontend_features[Feature.HARNESS_INSTALL.value] = current_harness_install_enabled
+        # The flag alone doesn't mount the gadget routes; the web reads this to show gadgets.
+        frontend_features[Feature.GADGETS.value] = app.state.gadgets_available()
         # installable_harnesses: the exact harness ids the install route accepts
         # (bare ids + native spellings resolving to an npm-installable family),
         # so the SPA offers setup only where it will succeed and never has to
