@@ -582,6 +582,11 @@ for (const [how, end] of [
     t.mock.timers.tick(FLOATING_COMPOSER_READY_FALLBACK_MS);
     assert.equal(panel.calls.includes("showInactive"), false);
     assert.equal(panel.calls.includes("webContents.focus"), false);
+    // Nor is its page told it took the keyboard.
+    assert.equal(
+      panel.calls.some((call) => call.startsWith("send:")),
+      false,
+    );
   });
 }
 
@@ -728,17 +733,4 @@ test("each way the panel takes the keyboard tells its page right after, once", (
       if (call === shown) assert.equal(panel.calls[index - 1], "webContents.focus");
     });
   }
-});
-
-test("a panel gone before its page was ready is never told it took the keyboard", (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout"] });
-  const { controller, created } = setup({ autoReady: false });
-  controller.show("https://a.example");
-  controller.close(created[0]);
-  controller.markReady(created[0]);
-  t.mock.timers.tick(FLOATING_COMPOSER_READY_FALLBACK_MS);
-  assert.equal(
-    created[0].calls.some((call) => call.startsWith("send:")),
-    false,
-  );
 });
