@@ -208,16 +208,25 @@ def test_the_fast_parse_agrees_with_checking_each_record(output: bytes, chunk_si
 
 
 def test_a_record_spanning_many_chunks_is_read_in_time_linear_in_its_length() -> None:
-    reader = files_module._TrackedListReader(None)
     chunk = b"x" * 65536
-    started = time.perf_counter()
-    for _ in range(1024):  # one 64 MiB name, as a crafted index could hold
-        reader.feed(chunk)
-    reader.feed(b"\0ok.txt\0")
-    elapsed = time.perf_counter() - started
 
-    assert [len(path) for path in reader.finish()] == [6, 64 * 1024 * 1024]
-    assert elapsed < 2  # copying the pending record on every chunk took far longer
+    def seconds_to_read(chunks: int) -> float:
+        """The fastest of three reads of one name ``chunks`` long, as a crafted index holds."""
+        fastest = float("inf")
+        for _ in range(3):
+            reader = files_module._TrackedListReader(None)
+            started = time.perf_counter()
+            for _ in range(chunks):
+                reader.feed(chunk)
+            reader.feed(b"\0ok.txt\0")
+            fastest = min(fastest, time.perf_counter() - started)
+            assert [len(path) for path in reader.finish()] == [6, chunks * len(chunk)]
+        return fastest
+
+    short, long = seconds_to_read(128), seconds_to_read(512)
+
+    # Avoid quadratic copying of the pending record: 4x the name, not 16x the work.
+    assert long < 10 * short
 
 
 @pytest.mark.parametrize(
@@ -229,12 +238,14 @@ def test_a_record_spanning_many_chunks_is_read_in_time_linear_in_its_length() ->
         (b"a.txt\0c.txt\0", False),
     ],
 )
+@pytest.mark.parametrize("chunk_size", [1, 3, 64])
 def test_a_relisting_returns_the_kept_list_only_when_its_paths_are_the_same(
-    output: bytes, same: bool
+    output: bytes, same: bool, chunk_size: int
 ) -> None:
     kept = ["a.txt", "b.txt"]
     reader = files_module._TrackedListReader(kept)
-    reader.feed(output)
+    for start in range(0, len(output), chunk_size):
+        reader.feed(output[start : start + chunk_size])
 
     paths = reader.finish()
 
@@ -248,13 +259,16 @@ async def test_an_index_rewritten_with_the_same_paths_keeps_the_same_list(
     root = _repository(tmp_path / "repo")
     files = WorkspaceFiles(root)
     first = await files.list_files(Deadline(10))
+    first_index = files._tracked[0] if files._tracked is not None else None
     _git(root, "update-index", "--index-version", "4")  # rewrites the index, same paths
     rewritten = await files.list_files(Deadline(10))
+    rewritten_index = files._tracked[0] if files._tracked is not None else None
     (root / "b.txt").write_text("x")
     _git(root, "add", "b.txt")
     added = await files.list_files(Deadline(10))
 
     assert first is not None and rewritten is not None and added is not None
+    assert rewritten_index != first_index  # listed again, not reused for an unchanged index
     assert rewritten.tracked is first.tracked
     assert added.tracked == ["a.txt", "b.txt"]
 
