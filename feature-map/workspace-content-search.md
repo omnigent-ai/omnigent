@@ -34,6 +34,12 @@ Filename search remains in Files.
   also works from the editor and terminal. The tab strip's arrows can select the
   tab too, and so can its number: **Ctrl+1–9** on macOS (**Alt+1–9** on
   Windows/Linux, except in a terminal) from anywhere in the app.
+- Tabs sidebar: with `workspace_sidebar_v2` on, in a desktop app or desktop
+  browser (not a touch client), the sidebar shows tabs instead of the Workspace
+  panel, in the Workspace drawer when the window is narrower than 1181px. Choose
+  **New tab → Search text** to search in a tab of its own, and move between tabs
+  from the strip or tab search. The Workspace panel's **Cmd+Shift+F** isn't
+  bound while the tabs show.
 
 ## Driving it with the repro environment
 

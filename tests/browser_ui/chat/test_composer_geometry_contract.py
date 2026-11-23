@@ -85,7 +85,7 @@ def _attach(page: Page, names: list[str]) -> None:
         [
             {
                 "name": name,
-                "mimeType": "video/mp4" if name.endswith(".mp4") else "text/plain",
+                "mimeType": "video/webm" if name.endswith(".webm") else "text/plain",
                 "buffer": b"geometry",
             }
             for name in names
@@ -210,7 +210,7 @@ def test_content_and_action_controls_follow_shared_inset_lines(
     if surface == "landing":
         chat.harness = "claude-native"
     _surface(page, chat, surface, DESKTOP)
-    _attach(page, ["alpha.txt", "clip.mp4"])
+    _attach(page, ["alpha.txt", "clip.webm"])
     card = box(page.locator("[data-composer-card]"))
     input_box = box(_input(page, surface))
     chip = box(page.get_by_role("button", name="Remove alpha.txt").locator(".."))

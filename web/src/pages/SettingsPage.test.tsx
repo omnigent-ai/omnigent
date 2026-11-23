@@ -16,6 +16,7 @@ import {
   within,
 } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
+import type * as IdentityApi from "@/lib/identity";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -144,13 +145,19 @@ vi.mock("@/lib/accountsApi", () => ({
   logout: vi.fn(),
   changePassword: vi.fn(),
 }));
-vi.mock("@/lib/identity", () => ({
+const identityUpdates = vi.hoisted(() => new Set<() => void>());
+
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityApi>()),
   authenticatedFetch: (...args: unknown[]) => mocks.authenticatedFetch(...args),
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
   getCurrentIsAdmin: () => mocks.effectiveAdmin ?? mocks.me?.is_admin ?? false,
   getCurrentAdminEligibility: () => mocks.me?.is_admin ?? false,
   getCurrentUserId: () => mocks.me?.id ?? null,
-  subscribeIdentity: () => () => {},
+  subscribeIdentity: (listener: () => void) => {
+    identityUpdates.add(listener);
+    return () => identityUpdates.delete(listener);
+  },
 }));
 vi.mock("@/hooks/useConversations", async () => {
   // A stateful mock that emulates useInfiniteQuery pagination: it tracks how
@@ -338,6 +345,7 @@ function renderPage(path = "/settings") {
 }
 
 beforeEach(() => {
+  identityUpdates.clear();
   mocks.setTheme.mockReset();
   mocks.archiveMutate.mockReset();
   mocks.deleteMutate.mockReset();
@@ -643,6 +651,32 @@ describe("SettingsPage", () => {
     renderPage("/settings/general");
     expect(await screen.findByRole("switch", newAgent)).toBeChecked();
     expect(getGlobalShortcut).toHaveBeenCalledWith("floatingComposer");
+  });
+
+  it("offers the right sidebar window setting in Desktop app only on shells that have it", async () => {
+    const name = { name: "Widen window when opening the right sidebar" };
+    const newAgent = { name: "Open New Agent from anywhere" };
+    renderPage("/settings/general");
+    expect(screen.queryByTestId("settings-group-desktop-app")).toBeNull();
+    cleanup();
+
+    const rightSidebarWindow = {
+      getWidensWindow: vi.fn().mockResolvedValue(false),
+      setWidensWindow: vi.fn().mockResolvedValue(true),
+      opened: vi.fn(),
+      closed: vi.fn(),
+    };
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      setBadgeCount: vi.fn(),
+      notify: vi.fn(),
+      rightSidebarWindow,
+    };
+    // A shell without global shortcuts still gets the Desktop app group for this setting.
+    renderPage("/settings/general");
+    const group = screen.getByTestId("settings-group-desktop-app");
+    await waitFor(() => expect(within(group).getByRole("switch", name)).toBeEnabled());
+    expect(within(group).queryByRole("switch", newAgent)).toBeNull();
   });
 
   it("offers the kanban board switch under Composer only when the server has the board", () => {
@@ -1770,6 +1804,23 @@ describe("SettingsPage", () => {
     mocks.loginUrl = null;
     renderPage("/settings/account");
     expect(screen.queryByText("alice")).toBeNull();
+  });
+
+  it("shows account identity after a transient probe recovers without remounting", async () => {
+    mocks.me = null;
+    const view = renderPage("/settings/account");
+    await act(async () => {});
+    expect(screen.queryByText("alice")).not.toBeInTheDocument();
+
+    mocks.me = { id: "alice", is_admin: true };
+    act(() => {
+      for (const listener of identityUpdates) listener();
+    });
+
+    expect(await screen.findByText("alice")).toBeInTheDocument();
+    expect(screen.getByText("(admin)")).toBeInTheDocument();
+    view.unmount();
+    expect(identityUpdates.size).toBe(0);
   });
 
   it("persists an Updates mode change through the desktop bridge", async () => {

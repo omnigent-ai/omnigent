@@ -1490,7 +1490,7 @@ def test_tcp_terminal_cleanup_does_not_block_event_loop(
         launcher_path = tmp_path / "fake-launcher"
         launcher_path.write_text("#!/bin/sh\n", encoding="utf-8")
         monkeypatch.setattr(
-            terminal_module, "create_exec_launcher", lambda *_args: str(launcher_path)
+            terminal_module, "create_exec_launcher", lambda *_args, **_kwargs: str(launcher_path)
         )
 
         async def fail_spawn(*_args: object, **_kwargs: object) -> None:

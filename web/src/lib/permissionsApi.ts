@@ -7,6 +7,7 @@
  * `omnigent/server/routes/workflow_permissions.py`.
  */
 
+import { isTempConvId } from "@/lib/tempConversationId";
 import type { Conversation } from "@/hooks/useConversations";
 import {
   isSharingOff,
@@ -84,6 +85,19 @@ export function isEditorLevel(level: number | null): boolean {
 }
 
 /**
+ * Whether the viewer may read a session's workspace files: editors, or anyone
+ * the owner shared files with. View grants alone don't include files. A
+ * session not loaded yet, or whose fetch failed, reads nothing; a loaded
+ * session's null level means permissions are off, as in single-user mode.
+ */
+export function canBrowseWorkspaceFiles(
+  session: { permissionLevel: number | null; shareWorkspaceFiles?: boolean } | null | undefined,
+): boolean {
+  if (session == null) return false;
+  return isEditorLevel(session.permissionLevel) || session.shareWorkspaceFiles === true;
+}
+
+/**
  * Derive the effective permission level for the active conversation.
  *
  * Resolution order:
@@ -135,7 +149,12 @@ export function isPermissionLevelPending(
   conversationsLoaded: boolean,
 ): boolean {
   if (session != null || activeConv?.permission_level != null) return false;
-  return sessionLoading || (Boolean(conversationId) && !conversationsLoaded);
+  // A `temp:` id has no snapshot to fetch yet, so its read-only fallback isn't a real level.
+  return (
+    sessionLoading ||
+    isTempConvId(conversationId) ||
+    (Boolean(conversationId) && !conversationsLoaded)
+  );
 }
 
 /**

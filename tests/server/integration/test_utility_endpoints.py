@@ -105,12 +105,14 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "project_kanban": True,
         "project_repository_creation": True,
         "quick_pick_palette": False,
+        "workspace_sidebar_v2": False,
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,
         "workspace_direct_access": False,
         "workspace_api_server_access": False,
         "floating_composer": False,
+        "sidebar_saved_views": False,
     }
     assert data["sibling_sessions"] is True
     # Compatibility field for frontend builds predating the nested map.

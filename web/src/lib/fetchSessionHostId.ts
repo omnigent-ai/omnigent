@@ -14,15 +14,16 @@ interface HostResolution {
 const inFlight = new Map<string, Promise<HostResolution>>();
 
 /** Resolve the nearest own host binding with fresh metadata for each ancestry hop.
- * Concurrent callers share a walk; completed host bindings are never cached. */
+ * Concurrent callers share a walk; completed host bindings are never cached.
+ * Pass fresh to start an independent walk after consent. */
 export async function fetchSessionHostId(
   sessionId: string,
-  { queryClient }: { queryClient?: QueryClient } = {},
+  { queryClient, fresh = false }: { queryClient?: QueryClient; fresh?: boolean } = {},
 ): Promise<string | null> {
-  let pending = inFlight.get(sessionId);
+  let pending = fresh ? undefined : inFlight.get(sessionId);
   if (!pending) {
     pending = fetchSessionHostChain(sessionId);
-    inFlight.set(sessionId, pending);
+    if (!fresh) inFlight.set(sessionId, pending);
   }
   try {
     const { hostId, snapshots } = await pending;

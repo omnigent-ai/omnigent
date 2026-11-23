@@ -2994,6 +2994,60 @@ it.each([false, true])(
   },
 );
 
+describe("side-chat sent command tint", () => {
+  function seedSentCommand(text: string) {
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "claude-sdk",
+      sessionStatus: "idle",
+      blocks: itemsToBlocks([
+        {
+          id: "sent_cmd",
+          response_id: "turn",
+          type: "message",
+          role: "user",
+          status: "completed",
+          content: [{ type: "input_text", text }],
+        },
+      ]),
+    });
+    skillsFixture.current = {
+      skills: [{ name: "team", description: "Run a team" }],
+      skillsStatus: "ready",
+    };
+  }
+  const tintedTeam = () => screen.queryByText("/team", { selector: ".text-brand-accent" });
+
+  it("keeps a sent command tinted once the side chat turns read-only", () => {
+    seedSentCommand("/team fix it");
+    const view = renderPane(<SideChatPane childId={childId} />);
+    expect(tintedTeam()).not.toBeNull();
+
+    view.rerender(<SideChatPane childId={childId} readOnly />);
+    expect(screen.queryByTestId("side-chat-input")).toBeNull();
+    expect(tintedTeam()).not.toBeNull();
+  });
+
+  it("keeps an unsettled `!` send literal as a shell command once the side chat ends", () => {
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "codex-native",
+      sessionStatus: "idle",
+      blocks: [],
+      pendingUserMessages: [
+        { tempId: "pend_shell", content: [{ type: "input_text", text: "!echo **hi**" }] },
+      ],
+    });
+    renderPane(<SideChatPane childId={childId} readOnly />);
+    expect(screen.getByText("!echo **hi**").tagName).toBe("CODE");
+  });
+
+  it("tints a sent command in a side chat that had already ended", () => {
+    seedSentCommand("/team fix it");
+    renderPane(<SideChatPane childId={childId} readOnly />);
+    expect(screen.queryByTestId("side-chat-input")).toBeNull();
+    expect(tintedTeam()).not.toBeNull();
+  });
+});
+
 describe("side-chat composer highlight", () => {
   it("tints a known side-chat command but not an unknown one", () => {
     conversationRegistry.acquire(childId).setState({ sessionHarness: "claude-sdk" });

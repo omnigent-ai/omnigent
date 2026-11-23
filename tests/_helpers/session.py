@@ -40,6 +40,20 @@ def post_session_bundle(
     )
 
 
+def create_sub_agent_sessions(
+    client: httpx.Client, *, agent_id: str, parent_id: str, count: int
+) -> list[str]:
+    """Create *count* sub-agent sessions of *agent_id* under *parent_id*; return their ids."""
+    session_ids = []
+    for _ in range(count):
+        response = client.post(
+            "/v1/sessions", json={"agent_id": agent_id, "parent_session_id": parent_id}
+        )
+        assert response.status_code == 201, response.text
+        session_ids.append(response.json()["id"])
+    return session_ids
+
+
 def bind_session_runner(
     patch: Callable[..., httpx.Response],
     base_url: str,

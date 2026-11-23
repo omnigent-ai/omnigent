@@ -84,7 +84,11 @@ const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { isBrowserViewFocused, sharedDesignTools } = require("./designTools");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
-const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
+const {
+  createHostThisMachineChecker,
+  SESSION_HOST_PROTOCOL,
+  SSH_PREVIEW_PROTOCOL,
+} = require("./hostIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
 const {
@@ -129,6 +133,7 @@ const {
   settingsMenuItem,
 } = require("./settingsNavigation");
 const { createQuitConfirmation } = require("./quitConfirmation");
+const { createRightSidebarWindow } = require("./rightSidebarWindow");
 const { acceleratorLabel, createGlobalShortcuts } = require("./globalShowShortcut");
 const {
   FLOATING_COMPOSER_PATH,
@@ -156,6 +161,8 @@ const { workspaceSocketRequest } = require("./workspaceSocket");
 const { createWorkspaceSshForwards } = require("./workspaceSshForwards");
 const { createSshHostStore } = require("./sshHosts");
 const { createSshTargetChecks } = require("./sshTargets");
+const { createSshPreviewHosts } = require("./sshPreviewHosts");
+const { verifySshPreviewIdentity } = require("./sshPreviewIdentity");
 
 const serverManager = require("./server_manager");
 const { diagnostics } = require("./diagnostics");
@@ -373,9 +380,48 @@ function databricksInternalFeaturesEnabled() {
  */
 const arcaIdentities = createArcaIdentityStore();
 // Hosts this desktop connected over SSH, and the connections that reach their workspace sockets.
-const sshHosts = createSshHostStore(() => path.join(app.getPath("userData"), "ssh-hosts.json"));
+const onSshDestinationChanged = (serverUrl, hostId) =>
+  sshPreviewHosts.destinationChanged(serverUrl, hostId);
+const sshHosts = createSshHostStore(() => path.join(app.getPath("userData"), "ssh-hosts.json"), {
+  onChange: onSshDestinationChanged,
+});
 const workspaceSshForwards = createWorkspaceSshForwards();
 const sshTargetChecks = createSshTargetChecks({ record: sshHosts.record });
+// Preview identity proofs must not approve workspace file access.
+const sshPreviewDestinations = createSshHostStore(
+  () => path.join(app.getPath("userData"), "ssh-preview-hosts.json"),
+  { onChange: onSshDestinationChanged },
+);
+const sshPreviewHosts = createSshPreviewHosts({
+  destination: (serverUrl, hostId) =>
+    sshHosts.destination(serverUrl, hostId) ??
+    sshPreviewDestinations.destination(serverUrl, hostId),
+  verify: verifySshPreviewIdentity,
+  record: sshPreviewDestinations.record,
+});
+
+/**
+ * Ask, in a dialog the page can't draw over, before sessions on a host reached
+ * over SSH may open this computer's localhost pages. Null when there is no window to ask in.
+ */
+async function approveSshPreviewHost(win, serverUrl, destination, needsVerification) {
+  if (!win || win.isDestroyed()) return null;
+  const { response } = await dialog.showMessageBox(win, {
+    type: "question",
+    buttons: ["Not now", "Allow"],
+    defaultId: 0,
+    cancelId: 0,
+    message: `Let sessions on "${destination}" open localhost pages?`,
+    detail:
+      `${new URL(serverUrl).host} says this session runs on the SSH destination "${destination}". ` +
+      (needsVerification
+        ? "Omnigent will use your SSH config and keys to check its running host identity first. It won't install software, start a host or sign in. "
+        : "Omnigent has already checked this destination. ") +
+      "Sessions there, and their agents, could then open localhost, 127.0.0.1 and *.localhost pages in the Browser pane. Those are this computer's own ports, including any you forward from that host.\n\n" +
+      `Allow only if you recognize "${destination}".`,
+  });
+  return win.isDestroyed() || windows.get(win)?.serverUrl !== serverUrl ? null : response === 1;
+}
 
 /**
  * Ask, in a dialog the page can't draw over, before SSH runs with a destination
@@ -526,7 +572,7 @@ const arcaAutoConnect = createArcaAutoConnect({
 });
 /** Agent retry bursts after a deliberate decline should not reopen the prompt immediately. */
 const ARCA_PREVIEW_DECLINE_COOLDOWN_MS = 10 * 1000;
-const arcaPreviewRecoveries = new Set();
+const pendingPreviewReconnects = new Set();
 const arcaPreviewDeclinedUntil = new Map();
 
 /**
@@ -1803,6 +1849,14 @@ const quitConfirmation = createQuitConfirmation({
   quit: () => app.quit(),
 });
 
+// Settings → "Widen window when opening the right sidebar" (opt-in).
+const rightSidebarWindow = createRightSidebarWindow({
+  loadSettings,
+  saveSettings,
+  workAreaFor: (bounds) => screen.getDisplayMatching(bounds).workArea,
+  animate: process.platform === "darwin",
+});
+
 // Main-window documents that can render the floating New Agent panel (see registerIpc).
 const floatingComposerSupport = createFloatingComposerSupport();
 
@@ -2856,7 +2910,11 @@ function registerNavigationFallbacks(win) {
   // → black window), so did-fail-load never fires. did-navigate is
   // main-frame-only and carries httpResponseCode; reuse the setup-page
   // fallback so the user sees the status and can change server / retry.
+  let navigations = 0;
+  let latestPageLoaded = false;
   win.webContents.on("did-navigate", (_event, url, httpResponseCode, httpStatusText) => {
+    const navigation = ++navigations;
+    latestPageLoaded = httpResponseCode < 400;
     if (httpResponseCode < 400) return;
     const state = windows.get(win);
     const failedOrigin = originOf(url ?? "");
@@ -2878,7 +2936,20 @@ function registerNavigationFallbacks(win) {
       const options = { hint: UNAVAILABLE_HINT, finalMessage: status };
       if (scheduleReconnect(win, state.serverUrl, url, options)) return;
     }
-    showConnectFailure(win, state.serverUrl ?? url ?? "", status);
+    const serverUrl = state.serverUrl;
+    if (httpResponseCode === 403 && serverUrl && usesBrowserAuth(pinnedOrigin(win))) {
+      // Off the VPN the IP access list refuses the page; a session renewal tells
+      // that (reconnect behind the overlay) apart from a real 403.
+      const replaced = () => navigation !== navigations && latestPageLoaded;
+      const checked = databricksAuth?.checkSession(win, "forbidden page load", replaced);
+      if (checked) {
+        void checked.then((connected) => {
+          if (connected && navigation === navigations) showConnectFailure(win, serverUrl, status);
+        });
+        return;
+      }
+    }
+    showConnectFailure(win, serverUrl ?? url ?? "", status);
   });
 }
 
@@ -2972,6 +3043,16 @@ function createWindow(targetUrl, opts = {}) {
   };
   win.on("enter-full-screen", sendFullScreenState);
   win.on("leave-full-screen", sendFullScreenState);
+  // A right sidebar closed while full screen or maximized shrinks the window once it's restored.
+  const restoreRightSidebarWindow = () => rightSidebarWindow.restored(win);
+  win.on("leave-full-screen", restoreRightSidebarWindow);
+  win.on("unmaximize", restoreRightSidebarWindow);
+  win.on("resize", restoreRightSidebarWindow);
+  // A new page doesn't know about the window's growth, so it mustn't shrink by it later.
+  win.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) rightSidebarWindow.forget(win);
+  });
+  win.webContents.on("render-process-gone", () => rightSidebarWindow.forget(win));
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
   // CLI config stores the API mount; Electron boots the browser-facing SPA.
@@ -4516,7 +4597,7 @@ function guardAgentPartitionRequests(partition, registry) {
  * Main-owned recovery scope for a loopback preview request, excluding the
  * renderer-supplied host match that decides whether this session may ask.
  */
-function arcaPreviewRecoveryTargetForEvent(event, url) {
+function previewRecoveryTargetForEvent(event, url) {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (
     !isLoopbackPreviewUrl(url) ||
@@ -4546,7 +4627,7 @@ function arcaPreviewRecoveryContextForEvent(
   rememberedArcaHostId,
   sourceIsArcaHost,
 ) {
-  const targetContext = arcaPreviewRecoveryTargetForEvent(event, url);
+  const targetContext = previewRecoveryTargetForEvent(event, url);
   if (
     !targetContext ||
     typeof sourceHostId !== "string" ||
@@ -4564,8 +4645,8 @@ function arcaPreviewRecoveryContextForEvent(
 
 /** Open one shared consent flow and let the requesting agent retry afterward. */
 function startArcaPreviewConsentRecovery({ win, target, sourceHostId }) {
-  if (arcaPreviewRecoveries.has(target)) return;
-  arcaPreviewRecoveries.add(target);
+  if (pendingPreviewReconnects.has(target)) return;
+  pendingPreviewReconnects.add(target);
   void arcaConnectFlow
     .run(win, target, { reason: "preview-reconnect" })
     .then((result) => {
@@ -4583,7 +4664,7 @@ function startArcaPreviewConsentRecovery({ win, target, sourceHostId }) {
       return { ok: false, error: String(error) };
     })
     .finally(() => {
-      arcaPreviewRecoveries.delete(target);
+      pendingPreviewReconnects.delete(target);
     });
 }
 
@@ -4647,7 +4728,10 @@ function createBrowserRegistryForWindow(win) {
             isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) &&
             isDatabricksManagedServerUrl(target),
           serverTarget: target,
-        }) || context?.hostIsThisMachine === true
+        }) ||
+        context?.hostIsThisMachine === true ||
+        (context?.hostIsSshPreview === true &&
+          sshPreviewHosts.allows(windows.get(win)?.serverUrl, context?.sourceHostId))
       );
     },
     createBoundsController: createBrowserViewBoundsController,
@@ -5354,6 +5438,34 @@ function registerIpc() {
     return true;
   });
 
+  // Settings → "Widen window when opening the right sidebar", and the page's reports of that
+  // sidebar opening and closing, which resize only the reporting window.
+  ipcMain.handle("omnigent:get-right-sidebar-widens-window", (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error(
+        "get-right-sidebar-widens-window is only available to a connected server page",
+      );
+    }
+    return rightSidebarWindow.enabled();
+  });
+  ipcMain.handle("omnigent:set-right-sidebar-widens-window", (event, enabled) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error(
+        "set-right-sidebar-widens-window is only available to a connected server page",
+      );
+    }
+    return rightSidebarWindow.setEnabled(enabled === true);
+  });
+  ipcMain.on("omnigent:right-sidebar-visibility", (event, report) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!isPinnedOriginSender(event) || !isMainWindow(win)) return;
+    // Only the window's own page speaks for its sidebar, not a frame inside it.
+    if (event.senderFrame !== event.sender.mainFrame) return;
+    if (report?.reset === true) rightSidebarWindow.forget(win);
+    else if (report?.open === true) rightSidebarWindow.opened(win, report.width);
+    else if (report?.open === false) rightSidebarWindow.closed(win);
+  });
+
   // A main window's document can render the floating panel for its server, until it's replaced.
   ipcMain.on("omnigent:floating-composer:announce", (event, version) => {
     const win = BrowserWindow.fromWebContents(event.sender);
@@ -5852,6 +5964,7 @@ function registerIpc() {
       // Importing local Chrome cookies is wired for macOS only (Keychain-decrypted
       // v10 values); the SPA hides the toolbar button everywhere else.
       chromeCookieImport: process.platform === "darwin",
+      sshLocalhostPreview: process.platform !== "win32",
       // The floating New Agent panel is a macOS panel window.
       floatingComposer: process.platform === "darwin",
       // Settings can read and change the panel's shortcut by id.
@@ -6104,6 +6217,11 @@ function registerIpc() {
       return {
         serverTarget: arcaTarget(windowArcaServerUrl(win)),
         sourceHostId,
+        ...(opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
+        opts?.sshPreviewProtocol === SSH_PREVIEW_PROTOCOL &&
+        sshPreviewHosts.allows(windows.get(win)?.serverUrl, sourceHostId)
+          ? { hostIsSshPreview: true }
+          : {}),
         hostIsThisMachine:
           opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
           isHostThisMachine({
@@ -6128,7 +6246,7 @@ function registerIpc() {
       );
       if (!context) return false;
       const { target } = context;
-      if (arcaPreviewRecoveries.has(target)) return false;
+      if (pendingPreviewReconnects.has(target)) return false;
       const declinedUntil = arcaPreviewDeclinedUntil.get(target) ?? 0;
       if (declinedUntil > Date.now()) return false;
       arcaPreviewDeclinedUntil.delete(target);
@@ -6150,6 +6268,31 @@ function registerIpc() {
         return false;
       }
     },
+    requestPreviewHostForEvent: async (event, url, opts) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      const serverUrl = senderServerUrl(event);
+      const sourceHostId = opts?.sourceHostId;
+      if (
+        !win ||
+        opts?.sessionHostProtocol !== SESSION_HOST_PROTOCOL ||
+        opts?.sshPreviewProtocol !== SSH_PREVIEW_PROTOCOL ||
+        process.platform === "win32" ||
+        win.isDestroyed() ||
+        !isPinnedOriginSender(event) ||
+        !isLoopbackPreviewUrl(url) ||
+        pendingPreviewReconnects.has(previewRecoveryTargetForEvent(event, url)?.target) ||
+        sshPreviewHosts.allows(serverUrl, sourceHostId)
+      ) {
+        return false;
+      }
+      return sshPreviewHosts.request(
+        serverUrl,
+        sourceHostId,
+        (destination, needsVerification) =>
+          approveSshPreviewHost(win, serverUrl, destination, needsVerification),
+        opts?.sourceSshTarget,
+      );
+    },
     getAgentNavigationHintForEvent: (
       event,
       url,
@@ -6157,7 +6300,11 @@ function registerIpc() {
       rememberedArcaHostId,
       sourceIsArcaHost,
     ) => {
-      const targetContext = arcaPreviewRecoveryTargetForEvent(event, url);
+      const previewHint = isLoopbackPreviewUrl(url)
+        ? sshPreviewHosts.hint(senderServerUrl(event), sourceHostId)
+        : null;
+      if (previewHint) return previewHint;
+      const targetContext = previewRecoveryTargetForEvent(event, url);
       if (!targetContext) return null;
       if (typeof rememberedArcaHostId !== "string") {
         return "Open New session > Host > Run on Arca to restore its connection details, then retry the preview.";
@@ -6176,7 +6323,7 @@ function registerIpc() {
       if ((arcaPreviewDeclinedUntil.get(target) ?? 0) > Date.now()) {
         return "Reconnect was declined. Wait a moment, then retry the preview to show the prompt again.";
       }
-      if (arcaPreviewRecoveries.has(target)) {
+      if (pendingPreviewReconnects.has(target)) {
         return "Finish the Arca reconnect in Omnigent, then retry the preview.";
       }
       return "Omnigent couldn't restore the Arca connection details. Retry the preview to reconnect.";

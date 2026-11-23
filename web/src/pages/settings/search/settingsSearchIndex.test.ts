@@ -52,6 +52,7 @@ const HIDDEN_SECTION: SettingsEntry = {
 const SHOWN: SettingsAvailability = {
   globalShortcut: true,
   floatingComposerShortcut: true,
+  widenWindowForRightSidebar: true,
   inAppBrowser: true,
   adminView: true,
   accountsEnabled: true,
@@ -65,6 +66,7 @@ const SHOWN: SettingsAvailability = {
 const HIDDEN: SettingsAvailability = {
   globalShortcut: false,
   floatingComposerShortcut: false,
+  widenWindowForRightSidebar: false,
   inAppBrowser: false,
   adminView: false,
   accountsEnabled: false,
@@ -253,6 +255,7 @@ describe("availability", () => {
     ["project-kanban-board", "projectKanban"],
     ["session-title-instructions", "sessionTitleInstructions"],
     ["proactive-agent", "proactiveAgent"],
+    ["widen-window-for-right-sidebar", "widenWindowForRightSidebar"],
   ] as const)("offers the catalog's %s only where %s is on", (id, gate) => {
     const offered = (availability: SettingsAvailability) =>
       settingsSearchTargets(SETTINGS_ENTRIES, SECTIONS, availability).map((target) => target.key);

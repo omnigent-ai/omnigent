@@ -3909,6 +3909,11 @@ describe("useArchiveConversation", () => {
       expect(d.pages[0].data[0].archived).toBe(true);
     });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    // The confirmed timestamp lands without a push frame, so recency sorts see the archive.
+    const settled = queryClient.getQueryData(["conversations", "", true]) as {
+      pages: { data: { updated_at: number }[] }[];
+    };
+    expect(settled.pages[0].data[0].updated_at).toBe(10);
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_a");
