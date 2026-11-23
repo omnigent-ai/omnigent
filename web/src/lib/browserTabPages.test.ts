@@ -108,6 +108,10 @@ describe("saved browser pages", () => {
       `https://docs.example/#/guide?${ordinaryParams}`,
       "https://docs.example/reports;country_code=US;sort_key=date/summary",
       "https://docs.example/#/reports;country_code=US;sort_key=date/summary",
+      "https://docs.example/50%off",
+      "https://docs.example/#100%",
+      "https://docs.example/%FF/guide",
+      "https://docs.example/#/%FF;country_code=US",
     ]) {
       saveBrowserPage(userTab, url, "Search");
       expect(readSavedBrowserPage(userTab), url).toEqual({ url, title: "Search" });
@@ -155,6 +159,9 @@ describe("saved browser pages", () => {
       "https://app.example/#/callback;lang=en;code=synthetic",
       "https://app.example/?lang=en;sid=synthetic",
       "https://app.example/#/callback?lang=en;sid=synthetic",
+      "https://app.example/50%off%3Bsid%3Dsynthetic",
+      "https://app.example/#100%%3Bcode%3Dsynthetic",
+      "https://app.example/report%FF%3Bsid%3Dsynthetic",
     ]) {
       saveBrowserPage(userTab, url);
       expect(readSavedBrowserPage(userTab), url).toEqual(previousPage);

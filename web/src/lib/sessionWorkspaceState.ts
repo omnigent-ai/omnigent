@@ -123,14 +123,21 @@ function isCredentialParam(name: string): boolean {
   return CREDENTIAL_PARAM_PART.test(name) || CREDENTIAL_PARAM_NAME.test(name);
 }
 
+function decodeCredentialUrlPart(value: string): string {
+  // Credential names and delimiters are ASCII; unrelated malformed escapes can stay literal.
+  return value.replace(/%([0-7][0-9a-f])/gi, (_match, hex: string) =>
+    String.fromCharCode(Number.parseInt(hex, 16)),
+  );
+}
+
 function carriesCredential({ username, password, pathname, search, hash }: URL): boolean {
   if (username !== "" || password !== "") return true;
   // Some servers rewrite session credentials into semicolon-delimited path parameters.
-  const pathParams = decodeURIComponent(pathname)
+  const pathParams = decodeCredentialUrlPart(pathname)
     .split("/")
     .flatMap((segment) => segment.split(";").slice(1));
   // Hash routes can carry query or semicolon-delimited path parameters.
-  const fragmentQueries = decodeURIComponent(hash.slice(1))
+  const fragmentQueries = decodeCredentialUrlPart(hash.slice(1))
     .split(/[?;]/)
     .filter((part) => part.includes("="));
   const params = [search, ...fragmentQueries, ...pathParams].flatMap((query) => [
