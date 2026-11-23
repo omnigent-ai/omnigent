@@ -657,6 +657,14 @@ async def test_the_tool_archives_sub_agents_in_any_of_the_owners_trees(
     own_child = store.create_conversation(
         agent_id=source["agent_id"], parent_conversation_id=source["id"], title="Worker"
     )
+    # Stopping a native side chat closes it without releasing its title.
+    closed_child = store.create_conversation(
+        agent_id=source["agent_id"],
+        parent_conversation_id=target["id"],
+        title="Stopped worker",
+        labels={"omnigent.closed": "true"},
+    )
+    children = (other_tree_child, own_child, closed_child)
     runner_id = store.get_conversation(source["id"]).runner_id
     assert runner_id
     assert store.set_runner_id(own_child.id, runner_id) is True
@@ -669,10 +677,10 @@ async def test_the_tool_archives_sub_agents_in_any_of_the_owners_trees(
     monkeypatch.setattr(sessions_module, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0)
     monkeypatch.setattr(orchestration, "_stop_session_via_runner", record_stop)
     store.set_session_live_status(source["id"], "running")
-    for session_id in (source["id"], target["id"], other_tree_child.id, own_child.id):
+    for session_id in (source["id"], target["id"], *(child.id for child in children)):
         monkeypatch.setitem(sessions_common._session_status_cache, session_id, "running")
 
-    for child in (other_tree_child, own_child):
+    for child in children:
         result = await _project_tool(
             auth_client, source, "sys_session_update", session_id=child.id, archived=True
         )
@@ -684,10 +692,11 @@ async def test_the_tool_archives_sub_agents_in_any_of_the_owners_trees(
         }
     await asyncio.gather(*list(orchestration._detached_stop_tasks))
     # Only the archived sub-agents stop; their parents keep running.
-    assert sorted(stopped) == sorted([other_tree_child.id, own_child.id])
+    assert sorted(stopped) == sorted(child.id for child in children)
     assert store.get_conversation(source["id"]).live_status == "running"
     assert store.get_conversation(target["id"]).archived is not True
-    for child, title in ((other_tree_child, "researcher:auth"), (own_child, "Worker")):
+    for child in children:
+        title = child.title
         saved = store.get_conversation(child.id)
         assert saved.archived is True and saved.labels["omnigent.closed"] == "true"
         assert saved.title == f"{title}:closed:{child.id}"
@@ -699,6 +708,15 @@ async def test_the_tool_archives_sub_agents_in_any_of_the_owners_trees(
             parent_conversation_id=saved.parent_conversation_id,
             title=title,
         )
+
+    # Snapshots hide the tombstone; archiving again must preserve the stored title.
+    repeated = await _project_tool(
+        auth_client, source, "sys_session_update", session_id=closed_child.id, archived=True
+    )
+    assert repeated["closed"] is True and repeated["archived"] is True
+    assert store.get_conversation(closed_child.id).title == (
+        f"Stopped worker:closed:{closed_child.id}"
+    )
 
     # A grandchild cannot archive its sub-agent parent: the server's lineage guard refuses.
     lead = store.create_conversation(

@@ -918,10 +918,15 @@ async def test_update_archives_and_closes_a_sub_agent_on_the_callers_runner(titl
     assert not [r for r in requests if "include_live_status" in r.url.params]
 
 
-async def test_update_refuses_a_sub_agent_on_the_callers_runner_without_the_server_check():
+@pytest.mark.parametrize("capability", [False, None], ids=["false", "omitted"])
+async def test_update_refuses_a_sub_agent_on_the_callers_runner_without_the_server_check(
+    capability,
+):
     requests: list[httpx.Request] = []
     # An older server cannot tell whether the sub-agent owns the shared runner.
-    info = {**ORGANIZE_INFO, "session_archive_runner_checks": False}
+    info = {k: v for k, v in ORGANIZE_INFO.items() if k != "session_archive_runner_checks"}
+    if capability is not None:
+        info["session_archive_runner_checks"] = capability
     snapshot = {
         "id": SUB_AGENT,
         "parent_session_id": PARENT,
@@ -938,13 +943,14 @@ async def test_update_refuses_a_sub_agent_on_the_callers_runner_without_the_serv
     assert not [r for r in requests if r.method == "PATCH"]
 
 
-async def test_update_leaves_an_already_closed_sub_agent_unchanged():
+@pytest.mark.parametrize("archived", [False, True], ids=["unarchived", "archived"])
+async def test_update_tombstones_a_label_only_closed_sub_agent(archived):
     requests: list[httpx.Request] = []
     snapshot = {
         "id": SUB_AGENT,
         "parent_session_id": PARENT,
         "title": "researcher:auth",
-        "archived": True,
+        "archived": archived,
         "labels": {"omnigent.closed": "true"},
     }
     async with _client(_organize_server(requests, snapshot)) as client:
@@ -953,8 +959,15 @@ async def test_update_leaves_an_already_closed_sub_agent_unchanged():
                 {"session_id": SUB_AGENT, "archived": True}, client, SOURCE
             )
         )
-    assert result["status"] == "unchanged" and result["closed"] is True
-    assert not [r for r in requests if r.method == "PATCH"]
+    assert result["status"] == "updated" and result["closed"] is True
+    (patch,) = [r for r in requests if r.method == "PATCH"]
+    expected = {
+        "title": f"researcher:auth:closed:{SUB_AGENT}",
+        "labels": {"omnigent.closed": "true"},
+    }
+    if not archived:
+        expected["archived"] = True
+    assert json.loads(patch.content) == expected
 
 
 @pytest.mark.parametrize(

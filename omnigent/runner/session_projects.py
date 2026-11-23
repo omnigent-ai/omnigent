@@ -22,7 +22,6 @@ from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
     closed_title,
-    is_session_closed,
 )
 
 _DEFAULT_LISTED_SESSIONS = 50
@@ -424,8 +423,7 @@ def _close_sub_agent(current: dict[str, Any], payload: dict[str, Any]) -> dict[s
     ``(parent, title)`` slot, so the parent could neither resume nor recreate
     it. Marking it closed and tombstoning the title frees that name.
     """
-    if is_session_closed(current.get("labels"), current.get("title")):
-        return payload
+    # Snapshots hide title tombstones, and a closed label alone does not free the name.
     closed = {
         **payload,
         "labels": {**payload.get("labels", {}), CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
