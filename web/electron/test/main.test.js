@@ -22,6 +22,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const moduleLoader = require("node:module");
 const path = require("node:path");
+const v8 = require("node:v8");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
 
@@ -447,7 +448,9 @@ function loadNavigationHarness({
     Notification: Object.assign(
       function Notification(options) {
         calls.notifications = [...(calls.notifications ?? []), options];
-        return { on: () => {}, show: () => {} };
+        const notification = Object.assign(new EventEmitter(), { show: () => {} });
+        calls.shownNotifications = [...(calls.shownNotifications ?? []), new WeakRef(notification)];
+        return notification;
       },
       { isSupported: () => notificationsSupported },
     ),
@@ -765,6 +768,7 @@ function loadNavigationHarness({
     "\nmodule.exports.sshHosts = sshHosts;" +
     "\nmodule.exports.panelTestApi = { activeWindow, mainWindows, enqueueDeepLink, floatingComposer, floatingComposerPanelIsCurrent, closePanelsOnSignIn, loadSetupPage, beginConnectionAttempt };" +
     "\nmodule.exports.quitStarted = () => quitConfirmation.quitStarted();" +
+    "\nmodule.exports.notificationTestApi = { retainedNotifications: () => retainedNotifications, maxRetainedNotifications: () => MAX_RETAINED_NOTIFICATIONS };" +
     "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, serverResponseTimeoutMs: () => serverResponseTimeoutMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
@@ -798,6 +802,7 @@ function loadNavigationHarness({
   vm.runInNewContext(source, sandbox, { filename: mainPath });
   const api = module.exports.testApi;
   Object.assign(api, module.exports.panelTestApi);
+  Object.assign(api, module.exports.notificationTestApi);
   api.quitStarted = module.exports.quitStarted;
   api.windows.set(win, {
     origin: new URL(serverUrl).origin,
@@ -7276,5 +7281,56 @@ describe("New Window keeps its source's server (src/main.js)", () => {
     h.api.buildMenu();
     h.calls.appMenu.getMenuItemById("new_window").click();
     assert.equal(h.api.windows.get(h.win).serverUrl, "https://host.example/ml/omnigents");
+  });
+});
+
+describe("desktop notifications", () => {
+  const server = "https://omni.example";
+  const pageEvent = (h) => ({ sender: h.webContents, senderFrame: { url: server } });
+  const collectGarbage = () => {
+    v8.setFlagsFromString("--expose-gc");
+    vm.runInNewContext("gc")();
+  };
+
+  it("opens the notification's session when it is clicked after garbage collection", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, notificationsSupported: true });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.webContents.isDestroyed = () => false;
+    await h.ipc.get("omnigent:notify")(pageEvent(h), {
+      title: "Done",
+      navigatePath: "/c/conv_abc",
+    });
+    await wait();
+    collectGarbage();
+    await wait();
+    collectGarbage();
+
+    const notification = h.calls.shownNotifications.at(-1).deref();
+    assert.ok(notification, "the shown notification was garbage-collected before its click");
+    notification.emit("click");
+    assert.deepEqual(h.calls.progress.at(-1), {
+      channel: "omnigent:notification-activated",
+      data: "/c/conv_abc",
+    });
+  });
+
+  it("releases clicked or failed notifications and keeps only the newest others", (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, notificationsSupported: true });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.webContents.isDestroyed = () => false;
+    for (let i = 0; i <= h.api.maxRetainedNotifications(); i++) {
+      h.ipc.get("omnigent:notify")(pageEvent(h), { title: "Done", navigatePath: `/c/${i}` });
+    }
+    const shown = h.calls.shownNotifications.map((ref) => ref.deref());
+    shown.at(-1).emit("click");
+    shown.at(-3).emit("failed");
+
+    const retained = shown.map((notification) => h.api.retainedNotifications().has(notification));
+    assert.deepEqual(
+      [retained[0], retained[1], retained.at(-3), retained.at(-2), retained.at(-1)],
+      [false, true, false, true, false],
+    );
   });
 });
