@@ -227,8 +227,7 @@ def _project(root: Path) -> Path:
     (root / "web" / "fast" / "tracks.ts").write_text("x")
     (root / "docs").mkdir()
     (root / "docs" / "workspace.md").write_text("x")
-    _git(root, "add", ".")
-    _git(root, "commit", "-q", "-m", "project")
+    _git(root, "add", ".")  # the index alone decides what's tracked
     (root / "web" / "electron" / "workspaceFastTrack.test.ts").write_text("x")  # untracked
     return root
 
