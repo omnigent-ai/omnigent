@@ -89,9 +89,11 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
   const [suggestion, setSuggestion] = useState<{ accelerator: string; enabled: boolean } | null>(
     null,
   );
-  // A save is waiting on the shell's approval; the row's controls wait with it.
+  // A save is waiting on the shell's approval; the row's controls wait with it. They're
+  // aria-disabled rather than disabled, so the focused one keeps the keyboard.
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
+  const recorderRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -120,9 +122,9 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
   }, [shortcutId]);
 
   const save = useCallback(
-    async (next: GlobalShortcutChange) => {
+    async (next: GlobalShortcutChange): Promise<boolean> => {
       // The switch, recorder and proposal all save here, so one pending save holds all three.
-      if (savingRef.current) return;
+      if (savingRef.current) return false;
       savingRef.current = true;
       setSaving(true);
       try {
@@ -140,6 +142,7 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
             result.suggestion ? { accelerator: result.suggestion, enabled: next.enabled } : null,
           );
         }
+        return result.ok;
       } finally {
         savingRef.current = false;
         setSaving(false);
@@ -160,6 +163,7 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
   useEffect(() => endShellRecording, [endShellRecording]);
 
   const startRecording = () => {
+    if (savingRef.current) return;
     setRecording(true);
     if (!shellRecordsGlobalShortcut() || setting === null || shellRecordingRef.current !== null) {
       return;
@@ -218,8 +222,9 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
             {...settingsControlProps(entry, "recorder", {
               runtime: recording ? RECORDING_PROMPT : formatAccelerator(setting.accelerator),
             })}
+            ref={recorderRef}
             data-testid={`${ids.testIdPrefix}-recorder`}
-            disabled={saving}
+            aria-disabled={saving}
             onClick={startRecording}
             onBlur={stopRecording}
           >
@@ -235,7 +240,7 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
               )
             }
             data-testid={`${ids.testIdPrefix}-toggle`}
-            disabled={saving}
+            aria-disabled={saving}
             componentId={ids.componentId}
           />
         </div>
@@ -253,11 +258,16 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
           {...settingsControlProps(entry, "suggestion", {
             runtime: formatAccelerator(suggestion.accelerator),
           })}
-          disabled={saving}
+          aria-disabled={saving}
           data-testid={`${ids.testIdPrefix}-suggestion`}
-          onClick={() =>
-            void save({ enabled: suggestion.enabled, accelerator: suggestion.accelerator })
-          }
+          onClick={() => {
+            // Accepted, the proposal goes away, so the keyboard moves to the chord it set.
+            void save({ enabled: suggestion.enabled, accelerator: suggestion.accelerator }).then(
+              (ok) => {
+                if (ok) recorderRef.current?.focus();
+              },
+            );
+          }}
         >
           Use {formatAccelerator(suggestion.accelerator)} instead
         </Button>

@@ -455,9 +455,13 @@ function acceleratorLabel(accelerator, isMac) {
         : (OTHER_MODIFIER_LABELS.get(name) ?? capitalized(name)),
     );
   const typed = accelerator.split("+").pop().trim();
+  // A chord with no key, such as one malformed over IPC, reads as sent.
+  if (typed === "") return accelerator;
   const alias = KEY_ALIASES.get(typed.toLowerCase());
+  const named = [...NAMED_KEYS.values()].find((name) => name.toLowerCase() === typed.toLowerCase());
   let key = typed;
   if (alias !== undefined) key = capitalized(alias);
+  else if (named !== undefined) key = named;
   else if (typed.length === 1) key = typed.toUpperCase();
   return isMac ? [...modifiers, key].join("") : [...modifiers, key].join("+");
 }

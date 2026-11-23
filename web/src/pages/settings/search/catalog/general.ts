@@ -150,6 +150,8 @@ export const GLOBAL_SHORTCUT_ENTRY = settingsEntry({
     recorder: { before: "Shortcut: " },
     suggestion: { before: "Use ", after: " instead" },
   },
+  // Offered only after the shell couldn't register the chord.
+  presence: { suggestion: { states: ["shortcut taken by another app"] } },
 });
 
 /** The desktop app's shortcut that opens the New Agent panel; macOS, with `floating_composer`. */
@@ -178,6 +180,8 @@ export const FLOATING_COMPOSER_SHORTCUT_ENTRY = settingsEntry({
     recorder: { before: "New Agent shortcut: " },
     suggestion: { before: "Use ", after: " instead" },
   },
+  // Offered only after the shell couldn't register the chord.
+  presence: { suggestion: { states: ["shortcut taken by another app"] } },
 });
 
 /** The desktop app's opt-in to make room for the right sidebar; a row only desktop builds show. */

@@ -852,6 +852,12 @@ describe("acceleratorLabel", () => {
     assert.equal(acceleratorLabel("Alt+return", false), "Alt+Enter");
     assert.equal(acceleratorLabel("Control+k", false), "Ctrl+K");
   });
+
+  it("spells a named key as Electron does, and shows a chord with no key as sent", () => {
+    assert.equal(acceleratorLabel("Control+space", true), "⌃Space");
+    assert.equal(acceleratorLabel("Control+", true), "Control+");
+    assert.equal(acceleratorLabel("Control++", false), "Control++");
+  });
 });
 
 describe("the New Agent shortcut's default chord on macOS", () => {

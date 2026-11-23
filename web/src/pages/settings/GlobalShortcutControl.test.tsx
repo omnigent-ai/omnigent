@@ -397,17 +397,29 @@ describe("GlobalShortcutControl", () => {
     const proposal = await screen.findByRole("button", { name: /^Use .+ instead$/ });
 
     fireEvent.click(proposal);
+    // aria-disabled controls still get clicks, so these reach the row's save guard.
     fireEvent.click(proposal);
+    fireEvent.click(screen.getByRole("switch", { name: SWITCH_NAME }));
+    fireEvent.click(screen.getByTestId(RECORDER_TEST_ID));
 
-    // The whole row waits for the pending approval, so nothing it shows is dropped.
-    expect(proposal).toBeDisabled();
-    expect(screen.getByRole("switch", { name: SWITCH_NAME })).toBeDisabled();
-    expect(screen.getByTestId(RECORDER_TEST_ID)).toBeDisabled();
+    // The whole row waits for the pending approval, and says so.
+    expect(proposal).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByRole("switch", { name: SWITCH_NAME })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    expect(screen.getByTestId(RECORDER_TEST_ID)).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByTestId(RECORDER_TEST_ID)).not.toHaveTextContent("Press a shortcut…");
     expect(bridge.setGlobalShortcut).toHaveBeenCalledTimes(1);
     await act(async () => {
       finish?.({ ok: true, setting: { enabled: true, accelerator: "Control+Alt+Shift+Space" } });
     });
     expect(bridge.setGlobalShortcut).toHaveBeenCalledTimes(1);
+    // Accepted: the warning and proposal go, and the keyboard lands on the chord it set.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Use .+ instead$/ })).not.toBeInTheDocument();
+    expect(screen.getByTestId(RECORDER_TEST_ID)).toHaveTextContent(/Space$/);
+    expect(screen.getByTestId(RECORDER_TEST_ID)).toHaveFocus();
   });
 
   it("still records a chord while off after a refused enable", async () => {
