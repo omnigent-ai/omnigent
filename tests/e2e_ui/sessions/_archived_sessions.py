@@ -42,7 +42,12 @@ def seed_archived_session(base_url: str, *, title: str, project: str | None) -> 
         json=body,
         timeout=10.0,
     )
-    patch_resp.raise_for_status()
+    try:
+        patch_resp.raise_for_status()
+    except httpx.HTTPError:
+        # The caller never gets the id, so it can't clean the session up itself.
+        delete_sessions(base_url, [session_id])
+        raise
     return session_id
 
 
