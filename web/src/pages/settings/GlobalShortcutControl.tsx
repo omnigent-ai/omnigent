@@ -89,8 +89,9 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
   const [suggestion, setSuggestion] = useState<{ accelerator: string; enabled: boolean } | null>(
     null,
   );
-  // A save in flight; the shell serialises the save, so a second one would race it.
+  // A save is waiting on the shell's approval; another one now would race it.
   const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -120,6 +121,9 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
 
   const save = useCallback(
     async (next: GlobalShortcutChange) => {
+      // The switch, recorder and proposal all save here, so one pending save holds all three.
+      if (savingRef.current) return;
+      savingRef.current = true;
       setSaving(true);
       try {
         const result = await setGlobalShortcut(next, shortcutId);
@@ -137,6 +141,7 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
           );
         }
       } finally {
+        savingRef.current = false;
         setSaving(false);
       }
     },

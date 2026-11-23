@@ -379,7 +379,7 @@ describe("GlobalShortcutControl", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  it("ignores a second click on the proposed chord while its save is pending", async () => {
+  it("ignores the row's other saves while the proposed chord's save is pending", async () => {
     const bridge = installBridge({
       enabled: true,
       accelerator: "Alt+Space",
@@ -398,6 +398,8 @@ describe("GlobalShortcutControl", () => {
 
     fireEvent.click(proposal);
     fireEvent.click(proposal);
+    // Turning it off meanwhile waits too, so a late approval can't undo it.
+    fireEvent.click(screen.getByRole("switch", { name: SWITCH_NAME }));
 
     expect(proposal).toBeDisabled();
     expect(bridge.setGlobalShortcut).toHaveBeenCalledTimes(1);
