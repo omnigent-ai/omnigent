@@ -115,6 +115,7 @@ describe("shortcuts that wait for quick_pick_palette", () => {
       canShare: true,
       canFork: true,
       canMarkUnread: true,
+      unread: false,
       canCreateAutomation: true,
       archived: false,
       desktopShortcuts: true,

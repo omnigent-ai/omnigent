@@ -568,6 +568,26 @@ describe("HeaderConversationMenu", () => {
       expect(screen.getByRole("dialog", { name: "Delete session?" })).toBeVisible();
     });
 
+    it("offers Mark session as read on a session marked unread, and runs it", async () => {
+      const readState = await vi.importActual<typeof UnseenConversationsModule>(
+        "@/hooks/useUnseenConversations",
+      );
+      readState.markConversationUnread(CONVERSATION.id, CONVERSATION.updated_at);
+      try {
+        renderMenu();
+        const labels = sessionCommands()[0].commands.map((command) => command.label);
+        expect(labels).toContain("Mark session as read");
+        expect(labels).not.toContain("Mark session as unread");
+        runCommand("Mark session as read");
+        expect(readState.isExplicitlyUnread(CONVERSATION.id)).toBe(false);
+        expect(sessionCommands()[0].commands.map((command) => command.label)).toContain(
+          "Mark session as unread",
+        );
+      } finally {
+        readState.resetReadStateForTests();
+      }
+    });
+
     it("drops a row built for the previous session once another is shown", () => {
       const view = renderMenu();
       const stalePin = sessionCommands()[0].commands.find((row) => row.label === "Pin session");

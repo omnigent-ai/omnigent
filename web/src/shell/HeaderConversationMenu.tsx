@@ -306,6 +306,9 @@ export function HeaderConversationMenu({
       case "mark-unread":
         markConversationUnread(conversation.id, conversation.updated_at);
         return;
+      case "mark-read":
+        markConversationRead(conversation.id, conversation.updated_at);
+        return;
       case "create-automation":
         setAutomationOpen(true);
         return;
@@ -333,6 +336,7 @@ export function HeaderConversationMenu({
       canFork,
       forkDisabledReason,
       canMarkUnread: canFlagUnread(conversation),
+      unread: explicitlyUnread,
       canCreateAutomation,
       archived: isArchived,
       desktopShortcuts,

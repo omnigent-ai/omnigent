@@ -9,6 +9,7 @@ import {
   GitForkIcon,
   type LucideIcon,
   MailIcon,
+  MailOpenIcon,
   PencilIcon,
   PinIcon,
   PinOffIcon,
@@ -41,6 +42,7 @@ export type OpenSessionCommandId =
   | "export"
   | "rename"
   | "mark-unread"
+  | "mark-read"
   | "create-automation"
   | "archive"
   | "unarchive"
@@ -61,6 +63,8 @@ export interface OpenSessionFacts {
   forkDisabledReason?: string;
   /** A muted session can't be flagged unread. */
   canMarkUnread: boolean;
+  /** Marked unread, so ⌘K offers Mark as read instead, as ⌘⌥U does. */
+  unread: boolean;
   canCreateAutomation: boolean;
   archived: boolean;
   /** The desktop shell binds Pin, Fork and Archive in its menu bar. */
@@ -142,13 +146,21 @@ export function openSessionCommands(facts: OpenSessionFacts): OpenSessionCommand
       icon: PencilIcon,
       availability: AVAILABLE,
     },
-    {
-      id: "mark-unread",
-      label: "Mark session as unread",
-      keywords: ["unread", "session"],
-      icon: MailIcon,
-      availability: offeredUnless(facts.canMarkUnread),
-    },
+    facts.unread
+      ? {
+          id: "mark-read",
+          label: "Mark session as read",
+          keywords: ["read", "seen", "session"],
+          icon: MailOpenIcon,
+          availability: AVAILABLE,
+        }
+      : {
+          id: "mark-unread",
+          label: "Mark session as unread",
+          keywords: ["unread", "session"],
+          icon: MailIcon,
+          availability: offeredUnless(facts.canMarkUnread),
+        },
     {
       id: "create-automation",
       label: "Create automation from session",

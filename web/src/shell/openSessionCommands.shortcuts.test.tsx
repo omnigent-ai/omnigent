@@ -16,6 +16,7 @@ const FACTS: OpenSessionFacts = {
   canShare: true,
   canFork: true,
   canMarkUnread: true,
+  unread: false,
   canCreateAutomation: true,
   archived: false,
   desktopShortcuts: false,

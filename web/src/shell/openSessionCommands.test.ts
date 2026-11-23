@@ -12,6 +12,7 @@ const OWNER_FACTS: OpenSessionFacts = {
   canShare: true,
   canFork: true,
   canMarkUnread: true,
+  unread: false,
   canCreateAutomation: true,
   archived: false,
   desktopShortcuts: false,
@@ -47,6 +48,20 @@ describe("openSessionCommands", () => {
         canCreateAutomation: false,
       }),
     ).toEqual(["export", "rename", "archive", "delete"]);
+  });
+
+  it("offers Mark as read in Mark as unread's place on a session marked unread", () => {
+    // ⌘⌥U marks such a session read, so ⌘K offers the same, muted or not.
+    for (const canMarkUnread of [true, false]) {
+      const commands = openSessionCommands({ ...OWNER_FACTS, unread: true, canMarkUnread });
+      const commandIds = commands.map((command) => command.id);
+      expect(commandIds).toContain("mark-read");
+      expect(commandIds).not.toContain("mark-unread");
+      expect(commands.find((command) => command.id === "mark-read")).toMatchObject({
+        label: "Mark session as read",
+        availability: AVAILABLE,
+      });
+    }
   });
 
   it("offers the opposite toggle for a pinned or archived session", () => {
