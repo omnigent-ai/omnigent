@@ -95,9 +95,9 @@ class ClientSafeErrorDetail(Protocol):
 
 
 class SubagentWorkIdForSession(Protocol):
-    """Return the ``work_id`` of the dispatch currently registered for a child."""
+    """Return the ``work_id`` of a child's current (registered or drained) dispatch."""
 
-    def __call__(self, conv_id: str) -> str | None:
+    def __call__(self, conv_id: str, /) -> str | None:
         raise NotImplementedError
 
 
