@@ -2,7 +2,7 @@
 // fork, automation, stop, archive, delete, leave), shared by the sidebar row and
 // the project board's cards so both menus confirm and act the same way.
 
-import { useRef, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { GitBranchIcon } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { PermissionsModal } from "@/components/PermissionsModal";
@@ -31,6 +31,7 @@ import { useNavigate } from "@/lib/routing";
 import { useArchivePrompt } from "./ArchivePrompt";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { ForkSessionDialog } from "./ForkSessionDialog";
+import { isOpenSession } from "./openSession";
 
 export interface SessionActions {
   setShareOpen: (open: boolean) => void;
@@ -75,10 +76,6 @@ export function useSessionActions({
 }): SessionActions {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  // A Leave that settles later asks the row as it is then, so it doesn't leave a session
-  // the user has switched to since.
-  const latestOnLeave = useRef(onLeave);
-  latestOnLeave.current = onLeave;
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
   const archivePrompt = useArchivePrompt();
@@ -174,9 +171,14 @@ export function useSessionActions({
     setLeaveOpen(false);
     // The promise settles even once the caller has unmounted, which a per-call
     // mutate callback wouldn't.
+    // A row's callback can't see a switch that unmounts it, so the open session is read live.
+    const leftFromItsView = isOpenSession(conversation.id);
     leave.mutateAsync({ id: conversation.id, viewerId }).then(
-      // The session 404s for this user now, so don't leave them staring at it.
-      () => latestOnLeave.current?.(),
+      // The session 404s for this user now, so don't leave them staring at it, unless they've
+      // already opened another one.
+      () => {
+        if (!leftFromItsView || isOpenSession(conversation.id)) onLeave?.();
+      },
       (err: unknown) => {
         const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
         showToast(`Couldn't leave the session${detail}`);
