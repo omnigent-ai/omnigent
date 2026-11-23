@@ -457,6 +457,34 @@ def test_quick_pick_deletes_the_project_a_new_session_starts_in(
     assert name not in _project_names(base_url)
 
 
+def _folder_names(page: Page) -> list[str]:
+    """Project folder header texts in the sidebar, in render order."""
+    return page.locator('button[data-slot="context-menu-trigger"]').all_inner_texts()
+
+
+def test_quick_pick_moves_the_project_in_view(request: pytest.FixtureRequest) -> None:
+    """⌘K moves the project a new session starts in, as its folder menu's Move does."""
+    base_url = request.getfixturevalue("live_server")
+    suffix = uuid.uuid4().hex[:6]
+    first, second = f"Wren {suffix} A", f"Wren {suffix} B"
+    _create_project(base_url, first)
+    _create_project(base_url, second)
+    page: Page = request.getfixturevalue("page")
+    enable_quick_pick_palette(page)
+    page.goto(f"{base_url}/?project={quote(first)}")
+    expect(_project_folder(page, second)).to_be_visible(timeout=30_000)
+
+    def order() -> list[str]:
+        texts = _folder_names(page)
+        return [name for text in texts for name in (first, second) if name in text]
+
+    assert order() == [first, second]
+    run_palette_command(
+        page, f"move project {first} down", f"Move Project {first} Down", closes=True
+    )
+    poll_until(lambda: order() == [second, first], timeout_s=15.0)
+
+
 def _rendered_row_ids(page: Page) -> list[str]:
     """Sidebar session row ids in render order, the first listing of each."""
     ids = page.locator("li[data-sidebar-session-id]").evaluate_all(

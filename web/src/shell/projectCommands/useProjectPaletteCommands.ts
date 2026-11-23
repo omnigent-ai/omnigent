@@ -1,7 +1,13 @@
 // ⌘K's actions for the project in view, outside the project home: the open session's project,
 // or the one a new session starts in. The project home offers its own.
 
-import { MessageCirclePlusIcon, PencilIcon, Settings2Icon, Trash2Icon } from "lucide-react";
+import {
+  ArrowUpDownIcon,
+  MessageCirclePlusIcon,
+  PencilIcon,
+  Settings2Icon,
+  Trash2Icon,
+} from "lucide-react";
 import { useMemo } from "react";
 
 import { type Conversation, type ProjectSummary, useProjects } from "@/hooks/useConversations";
@@ -16,7 +22,9 @@ import type { PaletteCommand } from "@/store/paletteCommands";
 import { type CommandView, useCommandContext } from "../commandContext";
 import { useQuickPickPaletteCommands } from "../screenCommands/useQuickPickPaletteCommands";
 import { sessionOwnership } from "../sessionCommands/model";
+import { projectMoveCommands } from "./ordering";
 import { type ProjectCommandId, requestProjectAction } from "./projectActionStore";
+import { type ProjectOrdering, useProjectOrdering } from "./projectOrderingStore";
 
 const NO_COMMANDS: PaletteCommand[] = [];
 
@@ -89,13 +97,31 @@ const COMMANDS: readonly {
   },
 ];
 
-/** The project in view's folder actions under "Project", each naming the project. */
+/**
+ * The project in view's folder actions under "Project", each naming the project, then the
+ * folder menu's moves while the sidebar lists it.
+ */
 export function projectPaletteCommands(
   project: ProjectSummary,
   view: CommandView,
+  ordering: ProjectOrdering | null = null,
 ): PaletteCommand[] {
-  return (
-    COMMANDS
+  const index = ordering ? ordering.names.indexOf(project.name) : -1;
+  const moves: PaletteCommand[] =
+    ordering && index >= 0
+      ? projectMoveCommands(project.name, index, ordering.names.length, ordering.facts).map(
+          (move) => ({
+            id: `project.move-${move.destination}:${project.name}`,
+            label: move.label,
+            icon: ArrowUpDownIcon,
+            keywords: [...move.keywords],
+            availability: move.availability,
+            run: () => ordering.move(project.name, move.destination),
+          }),
+        )
+      : [];
+  return [
+    ...COMMANDS
       // The new-session view already starts a session in its project.
       .filter((command) => !(view === "new-session" && command.id === "new-session"))
       .map((command) => ({
@@ -106,8 +132,9 @@ export function projectPaletteCommands(
         // A dialog or the new session's composer takes focus once the palette has closed.
         movesFocus: true,
         run: () => requestProjectAction(project, command.id),
-      }))
-  );
+      })),
+    ...moves,
+  ];
 }
 
 export function useProjectPaletteCommands(): void {
@@ -126,9 +153,10 @@ export function useProjectPaletteCommands(): void {
     newSessionProject: searchParams.get("project"),
     projects,
   });
+  const ordering = useProjectOrdering();
   const commands = useMemo(
-    () => (project ? projectPaletteCommands(project, view) : NO_COMMANDS),
-    [project, view],
+    () => (project ? projectPaletteCommands(project, view, ordering) : NO_COMMANDS),
+    [project, view, ordering],
   );
   useQuickPickPaletteCommands("project-in-view", "Project", commands);
 }
