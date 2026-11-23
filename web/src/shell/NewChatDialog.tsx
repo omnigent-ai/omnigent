@@ -894,8 +894,8 @@ export async function describeCreateError(res: Response): Promise<string> {
  * The ``needs-auth`` / ``binary-missing`` copy is Codex-specific ("run codex
  * login" / "set OMNIGENT_CODEX_PATH"), so it's gated on {@link isCodexHarness};
  * native Claude and Cursor have their own ``needs-auth`` copy.
- * Other harnesses that report those structured reasons (claude-native /
- * opencode-native now do) fall through to the generic "run omni setup"
+ * Other harnesses that report those structured reasons (e.g. opencode-native)
+ * fall through to the generic "run omni setup"
  * message — matching the pre-feature behavior, where only Codex ever produced
  * these reasons and everything else showed the generic text.
  */
