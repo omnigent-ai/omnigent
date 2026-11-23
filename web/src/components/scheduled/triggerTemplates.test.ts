@@ -851,7 +851,15 @@ describe("Slack thread replies", () => {
     // A worker's own thread posts (bot replies, or the owner's account with the attribution
     // line) must not come back to it as new replies.
     expect(prompt).toContain(
-      'messages from bots or with a system subtype, and your own posts that end with a "Sent with Omnigent" line',
+      'messages with a system subtype, posts that end with a "Sent with Omnigent" line, which Omnigent sessions add to what they post, and posts by bots.',
+    );
+    // Slack sets bot_id on what a person posts through an app (such as a Slack MCP), so a
+    // bot_id alone mustn't drop a person's follow-up.
+    expect(prompt).toContain(
+      "a reply with a bot_id is a bot's only when its user is a bot: check each such user once with users.info",
+    );
+    expect(prompt).toContain(
+      "bot_user_ids and person_user_ids (the users of replies with a bot_id that you checked with users.info)",
     );
     expect(prompt).toContain(
       "The conditions above apply only to the message that starts a thread, so every other reply counts.",
