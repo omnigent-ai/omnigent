@@ -153,6 +153,9 @@ _SUBAGENT_META_GLOB = "agent-*.meta.json"
 # stamped into each ``agent-<id>.meta.json``. Reuse the router's canonical set so
 # both the current ``Agent`` name and the still-supported ``Task`` alias match.
 _SUBAGENT_SPAWN_TOOL_NAMES = frozenset(AGENT_TOOL_NAMES)
+# Polls, with the normal retry backoff (about 90 s in total), that a sub-agent
+# meta may go without a resolved parent before it is set aside until restart.
+_SUBAGENT_RESOLVE_MAX_ATTEMPTS = 8
 
 
 def _subagent_id_from_meta_path(meta_path: Path) -> str:
@@ -1232,13 +1235,18 @@ class _PostRetryTracker:
             permanent=permanent,
         )
 
-    def record_snapshot_failure(
+    def failure_count(self, key: str) -> int:
+        """Return the failures recorded for ``key`` since it was last cleared."""
+        entry = self._entries.get(key)
+        return entry.attempts if entry is not None else 0
+
+    def record_local_failure(
         self,
         key: str,
         *,
         max_attempts: int,
     ) -> _PostRetryDecision:
-        """Record a bounded local snapshot failure using the normal backoff."""
+        """Record a bounded local (non-HTTP) failure using the normal backoff."""
         entry = self._entries.get(key)
         if entry is None:
             entry = _PostRetryEntry()
@@ -2711,72 +2719,112 @@ async def _forward_one_subagent(
     await checkpoint.put(replace(new_entry, last_status=desired_status))
 
 
+@dataclass(frozen=True)
+class _SpawnIdScan:
+    """Spawn tool-use ids found in a transcript's complete lines.
+
+    :param tool_use_ids: Ids from every line before ``end_offset``.
+    :param end_offset: Byte offset just past the last newline scanned.
+    :param tail: Up to :data:`_CURSOR_FINGERPRINT_BYTES` bytes before
+        ``end_offset``; a later scan continues only while they are unchanged.
+    """
+
+    tool_use_ids: frozenset[str]
+    end_offset: int
+    tail: bytes
+
+
+_EMPTY_SPAWN_ID_SCAN = _SpawnIdScan(tool_use_ids=frozenset(), end_offset=0, tail=b"")
+
+
 def _tool_use_ids_in_transcript(
     transcript_path: Path,
     *,
     include_sidechains: bool,
-) -> set[str] | None:
-    """Return assistant tool-use ids from a Claude transcript.
+    previous: _SpawnIdScan | None = None,
+) -> _SpawnIdScan | None:
+    """Return assistant spawn tool-use ids from a Claude transcript.
 
-    A partial trailing record is ignored because Claude may still be writing it;
-    the next watcher poll reads the completed record.
+    A trailing record without its newline is left for the next scan because
+    Claude may still be writing it.
 
     :param transcript_path: Claude JSONL transcript to inspect.
     :param include_sidechains: Whether records mirrored from child agents
         belong to this transcript owner.
-    :returns: Tool-use ids owned by this transcript, or ``None`` when the file
-        could not be read so the caller retries on the next poll.
+    :param previous: An earlier scan of this file to continue from. It is
+        used only while the bytes before its end are unchanged; otherwise the
+        file is scanned from the start.
+    :returns: The scan, or ``None`` when the file could not be read so the
+        caller retries on the next poll.
     """
     try:
-        # ``errors="replace"`` tolerates a snapshot that ends mid-multibyte char
-        # while Claude is writing; the mangled tail line fails JSON parse below
-        # and is skipped, and the completed record is read on the next poll.
-        lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        with transcript_path.open("rb") as handle:
+            scan = _EMPTY_SPAWN_ID_SCAN
+            if previous is not None:
+                handle.seek(previous.end_offset - len(previous.tail))
+                if handle.read(len(previous.tail)) == previous.tail:
+                    scan = previous
+            tool_use_ids = set(scan.tool_use_ids)
+            end_offset = scan.end_offset
+            handle.seek(end_offset)
+            for line in handle:
+                if not line.endswith(b"\n"):
+                    break
+                end_offset += len(line)
+                tool_use_ids.update(_spawn_tool_use_ids_in_record(line, include_sidechains))
+            tail_start = max(0, end_offset - _CURSOR_FINGERPRINT_BYTES)
+            handle.seek(tail_start)
+            tail = handle.read(end_offset - tail_start)
     except OSError:
         return None
-    tool_use_ids: set[str] = set()
-    for line in lines:
-        try:
-            record = json.loads(line)
-        except (json.JSONDecodeError, TypeError):
+    return _SpawnIdScan(tool_use_ids=frozenset(tool_use_ids), end_offset=end_offset, tail=tail)
+
+
+def _spawn_tool_use_ids_in_record(line: bytes, include_sidechains: bool) -> list[str]:
+    """Return the spawn tool-use ids in one transcript JSONL line."""
+    try:
+        record = json.loads(line.decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(record, dict):
+        return []
+    if record.get("isSidechain") is True and not include_sidechains:
+        return []
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    tool_use_ids: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
             continue
-        if not isinstance(record, dict):
+        # Only the sub-agent spawn tool mints the ids in ``.meta.json``.
+        # Restricting to it keeps an unrelated tool-use id collision from
+        # making a legitimate spawn look ambiguous.
+        if block.get("name") not in _SUBAGENT_SPAWN_TOOL_NAMES:
             continue
-        if record.get("isSidechain") is True and not include_sidechains:
-            continue
-        message = record.get("message")
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
-                continue
-            # Only the sub-agent spawn tool mints the ids in ``.meta.json``.
-            # Restricting to it keeps an unrelated tool-use id collision from
-            # making a legitimate spawn look ambiguous.
-            if block.get("name") not in _SUBAGENT_SPAWN_TOOL_NAMES:
-                continue
-            tool_use_id = block.get("id")
-            if isinstance(tool_use_id, str) and tool_use_id:
-                tool_use_ids.add(tool_use_id)
+        tool_use_id = block.get("id")
+        if isinstance(tool_use_id, str) and tool_use_id:
+            tool_use_ids.append(tool_use_id)
     return tool_use_ids
 
 
 @dataclass(frozen=True)
 class _TranscriptSpawnIdCacheEntry:
-    """Spawn tool-use IDs cached for a transcript's size, mtime and sidechain mode."""
+    """Spawn-id scan cached for a transcript's size, mtime and sidechain mode."""
 
     size: int
     mtime_ns: int
     include_sidechains: bool
-    tool_use_ids: frozenset[str]
+    scan: _SpawnIdScan
 
 
 # Spawn-id memo keyed by transcript path: an unregistered meta re-runs
-# correlation every poll, so unchanged files must not be re-parsed. Shared by
-# every session's forwarder thread (hence the lock); LRU entries age out.
+# correlation every poll, so unchanged files must not be re-parsed and grown
+# ones only from where the last scan stopped. Shared by every session's
+# forwarder thread (hence the lock); LRU entries age out.
 _SPAWN_TOOL_USE_ID_CACHE: dict[Path, _TranscriptSpawnIdCacheEntry] = {}
 _SPAWN_TOOL_USE_ID_CACHE_LOCK = threading.Lock()
 _SPAWN_TOOL_USE_ID_CACHE_MAX_ENTRIES = 1024
@@ -2788,7 +2836,8 @@ def _spawn_tool_use_ids_cached(
     include_sidechains: bool,
 ) -> frozenset[str]:
     """
-    :func:`_tool_use_ids_in_transcript`, rescanning only when the file changed.
+    :func:`_tool_use_ids_in_transcript`, reading only what changed since the
+    previous scan.
 
     :param transcript_path: Claude JSONL transcript to inspect.
     :param include_sidechains: Forwarded to :func:`_tool_use_ids_in_transcript`.
@@ -2811,25 +2860,34 @@ def _spawn_tool_use_ids_cached(
         ):
             # Re-insert so the entry is the most recently used.
             _SPAWN_TOOL_USE_ID_CACHE[transcript_path] = cached
-            return cached.tool_use_ids
+            return cached.scan.tool_use_ids
+    # Only a grown file can be an append; any other change rescans from the start.
+    previous = (
+        cached.scan
+        if cached is not None
+        and cached.include_sidechains == include_sidechains
+        and stat.st_size > cached.size
+        else None
+    )
     # Stat before read: a write landing in between is filed under the older
-    # stat, so the next poll sees a changed file and rescans.
-    scanned = _tool_use_ids_in_transcript(transcript_path, include_sidechains=include_sidechains)
-    if scanned is None:
+    # stat, so the next poll sees a changed file and continues the scan.
+    scan = _tool_use_ids_in_transcript(
+        transcript_path, include_sidechains=include_sidechains, previous=previous
+    )
+    if scan is None:
         # A failed read is not an empty transcript; leave it uncached so the
         # next poll retries instead of trusting an empty result.
         return frozenset()
-    tool_use_ids = frozenset(scanned)
     with _SPAWN_TOOL_USE_ID_CACHE_LOCK:
         _SPAWN_TOOL_USE_ID_CACHE[transcript_path] = _TranscriptSpawnIdCacheEntry(
             size=stat.st_size,
             mtime_ns=stat.st_mtime_ns,
             include_sidechains=include_sidechains,
-            tool_use_ids=tool_use_ids,
+            scan=scan,
         )
         while len(_SPAWN_TOOL_USE_ID_CACHE) > _SPAWN_TOOL_USE_ID_CACHE_MAX_ENTRIES:
             _SPAWN_TOOL_USE_ID_CACHE.pop(next(iter(_SPAWN_TOOL_USE_ID_CACHE)))
-    return tool_use_ids
+    return scan.tool_use_ids
 
 
 def _subagent_own_spawn_tool_use_id(agent_jsonl_path: Path) -> str | None:
@@ -2853,11 +2911,10 @@ def _subagent_parents_by_tool_use(
 ) -> dict[str, str | None]:
     """Correlate Claude spawn tool ids to their immediate transcript owner.
 
-    Scans the root transcript and every ``agent-*.jsonl``, re-reading a file
-    only when its size or mtime changed since the previous scan. The caller
-    only invokes this while unregistered meta files exist; an orphan meta whose
-    spawn record never lands therefore costs one ``stat`` per transcript per
-    poll rather than a full re-parse of every file.
+    Scans the root transcript and every ``agent-*.jsonl``, reading a file only
+    when its size or mtime changed since the previous scan, and then only the
+    bytes appended since. The caller invokes this only while an unregistered
+    meta needs a spawn-id lookup, within its resolve budget.
     """
     owners: dict[str, str | None] = {}
     ambiguous: set[str] = set()
@@ -2891,6 +2948,44 @@ def _subagent_parents_by_tool_use(
     for tool_use_id in ambiguous:
         owners.pop(tool_use_id, None)
     return owners
+
+
+def _subagent_resolve_key(subagent_id: str) -> str:
+    """Retry key for resolving a sub-agent meta to its parent."""
+    return f"subagent_parent:{subagent_id}"
+
+
+def _subagent_resolve_due(tracker: _PostRetryTracker, subagent_id: str) -> bool:
+    """Whether a sub-agent meta is within its resolve budget and out of backoff."""
+    key = _subagent_resolve_key(subagent_id)
+    return (
+        tracker.failure_count(key) < _SUBAGENT_RESOLVE_MAX_ATTEMPTS
+        and tracker.retry_delay_s(key) is None
+    )
+
+
+def _record_unresolved_subagent(
+    tracker: _PostRetryTracker,
+    *,
+    parent_session_id: str,
+    subagent_id: str,
+    tool_use_id: str | None,
+    reason: str,
+) -> None:
+    """Spend one resolve attempt, and name the sub-agent once when none remain."""
+    decision = tracker.record_local_failure(
+        _subagent_resolve_key(subagent_id), max_attempts=_SUBAGENT_RESOLVE_MAX_ATTEMPTS
+    )
+    if decision.exhausted:
+        _logger.warning(
+            "Setting aside claude-native sub-agent until the forwarder restarts because "
+            "%s; parent_session=%s subagent_id=%s tool_use_id=%s attempts=%s",
+            reason,
+            parent_session_id,
+            subagent_id,
+            tool_use_id,
+            decision.attempts,
+        )
 
 
 async def _forward_available_subagents(
@@ -2928,7 +3023,8 @@ async def _forward_available_subagents(
     :param agent_name: Agent/model name to stamp on mirrored items
         (mirrors the value used for the parent's transcript).
     :param start_retry_tracker: Backoff tracker for failed
-        ``external_subagent_start`` POSTs (keyed by ``subagent_id``).
+        ``external_subagent_start`` POSTs (keyed by ``subagent_id``) and for
+        the resolve budget of metas whose parent is not yet known.
     :param item_retry_tracker: Backoff tracker for failed
         ``external_conversation_item`` POSTs (keyed by source id).
     :param status_retry_tracker: Backoff tracker for failed
@@ -2959,20 +3055,37 @@ async def _forward_available_subagents(
         for path in meta_paths
         if (sid := _subagent_id_from_meta_path(path)) not in updated.subagents
         and start_retry_tracker.retry_delay_s(f"subagent_start:{sid}") is None
+        and _subagent_resolve_due(start_retry_tracker, sid)
     ]
+    candidate_metas: list[tuple[Path, _SubagentMeta | None]] = []
+    for meta_path in candidate_meta_paths:
+        candidate_metas.append(
+            (meta_path, await asyncio.to_thread(_read_subagent_meta, meta_path))
+        )
     parents_by_tool_use = (
         await asyncio.to_thread(
             _subagent_parents_by_tool_use,
             transcript_path,
             subagents_dir,
         )
-        if candidate_meta_paths
+        if any(
+            meta is not None and "parentAgentId" not in meta and meta.get("spawnDepth") != 1
+            for _, meta in candidate_metas
+        )
         else {}
     )
     pending: list[tuple[Path, _SubagentMeta, str | None]] = []
-    for meta_path in candidate_meta_paths:
-        meta = await asyncio.to_thread(_read_subagent_meta, meta_path)
+    for meta_path, meta in candidate_metas:
+        subagent_id = _subagent_id_from_meta_path(meta_path)
         if meta is None:
+            # Missing, still being written, or not a spawned sub-agent (a teammate).
+            _record_unresolved_subagent(
+                start_retry_tracker,
+                parent_session_id=parent_session_id,
+                subagent_id=subagent_id,
+                tool_use_id=None,
+                reason="its meta is unreadable or names no spawn call",
+            )
             continue
         tool_use_id = meta.get("toolUseId")
         if "parentAgentId" in meta:
@@ -2984,14 +3097,20 @@ async def _forward_available_subagents(
         else:
             # No transcript owns this spawn yet: the record is still mid-write, or
             # it resolved to two owners and was dropped as ambiguous. Either way we
-            # retry next tick; log so a persistent miss (e.g. a transcript-format
-            # drift) is diagnosable rather than silent.
+            # retry with backoff until the resolve budget runs out.
             _logger.debug(
                 "Deferring claude-native sub-agent with no resolved parent; "
                 "parent_session=%s subagent_id=%s tool_use_id=%s",
                 parent_session_id,
-                _subagent_id_from_meta_path(meta_path),
+                subagent_id,
                 tool_use_id,
+            )
+            _record_unresolved_subagent(
+                start_retry_tracker,
+                parent_session_id=parent_session_id,
+                subagent_id=subagent_id,
+                tool_use_id=tool_use_id,
+                reason="no transcript owns its spawn call",
             )
             continue
         pending.append((meta_path, meta, parent_subagent_id))
@@ -3105,6 +3224,7 @@ async def _forward_available_subagents(
                 )
                 continue
             start_retry_tracker.clear(retry_key)
+            start_retry_tracker.discard(_subagent_resolve_key(subagent_id))
             updated = SubagentForwardState(
                 subagents={
                     **updated.subagents,
@@ -3127,6 +3247,26 @@ async def _forward_available_subagents(
                     "registered; parent_session=%s pending=%s",
                     parent_session_id,
                     [_subagent_id_from_meta_path(path) for path, _, _ in deferred],
+                )
+            meta_path_set = set(meta_paths)
+            for meta_path, meta, parent_subagent_id in deferred:
+                # Waiting is free while the parent's own meta is still being worked on.
+                parent_meta_path = subagents_dir / f"agent-{parent_subagent_id}.meta.json"
+                if (
+                    parent_subagent_id is not None
+                    and parent_meta_path in meta_path_set
+                    and start_retry_tracker.failure_count(
+                        _subagent_resolve_key(parent_subagent_id)
+                    )
+                    < _SUBAGENT_RESOLVE_MAX_ATTEMPTS
+                ):
+                    continue
+                _record_unresolved_subagent(
+                    start_retry_tracker,
+                    parent_session_id=parent_session_id,
+                    subagent_id=_subagent_id_from_meta_path(meta_path),
+                    tool_use_id=meta.get("toolUseId"),
+                    reason=f"its parent sub-agent {parent_subagent_id} cannot be registered",
                 )
             break
         pending = deferred
@@ -4791,7 +4931,7 @@ async def _forward_available_status_events(
                                 ),
                             )
                         except _CompactionSnapshotError:
-                            decision = compaction_retry_tracker.record_snapshot_failure(
+                            decision = compaction_retry_tracker.record_local_failure(
                                 snapshot_retry_key,
                                 max_attempts=_COMPACTION_SNAPSHOT_MAX_FAILURES,
                             )
@@ -5374,7 +5514,7 @@ async def _handle_compact_summary_item(
             ),
         )
     except _CompactionSnapshotError:
-        decision = compaction_retry_tracker.record_snapshot_failure(
+        decision = compaction_retry_tracker.record_local_failure(
             snapshot_retry_key,
             max_attempts=_COMPACTION_SNAPSHOT_MAX_FAILURES,
         )

@@ -288,6 +288,25 @@ def test_read_pending_suppresses_resolved_call(tmp_path: Path) -> None:
     assert read_cursor_pending_tool_calls(store) == []
 
 
+def test_read_pending_drops_a_call_answered_after_an_earlier_poll(tmp_path: Path) -> None:
+    """A blob added after a poll is classified with the blobs that poll already parsed."""
+    store = tmp_path / "store.db"
+    _write_store(
+        store, [_framed(_pending_tool_call_obj("call_late\nfc", "Delete", {"path": "/a"}))]
+    )
+    assert [call.tool_name for call in read_cursor_pending_tool_calls(store)] == ["Delete"]
+    con = _sqlite3.connect(str(store))
+    try:
+        con.execute(
+            "INSERT INTO blobs (id, data) VALUES (?, ?)",
+            ("blob1", _json.dumps(_tool_result_obj("call_late\nfc")).encode("utf-8")),
+        )
+        con.commit()
+    finally:
+        con.close()
+    assert read_cursor_pending_tool_calls(store) == []
+
+
 def test_read_pending_excludes_committed_call(tmp_path: Path) -> None:
     """A marker'd call that ALSO appears committed (no-marker tool-call) is excluded.
 
@@ -347,6 +366,39 @@ def test_read_pending_detects_multiple_distinct_gated_calls(tmp_path: Path) -> N
     )
     names = sorted(c.tool_name for c in read_cursor_pending_tool_calls(store))
     assert names == ["Delete", "Write"]
+
+
+def test_repeat_poll_of_an_unchanged_store_scans_no_blobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The permission poll keeps finding the pending call without re-scanning old blobs."""
+    store = tmp_path / "store.db"
+    history = [
+        _json.dumps({"role": "user", "content": f"turn {index} " + "x" * 2000}).encode("utf-8")
+        for index in range(200)
+    ]
+    gated = _framed(_pending_tool_call_obj("call_wait\nfc_9", "Delete", {"path": "/x/a"}))
+    _write_store(store, [*history, gated])
+    scanned_sizes: list[int] = []
+    real_scan = cnp._iter_embedded_json_objects
+
+    def counting_scan(raw: bytes) -> list[dict[str, object]]:
+        scanned_sizes.append(len(raw))
+        return real_scan(raw)
+
+    monkeypatch.setattr(cnp, "_iter_embedded_json_objects", counting_scan)
+
+    first = read_cursor_pending_tool_calls(store)
+    first_poll_bytes = sum(scanned_sizes)
+    scanned_sizes.clear()
+    second = read_cursor_pending_tool_calls(store)
+
+    assert [call.tool_name for call in first] == ["Delete"]
+    assert second == first
+    assert scanned_sizes == [], (
+        f"the second poll of an unchanged store re-scanned {len(scanned_sizes)} blobs "
+        f"({sum(scanned_sizes)} bytes; the first poll scanned {first_poll_bytes})"
+    )
 
 
 def test_tool_call_elicitation_id_is_stable_and_scoped(tmp_path: Path) -> None:

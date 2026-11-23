@@ -42,6 +42,8 @@ import hashlib
 import json
 import logging
 import re
+import sqlite3
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -49,12 +51,12 @@ import httpx
 
 from omnigent.harnesses.cursor_native.bridge import capture_cursor_pane, send_cursor_pane_keys
 
-# Reuse the forwarder's store discovery and WAL-aware blob reader so the
+# Reuse the forwarder's store discovery and WAL-aware store reader so the
 # transcript-based detector binds to the SAME cursor chat the forwarder mirrors
 # (one chat per workspace) and reads the live ``-wal`` state correctly.
 from omnigent.harnesses.cursor_native.forwarder import (
     _discover_store,
-    _read_blob_rows,
+    _query_store,
     _read_state,
 )
 
@@ -486,6 +488,58 @@ def _pending_started_ms(obj: dict[str, object]) -> int | None:
     return marker if isinstance(marker, int) else None
 
 
+# A blob's ``(rowid, id, length(data))``. cursor's store is append-only and its
+# blob ids are content hashes, so an unchanged key means unchanged bytes.
+_BlobKey = tuple[int, str, int | None]
+# Each ``toolCallId`` part of a blob, in order: the pending call, or ``None`` once
+# the part shows the call committed or resolved.
+_BlobToolCallParts = tuple[tuple[str, CursorPendingToolCall | None], ...]
+
+# Parsed parts per store and blob, so each poll parses only blobs added since the
+# last one. Shared by every session's supervisor thread (hence the lock); LRU
+# stores age out.
+_PENDING_SCAN_CACHE: dict[Path, dict[_BlobKey, _BlobToolCallParts]] = {}
+_PENDING_SCAN_CACHE_LOCK = threading.Lock()
+_PENDING_SCAN_CACHE_MAX_STORES = 64
+
+
+def _blob_tool_call_parts(data: object) -> _BlobToolCallParts:
+    """Return the tool-call and tool-result parts embedded in one blob."""
+    raw = bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("utf-8")
+    parts: list[tuple[str, CursorPendingToolCall | None]] = []
+    for obj in _iter_embedded_json_objects(raw):
+        content = obj.get("content")
+        if not isinstance(content, list):
+            continue
+        marker = _pending_started_ms(obj)
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            tool_call_id = part.get("toolCallId")
+            if not isinstance(tool_call_id, str):
+                continue
+            if part_type == "tool-call":
+                if marker is not None:
+                    tool_name = part.get("toolName")
+                    args = part.get("args")
+                    parts.append(
+                        (
+                            tool_call_id,
+                            CursorPendingToolCall(
+                                tool_call_id=tool_call_id,
+                                tool_name=tool_name if isinstance(tool_name, str) else "tool",
+                                args=args if isinstance(args, dict) else {},
+                            ),
+                        )
+                    )
+                else:
+                    parts.append((tool_call_id, None))
+            elif part_type == "tool-result":
+                parts.append((tool_call_id, None))
+    return tuple(parts)
+
+
 def read_cursor_pending_tool_calls(store_path: Path) -> list[CursorPendingToolCall]:
     """Return the gated tool calls currently awaiting a human in *store_path*.
 
@@ -502,46 +556,56 @@ def read_cursor_pending_tool_calls(store_path: Path) -> list[CursorPendingToolCa
     resolved). Empirically a call that's genuinely blocked on the human appears
     ONLY with the marker (never committed) until answered, while an
     auto-approved / committed call appears without it — so this excludes the
-    auto-approve flash structurally, with no timing heuristic. Pure / read-only,
-    so it is safe to run alongside the forwarder tailing the same store.
+    auto-approve flash structurally, with no timing heuristic. Read-only, so it
+    is safe to run alongside the forwarder tailing the same store; each blob is
+    parsed once and its parts reused by later polls.
 
     :param store_path: This session's cursor ``store.db``.
     :returns: Active pending tool calls (cursor shows them one at a time, but the
         list supports more than one defensively), in first-seen order.
     """
+    with _PENDING_SCAN_CACHE_LOCK:
+        cached = _PENDING_SCAN_CACHE.get(store_path, {})
+
+    def read_new_blobs(
+        con: sqlite3.Connection,
+    ) -> tuple[list[_BlobKey], dict[int, object]]:
+        # One read transaction, so the data matches the key listing.
+        con.execute("BEGIN")
+        keys: list[_BlobKey] = con.execute(
+            "SELECT rowid, id, length(data) FROM blobs ORDER BY rowid"
+        ).fetchall()
+        unparsed = [key for key in keys if key not in cached]
+        if not unparsed:
+            return keys, {}
+        rows = con.execute(
+            "SELECT rowid, data FROM blobs WHERE rowid >= ? ORDER BY rowid", (unparsed[0][0],)
+        ).fetchall()
+        return keys, dict(rows)
+
+    result = _query_store(store_path, read_new_blobs)
+    if result is None:
+        return []
+    keys, data_by_rowid = result
+    current: dict[_BlobKey, _BlobToolCallParts] = {}
     pending: dict[str, CursorPendingToolCall] = {}
-    committed: set[str] = set()
-    resolved: set[str] = set()
-    for _rowid, _blob_id, data in _read_blob_rows(store_path, 0):
-        raw = bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("utf-8")
-        for obj in _iter_embedded_json_objects(raw):
-            content = obj.get("content")
-            if not isinstance(content, list):
-                continue
-            marker = _pending_started_ms(obj)
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                part_type = part.get("type")
-                tool_call_id = part.get("toolCallId")
-                if not isinstance(tool_call_id, str):
-                    continue
-                if part_type == "tool-call":
-                    if marker is not None:
-                        tool_name = part.get("toolName")
-                        args = part.get("args")
-                        pending[tool_call_id] = CursorPendingToolCall(
-                            tool_call_id=tool_call_id,
-                            tool_name=tool_name if isinstance(tool_name, str) else "tool",
-                            args=args if isinstance(args, dict) else {},
-                        )
-                    else:
-                        committed.add(tool_call_id)
-                elif part_type == "tool-result":
-                    resolved.add(tool_call_id)
-    return [
-        call for tcid, call in pending.items() if tcid not in committed and tcid not in resolved
-    ]
+    finished: set[str] = set()
+    for key in keys:
+        parts = cached.get(key)
+        if parts is None:
+            parts = _blob_tool_call_parts(data_by_rowid.get(key[0]))
+        current[key] = parts
+        for tool_call_id, call in parts:
+            if call is None:
+                finished.add(tool_call_id)
+            else:
+                pending[tool_call_id] = call
+    with _PENDING_SCAN_CACHE_LOCK:
+        _PENDING_SCAN_CACHE.pop(store_path, None)
+        _PENDING_SCAN_CACHE[store_path] = current
+        while len(_PENDING_SCAN_CACHE) > _PENDING_SCAN_CACHE_MAX_STORES:
+            _PENDING_SCAN_CACHE.pop(next(iter(_PENDING_SCAN_CACHE)))
+    return [call for tcid, call in pending.items() if tcid not in finished]
 
 
 def _preview_for_args(args: dict[str, object]) -> str:
