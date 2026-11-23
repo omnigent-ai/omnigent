@@ -212,6 +212,13 @@ describe("Files tab", () => {
       { place: { kind: "files", path: "src/c.ts" } },
       { opener: "user", disposition: "new" },
     );
+    // A breadcrumb pick steps the same tab, through the navigation its unsaved-edit guard holds.
+    onNavigate.mockClear();
+    captured.viewer!.onOpenFile!("src/d.ts");
+    expect(onNavigate.mock.calls).toEqual([
+      [{ kind: "files", path: "src/d.ts" }, { replace: false }],
+    ]);
+    expect(onOpen).toHaveBeenCalledTimes(1);
   });
 
   it("shows the file at its cited lines and opens its changes there for Show changes", () => {

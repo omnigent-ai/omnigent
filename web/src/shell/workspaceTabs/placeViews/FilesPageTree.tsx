@@ -1,7 +1,4 @@
-// The workspace Files tab's tree: the folder the session's tree browses (the workspace
-// root unless rooted elsewhere) and its uncommitted changes, under a header naming the
-// folder with its name filter, Back to working folder and Reveal Active File. While a
-// name filter is set, the tree shows its matches instead.
+// Shows the browsed folder, or name-filter matches, with root and reveal controls.
 
 import { FolderDotIcon, ListFilterIcon, LocateFixedIcon } from "lucide-react";
 import { type RefObject, useEffect, useId, useMemo, useRef, useState } from "react";
