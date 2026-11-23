@@ -133,8 +133,62 @@ def _note_audience(
     return _author_audience(row.session_id, row.agent_id, orchestrator_session_id)
 
 
+NEEDS_HUMAN_LABEL = "needs-human"
+
+
+def _has_needs_human(labels: Any) -> bool:
+    return isinstance(labels, list) and any(
+        isinstance(label, dict) and label.get("key") == NEEDS_HUMAN_LABEL for label in labels
+    )
+
+
+@dataclass
+class _HumanAsk:
+    """A span during which a ticket carried needs-human, and the session that added it."""
+
+    start: int
+    end: int | None
+    session_id: str | None
+
+    def covers(self, session_id: str | None, position: int) -> bool:
+        return (
+            session_id is not None
+            and session_id == self.session_id
+            and position > self.start
+            and (self.end is None or position < self.end)
+        )
+
+
+def _event_labels(row: SqlProjectTicketEvent) -> Any:
+    payload = row.payload
+    if row.kind == EVENT_CODES["created"]:
+        return payload.get("labels", payload.get("tags"))
+    changes = payload.get("changes")
+    if not isinstance(changes, dict):
+        return None
+    return changes.get("labels", changes.get("tags"))
+
+
+def _human_asks(rows: builtins.list[SqlProjectTicketEvent]) -> builtins.list[_HumanAsk]:
+    """Replay label changes, in position order, into needs-human spans."""
+    asks: builtins.list[_HumanAsk] = []
+    for row in rows:
+        labels = _event_labels(row)
+        if labels is None:
+            continue
+        active = asks[-1] if asks and asks[-1].end is None else None
+        if _has_needs_human(labels) and active is None:
+            asks.append(_HumanAsk(row.position, None, row.session_id))
+        elif not _has_needs_human(labels) and active is not None:
+            active.end = row.position
+    return asks
+
+
 def _labeled_event(
-    row: SqlProjectTicketEvent, orchestrator_session_id: str | None
+    row: SqlProjectTicketEvent,
+    orchestrator_session_id: str | None,
+    *,
+    asks_human: bool = False,
 ) -> dict[str, Any]:
     """An event whose comment payload always says who it is for, including older comments."""
     event = _event(row)
@@ -142,7 +196,9 @@ def _labeled_event(
         payload = event["payload"]
         event["payload"] = {
             **payload,
-            "audience": _note_audience(row, payload, orchestrator_session_id),
+            "audience": "human"
+            if asks_human
+            else _note_audience(row, payload, orchestrator_session_id),
         }
     return event
 
@@ -252,11 +308,50 @@ class ProjectTicketStore:
         with self._session("require_project_access") as session:
             self._project(session, project_id, user_id)
 
+    @classmethod
+    def _human_asks(cls, session: Session, ticket: SqlProjectTicket) -> builtins.list[_HumanAsk]:
+        return cls._human_asks_for(session, ticket, ticket.id)
+
     @staticmethod
-    def _comment_audience(project: SqlProject, actor: TicketActor, requested: str | None) -> str:
+    def _human_asks_for(
+        session: Session, owner: SqlProject | SqlProjectTicket, ticket_id: str
+    ) -> builtins.list[_HumanAsk]:
+        project_id = owner.id if isinstance(owner, SqlProject) else owner.project_id
+        rows = session.scalars(
+            select(SqlProjectTicketEvent)
+            .where(
+                SqlProjectTicketEvent.workspace_id == owner.workspace_id,
+                SqlProjectTicketEvent.project_id == project_id,
+                SqlProjectTicketEvent.ticket_id == ticket_id,
+                SqlProjectTicketEvent.kind.in_(NEW_UPDATE_KINDS),
+            )
+            .order_by(SqlProjectTicketEvent.position)
+        ).all()
+        return _human_asks(builtins.list(rows))
+
+    def _comment_audience(
+        self,
+        session: Session,
+        project: SqlProject,
+        ticket: SqlProjectTicket,
+        actor: TicketActor,
+        requested: str | None,
+        *,
+        adds_needs_human: bool = False,
+    ) -> str:
         if requested is not None:
             return requested
-        return _author_audience(actor.session_id, actor.agent_id, _orchestrator_session_id(project))
+        audience = _author_audience(
+            actor.session_id, actor.agent_id, _orchestrator_session_id(project)
+        )
+        if audience == "human" or adds_needs_human:
+            return "human"
+        # A worker that raised needs-human is talking to the human until it is cleared.
+        if _has_needs_human(ticket.labels):
+            asks = self._human_asks(session, ticket)
+            if asks and asks[-1].covers(actor.session_id, ticket.next_event_position):
+                return "human"
+        return audience
 
     def create(self, project_id: str, body: CreateTicket, actor: TicketActor) -> dict[str, Any]:
         def write(session: Session) -> dict[str, Any]:
@@ -490,12 +585,23 @@ class ProjectTicketStore:
                 count_new(ticket_id, "new_update_count", count, first_position)
             # Who a comment is for lives in its payload, so agent notes are filtered here.
             orchestrator_session_id = _orchestrator_session_id(project)
+            asks_by_ticket: dict[str, builtins.list[_HumanAsk]] = {}
             for row in session.scalars(
                 select(event)
                 .outerjoin(read, seen_marker)
                 .where(unseen, event.kind.in_(NEW_COMMENT_KINDS))
             ):
-                if _note_audience(row, row.payload, orchestrator_session_id) == "human":
+                human = _note_audience(row, row.payload, orchestrator_session_id) == "human"
+                if not human and row.session_id is not None:
+                    if row.ticket_id not in asks_by_ticket:
+                        asks_by_ticket[row.ticket_id] = self._human_asks_for(
+                            session, project, row.ticket_id
+                        )
+                    human = any(
+                        ask.covers(row.session_id, row.position)
+                        for ask in asks_by_ticket[row.ticket_id]
+                    )
+                if human:
                     count_new(row.ticket_id, "new_comment_count", 1, row.position)
             return result
 
@@ -618,6 +724,11 @@ class ProjectTicketStore:
             project = self._project(session, project_id, actor.user_id, write=True)
             row = self._row(session, project_id, ticket_id, write=True)
             target = _stage(_stages(project), body.stage_id) if body.stage_id is not None else None
+            adds_needs_human = (
+                body.labels is not None
+                and _has_needs_human(changes.get("labels"))
+                and not _has_needs_human(row.labels)
+            )
             for key, value in changes.items():
                 setattr(row, key, value)
             if target is not None:
@@ -635,7 +746,9 @@ class ProjectTicketStore:
                     {"changes": changes, **({"stage": _stage_snapshot(target)} if target else {})},
                 )
             if body.comment:
-                audience = self._comment_audience(project, actor, body.audience)
+                audience = self._comment_audience(
+                    session, project, row, actor, body.audience, adds_needs_human=adds_needs_human
+                )
                 self._append(
                     session,
                     project,
@@ -657,7 +770,7 @@ class ProjectTicketStore:
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)
             row = self._row(session, project_id, ticket_id, write=True)
-            audience = self._comment_audience(project, actor, body.audience)
+            audience = self._comment_audience(session, project, row, actor, body.audience)
             self._append(
                 session, project, row, actor, body.kind, {"text": body.text, "audience": audience}
             )
@@ -670,6 +783,26 @@ class ProjectTicketStore:
             return _ticket(row)
 
         return run_write_transaction(self._write, "comment_on_ticket", write)
+
+    @staticmethod
+    def _latest_ask_position(
+        session: Session, ticket: SqlProjectTicket, asks: builtins.list[_HumanAsk]
+    ) -> int | None:
+        """While needs-human is open, its raiser's latest comment is the question to show."""
+        if not _has_needs_human(ticket.labels) or not asks or asks[-1].end is not None:
+            return None
+        raiser = asks[-1].session_id
+        if raiser is None:
+            return None
+        return session.scalar(
+            select(func.max(SqlProjectTicketEvent.position)).where(
+                SqlProjectTicketEvent.workspace_id == ticket.workspace_id,
+                SqlProjectTicketEvent.project_id == ticket.project_id,
+                SqlProjectTicketEvent.ticket_id == ticket.id,
+                SqlProjectTicketEvent.kind.in_(NEW_COMMENT_KINDS),
+                SqlProjectTicketEvent.session_id == raiser,
+            )
+        )
 
     def events(
         self,
@@ -685,7 +818,7 @@ class ProjectTicketStore:
         with self._session("list_ticket_events") as session:
             project = self._project(session, project_id, user_id)
             orchestrator_session_id = _orchestrator_session_id(project)
-            self._row(session, project_id, ticket_id)
+            ticket = self._row(session, project_id, ticket_id)
             stmt = select(SqlProjectTicketEvent).where(
                 SqlProjectTicketEvent.workspace_id == current_workspace_id(),
                 SqlProjectTicketEvent.project_id == _identifier(project_id),
@@ -702,8 +835,19 @@ class ProjectTicketStore:
                 .order_by(SqlProjectTicketEvent.position, SqlProjectTicketEvent.id)
                 .limit(limit + 1)
             ).all()
+            asks = self._human_asks(session, ticket)
+            latest_ask = self._latest_ask_position(session, ticket, asks)
+
+            def asks_human(row: SqlProjectTicketEvent) -> bool:
+                if row.position == latest_ask:
+                    return True
+                return any(ask.covers(row.session_id, row.position) for ask in asks)
+
             return {
-                "data": [_labeled_event(row, orchestrator_session_id) for row in rows[:limit]],
+                "data": [
+                    _labeled_event(row, orchestrator_session_id, asks_human=asks_human(row))
+                    for row in rows[:limit]
+                ],
                 "has_more": len(rows) > limit,
                 "last_position": rows[min(limit, len(rows)) - 1].position if rows else after,
             }
