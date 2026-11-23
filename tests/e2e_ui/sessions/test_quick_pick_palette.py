@@ -477,6 +477,20 @@ def test_quick_pick_switches_the_session_lists_display(
     expect(archived_row.first).to_be_visible(timeout=10_000)
 
 
+def test_quick_pick_goes_to_the_sidebars_usage_page(
+    request: pytest.FixtureRequest, seeded_session: tuple[str, str]
+) -> None:
+    """⌘K's Go to Usage opens the page the sidebar's Usage link does."""
+    base_url, session_id = seeded_session
+    page: Page = request.getfixturevalue("page")
+    enable_quick_pick_palette(page, "usage_page")
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_test_id("usage-nav")).to_be_visible(timeout=30_000)
+
+    run_palette_command(page, "go to usage", "Go to Usage", closes=True)
+    expect(page).to_have_url(f"{base_url}/usage", timeout=10_000)
+
+
 def _folder_names(page: Page) -> list[str]:
     """Project folder header texts in the sidebar, in render order."""
     return page.locator('button[data-slot="context-menu-trigger"]').all_inner_texts()

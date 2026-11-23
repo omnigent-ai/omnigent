@@ -631,6 +631,8 @@ host-dependent unlink behavior.
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
 cards. Choosing Canvas in the sidebar returns to the selected board.
+With `quick_pick_palette` on, ⌘K's Go to Canvas and Go to Usage open the same
+pages as the sidebar's links, and are offered exactly when those links show.
 Drag the divider to resize, or focus it and use Left/Right arrows to
 adjust the split and Home/End to reach its limits. Double-click the divider to
 restore the default split. Focus the session to use the full area; Escape
