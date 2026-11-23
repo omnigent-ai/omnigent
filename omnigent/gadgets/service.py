@@ -461,7 +461,10 @@ class GadgetService:
         return self._app(gadget, self.access.permissions(self.viewer.user_id, gadget))
 
     def list_owned(self, limit: Any = 100, cursor: Any = None) -> dict:
-        """One page of the viewer's own gadgets, in ID order: ``{"items", "next_cursor"}``."""
+        """One page of the viewer's own gadgets, in the store's order.
+
+        :returns: ``{"items", "next_cursor"}``.
+        """
         owned, next_cursor = self.store.list_owned_page(
             self.viewer.user_id, limit=_page_limit(limit, MAX_OWNED_PAGE_SIZE), after=cursor
         )

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -263,26 +263,30 @@ class GadgetStore(ABC):
     def list_owned_page(
         self, owner_id: str, *, limit: int, after: str | None = None
     ) -> tuple[list[Gadget], str | None]:
-        """One page of the gadgets *owner_id* owns, in ID order.
+        """One page of the gadgets *owner_id* owns, in an order the store keeps stable.
+
+        Each page must cost bounded work, whatever the owner's count (an ordered index,
+        not a scan of every gadget they own).
 
         :param limit: The most gadgets to return, 1 to :data:`MAX_OWNED_PAGE_SIZE`.
-        :param after: The previous page's cursor (a gadget ID), or ``None`` to start.
+        :param after: The previous page's cursor (opaque to callers), or ``None`` to start.
         :returns: The page and the cursor of the next one, or ``None`` after the last.
             A page can hold fewer than *limit* gadgets, or none, and still continue.
+            Deleting gadgets already returned does not move the cursor.
         """
 
-    def list_owned(self, owner_id: str) -> list[Gadget]:
-        """Every gadget *owner_id* owns, oldest first, read a page at a time.
+    def iter_owned(self, owner_id: str) -> Iterator[Gadget]:
+        """Every gadget *owner_id* owns, read one page at a time as the caller goes.
 
-        For work that needs them all, such as deleting an account; requests page instead.
+        For work that visits them all, such as deleting an account, without holding the
+        whole list; requests page instead.
         """
-        owned: list[Gadget] = []
         cursor: str | None = None
         while True:
             page, cursor = self.list_owned_page(owner_id, limit=MAX_OWNED_PAGE_SIZE, after=cursor)
-            owned.extend(page)
+            yield from page
             if cursor is None:
-                return sorted(owned, key=lambda gadget: (gadget.created_at, gadget.id))
+                return
 
     @abstractmethod
     def rename(self, gadget_id: str, name: str) -> Gadget | None:

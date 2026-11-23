@@ -14,6 +14,7 @@ from omnigent.gadgets.access import (
     PermissionStoreGadgetAccess,
     SharedPage,
 )
+from omnigent.gadgets.accounts import DeletedAccountGadgets
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_READ
 from omnigent.stores.gadget_store.local import LocalGadgetStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -157,3 +158,38 @@ def test_permissions_for_several_gadgets_match_one_at_a_time(
     assert expected[own.id] == FULL_ACCESS and expected[private.id] == NO_ACCESS
     grants.deleted = frozenset({ALICE})
     assert access.permissions_many(CAROL, gadgets)[shared.id] == NO_ACCESS
+
+
+class _DecimalIdStore(LocalGadgetStore):
+    """A store naming gadgets with decimal IDs, as a deployment's own store may."""
+
+    def __init__(self, location: str) -> None:
+        super().__init__(location)
+        self._next = 102717306144392
+
+    def _new_id(self) -> str:
+        self._next += 1
+        return str(self._next)
+
+
+def test_grants_and_account_cleanup_work_for_a_store_without_uuid_ids(
+    db_uri: str, tmp_path: Path
+) -> None:
+    store = _DecimalIdStore(str(tmp_path))
+    grants = _GroupStore(db_uri)
+    for user in (BOB, CAROL):
+        grants.ensure_user(user)
+    access = PermissionStoreGadgetAccess(store, grants)
+    board, report = store.create(ALICE, "Board"), store.create(ALICE, "Report")
+    assert board.id.isdigit()
+    grants.grant_for_gadget(BOB, board.id, LEVEL_EDIT)
+    grants.grant_for_gadget(CAROL, report.id, LEVEL_READ)
+    assert access.permissions(BOB, board).write_data is True
+    assert [item.gadget.id for item in access.shared_with(BOB).items] == [board.id]
+
+    # Deleting Alice's account removes her gadgets and every grant on them.
+    DeletedAccountGadgets(store, access).delete_owned(ALICE)
+    assert store.get(board.id) is None and store.get(report.id) is None
+    assert grants.list_for_gadget(board.id) == ([], None)
+    assert grants.resolve_gadget_access([CAROL], report.id) is None
+    assert access.shared_with(BOB) == SharedPage([], None)

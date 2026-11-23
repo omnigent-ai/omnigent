@@ -318,7 +318,10 @@ def create_gadgets_router(
 
     @router.get("/gadgets", openapi_extra={"parameters": _PAGE_PARAMETERS})
     async def list_gadgets(request: Request) -> Response:
-        """A page of the caller's own gadgets in ID order: ``{"items", "next_cursor"}``."""
+        """A page of the caller's own gadgets, in the store's order: ``{"items", "next_cursor"}``.
+
+        Follow ``next_cursor``; a page can be short and still continue.
+        """
         limit, cursor = _page(request, 100)
         return _json(await run(request, lambda service: service.list_owned(limit, cursor)))
 

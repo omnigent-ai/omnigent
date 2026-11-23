@@ -29,9 +29,10 @@ class DeletedAccountGadgets:
         """Delete every gadget *user_id* owns, with its grants, then their shelf.
 
         Grants go first, so a gadget whose deletion fails half-way is shared with no
-        one; a retry finishes it.
+        one; a retry finishes it. Works through one page of gadgets at a time, so a
+        large account costs bounded memory and starts deleting at once.
         """
-        for gadget in self._store.list_owned(user_id):
+        for gadget in self._store.iter_owned(user_id):
             self._access.forget(gadget.id)
             self._store.delete(gadget.id)
         self._store.delete_user_files(user_id)

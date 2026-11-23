@@ -4,20 +4,24 @@ Layout under ``storage_location`` (by default ``<data_dir>/gadgets``)::
 
     gadgets/<id>/gadget.json        # metadata, replaced atomically on rename
     gadgets/<id>/files/...          # the gadget's GadgetFiles scope
-    owners/<owner key>/<id>          # empty marker: which gadgets a user owns
+    owners/<owner key>/sNNNNNNNN/<id>  # empty marker: which gadgets a user owns
     users/<user key>/...             # one user's GadgetFiles scope (their shelf)
     .tmp/                            # staging for atomic writes; never listed
     .trash/                          # deleted scopes being removed; emptied on start
 
 Owner and user keys are SHA-256 prefixes of the user ID, so any ID is a safe
-directory name. A create-only write stages the file in ``.tmp`` and hard-links
-it into place, which fails when the target exists and never exposes a partly
-written file, so the data directory must support hard links.
+directory name. Owner markers fill numbered segments of about
+:data:`_OWNER_SEGMENT_SIZE` in creation order (the gadget's metadata names its
+segment), so a page of a user's gadgets lists the segment names and at most two
+segments, however many gadgets the user has.
+
+A create-only write stages the file in ``.tmp`` and hard-links it into place,
+which fails when the target exists and never exposes a partly written file, so
+the data directory must support hard links.
 """
 
 from __future__ import annotations
 
-import bisect
 import contextlib
 import hashlib
 import json
@@ -31,6 +35,7 @@ import uuid
 from pathlib import Path
 
 from omnigent.stores.gadget_store import (
+    GADGET_ID_PATTERN,
     MAX_FILE_BYTES,
     MAX_OWNED_PAGE_SIZE,
     CapacityExceeded,
@@ -44,7 +49,12 @@ from omnigent.stores.gadget_store import (
     validate_relative_path,
 )
 
-_GADGET_ID = re.compile(r"[0-9a-f]{32}")
+# Any store's ID form is read; this store creates 32 hex digits.
+_GADGET_ID = GADGET_ID_PATTERN
+_OWNER_SEGMENT = re.compile(r"s[0-9]{8}")
+_OWNER_SEGMENT_SIZE = 1000
+# A page cursor: the segment, and the last gadget ID read in it (none: start of the segment).
+_OWNER_CURSOR = re.compile(rf"({_OWNER_SEGMENT.pattern})/((?:{GADGET_ID_PATTERN.pattern})?)")
 _METADATA_FILE = "gadget.json"
 _METADATA_KIND = "omnigent.gadget.v1"
 # A gadget directory without metadata this old is left over from an interrupted creation.
@@ -225,6 +235,8 @@ class LocalGadgetStore(GadgetStore):
         # Renames read and rewrite the metadata file, and a deletion moves it away;
         # serialize them in this process.
         self._metadata_lock = threading.Lock()
+        # Picks an owner segment with room; another process can overfill one slightly.
+        self._owner_lock = threading.Lock()
         self._sweep()
 
     def _sweep(self) -> None:
@@ -254,6 +266,11 @@ class LocalGadgetStore(GadgetStore):
         return self._root / "owners" / _user_key(owner_id)
 
     def _read_metadata(self, gadget_id: str) -> Gadget | None:
+        found = self._read_record(gadget_id)
+        return found[0] if found is not None else None
+
+    def _read_record(self, gadget_id: str) -> tuple[Gadget, str] | None:
+        """The gadget and the owner segment holding its marker."""
         if not isinstance(gadget_id, str) or _GADGET_ID.fullmatch(gadget_id) is None:
             return None
         files = LocalGadgetFiles(self._gadget_dir(gadget_id), self._tmp_dir)
@@ -262,34 +279,66 @@ class LocalGadgetStore(GadgetStore):
         except NotFound:
             return None
         owner, name, created_at = raw.get("owner_id"), raw.get("name"), raw.get("created_at")
+        segment = raw.get("owner_segment")
         if (
             raw.get("kind") != _METADATA_KIND
             or raw.get("id") != gadget_id
             or not isinstance(owner, str)
             or not isinstance(name, str)
             or not isinstance(created_at, int | float)
+            or not isinstance(segment, str)
+            or _OWNER_SEGMENT.fullmatch(segment) is None
         ):
             raise CorruptData("Invalid gadget metadata")
-        return Gadget(id=gadget_id, owner_id=owner, name=name, created_at=float(created_at))
+        gadget = Gadget(id=gadget_id, owner_id=owner, name=name, created_at=float(created_at))
+        return gadget, segment
 
     @staticmethod
-    def _metadata(gadget: Gadget) -> dict:
+    def _metadata(gadget: Gadget, segment: str) -> dict:
         return {
             "kind": _METADATA_KIND,
             "id": gadget.id,
             "owner_id": gadget.owner_id,
             "name": gadget.name,
             "created_at": gadget.created_at,
+            "owner_segment": segment,
         }
 
+    def _new_id(self) -> str:
+        """A new gadget's ID; a subclass may name gadgets differently within the contract."""
+        return uuid.uuid4().hex
+
+    @staticmethod
+    def _owner_segments(owner_dir: Path) -> list[str]:
+        """The owner's segment names in order: one per :data:`_OWNER_SEGMENT_SIZE` created."""
+        try:
+            return sorted(n for n in os.listdir(owner_dir) if _OWNER_SEGMENT.fullmatch(n))
+        except FileNotFoundError:
+            return []
+
+    def _segment_with_room(self, owner_dir: Path) -> str:
+        segments = self._owner_segments(owner_dir)
+        if not segments:
+            return "s00000000"
+        newest = segments[-1]
+        try:
+            used = len(os.listdir(owner_dir / newest))
+        except FileNotFoundError:
+            used = 0
+        return newest if used < _OWNER_SEGMENT_SIZE else f"s{int(newest[1:]) + 1:08d}"
+
     def create(self, owner_id: str, name: str) -> Gadget:
-        gadget = Gadget(id=uuid.uuid4().hex, owner_id=owner_id, name=name, created_at=time.time())
-        directory = self._gadget_dir(gadget.id)
-        (directory / "files").mkdir(parents=True)
-        _replace_file(self._tmp_dir, directory / _METADATA_FILE, self._metadata(gadget))
+        gadget = Gadget(id=self._new_id(), owner_id=owner_id, name=name, created_at=time.time())
         owner_dir = self._owner_dir(owner_id)
-        owner_dir.mkdir(parents=True, exist_ok=True)
-        (owner_dir / gadget.id).touch()
+        with self._owner_lock:
+            segment = self._segment_with_room(owner_dir)
+            (owner_dir / segment).mkdir(parents=True, exist_ok=True)
+            directory = self._gadget_dir(gadget.id)
+            (directory / "files").mkdir(parents=True)
+            _replace_file(
+                self._tmp_dir, directory / _METADATA_FILE, self._metadata(gadget, segment)
+            )
+            (owner_dir / segment / gadget.id).touch()
         return gadget
 
     def get(self, gadget_id: str) -> Gadget | None:
@@ -300,40 +349,54 @@ class LocalGadgetStore(GadgetStore):
     ) -> tuple[list[Gadget], str | None]:
         if type(limit) is not int or not 1 <= limit <= MAX_OWNED_PAGE_SIZE:
             raise InvalidInput(f"limit must be an integer in 1..{MAX_OWNED_PAGE_SIZE}")
-        if after is not None and (
-            not isinstance(after, str) or _GADGET_ID.fullmatch(after) is None
-        ):
-            raise InvalidInput("Invalid cursor")
-        try:
-            names = sorted(
-                name
-                for name in os.listdir(self._owner_dir(owner_id))
-                if _GADGET_ID.fullmatch(name)
-            )
-        except FileNotFoundError:
-            return [], None
-        start = bisect.bisect_right(names, after) if after is not None else 0
+        start_segment, start_id = "", ""
+        if after is not None:
+            match = _OWNER_CURSOR.fullmatch(after) if isinstance(after, str) else None
+            if match is None:
+                raise InvalidInput("Invalid cursor")
+            start_segment, start_id = match.group(1), match.group(2)
+        owner_dir = self._owner_dir(owner_id)
+        segments = [s for s in self._owner_segments(owner_dir) if s >= start_segment]
         owned: list[Gadget] = []
-        position = start
         # Markers can outlive a deletion that stopped half-way; they cost a read but no slot.
-        while position < len(names) and len(owned) < limit and position - start < 2 * limit:
-            gadget = self._read_metadata(names[position])
-            position += 1
-            if gadget is not None and gadget.owner_id == owner_id:
-                owned.append(gadget)
-        return owned, names[position - 1] if position < len(names) else None
+        reads_left = 2 * limit
+        # Bounded work per page: at most two segments listed and 2 * limit metadata reads;
+        # a page can come back short or empty and still continue.
+        for position, segment in enumerate(segments[:2]):
+            try:
+                names = sorted(
+                    n for n in os.listdir(owner_dir / segment) if _GADGET_ID.fullmatch(n)
+                )
+            except FileNotFoundError:
+                names = []
+            last = start_id if segment == start_segment else ""
+            if last:
+                names = [n for n in names if n > last]
+            for gadget_id in names:
+                if len(owned) == limit or reads_left == 0:
+                    return owned, f"{segment}/{last}"
+                reads_left -= 1
+                last = gadget_id
+                gadget = self._read_metadata(gadget_id)
+                if gadget is not None and gadget.owner_id == owner_id:
+                    owned.append(gadget)
+            later = segments[position + 1 :]
+            if later and (len(owned) == limit or reads_left == 0 or position == 1):
+                return owned, f"{later[0]}/"
+        return owned, None
 
     def rename(self, gadget_id: str, name: str) -> Gadget | None:
         with self._metadata_lock:
-            current = self._read_metadata(gadget_id)
-            if current is None:
+            found = self._read_record(gadget_id)
+            if found is None:
                 return None
+            current, segment = found
             renamed = Gadget(current.id, current.owner_id, name, current.created_at)
             try:
                 _replace_file(
                     self._tmp_dir,
                     self._gadget_dir(gadget_id) / _METADATA_FILE,
-                    self._metadata(renamed),
+                    self._metadata(renamed, segment),
                 )
             except (FileNotFoundError, NotADirectoryError):
                 # Deleted by another process between the read and the write.
@@ -345,16 +408,17 @@ class LocalGadgetStore(GadgetStore):
         # removing its files can then take as long as it needs.
         trash = self._root / ".trash" / f"{gadget_id}-{uuid.uuid4().hex}"
         with self._metadata_lock:
-            gadget = self._read_metadata(gadget_id)
-            if gadget is None:
+            found = self._read_record(gadget_id)
+            if found is None:
                 return False
+            gadget, segment = found
             trash.parent.mkdir(parents=True, exist_ok=True)
             try:
                 os.replace(self._gadget_dir(gadget_id), trash)
             except FileNotFoundError:
                 return False
         with contextlib.suppress(FileNotFoundError):
-            (self._owner_dir(gadget.owner_id) / gadget_id).unlink()
+            (self._owner_dir(gadget.owner_id) / segment / gadget_id).unlink()
         shutil.rmtree(trash, ignore_errors=True)
         return True
 

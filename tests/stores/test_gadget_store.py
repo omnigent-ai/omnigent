@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import omnigent.stores.gadget_store.local as local_module
 from omnigent.stores.gadget_store import (
     MAX_FILE_BYTES,
     CapacityExceeded,
@@ -37,9 +38,9 @@ def test_gadgets_are_created_listed_renamed_and_deleted_per_owner(
     other = store.create(BOB, "Tracker")
     assert len(first.id) == 32 and first.owner_id == ALICE
 
-    assert [gadget.id for gadget in store.list_owned(ALICE)] == [first.id, second.id]
-    assert [gadget.id for gadget in store.list_owned(BOB)] == [other.id]
-    assert store.list_owned("carol@example.com") == []
+    assert sorted(gadget.id for gadget in store.iter_owned(ALICE)) == sorted([first.id, second.id])
+    assert [gadget.id for gadget in store.iter_owned(BOB)] == [other.id]
+    assert list(store.iter_owned("carol@example.com")) == []
     assert store.get_many([first.id, "f" * 32, other.id]) == {first.id: first, other.id: other}
 
     renamed = store.rename(first.id, "Launch board")
@@ -52,7 +53,7 @@ def test_gadgets_are_created_listed_renamed_and_deleted_per_owner(
     assert store.delete(first.id) is True
     assert store.get(first.id) is None
     assert store.delete(first.id) is False
-    assert [gadget.id for gadget in store.list_owned(ALICE)] == [second.id]
+    assert [gadget.id for gadget in store.iter_owned(ALICE)] == [second.id]
     # The deleted gadget's files are gone too, and a new one starts empty.
     with pytest.raises(NotFound):
         store.gadget_files(first.id).read_json("data/cards/one.json")
@@ -314,28 +315,66 @@ def test_delete_tree_removes_a_file_or_a_directory_at_once(store: LocalGadgetSto
     assert files.read_json("data/cards/c1/00000001.json") == {"n": 2}
 
 
-def test_owned_gadgets_page_by_id_and_skip_markers_left_by_a_deletion(
+def _owned_pages(store: LocalGadgetStore, owner: str, limit: int) -> list[list[str]]:
+    pages: list[list[str]] = []
+    cursor = None
+    while True:
+        page, cursor = store.list_owned_page(owner, limit=limit, after=cursor)
+        pages.append([gadget.id for gadget in page])
+        if cursor is None:
+            return pages
+
+
+def test_owned_gadgets_page_through_once_and_skip_markers_left_by_a_deletion(
     store: LocalGadgetStore, tmp_path: Path
 ) -> None:
     made = sorted(store.create(ALICE, f"Board {n}").id for n in range(5))
     # A deletion that stopped before removing its owner marker.
     stale = made[1]
     store.delete(stale)
-    owners = tmp_path / "gadgets" / "owners"
-    (next(owners.iterdir()) / stale).touch()
-    seen: list[str] = []
-    cursor = None
-    while True:
-        page, cursor = store.list_owned_page(ALICE, limit=2, after=cursor)
-        seen.extend(gadget.id for gadget in page)
-        if cursor is None:
-            break
+    (segment,) = (tmp_path / "gadgets" / "owners").glob("*/s00000000")
+    (segment / stale).touch()
+    seen = [gadget_id for page in _owned_pages(store, ALICE, limit=2) for gadget_id in page]
     assert seen == [gadget_id for gadget_id in made if gadget_id != stale]
-    assert [gadget.id for gadget in store.list_owned(ALICE)] == sorted(
-        seen,
-        key=lambda gadget_id: store.get(gadget_id).created_at,  # type: ignore[union-attr]
-    )
+    assert sorted(gadget.id for gadget in store.iter_owned(ALICE)) == seen
     with pytest.raises(InvalidInput):
         store.list_owned_page(ALICE, limit=0)
-    with pytest.raises(InvalidInput):
-        store.list_owned_page(ALICE, limit=2, after="../x")
+    for cursor in ("../x", "s00000000", "s1/abc", made[0]):
+        with pytest.raises(InvalidInput):
+            store.list_owned_page(ALICE, limit=2, after=cursor)
+
+
+def test_a_page_of_owned_gadgets_reads_a_bounded_part_of_a_large_account(
+    store: LocalGadgetStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(local_module, "_OWNER_SEGMENT_SIZE", 3)
+    made = [store.create(ALICE, f"Board {n}").id for n in range(10)]
+    owner_dir = next((tmp_path / "gadgets" / "owners").iterdir())
+    assert sorted(path.name for path in owner_dir.iterdir()) == [
+        "s00000000",
+        "s00000001",
+        "s00000002",
+        "s00000003",
+    ]
+    listed: list[str] = []
+    real_listdir = os.listdir
+
+    def counting_listdir(path: object) -> list[str]:
+        listed.append(Path(str(path)).name)
+        return real_listdir(path)
+
+    monkeypatch.setattr(local_module.os, "listdir", counting_listdir)
+    page, cursor = store.list_owned_page(ALICE, limit=2)
+    # The segment names, and only the first segment's markers.
+    assert listed == [owner_dir.name, "s00000000"] and len(page) == 2 and cursor
+    listed.clear()
+
+    # Deleting every gadget in the next two segments leaves them empty: a page lists at
+    # most two of them, returns short, and still continues.
+    for gadget_id in made[3:9]:
+        store.delete(gadget_id)
+    page, cursor = store.list_owned_page(ALICE, limit=2, after=cursor)
+    assert len(listed) <= 3 and cursor is not None
+    monkeypatch.setattr(local_module.os, "listdir", real_listdir)
+    seen = [gadget_id for page in _owned_pages(store, ALICE, limit=2) for gadget_id in page]
+    assert sorted(seen) == sorted([*made[:3], made[9]])

@@ -18180,7 +18180,7 @@
     },
     "/v1/gadgets": {
       "get": {
-        "description": "A page of the caller's own gadgets in ID order: `{\"items\", \"next_cursor\"}`.",
+        "description": "A page of the caller's own gadgets, in the store's order: `{\"items\", \"next_cursor\"}`.\n\nFollow `next_cursor`; a page can be short and still continue.",
         "operationId": "list_gadgets_v1_gadgets_get",
         "parameters": [
           {
