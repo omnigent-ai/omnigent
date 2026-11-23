@@ -5,7 +5,12 @@ import { type ShortcutPageContext, shortcutPageGroups } from "@/lib/shortcuts/sh
 
 import { filterShortcutPage } from "./shortcutsFilter";
 
-const MAC: ShortcutEnvironment = { mac: true, native: false, desktopMenu: false };
+const MAC: ShortcutEnvironment = {
+  mac: true,
+  native: false,
+  desktopMenu: false,
+  submitWithModEnter: false,
+};
 const CONTEXT: ShortcutPageContext = {
   native: false,
   electron: false,
@@ -58,7 +63,12 @@ describe("filterShortcutPage", () => {
   it("finds a row the registry doesn't bind by the chord it shows, on a Mac and elsewhere", () => {
     expect(labels("cmd+shift+o")).toEqual(["Start a new session"]);
     expect(labels("⌘⇧O")).toEqual(["Start a new session"]);
-    const other: ShortcutEnvironment = { mac: false, native: false, desktopMenu: false };
+    const other: ShortcutEnvironment = {
+      mac: false,
+      native: false,
+      desktopMenu: false,
+      submitWithModEnter: false,
+    };
     const otherPage = shortcutPageGroups(CONTEXT, false);
     const otherLabels = (query: string) =>
       filterShortcutPage(otherPage, query, other).flatMap((group) =>
@@ -77,7 +87,12 @@ describe("filterShortcutPage", () => {
     expect(labels("ctrl+1")).toEqual(["Select a workspace tab"]);
     expect(labels("⌃4")).toEqual(["Select a workspace tab"]);
     expect(labels("cmd+option+3")).toEqual(["Jump to a sidebar session (1–10)"]);
-    const other: ShortcutEnvironment = { mac: false, native: false, desktopMenu: false };
+    const other: ShortcutEnvironment = {
+      mac: false,
+      native: false,
+      desktopMenu: false,
+      submitWithModEnter: false,
+    };
     const otherPage = shortcutPageGroups(CONTEXT, false);
     const otherLabels = (query: string) =>
       filterShortcutPage(otherPage, query, other).flatMap((group) =>

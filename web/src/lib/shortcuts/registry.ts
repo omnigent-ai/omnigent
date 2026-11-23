@@ -1,8 +1,9 @@
 // The keyboard shortcuts' chords, one entry per action. Hotkey hooks match
 // through it, so a chord is written down once instead of in each hook.
 
+import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isMacPlatform } from "@/lib/hotkeys";
-import { isNativeShell, supportsDesktopCommands } from "@/lib/nativeBridge";
+import { type DesktopCommand, isNativeShell, supportsDesktopCommands } from "@/lib/nativeBridge";
 import {
   type Chord,
   chordKeyLabel,
@@ -18,6 +19,8 @@ export interface ShortcutEnvironment {
   native: boolean;
   /** The desktop shell's menus own some chords (⌘, for Settings) and hand the command to the page. */
   desktopMenu: boolean;
+  /** The composer sends with ⌘↵ and inserts a newline with ↵. */
+  submitWithModEnter: boolean;
 }
 
 /** Environments built here, which read each field once, on first use. */
@@ -45,6 +48,9 @@ export function currentShortcutEnvironment(
     },
     get desktopMenu() {
       return read("desktopMenu", supportsDesktopCommands);
+    },
+    get submitWithModEnter() {
+      return read("submitWithModEnter", readSubmitWithModEnter);
     },
   };
   resolvedEnvironments.add(environment);
@@ -75,14 +81,20 @@ export const SHORTCUT_GROUPS: readonly ShortcutGroup[] = [
 
 /**
  * Who acts on a binding's chord. `app`: a window-level hotkey hook; `widget`: the focused
- * widget's own key handler. Both match through this registry. `unhandled`: nothing binds
- * the chord yet, so only its other entry points run the action.
+ * widget's own key handler. `menu`: a desktop menu item, whose accelerator hands its command
+ * to the page. `unhandled`: nothing binds the chord yet, so only other entry points run it.
  */
 export type ShortcutHandler =
-  { scope: "app" | "widget"; module: string } | { scope: "unhandled"; reason: string };
+  | { scope: "app" | "widget"; module: string }
+  | { scope: "menu"; command: DesktopCommand | "close-window" }
+  | { scope: "unhandled"; reason: string };
 
 const app = (module: string): ShortcutHandler => ({ scope: "app", module });
 const widget = (module: string): ShortcutHandler => ({ scope: "widget", module });
+const menu = (command: DesktopCommand | "close-window"): ShortcutHandler => ({
+  scope: "menu",
+  command,
+});
 
 // Handlers that several bindings share.
 const QUICK_PICK_SHORTCUTS = app("shell/quickPickShortcuts/QuickPickShortcutHost.tsx");
@@ -97,9 +109,53 @@ const GO_TO_FILE = {
 const FILE_EDITOR = widget("shell/codeMirror/CodeMirrorFileViewer.tsx");
 /** The editing commands' keymap, built from these bindings. */
 const EDITOR_COMMANDS = widget("shell/codeMirror/codeMirrorEditorCommands.ts");
+const COMPOSER = widget("components/composer/ChatComposer.tsx");
+const CHAT_PAGE = widget("pages/ChatPage.tsx");
+const QUESTION_FORM = widget("components/blocks/AskUserQuestionForm.tsx");
+const SLASH_MENU = widget("hooks/useSlashCompletion.ts");
 
 const NOT_IN_PALETTE_YET = "Not in ⌘K yet.";
 const ACTS_WHERE_PRESSED = "Acts on what has focus or is on screen, so it has no ⌘K row.";
+const EDITS_MESSAGE = "It edits the message you're typing in the chat input.";
+const ACTS_ON_QUESTION = "It acts on the question form on screen.";
+const ACTS_ON_MENU = "It acts on the open suggestions menu.";
+const MENU_COMMAND = "The desktop app's menu runs it; ⌘K offers the same action where it applies.";
+
+/** A binding the Keyboard shortcuts page leaves out, such as one listed on another's row. */
+const NOT_LISTED = (): boolean => false;
+
+const ENTER: Chord = { key: "Enter" };
+const SLASH_NEXT: Chord = { key: "ArrowDown" };
+const MOD_ENTER: Chord = { mod: true, key: "Enter" };
+/** A question's first nine rows by digit: its options, then the custom answer. */
+const QUESTION_OPTION_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"] as const;
+
+/** What the current runtime supports, which decides the Keyboard shortcuts page's rows. */
+export interface ShortcutPageContext {
+  /** A native shell, where chords a browser reserves (⌘-digit, ⌘B) are free. */
+  native: boolean;
+  electron: boolean;
+  /** The shell hosts browser tabs in the workspace rail. */
+  browser: boolean;
+  /** The composer sends on ⌘/Ctrl+Enter instead of Enter. */
+  submitWithModEnter: boolean;
+  /** Touch or narrow layout, where Enter inserts a newline instead of sending. */
+  preventsKeyboardSubmit: boolean;
+  contentSearch: boolean;
+  grids: boolean;
+  splitTerminal: boolean;
+  siblingSessions: boolean;
+  /** The shell's menus hand desktop commands (Close, Pin, Quit) to the page. */
+  desktopCommands: boolean;
+  /** quick_pick_palette is on, so Ctrl+Tab steps to the next session instead of switching. */
+  quickPick: boolean;
+}
+
+/** What a page row's keys may depend on. */
+interface ShortcutRowContext {
+  context: ShortcutPageContext;
+  environment: ShortcutEnvironment;
+}
 
 interface ShortcutBindingDefinition {
   label: string;
@@ -109,8 +165,8 @@ interface ShortcutBindingDefinition {
   paletteCommand?: string;
   /** Why the action has no ⌘K command; every app binding has a command or a reason. */
   paletteExempt?: string;
-  /** The page row's keys, from the first chord's, when they differ, such as a range of digits. */
-  rowKeys?: (firstChordKeys: string[], context: { contentSearch: boolean }) => string[];
+  /** The page row's keys, from the shown chord's, when they differ, such as a range of digits. */
+  rowKeys?: (shownKeys: string[], row: ShortcutRowContext) => string[];
   /**
    * The chords the page matches here, the shown one first; empty where something else owns
    * the action's chord.
@@ -120,6 +176,18 @@ interface ShortcutBindingDefinition {
   secondaryChords?: (environment: ShortcutEnvironment) => Chord[];
   /** What acts on the chord. */
   handler: ShortcutHandler;
+  /** The desktop menu's accelerators for the action, shown where it owns them; never matched here. */
+  menuChords?: (environment: ShortcutEnvironment) => Chord[];
+  /** Listed on another binding's page row as its alternative chord; that binding's id. */
+  alternateOf?: string;
+  /** Listed on another binding's page row, whose keys include this chord; that binding's id. */
+  partOf?: string;
+  /** Whether an alternate's chord is listed here; defaults to true. */
+  advertised?: (environment: ShortcutEnvironment) => boolean;
+  /** Whether the Keyboard shortcuts page lists the binding here; defaults to true. */
+  shownWhen?: (context: ShortcutPageContext) => boolean;
+  /** Left off touch and narrow layouts, where Enter inserts a newline instead of submitting. */
+  desktopOnly?: true;
   /** The feature flag a binding waits for; it's left out of `SHORTCUT_BINDINGS` until then. */
   flag?: "quick_pick_palette";
 }
@@ -160,6 +228,29 @@ const browserOpenSessionChord =
     environment.desktopMenu || (!environment.mac && !offMac) ? [] : [chord];
 
 const APP_BINDINGS = {
+  "session.new": {
+    group: "general",
+    handler: app("hooks/useNewSessionHotkey.ts"),
+    paletteCommand: "new-chat",
+    label: "Start a new session",
+    // A browser keeps ⌘N for a new window. Match the key that types N or O, on any layout.
+    chords: (environment) =>
+      environment.native ? [{ mod: true, key: "n" }] : [{ mod: true, shift: true, key: "o" }],
+    // The browser chord spells out Shift off macOS, as its tooltip does.
+    rowKeys: (keys, { environment }) =>
+      environment.native || environment.mac
+        ? keys
+        : keys.map((key) => (key === "⇧" ? "Shift" : key)),
+  },
+  "session.addSibling": {
+    group: "general",
+    handler: app("hooks/useAddSiblingSessionHotkey.ts"),
+    paletteExempt: NOT_IN_PALETTE_YET,
+    label: "Add nested agent",
+    // The physical key, because Option changes the character it types.
+    chords: () => [{ mod: true, alt: true, code: "KeyA" }],
+    shownWhen: (context) => context.siblingSessions,
+  },
   "palette.commands": {
     group: "general",
     handler: app("hooks/useCommandPaletteHotkey.ts"),
@@ -177,22 +268,6 @@ const APP_BINDINGS = {
     paletteExempt: "Opens ⌘K's own session search.",
     label: "Find a session by name",
     chords: () => [{ mod: true, alt: true, code: "KeyS" }],
-  },
-  "shortcuts.show": {
-    group: "general",
-    handler: app("components/KeyboardShortcutsDialog.tsx"),
-    paletteExempt: NOT_IN_PALETTE_YET,
-    label: "Show keyboard shortcuts",
-    chords: () => [{ mod: true, key: "/", exactKey: true, matchesAltGraph: true }],
-  },
-  "session.new": {
-    group: "general",
-    handler: app("hooks/useNewSessionHotkey.ts"),
-    paletteCommand: "new-chat",
-    label: "Start a new session",
-    // A browser keeps ⌘N for a new window. Match the key that types N or O, on any layout.
-    chords: (environment) =>
-      environment.native ? [{ mod: true, key: "n" }] : [{ mod: true, shift: true, key: "o" }],
   },
   "session.rename": {
     group: "general",
@@ -217,20 +292,258 @@ const APP_BINDINGS = {
     // The desktop menu's Settings item owns ⌘, there; a browser keeps ⌘, for its own settings.
     chords: (environment) =>
       environment.desktopMenu ? [] : [{ mod: true, alt: true, code: "Comma" }],
+    menuChords: (environment) => (environment.desktopMenu ? [{ mod: true, code: "Comma" }] : []),
   },
-  "history.back": {
-    group: "navigation",
-    handler: app("hooks/useHistoryNavigation.ts"),
+  "shortcuts.show": {
+    group: "general",
+    handler: app("components/KeyboardShortcutsDialog.tsx"),
     paletteExempt: NOT_IN_PALETTE_YET,
-    label: "Go back",
-    chords: () => [{ mod: true, code: "BracketLeft", matchesAltGraph: true }],
+    label: "Show keyboard shortcuts",
+    chords: () => [{ mod: true, key: "/", exactKey: true, matchesAltGraph: true }],
   },
-  "history.forward": {
+  // The desktop app's menu items, whose accelerators reach the page as commands.
+  "tab.close": {
+    group: "general",
+    handler: menu("close"),
+    paletteExempt: MENU_COMMAND,
+    label: "Close tab, or leave the session",
+    chords: () => [],
+    menuChords: (environment) => (environment.desktopMenu ? [{ mod: true, code: "KeyW" }] : []),
+  },
+  "window.close": {
+    group: "general",
+    handler: menu("close-window"),
+    paletteExempt: MENU_COMMAND,
+    label: "Close window",
+    chords: () => [],
+    menuChords: (environment) =>
+      environment.desktopMenu ? [{ mod: true, shift: true, code: "KeyW" }] : [],
+  },
+  // QuickPickShortcutHost runs these browser chords; the desktop menu keeps its own.
+  "session.pin": {
+    group: "general",
+    handler: QUICK_PICK_SHORTCUTS,
+    label: "Pin or unpin current session",
+    chords: browserOpenSessionChord(OPEN_SESSION_CHORDS.pin, false),
+    flag: "quick_pick_palette",
+    menuChords: (environment) => (environment.desktopMenu ? [OPEN_SESSION_CHORDS.pin] : []),
+    shownWhen: (context) => context.desktopCommands,
+  },
+  "session.archive": {
+    group: "general",
+    handler: QUICK_PICK_SHORTCUTS,
+    label: "Archive current session",
+    chords: browserOpenSessionChord(OPEN_SESSION_CHORDS.archive, true),
+    flag: "quick_pick_palette",
+    menuChords: (environment) => (environment.desktopMenu ? [OPEN_SESSION_CHORDS.archive] : []),
+    shownWhen: (context) => context.desktopCommands,
+  },
+  "session.fork": {
+    group: "general",
+    handler: QUICK_PICK_SHORTCUTS,
+    label: "Fork current session",
+    chords: browserOpenSessionChord(OPEN_SESSION_CHORDS.fork, false),
+    flag: "quick_pick_palette",
+    menuChords: (environment) => (environment.desktopMenu ? [OPEN_SESSION_CHORDS.fork] : []),
+    shownWhen: (context) => context.desktopCommands,
+  },
+  "app.quit": {
+    group: "general",
+    handler: menu("quit"),
+    paletteExempt: MENU_COMMAND,
+    label: "Quit Omnigent",
+    chords: () => [],
+    menuChords: (environment) => (environment.desktopMenu ? [{ mod: true, code: "KeyQ" }] : []),
+  },
+  // The composer's own keys. Touch and narrow layouts insert a newline on Enter instead.
+  "composer.send": {
+    group: "chats",
+    handler: COMPOSER,
+    paletteExempt: EDITS_MESSAGE,
+    label: "Send message",
+    chords: (environment) => [environment.submitWithModEnter ? MOD_ENTER : ENTER],
+    shownWhen: (context) => !context.preventsKeyboardSubmit,
+  },
+  "composer.sendWithQueue": {
+    group: "chats",
+    handler: COMPOSER,
+    paletteExempt: EDITS_MESSAGE,
+    label: "Send now, with all queued messages",
+    chords: (environment) => [
+      environment.submitWithModEnter ? { ...MOD_ENTER, shift: true } : MOD_ENTER,
+    ],
+    shownWhen: (context) => !context.preventsKeyboardSubmit,
+  },
+  "composer.newLine": {
+    group: "chats",
+    handler: COMPOSER,
+    paletteExempt: EDITS_MESSAGE,
+    label: "New line in message",
+    chords: (environment) => [
+      environment.submitWithModEnter ? ENTER : { shift: true, key: "Enter" },
+    ],
+    shownWhen: (context) => !context.preventsKeyboardSubmit,
+  },
+  // Alt+Enter is a newline in both modes; the browser inserts the others itself.
+  "composer.newLineWithAlt": {
+    group: "chats",
+    handler: COMPOSER,
+    paletteExempt: EDITS_MESSAGE,
+    label: "New line in message",
+    chords: () => [{ alt: true, key: "Enter" }],
+    alternateOf: "composer.newLine",
+    // Plain Enter already is a newline when ⌘↵ sends, so only the other mode lists it.
+    advertised: (environment) => !environment.submitWithModEnter,
+  },
+  "composer.previousPrompt": {
+    group: "chats",
+    handler: CHAT_PAGE,
+    paletteExempt: EDITS_MESSAGE,
+    label: "Recall previous prompt",
+    chords: () => [{ key: "ArrowUp" }],
+  },
+  "composer.nextPrompt": {
+    group: "chats",
+    handler: CHAT_PAGE,
+    paletteExempt: EDITS_MESSAGE,
+    label: "Recall next prompt",
+    chords: () => [{ key: "ArrowDown" }],
+  },
+  // Approval chords allow AltGr and compare the key exactly, as they always have.
+  "approval.accept": {
+    group: "chats",
+    handler: app("hooks/useApproveHotkey.ts"),
+    paletteExempt: ACTS_WHERE_PRESSED,
+    label: "Accept approval prompt",
+    chords: () => [{ mod: true, key: "Enter", exactKey: true, matchesAltGraph: true }],
+  },
+  "approval.decline": {
+    group: "chats",
+    handler: app("hooks/useApproveHotkey.ts"),
+    paletteExempt: ACTS_WHERE_PRESSED,
+    label: "Decline approval prompt",
+    chords: () => [{ key: "Escape", exactKey: true, matchesAltGraph: true }],
+  },
+  // A pending question's own keys.
+  "question.next": {
+    group: "chats",
+    handler: QUESTION_FORM,
+    paletteExempt: ACTS_ON_QUESTION,
+    label: "Next question, or submit all answers",
+    chords: () => [ENTER],
+    desktopOnly: true,
+  },
+  "question.pickOption": {
+    group: "chats",
+    handler: QUESTION_FORM,
+    paletteExempt: ACTS_ON_QUESTION,
+    label: "Pick a question option by number",
+    chords: () => QUESTION_OPTION_DIGITS.map((digit) => ({ key: digit })),
+    desktopOnly: true,
+    rowKeys: () => ["1…9"],
+  },
+  "question.cancel": {
+    group: "chats",
+    handler: QUESTION_FORM,
+    paletteExempt: ACTS_ON_QUESTION,
+    label: "Cancel pending question",
+    chords: () => [{ key: "Escape" }],
+    desktopOnly: true,
+  },
+  // Literal Control on macOS too: ⌘⇧M is a browser's profile switcher and ⌘⌥M minimizes
+  // every window. Physical keys, since Shift and Alt change the character.
+  "model.picker": {
+    group: "chats",
+    handler: app("hooks/useModelPickerHotkey.ts"),
+    paletteExempt: ACTS_WHERE_PRESSED,
+    label: "Open model picker",
+    chords: () => [{ ctrl: true, shift: true, code: "KeyM" }],
+  },
+  "model.cycle": {
+    group: "chats",
+    handler: app("hooks/useComposerConfigCycleHotkeys.ts"),
+    paletteExempt: ACTS_WHERE_PRESSED,
+    label: "Cycle model",
+    chords: () => [{ ctrl: true, alt: true, code: "KeyM" }],
+  },
+  "effort.cycle": {
+    group: "chats",
+    handler: app("hooks/useComposerConfigCycleHotkeys.ts"),
+    paletteExempt: ACTS_WHERE_PRESSED,
+    label: "Cycle reasoning effort",
+    chords: () => [{ ctrl: true, alt: true, code: "KeyE" }],
+  },
+  "composer.cyclePermissionMode": {
+    group: "chats",
+    handler: widget("lib/permissionModeCycle.ts"),
+    paletteExempt: "It works from the chat input, whose permission menu lists every mode.",
+    label: "Cycle permission mode (in session)",
+    chords: () => [{ shift: true, key: "Tab" }],
+  },
+  "composer.focus": {
+    group: "chats",
+    handler: app("hooks/useFocusComposerHotkey.ts"),
+    paletteExempt: ACTS_WHERE_PRESSED,
+    label: "Focus chat input",
+    chords: () => [{ ctrl: true, shift: true, code: "KeyL" }],
+  },
+  "dictation.toggle": {
+    group: "chats",
+    handler: app("hooks/useVoiceDictationHotkey.ts"),
+    paletteExempt: ACTS_WHERE_PRESSED,
+    label: "Toggle voice dictation",
+    chords: () => [{ mod: true, alt: true, code: "KeyV" }],
+  },
+  "response.stop": {
+    group: "chats",
+    handler: CHAT_PAGE,
+    paletteExempt: ACTS_WHERE_PRESSED,
+    label: "Stop response",
+    chords: () => [{ key: "Escape" }],
+  },
+  "message.previous": {
+    group: "chats",
+    handler: app("hooks/useMessageNavHotkeys.ts"),
+    label: "Go to previous message",
+    chords: () => [MESSAGE_STEP_CHORDS.previous],
+    secondaryChords: () => [{ ...MESSAGE_STEP_CHORDS.previous, shift: true }],
+    flag: "quick_pick_palette",
+    shownWhen: NOT_LISTED,
+  },
+  "message.next": {
+    group: "chats",
+    handler: app("hooks/useMessageNavHotkeys.ts"),
+    label: "Go to next message",
+    chords: () => [MESSAGE_STEP_CHORDS.next],
+    secondaryChords: () => [{ ...MESSAGE_STEP_CHORDS.next, shift: true }],
+    flag: "quick_pick_palette",
+    shownWhen: NOT_LISTED,
+  },
+  // With quick_pick_palette on, each runs its ⌘K command, and Ctrl+Tab steps instead of
+  // opening the recent switcher. A browser keeps Ctrl+Tab, so the desktop app lists it first.
+  "session.next": {
     group: "navigation",
-    handler: app("hooks/useHistoryNavigation.ts"),
-    paletteExempt: NOT_IN_PALETTE_YET,
-    label: "Go forward",
-    chords: () => [{ mod: true, code: "BracketRight", matchesAltGraph: true }],
+    handler: QUICK_PICK_SHORTCUTS,
+    paletteCommand: "next-session",
+    label: "Next session",
+    chords: (environment) =>
+      sessionStepChords(environment, { ctrl: true, key: "Tab", exactKey: true }, "ArrowDown"),
+    flag: "quick_pick_palette",
+    shownWhen: (context) => context.electron && context.quickPick,
+  },
+  "session.previous": {
+    group: "navigation",
+    handler: QUICK_PICK_SHORTCUTS,
+    paletteCommand: "previous-session",
+    label: "Previous session",
+    chords: (environment) =>
+      sessionStepChords(
+        environment,
+        { ctrl: true, shift: true, key: "Tab", exactKey: true },
+        "ArrowUp",
+      ),
+    flag: "quick_pick_palette",
+    shownWhen: (context) => context.electron && context.quickPick,
   },
   // With quick_pick_palette on, Ctrl+Tab is Next session instead.
   "sessions.recent": {
@@ -243,6 +556,25 @@ const APP_BINDINGS = {
       { ctrl: true, key: "Tab", exactKey: true },
       { ctrl: true, shift: true, key: "Tab", exactKey: true },
     ],
+    shownWhen: (context) => context.electron && !context.quickPick,
+  },
+  "history.back": {
+    group: "navigation",
+    handler: app("hooks/useHistoryNavigation.ts"),
+    paletteExempt: NOT_IN_PALETTE_YET,
+    label: "Go back",
+    chords: () => [{ mod: true, code: "BracketLeft", matchesAltGraph: true }],
+    // A browser tab keeps its own Back and Forward.
+    shownWhen: (context) => context.electron,
+  },
+  "history.forward": {
+    group: "navigation",
+    handler: app("hooks/useHistoryNavigation.ts"),
+    paletteExempt: NOT_IN_PALETTE_YET,
+    label: "Go forward",
+    chords: () => [{ mod: true, code: "BracketRight", matchesAltGraph: true }],
+    // A browser tab keeps its own Back and Forward.
+    shownWhen: (context) => context.electron,
   },
   "session.number": {
     group: "navigation",
@@ -258,6 +590,26 @@ const APP_BINDINGS = {
           ? { mod: true, key: digit, exactKey: true, matchesAltGraph: true }
           : { mod: true, alt: true, code: `Digit${digit}` },
       ),
+  },
+  // Hold Control and press ] or [ to walk recently visited sessions, then release to switch.
+  // macOS only: elsewhere Ctrl is the command key, and Ctrl+[ and Ctrl+] are taken.
+  "session.recent": {
+    group: "navigation",
+    handler: app("hooks/useRecentSessionSwitch.ts"),
+    paletteCommand: "recent-session",
+    label: "Switch to recent session",
+    chords: (environment) => (environment.mac ? [{ ctrl: true, code: "BracketRight" }] : []),
+    flag: "quick_pick_palette",
+    shownWhen: NOT_LISTED,
+  },
+  "session.recentReverse": {
+    group: "navigation",
+    handler: app("hooks/useRecentSessionSwitch.ts"),
+    paletteExempt: "It steps back while the switcher is held; Switch to recent session opens it.",
+    label: "Switch to recent session (reverse)",
+    chords: (environment) => (environment.mac ? [{ ctrl: true, code: "BracketLeft" }] : []),
+    flag: "quick_pick_palette",
+    shownWhen: NOT_LISTED,
   },
   "view.mode": {
     group: "view",
@@ -288,10 +640,18 @@ const APP_BINDINGS = {
         ? [{ mod: true, shift: true, key: "b" }]
         : [{ mod: true, alt: true, code: "BracketRight" }],
   },
+  "workspace.searchContents": {
+    group: "view",
+    handler: { scope: "unhandled", reason: "Nothing binds the chord the page lists." },
+    paletteExempt: NOT_IN_PALETTE_YET,
+    label: "Search workspace contents",
+    chords: () => [{ mod: true, shift: true, code: "KeyF" }],
+    shownWhen: (context) => context.contentSearch,
+  },
   "workspace.tab": {
     group: "view",
     handler: app("hooks/useWorkspaceTabHotkeys.ts"),
-    rowKeys: (keys, { contentSearch }) => withRangeLabel(keys, contentSearch ? "1…5" : "1…4"),
+    rowKeys: (keys, { context }) => withRangeLabel(keys, context.contentSearch ? "1…5" : "1…4"),
     paletteExempt: "Picks a workspace tab by its position.",
     label: "Select a workspace tab",
     // ⌃1–⌃9 on macOS; Alt elsewhere, where Ctrl+digit is a sidebar session.
@@ -302,6 +662,15 @@ const APP_BINDINGS = {
           : { alt: true, code: `Digit${digit}` },
       ),
   },
+  "browser.newTab": {
+    group: "view",
+    handler: menu("new-browser-tab"),
+    paletteExempt: MENU_COMMAND,
+    label: "Open a new browser tab",
+    chords: () => [],
+    menuChords: (environment) => (environment.desktopMenu ? [{ mod: true, code: "KeyT" }] : []),
+    shownWhen: (context) => context.browser,
+  },
   "terminal.new": {
     group: "view",
     handler: app("hooks/useNewShellHotkey.ts"),
@@ -310,57 +679,59 @@ const APP_BINDINGS = {
     // Literal Control on every platform, so it never meets macOS window cycling (⌘`).
     chords: () => [{ ctrl: true, code: "Backquote", matchesAltGraph: true }],
   },
-  // Literal Control on macOS too: ⌘⇧M is a browser's profile switcher and ⌘⌥M minimizes
-  // every window. Physical keys, since Shift and Alt change the character.
-  "model.picker": {
-    group: "chats",
-    handler: app("hooks/useModelPickerHotkey.ts"),
-    paletteExempt: ACTS_WHERE_PRESSED,
-    label: "Open model picker",
-    chords: () => [{ ctrl: true, shift: true, code: "KeyM" }],
+  "tab.previous": {
+    group: "view",
+    handler: menu("previous-tab"),
+    paletteExempt: MENU_COMMAND,
+    label: "Show the previous workspace tab",
+    chords: () => [],
+    menuChords: (environment) =>
+      environment.desktopMenu ? [{ mod: true, shift: true, code: "BracketLeft" }] : [],
   },
-  "model.cycle": {
-    group: "chats",
-    handler: app("hooks/useComposerConfigCycleHotkeys.ts"),
-    paletteExempt: ACTS_WHERE_PRESSED,
-    label: "Cycle model",
-    chords: () => [{ ctrl: true, alt: true, code: "KeyM" }],
+  "tab.next": {
+    group: "view",
+    handler: menu("next-tab"),
+    paletteExempt: MENU_COMMAND,
+    label: "Show the next workspace tab",
+    chords: () => [],
+    menuChords: (environment) =>
+      environment.desktopMenu ? [{ mod: true, shift: true, code: "BracketRight" }] : [],
   },
-  "effort.cycle": {
-    group: "chats",
-    handler: app("hooks/useComposerConfigCycleHotkeys.ts"),
-    paletteExempt: ACTS_WHERE_PRESSED,
-    label: "Cycle reasoning effort",
-    chords: () => [{ ctrl: true, alt: true, code: "KeyE" }],
+  "tab.reopen": {
+    group: "view",
+    handler: menu("reopen-closed-tab"),
+    paletteExempt: MENU_COMMAND,
+    label: "Reopen the last closed tab",
+    chords: () => [],
+    menuChords: (environment) =>
+      environment.desktopMenu ? [{ mod: true, shift: true, code: "KeyT" }] : [],
   },
-  "composer.focus": {
-    group: "chats",
-    handler: app("hooks/useFocusComposerHotkey.ts"),
-    paletteExempt: ACTS_WHERE_PRESSED,
-    label: "Focus chat input",
-    chords: () => [{ ctrl: true, shift: true, code: "KeyL" }],
+  "browser.reload": {
+    group: "view",
+    handler: menu("reload"),
+    paletteExempt: MENU_COMMAND,
+    label: "Reload the browser tab",
+    chords: () => [],
+    menuChords: (environment) => (environment.desktopMenu ? [{ mod: true, code: "KeyR" }] : []),
+    shownWhen: (context) => context.browser,
   },
-  "dictation.toggle": {
-    group: "chats",
-    handler: app("hooks/useVoiceDictationHotkey.ts"),
-    paletteExempt: ACTS_WHERE_PRESSED,
-    label: "Toggle voice dictation",
-    chords: () => [{ mod: true, alt: true, code: "KeyV" }],
+  "browser.focusAddressBar": {
+    group: "view",
+    handler: menu("focus-address-bar"),
+    paletteExempt: MENU_COMMAND,
+    label: "Focus the browser address bar",
+    chords: () => [],
+    menuChords: (environment) => (environment.desktopMenu ? [{ mod: true, code: "KeyL" }] : []),
+    shownWhen: (context) => context.browser,
   },
-  // Approval chords allow AltGr and compare the key exactly, as they always have.
-  "approval.accept": {
-    group: "chats",
-    handler: app("hooks/useApproveHotkey.ts"),
+  "fileViewer.exitFullScreen": {
+    group: "view",
+    handler: widget("shell/FileViewer.tsx"),
     paletteExempt: ACTS_WHERE_PRESSED,
-    label: "Accept approval prompt",
-    chords: () => [{ mod: true, key: "Enter", exactKey: true, matchesAltGraph: true }],
-  },
-  "approval.decline": {
-    group: "chats",
-    handler: app("hooks/useApproveHotkey.ts"),
-    paletteExempt: ACTS_WHERE_PRESSED,
-    label: "Decline approval prompt",
-    chords: () => [{ key: "Escape", exactKey: true, matchesAltGraph: true }],
+    label: "Exit full screen from a file",
+    chords: () => [{ key: "Escape" }],
+    // Touch and narrow layouts have no workspace full screen.
+    shownWhen: (context) => !context.preventsKeyboardSubmit,
   },
   "pane.previous": {
     group: "panes",
@@ -368,6 +739,7 @@ const APP_BINDINGS = {
     paletteExempt: ACTS_WHERE_PRESSED,
     label: "Focus previous pane",
     chords: () => [{ mod: true, alt: true, shift: true, code: "BracketLeft" }],
+    shownWhen: (context) => context.grids || context.splitTerminal,
   },
   "pane.next": {
     group: "panes",
@@ -375,6 +747,7 @@ const APP_BINDINGS = {
     paletteExempt: ACTS_WHERE_PRESSED,
     label: "Focus next pane",
     chords: () => [{ mod: true, alt: true, shift: true, code: "BracketRight" }],
+    shownWhen: (context) => context.grids || context.splitTerminal,
   },
   "terminal.splitRight": {
     group: "panes",
@@ -382,6 +755,7 @@ const APP_BINDINGS = {
     paletteExempt: ACTS_WHERE_PRESSED,
     label: "Split terminal right",
     chords: () => [{ mod: true, alt: true, shift: true, code: "Backslash" }],
+    shownWhen: (context) => context.splitTerminal,
   },
   "terminal.splitDown": {
     group: "panes",
@@ -389,86 +763,39 @@ const APP_BINDINGS = {
     paletteExempt: ACTS_WHERE_PRESSED,
     label: "Split terminal down",
     chords: () => [{ mod: true, alt: true, code: "Minus" }],
+    shownWhen: (context) => context.splitTerminal,
   },
-  // With quick_pick_palette on, each runs its ⌘K command, and Ctrl+Tab steps instead of
-  // opening the recent switcher. A browser keeps Ctrl+Tab, so the desktop app lists it first.
-  "session.next": {
-    group: "navigation",
-    handler: QUICK_PICK_SHORTCUTS,
-    paletteCommand: "next-session",
-    label: "Next session",
-    chords: (environment) =>
-      sessionStepChords(environment, { ctrl: true, key: "Tab", exactKey: true }, "ArrowDown"),
-    flag: "quick_pick_palette",
+  // The open suggestions menu's own keys.
+  "slash.previous": {
+    group: "slash",
+    handler: SLASH_MENU,
+    paletteExempt: ACTS_ON_MENU,
+    label: "Navigate suggestions",
+    chords: () => [{ key: "ArrowUp" }],
+    rowKeys: (keys, { environment }) => [...keys, ...chordKeys(SLASH_NEXT, environment.mac)],
   },
-  "session.previous": {
-    group: "navigation",
-    handler: QUICK_PICK_SHORTCUTS,
-    paletteCommand: "previous-session",
-    label: "Previous session",
-    chords: (environment) =>
-      sessionStepChords(
-        environment,
-        { ctrl: true, shift: true, key: "Tab", exactKey: true },
-        "ArrowUp",
-      ),
-    flag: "quick_pick_palette",
+  "slash.next": {
+    group: "slash",
+    handler: SLASH_MENU,
+    paletteExempt: ACTS_ON_MENU,
+    label: "Navigate suggestions",
+    chords: () => [SLASH_NEXT],
+    // Listed on Navigate suggestions' row, beside ↑.
+    partOf: "slash.previous",
   },
-  // Hold Control and press ] or [ to walk recently visited sessions, then release to switch.
-  // macOS only: elsewhere Ctrl is the command key, and Ctrl+[ and Ctrl+] are taken.
-  "session.recent": {
-    group: "navigation",
-    handler: app("hooks/useRecentSessionSwitch.ts"),
-    paletteCommand: "recent-session",
-    label: "Switch to recent session",
-    chords: (environment) => (environment.mac ? [{ ctrl: true, code: "BracketRight" }] : []),
-    flag: "quick_pick_palette",
+  "slash.apply": {
+    group: "slash",
+    handler: SLASH_MENU,
+    paletteExempt: ACTS_ON_MENU,
+    label: "Apply highlighted command",
+    chords: () => [{ key: "Tab" }],
   },
-  "session.recentReverse": {
-    group: "navigation",
-    handler: app("hooks/useRecentSessionSwitch.ts"),
-    paletteExempt: "It steps back while the switcher is held; Switch to recent session opens it.",
-    label: "Switch to recent session (reverse)",
-    chords: (environment) => (environment.mac ? [{ ctrl: true, code: "BracketLeft" }] : []),
-    flag: "quick_pick_palette",
-  },
-  // QuickPickShortcutHost runs these browser chords; the desktop menu keeps its own.
-  "session.pin": {
-    group: "general",
-    handler: QUICK_PICK_SHORTCUTS,
-    label: "Pin or unpin current session",
-    chords: browserOpenSessionChord(OPEN_SESSION_CHORDS.pin, false),
-    flag: "quick_pick_palette",
-  },
-  "session.archive": {
-    group: "general",
-    handler: QUICK_PICK_SHORTCUTS,
-    label: "Archive current session",
-    chords: browserOpenSessionChord(OPEN_SESSION_CHORDS.archive, true),
-    flag: "quick_pick_palette",
-  },
-  "session.fork": {
-    group: "general",
-    handler: QUICK_PICK_SHORTCUTS,
-    label: "Fork current session",
-    chords: browserOpenSessionChord(OPEN_SESSION_CHORDS.fork, false),
-    flag: "quick_pick_palette",
-  },
-  "message.previous": {
-    group: "chats",
-    handler: app("hooks/useMessageNavHotkeys.ts"),
-    label: "Go to previous message",
-    chords: () => [MESSAGE_STEP_CHORDS.previous],
-    secondaryChords: () => [{ ...MESSAGE_STEP_CHORDS.previous, shift: true }],
-    flag: "quick_pick_palette",
-  },
-  "message.next": {
-    group: "chats",
-    handler: app("hooks/useMessageNavHotkeys.ts"),
-    label: "Go to next message",
-    chords: () => [MESSAGE_STEP_CHORDS.next],
-    secondaryChords: () => [{ ...MESSAGE_STEP_CHORDS.next, shift: true }],
-    flag: "quick_pick_palette",
+  "slash.dismiss": {
+    group: "slash",
+    handler: SLASH_MENU,
+    paletteExempt: ACTS_ON_MENU,
+    label: "Dismiss menu",
+    chords: () => [{ key: "Escape" }],
   },
 } satisfies Record<string, ShortcutBindingDefinition>;
 
@@ -769,6 +1096,9 @@ const toBindings = (definitions: Record<string, ShortcutBindingDefinition>): Sho
 
 const APP_BINDING_LIST = toBindings(APP_BINDINGS);
 
+/** Every app binding in Keyboard shortcuts page order, those waiting for a flag included. */
+export const APP_SHORTCUT_BINDINGS: readonly ShortcutBinding[] = APP_BINDING_LIST;
+
 /** The workspace sidebar's bindings, in order, for the Keyboard Shortcuts page once it's routed. */
 export const WORKSPACE_SIDEBAR_BINDINGS: readonly ShortcutBinding[] = toBindings(
   WORKSPACE_SIDEBAR_DEFINITIONS,
@@ -834,6 +1164,20 @@ export function matchesShortcut(
   environment?: Partial<ShortcutEnvironment>,
 ): boolean {
   return matchedShortcutChordIndex(input, id, environment) !== -1;
+}
+
+/** The page row that lists binding `id`: its own, or the row it's an alternative on or part of. */
+export function shortcutDisplayRow(id: ShortcutId): ShortcutId {
+  const { alternateOf, partOf } = shortcutBinding(id);
+  return (alternateOf ?? partOf ?? id) as ShortcutId;
+}
+
+/** The desktop menu's accelerators for `id` here, which the page never matches. */
+export function menuShortcutChords(
+  id: ShortcutId,
+  environment?: Partial<ShortcutEnvironment>,
+): Chord[] {
+  return shortcutBinding(id).menuChords?.(currentShortcutEnvironment(environment)) ?? [];
 }
 
 /** Key caps for the first of `id`'s chords here, or none when it has no chord. */
@@ -904,15 +1248,4 @@ export function shortcutAriaKeys(
 /** Keys with the last one replaced by a range label such as "1…0". */
 function withRangeLabel(keys: string[], range: string): string[] {
   return [...keys.slice(0, -1), range];
-}
-
-/** The keys `id`'s Keyboard shortcuts page row shows here. */
-export function shortcutRowKeys(
-  id: ShortcutId,
-  environment: Partial<ShortcutEnvironment>,
-  context: { contentSearch: boolean },
-): string[] {
-  const keys = shortcutKeys(id, environment);
-  const rowKeys = shortcutBinding(id).rowKeys;
-  return rowKeys ? rowKeys(keys, context) : keys;
 }

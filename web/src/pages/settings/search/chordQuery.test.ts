@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import type { Chord, KeyChordInput } from "@/lib/shortcuts/chord";
 import {
   activeShortcutChords,
+  matchesShortcut,
+  shortcutDisplayRow,
   SHORTCUT_BINDINGS,
   type ShortcutEnvironment,
   type ShortcutId,
@@ -13,7 +15,7 @@ import { CHORD_TIER, parseChordQuery, rowsForChord, searchableChords } from "./c
 import type { SettingsAvailability } from "./catalog/types";
 import { searchSettings, settingsSearchTargets, textMatcher } from "./settingsSearchIndex";
 import { settingsSearchMatchers } from "./settingsSearchMatchers";
-import { isBoundShortcutRow, shortcutSettingsEntries } from "./shortcutEntries";
+import { shortcutSettingsEntries } from "./shortcutEntries";
 
 const press = (
   key: string,
@@ -216,10 +218,15 @@ function isBarePrintable(chord: Chord): boolean {
 /** Every environment the registry reads, as the page's own runtime can set them. */
 const ENVIRONMENTS: ShortcutEnvironment[] = [true, false].flatMap((mac) =>
   [true, false].flatMap((native) =>
-    [true, false].map((desktopMenu) => ({ mac, native, desktopMenu })),
+    [true, false].map((desktopMenu) => ({ mac, native, desktopMenu, submitWithModEnter: false })),
   ),
 );
-const MAC_DESKTOP: ShortcutEnvironment = { mac: true, native: true, desktopMenu: true };
+const MAC_DESKTOP: ShortcutEnvironment = {
+  mac: true,
+  native: true,
+  desktopMenu: true,
+  submitWithModEnter: false,
+};
 
 const ALL_LISTED: ReadonlySet<ShortcutId> = new Set(SHORTCUT_BINDINGS.map((binding) => binding.id));
 
@@ -229,7 +236,7 @@ const rows = (query: string, environment: ShortcutEnvironment) => {
 };
 
 describe("finding shortcuts by chord", () => {
-  it("finds each listed binding by any of its searchable chords, in every spelling", () => {
+  it("finds each listed binding's row by any of its searchable chords, in every spelling", () => {
     for (const environment of ENVIRONMENTS) {
       for (const binding of SHORTCUT_BINDINGS) {
         for (const chord of searchableChords(binding.id, environment)) {
@@ -237,7 +244,7 @@ describe("finding shortcuts by chord", () => {
             expect(
               rows(spelling, environment),
               `${spelling} in ${JSON.stringify(environment)}`,
-            ).toContain(binding.id);
+            ).toContain(shortcutDisplayRow(binding.id));
           }
         }
       }
@@ -302,9 +309,7 @@ const SHOWN: SettingsAvailability = {
 
 describe("chord results in Settings search", () => {
   const groups = shortcutPageGroups(PAGE_CONTEXT, true);
-  const listed = new Set(
-    groups.flatMap((group) => group.items.filter(isBoundShortcutRow).map((row) => row.shortcutId)),
-  );
+  const listed = new Set(groups.flatMap((group) => group.items.map((row) => row.shortcutId)));
   const targets = settingsSearchTargets(
     shortcutSettingsEntries(groups),
     [{ id: "shortcuts", label: "Keyboard shortcuts" }],
@@ -319,6 +324,28 @@ describe("chord results in Settings search", () => {
     expect(results[0]).toBe("palette.commands");
     expect(new Set(results).size).toBe(results.length);
     expect(CHORD_TIER).toBeLessThan(1);
+  });
+
+  it("finds a desktop menu row by the menu's accelerator, which no page hotkey matches", () => {
+    expect(keysFor("cmd w")[0]).toBe("tab.close");
+    expect(keysFor("cmd q")[0]).toBe("app.quit");
+    expect(keysFor("cmd ,")[0]).toBe("settings.open");
+    expect(keysFor("cmd opt p")[0]).toBe("session.pin");
+    expect(keysFor("cmd shift a")[0]).toBe("session.archive");
+    const closeTab = parseChordQuery("cmd w", true)!;
+    expect(matchesShortcut(closeTab, "tab.close", MAC_DESKTOP)).toBe(false);
+  });
+
+  it("finds no menu row in a browser tab, where the menu isn't there", () => {
+    const browser = { ...MAC_DESKTOP, native: false, desktopMenu: false };
+    const input = parseChordQuery("cmd w", true)!;
+    expect([...rowsForChord(input, browser, listed)]).not.toContain("tab.close");
+  });
+
+  it("finds the row an alternative or a part's chord is drawn on", () => {
+    expect(keysFor("opt enter")[0]).toBe("composer.newLine");
+    expect(keysFor("down")).toContain("slash.previous");
+    expect(keysFor("down")).not.toContain("slash.next");
   });
 
   it("ranks other queries by text alone", () => {

@@ -21,7 +21,7 @@ import { rowsForChord, searchableChords } from "@/pages/settings/search/chordQue
 
 const ENVIRONMENTS: ShortcutEnvironment[] = [true, false].flatMap((mac) =>
   [true, false].flatMap((native) =>
-    [true, false].map((desktopMenu) => ({ mac, native, desktopMenu })),
+    [true, false].map((desktopMenu) => ({ mac, native, desktopMenu, submitWithModEnter: false })),
   ),
 );
 

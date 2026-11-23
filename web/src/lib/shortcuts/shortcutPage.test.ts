@@ -4,6 +4,7 @@ import { SHORTCUT_GROUPS, shortcutBinding } from "./registry";
 import {
   type ShortcutPageContext,
   type ShortcutPageGroup,
+  type ShortcutPageRow,
   shortcutPageGroups,
 } from "./shortcutPage";
 import {
@@ -35,20 +36,21 @@ function everyContext(): ShortcutPageContext[] {
   ) as unknown as ShortcutPageContext[];
 }
 
-/** The recorded groups for `context`, assembled as the page would list them. */
+/** A page group as recorded, before rows named their registry binding. */
+type RecordedGroup = Omit<ShortcutPageGroup, "items"> & {
+  items: Omit<ShortcutPageRow, "shortcutId">[];
+};
+
 // The recorded rows predate the registry ids, which Settings search reads from the page.
-function withoutShortcutIds(groups: ShortcutPageGroup[]): ShortcutPageGroup[] {
+function withoutShortcutIds(groups: ShortcutPageGroup[]): RecordedGroup[] {
   return groups.map((group) => ({
     ...group,
-    items: group.items.map((row) => {
-      const copy = { ...row };
-      delete copy.shortcutId;
-      return copy;
-    }),
+    items: group.items.map(({ shortcutId: _shortcutId, ...row }) => row),
   }));
 }
 
-function goldenGroupsFor(context: ShortcutPageContext, mac: boolean): ShortcutPageGroup[] {
+/** The recorded groups for `context`, assembled as the page would list them. */
+function goldenGroupsFor(context: ShortcutPageContext, mac: boolean): RecordedGroup[] {
   const platform = mac ? 0 : 1;
   const caps = (keys: GoldenRow["keys"]) => keys[platform].split(" ");
   return Object.entries(GOLDEN_GROUP_FLAGS).flatMap(([title, flags]) => {
@@ -146,24 +148,6 @@ describe("shortcutPageGroups", () => {
     expect(labelsIn(BROWSER_TAB, "In chats").slice(0, 1)).toEqual(["Send message"]);
   });
 
-  it("ties the session number and workspace tab rows to a shortcut only with quickPick", () => {
-    const shortcutIds = (context: ShortcutPageContext) =>
-      shortcutPageGroups(context)
-        .flatMap((group) => group.items)
-        .filter((item) =>
-          [
-            shortcutBinding("session.number").label,
-            shortcutBinding("workspace.tab").label,
-          ].includes(item.label),
-        )
-        .map((item) => item.shortcutId);
-    expect(shortcutIds(BROWSER_TAB)).toEqual([undefined, undefined]);
-    expect(shortcutIds({ ...BROWSER_TAB, quickPick: true })).toEqual([
-      "session.number",
-      "workspace.tab",
-    ]);
-  });
-
   it("widens the workspace tab digits when content search adds a tab", () => {
     const tabRow = (context: ShortcutPageContext) =>
       shortcutPageGroups(context)
@@ -178,17 +162,25 @@ describe("shortcutPageGroups", () => {
 });
 
 describe("rows the registry binds", () => {
-  it("sit under their binding's group", () => {
+  it("are every row, each under its binding's group with its label", () => {
     for (const context of everyContext()) {
       for (const group of shortcutPageGroups(context, true)) {
         for (const row of group.items) {
-          if (row.shortcutId === undefined) continue;
-          const { title } = SHORTCUT_GROUPS.find(
-            (candidate) => candidate.id === shortcutBinding(row.shortcutId!).group,
-          )!;
+          const binding = shortcutBinding(row.shortcutId);
+          const { title } = SHORTCUT_GROUPS.find((candidate) => candidate.id === binding.group)!;
           expect(group.title, row.shortcutId).toBe(title);
+          expect(row.label, row.shortcutId).toBe(binding.label);
         }
       }
     }
+  });
+
+  it("show the desktop menu's chord where the menu owns it, and the page's elsewhere", () => {
+    const settingsKeys = (context: ShortcutPageContext) =>
+      shortcutPageGroups(context, true)
+        .flatMap((group) => group.items)
+        .find((row) => row.shortcutId === "settings.open")?.keys;
+    expect(settingsKeys({ ...BROWSER_TAB, desktopCommands: true })).toEqual(["⌘", ","]);
+    expect(settingsKeys(BROWSER_TAB)).toEqual(["⌘", "⌥", ","]);
   });
 });

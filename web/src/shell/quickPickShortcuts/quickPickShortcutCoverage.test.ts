@@ -36,7 +36,7 @@ const TAKES_OVER: Record<string, readonly string[]> = {
 
 const ENVIRONMENTS: ShortcutEnvironment[] = [true, false].flatMap((mac) =>
   [true, false].flatMap((native) =>
-    [true, false].map((desktopMenu) => ({ mac, native, desktopMenu })),
+    [true, false].map((desktopMenu) => ({ mac, native, desktopMenu, submitWithModEnter: false })),
   ),
 );
 
