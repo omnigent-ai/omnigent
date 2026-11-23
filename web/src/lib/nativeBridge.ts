@@ -1072,10 +1072,7 @@ export async function setWidenWindowForRightSidebar(enabled: boolean): Promise<b
   }
 }
 
-/**
- * Tell the shell the user opened (with its width in CSS px) or closed the right sidebar, so
- * its setting can resize the window. A no-op outside a shell that supports it.
- */
+/** Tell a supporting shell the user opened (`width` CSS px) or closed the right sidebar. */
 export function reportRightSidebarVisibility(open: boolean, width: number): void {
   if (!supportsWidenWindowForRightSidebar()) return;
   const bridge = electronApi()?.rightSidebarWindow;
