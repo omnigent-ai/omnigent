@@ -21,11 +21,13 @@ def _trace_events(cdp: CDPSession, page: Page) -> list[dict]:
         if "stream" in completed:
             break
         page.wait_for_timeout(100)
+    assert "stream" in completed, "the trace did not complete within 30 seconds"
     chunks = []
     while True:
         chunk = cdp.send("IO.read", {"handle": completed["stream"]})
         chunks.append(chunk["data"])
         if chunk.get("eof"):
+            cdp.send("IO.close", {"handle": completed["stream"]})
             return json.loads("".join(chunks))["traceEvents"]
 
 
@@ -56,6 +58,8 @@ def test_composer_keystroke_restyles_only_the_composer(
     if mac_shell:
         page.add_init_script(MAC_SHELL_INIT_SCRIPT)
     page.goto(f"{base_url}/c/{session_id}")
+    if mac_shell:
+        expect(page.locator("html")).to_have_attribute("data-electron-mac", "true")
     composer = page.get_by_label("Message the agent")
     composer.click()
     page_elements = page.evaluate("() => document.querySelectorAll('*').length")
@@ -74,7 +78,8 @@ def test_composer_keystroke_restyles_only_the_composer(
 
     assert composer.input_value() == TEXT
     assert len(per_keystroke) == len(TEXT)
-    assert statistics.median(per_keystroke) < page_elements / 4, (
-        f"a keystroke restyled a median of {statistics.median(per_keystroke)} elements "
-        f"on a page of {page_elements}"
+    median = statistics.median(per_keystroke)
+    # Each keystroke restyles the composer itself; a zero median means nothing was measured.
+    assert 0 < median < page_elements / 4, (
+        f"a keystroke restyled a median of {median} elements on a page of {page_elements}"
     )

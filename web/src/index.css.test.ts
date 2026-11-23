@@ -1282,10 +1282,22 @@ describe("index.css electron-mac window drag region", () => {
   });
 
   it("anchors no descendant selector on a root :has() so DOM edits stay cheap", () => {
-    const uncommentedCss = cssSource.replace(/\/\*[\s\S]*?\*\//g, "");
-    expect(uncommentedCss).not.toMatch(
-      /(?<![\w.#-])(?:html|body|:root)(?:\[[^\]]*\])*:has\([^)]*\)\s+[^\s{,]/,
+    const parenthesized = String.raw`\((?:[^()]|\([^()]*\))*\)`;
+    const compoundTail = String.raw`(?:\[[^\]]*\]|:[\w-]+(?:${parenthesized})?)*`;
+    const rootHasWithDescendant = new RegExp(
+      String.raw`(?<![\w.#-])(?:html|body|:root)${compoundTail}:has${parenthesized}${compoundTail}` +
+        String.raw`(?:\s*[>+~]\s*|\s+)[^\s{,)]`,
     );
+    for (const selector of [
+      "html[data-electron-mac]:has([data-fullscreen-overlay]) .actions {",
+      "html:has(:not(.x)) .y {",
+      "html:has(.x)[data-a]>.y {",
+    ]) {
+      expect(selector).toMatch(rootHasWithDescendant);
+    }
+    expect("html:has(.x), .y {").not.toMatch(rootHasWithDescendant);
+    const uncommentedCss = cssSource.replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(uncommentedCss).not.toMatch(rootHasWithDescendant);
   });
 
   it("covers the full width and height of the desktop header", () => {
