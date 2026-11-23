@@ -5,6 +5,8 @@
 // A call is allowed only when all of these hold:
 // - The browser reports transient user activation (`navigator.userActivation.isActive`). A click
 //   or key press anywhere in the page sets it for a few seconds, so on its own it proves nothing.
+//   A browser without the API gets the same few seconds from the moment the frame took focus,
+//   so a gadget left focused can't act for the viewer later.
 // - The gadget's frame is the focused element. A click or Tab into the frame focuses it, a click
 //   elsewhere in Omnigent moves focus away, and a cross-origin frame cannot take focus by script
 //   without a gesture of its own.
@@ -17,6 +19,8 @@
 //   apart, which bounds what one real click can start.
 
 const MIN_CALL_INTERVAL_MS = 1000;
+// About how long browsers keep transient activation after a click.
+const ACTIVATION_WINDOW_MS = 5000;
 const HOST_GESTURES = ["pointerdown", "mousedown", "touchstart", "keydown"] as const;
 
 export interface GadgetGestureGate {
@@ -30,14 +34,14 @@ export interface GadgetGestureGate {
 export interface GadgetGestureGateOptions {
   /** Holds the gadget's frame element and nothing else. Focus moves here after each decision. */
   frameHost: HTMLElement;
-  hasActivation?: () => boolean;
+  /** Whether the page has transient activation; `null` when the browser can't tell. */
+  hasActivation?: () => boolean | null;
   now?: () => number;
 }
 
-/** Browsers without the API rely on focus alone. */
-function pageHasActivation(): boolean {
+function pageHasActivation(): boolean | null {
   const activation = (navigator as { userActivation?: { isActive: boolean } }).userActivation;
-  return !activation || activation.isActive;
+  return activation ? activation.isActive : null;
 }
 
 export function createGadgetGestureGate({
@@ -49,6 +53,7 @@ export function createGadgetGestureGate({
   // Event order, not time: a Tab key press and the focus it moves can share a millisecond.
   let sequence = 0;
   let focusedAt: number | null = null;
+  let focusedAtTime = Number.NEGATIVE_INFINITY;
   let lastHostGesture = 0;
   let lastCallAt = Number.NEGATIVE_INFINITY;
 
@@ -60,6 +65,7 @@ export function createGadgetGestureGate({
     if (event.target !== frameHost) {
       sequence += 1;
       focusedAt = sequence;
+      focusedAtTime = now();
     }
   };
   // Chrome fires no focusin on the frame element when a click moves focus into the frame; Omnigent's
@@ -70,6 +76,7 @@ export function createGadgetGestureGate({
     if (frameFocused()) {
       sequence += 1;
       focusedAt = sequence;
+      focusedAtTime = now();
     }
   };
   // Untrusted events count too: only Omnigent's own scripts can dispatch them in its document,
@@ -88,12 +95,15 @@ export function createGadgetGestureGate({
   return {
     claim: () => {
       const focused = frameFocused();
+      const activation = hasActivation();
+      const activated =
+        activation === null ? now() - focusedAtTime <= ACTIVATION_WINDOW_MS : activation;
       const allowed =
         focused &&
         focusedAt !== null &&
         focusedAt > lastHostGesture &&
         now() - lastCallAt >= MIN_CALL_INTERVAL_MS &&
-        hasActivation();
+        activated;
       if (focused) {
         focusedAt = null;
         frameHost.focus({ preventScroll: true });

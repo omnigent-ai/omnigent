@@ -11,7 +11,7 @@ type FrameFocusReport = "focusin" | "window blur";
 
 let frameFocusReport: FrameFocusReport = "focusin";
 
-function setUp({ active = true }: { active?: boolean } = {}) {
+function setUp({ active = true }: { active?: boolean | null } = {}) {
   const hostButton = document.createElement("button");
   hostButton.textContent = "Composer";
   const frameHost = document.createElement("div");
@@ -20,7 +20,7 @@ function setUp({ active = true }: { active?: boolean } = {}) {
   frameHost.append(frame);
   document.body.append(hostButton, frameHost);
   let clock = 10_000;
-  const state = { active };
+  const state: { active: boolean | null } = { active };
   const gate = createGadgetGestureGate({
     frameHost,
     hasActivation: () => state.active,
@@ -124,6 +124,39 @@ describe.each<FrameFocusReport>(["focusin", "window blur"])(
       advance(1_000);
       gestureInFrame();
       expect(gate.claim()).toBe(true);
+      gate.dispose();
+    });
+
+    it("without the activation API, allows a call only just after the frame took focus", () => {
+      const { gate, gestureInFrame, advance } = setUp({ active: null });
+
+      gestureInFrame();
+      advance(1_000);
+      expect(gate.claim()).toBe(true);
+
+      // A gadget left focused can't act for the viewer later.
+      advance(1_000);
+      gestureInFrame();
+      advance(60_000);
+      expect(gate.claim()).toBe(false);
+      gate.dispose();
+    });
+
+    it("treats a browser without navigator.userActivation as unable to tell", () => {
+      expect("userActivation" in navigator).toBe(false);
+      const frameHost = document.createElement("div");
+      frameHost.tabIndex = -1;
+      const frame = document.createElement("iframe");
+      frameHost.append(frame);
+      document.body.append(frameHost);
+      let clock = 10_000;
+      const gate = createGadgetGestureGate({ frameHost, now: () => clock });
+
+      frame.focus();
+      if (report === "window blur") window.dispatchEvent(new FocusEvent("blur"));
+      clock += 60_000;
+
+      expect(gate.claim()).toBe(false);
       gate.dispose();
     });
 
