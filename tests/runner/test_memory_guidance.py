@@ -586,7 +586,7 @@ async def test_a_failing_codex_probe_yields_no_offer(
     assert not (tmp_path / "omnigent-data").exists()
 
 
-async def test_both_harnesses_record_their_offers_in_one_runner_directory(
+async def test_both_harnesses_record_their_offers_in_one_data_directory(
     claude_config: Path, tmp_path: Path
 ) -> None:
     """A host keeps one directory to stop both offers repeating; nothing sits beside the notes."""
@@ -597,7 +597,7 @@ async def test_both_harnesses_record_their_offers_in_one_runner_directory(
     assert await claude_memory_import_note(tmp_path) is not None
     assert await codex_memory_import_note(codex_home) is not None
 
-    offers = tmp_path / "omnigent-data" / "runners" / "memory-import-offers"
+    offers = tmp_path / "omnigent-data" / "memory-import-offers"
     assert sorted(marker.name.split("-")[0] for marker in offers.iterdir()) == ["claude", "codex"]
     # Codex versions its memory directory, so a marker there could reach its own consolidation.
     assert [path.name for path in (codex_home / "memories").iterdir()] == ["MEMORY.md"]
