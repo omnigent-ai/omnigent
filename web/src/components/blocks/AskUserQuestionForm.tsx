@@ -7,12 +7,13 @@
 // Unsent answers are restored on remount (see ``@/lib/askUserQuestionDrafts``).
 
 import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
-import { type ChangeEvent, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { ENTER_KEY } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
 import { isDraftingTarget } from "@/hooks/useApproveHotkey";
+import { useRequestedComposerEngine } from "@/components/composer/engine/composerEnginePolicy";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
 import {
@@ -32,7 +33,12 @@ import {
   isTextEntry,
 } from "@/lib/hotkeys";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { isComposerInput } from "@/components/composer/engine/composerInput";
+import type { SessionMention } from "@/lib/composerMentions";
+import {
+  type ComposerTextTarget,
+  isComposerInput,
+} from "@/components/composer/engine/composerInput";
+import { AskUserQuestionAnswerEditor, expandAnswerMentions } from "./AskUserQuestionAnswerEditor";
 
 /**
  * Map from question id/text → either a single selected label
@@ -106,6 +112,7 @@ function initialAnswers(questions: ClaudeQuestion[]): Omit<AskUserQuestionDraft,
     selections: {},
     customSelected: {},
     customInputs: {},
+    sessionMentions: [],
   };
   for (const q of questions) {
     const key = questionKey(q);
@@ -130,11 +137,13 @@ export function AskUserQuestionForm({
   const [initial] = useState(() => initialAnswers(questions));
   const rootRef = useRef<HTMLDivElement>(null);
   const questionRef = useRef<HTMLFieldSetElement>(null);
-  const customInputRef = useRef<HTMLTextAreaElement>(null);
+  const customInputRef = useRef<ComposerTextTarget | null>(null);
   // Set by a keystroke inside the form that moves to another question, so focus
   // follows the question instead of dropping to the page.
   const focusQuestionOnMoveRef = useRef(false);
   const isMobileViewport = useIsMobileViewport();
+  // The prompt editor only where the chat composer uses it (flag on, desktop, chunk loaded).
+  const engine = useRequestedComposerEngine();
   // The mobile layout keeps Enter as the newline key, as the composer does.
   const preventsKeyboardSubmit = isMobileViewport;
   const showKeyHints = !preventsKeyboardSubmit;
@@ -165,12 +174,18 @@ export function AskUserQuestionForm({
     draft?.customSelected ?? initial.customSelected,
   );
   const [customInputs, setCustomInputs] = useState(draft?.customInputs ?? initial.customInputs);
+  // Session tags in the custom answers, shared by every question. A tag whose token is no
+  // longer in an answer is left out when that answer is sent.
+  const [sessionMentions, setSessionMentions] = useState<SessionMention[]>(
+    draft?.sessionMentions ?? [],
+  );
 
   useEffect(() => {
     const answers = {
       selections: { ...selections },
       customSelected: { ...customSelected },
       customInputs: { ...customInputs },
+      sessionMentions: [...sessionMentions],
     };
     // Answers to a secret question are never kept past this mount.
     for (const q of draftQuestions) {
@@ -195,6 +210,7 @@ export function AskUserQuestionForm({
     selections,
     customSelected,
     customInputs,
+    sessionMentions,
   ]);
 
   useEffect(() => {
@@ -242,8 +258,7 @@ export function AskUserQuestionForm({
     setCustomSelected((prev) => ({ ...prev, [key]: !prev[key] }));
   };
 
-  const handleCustomInput = (key: string, e: ChangeEvent<HTMLTextAreaElement>) => {
-    const text = e.target.value;
+  const handleCustomInput = (key: string, text: string) => {
     setCustomInputs((prev) => ({ ...prev, [key]: text }));
     // Typing implies intent to use the custom answer — auto-check
     // the custom radio/checkbox so the user doesn't have to click
@@ -289,7 +304,7 @@ export function AskUserQuestionForm({
         q,
         selections[key] ?? "",
         customSelected[key] ?? false,
-        customInputs[key] ?? "",
+        expandAnswerMentions(customInputs[key] ?? "", sessionMentions),
       );
       if (answer === null) return; // unreachable while ``allAnswered`` gates the button
       finalAnswers[key] = answer;
@@ -315,6 +330,8 @@ export function AskUserQuestionForm({
       const embedRoot = getEmbedRoot();
       if (isEmbedded && (!embedRoot || !event.composedPath().includes(embedRoot))) return;
     }
+    // An open @ menu in the custom answer takes its keys, Escape included, before the form does.
+    if (inside && rootRef.current?.querySelector("[data-suggestions-open='true']")) return;
     // An open overlay keeps the keys even when focus wandered back into the form behind it.
     if (isKeyOwningOverlayOpen(rootRef.current)) return;
     if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) return;
@@ -563,20 +580,32 @@ export function AskUserQuestionForm({
                   data-testid="ask-user-question-custom-toggle"
                 />
               </label>
-              {/* ``field-sizing-content`` (Tailwind v4 / CSS) auto-grows
+              {engine === "codemirror" ? (
+                <AskUserQuestionAnswerEditor
+                  inputRef={customInputRef}
+                  value={customRowValue}
+                  onValueChange={(text) => handleCustomInput(currentKey, text)}
+                  sessions={sessionMentions}
+                  onSessionsChange={setSessionMentions}
+                />
+              ) : (
+                /* ``field-sizing-content`` (Tailwind v4 / CSS) auto-grows
                   the textarea to fit its content, so typing past the
                   first line wraps and expands downward instead of
-                  scrolling within a fixed single row. */}
-              <textarea
-                ref={customInputRef}
-                rows={1}
-                placeholder="Type something"
-                value={customRowValue}
-                onChange={(e) => handleCustomInput(currentKey, e)}
-                data-testid="ask-user-question-custom-input"
-                aria-label="Custom answer"
-                className="mobile-touch-target mobile-app:min-w-0 mobile-app:py-3 field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
-              />
+                  scrolling within a fixed single row. */
+                <textarea
+                  ref={(element) => {
+                    customInputRef.current = element;
+                  }}
+                  rows={1}
+                  placeholder="Type something"
+                  value={customRowValue}
+                  onChange={(e) => handleCustomInput(currentKey, e.target.value)}
+                  data-testid="ask-user-question-custom-input"
+                  aria-label="Custom answer"
+                  className="mobile-touch-target mobile-app:min-w-0 mobile-app:py-3 field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
+                />
+              )}
               {showKeyHints && current.options.length < DIGIT_SHORTCUT_COUNT && (
                 <CompactShortcutKeys
                   keys={[String(current.options.length + 1)]}

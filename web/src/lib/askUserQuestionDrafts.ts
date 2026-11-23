@@ -1,4 +1,5 @@
 import type { ClaudeQuestion } from "./askUserQuestion";
+import type { SessionMention } from "./composerMentions";
 
 /** Unsent answers on a pending AskUserQuestion card. */
 export interface AskUserQuestionDraft {
@@ -6,6 +7,8 @@ export interface AskUserQuestionDraft {
   selections: Record<string, string | string[]>;
   customSelected: Record<string, boolean>;
   customInputs: Record<string, string>;
+  /** Sessions @-tagged in the custom answers; their tokens may still be in the text. */
+  sessionMentions?: SessionMention[];
 }
 
 const MAX_DRAFTS = 20;
