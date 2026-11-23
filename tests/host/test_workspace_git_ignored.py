@@ -76,6 +76,20 @@ async def test_names_that_look_like_patterns_or_pathspec_magic_are_read_literall
     assert ignored == {":(top)a.log", "x.ts"}
 
 
+async def test_glob_characters_in_names_never_match_tracked_files(tmp_path: Path) -> None:
+    """A name like ``*.log`` is itself, not a glob over the index's ``tracked.log``."""
+    root = _repository(tmp_path / "repo")
+    (root / ".gitignore").write_text("*.log\n")
+    names = ["*.log", "q?.log", "[t]racked.log", "back\\slash.log", "tracked.log"]
+    for name in names:
+        (root / name).write_text("x")
+    _git(root, "add", "-f", "tracked.log")
+
+    ignored = await ignored_paths(root, names, Deadline(10))
+
+    assert ignored == {"*.log", "q?.log", "[t]racked.log", "back\\slash.log"}
+
+
 async def test_paths_are_relative_to_a_workspace_below_the_repository_root(
     tmp_path: Path,
 ) -> None:

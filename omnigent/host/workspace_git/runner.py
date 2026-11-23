@@ -78,7 +78,7 @@ _SUBCOMMAND_OPTIONS = {
     "log": ("--no-show-signature", "--no-color", "--no-ext-diff", "--no-textconv"),
 }
 # check-ignore refuses literal pathspecs, so it runs without them. It reads only
-# stdin paths, which its callers prefix with "./" so that none reads as magic.
+# stdin paths, which its callers make literal: "./" first and glob characters escaped.
 _MAGIC_PATHSPEC_SUBCOMMANDS = frozenset({"check-ignore"})
 
 # Tests add variables here, such as GIT_TRACE2_EVENT, to observe Git.

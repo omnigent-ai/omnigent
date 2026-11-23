@@ -8,6 +8,7 @@ Git decides with its own rules: ``.gitignore`` files at every level,
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -18,8 +19,16 @@ from omnigent.host.workspace_git.runner import (
     failure,
 )
 
-# The "./" keeps a name that starts with ":" from reading as pathspec magic.
+# check-ignore matches its paths as pathspecs against the index, so a name like "*.log"
+# would match a tracked file. "./" keeps a leading ":" from reading as magic, and a
+# backslash before each glob character makes Git read the name literally.
 _PREFIX = "./"
+_GLOB_CHARACTERS = re.compile(r"([*?\[\\])")
+
+
+def _literal(path: str) -> str:
+    """``path`` as a pathspec that matches only itself."""
+    return _PREFIX + _GLOB_CHARACTERS.sub(r"\\\1", path)
 
 
 async def ignored_paths(root: Path, paths: Sequence[str], deadline: Deadline) -> set[str]:
@@ -37,7 +46,9 @@ async def ignored_paths(root: Path, paths: Sequence[str], deadline: Deadline) ->
     repository = await GitRepository.discover(root, deadline)
     if repository is None:
         return set()
-    stdin = b"".join(os.fsencode(_PREFIX + path) + b"\0" for path in paths)
+    # Git echoes each path as it was given, so answers map back through the escaped form.
+    asked = {_literal(path): path for path in paths}
+    stdin = b"".join(os.fsencode(query) + b"\0" for query in asked)
     output = await repository.run_unchecked(
         ["check-ignore", "-z", "--stdin"],
         deadline=deadline,
@@ -49,8 +60,5 @@ async def ignored_paths(root: Path, paths: Sequence[str], deadline: Deadline) ->
         return set()
     if not output.success:
         raise failure(output, "check-ignore")
-    asked = set(paths)
     records = (os.fsdecode(record) for record in output.stdout.split(b"\0") if record)
-    return {
-        record.removeprefix(_PREFIX) for record in records if record.removeprefix(_PREFIX) in asked
-    }
+    return {asked[record] for record in records if record in asked}
