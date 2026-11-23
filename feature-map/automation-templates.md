@@ -40,6 +40,11 @@ to customize.
 - `link-posting`: a checkbox below the trigger controls posting the session link
   back to Jira, Slack, GitHub, Linear, or PagerDuty (as an incident note). Sessions
   start whether it is checked or not.
+- `slack-thread-replies`: Slack **Message posted in a channel** triggers also send
+  later replies in a handled message's thread to the session that handled it, which
+  posts in the thread only when a reply needs it; no reply starts a session. The form
+  has no control for it. Threads are followed for 24 hours after their latest reply,
+  at most 10 at a time; DM triggers don't follow threads.
 - `task-session`: when creating a trigger, Advanced shows **Start a new session for
   each match**, on by default. Turning it off sends every match to one task session,
   titled after the automation and started on the first match; later matches arrive

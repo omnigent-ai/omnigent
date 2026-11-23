@@ -9,6 +9,8 @@ import {
   describePagerDutyFilter,
   describeSlackFilter,
   emptyTriggerFields,
+  FOLLOWED_SLACK_THREAD_HOURS,
+  MAX_FOLLOWED_SLACK_THREADS,
   jiraAssignee,
   parseGithubReviewer,
   promptMayRunSavedWorkflow,
@@ -710,7 +712,9 @@ describe("Slack DM triggers", () => {
       slack({ scope: "eng-support, C0123ABCD", scopeOperator: "in" }),
       CTX,
     );
-    expect(prompt).toContain("Watch: new Slack messages in #eng-support, C0123ABCD\n");
+    expect(prompt).toContain(
+      "Watch: new Slack messages in #eng-support, C0123ABCD, then new replies in their threads\n",
+    );
   });
 
   it("saves a channel trigger's Slack lookups in its reply and bounds history reads", () => {
@@ -797,6 +801,127 @@ describe("Slack DM triggers", () => {
 
     expect(withAuthor).toContain("adding one yes/no column per author ID the conditions name");
     expect(withoutAuthor).not.toContain("yes/no column per author ID");
+  });
+});
+
+describe("Slack thread replies", () => {
+  const channel = (overrides: Partial<TriggerFields> = {}) =>
+    fields({
+      event: "posted",
+      scope: "eng-support",
+      scopeOperator: "is",
+      conditions: [{ field: "text", operator: "contains", value: "help" }],
+      ...overrides,
+    });
+  /** The numbered step of `prompt` that starts with `start`, e.g. 6 for "6. Then send". */
+  const stepNumber = (prompt: string, start: string) =>
+    Number(new RegExp(`\\n(\\d+)\\. ${start}`).exec(prompt)?.[1]);
+
+  it("sends new replies in a channel trigger's threads to the session the thread's message went to", () => {
+    const prompt = renderTriggerPrompt("slack", channel(), CTX);
+
+    expect(prompt).toContain(
+      'Watch: new Slack messages in #eng-support whose text contains "help", then new replies in their threads\n',
+    );
+    // Replies still never start a session of their own.
+    expect(prompt).toContain(
+      "Replies inside a thread (thread_ts set and different from ts) don't start a new session.",
+    );
+    // The thread step runs after sessions start, so this run's new threads are followed too.
+    const create = stepNumber(
+      prompt,
+      "For each other message, oldest first, call sys_session_create",
+    );
+    const threads = stepNumber(prompt, "Then send new replies in the threads you follow");
+    expect(threads).toBe(create + 1);
+    expect(stepNumber(prompt, "Reply with the title and session ID")).toBe(threads + 1);
+
+    expect(prompt).toContain(
+      `Your most recent reply's "Slack threads:" line, when there is one, lists those threads as one-line JSON: each key is "<channel ID> <thread ts>"`,
+    );
+    expect(prompt).toContain(
+      "Add the thread of each message this run started a session for with its task delivered, with session set to that session's conversation_id and through set to the message's own ts",
+    );
+    expect(prompt).toContain(
+      `Drop a thread whose through is more than ${FOLLOWED_SLACK_THREAD_HOURS} hours before the time you noted, then keep at most the ${MAX_FOLLOWED_SLACK_THREADS} with the newest through.`,
+    );
+    expect(prompt).toContain(
+      "conversations.replies with the channel ID, ts set to the thread ts, oldest set to its through, inclusive false",
+    );
+    // A worker's own thread posts (bot replies, or the owner's account with the attribution
+    // line) must not come back to it as new replies.
+    expect(prompt).toContain(
+      'messages from bots or with a system subtype, and your own posts that end with a "Sent with Omnigent" line',
+    );
+    expect(prompt).toContain(
+      "The conditions above apply only to the message that starts a thread, so every other reply counts.",
+    );
+    expect(prompt).toContain(
+      "send its session one message under 32000 characters with sys_session_message, with session_id set to the thread's session",
+    );
+    expect(prompt).toContain(
+      '"Slack <channel> <thread ts> replies through <ts of its newest reply>"',
+    );
+    expect(prompt).toContain("following the instructions it already has");
+    // Every channel trigger follows its threads, so the session stays quiet unless a reply needs it.
+    expect(prompt).toContain(
+      "It says to post in that same thread only when a reply asks it something or needs it to act, and not for thanks, acknowledgements or people talking among themselves",
+    );
+    expect(prompt).toContain(
+      "to name the message that started the thread, not a reply, wherever a Slack tool asks which message to reply to",
+    );
+    expect(prompt).toContain("between <slack-replies> and </slack-replies> lines");
+    // Dedupe: an accepted or uncertain send moves the thread past those replies for good.
+    expect(prompt).toContain(
+      "Once a send is accepted, set the thread's through to its newest reply's ts.",
+    );
+    expect(prompt).toContain(
+      'list it on a "Delivery pending:" line as "<title> <conversation_id>", set the thread\'s through to its newest reply\'s ts so those replies are never sent again',
+    );
+    expect(prompt).toContain("stop following that thread and say so in your reply");
+    expect(prompt).toContain(
+      "Stopping means starting no more sessions in this run; still send new thread replies and write your reply.",
+    );
+    expect(prompt).toContain("Do this step even if you stopped starting sessions above");
+    expect(prompt).toContain(
+      'above "Checked through:" write a "Slack threads:" line followed by one-line JSON of the threads you follow after this run\'s changes, or {} when you follow none.',
+    );
+  });
+
+  it("keeps the one creation call that worker settings edit", () => {
+    const prompt = renderTriggerPrompt("slack", channel(), { ...CTX, model: "old" });
+    expect(readTriggerWorkerSettings(prompt)).toEqual({ ...AGENT_DEFAULT_WORKERS, model: "old" });
+    expect(readTriggerMessageMaxChars(prompt)).toBe(32000);
+    expect(updateTriggerWorkerPlacement(prompt, "managed")).toBe(
+      prompt.replace('placement "same_host"', 'placement "managed"'),
+    );
+  });
+
+  it("sends a task session's thread replies there with its instructions", () => {
+    const prompt = renderTriggerPrompt("slack", channel(), { ...CTX, taskSessionMode: "continue" });
+    expect(prompt).toContain(
+      "Add the thread of each message this run sent to your task session, with session set to the task session it went to",
+    );
+    expect(prompt).toContain(
+      'a sentence saying that this is the task session of a Slack automation and that someone replied in the thread of a Slack message it was sent earlier, titled "Slack <channel> <thread ts>", then the instructions below',
+    );
+    expect(prompt).toContain("Do this step even if you stopped sending matches above");
+    expect(prompt).toContain(
+      "Stopping means sending no more matches in this run; still send new thread replies and write your reply.",
+    );
+  });
+
+  it("leaves DM and group DM triggers without a thread step", () => {
+    for (const event of ["dm", "group_dm"]) {
+      const prompt = renderTriggerPrompt(
+        "slack",
+        channel({ event, scope: "alice, bob", conditions: [] }),
+        CTX,
+      );
+      expect(prompt).not.toContain("Slack threads:");
+      expect(prompt).not.toContain("replies in their threads");
+      expect(prompt).toContain("still write your reply.");
+    }
   });
 });
 
@@ -1709,7 +1834,9 @@ describe("renderTriggerPrompt", () => {
       fields({ event: "posted", scope: "#eng-support", conditions: [] }),
       CTX,
     );
-    expect(unfiltered).toContain("Watch: new Slack messages in #eng-support\n");
+    expect(unfiltered).toContain(
+      "Watch: new Slack messages in #eng-support, then new replies in their threads\n",
+    );
     expect(unfiltered).toContain("Every top-level message counts.");
     // Bot posts still count, so a channel of alerts or a bot author can match.
     expect(unfiltered).not.toContain("bot_id set");
