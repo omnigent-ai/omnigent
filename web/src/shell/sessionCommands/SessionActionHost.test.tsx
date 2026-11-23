@@ -8,6 +8,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import type * as SessionModule from "@/hooks/useSession";
 import type * as UnseenModule from "@/hooks/useUnseenConversations";
 import type * as PermissionsApiModule from "@/lib/permissionsApi";
+import { LEVEL_READ } from "@/lib/permissionsApi";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 import { SessionActionHost } from "./SessionActionHost";
@@ -18,6 +19,7 @@ const writes = vi.hoisted(() => ({
   mute: vi.fn(),
   move: vi.fn(),
   rename: vi.fn(),
+  archive: vi.fn(),
 }));
 vi.mock("@/hooks/useConversations", async (importOriginal) => {
   const actual = await importOriginal<typeof ConversationsModule>();
@@ -33,6 +35,7 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
     useSetConversationMuted: mutation(writes.mute),
     useMoveToProject: mutation(writes.move),
     useRenameConversation: mutation(writes.rename),
+    useArchiveConversation: mutation(writes.archive),
   };
 });
 // The server's answers to Stop and Leave, which each test settles when it chooses.
@@ -191,6 +194,18 @@ describe("SessionActionHost", () => {
     );
   });
 
+  it("archives a request queued before the host mounted, and leaves the open session's view", () => {
+    ui.viewing = "c1";
+    requestSessionAction(SESSION, "archive");
+    renderHost();
+    expect(writes.archive).toHaveBeenCalledWith({
+      id: "c1",
+      archived: true,
+      deleteWorktree: false,
+    });
+    expect(location()).toBe("/");
+  });
+
   it("runs an action once, even on a host mounted again", () => {
     const { remountHost } = renderHost();
     act(() => requestSessionAction(SESSION, "pin"));
@@ -268,6 +283,14 @@ describe("SessionActionHost", () => {
       expect(ui.toast).toHaveBeenCalledWith("Couldn't leave the session: offline");
       expect(location()).toBe("/c/c1");
     });
+
+    it("stays on another session opened before Leave succeeds", async () => {
+      const { leave, remountHost } = await startLeave();
+      ui.viewing = "c2";
+      remountHost();
+      await act(async () => leave.resolve());
+      expect(location()).toBe("/c/c1");
+    });
   });
 
   describe("looks the session up as the action starts", () => {
@@ -299,9 +322,20 @@ describe("SessionActionHost", () => {
       expect(screen.queryByRole("dialog")).toBeNull();
     });
 
-    it("checks the owner of a search result no list holds by the row it showed", () => {
-      renderHost(cachedSessions());
-      act(() => requestSessionAction({ ...SESSION, owner: "someone-else" }, "rename"));
+    it("checks a search result's owner, not a fetched row that can't say whose it is", () => {
+      const queryClient = cachedSessions();
+      queryClient.setQueryData(["conversation-backfill", "c1"], {
+        ...SESSION,
+        owner: null,
+        permission_level: LEVEL_READ,
+      });
+      renderHost(queryClient);
+      act(() =>
+        requestSessionAction(
+          { ...SESSION, owner: "someone-else", permission_level: LEVEL_READ },
+          "rename",
+        ),
+      );
       expect(screen.queryByRole("dialog")).toBeNull();
     });
 

@@ -31,30 +31,53 @@ import {
 } from "./sessionActionStore";
 import { useSessionCommandFacts } from "./useSessionCommandFacts";
 
+// The open session, or its sub-agent's root, as the host last saw it. A Leave that settles
+// later reads it then, so it leaves only the session that's still open.
+let openRootSessionId: string | null = null;
+
 /** Mount once, beside the palette. */
 export function SessionActionHost() {
   const request = useSessionActionStore((state) => state.request);
-  return request ? <SessionActionResolver key={request.key} request={request} /> : null;
+  const openRoot = useActiveRootSessionId(useCommandContext().session?.id ?? null);
+  useEffect(() => {
+    openRootSessionId = openRoot;
+  }, [openRoot]);
+  return request ? (
+    <SessionActionResolver key={request.key} request={request} openRoot={openRoot} />
+  ) : null;
 }
 
 /** Looks the session up as the action starts; one gone since does nothing. */
-function SessionActionResolver({ request }: { request: SessionActionRequest }) {
+function SessionActionResolver({
+  request,
+  openRoot,
+}: {
+  request: SessionActionRequest;
+  openRoot: string | null;
+}) {
   const queryClient = useQueryClient();
   const [conversation] = useState(() =>
     currentSessionRow(queryClient, request.conversation, request.listed),
   );
   return conversation ? (
-    <SessionActionRunner conversation={conversation} request={request} />
+    <SessionActionRunner conversation={conversation} request={request} openRoot={openRoot} />
   ) : null;
 }
 
 function SessionActionRunner({
   conversation,
   request: { command, key },
+  openRoot,
 }: {
   conversation: Conversation;
   request: SessionActionRequest;
+  openRoot: string | null;
 }) {
+  // Child effects run before the host's, so an action started on first mount needs the
+  // open root recorded here, ahead of the effect that starts it.
+  useEffect(() => {
+    openRootSessionId = openRoot;
+  }, [openRoot]);
   const facts = useSessionCommandFacts(conversation);
   const viewerId = useViewerId();
   const serverInfo = useServerInfo();
@@ -63,15 +86,15 @@ function SessionActionRunner({
   const togglePinned = useTogglePinnedConversation();
   const setMuted = useSetConversationMuted();
   const moveToProject = useMoveToProject();
-  // Removing the open session, or one of its sub-agents' root, leaves its view first.
-  const viewing =
-    useActiveRootSessionId(useCommandContext().session?.id ?? null) === conversation.id;
   const actions = useSessionActions({
     conversation,
     label: conversationDisplayLabel(conversation),
     viewerId,
     serverInfo,
-    onLeave: viewing ? () => navigate("/", { replace: true }) : undefined,
+    // Leaving the open session, or one of its sub-agents' root, leaves its view too.
+    onLeave: () => {
+      if (openRootSessionId === conversation.id) navigate("/", { replace: true });
+    },
     componentIdPrefix: "palette.conversation",
   });
   const [picker, setPicker] = useState<"rename" | "move-to-project" | null>(null);

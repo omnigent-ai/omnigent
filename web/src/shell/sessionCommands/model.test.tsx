@@ -24,6 +24,8 @@ import {
   type SessionCommandFacts,
   sessionCommand,
   sessionCommands,
+  sessionOwnership,
+  UNKNOWN_OWNER_REASON,
 } from "./model";
 
 // The row's Fork reads its restriction from this hook; each case sets it from its facts.
@@ -35,6 +37,7 @@ vi.mock("@/hooks/useSessionActionRestrictions", () => ({
 const FACTS: SessionCommandFacts = {
   provisional: false,
   owner: true,
+  ownerUnknown: false,
   archived: false,
   pinned: false,
   indentedSibling: false,
@@ -97,6 +100,25 @@ describe("sessionCommands", () => {
     expect(reasonOf(shared, "rename")).toBe(OWNER_ONLY_REASONS.rename);
     expect(reasonOf(shared, "stop")).toBe(OWNER_ONLY_REASONS.stop);
     expect(reasonOf(shared, "archive")).toBe(OWNER_ONLY_REASONS.archive);
+  });
+
+  it("greys the owner's actions, Delete and Leave while it can't tell whose the session is", () => {
+    const unknown = { ...FACTS, owner: false, ownerUnknown: true, canCreateAutomation: false };
+    expect(listed(unknown)).toEqual([
+      "Pin",
+      "Share",
+      "Fork",
+      "Rename",
+      "Mute",
+      "Mark as unread",
+      "Stop session",
+      "Archive",
+      "Delete",
+      "Leave session",
+    ]);
+    for (const id of ["share", "rename", "stop", "archive", "delete", "leave"] as const) {
+      expect(reasonOf(unknown, id)).toBe(UNKNOWN_OWNER_REASON);
+    }
   });
 
   it("offers Unarchive on an archived session, and nothing to pin or nest", () => {
@@ -234,6 +256,33 @@ function rowMenu(facts: SessionCommandFacts) {
       .map(name),
   };
 }
+
+describe("sessionOwnership", () => {
+  it("trusts a named owner or an owner grant, and fails closed on a row that has neither", () => {
+    const row = (owner: string | null | undefined, level: number | null) => ({
+      owner,
+      permission_level: level,
+    });
+    expect(sessionOwnership(row("viewer", null), "viewer", false)).toBe("mine");
+    expect(sessionOwnership(row("someone-else", 4), "viewer", false)).toBe("theirs");
+    expect(sessionOwnership(row(undefined, 4), "viewer", false)).toBe("mine");
+    expect(sessionOwnership(row(null, 1), "viewer", false)).toBe("unknown");
+    expect(sessionOwnership(row(undefined, null), "viewer", false)).toBe("unknown");
+    // The single-user runtime owns every session.
+    expect(sessionOwnership(row(undefined, null), "local", true)).toBe("mine");
+    expect(sessionOwnership(row(null, null), null, true)).toBe("mine");
+  });
+
+  it("fails closed on an ownerless row while the viewer is unknown on a multi-user server", () => {
+    const ownerless = { owner: null, permission_level: null };
+    expect(sessionOwnership(ownerless, null, false)).toBe("unknown");
+    expect(sessionOwnership({ owner: undefined, permission_level: 1 }, null, false)).toBe(
+      "unknown",
+    );
+    // Positive evidence still counts without a viewer: an owner grant on the row.
+    expect(sessionOwnership({ owner: undefined, permission_level: 4 }, null, false)).toBe("mine");
+  });
+});
 
 describe("sessionCommands against the sidebar row's menu", () => {
   afterEach(() => {

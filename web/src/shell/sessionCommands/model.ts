@@ -2,7 +2,9 @@
 // as the sidebar row's menu, decided from plain facts about one session. No React here; the
 // icons and the code that runs each action live beside the palette.
 
+import type { Conversation } from "@/hooks/useConversations";
 import { SHARING_OFF_REASON } from "@/lib/capabilities";
+import { LEVEL_OWNER } from "@/lib/permissionsApi";
 import {
   AVAILABLE,
   type CommandAvailability,
@@ -37,8 +39,10 @@ export type SessionCommandId = (typeof SESSION_COMMAND_IDS)[number];
 export interface SessionCommandFacts {
   /** Still being created, so the server doesn't know it yet; its row offers no actions. */
   provisional: boolean;
-  /** The viewer owns it; see `isOwnedByViewer`. */
+  /** The viewer owns it, as far as the app can tell; see `sessionOwnership`. */
   owner: boolean;
+  /** The row the app has names no owner, so the owner's actions wait for one that does. */
+  ownerUnknown: boolean;
   archived: boolean;
   pinned: boolean;
   /** A family member shown under its leader, which pins and files with the family. */
@@ -111,6 +115,9 @@ export const OWNER_ONLY_REASONS = {
   unarchive: "Only the session owner can unarchive this session",
 } as const;
 
+/** Why the owner's actions are greyed while no cached row says whose the session is. */
+export const UNKNOWN_OWNER_REASON = "Can't tell who owns this session";
+
 export const PIN_SAVING_REASON = "A pin change is still saving.";
 export const PIN_CAPACITY_REASON = "Unpin a session to pin another.";
 
@@ -134,20 +141,41 @@ const KEYWORDS: Record<SessionCommandId, readonly string[]> = {
   leave: ["remove", "unshare"],
 };
 
-function ownerOnly(owner: boolean, reason: string): CommandAvailability {
-  return owner ? AVAILABLE : unavailableBecause(reason);
+/**
+ * Whose session `row` is. A row that names no owner and holds no owner grant counts as
+ * unknown, and so as not the viewer's, unless the server is the single-user local runtime.
+ */
+export function sessionOwnership(
+  row: Pick<Conversation, "owner" | "permission_level">,
+  viewerId: string | null,
+  singleUser: boolean,
+): "mine" | "theirs" | "unknown" {
+  if (singleUser) return "mine";
+  if (row.owner != null) return row.owner === viewerId ? "mine" : "theirs";
+  if (row.permission_level != null && row.permission_level >= LEVEL_OWNER) return "mine";
+  // No viewer yet, or a header-auth server that names none: nothing shows the row is theirs.
+  return "unknown";
+}
+
+function ownerOnly(
+  { owner, ownerUnknown }: SessionCommandFacts,
+  reason: string,
+): CommandAvailability {
+  if (owner) return AVAILABLE;
+  return unavailableBecause(ownerUnknown ? UNKNOWN_OWNER_REASON : reason);
 }
 
 function when(condition: boolean, availability: CommandAvailability): CommandAvailability {
   return condition ? availability : HIDDEN;
 }
 
-function shareAvailability({ owner, server }: SessionCommandFacts): CommandAvailability {
+function shareAvailability(facts: SessionCommandFacts): CommandAvailability {
+  const { server } = facts;
   // One user has nobody to share with, so the row menu leaves Share out.
   if (server.singleUser) return HIDDEN;
   // Sharing turned off server-wide outranks the viewer's own reason.
   if (server.sharingOff) return unavailableBecause(SHARING_OFF_REASON);
-  return ownerOnly(owner, OWNER_ONLY_REASONS.share);
+  return ownerOnly(facts, OWNER_ONLY_REASONS.share);
 }
 
 function pinAvailability(facts: SessionCommandFacts, pinning: boolean): CommandAvailability {
@@ -194,7 +222,7 @@ function availabilityOf(id: SessionCommandId, facts: SessionCommandFacts): Comma
     case "fork":
       return facts.forkDisabledReason ? unavailableBecause(facts.forkDisabledReason) : AVAILABLE;
     case "rename":
-      return ownerOnly(owner, OWNER_ONLY_REASONS.rename);
+      return ownerOnly(facts, OWNER_ONLY_REASONS.rename);
     case "mute":
       return when(server.sessionMute && !facts.muted, AVAILABLE);
     case "unmute":
@@ -210,15 +238,18 @@ function availabilityOf(id: SessionCommandId, facts: SessionCommandFacts): Comma
     case "move-to-project":
       return when(owner && !facts.indentedSibling, AVAILABLE);
     case "stop":
-      return when(facts.stoppable, ownerOnly(owner, OWNER_ONLY_REASONS.stop));
+      return when(facts.stoppable, ownerOnly(facts, OWNER_ONLY_REASONS.stop));
     case "archive":
-      return when(!facts.archived, ownerOnly(owner, OWNER_ONLY_REASONS.archive));
+      return when(!facts.archived, ownerOnly(facts, OWNER_ONLY_REASONS.archive));
     case "unarchive":
-      return when(facts.archived, ownerOnly(owner, OWNER_ONLY_REASONS.unarchive));
+      return when(facts.archived, ownerOnly(facts, OWNER_ONLY_REASONS.unarchive));
     // The owner deletes; anyone it's shared with leaves. One user only deletes.
+    // Neither is offered on a guess at whose session it is.
     case "delete":
+      if (facts.ownerUnknown) return unavailableBecause(UNKNOWN_OWNER_REASON);
       return when(owner || server.singleUser, AVAILABLE);
     case "leave":
+      if (facts.ownerUnknown) return unavailableBecause(UNKNOWN_OWNER_REASON);
       return when(!owner && !server.singleUser, AVAILABLE);
   }
 }
