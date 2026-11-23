@@ -330,10 +330,10 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
 ## Gotchas
 
 - "Created by" records origin only: workers remain independent and have their own
-  permissions and lifecycle. Sharing a worker does not share its creator; the
-  opaque creator ID remains in worker metadata, but the UI resolves its title
-  through a separate authorized read. Forks drop the creator label. Older
-  workers have no label; there is no backfill or automatic completion reply.
+  permissions and lifecycle. Sharing a worker does not share its creator; only
+  the opaque creator ID remains in worker metadata, never the creator's title.
+  Forks drop the creator label. Older workers have no label; there is no
+  backfill or automatic completion reply.
 
 - Same host also means the same workspace, inherited together from the host-bound
   ancestor for child managers. Separate sessions do not isolate filesystem edits.
