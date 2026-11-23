@@ -1,8 +1,5 @@
-// With "Widen window when opening the right sidebar" on, the right sidebar grows the window
-// instead of squeezing the chat, and closing it shrinks the window back.
-// Run: OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a -s "-screen 0 1600x900x24" \
-//   node --test e2e/desktop_right_sidebar_widens_window.e2e.js
-// Env: OMNIGENT_PYTHON (backend), OMNIGENT_DESKTOP_RECORD_DIR (one paced clip per journey).
+// With the setting on, the right sidebar widens the window instead of squeezing the chat.
+// Run under xvfb-run with OMNIGENT_PW_NO_SANDBOX=1; OMNIGENT_DESKTOP_RECORD_DIR films each journey.
 
 "use strict";
 

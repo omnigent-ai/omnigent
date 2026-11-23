@@ -219,10 +219,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.invoke("omnigent:record-global-shortcut", shortcutId(id)),
   cancelGlobalShortcutRecording: () =>
     ipcRenderer.invoke("omnigent:cancel-global-shortcut-recording"),
-  /**
-   * Settings → "Widen window when opening the right sidebar" (off by default), and the page's
-   * reports of its right sidebar opening and closing, which the shell acts on when it's on.
-   */
+  /** The opt-in "widen window for the right sidebar" setting and the page's sidebar reports. */
   rightSidebarWindow: {
     /** Resolves whether the setting is on. */
     getWidensWindow: () => ipcRenderer.invoke("omnigent:get-right-sidebar-widens-window"),
