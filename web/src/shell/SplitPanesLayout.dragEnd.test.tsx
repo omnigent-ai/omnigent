@@ -103,14 +103,46 @@ describe("a divider drag that ends unsaved", () => {
   });
 
   it.each([
-    ["pointer-cancelled", "pointerCancel"],
-    ["pointer-lost", "lostPointerCapture"],
-  ] as const)("names %s when the pointer is taken away", (reason, event) => {
+    [
+      "pointer-cancelled",
+      (divider: HTMLElement) => fireEvent.pointerCancel(divider, { pointerId: 1 }),
+    ],
+    [
+      "pointer-lost",
+      (divider: HTMLElement) => {
+        // Its capture ends, and the pointer it follows then moves with the button up.
+        fireEvent.lostPointerCapture(divider, { pointerId: 1 });
+        fireEvent.pointerMove(document.body, { pointerId: 1, buttons: 0 });
+      },
+    ],
+  ] as const)("names %s when the pointer is taken away", (reason, takeAway) => {
     render(<View split={SPLIT} />);
     const divider = pressDivider();
-    fireEvent[event](divider, { pointerId: 1 });
+    takeAway(divider);
     // The pointer's own end, once: the layout dropping the drag after it adds nothing.
     expect(logged()).toEqual([ended(reason)]);
+  });
+
+  it("logs nothing when its capture ends just before a release elsewhere", () => {
+    const onResize = vi.fn();
+    const panesRef = { current: null as HTMLDivElement | null };
+    render(
+      <SplitPanesLayout
+        conversationId="c1"
+        split={SPLIT}
+        singlePaneKey="a"
+        paneIdOf={(key) => key}
+        renderPane={(key) => <div data-testid={`content-${key}`} />}
+        onResize={onResize}
+        panesRef={panesRef}
+        sizing={() => null}
+      />,
+    );
+    const divider = pressDivider();
+    fireEvent.lostPointerCapture(divider, { pointerId: 1 });
+    fireEvent.pointerUp(screen.getByTestId("content-a"), { pointerId: 1 });
+    expect(logged()).toEqual([]);
+    expect(onResize).toHaveBeenCalledWith([{ path: [], ratio: 0.3 }]);
   });
 
   it("logs the layout's reason once, though the pointer is let go after it", () => {

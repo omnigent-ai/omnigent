@@ -33,10 +33,62 @@ export function usePaneDividerPointer({
   // The pointer this handle holds, and the call that ends the window's drag marker, once.
   const held = useRef<{ element: HTMLElement; pointerId: number } | null>(null);
   const endDrag = useRef<(() => void) | null>(null);
+  // Removes the window's listeners that follow a pointer whose capture ended before its release.
+  const unfollow = useRef<(() => void) | null>(null);
+  // The latest callbacks, for those listeners, which outlive the render that added them.
+  const latest = useRef({ onMove, onCommit, onAbort });
+  latest.current = { onMove, onCommit, onAbort };
   const finishDrag = () => {
     held.current = null;
+    unfollow.current?.();
+    unfollow.current = null;
     endDrag.current?.();
     endDrag.current = null;
+  };
+  const moveTo = (event: { clientX: number; clientY: number }) => {
+    if (!containerRef.current) return;
+    const bounds = containerRef.current.getBoundingClientRect();
+    if (bounds.width === 0 || bounds.height === 0) return;
+    latest.current.onMove({
+      left: ((event.clientX - bounds.left) / bounds.width) * 100,
+      top: ((event.clientY - bounds.top) / bounds.height) * 100,
+    });
+  };
+  // The macOS app can drop the handle's capture just before the release, which then lands on
+  // whatever is under the pointer. The drag follows its pointer through the document instead,
+  // until its release, a cancel, a move with the button already up, or the window's blur.
+  const follow = (element: HTMLElement, pointerId: number) => {
+    const doc = element.ownerDocument;
+    const view = doc.defaultView;
+    const ours = (event: globalThis.PointerEvent) => event.pointerId === pointerId;
+    const lose = (reason: PointerDragEnd) => {
+      finishDrag();
+      latest.current.onAbort(reason);
+    };
+    const onMoveEvent = (event: globalThis.PointerEvent) => {
+      if (!ours(event)) return;
+      if ((event.buttons & 1) === 0) lose("pointer-lost");
+      else moveTo(event);
+    };
+    const onUpEvent = (event: globalThis.PointerEvent) => {
+      if (!ours(event)) return;
+      finishDrag();
+      latest.current.onCommit();
+    };
+    const onCancelEvent = (event: globalThis.PointerEvent) => {
+      if (ours(event)) lose("pointer-cancelled");
+    };
+    const onBlur = () => lose("pointer-lost");
+    doc.addEventListener("pointermove", onMoveEvent, true);
+    doc.addEventListener("pointerup", onUpEvent, true);
+    doc.addEventListener("pointercancel", onCancelEvent, true);
+    view?.addEventListener("blur", onBlur);
+    unfollow.current = () => {
+      doc.removeEventListener("pointermove", onMoveEvent, true);
+      doc.removeEventListener("pointerup", onUpEvent, true);
+      doc.removeEventListener("pointercancel", onCancelEvent, true);
+      view?.removeEventListener("blur", onBlur);
+    };
   };
   useEffect(() => finishDrag, []);
   useEffect(() => {
@@ -70,17 +122,15 @@ export function usePaneDividerPointer({
       onStart();
     },
     onPointerMove: (event: PointerEvent<HTMLElement>) => {
-      if (!event.currentTarget.hasPointerCapture(event.pointerId) || !containerRef.current) return;
-      const bounds = containerRef.current.getBoundingClientRect();
-      if (bounds.width === 0 || bounds.height === 0) return;
-      onMove({
-        left: ((event.clientX - bounds.left) / bounds.width) * 100,
-        top: ((event.clientY - bounds.top) / bounds.height) * 100,
-      });
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) moveTo(event);
     },
     onPointerUp: end(onCommit),
     // After a release the drag is already over, so these drop nothing more.
     onPointerCancel: end(() => onAbort("pointer-cancelled")),
-    onLostPointerCapture: end(() => onAbort("pointer-lost")),
+    onLostPointerCapture: (event: PointerEvent<HTMLElement>) => {
+      const pointer = held.current;
+      if (pointer === null || pointer.pointerId !== event.pointerId || unfollow.current) return;
+      follow(pointer.element, pointer.pointerId);
+    },
   };
 }
