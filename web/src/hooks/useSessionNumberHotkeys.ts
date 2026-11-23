@@ -20,19 +20,22 @@ import { matchedShortcutChordIndex, SESSION_NUMBER_DIGITS } from "@/lib/shortcut
  *  can't drift. */
 export const SESSION_HOTKEY_DIGITS = SESSION_NUMBER_DIGITS;
 
+/** Whether the window's URL already shows *sessionId*, even before the route's render commits. */
+function showsSession(sessionId: string): boolean {
+  return window.location.pathname.endsWith(`/c/${sessionId}`);
+}
+
 /**
  * @param orderedSessionIds Conversation ids the sidebar shows, in render order.
- * @param activeId The open conversation (route param), or undefined off-list.
  */
 export function useSessionNumberHotkeys(
   orderedSessionIds: readonly string[],
-  activeId: string | undefined,
   isMac = isMacPlatform(),
 ): void {
   const navigate = useNavigate();
-  // Bound once; the ref keeps the handler reading the live list/route.
-  const latest = useRef({ orderedSessionIds, activeId });
-  latest.current = { orderedSessionIds, activeId };
+  // Bound once; the ref keeps the handler reading the live list.
+  const latest = useRef(orderedSessionIds);
+  latest.current = orderedSessionIds;
 
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent): void => {
@@ -42,13 +45,14 @@ export function useSessionNumberHotkeys(
       const index = matchedShortcutChordIndex(e, "session.number", { mac: isMac });
       if (index === -1) return;
 
-      const { orderedSessionIds: ids, activeId: active } = latest.current;
-      const targetId = ids[index];
+      const targetId = latest.current[index];
       // No session at that slot: leave the native event untouched.
       if (!targetId) return;
 
       e.preventDefault(); // suppress the browser's native ⌘-digit tab-switch
-      if (targetId !== active) navigate(`/c/${targetId}`);
+      // The URL, not the rendered route: right after leaving a session the router still renders
+      // it while the next page loads, and its digit must still go back to it.
+      if (!showsSession(targetId)) navigate(`/c/${targetId}`);
     };
 
     window.addEventListener("keydown", handler);

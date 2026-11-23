@@ -3426,7 +3426,7 @@ function ConversationList({
     () => [...new Set(orderedConversationIds)].slice(0, SESSION_HOTKEY_DIGITS.length),
     [orderedConversationIds],
   );
-  useSessionNumberHotkeys(numberedSessionIds, activeId);
+  useSessionNumberHotkeys(numberedSessionIds);
   // ⌘K's Next and Previous session step through the same rows.
   const listedSessionIds = useMemo(
     () => [...new Set(orderedConversationIds)],

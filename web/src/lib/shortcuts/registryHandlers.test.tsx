@@ -277,7 +277,7 @@ const HANDLERS: Partial<Record<ShortcutId, HandlerCase>> = {
   },
   "session.number": {
     mount: () => {
-      renderHook(() => useSessionNumberHotkeys(["a", "b"], "b"));
+      renderHook(() => useSessionNumberHotkeys(["a", "b"]));
       return navigatedTo("/c/a");
     },
   },
