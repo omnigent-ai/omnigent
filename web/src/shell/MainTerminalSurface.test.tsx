@@ -1,17 +1,21 @@
 import { render, screen } from "@testing-library/react";
+import { useEffect } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { MainTerminalSurface } from "./MainTerminalSurface";
+import { useMainOwnedTerminalKeys } from "./terminalPlacement";
 
 const gate = vi.hoisted(() => ({ panesView: false }));
 vi.mock("./panesViewGate", () => ({ usePanesView: () => gate.panesView }));
 const floating = vi.hoisted(() => ({ shown: false }));
 vi.mock("./useFloatingPanes", () => ({ useFloatingPanesShown: () => floating.shown }));
-// Each view reports the props it was given.
+// Each view reports the props it was given; the Terminal view also reports showing a shell.
 vi.mock("./MainTerminalView", () => ({
-  MainTerminalView: (props: object) => (
-    <div data-testid="terminal-view" data-props={JSON.stringify(props)} />
-  ),
+  MainTerminalView: (props: { onShownTerminalKeys?: (keys: readonly string[]) => void }) => {
+    const { onShownTerminalKeys } = props;
+    useEffect(() => onShownTerminalKeys?.(["shell:s"]), [onShownTerminalKeys]);
+    return <div data-testid="terminal-view" data-props={JSON.stringify(props)} />;
+  },
 }));
 const loaded = vi.hoisted(() => ({ panesView: false, fails: false }));
 vi.mock("./SplitPanesMainView", () => {
@@ -97,5 +101,27 @@ describe("MainTerminalSurface", () => {
       conversationId: "conv_surface",
       splittable: true,
     });
+  });
+
+  it("tells the sidebar which shells the fallback shows, until it unmounts", async () => {
+    gate.panesView = true;
+    loaded.fails = true;
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const NO_SPLIT = new Set<string>();
+    let owned: ReadonlySet<string> = new Set();
+    function Sidebar() {
+      owned = useMainOwnedTerminalKeys("conv_surface", { splitMembers: NO_SPLIT });
+      return null;
+    }
+    const view = render(
+      <>
+        <Surface />
+        <Sidebar />
+      </>,
+    );
+    await screen.findByTestId("terminal-view");
+    expect([...owned]).toEqual(["shell:s"]);
+    view.rerender(<Sidebar />);
+    expect([...owned]).toEqual([]);
   });
 });

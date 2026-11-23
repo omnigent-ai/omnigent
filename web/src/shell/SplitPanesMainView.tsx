@@ -11,7 +11,6 @@ import {
   useEffect,
   useMemo,
   useRef,
-  useState,
 } from "react";
 
 import { usePaneCommandsListed, useTerminalPaneHotkeys } from "@/hooks/useTerminalPaneHotkeys";
@@ -51,7 +50,7 @@ import {
   useChatPaneViewToggleHostRef,
 } from "./chatPaneToolbarHost";
 import { FileTypeIcon } from "./FileTypeIcon";
-import { MainTerminalView } from "./MainTerminalView";
+import type { MainTerminalView } from "./MainTerminalView";
 import { MissingTerminalPane } from "./MissingTerminalPane";
 import { PaneCloseDialog } from "./PaneCloseDialog";
 import { applyDividerResizes } from "./paneDividerCorners";
@@ -81,6 +80,7 @@ import {
 import { unzoomPane, useZoomedPaneKey } from "./terminalPaneZoom";
 import { usePanesSplitsAllowed } from "./panesViewGate";
 import { usePublishMainTerminalKeys } from "./terminalPlacement";
+import { PublishedTerminalView } from "./PublishedTerminalView";
 import { usePaneKeyboardOwner } from "./usePaneKeyboardOwner";
 import { mainSplitTarget } from "./terminalSplitTarget";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -120,12 +120,11 @@ export function SplitPanesMainView(props: SplitPanesMainViewProps) {
     initialTerminalKey !== PANEL_NO_TERMINAL_KEY &&
     initialTerminalKey !== agentKey;
   const panes = splitsAllowed && !shellView && !sandboxOffline && agentKey !== null;
-  // The sidebar leaves out exactly the terminals the Terminal view reports it shows.
-  const [terminalViewKeys, setTerminalViewKeys] = useState<readonly string[]>(NO_KEYS);
-  usePublishMainTerminalKeys(conversationId, panes ? NO_KEYS : terminalViewKeys);
+  // The panes own their shells; in their place, the Terminal view reports the ones it shows.
+  usePublishMainTerminalKeys(conversationId, NO_KEYS);
   if (!panes) {
     const { chatShown: _chatShown, cards: _cards, ...terminalViewProps } = props;
-    return <MainTerminalView {...terminalViewProps} onShownTerminalKeys={setTerminalViewKeys} />;
+    return <PublishedTerminalView {...terminalViewProps} />;
   }
   return (
     <MainSplitPanes

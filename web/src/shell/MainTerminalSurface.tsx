@@ -7,6 +7,7 @@ import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 
 import { MainTerminalView } from "./MainTerminalView";
 import { usePanesView } from "./panesViewGate";
+import { PublishedTerminalView } from "./PublishedTerminalView";
 import { useFloatingPanesShown } from "./useFloatingPanes";
 
 // The panes view loads only where it shows, so its code stays out of the session page's bundle
@@ -31,7 +32,7 @@ export function MainTerminalSurface({ chatShown, splittable, ...props }: MainTer
       <RenderErrorBoundary
         name="the terminal panes"
         resetKey={props.conversationId}
-        fallback={<MainTerminalView {...props} splittable={splittable} />}
+        fallback={<PublishedTerminalView {...props} splittable={splittable} />}
       >
         <Suspense fallback={null}>
           <SplitPanesMainView {...props} chatShown={chatShown} cards={floatingPanes} />
