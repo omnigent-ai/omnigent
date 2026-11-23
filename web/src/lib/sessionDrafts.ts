@@ -67,9 +67,10 @@ function saveDraftsToStorage(): void {
     const entries: Record<string, StoredDraft> = {};
     for (const [id, draft] of sessionDrafts) {
       if (!draft.text && !draft.reviewComments?.length) continue;
+      // Pasted chips hold Files, which the JSON storage cannot keep, so only the tags it can.
       const tagged =
         draft.mentions && (draft.mentions.files.length > 0 || draft.mentions.sessions.length > 0)
-          ? draft.mentions
+          ? { files: draft.mentions.files, sessions: draft.mentions.sessions }
           : undefined;
       entries[id] =
         draft.replyDraft || tagged || draft.reviewComments?.length

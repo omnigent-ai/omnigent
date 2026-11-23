@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   detectMentionAt,
+  mergeTaggedDrafts,
   recallFileMentions,
   recallSessionMentions,
   composerInlineMentions,
@@ -319,5 +320,26 @@ describe("harnessSupportsFileMentions", () => {
 
   it("is false before the session's harness is known", () => {
     expect(harnessSupportsFileMentions(null, declared)).toBe(false);
+  });
+});
+
+describe("mergeTaggedDrafts with pasted chips", () => {
+  it("renames a colliding chip and its file so the sent filename still matches the token", () => {
+    const first = {
+      files: [],
+      sessions: [],
+      attachments: [{ token: "@image.png", file: new File(["a"], "image.png") }],
+    };
+    const incoming = new File(["b"], "image.png", { type: "image/png" });
+    const merged = mergeTaggedDrafts(first, {
+      text: "see @image.png",
+      mentions: { files: [], sessions: [], attachments: [{ token: "@image.png", file: incoming }] },
+    });
+    expect(merged.text).toBe("see @image (2).png");
+    expect(merged.mentions!.attachments!.map((attachment) => attachment.token)).toEqual([
+      "@image.png",
+      "@image (2).png",
+    ]);
+    expect(merged.mentions!.attachments![1]!.file.name).toBe("image (2).png");
   });
 });

@@ -1315,3 +1315,166 @@ describe.each(["textarea", "codemirror"] as const)(
     );
   },
 );
+
+describe("Composer pasted chips", () => {
+  const codeMirrorInfo = { ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: true } };
+  let convSeq = 0;
+  beforeEach(() => {
+    resetWorkspaceMock();
+    declaredMentions.harnesses = new Set();
+    localStorage.clear();
+    useChatStore.setState({
+      conversationId: `conv_chips_${++convSeq}`,
+      sessionHarness: "claude-native",
+      pendingComposerAttachments: [],
+    });
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+  });
+  afterEach(() => {
+    cleanup();
+    resetCodeMirrorComposerLoadForTests();
+    vi.restoreAllMocks();
+  });
+
+  async function renderCodeMirrorComposer(onSend = vi.fn()) {
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <TooltipProvider>
+          <Composer {...composerProps({ onSend })} />
+        </TooltipProvider>
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() => expect(composerInput()).toHaveClass("cm-content"));
+    return onSend;
+  }
+  const composerInput = () => screen.getByLabelText("Message the agent");
+  const valueOf = () => composerTargetOf(composerInput())!.value;
+  const caretAt = (offset: number) =>
+    act(() => composerTargetOf(composerInput())!.setSelectionRange(offset, offset));
+  const typeAt = (text: string, offset = valueOf().length) =>
+    act(() => insertComposerText(composerTargetOf(composerInput())!, text, offset, offset));
+  const editorView = () => EditorView.findFromDOM(composerInput())!;
+  /** A paste as the clipboard carries it: text and/or file entries. */
+  function pasteOf({ text, files = [] }: { text?: string; files?: File[] }) {
+    const items = [
+      ...(text === undefined
+        ? []
+        : [{ kind: "string", type: "text/plain", getAsFile: () => null }]),
+      ...files.map((file) => ({ kind: "file", type: file.type, getAsFile: () => file })),
+    ];
+    return {
+      clipboardData: {
+        items,
+        getData: (format: string) => (format === "text/plain" ? (text ?? "") : ""),
+      },
+    };
+  }
+  const paste = (payload: Parameters<typeof pasteOf>[0]) =>
+    fireEvent.paste(composerInput(), pasteOf(payload));
+  const sentFiles = (onSend: ReturnType<typeof vi.fn>) =>
+    onSend.mock.calls[0]![1] as File[] | undefined;
+
+  it("inserts one named chip per pasted image at its caret, and sends both files", async () => {
+    const onSend = await renderCodeMirrorComposer();
+    const shot = new File(["a"], "shot.png", { type: "image/png" });
+    const diagram = new File(["b"], "diagram.png", { type: "image/png" });
+    typeAt("Compare  with the old one");
+    caretAt("Compare ".length);
+    paste({ files: [shot] });
+    caretAt(valueOf().length);
+    paste({ files: [diagram] });
+
+    expect(valueOf()).toBe("Compare @shot.png with the old one @diagram.png ");
+    expect(tokens()).toEqual(["@shot.png", "@diagram.png"]);
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(onSend.mock.calls[0]![0]).toBe("Compare @shot.png with the old one @diagram.png");
+    expect(sentFiles(onSend)).toEqual([shot, diagram]);
+  });
+
+  it("names a repeated paste with a suffix before its extension", async () => {
+    await renderCodeMirrorComposer();
+    paste({ files: [new File(["a"], "image.png", { type: "image/png" })] });
+    paste({ files: [new File(["b"], "image.png", { type: "image/png" })] });
+    expect(tokens()).toEqual(["@image.png", "@image (2).png"]);
+  });
+
+  it("drops a deleted chip's file from the send", async () => {
+    const onSend = await renderCodeMirrorComposer();
+    typeAt("Look ");
+    paste({ files: [new File(["a"], "shot.png", { type: "image/png" })] });
+    caretAt("Look @shot.png".length);
+    fireEvent.keyDown(composerInput(), { key: "Backspace" });
+    expect(tokens()).toEqual([]);
+
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(onSend).toHaveBeenCalledWith("Look", undefined);
+  });
+
+  it("⌘Z removes a fresh chip with its file, and ⌘⇧Z brings both back for the send", async () => {
+    const onSend = await renderCodeMirrorComposer();
+    const shot = new File(["a"], "shot.png", { type: "image/png" });
+    typeAt("Look ");
+    paste({ files: [shot] });
+    expect(valueOf()).toBe("Look @shot.png ");
+
+    act(() => void undo(editorView()));
+    expect(valueOf()).toBe("Look ");
+    expect(tokens()).toEqual([]);
+
+    act(() => void redo(editorView()));
+    expect(valueOf()).toBe("Look @shot.png ");
+    expect(tokens()).toEqual(["@shot.png"]);
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(sentFiles(onSend)).toEqual([shot]);
+    expect(sentFiles(onSend)![0]).toBe(shot);
+  });
+
+  it("attaches a large text paste as a .txt chip", async () => {
+    const onSend = await renderCodeMirrorComposer();
+    const log = "line\n".repeat(49) + "line";
+    paste({ text: log });
+    expect(valueOf()).toBe("@pasted-text.txt ");
+    expect(tokens()).toEqual(["@pasted-text.txt"]);
+
+    fireEvent.submit(composerInput().closest("form")!);
+    const [text] = sentFiles(onSend)!;
+    expect(text!.name).toBe("pasted-text.txt");
+    expect(text!.type).toBe("text/plain");
+    expect(text!.size).toBe(log.length);
+  });
+
+  it("keeps a small text paste inline", async () => {
+    await renderCodeMirrorComposer();
+    paste({ text: "hello world" });
+    expect(valueOf()).toBe("hello world");
+    expect(tokens()).toEqual([]);
+  });
+
+  it("inserts nothing for a rejected file and shows the rejection", async () => {
+    await renderCodeMirrorComposer();
+    paste({ files: [new File(["x"], "setup.exe", { type: "application/x-msdownload" })] });
+    expect(valueOf()).toBe("");
+    expect(tokens()).toEqual([]);
+    expect(screen.getByText(/"setup.exe" can't be attached/)).toBeInTheDocument();
+  });
+
+  it("keeps a chip and its file when the composer remounts with the saved draft", async () => {
+    const onSend = await renderCodeMirrorComposer();
+    typeAt("Look ");
+    paste({ files: [new File(["a"], "shot.png", { type: "image/png" })] });
+    cleanup();
+
+    await renderCodeMirrorComposer(onSend);
+    expect(tokens()).toEqual(["@shot.png"]);
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(sentFiles(onSend)!.map((file) => file.name)).toEqual(["shot.png"]);
+  });
+
+  it("leaves a large text paste inline on the textarea engine", () => {
+    render(<Composer {...composerProps()} />);
+    const log = "line\n".repeat(49) + "line";
+    paste({ text: log });
+    expect(textarea().value).toBe(log);
+    expect(screen.queryByText("pasted-text.txt")).toBeNull();
+  });
+});

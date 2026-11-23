@@ -2,7 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { insertPastedText } from "@/lib/composerText";
-import type { ComposerPasteEvent } from "@/components/composer/engine/composerInput";
+import { largePasteAsFile } from "@/lib/pastedAttachments";
+import type {
+  ComposerPasteEvent,
+  ComposerTextTarget,
+} from "@/components/composer/engine/composerInput";
 
 export interface UseComposerAttachmentsOptions {
   /**
@@ -18,6 +22,12 @@ export interface UseComposerAttachmentsOptions {
   onAccepted?: (accepted: File[]) => void;
   /** Runs after a removal. */
   onRemoved?: () => void;
+  /**
+   * Insert pasted files as chips at the paste's caret instead of adding them to the tray. Receives
+   * only validated files; a large plain-text paste arrives as one `.txt` file. Without it, pastes
+   * attach to the tray as before.
+   */
+  onPasteChips?: (files: File[], target: ComposerTextTarget) => void;
 }
 
 export interface ComposerAttachmentsApi {
@@ -60,6 +70,7 @@ export function useComposerAttachments({
   initialFiles,
   onAccepted,
   onRemoved,
+  onPasteChips,
 }: UseComposerAttachmentsOptions = {}): ComposerAttachmentsApi {
   const [files, setFiles] = useState<File[]>(() => initialFiles ?? []);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
@@ -69,6 +80,8 @@ export function useComposerAttachments({
   onAcceptedRef.current = onAccepted;
   const onRemovedRef = useRef(onRemoved);
   onRemovedRef.current = onRemoved;
+  const onPasteChipsRef = useRef(onPasteChips);
+  onPasteChipsRef.current = onPasteChips;
   // The server's filesystem attachment policy, read through a ref for the same reason.
   const info = useServerInfo();
   const policy = info === "loading" ? null : (info.filesystem_attachments ?? null);
@@ -90,14 +103,23 @@ export function useComposerAttachments({
     onRemovedRef.current?.();
   }, [policy]);
 
-  const addFiles = useCallback((incoming: File[]) => {
+  // Validate and surface the rejections; returns the files that passed.
+  const validateIncoming = useCallback((incoming: File[]): File[] => {
     const { accepted, errors } = validateAttachments(incoming, policyRef.current);
-    if (accepted.length > 0) {
-      setFiles((prev) => [...prev, ...accepted]);
-      onAcceptedRef.current?.(accepted);
-    }
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
+    return accepted;
   }, []);
+
+  const addFiles = useCallback(
+    (incoming: File[]) => {
+      const accepted = validateIncoming(incoming);
+      if (accepted.length > 0) {
+        setFiles((prev) => [...prev, ...accepted]);
+        onAcceptedRef.current?.(accepted);
+      }
+    },
+    [validateIncoming],
+  );
 
   const removeFile = useCallback((index: number) => {
     setFiles((prev) => prev.filter((_, i) => i !== index));
@@ -105,11 +127,10 @@ export function useComposerAttachments({
     onRemovedRef.current?.();
   }, []);
 
-  const replaceFiles = useCallback((incoming: File[]) => {
-    const { accepted, errors } = validateAttachments(incoming, policyRef.current);
-    setFiles(accepted);
-    setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
-  }, []);
+  const replaceFiles = useCallback(
+    (incoming: File[]) => setFiles(validateIncoming(incoming)),
+    [validateIncoming],
+  );
 
   const restoreFiles = useCallback((restored: File[]) => {
     setFiles(restored);
@@ -117,15 +138,25 @@ export function useComposerAttachments({
 
   const onPaste = useCallback(
     (e: ComposerPasteEvent) => {
-      const pasted = clipboardFiles(e.clipboardData);
+      const insertChips = onPasteChipsRef.current;
+      let pasted = clipboardFiles(e.clipboardData);
+      if (pasted.length === 0 && insertChips) {
+        const largeText = largePasteAsFile(e.clipboardData);
+        if (largeText) pasted = [largeText];
+      }
       if (pasted.length === 0) {
         insertPastedText(e);
         return;
       }
       e.preventDefault();
+      if (insertChips) {
+        const accepted = validateIncoming(pasted);
+        if (accepted.length > 0) insertChips(accepted, e.currentTarget);
+        return;
+      }
       addFiles(pasted);
     },
-    [addFiles],
+    [addFiles, validateIncoming],
   );
 
   const clearError = useCallback(() => setAttachmentError(null), []);

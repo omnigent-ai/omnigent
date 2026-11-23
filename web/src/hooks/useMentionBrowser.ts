@@ -6,6 +6,8 @@ import {
   type ComposerTextTarget,
 } from "@/components/composer/engine/composerInput";
 import { insertComposerText } from "@/lib/composerText";
+import { attachmentFilename } from "@/lib/attachments";
+import { uniqueAttachmentName } from "@/lib/pastedAttachments";
 
 import {
   detectMentionAt,
@@ -17,6 +19,7 @@ import {
   SESSION_MENTION_CAP,
   type MentionItem,
   type MentionState,
+  type PastedAttachment,
   type SessionMention,
   sessionMentionToken,
   type TaggedMentions,
@@ -31,8 +34,16 @@ function sessionTagToken(session: SessionMention): string {
   return session.token ?? `@${session.title}`;
 }
 
+function attachmentsOf(tags: TaggedMentions): PastedAttachment[] {
+  return tags.attachments ?? [];
+}
+
 function tagTokens(tags: TaggedMentions): string[] {
-  return [...tags.files.map(fileMentionToken), ...tags.sessions.map(sessionTagToken)];
+  return [
+    ...tags.files.map(fileMentionToken),
+    ...tags.sessions.map(sessionTagToken),
+    ...attachmentsOf(tags).map((it) => it.token),
+  ];
 }
 
 /**
@@ -53,20 +64,22 @@ function tokensIn(segments: readonly string[], tokens: readonly string[]): Set<s
 }
 
 /** `tags` without anything `removed` names by token. */
-function withoutTags(tags: TaggedMentions, removed: TaggedMentions): TaggedMentions {
+function withoutTags(tags: TaggedMentions, removed: TaggedMentions): Required<TaggedMentions> {
   const gone = new Set(tagTokens(removed));
   return {
     files: tags.files.filter((it) => !gone.has(fileMentionToken(it))),
     sessions: tags.sessions.filter((it) => !gone.has(sessionTagToken(it))),
+    attachments: attachmentsOf(tags).filter((it) => !gone.has(it.token)),
   };
 }
 
 /** `tags` plus `added`, which replace any with the same tokens. */
-function mergeTags(tags: TaggedMentions, added: TaggedMentions): TaggedMentions {
+function mergeTags(tags: TaggedMentions, added: TaggedMentions): Required<TaggedMentions> {
   const kept = withoutTags(tags, added);
   return {
     files: [...kept.files, ...added.files],
     sessions: [...kept.sessions, ...added.sessions],
+    attachments: [...kept.attachments, ...attachmentsOf(added)],
   };
 }
 
@@ -147,6 +160,10 @@ export interface MentionBrowser {
   setMentionedSessions: React.Dispatch<React.SetStateAction<SessionMention[]>>;
   /** Tag a session, replacing the typed ``@query`` with its token. */
   attachSession: (session: SessionMention) => void;
+  /** Pasted files, each inserted as a chip at its input's selection. Files are validated already. */
+  attachPastedFiles: (files: readonly File[], target: ComposerTextTarget) => void;
+  /** The pasted-file chips in the draft, released ones excluded. */
+  mentionedAttachments: PastedAttachment[];
   /** Tokens of everything tagged so far, for highlighting and Backspace. */
   mentionTokens: string[];
   /**
@@ -196,8 +213,12 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const [localSessions, setLocalSessions] = useState<SessionMention[]>(
     () => initialMentions?.sessions ?? [],
   );
+  const [localAttachments, setLocalAttachments] = useState<PastedAttachment[]>(
+    () => initialMentions?.attachments ?? [],
+  );
   const mentionedItems = tags ? tags.mentions.files : localItems;
   const mentionedSessions = tags ? tags.mentions.sessions : localSessions;
+  const mentionedAttachments = tags ? attachmentsOf(tags.mentions) : localAttachments;
   const setMentionedItems: React.Dispatch<React.SetStateAction<MentionItem[]>> = tags
     ? (update) =>
         tags.updateMentions((current) => ({
@@ -212,6 +233,15 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
           sessions: resolveUpdate(update, current.sessions),
         }))
     : setLocalSessions;
+  // A caller's draft gains an attachments key only once a chip exists, so its stored shape is unchanged.
+  const setMentionedAttachments: React.Dispatch<React.SetStateAction<PastedAttachment[]>> = tags
+    ? (update) =>
+        tags.updateMentions((current) => {
+          const attachments = resolveUpdate(update, attachmentsOf(current));
+          if (attachments.length === 0 && current.attachments === undefined) return current;
+          return { ...current, attachments };
+        })
+    : setLocalAttachments;
   // An opened list stays open for the "@" token it was opened from.
   const [browse, setBrowse] = useState<{ start: number; level: SessionMenuLevel } | null>(null);
   if (browse !== null && mention?.start !== browse.start) setBrowse(null);
@@ -261,10 +291,11 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     setMentionIndex(kept >= 0 ? kept : mentionEntryKeys.length > 0 ? 0 : -1);
   }
 
-  const mentionTokens = [
-    ...mentionedItems.map(fileMentionToken),
-    ...mentionedSessions.map(sessionTagToken),
-  ];
+  const mentionTokens = tagTokens({
+    files: mentionedItems,
+    sessions: mentionedSessions,
+    attachments: mentionedAttachments,
+  });
 
   // Tags whose tokens left the draft. They keep their tokens, so no other target is given
   // one while an undo could still bring it back; a reset forgets them.
@@ -272,9 +303,17 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   // Restore points by token: where a token was last removed, for an undo to bring it back.
   const restorePointsRef = useRef(new Map<string, RestorePoint>());
   // The latest tags, for callers that run outside a render (the file viewer's drain).
-  const activeRef = useRef<TaggedMentions>({ files: mentionedItems, sessions: mentionedSessions });
+  const activeRef = useRef<TaggedMentions>({
+    files: mentionedItems,
+    sessions: mentionedSessions,
+    attachments: mentionedAttachments,
+  });
   useLayoutEffect(() => {
-    activeRef.current = { files: mentionedItems, sessions: mentionedSessions };
+    activeRef.current = {
+      files: mentionedItems,
+      sessions: mentionedSessions,
+      attachments: mentionedAttachments,
+    };
   });
 
   // Every token a tag owns, active or released; new tags take none of them.
@@ -295,8 +334,9 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     const present = tokensIn(draftSegments, owned);
     const goneFiles = mentionedItems.filter((it) => !present.has(fileMentionToken(it)));
     const goneSessions = mentionedSessions.filter((it) => !present.has(sessionTagToken(it)));
-    if (goneFiles.length === 0 && goneSessions.length === 0) return;
-    const gone = { files: goneFiles, sessions: goneSessions };
+    const goneAttachments = mentionedAttachments.filter((it) => !present.has(it.token));
+    if (goneFiles.length === 0 && goneSessions.length === 0 && goneAttachments.length === 0) return;
+    const gone = { files: goneFiles, sessions: goneSessions, attachments: goneAttachments };
     releasedRef.current = mergeTags(releasedRef.current, gone);
     if (goneFiles.length > 0) {
       setMentionedItems((prev) => prev.filter((it) => present.has(fileMentionToken(it))));
@@ -304,18 +344,31 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     if (goneSessions.length > 0) {
       setMentionedSessions((prev) => prev.filter((it) => present.has(sessionTagToken(it))));
     }
+    if (goneAttachments.length > 0) {
+      setMentionedAttachments((prev) => prev.filter((it) => present.has(it.token)));
+    }
     // draftSegments is captured through segmentsKey, which changes with its content.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [segmentsKey, mentionedItems, mentionedSessions]);
+  }, [segmentsKey, mentionedItems, mentionedSessions, mentionedAttachments]);
 
   // Take released tags back as active ones, and drop the restore points they used.
   const reclaim = (restored: TaggedMentions) => {
-    if (restored.files.length === 0 && restored.sessions.length === 0) return;
+    const restoredAttachments = attachmentsOf(restored);
+    if (
+      restored.files.length === 0 &&
+      restored.sessions.length === 0 &&
+      restoredAttachments.length === 0
+    ) {
+      return;
+    }
     releasedRef.current = withoutTags(releasedRef.current, restored);
     for (const token of tagTokens(restored)) restorePointsRef.current.delete(token);
     if (restored.files.length > 0) setMentionedItems((prev) => [...prev, ...restored.files]);
     if (restored.sessions.length > 0) {
       setMentionedSessions((prev) => [...prev, ...restored.sessions]);
+    }
+    if (restoredAttachments.length > 0) {
+      setMentionedAttachments((prev) => [...prev, ...restoredAttachments]);
     }
   };
 
@@ -350,6 +403,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
       reclaim({
         files: released.files.filter((it) => restores(fileMentionToken(it))),
         sessions: released.sessions.filter((it) => restores(sessionTagToken(it))),
+        attachments: attachmentsOf(released).filter((it) => restores(it.token)),
       });
     } else {
       // Text typed or pasted back to a restore point's value is literal now, so that point is stale.
@@ -377,6 +431,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     restorePointsRef.current.clear();
     setMentionedItems(mentions?.files ?? []);
     setMentionedSessions(mentions?.sessions ?? []);
+    setMentionedAttachments(attachmentsOf(mentions ?? NO_TAGS));
   };
 
   const placeCaret = (caret: number) =>
@@ -415,20 +470,44 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     return true;
   };
 
+  // Replace [start, end) with the token, spaced off from the words around it, caret after it.
+  const insertTokenAt = (
+    target: ComposerTextTarget | null,
+    start: number,
+    end: number,
+    token: string,
+  ): boolean => {
+    const current = liveText(target);
+    const lead = start > 0 && !/\s/.test(current[start - 1]!) ? " " : "";
+    const trail = /^\s/.test(current.slice(end)) ? "" : " ";
+    const tokenStart = start + lead.length;
+    return editDraft(target, start, end, lead + token + trail, tokenStart + token.length + 1);
+  };
+
   // Swap the typed "@query" for the token plus one space, caret after it.
   const insertToken = (active: MentionState, token: string): boolean => {
-    const gap = /^\s/.test(liveText(textareaRef.current).slice(active.end)) ? "" : " ";
-    const edited = editDraft(
-      textareaRef.current,
-      active.start,
-      active.end,
-      token + gap,
-      active.start + token.length + 1,
-    );
-    if (!edited) return false;
+    if (!insertTokenAt(textareaRef.current, active.start, active.end, token)) return false;
     setMention(null);
     setMentionIndex(-1);
     return true;
+  };
+
+  const attachPastedFiles = (files: readonly File[], target: ComposerTextTarget) => {
+    const taken = ownedMentionTokens();
+    const added: PastedAttachment[] = [];
+    for (const file of files) {
+      // The chip's name is the filename the attachment is sent with, so it is also its token.
+      const name = uniqueAttachmentName(attachmentFilename(file), taken);
+      const token = `@${name}`;
+      const named = name === file.name ? file : new File([file], name, { type: file.type });
+      if (!insertTokenAt(target, target.selectionStart, target.selectionEnd, token)) break;
+      taken.push(token);
+      added.push({ token, file: named });
+    }
+    if (added.length === 0) return;
+    setMention(null);
+    setMentionIndex(-1);
+    setMentionedAttachments((prev) => [...prev, ...added]);
   };
 
   const attachSession = (session: SessionMention) => {
@@ -604,6 +683,8 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     mentionedSessions,
     setMentionedSessions,
     attachSession,
+    attachPastedFiles,
+    mentionedAttachments,
     mentionTokens,
     tagFiles,
     ownedMentionTokens,

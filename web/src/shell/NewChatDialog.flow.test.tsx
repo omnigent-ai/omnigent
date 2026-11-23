@@ -2188,6 +2188,36 @@ describe("NewChatLandingScreen create flow", () => {
     expect(navigateMock).toHaveBeenCalledWith("/c/conv_new");
   });
 
+  it("hands a pasted chip's file to the first message on the CodeMirror prompt", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    onTestFinished(() => resetCodeMirrorComposerLoadForTests());
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding([], { features: { chat_composer_codemirror: true } });
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    await waitForWorkspaceSeed();
+    const shot = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    const items = [{ kind: "file", type: "image/png", getAsFile: () => shot }];
+    fireEvent.paste(screen.getByTestId("new-chat-landing-input"), {
+      clipboardData: { items, getData: () => "" },
+    });
+    expect(screen.getByTestId("composer-mention-token").textContent).toBe("@shot.png");
+    expect(screen.queryByAltText("shot.png")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({ files: [shot] }),
+      ),
+    );
+  });
+
   it("stashes the first prompt as the session's optimistic label", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,

@@ -1,5 +1,6 @@
 import type { ComposerAttachment } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
+import { uniqueAttachmentName } from "@/lib/pastedAttachments";
 
 /**
  * Pure ``@``-mention utilities (workspace files and other sessions) shared by the in-session composer
@@ -299,7 +300,7 @@ export function mentionTokenAtCaret(
 }
 
 /** Mentions whose token still appears in any of ``texts``; deleted tokens drop out. */
-export function presentMentions<T extends InlineMention>(
+export function presentMentions<T extends { token: string }>(
   mentions: readonly T[],
   texts: readonly string[],
 ): T[] {
@@ -497,10 +498,21 @@ export function readableSentText(text: string): string {
   return replaceSentMentions(text, (m) => (m.kind === "session" ? `@${m.title}` : `@${m.path}`));
 }
 
+/**
+ * A file pasted into the CodeMirror composer as a chip. The chip's token is the attachment's
+ * sent filename, e.g. ``@image.png``; the file is sent with the message, not referenced by path.
+ */
+export interface PastedAttachment {
+  token: string;
+  file: File;
+}
+
 /** Everything tagged in one composer draft, saved and restored with its text. */
 export interface TaggedMentions {
   files: MentionItem[];
   sessions: SessionMention[];
+  /** In-memory only: a File cannot be saved with the draft, so a reload drops these chips. */
+  attachments?: PastedAttachment[];
 }
 
 // A tagged file's identity: the same path, kind and line range.
@@ -526,10 +538,16 @@ export function mergeTaggedDrafts(
   if (!second.mentions) return { text: second.text, mentions: first };
   const files = [...(first?.files ?? [])];
   const sessions = [...(first?.sessions ?? [])];
-  const taken = [...files.map(fileMentionToken), ...sessions.map(sessionTokenOf)];
+  const attachments = [...(first?.attachments ?? [])];
+  const taken = [
+    ...files.map(fileMentionToken),
+    ...sessions.map(sessionTokenOf),
+    ...attachments.map((it) => it.token),
+  ];
   const secondTokens = [
     ...second.mentions.files.map(fileMentionToken),
     ...second.mentions.sessions.map(sessionTokenOf),
+    ...(second.mentions.attachments ?? []).map((it) => it.token),
   ];
   // A new token must not collide with a later tag of ``second`` either.
   const avoid = (own: string) => [...taken, ...secondTokens.filter((t) => t !== own)];
@@ -560,13 +578,29 @@ export function mergeTaggedDrafts(
     sessions.push({ ...session, token: next });
     claim(token, next);
   }
+  for (const attachment of second.mentions.attachments ?? []) {
+    const token = attachment.token;
+    // A renamed chip's file takes the new name too, so the sent filename still matches its token.
+    const next = taken.includes(token)
+      ? `@${uniqueAttachmentName(token.slice(1), avoid(token))}`
+      : token;
+    const file =
+      next === token
+        ? attachment.file
+        : new File([attachment.file], next.slice(1), { type: attachment.file.type });
+    attachments.push({ token: next, file });
+    claim(token, next);
+  }
   // Scan every token of ``second`` so a longer one is never split by a shorter rename.
   let text = second.text;
   for (const range of findMentionTokens(text, secondTokens).reverse()) {
     const next = renamed.get(range.token);
     if (next !== undefined) text = text.slice(0, range.start) + next + text.slice(range.end);
   }
-  return { text, mentions: { files, sessions } };
+  return {
+    text,
+    mentions: attachments.length > 0 ? { files, sessions, attachments } : { files, sessions },
+  };
 }
 
 function sessionTokenOf(session: SessionMention): string {
