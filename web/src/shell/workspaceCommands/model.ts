@@ -516,3 +516,30 @@ export function tabActionCommandFor(
   if (!command) throw new Error(`No workspace tab command for "${action}"`);
   return command;
 }
+
+export const SHOW_ALL_PULL_REQUESTS_LABEL = "Show all pull requests";
+export const ALL_PULL_REQUESTS_LABEL = "All pull requests";
+export const NO_PULL_REQUESTS_REASON = "This session's workspace can't show pull requests.";
+
+export interface ShowAllPullRequestsFacts {
+  /** The session's workspace can show pull requests, the Pull requests page's own gate. */
+  pullRequestsAvailable: boolean;
+  /** A pull request tab is open, so its list is a step away even where the gate says no. */
+  hasPullRequestTab: boolean;
+}
+
+/** ⌘K's row for the session's list of pull requests, shared with a pull request page's button. */
+export function showAllPullRequestsCommand(facts: ShowAllPullRequestsFacts): {
+  label: string;
+  keywords: readonly string[];
+  availability: CommandAvailability;
+} {
+  return {
+    label: SHOW_ALL_PULL_REQUESTS_LABEL,
+    keywords: ["pull requests", "pulls", "prs", "list", "overview", "workspace"],
+    availability:
+      facts.pullRequestsAvailable || facts.hasPullRequestTab
+        ? AVAILABLE
+        : unavailableBecause(NO_PULL_REQUESTS_REASON),
+  };
+}

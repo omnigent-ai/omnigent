@@ -2,7 +2,14 @@
 // and Markdown (rich preview and edit), images, PDFs, 3D models and binaries in the app's viewer.
 
 import { FileDiffIcon, XIcon } from "lucide-react";
-import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import {
+  type ComponentProps,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -14,6 +21,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
+import { useComparisonFileDiff } from "@/hooks/useComparisonFileDiff";
 import { useFileContent } from "@/hooks/useFileContent";
 import { fileContentText } from "@/lib/workspaceSidebarSource";
 import { cn } from "@/lib/utils";
@@ -49,6 +57,8 @@ export interface FilesPageViewerProps {
   registerLeaveGuard?: (guard: FilesPageLeaveGuard) => () => void;
   /** The session's permission level, which limits the app's viewer as it does elsewhere. */
   permissionLevel?: number | null;
+  /** A comment whose thread a link opens; the app's viewer shows it, since the editor has no threads. */
+  commentId?: string;
 }
 
 /** Whether the app's own viewer shows `path` rather than the text editor. */
@@ -72,23 +82,26 @@ export function FilesPageViewer({
   onShowChanges,
   registerLeaveGuard,
   permissionLevel,
+  commentId,
 }: FilesPageViewerProps) {
   const file = useFileContent(conversationId, path, { visible: active });
   const contentType = file.data?.content_type;
   // Markdown, media and binaries show in the app's viewer, under the same toolbar as text.
-  const rich = file.data != null && showsInFileViewer(path, contentType);
-  const appViewer = (
-    <FileViewer
-      conversationId={conversationId}
-      path={path}
-      position={position}
-      open={active}
-      frameless
-      onClose={onClose}
-      registerLeaveGuard={registerLeaveGuard}
-      permissionLevel={permissionLevel}
-    />
-  );
+  const rich =
+    file.data != null && (commentId !== undefined || showsInFileViewer(path, contentType));
+  const viewerProps: AppViewerProps = {
+    linkedCommentId: commentId,
+    conversationId,
+    path,
+    position,
+    open: active,
+    frameless: true,
+    onClose,
+    registerLeaveGuard,
+    permissionLevel,
+  };
+  // Another linked comment opens its thread afresh.
+  const appViewer = <ComparisonFileViewer key={commentId} {...viewerProps} />;
   const text = file.data && !rich ? fileContentText(file.data) : null;
   return (
     <div className={cn("flex min-h-0 flex-col bg-background", WORKSPACE_SIDEBAR_LAYOUT.page)}>
@@ -120,9 +133,7 @@ export function FilesPageViewer({
       <div className={cn("flex min-h-0 flex-1 flex-col", WORKSPACE_SIDEBAR_LAYOUT.content)}>
         {/* A failed refresh keeps the last content, so an open editor and its edits stay. */}
         {file.isError && !file.data ? (
-          <p role="alert" className="p-3 text-ui text-destructive">
-            Couldn’t open {path}: {file.error.message}
-          </p>
+          <UnreadableFile viewer={viewerProps} message={file.error.message} />
         ) : !file.data ? (
           <div className="flex flex-1 items-center justify-center">
             <Spinner aria-label={`Loading ${path}`} />
@@ -143,6 +154,27 @@ export function FilesPageViewer({
         )}
       </div>
     </div>
+  );
+}
+
+type AppViewerProps = Omit<ComponentProps<typeof FileViewer>, "comparisonDiff">;
+
+/** The app's viewer, whose diff is the one the Changes review shows under the session's comparison. */
+function ComparisonFileViewer(props: AppViewerProps) {
+  const comparisonDiff = useComparisonFileDiff(props.conversationId, props.path);
+  return <FileViewer {...props} comparisonDiff={comparisonDiff} />;
+}
+
+/** A file that couldn't be read: the comparison's diff when it deleted the file, else why. */
+function UnreadableFile({ viewer, message }: { viewer: AppViewerProps; message: string }) {
+  const comparisonDiff = useComparisonFileDiff(viewer.conversationId, viewer.path);
+  if (comparisonDiff.base === "comparison" && comparisonDiff.deleted) {
+    return <FileViewer {...viewer} comparisonDiff={comparisonDiff} />;
+  }
+  return (
+    <p role="alert" className="p-3 text-ui text-destructive">
+      Couldn’t open {viewer.path}: {message}
+    </p>
   );
 }
 

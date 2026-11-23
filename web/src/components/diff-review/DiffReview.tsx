@@ -85,6 +85,7 @@ import {
   type DiffReviewCommand,
   FIND_IN_CHANGES_LABEL,
 } from "./diffReviewCommands";
+import { useDiffFileOrder } from "./diffFileOrderPreference";
 import { useOwnedFilesOnly, writeOwnedFilesOnly } from "./ownedFilesPreference";
 import { useDiffWorkers } from "./sharedDiffWorkers";
 import {
@@ -419,7 +420,8 @@ export function DiffReview<A = undefined>({
   presentation,
 }: DiffReviewProps<A>) {
   // The diff lists its files in the tree's order, so the two read the same top to bottom.
-  const files = useMemo(() => treeOrderedFiles(givenFiles), [givenFiles]);
+  const [fileOrder, setFileOrder] = useDiffFileOrder();
+  const files = useMemo(() => treeOrderedFiles(givenFiles, fileOrder), [givenFiles, fileOrder]);
   const viewer = useRef<CodeViewHandle<A>>(null);
   const [shell, setShell] = useState<HTMLDivElement | null>(null);
   const width = useElementWidth(shell);
@@ -636,10 +638,16 @@ export function DiffReview<A = undefined>({
       if (content?.status === "ready") requestPreview(path, content.fileDiff);
     }
   }, [findOpen, shownRich, contents, requestPreview]);
-  // The toolbar's totals and its by-language breakdown come from one pass over the same counts.
+  // The toolbar's totals and its by-language breakdown come from one pass over the same counts;
+  // the toolbar counts only files not yet viewed, so marking one brings its number down.
   const breakdown = useMemo(
-    () => lineBreakdown(listedFiles, (file) => fileLineCounts(file, contents.get(file.path))),
-    [listedFiles, contents],
+    () =>
+      lineBreakdown(
+        listedFiles,
+        (file) => fileLineCounts(file, contents.get(file.path)),
+        (file) => viewedPaths.has(file.path),
+      ),
+    [listedFiles, contents, viewedPaths],
   );
   const expandablePaths = useMemo(
     () =>
@@ -2001,6 +2009,8 @@ export function DiffReview<A = undefined>({
         label: `${action.label} for ${name}`,
         icon: action.icon,
         keywords: ["markdown", "rendered", "preview", "diff", file.path],
+        // Named after the file, so sessions matching its name stay above it.
+        leadsSources: false,
         run: action.run,
       },
     ];
@@ -2029,6 +2039,7 @@ export function DiffReview<A = undefined>({
         label: viewed ? `Mark ${name} as not viewed` : `Mark ${name} as viewed`,
         icon: CheckIcon,
         keywords: ["viewed", "reviewed", "done", "seen", file.path],
+        leadsSources: false,
         run: () => toggleFileViewed(file),
       },
     ];
@@ -2149,6 +2160,7 @@ export function DiffReview<A = undefined>({
       icon: SquarePlusIcon,
       keywords: [...command.keywords, command.path],
       availability: command.availability,
+      leadsSources: command.leadsSources,
       run: () => latestOpenInNewTab.current?.(command.path, { background: true }),
     }));
   }, [commandsActive, currentFile, opensInNewTab]);
@@ -2240,6 +2252,8 @@ export function DiffReview<A = undefined>({
         setIgnoreWhitespace: onIgnoreWhitespaceChange,
         wrapLines,
         setWrapLines: onWrapLinesChange,
+        fileOrder,
+        setFileOrder,
         allCollapsed,
         canCollapse: expandablePaths.length > 0,
         toggleAllFiles,
@@ -2274,6 +2288,8 @@ export function DiffReview<A = undefined>({
       wide,
       filters,
       dispatchFilter,
+      fileOrder,
+      setFileOrder,
       layout,
       onLayoutChange,
       canSplit,

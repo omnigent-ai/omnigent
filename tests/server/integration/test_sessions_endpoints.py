@@ -40,6 +40,7 @@ from omnigent.harnesses.claude_native import forwarder
 from omnigent.host.frames import HostHelloFrame
 from omnigent.llms.context_window import ModelPricing
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.runner.transports.ws_tunnel.frames import EventAckFrame, EventBatchFrame
 from omnigent.runtime import inflight_text
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
@@ -12256,6 +12257,59 @@ async def test_patch_approval_mode_forwards_and_persists_label(
     ]
     assert len(mode_events) == 1
     assert mode_events[0]["approval_mode"] == "full-access"
+
+
+_APPROVE_FOR_ME = PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]
+
+
+@pytest.mark.parametrize(
+    ("harness", "reported", "launch_args", "expected"),
+    [
+        pytest.param(
+            "codex-native", "read-only", _APPROVE_FOR_ME, "read-only", id="reported-mode"
+        ),
+        # Anyone who can edit the session can write the label, so it can't claim
+        # a mode that skips approval.
+        pytest.param(
+            "codex-native",
+            "full-access",
+            _APPROVE_FOR_ME,
+            "approve-for-me",
+            id="reported-approval-skipping-mode",
+        ),
+        pytest.param("cursor-native", None, ["--auto-review"], "auto-review", id="cursor"),
+        pytest.param(
+            "antigravity-native",
+            None,
+            ["--dangerously-skip-permissions"],
+            "skip",
+            id="antigravity",
+        ),
+        pytest.param("devin-native", None, ["--permission-mode", "smart"], "smart", id="devin"),
+        pytest.param(None, "read-only", _APPROVE_FOR_ME, None, id="harness-without-modes"),
+    ],
+)
+async def test_session_snapshot_reports_its_permission_mode(
+    client: httpx.AsyncClient,
+    harness: str | None,
+    reported: str | None,
+    launch_args: list[str],
+    expected: str | None,
+) -> None:
+    """The snapshot names the mode a session reports, over the one it launched in."""
+    executor = {"type": "omnigent", "config": {"harness": harness}} if harness else None
+    agent = await create_test_agent(client, executor=executor)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.codex_native.approval_mode": reported} if reported else None,
+        terminal_launch_args=launch_args,
+    )
+
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["permission_mode"] == expected
 
 
 @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])

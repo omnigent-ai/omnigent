@@ -3,6 +3,8 @@
 // app are kept as they are, and a store written by a newer version is never
 // overwritten.
 
+import { type ComparisonChoice, isWorkingCopyBaseIntent } from "@/lib/comparisonChoice";
+
 import type {
   ExplicitRange,
   LineRange,
@@ -74,6 +76,21 @@ function parseRange(value: unknown): ExplicitRange | undefined {
   return nonEmptyString(value.head) ? { base: value.base, head: value.head } : { base: value.base };
 }
 
+function parseComparison(value: unknown): ComparisonChoice | undefined {
+  if (!isRecord(value)) return undefined;
+  if (value.kind === "saved") {
+    return typeof value.intent === "string" && isWorkingCopyBaseIntent(value.intent)
+      ? { kind: "saved", intent: value.intent }
+      : undefined;
+  }
+  if (value.kind !== "typed" || !nonEmptyString(value.base)) return undefined;
+  return {
+    kind: "typed",
+    base: value.base,
+    head: typeof value.head === "string" ? value.head : "",
+  };
+}
+
 const PULL_REQUEST_VIEWS: readonly PullRequestView[] = [
   "summary",
   "comments",
@@ -105,6 +122,7 @@ export function parsePlace(value: unknown): WorkspacePlace | null | "unknown" {
         ...(path === undefined ? {} : optional("line", parseLine(value.line))),
         ...(path === undefined ? {} : optional("comment", comment)),
         ...optional("range", parseRange(value.range)),
+        ...optional("comparison", parseComparison(value.comparison)),
         ...(path !== undefined && value.fileTab === true ? { fileTab: true as const } : {}),
       };
     case "pulls":

@@ -7,6 +7,7 @@ import { randomUUID } from "@/lib/randomUUID";
 import { newPendingSideChatId } from "@/lib/sideChat";
 
 import { isPinnedTab, withPinnedFirst } from "./pinnedTabs";
+import { createShellWaits } from "./shellWaits";
 import { type HistoryMoveOptions, WorkspaceHistory } from "./workspaceHistory";
 import {
   bindingForPlace,
@@ -146,6 +147,8 @@ export interface WorkspaceTabsStoreOptions {
   newTabId?: () => TabId;
   newViewKey?: () => string;
   newDraftKey?: () => string;
+  /** How many comparisons the person has chosen for the session, stamped on each landing. */
+  choiceCount?: () => number;
 }
 
 /** A line, column or comment move inside the same file, which history records in place. */
@@ -181,6 +184,13 @@ function withoutUnseen(tab: WorkspaceTab): WorkspaceTab {
 
 export type WorkspaceTabsStore = ReturnType<typeof createWorkspaceTabsStore>;
 
+/** A tab's landing on a visit; its view marks it `settled` once it showed what the visit asks. */
+export interface TabLanding {
+  settled: boolean;
+  /** The session's choice count as it landed; a pick since is newer than the visit. */
+  choices: number;
+}
+
 export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
   const {
     scopeId,
@@ -194,9 +204,13 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     newTabId = () => randomUUID(),
     newViewKey = () => randomUUID(),
     newDraftKey = newPendingSideChatId,
+    choiceCount = () => 0,
   } = options;
 
   let tabs: WorkspaceTabRecord[] = withPinnedFirst([...options.initial.tabs]);
+  // Each tab's latest landing on a visit by a step, a link or an open, which its view settles once.
+  const landings = new Map<TabId, TabLanding>();
+  const land = (tabId: TabId) => landings.set(tabId, { settled: false, choices: choiceCount() });
   let selectedTabId: TabId | null = options.initial.selectedTabId;
   let closed: ClosedTab[] = [...options.initial.closed];
   let revision = 0;
@@ -208,6 +222,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
   const stamp = () => revision - excusedChanges;
   let saveFailureReported = false;
   let terminalInventory: TerminalInventory = { status: "unknown" };
+  const shellWaits = createShellWaits();
   // Shells seen in a loaded list this run, or saved from an earlier one. Only those
   // can end; a shell that is still starting stays "Connecting…" until it appears.
   const seenTerminals = new Set<string>(
@@ -407,6 +422,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
           ? withoutUnseen(moved)
           : { ...moved, ...(changed ? { unseen: true as const } : {}) };
         replaceTab(next);
+        land(tab.id);
         if (plan.select) markSelected(tab.id);
         recordVisit(plan.history, changed ? { tabId: tab.id, place: plan.place } : visitOf(next));
         return { tabId: tab.id, created: false, selected: plan.select };
@@ -429,6 +445,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
         // The first tab to arrive in an empty sidebar takes its New tab's place, and shows.
         if (plan.place.kind !== "new") takeEmptyNewTabsPlace();
         insertAfter(tab, plan.after);
+        land(tab.id);
         if (plan.select) markSelected(tab.id);
         recordVisit(plan.history, { tabId: tab.id, place: tab.place });
         return { tabId: tab.id, created: true, selected: plan.select };
@@ -548,6 +565,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
         const current = findTab(tabId);
         if (!current) return { ok: false as const, stale: true as const };
         replaceTab(withPlace(current, place));
+        land(tabId);
         if (current.id === selectedTabId) {
           const visit = { tabId, place };
           if (navigateOptions.replace || isPositionOnlyMove(current.place, place)) {
@@ -591,6 +609,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
         const current = landed ? findTab(landed.tabId) : undefined;
         if (!landed || !current) return { ok: false as const, stale: true as const };
         markSelected(current.id);
+        land(current.id);
         if (current.binding?.kind === "browser-view") landBrowserTab(current, landed);
         else replaceTab({ ...withoutUnseen(current), ...(moves ? { place: landed.place } : {}) });
         commit();
@@ -1029,6 +1048,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
         const wasSelected = current.id === selectedTabId;
         const shown = withPlace(withoutMarks(current), place);
         replaceTab(shown);
+        land(tabId);
         markSelected(tabId);
         recordVisit(
           wasSelected && isPositionOnlyMove(current.place, place) ? "replace" : "append",
@@ -1104,6 +1124,8 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     selectedTabId: () => snapshot.selectedTabId,
     selectedTab: () => (selectedTabId === null ? undefined : findTab(selectedTabId)),
     findTab,
+    /** How `tabId` last landed on its visit, if it did since the store was made. */
+    landing: (tabId: TabId): TabLanding | undefined => landings.get(tabId),
     revision: stamp,
     snapshot: () => snapshot,
     serialize,
@@ -1136,6 +1158,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     move,
     reorder,
     resourceState,
+    shellWaits,
     setTerminalInventory: (inventory: TerminalInventory) =>
       transact(() => setTerminalInventory(inventory)),
     completeDraftChat,

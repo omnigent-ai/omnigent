@@ -334,6 +334,7 @@ import {
 } from "@/components/composer/useSessionHarnessPickerProps";
 import { nextTranscriptBottomPin, type TranscriptBottomPin } from "./transcriptBottomPin";
 import { Transcript } from "@/components/chat/Transcript";
+import { canStopResponse, useStopResponsePaletteCommand } from "@/components/chat/stopResponse";
 
 /**
  * Whether the deployment has smart routing at all. `"loading"` (the `/v1/info`
@@ -1234,7 +1235,6 @@ export function ChatPage() {
   const mainAgent = (
     <MainAgentSurface
       conversationId={urlConvId ?? null}
-      hostId={activeSession?.hostId ?? activeConv?.host_id ?? null}
       status={status}
       isWorking={isWorking}
       showsWorking={showsWorking}
@@ -1378,7 +1378,6 @@ interface MainAgentSurfaceProps {
    * session in terminal-first mode.
    */
   conversationId: string | null;
-  hostId: string | null | undefined;
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. Gates the
    *  composer's Stop/Interrupt button — the parent's OWN turn only. */
@@ -1574,7 +1573,6 @@ export function updateWarmTerminalSurfaces(
  */
 const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   conversationId,
-  hostId,
   status,
   isWorking,
   showsWorking,
@@ -1890,7 +1888,6 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           alone — this surface's composer and chrome below bail out. */}
           <EditSentMessageContext.Provider value={composerReadOnly ? null : editSentMessage}>
             <Transcript
-              hostId={hostId}
               setConversationEl={setConversationEl}
               containerEl={containerEl}
               scroller={scroller}
@@ -2593,6 +2590,12 @@ function ComposerImpl(
   // No server session behind a temp id — gate goal/workspace fetches on it so
   // the create window issues no `/v1/sessions/temp:*` requests.
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
+  useStopResponsePaletteCommand({
+    conversationId: composerSessionId,
+    working: isWorking,
+    readOnly: isReadOnly,
+    stop: onStop,
+  });
   // A send held while the host was offline goes out once the host is back.
   useReleaseHostHeldSends(composerSessionId);
   const { session: composerSession } = useSession(composerSessionId);
@@ -3056,7 +3059,7 @@ function ComposerImpl(
   }, [conversationId]);
   useEffect(() => {
     if (!canStartWorkflow || composerSessionId === null) return;
-    return registerStartWorkflow(composerSessionId, () => openWorkflowDialog());
+    return registerStartWorkflow(composerSessionId, openWorkflowDialog);
   }, [canStartWorkflow, composerSessionId, openWorkflowDialog]);
   useEffect(() => {
     if (!canSaveWorkflow || composerSessionId === null) return;
@@ -4350,7 +4353,7 @@ function ComposerImpl(
     // Esc cancels an in-flight turn. When idle it's a no-op — clearing on
     // Esc destroys typed prompts with no undo (common muscle memory after
     // dismissing autocomplete suggestions).
-    if (e.key === "Escape" && isWorking && !isReadOnly) {
+    if (e.key === "Escape" && canStopResponse({ working: isWorking, readOnly: isReadOnly })) {
       e.preventDefault();
       onStop();
       return;
@@ -4755,6 +4758,7 @@ function ComposerImpl(
                   disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw
                 }
                 onAttach={() => fileInputRef.current?.click()}
+                paletteSource={composerSessionId ? `composer:${composerSessionId}` : undefined}
                 showGoal={showGoalControl || showClaudeGoalControl || showPollyCodexGoalControl}
                 onGoal={() => setGoalDialogOpen(true)}
                 goalDisabled={!composerSessionId || (!showGoalControl && isReadOnly)}
@@ -4848,6 +4852,12 @@ function ComposerImpl(
                     setBusy={setConfigBusy}
                     openNonce={pickerOpenNonce}
                     modelPickerShortcutEnabled={modelPickerHotkeyEnabled}
+                    paletteSettingsSource={
+                      composerSessionId &&
+                      isFeatureEnabled(composerServerInfo, "quick_pick_palette")
+                        ? `composer:${composerSessionId}`
+                        : undefined
+                    }
                     {...sessionHarnessPicker}
                   />
                 </div>

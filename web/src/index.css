@@ -994,7 +994,8 @@
     transform 200ms ease-in-out;
 }
 
-.workspace-panel-motion[data-state="open"] {
+.workspace-panel-motion[data-state="open"],
+.workspace-panel-motion[data-rail-state="open"] {
   opacity: 1;
   transform: translateX(0);
   pointer-events: auto;
@@ -1063,7 +1064,8 @@
 }
 
 @starting-style {
-  .workspace-panel-motion[data-state="open"][data-animate-visibility] {
+  .workspace-panel-motion[data-state="open"][data-animate-visibility],
+  .workspace-panel-motion[data-rail-state="open"][data-animate-visibility] {
     width: 0 !important;
     opacity: 0;
     transform: translateX(12px);
@@ -1405,6 +1407,18 @@ html[data-electron-mac] .floating-composer-header {
 html[data-electron-mac] .canvas-workspace {
   margin-top: var(--mac-titlebar-height);
 }
+/* Full-window views portal outside AppShell, so they clear the window's top
+ * inset themselves: the macOS title bar, or a phone's status bar. Absolutely
+ * positioned controls offset by the variable, since padding doesn't move them. */
+[data-fullscreen-overlay] {
+  --fullscreen-overlay-inset-top: var(--mac-titlebar-height, var(--omnigent-safe-top, 0px));
+  padding-top: var(--fullscreen-overlay-inset-top);
+}
+/* The title-bar cluster below sits above the z-50 layer to clear the sidebar,
+ * so it steps aside while a full-window view covers the app. */
+html[data-electron-mac]:has([data-fullscreen-overlay]) .electron-sidebar-header-actions {
+  display: none;
+}
 /* Align to the native lights at y=24px, regardless of the host rem size.
  * Keep the cluster independent of sidebar open, collapsed, and peek states. */
 html[data-electron-mac] .electron-sidebar-header-actions {
@@ -1442,6 +1456,34 @@ html[data-electron-mac]
  * when the collapsed sidebar exposes the chat header at the window edge. */
 html[data-electron-mac] .traffic-light-clearance {
   padding-left: var(--mac-header-actions-clearance);
+}
+/* A pane's strip row at the window corner starts after the lights and the title-bar cluster
+ * while the sidebar is closed, the same room the chat header's left slot keeps. */
+.pane-strip-window-inset {
+  display: none;
+}
+html[data-electron-mac] .app-shell:not([data-sidebar-open]) .pane-strip-window-inset {
+  display: block;
+  flex-shrink: 0;
+  align-self: stretch;
+  width: var(--mac-header-actions-clearance);
+}
+/* A pane's row under the title bar is as tall as the title bar, so it lines up with the headers
+ * beside it. A movable row drags its pane, not the window; its corner room still moves the window. */
+html[data-electron-mac] {
+  --pane-window-top-row: var(--mac-titlebar-height);
+}
+html[data-electron-mac] [data-pane-strip][data-pane-strip-title-bar-row] {
+  height: var(--pane-window-top-row);
+}
+html[data-electron-mac] [data-pane-strip][data-pane-strip-window-top][data-pane-strip-movable],
+html[data-electron-mac] [data-pane-strip][data-pane-strip-window-top][data-pane-strip-zoomable] {
+  /* A maximized pane's row too: a double-click there restores it, not the window. */
+  -webkit-app-region: no-drag;
+}
+html[data-electron-mac] [data-pane-strip-movable] .pane-strip-window-inset,
+html[data-electron-mac] [data-pane-strip-zoomable] .pane-strip-window-inset {
+  -webkit-app-region: drag;
 }
 /* A maximized rail reaches the same window corner while the sidebar is closed.
  * Once the sidebar opens, the rail starts to its right and needs no clearance. */

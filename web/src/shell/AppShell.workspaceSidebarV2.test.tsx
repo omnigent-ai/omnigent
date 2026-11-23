@@ -23,6 +23,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
+import { registeredPaletteCommands } from "@/test/paletteCommands";
 import type { TabsRecord } from "@/components/BrowserPane/agentTools/tabStore";
 import { type BrowserActionOutcome, emitBrowserActionSettled } from "@/lib/browserActionBus";
 import type { AgentBrowserTabRequest } from "@/components/BrowserPane/agentTools/useRevealBrowserOnAgentTabs";
@@ -32,7 +33,7 @@ const tabs = vi.hoisted(() => ({
   opened: { ok: true as const, tabId: "tab", created: true, selected: true },
   // The session's open tabs, the selected one first; set per test.
   store: {
-    records: [] as { id: string; binding?: { kind: string } }[],
+    records: [] as { id: string; place: { kind: string }; binding?: { kind: string } }[],
     selectedTabId: null as string | null,
     tabs() {
       return this.records;
@@ -41,6 +42,7 @@ const tabs = vi.hoisted(() => ({
       return this.records.find((tab) => tab.id === this.selectedTabId);
     },
     select: vi.fn((_id: string) => true),
+    subscribe: (_listener: () => void) => () => {},
   },
 }));
 
@@ -66,6 +68,15 @@ vi.mock("@/components/BrowserPane/agentTools/tabStore", async (importOriginal) =
   onBrowserTabsChanged: (listener: (conversationId: string) => void) => {
     browser.listeners.add(listener);
     return () => browser.listeners.delete(listener);
+  },
+}));
+
+// The file action host has its own suite; these tests check that it mounts only with the flag.
+const fileActionHost = vi.hoisted(() => ({ throws: false }));
+vi.mock("./fileCommands/FileActionHost", () => ({
+  FileActionHost: () => {
+    if (fileActionHost.throws) throw new Error("file action host broke");
+    return <div data-testid="file-action-host" />;
   },
 }));
 
@@ -199,6 +210,9 @@ function expectTabsUntouched() {
   expect(tabs.host).toBeNull();
   for (const route of tabRoutes()) expect(route).not.toHaveBeenCalled();
 }
+const showAllPullRequestsRows = () =>
+  registeredPaletteCommands().filter((command) => command.label === "Show all pull requests");
+
 const DESKTOP = 1440;
 const NARROW_DESKTOP = 700;
 
@@ -269,6 +283,9 @@ function ChatProbe() {
       </button>
       <button type="button" onClick={() => navigate("/c/conv_ws?file=README.md&line=4")}>
         Follow README link
+      </button>
+      <button type="button" onClick={() => navigate("/c/conv_other?file=README.md&fullscreen=1")}>
+        Follow another session's full screen link
       </button>
       <button type="button" onClick={() => openFile?.("src/app.ts", { line: 3 })}>
         Open cited file
@@ -372,6 +389,22 @@ describe("workspace_sidebar_v2", () => {
     expect(await screen.findByTestId("tabs-host")).toBeInTheDocument();
     expect(screen.queryByRole("tab", { name: /^Files$/ })).toBeNull();
     expect(tabs.host).toMatchObject({ conversationId: "conv_ws", terminals: [] });
+    // One file action host carries out what the sidebar's file menus and ⌘K ask for.
+    expect(await screen.findAllByTestId("file-action-host")).toHaveLength(1);
+  });
+
+  it("keeps the shell when the file action host throws", async () => {
+    fileActionHost.throws = true;
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      setViewport(DESKTOP);
+      renderShell(withFlag(true));
+      expect(await screen.findByTestId("tabs-host")).toBeInTheDocument();
+      expect(screen.queryByTestId("file-action-host")).toBeNull();
+      expect(screen.queryByText("Unable to display file actions.")).toBeNull();
+    } finally {
+      fileActionHost.throws = false;
+    }
   });
 
   it.each([
@@ -384,9 +417,44 @@ describe("workspace_sidebar_v2", () => {
 
     expect(screen.getByRole("tab", { name: /^Files$/ })).toBeInTheDocument();
     expect(screen.queryByTestId("tabs-host")).toBeNull();
+    expect(screen.queryByTestId("file-action-host")).toBeNull();
+    expect(showAllPullRequestsRows()).toHaveLength(0);
     fireEvent.click(screen.getByRole("button", { name: "Open linked PR" }));
     fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
     expectTabsUntouched();
+  });
+
+  it("offers ⌘K's Show all pull requests with the flag on, which opens the session's list", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true));
+    expect(await screen.findByTestId("tabs-host")).toBeInTheDocument();
+
+    await waitFor(() => expect(showAllPullRequestsRows()).toHaveLength(1));
+    const [row] = showAllPullRequestsRows();
+    expect(row).toMatchObject({ id: "workspace:conv_ws:pull-requests:all" });
+    act(() => row!.run());
+    await waitFor(() =>
+      expect(workspaceTabsSessions.showWorkspacePullRequests).toHaveBeenCalledWith("conv_ws", {
+        kind: "overview",
+      }),
+    );
+  });
+
+  it("offers ⌘K's Show all pull requests with the sidebar collapsed, and reveals the list", async () => {
+    writeWorkspacePanelDefault("collapsed");
+    setViewport(DESKTOP);
+    renderShell(withFlag(true));
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Collapse right panel" })).toBeNull();
+
+    await waitFor(() => expect(showAllPullRequestsRows()).toHaveLength(1));
+    act(() => showAllPullRequestsRows()[0]!.run());
+    await waitFor(() =>
+      expect(workspaceTabsSessions.showWorkspacePullRequests).toHaveBeenCalledWith("conv_ws", {
+        kind: "overview",
+      }),
+    );
+    expect(await screen.findByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
 
   it("shows the tabs in the Workspace drawer in a narrow desktop window", async () => {
@@ -461,9 +529,9 @@ describe("workspace_sidebar_v2", () => {
         data: { id: "agent", terminals: [{ name: "shell" }] },
       } as never);
       tabs.store.records = [
-        { id: "file", binding: undefined },
-        { id: "shell", binding: { kind: "terminal" } },
-        { id: "chat", binding: { kind: "chat" } },
+        { id: "file", place: { kind: "files" }, binding: undefined },
+        { id: "shell", place: { kind: "terminal" }, binding: { kind: "terminal" } },
+        { id: "chat", place: { kind: "chat" }, binding: { kind: "chat" } },
       ];
       tabs.store.selectedTabId = "file";
     });
@@ -495,7 +563,7 @@ describe("workspace_sidebar_v2", () => {
     it.each(["Shells", "Side chats"])(
       "%s opens a New tab to choose from when none is open",
       async (entry) => {
-        tabs.store.records = [{ id: "file", binding: undefined }];
+        tabs.store.records = [{ id: "file", place: { kind: "files" }, binding: undefined }];
         await chooseFromMenu(entry);
         expect(tabs.store.select).not.toHaveBeenCalled();
         expect(workspaceTabsSessions.openWorkspaceNewTab).toHaveBeenCalledWith("conv_ws");
@@ -629,6 +697,81 @@ describe("workspace_sidebar_v2", () => {
     await waitFor(() =>
       expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenCalledTimes(2),
     );
+  });
+
+  it("opens a ?diff= link's file in the Changes review, and a ?comment= link's thread on the file", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true), "/c/conv_ws?file=README.md&line=4&diff=1");
+    await waitFor(() =>
+      expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenCalledWith(
+        "conv_ws",
+        "README.md",
+        { line: 4, view: "diff" },
+        "link",
+      ),
+    );
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("diff="));
+    cleanup();
+
+    renderShell(withFlag(true), "/c/conv_ws?file=README.md&comment=c1");
+    await waitFor(() =>
+      expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenLastCalledWith(
+        "conv_ws",
+        "README.md",
+        { commentId: "c1" },
+        "link",
+      ),
+    );
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("comment="));
+
+    // Full screen and back only change the layout; neither opens the linked file again.
+    const linkOpens = vi.mocked(workspaceTabsSessions.openWorkspaceFileLink).mock.calls.length;
+    act(() => tabs.host!.onToggleMaximized());
+    await waitFor(() => expect(tabs.host).toMatchObject({ maximized: true }));
+    act(() => tabs.host!.onToggleMaximized());
+    await waitFor(() => expect(tabs.host).toMatchObject({ maximized: false }));
+    expect(screen.getByTestId("search")).not.toHaveTextContent("file=");
+    expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenCalledTimes(linkOpens);
+  });
+
+  it("fills the window with the sidebar for a ?fullscreen=1 link, and leaves the URL", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true), "/c/conv_ws?file=README.md&fullscreen=1");
+    await waitFor(() => expect(tabs.host).toMatchObject({ maximized: true }));
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("fullscreen="));
+    cleanup();
+
+    // In a narrow window the link opens the drawer instead, with nothing to fill.
+    setViewport(NARROW_DESKTOP);
+    renderShell(withFlag(true), "/c/conv_ws?file=README.md&fullscreen=1");
+    await waitFor(() =>
+      expect(screen.getByTestId("workspace-tabs-drawer")).toHaveAttribute("data-state", "open"),
+    );
+    expect(tabs.host).toMatchObject({ placement: "drawer", maximized: false });
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("file="));
+    expect(screen.getByTestId("search")).not.toHaveTextContent("fullscreen=");
+  });
+
+  it("reopens the left sidebar on leaving full screen after another session's full screen link", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true));
+    await screen.findByTestId("tabs-host");
+    const shell = document.querySelector(".app-shell");
+    // A wide window shows the left sidebar.
+    expect(shell).toHaveAttribute("data-sidebar-open", "true");
+    act(() => tabs.host!.onToggleMaximized());
+    expect(shell).not.toHaveAttribute("data-sidebar-open");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Follow another session's full screen link" }),
+    );
+    await waitFor(() => expect(tabs.host).toMatchObject({ maximized: true }));
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("fullscreen="));
+    expect(shell).not.toHaveAttribute("data-sidebar-open");
+
+    act(() => tabs.host!.onToggleMaximized());
+    expect(tabs.host).toMatchObject({ maximized: false });
+    expect(shell).toHaveAttribute("data-sidebar-open", "true");
   });
 
   it("shows the browser tab an agent selects in its tab", async () => {

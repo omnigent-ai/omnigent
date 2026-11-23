@@ -108,6 +108,20 @@ describe("openWorkspaceFile", () => {
     const result = await openWorkspaceFile("s1", "a.md", { line: 4 }, "user");
     expect(result).toMatchObject({ ok: true, tabId: tab.id, created: false });
   });
+
+  it("opens a comment's thread on the file itself, even when the link also asks for its diff", async () => {
+    const session = workspaceTabsSession("s1");
+    const tab = fileTab("a.md");
+
+    const result = await openWorkspaceFile("s1", "a.md", { view: "diff", commentId: "c1" }, "link");
+
+    expect(result).toMatchObject({ ok: true, tabId: tab.id });
+    expect(session.store.findTab(tab.id)?.place).toEqual({
+      kind: "files",
+      path: "a.md",
+      comment: "c1",
+    });
+  });
 });
 
 describe("workspaceTabsSession", () => {
@@ -303,12 +317,14 @@ describe("openWorkspaceFileLink", () => {
   it("keeps a file the review on screen shows in it, at the cited line, each time", async () => {
     const session = workspaceTabsSession("s1");
     const changes = await selectChanges();
+    const comparison = { kind: "saved", intent: "branch-point" } as const;
+    await session.store.navigate(changes.id, { kind: "changes", comparison });
     publishShownReview("s1", {}, { state: "listed", paths: ["src/a.py"] });
 
     await openWorkspaceFileLink("s1", "src/a.py", { line: 100 }, "user");
     expect(session.store.selectedTab()).toMatchObject({
       id: changes.id,
-      place: { kind: "changes", path: "src/a.py", line: { start: 100 } },
+      place: { kind: "changes", path: "src/a.py", line: { start: 100 }, comparison },
     });
     const first = session.fileRequest(changes.id)?.position;
     expect(first).toEqual({ line: 100 });
@@ -317,6 +333,19 @@ describe("openWorkspaceFileLink", () => {
     await openWorkspaceFileLink("s1", "src/a.py", { line: 100 }, "user");
     expect(session.fileRequest(changes.id)?.position).toEqual({ line: 100 });
     expect(session.fileRequest(changes.id)?.position).not.toBe(first);
+  });
+
+  it("opens a comment's thread on the file, not in the review that shows the file", async () => {
+    const session = workspaceTabsSession("s1");
+    const changes = await selectChanges();
+    publishShownReview("s1", {}, { state: "listed", paths: ["src/a.py"] });
+
+    await openWorkspaceFileLink("s1", "src/a.py", { commentId: "c1" }, "link");
+
+    expect(session.store.selectedTab()).toMatchObject({
+      place: { kind: "files", path: "src/a.py", comment: "c1" },
+    });
+    expect(session.store.findTab(changes.id)?.place).toEqual({ kind: "changes" });
   });
 
   it("opens a file the review doesn't show in Files, at the line", async () => {

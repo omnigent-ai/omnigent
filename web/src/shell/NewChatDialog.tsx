@@ -105,7 +105,6 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
-import { LaptopDbcertBanner } from "@/components/DbcertBanner";
 import { iconForAgent } from "@/components/agentIcon";
 import claudeCodeLogo from "@/assets/claude-code-logo.svg";
 import { showToast } from "@/components/ui/toast";
@@ -343,10 +342,8 @@ import { findConnectedArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/ar
 import {
   connectArcaHost,
   controlHost,
-  checkDbcert,
   getDesktopFeatures,
   getHostIdentity,
-  hasDbcertPreflightBridge,
   isElectronShell,
   onHostStatusChanged,
   type HostIdentity,
@@ -2295,20 +2292,11 @@ function forgetKeptLinkedPrompt(
   }
 }
 
-function NewChatWorkspaceControls({
-  children,
-  disabled,
-}: {
-  children: ReactNode;
-  disabled: boolean;
-}) {
+function NewChatWorkspaceControls({ children }: { children: ReactNode }) {
   const isMobile = useIsMobileViewport();
   if (!isMobile) return children;
   return (
-    <fieldset
-      disabled={disabled}
-      className="new-chat-workspace-controls relative isolate z-30 min-w-0 max-w-full self-center rounded-[20px] [--omni-glass-drop-shadow:0_0_#0000]"
-    >
+    <fieldset className="new-chat-workspace-controls relative isolate z-30 min-w-0 max-w-full self-center rounded-[20px] [--omni-glass-drop-shadow:0_0_#0000]">
       <OmniGlassSurface borderRadius={20} className="-z-10" />
       {children}
     </fieldset>
@@ -2730,7 +2718,6 @@ function NewChatLandingContent({
       return;
     writeLandingDraft(draftState, { ...draftRef.current, fromLink: true });
   }, [message, draftState, siblingSourceId]);
-  const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
@@ -2784,9 +2771,7 @@ function NewChatLandingContent({
 
   // Drag-and-drop — as in the in-session composer, a file dropped anywhere on
   // the landing surface attaches here. Declared after ``landingSurface``.
-  const isDragActive = useFileDropTarget(landingSurface, (droppedFiles) => {
-    if (!checkingDbcert) addFiles(droppedFiles);
-  });
+  const isDragActive = useFileDropTarget(landingSurface, addFiles);
 
   // Gates the sandbox host option: only servers whose sandbox
   // config can actually serve a managed launch advertise it. "loading"
@@ -3108,9 +3093,7 @@ function NewChatLandingContent({
   // Controlled so selecting an existing worktree can close the popover.
   const [worktreePopoverOpen, setWorktreePopoverOpen] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [dbcertRequired, setDbcertRequired] = useState(false);
   const createAttemptRef = useRef<symbol | null>(null);
-  const skipDbcertCheckRef = useRef<(() => void) | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
   const [connectOpen, setConnectOpen] = useState(false);
@@ -6340,43 +6323,8 @@ function NewChatLandingContent({
       }
     };
     try {
-      if (sandboxSelected && effectiveSandboxProvider === "arclet" && hasDbcertPreflightBridge()) {
-        const skipCheck = new Promise<null>((resolve) => {
-          skipDbcertCheckRef.current = () => resolve(null);
-        });
-        setCheckingDbcert(true);
-        setDbcertRequired(false);
-        const credentials = await Promise.race([
-          getDesktopFeatures().then((features) =>
-            createAttemptRef.current === createAttempt &&
-            skipDbcertCheckRef.current !== null &&
-            onScreenRef.current &&
-            window.location.href === createLocation &&
-            features?.databricksInternalFeatures === true &&
-            features.canRefreshDbcert === true
-              ? checkDbcert()
-              : null,
-          ),
-          skipCheck,
-        ]);
-        skipDbcertCheckRef.current = null;
-        if (
-          createAttemptRef.current !== createAttempt ||
-          !onScreenRef.current ||
-          window.location.href !== createLocation
-        )
-          return;
-        setCheckingDbcert(false);
-        if (credentials !== null && !credentials.ok) {
-          setCreateError(credentials.error);
-          return;
-        }
-        const needsDbcert = credentials !== null && !credentials.valid;
-        setDbcertRequired(needsDbcert);
-        if (needsDbcert) return;
-      }
       if (siblingSource && draftState.nestedProvisional !== nestedProvisional) return;
-      // Spend the draft only once provisioning starts, after the laptop credential check.
+      // Spend the draft only once provisioning starts.
       // A composer remounted in this commit would otherwise restore the submitted text.
       if (draftState.draft !== null) writeLandingDraft(draftState, null);
       submittedDraftRevisionRef.current = draftState.revision;
@@ -7065,8 +7013,6 @@ function NewChatLandingContent({
     } finally {
       if (createAttemptRef.current === createAttempt) {
         createAttemptRef.current = null;
-        skipDbcertCheckRef.current = null;
-        setCheckingDbcert(false);
         setCreating(false);
       }
     }
@@ -7208,7 +7154,7 @@ function NewChatLandingContent({
   );
 
   const workspaceControls = (
-    <NewChatWorkspaceControls disabled={checkingDbcert}>
+    <NewChatWorkspaceControls>
       {/* Keep the tray mounted while the execution target changes. */}
       {sandboxSelected && (
         <ComposerWorkspaceBar
@@ -7668,7 +7614,6 @@ function NewChatLandingContent({
         {/* Drop cue, spanning the landing surface. */}
         {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
         <fieldset
-          disabled={checkingDbcert}
           className={cn(
             "relative flex min-w-0 flex-col gap-0",
             floating ? "min-h-0 w-full flex-1" : COMPOSER_COLUMN_WIDTH,
@@ -7953,7 +7898,6 @@ function NewChatLandingContent({
                           <DropdownMenuTrigger asChild>
                             <ComposerHostTrigger
                               appearance={isMobileViewport ? "header" : "composer"}
-                              disabled={checkingDbcert}
                               label={hostChipLabel}
                               status={
                                 sandboxSelected ? undefined : (selectedHost?.status ?? "offline")
@@ -8253,13 +8197,7 @@ function NewChatLandingContent({
                           entriesFailed={agentsError}
                           loading={pickerLoading}
                           interactiveWhileLoading={pickerInteractiveWhileLoading}
-                          disabledLabel={
-                            checkingDbcert
-                              ? "Checking certificate"
-                              : noExecutionTargetSelected
-                                ? "No host selected"
-                                : undefined
-                          }
+                          disabledLabel={noExecutionTargetSelected ? "No host selected" : undefined}
                           cacheKey={pickerCacheKey}
                           host={harnessWarningHost}
                           onSelectAgent={handleSelectAgent}
@@ -8534,31 +8472,6 @@ function NewChatLandingContent({
             <p className="text-sm text-destructive" data-testid="new-chat-landing-error">
               {createError}
             </p>
-          )}
-
-          {checkingDbcert && (
-            <div
-              className="flex items-center gap-2 text-sm text-muted-foreground"
-              data-testid="new-chat-landing-dbcert-status"
-            >
-              <Spinner className="size-4 shrink-0" />
-              <p role="status">Checking laptop credentials…</p>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={() => skipDbcertCheckRef.current?.()}
-              >
-                Skip
-              </Button>
-            </div>
-          )}
-
-          {dbcertRequired && sandboxSelected && effectiveSandboxProvider === "arclet" && (
-            <LaptopDbcertBanner
-              onReady={() => setDbcertRequired(false)}
-              onDismiss={() => setDbcertRequired(false)}
-            />
           )}
 
           {connectError && (

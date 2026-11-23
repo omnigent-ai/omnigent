@@ -13,7 +13,8 @@ import {
 import { LanguageBreakdown } from "./LanguageBreakdown";
 
 const BREAKDOWN: LineBreakdown = {
-  totals: { additions: 1300, deletions: 400 },
+  totals: { files: 6, additions: 1300, deletions: 400 },
+  notViewed: { files: 6, additions: 1300, deletions: 400 },
   languages: [
     { language: "TypeScript", files: 3, additions: 1000, deletions: 200 },
     { language: "Python", files: 1, additions: 300, deletions: 200 },
@@ -37,6 +38,8 @@ function command(listedFileCount: number) {
     wrapLines: false,
     allCollapsed: false,
     canCollapse: false,
+    fileOrder: "path",
+    setFileOrder: () => {},
     toggleAllFiles: () => {},
   }).find((candidate) => candidate.id === "show-language-breakdown");
 }
@@ -79,10 +82,34 @@ describe("LanguageBreakdown", () => {
     expect(trigger()).toHaveAccessibleName("1,300 added, 400 removed. Show changes by language");
   });
 
-  it("lists each language's files, lines and share, most changed first, with the totals", async () => {
+  it("counts only files not yet viewed on the toolbar, and both totals in the popover", async () => {
+    const user = userEvent.setup();
+    render(
+      <Harness
+        dispatchFilter={vi.fn()}
+        breakdown={{ ...BREAKDOWN, notViewed: { files: 2, additions: 300, deletions: 200 } }}
+      />,
+    );
+    expect(trigger()).toHaveTextContent("+300−200");
+    expect(trigger()).toHaveAccessibleName(
+      "300 added, 200 removed in files not viewed. Show changes by language",
+    );
+    await user.click(trigger());
+    const totals = within(popover())
+      .getAllByRole("term")
+      .map((term) => `${term.textContent}: ${term.nextElementSibling?.textContent}`);
+    expect(totals).toEqual(["Not viewed: 2 files+300−200", "All files: 6 files+1,300−400"]);
+    // The languages keep counting every file, viewed or not.
+    expect(row("TypeScript")).toHaveTextContent("TypeScript3 files+1,000−200");
+  });
+
+  it("lists each language's files, lines and share, most changed first, with one total", async () => {
     const user = userEvent.setup();
     render(<Harness dispatchFilter={vi.fn()} />);
     await user.click(trigger());
+    // With no file viewed there's one total, not a Not viewed and an All files pair.
+    expect(within(popover()).queryByRole("term")).toBeNull();
+    expect(within(popover()).queryByText("Not viewed")).toBeNull();
     expect(within(popover()).getAllByText("6 files")).toHaveLength(1);
     const rows = within(screen.getByRole("group", { name: "Languages" })).getAllByRole("button");
     expect(rows.map((entry) => entry.dataset.language)).toEqual([
@@ -141,7 +168,7 @@ describe("LanguageBreakdown", () => {
       <Harness
         dispatchFilter={dispatchFilter}
         filters={{ ...DEFAULT_DIFF_REVIEW_FILTERS, selectedLanguages: ["TypeScript"] }}
-        breakdown={{ totals: BREAKDOWN.totals, languages: [BREAKDOWN.languages[0]!] }}
+        breakdown={{ ...BREAKDOWN, languages: [BREAKDOWN.languages[0]!] }}
       />,
     );
     await user.click(trigger());
@@ -183,7 +210,11 @@ describe("LanguageBreakdown", () => {
     render(
       <Harness
         dispatchFilter={vi.fn()}
-        breakdown={{ totals: { additions: 820, deletions: 0 }, languages }}
+        breakdown={{
+          totals: { files: 40, additions: 820, deletions: 0 },
+          notViewed: { files: 40, additions: 820, deletions: 0 },
+          languages,
+        }}
       />,
     );
     await user.click(trigger());
@@ -200,7 +231,11 @@ describe("LanguageBreakdown", () => {
       <Harness
         dispatchFilter={vi.fn()}
         listedFileCount={0}
-        breakdown={{ totals: { additions: 0, deletions: 0 }, languages: [] }}
+        breakdown={{
+          totals: { files: 0, additions: 0, deletions: 0 },
+          notViewed: { files: 0, additions: 0, deletions: 0 },
+          languages: [],
+        }}
       />,
     );
     expect(trigger()).toBeDisabled();

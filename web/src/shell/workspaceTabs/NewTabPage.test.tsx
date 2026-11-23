@@ -183,6 +183,24 @@ describe("NewTabPage", () => {
     );
   });
 
+  it("goes back to the apps with Backspace on the chooser's empty query, without dismissing", async () => {
+    const { onPlaceChange, onDismiss } = renderPage({ facts: manyShellFacts });
+    await userEvent.click(screen.getByRole("option", { name: /Choose shell/ }));
+    expect(onPlaceChange).toHaveBeenLastCalledWith({ kind: "new", app: "terminal" });
+    await userEvent.keyboard("{Backspace}");
+    expect(onPlaceChange).toHaveBeenLastCalledWith({ kind: "new" });
+    expect(onDismiss).not.toHaveBeenCalled();
+  });
+
+  it("marks Choose shell… as opening a page of its own", () => {
+    renderPage({ facts: manyShellFacts });
+    const chooser = screen.getByRole("option", { name: /Choose shell/ });
+    expect(chooser.querySelector(".lucide-chevron-right")).not.toBeNull();
+    expect(
+      screen.getByRole("option", { name: /^Terminal/ }).querySelector(".lucide-chevron-right"),
+    ).toBeNull();
+  });
+
   it("opens straight into the chooser for omnigent://new?app=terminal and follows outside place changes", async () => {
     const { setPlace } = renderPage({ initialPlace: { kind: "new", app: "terminal" } });
     expect(shellList()).toBeInTheDocument();
@@ -363,6 +381,19 @@ describe("NewTabPage sections", () => {
     await userEvent.keyboard("{Enter}");
     expect(onRunCommand).toHaveBeenCalledWith(expect.objectContaining({ kind: "shell" }));
     expect(onOpenRecent).not.toHaveBeenCalled();
+  });
+
+  it("ranks across sections, so a recent place matching the query exactly comes before an app that only starts with it", async () => {
+    const { onOpenRecent } = renderPage({
+      recents: [{ identity: "files:docs/pull", label: "pull", icon: null }],
+    });
+    await userEvent.type(appList()!, "pull");
+    const labels = screen
+      .getAllByRole("option")
+      .map((option) => option.querySelector("[data-slot=quick-pick-label]")?.textContent);
+    expect(labels.slice(0, 2)).toEqual(["pull", "Pull Requests"]);
+    await userEvent.keyboard("{Enter}");
+    expect(onOpenRecent).toHaveBeenCalledWith("files:docs/pull");
   });
 
   it("goes to a recent place that is the best match for the query", async () => {

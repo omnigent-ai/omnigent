@@ -75,6 +75,10 @@ class ScheduledTaskDispatchStore(Protocol):
 
         An already-recorded occurrence advances the cursor but returns None,
         as does a changed task. Neither case starts another run.
+
+        A timer runs one firing at a time: while its previous run is unfinished, this
+        returns None and changes nothing. Otherwise it first deletes the timer's
+        finished runs, so a timer keeps only its newest one.
         """
         ...
 

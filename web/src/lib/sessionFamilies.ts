@@ -53,6 +53,26 @@ export function orderSessionFamilies(
   return result;
 }
 
+/**
+ * The rows a collapsed project folder keeps listing for the open session: its family,
+ * so nested sessions stay reachable. A collapsed family shows only its head, so an
+ * open nested member of one is held alone.
+ */
+export function heldFolderRows(
+  rows: readonly Conversation[],
+  openId: string | null | undefined,
+  collapsedFamilies: ReadonlySet<string>,
+): Conversation[] {
+  const open = rows.find((row) => row.id === openId);
+  if (!open) return [];
+  const familyId = open.family?.id;
+  if (familyId === undefined) return [open];
+  const members = sessionFamilyGroups(rows.filter((row) => row.family?.id === familyId)).get(
+    familyId,
+  )!;
+  return collapsedFamilies.has(familyId) && members[0] !== open ? [open] : members;
+}
+
 export function isIndentedSibling(row: Conversation): boolean {
   return !!row.family?.representative_id && row.family.representative_id !== row.id;
 }

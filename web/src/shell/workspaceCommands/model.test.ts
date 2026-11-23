@@ -6,6 +6,8 @@ import { goBack, historyStartingAt, recordStep } from "../workspaceTabs/workspac
 import type { Visit } from "../workspaceTabs/workspacePlace";
 import {
   FIRST_TAB_REASON,
+  NO_PULL_REQUESTS_REASON,
+  showAllPullRequestsCommand,
   LAST_TAB_REASON,
   PINNED_EDGE_REASON,
   tabActionCommandFor,
@@ -505,5 +507,18 @@ describe("the chorded tab actions", () => {
     expect(close({ selectedCloseRefusal: LAST_NEW_TAB_REASON })).toEqual(
       unavailableBecause(LAST_NEW_TAB_REASON),
     );
+  });
+});
+
+describe("showAllPullRequestsCommand", () => {
+  it("is available where the workspace shows pull requests, or a pull request tab is open", () => {
+    const available = (pullRequestsAvailable: boolean, hasPullRequestTab: boolean) =>
+      showAllPullRequestsCommand({ pullRequestsAvailable, hasPullRequestTab }).availability;
+    expect(available(true, false)).toEqual(AVAILABLE);
+    expect(available(false, true)).toEqual(AVAILABLE);
+    expect(available(false, false)).toEqual(unavailableBecause(NO_PULL_REQUESTS_REASON));
+    expect(
+      showAllPullRequestsCommand({ pullRequestsAvailable: true, hasPullRequestTab: false }).label,
+    ).toBe("Show all pull requests");
   });
 });

@@ -1,5 +1,5 @@
 // How wide the Files tree docked beside a file may be: it keeps its share of the Files page as
-// the panel widens, within these limits, and never takes more than about half the page.
+// the panel widens, even at full size, and never takes more than about half the page.
 
 import { WIDE_REVIEW_MIN_WIDTH } from "@/components/diff-review/reviewLayout";
 import type { PaneWidthSpec } from "@/hooks/useRememberedPaneWidth";
@@ -7,6 +7,7 @@ import { readPanelSizePreference } from "@/lib/panelSizePreferences";
 
 export const FILES_TREE_DEFAULT_WIDTH = 256;
 export const FILES_TREE_MIN_WIDTH = 180;
+/** The widest before the page is measured; a measured page's room alone limits it after. */
 export const FILES_TREE_MAX_WIDTH = 360;
 /** The tree's largest share of the Files page. */
 export const FILES_TREE_MAX_SHARE = 0.48;
@@ -23,6 +24,8 @@ export const FILES_TREE_WIDTH: PaneWidthSpec = {
   minWidth: FILES_TREE_MIN_WIDTH,
   maxWidth: FILES_TREE_MAX_WIDTH,
   roomIn: (pageWidth) => Math.floor(pageWidth * FILES_TREE_MAX_SHARE),
+  // A tab gone full size widens the tree in proportion, rather than stopping at a fixed width.
+  growsWithRoom: true,
   label: "Resize the file tree",
   keyboardStep: 16,
 };

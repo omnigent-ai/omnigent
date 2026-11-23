@@ -352,6 +352,9 @@ class ServerInfoResponse(BaseModel):
     # Scheduled-task runs drop a trigger prompt's ``<!-- omnigent-trigger ... -->`` header
     # before dispatch; older servers would send it to the model.
     scheduled_task_trigger_headers: bool = True
+    # ``POST /v1/sessions/{id}/timers`` saves sys_timer_set timers as scheduled tasks,
+    # which needs the database scheduler; absent on older servers.
+    session_timers: bool = False
     automation_trigger_poll_minutes: int = 10
     # Longest session message this server delivers; older servers omit it and
     # deliver at most 8,000 characters.
@@ -2785,6 +2788,14 @@ def create_app(
         app.state.memory_available() and memory_store is not None and memory_store.supports_search
     )
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
+    # Agent timers are scheduled tasks only the database scheduler fires. Creating them
+    # waits for the release feature, until every server on the database reads them.
+    app.state.session_timers_enabled = (
+        automations_enabled
+        and automations_v2_enabled
+        and scheduled_task_store is not None
+        and resolved_feature_flags.enabled(Feature.SESSION_TIMERS)
+    )
     # Separate from dispatch: schedulers accept one-time rules from this release on,
     # and creating them waits until every scheduler on the database does.
     app.state.one_time_automations_enabled = automations_v2_enabled and (
@@ -4213,6 +4224,7 @@ def create_app(
                 "scheduled_task_shared_with_me": automation_sharing,
                 "scheduled_task_clone": automations_enabled
                 and bool(app.state.scheduled_task_dispatch_enabled),
+                "session_timers": bool(app.state.session_timers_enabled),
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
                 "sibling_other_project_standalone": True,

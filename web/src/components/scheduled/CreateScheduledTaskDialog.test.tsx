@@ -3938,6 +3938,17 @@ describe("automation trigger type", () => {
       }
     });
 
+    it("saves a trigger the server sends without a rule, leaving rrule out", async () => {
+      render(dialog({ editingTask: { ...slackTask, rrule: null } }));
+      expect(screen.queryByTestId("task-trigger-schedule-replacement")).not.toBeInTheDocument();
+      type("task-prompt-input", "Answer every question.");
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const input = updateMutateAsync.mock.calls[0][0].input;
+      expect(input.prompt).toContain("Answer every question.");
+      expect(input.rrule).toBeUndefined();
+    });
+
     it("saves the new source's trigger with the saved instructions and worker, in a new polling session", async () => {
       render(dialog({ editingTask: slackTask }));
       await choose("Jira");

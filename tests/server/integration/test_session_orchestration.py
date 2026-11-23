@@ -991,12 +991,26 @@ async def test_a_launch_skips_grantees_who_can_no_longer_see_its_source(
     assert _session_levels(db_uri, worker.id) == expected
 
 
+def _answer_workspace_and_launch(connection, payload):
+    """Answer a host's workspace check and runner launch as an online host does."""
+    from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
+
+    frame = decode_host_frame(payload)
+    if isinstance(frame, HostStatFrame):
+        connection.pending_stats[frame.request_id].set_result(
+            {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+        )
+    elif isinstance(frame, HostLaunchRunnerFrame):
+        connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+    else:
+        pytest.fail(f"Unexpected host frame: {frame}")
+
+
 @pytest.mark.parametrize("placement,shared", [("managed", True), ("same_host", False)])
 async def test_restricted_sharing_shares_a_launch_without_a_workspace_only_as_a_new_sandbox(
     auth_client, auth_app, peers, db_uri, monkeypatch, placement, shared
 ):
     """A new sandbox has no workspace yet; a same-host launch in a home directory is refused."""
-    from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
     from omnigent.server.auth import SharingMode
     from tests.server.integration.test_sessions_permissions import _register_online_host
 
@@ -1007,18 +1021,7 @@ async def test_restricted_sharing_shares_a_launch_without_a_workspace_only_as_a_
     _register_online_host(auth_app, host_id, "alice")
     SqlAlchemyConversationStore(db_uri).set_host_id(source["id"], host_id, workspace="/home/alice")
 
-    def answer_host(connection, payload):
-        frame = decode_host_frame(payload)
-        if isinstance(frame, HostStatFrame):
-            connection.pending_stats[frame.request_id].set_result(
-                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
-            )
-        elif isinstance(frame, HostLaunchRunnerFrame):
-            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
-        else:
-            pytest.fail(f"Unexpected host frame: {frame}")
-
-    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", _answer_workspace_and_launch)
     monkeypatch.setattr(auth_app.state, "sharing_mode", lambda: SharingMode.RESTRICTED_READ_ONLY)
 
     result = await _launch_worker(auth_client, source["agent_id"], source["id"], placement)
@@ -1224,7 +1227,6 @@ async def test_same_host_creation_from_runner_keeps_source_surface(
     auth_client, auth_app, peers, db_uri, monkeypatch
 ) -> None:
     """A web session's runner creates a same_host session, which is labeled web."""
-    from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
     from omnigent.telemetry.request_headers import client_user_agent
     from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY
     from tests.server.integration.test_sessions_permissions import _register_online_host
@@ -1236,18 +1238,7 @@ async def test_same_host_creation_from_runner_keeps_source_surface(
     store.set_host_id(source["id"], host_id, workspace="/tmp")
     store.set_labels(source["id"], {CLIENT_SURFACE_LABEL_KEY: "web"})
 
-    def answer_host(connection, payload):
-        frame = decode_host_frame(payload)
-        if isinstance(frame, HostStatFrame):
-            connection.pending_stats[frame.request_id].set_result(
-                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
-            )
-        elif isinstance(frame, HostLaunchRunnerFrame):
-            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
-        else:
-            pytest.fail(f"Unexpected host frame: {frame}")
-
-    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", _answer_workspace_and_launch)
     # The runner's own tool call carries the component User-Agent.
     auth_client.headers["User-Agent"] = client_user_agent().replace(
         "omnigent-cli/", "omnigent-runner/"
@@ -1528,6 +1519,246 @@ async def test_created_session_launches_in_the_requested_permission_mode(
     assert result.get("conversation_id"), result
     worker = SqlAlchemyConversationStore(db_uri).get_conversation(result["conversation_id"])
     assert worker.terminal_launch_args == expected
+
+
+@pytest.fixture
+def creator_client(auth_client, monkeypatch):
+    """Alice's client with late runner binds stubbed; ``_codex_creator`` binds a runner."""
+    auth_client.headers["X-Forwarded-Email"] = "alice"
+    _stub_late_runner_bind(monkeypatch)
+    return auth_client
+
+
+async def _codex_creator(auth_client, auth_app, db_uri, monkeypatch, permission_mode):
+    """Alice's runner-bound Codex session on her online host, running in *permission_mode*."""
+    from tests._helpers.session import post_session_bundle
+    from tests.server.helpers import build_agent_bundle
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    bundle = build_agent_bundle("codex-run", executor={"config": {"harness": "codex-native"}})
+    created = await post_session_bundle(auth_client.post, "/v1/sessions", bundle)
+    assert created.status_code == 201, created.text
+    creator = created.json()
+    host_id = uuid4().hex
+    _register_online_host(auth_app, host_id, "alice")
+    # A distinct name keeps another host of Alice's from counting as this one reconnecting.
+    auth_app.state.host_store.upsert_on_connect(host_id, "workflow-run-host", "alice")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(creator["session_id"], host_id, workspace="/tmp")
+    store.update_conversation(
+        creator["session_id"],
+        terminal_launch_args=PERMISSION_LAUNCH_ARGS["codex-native"][permission_mode],
+    )
+    # Codex reports its live mode on this label.
+    store.set_labels(
+        creator["session_id"], {"omnigent.codex_native.approval_mode": permission_mode}
+    )
+    auth_client.headers.update(_bind_runner(db_uri, creator["session_id"]))
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", _answer_workspace_and_launch)
+    return {**creator, "host_id": host_id}
+
+
+@pytest.mark.parametrize(
+    ("creator_mode", "placement", "requested_mode", "worker_config", "expected"),
+    [
+        # A workflow run in Full Access hands a step to a nested agent on its host.
+        pytest.param(
+            "full-access",
+            "same_host",
+            None,
+            None,
+            PERMISSION_LAUNCH_ARGS["codex-native"]["full-access"],
+            id="same-host",
+        ),
+        pytest.param(
+            "full-access",
+            "own-host",
+            None,
+            None,
+            PERMISSION_LAUNCH_ARGS["codex-native"]["full-access"],
+            id="explicit-own-host",
+        ),
+        # Full Access was chosen for the run's host, not a new sandbox or another host.
+        pytest.param("full-access", "managed", None, None, None, id="approval-skipping-off-host"),
+        pytest.param("full-access", "other-host", None, None, None, id="explicit-other-host"),
+        pytest.param(
+            "approve-for-me",
+            "managed",
+            None,
+            None,
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="managed",
+        ),
+        # The call's own choice wins, even the harness default.
+        pytest.param("full-access", "same_host", "default", None, None, id="requested-default"),
+        pytest.param(
+            "full-access",
+            "same_host",
+            "approve-for-me",
+            None,
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="requested-mode",
+        ),
+        # So does a mode the worker's own agent sets.
+        pytest.param(
+            "full-access",
+            "same_host",
+            None,
+            {"permission_mode": "read-only"},
+            PERMISSION_LAUNCH_ARGS["codex-native"]["read-only"],
+            id="worker-spec-mode",
+        ),
+        pytest.param(
+            "full-access",
+            "same_host",
+            None,
+            {"permission_mode": "default"},
+            None,
+            id="worker-spec-default",
+        ),
+    ],
+)
+async def test_nested_agent_starts_in_its_creators_permission_mode(
+    creator_client,
+    auth_app,
+    db_uri,
+    monkeypatch,
+    creator_mode,
+    placement,
+    requested_mode,
+    worker_config,
+    expected,
+):
+    from omnigent.server.routes.sessions import routes_core
+
+    creator = await _codex_creator(creator_client, auth_app, db_uri, monkeypatch, creator_mode)
+    agent_id = creator["agent_id"]
+    if worker_config is not None:
+        agent_id = await _upload_codex_worker(creator_client, **worker_config)
+
+    async def launch(**kwargs):
+        pass
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    arguments = {"agent_id": agent_id, "placement": placement}
+    if placement in ("own-host", "other-host"):
+        from tests.server.integration.test_sessions_permissions import _register_online_host
+
+        auth_app.state.feature_flags = resolve_feature_flags(
+            {FEATURES_ENV_VAR: "scripted_sessions"}
+        )
+        host_id = creator["host_id"]
+        if placement == "other-host":
+            host_id = uuid4().hex
+            _register_online_host(auth_app, host_id, "alice")
+        arguments.update(placement="host", host_id=host_id, workspace="/tmp")
+    if requested_mode is not None:
+        arguments["permission_mode"] = requested_mode
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(arguments),
+            server_client=creator_client,
+            conversation_id=creator["session_id"],
+        )
+    )
+    assert result.get("conversation_id"), result
+    worker = SqlAlchemyConversationStore(db_uri).get_conversation(result["conversation_id"])
+    assert worker.terminal_launch_args == expected
+
+
+async def test_a_planted_reported_mode_does_not_skip_approval_for_nested_agents(
+    creator_client, auth_app, db_uri, monkeypatch
+):
+    """An editor can write a session's reported-mode label but not its launch mode."""
+    creator = await _codex_creator(creator_client, auth_app, db_uri, monkeypatch, "approve-for-me")
+    session_id = creator["session_id"]
+    SqlAlchemyPermissionStore(db_uri).grant("bob", session_id, LEVEL_EDIT)
+    planted = await creator_client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.codex_native.approval_mode": "full-access"}},
+        headers={"X-Forwarded-Email": "bob"},
+    )
+    assert planted.status_code == 200, planted.text
+    # A shared source can't start sessions, so the owner removes the editor first.
+    revoked = await creator_client.delete(f"/v1/sessions/{session_id}/permissions/bob")
+    assert revoked.status_code == 204, revoked.text
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": creator["agent_id"], "placement": "same_host"}),
+            server_client=creator_client,
+            conversation_id=session_id,
+        )
+    )
+    assert result.get("conversation_id"), result
+    worker = SqlAlchemyConversationStore(db_uri).get_conversation(result["conversation_id"])
+    assert worker.terminal_launch_args == PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]
+    assert CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY not in worker.labels
+
+
+@pytest.mark.parametrize(
+    ("config", "leaves_open"),
+    [
+        ({"harness": "codex-native"}, True),
+        ({"harness": "codex-native", "permission_mode": "default"}, False),
+        ({"harness": "codex-native", "yolo": False}, False),
+        ({"harness": "cursor-native", "exec_mode": "default"}, False),
+    ],
+)
+async def test_any_spec_permission_setting_keeps_the_creators_mode_out(config, leaves_open):
+    """A worker spec that sets any permission key, even to its default, keeps its own mode."""
+    from types import SimpleNamespace
+
+    from omnigent.server.routes._sessions.orchestration import _spec_leaves_permission_mode_open
+
+    spec = SimpleNamespace(executor=SimpleNamespace(config=config))
+    assert _spec_leaves_permission_mode_open(spec) is leaves_open
+    assert _spec_leaves_permission_mode_open(None) is False
+
+
+async def test_a_worker_whose_spec_cannot_be_read_keeps_its_agent_default(
+    creator_client, auth_app, db_uri, monkeypatch
+):
+    """A worker spec the server can't read might set its own mode, so the creator's isn't used."""
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.routes.sessions import routes_core
+    from tests._helpers.session import post_session_bundle
+    from tests.server.helpers import build_agent_bundle
+
+    creator = await _codex_creator(creator_client, auth_app, db_uri, monkeypatch, "approve-for-me")
+    # A wrapper agent's harness resolves from its name, without its bundle.
+    bundle = build_agent_bundle(
+        "codex-native-ui",
+        executor={"config": {"harness": "codex-native", "permission_mode": "read-only"}},
+    )
+    uploaded = await post_session_bundle(creator_client.post, "/v1/sessions", bundle)
+    assert uploaded.status_code == 201, uploaded.text
+    worker_agent_id = uploaded.json()["agent_id"]
+    real_load = AgentCache.load
+
+    def load(self, agent_id, *args, **kwargs):
+        if agent_id == worker_agent_id:
+            raise OSError("The agent cache cannot be written")
+        return real_load(self, agent_id, *args, **kwargs)
+
+    async def launch(**kwargs):
+        pass
+
+    monkeypatch.setattr(AgentCache, "load", load)
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": worker_agent_id, "placement": "managed"}),
+            server_client=creator_client,
+            conversation_id=creator["session_id"],
+        )
+    )
+    assert result.get("conversation_id"), result
+    worker = SqlAlchemyConversationStore(db_uri).get_conversation(result["conversation_id"])
+    assert worker.terminal_launch_args is None
 
 
 @pytest.mark.parametrize(

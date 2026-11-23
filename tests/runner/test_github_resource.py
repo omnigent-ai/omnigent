@@ -9,15 +9,18 @@ check-summary reducer need neither ``gh`` nor the network.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import subprocess
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 
 from omnigent.errors import OmnigentError
+from omnigent.git_providers import load_facet
 from omnigent.runner import github_resource, pr_resource
 from omnigent.runner.github_resource import (
     _summarize_checks,
@@ -27,6 +30,7 @@ from omnigent.runner.github_resource import (
     github_pr_diff,
 )
 from omnigent.runner.session_prs import PullRequestRef
+from tests.budgets import budget
 
 
 def _stub_gh(
@@ -48,6 +52,168 @@ def _stub_gh(
         return (1, "", "no stub")
 
     monkeypatch.setattr(github_resource, "_gh", fake_gh)
+
+
+GH_TOKEN_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+
+
+# A whole synthetic environment, so a failing comparison can only print these values.
+SYNTHETIC_ENVIRONMENT = {
+    "PATH": "/example/bin:/usr/bin",
+    "HOME": "/home/example",
+    "LANG": "C.UTF-8",
+    "EXAMPLE_SETTING": "example-value",
+    **{name: f"synthetic-{name.lower()}" for name in GH_TOKEN_NAMES},
+}
+
+
+@pytest.fixture
+def gh_starts(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    """Record each process ``_gh`` starts, in a synthetic environment with ambient tokens."""
+    starts: list[dict[str, object]] = []
+
+    def run(
+        argv: list[str], *, cwd: str, timeout: float, env: dict[str, str] | None = None
+    ) -> tuple[int | None, str, str]:
+        starts.append({"argv": argv, "cwd": cwd, "timeout": timeout, "env": env})
+        return 0, "answer", ""
+
+    monkeypatch.setattr(github_resource, "_run", run)
+    monkeypatch.setattr(os, "environ", dict(SYNTHETIC_ENVIRONMENT))
+    return starts
+
+
+def _without_tokens(environment: dict[str, str]) -> dict[str, str]:
+    return {name: value for name, value in environment.items() if name not in GH_TOKEN_NAMES}
+
+
+@pytest.mark.parametrize("sandbox", [False, True], ids=["local", "sandbox"])
+@pytest.mark.parametrize("token", [None, "chosen-token"], ids=["ambient", "chosen-account"])
+def test_gh_starts_gh_with_todays_command_and_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    gh_starts: list[dict[str, object]],
+    sandbox: bool,
+    token: str | None,
+) -> None:
+    """Pin the process every ``gh`` call starts: command, environment, cwd and timeout."""
+    monkeypatch.setattr(github_resource, "_in_sandbox", lambda: sandbox)
+    # The synthetic environment, plus what pytest itself sets during the call.
+    ambient = dict(os.environ)
+    argv = ["pr", "view", "7", "-R", "ghe.example.test/acme/repo", "--json", "number"]
+
+    result = github_resource._gh(argv, cwd="/workspace", token=token)
+
+    if not sandbox and token is None:
+        expected_env = None
+    else:
+        expected_env = _without_tokens(ambient) if sandbox else dict(ambient)
+        if token is not None:
+            expected_env = {
+                **_without_tokens(expected_env),
+                "GH_TOKEN": token,
+                "GH_ENTERPRISE_TOKEN": token,
+            }
+    assert result == (0, "answer", "")
+    assert gh_starts == [
+        {
+            "argv": ["gh", *argv],
+            "cwd": "/workspace",
+            "timeout": github_resource._DEFAULT_GH_TIMEOUT_SECONDS,
+            "env": expected_env,
+        }
+    ]
+
+
+def test_gh_keeps_a_callers_timeout_and_starts_nothing_past_its_deadline(
+    monkeypatch: pytest.MonkeyPatch, gh_starts: list[dict[str, object]]
+) -> None:
+    monkeypatch.setattr(github_resource, "_in_sandbox", lambda: False)
+
+    github_resource._gh(["api", "user"], cwd="/workspace", timeout=90.0)
+    with github_resource._gh_deadline_scope(0.0):
+        late = github_resource._gh(["api", "user"], cwd="/workspace")
+
+    assert late == (None, "", "gh deadline exceeded")
+    assert gh_starts == [
+        {"argv": ["gh", "api", "user"], "cwd": "/workspace", "timeout": 90.0, "env": None}
+    ]
+
+
+def test_concurrent_steps_keep_their_own_target_host(
+    monkeypatch: pytest.MonkeyPatch, gh_starts: list[dict[str, object]]
+) -> None:
+    """Two steps for different hosts, overlapping in two threads, each see only their own."""
+    monkeypatch.setattr(github_resource, "_in_sandbox", lambda: False)
+    built = github_resource._gh_invocation
+    hosts_by_thread: dict[str, list[str | None]] = {}
+    both_scoped = threading.Barrier(2, timeout=budget(10))
+
+    def recording(argv: list[str], *, token: str | None, host: str | None):
+        invocation = built(argv, token=token, host=host)
+        hosts_by_thread.setdefault(threading.current_thread().name, []).append(invocation.host)
+        return invocation
+
+    monkeypatch.setattr(github_resource, "_gh_invocation", recording)
+
+    def step(host: str) -> None:
+        with github_resource.gh_target_host_scope(host):
+            both_scoped.wait()
+            github_resource._gh(["api", "user"], cwd="/workspace")
+            both_scoped.wait()
+            github_resource._gh(["api", "user"], cwd="/workspace")
+        github_resource._gh(["api", "user"], cwd="/workspace")
+
+    threads = [
+        threading.Thread(target=step, args=(host,), name=name)
+        for name, host in (("first", "One.Example.Test"), ("second", "two.example.test"))
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(budget(10))
+
+    assert hosts_by_thread == {
+        "first": ["one.example.test", "one.example.test", None],
+        "second": ["two.example.test", "two.example.test", None],
+    }
+    assert [start["argv"] for start in gh_starts] == [["gh", "api", "user"]] * 6
+
+
+def test_the_github_facet_targets_each_steps_reference_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    facet = load_facet("github", "pull_requests")
+    seen: list[str | None] = []
+
+    def record(*_args: object, **_kwargs: object) -> dict[str, object]:
+        seen.append(github_resource._gh_target_host.get())
+        return {"available": False}
+
+    monkeypatch.setattr(github_resource, "_reference_info", record)
+    monkeypatch.setattr(github_resource, "_workspace_github_info", record)
+    reference = PullRequestRef.from_url("https://github.com/acme/repo/pull/7")
+    enterprise = reference.model_copy(update={"host": "ghe.example.test"})
+
+    facet.reference_info("/workspace", reference)
+    facet.reference_info("/workspace", reference=enterprise)
+    facet.workspace_info("/workspace")
+    scoped = {
+        name
+        for name, value in vars(type(facet)).items()
+        if callable(value) and getattr(value, "__wrapped__", None) is not None
+    }
+    takes_reference = {
+        name
+        for name, value in vars(type(facet)).items()
+        if not name.startswith("_")
+        and callable(value)
+        and "reference" in inspect.signature(value).parameters
+    }
+
+    assert seen == ["github.com", "ghe.example.test", None]
+    assert github_resource._gh_target_host.get() is None
+    assert scoped == takes_reference
+    assert "reference_info" in scoped and "workspace_info" not in scoped
 
 
 def _git_env() -> dict[str, str]:

@@ -12,6 +12,13 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { useCreateProject, useProjects } from "@/hooks/useConversations";
@@ -36,6 +43,9 @@ interface WorkspaceSelection {
   hostId: string;
   path: string;
 }
+
+/** "Run on" value while no target is chosen; Radix Select items can't hold an empty value. */
+const NO_RUN_ON_TARGET = "__none__";
 
 function isSinglePathComponent(name: string): boolean {
   return (
@@ -491,12 +501,11 @@ export function NewProjectButton({
               <label htmlFor="new-project-run-on" className="font-medium text-ui">
                 Run on
               </label>
-              <select
-                id="new-project-run-on"
-                className="h-10 rounded-lg border border-input bg-transparent px-3 text-ui outline-none"
-                value={runOn ?? ""}
-                onChange={(event) => {
-                  const next = event.target.value;
+              <Select
+                value={runOn ?? NO_RUN_ON_TARGET}
+                // Radix opens on pointerdown without checking the fieldset's disabled state.
+                disabled={repositorySubmitting}
+                onValueChange={(next) => {
                   runOnPicked.current = true;
                   if (next !== runOn) {
                     // A submission still creating a folder for the old target must not save it.
@@ -511,27 +520,37 @@ export function NewProjectButton({
                   setSubmitError(null);
                 }}
               >
-                {runOn === null && (
-                  <option value="" disabled>
-                    {hostsLoading ? "Loading hosts…" : "No host available"}
-                  </option>
-                )}
-                {runOn !== null &&
-                  !onlineHosts.some((host) => host.host_id === runOn) &&
-                  !sandboxProviders.some((provider) => sandboxHostChoice(provider) === runOn) && (
-                    <option value={runOn}>{hostsLoading ? "Loading hosts…" : hostName}</option>
+                <SelectTrigger id="new-project-run-on" className="w-full data-[size=default]:h-10">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {runOn === null && (
+                    <SelectItem value={NO_RUN_ON_TARGET} disabled>
+                      {hostsLoading ? "Loading hosts…" : "No host available"}
+                    </SelectItem>
                   )}
-                {onlineHosts.map((host) => (
-                  <option key={host.host_id} value={host.host_id}>
-                    {host.name}
-                  </option>
-                ))}
-                {sandboxProviders.map((provider) => (
-                  <option key={sandboxHostChoice(provider)} value={sandboxHostChoice(provider)}>
-                    {sandboxOptionLabel(provider)}
-                  </option>
-                ))}
-              </select>
+                  {runOn !== null &&
+                    !onlineHosts.some((host) => host.host_id === runOn) &&
+                    !sandboxProviders.some((provider) => sandboxHostChoice(provider) === runOn) && (
+                      <SelectItem value={runOn}>
+                        {hostsLoading ? "Loading hosts…" : hostName}
+                      </SelectItem>
+                    )}
+                  {onlineHosts.map((host) => (
+                    <SelectItem key={host.host_id} value={host.host_id}>
+                      {host.name}
+                    </SelectItem>
+                  ))}
+                  {sandboxProviders.map((provider) => (
+                    <SelectItem
+                      key={sandboxHostChoice(provider)}
+                      value={sandboxHostChoice(provider)}
+                    >
+                      {sandboxOptionLabel(provider)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
           )}
           {repositoryCreation && !runsOnSandbox && hostTarget !== null && (

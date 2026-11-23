@@ -10,6 +10,7 @@ import { toast } from "sonner";
 import type { FilePosition } from "@/shell/FileViewerContext";
 import { citedFilePosition } from "@/shell/filePositionState";
 import { reviewMembership, settledShownReview } from "@/lib/reviewFileLinks";
+import { workingCopyComparisons } from "@/lib/workingCopyComparisons";
 
 import { type OpenOptions, samePlace } from "./planOpen";
 import { pullRequestTabPlace } from "./pullRequestSubpage";
@@ -109,6 +110,7 @@ function createSession(sessionId: string): WorkspaceTabsSession {
     isTabDirty: (tabId) => guards.has(tabId),
     onSaveFailed: () => toast.error(SAVE_FAILED_MESSAGE),
     newTabId,
+    choiceCount: () => workingCopyComparisons().choiceCount(sessionId),
   });
   const currentPlace = (tabId: TabId) => {
     const tab = store.findTab(tabId);
@@ -218,7 +220,8 @@ export async function openWorkspaceFile(
   const session = workspaceTabsSession(sessionId);
   const { store } = session;
   const line = lineRange(fileOptions);
-  if (fileOptions?.view === "diff") {
+  const comment = fileOptions?.commentId;
+  if (fileOptions?.view === "diff" && comment === undefined) {
     const result = await store.open(
       { place: { kind: "changes", path, ...(line ? { line } : {}) } },
       { opener },
@@ -227,7 +230,12 @@ export async function openWorkspaceFile(
       session.setFileRequest(result.tabId, { position: citedFilePosition(fileOptions) });
     return result;
   }
-  const place: WorkspacePlace = { kind: "files", path, ...(line ? { line } : {}) };
+  const place: WorkspacePlace = {
+    kind: "files",
+    path,
+    ...(line ? { line } : {}),
+    ...(comment !== undefined ? { comment } : {}),
+  };
   const showing = store
     .tabs()
     .find(
@@ -294,7 +302,10 @@ export async function openWorkspaceFileLink(
   };
   const click = {};
   latestFileLinks.set(sessionId, click);
-  if (!reviewTab()) return openWorkspaceFile(sessionId, path, fileOptions, opener);
+  // A comment's thread shows on the file itself, never in the review.
+  if (!reviewTab() || fileOptions?.commentId !== undefined) {
+    return openWorkspaceFile(sessionId, path, fileOptions, opener);
+  }
   const planned = store.revision();
   const review = await settledShownReview(sessionId);
   // A later link, or the person moving on while the comparison settled, replaces this one.
@@ -306,12 +317,13 @@ export async function openWorkspaceFileLink(
     return openWorkspaceFile(sessionId, path, fileOptions, opener);
   }
   const line = lineRange(fileOptions);
-  const range = selected.place.range;
+  const { range, comparison } = selected.place;
   const result = await store.navigate(selected.id, {
     kind: "changes",
     path,
     ...(line ? { line } : {}),
     ...(range ? { range } : {}),
+    ...(comparison ? { comparison } : {}),
   });
   // A fresh request each time, so the same line cited again is brought back into view.
   if (result.ok) session.setFileRequest(selected.id, { position: citedFilePosition(fileOptions) });

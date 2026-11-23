@@ -90,6 +90,42 @@ describe("opening", () => {
     expectInvariant(store);
   });
 
+  it("marks a fresh landing for each open and history step, and none for a click on a tab", async () => {
+    let choices = 0;
+    const { store } = makeStore({ choiceCount: () => choices });
+    expect(store.landing("P")).toBeUndefined();
+    await store.open({ place: { kind: "pulls" } }, { opener: "user" });
+    const opened = store.landing("P");
+    expect(opened).toEqual({ settled: false, choices: 0 });
+    store.select("F");
+    expect(store.landing("F")).toBeUndefined();
+    // Each landing keeps the session's choice count as it lands.
+    choices = 3;
+    await store.go("back");
+    expect(store.selectedTabId()).toBe("P");
+    expect(store.landing("P")).not.toBe(opened);
+    expect(store.landing("P")).toEqual({ settled: false, choices: 3 });
+  });
+
+  it("brings a Diffs tab forward without the comparison it showed before, for the session's own", async () => {
+    const { store } = makeStore();
+    const diffFile: WorkspacePlace = { kind: "changes", path: "a.go", fileTab: true };
+    const branch = { kind: "saved", intent: "branch-point" } as const;
+    const opened = await store.open(
+      { place: { ...diffFile, comparison: branch } },
+      { opener: "user", disposition: "new" },
+    );
+    store.select("F");
+    await store.open(
+      { place: diffFile },
+      { opener: "user", disposition: "focus", reuse: "same-place" },
+    );
+    expect(store.selectedTab()).toMatchObject({ id: opened.ok && opened.tabId });
+    expect(store.selectedTab()?.place).toEqual(diffFile);
+    expect(store.landing(store.selectedTabId()!)).toEqual({ settled: false, choices: 0 });
+    expectInvariant(store);
+  });
+
   it("reuses the tab that already shows a page", async () => {
     const { store } = makeStore();
     const result = await store.open({ place: { kind: "pulls" } }, { opener: "user" });
