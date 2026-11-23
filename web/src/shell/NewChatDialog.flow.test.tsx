@@ -1806,7 +1806,6 @@ describe("NewChatLandingScreen create flow", () => {
     } as unknown as Response);
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     await waitFor(() => expect(hydrateLocalConversationMock).toHaveBeenCalled());
-    // The first message's files, as the retried create hands them to the session.
     const sentFiles = hydrateLocalConversationMock.mock.calls.at(-1)![4] as File[];
     expect(sentFiles).toHaveLength(1);
     expect(sentFiles[0]).toBe(shot);

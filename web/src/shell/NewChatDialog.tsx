@@ -2740,6 +2740,11 @@ function NewChatLandingContent({
   // shared hook continues to grow from the one-row minimum.
   useAutoGrowTextarea(textareaRef, message, 9);
 
+  // The chip inserter comes from useMentionBrowser, set up further down.
+  const attachPastedFilesRef = useRef<
+    (files: File[], target: ComposerTextTarget, trayFiles: File[]) => void
+  >(() => {});
+
   // Attachments for the first message — same affordances as the in-session
   // composer (paperclip + paste); carried to ChatPage via the pending
   // initial prompt and sent with the auto-dispatched first turn. Validation
@@ -2747,10 +2752,6 @@ function NewChatLandingContent({
   // — without it the upload only fails after the session is created and
   // navigated into, where the first turn's 415 strands the typed message in
   // a session the user never wanted.
-  // The chip inserter comes from useMentionBrowser, set up further down.
-  const attachPastedFilesRef = useRef<
-    (files: File[], target: ComposerTextTarget, trayFiles: File[]) => void
-  >(() => {});
   const {
     files,
     attachmentError,
