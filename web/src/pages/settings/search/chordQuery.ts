@@ -7,6 +7,7 @@ import {
   activeShortcutChords,
   APP_SHORTCUT_BINDINGS,
   menuShortcutChords,
+  SHORTCUT_BINDINGS,
   type ShortcutEnvironment,
   type ShortcutId,
   shortcutDisplayRow,
@@ -250,27 +251,39 @@ function isBarePrintable(chord: Chord): boolean {
  * accelerators for it, but not bare printable keys, such as the digit a workspace tab takes
  * after its chord, which only works in context.
  */
-export function searchableChords(id: ShortcutId, environment: ShortcutEnvironment): Chord[] {
-  return [...activeShortcutChords(id, environment), ...menuShortcutChords(id, environment)].filter(
-    (chord) => !isBarePrintable(chord),
-  );
+export function searchableChords(
+  id: ShortcutId,
+  environment: ShortcutEnvironment,
+  { menuChords = true }: { menuChords?: boolean } = {},
+): Chord[] {
+  return [
+    ...activeShortcutChords(id, environment),
+    ...(menuChords ? menuShortcutChords(id, environment) : []),
+  ].filter((chord) => !isBarePrintable(chord));
+}
+
+/** How a typed chord finds rows: ⌘K's QuickPick adds menu accelerators and every binding. */
+export interface ChordSearchScope {
+  quickPick: boolean;
 }
 
 /**
  * The listed page rows a typed chord finds here: each row showing a binding whose searchable
- * chords it presses, an alternative's or a part's chord finding the row it's drawn on.
+ * chords it presses, an alternative's or a part's chord finding the row it's drawn on. Without
+ * ⌘K's QuickPick, only an unflagged binding's own chords find its row, as before.
  */
 export function rowsForChord(
   input: KeyChordInput,
   environment: ShortcutEnvironment,
   listedRows: ReadonlySet<ShortcutId>,
+  { quickPick }: ChordSearchScope,
 ): Set<ShortcutId> {
   const rows = new Set<ShortcutId>();
-  for (const binding of APP_SHORTCUT_BINDINGS) {
-    const row = shortcutDisplayRow(binding.id);
+  for (const binding of quickPick ? APP_SHORTCUT_BINDINGS : SHORTCUT_BINDINGS) {
+    const row = quickPick ? shortcutDisplayRow(binding.id) : binding.id;
     if (!listedRows.has(row)) continue;
     if (
-      searchableChords(binding.id, environment).some((chord) =>
+      searchableChords(binding.id, environment, { menuChords: quickPick }).some((chord) =>
         chordMatches(chord, input, environment.mac),
       )
     ) {
@@ -290,11 +303,12 @@ export const CHORD_TIER = 0;
 export function chordMatcher(
   environment: ShortcutEnvironment,
   listedRows: ReadonlySet<ShortcutId>,
+  scope: ChordSearchScope,
 ): SettingsSearchMatcher {
   return (query) => {
     const input = parseChordQuery(query, environment.mac);
     if (!input) return null;
-    const rows = rowsForChord(input, environment, listedRows);
+    const rows = rowsForChord(input, environment, listedRows, scope);
     if (rows.size === 0) return null;
     return (target) =>
       target.part === undefined &&

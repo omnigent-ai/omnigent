@@ -80,7 +80,9 @@ function surfaceLine(id: ShortcutId, environment: ShortcutEnvironment): string {
 /** What a typed chord finds in Settings search, for each listed binding's searchable chords. */
 function searchLine(id: ShortcutId, environment: ShortcutEnvironment, listed: Set<ShortcutId>) {
   const found = searchableChords(id, environment).map((chord) =>
-    [...rowsForChord(pressFor(chord, environment.mac), environment, listed)].toSorted().join(","),
+    [...rowsForChord(pressFor(chord, environment.mac), environment, listed, { quickPick: true })]
+      .toSorted()
+      .join(","),
   );
   return `${id} | search=${found.join(" ") || "-"}`;
 }

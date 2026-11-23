@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 
-import { useShortcutPageGroups } from "@/components/KeyboardShortcutsDialog";
+import { useShortcutPageContext } from "@/components/KeyboardShortcutsDialog";
 import { offersAnyHarness, useCuratedOutHarnesses } from "@/hooks/useCuratedOutHarnesses";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { SETTINGS_ENTRIES } from "@/pages/settings/search/catalog";
@@ -11,10 +11,13 @@ import {
   settingsSearchTargets,
 } from "@/pages/settings/search/settingsSearchIndex";
 import { settingsSearchMatchers } from "@/pages/settings/search/settingsSearchMatchers";
-import { shortcutSettingsEntries } from "@/pages/settings/search/shortcutEntries";
+import {
+  isSearchedShortcutRow,
+  shortcutSettingsEntries,
+} from "@/pages/settings/search/shortcutEntries";
 import { useSettingsAvailability } from "@/pages/settings/search/useSettingsAvailability";
 import { currentShortcutEnvironment, type ShortcutId } from "@/lib/shortcuts/registry";
-import type { ShortcutPageRow } from "@/lib/shortcuts/shortcutPage";
+import { type ShortcutPageRow, shortcutPageGroups } from "@/lib/shortcuts/shortcutPage";
 import {
   type SettingsNavItem,
   type SettingsSectionId,
@@ -41,7 +44,9 @@ export function useSettingsSearchTargets(): SettingsSearchTargets {
   const groups = useSettingsNavGroups(offersAnyHarness(curatedOut));
   const mobile = useIsMobileViewport();
   const availability = useSettingsAvailability();
-  const shortcutGroups = useShortcutPageGroups();
+  const shortcutContext = useShortcutPageContext();
+  const shortcutGroups = shortcutPageGroups(shortcutContext);
+  const quickPick = shortcutContext.quickPick;
   // A string, so the results rebuild only when a field of the environment changes.
   const environment = currentShortcutEnvironment();
   const mac = environment.mac;
@@ -49,6 +54,7 @@ export function useSettingsSearchTargets(): SettingsSearchTargets {
   const desktopMenu = environment.desktopMenu;
   const submitWithModEnter = environment.submitWithModEnter;
   return useMemo(() => {
+    const searchContext = { quickPick, native };
     const sections = new Map(
       groups
         .flatMap((group) => group.items)
@@ -60,16 +66,21 @@ export function useSettingsSearchTargets(): SettingsSearchTargets {
       return harness === undefined || !curatedOut.has(harness);
     });
     const targets = settingsSearchTargets(
-      [...entries, ...shortcutSettingsEntries(shortcutGroups)],
+      [...entries, ...shortcutSettingsEntries(shortcutGroups, searchContext)],
       [...sections.values()].map((item) => ({ id: item.id, label: item.label })),
       availability,
     );
     const shortcutRows = new Map(
-      shortcutGroups.flatMap((group) => group.items.map((row) => [row.shortcutId, row] as const)),
+      shortcutGroups.flatMap((group) =>
+        group.items
+          .filter((row) => isSearchedShortcutRow(row, searchContext))
+          .map((row) => [row.shortcutId, row] as const),
+      ),
     );
     const matchers = settingsSearchMatchers(
       { mac, native, desktopMenu, submitWithModEnter },
       new Set(shortcutRows.keys()),
+      { quickPick },
     );
     return { targets, sections, shortcutRows, matchers };
   }, [
@@ -82,5 +93,6 @@ export function useSettingsSearchTargets(): SettingsSearchTargets {
     native,
     desktopMenu,
     submitWithModEnter,
+    quickPick,
   ]);
 }

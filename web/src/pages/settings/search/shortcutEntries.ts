@@ -2,7 +2,12 @@
 // page lists, so the two can't disagree. An entry keeps the binding id, not key strings: the
 // keys come from the live page row wherever an entry is shown.
 
-import type { ShortcutPageGroup, ShortcutPageRow } from "@/lib/shortcuts/shortcutPage";
+import type { ShortcutId } from "@/lib/shortcuts/registry";
+import type {
+  ShortcutPageContext,
+  ShortcutPageGroup,
+  ShortcutPageRow,
+} from "@/lib/shortcuts/shortcutPage";
 
 import type { SettingsEntry } from "./catalog/types";
 
@@ -36,7 +41,55 @@ export function shortcutSettingsEntry(
   return entry;
 }
 
-/** Every row the page lists for these groups, in page order. */
-export function shortcutSettingsEntries(groups: readonly ShortcutPageGroup[]): SettingsEntry[] {
-  return groups.flatMap((group) => group.items.map((row) => shortcutSettingsEntry(row, group)));
+// Without ⌘K's QuickPick, Settings search finds only the rows it found before every page row
+// named its binding. Start a new session joins them only in the desktop app.
+const ROWS_SEARCHED_WITHOUT_QUICK_PICK: ReadonlySet<ShortcutId> = new Set<ShortcutId>([
+  "approval.accept",
+  "approval.decline",
+  "composer.focus",
+  "dictation.toggle",
+  "effort.cycle",
+  "history.back",
+  "history.forward",
+  "model.cycle",
+  "model.picker",
+  "palette.commands",
+  "palette.sessions",
+  "pane.next",
+  "pane.previous",
+  "session.rename",
+  "session.toggleUnread",
+  "sessions.recent",
+  "shortcuts.show",
+  "sidebar.left",
+  "sidebar.right",
+  "terminal.new",
+  "terminal.splitDown",
+  "terminal.splitRight",
+  "view.mode",
+]);
+
+/** What decides which page rows Settings search finds and reveals here. */
+export type ShortcutSearchContext = Pick<ShortcutPageContext, "quickPick" | "native">;
+
+/** Whether Settings search finds this page row, and the page lets search reveal it. */
+export function isSearchedShortcutRow(
+  row: Pick<ShortcutPageRow, "shortcutId">,
+  context: ShortcutSearchContext,
+): boolean {
+  if (context.quickPick) return true;
+  if (row.shortcutId === "session.new") return context.native;
+  return ROWS_SEARCHED_WITHOUT_QUICK_PICK.has(row.shortcutId);
+}
+
+/** Every row the page lists for these groups that search finds here, in page order. */
+export function shortcutSettingsEntries(
+  groups: readonly ShortcutPageGroup[],
+  context: ShortcutSearchContext,
+): SettingsEntry[] {
+  return groups.flatMap((group) =>
+    group.items
+      .filter((row) => isSearchedShortcutRow(row, context))
+      .map((row) => shortcutSettingsEntry(row, group)),
+  );
 }

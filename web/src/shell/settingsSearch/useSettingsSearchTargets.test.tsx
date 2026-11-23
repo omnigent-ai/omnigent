@@ -5,6 +5,8 @@ import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type * as CuratedOutHarnessesModule from "@/hooks/useCuratedOutHarnesses";
+import type { ServerInfo } from "@/lib/capabilities";
+import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
 import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
 
 import { useSettingsSearchTargets } from "./useSettingsSearchTargets";
@@ -17,11 +19,15 @@ vi.mock("@/hooks/useCuratedOutHarnesses", async (importOriginal) => ({
 
 const HARNESSES = NATIVE_CODING_AGENTS.map((spec) => spec.harness);
 
-function searchTargets() {
+const QUICK_PICK_INFO = { features: { quick_pick_palette: true } } as unknown as ServerInfo;
+
+function searchTargets(info: ServerInfo | "loading" = "loading") {
   const wrapper = ({ children }: { children: ReactNode }) => (
-    <QueryClientProvider client={new QueryClient()}>
-      <MemoryRouter initialEntries={["/settings/general"]}>{children}</MemoryRouter>
-    </QueryClientProvider>
+    <CapabilitiesContext.Provider value={info}>
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={["/settings/general"]}>{children}</MemoryRouter>
+      </QueryClientProvider>
+    </CapabilitiesContext.Provider>
   );
   return renderHook(() => useSettingsSearchTargets(), { wrapper }).result.current;
 }
@@ -62,12 +68,22 @@ describe("useSettingsSearchTargets and harness curation", () => {
 });
 
 describe("useSettingsSearchTargets and the Keyboard shortcuts page", () => {
-  it("offers every row the page lists, the composer's and slash menu's keys included", () => {
-    const { targets, shortcutRows } = searchTargets();
+  it("offers every row the page lists with quick_pick_palette, the composer's keys included", () => {
+    const { targets, shortcutRows } = searchTargets(QUICK_PICK_INFO);
     const shortcutIds = targets.flatMap((target) => target.entry.shortcutId ?? []);
     expect(shortcutIds.toSorted()).toEqual([...shortcutRows.keys()].toSorted());
     expect(shortcutIds).toEqual(
       expect.arrayContaining(["composer.send", "slash.apply", "response.stop"]),
     );
+  });
+
+  it("offers only the rows it offered before without quick_pick_palette", () => {
+    const { targets, shortcutRows } = searchTargets();
+    const shortcutIds = targets.flatMap((target) => target.entry.shortcutId ?? []);
+    expect(shortcutIds.toSorted()).toEqual([...shortcutRows.keys()].toSorted());
+    expect(shortcutIds).toContain("palette.commands");
+    for (const id of ["composer.send", "slash.apply", "response.stop", "session.number"]) {
+      expect(shortcutIds, id).not.toContain(id);
+    }
   });
 });

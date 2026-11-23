@@ -406,6 +406,16 @@ describe("Keyboard shortcuts", () => {
       quickPick ? 1 : 0,
     );
   });
+
+  it("lets search reveal only the rows it finds, without quick_pick_palette", () => {
+    renderPage("/settings/shortcuts");
+
+    const row = (label: string) => screen.getByText(label, { selector: "span" }).closest("li");
+    expect(row("Open command palette")?.getAttribute("data-settings-item")).toBe(
+      "shortcut.palette.commands",
+    );
+    expect(row("Stop response")?.hasAttribute("data-settings-item")).toBe(false);
+  });
 });
 
 describe("Import sessions", () => {

@@ -228,11 +228,13 @@ const MAC_DESKTOP: ShortcutEnvironment = {
   submitWithModEnter: false,
 };
 
+const QUICK_PICK = { quickPick: true };
+
 const ALL_LISTED: ReadonlySet<ShortcutId> = new Set(SHORTCUT_BINDINGS.map((binding) => binding.id));
 
 const rows = (query: string, environment: ShortcutEnvironment) => {
   const input = parseChordQuery(query, environment.mac);
-  return input ? [...rowsForChord(input, environment, ALL_LISTED)] : [];
+  return input ? [...rowsForChord(input, environment, ALL_LISTED, QUICK_PICK)] : [];
 };
 
 describe("finding shortcuts by chord", () => {
@@ -269,8 +271,8 @@ describe("finding shortcuts by chord", () => {
 
   it("finds only the rows the page lists", () => {
     const input = parseChordQuery("cmd k", true)!;
-    expect(rowsForChord(input, MAC_DESKTOP, new Set())).toEqual(new Set());
-    expect(rowsForChord(input, MAC_DESKTOP, new Set(["palette.commands"]))).toEqual(
+    expect(rowsForChord(input, MAC_DESKTOP, new Set(), QUICK_PICK)).toEqual(new Set());
+    expect(rowsForChord(input, MAC_DESKTOP, new Set(["palette.commands"]), QUICK_PICK)).toEqual(
       new Set(["palette.commands"]),
     );
   });
@@ -287,7 +289,7 @@ const PAGE_CONTEXT: ShortcutPageContext = {
   splitTerminal: true,
   siblingSessions: true,
   desktopCommands: true,
-  quickPick: false,
+  quickPick: true,
 };
 
 const SHOWN: SettingsAvailability = {
@@ -311,11 +313,11 @@ describe("chord results in Settings search", () => {
   const groups = shortcutPageGroups(PAGE_CONTEXT, true);
   const listed = new Set(groups.flatMap((group) => group.items.map((row) => row.shortcutId)));
   const targets = settingsSearchTargets(
-    shortcutSettingsEntries(groups),
+    shortcutSettingsEntries(groups, PAGE_CONTEXT),
     [{ id: "shortcuts", label: "Keyboard shortcuts" }],
     SHOWN,
   );
-  const matchers = settingsSearchMatchers(MAC_DESKTOP, listed);
+  const matchers = settingsSearchMatchers(MAC_DESKTOP, listed, QUICK_PICK);
   const keysFor = (query: string) =>
     searchSettings(query, targets, matchers).map((result) => result.target.entry.shortcutId);
 
@@ -339,7 +341,7 @@ describe("chord results in Settings search", () => {
   it("finds no menu row in a browser tab, where the menu isn't there", () => {
     const browser = { ...MAC_DESKTOP, native: false, desktopMenu: false };
     const input = parseChordQuery("cmd w", true)!;
-    expect([...rowsForChord(input, browser, listed)]).not.toContain("tab.close");
+    expect([...rowsForChord(input, browser, listed, QUICK_PICK)]).not.toContain("tab.close");
   });
 
   it("finds the row an alternative or a part's chord is drawn on", () => {
@@ -356,5 +358,53 @@ describe("chord results in Settings search", () => {
         ),
       );
     }
+  });
+});
+
+describe("Settings search without quick_pick_palette", () => {
+  const context = { ...PAGE_CONTEXT, quickPick: false };
+  const groups = shortcutPageGroups(context, true);
+  const entries = shortcutSettingsEntries(groups, context);
+  const listed = new Set(entries.flatMap((entry) => entry.shortcutId ?? []));
+  const targets = settingsSearchTargets(
+    entries,
+    [{ id: "shortcuts", label: "Keyboard shortcuts" }],
+    { ...SHOWN, quickPickPalette: false },
+  );
+  const matchers = settingsSearchMatchers(MAC_DESKTOP, listed, { quickPick: false });
+  const keysFor = (query: string) =>
+    searchSettings(query, targets, matchers).map((result) => result.target.entry.shortcutId);
+
+  it("finds the rows it found before the page named every row's binding", () => {
+    expect(listed).toContain("palette.commands");
+    expect(listed).toContain("session.new");
+    for (const id of ["response.stop", "settings.open", "tab.close", "session.number"] as const) {
+      expect(listed, id).not.toContain(id);
+    }
+    expect(keysFor("recall previous prompt")).toEqual([]);
+  });
+
+  it("finds a row by its own chords only, not a menu's or a flagged binding's", () => {
+    expect(keysFor("cmd k")[0]).toBe("palette.commands");
+    const found = (query: string) => [
+      ...rowsForChord(parseChordQuery(query, true)!, MAC_DESKTOP, listed, { quickPick: false }),
+    ];
+    for (const query of ["cmd w", "cmd q", "cmd ,", "cmd opt p", "cmd shift a"]) {
+      expect(found(query), query).toEqual([]);
+    }
+    // Esc finds Decline, not Stop response or the composer's menus.
+    expect(found("esc")).toEqual(["approval.decline"]);
+    // Every row listed, a menu accelerator still finds nothing.
+    const everyRow = new Set(SHORTCUT_BINDINGS.map((binding) => binding.id));
+    const closeTab = parseChordQuery("cmd w", true)!;
+    expect([...rowsForChord(closeTab, MAC_DESKTOP, everyRow, { quickPick: false })]).toEqual([]);
+  });
+
+  it("finds Start a new session only in the desktop app", () => {
+    const browser = { ...context, native: false };
+    const browserIds = shortcutSettingsEntries(shortcutPageGroups(browser, true), browser).map(
+      (entry) => entry.shortcutId,
+    );
+    expect(browserIds).not.toContain("session.new");
   });
 });
