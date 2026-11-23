@@ -1137,11 +1137,13 @@ def should_dispatch_locally(tool_name: str, agent_spec: object = None) -> bool:
     return tool_name in _ALL_LOCAL_TOOLS
 
 
-# Granted tool names per live AgentSpec + effective harness, keyed by
-# ``id(spec)`` because AgentSpec is an unhashable dataclass. The weakref
-# guards against id reuse after the spec is garbage-collected.
+# Granted tool names per live AgentSpec, effective harness, and routing answer,
+# keyed by ``id(spec)`` because AgentSpec is an unhashable dataclass. The weakref
+# guards against id reuse after the spec is garbage-collected. The routing answer
+# is part of the key because it gates ``sys_advise_models``, so a flip is seen
+# on the next call without clearing the cache.
 _granted_tool_names_cache: dict[
-    tuple[int, str | None], tuple[weakref.ref[AgentSpec], frozenset[str]]
+    tuple[int, str | None, bool], tuple[weakref.ref[AgentSpec], frozenset[str]]
 ] = {}
 _GRANTED_TOOL_NAMES_CACHE_MAX = 256
 
@@ -1183,7 +1185,9 @@ def _granted_tool_names(agent_spec: AgentSpec, harness: str | None = None) -> fr
     :raises Exception: Propagates ``ToolManager`` construction failures so
         callers can fail closed instead of guessing at the surface.
     """
-    cache_key = (id(agent_spec), harness)
+    from omnigent.runtime import routing_stamp
+
+    cache_key = (id(agent_spec), harness, routing_stamp())
     cached = _granted_tool_names_cache.get(cache_key)
     if cached is not None and cached[0]() is agent_spec:
         return cached[1]
