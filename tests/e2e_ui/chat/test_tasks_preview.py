@@ -8,11 +8,14 @@ through the Sessions events route (the same path the forwarders post to), so
 they're deterministic: no live agent turn is needed to produce a task list.
 
 Seed before load to prove the snapshot path, then re-publish the idempotent
-full-state list until the live SSE subscription catches it.
+full-state list until the live SSE subscription catches it. The last journey
+runs a scripted turn instead, whose journal writes mark the chat between its
+tool calls.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from collections.abc import Callable
@@ -20,6 +23,8 @@ from collections.abc import Callable
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests.e2e_ui.conftest import configure_mock_llm
 
 _PREVIEW = '[data-testid="tasks-preview"]'
 _TASKS_PANEL = '[data-testid="tasks-panel"]'
@@ -187,3 +192,107 @@ def test_task_markers_and_the_tasks_tab_link_both_ways(
     expect(
         panel.locator('[data-testid="tasks-row"]').nth(2).get_by_test_id("tasks-row-show-in-chat")
     ).to_have_count(0)
+
+
+# A settled turn's rows in order before anything is expanded: its "Worked" rows,
+# task markers and messages. A closed row's work isn't mounted.
+_TURN_OUTLINE_JS = """() => Array.from(
+  document.querySelectorAll(
+    '.turn-fold-row button, [data-testid="task-activity"], [data-testid="assistant-text-section"]'
+  ),
+  (node) => node.textContent.trim(),
+)"""
+
+
+def _one_call(call_id: str, tool: str, /, **arguments: object) -> dict[str, object]:
+    """A scripted model response that makes one tool call."""
+    return {"tool_calls": [{"call_id": call_id, "name": tool, "arguments": json.dumps(arguments)}]}
+
+
+@pytest.mark.min_server_version("0.23.0")
+def test_a_turn_that_moves_a_task_folds_its_work_around_the_markers(
+    page: Page,
+    seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
+) -> None:
+    """A settled turn folds the work on either side of its task markers into
+    "Worked for" rows, and the markers stay in view, live and after a reload.
+
+    The agent writes its plan and the task's statuses with the journal tools
+    mid-turn, so the journal route marks the chat between the turn's shell
+    calls, as in a workflow run.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :param mock_llm_server_url: Mock LLM server that scripts the turn.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    prompt_marker = "task-marker-folds-run"
+    answer = "task-marker-folds-done"
+    step = {"id": "explain", "name": "Explain the stage", "depends_on": []}
+    done = _one_call(
+        "call_tm_done", "sys_journal_write_status", step="explain", status="done", text="Explained"
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            _one_call("call_tm_before", "sys_os_shell", command="echo before-the-task"),
+            _one_call("call_tm_plan", "sys_journal_write_plan", name="Stage checks", steps=[step]),
+            _one_call(
+                "call_tm_start", "sys_journal_write_status", step="explain", status="started"
+            ),
+            _one_call("call_tm_during", "sys_os_shell", command="echo during-the-task"),
+            # The task takes a measurable span before it completes.
+            {**done, "delay": 2.0},
+            {"text": answer},
+        ],
+        key="task_marker_folds",
+        match=prompt_marker,
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+    composer = page.get_by_placeholder("Send a message…")
+    expect(composer).to_be_visible()
+    composer.fill(f"Explain the stage, tracking it as a task. ({prompt_marker})")
+    page.get_by_role("button", name="Send", exact=True).click()
+
+    folds = page.locator('[data-testid="turn-worked-fold"]')
+    markers = page.locator('[data-testid="task-activity"]')
+    worked = re.compile(r"^Worked for \d+s$")
+
+    def expect_folded_turn() -> None:
+        expect(page.get_by_text(answer, exact=True)).to_be_visible(timeout=60_000)
+        # The journal route marked where the plan was made and the task started and ended.
+        expect(markers).to_have_text(
+            [
+                re.compile(r"^Made a plan: Stage checks"),
+                "Started Explain the stage",
+                "Completed Explain the stage",
+            ]
+        )
+        # Each run of work around them folds once the turn settles.
+        expect(folds).to_have_count(2, timeout=15_000)
+        outline = page.evaluate(_TURN_OUTLINE_JS)
+        expected = [
+            worked,
+            "Made a plan: Stage checks",
+            "Started Explain the stage",
+            worked,
+            "Completed Explain the stage",
+            answer,
+        ]
+        assert len(outline) == len(expected), outline
+        for row, want in zip(outline, expected, strict=True):
+            matches = want.match(row) if isinstance(want, re.Pattern) else row.startswith(want)
+            assert matches, f"expected {want!r} in {outline!r}"
+        expect(page.get_by_text("Ran 1 shell command")).to_have_count(0)
+
+        # The task's own work opens from the row between its markers.
+        folds.nth(1).get_by_role("button", name=worked).click()
+        expect(folds.nth(1).get_by_text("Ran 1 shell command")).to_be_visible()
+
+    expect_folded_turn()
+    # Reloaded history folds the same way.
+    page.reload()
+    expect_folded_turn()

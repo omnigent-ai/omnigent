@@ -2665,7 +2665,9 @@ def build_hook_settings(
     server (``enableAllProjectMcpServers``): the "New MCP server found"
     dialog is another unhookable startup gate that a host-spawned terminal
     can never answer. It also turns off auto mode's post-turn
-    environment-setup offer (``skillOverrides``) for the same reason.
+    environment-setup offer (``skillOverrides``) for the same reason, and keeps
+    automatic compaction on (``autoCompactEnabled``) so a full context compacts
+    instead of refusing every turn until someone types ``/compact``.
 
     :param bridge_dir: Bridge directory path.
     :param python_executable: Python executable to run, e.g.
@@ -3011,6 +3013,10 @@ def build_hook_settings(
     # only the terminal can answer it, so web-UI messages stall behind it. This
     # Claude Code switch turns off that offer and its /auto-mode-setup wizard.
     settings["skillOverrides"] = {"auto-mode-setup": "off"}
+    # With auto-compaction off, a full context refuses every turn until someone
+    # types /compact, which an unattended run never does. This outranks the
+    # user's setting; DISABLE_AUTO_COMPACT and managed policy still win.
+    settings["autoCompactEnabled"] = True
     if launch_effort and launch_effort in CLAUDE_EFFORTS:
         settings["effortLevel"] = launch_effort
     if api_key_helper:

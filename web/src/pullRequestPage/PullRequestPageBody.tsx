@@ -2,7 +2,7 @@
 // request, with the tab's place owning which section shows, so Back and Forward step it.
 
 import { useQueryClient } from "@tanstack/react-query";
-import { RefreshCwIcon } from "lucide-react";
+import { ListIcon, RefreshCwIcon } from "lucide-react";
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -13,6 +13,7 @@ import {
   type PullRequestSubtab,
   refreshSessionPullRequests,
 } from "@/shell/PullRequestPanel";
+import { ALL_PULL_REQUESTS_LABEL } from "@/shell/workspaceCommands/model";
 
 import { useStoredPullRequestFallback } from "./useStoredPullRequestFallback";
 
@@ -30,6 +31,8 @@ export interface PullRequestPageBodyProps {
   onSectionChange: (section: PullRequestSubtab) => void;
   /** The tab is selected and the sidebar is open: only then does it poll. */
   active: boolean;
+  /** Show the session's list of pull requests, as ⌘K's Show all pull requests does. */
+  onShowAllPullRequests: () => void;
 }
 
 export function PullRequestPageBody({
@@ -38,6 +41,7 @@ export function PullRequestPageBody({
   section,
   onSectionChange,
   active,
+  onShowAllPullRequests,
 }: PullRequestPageBodyProps) {
   const queryClient = useQueryClient();
   const info = usePullRequestInfo(conversationId, { poll: active, prUrl });
@@ -69,13 +73,19 @@ export function PullRequestPageBody({
           if (next !== tab) onSectionChange(next);
         }}
         refreshButton={
-          <Button size="sm" variant="ghost" disabled={refreshing} onClick={refresh}>
-            <RefreshCwIcon
-              className={cn("size-3.5", refreshing && "animate-spin")}
-              aria-hidden="true"
-            />
-            Refresh
-          </Button>
+          <div className="flex items-center gap-1">
+            <Button size="sm" variant="ghost" onClick={onShowAllPullRequests}>
+              <ListIcon className="size-3.5" aria-hidden="true" />
+              {ALL_PULL_REQUESTS_LABEL}
+            </Button>
+            <Button size="sm" variant="ghost" disabled={refreshing} onClick={refresh}>
+              <RefreshCwIcon
+                className={cn("size-3.5", refreshing && "animate-spin")}
+                aria-hidden="true"
+              />
+              Refresh
+            </Button>
+          </div>
         }
       />
     </div>

@@ -5,7 +5,6 @@
 // links, restore and Back can open it, and opening it updates the tab.
 
 import {
-  ArrowLeftIcon,
   BotIcon,
   FolderTreeIcon,
   GitCompareIcon,
@@ -17,9 +16,8 @@ import {
   TextSearchIcon,
   type LucideIcon,
 } from "lucide-react";
-import { type KeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
-import { Button } from "@/components/ui/button";
 import type { QuickPickItem } from "@/components/ui/quick-pick/model";
 import { QuickPick } from "@/components/ui/quick-pick/QuickPick";
 import type { SandboxResumeStatus } from "@/lib/sandboxResume";
@@ -144,11 +142,13 @@ function toItem(
     icon: <Icon aria-hidden className="size-4 text-muted-foreground" />,
     ...(shortcut ? { shortcut } : {}),
     ...(entry.disabledReason ? { disabledReason: entry.disabledReason } : {}),
+    ...(entry.action.kind === "choose-shell" ? { opensPage: true } : {}),
     ...(grouped && CARD_APPS.includes(entry.id)
       ? { group: "Apps", layout: "card" as const, description: appHint(entry, sandbox) }
       : grouped
         ? { group: "More" }
         : {}),
+    rememberInHistory: false,
     value: entry.action,
   };
 }
@@ -226,31 +226,23 @@ export function NewTabPage({
     onPlaceChange({ kind: "new", app: "terminal" });
   };
   const backToApps = () => onPlaceChange({ kind: "new" });
-  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (event.defaultPrevented) return;
-    // Escape leaves the shell chooser for the apps, or dismisses the app list.
-    if (event.key === "Escape") {
-      const leave = onShells ? backToApps : onDismiss;
-      if (!leave) return;
-      event.preventDefault();
-      leave();
-      return;
-    }
-    // Right Arrow on Terminal, with the caret at the end of the query, opens the chooser.
-    if (event.key === "ArrowRight" && !onShells && canChooseShell && terminalIsActive(event)) {
-      event.preventDefault();
-      openChooser();
-    }
-  };
-
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3 p-3" data-testid="workspace-new-tab-page">
       {notice}
-      <div ref={pageRef} className="flex min-h-0 flex-1 flex-col" onKeyDown={onKeyDown}>
+      <div ref={pageRef} className="flex min-h-0 flex-1 flex-col">
         <QuickPick<PageAction>
           label={onShells ? "Choose a shell" : "Open an app in this tab"}
           placeholder={onShells ? "Choose a shell…" : "Search apps and recent places…"}
-          segments={[{ sourceId: "new-tab", ranking: "client", fuzzyMatching: "words", items }]}
+          backLabel="Back to apps"
+          segments={[
+            {
+              sourceId: "new-tab",
+              ranking: "client",
+              groupOrder: "match",
+              fuzzyMatching: "words",
+              items,
+            },
+          ]}
           query={current.query}
           onQueryChange={(query) => setCurrent({ query, activeId: null })}
           activeId={current.activeId}
@@ -260,14 +252,14 @@ export function NewTabPage({
           autoFocus={autoFocus}
           fillHeight
           inputRef={queryFieldRef}
-          inputEnd={
-            onShells ? (
-              <Button type="button" variant="ghost" size="sm" onClick={backToApps}>
-                <ArrowLeftIcon aria-hidden="true" />
-                Back to apps
-              </Button>
-            ) : undefined
-          }
+          onBack={onShells ? backToApps : undefined}
+          onDismiss={onShells ? undefined : onDismiss}
+          // Right Arrow on Terminal shows every shell, as the chooser page does.
+          onExpand={(item) => {
+            if (onShells || !canChooseShell || item.id !== "terminal") return false;
+            openChooser();
+            return true;
+          }}
           onAccept={(item) => {
             const action = item.value;
             if (action.kind === "choose-shell") {
@@ -283,15 +275,4 @@ export function NewTabPage({
       </div>
     </div>
   );
-}
-
-/** The query field has the caret at its end and Terminal is the active row. */
-function terminalIsActive(event: KeyboardEvent<HTMLDivElement>): boolean {
-  const field = event.target;
-  if (!(field instanceof HTMLInputElement)) return false;
-  if (field.selectionStart !== field.value.length || field.selectionEnd !== field.value.length) {
-    return false;
-  }
-  const active = field.getAttribute("aria-activedescendant") ?? "";
-  return active.endsWith(`-option-${encodeURIComponent("item:terminal")}`);
 }

@@ -19,6 +19,7 @@ import { MUTED_LABEL_KEY } from "@/lib/sessionMute";
 import { toast } from "sonner";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 
 const mocks = vi.hoisted(() => ({
@@ -426,6 +427,76 @@ describe("HeaderConversationMenu", () => {
     expect(mocks.deleteConversation).toHaveBeenCalledWith({
       id: "conv-1",
       deleteBranch: true,
+    });
+  });
+
+  describe("in ⌘K", () => {
+    const sessionCommands = () =>
+      Object.values(usePaletteCommandsStore.getState().groups).filter(
+        (group) => group.heading === "Session",
+      );
+    const runCommand = (label: string) => {
+      const command = sessionCommands()[0]?.commands.find((row) => row.label === label);
+      if (!command) throw new Error(`No ⌘K command "${label}"`);
+      act(() => command.run());
+    };
+
+    it("offers the menu's actions for the session shown and withdraws them on unmount", () => {
+      const view = renderMenu();
+      expect(sessionCommands()).toHaveLength(1);
+      expect(sessionCommands()[0].commands.map((command) => command.id)).toEqual([
+        "open-session:conv-1:add-nested-agent",
+        "open-session:conv-1:pin",
+        "open-session:conv-1:share",
+        "open-session:conv-1:fork",
+        "open-session:conv-1:export",
+        "open-session:conv-1:rename",
+        "open-session:conv-1:mark-unread",
+        "open-session:conv-1:archive",
+        "open-session:conv-1:delete",
+      ]);
+      view.unmount();
+      expect(sessionCommands()).toEqual([]);
+    });
+
+    it("runs the menu's own handlers", () => {
+      renderMenu();
+      runCommand("Pin session");
+      expect(mocks.togglePinned).toHaveBeenCalledWith({ id: "conv-1", pinned: true });
+      runCommand("Fork session");
+      expect(mocks.fork).toHaveBeenCalledTimes(1);
+      runCommand("Rename session");
+      fireEvent.change(screen.getByRole("textbox", { name: "Session name" }), {
+        target: { value: "Roadmap planning" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+      expect(mocks.rename).toHaveBeenCalledWith({ id: "conv-1", title: "Roadmap planning" });
+      runCommand("Delete session");
+      expect(screen.getByRole("dialog", { name: "Delete session?" })).toBeVisible();
+    });
+
+    it("drops a row built for the previous session once another is shown", () => {
+      const view = renderMenu();
+      const stalePin = sessionCommands()[0].commands.find((row) => row.label === "Pin session");
+      view.rerender(menuTree({ conversation: SECOND_CONVERSATION }));
+      expect(sessionCommands()[0].commands[0].id).toMatch(/^open-session:conv-2:/);
+      act(() => stalePin?.run());
+      expect(mocks.togglePinned).not.toHaveBeenCalled();
+    });
+
+    it("doesn't run a held row once its action can't run, as when sharing turns off", () => {
+      const onShare = vi.fn();
+      const view = renderMenu({ onShare });
+      const share = sessionCommands()[0].commands.find((row) => row.label === "Share session");
+      view.rerender(menuTree({ onShare, shareDisabled: true, shareDisabledReason: "Off." }));
+      act(() => share?.run());
+      expect(onShare).not.toHaveBeenCalled();
+    });
+
+    it("keeps Share listed with its reason when sharing is off", () => {
+      renderMenu({ shareDisabled: true, shareDisabledReason: "Sharing is turned off." });
+      const share = sessionCommands()[0].commands.find((row) => row.label === "Share session");
+      expect(share?.availability).toEqual({ available: false, reason: "Sharing is turned off." });
     });
   });
 

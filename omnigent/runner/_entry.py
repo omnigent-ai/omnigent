@@ -1808,7 +1808,7 @@ def create_app(
             # the multipart routes (POST /v1/sessions bundle create, file upload
             # — both reached from tool_dispatch over this client) requires a
             # trusted Origin; the runner sends none otherwise, so the sentinel is
-            # what lets sys_session_create / sys_upload_file through. The factory
+            # what lets sys_session_create / sys_files_upload through. The factory
             # folds the routing/slice-key headers in on top; we pass only the
             # runner's tunnel-binding token (when present) alongside the Origin.
             headers={

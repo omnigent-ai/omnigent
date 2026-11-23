@@ -3,6 +3,7 @@
 // each rule is tested without the views; the views only run the result.
 
 import type { OpenOptions } from "../planOpen";
+import type { ComparisonChoice } from "@/lib/comparisonChoice";
 import type { FilePosition } from "@/shell/FileViewerContext";
 
 import { pullRequestTabPlace } from "../pullRequestSubpage";
@@ -70,6 +71,17 @@ export function changedFileViewed(path: string): PlaceViewAction {
   return { type: "open", link: { place: { kind: "files", path } }, options: USER };
 }
 
+/** The comparison the session shows, kept on the visit: a step when the person picked it. */
+export function changesComparisonShown(
+  current: ChangesPlace,
+  comparison: ComparisonChoice,
+  step: boolean,
+): PlaceViewAction {
+  // The recorded comparison replaces a link's range, which would otherwise outlive it.
+  const { range: _range, ...rest } = current;
+  return { type: "navigate", place: { ...rest, comparison }, replace: !step };
+}
+
 /** Leaves a comparison a link asked for, for the session's own, keeping the file. */
 export function changesDefaultComparison(current: ChangesPlace): PlaceViewAction {
   if (!current.range) return NONE;
@@ -90,6 +102,7 @@ export function changesFileInNewTab(
 ): PlaceViewAction {
   const place: ChangesPlace = { kind: "changes", path, fileTab: true };
   if (current.range) place.range = current.range;
+  if (current.comparison) place.comparison = current.comparison;
   return {
     type: "open",
     link: { place },
@@ -107,7 +120,11 @@ export function changesOverview(current: ChangesPlace): PlaceViewAction {
   if (current.path === undefined) return NONE;
   return {
     type: "navigate",
-    place: current.range ? { kind: "changes", range: current.range } : { kind: "changes" },
+    place: {
+      kind: "changes",
+      ...(current.range ? { range: current.range } : {}),
+      ...(current.comparison ? { comparison: current.comparison } : {}),
+    },
     replace: false,
   };
 }
@@ -119,6 +136,15 @@ export function pullRequestChosen(
   section?: Extract<PullRequestPlace, { kind: "pull" }>["view"],
 ): PlaceViewAction {
   return { type: "navigate", place: pullRequestTabPlace(url, section), replace: false };
+}
+
+/** The session's pull request list, asked for from one pull request: its own tab, shown. */
+export function allPullRequestsChosen(): PlaceViewAction {
+  return {
+    type: "open",
+    link: { place: { kind: "pulls" } },
+    options: { opener: "user", disposition: "focus" },
+  };
 }
 
 export function pullRequestSectionChosen(

@@ -66,6 +66,7 @@ import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
@@ -98,6 +99,8 @@ _DEFAULT_GH_TIMEOUT_SECONDS = 15.0
 # A request with its own time budget bounds every ``gh`` call by this monotonic
 # deadline (see :func:`_gh_deadline_scope`); ``_gh_timed_out`` records a cut-off call.
 _gh_deadline: ContextVar[float | None] = ContextVar("gh_deadline", default=None)
+# The host the current panel step's ``gh`` calls are for, set by the provider facet.
+_gh_target_host: ContextVar[str | None] = ContextVar("gh_target_host", default=None)
 _gh_timed_out: ContextVar[bool] = ContextVar("gh_timed_out", default=False)
 
 # Always pass --json (bare gh pr view opens a pager); body, comments,
@@ -183,17 +186,43 @@ def _in_sandbox() -> bool:
     return in_managed_sandbox()
 
 
-def _gh(
-    argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
-) -> tuple[int | None, str, str]:
-    # ``timeout`` replaces the per-call limit: higher for a slow call such as a video
-    # upload, lower for a best-effort one.
-    timeout = timeout or _gh_timeout_seconds()
-    if (deadline := _gh_deadline.get()) is not None:
-        timeout = min(timeout, deadline - time.monotonic())
-        if timeout <= 0:
-            _gh_timed_out.set(True)
-            return None, "", "gh deadline exceeded"
+@dataclass(frozen=True)
+class GhInvocation:
+    """The process one ``gh`` call starts.
+
+    :ivar argv: The command and its arguments.
+    :ivar env: The child's whole environment, or ``None`` to inherit this process's.
+    :ivar host: The code host the call is for, from :func:`gh_target_host_scope`;
+        ``None`` when the step didn't name one.
+    """
+
+    argv: list[str]
+    env: dict[str, str] | None
+    host: str | None = None
+
+
+@contextmanager
+def gh_target_host_scope(host: str | None) -> Iterator[None]:
+    """Mark every ``gh`` call in the block as being for *host*.
+
+    The value is per context, so concurrent steps in other threads keep their own.
+    """
+    token = _gh_target_host.set(host.lower() if host else None)
+    try:
+        yield
+    finally:
+        _gh_target_host.reset(token)
+
+
+def _gh_invocation(argv: list[str], *, token: str | None, host: str | None) -> GhInvocation:
+    """Return the command and environment that run ``gh`` with *argv*.
+
+    Every ``gh`` call the panel makes starts through here.
+
+    :param argv: Arguments after ``gh``.
+    :param token: A GitHub token to run this one call as a chosen account, or ``None``.
+    :param host: The code host the call is for, or ``None``; every host runs ``gh``.
+    """
     # In a managed sandbox the panel must authenticate as the connected owner via
     # the per-user hosts.yml that configure_host_gh writes — never an ambient
     # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
@@ -218,7 +247,22 @@ def _gh(
         env["GH_ENTERPRISE_TOKEN"] = token
         env.pop("GITHUB_TOKEN", None)
         env.pop("GITHUB_ENTERPRISE_TOKEN", None)
-    result = _run(["gh", *argv], cwd=cwd, timeout=timeout, env=env)
+    return GhInvocation(argv=["gh", *argv], env=env, host=host)
+
+
+def _gh(
+    argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
+) -> tuple[int | None, str, str]:
+    # ``timeout`` replaces the per-call limit: higher for a slow call such as a video
+    # upload, lower for a best-effort one.
+    timeout = timeout or _gh_timeout_seconds()
+    if (deadline := _gh_deadline.get()) is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            _gh_timed_out.set(True)
+            return None, "", "gh deadline exceeded"
+    invocation = _gh_invocation(argv, token=token, host=_gh_target_host.get())
+    result = _run(invocation.argv, cwd=cwd, timeout=timeout, env=invocation.env)
     if (
         deadline is not None
         and result[0] is None

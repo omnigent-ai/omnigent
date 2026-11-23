@@ -55,8 +55,12 @@ function host(overrides: Partial<WorkspaceTabsHostProps> = {}) {
     onReveal,
     ...overrides,
   } as WorkspaceTabsHostProps;
-  render(<WorkspaceTabsHost {...props} />);
-  return { onReveal };
+  const view = render(<WorkspaceTabsHost {...props} />);
+  return {
+    onReveal,
+    rerender: (next: Partial<WorkspaceTabsHostProps>) =>
+      view.rerender(<WorkspaceTabsHost {...props} {...next} />),
+  };
 }
 
 beforeEach(() => {
@@ -70,6 +74,38 @@ afterEach(() => {
 });
 
 describe("WorkspaceTabsHost", () => {
+  it("makes a collapsing rail inert a frame after the toggle, and an expanding one at once", async () => {
+    const { rerender } = host({ open: true, inert: false });
+    expect(captured.panel?.inert).toBe(false);
+    rerender({ open: false, inert: true });
+    // The toggle's own frame leaves the rail's subtree alone; the panel keeps focus out of it.
+    expect(captured.panel?.inert).toBe(false);
+    await act(async () => {
+      await new Promise((resolve) => {
+        requestAnimationFrame(() => resolve(undefined));
+      });
+    });
+    await vi.waitFor(() => expect(captured.panel?.inert).toBe(true));
+    rerender({ open: true, inert: false });
+    expect(captured.panel?.inert).toBe(false);
+  });
+
+  it("keeps focus out while any change to inert is deferred, also with the rail still open", async () => {
+    // A rail dragged to no width goes inert while it stays open.
+    const { rerender } = host({ open: true, inert: false });
+    expect(captured.panel?.inertPending).toBe(false);
+    rerender({ open: true, inert: true });
+    expect(captured.panel?.inert).toBe(false);
+    expect(captured.panel?.inertPending).toBe(true);
+    await act(async () => {
+      await new Promise((resolve) => {
+        requestAnimationFrame(() => resolve(undefined));
+      });
+    });
+    await vi.waitFor(() => expect(captured.panel?.inert).toBe(true));
+    expect(captured.panel?.inertPending).toBe(false);
+  });
+
   it("asks in the Close shell dialog before a shell's tab closes, then ends it", async () => {
     const user = userEvent.setup();
     host();

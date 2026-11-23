@@ -35,6 +35,8 @@ export interface CommandPaletteProps {
   onToggleRightSidebar: () => void;
   /** False on grid routes, where ⌘⌥] belongs to the grid's own workspace. */
   rightSidebarShortcutEnabled?: boolean;
+  /** Switches ⌘K to searching sessions only, as its session chord opens it; QuickPick offers it. */
+  onGoToSession?: () => void;
 }
 
 /** Split `text` on case-insensitive occurrences of `query`, bolding the matches

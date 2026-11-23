@@ -51,7 +51,9 @@ from omnigent.runner.git_providers import (
     ReviewerRef,
     ReviewThreadsFacet,
     local_git,
+    offered_capabilities,
     unsupported_remote_info,
+    with_offered_capabilities,
 )
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, SessionPullRequest
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
@@ -348,9 +350,11 @@ def _workspace_info(root: str, resolution: ProviderResolution | None = None) -> 
     if facet is None:
         return unsupported_remote_info(resolution.remote_host or "")
     info = facet.workspace_info(root)
-    if resolution.unclaimed and _cannot_serve(info, facet.capabilities):
+    if resolution.unclaimed and _cannot_serve(
+        info, offered_capabilities(facet, resolution.remote_host)
+    ):
         return unsupported_remote_info(resolution.remote_host or "")
-    return info
+    return with_offered_capabilities(info, facet, resolution.remote_host)
 
 
 def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
@@ -359,7 +363,9 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         facet = _facet(reference.provider)
         if facet is None:
             return {**unsupported_remote_info(reference.host), "selected_pr_url": reference.url}
-        return facet.reference_info(root, reference)
+        return with_offered_capabilities(
+            facet.reference_info(root, reference), facet, reference.host
+        )
     except Exception:  # retain the selector and healthy providers on failure
         _logger.warning("Git provider %s failed PR lookup", reference.provider, exc_info=True)
         return {
@@ -729,9 +735,10 @@ def set_pr_preference(
     :returns: The refreshed :func:`pr_info` payload.
     """
     reference = _selected_pr(session_id, pr_url) if pr_url and session_id else None
-    facet = _serving_facet(root, reference)
+    resolution = _resolve(root, reference)
+    facet = _facet(resolution.provider)
     if facet is not None:
-        capabilities = facet.capabilities
+        capabilities = offered_capabilities(facet, resolution.remote_host)
         account = account if capabilities.account_switching else None
         remote = remote if capabilities.base_remote_selection else None
         if account is not None or remote:
@@ -759,7 +766,7 @@ def _capable_target(
         raise ValueError(unselected)
     reference = _selected_pr(session_id, pr_url)
     facet = _facet(reference.provider)
-    if facet is None or not capable(facet.capabilities):
+    if facet is None or not capable(offered_capabilities(facet, reference.host)):
         display = provider_display(reference.provider)
         kind = (
             f"{display['display_name']} {display['request_name']}"
@@ -930,7 +937,7 @@ def merge_pr_as(
     if not isinstance(account, str) or not account.strip():
         raise ValueError("Expected account to be an account login")
     facet, reference = _merge_target(session_id, pr_url)
-    capabilities = facet.capabilities
+    capabilities = offered_capabilities(facet, reference.host)
     if not (
         capabilities.account_switching
         and capabilities.merge_as_account

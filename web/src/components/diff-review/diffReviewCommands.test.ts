@@ -24,6 +24,8 @@ function state(overrides: Partial<DiffReviewCommandState> = {}): DiffReviewComma
     setIgnoreWhitespace: vi.fn(),
     wrapLines: false,
     setWrapLines: vi.fn(),
+    fileOrder: "path",
+    setFileOrder: vi.fn(),
     allCollapsed: false,
     canCollapse: true,
     toggleAllFiles: vi.fn(),
@@ -45,8 +47,35 @@ describe("diffReviewCommands", () => {
       "toggle-layout",
       "toggle-whitespace",
       "toggle-wrap",
+      "sort-files",
       "toggle-collapse-all",
     ]);
+  });
+
+  it("sorts files by size or path through one command, a ⌘K setting with both orders", () => {
+    const byPath = state();
+    const sort = byId(diffReviewCommands(byPath), "sort-files");
+    expect(sort).toMatchObject({ label: "Sort files by size", pressed: false });
+    expect(sort.setting).toMatchObject({
+      label: "Sort changed files",
+      current: "path",
+      choices: [
+        { value: "path", label: "By path" },
+        { value: "size", label: "By size, largest first" },
+      ],
+    });
+    sort.run();
+    expect(byPath.setFileOrder).toHaveBeenCalledWith("size");
+    sort.setting!.choose("path");
+    expect(byPath.setFileOrder).toHaveBeenLastCalledWith("path");
+    sort.setting!.choose("newest");
+    expect(byPath.setFileOrder).toHaveBeenCalledTimes(2);
+
+    const bySize = state({ fileOrder: "size" });
+    const sorted = byId(diffReviewCommands(bySize), "sort-files");
+    expect(sorted).toMatchObject({ label: "Sort files by path", pressed: true });
+    sorted.run();
+    expect(bySize.setFileOrder).toHaveBeenCalledWith("path");
   });
 
   it("withholds the commands whose setting the source doesn't offer", () => {

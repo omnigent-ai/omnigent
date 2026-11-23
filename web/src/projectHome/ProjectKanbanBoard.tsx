@@ -52,7 +52,7 @@ import {
 } from "@/hooks/useConversations";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useHosts, type Host } from "@/hooks/useHosts";
-import { getSessionState } from "@/hooks/useSessionState";
+import { getSessionState, withUnreadState } from "@/hooks/useSessionState";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOptionalLoadedConversations, useOptionalSidebarShow } from "@/hooks/useSidebarData";
 import {
@@ -672,9 +672,10 @@ function KanbanCardBody({
   className?: string;
 }) {
   const { conversation, members } = card;
-  const state =
-    getSessionState(conversation) ??
-    (showsUnreadFor(conversation, isUnseen(conversation)) ? { kind: "unseen" as const } : null);
+  const state = withUnreadState(
+    getSessionState(conversation),
+    showsUnreadFor(conversation, isUnseen(conversation)),
+  );
   const working = state?.kind === "running";
   const nestedCount = members.length - 1;
   const responsePreview = useLastResponsePreview(conversation);

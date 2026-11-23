@@ -2,6 +2,7 @@
 
 With the flag on, a desktop client's sidebar is the tabs panel: a New Tab page, Files with
 the tree and editor, each pull request as its own page, and Back and Forward through them.
+A Files row's menu copies its path and a link to it.
 A narrow desktop window shows the tabs in its Workspace drawer. A touch client, such as a
 phone, keeps the classic drawers with the flag on, as every client does with the flag off;
 there the tabs code never loads.
@@ -10,7 +11,8 @@ The flag is turned on by answering ``/v1/info`` with it added to the server's ow
 the server side of the flag is covered by ``tests/server/test_feature_flags.py``. Pull
 requests come from the same stubs as ``test_github_tab.py``, so no ``gh`` runs. The Changes
 journey runs on its own server and host, with ``workspace_api_server_access`` on, so its Git
-reads go through the workspace API.
+reads go through the workspace API. A reopened shell tab says it's connecting until the session
+lists its shell, then shows its terminal.
 """
 
 from __future__ import annotations
@@ -18,12 +20,14 @@ from __future__ import annotations
 import re
 import subprocess
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
 import pytest
 from playwright.sync_api import Locator, Page, Request, Route, expect
 
+from tests._helpers.polling import poll_until
 from tests._helpers.pull_request_ui import open_session_pull_requests
 from tests._helpers.server_runner import server_runner
 from tests.e2e_ui.conftest import _BUILD_OUTPUT, open_right_rail
@@ -216,6 +220,19 @@ def test_tabs_sidebar_files_history_and_pull_request(
         "aria-selected", "true"
     )
 
+    # The PR's page and ⌘K both show the session's list in a tab of its own.
+    list_tab = sidebar.get_by_role("tab", name=re.compile(r"^Pull requests"))
+    sidebar.get_by_role("button", name="All pull requests").click()
+    expect(list_tab).to_have_attribute("aria-selected", "true", timeout=30_000)
+    pr_tab.click()
+    page.keyboard.press("ControlOrMeta+k")
+    palette = page.get_by_test_id("command-palette-input")
+    expect(palette).to_be_focused(timeout=10_000)
+    palette.fill("Show all pull requests")
+    page.get_by_role("option", name=re.compile("Show all pull requests")).click()
+    expect(list_tab).to_have_attribute("aria-selected", "true")
+    expect(list_tab).to_have_count(1)
+
     # From another tab, the composer's link to its one PR shows that PR's tab again; it
     # waits for the selection to move, so the click's effect has landed.
     file_tab.click()
@@ -231,6 +248,114 @@ def test_tabs_sidebar_files_history_and_pull_request(
     bodies = _script_bodies(page, scripts).values()
     for marker in _TABS_CODE_MARKERS:
         assert any(marker in body for body in bodies), marker
+
+
+def test_files_menu_copies_the_path_and_a_link_to_the_file(
+    page: Page, workspace_session: tuple[str, str]
+) -> None:
+    """A Files row's menu puts the file's path, then a link into the session, on the clipboard."""
+    base_url, session_id = workspace_session
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    _open_app(page, sidebar, "Files")
+    file_row = sidebar.get_by_role("treeitem", name=re.compile(re.escape(_FILE)))
+    expect(file_row).to_be_visible(timeout=30_000)
+
+    file_row.click(button="right")
+    page.get_by_role("menuitem", name="Copy path", exact=True).click()
+    expect(page.get_by_text("Copied path", exact=True)).to_be_visible(timeout=10_000)
+    copied = page.evaluate("() => navigator.clipboard.readText()")
+    assert copied.startswith("/") and copied.endswith(f"/{_FILE}"), copied
+
+    file_row.click(button="right")
+    page.get_by_role("menuitem", name="Copy link to file", exact=True).click()
+    expect(page.get_by_text("Link copied", exact=True)).to_be_visible(timeout=10_000)
+    link = page.evaluate("() => navigator.clipboard.readText()")
+    assert re.search(rf"/c/{re.escape(session_id)}\?(?:.*&)?file={re.escape(_FILE)}", link), link
+
+
+def test_file_link_opens_its_comment_in_a_full_screen_sidebar(
+    page: Page, workspace_session: tuple[str, str]
+) -> None:
+    """A ``?file=`` link with ``comment`` and ``fullscreen=1`` shows that thread, full screen."""
+    base_url, session_id = workspace_session
+    anchor = "hello"
+    response = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/comments",
+        json={
+            "path": _FILE,
+            "body": "Say goodbye too",
+            "start_index": "print('hello')".index(anchor),
+            "end_index": "print('hello')".index(anchor) + len(anchor),
+            "anchor_content": anchor,
+        },
+        timeout=10.0,
+    )
+    response.raise_for_status()
+    comment_id = response.json()["id"]
+    _set_flag(page, True)
+    page.set_viewport_size(_VIEWPORTS["desktop"])
+    page.goto(f"{base_url}/c/{session_id}?file={_FILE}&comment={comment_id}&fullscreen=1")
+
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    viewer = sidebar.get_by_test_id("file-viewer")
+    expect(viewer).to_contain_text("Say goodbye too", timeout=60_000)
+    expect(page.locator("[data-maximized]")).to_have_count(1)
+    # The link is handed to the tab, so a reload doesn't open it again.
+    expect(page).not_to_have_url(re.compile(r"[?&](?:file|comment|fullscreen)="))
+
+
+def test_tabs_sidebar_shell_tab_connects_then_shows_its_terminal(
+    page: Page, terminal_session: tuple[str, str]
+) -> None:
+    """A reopened shell tab spins and says Connecting… until its shell is listed, then shows it."""
+    base_url, session_id = terminal_session
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    _open_app(page, sidebar, "Terminal")
+    terminal = sidebar.get_by_test_id("terminal-view").last
+    expect(terminal).to_have_attribute("data-state", "connected", timeout=60_000)
+
+    # Reopen the session while its shell list is held: the restored tab can't know its shell yet.
+    # The page's clock stands still meanwhile, so the list read's deadline can't fire however
+    # long the hold takes.
+    held: list[Route] = []
+    holding = True
+
+    def hold_list(route: Route) -> None:
+        if holding and route.request.method == "GET":
+            held.append(route)
+        else:
+            route.continue_()
+
+    page.route(re.compile(r"/v1/sessions/[^/]+/resources/terminals(?:\?.*)?$"), hold_list)
+    page.clock.install()
+    page.clock.pause_at(datetime.now(UTC) + timedelta(seconds=1))
+    try:
+        page.reload()
+        open_right_rail(page)
+        connecting = sidebar.get_by_test_id("terminal-tab-connecting")
+        expect(connecting).to_contain_text("Connecting…", timeout=60_000)
+        selected = sidebar.get_by_role("tab", selected=True)
+        expect(selected.get_by_role("status", name="Loading")).to_be_visible()
+        expect(sidebar.get_by_test_id("terminal-view")).to_have_count(0)
+        assert held, "the shell list was never requested"
+    finally:
+        page.clock.resume()
+        holding = False
+        for route in held:
+            route.continue_()
+
+    expect(terminal).to_have_attribute("data-state", "connected", timeout=30_000)
+    expect(connecting).to_have_count(0)
+    expect(selected.get_by_role("status", name="Loading")).to_have_count(0)
 
 
 def _press_palette(page: Page) -> Locator:
@@ -318,8 +443,10 @@ def test_flag_off_keeps_the_classic_sidebar(
     _expect_no_tabs_code(page, scripts)
 
 
-def _commit(repository: Path, path: str, subject: str) -> None:
-    (repository / path).write_text(f"{subject}\n")
+def _commit(repository: Path, path: str, subject: str, extra_lines: int = 0) -> None:
+    (repository / path).write_text(
+        f"{subject}\n" + "".join(f"line {index}\n" for index in range(extra_lines))
+    )
     for args in (("add", path), ("commit", "-q", "-m", subject)):
         subprocess.run(
             ["git", "-c", "user.name=Example", "-c", "user.email=dev@example.com", *args],
@@ -333,13 +460,16 @@ def git_session(built_spa: None, tmp_path: Path) -> Iterator[tuple[str, str]]:
     """A session on a real host whose workspace is a repository on a feature branch.
 
     ``main`` has one commit, tagged ``v1.0``, and is ``origin``'s default branch;
-    ``feature`` adds two more.
+    ``feature`` adds two more, the last with the longer file.
     """
     repository = tmp_path / "repository"
     repository.mkdir()
     origin = tmp_path / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repository, check=True)
+    # Otherwise the host's untracked-cache probe briefly writes mtime-test-*/ files into the
+    # repository, and a listing that lands then shows a file that's gone when its diff loads.
+    subprocess.run(["git", "config", "core.untrackedCache", "true"], cwd=repository, check=True)
     _commit(repository, "base.txt", "Add the base")
     subprocess.run(["git", "tag", "v1.0"], cwd=repository, check=True)
     # All branch changes compares with the merge base of origin's default branch.
@@ -351,7 +481,7 @@ def git_session(built_spa: None, tmp_path: Path) -> Iterator[tuple[str, str]]:
         subprocess.run(["git", *args], cwd=repository, check=True)
     subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=repository, check=True)
     _commit(repository, "feature_first.txt", "Add the first feature file")
-    _commit(repository, "feature_last.txt", "Add the last feature file")
+    _commit(repository, "feature_last.txt", "Add the last feature file", extra_lines=5)
     server_env = {
         "OMNIGENT_FEATURES": "workspace_api_server_access",
         "OMNIGENT_WEB_UI_DIST": str(_BUILD_OUTPUT),
@@ -382,7 +512,10 @@ def git_session(built_spa: None, tmp_path: Path) -> Iterator[tuple[str, str]]:
 def test_changes_compare_branches_and_tags_through_the_workspace_api(
     page: Page, git_session: tuple[str, str]
 ) -> None:
-    """The picker suggests branches and tags; All branch changes and Last commit list files."""
+    """The picker suggests branches and tags; each comparison lists its files and is a step.
+
+    Diff options then sorts the files by size, and the order outlasts a reload.
+    """
     base_url, session_id = git_session
     _set_flag(page, True)
     _open_session(page, base_url, session_id, "desktop")
@@ -428,3 +561,42 @@ def test_changes_compare_branches_and_tags_through_the_workspace_api(
         timeout=30_000
     )
     expect(sidebar.get_by_text("Not available on this host yet.")).to_have_count(0)
+
+    # Each pick is a step: Back shows All branch changes again, and Forward the last commit.
+    history = sidebar.get_by_role("group", name="Workspace history")
+    trigger = sidebar.get_by_role("button", name="Change compared revisions")
+    history.get_by_role("button", name="Back").click()
+    expect(trigger).to_contain_text("All branch changes", timeout=30_000)
+    expect(changed("feature_first.txt")).to_be_visible(timeout=30_000)
+    history.get_by_role("button", name="Forward").click()
+    expect(trigger).to_contain_text("Last commit", timeout=30_000)
+    expect(changed("feature_first.txt")).to_have_count(0, timeout=30_000)
+
+    # A reload keeps the visit and what it compares.
+    page.reload()
+    open_right_rail(page)
+    expect(trigger).to_contain_text("Last commit", timeout=60_000)
+    history.get_by_role("button", name="Back").click()
+    expect(trigger).to_contain_text("All branch changes", timeout=30_000)
+
+    # Diff options sorts by size: the longer file moves above the one before it by path.
+    def shows_above(name: str, other: str) -> bool:
+        first = changed(name).bounding_box()
+        second = changed(other).bounding_box()
+        return first is not None and second is not None and first["y"] < second["y"]
+
+    def expect_first(name: str, other: str) -> None:
+        try:
+            poll_until(lambda: shows_above(name, other), timeout_s=10, interval_s=0.1)
+        except AssertionError:
+            raise AssertionError(f"{name}'s diff never showed above {other}'s") from None
+
+    expect_first("feature_first.txt", "feature_last.txt")
+    sidebar.get_by_role("button", name="Diff options").click()
+    page.get_by_role("menuitemradio", name="By size, largest first").click()
+    expect(page.get_by_role("menu", name="Diff options")).to_have_count(0)
+    expect_first("feature_last.txt", "feature_first.txt")
+    page.reload()
+    open_right_rail(page)
+    expect(changed("feature_first.txt")).to_be_visible(timeout=60_000)
+    expect_first("feature_last.txt", "feature_first.txt")
