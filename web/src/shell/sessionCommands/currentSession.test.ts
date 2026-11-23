@@ -2,6 +2,7 @@ import { QueryClient } from "@tanstack/react-query";
 import { describe, expect, it } from "vitest";
 
 import type { Conversation } from "@/hooks/useConversations";
+import { LEVEL_OWNER, LEVEL_READ } from "@/lib/permissionsApi";
 
 import { currentSessionRow, isSessionListed } from "./currentSession";
 
@@ -54,5 +55,20 @@ describe("currentSessionRow", () => {
     expect(currentSessionRow(queryClient, shared, false)).toBe(
       currentSessionRow(queryClient, shared, false),
     );
+  });
+
+  it("keeps a search result's owner over a fetched row that can't say whose session it is", () => {
+    const queryClient = cached();
+    // The open session's own fetch, shared with the viewer: no owner, below owner level.
+    const fetched = { ...SESSION, owner: null, permission_level: LEVEL_READ };
+    queryClient.setQueryData(["conversation-backfill", "c1"], fetched);
+    const shared = { ...SESSION, owner: "someone-else", permission_level: LEVEL_READ };
+    expect(isSessionListed(queryClient, "c1")).toBe(false);
+    expect(currentSessionRow(queryClient, shared, false)).toBe(shared);
+    expect(currentSessionRow(queryClient, shared, true)).toBeNull();
+    // A fetched row the viewer owns at owner level still stands for the session.
+    const owned = { ...fetched, permission_level: LEVEL_OWNER, title: "Parser rewrite" };
+    queryClient.setQueryData(["conversation-backfill", "c1"], owned);
+    expect(currentSessionRow(queryClient, shared, false)).toEqual(owned);
   });
 });

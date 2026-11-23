@@ -21,8 +21,7 @@ import { isSessionStoppable } from "@/lib/sessionStop";
 import { PinCapacityContext } from "@/lib/sidebarConfig";
 
 import { useCommandContext } from "../commandContext";
-import { isOwnedByViewer } from "../sidebarNav";
-import type { SessionCommandFacts } from "./model";
+import { type SessionCommandFacts, sessionOwnership } from "./model";
 
 /** The facts for `conversation`, or null without one. */
 export function useSessionCommandFacts(
@@ -46,7 +45,8 @@ export function useSessionCommandFacts(
 
   return useMemo(() => {
     if (!conversation) return null;
-    const owner = isOwnedByViewer(conversation, viewerId);
+    const ownership = sessionOwnership(conversation, viewerId, isSingleUserMode(serverInfo));
+    const owner = ownership === "mine";
     const currentProject =
       (conversation.project_id != null
         ? projects?.find((project) => project.id === conversation.project_id)?.name
@@ -58,6 +58,7 @@ export function useSessionCommandFacts(
     return {
       provisional: conversation.provisional === true,
       owner,
+      ownerUnknown: ownership === "unknown",
       archived: conversation.archived === true,
       // As the row decides it, so a family pinned through its leader reads as pinned.
       pinned: isSessionPinned(conversation, new Set(pinnedRows?.map((row) => row.id))),

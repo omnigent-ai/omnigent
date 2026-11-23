@@ -9,6 +9,7 @@ import {
   PINNED_CONVERSATIONS_KEY,
   type PinnedConversationsResult,
 } from "@/hooks/useConversations";
+import { rowKnowsItsOwner } from "@/hooks/useOpenSessionRow";
 import { findCachedListRow } from "@/lib/sessionListCache";
 
 /**
@@ -17,13 +18,14 @@ import { findCachedListRow } from "@/lib/sessionListCache";
  * stays the same until the cache changes.
  */
 function listedSessionRow(queryClient: QueryClient, id: string): Conversation | undefined {
+  // A fetched row that can't say whose session it is counts for nothing, as in the sidebar.
+  const fetched = queryClient.getQueryData<Conversation | null>(["conversation-backfill", id]);
   return (
     queryClient
       .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
       ?.conversations.find((row) => row.id === id) ??
     findCachedListRow(queryClient, id) ??
-    queryClient.getQueryData<Conversation | null>(["conversation-backfill", id]) ??
-    undefined
+    (fetched && rowKnowsItsOwner(fetched) ? fetched : undefined)
   );
 }
 

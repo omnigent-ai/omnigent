@@ -68,6 +68,14 @@ export async function fetchConversationById(
 }
 
 /**
+ * Whether `row` says who owns it. A fetched row has no ``owner``, so one the viewer
+ * doesn't own at owner level can't tell whose it is and mustn't stand in for a listed row.
+ */
+export function rowKnowsItsOwner(row: Conversation): boolean {
+  return (row.owner !== null && row.owner !== undefined) || isOwnerLevel(row.permission_level);
+}
+
+/**
  * Keep the list row of a session about to be opened, such as a search result,
  * so the sidebar can list it with its owner once that list is gone.
  *
@@ -122,8 +130,5 @@ export function useOpenSessionRow(id: string | null): Conversation | null {
   });
   const row = listRow ?? data;
   if (id === null || !row || row.id !== id) return null;
-  if ((row.owner === null || row.owner === undefined) && !isOwnerLevel(row.permission_level)) {
-    return null;
-  }
-  return row;
+  return rowKnowsItsOwner(row) ? row : null;
 }

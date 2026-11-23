@@ -8,8 +8,10 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type { Conversation } from "@/hooks/useConversations";
 
+import { LEVEL_READ } from "@/lib/permissionsApi";
+
 import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
-import { OWNER_ONLY_REASONS } from "./sessionCommands/model";
+import { OWNER_ONLY_REASONS, UNKNOWN_OWNER_REASON } from "./sessionCommands/model";
 import {
   latestSessionActionRequest,
   useSessionActionStore,
@@ -203,6 +205,47 @@ describe("QuickPick ⌘K session actions", () => {
     await waitFor(() => expect(heading()).toBe("Actions for “Review notes”"));
     const rename = screen.getByRole("option", { name: /Rename/ });
     expect(rename).toHaveAttribute("aria-disabled", "true");
+  });
+
+  it("keeps a search result's owner over a fetched row that can't say whose it is", async () => {
+    const queryClient = new QueryClient();
+    // The open session's own fetch: shared with the viewer, so it has no owner.
+    queryClient.setQueryData(["conversation-backfill", "c2"], {
+      ...SHARED,
+      owner: null,
+      permission_level: LEVEL_READ,
+    });
+    listSessions({ ...SHARED, permission_level: LEVEL_READ }, MINE);
+    const { input } = renderPalette(queryClient);
+    openActions(input);
+    await waitFor(() => expect(heading()).toBe("Actions for “Review notes”"));
+    expect(screen.getByRole("option", { name: /Rename/ })).toHaveAttribute("aria-disabled", "true");
+    expect(optionNames().at(-1)).toContain("Leave session");
+    expect(optionNames().some((name) => name.includes("Delete"))).toBe(false);
+  });
+
+  it("greys the owner's actions when a cached row can't say whose the session is", async () => {
+    const queryClient = new QueryClient();
+    // Pinning builds the pinned row from what the cache has, which may name no owner.
+    const { PINNED_CONVERSATIONS_KEY } = await vi.importActual<typeof ConversationsModule>(
+      "@/hooks/useConversations",
+    );
+    queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, {
+      conversations: [{ ...SHARED, owner: undefined, permission_level: null }],
+    });
+    listSessions(SHARED, MINE);
+    const { input } = renderPalette(queryClient);
+    openActions(input);
+    await waitFor(() => expect(heading()).toBe("Actions for “Review notes”"));
+    const rename = screen.getByRole("option", { name: /Rename/ });
+    expect(rename).toHaveAttribute("aria-disabled", "true");
+    expect(rename).toHaveTextContent(UNKNOWN_OWNER_REASON);
+    const remove = screen.getByRole("option", { name: /Delete/ });
+    expect(remove).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByRole("option", { name: /Leave session/ })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
   });
 
   it("names the page as the session reads now, after a rename elsewhere", async () => {
