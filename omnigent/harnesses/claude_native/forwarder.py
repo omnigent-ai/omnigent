@@ -15,7 +15,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from stat import S_ISREG
+from stat import S_ISDIR, S_ISREG
 from typing import NotRequired, TypedDict
 
 import httpx
@@ -65,7 +65,6 @@ from omnigent.native._native_post_delivery import (
     append_dead_letter,
     post_external_session_status,
     post_may_have_been_delivered,
-    post_session_event_with_retry,
 )
 from omnigent.native._native_supersession import (
     clear_replacement_create_body,
@@ -366,19 +365,6 @@ def _observe_transcript_discovery(
     diagnostics.warning_logged = True
 
 
-_MISSING_TRANSCRIPT_ERROR_CODE = "claude_transcript_missing"
-# The chat notice is posted once per turn ahead of the idle edge. Bounded
-# retries plus a wall-clock deadline cap how long the edge waits, including
-# when the tunnel that carries source-keyed items is down.
-_MISSING_TRANSCRIPT_NOTICE_ATTEMPTS = 3
-_MISSING_TRANSCRIPT_NOTICE_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
-_MISSING_TRANSCRIPT_NOTICE_DEADLINE_S = 10.0
-# A transcript still absent at ``Stop`` is often a write that has not landed yet,
-# so it is re-probed for this long before it is reported as never written.
-_MISSING_TRANSCRIPT_GRACE_S = 2.0
-_MISSING_TRANSCRIPT_GRACE_POLL_S = 0.25
-
-
 # Shapes of a hook-reported transcript path. ``unusable`` covers everything that is
 # neither a readable regular file nor a plain absence, so it never reaches the
 # transcript readers and never yields a loss diagnostic.
@@ -401,12 +387,21 @@ def _transcript_shape(transcript_path: Path) -> str:
     try:
         status = os.stat(transcript_path)
     except FileNotFoundError:
-        try:
-            parent = transcript_path.parent
-            searchable = parent.is_dir() and os.access(parent, os.X_OK)
-        except OSError:
-            return _TRANSCRIPT_UNUSABLE
-        return _TRANSCRIPT_NOT_YET_PRESENT if searchable else _TRANSCRIPT_UNUSABLE
+        # Missing directories are not an obstacle: the first existing ancestor decides.
+        ancestor = transcript_path.parent
+        while True:
+            try:
+                ancestor_status = os.stat(ancestor)
+                break
+            except FileNotFoundError:
+                if ancestor.parent == ancestor:
+                    return _TRANSCRIPT_UNUSABLE
+                ancestor = ancestor.parent
+            except OSError:
+                return _TRANSCRIPT_UNUSABLE
+        if S_ISDIR(ancestor_status.st_mode) and os.access(ancestor, os.X_OK):
+            return _TRANSCRIPT_NOT_YET_PRESENT
+        return _TRANSCRIPT_UNUSABLE
     except OSError:
         return _TRANSCRIPT_UNUSABLE
     if not S_ISREG(status.st_mode) or not os.access(transcript_path, os.R_OK):
@@ -474,17 +469,6 @@ class _LostTranscript:
     blocker: str
 
 
-def _saved_transcript_path(bridge_dir: Path) -> Path | None:
-    """
-    Return the transcript path the forwarder's saved cursor follows, if any.
-
-    :param bridge_dir: Native Claude bridge directory.
-    :returns: The saved cursor's transcript path, or ``None`` when nothing is saved.
-    """
-    state = _read_forward_state(bridge_dir)
-    return state.transcript_path if state is not None else None
-
-
 def _transcript_loss(
     bridge_dir: Path, stop_path: Path | None, saved_path: Path | None
 ) -> _LostTranscript | None:
@@ -492,20 +476,28 @@ def _transcript_loss(
     Return the loss a ``Stop`` proves, or ``None`` when the evidence is not unambiguous.
 
     Deliberately conservative: a missed warning is acceptable, a false "transcript
-    lost" is not. The loss fires only when the Stop's path is still the path hooks
-    advertise now, the file is absent under a searchable directory, and no other
-    transcript path this session has is present. A relocation, or a later hook that
-    advertised another path, leaves the evidence ambiguous, so the function stays
-    quiet; a readable later path is processed normally by the transcript forwarder.
+    lost" is not. The loss is reported only when the Stop's path is still the path
+    hooks advertise now, the file is absent under a searchable directory, and no
+    other transcript path this session has is present. A relocation, or a later
+    hook that advertised another path, leaves the evidence ambiguous, so the
+    function returns ``None``; a readable later path is processed normally.
 
     :param bridge_dir: Native Claude bridge directory.
     :param stop_path: Transcript path carried by the ``Stop`` hook record.
-    :param saved_path: Transcript path the forwarder's saved cursor follows.
+    :param saved_path: Transcript path the saved cursor followed before this
+        poll's initialization.
     :returns: The lost transcript, or ``None``.
     """
     if stop_path is None or read_transcript_path(bridge_dir) != stop_path:
         return None
     if _transcript_shape(stop_path) != _TRANSCRIPT_NOT_YET_PRESENT:
+        return None
+    # The loss is claimed only where the transcript's own directory exists and can be searched.
+    try:
+        parent_searchable = stop_path.parent.is_dir() and os.access(stop_path.parent, os.X_OK)
+    except OSError:
+        parent_searchable = False
+    if not parent_searchable:
         return None
     if saved_path is not None and saved_path != stop_path:
         if _transcript_path_present(saved_path):
@@ -513,127 +505,41 @@ def _transcript_loss(
     return _LostTranscript(stop_path, _transcript_write_blocker(stop_path))
 
 
-async def _lost_transcript_after_grace(
-    bridge_dir: Path, stop_path: Path | None
-) -> _LostTranscript | None:
-    """
-    Re-probe an absent transcript until it appears, becomes ambiguous, or the grace ends.
-
-    :param bridge_dir: Native Claude bridge directory.
-    :param stop_path: Transcript path carried by the ``Stop`` hook record.
-    :returns: The lost transcript if it is still absent when the window closes.
-    """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + _MISSING_TRANSCRIPT_GRACE_S
-    while True:
-        saved_path = await asyncio.to_thread(_saved_transcript_path, bridge_dir)
-        lost = await asyncio.to_thread(_transcript_loss, bridge_dir, stop_path, saved_path)
-        if lost is None or loop.time() >= deadline:
-            return lost
-        await asyncio.sleep(_MISSING_TRANSCRIPT_GRACE_POLL_S)
-
-
-async def _surface_missing_transcript(
-    client: httpx.AsyncClient,
+async def _log_missing_transcript(
     *,
     session_id: str,
     bridge_dir: Path,
     record: ClaudeHookRecord,
     dedupe: _ForwardDedupeState,
-) -> str | None:
+    saved_path: Path | None,
+) -> None:
     """
-    Report a finished turn whose transcript is unambiguously absent.
+    Log once per path when a finished turn's transcript never appeared.
 
-    Logs once per path, posts an error item into the session, and returns the text the
-    idle edge carries as ``output`` when the hook carried no reply of its own.
+    Log-only by design: nothing is posted to the session or the parent, so a
+    false positive cannot reach the chat, and the turn settles as it did before.
 
-    :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
     :param bridge_dir: Native Claude bridge directory.
     :param record: The ``Stop`` hook record ending the turn.
-    :param dedupe: Per-session baseline holding the once-per-path log latch.
-    :returns: Parent-facing notice naming the absent transcript, or ``None``
-        when the evidence is not unambiguous.
+    :param dedupe: Per-run baseline holding the once-per-path log latch.
+    :param saved_path: Transcript path the saved cursor followed before this
+        poll's initialization, so a legacy checkpoint naming another path is seen.
+    :returns: None.
     """
-    lost = await _lost_transcript_after_grace(bridge_dir, record.transcript_path)
-    if lost is None:
-        return None
-    title = "Claude Code's transcript was never written"
-    message = (
-        f"Claude Code reported its transcript at {lost.path}, but the file never "
-        "appeared, so this turn's prompt and replies were not mirrored into this session."
+    lost = await asyncio.to_thread(
+        _transcript_loss, bridge_dir, record.transcript_path, saved_path
     )
-    remediation = (
-        "Make that directory writable by the session user so Claude Code can write its transcript."
-    )
-    if lost.path not in dedupe.missing_transcript_warned_paths:
-        dedupe.missing_transcript_warned_paths.add(lost.path)
-        _logger.warning(
-            "Claude transcript %s reported by hooks never appeared before the turn's Stop (%s); "
-            "the turn's prompt and replies were not mirrored; session=%s",
-            lost.path,
-            lost.blocker,
-            session_id,
-            extra={"session_id": session_id},
-        )
-    payload: dict[str, object] = {
-        "type": "external_conversation_item",
-        "data": {
-            # Stable per hook record, so a retried or re-seen Stop cannot duplicate
-            # the notice. The timestamp also separates hook-log generations, since
-            # a cold resume rewrites the log and can reuse the same cursor.
-            "source_id": (
-                f"missing-transcript:{record.event_cursor}:{record.byte_offset}"
-                f":{record.recorded_at}"
-            ),
-            "item_type": "error",
-            "item_data": {
-                "source": "harness",
-                "code": _MISSING_TRANSCRIPT_ERROR_CODE,
-                "title": title,
-                "message": message,
-                "cause": f"{lost.blocker}.",
-                "remediation": remediation,
-            },
-        },
-    }
-    outcome: str | None = None
-    try:
-        # Source-keyed items ride the tunnel and wait for its acknowledgement, so a
-        # wall-clock deadline keeps a tunnel outage from holding the idle edge.
-        response = await asyncio.wait_for(
-            post_session_event_with_retry(
-                client=client,
-                url=f"/v1/sessions/{url_component(session_id)}/events",
-                payload=payload,
-                event_type="external_conversation_item",
-                max_attempts=_MISSING_TRANSCRIPT_NOTICE_ATTEMPTS,
-                retry_status_codes=_MISSING_TRANSCRIPT_NOTICE_RETRY_STATUSES,
-                sleep=asyncio.sleep,
-                retry_delay=lambda attempt: 0.25 * attempt,
-                logger_name=__name__,
-            ),
-            timeout=_MISSING_TRANSCRIPT_NOTICE_DEADLINE_S,
-        )
-    except TimeoutError:
-        outcome = "deadline"
-    else:
-        if response is None:
-            outcome = "transport"
-        elif response.status_code >= 400:
-            outcome = str(response.status_code)
-    if outcome is not None:
-        _logger.warning(
-            "Failed to post Claude missing-transcript notice; "
-            "session=%s event_cursor=%s outcome=%s",
-            session_id,
-            record.event_cursor,
-            outcome,
-            extra={"session_id": session_id},
-        )
-    return (
-        "Omnigent could not read this turn's output: Claude Code's transcript "
-        f"{lost.path} never appeared ({lost.blocker})."
+    if lost is None or lost.path in dedupe.missing_transcript_warned_paths:
+        return
+    dedupe.missing_transcript_warned_paths.add(lost.path)
+    _logger.warning(
+        "Claude transcript %s reported by hooks never appeared before the turn's Stop (%s); "
+        "the turn's prompt and replies were not mirrored; session=%s",
+        lost.path,
+        lost.blocker,
+        session_id,
+        extra={"session_id": session_id},
     )
 
 
@@ -1838,6 +1744,8 @@ async def forward_claude_transcript_to_session(
                         transcript_path=transcript_path,
                         diagnostics=transcript_diagnostics,
                     )
+                    # Initialization below can replace the saved cursor; keep its path.
+                    prior_transcript_path = state.transcript_path if state is not None else None
                     if (
                         transcript_path is not None
                         and _transcript_shape(transcript_path) == _TRANSCRIPT_UNUSABLE
@@ -1860,6 +1768,7 @@ async def forward_claude_transcript_to_session(
                             response_id=state.current_response_id if state is not None else None,
                             diagnostic_health=diagnostic_health,
                             hooks_cutoff_byte_offset=None,
+                            saved_transcript_path=prior_transcript_path,
                         )
                     elif transcript_path is not None:
                         state = await _ensure_state_for_transcript(
@@ -1925,6 +1834,7 @@ async def forward_claude_transcript_to_session(
                             response_id=state.current_response_id,
                             diagnostic_health=diagnostic_health,
                             hooks_cutoff_byte_offset=hooks_cutoff_byte_offset,
+                            saved_transcript_path=prior_transcript_path,
                         )
                         # Deferred ``/compact``-refusal dismissal: runs AFTER
                         # the hook phase so the ``failed`` post always follows
@@ -4008,10 +3918,7 @@ async def _maybe_rotate_session_on_clear(
         )
     await _write_hook_state_async(bridge_dir, durable)
     reset_transcript_forward_state(bridge_dir, reset_hooks=False)
-    if (
-        clear_record.transcript_path is not None
-        and _transcript_shape(clear_record.transcript_path) != _TRANSCRIPT_UNUSABLE
-    ):
+    if clear_record.transcript_path is not None:
         # A cleared native conversation has no copied history to skip.
         await _ensure_state_for_transcript(
             bridge_dir=bridge_dir,
@@ -4208,14 +4115,10 @@ async def _maybe_rotate_session_on_fork(
             extra={"session_id": session_id},
         )
     await _write_hook_state_async(bridge_dir, durable)
-    if (
-        fork_record.transcript_path is not None
-        and _transcript_shape(fork_record.transcript_path) != _TRANSCRIPT_UNUSABLE
-    ):
-        await _seed_fork_transcript_forward_state(
-            bridge_dir=bridge_dir,
-            transcript_path=fork_record.transcript_path,
-        )
+    await _seed_fork_transcript_forward_state(
+        bridge_dir=bridge_dir,
+        transcript_path=fork_record.transcript_path,
+    )
     return new_session_id
 
 
@@ -4735,6 +4638,7 @@ async def _forward_available_status_events(
     response_id: str | None = None,
     diagnostic_health: Callable[[], FailureContext] | None = None,
     hooks_cutoff_byte_offset: int | None = None,
+    saved_transcript_path: Path | None = None,
 ) -> HookForwardState:
     """
     Forward currently available hook events as ``session.status``.
@@ -4784,6 +4688,8 @@ async def _forward_available_status_events(
         transcript read; only records ending at or before it are forwarded, so a
         ``Stop`` written mid-poll waits until its reply is mirrored. ``None``
         forwards every available record.
+    :param saved_transcript_path: Transcript path the saved cursor followed before
+        this poll's initialization, so a diagnostic can still see a legacy checkpoint.
     :returns: Updated state. On post failure, returns the last
         durable state so successfully-posted statuses are not
         retried and the failing event is retried later.
@@ -5240,17 +5146,15 @@ async def _forward_available_status_events(
                 _logger.debug("Claude hook failure telemetry failed: %s", type(exc).__name__)
         # A finished turn whose hook-reported transcript still does not exist
         # has nothing mirrored; tell the parent instead of settling a silent idle.
-        unread_transcript_output: str | None = None
         if status == "idle":
             try:
-                unread_transcript_output = await _surface_missing_transcript(
-                    client,
+                await _log_missing_transcript(
                     session_id=session_id,
                     bridge_dir=bridge_dir,
                     record=record,
                     dedupe=dedupe,
+                    saved_path=saved_transcript_path,
                 )
-            # Diagnostics must not prevent status delivery.
             except Exception:
                 _logger.warning(
                     "Claude missing-transcript diagnostic failed; session=%s event_cursor=%s",
@@ -5259,11 +5163,6 @@ async def _forward_available_status_events(
                     exc_info=True,
                     extra={"session_id": session_id},
                 )
-        # The Stop hook's reply is authoritative when present. The transcript notice
-        # only stands in for a reply the hook did not carry, never for a real one.
-        idle_output: str | None = record.completion_output if status == "idle" else None
-        if unread_transcript_output is not None and not idle_output:
-            idle_output = unread_transcript_output
         try:
             await post_external_session_status(
                 client,
@@ -5294,7 +5193,7 @@ async def _forward_available_status_events(
                 else None,
                 failure_context=failure_context,
                 # The Stop hook may arrive before its final transcript item is mirrored.
-                output=idle_output,
+                output=record.completion_output if status == "idle" else None,
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)

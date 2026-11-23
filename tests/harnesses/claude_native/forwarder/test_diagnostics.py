@@ -19,10 +19,6 @@ import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     record_hook_event,
 )
-from omnigent.runner.transports.ws_tunnel.event_delivery import (
-    RunnerEventDispatcher,
-    TunnelEventClient,
-)
 
 from ._support import _start_recording_server
 
@@ -409,12 +405,6 @@ def _is_error_item_post(post: dict[str, Any]) -> bool:
     )
 
 
-@pytest.fixture(autouse=True)
-def _short_transcript_grace(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep the real grace window from slowing tests that never expect the transcript to land."""
-    monkeypatch.setattr(forwarder, "_MISSING_TRANSCRIPT_GRACE_S", 0.2)
-
-
 def _record_turn(
     bridge_dir: Path, transcript_path: Path, *, last_assistant_message: str | None = None
 ) -> None:
@@ -503,151 +493,6 @@ def test_unwritable_directory_errno_names_a_read_only_mount(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("rejections", "notice_delivered"),
-    [pytest.param(1, True, id="transient"), pytest.param(10, False, id="persistent")],
-)
-async def test_missing_transcript_notice_retries_then_still_posts_the_idle_edge(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-    rejections: int,
-    notice_delivered: bool,
-) -> None:
-    """A rejected chat notice is retried under its stable id before the idle edge.
-
-    The retries are bounded, so completion is delayed at most briefly and the
-    idle edge posts whether or not the notice landed.
-    """
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    transcript_path = tmp_path / "never-written.jsonl"
-    _record_turn(bridge_dir, transcript_path)
-    caplog.set_level(logging.WARNING, logger=forwarder.__name__)
-    requests: list[dict[str, Any]] = []
-    remaining_rejections = rejections
-
-    def _reject_notices(payload: dict[str, Any]) -> httpx.Response:
-        nonlocal remaining_rejections
-        if payload["type"] == "external_conversation_item" and remaining_rejections > 0:
-            remaining_rejections -= 1
-            return httpx.Response(503, json={"error": "busy"})
-        return httpx.Response(202, json={})
-
-    async with httpx.AsyncClient(
-        transport=_recording_transport(requests, _reject_notices), base_url="http://test"
-    ) as client:
-        await _forward_stop_edge(client, bridge_dir, "conv_retry")
-
-    notices = [
-        request["data"] for request in requests if request["type"] == "external_conversation_item"
-    ]
-    statuses = [
-        request["data"] for request in requests if request["type"] == "external_session_status"
-    ]
-    expected_attempts = min(rejections + 1, forwarder._MISSING_TRANSCRIPT_NOTICE_ATTEMPTS)
-    assert len(notices) == expected_attempts
-    assert len({notice["source_id"] for notice in notices}) == 1
-    assert [status["status"] for status in statuses] == ["idle"]
-    assert statuses[0]["turn_completed"] is True
-    assert str(transcript_path) in statuses[0]["output"]
-    # Every notice attempt precedes the edge; the edge posts whether or not one landed.
-    assert requests[-1]["type"] == "external_session_status"
-    dropped = [
-        record
-        for record in caplog.records
-        if "Failed to post Claude missing-transcript notice" in record.getMessage()
-    ]
-    assert len(dropped) == (0 if notice_delivered else 1)
-
-
-@pytest.mark.asyncio
-async def test_missing_transcript_notice_deadline_frees_the_idle_edge_during_a_tunnel_outage(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A tunnel that stops acknowledging cannot hold the confirmed idle edge behind the notice.
-
-    Source-keyed items ride the tunnel and wait for its next connection, while
-    the status edge uses HTTP. Once the notice deadline passes, the edge still
-    posts with its diagnostic output.
-    """
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    transcript_path = tmp_path / "never-written.jsonl"
-    _record_turn(bridge_dir, transcript_path)
-    monkeypatch.setattr(forwarder, "_MISSING_TRANSCRIPT_NOTICE_DEADLINE_S", 0.3)
-    caplog.set_level(logging.WARNING, logger=forwarder.__name__)
-
-    async def _send(_frame: str) -> None:
-        return None
-
-    dispatcher = RunnerEventDispatcher()
-    dispatcher.ready(_send)
-    dispatcher.disconnected()
-    requests: list[dict[str, Any]] = []
-    started = asyncio.get_running_loop().time()
-    async with TunnelEventClient(
-        event_dispatcher=dispatcher,
-        transport=_recording_transport(requests),
-        base_url="http://test",
-    ) as client:
-        await _forward_stop_edge(client, bridge_dir, "conv_tunnel_outage")
-    elapsed = asyncio.get_running_loop().time() - started
-
-    # The notice waited on the tunnel and never reached HTTP; the edge did.
-    assert [request["type"] for request in requests] == ["external_session_status"]
-    assert requests[0]["data"]["turn_completed"] is True
-    assert str(transcript_path) in requests[0]["data"]["output"]
-    assert 0.3 <= elapsed < 5.0
-    dropped = [
-        record
-        for record in caplog.records
-        if "Failed to post Claude missing-transcript notice" in record.getMessage()
-    ]
-    assert len(dropped) == 1
-    assert "outcome=deadline" in dropped[0].getMessage()
-
-
-@pytest.mark.asyncio
-async def test_transcript_written_during_the_grace_window_is_not_flagged(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A transcript that lands just after ``Stop`` is a slow write, not a lost one."""
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    transcript_path = tmp_path / "projects" / "claude-session.jsonl"
-    transcript_path.parent.mkdir()
-    _record_turn(bridge_dir, transcript_path, last_assistant_message="Late reply")
-    monkeypatch.setattr(forwarder, "_MISSING_TRANSCRIPT_GRACE_S", 2.0)
-    caplog.set_level(logging.WARNING, logger=forwarder.__name__)
-
-    async def _write_late() -> None:
-        await asyncio.sleep(0.1)
-        transcript_path.write_text("", encoding="utf-8")
-
-    requests: list[dict[str, Any]] = []
-    async with httpx.AsyncClient(
-        transport=_recording_transport(requests), base_url="http://test"
-    ) as client:
-        writer = asyncio.create_task(_write_late())
-        await _forward_stop_edge(client, bridge_dir, "conv_late")
-        await writer
-
-    assert not [r for r in requests if r["type"] == "external_conversation_item"]
-    [status] = [r["data"] for r in requests if r["type"] == "external_session_status"]
-    assert status == {
-        "status": "idle",
-        "background_task_count": 0,
-        "turn_completed": True,
-        "output": "Late reply",
-    }
-    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
-
-
-@pytest.mark.asyncio
 async def test_readable_transcript_with_a_partial_trailing_line_is_not_flagged(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -691,107 +536,6 @@ async def test_readable_transcript_keeps_an_empty_stop_reply_as_authoritative(
     assert not [r for r in requests if r["type"] == "external_conversation_item"]
     [status] = [r["data"] for r in requests if r["type"] == "external_session_status"]
     assert status["output"] == ""
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("reply", "expected_output"),
-    [
-        pytest.param("Final answer", "Final answer", id="nonempty-reply-kept"),
-        pytest.param("", "notice", id="empty-reply-replaced"),
-        pytest.param(None, "notice", id="no-reply-replaced"),
-    ],
-)
-async def test_missing_transcript_reply_matrix(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-    reply: str | None,
-    expected_output: str,
-) -> None:
-    """The parent gets the real reply, or the notice without one; the chat names the loss."""
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    transcript_path = tmp_path / "never-written.jsonl"
-    _record_turn(bridge_dir, transcript_path, last_assistant_message=reply)
-    caplog.set_level(logging.WARNING, logger=forwarder.__name__)
-    requests: list[dict[str, Any]] = []
-    async with httpx.AsyncClient(
-        transport=_recording_transport(requests), base_url="http://test"
-    ) as client:
-        await _forward_stop_edge(client, bridge_dir, "conv_reply_matrix")
-
-    assert [request["type"] for request in requests] == [
-        "external_conversation_item",
-        "external_session_status",
-    ]
-    [notice] = [r["data"] for r in requests if r["type"] == "external_conversation_item"]
-    [status] = [r["data"] for r in requests if r["type"] == "external_session_status"]
-    assert notice["item_data"]["code"] == "claude_transcript_missing"
-    assert str(transcript_path) in notice["item_data"]["message"]
-    if expected_output == "notice":
-        assert status["output"].startswith("Omnigent could not read this turn's output")
-        assert str(transcript_path) in status["output"]
-    else:
-        assert status["output"] == expected_output
-    assert status["turn_completed"] is True
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert len(warnings) == 1
-    assert str(transcript_path) in warnings[0].getMessage()
-
-
-@pytest.mark.asyncio
-async def test_diagnostic_ids_differ_across_hook_log_generations(tmp_path: Path) -> None:
-    """A cold resume rewrites the hook log; equal cursors must not reuse a diagnostic id.
-
-    The two generations use the same payload and serialized length, so the cursor
-    and byte offset match and only the recorded timestamps differ.
-    """
-    transcript_path = tmp_path / "never-written.jsonl"
-
-    def generation(name: str, recorded_at: float) -> Path:
-        bridge_dir = tmp_path / name
-        bridge_dir.mkdir()
-        (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
-        lines = [
-            json.dumps(
-                {
-                    "recorded_at": recorded_at,
-                    "payload": {
-                        "hook_event_name": event_name,
-                        "session_id": "claude-session",
-                        "transcript_path": str(transcript_path),
-                    },
-                },
-                separators=(",", ":"),
-            )
-            for event_name in ("UserPromptSubmit", "Stop")
-        ]
-        (bridge_dir / forwarder._HOOKS_FILE).write_text("\n".join(lines) + "\n", encoding="utf-8")
-        (bridge_dir / "state.json").write_text(
-            json.dumps({"transcript_path": str(transcript_path)}), encoding="utf-8"
-        )
-        return bridge_dir
-
-    async def diagnostic_ids(bridge_dir: Path) -> list[str]:
-        requests: list[dict[str, Any]] = []
-        async with httpx.AsyncClient(
-            transport=_recording_transport(requests), base_url="http://test"
-        ) as client:
-            await _forward_stop_edge(client, bridge_dir, "conv_generations")
-        return [
-            request["data"]["source_id"]
-            for request in requests
-            if request["type"] == "external_conversation_item"
-        ]
-
-    first = generation("gen-first", 1700000000.1)
-    second = generation("gen-second", 1700000999.9)
-    first_ids = await diagnostic_ids(first)
-    second_ids = await diagnostic_ids(second)
-    assert len(first_ids) == len(second_ids) == 1
-    assert first_ids[0] != second_ids[0]
-    # A retry of the same generation re-posts the same notice id.
-    assert await diagnostic_ids(first) == first_ids
 
 
 def _priced_assistant_line(uuid: str) -> str:
@@ -1068,21 +812,18 @@ def test_forwarder_loop_reports_only_unambiguous_transcript_loss(
         if shape == "unreadable-existing-file":
             path.chmod(0o644)
 
-    # The Stop always reaches the idle edge; an unusable transcript must not stall it.
+    # The Stop always reaches the idle edge; no shape stalls it or adds a chat notice.
     [edge] = _idle_edges(posts)
     assert edge["turn_completed"] is True
-    errors = [post for post in posts if _is_error_item_post(post)]
+    assert "output" not in edge
+    assert [post for post in posts if _is_error_item_post(post)] == []
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     if expected_loss is None:
-        assert errors == []
         assert warnings == []
-        assert not str(edge.get("output", "")).startswith("Omnigent could not read")
     else:
-        [error] = errors
-        assert error["body"]["data"]["item_data"]["code"] == "claude_transcript_missing"
-        assert str(expected_loss) in error["body"]["data"]["item_data"]["message"]
-        assert edge["output"].startswith("Omnigent could not read this turn's output")
-        assert [str(expected_loss) in r.getMessage() for r in warnings] == [True]
+        [warning] = warnings
+        assert warning.levelno == logging.WARNING
+        assert str(expected_loss) in warning.getMessage()
 
 
 @pytest.mark.parametrize(
@@ -1090,6 +831,7 @@ def test_forwarder_loop_reports_only_unambiguous_transcript_loss(
     [
         ("file", "file"),
         ("absent", "not_yet_present"),
+        ("missing-directory", "not_yet_present"),
         ("parent-is-a-file", "unusable"),
         ("directory", "unusable"),
         ("fifo", "unusable"),
@@ -1102,7 +844,9 @@ def test_transcript_shape_separates_readable_absent_and_unusable(
     parent = tmp_path / "slug"
     parent.mkdir()
     path = parent / "claude-session.jsonl"
-    if shape == "file":
+    if shape == "missing-directory":
+        path = tmp_path / "missing" / "slug" / "claude-session.jsonl"
+    elif shape == "file":
         path.write_text("", encoding="utf-8")
     elif shape == "parent-is-a-file":
         (tmp_path / "blocker").write_text("", encoding="utf-8")
@@ -1132,42 +876,6 @@ def test_transcript_shape_treats_unsearchable_ancestor_and_unreadable_file_as_un
     finally:
         locked.chmod(0o755)
         unreadable.chmod(0o644)
-
-
-@pytest.mark.asyncio
-async def test_known_transcript_path_that_never_appears_is_surfaced_after_stop(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A transcript that never lands under a searchable directory is reported on each turn."""
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
-    projects = tmp_path / "projects" / "-home-user-workspace"
-    projects.mkdir(parents=True)
-    transcript_path = projects / "claude-session.jsonl"
-    _record_turn(bridge_dir, transcript_path)
-    _record_turn(bridge_dir, transcript_path)
-    caplog.set_level(logging.INFO, logger=forwarder.__name__)
-
-    posts = await _run_forwarder_until_idle(bridge_dir, idle_count=2)
-
-    idle_edges = _idle_edges(posts)
-    assert len(idle_edges) == 2
-    for edge in idle_edges:
-        assert edge["turn_completed"] is True
-        assert edge["output"].startswith("Omnigent could not read this turn's output")
-        assert str(transcript_path) in edge["output"]
-    error_items = [post["body"]["data"] for post in posts if _is_error_item_post(post)]
-    assert len(error_items) == 2
-    assert len({item["source_id"] for item in error_items}) == 2
-    for item in error_items:
-        assert item["item_data"]["code"] == "claude_transcript_missing"
-        assert item["item_data"]["title"] == "Claude Code's transcript was never written"
-        assert "writable" in item["item_data"]["remediation"]
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert len(warnings) == 1
-    assert str(transcript_path) in warnings[0].getMessage()
 
 
 @pytest.mark.asyncio
@@ -1206,3 +914,133 @@ async def test_failed_missing_transcript_diagnostic_does_not_block_the_idle_edge
     assert len(failures) == 1
     assert failures[0].levelno == logging.WARNING
     assert failures[0].session_id == "conv_probe_failed"
+
+
+def test_known_transcript_path_that_never_appears_is_logged_once_per_path(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An absent transcript under a searchable directory is logged once, with no chat notice."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
+    slug = tmp_path / "projects" / "-home-user-workspace"
+    slug.mkdir(parents=True)
+    transcript_path = slug / "claude-session.jsonl"
+    _record_turn(bridge_dir, transcript_path)
+    _record_turn(bridge_dir, transcript_path)
+    caplog.set_level(logging.WARNING, logger=forwarder.__name__)
+
+    posts = asyncio.run(_run_forwarder_until_idle(bridge_dir, idle_count=2))
+
+    edges = _idle_edges(posts)
+    assert len(edges) == 2
+    assert all(edge["turn_completed"] is True and "output" not in edge for edge in edges)
+    assert [post for post in posts if _is_error_item_post(post)] == []
+    [warning] = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert str(transcript_path) in warning.getMessage()
+    assert "is writable but the file was never created" in warning.getMessage()
+
+
+def test_legacy_checkpoint_naming_another_path_stays_quiet(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A line-cursor-only checkpoint names a readable A; hooks now advertise an absent B.
+
+    Initialization replaces the checkpoint with B, so the loss decision must read the
+    path the checkpoint followed before that replacement, and stay quiet.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
+    readable = tmp_path / "projects" / "a" / "claude-session.jsonl"
+    readable.parent.mkdir(parents=True)
+    readable.write_text(_priced_assistant_line("a1") + "\n", encoding="utf-8")
+    absent = tmp_path / "projects" / "b" / "claude-session.jsonl"
+    absent.parent.mkdir(parents=True)
+    (bridge_dir / forwarder._FORWARDER_STATE_FILE).write_text(
+        json.dumps({"transcript_path": str(readable), "line_cursor": 1}), encoding="utf-8"
+    )
+    _record_turn(bridge_dir, absent)
+    caplog.set_level(logging.WARNING, logger=forwarder.__name__)
+
+    posts = asyncio.run(_run_forwarder_until_idle(bridge_dir, idle_count=1))
+
+    assert len(_idle_edges(posts)) == 1
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def test_clear_after_directory_removal_delivers_the_first_new_turn(tmp_path: Path) -> None:
+    """A /clear whose transcript directory is missing still forwards the first turn once it lands.
+
+    The clear seeds the new conversation's zero-offset checkpoint even though the
+    directory does not exist yet; the reattached forwarder must not skip the turn
+    Claude writes after the directory reappears.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
+    slug = tmp_path / "projects" / "slug"
+    transcript_path = slug / "claude-session.jsonl"
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "source": "clear",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+
+    async def _writer() -> None:
+        await asyncio.sleep(0.3)
+        slug.mkdir(parents=True)
+        lines = [
+            {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "first"}},
+            json.loads(_priced_assistant_line("a1")),
+        ]
+        transcript_path.write_text(
+            "".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8"
+        )
+        _record_turn(bridge_dir, transcript_path)
+
+    async def _run() -> list[dict[str, Any]]:
+        server, thread, base_url = _start_recording_server()
+        task = asyncio.create_task(
+            forwarder.forward_claude_transcript_to_session(
+                base_url=base_url,
+                headers={},
+                session_id="conv_clear_reattach",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                start_at_end=True,
+                poll_interval_s=0.01,
+            )
+        )
+        writer = asyncio.create_task(_writer())
+        posts: list[dict[str, Any]] = []
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 10.0
+            while not _idle_edges(posts) and loop.time() < deadline:
+                try:
+                    posts.append(server.requests.get_nowait())
+                except queue.Empty:
+                    await asyncio.sleep(0.02)
+            await writer
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5.0)
+        while True:
+            try:
+                posts.append(server.requests.get_nowait())
+            except queue.Empty:
+                return posts
+
+    posts = asyncio.run(_run())
+
+    assert len(_idle_edges(posts)) == 1
+    assert "reply" in json.dumps(posts) or "priced reply" in json.dumps(posts)
