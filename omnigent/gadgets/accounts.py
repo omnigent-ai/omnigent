@@ -15,6 +15,7 @@ deletion, a registration of that or another name) go on with it.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 from collections.abc import Callable
 
@@ -100,13 +101,11 @@ class DeletedAccountGadgets:
     def _note(self, user_id: str, registration: str | None) -> None:
         files = self._store.user_files(_CLEANUP_SCOPE)
         files.mkdirs("pending")
-        try:
+        with contextlib.suppress(Conflict):  # Already noted.
             files.create_json(
                 self._note_name(user_id, registration),
                 {"user_id": user_id, "registration": registration},
             )
-        except Conflict:
-            pass  # Already noted.
 
     def _step(self, user_id: str, registration: str | None) -> bool:
         """Delete one page of the registration's gadgets; its shelf and note after the last."""

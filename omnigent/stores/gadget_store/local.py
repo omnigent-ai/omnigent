@@ -531,7 +531,7 @@ class LocalGadgetStore(GadgetStore):
         root = self._root / ".trash"
         budget = _TRASH_ENTRIES_PER_CALL
         removed = 0
-        for directory, dirnames, filenames in os.walk(root, topdown=False):
+        for directory, _dirnames, filenames in os.walk(root, topdown=False):
             for name in filenames:
                 if removed >= budget:
                     return

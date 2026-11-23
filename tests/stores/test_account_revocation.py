@@ -1869,7 +1869,7 @@ def test_a_name_registered_again_is_not_the_author_of_the_old_accounts_comments_
 
     accounts = SqlAlchemyAccountStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
-    store, access, service = _gadgets(db_uri, tmp_path, accounts)
+    _, _, service = _gadgets(db_uri, tmp_path, accounts)
     accounts.create_user_with_password("bob", "bob-hash")
     accounts.create_user_with_password("alice", "alice-hash")
     board = publish_actions_board(service("bob").service)
@@ -1903,8 +1903,13 @@ def test_a_name_registered_again_is_not_the_author_of_the_old_accounts_comments_
     with pytest.raises(GadgetError):
         alice.update_action(
             board["id"],
-            {"id": action["id"], "if_version": action["version"], "operation_id": "u1",
-             "state": "running", "session_id": "s1"},
+            {
+                "id": action["id"],
+                "if_version": action["version"],
+                "operation_id": "u1",
+                "state": "running",
+                "session_id": "s1",
+            },
         )
     # Retrying the old account's requests makes new records, not replays of the old ones.
     again = alice.create_comment(
@@ -1938,8 +1943,13 @@ def test_a_password_change_keeps_the_accounts_comments_and_actions_its_own(
     assert entry["yours"] is True
     alice.update_action(
         board["id"],
-        {"id": action["id"], "if_version": action["version"], "operation_id": "u1",
-         "state": "running", "session_id": "s1"},
+        {
+            "id": action["id"],
+            "if_version": action["version"],
+            "operation_id": "u1",
+            "state": "running",
+            "session_id": "s1",
+        },
     )
 
 
