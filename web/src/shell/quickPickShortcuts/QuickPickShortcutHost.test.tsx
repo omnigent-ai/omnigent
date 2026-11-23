@@ -37,6 +37,7 @@ const bridge = vi.hoisted(() => ({
 vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   ...(await importOriginal<typeof NativeBridgeModule>()),
   supportsDesktopCommands: () => shell.menu,
+  shellRoutesDesktopCommands: () => shell.menu,
   onBrowserRecentSessionInput: (callback: (input: BrowserRecentSessionInput) => void) => {
     bridge.forward = callback;
     return () => {

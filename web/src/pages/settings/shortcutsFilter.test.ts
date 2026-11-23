@@ -9,6 +9,7 @@ const MAC: ShortcutEnvironment = {
   mac: true,
   native: false,
   desktopMenu: false,
+  goMenu: false,
   submitWithModEnter: false,
 };
 const CONTEXT: ShortcutPageContext = {
@@ -67,6 +68,7 @@ describe("filterShortcutPage", () => {
       mac: false,
       native: false,
       desktopMenu: false,
+      goMenu: false,
       submitWithModEnter: false,
     };
     const otherPage = shortcutPageGroups(CONTEXT, false);
@@ -91,6 +93,7 @@ describe("filterShortcutPage", () => {
       mac: false,
       native: false,
       desktopMenu: false,
+      goMenu: false,
       submitWithModEnter: false,
     };
     const otherPage = shortcutPageGroups(CONTEXT, false);

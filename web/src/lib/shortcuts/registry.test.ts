@@ -6,6 +6,7 @@ import {
   currentShortcutEnvironment,
   matchedShortcutChordIndex,
   matchesShortcut,
+  menuShortcutChords,
   SHORTCUT_BINDINGS,
   shortcutBinding,
   shortcutKeys,
@@ -155,6 +156,17 @@ describe("shortcut registry", () => {
     expect(shortcutKeys("settings.open", { ...mac, desktopMenu: true })).toEqual(["⌘", ","]);
     expect(shortcutKeys("settings.open", { ...mac, desktopMenu: false })).toEqual(["⌥", "⌘", ","]);
     expect(matchesShortcut(comma, "settings.open", { ...mac, desktopMenu: true })).toBe(false);
+  });
+
+  it("leaves ⌘[ / ⌘] to the menu only on a shell that routes Go, which came after the bridge", () => {
+    const back = press({ key: "[", code: "BracketLeft", metaKey: true });
+    const bridgeWithoutGo = { ...mac, native: true, desktopMenu: true, goMenu: false };
+    expect(matchesShortcut(back, "history.back", bridgeWithoutGo)).toBe(true);
+    expect(menuShortcutChords("history.back", bridgeWithoutGo)).toEqual([]);
+    const goMenu = { ...bridgeWithoutGo, goMenu: true };
+    expect(matchesShortcut(back, "history.back", goMenu)).toBe(false);
+    expect(shortcutKeys("history.back", goMenu)).toEqual(["⌘", "["]);
+    expect(shortcutKeys("history.back", bridgeWithoutGo)).toEqual(["⌘", "["]);
   });
 
   it("never matches AltGr, which reports as Control+Alt", () => {

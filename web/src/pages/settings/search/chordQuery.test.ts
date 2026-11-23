@@ -218,13 +218,20 @@ function isBarePrintable(chord: Chord): boolean {
 /** Every environment the registry reads, as the page's own runtime can set them. */
 const ENVIRONMENTS: ShortcutEnvironment[] = [true, false].flatMap((mac) =>
   [true, false].flatMap((native) =>
-    [true, false].map((desktopMenu) => ({ mac, native, desktopMenu, submitWithModEnter: false })),
+    [true, false].map((desktopMenu) => ({
+      mac,
+      native,
+      desktopMenu,
+      goMenu: desktopMenu,
+      submitWithModEnter: false,
+    })),
   ),
 );
 const MAC_DESKTOP: ShortcutEnvironment = {
   mac: true,
   native: true,
   desktopMenu: true,
+  goMenu: true,
   submitWithModEnter: false,
 };
 

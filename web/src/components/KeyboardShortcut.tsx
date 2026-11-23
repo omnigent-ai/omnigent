@@ -49,8 +49,8 @@ export const REOPEN_TAB_KEYS = ordered([MOD_KEY, SHIFT_KEY, "T"]);
 export const PREVIOUS_TAB_KEYS = ordered([MOD_KEY, SHIFT_KEY, "["]);
 export const NEXT_TAB_KEYS = ordered([MOD_KEY, SHIFT_KEY, "]"]);
 // The same keys whether the desktop menu or the page takes them, so no shell is probed on load.
-export const BACK_KEYS = shortcutKeys("history.back", { desktopMenu: false });
-export const FORWARD_KEYS = shortcutKeys("history.forward", { desktopMenu: false });
+export const BACK_KEYS = shortcutKeys("history.back", { goMenu: false });
+export const FORWARD_KEYS = shortcutKeys("history.forward", { goMenu: false });
 export const COMMAND_PALETTE_KEYS = shortcutKeys("palette.commands");
 // The browser chords; the desktop app's are below.
 export const SIDEBAR_TOGGLE_KEYS = shortcutKeys("sidebar.left", { native: false });

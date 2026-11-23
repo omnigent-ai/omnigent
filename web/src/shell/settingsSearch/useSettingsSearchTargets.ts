@@ -68,7 +68,7 @@ export function useSettingsSearchTargets(): SettingsSearchTargets {
       shortcutGroups.flatMap((group) => group.items.map((row) => [row.shortcutId, row] as const)),
     );
     const matchers = settingsSearchMatchers(
-      { mac, native, desktopMenu, submitWithModEnter },
+      currentShortcutEnvironment({ mac, native, desktopMenu, submitWithModEnter }),
       new Set(shortcutRows.keys()),
     );
     return { targets, sections, shortcutRows, matchers };

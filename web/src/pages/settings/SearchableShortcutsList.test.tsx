@@ -18,6 +18,7 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   isElectronShell: () => false,
   supportsBrowser: () => false,
   supportsDesktopCommands: () => false,
+  shellRoutesDesktopCommands: () => false,
 }));
 
 let navigate: (to: string) => void = () => {};

@@ -3,7 +3,12 @@
 
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isMacPlatform } from "@/lib/hotkeys";
-import { type DesktopCommand, isNativeShell, supportsDesktopCommands } from "@/lib/nativeBridge";
+import {
+  type DesktopCommand,
+  isNativeShell,
+  shellRoutesDesktopCommands,
+  supportsDesktopCommands,
+} from "@/lib/nativeBridge";
 import {
   type Chord,
   chordKeyLabel,
@@ -19,9 +24,13 @@ export interface ShortcutEnvironment {
   native: boolean;
   /** The desktop shell's menus own some chords (⌘, for Settings) and hand the command to the page. */
   desktopMenu: boolean;
+  /** The desktop menu's Go items own ⌘[ / ⌘]: the shell says it routes Go Back and Go Forward. */
+  goMenu: boolean;
   /** The composer sends with ⌘↵ and inserts a newline with ↵. */
   submitWithModEnter: boolean;
 }
+
+const GO_COMMANDS: readonly DesktopCommand[] = ["go-back", "go-forward"];
 
 /** Environments built here, which read each field once, on first use. */
 const resolvedEnvironments = new WeakSet<object>();
@@ -48,6 +57,9 @@ export function currentShortcutEnvironment(
     },
     get desktopMenu() {
       return read("desktopMenu", supportsDesktopCommands);
+    },
+    get goMenu() {
+      return read("goMenu", () => shellRoutesDesktopCommands(GO_COMMANDS));
     },
     get submitWithModEnter() {
       return read("submitWithModEnter", readSubmitWithModEnter);
@@ -551,11 +563,10 @@ const APP_BINDINGS = {
     handler: app("hooks/useHistoryNavigation.ts"),
     paletteExempt: NOT_IN_PALETTE_YET,
     label: "Go back",
-    // The desktop menu's Go item where the shell hands its commands to the page; older shells
-    // leave the chord to the page. A browser tab keeps its own Back and Forward.
-    chords: (environment) => (environment.desktopMenu ? [] : [{ mod: true, code: "BracketLeft" }]),
-    menuChords: (environment) =>
-      environment.desktopMenu ? [{ mod: true, code: "BracketLeft" }] : [],
+    // The desktop menu's Go item on a shell that routes it; older shells, including ones with
+    // the command bridge but no Go menu, leave the chord to the page.
+    chords: (environment) => (environment.goMenu ? [] : [{ mod: true, code: "BracketLeft" }]),
+    menuChords: (environment) => (environment.goMenu ? [{ mod: true, code: "BracketLeft" }] : []),
     shownWhen: (context) => context.electron,
   },
   "history.forward": {
@@ -563,11 +574,8 @@ const APP_BINDINGS = {
     handler: app("hooks/useHistoryNavigation.ts"),
     paletteExempt: NOT_IN_PALETTE_YET,
     label: "Go forward",
-    // The desktop menu's Go item where the shell hands its commands to the page; older shells
-    // leave the chord to the page. A browser tab keeps its own Back and Forward.
-    chords: (environment) => (environment.desktopMenu ? [] : [{ mod: true, code: "BracketRight" }]),
-    menuChords: (environment) =>
-      environment.desktopMenu ? [{ mod: true, code: "BracketRight" }] : [],
+    chords: (environment) => (environment.goMenu ? [] : [{ mod: true, code: "BracketRight" }]),
+    menuChords: (environment) => (environment.goMenu ? [{ mod: true, code: "BracketRight" }] : []),
     shownWhen: (context) => context.electron,
   },
   "session.number": {

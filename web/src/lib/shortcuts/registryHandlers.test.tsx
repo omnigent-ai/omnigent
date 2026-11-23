@@ -74,6 +74,7 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   isNativeShell: () => shell.native,
   isElectronShell: () => shell.electron,
   supportsDesktopCommands: () => false,
+  shellRoutesDesktopCommands: () => false,
 }));
 vi.mock("@/lib/hotkeys", async (importOriginal) => ({
   ...(await importOriginal<typeof HotkeysModule>()),

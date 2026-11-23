@@ -23,7 +23,8 @@ vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => embedded }));
 type CommandListener = (event: { command: string; browserViewId: string | null }) => void;
 let sendCommand: CommandListener = () => {};
 
-function installDesktop(): void {
+/** A desktop shell with the command bridge, whose menu routes `desktopCommands` if it lists them. */
+function installDesktop(desktopCommands: string[] | null = ["go-back", "go-forward"]): void {
   Object.assign(window, {
     omnigentDesktop: {
       kind: "electron",
@@ -32,6 +33,7 @@ function installDesktop(): void {
         return () => {};
       },
       setDesktopCommandState: () => {},
+      ...(desktopCommands ? { desktopCommands } : {}),
     },
   });
 }
@@ -129,7 +131,18 @@ describe("useHistoryNavigation", () => {
     expect(navigate).not.toHaveBeenCalled();
   });
 
-  it("leaves Cmd+[ and Cmd+] to the Go menu on a shell that hands it to the page", () => {
+  it.each([
+    ["has the command bridge but no Go menu", null],
+    ["routes other commands but not Go", ["close", "quit"]],
+  ])("keeps Cmd+[ and Cmd+] on a shell that %s", (_shell, desktopCommands) => {
+    installDesktop(desktopCommands);
+    renderHook(() => useHistoryNavigation(true));
+    expect(pressBracket("BracketLeft").defaultPrevented).toBe(true);
+    pressBracket("BracketRight");
+    expect(navigate.mock.calls).toEqual([[-1], [1]]);
+  });
+
+  it("leaves Cmd+[ and Cmd+] to the Go menu on a shell that routes Go to the page", () => {
     renderHook(() => useHistoryNavigation(true));
     expect(pressBracket("BracketLeft").defaultPrevented).toBe(false);
     pressBracket("BracketRight");
