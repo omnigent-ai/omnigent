@@ -682,7 +682,8 @@ function WorkspaceTabsPanelImpl({
   };
   const inDrawer = placement === "drawer";
   // Where the panes float now: the flag on and 48rem or wider. The drawer keeps its classic strip.
-  const floatingPanes = useFloatingPanesShown() && !inDrawer;
+  // A grid cell keeps its own layout, as the floating styles leave it.
+  const floatingPanes = useFloatingPanesShown() && !inDrawer && !contained;
   // Hotkeys and ⌘K rows act only while this panel is the keyboard target.
   const commandsActive = !pending && keyboardTarget;
   useNewBrowserHotkey(() => addBrowser(), showBrowserTab && commandsActive);
@@ -1280,7 +1281,7 @@ function WorkspaceTabsPanelImpl({
 
   const selectedUnknown = tabs.find((tab) => tab.id === selectedTabId && isUnknownTab(tab));
   // Floating panes leave a gutter beside the rail; dragging it resizes the rail too.
-  const gutterHandle = floatingPanes && !contained && !maximized;
+  const gutterHandle = floatingPanes && !maximized;
 
   const rail = (
     <aside

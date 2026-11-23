@@ -437,6 +437,15 @@ describe("All tabs' place in the strip", () => {
     expect(precedes(stripDividers()[0]!, allTabs)).toBe(true);
   });
 
+  it("keeps the classic place in a grid cell, which floating panes leave as it is", () => {
+    floatingPanes.on = true;
+    renderPanels([{ conversationId: "conv_a", open: true, contained: true }]);
+    const allTabs = button("All tabs");
+    expect(precedes(allTabs, firstTab())).toBe(true);
+    expect(allTabs.querySelector(".lucide-layers")).not.toBeNull();
+    expect(precedes(button("New tab"), stripDividers()[0]!)).toBe(true);
+  });
+
   // The drawer holds the tabs below the desktop breakpoint, past 48rem too, where the panes float.
   it.each([
     ["a narrow window's", false],
