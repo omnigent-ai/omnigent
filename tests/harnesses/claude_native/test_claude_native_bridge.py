@@ -20641,9 +20641,24 @@ def test_read_tmux_target_rejects_invalid_payloads(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("saved", [False, True])
 @pytest.mark.parametrize("active", [None, [], ["claude"]])
+@pytest.mark.parametrize(
+    "caller_args",
+    [
+        (),
+        (
+            "--model",
+            "test-model",
+            "--settings",
+            '{"deniedMcpServers":[{"serverName":"earlier-caller"}]}',
+            "--settings",
+            '{"deniedMcpServers":[{"serverName":"caller-disabled"}]}',
+        ),
+    ],
+    ids=["no-caller-settings", "caller-settings"],
+)
 @pytest.mark.usefixtures("claude_settings_validator")
 async def test_disabled_mcp_settings_launch_hook(
-    tmp_path, monkeypatch, active, saved, _finalize_test_claude_args
+    tmp_path, monkeypatch, active, saved, caller_args, _finalize_test_claude_args
 ):
     from omnigent.inner.datamodel import OSEnvSpec
     from tests._helpers.mcp_disabled_servers import launch_activation
@@ -20658,14 +20673,7 @@ async def test_disabled_mcp_settings_launch_hook(
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     caller_denial = {"serverName": "caller-disabled"}
-    caller_args = (
-        "--model",
-        "test-model",
-        "--settings",
-        json.dumps({"deniedMcpServers": [{"serverName": "earlier-caller"}]}),
-        "--settings",
-        json.dumps({"deniedMcpServers": [caller_denial]}),
-    )
+    caller_servers = [caller_denial] if caller_args else []
 
     async def build_args(active_harnesses=None):
         args = augment_claude_args(
@@ -20685,20 +20693,20 @@ async def test_disabled_mcp_settings_launch_hook(
             ),
         )
         assert baseline_path.read_bytes() == baseline
-        assert Path(args[args.index("--settings") + 1]) != baseline_path
+        assert (Path(args[args.index("--settings") + 1]) != baseline_path) is bool(caller_args)
         return args
 
     original_args = await build_args()
     settings_path = Path(original_args[original_args.index("--settings") + 1])
     original = settings_path.read_bytes()
-    assert json.loads(original)["deniedMcpServers"] == [caller_denial]
+    assert json.loads(original).get("deniedMcpServers", []) == caller_servers
     if saved:
         set_disabled(ServerKey("claude", "fixture"), True)
     with patch(
         "omnigent.mcp_disabled_servers.apply_claude_settings", wraps=apply_claude_settings
     ) as hook:
         args = await build_args(active)
-    assert hook.call_count == 2
+    assert hook.call_count == (2 if caller_args else 1)
     assert all(
         call.kwargs == {"executor": "claude-native", "active_harnesses": active}
         for call in hook.call_args_list
@@ -20714,11 +20722,14 @@ async def test_disabled_mcp_settings_launch_hook(
     if active and saved:
         assert json.loads(settings_path.read_bytes()) == {
             **json.loads(original),
-            "deniedMcpServers": [caller_denial, {"serverName": "fixture"}],
+            "deniedMcpServers": [*caller_servers, {"serverName": "fixture"}],
         }
     else:
         assert settings_path.read_bytes() == original
-    assert caller_denial in json.loads(settings_path.read_bytes())["deniedMcpServers"]
+    assert all(
+        server in json.loads(settings_path.read_bytes())["deniedMcpServers"]
+        for server in caller_servers
+    )
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")

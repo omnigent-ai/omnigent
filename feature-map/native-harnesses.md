@@ -10,8 +10,9 @@ implements them separately, so a fix for one harness does not reach the others.
 ## Sub-features
 
 - `launch-web`: pick the harness in the new-session composer and start a session.
-  Claude composes configured caller settings before launch and refuses invalid
-  settings or unavailable validation with actionable guidance.
+  Claude composes readable, supported caller settings before launch and refuses
+  parsed objects that fail validation, or unavailable validation, with guidance.
+  Unsupported or unreadable operands keep their historical argument precedence.
 - `picker-curation`: server config `restrict_to_agent_names` limits and orders
   what New Chat offers, and `default_agent_name` pre-selects one for a user
   with no remembered pick. Curated, the menu is one flat list with no Harnesses
@@ -61,8 +62,9 @@ implements them separately, so a fix for one harness does not reach the others.
   an Omnigent session behind it. With `OMNIGENT_SESSION_ENV_PASSTHROUGH=NAME,...`
   the named shell variables reach only the new runner that command launches; a
   reused live runner keeps its launch values, and a later server-driven restart
-  starts without them. Claude composes repeated `--settings` values in order
-  with Omnigent's required settings and refuses startup if validation fails.
+  starts without them. Claude composes readable, supported `--settings` values
+  in order with Omnigent's required settings and refuses startup if validation
+  fails. Unsupported or unreadable operands keep their existing argument order.
 - `gateway-attribution`: Unity Gateway requests name the coding agent and the
   interface that created its session: desktop app, web UI, mobile, or CLI.
 - `gemini-gateways`: configure native Gemini URL/key or Databricks profile routing,
@@ -239,10 +241,12 @@ view appear in the session.
 `omnigent claude --settings ./settings.json`, or add `--settings` operands to
 the host's `harness.claude-native.args` configuration and start Claude from New
 Chat. Relative files resolve in the selected terminal workspace. Repeated files
-and inline JSON compose in order while preserving Omnigent's hooks. Invalid
-settings or a CLI/wrapper that cannot perform the read-only validation check
-refuse startup with guidance; the launch inputs remain intact. Opaque serialized
-shell invocations keep their existing behavior.
+and inline JSON compose in order while preserving Omnigent's hooks. Parsed
+settings objects that fail validation, or a CLI/wrapper that cannot perform the
+read-only validation check, refuse startup with guidance; launch inputs remain
+intact. Unsupported or unreadable operands keep their historical argument order,
+so the final bridge settings can still take precedence. Opaque serialized shell
+invocations keep their existing behavior.
 
 **Gateway attribution:** start a fresh Claude Code or Codex session from the
 desktop app, browser, iOS/Android app, and CLI. The session keeps that creating

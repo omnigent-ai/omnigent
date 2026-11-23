@@ -346,7 +346,10 @@ for further diagnosis.
 
 Launches whose arguments are hidden inside serialized shell commands retain
 their existing behavior; this merge and validation apply to inspectable
-invocations.
+invocations. Unreadable or unsupported settings operands also retain their
+historical argument order rather than being composed; the final bridge settings
+can still take precedence. Parsed settings objects that fail validation refuse
+startup as described above.
 
 New peers negotiate fenced settings ownership through a dedicated v2 terminal
 route. Immutable baselines protect overlapping launches. A receiver acquires

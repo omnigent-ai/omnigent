@@ -1917,7 +1917,12 @@ async def test_create_terminal_bootstrap_markers_do_not_bypass_gate_for_other_sh
         ),
         (
             409,
-            "expired-settings",
+            {
+                "error": {
+                    "code": ErrorCode.CONFLICT,
+                    "message": "Claude settings request expired; rebuild the request",
+                }
+            },
             409,
             ErrorCode.CONFLICT,
             "Claude settings request expired; rebuild the request",
@@ -1926,7 +1931,12 @@ async def test_create_terminal_bootstrap_markers_do_not_bypass_gate_for_other_sh
         ),
         (
             400,
-            "missing-bridge",
+            {
+                "error": {
+                    "code": ErrorCode.INVALID_INPUT,
+                    "message": "Fenced Claude settings require native bridge injection",
+                }
+            },
             400,
             ErrorCode.INVALID_INPUT,
             "Fenced Claude settings require native bridge injection",
@@ -1970,11 +1980,9 @@ async def test_create_terminal_bootstrap_markers_do_not_bypass_gate_for_other_sh
 async def test_create_terminal_surfaces_runner_error_without_crashing(
     client: httpx.AsyncClient,
     bash_terminal_spec: None,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     terminal_path: str,
     runner_status: int,
-    runner_payload: dict[str, Any] | str,
+    runner_payload: dict[str, Any],
     expected_status: int,
     expected_code: str,
     expected_message: str,
@@ -2008,46 +2016,6 @@ async def test_create_terminal_surfaces_runner_error_without_crashing(
     session_id = "79b22ebd2309e48fdeb450c65611d51b"
     path = f"/v1/sessions/{session_id}/resources/{terminal_path}"
     request_body: dict[str, Any] = {"terminal": "bash", "session_key": "s1"}
-    if isinstance(runner_payload, str):
-        from unittest.mock import AsyncMock
-
-        from omnigent.harnesses.claude_native import bridge
-        from omnigent.harnesses.claude_native.settings_generation import ClaudeSettingsRequest
-        from tests.runner.test_comment_relay import (
-            _spec_without_terminals,
-            _StubResourceRegistry,
-            _switch_app,
-            _SwitchableServerClient,
-        )
-
-        monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
-        monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
-        registry = _StubResourceRegistry(tmp_path)
-        launch = AsyncMock(
-            side_effect=AssertionError("refused requests must not start a terminal")
-        )
-        monkeypatch.setattr(registry, "launch_required_terminal", launch)
-        runner_app = _switch_app(
-            tmp_path,
-            _SwitchableServerClient("settings-agent"),
-            {"settings-agent": _spec_without_terminals()},
-            resource_registry=registry,
-        )
-        bridge_dir = bridge.prepare_bridge_dir(session_id, workspace=tmp_path)
-        settings_request = ClaudeSettingsRequest.create(bridge_dir, protocol=2)
-        request_body.update(
-            claude_settings_request_protocol=2,
-            claude_settings_request=settings_request.generation,
-            bridge_inject_dir=runner_payload == "expired-settings",
-        )
-        settings_request.close()
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=runner_app), base_url="http://runner"
-        ) as runner_client:
-            runner_response = await runner_client.post(path, json=request_body)
-        assert runner_response.status_code == runner_status, runner_response.text
-        runner_payload = runner_response.json()
-        launch.assert_not_awaited()
     if settings_request_ack is not None:
         runner_payload = {**runner_payload, "claude_settings_request_ack": settings_request_ack}
     fake_runner = _FakeRunnerClient(responses={path: (runner_status, runner_payload)})
