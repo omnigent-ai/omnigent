@@ -417,10 +417,12 @@ struct OmnigentWebView: UIViewRepresentable {
 
   @MainActor
   final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler,
-    UIGestureRecognizerDelegate, UIScrollViewDelegate
+    WKDownloadDelegate, UIGestureRecognizerDelegate, UIScrollViewDelegate
   {
     var parent: OmnigentWebView
     private weak var webView: WKWebView?
+    /// Where each in-flight `<a download>` is being written, keyed by its download.
+    private var downloadFiles: [WKDownload: URL] = [:]
     /// The server this web view is pinned to; nil before the first load. Doubles as
     /// the identity `updateUIView` compares against, so a re-render only reloads
     /// when SwiftUI hands over a different server.
@@ -1583,7 +1585,8 @@ struct OmnigentWebView: UIViewRepresentable {
       }
 
       if ["http", "https", "about", "blob", "data"].contains(scheme) {
-        decisionHandler(.allow)
+        // WKWebView ignores `<a download>` unless the shell turns it into a download.
+        decisionHandler(navigationAction.shouldPerformDownload ? .download : .allow)
         return
       }
 
@@ -1625,6 +1628,51 @@ struct OmnigentWebView: UIViewRepresentable {
         return true
       }
       return false
+    }
+
+    func webView(
+      _ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload
+    ) {
+      download.delegate = self
+    }
+
+    func download(
+      _ download: WKDownload, decideDestinationUsing response: URLResponse,
+      suggestedFilename: String, completionHandler: @escaping (URL?) -> Void
+    ) {
+      // A fresh directory per download, so the page-chosen name can't collide or escape it.
+      let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+      do {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+      } catch {
+        completionHandler(nil)
+        return
+      }
+      let file = directory.appendingPathComponent((suggestedFilename as NSString).lastPathComponent)
+      downloadFiles[download] = file
+      completionHandler(file)
+    }
+
+    /// Hands the saved file to the share sheet, which offers Save to Files, AirDrop and Print.
+    func downloadDidFinish(_ download: WKDownload) {
+      guard let file = downloadFiles.removeValue(forKey: download) else { return }
+      let share = UIActivityViewController(activityItems: [file], applicationActivities: nil)
+      share.popoverPresentationController?.sourceView = webView
+      share.completionWithItemsHandler = { _, _, _, _ in
+        try? FileManager.default.removeItem(at: file.deletingLastPathComponent())
+      }
+      topViewController()?.present(share, animated: true)
+    }
+
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+      if let file = downloadFiles.removeValue(forKey: download) {
+        try? FileManager.default.removeItem(at: file.deletingLastPathComponent())
+      }
+      let alert = UIAlertController(
+        title: "Download failed", message: error.localizedDescription, preferredStyle: .alert)
+      alert.addAction(UIAlertAction(title: "OK", style: .default))
+      topViewController()?.present(alert, animated: true)
     }
 
     func webView(
