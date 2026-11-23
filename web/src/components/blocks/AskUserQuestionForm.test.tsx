@@ -834,6 +834,19 @@ describe("AskUserQuestionForm — prompt editor", () => {
     expect(screen.getByTestId("ask-user-question-section")).toHaveFocus();
   });
 
+  it("leaves Shift+Enter in the editor to the editor, without advancing", async () => {
+    renderForm([framework, snacks], { codeMirror: true });
+    fireEvent.keyDown(await promptEditor(), { key: "Enter", shiftKey: true });
+    expect(progress()).toBe("Question 1 of 2:");
+  });
+
+  it("keeps the textarea on a narrow viewport even with the flag on", () => {
+    stubMedia((query: string) => query.includes("max-width"));
+    renderForm([framework], { codeMirror: true });
+    expect(screen.getByTestId("ask-user-question-custom-input").tagName).toBe("TEXTAREA");
+    expect(document.querySelector("[data-composer-engine]")).toBeNull();
+  });
+
   it("leaves digits typed in the editor to the editor", async () => {
     renderForm([framework], { codeMirror: true });
     fireEvent.keyDown(await promptEditor(), { key: "2" });
