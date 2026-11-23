@@ -193,7 +193,8 @@ describe("QuickPick row buttons", () => {
     expect(active()).toBe("beta");
   });
 
-  it("keeps a newer pointer pick when a row's close finishes later", () => {
+  /** A list whose rows close only once a later step finishes, as a shell that asks first. */
+  function renderSlowClose() {
     let finishClose: () => void = () => {};
     function SlowClose() {
       const [ids, setIds] = useState(["alpha", "beta", "gamma"]);
@@ -235,14 +236,29 @@ describe("QuickPick row buttons", () => {
     const input = screen.getByRole("combobox", { name: "Things" });
     const active = () =>
       document.getElementById(input.getAttribute("aria-activedescendant") ?? "")?.textContent;
+    return { input, active, finishClose: () => act(() => finishClose()) };
+  }
+
+  it("keeps a newer pointer pick when a row's close finishes later", () => {
+    const { input, active, finishClose } = renderSlowClose();
     fireEvent.keyDown(input, { key: "ArrowDown" });
     fireEvent.keyDown(input, { key: "Backspace", ctrlKey: true });
     expect(active()).toBe("beta");
     fireEvent.pointerMove(screen.getByRole("option", { name: "alpha" }));
     expect(active()).toBe("alpha");
-    act(() => finishClose());
+    finishClose();
     expect(screen.queryByRole("option", { name: "beta" })).toBeNull();
     expect(active()).toBe("alpha");
+  });
+
+  it("moves to the next row when a row's close finishes later with no newer pick", () => {
+    const { input, active, finishClose } = renderSlowClose();
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "Backspace", ctrlKey: true });
+    expect(active()).toBe("beta");
+    finishClose();
+    expect(screen.queryByRole("option", { name: "beta" })).toBeNull();
+    expect(active()).toBe("gamma");
   });
 
   it("leaves the chord to the query while it has text before the caret or selected", () => {
