@@ -262,9 +262,11 @@ function FooterAction({
 function navigationFor(
   event: KeyboardEvent<HTMLInputElement>,
   pageSize: () => number,
+  listShown: boolean,
 ): QuickPickNavigation | null {
-  // Ctrl-N/Ctrl-P step through rows like the arrows, as in every other pick list.
-  const readlineStep = readlineListStep(event);
+  // Ctrl-N/Ctrl-P step through shown rows like the arrows, as in every other pick list;
+  // with no list shown they stay text editing, and app-wide chords keep them.
+  const readlineStep = listShown ? readlineListStep(event) : null;
   if (readlineStep) return { type: readlineStep };
   switch (event.key) {
     case "ArrowDown":
@@ -503,7 +505,7 @@ export function QuickPick<Value>({
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     // Keys that drive an IME composition, including its Enter, belong to the composition.
     if (isImeCompositionKeyEvent(event)) return;
-    const navigation = navigationFor(event, pageSize);
+    const navigation = navigationFor(event, pageSize, !collapsed);
     if (navigation) {
       event.preventDefault();
       navigate(navigation);
@@ -810,7 +812,7 @@ export function QuickPick<Value>({
         <input
           ref={setQueryField}
           role="combobox"
-          {...pickListInputProps(true)}
+          {...pickListInputProps(!collapsed)}
           aria-label={label}
           aria-expanded={!collapsed}
           aria-controls={collapsed ? undefined : listId}

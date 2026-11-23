@@ -232,4 +232,35 @@ describe("useNewSessionHotkey with a real QuickPick (native Windows/Linux)", () 
     );
     expect(navigate).not.toHaveBeenCalled();
   });
+
+  it("still starts a session from a sidebar search that shows no list yet", () => {
+    shell.native = true;
+    function Shell() {
+      useNewSessionHotkey(true, false);
+      return (
+        <TooltipProvider>
+          <QuickPick
+            label="Search settings"
+            presentation="sidebar"
+            segments={[
+              {
+                sourceId: "settings",
+                ranking: "client",
+                items: [{ id: "theme", label: "Theme", value: "theme" }],
+              },
+            ]}
+            query=""
+            onQueryChange={vi.fn()}
+            emptyMessage="No results"
+            onAccept={vi.fn()}
+          />
+        </TooltipProvider>
+      );
+    }
+    render(<Shell />);
+    const field = screen.getByRole("combobox", { name: "Search settings" });
+    field.focus();
+    fireEvent.keyDown(field, { key: "n", code: "KeyN", ctrlKey: true });
+    expect(navigate).toHaveBeenCalledOnce();
+  });
 });

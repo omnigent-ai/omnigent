@@ -787,6 +787,19 @@ describe("QuickPick sidebar presentation", () => {
     expect(screen.getByRole("status")).toHaveTextContent("1 result");
   });
 
+  it("leaves Ctrl-N/Ctrl-P to its field while collapsed, and steps on them once results show", () => {
+    const input = renderSidebar();
+    expect(input).not.toHaveAttribute("data-pick-list-input");
+    for (const letter of ["n", "p"]) {
+      const press = { key: letter, code: `Key${letter.toUpperCase()}`, ctrlKey: true };
+      expect(fireEvent.keyDown(input, press)).toBe(true);
+    }
+
+    fireEvent.change(input, { target: { value: "e" } });
+    expect(input).toHaveAttribute("data-pick-list-input");
+    expect(fireEvent.keyDown(input, { key: "n", code: "KeyN", ctrlKey: true })).toBe(false);
+  });
+
   it("accepts nothing while collapsed", () => {
     const onAccept = vi.fn();
     const input = renderSidebar({ onAccept });
