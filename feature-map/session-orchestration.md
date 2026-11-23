@@ -75,6 +75,17 @@ MCP independent creation.
   host. An automation that sets a mode gives it to its run's workers first (see
   `scheduled`), and a worker whose agent sets a mode keeps it. Coverage:
   `tests/e2e/test_nested_agent_permission_mode_e2e.py`.
+  A child (`parent_session_id`, also one created by `POST /v1/sessions`) of a
+  Claude Code parent starts in the parent's current mode, mapped to its own harness
+  (Claude Code Auto → Codex Approve for me), unless its agent spec or an automation
+  sets a mode. Approval-skipping, plan and default parent modes aren't passed on,
+  and Claude Code flags after `--` are prompt text, not options. A child of a Codex
+  or other parent keeps its agent's default.
+  A `config_path` child gets the same, except an undeclared Codex or Cursor child
+  keeps its headless full-bypass default. A named sub-agent (`sub_agent_name`) keeps
+  the launch settings its sub-spec declares.
+  Covered by `tests/server/integration/test_session_orchestration.py::test_sub_agent_starts_in_its_parents_permission_mode`
+  and `::test_uploaded_child_starts_in_its_parents_permission_mode`.
   An optional `workflow_id` (agent_id only) starts the session as a run of one
   of the owner's saved workflows, with that workflow's plan already in its
   journal. With workflows disabled, or on a server that doesn't advertise
@@ -152,7 +163,12 @@ MCP independent creation.
   chats, so only the server could tell that a project is empty, and it has no
   check for that yet. Sub-agents follow their parent and a
   family follows its representative for filing; each refusal names the
-  session to update instead. An edit-shared caller cannot change a project or
+  session to update instead. `archived: true` is the one change that applies
+  to a sub-agent: the tool archives any of the owner's sub-agents, in another
+  tree or the caller's own on its runner (the server never stops an
+  ancestor's runner; servers must advertise `session_archive_runner_checks`
+  for sub-agent archives), and closes it like `sys_session_close` so its parent
+  can reuse the name. A sub-agent cannot archive itself. An edit-shared caller cannot change a project or
   create or rename one, or rename, pin or archive a session, while
   listing stays an ordinary owner read. A session shared with the caller
   but owned by someone else is refused, even when it is already in the target
@@ -163,7 +179,8 @@ MCP independent creation.
   `tests/server/integration/test_session_orchestration_projects.py::test_project_tools_list_and_file_running_sessions`,
   `::test_organizing_tools_rename_pin_archive_and_manage_projects`,
   `::test_organizing_tools_refuse_a_source_shared_with_edit_access`,
-  `::test_a_child_cannot_archive_its_rebound_parent`
+  `::test_a_child_cannot_archive_its_parent`,
+  `::test_the_tool_archives_sub_agents_in_any_of_the_owners_trees`
   and the browser journeys in
   `tests/e2e_ui/sessions/test_agent_files_sessions_into_projects.py`.
 - `refusal`: disabled orchestration, another owner, edit-shared sender or wrong runner binding
