@@ -10603,20 +10603,26 @@ def _host_session_visibility(base_url: str) -> Literal["all", "mine"]:
     """
     Pick the session-list scope that finds a daemon's host sessions.
 
-    A host only runs sessions its owner started, so the caller's own sessions
-    hold all of them; listing ``"all"`` makes the server read every session the
-    caller can see, including everyone's shared ones. A server that doesn't
-    advertise ``session_list_scoped_archives`` in ``GET /v1/info`` drops archived
-    rows from ``"mine"`` lists, so it keeps ``"all"``.
+    Launching a runner on a host takes owner access to the session, so an
+    ordinary user's host sessions are all in their own ``"mine"`` list, while
+    ``"all"`` makes the server read every session they can see, everyone's
+    shared ones included. Administrators pass that check for sessions they
+    don't own, so they keep ``"all"``, as does a caller ``GET /v1/me`` doesn't
+    confirm as a non-administrator. So does a server that doesn't advertise
+    ``session_list_scoped_archives`` in ``GET /v1/info``, because it drops
+    archived rows from ``"mine"`` lists.
 
     :param base_url: Omnigent server base URL, e.g. ``"https://example.com"``.
     :returns: ``"mine"`` when the server keeps archived rows in owner-scoped
-        lists, otherwise ``"all"``.
+        lists and the caller is not an administrator, otherwise ``"all"``.
     """
     info = _host_http_json(base_url=base_url, method="GET", path="/v1/info")
-    body = info.body if info.status_code == 200 else None
-    scoped = isinstance(body, dict) and body.get("session_list_scoped_archives") is True
-    return "mine" if scoped else "all"
+    info_body = info.body if info.status_code == 200 else None
+    if not (isinstance(info_body, dict) and info_body.get("session_list_scoped_archives") is True):
+        return "all"
+    me = _host_http_json(base_url=base_url, method="GET", path="/v1/me")
+    me_body = me.body if me.status_code == 200 else None
+    return "mine" if isinstance(me_body, dict) and me_body.get("is_admin") is False else "all"
 
 
 def _sessions_for_daemon(

@@ -1,18 +1,10 @@
-"""E2E: a daemon's session lookup lists only the caller's own sessions.
+"""E2E: ``host status`` and ``host stop`` list only an ordinary owner's sessions.
 
-``omnigent host status --sessions`` finds a daemon's sessions by listing
-sessions and keeping the ones bound to the daemon's host. A host only runs
-sessions its owner started, but the lookup listed ``visibility=all``: every
-session the caller can read, other users' shared sessions included, which on a
-busy multi-user server is most of what the server scans. The lookup must list
-the caller's own sessions and still report the host's archived sessions.
-
-The test drives the real journey against a real server (header auth) and a
-real host daemon: two sessions launched on the host, one then archived, plus
-another user's session shared with the host's owner. The real ``host status``
-must report both host sessions, ``host stop`` must drain and stop the daemon,
-and the server's access log must show that every session list either command
-sent asked for ``visibility=mine``.
+A real server and host daemon run two sessions on the host, one archived, plus
+another user's session shared with the host's owner. While the owner is an
+administrator, the CLI's lookups keep ``visibility=all``; once the owner is an
+ordinary user they ask for ``visibility=mine`` and still report the archived
+session. Request scopes come from the server's access log.
 
 No turn runs, so no LLM credentials are needed::
 
@@ -23,9 +15,7 @@ No turn runs, so no LLM credentials are needed::
 from __future__ import annotations
 
 import json
-import os
 import re
-import signal
 import subprocess
 import sys
 import time
@@ -37,9 +27,10 @@ import httpx
 import pytest
 
 from omnigent.server.auth import LEVEL_READ
-from tests._helpers.live_server import isolated_local_server, upload_agent
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests._helpers.host import Host, isolated_host
+from tests._helpers.live_server import isolated_local_server, isolated_process_env, upload_agent
 from tests.e2e.conftest import lookup_agent_id
-from tests.e2e.test_host_e2e import _spawn_host_daemon, _wait_for_host_online
 
 pytestmark = pytest.mark.timeout(300)
 
@@ -162,103 +153,116 @@ def _wait_for_cli_session_lists(server_log: Path, offset: int, *, count: int) ->
     return scopes
 
 
-def _run_cli(daemon_home: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _run_cli(host: Host, *args: str) -> subprocess.CompletedProcess[str]:
     """
-    Run the real CLI as the host's owner against the daemon's registry.
+    Run the real CLI as the host's owner, in the daemon's home and data directory.
 
-    :param daemon_home: ``HOME`` the daemon wrote its registry record under.
+    :param host: The running host daemon.
     :param args: CLI arguments, e.g. ``("host", "status", "--json")``.
     :returns: The finished process, with text output captured.
     """
     return subprocess.run(
         [sys.executable, "-m", "omnigent", *args],
-        env={**os.environ, "HOME": str(daemon_home)},
+        env=isolated_process_env(host.home, {}, None),
         capture_output=True,
         text=True,
         timeout=120,
     )
 
 
-def test_host_status_and_stop_list_only_the_owners_sessions(tmp_path: Path) -> None:
-    """Host lookups find archived host sessions without listing shared ones."""
+def _reported_sessions(host: Host) -> set[str]:
+    """
+    Return the session ids ``host status --sessions --json`` reports for *host*.
+
+    :param host: The running host daemon.
+    :returns: Ids of the sessions listed under the host's daemon.
+    """
+    status = _run_cli(host, "host", "status", "--sessions", "--json")
+    assert status.returncode == 0, status.stdout + status.stderr
+    (payload,) = [
+        daemon
+        for daemon in json.loads(status.stdout)["daemons"]
+        if daemon["host_id"] == host.host_id
+    ]
+    assert payload["error"] is None, payload
+    return {str(session["id"]) for session in payload["sessions"]}
+
+
+def test_host_lookups_list_only_an_ordinary_owners_sessions(tmp_path: Path) -> None:
+    """An ordinary owner's lookups list their own sessions and still find archived ones."""
     server_dir = tmp_path / "server"
-    daemon_home = tmp_path / "daemon-home"
-    workspace = daemon_home / "work"
-    workspace.mkdir(parents=True)
+    workspace = tmp_path / "work"
+    workspace.mkdir()
     with (
         isolated_local_server(server_dir) as base_url,
         httpx.Client(base_url=base_url, timeout=60.0, trust_env=False) as owner,
-    ):
-        daemon = _spawn_host_daemon(
-            tmp_path=daemon_home,
-            live_server=base_url,
+        isolated_host(
+            tmp_path / "host",
+            base_url,
             # No turn runs, so the runners never reach this LLM endpoint.
-            mock_llm_server_url="http://127.0.0.1:9",
+            env={"OPENAI_BASE_URL": "http://127.0.0.1:9/v1", "OPENAI_API_KEY": "unused"},
+            ready=lambda started: started.wait_online(owner, timeout=60),
+        ) as host,
+    ):
+        agent_id = lookup_agent_id(
+            owner, upload_agent(owner, _write_agent(tmp_path / "owner", "scope-e2e-owner"))
         )
-        try:
-            _wait_for_host_online(owner, daemon.host_id, timeout=60.0)
-            agent_id = lookup_agent_id(
-                owner, upload_agent(owner, _write_agent(tmp_path / "owner", "scope-e2e-owner"))
+        host_sessions = []
+        for _ in range(2):
+            created = owner.post(
+                "/v1/sessions",
+                json={"agent_id": agent_id, "host_id": host.host_id, "workspace": str(workspace)},
             )
-            host_sessions = []
-            for _ in range(2):
-                created = owner.post(
-                    "/v1/sessions",
-                    json={
-                        "agent_id": agent_id,
-                        "host_id": daemon.host_id,
-                        "workspace": str(workspace),
-                    },
-                )
-                assert created.status_code in (200, 201), created.text
-                host_sessions.append(str(created.json()["id"]))
-            archived = owner.patch(f"/v1/sessions/{host_sessions[1]}", json={"archived": True})
-            assert archived.status_code == 200, archived.text
+            assert created.status_code in (200, 201), created.text
+            host_sessions.append(str(created.json()["id"]))
+        archived = owner.patch(f"/v1/sessions/{host_sessions[1]}", json={"archived": True})
+        assert archived.status_code == 200, archived.text
 
-            shared_id = _share_another_users_session(base_url, tmp_path)
-            # The owner can read the shared session, so listing everything includes it.
-            assert shared_id in _listed_ids(owner, visibility="all")
-            assert shared_id not in _listed_ids(owner, visibility="mine")
+        shared_id = _share_another_users_session(base_url, tmp_path)
+        # The owner can read the shared session, so listing everything includes it.
+        assert shared_id in _listed_ids(owner, visibility="all")
+        assert shared_id not in _listed_ids(owner, visibility="mine")
+        server_log = _server_log_file(server_dir)
 
-            server_log = _server_log_file(server_dir)
-            offset = server_log.stat().st_size
-            status = _run_cli(daemon_home, "host", "status", "--sessions", "--json")
-            assert status.returncode == 0, status.stdout + status.stderr
-            (payload,) = [
-                daemon_payload
-                for daemon_payload in json.loads(status.stdout)["daemons"]
-                if daemon_payload["host_id"] == daemon.host_id
-            ]
-            assert payload["error"] is None, payload
-            reported = {str(session["id"]) for session in payload["sessions"]}
-            assert set(host_sessions) <= reported, (
-                f"host status dropped a host session (the second is archived): "
-                f"expected {host_sessions}, got {sorted(reported)}"
-            )
-            assert shared_id not in reported
-            status_scopes = _wait_for_cli_session_lists(server_log, offset, count=1)
-            assert status_scopes, "the server logged no session list from host status"
-            assert set(status_scopes) == {"mine"}, (
-                f"host status listed sessions with visibility={status_scopes}; a host only "
-                "runs its owner's sessions, so the lookup must not scan everyone's shared ones"
-            )
+        # A single-user server's ``local`` user is an administrator, and an
+        # administrator can launch sessions it doesn't own, so it lists everything.
+        assert owner.get("/v1/me").json()["is_admin"] is True
+        offset = server_log.stat().st_size
+        reported = _reported_sessions(host)
+        assert set(host_sessions) <= reported, (host_sessions, reported)
+        admin_scopes = _wait_for_cli_session_lists(server_log, offset, count=1)
+        assert admin_scopes, "the server logged no session list from host status"
+        assert set(admin_scopes) == {"all"}, (
+            f"an administrator's host status listed sessions with visibility={admin_scopes}"
+        )
 
-            # Stopping drains the host's sessions through the same lookup, for
-            # root sessions and their sub-agents.
-            offset = server_log.stat().st_size
-            stop = _run_cli(daemon_home, "host", "stop", "--server", base_url)
-            assert stop.returncode == 0, stop.stdout + stop.stderr
-            assert "sessions_stopped=" in stop.stdout, stop.stdout
-            daemon.proc.wait(timeout=30)
-            stop_scopes = _wait_for_cli_session_lists(server_log, offset, count=2)
-            assert len(stop_scopes) >= 2, f"host stop logged session lists {stop_scopes}"
-            assert set(stop_scopes) == {"mine"}, (
-                f"host stop listed sessions with visibility={stop_scopes} to drain the host"
-            )
-        finally:
-            daemon.proc.send_signal(signal.SIGTERM)
-            try:
-                daemon.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                daemon.proc.kill()
-                daemon.proc.wait(timeout=5)
+        # Make the owner an ordinary user, as on a multi-user server.
+        SqlAlchemyPermissionStore(f"sqlite:///{server_dir / 'chat.db'}").set_admin("local", False)
+        assert owner.get("/v1/me").json()["is_admin"] is False
+        offset = server_log.stat().st_size
+        reported = _reported_sessions(host)
+        assert set(host_sessions) <= reported, (
+            f"host status dropped a host session (the second is archived): "
+            f"expected {host_sessions}, got {sorted(reported)}"
+        )
+        assert shared_id not in reported
+        status_scopes = _wait_for_cli_session_lists(server_log, offset, count=1)
+        assert status_scopes, "the server logged no session list from host status"
+        assert set(status_scopes) == {"mine"}, (
+            f"host status listed sessions with visibility={status_scopes}; an ordinary "
+            "user's host only runs their own sessions, so the lookup must not scan "
+            "everyone's shared ones"
+        )
+
+        # host stop finds the sessions to stop through the same lookup, for root
+        # sessions and their sub-agents, then stops the daemon.
+        offset = server_log.stat().st_size
+        stop = _run_cli(host, "host", "stop", "--server", base_url)
+        assert stop.returncode == 0, stop.stdout + stop.stderr
+        assert "sessions_stopped=" in stop.stdout, stop.stdout
+        host.proc.wait(timeout=30)
+        stop_scopes = _wait_for_cli_session_lists(server_log, offset, count=2)
+        assert len(stop_scopes) >= 2, f"host stop logged session lists {stop_scopes}"
+        assert set(stop_scopes) == {"mine"}, (
+            f"host stop listed sessions with visibility={stop_scopes}"
+        )
