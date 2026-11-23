@@ -14,7 +14,6 @@ import { TaskMarkersProvider } from "@/components/blocks/TaskActivityMessage";
 import { readTaskActivity, taskMarkerId } from "@/lib/taskActivity";
 import { cn } from "@/lib/utils";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { hasCommandModifier } from "@/lib/hotkeys";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { isTerminalCommandInput, isTextBlock } from "@/lib/blocks";
 import {
@@ -33,6 +32,7 @@ import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import { onFindOpened } from "@/lib/nativeBridge";
 import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
+import { useMessageNavHotkeys } from "@/hooks/useMessageNavHotkeys";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { ChatTasksPreview, hasTaskPreview } from "@/shell/ChatTasksPreview";
 import {
@@ -390,19 +390,7 @@ function TranscriptImpl({
     [display.streamBubbles],
   );
 
-  // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) user-turn navigation.
-  useEffect(() => {
-    const handler = (e: globalThis.KeyboardEvent) => {
-      if (!hasCommandModifier(e) || !e.altKey) return;
-      if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
-      if (e.defaultPrevented) return;
-      e.preventDefault();
-      if (e.key === "ArrowUp") nav.goPrev();
-      else nav.goNext();
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [nav]);
+  useMessageNavHotkeys(nav);
 
   const showWorkingIndicator =
     !sandboxFailed && shouldShowWorkingIndicator(display.showsWorking, display.bubbles);

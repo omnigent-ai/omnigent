@@ -33,8 +33,8 @@ session.recentReverse | Switch to recent session (reverse) | chords=ctrl+code:Br
 session.pin | Pin or unpin current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.archive | Archive current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.fork | Fork current session | chords=- | keys=- | aria=- | editor=- | matches=-
-message.previous | Go to previous message | chords=mod+alt+key:ArrowUp+exact | keys=⌘ ⌥ ↑ | aria=Meta+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
-message.next | Go to next message | chords=mod+alt+key:ArrowDown+exact | keys=⌘ ⌥ ↓ | aria=Meta+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
+message.previous | Go to previous message | chords=mod+alt+key:ArrowUp+exact mod+alt+shift+key:ArrowUp+exact | keys=⌘ ⌥ ↑ | aria=Meta+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
+message.next | Go to next message | chords=mod+alt+key:ArrowDown+exact mod+alt+shift+key:ArrowDown+exact | keys=⌘ ⌥ ↓ | aria=Meta+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
 workspace.newTab | New workspace tab | chords=mod+alt+shift+code:KeyN | keys=⌘ ⌥ ⇧ N | aria=Meta+Alt+Shift+N | editor=Mod-Alt-Shift-n | matches=true
 workspace.closeTab | Close workspace tab | chords=mod+alt+code:KeyW | keys=⌘ ⌥ W | aria=Meta+Alt+W | editor=Mod-Alt-w | matches=true
 workspace.reopenTab | Reopen closed workspace tab | chords=mod+alt+shift+code:KeyT | keys=⌘ ⌥ ⇧ T | aria=Meta+Alt+Shift+T | editor=Mod-Alt-Shift-t | matches=true
@@ -138,8 +138,8 @@ session.recentReverse | Switch to recent session (reverse) | chords=ctrl+code:Br
 session.pin | Pin or unpin current session | chords=mod+alt+code:KeyP | keys=⌘ ⌥ P | aria=Meta+Alt+P | editor=Mod-Alt-p | matches=true
 session.archive | Archive current session | chords=mod+shift+key:a | keys=⌘ ⇧ A | aria=Meta+Shift+A | editor=Mod-Shift-a | matches=true
 session.fork | Fork current session | chords=mod+alt+code:KeyF | keys=⌘ ⌥ F | aria=Meta+Alt+F | editor=Mod-Alt-f | matches=true
-message.previous | Go to previous message | chords=mod+alt+key:ArrowUp+exact | keys=⌘ ⌥ ↑ | aria=Meta+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
-message.next | Go to next message | chords=mod+alt+key:ArrowDown+exact | keys=⌘ ⌥ ↓ | aria=Meta+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
+message.previous | Go to previous message | chords=mod+alt+key:ArrowUp+exact mod+alt+shift+key:ArrowUp+exact | keys=⌘ ⌥ ↑ | aria=Meta+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
+message.next | Go to next message | chords=mod+alt+key:ArrowDown+exact mod+alt+shift+key:ArrowDown+exact | keys=⌘ ⌥ ↓ | aria=Meta+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
 workspace.newTab | New workspace tab | chords=mod+alt+shift+code:KeyN | keys=⌘ ⌥ ⇧ N | aria=Meta+Alt+Shift+N | editor=Mod-Alt-Shift-n | matches=true
 workspace.closeTab | Close workspace tab | chords=mod+alt+code:KeyW | keys=⌘ ⌥ W | aria=Meta+Alt+W | editor=Mod-Alt-w | matches=true
 workspace.reopenTab | Reopen closed workspace tab | chords=mod+alt+shift+code:KeyT | keys=⌘ ⌥ ⇧ T | aria=Meta+Alt+Shift+T | editor=Mod-Alt-Shift-t | matches=true
@@ -243,8 +243,8 @@ session.recentReverse | Switch to recent session (reverse) | chords=ctrl+code:Br
 session.pin | Pin or unpin current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.archive | Archive current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.fork | Fork current session | chords=- | keys=- | aria=- | editor=- | matches=-
-message.previous | Go to previous message | chords=mod+alt+key:ArrowUp+exact | keys=⌘ ⌥ ↑ | aria=Meta+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
-message.next | Go to next message | chords=mod+alt+key:ArrowDown+exact | keys=⌘ ⌥ ↓ | aria=Meta+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
+message.previous | Go to previous message | chords=mod+alt+key:ArrowUp+exact mod+alt+shift+key:ArrowUp+exact | keys=⌘ ⌥ ↑ | aria=Meta+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
+message.next | Go to next message | chords=mod+alt+key:ArrowDown+exact mod+alt+shift+key:ArrowDown+exact | keys=⌘ ⌥ ↓ | aria=Meta+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
 workspace.newTab | New workspace tab | chords=mod+alt+shift+code:KeyN | keys=⌘ ⌥ ⇧ N | aria=Meta+Alt+Shift+N | editor=Mod-Alt-Shift-n | matches=true
 workspace.closeTab | Close workspace tab | chords=mod+alt+code:KeyW | keys=⌘ ⌥ W | aria=Meta+Alt+W | editor=Mod-Alt-w | matches=true
 workspace.reopenTab | Reopen closed workspace tab | chords=mod+alt+shift+code:KeyT | keys=⌘ ⌥ ⇧ T | aria=Meta+Alt+Shift+T | editor=Mod-Alt-Shift-t | matches=true
@@ -348,8 +348,8 @@ session.recentReverse | Switch to recent session (reverse) | chords=ctrl+code:Br
 session.pin | Pin or unpin current session | chords=mod+alt+code:KeyP | keys=⌘ ⌥ P | aria=Meta+Alt+P | editor=Mod-Alt-p | matches=true
 session.archive | Archive current session | chords=mod+shift+key:a | keys=⌘ ⇧ A | aria=Meta+Shift+A | editor=Mod-Shift-a | matches=true
 session.fork | Fork current session | chords=mod+alt+code:KeyF | keys=⌘ ⌥ F | aria=Meta+Alt+F | editor=Mod-Alt-f | matches=true
-message.previous | Go to previous message | chords=mod+alt+key:ArrowUp+exact | keys=⌘ ⌥ ↑ | aria=Meta+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
-message.next | Go to next message | chords=mod+alt+key:ArrowDown+exact | keys=⌘ ⌥ ↓ | aria=Meta+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
+message.previous | Go to previous message | chords=mod+alt+key:ArrowUp+exact mod+alt+shift+key:ArrowUp+exact | keys=⌘ ⌥ ↑ | aria=Meta+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
+message.next | Go to next message | chords=mod+alt+key:ArrowDown+exact mod+alt+shift+key:ArrowDown+exact | keys=⌘ ⌥ ↓ | aria=Meta+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
 workspace.newTab | New workspace tab | chords=mod+alt+shift+code:KeyN | keys=⌘ ⌥ ⇧ N | aria=Meta+Alt+Shift+N | editor=Mod-Alt-Shift-n | matches=true
 workspace.closeTab | Close workspace tab | chords=mod+alt+code:KeyW | keys=⌘ ⌥ W | aria=Meta+Alt+W | editor=Mod-Alt-w | matches=true
 workspace.reopenTab | Reopen closed workspace tab | chords=mod+alt+shift+code:KeyT | keys=⌘ ⌥ ⇧ T | aria=Meta+Alt+Shift+T | editor=Mod-Alt-Shift-t | matches=true
@@ -453,8 +453,8 @@ session.recentReverse | Switch to recent session (reverse) | chords=- | keys=- |
 session.pin | Pin or unpin current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.archive | Archive current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.fork | Fork current session | chords=- | keys=- | aria=- | editor=- | matches=-
-message.previous | Go to previous message | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
-message.next | Go to next message | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
+message.previous | Go to previous message | chords=mod+alt+key:ArrowUp+exact mod+alt+shift+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
+message.next | Go to next message | chords=mod+alt+key:ArrowDown+exact mod+alt+shift+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
 workspace.newTab | New workspace tab | chords=mod+alt+shift+code:KeyN | keys=Ctrl Alt ⇧ N | aria=Control+Alt+Shift+N | editor=Mod-Alt-Shift-n | matches=true
 workspace.closeTab | Close workspace tab | chords=mod+alt+code:KeyW | keys=Ctrl Alt W | aria=Control+Alt+W | editor=Mod-Alt-w | matches=true
 workspace.reopenTab | Reopen closed workspace tab | chords=mod+alt+shift+code:KeyT | keys=Ctrl Alt ⇧ T | aria=Control+Alt+Shift+T | editor=Mod-Alt-Shift-t | matches=true
@@ -558,8 +558,8 @@ session.recentReverse | Switch to recent session (reverse) | chords=- | keys=- |
 session.pin | Pin or unpin current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.archive | Archive current session | chords=mod+shift+key:a | keys=Ctrl ⇧ A | aria=Control+Shift+A | editor=Mod-Shift-a | matches=true
 session.fork | Fork current session | chords=- | keys=- | aria=- | editor=- | matches=-
-message.previous | Go to previous message | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
-message.next | Go to next message | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
+message.previous | Go to previous message | chords=mod+alt+key:ArrowUp+exact mod+alt+shift+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
+message.next | Go to next message | chords=mod+alt+key:ArrowDown+exact mod+alt+shift+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
 workspace.newTab | New workspace tab | chords=mod+alt+shift+code:KeyN | keys=Ctrl Alt ⇧ N | aria=Control+Alt+Shift+N | editor=Mod-Alt-Shift-n | matches=true
 workspace.closeTab | Close workspace tab | chords=mod+alt+code:KeyW | keys=Ctrl Alt W | aria=Control+Alt+W | editor=Mod-Alt-w | matches=true
 workspace.reopenTab | Reopen closed workspace tab | chords=mod+alt+shift+code:KeyT | keys=Ctrl Alt ⇧ T | aria=Control+Alt+Shift+T | editor=Mod-Alt-Shift-t | matches=true
@@ -663,8 +663,8 @@ session.recentReverse | Switch to recent session (reverse) | chords=- | keys=- |
 session.pin | Pin or unpin current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.archive | Archive current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.fork | Fork current session | chords=- | keys=- | aria=- | editor=- | matches=-
-message.previous | Go to previous message | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
-message.next | Go to next message | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
+message.previous | Go to previous message | chords=mod+alt+key:ArrowUp+exact mod+alt+shift+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
+message.next | Go to next message | chords=mod+alt+key:ArrowDown+exact mod+alt+shift+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
 workspace.newTab | New workspace tab | chords=mod+alt+shift+code:KeyN | keys=Ctrl Alt ⇧ N | aria=Control+Alt+Shift+N | editor=Mod-Alt-Shift-n | matches=true
 workspace.closeTab | Close workspace tab | chords=mod+alt+code:KeyW | keys=Ctrl Alt W | aria=Control+Alt+W | editor=Mod-Alt-w | matches=true
 workspace.reopenTab | Reopen closed workspace tab | chords=mod+alt+shift+code:KeyT | keys=Ctrl Alt ⇧ T | aria=Control+Alt+Shift+T | editor=Mod-Alt-Shift-t | matches=true
@@ -768,8 +768,8 @@ session.recentReverse | Switch to recent session (reverse) | chords=- | keys=- |
 session.pin | Pin or unpin current session | chords=- | keys=- | aria=- | editor=- | matches=-
 session.archive | Archive current session | chords=mod+shift+key:a | keys=Ctrl ⇧ A | aria=Control+Shift+A | editor=Mod-Shift-a | matches=true
 session.fork | Fork current session | chords=- | keys=- | aria=- | editor=- | matches=-
-message.previous | Go to previous message | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
-message.next | Go to next message | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
+message.previous | Go to previous message | chords=mod+alt+key:ArrowUp+exact mod+alt+shift+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
+message.next | Go to next message | chords=mod+alt+key:ArrowDown+exact mod+alt+shift+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
 workspace.newTab | New workspace tab | chords=mod+alt+shift+code:KeyN | keys=Ctrl Alt ⇧ N | aria=Control+Alt+Shift+N | editor=Mod-Alt-Shift-n | matches=true
 workspace.closeTab | Close workspace tab | chords=mod+alt+code:KeyW | keys=Ctrl Alt W | aria=Control+Alt+W | editor=Mod-Alt-w | matches=true
 workspace.reopenTab | Reopen closed workspace tab | chords=mod+alt+shift+code:KeyT | keys=Ctrl Alt ⇧ T | aria=Control+Alt+Shift+T | editor=Mod-Alt-Shift-t | matches=true
