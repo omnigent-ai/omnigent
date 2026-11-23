@@ -386,6 +386,7 @@ const ADMIN_VIEW_NOT_LOADED =
   "Shows only to an admin whose identity is loaded, which no scenario loads yet.";
 const PROJECT_KANBAN_OFF =
   "Shows only when the server turns on project kanban, which no scenario does.";
+const QUICK_PICK_OFF = "Shows only with quick_pick_palette, which the web scenario leaves off.";
 const PROACTIVE_AGENT_OFF =
   "Shows only where the server offers the proactive agent, which no scenario sets up yet.";
 const OMNI_ADVISOR_OFF = "The server doesn't offer Omni Advisor.";
@@ -792,7 +793,18 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
       },
     ],
   },
-  { section: "shortcuts", scenario: "web", ready: ["Speed up common actions with the keyboard."] },
+  {
+    section: "shortcuts",
+    scenario: "web",
+    ready: ["Speed up common actions with the keyboard."],
+    hides: { "shortcuts-search": QUICK_PICK_OFF },
+  },
+  {
+    section: "shortcuts",
+    scenario: "web › ⌘K's QuickPick on",
+    info: { features: { ...SERVER_INFO.features, quick_pick_palette: true } },
+    ready: ["Speed up common actions with the keyboard."],
+  },
   {
     section: "account",
     scenario: "web",
