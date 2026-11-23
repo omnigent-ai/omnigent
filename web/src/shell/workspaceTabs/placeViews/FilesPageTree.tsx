@@ -4,7 +4,7 @@
 // name filter is set, the tree shows its matches instead.
 
 import { FolderDotIcon, ListFilterIcon, LocateFixedIcon } from "lucide-react";
-import { type RefObject, useEffect, useMemo, useRef, useState } from "react";
+import { type RefObject, useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -231,7 +231,9 @@ export function FilesPageTree({
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [active, summary.active, conversationId],
   );
-  usePaletteCommands(`files-page-tree-filter:${conversationId}`, "Files", clearCommands);
+  // Each mounted tree registers its own, so an inactive tab can't drop the active tab's row.
+  const commandSource = useId();
+  usePaletteCommands(`files-page-tree-filter:${commandSource}`, "Files", clearCommands);
   const search = useWorkspaceFileSearch(
     conversationId,
     filters.applied.nameContains,
@@ -316,10 +318,19 @@ export function FilesPageTree({
       </div>
     );
     const result = matchesFromOtherFolder ? undefined : search.data;
+    // The host can't search, or the search waits, never starting, on an unreachable workspace.
+    const unsearchable =
+      result?.unavailable || (!result && search.isPending && search.fetchStatus === "idle");
     let content: React.ReactNode;
     if (search.isError && !result) {
       content = (
         <TreeMessage alert>{`Couldn’t search the files: ${search.error.message}`}</TreeMessage>
+      );
+    } else if (unsearchable) {
+      content = (
+        <TreeMessage>
+          The files can’t be searched right now. Send a message to reconnect the session’s machine.
+        </TreeMessage>
       );
     } else if (!result) {
       content = <TreeMessage>Searching…</TreeMessage>;
@@ -329,7 +340,11 @@ export function FilesPageTree({
       );
       content =
         matches.length === 0 ? (
-          <TreeMessage>{summary.emptyText}</TreeMessage>
+          <TreeMessage>
+            {result.truncated
+              ? "No matches in the files searched so far. The search stopped early, so narrow it with an include glob to search the rest."
+              : summary.emptyText}
+          </TreeMessage>
         ) : (
           <>
             <FilesTreeMatches

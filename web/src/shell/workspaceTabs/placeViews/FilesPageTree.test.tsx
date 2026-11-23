@@ -432,6 +432,82 @@ describe("FilesPageTree", () => {
       expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t search the files: timed out");
     });
 
+    it.each([
+      [
+        "the host can't search",
+        { data: { files: [], truncated: false, hasMore: false, unavailable: true } },
+      ],
+      [
+        "the workspace can't be reached, so the search never starts",
+        { isPending: true, fetchStatus: "idle" },
+      ],
+    ])(
+      "says the files can't be searched when %s, rather than that nothing matched",
+      (_case, search) => {
+        vi.useFakeTimers();
+        vi.mocked(useWorkspaceFileSearch).mockReturnValue(search as never);
+        renderTree(listed([entry("src")]));
+        fireEvent.click(filterButton());
+        typeName("zzz");
+        expect(screen.getByTestId("tree-filter-strip").nextElementSibling).toHaveTextContent(
+          "The files can’t be searched right now. Send a message to reconnect the session’s machine.",
+        );
+        expect(screen.queryByText("No files match “zzz”.")).toBeNull();
+        expect(screen.queryByText("Searching…")).toBeNull();
+      },
+    );
+
+    it("says a search that stopped early may have missed matches", () => {
+      vi.useFakeTimers();
+      vi.mocked(useWorkspaceFileSearch).mockReturnValue({
+        data: { files: [], truncated: true, hasMore: false, unavailable: false },
+      } as never);
+      renderTree(listed([entry("src")]));
+      fireEvent.click(filterButton());
+      typeName("zzz");
+      expect(screen.getByText(/^No matches in the files searched so far\./)).toBeInTheDocument();
+      expect(screen.queryByText("No files match “zzz”.")).toBeNull();
+    });
+
+    it("keeps the active tab's Clear Files Tree Filter while other tabs of the session change", () => {
+      vi.useFakeTimers();
+      vi.mocked(useWorkspaceAllFiles).mockReturnValue(listed([entry("src")]));
+      const tab = (active: boolean) => (
+        <FilesPageTree
+          conversationId="conv_1"
+          active={active}
+          activePath="src/a.ts"
+          sort="alpha"
+          showHidden={false}
+          onFileSelect={vi.fn()}
+        />
+      );
+      const tabs = (firstActive: boolean, firstMounted = true) => (
+        <TooltipProvider>
+          {firstMounted ? <div key="first">{tab(firstActive)}</div> : null}
+          <div key="second">{tab(!firstActive)}</div>
+        </TooltipProvider>
+      );
+      const view = render(tabs(true));
+      // Both tabs filter their trees.
+      for (const button of screen.getAllByRole("button", { name: "Filter Files Tree by Name" })) {
+        fireEvent.click(button);
+      }
+      for (const field of screen.getAllByRole("textbox", { name: "Name contains" })) {
+        fireEvent.change(field, { target: { value: "app" } });
+      }
+      act(() => vi.advanceTimersByTime(TREE_FILTER_DEBOUNCE_MS));
+      expect(paletteLabels().filter((label) => label === "Clear Files Tree Filter")).toHaveLength(
+        1,
+      );
+
+      // The second tab becomes active, then the first, now inactive, closes.
+      view.rerender(tabs(false));
+      expect(paletteLabels()).toContain("Clear Files Tree Filter");
+      view.rerender(tabs(false, false));
+      expect(paletteLabels()).toContain("Clear Files Tree Filter");
+    });
+
     it("keeps the filter across a remount, and clears it from the strip", () => {
       vi.useFakeTimers();
       renderTree(listed([entry("src")]));
