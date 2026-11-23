@@ -5536,6 +5536,39 @@ describe("Sidebar view options", () => {
     );
   });
 
+  it("rechecks the creator each time the card opens, without showing a cached title", async () => {
+    let rejectRecheck!: (error: Error) => void;
+    const lookup = vi
+      .spyOn(sessionsApi, "getSessionSlim")
+      .mockResolvedValueOnce({ id: "conv_manager", title: "Release manager" } as Session)
+      .mockReturnValueOnce(
+        new Promise<Session>((_, reject) => {
+          rejectRecheck = reject;
+        }),
+      );
+    onTestFinished(() => lookup.mockRestore());
+    mockConversations([
+      conv("conv_worker", "Codex", { labels: { [CREATED_BY_SESSION_LABEL_KEY]: "conv_manager" } }),
+    ]);
+    renderGroupingSidebar();
+    const row = screen.getByRole("link", { name: "conv_worker" });
+
+    fireEvent.pointerMove(row, { pointerType: "mouse" });
+    expect(await screen.findByText("Release manager")).toBeInTheDocument();
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("session-tooltip-content")).toBeNull());
+
+    // Access was revoked after the first opening; the cached title must not reappear.
+    fireEvent.pointerLeave(row, { pointerType: "mouse" });
+    fireEvent.pointerMove(row, { pointerType: "mouse" });
+    const creator = await screen.findByTestId("session-tooltip-creator");
+    expect(creator).toHaveTextContent("Created by…");
+    await act(async () => rejectRecheck(new sessionsApi.ApiError("Forbidden", 403, null)));
+    await waitFor(() => expect(creator).toHaveTextContent("Created byAnother session"));
+    expect(screen.queryByText("Release manager")).toBeNull();
+    expect(lookup).toHaveBeenCalledTimes(2);
+  });
+
   it.each(["legacy", "pinned"] as const)(
     "keeps Nested in on the %s card, which doesn't name the creator",
     async (surface) => {

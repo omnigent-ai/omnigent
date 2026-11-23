@@ -623,12 +623,12 @@ def test_render_status_tool_raw_error_prefix() -> None:
     ("tool_name", "output", "expected"),
     [
         (
-            "sys_upload_file",
+            "sys_files_upload",
             {"file_id": "file_abc123", "filename": "chart.png", "content_type": "image/png"},
             ["uploaded file", "chart.png", "image/png", "file_abc123"],
         ),
         (
-            "sys_download_file",
+            "sys_files_download",
             {"path": "notes.txt", "filename": "notes.txt", "bytes": 2048},
             ["downloaded file", "notes.txt", "2.0 KB"],
         ),
@@ -654,10 +654,10 @@ def test_render_session_file_tools(
 )
 def test_runner_download_content_falls_through_to_the_generic_panel(content: str) -> None:
     """
-    The runner's ``sys_download_file`` returns the file's own content, so even a
+    The runner's ``sys_files_download`` returns the file's own content, so even a
     JSON document is shown as content rather than as a download status panel.
     """
-    ex = _tool_ex("sys_download_file", output=content, arguments={"file_id": "file_abc123"})
+    ex = _tool_ex("sys_files_download", output=content, arguments={"file_id": "file_abc123"})
     result = DEFAULT_TOOL_RENDERERS.render_tool(ex, parse_tool_output(content), _theme())
     assert result is None, _render_to_text(result)
 

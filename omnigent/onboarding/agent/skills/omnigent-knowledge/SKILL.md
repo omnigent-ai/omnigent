@@ -189,9 +189,9 @@ list — new tools may be added at any time.
 - "I want a conversational assistant" → no tools needed (or `web_search` for current info)
 - "I want an agent that can access external APIs" → consider MCP servers (see below)
 
-Every agent also gets `sys_upload_file`, `sys_list_files` and
-`sys_download_file` for sharing files with the user, without a
-`tools.builtins` entry; `tool_groups.files: false` removes them.
+An agent that shares files with the user sets `tool_groups.files: true` to get
+`sys_files_upload`, `sys_files_list` and `sys_files_download`; they are off by
+default and need no `tools.builtins` entry.
 
 ### MCP servers (external tool integrations)
 

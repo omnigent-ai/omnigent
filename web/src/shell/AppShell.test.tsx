@@ -878,6 +878,39 @@ describe("AppShell header", () => {
     expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
   });
 
+  it("leaves an agent-created session's creator out of the header", async () => {
+    mockConversations([]);
+    getSessionSlimMock.mockResolvedValue({ id: "conv_manager", title: "Manager" } as Session);
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_worker",
+        agentId: "ag_owner",
+        agentName: "developer",
+        runnerId: null,
+        status: "idle",
+        createdAt: 1_700_000_000,
+        title: "Docs worker",
+        labels: { "omnigent.created_by_session_id": "conv_manager" },
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: null,
+        subAgentName: null,
+        kind: "default",
+      },
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_worker");
+    // Let any creator lookup settle so a late label would have rendered.
+    await act(async () => {});
+
+    expect(screen.getByText("Docs worker")).toBeInTheDocument();
+    expect(screen.queryByText(/Created by/)).toBeNull();
+    expect(getSessionSlimMock).not.toHaveBeenCalledWith("conv_manager");
+  });
+
   it.each([
     { title: "Off-window owner session", archived: false, sibling: false },
     { title: null, archived: true, sibling: false },
