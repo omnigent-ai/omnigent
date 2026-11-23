@@ -45,7 +45,15 @@ async function waitForHostOnline(
   const deadline = Date.now() + LOCAL_HOST_ONLINE_WAIT_MS;
   let listRead = false;
   const poll = async (): Promise<boolean | null> => {
-    const hosts = await fetchHosts(false).catch(() => null);
+    // Bound each read by the time left, so a stalled request can't hold Reconnect host.
+    const readLimit = new AbortController();
+    const readTimer = setTimeout(
+      () => readLimit.abort(),
+      Math.max(deadline - Date.now(), LOCAL_HOST_ONLINE_POLL_MS),
+    );
+    const hosts = await fetchHosts(false, undefined, readLimit.signal)
+      .catch(() => null)
+      .finally(() => clearTimeout(readTimer));
     if (!isCurrent()) return null;
     if (hosts !== null) {
       if (hosts.some((host) => host.host_id === hostId && host.status === "online")) return true;

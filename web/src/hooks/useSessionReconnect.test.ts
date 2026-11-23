@@ -195,6 +195,7 @@ describe("useSessionReconnect", () => {
     {
       label: "a running host whose connection stays down",
       readHosts: () => Promise.resolve([hostRow("this-mac", "offline")]),
+      reads: LOCAL_HOST_ONLINE_WAIT_MS / 1_000 + 1,
       message: () =>
         "This machine's host is running but still isn't connected to the server. " +
         `If its sign-in expired, run \`omnigent login ${getCliServerUrl()}\`. Otherwise ` +
@@ -203,6 +204,16 @@ describe("useSessionReconnect", () => {
     {
       label: "an unreadable host list",
       readHosts: () => Promise.reject(new Error("503 Service Unavailable")),
+      reads: LOCAL_HOST_ONLINE_WAIT_MS / 1_000 + 1,
+      message: () => "Couldn't check whether this machine is back online. Try again.",
+    },
+    {
+      label: "a host list read that never answers",
+      readHosts: (_includeSandbox: boolean, _sourceHostId?: string | null, signal?: AbortSignal) =>
+        new Promise<Host[]>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason));
+        }),
+      reads: 1,
       message: () => "Couldn't check whether this machine is back online. Try again.",
     },
   ])("opens recovery instead of reporting $label as back online", async (scenario) => {
@@ -216,7 +227,7 @@ describe("useSessionReconnect", () => {
         await reconnect;
       });
       expect(controlHost).toHaveBeenCalledExactlyOnceWith("start");
-      expect(fetchHosts).toHaveBeenCalledTimes(LOCAL_HOST_ONLINE_WAIT_MS / 1_000 + 1);
+      expect(fetchHosts).toHaveBeenCalledTimes(scenario.reads);
       expect(result.current.dialogOpen).toBe(true);
       expect(result.current.localReconnect?.reconnecting).toBe(false);
       expect(result.current.localReconnect?.error).toBe(scenario.message());
@@ -1181,6 +1192,46 @@ describe("useSessionReconnect", () => {
     });
     expect(result.current.dialogOpen).toBe(true);
     expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it("drops a host-list answer that arrives after switching to another session", async () => {
+    const oldHosts = deferred<Host[]>();
+    const newHosts = deferred<Host[]>();
+    vi.mocked(fetchHosts)
+      .mockReturnValueOnce(oldHosts.promise)
+      .mockReturnValueOnce(newHosts.promise);
+    vi.mocked(toast.loading)
+      .mockReturnValueOnce("old-progress")
+      .mockReturnValueOnce("new-progress");
+    const { result, rerender } = renderHook(useSessionReconnect, { initialProps: localSession });
+    let first!: Promise<void>;
+    let second!: Promise<void>;
+    await act(async () => {
+      first = result.current.reconnect();
+    });
+    expect(fetchHosts).toHaveBeenCalledOnce();
+    rerender({ ...localSession, sessionId: "other-session" });
+    await act(async () => {
+      second = result.current.reconnect();
+    });
+    expect(fetchHosts).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      oldHosts.resolve(thisMachineOnline);
+      await first;
+    });
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(result.current.dialogOpen).toBe(false);
+    expect(result.current.localReconnect?.reconnecting).toBe(true);
+    expect(toast.dismiss).not.toHaveBeenCalledWith("new-progress");
+
+    await act(async () => {
+      newHosts.resolve(thisMachineOnline);
+      await second;
+    });
+    expect(fetchHosts).toHaveBeenCalledTimes(2);
+    expect(toast.success).toHaveBeenCalledExactlyOnceWith("This machine is back online.");
+    expect(toast.dismiss).toHaveBeenCalledWith("new-progress");
   });
 
   it("does not let an old reconnect clear a newer session's progress or lock", async () => {
