@@ -33,13 +33,19 @@ export function useRecentPullRequestFacts(
   );
   useSyncExternalStore(subscribe, () => detailsVersion(client, keys));
   const details = new Map<string, PullRequest>();
-  if (info.data?.pr) details.set(info.data.pr.url, info.data.pr);
+  const detailsUpdatedAt = new Map<string, number>();
+  if (info.data?.pr) {
+    details.set(info.data.pr.url, info.data.pr);
+    detailsUpdatedAt.set(info.data.pr.url, info.dataUpdatedAt);
+  }
   keys.forEach((key, index) => {
     const pr = client.getQueryData<PullRequestInfo>(key)?.pr;
-    if (pr) details.set(urls[index]!, pr);
+    if (!pr) return;
+    details.set(urls[index]!, pr);
+    detailsUpdatedAt.set(urls[index]!, client.getQueryState(key)?.dataUpdatedAt ?? 0);
   });
   const linked = linkedPullRequests(info.data, stored.data);
-  return { linked, details };
+  return { linked, details, detailsUpdatedAt };
 }
 
 /** Each URL's details key, as the PR's own query names it. */

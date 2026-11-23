@@ -124,6 +124,19 @@ describe("useRecentPullRequestFacts", () => {
     expect(prRequests()).toEqual([]);
   });
 
+  it("says when each PR's details were read, as the cache does", async () => {
+    const { client, result } = setup({ conversationId: "conv", urls: [URL_321] });
+    const readAt = Date.UTC(2026, 0, 1, 10, 0);
+    act(() => {
+      client.setQueryData(
+        ["github-info", "conv", URL_321],
+        detailInfo({ url: URL_321, number: 321, title: "Retry uploads", author: "sam-lee" }),
+        { updatedAt: readAt },
+      );
+    });
+    await waitFor(() => expect(result.current.detailsUpdatedAt?.get(URL_321)).toBe(readAt));
+  });
+
   it("reads the selected PR's details from the session's own info", async () => {
     const { client, result } = setup({ conversationId: "conv", urls: [] });
     act(() => {

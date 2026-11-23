@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
-import type { PullRequest } from "@/hooks/usePullRequests";
+import type { PullRequest, PullRequestAssociation } from "@/hooks/usePullRequests";
 import { LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ } from "@/lib/permissionsApi";
 import { terminalsQueryKey } from "@/lib/terminals";
 import { LOCAL_RECONNECT_DESCRIPTION, LOCAL_RECONNECT_TITLE } from "@/shell/ReconnectSessionDialog";
@@ -932,5 +932,42 @@ describe("closing a group of tabs", () => {
     await waitFor(() => expect(urls()).toEqual([pinnedMerged, open]));
     // Nothing merged is left to close but the pinned tab, which stays.
     expect(screen.queryByRole("button", { name: "Close merged pull request tabs" })).toBeNull();
+  });
+
+  it("counts a PR as merged when the session saw it merge after its details were read", async () => {
+    const conversationId = "s-close-merged-later";
+    const url = "https://github.example.com/acme/repo/pull/7";
+    knownPullRequests.facts = {
+      linked: [
+        {
+          url,
+          host: "github.example.com",
+          repository: "acme/repo",
+          number: 7,
+          title: "Change 7",
+          relationship: "created",
+          state: "MERGED",
+          state_checked_at: Date.UTC(2026, 0, 1, 10, 5) / 1000,
+        } as PullRequestAssociation,
+      ],
+      details: new Map([
+        [url, { url, number: 7, title: "Change 7", state: "OPEN", is_draft: false } as PullRequest],
+      ]),
+      detailsUpdatedAt: new Map([[url, Date.UTC(2026, 0, 1, 10, 0)]]),
+    };
+    renderPanels([{ conversationId }]);
+    const { store } = workspaceTabsSession(conversationId);
+    await act(async () => {
+      await store.open({ place: { kind: "pull", url, view: "summary" } }, { opener: "user" });
+      await store.open({ place: { kind: "agents" } }, { opener: "user" });
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "All tabs" }));
+    const pulls = await screen.findByRole("group", { name: /^Pull requests 1/ });
+    expect(within(pulls).getByRole("option", { name: /#7 Change 7/ })).toHaveTextContent("Merged");
+    await userEvent.click(screen.getByRole("button", { name: "Close merged pull request tabs" }));
+    await waitFor(() =>
+      expect(store.tabs().some((tab) => "place" in tab && tab.place.kind === "pull")).toBe(false),
+    );
   });
 });

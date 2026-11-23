@@ -112,7 +112,11 @@ import { useWorkspaceSidebarTabActions } from "../workspaceSidebar/useWorkspaceS
 import { useCanStartSideChat } from "@/hooks/usePermissions";
 import { RailTerminalView, WorkspaceTabTooltip } from "../WorkspacePanel";
 import { NewTabPage, type NewTabRecent } from "./NewTabPage";
-import { recentPullRequestRows, recentPullRequestUrl } from "./recentPullRequestRow";
+import {
+  knownPullRequestStatus,
+  recentPullRequestRows,
+  recentPullRequestUrl,
+} from "./recentPullRequestRow";
 import { useRecentPullRequestFacts } from "./useRecentPullRequestFacts";
 import { FileTypeIcon } from "@/shell/FileTypeIcon";
 import { WorkspaceHistoryChevrons } from "./WorkspaceHistoryChevrons";
@@ -434,9 +438,7 @@ function WorkspaceTabsPanelImpl({
   const openPullRequestRows = recentPullRequestRows(openPullRequestUrls, pullRequestFacts);
   // A PR tab's status, from its read details or the session's link; unknown until either says.
   const pullRequestStatusOf = (url: string) =>
-    getPullRequestStatus(
-      pullRequestFacts.details.get(url) ?? pullRequestFacts.linked.find((pr) => pr.url === url),
-    );
+    getPullRequestStatus(knownPullRequestStatus(url, pullRequestFacts));
   const chatTabs = knownTabs.filter((tab) => tab.binding?.kind === "chat");
   // In the order the review lists them, so a file tab's "2/3" matches what it shows.
   const orderedChangedPaths = useMemo(
