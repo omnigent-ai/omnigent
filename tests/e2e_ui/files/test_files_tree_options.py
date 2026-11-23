@@ -23,8 +23,9 @@ from tests.e2e_ui.files.test_file_breadcrumbs import _open_workspace
 from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-# Alphabetical and size order disagree, and one file is hidden (shown by default).
-_FILES = {"alpha.txt": "a\n", "zulu.txt": "z" * 4000 + "\n", ".env": "SECRET=1\n"}
+# Alphabetical and size order disagree, and one file is hidden (shown by default). The
+# large file is written first, so only a real size sort puts it before the newer alpha.txt.
+_FILES = {"zulu.txt": "z" * 4000 + "\n", "alpha.txt": "a\n", ".env": "SECRET=1\n"}
 
 
 @pytest.fixture

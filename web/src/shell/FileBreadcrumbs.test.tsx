@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { FileBreadcrumbs } from "./FileBreadcrumbs";
 import { FileViewerContext } from "./FileViewerContext";
+import { rememberBrowseLocation, rememberedBrowseLocation } from "./filesPane/browseLocations";
 
 const { copyText } = vi.hoisted(() => ({ copyText: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/lib/clipboard", () => ({ copyText }));
@@ -281,6 +282,23 @@ describe("FileBreadcrumbs segment menu", () => {
     const breadcrumbs = renderInWorkspace("src/viewer.ts");
     fireEvent.contextMenu(within(breadcrumbs).getByRole("button", { name: segment }));
     expect(menuItems()).toEqual(expect.arrayContaining(["Copy path", "Copy relative path"]));
+  });
+
+  it("roots the Files tree at a folder segment, but not at the folder it already shows", () => {
+    const breadcrumbs = renderInWorkspace("src/lib/viewer.ts");
+    fireEvent.contextMenu(within(breadcrumbs).getByRole("button", { name: "lib" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Open folder as root" }));
+    expect(rememberedBrowseLocation("conv_1")).toBe("/repo/src/lib");
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    fireEvent.contextMenu(within(breadcrumbs).getByRole("button", { name: "lib" }));
+    expect(menuItems()).not.toContain("Open folder as root");
+    rememberBrowseLocation("conv_1", null);
+  });
+
+  it("offers no root for a file segment", () => {
+    const breadcrumbs = renderInWorkspace("src/viewer.ts");
+    fireEvent.contextMenu(within(breadcrumbs).getByRole("button", { name: "viewer.ts" }));
+    expect(menuItems()).not.toContain("Open folder as root");
   });
 });
 

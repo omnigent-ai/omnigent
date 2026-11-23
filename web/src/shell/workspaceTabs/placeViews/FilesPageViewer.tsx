@@ -25,6 +25,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useComparisonFileDiff } from "@/hooks/useComparisonFileDiff";
 import { useFileContent } from "@/hooks/useFileContent";
 import { fileContentText } from "@/lib/workspaceSidebarSource";
+import { isOwnerLevel } from "@/lib/permissionsApi";
 import { cn } from "@/lib/utils";
 import { CodeMirrorFileEditor } from "@/shell/codeMirror/CodeMirrorFileEditor";
 import {
@@ -99,6 +100,7 @@ export function FilesPageViewer({
         path={path}
         workspaceName={workspaceFolderName(workspaceRoot)}
         onOpenFile={onOpenFile}
+        canBrowseOutside={isOwnerLevel(permissionLevel ?? null)}
       />
     </TooltipProvider>
   );

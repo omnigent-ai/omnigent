@@ -222,6 +222,7 @@ function FilesPlaceView({
       sidebar={
         <FilesPageTree
           conversationId={conversationId}
+          active={active}
           activePath={place.path}
           sort={files.sort}
           showHidden={files.showHidden}

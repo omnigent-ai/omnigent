@@ -1,16 +1,19 @@
 // The file viewer's full path as breadcrumbs, scrolling sideways to keep the file
 // name in view. Each segment lists its siblings, the folder holding it with the
 // segment selected, and a copy button copies the path. Right-clicking a segment
-// offers its file actions.
+// offers its file actions; a folder's include rooting the Files tree there.
 
 import { Fragment, useLayoutEffect, useRef, useState } from "react";
 import { XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { useWorkspacePaths } from "@/shell/FileViewerContext";
 import { cn } from "@/lib/utils";
 import { CopyPathButton } from "./CopyPathButton";
 import { useFileCommandMenu } from "./fileCommands/useFileCommandMenu";
+import { useRememberedBrowseLocation } from "./filesPane/browseLocations";
+import { planFolderAsTreeRoot, showTreeRoot } from "./fileTree/treeRoot";
 import {
   type BreadcrumbSegment,
   breadcrumbSegments,
@@ -29,6 +32,8 @@ interface FileBreadcrumbsProps {
   workspaceName: string;
   /** Opens another file; without it the breadcrumbs only show the path. */
   onOpenFile?: (path: string) => void;
+  /** Whether this viewer may root the Files tree outside the workspace. */
+  canBrowseOutside?: boolean;
 }
 
 const SEGMENT_CLASS =
@@ -39,6 +44,7 @@ export function FileBreadcrumbs({
   path,
   workspaceName,
   onOpenFile,
+  canBrowseOutside = false,
 }: FileBreadcrumbsProps) {
   const segments = breadcrumbSegments(path);
   // The segment whose tree is open; another file or conversation closes it for good.
@@ -55,6 +61,19 @@ export function FileBreadcrumbs({
     scrollTabIntoView(navRef.current?.querySelector<HTMLElement>('[aria-current="page"]') ?? null);
   }, [viewedFile]);
   const dark = useResolvedThemeMode() === "dark";
+  const { root: workspaceRoot } = useWorkspacePaths();
+  const browsed = useRememberedBrowseLocation(conversationId);
+  /** Rooting the Files tree at a folder segment, when the tree can show it there. */
+  const rootAt = (segment: BreadcrumbSegment) => {
+    if (segment.isFile) return undefined;
+    const plan = planFolderAsTreeRoot({
+      folder: segment.path,
+      browsed,
+      workspaceRoot,
+      canBrowseOutside,
+    });
+    return plan.availability.available ? () => showTreeRoot(conversationId, plan.root) : undefined;
+  };
   const tree = (segment: BreadcrumbSegment) => {
     const folder = segmentFolder(segment);
     const title = folderTitle(folder, workspaceName);
@@ -89,7 +108,7 @@ export function FileBreadcrumbs({
       );
     }
     return (
-      <SegmentWithMenu segment={segment}>
+      <SegmentWithMenu segment={segment} onOpenAsRoot={rootAt(segment)}>
         {(menuProps) => (
           <Popover
             open={openSegment === segment.path}
@@ -137,15 +156,20 @@ export function FileBreadcrumbs({
   );
 }
 
-/** A segment's right-click menu: its file actions. */
+/** A segment's right-click menu: its file actions, a folder's with rooting the tree there. */
 function SegmentWithMenu({
   segment,
+  onOpenAsRoot,
   children,
 }: {
   segment: BreadcrumbSegment;
+  onOpenAsRoot: (() => void) | undefined;
   children: (menuProps: ReturnType<typeof useFileCommandMenu>["rowProps"]) => React.ReactNode;
 }) {
-  const { rowProps, menu } = useFileCommandMenu(segment.path, { directory: !segment.isFile });
+  const { rowProps, menu } = useFileCommandMenu(segment.path, {
+    directory: !segment.isFile,
+    opens: onOpenAsRoot ? { onOpenAsRoot } : undefined,
+  });
   return (
     <>
       {children(rowProps)}
