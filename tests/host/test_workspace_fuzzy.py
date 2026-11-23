@@ -35,6 +35,15 @@ def test_every_word_must_match_and_case_matters_only_for_capitals() -> None:
     assert _ranked(paths, "Main") == ["src/Main.py"]
 
 
+def test_a_typo_matches_nothing() -> None:
+    paths = ["src/main.py"]
+
+    # A swapped, wrong or extra letter isn't forgiven.
+    assert _ranked(paths, "mian") == []
+    assert _ranked(paths, "maxn") == []
+    assert _ranked(paths, "mainx") == []
+
+
 def test_ties_go_to_the_shorter_path_then_path_order() -> None:
     paths = ["b/deep/x/notes.md", "b/notes.md", "a/notes.md"]
 

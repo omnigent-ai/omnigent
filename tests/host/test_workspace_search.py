@@ -58,6 +58,17 @@ async def _fuzzy(root: Path, query: str, **fields: object) -> SearchFilesRespons
     return await search_files(root, request)
 
 
+async def _search_in(root: Path, mode: int, query: str, **fields: object) -> SearchFilesResponse:
+    request = SearchFilesRequest(query=query, mode=mode, **fields)  # type: ignore[arg-type]
+    return await search_files(root, request)
+
+
+# Both ways of finding files must consider the same candidates.
+_BOTH_MODES = pytest.mark.parametrize(
+    "mode", [FILE_SEARCH_MODE_SUBSTRING, FILE_SEARCH_MODE_FUZZY], ids=["substring", "fuzzy"]
+)
+
+
 def _paths(response: SearchFilesResponse) -> list[str]:
     return [result.entry.path for result in response.results]
 
@@ -73,6 +84,7 @@ def _ignoring_repository(root: Path) -> Path:
     return root
 
 
+@_BOTH_MODES
 @pytest.mark.parametrize(
     ("include_git_ignored", "expected"),
     [
@@ -81,13 +93,13 @@ def _ignoring_repository(root: Path) -> Path:
     ],
 )
 async def test_ignored_files_are_searched_only_when_asked(
-    tmp_path: Path, include_git_ignored: bool, expected: list[str]
+    tmp_path: Path, mode: int, include_git_ignored: bool, expected: list[str]
 ) -> None:
     root = _ignoring_repository(tmp_path / "repo")
 
-    response = await _search(root, "main", include_git_ignored=include_git_ignored)
+    response = await _search_in(root, mode, "main", include_git_ignored=include_git_ignored)
 
-    assert _paths(response) == expected
+    assert sorted(_paths(response)) == expected
     assert response.indexed_paths == 4  # a.txt, src/main.py, src/new_main.py, src/.gitignore
     assert not response.truncated and not response.untracked_unavailable
 
@@ -179,11 +191,13 @@ async def test_a_subfolder_search_reports_paths_beneath_it(tmp_path: Path) -> No
     assert _paths(response) == ["main.py", "new_main.py"]
 
 
-async def test_outside_git_the_walk_finds_everything(tmp_path: Path) -> None:
+@_BOTH_MODES
+async def test_outside_git_the_walk_finds_everything(tmp_path: Path, mode: int) -> None:
     (tmp_path / "notes").mkdir()
     (tmp_path / "notes" / "todo.md").write_text("x")
+    (tmp_path / "readme.md").write_text("x")
 
-    response = await _search(tmp_path, "todo")
+    response = await _search_in(tmp_path, mode, "todo")
 
     assert _paths(response) == ["notes/todo.md"]
     assert response.indexed_paths == 0
@@ -219,10 +233,13 @@ def _project(root: Path) -> Path:
     return root
 
 
-async def test_fuzzy_queries_rank_files_best_first_with_highlights(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", [FILE_SEARCH_MODE_FUZZY, FILE_SEARCH_MODE_UNSPECIFIED])
+async def test_fuzzy_queries_rank_files_best_first_with_highlights(
+    tmp_path: Path, mode: int
+) -> None:
     root = _project(tmp_path / "repo")
 
-    response = await _fuzzy(root, "wsft")
+    response = await _search_in(root, mode, "wsft")
 
     assert _paths(response)[:2] == [
         "web/electron/workspaceFastTrack.ts",
@@ -281,34 +298,6 @@ async def test_fuzzy_results_keep_to_the_path_scopes_and_globs(tmp_path: Path) -
         "web/electron/workspaceFastTrack.ts",
     ]
     assert _paths(globbed) == ["docs/workspace.md"]
-
-
-@pytest.mark.parametrize(
-    ("include_git_ignored", "expected"),
-    [
-        (False, ["src/main.py", "src/new_main.py"]),
-        (True, ["src/build/main.o", "src/main.py", "src/new_main.py"]),
-    ],
-)
-async def test_fuzzy_mode_ranks_ignored_files_only_when_asked(
-    tmp_path: Path, include_git_ignored: bool, expected: list[str]
-) -> None:
-    root = _ignoring_repository(tmp_path / "repo")
-
-    response = await _fuzzy(root, "main", include_git_ignored=include_git_ignored)
-
-    assert sorted(_paths(response)) == expected
-
-
-async def test_outside_git_fuzzy_mode_ranks_the_walked_files(tmp_path: Path) -> None:
-    (tmp_path / "notes").mkdir()
-    (tmp_path / "notes" / "todo.md").write_text("x")
-    (tmp_path / "readme.md").write_text("x")
-
-    response = await _fuzzy(tmp_path, "todo")
-
-    assert _paths(response) == ["notes/todo.md"]
-    assert response.indexed_paths == 0
 
 
 async def test_fuzzy_mode_skips_deleted_files_and_never_describes_outside_links(
