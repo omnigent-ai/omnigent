@@ -513,7 +513,10 @@ project still opens that folder.
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
 that slot: the line marks whether it lands above or below the row. Release it
 just below the last pin to pin it at the bottom. Only standalone sessions and
-family representatives can be dragged to pin or reorder a pin.
+family representatives can be dragged to pin or reorder a pin. With
+`quick_pick_palette` on, open a pinned session and press Cmd/Ctrl+K for Move to
+top of Pinned, Move up in Pinned and Move down in Pinned, each offered only
+where it would move the pin and making the same write as a drop.
 
 **Custom order:** with `sidebar_grouping_ui` on (the default), drag one of your sessions onto
 another row in the same list, project or group and release it; a line like the
