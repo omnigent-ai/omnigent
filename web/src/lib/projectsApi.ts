@@ -83,6 +83,17 @@ export interface Project {
   config?: ProjectConfig;
   /** Owner-written guidance loaded into every project session; `null` when unset. */
   mandate?: string | null;
+  /** Proposed mandate additions awaiting the owner, oldest first. */
+  mandate_proposals?: MandateProposal[];
+}
+
+/** A proposed addition to a project's mandate; it applies only once the owner accepts it. */
+export interface MandateProposal {
+  id: string;
+  text: string;
+  created_at: number;
+  /** The proposing session, or `null` when the owner proposed it. */
+  session_id?: string | null;
 }
 
 /** Most UTF-8 bytes a mandate may hold; mirrors `PROJECT_MANDATE_MAX_BYTES` on the server. */
@@ -170,6 +181,34 @@ export async function updateProjectMandate(id: string, mandate: string): Promise
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ mandate }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return (await res.json()) as Project;
+}
+
+function mandateProposalPath(projectId: string, proposalId: string): string {
+  return `/v1/projects/${encodeURIComponent(projectId)}/mandate/proposals/${encodeURIComponent(proposalId)}`;
+}
+
+/** Append a pending proposal to the mandate. */
+export async function acceptMandateProposal(
+  projectId: string,
+  proposalId: string,
+): Promise<Project> {
+  const res = await authenticatedFetch(`${mandateProposalPath(projectId, proposalId)}/accept`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return (await res.json()) as Project;
+}
+
+/** Drop a pending proposal without changing the mandate. */
+export async function dismissMandateProposal(
+  projectId: string,
+  proposalId: string,
+): Promise<Project> {
+  const res = await authenticatedFetch(mandateProposalPath(projectId, proposalId), {
+    method: "DELETE",
   });
   if (!res.ok) throw new Error(await readError(res));
   return (await res.json()) as Project;

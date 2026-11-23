@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -27,7 +28,11 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
-from omnigent.entities.project import PROJECT_MANDATE_MAX_BYTES
+from omnigent.entities.project import (
+    MANDATE_PROPOSAL_MAX_BYTES,
+    MANDATE_PROPOSALS_MAX_PENDING,
+    PROJECT_MANDATE_MAX_BYTES,
+)
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runtime import user_session_stream
 from omnigent.runtime.agent_cache import AgentCache
@@ -351,6 +356,75 @@ async def test_session_snapshot_returns_the_mandate_only_on_request(
     await project_client.patch(f"/v1/projects/{created['id']}", json={"mandate": "Docs only."})
     requested = await project_client.get(path, params={"include_project_mandate": "true"})
     assert requested.json()["project_mandate"] == "Docs only."
+
+
+async def test_agent_proposals_wait_for_the_owner_before_reaching_any_session(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """An agent can propose a mandate addition, but only the owner can apply it."""
+    created = (
+        await project_client.post("/v1/projects", json={"name": "P", "mandate": "Stay in docs/."})
+    ).json()
+    source = created["main_session_id"]
+    agent = {ORCHESTRATION_SOURCE_HEADER: source}
+    base = f"/v1/projects/{created['id']}/mandate/proposals"
+    proposed = await project_client.post(
+        base, json={"text": "  Attach a video to every change.  "}, headers=agent
+    )
+    assert proposed.status_code == 200
+    proposal = proposed.json()["proposal"]
+    assert proposal["text"] == "Attach a video to every change."
+    assert proposal["session_id"] == source
+    project = (await project_client.get(f"/v1/projects/{created['id']}")).json()
+    assert project["mandate"] == "Stay in docs/."
+    assert [entry["id"] for entry in project["mandate_proposals"]] == [proposal["id"]]
+    snapshot = await project_client.get(
+        f"/v1/sessions/{source}", params={"include_project_mandate": "true"}
+    )
+    assert snapshot.json()["project_mandate"] == "Stay in docs/."
+
+    accept = f"{base}/{proposal['id']}/accept"
+    assert (await project_client.post(accept, headers=agent)).status_code == 403
+    assert (
+        await project_client.delete(f"{base}/{proposal['id']}", headers=agent)
+    ).status_code == 403
+    accepted = (await project_client.post(accept)).json()
+    assert accepted["mandate"] == "Stay in docs/.\n\nAttach a video to every change."
+    assert accepted["mandate_proposals"] == []
+    assert (await project_client.post(accept)).status_code == 404
+
+    dismissed_id = (await project_client.post(base, json={"text": "Skip tests."})).json()[
+        "proposal"
+    ]["id"]
+    dismissed = (await project_client.delete(f"{base}/{dismissed_id}")).json()
+    assert dismissed["mandate_proposals"] == []
+    assert dismissed["mandate"] == accepted["mandate"]
+
+
+async def test_mandate_proposals_are_bounded(project_client: httpx.AsyncClient) -> None:
+    """Blank, oversized and excess proposals are refused; so is an overflowing accept."""
+    created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    base = f"/v1/projects/{created['id']}/mandate/proposals"
+    assert (await project_client.post(base, json={"text": "  "})).status_code == 400
+    oversized = "x" * (MANDATE_PROPOSAL_MAX_BYTES + 1)
+    assert (await project_client.post(base, json={"text": oversized})).status_code == 400
+    ids = [
+        (await project_client.post(base, json={"text": f"Rule {index}."})).json()["proposal"]["id"]
+        for index in range(MANDATE_PROPOSALS_MAX_PENDING)
+    ]
+    assert (await project_client.post(base, json={"text": "One more."})).status_code == 409
+    await project_client.delete(f"{base}/{ids[0]}")
+    full = "y" * (PROJECT_MANDATE_MAX_BYTES - 5)
+    await project_client.patch(f"/v1/projects/{created['id']}", json={"mandate": full})
+    overflow = await project_client.post(f"{base}/{ids[1]}/accept")
+    assert overflow.status_code == 400
+    project = (await project_client.get(f"/v1/projects/{created['id']}")).json()
+    assert project["mandate"] == full
+    assert len(project["mandate_proposals"]) == MANDATE_PROPOSALS_MAX_PENDING - 1
+    missing = await project_client.post(
+        f"/v1/projects/{uuid.uuid4().hex}/mandate/proposals", json={"text": "Rule."}
+    )
+    assert missing.status_code == 404
 
 
 async def test_delete_project(project_client: httpx.AsyncClient) -> None:

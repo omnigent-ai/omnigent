@@ -5,6 +5,7 @@ from __future__ import annotations
 import builtins
 import json
 import re
+import uuid
 from typing import Any
 
 import zstandard
@@ -22,7 +23,12 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import Project
-from omnigent.entities.project import PROJECT_MANDATE_MAX_BYTES
+from omnigent.entities.project import (
+    MANDATE_PROPOSAL_MAX_BYTES,
+    MANDATE_PROPOSALS_MAX_PENDING,
+    PROJECT_MANDATE_MAX_BYTES,
+    MandateProposal,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore
@@ -94,6 +100,43 @@ def _normalize_mandate(mandate: str) -> str | None:
     return trimmed or None
 
 
+def _decode_proposals(raw: object) -> list[MandateProposal]:
+    """Read stored proposals, skipping malformed entries rather than failing the project."""
+    if not isinstance(raw, list):
+        return []
+    proposals = []
+    for entry in raw:
+        if (
+            isinstance(entry, dict)
+            and isinstance(entry.get("id"), str)
+            and isinstance(entry.get("text"), str)
+            and isinstance(entry.get("created_at"), int)
+        ):
+            session_id = entry.get("session_id")
+            proposals.append(
+                MandateProposal(
+                    id=entry["id"],
+                    text=entry["text"],
+                    created_at=entry["created_at"],
+                    session_id=session_id if isinstance(session_id, str) else None,
+                )
+            )
+    return proposals
+
+
+def _encode_proposals(proposals: list[MandateProposal]) -> list[dict[str, Any]] | None:
+    """Store proposals as plain JSON objects; none stores SQL ``NULL``."""
+    return [
+        {
+            "id": proposal.id,
+            "text": proposal.text,
+            "created_at": proposal.created_at,
+            "session_id": proposal.session_id,
+        }
+        for proposal in proposals
+    ] or None
+
+
 def _to_entity(row: SqlProject) -> Project:
     """
     Convert a :class:`SqlProject` ORM row to a :class:`Project`.
@@ -110,6 +153,7 @@ def _to_entity(row: SqlProject) -> Project:
         config=_decode_config(row.config),
         main_session_id=row.main_session_id or row.legacy_orchestrator_session_id,
         mandate=row.mandate,
+        mandate_proposals=_decode_proposals(row.mandate_proposals),
     )
 
 
@@ -404,6 +448,75 @@ class SqlAlchemyProjectStore(ProjectStore):
             return True
 
         return run_write_transaction(self._session_immediate, "delete_project", write)
+
+    def propose_mandate_addition(
+        self,
+        project_id: str,
+        text: str,
+        *,
+        user_id: str | None,
+        session_id: str | None = None,
+    ) -> tuple[Project, MandateProposal] | None:
+        """Queue an addition for the owner to accept; it changes no instructions until then."""
+        trimmed = text.strip()
+        size = len(trimmed.encode("utf-8"))
+        if not trimmed or size > MANDATE_PROPOSAL_MAX_BYTES:
+            raise OmnigentError(
+                f"a mandate proposal must be 1 to {MANDATE_PROPOSAL_MAX_BYTES} bytes (got {size})",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        proposal = MandateProposal(
+            id=uuid.uuid4().hex, text=trimmed, created_at=now_epoch(), session_id=session_id
+        )
+
+        def write(session: Session) -> tuple[Project, MandateProposal] | None:
+            require_active_account(session, user_id)
+            row = session.get(
+                SqlProject, (current_workspace_id(), project_id), with_for_update=True
+            )
+            if row is None or row.user_id != user_id:
+                return None
+            pending = _decode_proposals(row.mandate_proposals)
+            if len(pending) >= MANDATE_PROPOSALS_MAX_PENDING:
+                raise OmnigentError(
+                    f"{len(pending)} mandate proposals already await the owner; "
+                    "ask them to accept or dismiss one first",
+                    code=ErrorCode.CONFLICT,
+                )
+            row.mandate_proposals = _encode_proposals([*pending, proposal])
+            session.flush()
+            return _to_entity(row), proposal
+
+        return run_write_transaction(self._session_immediate, "propose_mandate_addition", write)
+
+    def resolve_mandate_proposal(
+        self, project_id: str, proposal_id: str, *, user_id: str | None, accept: bool
+    ) -> Project | None:
+        """Accept (append to the mandate) or dismiss a pending proposal."""
+
+        def write(session: Session) -> Project | None:
+            require_active_account(session, user_id)
+            row = session.get(
+                SqlProject, (current_workspace_id(), project_id), with_for_update=True
+            )
+            if row is None or row.user_id != user_id:
+                return None
+            pending = _decode_proposals(row.mandate_proposals)
+            proposal = next((entry for entry in pending if entry.id == proposal_id), None)
+            if proposal is None:
+                raise OmnigentError("Mandate proposal not found", code=ErrorCode.NOT_FOUND)
+            if accept:
+                combined = "\n\n".join(part for part in (row.mandate, proposal.text) if part)
+                row.mandate = _normalize_mandate(combined)
+                row.updated_at = now_epoch()
+            row.mandate_proposals = _encode_proposals(
+                [entry for entry in pending if entry.id != proposal_id]
+            )
+            session.flush()
+            return _to_entity(row)
+
+        operation = "accept_mandate_proposal" if accept else "dismiss_mandate_proposal"
+        return run_write_transaction(self._session_immediate, operation, write)
 
     def set_main_session(
         self,

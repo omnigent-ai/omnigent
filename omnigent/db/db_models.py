@@ -921,6 +921,10 @@ class SqlProject(OmnigentBase):
     )
     # Owner-written guidance loaded into every project session; NULL means none.
     mandate: Mapped[str | None] = mapped_column(EnvelopedText(16383), nullable=True)
+    # Proposed mandate additions awaiting the owner; never part of any instructions.
+    mandate_proposals: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        EnvelopedJSON(16383), nullable=True
+    )
 
     __table_args__ = (
         # "list my projects" — prefix scan on (workspace_id, user_id) with

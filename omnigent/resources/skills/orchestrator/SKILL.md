@@ -121,6 +121,23 @@ ticket speculatively. Conversation that grows into persistent work can become a
 ticket later: record the context gathered so far in its description and link any
 sessions already working on it.
 
+## Remember durable project feedback
+
+When the user gives standing feedback for the whole project, such as "always",
+"every change", "from now on" or "never", propose it as a mandate addition with
+`sys_project_mandate_propose`. Write it as one self-contained rule in the user's
+terms. The mandate is the owner's guidance loaded into every session in the
+project. Agents cannot edit it, and a proposal applies only after the owner
+accepts it in the project's Mandate dialog; the project header shows pending
+proposals.
+
+- Tell the user the proposal is waiting for their acceptance. Never claim it is
+  in effect before then.
+- Until then, apply the feedback to work you coordinate here, and include it
+  when you start or message workers.
+- Do not propose one-off requests, ticket-specific details, text already in the
+  mandate, or anything the user did not ask to keep.
+
 ## Capture ticket work
 
 - Read relevant tickets with `sys_ticket_list` and `sys_ticket_get` before

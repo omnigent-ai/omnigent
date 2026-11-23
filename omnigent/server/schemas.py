@@ -6409,6 +6409,35 @@ class ProjectOrderResponse(BaseModel):
     ordered_project_ids: list[str] | None
 
 
+class MandateProposalObject(BaseModel):
+    """
+    A proposed addition to a project's mandate, awaiting the owner.
+
+    :param id: Proposal id (bare 32-char hex).
+    :param text: The proposed addition.
+    :param created_at: Unix epoch seconds when it was proposed.
+    :param session_id: The proposing session, or ``None`` when the owner proposed it.
+    """
+
+    id: str
+    text: str
+    created_at: int
+    session_id: str | None = None
+
+
+class ProposeMandateRequest(BaseModel):
+    """
+    Request body for ``POST /v1/projects/{project_id}/mandate/proposals``.
+
+    :param text: The addition to propose. Trimmed; 1 to 2,000 UTF-8 bytes. It
+        reaches no session's instructions until the owner accepts it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str
+
+
 class ProjectObject(BaseModel):
     """
     A first-class project (see ``designs/PROJECTS_PRD.md``).
@@ -6425,6 +6454,7 @@ class ProjectObject(BaseModel):
         new-chat dialog pre-fills, not enforced requirements.
     :param mandate: Owner-written guidance (markdown) loaded into every agent
         session in the project to set its bounds, or ``None`` when unset.
+    :param mandate_proposals: Proposed additions awaiting the owner, oldest first.
     """
 
     id: str
@@ -6434,6 +6464,7 @@ class ProjectObject(BaseModel):
     updated_at: int | None = None
     config: dict[str, Any] = Field(default_factory=dict)
     mandate: str | None = None
+    mandate_proposals: list[MandateProposalObject] = Field(default_factory=list)
     main_session_id: str | None = None
     main_session_state: Literal["absent", "missing", "archived", "active", "unavailable"] = (
         "absent"

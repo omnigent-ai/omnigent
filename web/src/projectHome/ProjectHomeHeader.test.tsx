@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   projectsLoading: false,
   projectsError: null as Error | null,
   menuArgs: [] as unknown[],
+  mandateProposals: [] as { id: string; text: string; created_at: number }[],
   actions: {
     openRename: vi.fn(),
     openSettings: vi.fn(),
@@ -55,6 +56,17 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
 });
 
 vi.mock("@/components/ProjectIconPicker", () => ({ ProjectLandingIcon: () => null }));
+
+vi.mock("./ProjectMandateDialog", () => ({
+  useProjectMandate: () => ({ data: { mandate_proposals: mocks.mandateProposals } }),
+  ProjectMandateDialog: ({ projectName }: { projectName: string }) => (
+    <Dialog open>
+      <DialogContent aria-describedby={undefined}>
+        <DialogTitle>{`${projectName} mandate`}</DialogTitle>
+      </DialogContent>
+    </Dialog>
+  ),
+}));
 
 vi.mock("@/lib/projectTicketsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof ticketsApi>()),
@@ -153,6 +165,7 @@ function renderNavigation(view: "chat" | "board" = "board", stages = true, summa
 
 beforeEach(() => {
   mocks.isMobile = false;
+  mocks.mandateProposals = [];
   mocks.projectsLoading = false;
   mocks.projectsError = null;
   useProjectComposerStore.setState({ open: false });
@@ -261,6 +274,41 @@ describe("ProjectHomeTitle", () => {
     await user.click(screen.getByRole("button", { name: "Close editor" }));
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(trigger).toHaveFocus();
+  });
+
+  function renderMandateHeader() {
+    const client = new QueryClient();
+    clients.push(client);
+    render(
+      <QueryClientProvider client={client}>
+        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, project_mandate: true }}>
+          <MemoryRouter initialEntries={["/projects/Payments"]}>
+            <TooltipProvider>
+              <ProjectHomeTitle projectName="Payments" />
+            </TooltipProvider>
+          </MemoryRouter>
+        </CapabilitiesProvider>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("offers the mandate editor in the project menu", async () => {
+    const user = userEvent.setup();
+    renderMandateHeader();
+    expect(screen.queryByTestId("project-mandate-proposals-button")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Project actions for Payments" }));
+    await user.click(screen.getByRole("menuitem", { name: "Edit mandate" }));
+    expect(screen.getByRole("dialog", { name: "Payments mandate" })).toBeInTheDocument();
+  });
+
+  it("flags proposed mandate additions waiting for the owner", async () => {
+    mocks.mandateProposals = [
+      { id: "a", text: "Attach a video.", created_at: 1 },
+      { id: "b", text: "Never push.", created_at: 2 },
+    ];
+    renderMandateHeader();
+    await userEvent.click(screen.getByRole("button", { name: "2 proposed mandate additions" }));
+    expect(screen.getByRole("dialog", { name: "Payments mandate" })).toBeInTheDocument();
   });
 
   it("hides the title and moves the project actions beside New session on phones", () => {

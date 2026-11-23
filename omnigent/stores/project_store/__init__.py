@@ -18,6 +18,7 @@ from collections.abc import Callable
 from typing import Any, Literal, TypedDict, TypeVar
 
 from omnigent.entities import Project
+from omnigent.entities.project import MandateProposal
 
 
 class ProjectOrderPreference(TypedDict):
@@ -162,6 +163,39 @@ class ProjectStore(ABC):
         expected_main_session_id: str | None = None,
     ) -> Project:
         """Compare-and-set the main session; a repeated assignment is idempotent."""
+        raise NotImplementedError
+
+    def propose_mandate_addition(
+        self,
+        project_id: str,
+        text: str,
+        *,
+        user_id: str | None,
+        session_id: str | None = None,
+    ) -> tuple[Project, MandateProposal] | None:
+        """
+        Queue an addition to the mandate; it reaches no instructions until accepted.
+
+        :param project_id: The owned project.
+        :param text: The addition, trimmed; at most 2,000 UTF-8 bytes.
+        :param user_id: The requesting owner.
+        :param session_id: The proposing session, or ``None`` for the owner.
+        :returns: The project and new proposal, or ``None`` if not found / not owned.
+        :raises OmnigentError: ``INVALID_INPUT`` for blank or oversized text,
+            ``CONFLICT`` when the pending list is full.
+        """
+        raise NotImplementedError
+
+    def resolve_mandate_proposal(
+        self, project_id: str, proposal_id: str, *, user_id: str | None, accept: bool
+    ) -> Project | None:
+        """
+        Accept a pending proposal, appending it to the mandate, or dismiss it.
+
+        :returns: The updated project, or ``None`` if not found / not owned.
+        :raises OmnigentError: ``NOT_FOUND`` for an unknown proposal,
+            ``INVALID_INPUT`` when accepting would exceed the mandate limit.
+        """
         raise NotImplementedError
 
     @abstractmethod

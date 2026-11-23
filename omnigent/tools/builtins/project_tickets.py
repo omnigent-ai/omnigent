@@ -4,6 +4,7 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from omnigent.entities.project import MANDATE_PROPOSAL_MAX_BYTES
 from omnigent.entities.project_ticket import (
     CommentOnTicket,
     CreateTicket,
@@ -72,6 +73,18 @@ class LinkSessionTicket(TicketSessionLinkOptions):
 
 class LinkTickets(LinkRelatedTicket):
     ticket_id: str
+
+
+class ProposeMandateAddition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(
+        min_length=1,
+        max_length=MANDATE_PROPOSAL_MAX_BYTES,
+        description=(
+            "The addition in the user's terms, written as a standing rule for every agent in "
+            "the project, e.g. 'Run the UI tests before moving a ticket to review.'"
+        ),
+    )
 
 
 class _TicketTool(Tool):
@@ -204,6 +217,23 @@ class SysTicketLinkTool(_TicketTool):
     arguments = LinkTickets
 
 
+class SysProjectMandateProposeTool(_TicketTool):
+    tool_name = "sys_project_mandate_propose"
+    help_text = (
+        "Propose an addition to this project's mandate, the owner's standing guidance loaded "
+        "into every agent session in the project. Use it when the user asks for durable "
+        "project-wide feedback to be remembered, such as 'always', 'every change' or 'from "
+        "now on'. The proposal changes nothing until the owner accepts it in the project's "
+        "Mandate dialog, so tell the user it is waiting for them. Never claim it is in "
+        "effect. Agents cannot edit the mandate directly. Scoped to this session's project."
+    )
+    arguments = ProposeMandateAddition
+
+    @classmethod
+    def description(cls) -> str:
+        return cls.help_text
+
+
 TICKET_TOOL_CLASSES = (
     SysTicketListTool,
     SysTicketGetTool,
@@ -213,5 +243,6 @@ TICKET_TOOL_CLASSES = (
     SysTicketCommentTool,
     SysSessionLinkTicketTool,
     SysTicketLinkTool,
+    SysProjectMandateProposeTool,
 )
 TICKET_TOOLS = {tool.name(): tool for tool in TICKET_TOOL_CLASSES}

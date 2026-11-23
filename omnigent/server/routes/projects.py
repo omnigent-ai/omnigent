@@ -23,6 +23,7 @@ from fastapi import APIRouter, Query, Request
 from sqlalchemy.exc import IntegrityError
 
 from omnigent.entities import Project
+from omnigent.entities.project import MandateProposal
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server.auth import AuthProvider
@@ -41,12 +42,14 @@ from omnigent.server.schemas import (
     CreateProjectRequest,
     ProjectOrderRequest,
     ProjectOrderResponse,
+    ProposeMandateRequest,
     UpdateProjectRequest,
 )
 from omnigent.server.session_orchestration import require_named_source_private
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore, apply_project_order
+from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 _DEFAULT_PROJECT_PAGE = 50
 _MAX_PROJECT_PAGE = 200
@@ -66,14 +69,25 @@ def _to_response(project: Project) -> dict[str, Any]:
         "updated_at": project.updated_at,
         "config": project.config,
         "mandate": project.mandate,
+        "mandate_proposals": [_proposal_response(entry) for entry in project.mandate_proposals],
         "main_session_id": project.main_session_id,
         # Deprecated response alias; remove in 0.25.0.
         "orchestrator_session_id": project.main_session_id,
     }
 
 
+def _proposal_response(proposal: MandateProposal) -> dict[str, Any]:
+    """Serialize a pending proposal as a ``MandateProposalObject``."""
+    return {
+        "id": proposal.id,
+        "text": proposal.text,
+        "created_at": proposal.created_at,
+        "session_id": proposal.session_id,
+    }
+
+
 def _refuse_agent_mandate_write(request: Request, mandate: str | None) -> None:
-    """Keep the mandate owner-written: agents it bounds may not set or change it.
+    """Keep the mandate owner-written: agents it bounds may only propose additions.
 
     :param request: The incoming request; agent tools mark theirs with
         :data:`ORCHESTRATION_SOURCE_HEADER`.
@@ -82,7 +96,8 @@ def _refuse_agent_mandate_write(request: Request, mandate: str | None) -> None:
     """
     if mandate is not None and ORCHESTRATION_SOURCE_HEADER in request.headers:
         raise OmnigentError(
-            "Only the project owner can change a project's mandate",
+            "Only the project owner can change a project's mandate; propose an addition "
+            "with sys_project_mandate_propose instead",
             code=ErrorCode.FORBIDDEN,
         )
 
@@ -316,6 +331,84 @@ def create_projects_router(
         # their projects cache until a full reload.
         announce_projects_changed(user_id)
         return await response(project)
+
+    @router.post("/projects/{project_id}/mandate/proposals")
+    async def propose_mandate_addition(
+        request: Request, project_id: str, body: ProposeMandateRequest
+    ) -> dict[str, Any]:
+        """Queue a mandate addition for the owner; agents may propose but never apply one.
+
+        :param request: The incoming request; an agent tool's names its session.
+        :param project_id: The project whose mandate the addition extends.
+        :param body: The proposed text.
+        :returns: ``{"proposal": ..., "project": ...}``.
+        :raises OmnigentError: 404 if not found / not owned, 400 for blank or
+            oversized text, 409 when the pending list is full.
+        """
+        user_id = require_user(request, auth_provider)
+        await _require_private_source(request, user_id)
+        source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+        try:
+            source_session = uuid_to_bytes(source).hex() if source else None
+        except (InvalidUuidError, ValueError):
+            source_session = None
+        result = await asyncio.to_thread(
+            project_store.propose_mandate_addition,
+            project_id,
+            body.text,
+            user_id=user_id,
+            session_id=source_session,
+        )
+        if result is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        project, proposal = result
+        announce_projects_changed(user_id)
+        return {"proposal": _proposal_response(proposal), "project": await response(project)}
+
+    async def resolve_proposal(
+        request: Request, project_id: str, proposal_id: str, *, accept: bool
+    ) -> dict[str, Any]:
+        user_id = require_user(request, auth_provider)
+        if ORCHESTRATION_SOURCE_HEADER in request.headers:
+            raise OmnigentError(
+                "Only the project owner can accept or dismiss a mandate proposal",
+                code=ErrorCode.FORBIDDEN,
+            )
+        project = await asyncio.to_thread(
+            project_store.resolve_mandate_proposal,
+            project_id,
+            proposal_id,
+            user_id=user_id,
+            accept=accept,
+        )
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        announce_projects_changed(user_id)
+        return await response(project)
+
+    @router.post("/projects/{project_id}/mandate/proposals/{proposal_id}/accept")
+    async def accept_mandate_proposal(
+        request: Request, project_id: str, proposal_id: str
+    ) -> dict[str, Any]:
+        """Append a pending proposal to the mandate. Owner only, never an agent tool.
+
+        :returns: The updated project.
+        :raises OmnigentError: 403 for an agent request, 404 for an unknown
+            project or proposal, 400 when the mandate would exceed its limit.
+        """
+        return await resolve_proposal(request, project_id, proposal_id, accept=True)
+
+    @router.delete("/projects/{project_id}/mandate/proposals/{proposal_id}")
+    async def dismiss_mandate_proposal(
+        request: Request, project_id: str, proposal_id: str
+    ) -> dict[str, Any]:
+        """Drop a pending proposal without changing the mandate. Owner only.
+
+        :returns: The updated project.
+        :raises OmnigentError: 403 for an agent request, 404 for an unknown
+            project or proposal.
+        """
+        return await resolve_proposal(request, project_id, proposal_id, accept=False)
 
     @router.delete("/projects/{project_id}")
     async def delete_project(request: Request, project_id: str) -> dict[str, Any]:

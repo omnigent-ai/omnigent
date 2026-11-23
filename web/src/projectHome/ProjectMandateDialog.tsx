@@ -11,7 +11,15 @@ import {
 } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
-import { getProject, PROJECT_MANDATE_MAX_BYTES, updateProjectMandate } from "@/lib/projectsApi";
+import {
+  acceptMandateProposal,
+  dismissMandateProposal,
+  getProject,
+  PROJECT_MANDATE_MAX_BYTES,
+  updateProjectMandate,
+  type MandateProposal,
+  type Project,
+} from "@/lib/projectsApi";
 import { TicketError } from "./TicketControls";
 import { useTicketProject } from "./useProjectTickets";
 
@@ -20,6 +28,16 @@ const encoder = new TextEncoder();
 /** Bytes the server counts against the limit: it stores the trimmed text. */
 function mandateBytes(text: string): number {
   return encoder.encode(text.trim()).length;
+}
+
+/** The project's mandate and pending proposals; agents' proposals refresh it live. */
+export function useProjectMandate(projectId: string | null, enabled = true) {
+  return useQuery<Project>({
+    queryKey: ["project-mandate", projectId],
+    queryFn: () => getProject(projectId as string),
+    enabled: projectId !== null && enabled,
+    staleTime: 30_000,
+  });
 }
 
 /** Edits the guidance every agent session in the project receives as its bounds. */
@@ -33,30 +51,48 @@ export function ProjectMandateDialog({
   onCloseAutoFocus?: ComponentProps<typeof DialogContent>["onCloseAutoFocus"];
 }) {
   const { projectId, projects, ensure } = useTicketProject(projectName);
-  const query = useQuery({
-    queryKey: ["project-mandate", projectId],
-    queryFn: async () => (await getProject(projectId as string)).mandate ?? "",
-    enabled: projectId !== null,
-  });
-  // A label-only folder has no row yet; it starts blank and saving creates it.
+  const query = useProjectMandate(projectId);
+  // The text the draft started from, to tell unsaved edits apart from server changes.
+  const [loaded, setLoaded] = useState<string | null>(null);
   const [draft, setDraft] = useState<string | null>(null);
   useEffect(() => {
     if (draft !== null || projects.isLoading || projects.error) return;
-    if (projectId === null) setDraft("");
-    else if (query.data !== undefined) setDraft(query.data);
+    // A label-only folder has no row yet; it starts blank and saving creates it.
+    const initial = projectId === null ? "" : query.data ? (query.data.mandate ?? "") : null;
+    if (initial === null) return;
+    setLoaded(initial);
+    setDraft(initial);
   }, [draft, projects.isLoading, projects.error, projectId, query.data]);
   const loadError = projects.error ?? query.error;
   const client = useQueryClient();
+  const remember = (project: Project) =>
+    client.setQueryData(["project-mandate", project.id], project);
   const save = useMutation({
     mutationFn: async (mandate: string) => {
       const id = projectId ?? (await ensure.mutateAsync());
       return updateProjectMandate(id, mandate);
     },
     onSuccess: (project) => {
-      client.setQueryData(["project-mandate", project.id], project.mandate ?? "");
+      remember(project);
       onClose();
     },
   });
+  const resolve = useMutation({
+    mutationFn: ({ proposal, accept }: { proposal: MandateProposal; accept: boolean }) =>
+      (accept ? acceptMandateProposal : dismissMandateProposal)(projectId as string, proposal.id),
+    onSuccess: (project, { proposal, accept }) => {
+      remember(project);
+      if (!accept || draft === null) return;
+      const accepted = project.mandate ?? "";
+      // Keep unsaved edits, adding the accepted text so saving them doesn't drop it.
+      const next =
+        draft === loaded ? accepted : [draft.trim(), proposal.text].filter(Boolean).join("\n\n");
+      setLoaded(accepted);
+      setDraft(next);
+    },
+  });
+  const proposals = query.data?.mandate_proposals ?? [];
+  const busy = save.isPending || resolve.isPending;
   const bytes = draft === null ? 0 : mandateBytes(draft);
   const tooLarge = bytes > PROJECT_MANDATE_MAX_BYTES;
   const onSubmit = (event: FormEvent) => {
@@ -67,7 +103,7 @@ export function ProjectMandateDialog({
     <Dialog
       open
       onOpenChange={(open) => {
-        if (!open && !save.isPending) onClose();
+        if (!open && !busy) onClose();
       }}
     >
       <DialogContent
@@ -84,6 +120,48 @@ export function ProjectMandateDialog({
         </DialogHeader>
         {draft !== null ? (
           <form onSubmit={onSubmit} className="flex flex-col gap-2">
+            {proposals.length > 0 && (
+              <section
+                aria-label="Proposed additions"
+                className="flex flex-col gap-2"
+                data-testid="project-mandate-proposals"
+              >
+                <h3 className="font-medium text-ui">Proposed additions</h3>
+                <p className="text-sm text-muted-foreground">
+                  Agents suggested these from your feedback. They apply only once you accept them.
+                </p>
+                {proposals.map((proposal) => (
+                  <div
+                    key={proposal.id}
+                    className="flex flex-col gap-2 rounded-lg border border-border p-2.5 sm:flex-row sm:items-start"
+                    data-testid="project-mandate-proposal"
+                  >
+                    <p className="min-w-0 flex-1 whitespace-pre-wrap text-sm">{proposal.text}</p>
+                    <div className="flex shrink-0 gap-1">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        disabled={busy}
+                        onClick={() => resolve.mutate({ proposal, accept: false })}
+                      >
+                        Dismiss
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        disabled={busy}
+                        onClick={() => resolve.mutate({ proposal, accept: true })}
+                      >
+                        Accept
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+                <TicketError error={resolve.error} />
+              </section>
+            )}
             <Textarea
               aria-label="Project mandate"
               data-testid="project-mandate-input"
@@ -92,7 +170,7 @@ export function ProjectMandateDialog({
               placeholder="e.g. Only change files under docs/. Never push or open pull requests."
               aria-invalid={tooLarge || undefined}
               className="min-h-48 max-h-[55dvh] font-mono text-sm"
-              disabled={save.isPending}
+              disabled={busy}
             />
             <p
               className={tooLarge ? "text-sm text-destructive" : "text-sm text-muted-foreground"}
@@ -102,14 +180,14 @@ export function ProjectMandateDialog({
             </p>
             <TicketError error={save.error} />
             <DialogFooter className="border-t-0 bg-transparent">
-              <Button type="button" variant="ghost" onClick={onClose} disabled={save.isPending}>
+              <Button type="button" variant="ghost" onClick={onClose} disabled={busy}>
                 Cancel
               </Button>
               <Button
                 type="submit"
                 data-testid="project-mandate-save"
                 loading={save.isPending}
-                disabled={tooLarge}
+                disabled={tooLarge || resolve.isPending}
               >
                 Save
               </Button>

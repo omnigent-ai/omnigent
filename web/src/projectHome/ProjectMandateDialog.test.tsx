@@ -17,7 +17,11 @@ vi.mock("@/lib/projectsApi", async (importOriginal) => ({
   createProject: vi.fn(),
   getProject: vi.fn(),
   updateProjectMandate: vi.fn(),
+  acceptMandateProposal: vi.fn(),
+  dismissMandateProposal: vi.fn(),
 }));
+
+const PROPOSAL = { id: "proposal", text: "Attach a video to every change.", created_at: 1 };
 
 const clients: QueryClient[] = [];
 function renderDialog() {
@@ -101,6 +105,81 @@ describe("Project mandate editor", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("project mandate too large");
     expect(input).toHaveValue("Only edit docs/. More.");
     expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("lists proposals and applies them only when the owner accepts one", async () => {
+    vi.mocked(api.getProject).mockResolvedValue({
+      id: "project",
+      name: "Shipping",
+      mandate: "Only edit docs/.",
+      mandate_proposals: [PROPOSAL],
+    });
+    vi.mocked(api.acceptMandateProposal).mockResolvedValue({
+      id: "project",
+      name: "Shipping",
+      mandate: "Only edit docs/.\n\nAttach a video to every change.",
+      mandate_proposals: [],
+    });
+    renderDialog();
+    const input = await screen.findByLabelText("Project mandate");
+    expect(screen.getByTestId("project-mandate-proposal")).toHaveTextContent(PROPOSAL.text);
+    expect(input).toHaveValue("Only edit docs/.");
+    await userEvent.click(screen.getByRole("button", { name: "Accept" }));
+    await waitFor(() =>
+      expect(input).toHaveValue("Only edit docs/.\n\nAttach a video to every change."),
+    );
+    expect(api.acceptMandateProposal).toHaveBeenCalledWith("project", "proposal");
+    expect(screen.queryByTestId("project-mandate-proposals")).toBeNull();
+    expect(api.updateProjectMandate).not.toHaveBeenCalled();
+  });
+
+  it("keeps unsaved edits when accepting, so saving keeps the accepted text", async () => {
+    vi.mocked(api.getProject).mockResolvedValue({
+      id: "project",
+      name: "Shipping",
+      mandate: "Only edit docs/.",
+      mandate_proposals: [PROPOSAL],
+    });
+    vi.mocked(api.acceptMandateProposal).mockResolvedValue({
+      id: "project",
+      name: "Shipping",
+      mandate: "Only edit docs/.\n\nAttach a video to every change.",
+      mandate_proposals: [],
+    });
+    const { onClose } = renderDialog();
+    const input = await screen.findByLabelText("Project mandate");
+    await userEvent.type(input, " Never push.");
+    await userEvent.click(screen.getByRole("button", { name: "Accept" }));
+    await waitFor(() =>
+      expect(input).toHaveValue("Only edit docs/. Never push.\n\nAttach a video to every change."),
+    );
+    await userEvent.click(screen.getByTestId("project-mandate-save"));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(api.updateProjectMandate).toHaveBeenCalledWith(
+      "project",
+      "Only edit docs/. Never push.\n\nAttach a video to every change.",
+    );
+  });
+
+  it("dismisses a proposal without changing the mandate", async () => {
+    vi.mocked(api.getProject).mockResolvedValue({
+      id: "project",
+      name: "Shipping",
+      mandate: "Only edit docs/.",
+      mandate_proposals: [PROPOSAL],
+    });
+    vi.mocked(api.dismissMandateProposal).mockResolvedValue({
+      id: "project",
+      name: "Shipping",
+      mandate: "Only edit docs/.",
+      mandate_proposals: [],
+    });
+    renderDialog();
+    const input = await screen.findByLabelText("Project mandate");
+    await userEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    await waitFor(() => expect(screen.queryByTestId("project-mandate-proposals")).toBeNull());
+    expect(api.dismissMandateProposal).toHaveBeenCalledWith("project", "proposal");
+    expect(input).toHaveValue("Only edit docs/.");
   });
 
   it("does not offer a blank editor when the mandate fails to load", async () => {

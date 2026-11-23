@@ -285,7 +285,7 @@ async def test_source_errors_are_reported_without_writes(status, project_id, nam
 
 
 def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
-    assert len(TICKET_TOOLS) == 8
+    assert len(TICKET_TOOLS) == 9
     for tool in TICKET_TOOLS.values():
         properties = tool().get_schema()["function"]["parameters"]["properties"]
         assert (
@@ -319,3 +319,36 @@ def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
         "color",
         "icon",
     }
+
+
+async def test_mandate_proposal_goes_to_the_callers_project_and_reports_it_pending():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        assert request.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+        if request.url.path == f"/v1/sessions/{SOURCE}":
+            return httpx.Response(200, json={"project_id": PROJECT})
+        assert request.method == "POST"
+        assert request.url.path == f"/v1/projects/{PROJECT}/mandate/proposals"
+        assert json.loads(request.content) == {"text": "Attach a video to every change."}
+        proposal = {"id": TICKET, "text": "Attach a video to every change.", "created_at": 1}
+        return httpx.Response(200, json={"proposal": proposal, "project": {"id": PROJECT}})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server.test"
+    ) as client:
+        result = json.loads(
+            await execute_ticket_tool(
+                "sys_project_mandate_propose",
+                {"text": "Attach a video to every change."},
+                client,
+                SOURCE,
+            )
+        )
+    assert result["status"] == "pending_owner_approval"
+    assert result["proposal"]["id"] == TICKET
+    assert "Not in effect" in result["note"]
+    assert len(requests) == 2
+    description = TICKET_TOOLS["sys_project_mandate_propose"].description()
+    assert "changes nothing until the owner accepts it" in description

@@ -7050,6 +7050,22 @@
         "title": "ProjectSessionCreateRequest",
         "type": "object"
       },
+      "ProposeMandateRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `POST /v1/projects/{project_id}/mandate/proposals`.",
+        "properties": {
+          "text": {
+            "description": "The addition to propose. Trimmed; 1 to 2,000 UTF-8 bytes. It reaches no session's instructions until the owner accepts it.",
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "ProposeMandateRequest",
+        "type": "object"
+      },
       "PullRequestCommentAnchor": {
         "description": "Immutable PR coordinates for a session-only review comment.",
         "properties": {
@@ -21226,6 +21242,170 @@
           }
         },
         "summary": "Update Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/mandate/proposals": {
+      "post": {
+        "description": "Queue a mandate addition for the owner; agents may propose but never apply one.\n\n**Parameters**\n\n- `body` \u2014 The proposed text.\n\n**Returns:** `{\"proposal\": ..., \"project\": ...}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if not found / not owned, 400 for blank or oversized text, 409 when the pending list is full.",
+        "operationId": "propose_mandate_addition_v1_projects__project_id__mandate_proposals_post",
+        "parameters": [
+          {
+            "description": "The project whose mandate the addition extends.",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProposeMandateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Propose Mandate Addition V1 Projects  Project Id  Mandate Proposals Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Propose Mandate Addition",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/mandate/proposals/{proposal_id}": {
+      "delete": {
+        "description": "Drop a pending proposal without changing the mandate. Owner only.\n\n**Returns:** The updated project.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 for an agent request, 404 for an unknown project or proposal.",
+        "operationId": "dismiss_mandate_proposal_v1_projects__project_id__mandate_proposals__proposal_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "proposal_id",
+            "required": true,
+            "schema": {
+              "title": "Proposal Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Dismiss Mandate Proposal V1 Projects  Project Id  Mandate Proposals  Proposal Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Dismiss Mandate Proposal",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/mandate/proposals/{proposal_id}/accept": {
+      "post": {
+        "description": "Append a pending proposal to the mandate. Owner only, never an agent tool.\n\n**Returns:** The updated project.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 for an agent request, 404 for an unknown project or proposal, 400 when the mandate would exceed its limit.",
+        "operationId": "accept_mandate_proposal_v1_projects__project_id__mandate_proposals__proposal_id__accept_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "proposal_id",
+            "required": true,
+            "schema": {
+              "title": "Proposal Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Accept Mandate Proposal V1 Projects  Project Id  Mandate Proposals  Proposal Id  Accept Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Accept Mandate Proposal",
         "tags": [
           "projects"
         ]

@@ -35,6 +35,7 @@ class Project:
     :param main_session_id: The project's Orchestrator session, or ``None``.
     :param mandate: Owner-written guidance (markdown) loaded into every agent
         session in the project to set its bounds, or ``None`` when unset.
+    :param mandate_proposals: Proposed additions awaiting the owner, oldest first.
     """
 
     id: str
@@ -45,8 +46,32 @@ class Project:
     config: dict[str, Any] = field(default_factory=dict)
     main_session_id: str | None = None
     mandate: str | None = None
+    mandate_proposals: list[MandateProposal] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class MandateProposal:
+    """
+    An addition to a project's mandate that an agent or the owner proposed.
+
+    It reaches no session's instructions until the owner accepts it, which
+    appends its text to the mandate.
+
+    :param id: Proposal id (bare 32-char hex).
+    :param text: The proposed addition, e.g. ``"Run the UI tests before review."``.
+    :param created_at: Unix epoch seconds when it was proposed.
+    :param session_id: The session that proposed it, or ``None`` for the owner.
+    """
+
+    id: str
+    text: str
+    created_at: int
+    session_id: str | None = None
 
 
 # Most UTF-8 bytes a project mandate may hold. It is added to every project
 # session's instructions, so it stays well inside the stored column's bound.
 PROJECT_MANDATE_MAX_BYTES = 12_000
+# Most UTF-8 bytes in one proposed addition, and how many may wait for review.
+MANDATE_PROPOSAL_MAX_BYTES = 2_000
+MANDATE_PROPOSALS_MAX_PENDING = 5

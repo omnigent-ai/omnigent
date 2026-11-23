@@ -52,6 +52,19 @@ async def execute_ticket_tool(
         if not source.get("project_id"):
             return json.dumps({"error": "File this session into a project before using its board"})
         project_id = uuid_to_bytes(source["project_id"]).hex()
+        if name == "sys_project_mandate_propose":
+            created = await request(
+                "POST", f"/v1/projects/{project_id}/mandate/proposals", json=body
+            )
+            return json.dumps(
+                {
+                    "status": "pending_owner_approval",
+                    "proposal": created["proposal"],
+                    "note": "Not in effect until the project owner accepts it in the "
+                    "project's Mandate dialog.",
+                },
+                ensure_ascii=False,
+            )
         path = f"/v1/projects/{project_id}/tickets"
         if ticket_id is not None:
             path += f"/{ticket_id}"

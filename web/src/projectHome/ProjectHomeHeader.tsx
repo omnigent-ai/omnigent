@@ -34,7 +34,7 @@ import { useProjectFolderMenu } from "@/shell/Sidebar";
 import { projectHomePath } from "./projectHomeNavigation";
 import { useProjectTicketsEnabled, useTicketStagesEnabled } from "./useProjectTickets";
 import { ProjectBoardActions } from "./ProjectBoardActions";
-import { ProjectMandateDialog } from "./ProjectMandateDialog";
+import { ProjectMandateDialog, useProjectMandate } from "./ProjectMandateDialog";
 import { ProjectTicketStagesDialog } from "./ProjectTicketStagesDialog";
 
 interface ProjectComposerState {
@@ -136,6 +136,14 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
   const itemClass = cn("mobile-touch-target", isMobile && "gap-2.5 px-2.5 py-2");
   return (
     <div className={isMobile ? "contents" : "flex shrink-0 items-center gap-0.5"}>
+      {mandateEnabled && (
+        <MandateProposalsButton
+          projectId={projectId}
+          className={buttonClass}
+          iconClass={iconClass}
+          onOpen={() => setEditingMandate(true)}
+        />
+      )}
       <Tooltip>
         <TooltipTrigger asChild>
           <MobileHeaderButton
@@ -242,6 +250,43 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
         />
       )}
     </div>
+  );
+}
+
+/** Appears while agents' proposed mandate additions wait for the owner. */
+function MandateProposalsButton({
+  projectId,
+  className,
+  iconClass,
+  onOpen,
+}: {
+  projectId: string | null;
+  className: string;
+  iconClass?: string;
+  onOpen: () => void;
+}) {
+  const isMobile = useIsMobileViewport();
+  const pending = useProjectMandate(projectId).data?.mandate_proposals?.length ?? 0;
+  if (pending === 0) return null;
+  const label = `${pending} proposed mandate ${pending === 1 ? "addition" : "additions"}`;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <MobileHeaderButton
+          type="button"
+          variant="ghost"
+          size={isMobile ? "icon-sm" : "sm"}
+          aria-label={label}
+          data-testid="project-mandate-proposals-button"
+          className={cn(className, "text-foreground")}
+          onClick={onOpen}
+        >
+          <ScrollTextIcon className={iconClass} />
+          {!isMobile && pending}
+        </MobileHeaderButton>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">Review proposed mandate additions</TooltipContent>
+    </Tooltip>
   );
 }
 
