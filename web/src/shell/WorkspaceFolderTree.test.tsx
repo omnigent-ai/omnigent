@@ -287,17 +287,16 @@ describe("WorkspaceFolderTree", () => {
     expect(tree.model.focusPath).not.toHaveBeenCalledWith("pkg/inner/");
   });
 
-  it("opens a chosen file, but not a folder or the file already open", async () => {
+  it("opens nothing when only the selection changes", async () => {
     serveListings(SRC_LISTINGS);
     const { onOpenFile } = renderTree("src", "shell/viewer.ts");
     await screen.findByTestId("file-tree");
 
+    // The clicks and keys that open a file are in WorkspaceFolderTree.selection.test.tsx.
     tree.options?.onSelectionChange(["lib/"]);
-    tree.options?.onSelectionChange(["shell/viewer.ts"]);
-    expect(onOpenFile).not.toHaveBeenCalled();
-
     tree.options?.onSelectionChange(["app.ts"]);
-    expect(onOpenFile).toHaveBeenCalledWith("app.ts");
+    tree.options?.onSelectionChange(["app.ts", "lib/", "shell/"]);
+    expect(onOpenFile).not.toHaveBeenCalled();
   });
 
   it("loads a folder's contents the first time it expands", async () => {
@@ -496,7 +495,7 @@ describe("WorkspaceFolderTree in the breadcrumb popover", () => {
     expect(tree.options?.initialSelectedPaths).toEqual(["shell/"]);
   });
 
-  it("lists a folder segment's siblings with that folder selected, and opens a sibling file", async () => {
+  it("lists a folder segment's siblings with that folder selected", async () => {
     serveListings(SRC_LISTINGS);
     const onOpenFile = vi.fn();
     const user = userEvent.setup();
@@ -522,8 +521,5 @@ describe("WorkspaceFolderTree in the breadcrumb popover", () => {
     );
     expect(tree.options?.paths).toEqual(["shell/", "lib/", "app.ts"]);
     expect(tree.options?.initialSelectedPaths).toEqual(["shell/"]);
-    act(() => tree.options?.onSelectionChange(["app.ts"]));
-    expect(onOpenFile).toHaveBeenCalledWith("src/app.ts");
-    expect(screen.queryByRole("dialog")).toBeNull();
   });
 });

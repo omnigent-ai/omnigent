@@ -14,7 +14,9 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { folderTreePath, revealedFolders } from "./breadcrumbPaths";
 import { visibleTreeRow } from "./folderTreeSync";
+import { SingleSelection } from "./fileTree/treeSelection";
 import { initialFolderTree, useLazyFolderTree } from "./fileTree/useLazyFolderTree";
+import { useTreeRowInput } from "./fileTree/useTreeRowInput";
 
 interface WorkspaceFolderTreeProps {
   conversationId: string;
@@ -98,20 +100,23 @@ function LoadedFolderTree({
     initialFolderTree(listings.map((entries, index) => ({ folder: folders[index], entries }))),
   );
   const initialRow = visibleTreeRow(initial.present, revealPath);
-  const onOpenFileRef = useRef(onOpenFile);
-  onOpenFileRef.current = onOpenFile;
 
+  // A file opens from the click, Enter or Space that chose it; selection changes open nothing.
+  const selectionRef = useRef<SingleSelection | null>(null);
   const { model } = useFileTree({
     paths: [...initial.present],
     flattenEmptyDirectories: true,
     initialExpansion: "closed",
     initialExpandedPaths: folders.slice(1).map(folderTreePath),
     initialSelectedPaths: initialRow ? [initialRow] : undefined,
-    onSelectionChange: (selected) => {
-      const path = selected.at(-1);
-      if (!path || path.endsWith("/") || path === revealPath) return;
-      onOpenFileRef.current(path);
-    },
+    onSelectionChange: () => selectionRef.current?.normalize(),
+  });
+  selectionRef.current ??= new SingleSelection(model);
+  const selection = selectionRef.current;
+  const treeContainer = useRef<HTMLDivElement>(null);
+  useTreeRowInput(treeContainer, selection, (path) => {
+    if (path.endsWith("/") || path === revealPath) return;
+    onOpenFile(path);
   });
 
   // Every listed folder stays subscribed, so a refetch or invalidation reaches the tree.
@@ -166,14 +171,12 @@ function LoadedFolderTree({
     if (revealedRow === markedRow.current) return;
     markedRow.current = revealedRow;
     if (!revealedRow || readerActed.current) return;
-    for (const path of model.getSelectedPaths()) model.getItem(path)?.deselect();
-    model.getItem(revealedRow)?.select();
+    selection.selectWithoutFocus(revealedRow);
     setFocusTarget(revealedRow);
-  }, [model, revealedRow]);
+  }, [selection, revealedRow]);
 
   // Land keyboard focus on the revealed entry, or the first row, once the
   // virtualized rows have rendered.
-  const treeContainer = useRef<HTMLDivElement>(null);
   useEffect(() => {
     let frame = 0;
     let attempts = 0;
