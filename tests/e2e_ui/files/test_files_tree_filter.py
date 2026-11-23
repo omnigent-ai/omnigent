@@ -14,16 +14,14 @@ from __future__ import annotations
 import re
 import shutil
 from collections.abc import Iterator
-from pathlib import Path
 
 import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
-from tests.e2e_ui.files.test_file_breadcrumbs import _open_workspace
+from tests.e2e_ui.files.test_file_breadcrumbs import _open_workspace, _session_workspace
 from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 _FILES = {
     "src/ui/button.ts": "button-sentinel\n",
     "src/ui/button.test.ts": "button test\n",
@@ -41,10 +39,11 @@ def filter_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]
             json={"content": content, "encoding": "utf-8"},
             timeout=10.0,
         ).raise_for_status()
+    workspace = _session_workspace(base_url, session_id)
     try:
         yield (base_url, session_id)
     finally:
-        shutil.rmtree(_REPO_ROOT / session_id, ignore_errors=True)
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def _row(container: Locator, path: str) -> Locator:

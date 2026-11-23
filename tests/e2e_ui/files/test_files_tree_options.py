@@ -12,17 +12,15 @@ from __future__ import annotations
 import re
 import shutil
 from collections.abc import Iterator
-from pathlib import Path
 
 import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
 from tests._helpers.polling import poll_until
-from tests.e2e_ui.files.test_file_breadcrumbs import _open_workspace
+from tests.e2e_ui.files.test_file_breadcrumbs import _open_workspace, _session_workspace
 from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 # Alphabetical and size order disagree, and one file is hidden (shown by default). The
 # large file is written first, so only a real size sort puts it before the newer alpha.txt.
 _FILES = {"zulu.txt": "z" * 4000 + "\n", "alpha.txt": "a\n", ".env": "SECRET=1\n"}
@@ -37,10 +35,11 @@ def options_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]
             json={"content": content, "encoding": "utf-8"},
             timeout=10.0,
         ).raise_for_status()
+    workspace = _session_workspace(base_url, session_id)
     try:
         yield (base_url, session_id)
     finally:
-        shutil.rmtree(_REPO_ROOT / session_id, ignore_errors=True)
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def _names(sidebar: Locator) -> list[str]:

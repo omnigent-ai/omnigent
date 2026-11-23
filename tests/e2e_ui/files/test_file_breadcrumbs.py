@@ -22,10 +22,20 @@ from playwright.sync_api import Locator, Page, expect
 from tests.e2e_ui.conftest import open_right_rail
 from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app, _set_flag
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 _DESKTOP = {"width": 1440, "height": 900}
 _LONG_PATH = "services/platform/ingestion/pipelines/streaming/handlers/event_router.py"
 _FILES = ("src/pkg/alpha.py", "src/pkg/beta.py", "src/top.py", _LONG_PATH)
+
+
+def _session_workspace(base_url: str, session_id: str) -> Path:
+    """The session's workspace on its host, where the filesystem PUTs write."""
+    response = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/shell",
+        json={"command": "pwd", "timeout": 30},
+        timeout=60.0,
+    )
+    response.raise_for_status()
+    return Path(response.json()["stdout"].strip().splitlines()[-1])
 
 
 @pytest.fixture
@@ -37,10 +47,11 @@ def breadcrumb_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, s
             json={"content": f"# {path}\n", "encoding": "utf-8"},
             timeout=10.0,
         ).raise_for_status()
+    workspace = _session_workspace(base_url, session_id)
     try:
         yield (base_url, session_id)
     finally:
-        shutil.rmtree(_REPO_ROOT / session_id, ignore_errors=True)
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def _mac(page: Page) -> bool:
