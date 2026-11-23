@@ -253,6 +253,26 @@ class SqlAlchemyFileStore(FileStore):
                 has_more=has_more,
             )
 
+    def list_by_metadata(
+        self, key: str, value: str, limit: int = 200
+    ) -> builtins.list[StoredFile]:
+        """Return unscoped files whose ``source_metadata[key] == value``, newest first."""
+        # source_metadata is JSON text; narrow in SQL, then confirm exactly in Python.
+        needle = json.dumps(value)
+        with self._session("list_files_by_metadata") as session:
+            stmt = (
+                select(SqlFile)
+                .where(
+                    SqlFile.workspace_id == current_workspace_id(),
+                    SqlFile.session_id.is_(None),
+                    SqlFile.source_metadata.contains(needle),
+                )
+                .order_by(desc(SqlFile.created_at), desc(SqlFile.id))
+                .limit(limit * 2)
+            )
+            rows = [_to_entity(row) for row in session.execute(stmt).scalars().all()]
+        return [row for row in rows if (row.source_metadata or {}).get(key) == value][:limit]
+
     def delete(
         self,
         file_id: str,

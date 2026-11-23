@@ -1,8 +1,9 @@
 import { Fragment, useState, type KeyboardEvent, type ReactNode, type Ref } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   BotIcon,
   ExternalLinkIcon,
+  FileTextIcon,
   GitPullRequestIcon,
   LinkIcon,
   Maximize2Icon,
@@ -37,6 +38,8 @@ import { cn } from "@/lib/utils";
 import { ProjectOrchestrator } from "./ProjectOrchestrator";
 import {
   createTicket,
+  getProjectFile,
+  openProjectFile,
   ticketOutputs,
   ticketEventStage,
   type ProjectTicket,
@@ -733,6 +736,7 @@ function TicketOutputs({ projectId, ticketId }: { projectId: string; ticketId: s
       {(
         [
           ["pull_request", "Pull requests"],
+          ["artifact", "Files"],
           ["link", "Links"],
         ] as const
       ).map(([type, label]) => {
@@ -765,7 +769,53 @@ function TicketOutputs({ projectId, ticketId }: { projectId: string; ticketId: s
   );
 }
 
+function TicketArtifactLink({ output, inline }: { output: TicketOutput; inline: boolean }) {
+  const file = useQuery({
+    queryKey: ["project-file", output.url],
+    queryFn: () => getProjectFile(output.url),
+    staleTime: Infinity,
+  });
+  const [error, setError] = useState<string | null>(null);
+  const name = file.data?.title ?? file.data?.filename ?? "Project file";
+  return (
+    <button
+      type="button"
+      title={name}
+      onClick={() => {
+        setError(null);
+        openProjectFile(output.url, file.data?.filename ?? "file").catch((reason: unknown) =>
+          setError(reason instanceof Error ? reason.message : "Couldn't open the file"),
+        );
+      }}
+      className={cn(
+        "min-w-0 rounded-sm text-left text-foreground underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        inline
+          ? "wrap-anywhere hover:underline"
+          : "flex w-full items-center gap-3 p-3 transition-colors hover:bg-muted/40 focus-visible:ring-inset",
+      )}
+    >
+      {!inline && <FileTextIcon aria-hidden className="size-4 shrink-0 text-muted-foreground" />}
+      <span className={inline ? undefined : "min-w-0 flex-1"}>
+        <span className={inline ? undefined : "block truncate text-sm font-medium"}>{name}</span>
+        {!inline && (
+          <span className="block text-sm text-muted-foreground">
+            {error ??
+              (file.data ? `Project file · ${formatBytes(file.data.bytes)}` : "Project file")}
+          </span>
+        )}
+      </span>
+    </button>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function TicketOutputLink({ output, inline = false }: { output: TicketOutput; inline?: boolean }) {
+  if (output.type === "artifact") return <TicketArtifactLink output={output} inline={inline} />;
   const url = parseHttpUrl(output.url);
   if (!url) return null;
   const pullRequest =
@@ -1047,6 +1097,8 @@ function TicketActivityItem({
         ) : event.kind === "output" ? (
           event.payload.type === "pull_request" ? (
             <GitPullRequestIcon aria-hidden className="size-3.5" />
+          ) : event.payload.type === "artifact" ? (
+            <FileTextIcon aria-hidden className="size-3.5" />
           ) : (
             <LinkIcon aria-hidden className="size-3.5" />
           )

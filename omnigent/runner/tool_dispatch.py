@@ -8288,7 +8288,15 @@ async def execute_tool(
         elif tool_name in TICKET_TOOLS:
             from omnigent.runner.project_tickets import execute_ticket_tool
 
-            output = await execute_ticket_tool(tool_name, args, server_client, conversation_id)
+            ticket_workspace = None
+            if tool_name == "sys_project_artifact_save" and conversation_id is not None:
+                os_spec = _effective_runner_os_env_spec(
+                    agent_spec, conversation_id, runner_workspace
+                )
+                ticket_workspace = Path(os_spec.cwd) if os_spec.cwd else None
+            output = await execute_ticket_tool(
+                tool_name, args, server_client, conversation_id, ticket_workspace
+            )
         elif tool_name in _PROJECT_TOOLS:
             from omnigent.runner.session_projects import (
                 execute_project_list,

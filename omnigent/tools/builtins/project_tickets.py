@@ -192,7 +192,8 @@ class SysTicketCommentTool(_TicketTool):
     tool_name = "sys_ticket_comment"
     help_text = (
         "Append a comment or execution summary, optionally with outputs such as "
-        "{type: pull_request, url: ...}. When progress changes the ticket's stage, use "
+        "{type: pull_request, url: ...} or a project file as {type: artifact, url: ...}. "
+        "When progress changes the ticket's stage, use "
         "sys_ticket_update with stage_id and comment together instead. "
         "Worker comments default to terse agent notes that the board folds away; the "
         "orchestrator's and people's comments are for the human. "
@@ -238,6 +239,37 @@ class SysProjectMandateProposeTool(_TicketTool):
         return cls.help_text
 
 
+class SaveProjectArtifact(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: str = Field(
+        min_length=1,
+        max_length=4096,
+        description="Workspace-relative file to save, e.g. 'out/proposal.md' or 'shot.png'.",
+    )
+    title: str | None = Field(default=None, max_length=200, description="Display title.")
+    ticket_id: str | None = Field(
+        default=None, description="Ticket to attach it to with a comment carrying the artifact."
+    )
+    comment: str | None = Field(
+        default=None,
+        max_length=2000,
+        description="Comment posted with the attachment when ticket_id is set.",
+    )
+
+
+class SysProjectArtifactSaveTool(_TicketTool):
+    tool_name = "sys_project_artifact_save"
+    help_text = (
+        "Save a workspace file (document, screenshot, log or other evidence, up to 50 MB) to "
+        "this project's Files so the user can open it from the project and its tickets. "
+        "With ticket_id, also posts a ticket comment with the file as an artifact output. "
+        "Returns the artifact's id and url; pass {type: artifact, url} in a later "
+        "sys_ticket_comment's outputs to attach it elsewhere. Prefer this over publishing to "
+        "external services or reporting local-only paths."
+    )
+    arguments = SaveProjectArtifact
+
+
 TICKET_TOOL_CLASSES = (
     SysTicketListTool,
     SysTicketGetTool,
@@ -248,5 +280,6 @@ TICKET_TOOL_CLASSES = (
     SysSessionLinkTicketTool,
     SysTicketLinkTool,
     SysProjectMandateProposeTool,
+    SysProjectArtifactSaveTool,
 )
 TICKET_TOOLS = {tool.name(): tool for tool in TICKET_TOOL_CLASSES}

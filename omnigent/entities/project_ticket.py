@@ -133,14 +133,33 @@ class TicketLabel(BaseModel):
         return value.strip()
 
 
+_ARTIFACT_PATH = re.compile(
+    r"/v1/projects/([0-9a-fA-F-]{32,36})/files/([0-9a-fA-F-]{32,36})(?:/content)?"
+)
+
+
+def _hex(value: str) -> str:
+    return value.replace("-", "").lower()
+
+
 class TicketOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    type: Literal["pull_request", "link"]
+    type: Literal["pull_request", "link", "artifact"]
     url: str = Field(min_length=1, max_length=2048)
 
     @model_validator(mode="after")
     def canonicalize(self) -> TicketOutput:
+        if self.type == "artifact":
+            # Project artifacts live on this server, so they are stored as its
+            # relative content path rather than an external link.
+            match = _ARTIFACT_PATH.fullmatch(self.url.strip())
+            if match is None:
+                raise ValueError(
+                    "artifact outputs must be a project file path from sys_project_artifact_save"
+                )
+            self.url = f"/v1/projects/{_hex(match[1])}/files/{_hex(match[2])}/content"
+            return self
         parts = urlsplit(self.url.strip())
         if parts.scheme not in ("https", "http") or not parts.hostname:
             raise ValueError("outputs must be HTTP or HTTPS links")

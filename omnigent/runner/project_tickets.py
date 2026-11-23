@@ -2,12 +2,15 @@
 
 import asyncio
 import json
+import mimetypes
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.tools.builtins.project_tickets import TICKET_TOOLS
+from omnigent.tools.builtins.upload_file import safe_resolve
 from omnigent.util.uuid import uuid_to_bytes
 
 
@@ -16,6 +19,7 @@ async def execute_ticket_tool(
     args: dict[str, Any],
     client: httpx.AsyncClient | None,
     source_id: str | None,
+    workspace: Path | None = None,
 ) -> str:
     if client is None or source_id is None:
         return json.dumps(
@@ -52,6 +56,10 @@ async def execute_ticket_tool(
         if not source.get("project_id"):
             return json.dumps({"error": "File this session into a project before using its board"})
         project_id = uuid_to_bytes(source["project_id"]).hex()
+        if name == "sys_project_artifact_save":
+            return await _save_artifact(
+                body, ticket_id, project_id, workspace, request, client, source_id
+            )
         if name == "sys_project_mandate_propose":
             created = await request(
                 "POST", f"/v1/projects/{project_id}/mandate/proposals", json=body
@@ -113,3 +121,46 @@ async def execute_ticket_tool(
         )
     except (ValueError, httpx.HTTPError) as exc:
         return json.dumps({"error": str(exc)})
+
+
+async def _save_artifact(
+    body: dict[str, Any],
+    ticket_id: str | None,
+    project_id: str,
+    workspace: Path | None,
+    request: Any,
+    client: httpx.AsyncClient,
+    source_id: str,
+) -> str:
+    if workspace is None:
+        return json.dumps({"error": "sys_project_artifact_save needs a session workspace"})
+    # The runner reads outside any sandbox, so confine the path to the workspace.
+    resolved = safe_resolve(body["path"], workspace)
+    if not resolved.is_file():
+        return json.dumps({"error": f"Not a file: {body['path']}"})
+    content = await asyncio.to_thread(resolved.read_bytes)
+    content_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+    if resolved.suffix.lower() == ".md":
+        content_type = "text/markdown"
+    form = {key: body[key] for key in ("title",) if body.get(key)}
+    if ticket_id is not None:
+        form["ticket_id"] = ticket_id
+    headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
+    response = await client.post(
+        f"/v1/projects/{project_id}/files",
+        files={"file": (resolved.name, content, content_type)},
+        data=form,
+        headers=headers,
+        timeout=60.0,
+    )
+    response.raise_for_status()
+    artifact = response.json()
+    result: dict[str, Any] = {"artifact": artifact}
+    if ticket_id is not None:
+        text = body.get("comment") or f"Attached `{artifact['title']}`."
+        result["comment"] = await request(
+            "POST",
+            f"/v1/projects/{project_id}/tickets/{ticket_id}/comments",
+            json={"text": text, "outputs": [{"type": "artifact", "url": artifact["url"]}]},
+        )
+    return json.dumps(result, ensure_ascii=False)

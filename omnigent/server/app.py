@@ -4666,6 +4666,18 @@ def create_app(
                     prefix="/v1",
                     tags=["project tickets"],
                 )
+                from omnigent.server.routes.project_files import create_project_files_router
+
+                app.include_router(
+                    create_project_files_router(
+                        ticket_store,
+                        file_store,
+                        artifact_store,
+                        auth_provider=auth_provider,
+                    ),
+                    prefix="/v1",
+                    tags=["project files"],
+                )
 
     if user_settings_store is not None:
         app.include_router(

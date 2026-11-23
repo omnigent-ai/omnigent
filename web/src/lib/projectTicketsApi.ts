@@ -60,7 +60,7 @@ export interface TicketLabel {
   value?: string | null;
 }
 export interface TicketOutput {
-  type: "pull_request" | "link";
+  type: "pull_request" | "link" | "artifact";
   url: string;
 }
 export interface ProjectTicket {
@@ -261,9 +261,11 @@ export function linkRelatedTicket(
 export function ticketOutputs(events: TicketEvent[]): TicketOutput[] {
   const outputs = new Map<string, TicketOutput>();
   for (const { kind, payload } of events) {
-    if (kind !== "output" || typeof payload.url !== "string" || !/^https?:\/\//i.test(payload.url))
-      continue;
-    if (payload.type !== "pull_request" && payload.type !== "link") continue;
+    if (kind !== "output" || typeof payload.url !== "string") continue;
+    if (payload.type === "artifact") {
+      if (!PROJECT_FILE_PATH.test(payload.url)) continue;
+    } else if (payload.type !== "pull_request" && payload.type !== "link") continue;
+    else if (!/^https?:\/\//i.test(payload.url)) continue;
     const output: TicketOutput = { type: payload.type, url: payload.url };
     outputs.set(`${output.type}:${output.url}`, output);
   }
@@ -341,4 +343,59 @@ export async function uploadTicketImage(projectId: string, file: File): Promise<
   );
   if (!response.ok) throw await apiErrorFromResponse(response);
   return (await response.json()) as TicketImage;
+}
+
+/** Content path of a project file, the form an `artifact` ticket output stores. */
+export const PROJECT_FILE_PATH = /^\/v1\/projects\/([0-9a-f]{32})\/files\/([0-9a-f]{32})\/content$/;
+
+export interface ProjectFile {
+  id: string;
+  filename: string;
+  title: string;
+  bytes: number;
+  content_type: string | null;
+  created_at: number;
+  kind: "artifact" | "ticket_attachment";
+  ticket_id: string | null;
+  url: string;
+}
+
+export async function listProjectFiles(projectId: string): Promise<ProjectFile[]> {
+  const response = await authenticatedFetch(`/v1/projects/${encodeURIComponent(projectId)}/files`);
+  if (!response.ok) throw await apiErrorFromResponse(response);
+  return ((await response.json()) as { data: ProjectFile[] }).data;
+}
+
+export async function getProjectFile(contentPath: string): Promise<ProjectFile> {
+  const response = await authenticatedFetch(contentPath.replace(/\/content$/, ""));
+  if (!response.ok) throw await apiErrorFromResponse(response);
+  return (await response.json()) as ProjectFile;
+}
+
+// Blob URLs share the app's origin, so only types that cannot run script open inline.
+const INLINE_FILE_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "application/pdf",
+  "text/plain",
+]);
+
+/** Fetch a project file with the viewer's credentials, then preview or download it. */
+export async function openProjectFile(contentPath: string, filename: string): Promise<void> {
+  const response = await authenticatedFetch(contentPath);
+  if (!response.ok) throw await apiErrorFromResponse(response);
+  const blob = await response.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const type = blob.type.split(";", 1)[0].trim().toLowerCase();
+  if (INLINE_FILE_TYPES.has(type)) {
+    window.open(objectUrl, "_blank", "noopener");
+  } else {
+    const anchor = document.createElement("a");
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    anchor.click();
+  }
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
 }

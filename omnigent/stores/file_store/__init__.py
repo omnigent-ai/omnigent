@@ -134,6 +134,22 @@ class FileStore(ABC):
         """
         ...
 
+    def list_by_metadata(
+        self, key: str, value: str, limit: int = 200
+    ) -> builtins.list[StoredFile]:
+        """
+        Return unscoped files whose ``source_metadata[key] == value``, newest first.
+
+        Project files carry no session; their project is recorded in
+        ``source_metadata`` (see ``omnigent.server.project_files``).
+
+        :param key: Metadata key, e.g. ``"ticket_project_id"``.
+        :param value: Exact string value to match.
+        :param limit: Maximum number of rows.
+        :returns: Matching files.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def delete(
         self,

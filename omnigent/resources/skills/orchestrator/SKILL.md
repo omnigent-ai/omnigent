@@ -86,6 +86,11 @@ Record unavailable metadata in comments while using supported fields.
   for information or authority genuinely needed, then add `needs-human` when
   a response is needed. Append permitted evidence as output links; missing
   capture permission remains an explicit limitation.
+- Keep documents, screenshots and evidence in the project. Workers save files
+  with `sys_project_artifact_save` and attach them as `artifact` outputs. Never
+  offer or ask a worker to publish to an external service (Google Docs, Slack,
+  Jira, gists) unless the user explicitly asked for it; then the project
+  artifact stays the source and sharing goes only to the people they named.
 - Enter the last stage only when the agreed outcome is delivered and
   verified, including any requested human acceptance. Record results in a comment;
   a PR or ended session alone is insufficient. Merge/deployment is required only
