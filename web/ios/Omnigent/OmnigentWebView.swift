@@ -421,8 +421,8 @@ struct OmnigentWebView: UIViewRepresentable {
   {
     var parent: OmnigentWebView
     private weak var webView: WKWebView?
-    /// Where each in-flight `<a download>` is being written, keyed by its download.
-    private var downloadFiles: [WKDownload: URL] = [:]
+    /// Where each in-flight `<a download>` is written, and the fresh directory holding it.
+    private var downloadFiles: [WKDownload: (file: URL, directory: URL)] = [:]
     /// The server this web view is pinned to; nil before the first load. Doubles as
     /// the identity `updateUIView` compares against, so a re-render only reloads
     /// when SwiftUI hands over a different server.
@@ -1649,25 +1649,41 @@ struct OmnigentWebView: UIViewRepresentable {
         completionHandler(nil)
         return
       }
-      let file = directory.appendingPathComponent((suggestedFilename as NSString).lastPathComponent)
-      downloadFiles[download] = file
+      let file = directory.appendingPathComponent(Self.downloadFileName(suggestedFilename))
+      downloadFiles[download] = (file, directory)
       completionHandler(file)
+    }
+
+    /// The page-suggested name as a single path component that stays inside its directory.
+    static func downloadFileName(_ suggestedFilename: String) -> String {
+      let name = (suggestedFilename as NSString).lastPathComponent
+      return ["", ".", "..", "/"].contains(name) ? "download" : name
     }
 
     /// Hands the saved file to the share sheet, which offers Save to Files, AirDrop and Print.
     func downloadDidFinish(_ download: WKDownload) {
-      guard let file = downloadFiles.removeValue(forKey: download) else { return }
-      let share = UIActivityViewController(activityItems: [file], applicationActivities: nil)
-      share.popoverPresentationController?.sourceView = webView
-      share.completionWithItemsHandler = { _, _, _, _ in
-        try? FileManager.default.removeItem(at: file.deletingLastPathComponent())
+      guard let saved = downloadFiles.removeValue(forKey: download) else { return }
+      // A download that outlives its web view (e.g. a server switch) has nowhere to show.
+      guard let webView, isCurrent(webView), let presenter = topViewController() else {
+        try? FileManager.default.removeItem(at: saved.directory)
+        return
       }
-      topViewController()?.present(share, animated: true)
+      let share = UIActivityViewController(activityItems: [saved.file], applicationActivities: nil)
+      if let popover = share.popoverPresentationController {
+        popover.sourceView = webView
+        popover.sourceRect = CGRect(
+          x: webView.bounds.midX, y: webView.bounds.midY, width: 0, height: 0)
+        popover.permittedArrowDirections = []
+      }
+      share.completionWithItemsHandler = { _, _, _, _ in
+        try? FileManager.default.removeItem(at: saved.directory)
+      }
+      presenter.present(share, animated: true)
     }
 
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
-      if let file = downloadFiles.removeValue(forKey: download) {
-        try? FileManager.default.removeItem(at: file.deletingLastPathComponent())
+      if let saved = downloadFiles.removeValue(forKey: download) {
+        try? FileManager.default.removeItem(at: saved.directory)
       }
       let alert = UIAlertController(
         title: "Download failed", message: error.localizedDescription, preferredStyle: .alert)

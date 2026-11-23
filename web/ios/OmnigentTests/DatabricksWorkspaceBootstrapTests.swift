@@ -782,6 +782,14 @@ final class DatabricksLifecycleTests: XCTestCase {
       ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast)
   }
 
+  func testDownloadFileNamesStayInsideTheirDirectory() {
+    XCTAssertEqual(
+      ["report.pdf", "../../Library/settings", "", ".", "..", "/"].map {
+        OmnigentWebView.Coordinator.downloadFileName($0)
+      },
+      ["report.pdf", "settings", "download", "download", "download", "download"])
+  }
+
   private struct CoordinatorFixture {
     let context: DatabricksWebContext
     let credentials: MemoryDatabricksCredentialStore
