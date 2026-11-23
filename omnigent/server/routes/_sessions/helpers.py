@@ -259,6 +259,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_blocked_on_cache,
+    _session_dispatched_turns,
     _session_held_request_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
@@ -5255,6 +5256,8 @@ def _publish_status(
         left running, on its ``"waiting"`` edge. Kept for snapshots until the
         next non-``waiting`` edge; ignored on every other status.
     """
+    # Any status edge tells the server where the runner's turn stands.
+    _session_dispatched_turns.discard(session_id)
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
     # follow-on quiescence signal. This matters for claude-native: the
@@ -8739,6 +8742,7 @@ async def _dispatch_skill_slash_command_to_runner(
             json=runner_body,
             timeout=_RUNNER_FORWARD_TIMEOUT,
         )
+        _session_dispatched_turns.add(session_id)
         event = OutputItemDoneEvent(type="response.output_item.done", item=visible.to_api_dict())
         session_stream.publish(session_id, event.model_dump())
     except (httpx.HTTPError, ConnectionError) as exc:

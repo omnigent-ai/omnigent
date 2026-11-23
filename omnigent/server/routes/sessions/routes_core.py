@@ -164,6 +164,7 @@ from omnigent.server.routes._sessions.common import (
     _NO_TURN_REQUEST,
     _logger,
     _session_background_agents_cache,
+    _session_dispatched_turns,
     _session_turn_request_cache,
     get_server_runner_router,
     set_server_runner_router,
@@ -5136,7 +5137,7 @@ def register_core_routes(
         # A side chat must not inherit a request its source is answering or about
         # to answer, or the side chat's model takes that request up as its own.
         source_running = _session_status_from_cache(source.id, source.live_status) == "running"
-        # A recorded turn start counts too: its running edge can trail the runner's reply.
+        # A runner that took a message counts too: its running edge can trail the reply.
         side_chat_mid_turn = (
             body.side_chat
             and copy_history
@@ -5145,7 +5146,7 @@ def register_core_routes(
             and (
                 source_running
                 or _session_is_starting(source.id)
-                or _session_turn_request_cache.get(source.id) is not None
+                or source.id in _session_dispatched_turns
             )
         )
         up_to_response_id = body.up_to_response_id

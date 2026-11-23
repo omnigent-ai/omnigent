@@ -680,6 +680,10 @@ _MAX_HELD_REQUESTS = 64
 # buffered /compact, so a side chat leaves none of the history out.
 _NO_TURN_REQUEST = ""
 
+# Sessions whose runner took a message, until the server sees their next status
+# edge: a side chat counts the turn in flight before its running edge arrives.
+_session_dispatched_turns: WorkspaceScopedSet[str] = WorkspaceScopedSet()
+
 
 def _record_turn_request(session_id: str, item_id: str) -> None:
     """
@@ -1401,6 +1405,7 @@ __all__ = [
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
     "_session_blocked_on_cache",
+    "_session_dispatched_turns",
     "_session_held_request_cache",
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",

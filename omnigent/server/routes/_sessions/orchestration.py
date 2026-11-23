@@ -259,6 +259,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_blocked_on_cache,
+    _session_dispatched_turns,
     _session_held_request_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
@@ -8780,6 +8781,7 @@ async def _forward_event_to_runner(
                 f"Runner rejected the message: {_reject_detail}",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
+        _session_dispatched_turns.add(session_id)
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         _publish_input_consumed(session_id, persisted_items[0])
@@ -9778,6 +9780,7 @@ def _relinquish_session_live_state(session_id: str) -> None:
     _session_active_response_cache.pop(session_id, None)
     _session_turn_request_cache.pop(session_id, None)
     _session_held_request_cache.pop(session_id, None)
+    _session_dispatched_turns.discard(session_id)
     _session_blocked_on_cache.pop(session_id, None)
     session_live_state.forget_live_status(session_id)
 
