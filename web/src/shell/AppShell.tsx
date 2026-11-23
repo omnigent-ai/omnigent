@@ -2485,18 +2485,20 @@ function AppShellImpl() {
   const tasksTabToOpen = useSessionTasksActions((state) => state.tasksTabToOpen);
   useEffect(() => {
     if (tasksTabToOpen === null || tasksTabToOpen !== conversationId) return;
-    const automatic = useSessionTasksActions.getState().tasksTabAutoOpen;
-    useSessionTasksActions.setState({ tasksTabToOpen: null, tasksTabAutoOpen: false });
+    const requestedBy = useSessionTasksActions.getState().tasksTabRequestedBy;
+    useSessionTasksActions.setState({ tasksTabToOpen: null, tasksTabRequestedBy: "click" });
     if (!railTabsAvailable.tasks) return;
     if (isMobileViewport()) {
       // A drawer the agent opened would cover the chat it's working in.
-      if (automatic) return;
+      if (requestedBy !== "click") return;
       if (!tabsModeRef.current) {
         openTasksPanel();
         return;
       }
     }
     selectRightRailTab("tasks");
+    // The rail keeps the session's saved open state, else the Workspace panel default.
+    if (requestedBy === "session-open") return;
     if (tabsModeRef.current) revealTabsSidebar();
     else setRightPanelOpenAnimated(true);
   });
