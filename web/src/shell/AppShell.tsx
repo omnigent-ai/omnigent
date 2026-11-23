@@ -2479,9 +2479,8 @@ function AppShellImpl() {
     setRightPanelOpenAnimated,
     revealTabsSidebar,
   ]);
-  // The chat's task preview, a task's marker, or the agent's first plan asks
-  // for this session's Tasks tab: open the rail on it, or its drawer on a phone
-  // unless the agent asked, then clear the one-shot request.
+  // A click on the task preview or a task's marker, the agent's first plan, or opening a
+  // session with tasks asks for its Tasks tab; clear the one-shot request, then show it.
   const tasksTabToOpen = useSessionTasksActions((state) => state.tasksTabToOpen);
   useEffect(() => {
     if (tasksTabToOpen === null || tasksTabToOpen !== conversationId) return;
@@ -2489,7 +2488,7 @@ function AppShellImpl() {
     useSessionTasksActions.setState({ tasksTabToOpen: null, tasksTabRequestedBy: "click" });
     if (!railTabsAvailable.tasks) return;
     if (isMobileViewport()) {
-      // A drawer the agent opened would cover the chat it's working in.
+      // Only a click opens the phone drawer; automatic requests would cover the chat.
       if (requestedBy !== "click") return;
       if (!tabsModeRef.current) {
         openTasksPanel();

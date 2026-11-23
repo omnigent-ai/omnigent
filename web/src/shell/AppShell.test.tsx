@@ -348,7 +348,11 @@ import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
 import { bindConversationForTest, useChatStore } from "@/store/chatStore";
-import { openTasksTab, showTasksTabBesideChat } from "@/store/sessionTasksActions";
+import {
+  openTasksTab,
+  showTasksTabBesideChat,
+  useSessionTasksActions,
+} from "@/store/sessionTasksActions";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
 
@@ -3282,11 +3286,15 @@ describe("Right workspace card visibility", () => {
     },
   );
 
-  function bindSessionWithTasks() {
+  function bindSessionWithTasks({ phone = false } = {}) {
+    const viewport: Record<string, boolean> = {
+      "(min-width: 1181px)": !phone,
+      "(max-width: 1180.98px)": phone,
+    };
     const baseMatchMedia = window.matchMedia;
     const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
       ...baseMatchMedia(query),
-      matches: query === "(min-width: 1181px)" || baseMatchMedia(query).matches,
+      matches: viewport[query] ?? baseMatchMedia(query).matches,
     }));
     onTestFinished(() => matchMedia.mockRestore());
     mockConversations([
@@ -3307,6 +3315,7 @@ describe("Right workspace card visibility", () => {
   it.each([
     ["follows the collapsed default", "collapsed", undefined, false],
     ["keeps the rail the user left open", "collapsed", true, true],
+    ["keeps the rail the user collapsed", "open", false, false],
   ] as const)(
     "opening a session with tasks %s, on the Tasks tab",
     async (_, panelDefault, savedOpen, expectOpen) => {
@@ -3347,8 +3356,18 @@ describe("Right workspace card visibility", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
     fireEvent.click(screen.getByRole("link", { name: "Other chat" }));
+    const requests: string[] = [];
+    onTestFinished(
+      useSessionTasksActions.subscribe(({ tasksTabToOpen }) => {
+        if (tasksTabToOpen) requests.push(tasksTabToOpen);
+      }),
+    );
     fireEvent.click(screen.getByRole("link", { name: "Chat with tasks" }));
 
+    await waitFor(() => {
+      expect(requests).toContain("conv_tasks");
+      expect(useSessionTasksActions.getState().tasksTabToOpen).toBeNull();
+    });
     expect(workspaceRail()).toBeNull();
   });
 
@@ -3366,6 +3385,21 @@ describe("Right workspace card visibility", () => {
 
     expect(workspaceRail()).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it.each([
+    ["the session opening", "closed", () => showTasksTabBesideChat("conv_tasks", "session-open")],
+    ["the agent's first plan", "closed", () => showTasksTabBesideChat("conv_tasks", "first-plan")],
+    ["a click", "open", () => openTasksTab("conv_tasks")],
+  ] as const)("on a phone, %s leaves the Tasks drawer %s", async (_, state, requestTasksTab) => {
+    bindSessionWithTasks({ phone: true });
+    renderShell("/c/conv_tasks", serverInfo());
+    await screen.findByTestId("tasks-panel-drawer");
+
+    act(requestTasksTab);
+
+    expect(useSessionTasksActions.getState().tasksTabToOpen).toBeNull();
+    expect(screen.getByTestId("tasks-panel-drawer")).toHaveAttribute("data-state", state);
   });
 
   it.each([true, false])(
