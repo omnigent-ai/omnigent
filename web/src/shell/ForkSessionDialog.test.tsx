@@ -3260,6 +3260,132 @@ describe("ForkSessionDialog", () => {
           expect.anything(),
         );
       });
+
+      it("drops a host's model pick when the fork moves to a sandbox", async () => {
+        useHostModelOptionsMock.mockReturnValue({
+          data: [{ id: "host-model", displayName: "Host model" }],
+          isLoading: false,
+          error: null,
+        } as unknown as ReturnType<typeof useHostModelOptions>);
+        renderDialog({ ...CODING, info: GATEWAY_SANDBOX });
+
+        openModelSelect();
+        fireEvent.click(screen.getByRole("option", { name: "Host model" }));
+        selectSandbox();
+        expect(screen.getByTestId("fork-session-config-model")).toHaveTextContent("Default");
+        fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+        expect(forkSessionMock.mock.calls[0]![1]?.config).toEqual({});
+      });
+
+      function previewReturns(status: string, error: string): void {
+        fetchMock.mockImplementation(async () =>
+          Response.json({
+            configured: false,
+            status,
+            models: [],
+            configuration_revision: null,
+            provider_label: "AI Gateway",
+            default_model: null,
+            error,
+          }),
+        );
+      }
+
+      it("blocks a fork onto a sandbox that can't run the agent, giving the provider's reason", async () => {
+        previewReturns("unsupported", "Claude Code can't run in this sandbox.");
+        setHosts([host(), host({ host_id: "sandbox_src", sandbox_provider: "modal" })]);
+        renderDialog({ ...CODING, sourceHostId: "sandbox_src", info: GATEWAY_SANDBOX });
+
+        openModelSelect();
+        expect(await screen.findByText("Claude Code can't run in this sandbox.")).toBeVisible();
+        fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
+        const submit = screen.getByTestId("fork-session-submit");
+        expect(submit).toHaveAttribute("aria-disabled", "true");
+        fireEvent.click(submit);
+
+        expect(screen.getByTestId("fork-session-field-error")).toHaveTextContent(
+          "Claude Code can't run in this sandbox.",
+        );
+        expect(screen.getByTestId("fork-session-agent-select")).toHaveFocus();
+        expect(forkSessionMock).not.toHaveBeenCalled();
+      });
+
+      it("explains a failed gateway listing and still forks on Default", async () => {
+        previewReturns("unavailable", "The gateway didn't answer.");
+        setHosts([host(), host({ host_id: "sandbox_src", sandbox_provider: "modal" })]);
+        renderDialog({ ...CODING, sourceHostId: "sandbox_src", info: GATEWAY_SANDBOX });
+
+        openModelSelect();
+        expect(await screen.findByText("The gateway didn't answer.")).toBeVisible();
+        fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
+        fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+        expect(forkSessionMock.mock.calls[0]![1]?.config).toEqual({});
+      });
+
+      it("keeps a source's saved inference settings instead of offering the provider's models", async () => {
+        // The server checks a fork's model against the source's saved policy.
+        useSessionMock.mockReturnValue({
+          session: { inferenceConfigured: true, modelOverride: "saved-model" },
+          isLoading: false,
+          error: null,
+        } as unknown as ReturnType<typeof useSession>);
+        setHosts([host(), host({ host_id: "sandbox_src", sandbox_provider: "modal" })]);
+        renderDialog({ ...CODING, sourceHostId: "sandbox_src", info: GATEWAY_SANDBOX });
+
+        openModelSelect();
+        expect(
+          screen.getByText("The fork keeps the original session's model settings."),
+        ).toBeVisible();
+        expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual([
+          "Default",
+        ]);
+        fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
+        fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+        expect(forkSessionMock.mock.calls[0]![1]?.config).toEqual({});
+        expect(fetchMock).not.toHaveBeenCalledWith(
+          expect.stringContaining("/model-options"),
+          expect.anything(),
+        );
+      });
+
+      it("doesn't offer a bound destination's catalog, which a fork doesn't take on", () => {
+        fetchMock.mockImplementation(async () =>
+          Response.json({
+            configured: true,
+            status: "ready",
+            models: [{ id: "bound/model", displayName: "Bound model" }],
+            configuration_revision: "revision-1",
+            provider_label: "Bound provider",
+            default_model: "bound/model",
+          }),
+        );
+        setHosts([host(), host({ host_id: "sandbox_src", sandbox_provider: "modal" })]);
+        renderDialog({
+          ...CODING,
+          sourceHostId: "sandbox_src",
+          info: {
+            managed_sandboxes_enabled: true,
+            sandbox_provider: "modal",
+            sandbox_provider_capabilities: { modal: { inference_models: true } },
+          },
+        });
+
+        openModelSelect();
+        for (const model of CLAUDE_NATIVE_MODELS) {
+          expect(screen.getByRole("option", { name: model.id })).toBeInTheDocument();
+        }
+        expect(screen.queryByRole("option", { name: "Bound model" })).not.toBeInTheDocument();
+        expect(fetchMock).not.toHaveBeenCalledWith(
+          expect.stringContaining("/model-options"),
+          expect.anything(),
+        );
+      });
     });
   });
 });

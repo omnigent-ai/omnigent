@@ -59,6 +59,7 @@ import type { NativeModelOption, Session } from "@/lib/types";
 import { useHosts, useHostModelOptions, type Host } from "@/hooks/useHosts";
 import {
   newSandboxModelOptions,
+  noReachableModelsMessage,
   useNewSandboxModelCatalog,
 } from "@/hooks/useNewSandboxModelCatalog";
 import { getCurrentUserId } from "@/lib/identity";
@@ -146,9 +147,10 @@ const SAME_AS_SOURCE = "__same__";
 const FORK_SELECT_ITEM_SM = "[&_[data-slot=select-item]]:text-sm";
 
 /** Form fields that can block submit, mapped to the control a blocked click focuses. */
-type ForkField = "host" | "directory" | "sandboxRepo" | "sandboxProfile";
+type ForkField = "host" | "agent" | "directory" | "sandboxRepo" | "sandboxProfile";
 const FORK_FIELD_IDS: Record<ForkField, string> = {
   host: "fork-session-host",
+  agent: "fork-session-agent",
   directory: "fork-session-directory",
   sandboxRepo: "fork-session-sandbox-repo-input",
   sandboxProfile: "fork-session-sandbox-profile",
@@ -301,7 +303,7 @@ export interface ForkRunConfigValue {
  * @param selectedHostId - Host whose model catalog feeds the model picker; null
  *   leaves it on Default until a host is chosen.
  * @param modelCatalog - Models to offer instead of the host's, e.g. a new
- *   sandbox's; omitted to list the selected host's.
+ *   sandbox's, and why none are listed; omitted to list the selected host's.
  * @param remembered - Settings to start on in place of the source's, e.g. the
  *   last ones used for a new session. With it, every shown control reports its
  *   value, changed or not: a new session has no source to inherit from.
@@ -324,7 +326,7 @@ export function ForkRunConfig({
   sameFamilyAsSource: boolean;
   sameAgentAsSource: boolean;
   selectedHostId: string | null;
-  modelCatalog?: { options: NativeModelOption[]; loading: boolean };
+  modelCatalog?: { options: NativeModelOption[]; loading: boolean; emptyReason?: string | null };
   remembered?: ForkRunConfigValue;
   onChange: (value: ForkRunConfigValue) => void;
 }) {
@@ -603,9 +605,10 @@ export function ForkRunConfig({
             )}
             {!modelsLoading && modelOptions.length === 0 && (
               <div className="px-2.5 py-1 text-sm text-muted-foreground">
-                {selectedHostId === null && modelCatalog === undefined
-                  ? "Select a host to list models"
-                  : "Models unavailable"}
+                {modelCatalog?.emptyReason ??
+                  (selectedHostId === null && modelCatalog === undefined
+                    ? "Select a host to list models"
+                    : "Models unavailable")}
               </div>
             )}
           </RoutingModelSelect>
@@ -1348,35 +1351,67 @@ function SupportedForkSessionForm({
   const forkEffectiveProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
   // A sandbox the fork will create has no host to list models, so offer its
-  // provider's catalog, as the new-session picker does.
+  // provider's catalog, as the new-session picker does. A fork keeps the
+  // source's saved inference settings, which the server checks the model
+  // against, and doesn't take on a destination's bound profile, so only an
+  // unbound catalog offered to a source without saved settings applies.
+  const sourceInferenceConfigured = sourceSession?.inferenceConfigured === true;
+  const destinationBindsInference =
+    info !== "loading" &&
+    forkEffectiveProvider !== null &&
+    info.sandbox_provider_capabilities?.[forkEffectiveProvider]?.inference_models === true;
   const newSandbox = useNewSandboxModelCatalog(
     forkEffectiveProvider,
     targetHarness,
     switching ? agentChoice : (sourceAgent?.id ?? null),
     getCurrentUserId(),
+    sandboxSelected && !sourceInferenceConfigured && !destinationBindsInference,
+  );
+  // As in New Chat, a provider certain that no model serves the target says why
+  // and blocks the fork; a failed listing only explains the empty menu.
+  const sandboxUnsupportedReason = newSandbox.unsupported
+    ? (newSandbox.preview.data?.error ??
+      noReachableModelsMessage(
+        switching
+          ? switchableAgents.find((agent) => agent.id === agentChoice)?.display_name
+          : sourceAgentDisplay,
+      ))
+    : null;
+  const sandboxModelCatalog = useMemo(() => {
+    if (!sandboxSelected) return undefined;
+    if (sourceInferenceConfigured) {
+      return {
+        options: [],
+        loading: false,
+        emptyReason: "The fork keeps the original session's model settings.",
+      };
+    }
+    return {
+      options: newSandboxModelOptions(
+        targetHarness,
+        newSandbox.catalog,
+        newSandbox.pending || newSandbox.unsupported || newSandbox.boundCatalogError !== null,
+      ),
+      loading: newSandbox.pending,
+      emptyReason:
+        sandboxUnsupportedReason ?? newSandbox.boundCatalogError ?? newSandbox.defaultCatalogError,
+    };
+  }, [
     sandboxSelected,
-  );
-  const sandboxModelCatalog = useMemo(
-    () =>
-      sandboxSelected
-        ? {
-            options: newSandboxModelOptions(
-              targetHarness,
-              newSandbox.catalog,
-              newSandbox.pending || newSandbox.unsupported || newSandbox.boundCatalogError !== null,
-            ),
-            loading: newSandbox.pending,
-          }
-        : undefined,
-    [
-      sandboxSelected,
-      targetHarness,
-      newSandbox.catalog,
-      newSandbox.pending,
-      newSandbox.unsupported,
-      newSandbox.boundCatalogError,
-    ],
-  );
+    sourceInferenceConfigured,
+    targetHarness,
+    newSandbox.catalog,
+    newSandbox.pending,
+    newSandbox.unsupported,
+    newSandbox.boundCatalogError,
+    newSandbox.defaultCatalogError,
+    sandboxUnsupportedReason,
+  ]);
+  // Each destination lists its own models, so the run settings start over when
+  // it changes rather than keep a pick the new list may not offer.
+  const modelCatalogSource = sandboxSelected
+    ? `sandbox:${forkEffectiveProvider ?? ""}`
+    : (selectedHostId ?? "");
   const {
     launchError: sandboxProfileError,
     selection: selectedSandboxProfile,
@@ -1434,6 +1469,9 @@ function SupportedForkSessionForm({
   // (the server provisions both), only a coherent repository.
   const submitBlocker = ((): { field: ForkField; message: string } | null => {
     if (sandboxSelected) {
+      if (sandboxUnsupportedReason !== null) {
+        return { field: "agent", message: sandboxUnsupportedReason };
+      }
       if (sandboxProfileError !== null) {
         return { field: "sandboxProfile", message: sandboxProfileError };
       }
@@ -2038,18 +2076,20 @@ function SupportedForkSessionForm({
               ))}
             </SelectContent>
           </Select>
+          <ForkFieldError message={fieldError("agent")} />
         </div>
 
         {/* Run config (native targets only): model / effort / permission mode.
               Seeds from the source on a same-harness fork, else from the target
               harness's defaults. Renders nothing for a non-native target.
-              key=agentChoice remounts on any agent switch so the pickers'
+              The key remounts on any agent or destination switch so the pickers'
               touched-state and values reset and re-seed from scratch — otherwise
-              a model picked for one harness would leak onto the next and defeat
-              the backend's cross-family reset. */}
+              a model picked for one harness or destination would leak onto the
+              next, defeating the backend's cross-family reset or naming a model
+              the new destination doesn't offer. */}
         {targetAgent !== null && (
           <ForkRunConfig
-            key={agentChoice}
+            key={`${agentChoice}:${modelCatalogSource}`}
             targetHarness={targetHarness}
             targetAgent={targetAgent}
             sourceSession={sourceSession}

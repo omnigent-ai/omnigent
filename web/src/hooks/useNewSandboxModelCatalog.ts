@@ -118,3 +118,8 @@ export function newSandboxModelOptions(
   if (catalog !== undefined) return catalog;
   return harness === "claude-native" && !unavailable ? CLAUDE_BUILT_IN_MODEL_OPTIONS : [];
 }
+
+/** Why a launch is blocked when the provider is certain no model serves *name*. */
+export function noReachableModelsMessage(name: string | undefined): string {
+  return `No models are available for ${name ?? "this harness"}. Ask an admin to enable model access.`;
+}

@@ -333,6 +333,7 @@ import {
 } from "@/hooks/useSandboxModelOptions";
 import {
   newSandboxModelOptions,
+  noReachableModelsMessage,
   useNewSandboxModelCatalog,
 } from "@/hooks/useNewSandboxModelCatalog";
 import { markSandboxLaunch } from "@/hooks/useSandboxLaunchSelectionCheck";
@@ -1220,10 +1221,6 @@ function NewChatPickerLoading({
       <Spinner className="size-4" aria-hidden="true" />
     </span>
   );
-}
-
-function noReachableModelsMessage(name: string | undefined): string {
-  return `No models are available for ${name ?? "this harness"}. Ask an admin to enable model access.`;
 }
 
 /**

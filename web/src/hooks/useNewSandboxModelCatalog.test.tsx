@@ -144,6 +144,47 @@ describe("useNewSandboxModelCatalog", () => {
     expect(result.current.catalog).toBeUndefined();
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it("reports a pending preview without rows", () => {
+    fetchMock.mockReturnValue(new Promise<Response>(() => {}));
+    const { result } = render({ default_models: true });
+    expect(result.current).toMatchObject({ pending: true, catalog: [], unsupported: false });
+  });
+
+  it.each([
+    {
+      name: "a failed default listing",
+      capabilities: { default_models: true },
+      response: () => new Response(JSON.stringify(preview({ models: [], status: "unavailable" }))),
+      expected: { defaultCatalogError: "Could not load AI Gateway models.", catalog: [] },
+    },
+    {
+      name: "a rejected preview request",
+      capabilities: { default_models: true },
+      response: () => new Response(JSON.stringify({ detail: "Gateway down" }), { status: 502 }),
+      expected: { defaultCatalogError: "Gateway down", catalog: [] },
+    },
+    {
+      name: "a bound profile without usable models",
+      capabilities: { inference_models: true },
+      response: () =>
+        new Response(
+          JSON.stringify(preview({ configured: true, models: [], status: "empty", error: "None" })),
+        ),
+      expected: { boundCatalogError: "None", defaultCatalogError: null },
+    },
+    {
+      name: "a harness no model can serve",
+      capabilities: { default_models: true },
+      response: () => new Response(JSON.stringify(preview({ models: [], status: "unsupported" }))),
+      expected: { unsupported: true, defaultCatalogError: null, catalog: [] },
+    },
+  ])("reports $name", async ({ capabilities, response, expected }) => {
+    fetchMock.mockImplementation(async () => response());
+    const { result } = render(capabilities);
+    await waitFor(() => expect(result.current.pending).toBe(false));
+    expect(result.current).toMatchObject(expected);
+  });
 });
 
 describe("newSandboxModelOptions", () => {

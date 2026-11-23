@@ -1,15 +1,11 @@
 """Browser e2e: forking onto a new sandbox lists that sandbox's gateway models.
 
-The fork dialog asked only a connected host for models. A sandbox the fork will
-create has no host yet, so for Claude Code and Codex its Model picker offered
-"Default" alone, with "Select a host to list models", while New Chat listed the
-same provider's gateway models for those agents.
-
-The server, its sandbox provider's model discovery and the SPA are real; the
-mock LLM is the provider's gateway and lists the test's models. The source is a
-Claude Code session with a working directory and no host, so the dialog starts
-on a new sandbox. Its exchange is seeded through the server's store, and no
-sandbox is provisioned.
+A sandbox the fork will create has no host to ask, so its models come from the
+provider. The server, its sandbox provider's model discovery and the SPA are
+real; the mock LLM is the provider's gateway and lists the test's models. The
+source is a Claude Code session with a working directory and no host, so the
+dialog starts on a new sandbox. Its exchange is seeded through the server's
+store, and no sandbox is provisioned.
 """
 
 from __future__ import annotations
