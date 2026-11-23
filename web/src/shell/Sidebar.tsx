@@ -308,6 +308,7 @@ import {
   isOwnedByViewer,
   isSharedAutomationRun,
   sessionInSidebarFolder,
+  isAgentCreatedWorker,
   sessionsListAcceptsDrop,
   withAutomationFolder,
 } from "./sidebarNav";
@@ -351,6 +352,7 @@ import {
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
 import { projectHomePath, projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
+import { useProjectTicketsEnabled } from "@/projectHome/useProjectTickets";
 import { getEmbedRoot } from "../lib/host";
 import { canCreateProject, projectsMatching } from "./projectChoices";
 import {
@@ -1778,9 +1780,16 @@ function ProjectFolder({
     visibleCount: number,
   ) => void;
 }) {
-  const { registerFolder, sortBy, customOrder, applyLocalResolutions } = useSidebarData();
+  const { registerFolder, sortBy, customOrder, applyLocalResolutions, view } = useSidebarData();
   const viewerId = useViewerId();
-  const query = useProjectSessions(name, expanded && !placeholder, sortBy, archived);
+  const hideWorkers = useHideTicketWorkers(view);
+  const query = useProjectSessions(
+    name,
+    expanded && !placeholder,
+    sortBy,
+    archived,
+    hideWorkers && !archived,
+  );
   const watchedRows = useMemo(
     () => query.data?.pages.flatMap((page) => page.data) ?? [],
     [query.data],
@@ -1807,7 +1816,8 @@ function ProjectFolder({
           (c) =>
             (c.archived === true) === archived &&
             sessionInSidebarFolder(c, { id: projectId, name }, viewerId, includeSharedRuns) &&
-            (archived || !isSessionPinned(c, pinnedSet)),
+            (archived || !isSessionPinned(c, pinnedSet)) &&
+            (!hideWorkers || c.id === activeConversationId || !isAgentCreatedWorker(c)),
         ),
         activeOverride,
         frozenSortKeys,
@@ -1816,6 +1826,8 @@ function ProjectFolder({
       ),
     );
   }, [
+    hideWorkers,
+    activeConversationId,
     query.data,
     windowConversations,
     applyLocalResolutions,
@@ -2279,6 +2291,8 @@ function ConversationList({
     loadedRows,
     sharedActive,
   } = useSidebarData();
+  const ticketsEnabled = useProjectTicketsEnabled();
+  const hideWorkers = ticketsEnabled && !view.ticketWorkers;
   const updateView = useStableCallback((patch: Partial<SidebarViewPreferences>) => {
     // Regrouping swaps which sections (and selection scopes) exist, so leave
     // selection the way a Display switch does.
@@ -2625,14 +2639,18 @@ function ConversationList({
           sessionInSidebarFolder(c, { id, name }, viewerId, includeSharedRuns) &&
           !pinnedIdSet.has(c.id),
       );
+      // Hidden workers stay filed, so they never fall through to the flat list.
       inProject.forEach((c) => filedIds.add(c.id));
+      const listedInProject = hideWorkers
+        ? inProject.filter((c) => c.id === activeRootSessionId || !isAgentCreatedWorker(c))
+        : inProject;
       return {
         id,
         name,
         icon: "placeholder" in folder ? null : folder.icon,
         placeholder: "placeholder" in folder,
         conversations: orderSessionFamilies(
-          sortConversations(inProject, activeOverride, frozenKeys, sortBy, customOrder),
+          sortConversations(listedInProject, activeOverride, frozenKeys, sortBy, customOrder),
         ),
       };
     });
@@ -2726,6 +2744,7 @@ function ConversationList({
     // `unseenTick` / `draftIds` aren't read here: they version the stores status buckets read.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
+    hideWorkers,
     allConversations,
     activeRootSessionId,
     pinnedConversations,
@@ -3413,6 +3432,7 @@ function ConversationList({
       multiUser={multiUser}
       view={groupingUi ? view : null}
       onViewChange={updateView}
+      ticketWorkers={ticketsEnabled ? Boolean(view.ticketWorkers) : null}
     />
   );
 
@@ -4277,12 +4297,18 @@ function FilterMenuSub({
   );
 }
 
+/** Whether project folders hide ticket workers: the board lists them, unless the viewer opts in. */
+function useHideTicketWorkers(view: SidebarViewPreferences): boolean {
+  return useProjectTicketsEnabled() && !view.ticketWorkers;
+}
+
 function SessionFilterMenu({
   value,
   onChange,
   multiUser,
   view,
   onViewChange,
+  ticketWorkers,
 }: {
   value: SidebarTab;
   onChange: (value: SidebarTab) => void;
@@ -4290,6 +4316,8 @@ function SessionFilterMenu({
   /** Null while the sidebar_grouping_ui release flag is off: only Display is offered. */
   view: SidebarViewPreferences | null;
   onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
+  /** Whether project folders list ticket workers; null where there's no ticket board. */
+  ticketWorkers: boolean | null;
 }) {
   const triggerLabel = view === null ? "Filter sessions" : "Group, sort, and filter sessions";
   const [menuOpen, setMenuOpen] = useState(false);
@@ -4313,6 +4341,19 @@ function SessionFilterMenu({
         </DropdownMenuRadioItem>
       ))}
     </DropdownMenuRadioGroup>
+  );
+  const ticketWorkersOption = ticketWorkers !== null && (
+    <>
+      <DropdownMenuSeparator />
+      <DropdownMenuCheckboxItem
+        className="mobile-touch-target"
+        checked={ticketWorkers}
+        data-testid="session-show-ticket-workers"
+        onCheckedChange={(checked) => onViewChange({ ticketWorkers: checked })}
+      >
+        Show ticket workers
+      </DropdownMenuCheckboxItem>
+    </>
   );
   return (
     <DropdownMenu
@@ -4349,6 +4390,7 @@ function SessionFilterMenu({
         <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-ui">
           <DropdownMenuLabel className="text-muted-foreground text-sm">Display</DropdownMenuLabel>
           {displayOptions}
+          {ticketWorkersOption}
         </DropdownMenuContent>
       ) : (
         <DropdownMenuContent align="end" className="min-w-56">
@@ -4426,6 +4468,7 @@ function SessionFilterMenu({
               </DropdownMenuCheckboxItem>
             ))}
           </FilterMenuSub>
+          {ticketWorkersOption}
         </DropdownMenuContent>
       )}
     </DropdownMenu>

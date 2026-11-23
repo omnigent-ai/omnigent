@@ -206,6 +206,15 @@ _LABEL_SWAP_ATTEMPTS = 5
 
 # Creation provenance only; this does not confer parentage or permissions.
 CREATED_BY_SESSION_LABEL_KEY = "omnigent.created_by_session_id"
+# The project identity a session runs as; such sessions are chats, not ticket workers.
+PROJECT_IDENTITY_LABEL_KEY = "omnigent.project_identity_id"
+# Agent-created sessions carrying any of these stay in default lists: automation
+# runs and project identities are what the user reads, not background workers.
+AGENT_CREATED_VISIBLE_LABEL_KEYS = (
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SCHEDULED_TASK_LAUNCH_LABEL_KEY,
+    PROJECT_IDENTITY_LABEL_KEY,
+)
 FAMILY_PIN_LABEL_PREFIX = "omnigent.family_pinned."
 MAX_SESSION_FAMILY_MEMBERS = 100
 
@@ -1041,6 +1050,7 @@ class ConversationStore(ABC):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        exclude_agent_created: bool = False,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -1160,6 +1170,10 @@ class ConversationStore(ABC):
             Powers the ``(agent, title)`` child-session lookup in
             ``sys_session_send`` so the server can resolve the target
             in a single indexed query instead of fetching all children.
+        :param exclude_agent_created: When ``True``, omit sessions another
+            session created (``omnigent.created_by_session_id``) unless they
+            carry one of :data:`AGENT_CREATED_VISIBLE_LABEL_KEYS`. Hides ticket
+            workers from project folders. ``False`` (default) disables it.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         :raises omnigent.errors.StaleCursorError: If the ``after``/``before``

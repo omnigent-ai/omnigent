@@ -110,6 +110,7 @@ from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
     _SANDBOX_REPO_LABEL_KEY,
+    AGENT_CREATED_VISIBLE_LABEL_KEYS,
     ARCHIVED_AT_LABEL_KEY,
     CREATED_BY_SESSION_LABEL_KEY,
     FAMILY_PIN_LABEL_PREFIX,
@@ -4131,6 +4132,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        exclude_agent_created: bool = False,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -4540,6 +4542,24 @@ class SqlAlchemyConversationStore(ConversationStore):
                         )
                     )
                 )
+            if exclude_agent_created:
+                # Ticket workers: created by another session and not an automation
+                # run or project identity, which the user reads as chats.
+                labeled = select(SqlConversationLabel.conversation_id).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id()
+                )
+                stmt = stmt.where(
+                    SqlConversation.id.not_in(
+                        labeled.where(
+                            SqlConversationLabel.key == CREATED_BY_SESSION_LABEL_KEY,
+                            SqlConversationLabel.conversation_id.not_in(
+                                labeled.where(
+                                    SqlConversationLabel.key.in_(AGENT_CREATED_VISIBLE_LABEL_KEYS)
+                                )
+                            ),
+                        )
+                    )
+                )
             if after:
                 stmt = self._apply_cursor(
                     session,
@@ -4849,6 +4869,8 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
+        :param exclude_agent_created: Omit ticket workers; see the base
+            :meth:`ConversationStore.list_conversations`.
         :param title: New title, or ``None`` to leave unchanged.
         :param reasoning_effort: Per-session reasoning effort,
             e.g. ``"high"``. ``None`` leaves unchanged.

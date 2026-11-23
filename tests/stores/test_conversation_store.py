@@ -8166,6 +8166,40 @@ def test_list_conversations_filters_by_project_name_dual_read(
     assert labelled.id not in unfiled_ids
 
 
+def test_list_conversations_excludes_agent_created_workers(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``exclude_agent_created`` drops sessions another session created, but
+    keeps automation runs and project identities, which read as chats."""
+    from omnigent.stores.conversation_store import (
+        CREATED_BY_SESSION_LABEL_KEY,
+        PROJECT_IDENTITY_LABEL_KEY,
+        SCHEDULED_TASK_LAUNCH_LABEL_KEY,
+        SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    )
+
+    chat = conversation_store.create_conversation(title="chat")
+    worker = conversation_store.create_conversation(title="worker")
+    automation_worker = conversation_store.create_conversation(title="automation worker")
+    launched = conversation_store.create_conversation(title="launched")
+    identity = conversation_store.create_conversation(title="identity")
+    conversation_store.set_labels(worker.id, {CREATED_BY_SESSION_LABEL_KEY: chat.id})
+    for row, extra in (
+        (automation_worker, {SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1"}),
+        (launched, {SCHEDULED_TASK_LAUNCH_LABEL_KEY: "task_1"}),
+        (identity, {PROJECT_IDENTITY_LABEL_KEY: "identity_1"}),
+    ):
+        conversation_store.set_labels(row.id, {CREATED_BY_SESSION_LABEL_KEY: chat.id, **extra})
+
+    every = {c.id for c in conversation_store.list_conversations(limit=50).data}
+    assert worker.id in every
+    listed = {
+        c.id
+        for c in conversation_store.list_conversations(limit=50, exclude_agent_created=True).data
+    }
+    assert listed == every - {worker.id}
+
+
 @pytest.mark.parametrize("user_id", ["alice", "a" * 112])
 def test_list_conversations_filters_by_pinned_label(
     conversation_store: SqlAlchemyConversationStore,

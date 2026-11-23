@@ -14,6 +14,26 @@ import { isIndentedSibling, isSessionPinned, orderSessionFamilies } from "@/lib/
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
 
+/** Creation provenance: the session that created this one through orchestration. */
+export const CREATED_BY_SESSION_LABEL_KEY = "omnigent.created_by_session_id";
+/** The project identity a session was started for; such sessions are chats. */
+export const PROJECT_IDENTITY_LABEL_KEY = "omnigent.project_identity_id";
+
+/**
+ * A ticket worker: created by another session and not an automation run or a
+ * project identity. Project folders hide these by default; the ticket links them.
+ * Mirrors the server's `exclude_agent_created` list filter.
+ */
+export function isAgentCreatedWorker(conversation: Conversation): boolean {
+  const labels = conversation.labels ?? {};
+  return Boolean(
+    labels[CREATED_BY_SESSION_LABEL_KEY] &&
+    !labels[SCHEDULED_TASK_ORIGIN_LABEL_KEY] &&
+    !labels[SCHEDULED_TASK_LAUNCH_LABEL_KEY] &&
+    !labels[PROJECT_IDENTITY_LABEL_KEY],
+  );
+}
+
 // ── Legacy localStorage pin helpers ───────────────────────────────────────
 //
 // Pins are server-authoritative now, but two paths still touch the legacy

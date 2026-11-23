@@ -1138,6 +1138,31 @@ async def test_list_sessions_pinned_filter(
     assert other_user_pin.id not in ids
 
 
+async def test_list_sessions_excludes_agent_created_workers(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``?exclude_agent_created=true`` omits sessions another session created;
+    the default listing still returns them."""
+    from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
+
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="worker-agent", bundle_location="test:///bundle")
+    chat = conv_store.create_conversation(agent_id=agent_id)
+    worker = conv_store.create_conversation(agent_id=agent_id)
+    conv_store.set_labels(worker.id, {CREATED_BY_SESSION_LABEL_KEY: chat.id})
+
+    default_ids = [s["id"] for s in (await client.get("/v1/sessions")).json()["data"]]
+    assert {chat.id, worker.id} <= set(default_ids)
+    resp = await client.get("/v1/sessions?exclude_agent_created=true")
+    assert resp.status_code == 200
+    ids = [s["id"] for s in resp.json()["data"]]
+    assert chat.id in ids
+    assert worker.id not in ids
+
+
 @pytest.mark.parametrize(
     "label_key",
     [

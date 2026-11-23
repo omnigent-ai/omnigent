@@ -2758,6 +2758,7 @@ async function fetchProjectSessionsPage(
   sortBy: SessionSortBy = "updated_at",
   archived = false,
   signal?: AbortSignal,
+  excludeWorkers = false,
 ): Promise<ConversationsPage> {
   const params = new URLSearchParams({
     order: "desc",
@@ -2767,6 +2768,8 @@ async function fetchProjectSessionsPage(
     project,
     expand_families: "true",
   });
+  // Ticket workers are found from their tickets; older servers ignore this.
+  if (excludeWorkers) params.set("exclude_agent_created", "true");
   // The all+project path resolves owned first-class projects on older servers too.
   if (archived) params.set("include_archived", "true");
   if (after) params.set("after", after);
@@ -2804,6 +2807,8 @@ export function useProjectSessions(
   enabled: boolean,
   sortBy: SessionSortBy = "updated_at",
   archived = false,
+  /** Not in the key: toggling it resets every folder (see `useSidebarSources`). */
+  excludeWorkers = false,
 ) {
   const queryKey = ["project-sessions", project, sortBy, archived];
   const query = useInfiniteQuery({
@@ -2817,6 +2822,7 @@ export function useProjectSessions(
         sortBy,
         archived,
         signal,
+        excludeWorkers,
       ),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>

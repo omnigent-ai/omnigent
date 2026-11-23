@@ -19,6 +19,8 @@ export interface SidebarViewPreferences {
   grouping: SidebarGrouping;
   ordering: SidebarOrdering;
   show: readonly SidebarShowField[];
+  /** List the ticket workers project folders hide by default. */
+  ticketWorkers?: boolean;
   /** Kept while another ordering is selected, so Custom can be restored. */
   custom?: SidebarCustomOrder;
 }
@@ -72,6 +74,7 @@ export function readSidebarViewPreferences(): SidebarViewPreferences {
     ordering: ordering === "custom" && !custom ? DEFAULT_SIDEBAR_VIEW.ordering : ordering,
     // Keep the menu's field order so equal selections compare equal.
     show: SIDEBAR_SHOW_FIELDS.filter((field) => show.includes(field)),
+    ...(stored.ticketWorkers === true && { ticketWorkers: true }),
     ...(custom && { custom }),
   };
 }

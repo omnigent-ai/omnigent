@@ -23600,6 +23600,17 @@
               "title": "Visibility",
               "type": "string"
             }
+          },
+          {
+            "description": "When `True`, omit sessions another session created, except automation runs and project identities \u2014 the ticket workers a project folder hides by default.",
+            "in": "query",
+            "name": "exclude_agent_created",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Exclude Agent Created",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {

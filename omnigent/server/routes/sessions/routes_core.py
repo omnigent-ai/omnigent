@@ -2862,6 +2862,7 @@ def register_core_routes(
         pinned: bool = Query(default=False),
         expand_families: bool = Query(default=False),
         visibility: str = Query(default="all", pattern="^(all|mine|shared|archived)$"),
+        exclude_agent_created: bool = Query(default=False),
     ) -> dict[str, Any]:
         """
         List sessions with cursor-based pagination.
@@ -2928,6 +2929,9 @@ def register_core_routes(
             ``"all"`` (default) returns all accessible non-archived
             sessions, matching the legacy behaviour. ``include_archived``
             adds archived rows to ``"mine"``, ``"shared"`` and ``"all"``.
+        :param exclude_agent_created: When ``True``, omit sessions another
+            session created, except automation runs and project identities —
+            the ticket workers a project folder hides by default.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
         """
@@ -3024,6 +3028,7 @@ def register_core_routes(
                     pinned=pinned,
                     # Pins are per-user: filter to the caller's own pin key.
                     pinned_owner=user_id,
+                    exclude_agent_created=exclude_agent_created,
                 )
                 # Side chats surface only as Workspace-rail tabs, so drop any
                 # side-chat-labeled fork from the sidebar list (it is still a

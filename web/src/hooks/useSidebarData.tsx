@@ -89,9 +89,17 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const client = useQueryClient();
   const serverInfo = useServerInfo();
   const [storedView, setView] = useState(readSidebarViewPreferences);
-  const view = isFeatureEnabled(serverInfo, "sidebar_grouping_ui")
-    ? storedView
-    : DEFAULT_SIDEBAR_VIEW;
+  const groupingUi = isFeatureEnabled(serverInfo, "sidebar_grouping_ui");
+  // The ticket-worker toggle is offered with or without the grouping release flag.
+  const view = useMemo(
+    () =>
+      groupingUi
+        ? storedView
+        : storedView.ticketWorkers
+          ? { ...DEFAULT_SIDEBAR_VIEW, ticketWorkers: true }
+          : DEFAULT_SIDEBAR_VIEW,
+    [groupingUi, storedView],
+  );
   const sortBy: SessionSortBy = sidebarSortBy(sidebarBaseOrdering(view));
   const customOrder = useMemo(
     () => (view.ordering === "custom" && view.custom ? customSortOrder(view.custom) : null),
@@ -116,6 +124,9 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
         }
         void client.resetQueries({ queryKey: PINNED_CONVERSATIONS_KEY });
       }
+      // Folder fetches read the toggle but don't key on it, so reload them.
+      if (Boolean(next.ticketWorkers) !== Boolean(storedView.ticketWorkers))
+        void client.resetQueries({ queryKey: ["project-sessions"] });
       setView(next);
     },
     [storedView, client],
