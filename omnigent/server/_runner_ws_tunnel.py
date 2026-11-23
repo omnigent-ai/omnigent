@@ -97,14 +97,17 @@ class RunnerRuntimeSupportWSError(RuntimeError):
         self.code = code
 
 
-# Match the runner-side WS attach path that
-# ``attach_terminal_by_resource_id`` constructs:
+# Match the runner-side WS attach paths the server routes construct:
 #   ``/v1/sessions/{conv}/resources/terminals/{terminal_id}/attach``
+#   ``/v1/sessions/{conv}/resources/remote_browser/attach``
 #
 # ``session_id`` and ``conversation_id`` are the same identifier by
 # construction, so the captured value feeds
 # ``router.client_for_existing_conversation()``.
-_RUNNER_PATH_RE = re.compile(r"^/v1/sessions/(?P<conv>[^/?]+)/resources/terminals/[^/?]+/attach")
+_RUNNER_PATH_RE = re.compile(
+    r"^/v1/sessions/(?P<conv>[^/?]+)/resources/"
+    r"(?:terminals/[^/?]+|remote_browser)/attach"
+)
 
 
 @dataclass(frozen=True)

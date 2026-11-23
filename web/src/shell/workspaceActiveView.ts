@@ -6,7 +6,15 @@ import type { RightRailTab } from "./railTabs";
 
 /** The page beneath any open shell or file. */
 export type WorkspaceScopeView =
-  "sidechat" | "browser" | "github" | "tasks" | "subagents" | "empty" | "content-search" | "files";
+  | "sidechat"
+  | "browser"
+  | "remote-browser"
+  | "github"
+  | "tasks"
+  | "subagents"
+  | "empty"
+  | "content-search"
+  | "files";
 
 export interface WorkspaceSelection {
   rightRailTab: RightRailTab | null;
@@ -14,12 +22,16 @@ export interface WorkspaceSelection {
   selectedTerminalKey: string | null;
   selectedBrowserId: string | null;
   selectedSideChatId: string | null;
+  /** Whether the remote browser tab is open; absent reads as closed. */
+  remoteBrowserOpen?: boolean;
 }
 
 export interface WorkspaceViewAvailability {
   /** Whether the selected shell's terminal is present. */
   terminalPresent: (key: string) => boolean;
   showBrowserTab: boolean;
+  /** Whether the server offers the remote browser; absent reads as not offered. */
+  showRemoteBrowser?: boolean;
   showGithubTab: boolean;
   /** Whether the session has a Tasks page. */
   showTasksTab: boolean;
@@ -39,6 +51,7 @@ export interface WorkspaceActiveView {
   flat: boolean;
   sideChatSelected: boolean;
   browserSelected: boolean;
+  remoteBrowserSelected: boolean;
 }
 
 export function resolveWorkspaceActiveView(
@@ -56,22 +69,29 @@ export function resolveWorkspaceActiveView(
     rightRailTab === "sidechat" && nothingInFront && selection.selectedSideChatId !== null;
   const browserSelected =
     rightRailTab === "browser" && nothingInFront && selection.selectedBrowserId !== null;
+  const remoteBrowserSelected =
+    rightRailTab === "remote-browser" &&
+    nothingInFront &&
+    selection.remoteBrowserOpen === true &&
+    availability.showRemoteBrowser === true;
   const scope: WorkspaceScopeView =
     sideChatSelected && !availability.mobile
       ? "sidechat"
       : browserSelected && availability.showBrowserTab
         ? "browser"
-        : rightRailTab === "github" && availability.showGithubTab
-          ? "github"
-          : rightRailTab === "tasks" && availability.showTasksTab
-            ? "tasks"
-            : rightRailTab === "subagents" && availability.hasAgentTree
-              ? "subagents"
-              : rightRailTab === null
-                ? "empty"
-                : rightRailTab === "content-search" && availability.showContentSearch
-                  ? "content-search"
-                  : "files";
+        : remoteBrowserSelected
+          ? "remote-browser"
+          : rightRailTab === "github" && availability.showGithubTab
+            ? "github"
+            : rightRailTab === "tasks" && availability.showTasksTab
+              ? "tasks"
+              : rightRailTab === "subagents" && availability.hasAgentTree
+                ? "subagents"
+                : rightRailTab === null
+                  ? "empty"
+                  : rightRailTab === "content-search" && availability.showContentSearch
+                    ? "content-search"
+                    : "files";
   return {
     terminalKey,
     filePath: terminalKey === null ? selectedFilePath : null,
@@ -79,5 +99,6 @@ export function resolveWorkspaceActiveView(
     flat: rightRailTab === "changes",
     sideChatSelected,
     browserSelected,
+    remoteBrowserSelected,
   };
 }

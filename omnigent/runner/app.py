@@ -166,6 +166,7 @@ from omnigent.runner.native.interrupt import NativeInterruptRunner
 from omnigent.runner.native_controls import build_native_controls
 from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+from omnigent.runner.remote_browser import register_remote_browser_routes
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
     TerminalExitEvent,
@@ -9215,6 +9216,7 @@ def create_runner_app(
         server_client=server_client,
         terminal_registry=terminal_registry,
     )
+    register_remote_browser_routes(app)
     _ensure_native_terminal_for_turn = _resource_routes.ensure_native_terminal_for_turn
     _require_os_env = _resource_routes.require_os_env
     _resolve_conversation_id = _resource_routes.resolve_conversation_id

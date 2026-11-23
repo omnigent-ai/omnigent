@@ -70,6 +70,24 @@ describe("resolveWorkspaceActiveView", () => {
       "files",
     ],
     ["the browser mode with no browser selected", { rightRailTab: "browser" }, {}, "files"],
+    [
+      "the remote browser",
+      { rightRailTab: "remote-browser", remoteBrowserOpen: true },
+      { showRemoteBrowser: true },
+      "remote-browser",
+    ],
+    [
+      "the remote browser where the server doesn't offer it",
+      { rightRailTab: "remote-browser", remoteBrowserOpen: true },
+      {},
+      "files",
+    ],
+    [
+      "the remote browser mode with its tab closed",
+      { rightRailTab: "remote-browser" },
+      { showRemoteBrowser: true },
+      "files",
+    ],
     ["a side chat", { rightRailTab: "sidechat", selectedSideChatId: "c1" }, {}, "sidechat"],
     [
       "a side chat on a phone, which shows it in a drawer",

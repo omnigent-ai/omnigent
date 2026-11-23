@@ -9,6 +9,7 @@ import {
   MaximizeIcon,
   MessagesSquareIcon,
   MinimizeIcon,
+  MonitorPlayIcon,
   PlusIcon,
   TerminalIcon,
   XIcon,
@@ -62,6 +63,11 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
+import { RemoteBrowserPane } from "@/components/RemoteBrowserPane/RemoteBrowserPane";
+import {
+  REMOTE_BROWSER_LABEL,
+  useRemoteBrowserTab,
+} from "@/components/RemoteBrowserPane/useRemoteBrowserTab";
 import { browserViewId, useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useInertRef } from "@/hooks/useInertRef";
 import { requestSandboxWake } from "@/hooks/useSandboxAutoWake";
@@ -197,6 +203,7 @@ function NewTabMenu({
   onOpenPanel,
   onOpenTerminal,
   onOpenBrowser,
+  onOpenRemoteBrowser,
   onOpen,
   onOpenSideChat,
   onCreateStart,
@@ -210,6 +217,8 @@ function NewTabMenu({
   /** Open a freshly-created terminal as a rail tab by its tab key. */
   onOpenTerminal: (key: string) => void;
   onOpenBrowser?: () => void;
+  /** Open the live view of the browser on the session's host. */
+  onOpenRemoteBrowser?: () => void;
   /** Called as the menu opens, before it takes focus, so its caller can note what had it. */
   onOpen?: () => void;
   /** Open a new side chat (a fork of this conversation) as a rail tab. Absent
@@ -244,7 +253,8 @@ function NewTabMenu({
   // declare a non-empty ``terminals:`` block.
   const declaredTerminals = agent?.terminals ?? [];
   const canOpenShell = declaredTerminals.length > 0;
-  if (!canOpenShell && !onOpenBrowser && !onOpenSideChat && panels.length === 0) return null;
+  const hasBrowserItem = Boolean(onOpenBrowser || onOpenRemoteBrowser);
+  if (!canOpenShell && !hasBrowserItem && !onOpenSideChat && panels.length === 0) return null;
 
   // The remembered shell, or the first declared type. Used only when shell
   // access is available; the menu can also contain just built-in pages.
@@ -347,7 +357,7 @@ function NewTabMenu({
             </DropdownMenuItem>
           );
         })}
-        {panels.length > 0 && (onOpenBrowser || onOpenSideChat || canOpenShell) && (
+        {panels.length > 0 && (hasBrowserItem || onOpenSideChat || canOpenShell) && (
           <DropdownMenuSeparator />
         )}
         {onOpenBrowser && (
@@ -358,6 +368,12 @@ function NewTabMenu({
             {supportsDesktopCommands() && (
               <WorkspaceMenuShortcut keys={NEW_BROWSER_TAB_KEYS} className="ml-auto pl-4" />
             )}
+          </DropdownMenuItem>
+        )}
+        {onOpenRemoteBrowser && (
+          <DropdownMenuItem onSelect={onOpenRemoteBrowser} className="cursor-pointer">
+            <MonitorPlayIcon className="size-4" />
+            {REMOTE_BROWSER_LABEL}
           </DropdownMenuItem>
         )}
         {onOpenSideChat && (
@@ -722,6 +738,8 @@ interface WorkspacePanelProps {
   showGithubTab: boolean;
   /** Whether the session has a Tasks tab. */
   showTasksTab?: boolean;
+  /** Whether the server offers a live view of a browser on the session's host. */
+  showRemoteBrowser?: boolean;
   /** Whether Browser soft tabs are available — hidden without a browser bridge. */
   showBrowserTab: boolean;
   /** Reveal the workspace when a global shortcut opens a tab. */
@@ -902,6 +920,7 @@ function WorkspacePanelImpl({
   showContentSearch = false,
   showGithubTab,
   showTasksTab = false,
+  showRemoteBrowser = false,
   showBrowserTab,
   onReveal,
   onHide,
@@ -946,6 +965,7 @@ function WorkspacePanelImpl({
   const railRef = useRef<HTMLElement | null>(null);
   const railContentRef = useRef<HTMLDivElement | null>(null);
   const browsers = useBrowserTabs(conversationId);
+  const remoteBrowser = useRemoteBrowserTab(conversationId);
   const sideChats = useSideChats(conversationId);
   const mobileViewport = useIsMobileViewport();
   const isMobile = mobileViewport && !contained;
@@ -956,10 +976,12 @@ function WorkspacePanelImpl({
       selectedTerminalKey,
       selectedBrowserId: browsers.selected,
       selectedSideChatId: sideChats.selected,
+      remoteBrowserOpen: remoteBrowser.open,
     },
     {
       terminalPresent: (key) => openTerminals.includes(key),
       showBrowserTab,
+      showRemoteBrowser,
       showGithubTab,
       showTasksTab: showTasksTab && Boolean(conversationId),
       showContentSearch,
@@ -967,7 +989,13 @@ function WorkspacePanelImpl({
       mobile: isMobile,
     },
   );
-  const { browserSelected, sideChatSelected } = activeView;
+  const { browserSelected, remoteBrowserSelected, sideChatSelected } = activeView;
+  const remoteBrowserTabShown = showRemoteBrowser && remoteBrowser.open;
+  const openRemoteBrowser = () => {
+    remoteBrowser.setOpen(true);
+    onRightRailTabChange("remote-browser");
+    onReveal?.();
+  };
   const terminalShown = activeView.terminalKey !== null;
   const returnPointRef = useRef<ReturnPoint | null>(null);
   // The latest returnFrom, so a close that finishes later uses the tabs open by then.
@@ -1370,6 +1398,7 @@ function WorkspacePanelImpl({
       openFiles.length > 0 ||
       openTerminals.length > 0 ||
       sideChats.tabs.length > 0 ||
+      remoteBrowserTabShown ||
       (showBrowserTab && browsers.tabs.length > 0));
   const newTabMenu = (menuAlign: "start" | "end") => (
     <NewTabMenu
@@ -1377,6 +1406,7 @@ function WorkspacePanelImpl({
       panels={unpinnedTabs}
       onOpenPanel={selectPermanentTab}
       onOpenBrowser={showBrowserTab ? addBrowserFromMenu : undefined}
+      onOpenRemoteBrowser={showRemoteBrowser ? openRemoteBrowser : undefined}
       onOpen={noteMenuOrigin}
       onOpenSideChat={onNewSideChat}
       onOpenTerminal={openTerminalTab}
@@ -1425,6 +1455,7 @@ function WorkspacePanelImpl({
   useEffect(() => {
     if (
       ((rightRailTab === "browser" && browsers.selected === null) ||
+        (rightRailTab === "remote-browser" && !remoteBrowserTabShown) ||
         (rightRailTab === "sidechat" && sideChats.selected === null)) &&
       selectedFilePath === null &&
       selectedTerminalKey === null
@@ -1434,6 +1465,7 @@ function WorkspacePanelImpl({
   }, [
     rightRailTab,
     browsers.selected,
+    remoteBrowserTabShown,
     sideChats.selected,
     selectedFilePath,
     selectedTerminalKey,
@@ -1486,6 +1518,17 @@ function WorkspacePanelImpl({
       },
       disabled: false,
     })),
+    ...(remoteBrowserTabShown
+      ? [
+          {
+            key: "remote-browser",
+            label: REMOTE_BROWSER_LABEL,
+            active: remoteBrowserSelected,
+            select: openRemoteBrowser,
+            disabled: false,
+          },
+        ]
+      : []),
     ...sideChats.tabs.map((childId) => ({
       key: `sidechat:${childId}`,
       label: chatTabLabels[childId] ?? childId,
@@ -1563,6 +1606,8 @@ function WorkspacePanelImpl({
         void closeSideChat(sideChats.selected);
       } else if (scopeView === "browser" && browsers.selected !== null) {
         void closeBrowserTab(browsers.selected);
+      } else if (scopeView === "remote-browser") {
+        remoteBrowser.setOpen(false);
       } else if (openPanel !== undefined) {
         closePanel(openPanel);
       } else if (onHide) {
@@ -1925,6 +1970,41 @@ function WorkspacePanelImpl({
                       </button>
                     </div>
                   ))}
+                {remoteBrowserTabShown && (
+                  <div
+                    className={cn(
+                      "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
+                      remoteBrowserSelected
+                        ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
+                        : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
+                    )}
+                  >
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={remoteBrowserSelected}
+                      className="flex min-w-0 items-center gap-1"
+                      onAuxClick={(event) => {
+                        if (event.button === 1) {
+                          event.preventDefault();
+                          remoteBrowser.setOpen(false);
+                        }
+                      }}
+                      onClick={openRemoteBrowser}
+                    >
+                      <MonitorPlayIcon className="size-4 shrink-0" />
+                      <span className="max-w-44 truncate">{REMOTE_BROWSER_LABEL}</span>
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`Close ${REMOTE_BROWSER_LABEL}`}
+                      className="flex size-4 items-center justify-center rounded hover:bg-muted"
+                      onClick={() => remoteBrowser.setOpen(false)}
+                    >
+                      <XIcon className="size-3" />
+                    </button>
+                  </div>
+                )}
                 {sideChats.tabs.map((childId) => {
                   const active = sideChatSelected && sideChats.selected === childId;
                   const label = chatTabLabels[childId] ?? childId;
@@ -2180,6 +2260,15 @@ function WorkspacePanelImpl({
                 onFocused={clearBrowserFocus}
                 className="min-h-0 flex-1"
               />
+            ) : scopeView === "remote-browser" ? (
+              <RenderErrorBoundary name="remote browser" resetKey={conversationId}>
+                <RemoteBrowserPane
+                  conversationId={conversationId}
+                  readOnly={!isOwnerLevel(permissionLevel)}
+                  active={open && !inert}
+                  className="min-h-0 flex-1"
+                />
+              </RenderErrorBoundary>
             ) : scopeView === "github" ? (
               <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
                 <PullRequestPanel conversationId={conversationId} active={open && !inert} />

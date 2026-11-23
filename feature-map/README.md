@@ -160,6 +160,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Composer](./composer.md) covers the session and new-session composers,
   the model/effort pill, the configuration gear, slash commands, and the
   native `!` shell mode.
+- [Remote browser](./remote-browser.md) covers the live view of a Chrome on
+  the session's host: opening it, input, tab switching and view-only access.
 - [Terminals](./terminals.md) covers the Chat/Terminal switcher, the agent
   terminal, shell terminals, and terminal reattachment.
 - [Native harnesses](./native-harnesses.md) is the matrix of every native

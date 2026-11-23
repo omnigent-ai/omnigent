@@ -655,6 +655,7 @@ export function GridSessionPane({
                     (state.todos?.length ?? 0) > 0
                   }
                   showBrowserTab={supportsBrowser()}
+                  showRemoteBrowser={isFeatureEnabled(serverInfo, "remote_browser")}
                   onReveal={onOpenWorkspace}
                   changedCount={changedCount}
                   subagentsWorking={childSessions.filter((child) => child.busy).length}

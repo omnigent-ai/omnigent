@@ -63,6 +63,7 @@ class Feature(StrEnum):
     FLOATING_COMPOSER = "floating_composer"
     WORKSPACE_SIDEBAR_V2 = "workspace_sidebar_v2"
     SIDEBAR_SAVED_VIEWS = "sidebar_saved_views"
+    REMOTE_BROWSER = "remote_browser"
 
 
 @dataclass(frozen=True)
@@ -359,6 +360,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         feature=Feature.SIDEBAR_SAVED_VIEWS,
         description="Filter the sidebar's sessions by their pull request, and save views",
         owner="web",
+        review_by_release="0.28.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.REMOTE_BROWSER,
+        description="Show a Chrome running on the session's host live in the workspace",
+        owner="server",
         review_by_release="0.28.0",
     ),
 )

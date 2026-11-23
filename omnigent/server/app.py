@@ -150,6 +150,7 @@ from omnigent.server.routes.proactive_agent_settings import (
     create_proactive_agent_settings_router,
 )
 from omnigent.server.routes.projects import create_projects_router
+from omnigent.server.routes.remote_browser_attach import create_remote_browser_attach_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.scheduled_task_permissions import scheduled_task_sharing_supported
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
@@ -4478,6 +4479,16 @@ def create_app(
         prefix="/v1",
         tags=["terminals"],
     )
+    if resolved_feature_flags.enabled(Feature.REMOTE_BROWSER):
+        app.include_router(
+            create_remote_browser_attach_router(
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+                conversation_store=conversation_store,
+            ),
+            prefix="/v1",
+            tags=["remote-browser"],
+        )
     app.include_router(
         create_session_mcp_servers_router(
             conversation_store,
