@@ -9,8 +9,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "./useSessionNumberHotkeys";
 
 const navigate = vi.fn();
+// The app's mount when embedded; identity standalone.
+const rebasePath = vi.fn((path: string) => path);
 vi.mock("@/lib/routing", () => ({
   useNavigate: () => navigate,
+  useRebasePath: () => rebasePath,
 }));
 
 // The chord is platform-aware: plain Cmd+digit in the Electron shell, but
@@ -50,6 +53,8 @@ beforeEach(() => {
 afterEach(() => {
   document.body.innerHTML = "";
   window.history.replaceState(null, "", "/");
+  delete window.__OMNIGENT_BASE_PATH__;
+  rebasePath.mockImplementation((path) => path);
 });
 
 describe("useSessionNumberHotkeys", () => {
@@ -147,10 +152,28 @@ describe("useSessionNumberHotkeys", () => {
     expect(navigate).toHaveBeenCalledWith("/c/a");
   });
 
-  it("knows the session under a base path", () => {
-    render(ids, "/omnigent/c/b");
-    press("2");
+  it.each([
+    ["a trailing slash", "/c/a/", undefined],
+    ["a Canvas route", "/canvas/c/a", undefined],
+    ["the server's base path", "/omnigent/c/a/", "/omnigent"],
+  ])("knows the window shows the session at %s", (_case, path, base) => {
+    window.__OMNIGENT_BASE_PATH__ = base;
+    render(ids, path);
+    press("1");
     expect(navigate).not.toHaveBeenCalled();
+    press("2");
+    expect(navigate).toHaveBeenCalledWith("/c/b");
+  });
+
+  it("knows the session under an embedding host's mount", () => {
+    rebasePath.mockImplementation((path) => `/mount${path}`);
+    render(ids, "/mount/c/a");
+    press("1");
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("opens the session from a page whose path only ends like its route", () => {
+    render(ids, "/extensions/demo/c/a");
     press("1");
     expect(navigate).toHaveBeenCalledWith("/c/a");
   });

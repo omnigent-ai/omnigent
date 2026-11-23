@@ -13,17 +13,13 @@
 
 import { useEffect, useRef } from "react";
 import { isMacPlatform } from "@/lib/hotkeys";
-import { useNavigate } from "@/lib/routing";
+import { useNavigate, useRebasePath } from "@/lib/routing";
+import { sessionIdAtPath } from "@/lib/sessionRoutes";
 import { matchedShortcutChordIndex, SESSION_NUMBER_DIGITS } from "@/lib/shortcuts/registry";
 
 /** Index → the digit that selects it. Shared with the sidebar's row hints so binding and label
  *  can't drift. */
 export const SESSION_HOTKEY_DIGITS = SESSION_NUMBER_DIGITS;
-
-/** Whether the window's URL already shows *sessionId*, even before the route's render commits. */
-function showsSession(sessionId: string): boolean {
-  return window.location.pathname.endsWith(`/c/${sessionId}`);
-}
 
 /**
  * @param orderedSessionIds Conversation ids the sidebar shows, in render order.
@@ -33,9 +29,10 @@ export function useSessionNumberHotkeys(
   isMac = isMacPlatform(),
 ): void {
   const navigate = useNavigate();
-  // Bound once; the ref keeps the handler reading the live list.
-  const latest = useRef(orderedSessionIds);
-  latest.current = orderedSessionIds;
+  const rebasePath = useRebasePath();
+  // Bound once; the ref keeps the handler reading the live list and mount.
+  const latest = useRef({ orderedSessionIds, rebasePath });
+  latest.current = { orderedSessionIds, rebasePath };
 
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent): void => {
@@ -45,14 +42,17 @@ export function useSessionNumberHotkeys(
       const index = matchedShortcutChordIndex(e, "session.number", { mac: isMac });
       if (index === -1) return;
 
-      const targetId = latest.current[index];
+      const { orderedSessionIds: ids, rebasePath: rebase } = latest.current;
+      const targetId = ids[index];
       // No session at that slot: leave the native event untouched.
       if (!targetId) return;
 
       e.preventDefault(); // suppress the browser's native ⌘-digit tab-switch
       // The URL, not the rendered route: right after leaving a session the router still renders
       // it while the next page loads, and its digit must still go back to it.
-      if (!showsSession(targetId)) navigate(`/c/${targetId}`);
+      if (sessionIdAtPath(window.location.pathname, rebase) !== targetId) {
+        navigate(`/c/${targetId}`);
+      }
     };
 
     window.addEventListener("keydown", handler);

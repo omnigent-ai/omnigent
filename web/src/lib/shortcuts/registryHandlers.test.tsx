@@ -64,6 +64,7 @@ vi.mock("@/lib/routing", () => ({
   useNavigate: () => navigate,
   useLocation: () => ({ pathname: "/" }),
   useNavigationType: () => "PUSH",
+  useRebasePath: () => (path: string) => path,
 }));
 
 // A desktop-only binding switches the native shell on while its case runs; the platform is
