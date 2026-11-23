@@ -6,6 +6,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import enum
 import itertools
 import secrets
 import time
@@ -442,6 +443,43 @@ def _is_batchable_external_item(event: SessionEventInput) -> bool:
         and item_data.get("kind") == "input"
     )
     return item_type != "slash_command" and not is_user_message and not is_shell_input
+
+
+# Per-chunk live output: publishing one changes no session state, so consecutive
+# chunks in one batch can share the authorization made for the first.
+_STREAMED_DELTA_EVENT_TYPES = frozenset(
+    {
+        _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
+        _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
+        _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
+    }
+)
+
+
+class _BatchRun(enum.Enum):
+    """How ``POST /events`` handles a run of consecutive entries in an event array."""
+
+    # Appended with one authorization and one store call.
+    EXTERNAL_ITEMS = enum.auto()
+    # Authorized once, then each entry takes the per-entry path.
+    STREAMED_DELTAS = enum.auto()
+    # Each entry takes the per-entry path with its own authorization.
+    PER_ENTRY = enum.auto()
+
+
+def _batch_run(event: SessionEventInput) -> _BatchRun:
+    """
+    Classify a batch entry so consecutive entries of the same kind form one run.
+
+    :param event: One entry of a ``POST /events`` array, e.g. an
+        ``external_output_text_delta`` chunk.
+    :returns: The run kind the entry belongs to.
+    """
+    if _is_batchable_external_item(event):
+        return _BatchRun.EXTERNAL_ITEMS
+    if event.type in _STREAMED_DELTA_EVENT_TYPES:
+        return _BatchRun.STREAMED_DELTAS
+    return _BatchRun.PER_ENTRY
 
 
 def _event_body_too_large() -> HTTPException:
@@ -1002,6 +1040,20 @@ class _RunnerEventContext:
     runner_id: str
 
 
+@dataclass(frozen=True)
+class _EventAuthorization:
+    """
+    A caller's authorization to write events to one session.
+
+    :param user_id: The authenticated caller, e.g. ``"alice@example.com"``, or
+        ``None`` when auth is disabled.
+    :param conversation: The session read while authorizing.
+    """
+
+    user_id: str | None
+    conversation: Conversation
+
+
 _RUNNER_EVENT_TYPES = frozenset(
     {
         _EXTERNAL_CONVERSATION_ITEM_TYPE,
@@ -1142,7 +1194,7 @@ def register_events_routes(
         session_id: str,
         *,
         external_transcript: bool = False,
-    ) -> tuple[str | None, Any]:
+    ) -> _EventAuthorization:
         """Authorize event writes, reserving transcripts for owners and bound runners."""
         user_id = (
             request.user_id
@@ -1159,7 +1211,7 @@ def register_events_routes(
                     "session is not bound to this runner", code=ErrorCode.FORBIDDEN
                 )
             if _has_bound_runner_authority(request, conv):
-                return user_id, conv
+                return _EventAuthorization(user_id, conv)
         access = await _require_access_and_level(
             user_id,
             session_id,
@@ -1176,7 +1228,7 @@ def register_events_routes(
             raise _RunnerNotBoundError(
                 "session is not bound to this runner", code=ErrorCode.FORBIDDEN
             )
-        return user_id, conv
+        return _EventAuthorization(user_id, conv)
 
     @event_router.post("/sessions/{session_id}/recovery/admit", include_in_schema=False)
     async def admit_recovery_turn(
@@ -1184,7 +1236,9 @@ def register_events_routes(
         session_id: str,
         recovery_id: str = Query(min_length=1, max_length=128),
     ) -> dict[str, bool]:
-        _, conv = await _authorized_conversation(request, session_id, external_transcript=True)
+        conv = (
+            await _authorized_conversation(request, session_id, external_transcript=True)
+        ).conversation
         reporting_runner = _reporting_runner_id(request)
         if reporting_runner is not None and reporting_runner != conv.runner_id:
             raise OmnigentError("session is not bound to this runner", code=ErrorCode.FORBIDDEN)
@@ -1234,11 +1288,17 @@ def register_events_routes(
                 # A sub-agent transcript arrives as one array of up to 100 items with a
                 # 10 s client timeout, and persisting it per entry on a store with
                 # per-append overhead outlasts that. Each run of batchable entries is
-                # authorized once and appended in one store call; every other entry
+                # authorized once and appended in one store call. A run of streamed
+                # chunks is authorized once and published per entry; every other entry
                 # keeps the per-entry path, in order.
                 acks: list[dict[str, bool | str]] = []
-                for batchable, run in itertools.groupby(body, key=_is_batchable_external_item):
-                    if not batchable:
+                for run_kind, run in itertools.groupby(body, key=_batch_run):
+                    if run_kind is not _BatchRun.EXTERNAL_ITEMS:
+                        authorization = (
+                            await _authorized_conversation(request, session_id)
+                            if run_kind is _BatchRun.STREAMED_DELTAS
+                            else None
+                        )
                         for event in run:
                             acks.append(
                                 await _post_event_impl(
@@ -1248,6 +1308,7 @@ def register_events_routes(
                                     in_flight=in_flight
                                     if event.type in _IN_FLIGHT_EVENT_TYPES
                                     else None,
+                                    authorization=authorization,
                                 )
                             )
                         continue
@@ -1279,6 +1340,8 @@ def register_events_routes(
         if len(batch.events) > 32 or len(encode_frame(batch).encode("utf-8")) > 256 * 1024:
             return EventAckFrame(batch.id, 0, "event batch exceeds count or size limit")
         request = _RunnerEventContext(app, headers, owner, runner_id)
+        # Shared by consecutive streamed chunks, like a run in a POST /events array.
+        delta_authorization: _EventAuthorization | None = None
         for index, payload in enumerate(batch.events):
             event_type = payload.get("type")
             if event_type not in _RUNNER_EVENT_TYPES:
@@ -1289,7 +1352,13 @@ def register_events_routes(
                     return EventAckFrame(batch.id, index, "source_id required for tunnel replay")
             try:
                 body = SessionEventInput.model_validate(payload)
-                await _post_event_impl(request, batch.session_id, body)
+                if body.type not in _STREAMED_DELTA_EVENT_TYPES:
+                    delta_authorization = None
+                elif delta_authorization is None:
+                    delta_authorization = await _authorized_conversation(request, batch.session_id)
+                await _post_event_impl(
+                    request, batch.session_id, body, authorization=delta_authorization
+                )
             except _RunnerNotBoundError:
                 # The session moved to another runner, which mirrors its own
                 # transcript. Acknowledge this runner's late events as handled:
@@ -1399,6 +1468,7 @@ def register_events_routes(
         session_id: str,
         body: SessionEventInput,
         in_flight: contextlib.ExitStack | None = None,
+        authorization: _EventAuthorization | None = None,
     ) -> dict[str, bool | str]:
         """
         Submit a session event (input message, tool output,
@@ -1485,6 +1555,10 @@ def register_events_routes(
         :param in_flight: When given, the session is marked as having a
             dispatch in flight once the caller is authorized, for the rest
             of the request.
+        :param authorization: The authorization this request already made for
+            ``session_id`` with :func:`_authorized_conversation`'s default level,
+            reused instead of authorizing again. Only streamed chunks (see
+            ``_STREAMED_DELTA_EVENT_TYPES``) pass one; ``None`` authorizes here.
         :returns: ``{"queued": True, "item_id": "..."}`` for
             item-typed events, where ``item_id`` is the persisted
             conversation item id also emitted by
@@ -1495,15 +1569,18 @@ def register_events_routes(
         # A report must not land on a replica that hands the session off before it is written.
         handoffs_at_request = handoff_count(session_id)
         start_fire_stage("owner_authorization", session_id=session_id)
-        user_id, conv = await _authorized_conversation(
-            request,
-            session_id,
-            external_transcript=body.type
-            in (
-                _EXTERNAL_CONVERSATION_ITEM_TYPE,
-                _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
-            ),
-        )
+        if authorization is None:
+            authorization = await _authorized_conversation(
+                request,
+                session_id,
+                external_transcript=body.type
+                in (
+                    _EXTERNAL_CONVERSATION_ITEM_TYPE,
+                    _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
+                ),
+            )
+        user_id = authorization.user_id
+        conv = authorization.conversation
         from omnigent.server.session_journal import require_current_workflow_run
 
         await require_current_workflow_run(conversation_store, session_id, body.workflow_run_id)
