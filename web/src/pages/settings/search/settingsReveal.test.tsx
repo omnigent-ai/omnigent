@@ -152,9 +152,9 @@ describe("revealing a Settings row from its hash", () => {
     expect(scrollOptions).toEqual([{ block: "center" }, { block: "nearest" }]);
   });
 
-  it("keeps the focused control in view while its row resizes, until the user acts", () => {
+  /** Runs `body` with a ResizeObserver that `resize` drives and whose live observers it counts. */
+  function withResizeObserver(body: (resize: () => void, live: () => number) => void) {
     const observers = new Set<() => void>();
-    const resize = () => [...observers].forEach((callback) => callback());
     vi.stubGlobal(
       "ResizeObserver",
       class {
@@ -171,6 +171,17 @@ describe("revealing a Settings row from its hash", () => {
       },
     );
     try {
+      body(
+        () => [...observers].forEach((callback) => callback()),
+        () => observers.size,
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }
+
+  it("keeps the focused control in view while its row resizes, until the user acts", () => {
+    withResizeObserver((resize, live) => {
       renderAt("#fixture-row:reset", <FixtureRow entry={ROW} />);
       const reset = screen.getByRole("button", { name: "Reset" });
       expect(controlsScrolled).toEqual([reset]);
@@ -178,11 +189,33 @@ describe("revealing a Settings row from its hash", () => {
       act(resize);
       expect(controlsScrolled).toEqual([reset, reset]);
       fireEvent.keyDown(document, { key: "ArrowDown" });
+      expect(live()).toBe(0);
       act(resize);
       expect(controlsScrolled).toEqual([reset, reset]);
-    } finally {
-      vi.unstubAllGlobals();
-    }
+    });
+  });
+
+  it("stops keeping the control in view once the reveal window closes", () => {
+    withResizeObserver((resize, live) => {
+      renderAt("#fixture-row:reset", <FixtureRow entry={ROW} />);
+      const reset = screen.getByRole("button", { name: "Reset" });
+      expect(live()).toBe(1);
+      act(() => vi.advanceTimersByTime(SETTINGS_REVEAL_WINDOW_MS));
+      expect(live()).toBe(0);
+      act(resize);
+      expect(controlsScrolled).toEqual([reset]);
+    });
+  });
+
+  it("stops keeping the control in view when the user navigates away", () => {
+    withResizeObserver((resize, live) => {
+      renderAt("#fixture-row:reset", <FixtureRow entry={ROW} />);
+      const reset = screen.getByRole("button", { name: "Reset" });
+      act(() => navigate("/settings/general#somewhere-else"));
+      expect(live()).toBe(0);
+      act(resize);
+      expect(controlsScrolled).toEqual([reset]);
+    });
   });
 
   it("focuses the row's main control for a bare row, which is its first control", () => {

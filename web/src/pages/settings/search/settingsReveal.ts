@@ -176,13 +176,6 @@ function selectedTab(list: HTMLElement): HTMLElement | null {
 }
 
 /**
- * Focuses the row's control now, or once it exists and is enabled, while the reveal window is
- * open. A part that isn't usable yet lands on a stand-in at once, then takes focus over from it
- * when it appears, as one shown once data loads does, unless the user has acted in the meantime.
- * Waiting stops when the navigation is aborted, when focus moves somewhere else after the
- * navigation began, or when the window closes.
- */
-/**
  * Keeps a revealed control in view while its row settles during the reveal window, as when
  * content loading above it pushes it down. The user's own input, or focus leaving it, ends this.
  */
@@ -192,7 +185,8 @@ function keepFocusedControlInView(
   signal: AbortSignal,
   windowEndsAt: number,
 ) {
-  if (typeof ResizeObserver === "undefined") return;
+  // A navigation already left needs no tracking: its abort has fired.
+  if (typeof ResizeObserver === "undefined" || signal.aborted) return;
   let stopped = false;
   const observer = new ResizeObserver(() => {
     if (stopped) return;
@@ -213,6 +207,13 @@ function keepFocusedControlInView(
   observer.observe(row);
 }
 
+/**
+ * Focuses the row's control now, or once it exists and is enabled, while the reveal window is
+ * open. A part that isn't usable yet lands on a stand-in at once, then takes focus over from it
+ * when it appears, as one shown once data loads does, unless the user has acted in the meantime.
+ * Waiting stops when the navigation is aborted, when focus moves somewhere else after the
+ * navigation began, or when the window closes.
+ */
 function focusControlWhenReady(
   row: HTMLElement,
   entry: SettingsEntry,
