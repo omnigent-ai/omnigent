@@ -492,10 +492,17 @@ describe("shortcut registry handlers", () => {
     expect(Object.keys(HANDLERS).sort()).toEqual(appBindings.map(({ id }) => id).sort());
   });
 
-  it.each(appBindings.map(({ id }) => id))("runs %s from the chord it shows", (id) => {
-    const chord = primaryShortcutChords(id, environmentOf(id))[0];
-    expect(chord, `${id} has no chord here`).toBeDefined();
-    expect(pressFor(id, chord!)).toBe(true);
+  const shownBindings = appBindings.filter(
+    ({ id }) => primaryShortcutChords(id, environmentOf(id)).length > 0,
+  );
+
+  it("shows a chord for every window-level binding but the hidden session search", () => {
+    const hidden = appBindings.filter((binding) => !shownBindings.includes(binding));
+    expect(hidden.map(({ id }) => id)).toEqual(["palette.sessions"]);
+  });
+
+  it.each(shownBindings.map(({ id }) => id))("runs %s from the chord it shows", (id) => {
+    expect(pressFor(id, primaryShortcutChords(id, environmentOf(id))[0]!)).toBe(true);
   });
 
   const secondaryCases = appBindings.flatMap(({ id }) => {
@@ -507,7 +514,11 @@ describe("shortcut registry handlers", () => {
   });
 
   it("has window-level bindings with secondary chords to run", () => {
-    expect(secondaryCases.map(([id]) => id)).toEqual(["message.previous", "message.next"]);
+    expect(secondaryCases.map(([id]) => id)).toEqual([
+      "palette.sessions",
+      "message.previous",
+      "message.next",
+    ]);
   });
 
   it.each(secondaryCases)("runs %s from its secondary chord %s", (id, _aria, chord) => {

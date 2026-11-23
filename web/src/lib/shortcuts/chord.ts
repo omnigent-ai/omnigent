@@ -18,8 +18,6 @@ export interface Chord {
   key?: string;
   /** Compare `key` exactly, case included, for chords that always compared it exactly. */
   exactKey?: boolean;
-  /** Also fires while AltGr is reported, as the chords that never checked for it always have. */
-  matchesAltGraph?: boolean;
 }
 
 /** The fields a chord is matched against. */
@@ -30,7 +28,7 @@ export interface KeyChordInput {
   ctrlKey: boolean;
   altKey: boolean;
   shiftKey: boolean;
-  /** AltGr, which reports as Ctrl+Alt on some layouts; only a chord that opts in matches it. */
+  /** AltGr, which reports as Ctrl+Alt on some layouts and types a character, never a chord. */
   altGraph?: boolean;
 }
 
@@ -54,7 +52,7 @@ export function chordMatches(
   mac: boolean = isMacPlatform(),
 ): boolean {
   const keys = "getModifierState" in input ? keyChordInput(input) : input;
-  if (keys.altGraph && !chord.matchesAltGraph) return false;
+  if (keys.altGraph) return false;
   const wantMeta = mac && !!chord.mod;
   const wantCtrl = !!chord.ctrl || (!mac && !!chord.mod);
   if (keys.metaKey !== wantMeta || keys.ctrlKey !== wantCtrl) return false;
@@ -110,7 +108,26 @@ export function chordKeyLabel(chord: Chord): string {
   return key.length === 1 ? key.toUpperCase() : key;
 }
 
-/** Key caps for a chord, left to right: command modifier, Control, Alt, Shift, then the key. */
+/** Key caps for a chord: ⌃⌥⇧⌘ then the key on macOS; Ctrl, Alt, Shift then the key elsewhere. */
+/** Apple's modifier order: Control, Option, Shift, Command. */
+const MAC_MODIFIER_ORDER = ["⌃", "⌥", "⇧", "⌘"];
+
+/**
+ * Key caps with their modifiers in the platform's order: ⌃⌥⇧⌘ on macOS, as written
+ * elsewhere. Keys that aren't modifiers keep their place after them.
+ */
+export function inModifierOrder(keys: readonly string[], mac: boolean = isMacPlatform()): string[] {
+  if (!mac) return [...keys];
+  const rank = (key: string) => {
+    const index = MAC_MODIFIER_ORDER.indexOf(key);
+    return index === -1 ? MAC_MODIFIER_ORDER.length : index;
+  };
+  return keys
+    .map((key, index) => ({ key, index }))
+    .sort((left, right) => rank(left.key) - rank(right.key) || left.index - right.index)
+    .map(({ key }) => key);
+}
+
 export function chordKeys(chord: Chord, mac: boolean = isMacPlatform()): string[] {
   const glyphs = modifierGlyphs(mac);
   const keys: string[] = [];
@@ -120,5 +137,5 @@ export function chordKeys(chord: Chord, mac: boolean = isMacPlatform()): string[
   if (chord.alt) keys.push(glyphs.alt);
   if (chord.shift) keys.push(glyphs.shift);
   keys.push(chordKeyLabel(chord));
-  return keys;
+  return inModifierOrder(keys, mac);
 }

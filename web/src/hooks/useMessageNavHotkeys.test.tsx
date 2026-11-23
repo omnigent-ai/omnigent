@@ -50,10 +50,10 @@ describe("useMessageNavHotkeys", () => {
     expect(nav.goNext).not.toHaveBeenCalled();
   });
 
-  it("still steps while AltGr is reported, as it always has", () => {
+  it("leaves AltGr alone, which types a character rather than pressing a chord", () => {
     const { nav } = mount();
     press({ key: "ArrowDown", ctrlKey: true, altKey: true, altGraph: true });
-    expect(nav.goNext).toHaveBeenCalledTimes(1);
+    expect(nav.goNext).not.toHaveBeenCalled();
   });
 
   it("leaves other chords, a chord a focused editor took, and stops on unmount", () => {

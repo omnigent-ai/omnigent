@@ -182,7 +182,7 @@ interface ShortcutBindingDefinition {
   alternateOf?: string;
   /** Listed on another binding's page row, whose keys include this chord; that binding's id. */
   partOf?: string;
-  /** Whether an alternate's chord is listed here; defaults to true. */
+  /** Whether the binding's chord is shown here, on its own row or another's; defaults to true. */
   advertised?: (environment: ShortcutEnvironment) => boolean;
   /** Whether the Keyboard shortcuts page lists the binding here; defaults to true. */
   shownWhen?: (context: ShortcutPageContext) => boolean;
@@ -192,26 +192,16 @@ interface ShortcutBindingDefinition {
   flag?: "quick_pick_palette";
 }
 
-/** A session step's Ctrl+Tab chord and its Ctrl+Alt+Shift arrow, the one a browser tab reaches. */
-function sessionStepChords(
-  environment: ShortcutEnvironment,
-  tab: Chord,
-  arrow: "ArrowDown" | "ArrowUp",
-): Chord[] {
-  const arrowChord: Chord = { ctrl: true, alt: true, shift: true, key: arrow, exactKey: true };
-  return environment.native ? [tab, arrowChord] : [arrowChord, tab];
-}
-
-/** Sidebar slots in order: ⌘1–⌘9 pick the first nine and ⌘0 the tenth, as browser tabs do. */
-export const SESSION_NUMBER_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"] as const;
+/** Sidebar slots in order: ⌘1–⌘9 pick the first nine. ⌘0 stays the menu's Actual Size. */
+export const SESSION_NUMBER_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"] as const;
 
 /** Workspace rail tabs ⌃1–⌃9, by position. */
 const WORKSPACE_TAB_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"] as const;
 
-// The transcript's message steps, which have always allowed AltGr and Shift.
+// The transcript's message steps, which have always allowed Shift.
 const MESSAGE_STEP_CHORDS = {
-  previous: { mod: true, alt: true, key: "ArrowUp", exactKey: true, matchesAltGraph: true },
-  next: { mod: true, alt: true, key: "ArrowDown", exactKey: true, matchesAltGraph: true },
+  previous: { mod: true, alt: true, key: "ArrowUp", exactKey: true },
+  next: { mod: true, alt: true, key: "ArrowDown", exactKey: true },
 } as const satisfies Record<string, Chord>;
 
 /** The open session's Pin, Fork and Archive chords, as the desktop app's Session menu binds them. */
@@ -267,7 +257,9 @@ const APP_BINDINGS = {
     handler: app("hooks/useCommandPaletteHotkey.ts"),
     paletteExempt: "Opens ⌘K's own session search.",
     label: "Find a session by name",
-    chords: () => [{ mod: true, alt: true, code: "KeyS" }],
+    // ⌘K finds sessions too, so this view of them alone shows no chord; ⌘⌥S still opens it.
+    chords: () => [],
+    secondaryChords: () => [{ mod: true, alt: true, code: "KeyS" }],
   },
   "session.rename": {
     group: "general",
@@ -299,7 +291,7 @@ const APP_BINDINGS = {
     handler: app("components/KeyboardShortcutsDialog.tsx"),
     paletteExempt: NOT_IN_PALETTE_YET,
     label: "Show keyboard shortcuts",
-    chords: () => [{ mod: true, key: "/", exactKey: true, matchesAltGraph: true }],
+    chords: () => [{ mod: true, key: "/", exactKey: true }],
   },
   // The desktop app's menu items, whose accelerators reach the page as commands.
   "tab.close": {
@@ -415,14 +407,14 @@ const APP_BINDINGS = {
     handler: app("hooks/useApproveHotkey.ts"),
     paletteExempt: ACTS_WHERE_PRESSED,
     label: "Accept approval prompt",
-    chords: () => [{ mod: true, key: "Enter", exactKey: true, matchesAltGraph: true }],
+    chords: () => [{ mod: true, key: "Enter", exactKey: true }],
   },
   "approval.decline": {
     group: "chats",
     handler: app("hooks/useApproveHotkey.ts"),
     paletteExempt: ACTS_WHERE_PRESSED,
     label: "Decline approval prompt",
-    chords: () => [{ key: "Escape", exactKey: true, matchesAltGraph: true }],
+    chords: () => [{ key: "Escape", exactKey: true }],
   },
   // A pending question's own keys.
   "question.next": {
@@ -520,14 +512,14 @@ const APP_BINDINGS = {
     shownWhen: NOT_LISTED,
   },
   // With quick_pick_palette on, each runs its ⌘K command, and Ctrl+Tab steps instead of
-  // opening the recent switcher. A browser keeps Ctrl+Tab, so the desktop app lists it first.
+  // opening the recent switcher. A browser keeps Ctrl+Tab, so only the desktop app lists it.
   "session.next": {
     group: "navigation",
     handler: QUICK_PICK_SHORTCUTS,
     paletteCommand: "next-session",
     label: "Next session",
-    chords: (environment) =>
-      sessionStepChords(environment, { ctrl: true, key: "Tab", exactKey: true }, "ArrowDown"),
+    chords: () => [{ ctrl: true, key: "Tab", exactKey: true }],
+    advertised: (environment) => environment.native,
     flag: "quick_pick_palette",
     shownWhen: (context) => context.electron && context.quickPick,
   },
@@ -536,12 +528,8 @@ const APP_BINDINGS = {
     handler: QUICK_PICK_SHORTCUTS,
     paletteCommand: "previous-session",
     label: "Previous session",
-    chords: (environment) =>
-      sessionStepChords(
-        environment,
-        { ctrl: true, shift: true, key: "Tab", exactKey: true },
-        "ArrowUp",
-      ),
+    chords: () => [{ ctrl: true, shift: true, key: "Tab", exactKey: true }],
+    advertised: (environment) => environment.native,
     flag: "quick_pick_palette",
     shownWhen: (context) => context.electron && context.quickPick,
   },
@@ -563,8 +551,11 @@ const APP_BINDINGS = {
     handler: app("hooks/useHistoryNavigation.ts"),
     paletteExempt: NOT_IN_PALETTE_YET,
     label: "Go back",
-    chords: () => [{ mod: true, code: "BracketLeft", matchesAltGraph: true }],
-    // A browser tab keeps its own Back and Forward.
+    // The desktop menu's Go item where the shell hands its commands to the page; older shells
+    // leave the chord to the page. A browser tab keeps its own Back and Forward.
+    chords: (environment) => (environment.desktopMenu ? [] : [{ mod: true, code: "BracketLeft" }]),
+    menuChords: (environment) =>
+      environment.desktopMenu ? [{ mod: true, code: "BracketLeft" }] : [],
     shownWhen: (context) => context.electron,
   },
   "history.forward": {
@@ -572,22 +563,25 @@ const APP_BINDINGS = {
     handler: app("hooks/useHistoryNavigation.ts"),
     paletteExempt: NOT_IN_PALETTE_YET,
     label: "Go forward",
-    chords: () => [{ mod: true, code: "BracketRight", matchesAltGraph: true }],
-    // A browser tab keeps its own Back and Forward.
+    // The desktop menu's Go item where the shell hands its commands to the page; older shells
+    // leave the chord to the page. A browser tab keeps its own Back and Forward.
+    chords: (environment) => (environment.desktopMenu ? [] : [{ mod: true, code: "BracketRight" }]),
+    menuChords: (environment) =>
+      environment.desktopMenu ? [{ mod: true, code: "BracketRight" }] : [],
     shownWhen: (context) => context.electron,
   },
   "session.number": {
     group: "navigation",
     handler: app("hooks/useSessionNumberHotkeys.ts"),
-    rowKeys: (keys) => withRangeLabel(keys, "1…0"),
+    rowKeys: (keys) => withRangeLabel(keys, "1…9"),
     paletteExempt: "Picks a sidebar row by its position.",
-    label: "Jump to a sidebar session (1–10)",
+    label: "Jump to a sidebar session (1–9)",
     // A browser keeps ⌘-digit for its tabs, so there Alt joins it, matched by the
     // physical key because Alt rewrites the digit on macOS.
     chords: (environment) =>
       SESSION_NUMBER_DIGITS.map((digit) =>
         environment.native
-          ? { mod: true, key: digit, exactKey: true, matchesAltGraph: true }
+          ? { mod: true, key: digit, exactKey: true }
           : { mod: true, alt: true, code: `Digit${digit}` },
       ),
   },
@@ -629,6 +623,8 @@ const APP_BINDINGS = {
       environment.native
         ? [{ mod: true, key: "b" }]
         : [{ mod: true, alt: true, code: "BracketLeft" }],
+    // ⌘\ works too on macOS, unlisted; off it Ctrl+\ is a terminal's quit signal.
+    secondaryChords: (environment) => (environment.mac ? [{ mod: true, code: "Backslash" }] : []),
   },
   "sidebar.right": {
     group: "view",
@@ -639,6 +635,9 @@ const APP_BINDINGS = {
       environment.native
         ? [{ mod: true, shift: true, key: "b" }]
         : [{ mod: true, alt: true, code: "BracketRight" }],
+    // A focused code editor keeps ⇧⌘\ for Go to matching bracket.
+    secondaryChords: (environment) =>
+      environment.mac ? [{ mod: true, shift: true, code: "Backslash" }] : [],
   },
   "workspace.searchContents": {
     group: "view",
@@ -677,7 +676,7 @@ const APP_BINDINGS = {
     paletteExempt: NOT_IN_PALETTE_YET,
     label: "Open a new shell",
     // Literal Control on every platform, so it never meets macOS window cycling (⌘`).
-    chords: () => [{ ctrl: true, code: "Backquote", matchesAltGraph: true }],
+    chords: () => [{ ctrl: true, code: "Backquote" }],
   },
   "tab.previous": {
     group: "view",
@@ -1180,10 +1179,19 @@ export function menuShortcutChords(
   return shortcutBinding(id).menuChords?.(currentShortcutEnvironment(environment)) ?? [];
 }
 
-/** Key caps for the first of `id`'s chords here, or none when it has no chord. */
+/**
+ * The chord `id` shows here: its own first chord, else the desktop menu's accelerator where the
+ * menu owns it; none where it isn't advertised.
+ */
+function shownChord(id: ShortcutId, environment: ShortcutEnvironment): Chord | undefined {
+  if (!(shortcutBinding(id).advertised?.(environment) ?? true)) return undefined;
+  return primaryShortcutChords(id, environment)[0] ?? menuShortcutChords(id, environment)[0];
+}
+
+/** Key caps for the chord `id` shows here, or none when it shows no chord. */
 export function shortcutKeys(id: ShortcutId, environment?: Partial<ShortcutEnvironment>): string[] {
   const resolved = currentShortcutEnvironment(environment);
-  const chord = primaryShortcutChords(id, resolved)[0];
+  const chord = shownChord(id, resolved);
   return chord ? chordKeys(chord, resolved.mac) : [];
 }
 
@@ -1235,13 +1243,13 @@ export function chordAriaShortcut(chord: Chord, mac: boolean = isMacPlatform()):
   return parts.join("+");
 }
 
-/** `aria-keyshortcuts` for the first of `id`'s chords here, or none when it has no chord. */
+/** `aria-keyshortcuts` for the chord `id` shows here, or none when it shows no chord. */
 export function shortcutAriaKeys(
   id: ShortcutId,
   environment?: Partial<ShortcutEnvironment>,
 ): string | undefined {
   const resolved = currentShortcutEnvironment(environment);
-  const chord = primaryShortcutChords(id, resolved)[0];
+  const chord = shownChord(id, resolved);
   return chord ? chordAriaShortcut(chord, resolved.mac) : undefined;
 }
 

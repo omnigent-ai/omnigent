@@ -139,9 +139,9 @@ describe("KeyboardShortcutsDialog", () => {
     expect(keysFor("Split terminal down")).toEqual(["Ctrl", "Alt", "-"]);
   });
 
-  it("advertises the session-search chord without taking the Print shortcut", () => {
+  it("lists no session-search row, since ⌘K finds sessions and ⌘⌥S stays unshown", () => {
     render(<KeyboardShortcutsList />);
-    expect(keysFor("Find a session by name")).toEqual(["Ctrl", "Alt", "S"]);
+    expect(screen.queryByText("Find a session by name")).toBeNull();
   });
 
   it("shows Add nested agent only when sibling sessions are available", () => {
@@ -236,21 +236,21 @@ describe("KeyboardShortcutsDialog", () => {
   it("shows the pinned-session shortcut with the Alt chord in a plain browser", () => {
     render(<KeyboardShortcutsDialog />);
     toggleViaHotkey();
-    const row = screen.getByText("Jump to a sidebar session (1–10)").closest("li");
+    const row = screen.getByText("Jump to a sidebar session (1–9)").closest("li");
     expect(row).toBeTruthy();
-    // Browser chord adds Alt (jsdom navigator is non-mac → "Alt") + the 1…0 chip.
+    // Browser chord adds Alt (jsdom navigator is non-mac → "Alt") + the 1…9 chip; ⌘0 stays zoom.
     expect(within(row!).getByText("Alt")).toBeTruthy();
-    expect(within(row!).getByText("1…0")).toBeTruthy();
+    expect(within(row!).getByText("1…9")).toBeTruthy();
   });
 
   it("shows the pinned-session shortcut without Alt in the Electron shell", () => {
     isNativeShell.mockReturnValue(true);
     render(<KeyboardShortcutsDialog />);
     toggleViaHotkey();
-    const row = screen.getByText("Jump to a sidebar session (1–10)").closest("li");
+    const row = screen.getByText("Jump to a sidebar session (1–9)").closest("li");
     expect(row).toBeTruthy();
     expect(within(row!).queryByText("Alt")).toBeNull();
-    expect(within(row!).getByText("1…0")).toBeTruthy();
+    expect(within(row!).getByText("1…9")).toBeTruthy();
   });
 
   it("shows the recent-session switcher and Back/Forward only in Electron", () => {

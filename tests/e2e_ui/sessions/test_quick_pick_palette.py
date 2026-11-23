@@ -814,45 +814,25 @@ def _palette_row_keys(page: Page, query: str, name: str) -> list[str]:
     return keys
 
 
-def test_quick_pick_session_shortcuts(
+def test_quick_pick_session_shortcut_keys(
     request: pytest.FixtureRequest, seeded_session_pair: tuple[str, str, str]
 ) -> None:
-    """Next and Previous session step through the sidebar, and ⌘K shows their keys."""
+    """⌘K shows the session and message chords a browser tab leaves to the page."""
     base_url, open_id, _other_id = seeded_session_pair
     page: Page = request.getfixturevalue("page")
     enable_quick_pick_palette(page)
     page.goto(f"{base_url}/c/{open_id}")
     expect(page.get_by_placeholder("Send a message…")).to_be_visible(timeout=30_000)
-    expect(page.locator(f'nav a[href="/c/{open_id}"]').first).to_be_visible(timeout=30_000)
     mac = bool(
         page.evaluate("/Mac/i.test(navigator.userAgentData?.platform ?? navigator.platform)")
     )
 
-    # ⌘K lists the shortcuts on their rows, in the runner's own key caps.
-    assert _palette_row_keys(page, "next session", "Next session") == (
-        ["⌃", "⌥", "⇧", "↓"] if mac else ["Ctrl", "Alt", "⇧", "↓"]
-    )
+    # A browser keeps Ctrl+Tab for its own tabs, so Next session shows no keys there; the
+    # chord itself is covered by test_quick_pick_ctrl_tab_steps_through_the_sidebar.
+    assert _palette_row_keys(page, "next session", "Next session") == []
     assert _palette_row_keys(page, "previous message", "Go to previous message") == (
-        ["⌘", "⌥", "↑"] if mac else ["Ctrl", "Alt", "↑"]
+        ["⌥", "⌘", "↑"] if mac else ["Ctrl", "Alt", "↑"]
     )
-
-    # Next session leaves for the sidebar's neighbouring row; Previous comes back.
-    page.keyboard.press("Control+Alt+Shift+ArrowDown")
-    expect(page).not_to_have_url(f"{base_url}/c/{open_id}", timeout=10_000)
-    expect(page).to_have_url(re.compile(rf"{re.escape(base_url)}/c/[^/]+$"))
-    # Previous steps from the row the sidebar highlights as open, so wait for it to move.
-    page.wait_for_function(
-        """(path) => [...document.querySelectorAll(`nav a[href="${path}"]`)].some((link) => {
-          for (let node = link; node && node.tagName !== "NAV"; node = node.parentElement) {
-            if (node.className?.includes?.("bg-[var(--sidebar-active)]")) return true;
-          }
-          return false;
-        })""",
-        arg=page.url.removeprefix(base_url),
-        timeout=10_000,
-    )
-    page.keyboard.press("Control+Alt+Shift+ArrowUp")
-    expect(page).to_have_url(f"{base_url}/c/{open_id}", timeout=10_000)
 
 
 def test_quick_pick_open_session_keys(
@@ -869,11 +849,11 @@ def test_quick_pick_open_session_keys(
     )
 
     assert _palette_row_keys(page, "archive session", "Archive session") == (
-        ["⌘", "⇧", "A"] if mac else ["Ctrl", "⇧", "A"]
+        ["⇧", "⌘", "A"] if mac else ["Ctrl", "⇧", "A"]
     )
     # Off macOS, Ctrl+Alt+P is Go to a file, so Pin has no browser key there.
     assert _palette_row_keys(page, "pin session", "Pin session") == (
-        ["⌘", "⌥", "P"] if mac else []
+        ["⌥", "⌘", "P"] if mac else []
     )
 
     page.keyboard.press("Meta+Shift+KeyA" if mac else "Control+Shift+KeyA")

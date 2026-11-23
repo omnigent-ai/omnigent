@@ -20,7 +20,7 @@ def test_keyboard_shortcuts_use_grouped_settings_cards(page: Page, live_server: 
     new_session = card.get_by_text("Start a new session", exact=True)
     expect(new_session).to_be_visible()
     expect(new_session.locator("xpath=..").locator("kbd")).to_have_text(
-        ["⌘", "⇧", "O"] if sys.platform == "darwin" else ["Ctrl", "Shift", "O"]
+        ["⇧", "⌘", "O"] if sys.platform == "darwin" else ["Ctrl", "Shift", "O"]
     )
     expect(card.get_by_text("Show keyboard shortcuts", exact=True)).to_be_visible()
 

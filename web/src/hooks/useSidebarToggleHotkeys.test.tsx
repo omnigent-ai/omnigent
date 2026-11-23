@@ -259,4 +259,29 @@ describe("useSidebarToggleHotkeys in the desktop app", () => {
     pressB({ ctrlKey: true, shiftKey: true, key: "B" }, input);
     expect(onToggleRight).toHaveBeenCalledTimes(1);
   });
+
+  it("also toggles with ⌘\\ and ⇧⌘\\ on macOS, unless a code editor has focus", () => {
+    const { onToggleLeft, onToggleRight } = setupNative(true);
+    press({ metaKey: true }, "Backslash");
+    press({ metaKey: true, shiftKey: true }, "Backslash");
+    expect(onToggleLeft).toHaveBeenCalledTimes(1);
+    expect(onToggleRight).toHaveBeenCalledTimes(1);
+
+    const editor = document.createElement("div");
+    editor.className = "cm-editor";
+    const content = document.createElement("textarea");
+    editor.append(content);
+    document.body.append(editor);
+    content.focus();
+    press({ metaKey: true, shiftKey: true }, "Backslash");
+    expect(onToggleRight).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves Ctrl+\\ alone off macOS, where it is a terminal's quit signal", () => {
+    const { onToggleLeft, onToggleRight } = setupNative(false);
+    press({ ctrlKey: true }, "Backslash");
+    press({ ctrlKey: true, shiftKey: true }, "Backslash");
+    expect(onToggleLeft).not.toHaveBeenCalled();
+    expect(onToggleRight).not.toHaveBeenCalled();
+  });
 });

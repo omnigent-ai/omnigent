@@ -26,6 +26,8 @@ export interface SidebarToggleHandlers {
 
 // Rich-text editors keep ⌘B for Bold.
 const RICH_TEXT_SELECTOR = "[contenteditable]:not([contenteditable='false'])";
+// Code editors keep ⇧⌘\ for Go to matching bracket, so the backslash chords leave them alone.
+const CODE_EDITORS = ".monaco-editor, .cm-editor";
 
 /** The sidebar a keydown toggles, or null when it isn't a sidebar chord here. */
 export function sidebarToggleSide(
@@ -43,6 +45,7 @@ export function sidebarToggleSide(
       : null;
   if (side === null) return null;
   const focused = document.activeElement;
+  if (e.code === "Backslash" && focused?.closest(CODE_EDITORS)) return null;
   if (native) {
     if (side === "right") return side;
     if (focused?.closest(RICH_TEXT_SELECTOR)) return null;

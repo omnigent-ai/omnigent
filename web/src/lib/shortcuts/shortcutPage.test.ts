@@ -181,6 +181,6 @@ describe("rows the registry binds", () => {
         .flatMap((group) => group.items)
         .find((row) => row.shortcutId === "settings.open")?.keys;
     expect(settingsKeys({ ...BROWSER_TAB, desktopCommands: true })).toEqual(["⌘", ","]);
-    expect(settingsKeys(BROWSER_TAB)).toEqual(["⌘", "⌥", ","]);
+    expect(settingsKeys(BROWSER_TAB)).toEqual(["⌥", "⌘", ","]);
   });
 });

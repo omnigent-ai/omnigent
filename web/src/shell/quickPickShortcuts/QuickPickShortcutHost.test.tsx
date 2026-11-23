@@ -77,11 +77,11 @@ function headerRow(id: string, availability: PaletteCommand["availability"] = AV
 const PIN = { key: "π", code: "KeyP", metaKey: true, altKey: true };
 const ARCHIVE = { key: "A", code: "KeyA", metaKey: true, shiftKey: true };
 
-const NEXT = { key: "ArrowDown", code: "ArrowDown", ctrlKey: true, altKey: true, shiftKey: true };
-const PREVIOUS = { key: "ArrowUp", code: "ArrowUp", ctrlKey: true, altKey: true, shiftKey: true };
 const press = (init: KeyboardEventInit) => fireEvent.keyDown(window, init);
 const CTRL_TAB = { key: "Tab", code: "Tab", ctrlKey: true };
 const CTRL_SHIFT_TAB = { ...CTRL_TAB, shiftKey: true };
+const NEXT = CTRL_TAB;
+const PREVIOUS = CTRL_SHIFT_TAB;
 
 /** Focus a field inside a new element matching `markup`, such as a terminal. */
 function focusInside(attributes: Record<string, string>): () => void {
@@ -134,6 +134,14 @@ describe("QuickPickShortcutHost", () => {
     expect(navigate.mock.calls).toEqual([["/c/c"], ["/c/b"]]);
   });
 
+  it("leaves Ctrl+Alt+Shift+arrows to the page", () => {
+    renderHost();
+    const arrow = { ctrlKey: true, altKey: true, shiftKey: true };
+    expect(press({ key: "ArrowDown", code: "ArrowDown", ...arrow })).toBe(true);
+    expect(press({ key: "ArrowUp", code: "ArrowUp", ...arrow })).toBe(true);
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
   it("leaves the key alone when no sidebar lists sessions, or a dialog has focus", () => {
     renderHost();
     act(() =>
@@ -158,7 +166,7 @@ describe("QuickPickShortcutHost", () => {
 
   it("claims its chord before a page listener that would read it too", () => {
     renderHost();
-    // As the transcript's message steps do, which don't check Shift.
+    // As a page listener that reads Control+Tab would.
     const pageListener = vi.fn((event: KeyboardEvent) => event.defaultPrevented);
     window.addEventListener("keydown", pageListener);
     press(NEXT);
@@ -185,8 +193,6 @@ describe("QuickPickShortcutHost", () => {
   it("takes Ctrl+Tab from a terminal, but leaves it to a dialog", () => {
     renderHost();
     const removeTerminal = focusInside({ class: "xterm" });
-    press(NEXT);
-    expect(navigate).not.toHaveBeenCalled();
     press(CTRL_TAB);
     expect(navigate).toHaveBeenCalledWith("/c/c");
     removeTerminal();

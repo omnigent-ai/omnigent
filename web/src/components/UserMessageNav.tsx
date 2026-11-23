@@ -2,14 +2,9 @@
 // corner (right-4) so the two don't collide.
 
 import { ChevronDownIcon, ChevronUpIcon } from "lucide-react";
-import {
-  ALT_KEY,
-  ARROW_DOWN_KEY,
-  ARROW_UP_KEY,
-  KeyboardShortcutTooltip,
-  MOD_KEY,
-} from "@/components/KeyboardShortcut";
+import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
+import { shortcutKeys } from "@/lib/shortcuts/registry";
 import { cn } from "@/lib/utils";
 
 export interface UserMessageNavProps {
@@ -37,7 +32,7 @@ export function UserMessageNav({
     >
       <KeyboardShortcutTooltip
         label="Previous message"
-        keys={[MOD_KEY, ALT_KEY, ARROW_UP_KEY]}
+        keys={shortcutKeys("message.previous")}
         side="left"
       >
         <Button
@@ -52,11 +47,7 @@ export function UserMessageNav({
           <ChevronUpIcon className="size-4" />
         </Button>
       </KeyboardShortcutTooltip>
-      <KeyboardShortcutTooltip
-        label="Next message"
-        keys={[MOD_KEY, ALT_KEY, ARROW_DOWN_KEY]}
-        side="left"
-      >
+      <KeyboardShortcutTooltip label="Next message" keys={shortcutKeys("message.next")} side="left">
         <Button
           className="pointer-events-auto rounded-full dark:bg-background dark:hover:bg-muted"
           onClick={goNext}

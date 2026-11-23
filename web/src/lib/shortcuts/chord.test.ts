@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { type Chord, chordKeys, chordMatches, type KeyChordInput } from "./chord";
+import { type Chord, chordKeys, chordMatches, inModifierOrder, type KeyChordInput } from "./chord";
 
 function press(init: Partial<KeyChordInput> & { key: string }): KeyChordInput {
   return { metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, ...init };
@@ -88,10 +88,11 @@ describe("chordMatches", () => {
     expect(chordMatches({ key: "Tab", exactKey: true }, press({ key: "Tab" }), true)).toBe(true);
   });
 
-  it("matches under AltGr only for a chord that opts in", () => {
+  it("never matches under AltGr, even a chord whose key AltGr leaves alone", () => {
     const slash = press({ key: "/", ctrlKey: true, altGraph: true });
     expect(chordMatches({ mod: true, key: "/" }, slash, false)).toBe(false);
-    expect(chordMatches({ mod: true, key: "/", matchesAltGraph: true }, slash, false)).toBe(true);
+    const arrow = press({ key: "ArrowUp", ctrlKey: true, altKey: true, altGraph: true });
+    expect(chordMatches({ mod: true, alt: true, key: "ArrowUp" }, arrow, false)).toBe(false);
   });
 
   it("reads AltGr from a DOM keydown", () => {
@@ -109,15 +110,23 @@ describe("chordMatches", () => {
   });
 });
 
+describe("inModifierOrder", () => {
+  it("sorts macOS modifiers ⌃⌥⇧⌘ and keeps other keys in place after them", () => {
+    expect(inModifierOrder(["⌘", "⇧", "⌥", "⌃", "K"], true)).toEqual(["⌃", "⌥", "⇧", "⌘", "K"]);
+    expect(inModifierOrder(["⌘", "↑", "↓"], true)).toEqual(["⌘", "↑", "↓"]);
+    expect(inModifierOrder(["Ctrl", "Alt", "⇧", "K"], false)).toEqual(["Ctrl", "Alt", "⇧", "K"]);
+  });
+});
+
 describe("chordKeys", () => {
-  it("draws modifiers as symbols on macOS and words elsewhere, in a fixed order", () => {
+  it("draws modifiers as symbols in Apple's ⌃⌥⇧⌘ order on macOS, and words elsewhere", () => {
     const chord: Chord = { mod: true, alt: true, shift: true, code: "BracketLeft" };
-    expect(chordKeys(chord, true)).toEqual(["⌘", "⌥", "⇧", "["]);
+    expect(chordKeys(chord, true)).toEqual(["⌥", "⇧", "⌘", "["]);
     expect(chordKeys(chord, false)).toEqual(["Ctrl", "Alt", "⇧", "["]);
     expect(chordKeys({ ctrl: true, shift: true, code: "KeyM" }, true)).toEqual(["⌃", "⇧", "M"]);
     expect(chordKeys({ ctrl: true, code: "Backquote" }, false)).toEqual(["Ctrl", "`"]);
     expect(chordKeys({ mod: true, ctrl: true, code: "KeyM" }, false)).toEqual(["Ctrl", "M"]);
-    expect(chordKeys({ mod: true, ctrl: true, code: "KeyM" }, true)).toEqual(["⌘", "⌃", "M"]);
+    expect(chordKeys({ mod: true, ctrl: true, code: "KeyM" }, true)).toEqual(["⌃", "⌘", "M"]);
   });
 
   it("labels keys by their cap", () => {
@@ -130,9 +139,9 @@ describe("chordKeys", () => {
     expect(chordKeys({ mod: true, key: "Enter" }, true)).toEqual(["⌘", "↵"]);
     expect(chordKeys({ key: "Escape" }, true)).toEqual(["Esc"]);
     expect(chordKeys({ ctrl: true, key: "Tab" }, true)).toEqual(["⌃", "Tab"]);
-    expect(chordKeys({ mod: true, alt: true, code: "Backslash" }, true)).toEqual(["⌘", "⌥", "\\"]);
-    expect(chordKeys({ mod: true, alt: true, code: "Minus" }, true)).toEqual(["⌘", "⌥", "-"]);
-    expect(chordKeys({ mod: true, alt: true, code: "Comma" }, true)).toEqual(["⌘", "⌥", ","]);
-    expect(chordKeys({ mod: true, alt: true, code: "Digit1" }, true)).toEqual(["⌘", "⌥", "1"]);
+    expect(chordKeys({ mod: true, alt: true, code: "Backslash" }, true)).toEqual(["⌥", "⌘", "\\"]);
+    expect(chordKeys({ mod: true, alt: true, code: "Minus" }, true)).toEqual(["⌥", "⌘", "-"]);
+    expect(chordKeys({ mod: true, alt: true, code: "Comma" }, true)).toEqual(["⌥", "⌘", ","]);
+    expect(chordKeys({ mod: true, alt: true, code: "Digit1" }, true)).toEqual(["⌥", "⌘", "1"]);
   });
 });

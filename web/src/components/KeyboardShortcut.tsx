@@ -4,11 +4,15 @@ export { CompactKbd, CompactShortcutKeys } from "@/components/ui/kbd";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { isNativeShell, supportsDesktopCommands } from "@/lib/nativeBridge";
+import { inModifierOrder } from "@/lib/shortcuts/chord";
 import { shortcutKeys } from "@/lib/shortcuts/registry";
 import type { TerminalSplitAxis } from "@/lib/terminalSplitLayout";
 import { cn } from "@/lib/utils";
 
 const IS_MAC = isMacPlatform();
+
+/** Key caps with their modifiers in the platform order: ⌃⌥⇧⌘ on macOS. */
+const ordered = (keys: readonly string[]): readonly string[] => inModifierOrder(keys, IS_MAC);
 
 export const MOD_KEY = IS_MAC ? "⌘" : "Ctrl";
 // Literal Control on every platform (⌃ on Mac), for chords that use Ctrl rather
@@ -33,19 +37,20 @@ export const SPLIT_TERMINAL_KEYS: Record<TerminalSplitAxis, string[]> = {
 export const NEW_TERMINAL_KEYS = shortcutKeys("terminal.new");
 export const NEW_BROWSER_TAB_KEYS = [MOD_KEY, "T"] as const;
 export const CLOSE_KEYS = [MOD_KEY, "W"] as const;
-export const CLOSE_WINDOW_KEYS = [MOD_KEY, SHIFT_KEY, "W"] as const;
-export const PIN_SESSION_KEYS = [MOD_KEY, ALT_KEY, "P"] as const;
-export const TOGGLE_UNREAD_KEYS = [MOD_KEY, ALT_KEY, "U"] as const;
-export const ARCHIVE_SESSION_KEYS = [MOD_KEY, SHIFT_KEY, "A"] as const;
-export const FORK_SESSION_KEYS = [MOD_KEY, ALT_KEY, "F"] as const;
+export const CLOSE_WINDOW_KEYS = ordered([MOD_KEY, SHIFT_KEY, "W"]);
+export const PIN_SESSION_KEYS = ordered([MOD_KEY, ALT_KEY, "P"]);
+export const TOGGLE_UNREAD_KEYS = ordered([MOD_KEY, ALT_KEY, "U"]);
+export const ARCHIVE_SESSION_KEYS = ordered([MOD_KEY, SHIFT_KEY, "A"]);
+export const FORK_SESSION_KEYS = ordered([MOD_KEY, ALT_KEY, "F"]);
 export const QUIT_KEYS = [MOD_KEY, "Q"] as const;
 export const RELOAD_KEYS = [MOD_KEY, "R"] as const;
 export const ADDRESS_BAR_KEYS = [MOD_KEY, "L"] as const;
-export const REOPEN_TAB_KEYS = [MOD_KEY, SHIFT_KEY, "T"] as const;
-export const PREVIOUS_TAB_KEYS = [MOD_KEY, SHIFT_KEY, "["] as const;
-export const NEXT_TAB_KEYS = [MOD_KEY, SHIFT_KEY, "]"] as const;
-export const BACK_KEYS = shortcutKeys("history.back");
-export const FORWARD_KEYS = shortcutKeys("history.forward");
+export const REOPEN_TAB_KEYS = ordered([MOD_KEY, SHIFT_KEY, "T"]);
+export const PREVIOUS_TAB_KEYS = ordered([MOD_KEY, SHIFT_KEY, "["]);
+export const NEXT_TAB_KEYS = ordered([MOD_KEY, SHIFT_KEY, "]"]);
+// The same keys whether the desktop menu or the page takes them, so no shell is probed on load.
+export const BACK_KEYS = shortcutKeys("history.back", { desktopMenu: false });
+export const FORWARD_KEYS = shortcutKeys("history.forward", { desktopMenu: false });
 export const COMMAND_PALETTE_KEYS = shortcutKeys("palette.commands");
 // The browser chords; the desktop app's are below.
 export const SIDEBAR_TOGGLE_KEYS = shortcutKeys("sidebar.left", { native: false });
@@ -58,7 +63,7 @@ export function shortcutText(keys: readonly string[]): string {
 }
 
 export function newSessionShortcutKeys(native = isNativeShell()): string[] {
-  return native ? [MOD_KEY, "N"] : [MOD_KEY, IS_MAC ? SHIFT_KEY : "Shift", "O"];
+  return native ? [MOD_KEY, "N"] : [...ordered([MOD_KEY, IS_MAC ? SHIFT_KEY : "Shift", "O"])];
 }
 
 export function newSessionAriaShortcut(native = isNativeShell()): string {
@@ -112,7 +117,7 @@ export function workspaceTabAriaShortcut(digit: string): string {
 
 /** Keys for the numbered-session jump chord; `digit` is one slot's digit or a range label. */
 export function sessionNumberShortcutKeys(digit: string, native = isNativeShell()): string[] {
-  return native ? [MOD_KEY, digit] : [MOD_KEY, ALT_KEY, digit];
+  return native ? [MOD_KEY, digit] : [...ordered([MOD_KEY, ALT_KEY, digit])];
 }
 
 export function sessionNumberAriaShortcut(digit: string, native = isNativeShell()): string {
@@ -124,7 +129,7 @@ export function composerSendShortcutKeys(submitWithModEnter: boolean): string[] 
 }
 
 export function composerSteerAllShortcutKeys(submitWithModEnter: boolean): string[] {
-  return submitWithModEnter ? [MOD_KEY, SHIFT_KEY, ENTER_KEY] : [MOD_KEY, ENTER_KEY];
+  return submitWithModEnter ? [...ordered([MOD_KEY, SHIFT_KEY, ENTER_KEY])] : [MOD_KEY, ENTER_KEY];
 }
 
 export function composerNewLineShortcutKeys(submitWithModEnter: boolean): string[] {

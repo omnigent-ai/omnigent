@@ -13,7 +13,8 @@ import {
   type LucideIcon,
   SearchIcon,
 } from "lucide-react";
-import { ARIA_MOD_KEY, MOD_KEY, SHIFT_KEY } from "@/components/KeyboardShortcut";
+import { ARIA_MOD_KEY } from "@/components/KeyboardShortcut";
+import { shortcutKeys } from "@/lib/shortcuts/registry";
 import { cn } from "@/lib/utils";
 import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
 
@@ -62,7 +63,7 @@ export const WORKSPACE_PANEL_TABS: Record<WorkspacePanelTab, WorkspacePanelTabDe
     label: "Content search",
     icon: SearchIcon,
     shown: ({ showContentSearch, showFilesPanel }) => showContentSearch && showFilesPanel,
-    tooltipShortcut: () => [MOD_KEY, SHIFT_KEY, "F"],
+    tooltipShortcut: () => shortcutKeys("workspace.searchContents"),
     ariaKeyShortcuts: ({ digitAriaShortcut }) =>
       `${ARIA_MOD_KEY}+Shift+F ${digitAriaShortcut ?? ""}`.trim(),
   },

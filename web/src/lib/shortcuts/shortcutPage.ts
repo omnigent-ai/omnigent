@@ -3,13 +3,11 @@
 // here: the page's own, or the desktop menu's where the menu owns it.
 
 import { isMacPlatform } from "@/lib/hotkeys";
-import { chordKeys } from "@/lib/shortcuts/chord";
 import {
   APP_SHORTCUT_BINDINGS,
   currentShortcutEnvironment,
-  menuShortcutChords,
-  primaryShortcutChords,
   SHORTCUT_GROUPS,
+  shortcutKeys,
   type ShortcutBinding,
   type ShortcutEnvironment,
   type ShortcutGroupId,
@@ -39,10 +37,10 @@ export interface ShortcutPageGroup {
   items: ShortcutPageRow[];
 }
 
-/** Key caps for the chord `id` shows here: its own first chord, else the desktop menu's. */
-function shownKeys(id: ShortcutId, environment: ShortcutEnvironment): string[] {
-  const chord = primaryShortcutChords(id, environment)[0] ?? menuShortcutChords(id, environment)[0];
-  return chord ? chordKeys(chord, environment.mac) : [];
+/** An alternate's keys, or undefined where its chord isn't listed. */
+function alternateKeys(id: ShortcutId, environment: ShortcutEnvironment): string[] | undefined {
+  const keys = shortcutKeys(id, environment);
+  return keys.length > 0 ? keys : undefined;
 }
 
 function pageRow(
@@ -50,18 +48,15 @@ function pageRow(
   context: ShortcutPageContext,
   environment: ShortcutEnvironment,
 ): ShortcutPageRow | null {
-  const keys = shownKeys(binding.id, environment);
+  const keys = shortcutKeys(binding.id, environment);
   const rowKeys = binding.rowKeys ? binding.rowKeys(keys, { context, environment }) : keys;
   if (rowKeys.length === 0) return null;
   const alternate = APP_SHORTCUT_BINDINGS.find((candidate) => candidate.alternateOf === binding.id);
-  const alternateShown = alternate && (alternate.advertised?.(environment) ?? true);
   return {
     label: binding.label,
     keys: rowKeys,
     // A row with an alternative lists it after "or" only where its chord applies.
-    ...(alternate
-      ? { alternateKeys: alternateShown ? shownKeys(alternate.id, environment) : undefined }
-      : {}),
+    ...(alternate ? { alternateKeys: alternateKeys(alternate.id, environment) } : {}),
     ...(binding.desktopOnly ? { desktopOnly: true } : {}),
     shortcutId: binding.id,
   };

@@ -148,11 +148,12 @@ describe("shortcut registry", () => {
     expect(unread({ ctrlKey: true, altKey: true, altGraph: true })).toBe(false);
   });
 
-  it("leaves Settings' chord to the desktop menu when there is one", () => {
+  it("leaves Settings' chord to the desktop menu when there is one, and shows the menu's", () => {
     const comma = press({ key: "≤", code: "Comma", metaKey: true, altKey: true });
     expect(matchesShortcut(comma, "settings.open", mac)).toBe(true);
     expect(activeShortcutChords("settings.open", { desktopMenu: true })).toEqual([]);
-    expect(shortcutKeys("settings.open", { ...mac, desktopMenu: true })).toEqual([]);
+    expect(shortcutKeys("settings.open", { ...mac, desktopMenu: true })).toEqual(["⌘", ","]);
+    expect(shortcutKeys("settings.open", { ...mac, desktopMenu: false })).toEqual(["⌥", "⌘", ","]);
     expect(matchesShortcut(comma, "settings.open", { ...mac, desktopMenu: true })).toBe(false);
   });
 
@@ -230,14 +231,17 @@ describe("General and Navigation bindings", () => {
     }
   });
 
-  it("numbers sidebar sessions ⌘1–⌘9 then ⌘0, adding Alt in a browser", () => {
+  it("numbers sidebar sessions ⌘1–⌘9, leaving ⌘0 to Actual Size, adding Alt in a browser", () => {
     const native = { ...mac, native: true };
     expect(
       matchedShortcutChordIndex(press({ key: "1", metaKey: true }), "session.number", native),
     ).toBe(0);
     expect(
+      matchedShortcutChordIndex(press({ key: "9", metaKey: true }), "session.number", native),
+    ).toBe(8);
+    expect(
       matchedShortcutChordIndex(press({ key: "0", metaKey: true }), "session.number", native),
-    ).toBe(9);
+    ).toBe(-1);
     expect(
       matchedShortcutChordIndex(press({ key: "1", metaKey: true }), "session.number", mac),
     ).toBe(-1);
@@ -257,24 +261,24 @@ describe("General and Navigation bindings", () => {
     ).toBe(-1);
   });
 
-  it("keeps firing under AltGr for the chords that never checked for it", () => {
+  it("ignores every chord under AltGr, which types characters", () => {
     const altGraph = { altGraph: true };
     expect(
       matchesShortcut(press({ key: "/", ctrlKey: true, ...altGraph }), "shortcuts.show", other),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       matchesShortcut(
         press({ key: "[", code: "BracketLeft", ctrlKey: true, ...altGraph }),
         "history.back",
         other,
       ),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       matchedShortcutChordIndex(press({ key: "2", ctrlKey: true, ...altGraph }), "session.number", {
         ...other,
         native: true,
       }),
-    ).toBe(1);
+    ).toBe(-1);
     expect(
       matchesShortcut(press({ key: "k", ctrlKey: true, ...altGraph }), "palette.commands", other),
     ).toBe(false);
@@ -333,11 +337,11 @@ describe("View bindings", () => {
     ).toBe(-1);
   });
 
-  it("opens a new shell with literal Control+` on every platform, even under AltGr", () => {
+  it("opens a new shell with literal Control+` on every platform, but not under AltGr", () => {
     const shell = press({ key: "`", code: "Backquote", ctrlKey: true });
     expect(matchesShortcut(shell, "terminal.new", mac)).toBe(true);
     expect(matchesShortcut(shell, "terminal.new", other)).toBe(true);
-    expect(matchesShortcut({ ...shell, altGraph: true }, "terminal.new", other)).toBe(true);
+    expect(matchesShortcut({ ...shell, altGraph: true }, "terminal.new", other)).toBe(false);
     expect(
       matchesShortcut(press({ key: "`", code: "Backquote", metaKey: true }), "terminal.new", mac),
     ).toBe(false);
@@ -423,7 +427,7 @@ describe("Chat and Pane bindings", () => {
     );
     expect(
       matchesShortcut(press({ key: "Escape", altGraph: true }), "approval.decline", other),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("cycles panes with ⌘⌥⇧[ / ⌘⌥⇧] and splits with ⌘⌥⇧\\ and ⌘⌥-", () => {

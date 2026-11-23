@@ -49,7 +49,7 @@ describe("pane shortcuts", () => {
   it("names each key as the pane command table does, with caps and aria for its chord", () => {
     expect(paneShortcutLabel("terminal.splitRight")).toBe("Split Right");
     expect(paneShortcutLabel("terminal.resizeLeft")).toBe("Move Divider Left");
-    expect(paneKeyCaps("terminal.splitDown", MAC)).toEqual(["⌘", "⇧", "D"]);
+    expect(paneKeyCaps("terminal.splitDown", MAC)).toEqual(["⇧", "⌘", "D"]);
     expect(paneKeyAria("terminal.splitDown", MAC)).toBe("Meta+Shift+D");
     expect(paneKeyCaps("terminal.splitDown", LINUX)).toEqual([]);
     expect(paneKeyAria("terminal.splitDown", LINUX)).toBeUndefined();

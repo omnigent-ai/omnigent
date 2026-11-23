@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
-import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import { ARIA_MOD_KEY } from "@/components/KeyboardShortcut";
+import { shortcutKeys } from "@/lib/shortcuts/registry";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useRenameConversation } from "@/hooks/useConversations";
 import { useRenameSessionHotkey } from "@/hooks/useRenameSessionHotkey";
@@ -41,7 +42,7 @@ export function HeaderTitle({ conversationId, title }: { conversationId: string;
         </TooltipTrigger>
         {/* Bottom placement: the header sits at top-0, so a top-side tooltip
             would clip above the viewport edge. */}
-        <TooltipContent side="bottom" shortcut={[MOD_KEY, ALT_KEY, "R"]}>
+        <TooltipContent side="bottom" shortcut={shortcutKeys("session.rename")}>
           Rename
         </TooltipContent>
       </Tooltip>

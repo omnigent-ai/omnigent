@@ -53,8 +53,8 @@ afterEach(() => {
 describe("useSessionNumberHotkeys", () => {
   const ids = ["a", "b", "c"];
 
-  it("exposes ten digits mapping 1–9 then 0", () => {
-    expect(SESSION_HOTKEY_DIGITS).toEqual(["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]);
+  it("exposes nine digits, 1–9; ⌘0 stays the menu's Actual Size", () => {
+    expect(SESSION_HOTKEY_DIGITS).toEqual(["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
   });
 
   it("Cmd+1 opens the first pinned session", () => {
@@ -69,11 +69,12 @@ describe("useSessionNumberHotkeys", () => {
     expect(navigate).toHaveBeenCalledWith("/c/c");
   });
 
-  it("Cmd+0 opens the tenth pinned session", () => {
+  it("leaves Cmd+0 to Actual Size, even with a tenth session", () => {
     const ten = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
     render(ten, undefined);
-    press("0");
-    expect(navigate).toHaveBeenCalledWith("/c/j");
+    const e = press("0");
+    expect(navigate).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(false);
   });
 
   it("Cmd+9 opens the ninth pinned session", () => {
@@ -141,12 +142,13 @@ describe("useSessionNumberHotkeys", () => {
     expect(e.defaultPrevented).toBe(true);
   });
 
-  it("only maps the first ten: an 11th pinned session has no shortcut", () => {
-    const eleven = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"];
-    render(eleven, undefined);
-    // No digit maps to index 10, so "k" is unreachable; 0 still lands on the 10th.
+  it("only maps the first nine: a tenth pinned session has no shortcut", () => {
+    const ten = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
+    render(ten, undefined);
+    press("9");
+    expect(navigate).toHaveBeenCalledWith("/c/i");
     press("0");
-    expect(navigate).toHaveBeenCalledWith("/c/j");
+    expect(navigate).toHaveBeenCalledTimes(1);
   });
 
   it("does nothing when the list is empty", () => {
@@ -194,11 +196,11 @@ describe("useSessionNumberHotkeys", () => {
     altGraph.mockRestore();
   });
 
-  it("browser: Cmd+Alt+Digit0 opens the tenth pinned session", () => {
+  it("browser: Cmd+Alt+Digit0 opens nothing", () => {
     isNativeShell.mockReturnValue(false);
     const ten = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
     render(ten, undefined);
     press("º", { metaKey: true, altKey: true }, document.body, "Digit0");
-    expect(navigate).toHaveBeenCalledWith("/c/j");
+    expect(navigate).not.toHaveBeenCalled();
   });
 });
