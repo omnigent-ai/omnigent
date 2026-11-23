@@ -6,13 +6,13 @@ import asyncio
 import base64
 import binascii
 import contextlib
-import enum
 import itertools
 import secrets
 import time
 import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Any, Literal, Never, cast
 
 import httpx
@@ -456,15 +456,15 @@ _STREAMED_DELTA_EVENT_TYPES = frozenset(
 )
 
 
-class _BatchRun(enum.Enum):
+class _BatchRun(Enum):
     """How ``POST /events`` handles a run of consecutive entries in an event array."""
 
     # Appended with one authorization and one store call.
-    EXTERNAL_ITEMS = enum.auto()
+    EXTERNAL_ITEMS = auto()
     # Authorized once, then each entry takes the per-entry path.
-    STREAMED_DELTAS = enum.auto()
+    STREAMED_DELTAS = auto()
     # Each entry takes the per-entry path with its own authorization.
-    PER_ENTRY = enum.auto()
+    PER_ENTRY = auto()
 
 
 def _batch_run(event: SessionEventInput) -> _BatchRun:
