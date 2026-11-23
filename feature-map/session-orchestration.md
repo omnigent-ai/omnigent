@@ -163,7 +163,12 @@ MCP independent creation.
   chats, so only the server could tell that a project is empty, and it has no
   check for that yet. Sub-agents follow their parent and a
   family follows its representative for filing; each refusal names the
-  session to update instead. An edit-shared caller cannot change a project or
+  session to update instead. `archived: true` is the one change that applies
+  to a sub-agent: the tool archives any of the owner's sub-agents, in another
+  tree or the caller's own on its runner (the server never stops an
+  ancestor's runner; servers must advertise `session_archive_runner_checks`
+  for sub-agent archives), and closes it like `sys_session_close` so its parent
+  can reuse the name. A sub-agent cannot archive itself. An edit-shared caller cannot change a project or
   create or rename one, or rename, pin or archive a session, while
   listing stays an ordinary owner read. A session shared with the caller
   but owned by someone else is refused, even when it is already in the target
@@ -174,7 +179,8 @@ MCP independent creation.
   `tests/server/integration/test_session_orchestration_projects.py::test_project_tools_list_and_file_running_sessions`,
   `::test_organizing_tools_rename_pin_archive_and_manage_projects`,
   `::test_organizing_tools_refuse_a_source_shared_with_edit_access`,
-  `::test_a_child_cannot_archive_its_rebound_parent`
+  `::test_a_child_cannot_archive_its_parent`,
+  `::test_the_tool_archives_sub_agents_in_any_of_the_owners_trees`
   and the browser journeys in
   `tests/e2e_ui/sessions/test_agent_files_sessions_into_projects.py`.
 - `refusal`: disabled orchestration, another owner, edit-shared sender or wrong runner binding

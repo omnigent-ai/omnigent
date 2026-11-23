@@ -449,6 +449,9 @@ class ServerInfoResponse(BaseModel):
     # Every other agent-tool organizing write checks it too: session title, pin
     # and archive, and project rename, icon and delete.
     session_organize_source_checks: bool = False
+    # Sub-agent archives check runner ownership and route through inherited hosts;
+    # runner tools require this capability before archiving a sub-agent.
+    session_archive_runner_checks: bool = False
     # An agent's create that names a project other than its source's project makes a
     # standalone session; older servers refuse it while sibling sessions are on.
     sibling_other_project_standalone: bool = False
@@ -4227,6 +4230,7 @@ def create_app(
                 "session_timers": bool(app.state.session_timers_enabled),
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
+                "session_archive_runner_checks": True,
                 "sibling_other_project_standalone": True,
                 "memory": app.state.memory_available(),
                 "automations_enabled": automations_enabled,
