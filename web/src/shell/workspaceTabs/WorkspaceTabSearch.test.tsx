@@ -1,4 +1,4 @@
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { act, cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { FileIcon, GlobeIcon, TerminalIcon } from "lucide-react";
 import { useState } from "react";
@@ -228,6 +228,13 @@ describe("WorkspaceTabSearch", () => {
     await userEvent.click(screen.getByRole("button", { name: "All tabs" }));
     const field = screen.getByRole("combobox", { name: "Search tabs" });
     await userEvent.keyboard("main");
+    // With text before the caret, the chord edits the query, as it does in any text field.
+    await userEvent.keyboard("{Control>}{Backspace}{/Control}");
+    expect(closeTab).not.toHaveBeenCalled();
+    await userEvent.clear(field);
+    await userEvent.keyboard("main");
+    // With the caret at the start there's nothing for it to delete, so it closes the tab.
+    act(() => (field as HTMLInputElement).setSelectionRange(0, 0));
     await userEvent.keyboard("{Control>}{Backspace}{/Control}");
     expect(closeTab).toHaveBeenCalledWith("t1");
     expect(field).toHaveFocus();

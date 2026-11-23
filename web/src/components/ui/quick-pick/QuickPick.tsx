@@ -26,7 +26,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { pickListInputProps, readlineListStep } from "@/lib/listNavigationKeys";
 import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { chordAriaShortcut, chordKeys, chordMatches } from "@/lib/shortcuts/chord";
+import { type Chord, chordAriaShortcut, chordKeys, chordMatches } from "@/lib/shortcuts/chord";
 import { cn } from "@/lib/utils";
 
 import { readQuickPickHistory, recordQuickPickHistory } from "./history";
@@ -274,6 +274,19 @@ function rowActionShortcuts(actions: readonly QuickPickRowAction[] | undefined) 
   return shortcuts.length > 0 ? shortcuts.join(" ") : undefined;
 }
 
+/**
+ * Whether `chord` would edit the query instead, as ⌘⌫ or Ctrl+Backspace deletes text before the
+ * caret, so the field keeps it while there's something there to delete.
+ */
+function chordEditsField(chord: Chord, field: HTMLInputElement): boolean {
+  const key = chord.key?.toLowerCase();
+  if (key !== "backspace" && key !== "delete") return false;
+  const start = field.selectionStart ?? field.value.length;
+  const end = field.selectionEnd ?? start;
+  if (start !== end) return true;
+  return key === "backspace" ? start > 0 : start < field.value.length;
+}
+
 /** A button beside a row, for the pointer: it never takes focus, which stays in the query. */
 function RowActionButton({
   action,
@@ -439,7 +452,6 @@ export function QuickPick<Value>({
   );
   const isMac = useMemo(() => isMacPlatform(), []);
   const sections = useMemo(() => sectionsOf(rows), [rows]);
-  // How many rows each heading lists, for headings that show it.
   const headingCounts = useMemo(() => {
     const counts = new Map<string, number>();
     for (const row of rows) {
@@ -449,7 +461,6 @@ export function QuickPick<Value>({
     }
     return counts;
   }, [rows]);
-  // Each heading's buttons, by heading key, for the headings listed now.
   const headingActions = useMemo(() => {
     const byKey = new Map<string, readonly QuickPickGroupAction[]>();
     if (!groupActions) return byKey;
@@ -659,9 +670,14 @@ export function QuickPick<Value>({
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     // Keys that drive an IME composition, including its Enter, belong to the composition.
     if (isImeCompositionKeyEvent(event)) return;
-    const rowAction = activeRow?.item.actions?.find(
-      (action) => action.chord && chordMatches(action.chord, event.nativeEvent, isMac),
-    );
+    const rowAction = activeRow?.item.disabledReason
+      ? undefined
+      : activeRow?.item.actions?.find(
+          (action) =>
+            action.chord &&
+            chordMatches(action.chord, event.nativeEvent, isMac) &&
+            !chordEditsField(action.chord, event.currentTarget),
+        );
     if (rowAction && activeRow) {
       event.preventDefault();
       runRowAction(activeRow, rowAction);

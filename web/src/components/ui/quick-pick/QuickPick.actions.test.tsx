@@ -194,6 +194,37 @@ describe("QuickPick row buttons", () => {
     expect(active()).toBe("alpha");
   });
 
+  it("leaves the chord to the query while it has text before the caret or selected", () => {
+    const run = vi.fn();
+    const { input } = renderPicker({ segments: withClose(run), query: "al" });
+    // The caret sits at the end, as after typing: Ctrl+Backspace deletes a word.
+    input.setSelectionRange(2, 2);
+    expect(fireEvent.keyDown(input, { key: "Backspace", ctrlKey: true })).toBe(true);
+    input.setSelectionRange(0, 2);
+    expect(fireEvent.keyDown(input, { key: "Backspace", ctrlKey: true })).toBe(true);
+    expect(run).not.toHaveBeenCalled();
+    // At the start there's nothing to delete, so the row's button takes it.
+    input.setSelectionRange(0, 0);
+    expect(fireEvent.keyDown(input, { key: "Backspace", ctrlKey: true })).toBe(false);
+    expect(run).toHaveBeenCalledWith("alpha");
+  });
+
+  it("runs no button by keys on a disabled row", () => {
+    const run = vi.fn();
+    const [segment] = withClose(run);
+    renderPicker({
+      segments: [
+        {
+          ...segment!,
+          items: segment!.items.map((item) => ({ ...item, disabledReason: "Not now" })),
+        },
+      ],
+    });
+    const input = screen.getByRole("combobox", { name: "Things" });
+    fireEvent.keyDown(input, { key: "Backspace", ctrlKey: true });
+    expect(run).not.toHaveBeenCalled();
+  });
+
   it("leaves Backspace alone without the modifier", () => {
     const run = vi.fn();
     const { input } = renderPicker({ segments: withClose(run) });
@@ -257,17 +288,20 @@ describe("QuickPick group headings", () => {
           ? new DOMRect(0, 0, 0, 0)
           : new DOMRect(0, 0, 180, 32);
       });
-    renderPicker({
-      segments: grouped,
-      groupCounts: true,
-      groupActions: (group) =>
-        group === "Files" ? [{ id: "close-all", label: "Close all", run: () => {} }] : [],
-    });
-    const headings = [
-      ...document.querySelectorAll<HTMLElement>("[data-slot=quick-pick-group-heading]"),
-    ];
-    expect(headings.map((heading) => heading.style.paddingRight)).toEqual(["188px", ""]);
-    measure.mockRestore();
+    try {
+      renderPicker({
+        segments: grouped,
+        groupCounts: true,
+        groupActions: (group) =>
+          group === "Files" ? [{ id: "close-all", label: "Close all", run: () => {} }] : [],
+      });
+      const headings = [
+        ...document.querySelectorAll<HTMLElement>("[data-slot=quick-pick-group-heading]"),
+      ];
+      expect(headings.map((heading) => heading.style.paddingRight)).toEqual(["188px", ""]);
+    } finally {
+      measure.mockRestore();
+    }
   });
 
   it("closes the picker on Escape from a heading button", () => {
