@@ -28,6 +28,12 @@ export function usePublishOpenSession(routedSessionId: string | null): void {
   }, [routedSessionId, rootId, draftSourceId]);
 }
 
+/** `usePublishOpenSession` as a component, so the shell can mount it only with ⌘K's QuickPick on. */
+export function OpenSessionPublisher({ sessionId }: { sessionId: string | null }) {
+  usePublishOpenSession(sessionId);
+  return null;
+}
+
 /** Whether the page shows `sessionId` now, itself, as an open sub-agent's root or as a draft's source. */
 export function isOpenSession(sessionId: string): boolean {
   return openSessionIds.includes(sessionId);

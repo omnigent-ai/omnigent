@@ -47,7 +47,7 @@ import {
   useProjects,
   useSyncMutedProjects,
 } from "@/hooks/useConversations";
-import { usePublishOpenSession } from "./openSession";
+import { OpenSessionPublisher } from "./openSession";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useOpenSessionRow } from "@/hooks/useOpenSessionRow";
@@ -808,8 +808,6 @@ function AppShellImpl() {
   }, [serverConversationId, allConversations]);
   // What ⌘K commands act on. The level is only authoritative once this route's snapshot loads.
   const commandSession = useCommandSession(serverConversationId, activeConv);
-  // Read by requests that settle after their row has gone, such as a Leave.
-  usePublishOpenSession(serverConversationId ?? null);
   const commandView = commandViewForPath(location.pathname, rebasePath);
   // A temporary row is display-only: it can supply optimistic breadcrumb
   // text, but must not participate in permissions, actions, or server hooks.
@@ -3900,7 +3898,13 @@ function AppShellImpl() {
             serverConversationId={serverConversationId}
             updateOverlayHeight={updateOverlayHeight}
           />
-          {isFeatureEnabled(serverInfo, "quick_pick_palette") && <MarkAllReadPaletteCommand />}
+          {isFeatureEnabled(serverInfo, "quick_pick_palette") && (
+            <>
+              <MarkAllReadPaletteCommand />
+              {/* Read by ⌘K's actions that settle after their host has gone, such as a Leave. */}
+              <OpenSessionPublisher sessionId={serverConversationId ?? null} />
+            </>
+          )}
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>
     </AppShellRootProviders>

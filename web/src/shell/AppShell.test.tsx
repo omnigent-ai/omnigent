@@ -22,6 +22,7 @@ vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>canvas board</div>
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as MarkAllReadPaletteCommandModule from "@/shell/markAllReadPaletteCommand";
+import { isOpenSession } from "@/shell/openSession";
 import type { TerminalInfo } from "@/lib/terminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
@@ -7536,4 +7537,14 @@ describe("Mark all as read in ⌘K", () => {
     if (quickPick) expect(markAllReadCommand.renders).toBeGreaterThan(0);
     else expect(markAllReadCommand.renders).toBe(0);
   });
+
+  it.each([false, true])(
+    "publishes the open session only with quick_pick_palette on (%s)",
+    async (quickPick) => {
+      mockConversations([{ id: "conv_published", permission_level: null }]);
+      renderShell("/c/conv_published", serverInfo({ features: { quick_pick_palette: quickPick } }));
+      await waitFor(() => expect(document.querySelector("header.chat-header")).not.toBeNull());
+      expect(isOpenSession("conv_published")).toBe(quickPick);
+    },
+  );
 });
