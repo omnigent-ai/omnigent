@@ -46,6 +46,7 @@ from urllib.parse import urlparse
 import pytest
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e_ui._quick_pick_palette import enable_quick_pick_palette, run_palette_command
 from tests.e2e_ui.conftest import fetch_with_retry
 
 _COMPOSER_PLACEHOLDER = "Send a message…"
@@ -439,3 +440,37 @@ def test_wake_stuck_on_stage_brings_reconnect_host_back(
     expect(page.get_by_role("menuitem", name="Reconnect host")).to_be_visible()
     page.keyboard.press("Escape")
     expect(toasts).to_have_count(0)
+
+
+def test_resume_sandbox_from_quick_pick_palette(
+    request: pytest.FixtureRequest,
+    seeded_session: tuple[str, str],
+) -> None:
+    """⌘K's Resume sandbox asks the server to resume the open session's asleep sandbox.
+
+    The wake that opening the session sends is refused, so the sandbox stays asleep
+    and ⌘K's Resume sandbox sends the next ``retry_session``.
+
+    :param request: Supplies the recorded ``page`` after server setup.
+    :param seeded_session: ``(base_url, session_id)`` for a real server-backed
+        session; the browser view is patched to the host_asleep shape.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    page: Page = request.getfixturevalue("page")
+    enable_quick_pick_palette(page)
+    _force_host_asleep(page, session_id)
+    held = _hold_wake_requests(page, session_id)
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    _next_held(page, held, timeout_ms=30_000).fulfill(
+        status=503,
+        content_type="application/json",
+        body=json.dumps({"error": {"message": "Sandbox is asleep."}}),
+    )
+    _expect_host_status(page, "offline", tooltip="Asleep — wakes on next message")
+
+    run_palette_command(page, "Resume sandbox", "Resume sandbox", closes=True)
+    resume = _next_held(page, held)
+    assert resume.request.post_data_json == {"type": "retry_session", "data": {}}

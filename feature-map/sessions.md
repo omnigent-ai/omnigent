@@ -702,8 +702,10 @@ Requests pick, or a message. Reconnect host, opening the session, a Files,
 Changes or Pull Requests pick, the terminal's Resume and a tabs-sidebar shell
 tab's Resume session join one wake per session, including after switching to
 another session and back. The Resume sandbox notices (the Changes view, the
-tabs sidebar's panels and shell tabs, with their Retry, and ⌘K) share a resume
-of their own, so the two groups show their own progress until the server
+tabs sidebar's panels and shell tabs, with their Retry, and the QuickPick ⌘K
+palette's **Resume sandbox**, listed for the open session while its sandbox is
+asleep or failed to resume and greyed out with the reason for anyone but its
+owner) share a resume of their own, so the two groups show their own progress until the server
 reports the launch, which every surface then shows. The Files and Pull Requests
 views say the sandbox is starting while it runs or the server reports its launch.
 
@@ -1314,8 +1316,9 @@ plain `uv run pytest`, which starts a private server for the test.
   host. It checks that opening the session sends `retry_session` on its own,
   spins the chip and menu dots with no toast, and turns them green once
   `/health` reports the host online. Sibling tests cover a failed wake's error
-  toast and Reconnect host retry, a session opened mid-wake, and a wake whose
-  stage outlasts its limit. The open dwell, Files/Changes/Pull Requests picks, and the
+  toast and Reconnect host retry, a session opened mid-wake, a wake whose
+  stage outlasts its limit, and ⌘K's Resume sandbox sending `retry_session`
+  (`test_resume_sandbox_from_quick_pick_palette`). The open dwell, Files/Changes/Pull Requests picks, and the
   one-wake-per-session sharing are covered by
   `web/src/hooks/useSandboxAutoWake.test.ts` and
   `web/src/hooks/useSessionReconnect.test.ts`. None

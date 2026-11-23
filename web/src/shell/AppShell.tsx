@@ -177,6 +177,7 @@ import { AppShellWorkspacePanels } from "./AppShellWorkspacePanels";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { AppShellOverlays } from "./AppShellOverlays";
 import { MarkAllReadPaletteCommand } from "./markAllReadPaletteCommand";
+import { ResumeSandboxPaletteCommand } from "./resumeSandboxCommand";
 import { AppShellRootProviders } from "./AppShellRootProviders";
 import { replaceThemePicker } from "@/store/themePicker";
 import { commandViewForPath, useCommandSession } from "./commandContext";
@@ -3824,7 +3825,12 @@ function AppShellImpl() {
             serverConversationId={serverConversationId}
             updateOverlayHeight={updateOverlayHeight}
           />
-          {isFeatureEnabled(serverInfo, "quick_pick_palette") && <MarkAllReadPaletteCommand />}
+          {isFeatureEnabled(serverInfo, "quick_pick_palette") && (
+            <>
+              <MarkAllReadPaletteCommand />
+              <ResumeSandboxPaletteCommand />
+            </>
+          )}
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>
     </AppShellRootProviders>
