@@ -8,7 +8,12 @@ import { isPinnedTab } from "./pinnedTabs";
 import { reorderStripEntries, type StripReorderEntry } from "./stripReorder";
 import { pinnedTabsMaxWidth, TAB_GAP } from "./tabStripWidth";
 import { useTabStripWidth } from "./useTabStripWidth";
-import { type TabSearchEntry, WorkspaceTabSearch } from "./WorkspaceTabSearch";
+import { tabGroup as tabGroupDefinition, tabGroupOf, tabPullRequestUrl } from "./tabGroups";
+import {
+  type TabSearchClosing,
+  type TabSearchEntry,
+  WorkspaceTabSearch,
+} from "./WorkspaceTabSearch";
 import {
   NEW_TAB_DIVIDER_ROOM,
   NewTabButton,
@@ -62,6 +67,7 @@ import { terminalDisplayLabel, terminalTabKey, useTerminals } from "@/hooks/useT
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
 import { closeBrowserView, forgetBrowserTab } from "@/hooks/useBrowserTabs";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import { getPullRequestStatus } from "@/lib/pullRequestStatus";
 import { shortcutAriaKeys, shortcutKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
 import { supportsSideChat } from "@/lib/sideChat";
 import { subagentSessionIdFromTab, subagentTabId } from "@/lib/subagentTabs";
@@ -106,7 +112,11 @@ import { useWorkspaceSidebarTabActions } from "../workspaceSidebar/useWorkspaceS
 import { useCanStartSideChat } from "@/hooks/usePermissions";
 import { RailTerminalView, WorkspaceTabTooltip } from "../WorkspacePanel";
 import { NewTabPage, type NewTabRecent } from "./NewTabPage";
-import { recentPullRequestRows, recentPullRequestUrl } from "./recentPullRequestRow";
+import {
+  knownPullRequestStatus,
+  recentPullRequestRows,
+  recentPullRequestUrl,
+} from "./recentPullRequestRow";
 import { useRecentPullRequestFacts } from "./useRecentPullRequestFacts";
 import { FileTypeIcon } from "@/shell/FileTypeIcon";
 import { WorkspaceHistoryChevrons } from "./WorkspaceHistoryChevrons";
@@ -408,7 +418,7 @@ function WorkspaceTabsPanelImpl({
     tab.binding?.kind === "agent" ? [subagentTabId(tab.binding.id)] : [],
   );
   const agentLabels = useSubagentTabLabels(agentTabIds);
-  // Recent pull requests on any new-tab page, named from what the session already knows of them.
+  // PRs on new-tab pages and open PR tabs, named from what the session already knows of them.
   const recentPullRequestUrls = [
     ...new Set(
       knownTabs.flatMap((tab) =>
@@ -418,8 +428,17 @@ function WorkspaceTabsPanelImpl({
       ),
     ),
   ];
-  const pullRequestFacts = useRecentPullRequestFacts(conversationId, recentPullRequestUrls);
+  const openPullRequestUrls = [
+    ...new Set(knownTabs.flatMap((tab) => tabPullRequestUrl(tab) ?? [])),
+  ];
+  const pullRequestFacts = useRecentPullRequestFacts(conversationId, [
+    ...new Set([...recentPullRequestUrls, ...openPullRequestUrls]),
+  ]);
   const pullRequestRows = recentPullRequestRows(recentPullRequestUrls, pullRequestFacts);
+  const openPullRequestRows = recentPullRequestRows(openPullRequestUrls, pullRequestFacts);
+  // A PR tab's status, from its read details or the session's link; unknown until either says.
+  const pullRequestStatusOf = (url: string) =>
+    getPullRequestStatus(knownPullRequestStatus(url, pullRequestFacts));
   const chatTabs = knownTabs.filter((tab) => tab.binding?.kind === "chat");
   // In the order the review lists them, so a file tab's "2/3" matches what it shows.
   const orderedChangedPaths = useMemo(
@@ -651,6 +670,13 @@ function WorkspaceTabsPanelImpl({
     releaseFor,
     offers: { newTab, searchTabs: () => setTabSearchOpen(true) },
     pinning: {},
+    tabGroups: {
+      groupOf: tabGroupOf,
+      merged: (tab) => {
+        const url = tabPullRequestUrl(tab);
+        return url !== undefined && pullRequestStatusOf(url) === "merged";
+      },
+    },
     onReveal,
   });
   const closeTab = actions.closeTab;
@@ -694,9 +720,13 @@ function WorkspaceTabsPanelImpl({
   const fullScreenCommand = workspaceFullScreenCommand(facts);
   const tabActionCommands = actions.commands;
   const reopenCommand = tabActionCommandFor(tabActionCommands, "reopen");
+  const unsavedTabIds = session.dirtyTabIds();
   const tabSearchEntries: TabSearchEntry[] = tabs.flatMap((tab) => {
     if (isUnknownTab(tab)) return [];
     const title = titleOf(tab);
+    const pullRequestUrl = tabPullRequestUrl(tab);
+    const pullRequestRow =
+      pullRequestUrl === undefined ? undefined : openPullRequestRows.get(pullRequestUrl);
     return [
       {
         tabId: tab.id,
@@ -705,9 +735,48 @@ function WorkspaceTabsPanelImpl({
         icon: title.icon,
         ...(title.filePath !== undefined ? { filePath: title.filePath } : {}),
         selected: tab.id === selectedTabId,
+        group: tabGroupOf(tab),
+        ...(pullRequestUrl !== undefined
+          ? {
+              pullRequest: {
+                number: pullRequestRow?.detail,
+                // The row's label is the PR's title once it carries a number beside it.
+                title:
+                  tab.place.kind === "pull" &&
+                  tab.place.path === undefined &&
+                  pullRequestRow?.detail
+                    ? pullRequestRow.label
+                    : undefined,
+                description: pullRequestRow?.description,
+                status: pullRequestStatusOf(pullRequestUrl),
+              },
+            }
+          : {}),
+        unsaved: unsavedTabIds.has(tab.id),
+        closable: closeRefusalFor(tab) === undefined,
       },
     ];
   });
+  // Each heading's buttons run the group's ⌘K commands, named and offered as those are.
+  const tabSearchClosing: TabSearchClosing = {
+    closeTab: (tabId) => closeTab(tabId),
+    groupActions: (group) => {
+      const { closeMerged, closeAll } = tabGroupDefinition(group);
+      return [closeMerged, closeAll].flatMap((action) => {
+        if (action === undefined) return [];
+        const command = tabActionCommandFor(tabActionCommands, action);
+        if (!command.availability.available) return [];
+        return [
+          {
+            id: action,
+            label: command.menuLabel,
+            ariaLabel: command.label,
+            run: () => runCommand(command),
+          },
+        ];
+      });
+    },
+  };
   // A launch from a new-tab page turns that tab into the shell once it opens.
   const runCommand = (
     command: WorkspaceCommand,
@@ -1077,6 +1146,7 @@ function WorkspaceTabsPanelImpl({
                   open={tabSearchOpen}
                   onOpenChange={setTabSearchOpen}
                   entries={tabSearchEntries}
+                  closing={tabSearchClosing}
                   reopen={
                     reopenCommand.availability.available
                       ? {

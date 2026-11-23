@@ -29,7 +29,7 @@ TASK_SESSION_MESSAGE = (
 _WORKFLOW_RUN_OPENING = (
     r'[/$]workflow Run the saved workflow "'
     r"(?P<name>[^\n\r\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}]+)"
-    r'" \(ID [0-9a-f]{32}\)\.'
+    r'" \(ID (?P<workflow_id>[0-9a-f]{32})\)\.'
 )
 _SAVED_WORKFLOW_RUN = re.compile(_WORKFLOW_RUN_OPENING + r"(?:\n\n[\s\S]*)?")
 # A run's first line, for instructions whose end the prompt doesn't mark. Keep in sync
@@ -77,6 +77,25 @@ def workflow_session_reuse_error(prompt: str, session_mode: str) -> str | None:
     if is_trigger_prompt(prompt):
         return TASK_SESSION_MESSAGE if task_session else None
     return CONTINUED_SESSION_MESSAGE if session_mode == "continue" else None
+
+
+def saved_workflow_id(prompt: str) -> str | None:
+    """The saved workflow a scheduled prompt runs, or None.
+
+    Each run of such a schedule starts as a run of that workflow. A trigger's prompt
+    runs none itself: the sessions it starts for its matches do.
+
+    :param prompt: The prompt a run sends, e.g.
+        ``'/workflow Run the saved workflow "Triage" (ID 0123456789abcdef0123456789abcdef).'``
+    :returns: The workflow's ID, e.g. ``"0123456789abcdef0123456789abcdef"``.
+    """
+    if is_trigger_prompt(prompt):
+        return None
+    instructions = _trigger_instructions(strip_trigger_header(prompt))
+    if instructions is None:
+        return None
+    match = _SAVED_WORKFLOW_RUN.fullmatch(instructions.strip(_JS_WHITESPACE))
+    return None if match is None else match["workflow_id"]
 
 
 def saved_workflow_run_name(text: str) -> str | None:

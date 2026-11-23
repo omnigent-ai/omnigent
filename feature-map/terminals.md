@@ -94,7 +94,9 @@ with their own terminal retain the switcher.
   can't be read or doesn't show the shell within 20 seconds. While the session's sandbox
   is asleep or failed to wake, the tab shows the same sandbox notice as the other
   workspace panes, with **Resume sandbox**, or **Retry** after a failed wake, for those
-  who may resume it.
+  who may resume it. The strip's All tabs list shows shells under **Shells**; a row's × or
+  Cmd/Ctrl+Backspace closes that one shell with the same terminal confirmation as its tab.
+  Group closes there leave shells open.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host or a new sandbox, then look at both the terminal strip and the

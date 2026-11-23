@@ -92,7 +92,10 @@ from omnigent.server.scheduled.schedule import (
     timer_rule,
 )
 from omnigent.server.scheduled.telemetry import log_task_created
-from omnigent.server.scheduled.workflow_automations import workflow_session_reuse_error
+from omnigent.server.scheduled.workflow_automations import (
+    saved_workflow_id,
+    workflow_session_reuse_error,
+)
 from omnigent.server.session_mcp_selection import (
     MAX_SESSION_MCP_SERVICES,
     SessionMcpSelection,
@@ -1166,6 +1169,26 @@ def create_scheduled_tasks_router(
                 f"cannot continue this session: {problem[0]}", code=ErrorCode.INVALID_INPUT
             )
 
+    async def _require_runnable_workflow(request: Request, prompt: str, owner: str) -> None:
+        """Refuse a schedule's prompt that runs a saved workflow its owner can't run.
+
+        Every run starts as a run of the workflow the prompt names, so none could start.
+
+        :param prompt: The automation's prompt, e.g.
+            ``'/workflow Run the saved workflow "Triage" (ID 0123456789abcdef0123456789abcdef).'``
+        :param owner: The automation's owner, e.g. ``"alice@example.com"``.
+        :raises OmnigentError: If workflows are off, or the owner can't run that workflow.
+        """
+        from omnigent.server.session_journal import load_workflow_for_run
+
+        workflow_id = await asyncio.to_thread(saved_workflow_id, prompt)
+        if workflow_id is None:
+            return
+        require_workflows(request)
+        await load_workflow_for_run(
+            conversation_store, workflow_id, user_id=owner, permission_store=permission_store
+        )
+
     @router.post("/scheduled-tasks")
     async def create_scheduled_task(
         request: Request,
@@ -1234,6 +1257,7 @@ def create_scheduled_tasks_router(
         )
         _reject_proactive_agent(body.agent_id)
         _refuse_workflow_reuse(await _workflow_reuse_problem(body.prompt, body.session_mode))
+        await _require_runnable_workflow(request, body.prompt, owner)
         await _validate_rrule_or_400(
             body.rrule,
             body.session_mode,
@@ -1944,6 +1968,8 @@ def create_scheduled_tasks_router(
         if snapshot_change is not None:
             workflow_checks[snapshot_change] = await _workflow_reuse_problem(*snapshot_change)
             _refuse_workflow_reuse(workflow_checks[snapshot_change])
+        if body.prompt is not None and body.prompt != existing.prompt:
+            await _require_runnable_workflow(request, body.prompt, owner)
         target_execution = fields.get("execution_target") or existing.execution_target
         if body.rrule is not None or {"session_mode", "execution_target"}.intersection(fields):
             await _validate_rrule_or_400(
