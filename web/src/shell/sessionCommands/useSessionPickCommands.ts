@@ -20,7 +20,6 @@ export function sessionPickCommands(): PaletteCommand[] {
       label: pick.label,
       icon: SESSION_COMMAND_ICONS[command],
       keywords: ["session", "any session", "other session", "sidebar"],
-      // Switches the palette to its session picker for this action.
       keepsPaletteOpen: true,
       run: () => openPaletteChildPage({ kind: "pick-session", command }),
     }),

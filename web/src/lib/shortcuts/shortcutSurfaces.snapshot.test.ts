@@ -1,7 +1,5 @@
 // Every shortcut as each surface reads it, in all eight environments: label, chords, key caps
 // for tooltips and rows, aria-keyshortcuts, editor keymaps, and what Settings search finds.
-// Recorded in shortcutSurfaces.golden.txt before the registries merged, so moving bindings
-// between them can't change a surface.
 
 import { describe, expect, it } from "vitest";
 

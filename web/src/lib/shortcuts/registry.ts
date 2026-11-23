@@ -329,7 +329,7 @@ const APP_BINDINGS = {
     chords: () => [{ ctrl: true, alt: true, shift: true, key: "ArrowUp", exactKey: true }],
     flag: "quick_pick_palette",
   },
-  // The transcript has always handled these chords itself; listed here for their ⌘K rows.
+  // QuickPickShortcutHost runs these browser chords; the desktop menu keeps its own.
   "session.pin": {
     group: "general",
     label: "Pin or unpin current session",

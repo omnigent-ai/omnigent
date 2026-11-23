@@ -50,10 +50,8 @@ _VIEWPORTS = {
 _TABS_CHUNK = re.compile(
     r"/assets/(?:WorkspaceTabsHost|workspaceTabsSessions|featurePaletteRows)-[^/]*\.js"
 )
-# Text only the tabs sidebar's code carries: its CodeMirror token class, history group and
-# New Tab picker. A chunk rule that pulled that code into an eager chunk, or a lazy branch
-# that loaded it, would bring one of them here. Its shortcuts' labels aren't markers: they
-# live in the app's one shortcut registry, which every page loads.
+# Text only the tabs sidebar's code carries; an eager chunk or stray lazy load would bring it here.
+# Its shortcuts' labels aren't markers: they live in the shared registry every page loads.
 _TABS_CODE_MARKERS = (
     "cm-shiki-token",
     "Workspace history",
