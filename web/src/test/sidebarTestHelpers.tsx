@@ -1,7 +1,7 @@
 /** Standard mounted Sidebar with a fresh query cache for each test; `setOpen` rerenders it. */
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
@@ -18,6 +18,8 @@ export function renderSidebar(
     open?: boolean;
     onClose?: () => void;
     route?: string;
+    /** Match `route` against this path, as the app's routes do, so the sidebar reads its params. */
+    routePattern?: string;
     dragProgress?: number | null;
     features?: Record<string, boolean>;
     info?: ServerInfo;
@@ -34,7 +36,18 @@ export function renderSidebar(
         <SidebarDataProvider>
           <TooltipProvider>
             <MemoryRouter initialEntries={[props.route ?? "/"]}>
-              <Sidebar open={open} onClose={onClose} dragProgress={props.dragProgress} />
+              {props.routePattern ? (
+                <Routes>
+                  <Route
+                    path={props.routePattern}
+                    element={
+                      <Sidebar open={open} onClose={onClose} dragProgress={props.dragProgress} />
+                    }
+                  />
+                </Routes>
+              ) : (
+                <Sidebar open={open} onClose={onClose} dragProgress={props.dragProgress} />
+              )}
             </MemoryRouter>
           </TooltipProvider>
         </SidebarDataProvider>

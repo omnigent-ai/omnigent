@@ -53,6 +53,7 @@ from tests.e2e_ui.conftest import (
     _server_state,
 )
 from tests.e2e_ui.sessions._sidebar_helpers import patch_session, session_archived
+from tests.e2e_ui.sessions.test_pinned_session_hotkeys import _pin, _pinned_slot_ids
 from tests.e2e_ui.sessions.test_sidebar_mark_unread import _row, _unread_dot
 
 _PALETTE_INPUT = "command-palette-input"
@@ -489,6 +490,32 @@ def test_quick_pick_goes_to_the_sidebars_usage_page(
 
     run_palette_command(page, "go to usage", "Go to Usage", closes=True)
     expect(page).to_have_url(f"{base_url}/usage", timeout=10_000)
+
+
+def test_quick_pick_moves_the_open_pin_up(
+    request: pytest.FixtureRequest, seeded_session_pair: tuple[str, str, str]
+) -> None:
+    """⌘K's Move up in Pinned swaps the open pin with the one above, as a drag would."""
+    base_url, first, second = seeded_session_pair
+    page: Page = request.getfixturevalue("page")
+    enable_quick_pick_palette(page)
+    page.goto(f"{base_url}/c/{second}")
+    expect(page.locator(f'li[data-sidebar-session-id="{first}"]').first).to_be_visible(
+        timeout=30_000
+    )
+    _pin(page, first)
+    _pin(page, second)
+    expect(page).to_have_url(re.compile(rf"/c/{second}$"))
+    pins = [sid for sid in _pinned_slot_ids(page) if sid in (first, second)]
+    assert pins == [first, second], pins
+
+    run_palette_command(page, "move up in pinned", "Move up in Pinned", closes=True)
+    poll_until(
+        lambda: (
+            [sid for sid in _pinned_slot_ids(page) if sid in (first, second)] == [second, first]
+        ),
+        timeout_s=15.0,
+    )
 
 
 def _folder_names(page: Page) -> list[str]:
