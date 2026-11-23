@@ -177,6 +177,7 @@ async def _create_session(
     title: str | None = None,
     labels: dict[str, str] | None = None,
     terminal_launch_args: list[str] | None = None,
+    harness_override: str | None = None,
 ) -> dict[str, Any]:
     """
     Create a session and return the response JSON.
@@ -190,6 +191,7 @@ async def _create_session(
     :param terminal_launch_args: Optional native-terminal
         pass-through CLI args, e.g.
         ``["--dangerously-skip-permissions"]``.
+    :param harness_override: Optional resolved harness for a custom agent.
     :returns: The ``POST /v1/sessions`` response body.
     """
     payload: dict[str, Any] = {"agent_id": agent_id}
@@ -209,6 +211,8 @@ async def _create_session(
         payload["labels"] = labels
     if terminal_launch_args is not None:
         payload["terminal_launch_args"] = terminal_launch_args
+    if harness_override is not None:
+        payload["harness_override"] = harness_override
     resp = await client.post("/v1/sessions", json=payload)
     assert resp.status_code == 201, f"session create failed: {resp.status_code} {resp.text}"
     return resp.json()
@@ -12121,9 +12125,11 @@ async def test_patch_collaboration_mode_rejects_non_codex_session(
     assert "collaboration_mode is only supported" in resp.text
 
 
+@pytest.mark.parametrize("binding", ["wrapper", "custom", "override"])
 async def test_patch_approval_mode_forwards_and_persists_label(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    binding: str,
 ) -> None:
     """
     PATCH ``approval_mode`` drives the Codex ``/permissions`` popup and records it.
@@ -12150,14 +12156,22 @@ async def test_patch_approval_mode_forwards_and_persists_label(
         return httpx.Response(200, json={"approval_mode": "full-access"})
 
     async with _runtime_runner(_handler):
-        agent = await create_test_agent(client)
+        agent = await create_test_agent(
+            client,
+            executor={"type": "omnigent", "config": {"harness": "codex-native"}}
+            if binding == "custom"
+            else None,
+        )
         session = await _create_session(
             client,
             agent["id"],
             labels={
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "codex-native-ui",
-            },
+            }
+            if binding == "wrapper"
+            else {},
+            harness_override="codex-native" if binding == "override" else None,
             terminal_launch_args=["--model", "gpt-5-codex"],
         )
         captured.clear()
@@ -12359,10 +12373,12 @@ async def test_post_external_codex_approval_mode_change_requires_a_field(
     ("requested_mode", "confirmed_mode"),
     [("auto", "auto"), ("default", "default"), ("auto", "acceptEdits")],
 )
+@pytest.mark.parametrize("binding", ["wrapper", "custom", "override"])
 async def test_patch_permission_mode_persists_label_and_forwards_event(
     client: httpx.AsyncClient,
     requested_mode: str,
     confirmed_mode: str,
+    binding: str,
 ) -> None:
     """
     PATCH ``permission_mode`` forwards the switch and persists what landed.
@@ -12387,14 +12403,22 @@ async def test_patch_permission_mode_persists_label_and_forwards_event(
         return httpx.Response(200, json={"permission_mode": confirmed_mode})
 
     async with _runtime_runner(_handler):
-        agent = await create_test_agent(client)
+        agent = await create_test_agent(
+            client,
+            executor={"type": "omnigent", "config": {"harness": "claude-native"}}
+            if binding == "custom"
+            else None,
+        )
         session = await _create_session(
             client,
             agent["id"],
             labels={
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "claude-code-native-ui",
-            },
+            }
+            if binding == "wrapper"
+            else {},
+            harness_override="claude-native" if binding == "override" else None,
         )
         captured.clear()
 

@@ -1761,16 +1761,20 @@ describe("chatStore — switchTo", () => {
   // wrappers whose model is chosen inside the vendor TUI (qwen/goose/pi/cursor/
   // opencode) — claude/codex keep it (they expose an Omnigent model picker).
   it.each([
-    ["claude-code-native-ui", true, false],
-    ["codex-native-ui", true, false],
-    ["pi-native-ui", true, true],
-    ["qwen-native-ui", true, true],
-    ["goose-native-ui", true, true],
-    ["some-other-wrapper", false, false],
-    [null, false, false],
+    ["claude-code-native-ui", null, true, false],
+    ["codex-native-ui", null, true, false],
+    ["pi-native-ui", null, true, true],
+    ["qwen-native-ui", null, true, true],
+    ["goose-native-ui", null, true, true],
+    ["some-other-wrapper", null, false, false],
+    [null, null, false, false],
+    [null, "claude-native", true, false],
+    [null, "codex-native", true, false],
+    ["claude-code-native-ui-subagent", "claude-native", true, true],
+    ["codex-native-ui-subagent", "codex-native", true, true],
   ])(
-    "switchTo derives native flags from wrapper=%s",
-    async (wrapper, expectedNative, expectedVendorOwnsModel) => {
+    "switchTo derives native flags from wrapper=%s and harness=%s",
+    async (wrapper, harness, expectedNative, expectedVendorOwnsModel) => {
       seedSession("conv_wrap", []);
       fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input.toString();
@@ -1778,6 +1782,7 @@ describe("chatStore — switchTo", () => {
           return mockResponse({
             id: "conv_wrap",
             agent_id: "agent_xyz",
+            harness,
             status: "idle",
             created_at: 0,
             items: [],

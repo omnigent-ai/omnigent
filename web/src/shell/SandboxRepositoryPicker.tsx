@@ -46,10 +46,12 @@ function SandboxRepoCombobox({
   repos,
   onSelect,
   testIdPrefix,
+  controlClassName,
 }: {
   repos: GithubRepo[];
   onSelect: (repo: GithubRepo) => void;
   testIdPrefix: string;
+  controlClassName?: string;
 }): ReactNode {
   const [open, setOpen] = useState(false);
   return (
@@ -60,7 +62,7 @@ function SandboxRepoCombobox({
           role="combobox"
           aria-expanded={open}
           aria-label="GitHub repository"
-          className={cn("mobile-touch-target", COMBOBOX_TRIGGER_CLASS)}
+          className={cn("mobile-touch-target", COMBOBOX_TRIGGER_CLASS, controlClassName)}
           data-testid={`${testIdPrefix}-select`}
         >
           <span className="truncate">Choose a repository…</span>
@@ -113,6 +115,7 @@ function SandboxRepoBranchSelect({
   testIdPrefix,
   descriptionId,
   invalid,
+  controlClassName,
 }: {
   repo: GithubRepo;
   url: string;
@@ -122,6 +125,7 @@ function SandboxRepoBranchSelect({
   testIdPrefix: string;
   descriptionId?: string;
   invalid: boolean;
+  controlClassName?: string;
 }): ReactNode {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
@@ -164,7 +168,7 @@ function SandboxRepoBranchSelect({
           aria-label={`Branch for ${repo.full_name}`}
           aria-describedby={descriptionId}
           aria-invalid={invalid || undefined}
-          className={COMBOBOX_TRIGGER_CLASS}
+          className={cn(COMBOBOX_TRIGGER_CLASS, controlClassName)}
           data-testid={`${testIdPrefix}-branch-select`}
           title={value || defaultLabel}
         >
@@ -245,6 +249,8 @@ interface SandboxRepositoryPickerProps {
   testIdPrefix?: string;
   pendingUrl?: string;
   onPendingUrlChange?: (url: string) => void;
+  controlClassName?: string;
+  addButtonClassName?: string;
 }
 
 /** Shared repository and branch selection for starting and cloning sandbox sessions. */
@@ -257,6 +263,8 @@ export function SandboxRepositoryPicker({
   testIdPrefix = "new-chat-landing-repo",
   pendingUrl,
   onPendingUrlChange,
+  controlClassName,
+  addButtonClassName,
 }: SandboxRepositoryPickerProps): ReactNode {
   const info = useServerInfo();
   const [localPendingUrl, setLocalPendingUrl] = useState("");
@@ -360,6 +368,7 @@ export function SandboxRepositoryPicker({
                     testIdPrefix={testIdPrefix}
                     descriptionId={descriptionId}
                     invalid={invalid}
+                    controlClassName={controlClassName}
                   />
                 ) : (
                   <input
@@ -370,7 +379,10 @@ export function SandboxRepositoryPicker({
                     aria-label={`Branch for ${name}`}
                     aria-describedby={descriptionId}
                     aria-invalid={invalid || undefined}
-                    className="w-full rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
+                    className={cn(
+                      "w-full rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring",
+                      controlClassName,
+                    )}
                   />
                 )}
               </div>
@@ -404,6 +416,7 @@ export function SandboxRepositoryPicker({
                 repos={unselectedRepos}
                 onSelect={(repo) => addRepo(repoCloneUrl(repo))}
                 testIdPrefix={testIdPrefix}
+                controlClassName={controlClassName}
               />
               {data.truncated && (
                 <p
@@ -438,14 +451,21 @@ export function SandboxRepositoryPicker({
               aria-label="Repository URL"
               aria-invalid={urlError !== null}
               aria-describedby={urlError ? `${testIdPrefix}-input-error` : undefined}
-              className="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
+              className={cn(
+                "min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring",
+                controlClassName,
+              )}
               data-testid={`${testIdPrefix}-input`}
             />
             <button
               type="button"
               disabled={!canAdd}
               onClick={addInput}
-              className="flex shrink-0 items-center gap-1 rounded-md border border-input px-2.5 py-2 text-sm text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
+              className={cn(
+                "flex shrink-0 items-center gap-1 rounded-md border border-input px-2.5 py-2 text-sm text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40",
+                controlClassName,
+                addButtonClassName,
+              )}
               data-testid={`${testIdPrefix}-add`}
             >
               <PlusIcon className="size-3.5" />

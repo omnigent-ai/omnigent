@@ -233,7 +233,7 @@ import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import { reuseCreationAttempt, type CreationAttempt } from "@/lib/creationAttempt";
 import type { ProjectTicket } from "@/lib/projectTicketsApi";
-import { ProjectAgentIdentity } from "@/projectHome/ProjectAgentIdentity";
+import { AgentChatIdentity } from "@/components/chat/AgentChatIdentity";
 import { useLaunchModelOptions } from "@/hooks/useLaunchModelOptions";
 import {
   onProjectLaunchDefaultsCleared,
@@ -7723,7 +7723,7 @@ function NewChatLandingContent({
           <>
             {projectMainSession && selectedAgent && (
               <div className="mb-8">
-                <ProjectAgentIdentity agent={selectedAgent} />
+                <AgentChatIdentity agent={selectedAgent} />
               </div>
             )}
             {isMobileViewport && workspaceControls}

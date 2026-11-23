@@ -1823,10 +1823,7 @@ function isEditableTarget(target: EventTarget | null): boolean {
   );
 }
 
-export function HistoryAutoLoader({
-  scrollElement,
-  rowCount,
-}: {
+interface HistoryAutoLoaderProps {
   scrollElement?: HTMLElement | null;
   /**
    * Rows the transcript renders. A page that adds none folded into a turn
@@ -1834,17 +1831,46 @@ export function HistoryAutoLoader({
    * seek one page early; the reader's next flick resumes it.
    */
   rowCount: number;
-}) {
+}
+
+export function HistoryAutoLoader(props: HistoryAutoLoaderProps) {
   // useStickToBottomContext exposes scrollRef in the runtime context even though
   // the public TS types only declare isAtBottom and scrollToBottom. Cast to it.
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef: React.RefObject<HTMLElement>;
   };
-  const historyGeneration = useChatStore((s) => s.historyGeneration);
-  const loadingMoreHistory = useChatStore((s) => s.loadingMoreHistory);
+  return <ConversationHistoryAutoLoader {...props} scrollRef={ctx.scrollRef} />;
+}
+
+function conversationHistoryState(conversationId: string | null) {
+  return conversationId === null
+    ? useChatStore.getState()
+    : conversationRegistry.peek(conversationId)?.getState();
+}
+
+/** Shared history gestures for the main transcript and session-scoped panes. */
+export function ConversationHistoryAutoLoader({
+  scrollElement,
+  scrollRef,
+  rowCount,
+  onLoad,
+}: HistoryAutoLoaderProps & {
+  scrollRef?: React.RefObject<HTMLElement | null>;
+  /** Release a pane's follow-tail lock before prepending history. */
+  onLoad?: () => void;
+}) {
+  const scopedConversationId = useContext(ConversationScopeContext);
+  const scopedState = useConversationEntryState(scopedConversationId);
+  const rootGeneration = useChatStore((s) => s.historyGeneration);
+  const rootLoading = useChatStore((s) => s.loadingMoreHistory);
   // A successful page updates this cursor in the same store transaction that
   // prepends its items and clears loadingMoreHistory.
-  const oldestItemId = useChatStore((s) => s.oldestItemId);
+  const rootOldestItemId = useChatStore((s) => s.oldestItemId);
+  const historyGeneration =
+    scopedConversationId === null ? rootGeneration : scopedState.historyGeneration;
+  const loadingMoreHistory =
+    scopedConversationId === null ? rootLoading : scopedState.loadingMoreHistory;
+  const oldestItemId = scopedConversationId === null ? rootOldestItemId : scopedState.oldestItemId;
   const generationRef = useRef(historyGeneration);
   const [scrollRevision, setScrollRevision] = useState(0);
   const handledScrollRevisionRef = useRef(scrollRevision);
@@ -1885,7 +1911,7 @@ export function HistoryAutoLoader({
   // by this component. Writing scrollTop here instead used to interrupt the
   // reader's gesture.
   useLayoutEffect(() => {
-    const el = scrollElement ?? ctx.scrollRef?.current;
+    const el = scrollElement ?? scrollRef?.current;
     if (!el) return;
     const noteUpwardGesture = (seekPages: number, viaTouch = false) => {
       touchArmedRef.current = viaTouch;
@@ -2012,12 +2038,12 @@ export function HistoryAutoLoader({
       doc.removeEventListener("focusin", handleFocusIn);
       doc.removeEventListener("keydown", handleKeyDown);
     };
-  }, [ctx.scrollRef, scrollElement]);
+  }, [scrollRef, scrollElement]);
 
   // The single paging effect. Re-evaluated on reader input, scroll movement, and
   // a changed oldest item (a settled prepend, even a height-neutral one).
   useLayoutEffect(() => {
-    const el = scrollElement ?? ctx.scrollRef?.current;
+    const el = scrollElement ?? scrollRef?.current;
     if (!el) return;
 
     const generationChanged = generationRef.current !== historyGeneration;
@@ -2037,9 +2063,9 @@ export function HistoryAutoLoader({
       lastUpwardTickAtRef.current = Number.NEGATIVE_INFINITY;
     }
 
-    const state = useChatStore.getState();
+    const state = conversationHistoryState(scopedConversationId);
     if (
-      !state.oldestItemId ||
+      !state?.oldestItemId ||
       !state.hasMoreHistory ||
       state.loadingMoreHistory ||
       !(itemsChanged || scrollPositionChanged)
@@ -2076,7 +2102,8 @@ export function HistoryAutoLoader({
       }
       gestureFetchedRef.current = true;
       seekBaseRowsRef.current ??= rowCount;
-      void state.loadMoreHistory();
+      onLoad?.();
+      void useChatStore.getState().loadMoreHistory(scopedConversationId ?? undefined);
       return;
     }
     // No open request: a settled page chains only while the gesture is still
@@ -2087,13 +2114,16 @@ export function HistoryAutoLoader({
       return;
     }
     seekPagesLeftRef.current -= 1;
-    void state.loadMoreHistory();
+    onLoad?.();
+    void useChatStore.getState().loadMoreHistory(scopedConversationId ?? undefined);
   }, [
-    ctx.scrollRef,
+    scrollRef,
     historyGeneration,
     loadingMoreHistory,
     oldestItemId,
+    onLoad,
     rowCount,
+    scopedConversationId,
     scrollElement,
     scrollRevision,
   ]);
@@ -2386,7 +2416,7 @@ export function LatestTurnSpacer({
  */
 export interface ConversationScroller {
   el: HTMLElement;
-  state: { isAtBottom: boolean; escapedFromLock: boolean };
+  state?: { isAtBottom: boolean; escapedFromLock: boolean };
   stopScroll: () => void;
 }
 
@@ -2429,11 +2459,15 @@ export function JumpToTopButton({
   containerEl,
   scroller,
   hasMoreHistory,
+  topOffset = "calc(50px + var(--omnigent-inset-top))",
 }: {
   containerEl: HTMLElement | null;
   scroller: ConversationScroller | null;
   hasMoreHistory: boolean;
+  /** Panes below a pinned header need only their content inset. */
+  topOffset?: string;
 }) {
+  const scopedConversationId = useContext(ConversationScopeContext);
   const [atTop, setAtTop] = useState(true);
   const [hovering, setHovering] = useState(false);
   const [jumping, setJumping] = useState(false);
@@ -2501,6 +2535,13 @@ export function JumpToTopButton({
   const jumpToTop = useCallback(async () => {
     if (!scroller) return;
     const { el, state, stopScroll } = scroller;
+    const releaseBottomLock = () => {
+      stopScroll();
+      if (state) {
+        state.isAtBottom = false;
+        state.escapedFromLock = true;
+      }
+    };
     const nextFrame = () =>
       new Promise<void>((resolve) => {
         requestAnimationFrame(() => resolve());
@@ -2509,21 +2550,22 @@ export function JumpToTopButton({
     try {
       // Release StickToBottom's bottom-lock so prepend-driven scrolls bail
       // instead of yanking the view back to the bottom.
-      stopScroll();
-      state.isAtBottom = false;
-      state.escapedFromLock = true;
+      releaseBottomLock();
 
       // Page in every older block before scrolling. loadMoreHistory serializes
       // via its own guard; the rAF wait yields a frame for the prepend to
       // commit. The iteration cap is a backstop against a server that never
       // reports done.
       /* oxlint-disable no-await-in-loop */
-      for (let i = 0; i < 1000 && useChatStore.getState().hasMoreHistory; i++) {
-        await useChatStore.getState().loadMoreHistory();
+      for (
+        let i = 0;
+        i < 1000 && conversationHistoryState(scopedConversationId)?.hasMoreHistory;
+        i++
+      ) {
+        await useChatStore.getState().loadMoreHistory(scopedConversationId ?? undefined);
         // Keep the lock released — a prepend that briefly lands us near the
         // bottom can otherwise re-arm it via the library's scroll handler.
-        state.isAtBottom = false;
-        state.escapedFromLock = true;
+        releaseBottomLock();
         await nextFrame();
       }
       // Pin to the very top, re-asserting across frames until it holds.
@@ -2539,14 +2581,14 @@ export function JumpToTopButton({
     } finally {
       setJumping(false);
     }
-  }, [scroller]);
+  }, [scroller, scopedConversationId]);
 
   return (
     <div
       // top 50px centers the pill on the chat-scroll-fade border, just below the
       // h-14 ChatHeader. z-40 > header z-30. On iOS the header/fade shift down by
       // the safe-area inset, so add --omnigent-inset-top (0px off-shell).
-      style={{ top: "calc(50px + var(--omnigent-inset-top))" }}
+      style={{ top: topOffset }}
       className={cn(
         "pointer-events-none absolute inset-x-0 z-40 flex justify-center transition-opacity duration-150 max-md:hidden",
         visible ? "opacity-100" : "opacity-0",

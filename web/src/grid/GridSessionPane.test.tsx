@@ -299,42 +299,45 @@ const twoCellGrid = () => (
   </MemoryRouter>
 );
 
-it("shows each cell's session controls and targets that session's permission mode", async () => {
-  fixture.labels = { "omnigent.wrapper": "claude-code-native-ui" };
-  document.title = "Single session";
-  const view = render(twoCellGrid());
-  // Named from the cells' snapshots; neither session is on a loaded sidebar page.
-  await waitFor(() => expect(document.title).toBe("first + second"));
-  const second = within(screen.getByRole("region", { name: "second" }));
-  expect(second.getByText("Host for second")).toBeInTheDocument();
-  expect(second.getByRole("button", { name: "Configure session" })).toBeEnabled();
-  fireEvent.pointerDown(second.getByRole("button", { name: "Permission mode: Manual" }), {
-    button: 0,
-  });
-  fireEvent.click(screen.getByTestId("composer-permission-option-auto"));
-  await waitFor(() =>
-    expect(updateSession).toHaveBeenCalledWith("second", { claudePermissionMode: "auto" }),
-  );
-  // A rejected switch reports why and frees the chip for another try.
-  const toastError = vi.spyOn(toast, "error").mockReturnValue("error");
-  vi.mocked(updateSession).mockRejectedValueOnce(new Error("Runner unavailable"));
-  const chip = () => second.getByRole("button", { name: "Permission mode: Manual" });
-  fireEvent.pointerDown(chip(), { button: 0 });
-  fireEvent.click(screen.getByTestId("composer-permission-option-plan"));
-  await waitFor(() => expect(toastError).toHaveBeenCalledWith("Runner unavailable"));
-  await waitFor(() => expect(chip()).toBeEnabled());
-  // Only the owner can switch modes.
-  fixture.permissionLevel = 2;
-  view.rerender(twoCellGrid());
-  expect(chip()).toBeDisabled();
-  fixture.permissionLevel = null;
-  // Like the main composer, an unreachable session's chip can't switch modes.
-  fixture.livenessKind = "host_offline";
-  view.rerender(twoCellGrid());
-  expect(second.getByRole("button", { name: "Permission mode: Manual" })).toBeDisabled();
-  view.unmount();
-  expect(document.title).toBe("Single session");
-});
+it.each([true, false])(
+  "shows each cell's controls and targets its permission mode (wrapper: %s)",
+  async (wrapped) => {
+    fixture.labels = wrapped ? { "omnigent.wrapper": "claude-code-native-ui" } : {};
+    document.title = "Single session";
+    const view = render(twoCellGrid());
+    // Named from the cells' snapshots; neither session is on a loaded sidebar page.
+    await waitFor(() => expect(document.title).toBe("first + second"));
+    const second = within(screen.getByRole("region", { name: "second" }));
+    expect(second.getByText("Host for second")).toBeInTheDocument();
+    expect(second.getByRole("button", { name: "Configure session" })).toBeEnabled();
+    fireEvent.pointerDown(second.getByRole("button", { name: "Permission mode: Manual" }), {
+      button: 0,
+    });
+    fireEvent.click(screen.getByTestId("composer-permission-option-auto"));
+    await waitFor(() =>
+      expect(updateSession).toHaveBeenCalledWith("second", { claudePermissionMode: "auto" }),
+    );
+    // A rejected switch reports why and frees the chip for another try.
+    const toastError = vi.spyOn(toast, "error").mockReturnValue("error");
+    vi.mocked(updateSession).mockRejectedValueOnce(new Error("Runner unavailable"));
+    const chip = () => second.getByRole("button", { name: "Permission mode: Manual" });
+    fireEvent.pointerDown(chip(), { button: 0 });
+    fireEvent.click(screen.getByTestId("composer-permission-option-plan"));
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Runner unavailable"));
+    await waitFor(() => expect(chip()).toBeEnabled());
+    // Only the owner can switch modes.
+    fixture.permissionLevel = 2;
+    view.rerender(twoCellGrid());
+    expect(chip()).toBeDisabled();
+    fixture.permissionLevel = null;
+    // Like the main composer, an unreachable session's chip can't switch modes.
+    fixture.livenessKind = "host_offline";
+    view.rerender(twoCellGrid());
+    expect(second.getByRole("button", { name: "Permission mode: Manual" })).toBeDisabled();
+    view.unmount();
+    expect(document.title).toBe("Single session");
+  },
+);
 
 it("gives each cell its own host-switch access and launch progress", () => {
   fixture.readOnlySessions = ["first"];

@@ -2356,43 +2356,153 @@ describe("side-chat scroll position", () => {
     fireEvent.scroll(transcript);
   }
 
+  it("uses the shared hover arrow to load only this session's history", async () => {
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({
+      sessionStatus: "idle",
+      blocks: earlierAnswer,
+      oldestItemId: "earlier",
+      hasMoreHistory: true,
+    });
+    useChatStore.setState({ hasMoreHistory: false, oldestItemId: "main_oldest" });
+    let page = 0;
+    const loadMoreHistory = vi.fn(async () => {
+      page += 1;
+      const id = `older_${page}`;
+      entry.setState({
+        blocks: [
+          ...itemsToBlocks([
+            {
+              id,
+              response_id: id,
+              type: "message",
+              role: "assistant",
+              status: "completed",
+              content: [{ type: "output_text", text: id }],
+            },
+          ]),
+          ...entry.getState().blocks,
+        ],
+        oldestItemId: id,
+        hasMoreHistory: page < 2,
+      });
+    });
+    useChatStore.setState({ loadMoreHistory });
+    const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+    renderPane(<SideChatPane childId={childId} fullSession />);
+    expect(screen.queryByRole("button", { name: "Load earlier messages" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Jump to the first message" })).toBeNull();
+    expect(loadMoreHistory).not.toHaveBeenCalled();
+
+    const transcript = screen.getByText("Earlier side-chat answer").closest(".overflow-y-auto")!;
+    fireEvent.mouseMove(transcript, { clientY: 10 });
+    const arrow = screen.getByRole("button", { name: "Jump to the first message" });
+    expect(arrow).toHaveAttribute("data-component-id", "chat.nav.jump_to_top");
+    expect(arrow).not.toHaveTextContent("Load earlier messages");
+    scrollIntoView.mockClear();
+    fireEvent.click(arrow);
+
+    await waitFor(() => expect(arrow).not.toBeDisabled());
+    expect(loadMoreHistory.mock.calls).toEqual([[childId], [childId]]);
+    expect(screen.getByText("older_2")).toBeInTheDocument();
+    expect(transcript.scrollTop).toBe(0);
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    expect(useChatStore.getState().oldestItemId).toBe("main_oldest");
+  });
+
+  it.each(["wheel", "touch"] as const)(
+    "loads this session's older history on an upward %s gesture without following the tail",
+    (gesture) => {
+      const entry = conversationRegistry.acquire(childId);
+      entry.setState({
+        sessionStatus: "idle",
+        blocks: earlierAnswer,
+        oldestItemId: "earlier",
+        hasMoreHistory: true,
+      });
+      const loadMoreHistory = vi.fn(async () => {
+        entry.setState({ loadingMoreHistory: true });
+      });
+      useChatStore.setState({ hasMoreHistory: false, loadMoreHistory });
+      const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+      renderPane(<SideChatPane childId={childId} fullSession />);
+      const transcript = screen.getByText("Earlier side-chat answer").closest(".overflow-y-auto")!;
+      expect(loadMoreHistory).not.toHaveBeenCalled();
+      scrollIntoView.mockClear();
+      if (gesture === "wheel") {
+        fireEvent.wheel(transcript, { deltaY: -120 });
+      } else {
+        fireEvent.touchStart(transcript, { touches: [{ clientY: 100 }] });
+        fireEvent.touchMove(transcript, { touches: [{ clientY: 150 }] });
+        fireEvent.touchEnd(transcript);
+      }
+      expect(loadMoreHistory).toHaveBeenCalledExactlyOnceWith(childId);
+      expect(screen.getByText("Loading earlier messages…")).toBeInTheDocument();
+      act(() =>
+        entry.setState({
+          activeResponse: { responseId: "later", state: "completed", error: null },
+          hasMoreHistory: false,
+          loadingMoreHistory: false,
+          oldestItemId: "oldest",
+        }),
+      );
+      expect(scrollIntoView).not.toHaveBeenCalled();
+      expect(screen.queryByText("Loading earlier messages…")).toBeNull();
+    },
+  );
+
   it.each([
     { name: "side chat", fullSession: false },
     { name: "grid session", fullSession: true },
-  ])("keeps a scrolled-up $name reader in place until they send", ({ fullSession }) => {
-    const entry = conversationRegistry.acquire(childId);
-    entry.setState({
-      sessionStatus: "running",
-      activeResponse: { responseId: "turn_reply", state: "streaming", error: null },
-      blocks: earlierAnswer,
-    });
-    const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
-    renderPane(<SideChatPane childId={childId} fullSession={fullSession} />);
-    scrollReaderUp();
-    scrollIntoView.mockClear();
-
-    act(() =>
+    { name: "project chat", fullSession: true, agentHeader: true },
+  ])(
+    "keeps a scrolled-up $name reader in place until they send",
+    ({ fullSession, agentHeader }) => {
+      const entry = conversationRegistry.acquire(childId);
       entry.setState({
-        sessionStatus: "idle",
-        activeResponse: { responseId: "turn_reply", state: "completed", error: null },
-      }),
-    );
-    expect(scrollIntoView).not.toHaveBeenCalled();
+        sessionStatus: "running",
+        activeResponse: { responseId: "turn_reply", state: "streaming", error: null },
+        blocks: earlierAnswer,
+      });
+      const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+      renderPane(
+        <SideChatPane
+          childId={childId}
+          fullSession={fullSession}
+          presentation={
+            agentHeader ? { header: () => <span role="img" aria-label="Maestro" /> } : undefined
+          }
+        />,
+      );
+      scrollReaderUp();
+      if (agentHeader) {
+        expect(screen.getByRole("img", { name: "Maestro" }).closest(".overflow-y-auto")).toBeNull();
+      }
+      scrollIntoView.mockClear();
 
-    const input = screen.getByTestId("side-chat-input");
-    fireEvent.change(input, { target: { value: "One more question" } });
-    fireEvent.keyDown(input, { key: "Enter" });
-    expect(send).toHaveBeenCalledOnce();
-    expect(scrollIntoView).toHaveBeenCalledWith({ block: "end" });
+      act(() =>
+        entry.setState({
+          sessionStatus: "idle",
+          activeResponse: { responseId: "turn_reply", state: "completed", error: null },
+        }),
+      );
+      expect(scrollIntoView).not.toHaveBeenCalled();
 
-    scrollIntoView.mockClear();
-    act(() =>
-      entry.setState({
-        activeResponse: { responseId: "turn_follow_up", state: "completed", error: null },
-      }),
-    );
-    expect(scrollIntoView).toHaveBeenCalledWith({ block: "end" });
-  });
+      const input = screen.getByTestId("side-chat-input");
+      fireEvent.change(input, { target: { value: "One more question" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(send).toHaveBeenCalledOnce();
+      expect(scrollIntoView).toHaveBeenCalledWith({ block: "end" });
+
+      scrollIntoView.mockClear();
+      act(() =>
+        entry.setState({
+          activeResponse: { responseId: "turn_follow_up", state: "completed", error: null },
+        }),
+      );
+      expect(scrollIntoView).toHaveBeenCalledWith({ block: "end" });
+    },
+  );
 
   it("follows the list's size while the reader is at the end", () => {
     // A reply's last markdown update can land after the render that changed the turn.

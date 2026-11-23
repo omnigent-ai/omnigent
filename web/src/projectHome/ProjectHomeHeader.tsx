@@ -7,7 +7,7 @@ import {
   Trash2Icon,
   XIcon,
 } from "lucide-react";
-import { useRef } from "react";
+import { useCallback, useRef } from "react";
 import { create } from "zustand";
 import { ProjectLandingIcon } from "@/components/ProjectIconPicker";
 import { Button } from "@/components/ui/button";
@@ -53,6 +53,11 @@ export const useProjectBoardSearchStore = create<ProjectBoardSearchState>((set) 
   setQuery: (query) => set({ query }),
 }));
 
+/** The title-row destination for navigation that retains the page's Tabs context. */
+export const useProjectViewNavigationTarget = create<{
+  target: { projectName: string; element: HTMLDivElement } | null;
+}>(() => ({ target: null }));
+
 function useProjectHomeConfig(projectName: string) {
   const { data: projects, isLoading: projectsLoading, error: projectsError } = useProjects();
   const projectId = projects?.find((project) => project.name === projectName)?.id ?? null;
@@ -67,10 +72,23 @@ function useProjectHomeConfig(projectName: string) {
  */
 export function ProjectHomeTitle({ projectName }: { projectName: string }) {
   const isMobile = useIsMobileViewport();
+  const tickets = useProjectTicketsEnabled();
   const { projectId, config, projectsLoading } = useProjectHomeConfig(projectName);
+  const navigationSlot = useRef<HTMLDivElement | null>(null);
+  const registerNavigationTarget = useCallback(
+    (element: HTMLDivElement | null) => {
+      const previous = navigationSlot.current;
+      navigationSlot.current = element;
+      useProjectViewNavigationTarget.setState((state) => {
+        if (element) return { target: { projectName, element } };
+        return state.target?.element === previous ? { target: null } : state;
+      });
+    },
+    [projectName],
+  );
   if (isMobile) return <h1 className="sr-only">{projectName}</h1>;
   return (
-    <div className="flex min-w-0 items-center gap-3">
+    <div className="flex min-w-0 items-center gap-2.5">
       <ProjectLandingIcon
         projectId={projectId}
         projectName={projectName}
@@ -80,8 +98,15 @@ export function ProjectHomeTitle({ projectName }: { projectName: string }) {
         configReady={!projectsLoading && (projectId === null || config !== undefined)}
         small
       />
-      <h1 className="min-w-0 truncate text-xl font-medium text-foreground">{projectName}</h1>
+      <h1 className="min-w-0 truncate text-lg font-medium text-foreground">{projectName}</h1>
       <ProjectHomeActions projectName={projectName} />
+      {tickets && (
+        <div
+          ref={registerNavigationTarget}
+          data-orientation="horizontal"
+          className="group/tabs no-drag ml-2 flex shrink-0 items-center empty:hidden"
+        />
+      )}
     </div>
   );
 }

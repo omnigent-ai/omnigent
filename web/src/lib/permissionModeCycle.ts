@@ -3,14 +3,12 @@
 import {
   CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
   claudePermissionModeLabel,
-  isClaudeNativeSession,
 } from "@/lib/claudePermissionMode";
 import {
   CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
   codexApprovalModeLabel,
 } from "@/lib/codexApprovalMode";
-import { isCodexNativeSession } from "@/lib/codexPlanMode";
-import { modelPickerKindForConv } from "@/lib/composerCapabilities";
+import { effectiveNativeWrapperLabel, type NativeSessionSource } from "@/lib/nativeCodingAgents";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 
@@ -84,15 +82,21 @@ export type PermissionChipKind = "claude" | "devin" | "codex";
 
 /**
  * The vocabulary of a session's permission chip, or null when its harness has
- * none. Same precedence as the main composer: Devin, then Claude, then Codex.
+ * none. Shared by the full-session, project and grid composers.
  */
 export function permissionChipKind(
-  session: Parameters<typeof modelPickerKindForConv>[0],
+  session: NativeSessionSource | null | undefined,
 ): PermissionChipKind | null {
-  if (modelPickerKindForConv(session) === "devin") return "devin";
-  if (isClaudeNativeSession(session)) return "claude";
-  if (isCodexNativeSession(session)) return "codex";
-  return null;
+  switch (effectiveNativeWrapperLabel(session)) {
+    case "claude-code-native-ui":
+      return "claude";
+    case "codex-native-ui":
+      return "codex";
+    case "devin-native-ui":
+      return "devin";
+    default:
+      return null;
+  }
 }
 
 /** The chip's menu options, selected value and label for a session's current modes. */

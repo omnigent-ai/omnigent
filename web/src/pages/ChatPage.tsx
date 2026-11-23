@@ -294,13 +294,13 @@ import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import { modelPickerKindForConv, type NativeModelPickerKind } from "@/lib/composerCapabilities";
 
-import { isClaudeNativeSession } from "@/lib/claudePermissionMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import {
   isPermissionModeCycleKey,
   nextCycledPermissionMode,
   nextPermissionModePress,
   permissionChip,
+  permissionChipKind,
   type PermissionChipKind,
 } from "@/lib/permissionModeCycle";
 import { getCliServerUrl } from "@/lib/host";
@@ -335,6 +335,7 @@ import {
 } from "@/components/composer/useSessionHarnessPickerProps";
 import { nextTranscriptBottomPin, type TranscriptBottomPin } from "./transcriptBottomPin";
 import { Transcript } from "@/components/chat/Transcript";
+import { useAgentChatPresentation } from "@/components/chat/useAgentChatPresentation";
 
 /**
  * Whether the deployment has smart routing at all. `"loading"` (the `/v1/info`
@@ -1613,6 +1614,9 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   wrapperLabel,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
+  const presentation = useAgentChatPresentation(
+    agents?.find((agent) => agent.id === selectedAgentId),
+  );
   // Streaming-hot subscriptions and the bubble pipeline live in <Transcript>.
   // The turn rail is a hover minimap with no mobile affordance (CSS-hidden
   // under `md`). Gate its MOUNT — not just its visibility — on the viewport so
@@ -1884,6 +1888,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           alone — this surface's composer and chrome below bail out. */}
           <EditSentMessageContext.Provider value={composerReadOnly ? null : editSentMessage}>
             <Transcript
+              presentation={presentation}
               hostId={hostId}
               setConversationEl={setConversationEl}
               containerEl={containerEl}
@@ -5260,22 +5265,12 @@ export function shouldShowCodexPlanModeControl(
   return isCodexNativeSession(conv);
 }
 
-/**
- * True when the claude-native permission-mode picker should be visible.
- *
- * Claude-native sessions only: the switch drives Claude Code's own
- * shift+tab cycle, which no other harness has.
- *
- * :param conv: Session-like object carrying `labels`; a missing session
- *     or missing labels fails closed.
- * :returns: True only for sessions running the claude-native wrapper.
- */
+/** Native permission controls follow the resolved harness, including custom agents. */
 export function shouldShowPermissionModeControl(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv: Parameters<typeof permissionChipKind>[0],
 ): boolean {
-  // Devin cycles its own rungs with Shift+Tab, which the runner drives, so it
-  // gets the same control — with its own vocabulary (see `permissionOptions`).
-  return isClaudeNativeSession(conv) || modelPickerKindForConv(conv) === "devin";
+  const kind = permissionChipKind(conv);
+  return kind === "claude" || kind === "devin";
 }
 
 /**
@@ -5284,14 +5279,13 @@ export function shouldShowPermissionModeControl(
  * Codex-native sessions only: the switch drives Codex's own approval/sandbox
  * presets (the ``/permissions`` popup), which no other harness has.
  *
- * :param conv: Session-like object carrying `labels`; a missing session or
- *     missing labels fails closed.
- * :returns: True only for sessions running the codex-native wrapper.
+ * :param conv: Session-like object carrying labels and the resolved harness.
+ * :returns: True for a top-level Codex-native session, including custom agents.
  */
 export function shouldShowCodexApprovalModeControl(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv: Parameters<typeof permissionChipKind>[0],
 ): boolean {
-  return isCodexNativeSession(conv);
+  return permissionChipKind(conv) === "codex";
 }
 
 /**

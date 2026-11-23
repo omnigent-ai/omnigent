@@ -63,8 +63,7 @@ vi.mock("@/projectHome/ProjectTicketPanel", () => ({
   }) => (
     <>
       <input aria-label="Ticket draft" />
-      <Link to={`?ticket=${ticketId}&session=worker`}>Chat with worker</Link>
-      <Link to={`?ticket=${ticketId}`}>Back to ticket</Link>
+      <Link to="/c/worker">Chat with worker</Link>
       <Link to="?ticket=ticket-2">Related ticket</Link>
       {onExpandedChange && (
         <button type="button" onClick={() => onExpandedChange(!expanded)}>
@@ -95,19 +94,12 @@ vi.mock("@/projectHome/ProjectKanbanBoard", async () => {
     }) => (
       <>
         <output data-testid="selected-card">{selectedSessionId ?? "none"}</output>
+        <ProjectLink to="/c/session-1">Open session</ProjectLink>
         {quickViewHref && <ProjectLink to={quickViewHref("session-1")}>Quick view</ProjectLink>}
       </>
     ),
   };
 });
-
-vi.mock("@/projectHome/ProjectSessionPanel", () => ({
-  ProjectSessionPanel: ({ sessionId, onClose }: { sessionId: string; onClose: () => void }) => (
-    <button type="button" onClick={onClose}>
-      Close {sessionId}
-    </button>
-  ),
-}));
 
 function LocationProbe() {
   const location = useLocation();
@@ -119,6 +111,7 @@ function renderPage(entry: string) {
     <MemoryRouter initialEntries={[entry]}>
       <Routes>
         <Route path="/projects/:projectName" element={<ProjectHomePage />} />
+        <Route path="/c/:sessionId" element={<output data-testid="full-session">Session</output>} />
       </Routes>
       <LocationProbe />
     </MemoryRouter>,
@@ -190,12 +183,6 @@ describe("ProjectHomePage tickets", () => {
       expect(draft).toHaveValue("Keep this draft");
       expect(screen.getByRole("textbox", { name: "Ticket draft" })).toBe(draft);
 
-      fireEvent.click(screen.getByRole("link", { name: "Chat with worker" }));
-      expect(screen.getByTestId("location")).toHaveTextContent("session=worker");
-      fireEvent.click(screen.getByRole("link", { name: "Back to ticket" }));
-      expect(panel).toHaveStyle({ width: "100%" });
-      expect(draft).toHaveValue("Keep this draft");
-
       fireEvent.click(screen.getByRole("button", { name: "Restore ticket panel" }));
       expect(panel).toHaveStyle({ width });
       expect(board).toBeVisible();
@@ -254,10 +241,7 @@ describe("ProjectHomePage tickets", () => {
     expect(screen.queryByRole("separator")).toBeNull();
   });
 
-  it.each([
-    ["ticket=ticket-1", "Ticket details", "Close ticket ticket-1"],
-    ["session=session-1", "Session quick view", "Close session-1"],
-  ])(
+  it.each([["ticket=ticket-1", "Ticket details", "Close ticket ticket-1"]])(
     "opens %s beside the board and preserves the normal New session composer",
     (search, panel, close) => {
       mocks.ticketsEnabled = true;
@@ -288,33 +272,34 @@ afterEach(() => {
   resetSharedWidthStoreForTesting();
 });
 
-describe("ProjectHomePage session quick view", () => {
-  it("opens a card's session beside the board and closes it from the panel or Escape", () => {
+describe("ProjectHomePage session navigation", () => {
+  it.each([false, true])("opens a card directly in the session page (mobile=%s)", (mobile) => {
+    mocks.isMobile = mobile;
     renderPage("/projects/Payments");
     expect(screen.getByTestId("selected-card")).toHaveTextContent("none");
-
-    fireEvent.click(screen.getByRole("link", { name: "Quick view" }));
-    expect(screen.getByTestId("location")).toHaveTextContent(
-      "/projects/Payments?session=session-1",
-    );
-    expect(screen.getByTestId("selected-card")).toHaveTextContent("session-1");
-
-    fireEvent.click(screen.getByRole("button", { name: "Close session-1" }));
-    expect(screen.getByTestId("location")).toHaveTextContent(/^\/projects\/Payments$/);
-    expect(screen.queryByRole("button", { name: "Close session-1" })).toBeNull();
-
-    fireEvent.click(screen.getByRole("link", { name: "Quick view" }));
-    act(() => {
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
-    });
-    expect(screen.queryByRole("button", { name: "Close session-1" })).toBeNull();
-  });
-
-  it("leaves phones on the full session page, with no quick view", () => {
-    mocks.isMobile = true;
-    renderPage("/projects/Payments?session=session-1");
     expect(screen.queryByRole("link", { name: "Quick view" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Close session-1" })).toBeNull();
-    expect(screen.getByTestId("selected-card")).toHaveTextContent("none");
+    fireEvent.click(screen.getByRole("link", { name: "Open session" }));
+    expect(screen.getByTestId("location")).toHaveTextContent("/c/session-1");
+    expect(screen.getByTestId("full-session")).toBeVisible();
+    expect(screen.queryByRole("complementary")).toBeNull();
   });
+
+  it.each([
+    { mobile: false, tickets: false, query: "session=session-1" },
+    { mobile: true, tickets: false, query: "session=session-1" },
+    { mobile: false, tickets: true, query: "session=session-1" },
+    { mobile: false, tickets: true, query: "ticket=ticket-1&session=session-1" },
+    { mobile: true, tickets: true, query: "ticket=ticket-1&session=session-1" },
+  ])(
+    "redirects old session links to the full page (mobile=$mobile, tickets=$tickets, query=$query)",
+    ({ mobile, tickets, query }) => {
+      mocks.isMobile = mobile;
+      mocks.ticketsEnabled = tickets;
+      renderPage(`/projects/Payments?${query}`);
+      expect(screen.getByTestId("location")).toHaveTextContent("/c/session-1");
+      expect(screen.getByTestId("full-session")).toBeVisible();
+      expect(screen.queryByRole("complementary")).toBeNull();
+      expect(screen.queryByRole("link", { name: "Back to ticket" })).toBeNull();
+    },
+  );
 });

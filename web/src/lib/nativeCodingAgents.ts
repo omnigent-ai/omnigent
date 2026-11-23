@@ -4,6 +4,22 @@ export const WRAPPER_LABEL_KEY = "omnigent.wrapper";
 export const UI_MODE_LABEL_KEY = "omnigent.ui";
 export const UI_MODE_TERMINAL_VALUE = "terminal";
 
+export interface NativeSessionSource {
+  labels?: Record<string, string | null> | null;
+  harness?: string | null;
+  parentSessionId?: string | null;
+}
+
+/** Custom agents use their resolved harness; explicit wrapper and child labels stay authoritative. */
+export function effectiveNativeWrapperLabel(
+  session: NativeSessionSource | null | undefined,
+): string | undefined {
+  const wrapper = session?.labels?.[WRAPPER_LABEL_KEY];
+  if (wrapper != null) return wrapper;
+  if (session?.parentSessionId != null) return undefined;
+  return nativeCodingAgentForHarness(session?.harness)?.wrapperLabel;
+}
+
 /** Wrapper stamped on a child row that tracks a Claude Code Task sub-agent. */
 export const CLAUDE_NATIVE_SUBAGENT_WRAPPER = "claude-code-native-ui-subagent";
 /** Task-tool `description` forwarded onto that child row, e.g. `"wave-worker-696"`. */

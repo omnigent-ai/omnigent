@@ -1,9 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef } from "react";
-import { ArrowLeftIcon, Maximize2Icon } from "lucide-react";
+import { useEffect, useMemo, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { useSessionAgent } from "@/hooks/useAgents";
-import { sessionAgentIdentity } from "@/lib/sessionAgentIdentity";
+import { useAgentChatPresentation } from "@/components/chat/useAgentChatPresentation";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import { mergeTaggedDrafts } from "@/lib/composerMentions";
 import {
@@ -18,13 +16,7 @@ import type { ChatPresentation } from "@/components/chat/assistantPresentation";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { Link, useSearchParams } from "@/lib/routing";
-import { cn } from "@/lib/utils";
-import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
-import { ProjectAgentIdentity } from "./ProjectAgentIdentity";
-import { ticketPanelSearch } from "./projectHomeNavigation";
 import { TicketError } from "./TicketControls";
 import { useProjectChatSession } from "./useProjectAgentSession";
 import { ticketResponseExtras } from "./ProjectTicketUpdates";
@@ -115,15 +107,8 @@ export function ProjectAgentChat({
   projectId: string;
   ticket?: { id: string; title: string };
 }) {
-  const [search] = useSearchParams();
   const agent = useSessionAgent(sessionId);
-  const identity = useMemo(
-    () =>
-      !agent.isError && agent.data
-        ? sessionAgentIdentity({ agentName: agent.data.name, harness: agent.data.harness })
-        : null,
-    [agent.data, agent.isError],
-  );
+  const agentPresentation = useAgentChatPresentation(agent.isError ? undefined : agent.data);
   const ticketContext = useRef<string | null>(null);
   useEffect(() => {
     const key = ticket ? `${sessionId}:${ticket.id}` : null;
@@ -132,67 +117,19 @@ export function ProjectAgentChat({
       addTicketToSessionDraft(sessionId, { ...ticket, project_id: projectId });
     }
   }, [sessionId, projectId, ticket]);
-  const renderHeader = useCallback(
-    (empty: boolean) => (
-      <div
-        className={cn("flex shrink-0 justify-center pb-8", empty ? "pt-[min(12vh,6rem)]" : "pt-5")}
-      >
-        {agent.data && !agent.isError && <ProjectAgentIdentity agent={agent.data} />}
-      </div>
-    ),
-    [agent.data, agent.isError],
-  );
   const presentation = useMemo<ChatPresentation>(
     () => ({
-      header: renderHeader,
-      assistant: identity
-        ? {
-            name: identity.displayName,
-            icon: <ComposerAgentIcon agent={identity} />,
-          }
-        : undefined,
+      ...agentPresentation,
       responseExtras: (bubbles) => ticketResponseExtras(bubbles, projectId),
     }),
-    [renderHeader, identity, projectId],
+    [agentPresentation, projectId],
   );
-  const backSearch = new URLSearchParams(search);
-  backSearch.set("view", "board");
   return (
     <section
       data-project-chat
-      aria-label={identity ? `${identity.displayName} chat` : "Project chat"}
-      className={cn(
-        "relative mx-auto flex min-h-0 min-w-0 flex-1 flex-col px-1 md:px-4",
-        CHAT_COLUMN_WIDTH,
-      )}
+      aria-label={presentation.assistant ? `${presentation.assistant.name} chat` : "Project chat"}
+      className="relative mx-auto flex min-h-0 w-full max-w-4xl min-w-0 flex-1 flex-col px-1 md:px-6"
     >
-      {ticket && (
-        <Link
-          to={ticketPanelSearch(ticket.id, backSearch)}
-          aria-label="Back to ticket"
-          className="mr-10 mb-1 flex min-w-0 items-center gap-1.5 px-3 text-sm text-muted-foreground hover:text-foreground"
-        >
-          <ArrowLeftIcon className="size-3.5 shrink-0" />
-          <span>Back to ticket</span>
-          <span aria-hidden>·</span>
-          <span className="truncate">{ticket.title}</span>
-        </Link>
-      )}
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button
-            asChild
-            variant="ghost"
-            size="icon-sm"
-            className="absolute top-0 right-3 z-10 text-muted-foreground md:right-7"
-          >
-            <Link to={`/c/${sessionId}`} aria-label="Open full session">
-              <Maximize2Icon />
-            </Link>
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent>Open full session</TooltipContent>
-      </Tooltip>
       <RenderErrorBoundary name="chat" resetKey={sessionId}>
         <FullSessionChat sessionId={sessionId} sessionComposer presentation={presentation} />
       </RenderErrorBoundary>

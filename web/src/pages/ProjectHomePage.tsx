@@ -12,7 +12,6 @@ import {
 } from "@/projectHome/ProjectHomeHeader";
 import {
   PROJECT_PANEL_SESSION_PARAM,
-  projectSessionPanelSearch,
   projectView,
   projectViewSearch,
   ticketPanelSearch,
@@ -46,11 +45,10 @@ export function ProjectHomePage() {
   // Each project starts unfiltered.
   useEffect(() => () => setSearchQuery(""), [projectName, setSearchQuery]);
 
-  // Phones have no room beside the board; their cards open the full session.
+  // Saved session-panel links redirect to the normal session on every viewport.
   const [searchParams] = useSearchParams();
   const view = projectView(searchParams);
-  const panelSessionId =
-    isMobile && !tickets ? null : searchParams.get(PROJECT_PANEL_SESSION_PARAM);
+  const panelSessionId = searchParams.get(PROJECT_PANEL_SESSION_PARAM);
   const panelTicketId = tickets ? searchParams.get("ticket") : null;
   const hasPanel = panelSessionId !== null || panelTicketId !== null;
   const [ticketExpanded, setTicketExpanded] = useState(false);
@@ -101,6 +99,8 @@ export function ProjectHomePage() {
     }
   }
 
+  if (panelSessionId) return <ProjectSessionPanel sessionId={panelSessionId} />;
+
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
       {/* Only the lanes and the panel scroll; the page stays put. */}
@@ -108,8 +108,8 @@ export function ProjectHomePage() {
         className="overflow-hidden"
         maxWidthClassName="max-w-none"
         contentClassName="flex h-full"
-        // Clears the taller header the project title gets on desktop.
-        extraTop={isMobile ? "0.75rem" : "4rem"}
+        // Matches the compact project title row above the view tabs.
+        extraTop={isMobile ? "0.25rem" : "0.5rem"}
         extraBottom="0px"
       >
         <ProjectViews enabled={tickets} projectName={projectName} view={view}>
@@ -133,7 +133,6 @@ export function ProjectHomePage() {
             <ProjectKanbanBoard
               projectName={projectName}
               searchQuery={searchQuery}
-              quickViewHref={isMobile ? undefined : projectSessionPanelSearch}
               selectedSessionId={panelSessionId}
               onCloseQuickView={closePanel}
               overlayClearance={composerOpen ? "10rem" : undefined}
@@ -159,7 +158,7 @@ export function ProjectHomePage() {
                   <span className="h-9 w-0.5 rounded-full bg-muted-foreground/30 opacity-0 group-hover/resize:opacity-100 group-focus-visible/resize:opacity-100" />
                 </div>
               )}
-              {panelTicketId !== null ? (
+              {panelTicketId !== null && (
                 <ProjectTicketPanel
                   key={`${projectName}:${panelTicketId}`}
                   projectName={projectName}
@@ -171,10 +170,6 @@ export function ProjectHomePage() {
                   expanded={ticketFillsPage}
                   onExpandedChange={isMobile ? undefined : setTicketExpanded}
                 />
-              ) : (
-                panelSessionId !== null && (
-                  <ProjectSessionPanel sessionId={panelSessionId} onClose={closePanel} />
-                )
               )}
             </aside>
           )}
@@ -224,7 +219,7 @@ function ProjectViews({
       className="min-h-0 min-w-0 flex-1 gap-0"
     >
       <ProjectViewNavigation projectName={projectName} view={view} />
-      <TabsContent value={view} className="flex min-h-0 min-w-0 pt-3">
+      <TabsContent value={view} className="flex min-h-0 min-w-0 pt-1">
         {children}
       </TabsContent>
     </Tabs>

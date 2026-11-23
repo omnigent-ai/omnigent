@@ -8,6 +8,7 @@ import {
 } from "@/lib/composerCapabilities";
 import {
   shouldShowCodexApprovalModeControl,
+  shouldShowPermissionModeControl,
   shouldShowCodexPlanModeControl,
   shouldShowGoalControl,
   shouldShowPollyClaudeGoalControl,
@@ -41,6 +42,21 @@ const CODEX_MODEL_OPTIONS: NativeModelOption[] = [
     isDefault: false,
   },
 ];
+
+it.each([
+  ["claude-native", true, false],
+  ["codex-native", false, true],
+  ["devin-native", true, false],
+  ["cursor-native", false, false],
+  ["claude-sdk", false, false],
+])(
+  "full-session permission controls follow a custom agent's %s harness",
+  (harness, permission, approval) => {
+    const session = { labels: {}, harness };
+    expect(shouldShowPermissionModeControl(session)).toBe(permission);
+    expect(shouldShowCodexApprovalModeControl(session)).toBe(approval);
+  },
+);
 
 describe("effortLevelsForConv", () => {
   it("returns the Claude-native effort set for claude-native conversations", () => {

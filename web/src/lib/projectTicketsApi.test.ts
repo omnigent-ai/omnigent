@@ -8,9 +8,11 @@ import {
   listTickets,
   setTicketSessionInvolvement,
   ticketEventStage,
+  ticketResponseSession,
   updateTicket,
   updateTicketStages,
   type TicketEvent,
+  type EventPage,
 } from "./projectTicketsApi";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -179,5 +181,71 @@ it.each([
 it("does not invent a stage for unrelated activity", () => {
   expect(
     ticketEventStage({ ...event, payload: { changes: { plan: "Review the design" } } }),
+  ).toBeNull();
+});
+
+it("attributes an unresolved response request without letting unrelated edits steal it", () => {
+  const labels = [{ key: "needs-human", value: "Repro details" }];
+  const ticket = { labels, updated_at: 1000 };
+  const created: TicketEvent = { ...event, kind: "created", payload: { labels: [] } };
+  const request: TicketEvent = {
+    ...event,
+    position: 1,
+    session_id: "worker",
+    payload: { changes: { labels } },
+  };
+  const pages: EventPage[] = [
+    {
+      data: [
+        created,
+        request,
+        {
+          ...event,
+          position: 2,
+          session_id: "coordinator",
+          payload: { changes: { labels: [...labels, { key: "area", value: "mobile" }] } },
+        },
+        { ...event, position: 3, payload: { changes: { stage_id: "review" } } },
+        { ...event, position: 4, kind: "comment", payload: { text: "I approve" } },
+      ],
+      has_more: false,
+      last_position: 4,
+    },
+  ];
+  expect(ticketResponseSession(ticket, pages)).toBe("worker");
+  expect(ticketResponseSession({ ...ticket, labels: [] }, pages)).toBeNull();
+
+  const resolution: TicketEvent = {
+    ...event,
+    position: 5,
+    payload: { changes: { labels: [] } },
+  };
+  pages[0].data.push(resolution);
+  expect(ticketResponseSession(ticket, pages)).toBeNull();
+  pages[0].data.push({ ...request, position: 6, session_id: "reviewer" });
+  expect(ticketResponseSession(ticket, pages)).toBe("reviewer");
+  pages[0].data.push({ ...resolution, position: 7 }, { ...request, position: 8, session_id: null });
+  expect(ticketResponseSession(ticket, pages)).toBeNull();
+});
+
+it("does not attribute a response from incomplete, failed-to-catch-up or mismatched history", () => {
+  const labels = [{ key: "needs-human" }];
+  const ticket = { labels, updated_at: 1000 };
+  const page: EventPage = {
+    data: [{ ...event, kind: "created", session_id: "worker", payload: { labels } }],
+    has_more: false,
+    last_position: 0,
+  };
+  expect(ticketResponseSession(ticket, [page])).toBe("worker");
+  expect(ticketResponseSession(ticket, [])).toBeNull();
+  expect(ticketResponseSession(ticket, [{ ...page, has_more: true }])).toBeNull();
+  expect(
+    ticketResponseSession(ticket, [{ ...page, data: [{ ...page.data[0], position: 10 }] }]),
+  ).toBeNull();
+  expect(ticketResponseSession({ ...ticket, updated_at: 1001 }, [page])).toBeNull();
+  expect(
+    ticketResponseSession({ ...ticket, labels: [{ key: "needs-human", value: "New question" }] }, [
+      page,
+    ]),
   ).toBeNull();
 });

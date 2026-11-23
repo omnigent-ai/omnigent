@@ -164,7 +164,6 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
-    _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
     _EXTERNAL_CONVERSATION_ITEM_TYPE,
     _FORK_HISTORY_NATIVE_HARNESSES,
     _logger,
@@ -340,6 +339,23 @@ from omnigent.version import VERSION
 
 # Harnesses whose sessions offer ``/rewind``.
 _REWIND_HARNESSES = frozenset({"claude-sdk", "claude-native"})
+
+
+def _permission_harness_for_session(
+    conv: Conversation,
+    *,
+    agent_store: AgentStore,
+    agent_cache: AgentCache | None,
+) -> str | None:
+    """Resolve native permission controls without treating custom agents as wrappers."""
+    wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+    if wrapper is not None:
+        native = native_coding_agent_for_wrapper_label(wrapper)
+        return native.harness if native is not None else None
+    if conv.parent_conversation_id is not None:
+        return None
+    return _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
+
 
 # An image a prompt carries inline rather than as a stored file.
 _INLINE_IMAGE_URL = re.compile(r"^data:image/[\w.+-]+;base64,", re.IGNORECASE)
@@ -4010,15 +4026,15 @@ def register_core_routes(
             )
             if conv_for_permission_mode is None:
                 raise _session_not_found()
-            # The mode lives in the harness's own TUI, so both the eligible wrapper
-            # and the vocabulary are per harness — Devin's rungs are not Claude's,
-            # and validating one against the other would reject a valid switch.
-            wrapper_for_permission_mode = conv_for_permission_mode.labels.get(
-                _CLAUDE_NATIVE_WRAPPER_LABEL_KEY
+            permission_harness = await asyncio.to_thread(
+                _permission_harness_for_session,
+                conv_for_permission_mode,
+                agent_store=agent_store,
+                agent_cache=agent_cache,
             )
-            if wrapper_for_permission_mode == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
+            if permission_harness == "claude-native":
                 allowed_permission_modes: tuple[str, ...] = tuple(_CLAUDE_NATIVE_PERMISSION_MODES)
-            elif wrapper_for_permission_mode == _DEVIN_NATIVE_WRAPPER_LABEL_VALUE:
+            elif permission_harness == "devin-native":
                 from omnigent.harnesses.devin_native.bridge import DEVIN_PERMISSION_MODES
 
                 allowed_permission_modes = DEVIN_PERMISSION_MODES
@@ -4053,10 +4069,13 @@ def register_core_routes(
             )
             if conv_for_approval_mode is None:
                 raise _session_not_found()
-            if (
-                conv_for_approval_mode.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-                != _CODEX_NATIVE_WRAPPER_LABEL_VALUE
-            ):
+            approval_harness = await asyncio.to_thread(
+                _permission_harness_for_session,
+                conv_for_approval_mode,
+                agent_store=agent_store,
+                agent_cache=agent_cache,
+            )
+            if approval_harness != "codex-native":
                 raise OmnigentError(
                     "approval_mode is only supported for codex-native sessions",
                     code=ErrorCode.INVALID_INPUT,

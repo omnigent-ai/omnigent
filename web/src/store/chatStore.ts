@@ -180,7 +180,8 @@ import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
-import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
+import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
+import { permissionChipKind } from "@/lib/permissionModeCycle";
 import {
   getCurrentAuthorId,
   getCurrentUserId,
@@ -206,6 +207,7 @@ import {
   withoutAttachedMarkers,
 } from "@/lib/systemMessage";
 import {
+  effectiveNativeWrapperLabel,
   isNativeTerminalSession as isNativeTerminalSessionFn,
   nativeCodingAgentForHarness,
 } from "@/lib/nativeCodingAgents";
@@ -4748,22 +4750,21 @@ type NativeModelFamily = "claude" | "codex";
  * The wrapper label is authoritative. Custom YAML agents carry no
  * presentation label, so for label-less sessions the resolved harness is the
  * fallback — mirroring the composer capability gates, so a custom
- * codex-native session keeps its reported model in the composer label.
+ * native session keeps its reported model in the composer label.
  *
  * :param session: Session snapshot from the API.
  * :returns: ``"claude"`` / ``"codex"`` for native sessions, else ``null``.
  */
 function nativeModelFamilyForSession(
-  session: Pick<Session, "labels" | "harness">,
+  session: Pick<Session, "labels" | "harness" | "parentSessionId">,
 ): NativeModelFamily | null {
-  const wrapper = session.labels?.["omnigent.wrapper"];
-  switch (wrapper) {
+  switch (effectiveNativeWrapperLabel(session)) {
     case "claude-code-native-ui":
       return "claude";
     case "codex-native-ui":
       return "codex";
     default:
-      return wrapper == null && session.harness === "codex-native" ? "codex" : null;
+      return null;
   }
 }
 
@@ -5077,9 +5078,8 @@ function sessionBindingPatch(
     claudePermissionMode: isNativeTerminalSessionFn(session)
       ? (claudePermissionModeFromSession(session) ?? "")
       : "",
-    codexApprovalMode: isCodexNativeSession(session)
-      ? (codexApprovalModeFromSession(session) ?? "")
-      : "",
+    codexApprovalMode:
+      permissionChipKind(session) === "codex" ? (codexApprovalModeFromSession(session) ?? "") : "",
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,
     codexModelOptions: session.codexModelOptions ?? [],

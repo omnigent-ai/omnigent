@@ -128,6 +128,21 @@ describe("nextPermissionModePress", () => {
 
 describe("permissionChipKind", () => {
   it.each([
+    ["claude-native", "claude"],
+    ["codex-native", "codex"],
+    ["devin-native", "devin"],
+    ["cursor-native", null],
+    ["pi-native", null],
+    ["claude-sdk", null],
+  ])("uses a custom agent's %s harness for live permission controls", (harness, kind) => {
+    expect(permissionChipKind({ labels: {}, harness })).toBe(kind);
+    expect(permissionChipKind({ labels: {}, harness, parentSessionId: "parent" })).toBeNull();
+    expect(
+      permissionChipKind({ labels: { "omnigent.wrapper": "codex-native-ui-subagent" }, harness }),
+    ).toBeNull();
+  });
+
+  it.each([
     ["claude-code-native-ui", "claude"],
     ["devin-native-ui", "devin"],
     ["codex-native-ui", "codex"],
@@ -136,7 +151,7 @@ describe("permissionChipKind", () => {
     expect(permissionChipKind({ labels: { "omnigent.wrapper": wrapper } })).toBe(kind);
   });
 
-  it("has no chip without a wrapper", () => {
+  it("has no chip without a known wrapper or harness", () => {
     expect(permissionChipKind({ labels: {} })).toBeNull();
   });
 });

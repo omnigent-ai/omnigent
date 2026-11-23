@@ -252,6 +252,36 @@ export function ticketOutputs(events: TicketEvent[]): TicketOutput[] {
   return [...outputs.values()];
 }
 
+/** The current response contact is the session that raised the unresolved label. */
+export function ticketResponseSession(
+  ticket: Pick<ProjectTicket, "labels" | "updated_at">,
+  pages: readonly EventPage[],
+): string | null {
+  const current = ticket.labels.find((label) => label.key === "needs-human");
+  const lastPage = pages.at(-1);
+  if (!current || !lastPage || lastPage.has_more) return null;
+  const events = pages.flatMap((page) => page.data);
+  if (events[0]?.position !== 0) return null;
+  if ((events.at(-1)?.created_at ?? 0) < ticket.updated_at) return null;
+  let active: TicketLabel | undefined;
+  let requester: string | null = null;
+  for (const event of events) {
+    const changes = event.payload.changes as { labels?: unknown } | undefined;
+    const labels =
+      event.kind === "created"
+        ? event.payload.labels
+        : event.kind === "updated"
+          ? changes?.labels
+          : undefined;
+    if (!Array.isArray(labels)) continue;
+    const next = labels.find((label): label is TicketLabel => label?.key === "needs-human");
+    if (!next) requester = null;
+    else if (!active) requester = event.session_id;
+    active = next;
+  }
+  return active && (active.value ?? "") === (current.value ?? "") ? requester : null;
+}
+
 /** Snapshots retain the stage's name, meaning and appearance even after removal. */
 export function ticketEventStage(event: TicketEvent): TicketStage | null {
   const snapshot = event.payload.stage as Partial<TicketStage> | undefined;

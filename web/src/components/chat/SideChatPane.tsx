@@ -27,6 +27,9 @@ import {
 } from "@/lib/renderItems";
 import {
   BubbleView,
+  ConversationHistoryAutoLoader,
+  HistoryLoadingIndicator,
+  JumpToTopButton,
   WorkingIndicatorRow,
   bubbleKey,
   computeIsWorking,
@@ -510,10 +513,23 @@ export function SideChatPane({
   // Keep the newest content in view until the reader scrolls up; sending
   // follows the tail again. A side chat is short and non-virtualized, so a
   // bottom sentinel scrolled on each change is enough.
-  const transcriptRef = useRef<HTMLDivElement>(null);
+  const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const [transcriptElement, setTranscriptElement] = useState<HTMLDivElement | null>(null);
+  const [transcriptContainer, setTranscriptContainer] = useState<HTMLDivElement | null>(null);
+  const attachTranscript = useCallback((element: HTMLDivElement | null) => {
+    transcriptRef.current = element;
+    setTranscriptElement(element);
+  }, []);
   const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const followTail = useRef(true);
+  const stopFollowing = useCallback(() => {
+    followTail.current = false;
+  }, []);
+  const scroller = useMemo(
+    () => (transcriptElement ? { el: transcriptElement, stopScroll: stopFollowing } : null),
+    [transcriptElement, stopFollowing],
+  );
   useEffect(() => {
     if (followTail.current) bottomRef.current?.scrollIntoView({ block: "end" });
   }, [bubbles.length, activeResponse]);
@@ -577,89 +593,109 @@ export function SideChatPane({
         {/* Keys pressed in here belong to the side chat, not the parent's question. */}
         <div className="side-chat-backdrop flex h-full min-h-0 flex-col" data-side-chat-pane="">
           {replaceDraftDialog}
-          <div
-            ref={transcriptRef}
-            className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-4"
-            style={
-              transcriptTopInset ? { paddingTop: `calc(1rem + ${transcriptTopInset})` } : undefined
-            }
-            onScroll={(event) => {
-              const node = event.currentTarget;
-              followTail.current = node.scrollHeight - node.scrollTop - node.clientHeight < 64;
-            }}
-          >
-            {presentation?.header?.(isEmpty)}
-            {fullSession && state.hasMoreHistory && (
-              <Button
-                variant="ghost"
-                size="sm"
-                disabled={state.loadingMoreHistory}
-                onClick={() => {
-                  followTail.current = false;
-                  void useChatStore.getState().loadMoreHistory(childId);
-                }}
-              >
-                {state.loadingMoreHistory ? "Loading…" : "Load earlier messages"}
-              </Button>
-            )}
-            {loadFailed ? (
-              <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
-                <TriangleAlertIcon className="size-6 text-muted-foreground" />
-                <p className="text-ui font-medium text-foreground">
-                  {fullSession ? "Couldn’t load this session" : "Couldn’t load this side chat"}
+          {presentation?.header && (
+            <div
+              className="shrink-0"
+              style={transcriptTopInset ? { paddingTop: transcriptTopInset } : undefined}
+            >
+              {presentation.header(isEmpty)}
+            </div>
+          )}
+          <div ref={setTranscriptContainer} className="relative flex min-h-0 flex-1 flex-col">
+            <div
+              ref={attachTranscript}
+              className="side-chat-transcript flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-4"
+              style={
+                transcriptTopInset && !presentation?.header
+                  ? { paddingTop: `calc(1rem + ${transcriptTopInset})` }
+                  : undefined
+              }
+              onScroll={(event) => {
+                const node = event.currentTarget;
+                followTail.current = node.scrollHeight - node.scrollTop - node.clientHeight < 64;
+              }}
+            >
+              {fullSession && state.loadingMoreHistory && <HistoryLoadingIndicator />}
+              {loadFailed ? (
+                <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
+                  <TriangleAlertIcon className="size-6 text-muted-foreground" />
+                  <p className="text-ui font-medium text-foreground">
+                    {fullSession ? "Couldn’t load this session" : "Couldn’t load this side chat"}
+                  </p>
+                  <p className="max-w-[36ch] text-sm text-muted-foreground">
+                    {conversationLoadError?.message ?? "Please try again."}
+                  </p>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="mt-1"
+                    onClick={() => void ensureConversationStreamed(childId)}
+                  >
+                    Retry
+                  </Button>
+                </div>
+              ) : fullSession && loadingConversation && bubbles.length === 0 ? (
+                <p role="status" className="m-auto text-sm text-muted-foreground">
+                  Loading session…
                 </p>
-                <p className="max-w-[36ch] text-sm text-muted-foreground">
-                  {conversationLoadError?.message ?? "Please try again."}
-                </p>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  className="mt-1"
-                  onClick={() => void ensureConversationStreamed(childId)}
-                >
-                  Retry
-                </Button>
-              </div>
-            ) : fullSession && loadingConversation && bubbles.length === 0 ? (
-              <p role="status" className="m-auto text-sm text-muted-foreground">
-                Loading session…
-              </p>
-            ) : isEmpty && launch !== null ? (
-              <RunnerStartingIndicator variant="hero" status={launch} />
-            ) : isEmpty && presentation?.header ? (
-              <div className="flex-1" />
-            ) : isEmpty ? (
-              <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
-                <MessagesSquareIcon className="size-6 text-muted-foreground" />
-                <p className="text-ui font-medium text-foreground">
-                  {fullSession ? "No messages yet" : "Side chat"}
-                </p>
-                {!fullSession && (
-                  <p className="max-w-[36ch] text-sm text-muted-foreground">{EMPTY_STATE_BODY}</p>
-                )}
-              </div>
-            ) : (
-              <div ref={listRef} className="flex flex-col gap-4">
-                <EditSentMessageContext.Provider
-                  value={readOnly || starting ? null : editSentMessage}
-                >
-                  {bubbles.map((bubble, index) => (
-                    <BubbleView
-                      key={bubbleKey(bubble)}
-                      bubble={bubble}
-                      isLastAssistant={index === lastAssistantIndex}
-                      showsWorking={showsWorking}
-                      recoveryDisabled={readOnly}
-                    />
-                  ))}
-                </EditSentMessageContext.Provider>
-                <WorkingIndicatorRow key={childId} show={showsWorkingRow} />
-                {!showsWorkingRow && launch !== null && (
-                  <RunnerStartingIndicator variant="row" status={launch} />
-                )}
-                <div ref={bottomRef} />
-              </div>
+              ) : isEmpty && launch !== null ? (
+                <RunnerStartingIndicator variant="hero" status={launch} />
+              ) : isEmpty && presentation?.header ? (
+                <div className="flex-1" />
+              ) : isEmpty ? (
+                <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
+                  <MessagesSquareIcon className="size-6 text-muted-foreground" />
+                  <p className="text-ui font-medium text-foreground">
+                    {fullSession ? "No messages yet" : "Side chat"}
+                  </p>
+                  {!fullSession && (
+                    <p className="max-w-[36ch] text-sm text-muted-foreground">{EMPTY_STATE_BODY}</p>
+                  )}
+                </div>
+              ) : (
+                <div ref={listRef} className="flex flex-col gap-4">
+                  <EditSentMessageContext.Provider
+                    value={readOnly || starting ? null : editSentMessage}
+                  >
+                    {bubbles.map((bubble, index) => (
+                      <BubbleView
+                        key={bubbleKey(bubble)}
+                        bubble={bubble}
+                        isLastAssistant={index === lastAssistantIndex}
+                        showsWorking={showsWorking}
+                        recoveryDisabled={readOnly}
+                      />
+                    ))}
+                  </EditSentMessageContext.Provider>
+                  <WorkingIndicatorRow key={childId} show={showsWorkingRow} />
+                  {!showsWorkingRow && launch !== null && (
+                    <RunnerStartingIndicator variant="row" status={launch} />
+                  )}
+                  <div ref={bottomRef} />
+                </div>
+              )}
+            </div>
+            {fullSession && (
+              <>
+                <ConversationHistoryAutoLoader
+                  key={`history:${childId}`}
+                  scrollElement={transcriptElement}
+                  rowCount={bubbles.length}
+                  onLoad={stopFollowing}
+                />
+                <JumpToTopButton
+                  key={`jump:${childId}`}
+                  containerEl={transcriptContainer}
+                  scroller={scroller}
+                  hasMoreHistory={state.hasMoreHistory}
+                  topOffset={
+                    transcriptTopInset && !presentation?.header
+                      ? `calc(0.5rem + ${transcriptTopInset})`
+                      : "0.5rem"
+                  }
+                />
+              </>
             )}
           </div>
           {launch !== null && (

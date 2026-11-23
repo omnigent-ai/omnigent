@@ -1120,6 +1120,14 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
     mask-image: var(--chat-edge-fade);
   }
 
+  .session-chat-transcript[data-agent-header] > [role="log"] {
+    --chat-edge-fade: linear-gradient(
+      to bottom,
+      black calc(100% - max(64px, var(--omnigent-safe-bottom))),
+      transparent 100%
+    );
+  }
+
   [data-chat-surface] .session-chat-transcript {
     margin-bottom: calc(-1 * var(--session-composer-height, 0px));
   }
@@ -1562,6 +1570,11 @@ html[data-electron-mac] .breadcrumb-folder {
     padding-top: 1rem;
   }
 
+  :is([data-ios-native], [data-android-native])
+    .chat-conversation-content.chat-content-under-agent-header {
+    padding-top: 1rem;
+  }
+
   [data-ios-native] .main-terminal-view,
   [data-android-native] .main-terminal-view {
     padding-top: calc(3.25rem + var(--omnigent-inset-top));
@@ -1870,12 +1883,13 @@ html[data-electron-mac] .breadcrumb-folder {
   );
 }
 
-/* The transcript draws its own constant-height scrollbar (TranscriptScrollbar);
- * hide the native one so both don't show. */
-.transcript-hide-native-scrollbar {
+/* Full sessions draw their own scrollbar; project chat keeps scrolling without a visible track. */
+.transcript-hide-native-scrollbar,
+[data-project-chat] .side-chat-transcript {
   scrollbar-width: none;
 }
-.transcript-hide-native-scrollbar::-webkit-scrollbar {
+.transcript-hide-native-scrollbar::-webkit-scrollbar,
+[data-project-chat] .side-chat-transcript::-webkit-scrollbar {
   display: none;
 }
 

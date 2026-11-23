@@ -156,17 +156,14 @@ afterEach(() => {
 });
 
 describe("project Chat", () => {
-  it("only reads the saved lead session and opens that exact conversation full screen", async () => {
+  it("only reads the saved lead session and uses its shared composer", async () => {
     renderChat();
     expect(await screen.findByLabelText("Existing session")).toHaveTextContent("lead");
     expect(screen.getByLabelText("Existing session")).toHaveAttribute(
       "data-shared-composer",
       "true",
     );
-    expect(screen.getByRole("link", { name: "Open full session" })).toHaveAttribute(
-      "href",
-      "/c/lead",
-    );
+    expect(screen.queryByRole("link", { name: "Open full session" })).toBeNull();
     expect(projectsApi.createProject).not.toHaveBeenCalled();
     expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith("lead");
     expect(screen.getByRole("button", { name: "About Codex" })).toHaveTextContent("");
@@ -352,10 +349,7 @@ describe("project Chat", () => {
     );
     expect(getSessionDraft("lead")?.text).toContain("My question");
     expect(getSessionDraft("lead")?.text).toContain("Ticket ID: ticket-a");
-    expect(screen.getByRole("link", { name: "Back to ticket" })).toHaveAttribute(
-      "href",
-      "/?view=board&ticket=ticket-a",
-    );
+    expect(screen.queryByRole("link", { name: "Back to ticket" })).toBeNull();
     setSessionDraft("lead", { text: "", files: [] });
     // The current ticket may refresh while this chat remains open.
     chat.rerender(

@@ -581,7 +581,12 @@ async def test_maestro_session_choices_are_independent_and_do_not_change_agent(
     project_client, project_agents, db_uri
 ):
     agent = project_agents.get_by_name("maestro")
-    choices = [("codex", "gpt-5.4-mini", "high"), ("claude-sdk", "claude-sonnet-4-6", "medium")]
+    choices = [
+        ("codex", "gpt-5.4-mini", "high"),
+        ("claude-sdk", "claude-sonnet-4-6", "medium"),
+        ("claude-native", "claude-sonnet-4-6", "high"),
+        ("codex-native", "gpt-5.4-mini", "high"),
+    ]
     for harness, model, effort in choices:
         response = await project_client.post(
             "/v1/projects",

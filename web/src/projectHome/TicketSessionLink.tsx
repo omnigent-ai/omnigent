@@ -3,15 +3,14 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { BotIcon, ChevronRightIcon } from "lucide-react";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { fetchConversationById } from "@/hooks/useOpenSessionRow";
 import { useSessionBadgeStates } from "@/hooks/useSessionBadgeStates";
-import { Link, useSearchParams } from "@/lib/routing";
+import { Link } from "@/lib/routing";
+import { getSessionSharePath } from "@/lib/shareLink";
 import { findCachedListRow } from "@/lib/sessionListCache";
 import { sessionAgentIdentity } from "@/lib/sessionAgentIdentity";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
-import { projectSessionPanelSearch, ticketSessionSearch } from "./projectHomeNavigation";
 
 function useTicketSessionMetadata(sessionId: string, refresh: boolean) {
   const client = useQueryClient();
@@ -31,22 +30,20 @@ function useTicketSessionMetadata(sessionId: string, refresh: boolean) {
 export function TicketSessionLink({
   sessionId,
   showStatus = false,
-  ticketId,
+  showAgentName = false,
+  needsResponse = false,
   involvement,
   label,
   icon,
-  to,
 }: {
   sessionId: string;
   showStatus?: boolean;
-  ticketId?: string;
+  showAgentName?: boolean;
+  needsResponse?: boolean;
   involvement?: string;
   label?: string;
   icon?: ReactNode;
-  to?: string;
 }) {
-  const mobile = useIsMobileViewport();
-  const [search] = useSearchParams();
   const { query, title: sessionTitle } = useTicketSessionMetadata(sessionId, showStatus);
   const session = query.data;
   const agent = session
@@ -56,10 +53,14 @@ export function TicketSessionLink({
         labels: session.labels,
       })
     : null;
-  const title = label ?? (showStatus ? agent?.displayName : undefined) ?? sessionTitle;
+  const title =
+    label ??
+    (showStatus || showAgentName ? agent?.displayName : undefined) ??
+    (showAgentName ? "Agent" : sessionTitle);
   const [state] = useSessionBadgeStates(session ? [session] : []);
   const unavailable = query.isError || session === null;
   const awaiting = !unavailable && !session?.archived && state?.kind === "awaiting";
+  const respond = !unavailable && !!session && !session.archived && (awaiting || needsResponse);
   const status = unavailable
     ? "Unavailable"
     : !session
@@ -82,19 +83,11 @@ export function TicketSessionLink({
         showStatus
           ? "flex min-w-0 flex-1 items-start gap-3 rounded-lg p-3 transition-colors hover:bg-muted/40 focus-visible:ring-inset"
           : "inline-block max-w-full align-bottom wrap-anywhere hover:underline",
+        showStatus && respond && "bg-tag-pink hover:bg-tag-pink",
       )}
       title={`${sessionTitle} (${sessionId})`}
-      aria-label={
-        showStatus ? `${awaiting ? "Respond to" : "Open chat with"}: ${title}` : undefined
-      }
-      to={
-        to ??
-        (ticketId
-          ? ticketSessionSearch(ticketId, sessionId, search)
-          : mobile
-            ? `/c/${encodeURIComponent(sessionId)}`
-            : projectSessionPanelSearch(sessionId))
-      }
+      aria-label={showStatus ? `${respond ? "Respond to" : "Open chat with"}: ${title}` : undefined}
+      to={getSessionSharePath(encodeURIComponent(sessionId))}
     >
       {showStatus &&
         (icon ??
@@ -121,10 +114,10 @@ export function TicketSessionLink({
             <span
               className={cn(
                 "inline-flex items-center gap-1 font-medium",
-                awaiting && "text-brand-accent",
+                respond && "text-brand-accent",
               )}
             >
-              {awaiting ? "Respond" : "Open chat"}
+              {respond ? "Respond" : "Open chat"}
               <ChevronRightIcon aria-hidden className="size-3.5" />
             </span>
           </span>

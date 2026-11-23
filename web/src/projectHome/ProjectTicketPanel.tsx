@@ -6,7 +6,6 @@ import {
   GitPullRequestIcon,
   LinkIcon,
   Maximize2Icon,
-  MessageSquareIcon,
   Minimize2Icon,
   PencilIcon,
   PlusIcon,
@@ -36,7 +35,7 @@ import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { Link, useSearchParams, useReplaceSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { useProjectChatSession } from "./useProjectAgentSession";
-import { ProjectAgentChat, ProjectChat } from "./ProjectChat";
+import { ProjectChat } from "./ProjectChat";
 import {
   createTicket,
   ticketOutputs,
@@ -47,7 +46,7 @@ import {
   type TicketLabel,
 } from "@/lib/projectTicketsApi";
 import { ProjectSessionPanel } from "./ProjectSessionPanel";
-import { ticketPanelSearch, ticketSessionSearch } from "./projectHomeNavigation";
+import { ticketPanelSearch } from "./projectHomeNavigation";
 import { TicketAgents } from "./TicketAgents";
 import { TicketCommentBody } from "./TicketCommentBody";
 import { TicketSessionLink } from "./TicketSessionLink";
@@ -143,30 +142,10 @@ export function ProjectOrchestratorPanel({
   onClose: () => void;
   ticket?: { id: string; title: string };
 }) {
-  const { projectId, sessionId } = useProjectChatSession(projectName);
-  const [search] = useSearchParams();
-  if (
-    sessionId &&
-    projectId &&
-    (search.get("view") === "chat" || search.get("agent") === "primary")
-  )
-    return (
-      <ProjectAgentChat
-        key={sessionId}
-        sessionId={sessionId}
-        projectId={projectId}
-        ticket={ticket}
-      />
-    );
-  if (sessionId)
-    return <ProjectSessionPanel sessionId={sessionId} onClose={onClose} ticket={ticket} />;
+  const { sessionId } = useProjectChatSession(projectName);
+  if (sessionId) return <ProjectSessionPanel sessionId={sessionId} />;
   return (
     <Panel title="Chat" onClose={onClose}>
-      {ticket && (
-        <Button asChild variant="ghost" size="sm">
-          <Link to={ticketPanelSearch(ticket.id)}>Back to ticket</Link>
-        </Button>
-      )}
       <ProjectChat projectName={projectName} ticket={ticket} />
     </Panel>
   );
@@ -448,14 +427,8 @@ function TicketDetails({
               </div>
               <TicketError error={configuration.error} />
               <TicketAgents projectId={projectId} ticket={ticket} />
-              <Button asChild variant="outline" size="sm">
-                <Link to={ticketSessionSearch(ticketId, undefined, searchParams)}>
-                  <MessageSquareIcon />
-                  Ask in Chat
-                </Link>
-              </Button>
               <section aria-label="Description" className="space-y-2">
-                <h3 className="text-sm font-medium">Description</h3>
+                <h3 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Description</h3>
                 {ticket.description ? (
                   <ProseMarkdown className="text-ui leading-relaxed">
                     {ticket.description}
@@ -484,7 +457,7 @@ function TicketDetails({
         </Panel>
       </div>
       {chatSessionId ? (
-        <ProjectSessionPanel sessionId={chatSessionId} onClose={closeChat} ticket={ticket} />
+        <ProjectSessionPanel sessionId={chatSessionId} />
       ) : (
         orchestratorChat && (
           <ProjectOrchestratorPanel projectName={projectName} onClose={closeChat} ticket={ticket} />
@@ -733,7 +706,7 @@ function TicketOutputs({ projectId, ticketId }: { projectId: string; ticketId: s
         const group = outputs.filter((output) => output.type === type);
         return group.length > 0 ? (
           <section key={type} aria-label={label} className="space-y-2">
-            <h3 className="text-sm font-medium">{label}</h3>
+            <h3 className="text-[length:calc(var(--text-ui)+2px)] font-bold">{label}</h3>
             <ul className="divide-y divide-border/60 overflow-hidden rounded-lg border border-border/60">
               {group.map((output) => (
                 <li key={output.url}>
@@ -818,7 +791,7 @@ function ActivityChange({ event }: { event: TicketEvent }) {
               ? "updated the role for"
               : "cleared the role for"
             : "unlinked"}{" "}
-        <TicketSessionLink sessionId={event.payload.session_id} ticketId={event.ticket_id} />
+        <TicketSessionLink sessionId={event.payload.session_id} />
       </>
     );
   if (typeof event.payload.related_ticket_id === "string")
@@ -866,7 +839,7 @@ function TicketActivity({ projectId, ticketId }: { projectId: string; ticketId: 
   if (!query.isPending && !query.error && !query.hasNextPage && events.length === 0) return null;
   return (
     <section aria-label="Ticket activity" className="space-y-4 border-t border-border/60 pt-5">
-      <h3 className="text-sm font-medium">Activity</h3>
+      <h3 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Activity</h3>
       <TicketError error={query.error} />
       {query.isPending && <Spinner aria-label="Loading activity" />}
       <ol>
@@ -914,7 +887,7 @@ function TicketActivityItem({
       ? "You"
       : (event.user_id ?? (agent ? "Agent" : "System"));
   const actor = event.session_id ? (
-    <TicketSessionLink sessionId={event.session_id} ticketId={event.ticket_id} />
+    <TicketSessionLink sessionId={event.session_id} showAgentName />
   ) : (
     <span className="text-foreground">{author}</span>
   );

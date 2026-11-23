@@ -1,5 +1,7 @@
 /** UI-only session capability gates, derived from the live session snapshot. */
 
+import { effectiveNativeWrapperLabel } from "./nativeCodingAgents";
+
 export const SANDBOX_SWITCH_HOST_UNSUPPORTED =
   "Switching hosts is not supported for this sandbox session yet.";
 export const SESSION_ACTIONS_LOADING = "Checking session capabilities…";
@@ -58,14 +60,11 @@ export function effortLevelsForFamily(family: string | null | undefined): readon
 /**
  * Fail-closed gate for Web UI reasoning-effort controls.
  *
- * :param session: Session or sidebar row carrying labels. ``null`` or missing
- *     labels fail closed.
+ * :param session: Session or sidebar row carrying labels and a resolved harness.
  * :param effortFamily: The declared effort family of the session's harness,
  *     supplied only for a NON-native harness (claude-sdk, codex, …) whose
  *     effort rides the session's ``reasoning_effort`` into the SDK executor.
- *     Native harnesses keep the wrapper-label gate below and must pass
- *     ``null`` so a label-less native session does not gain a control its
- *     bridge cannot honor.
+ *     Native harnesses use their own supported controls below and pass ``null``.
  * :returns: True for native sessions with Web UI effort controls, and for a
  *     top-level label-less session whose harness family has an effort ladder.
  *     cursor-native is intentionally excluded: its effort lives on the /model
@@ -84,15 +83,14 @@ export function supportsEffortControl(
     | undefined,
   effortFamily: string | null = null,
 ): boolean {
-  const wrapper = session?.labels?.["omnigent.wrapper"];
+  const wrapper = effectiveNativeWrapperLabel(session);
   if (
     wrapper === CLAUDE_NATIVE_WRAPPER ||
     wrapper === CODEX_NATIVE_WRAPPER ||
     wrapper === PI_NATIVE_WRAPPER ||
     // Devin has no --effort flag: effort is a model-variant suffix the executor
     // recombines and re-applies via /model, so the in-chat effort dial is live.
-    wrapper === DEVIN_NATIVE_WRAPPER ||
-    (wrapper == null && session?.harness === "codex-native")
+    wrapper === DEVIN_NATIVE_WRAPPER
   ) {
     return true;
   }

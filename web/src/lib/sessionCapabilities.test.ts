@@ -72,6 +72,24 @@ describe("effortLevelsForFamily", () => {
 });
 
 describe("supportsEffortControl with a declared effort family", () => {
+  it.each([
+    ["claude-native", true],
+    ["codex-native", true],
+    ["pi-native", true],
+    ["devin-native", true],
+    ["cursor-native", false],
+    ["claude-sdk", false],
+  ])("uses a custom agent's %s harness for effort support", (harness, supported) => {
+    expect(supportsEffortControl({ harness, labels: {} })).toBe(supported);
+    expect(supportsEffortControl({ harness, labels: {}, parentSessionId: "parent" })).toBe(false);
+    expect(
+      supportsEffortControl({
+        harness,
+        labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+      }),
+    ).toBe(false);
+  });
+
   it("shows the dial for a top-level label-less SDK session whose family has a ladder", () => {
     // WHY: claude-sdk / codex carry no wrapper label; their effort reaches the
     // executor through the session's reasoning_effort, so the family is the gate.

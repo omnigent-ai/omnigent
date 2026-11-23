@@ -186,7 +186,7 @@ interface ChatHeaderProps {
    * making the title a way back out. ``undefined`` renders it as plain text.
    */
   titleLinkTo?: string;
-  /** Left-slot title for a page with no conversation, such as a project home; makes the header taller. */
+  /** Left-slot title for a page with no conversation, such as a project home. */
   pageTitle?: ReactNode;
   /** Right-slot actions for a page with no conversation. */
   pageActions?: ReactNode;
@@ -599,8 +599,8 @@ export function ChatHeader({
         // Mobile keeps only the individual glass button surfaces.
         "chat-header absolute inset-x-0 top-0 z-30 flex h-[76px] md:h-12 items-center justify-between px-4 py-4 md:py-3 md:right-[var(--workspace-panel-offset,0px)]",
         (conversationId || hasPageTitle) && !isMobile && "session-header-glass",
-        // On desktop a page title gets a taller header, with room above it for hover toolbars.
-        hasPageTitle && "md:h-26 md:pt-8 md:pb-0",
+        // Project pages keep a compact title row above their view tabs.
+        hasPageTitle && "md:h-16 md:py-0",
         // Pages scroll under the header without a background, so only its controls take clicks.
         !conversationId && "pointer-events-none *:pointer-events-auto",
         settingsMode && !sidebarOpen && "settings-mobile-header",

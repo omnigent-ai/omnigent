@@ -16,6 +16,7 @@ import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNat
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import { useChatStore } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
+import { sessionAgentIdentity } from "@/lib/sessionAgentIdentity";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import {
   ComposerConfigSections,
@@ -86,7 +87,7 @@ export function SessionHarnessPicker({
   modelPickerShortcutEnabled = false,
 }: {
   appearance?: "composer" | "header";
-  /** Project agents may supply their own identity without changing the session's harness. */
+  /** Agent identity is independent of the session's harness. */
   agentIcon?: ReactNode;
   busy: boolean;
   busyRef: { current: boolean };
@@ -164,6 +165,12 @@ export function SessionHarnessPicker({
     modelLabelOptions,
     modelLabelHostId,
   );
+  const defaultEffortForModel = (model: string | null) =>
+    modelPickerKind === "codex"
+      ? (findNativeModelOption(codexModelOptions, model)?.defaultReasoningEffort ?? null)
+      : null;
+  // Resolve an inherited Codex effort from this model's catalog, without pinning it.
+  const effectiveEffort = selectedEffort ?? defaultEffortForModel(effectiveModel);
   const modelSummary = modelLabelLoading
     ? "Loading model…"
     : modelLabelUnavailable
@@ -173,9 +180,13 @@ export function SessionHarnessPicker({
     nativeCodingAgentForHarness(sessionHarness) ??
     (modelPickerKind ? nativeCodingAgentForHarness(modelPickerKind + "-native") : undefined);
   const iconAgent = {
-    name: nativeAgent?.agentName ?? agentName ?? subAgentName ?? "",
+    name: agentName ?? subAgentName ?? nativeAgent?.agentName ?? "",
     harness: nativeAgent?.harness ?? sessionHarness,
   };
+  const agentLabel = sessionAgentIdentity({
+    agentName: iconAgent.name,
+    harness: iconAgent.harness,
+  })?.displayName;
   const summary = useSessionConfigSummary({
     sessionId,
     harnessLabel,
@@ -183,6 +194,8 @@ export function SessionHarnessPicker({
     showEffort,
     codexModelOptions,
     effectiveModel,
+    effectiveEffort,
+    effortInherited: selectedEffort === null,
     modelLabel: modelSummary,
     costRoutingEligible,
   });
@@ -190,14 +203,13 @@ export function SessionHarnessPicker({
     showModels,
     showEffort,
   });
-  const effortLabel = showEffort && !routingOn ? formatStatusEffortLabel(selectedEffort) : null;
+  const effortLabel =
+    showEffort && !routingOn ? (formatStatusEffortLabel(effectiveEffort) ?? "Default") : null;
   const label = routingOn
     ? SMART_ROUTING_LABEL
     : modelLabelLoading
       ? ""
-      : compactModelTriggerLabel(
-          modelSummary ?? nativeAgent?.displayName ?? harnessLabel ?? "Session",
-        );
+      : compactModelTriggerLabel(modelSummary ?? "Default model");
   const availableEfforts =
     modelPickerKind === "codex"
       ? codexEffortLevelsForModel(codexModelOptions, pickerSelectedModel)
@@ -351,7 +363,7 @@ export function SessionHarnessPicker({
   });
   const effortSection =
     showEffort && availableEfforts.length > 0
-      ? buildEffortSection(availableEfforts, selectedEffort, routingOn, selectEffort)
+      ? buildEffortSection(availableEfforts, effectiveEffort, routingOn, selectEffort)
       : undefined;
   const fusionSections: readonly ComposerConfigSection[] | undefined =
     composerFusion !== undefined && fusionSelected && !routingOn
@@ -424,7 +436,7 @@ export function SessionHarnessPicker({
           cycleEffortLevels.length > 0
         ? buildEffortSection(
             cycleEffortLevels,
-            staged?.effort ?? selectedEffort,
+            staged?.effort ?? selectedEffort ?? defaultEffortForModel(cycleModel),
             cycleRoutingOn,
             stageEffort,
           )
@@ -573,7 +585,7 @@ export function SessionHarnessPicker({
         </HarnessPickerConfigPage>
       ) : (
         <HarnessPickerConfigRow
-          label={nativeAgent?.displayName ?? harnessLabel ?? "Session"}
+          label={agentLabel ?? harnessLabel ?? "Session"}
           value={routingOn ? SMART_ROUTING_LABEL : (modelSummary ?? "Default")}
           open={configOpen}
           onOpenChange={setConfigOpen}
@@ -602,6 +614,8 @@ function useSessionConfigSummary({
   showEffort,
   codexModelOptions,
   effectiveModel,
+  effectiveEffort,
+  effortInherited,
   modelLabel,
   costRoutingEligible,
 }: {
@@ -611,10 +625,11 @@ function useSessionConfigSummary({
   showEffort: boolean;
   codexModelOptions: readonly NativeModelOption[];
   effectiveModel: string | null;
+  effectiveEffort: string | null;
+  effortInherited: boolean;
   modelLabel: string | null;
   costRoutingEligible: boolean;
 }): { label: string; value: string }[] {
-  const selectedEffort = useSessionEffort(sessionId);
   const costControlModeOverride = useSessionField(sessionId, (s) => s.costControlModeOverride);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
 
@@ -629,8 +644,12 @@ function useSessionConfigSummary({
   // Suppress Effort while routing is on: the router picks the model and its
   // effort per turn, so a pinned effort doesn't apply and would mislead.
   if (showEffort && !routingOn) {
-    const effortValue = formatStatusEffortLabel(selectedEffort);
-    if (effortValue) rows.push({ label: "Effort", value: effortValue });
+    const effortValue = formatStatusEffortLabel(effectiveEffort);
+    if (effortValue)
+      rows.push({
+        label: "Effort",
+        value: effortInherited ? `${effortValue} (model default)` : effortValue,
+      });
   }
   if (!routingOn) {
     const source =
@@ -697,12 +716,8 @@ function useResolvedComposerModel(
   }[] = usesServerModelOptions ? codexModelOptions : [];
   const isNativeModelPicker = modelPickerKind !== null;
 
-  // The harness's own report is the display authority for claude-/codex-
-  // native sessions: `llmModel` carries the verbatim reported model (the
-  // launch's own report, or an in-pane switch), and the chip, the gear
-  // highlight, and the hover summary all resolve from it alone. The user's
-  // request (`sessionModelOverride`) is input, never display state — rendering
-  // a request as if it were truth is exactly how a record/pane divergence hides.
+  // Native reports win over saved requests. Before the first report, show the
+  // saved launch choice; opening the picker must not disagree with its trigger.
   const isReportedModelPicker = modelPickerKind === "claude" || modelPickerKind === "codex";
   const pickerSelectedModel = selectedModelForPicker(
     modelPickerKind,
@@ -719,7 +734,7 @@ function useResolvedComposerModel(
           ? (sessionModelOverride ?? llmModel)
           : null
       : isReportedModelPicker
-        ? llmModel
+        ? (llmModel ?? sessionModelOverride)
         : (sessionModelOverride ?? llmModel);
   const {
     label: modelLabel,

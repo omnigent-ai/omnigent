@@ -1,61 +1,33 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { TooltipProvider } from "@/components/ui/tooltip";
+import { cleanup, render, screen } from "@testing-library/react";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { afterEach, describe, expect, it } from "vitest";
 import { ProjectSessionPanel } from "./ProjectSessionPanel";
 
-vi.mock("@/hooks/useSession", () => ({
-  useSession: () => ({ session: { title: "Plan the feature" } }),
-}));
-vi.mock("@/components/chat/FullSessionChat", () => ({
-  FullSessionChat: ({
-    sessionId,
-    transcriptTopInset,
-  }: {
-    sessionId: string;
-    transcriptTopInset: string;
-  }) => (
-    <output aria-label="Chat" data-inset={transcriptTopInset}>
-      {sessionId}
-    </output>
-  ),
-}));
+function SessionLocation() {
+  return <output aria-label="Session route">{useLocation().pathname}</output>;
+}
 afterEach(cleanup);
 
-describe("Project session ticket context", () => {
-  it.each([false, true])(
-    "reuses the conversation with optional return navigation (ticket=%s)",
-    (withTicket) => {
-      const onClose = vi.fn();
-      const { container } = render(
-        <MemoryRouter>
-          <TooltipProvider>
-            <ProjectSessionPanel
-              sessionId="planner"
-              onClose={onClose}
-              ticket={withTicket ? { id: "ticket", title: "Build the feature" } : undefined}
+describe("Legacy project session links", () => {
+  it.each(["planner", "a b/c&d"])(
+    "redirects %s to the normal session without mounting an embedded chat",
+    (sessionId) => {
+      render(
+        <MemoryRouter initialEntries={["/projects/Example?ticket=ticket&session=old"]}>
+          <Routes>
+            <Route
+              path="/projects/:projectName"
+              element={<ProjectSessionPanel sessionId={sessionId} />}
             />
-          </TooltipProvider>
+            <Route path="/c/:sessionId" element={<SessionLocation />} />
+          </Routes>
         </MemoryRouter>,
       );
-      expect(screen.getByLabelText("Chat")).toHaveTextContent("planner");
-      expect(screen.getByLabelText("Chat")).toHaveAttribute(
-        "data-inset",
-        container.querySelector("header")?.style.height,
+      expect(screen.getByLabelText("Session route")).toHaveTextContent(
+        `/c/${encodeURIComponent(sessionId)}`,
       );
-      expect(screen.getByRole("link", { name: "Open full session" })).toHaveAttribute(
-        "href",
-        "/c/planner",
-      );
-      if (withTicket) {
-        expect(screen.getByRole("link", { name: "Back to ticket" })).toHaveAttribute(
-          "href",
-          "/?ticket=ticket",
-        );
-        expect(screen.getByText("Build the feature")).toBeInTheDocument();
-      } else expect(screen.queryByRole("link", { name: "Back to ticket" })).toBeNull();
-      fireEvent.click(screen.getByRole("button", { name: "Close panel" }));
-      expect(onClose).toHaveBeenCalledOnce();
+      expect(screen.queryByTestId("project-session-panel")).toBeNull();
+      expect(screen.queryByRole("link", { name: "Back to ticket" })).toBeNull();
     },
   );
 });

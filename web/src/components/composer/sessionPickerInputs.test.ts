@@ -63,6 +63,28 @@ it("reads a background session's options and model, not the active conversation'
   expect(result.current.modelPickerKind).toBe("codex");
   expect(result.current.modelLabelOptions).toBe(CELL_OPTIONS);
   expect(result.current.effortLevels).toEqual(["high"]);
+  expect(result.current.showEffort).toBe(true);
+});
+
+it("offers model and effort controls for Maestro using Claude native without wrapper labels", () => {
+  conversationRegistry.acquire("main").setState({
+    sessionHarness: "claude-native",
+    llmModel: "sonnet",
+    codexModelOptions: [{ id: "sonnet", displayName: "Sonnet" }],
+  });
+  const session = {
+    id: "main",
+    harness: "claude-native",
+    labels: {},
+    agentName: "maestro",
+    parentSessionId: null,
+  } as unknown as Session;
+
+  const { result } = renderHook(() => useSessionPickerInputs("main", session));
+  expect(result.current.modelPickerKind).toBe("claude");
+  expect(result.current.showModels).toBe(true);
+  expect(result.current.showEffort).toBe(true);
+  expect(result.current.effortLevels).toEqual(["low", "medium", "high", "xhigh", "max"]);
 });
 
 it("uses the launch preview only while the active conversation has no catalog", () => {

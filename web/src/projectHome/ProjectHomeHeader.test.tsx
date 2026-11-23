@@ -7,7 +7,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
-import { Tabs } from "@/components/ui/tabs";
+import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { ProjectViewNavigation } from "./ProjectViewNavigation";
 import * as ticketsApi from "@/lib/projectTicketsApi";
 import type * as ConversationsModule from "@/hooks/useConversations";
@@ -140,10 +140,13 @@ function renderNavigation(view: "chat" | "board" = "board", stages = true, summa
       >
         <MemoryRouter initialEntries={[`/projects/Billing%20%26%20Payments?view=${view}`]}>
           <TooltipProvider>
-            <ProjectHomeTitle projectName="Billing & Payments" />
-            <ProjectHomeHeaderActions projectName="Billing & Payments" />
+            <header>
+              <ProjectHomeTitle projectName="Billing & Payments" />
+              <ProjectHomeHeaderActions projectName="Billing & Payments" />
+            </header>
             <Tabs value={view}>
               <ProjectViewNavigation projectName="Billing & Payments" view={view} />
+              <TabsContent value={view}>Project {view}</TabsContent>
             </Tabs>
           </TooltipProvider>
           <LocationProbe />
@@ -248,6 +251,48 @@ describe("ProjectHomeTitle", () => {
       </CapabilitiesProvider>,
     );
   }
+
+  it("puts the view tabs beside the title and leaves ticket actions on the board", () => {
+    renderNavigation();
+    const header = screen.getByRole("banner");
+    const tablist = within(header).getByRole("tablist", { name: "Project views" });
+    const board = within(tablist).getByRole("tab", { name: "Board" });
+    expect(tablist).toHaveAttribute("data-variant", "pill");
+    expect(screen.getAllByRole("tablist", { name: "Project views" })).toHaveLength(1);
+    expect(within(header).getByRole("button", { name: "Board actions" })).toBeVisible();
+    expect(within(header).queryByRole("group", { name: "Ticket actions" })).toBeNull();
+    expect(screen.getByRole("group", { name: "Ticket actions" })).toBeVisible();
+    expect(screen.getByRole("tabpanel")).toHaveAttribute("id", board.getAttribute("aria-controls"));
+    expect(screen.getByRole("tabpanel")).toHaveAttribute("aria-labelledby", board.id);
+  });
+
+  it("keeps a single accessible view row below the compact phone header", () => {
+    mocks.isMobile = true;
+    renderNavigation();
+    expect(within(screen.getByRole("banner")).queryByRole("tablist")).toBeNull();
+    expect(screen.getAllByRole("tablist", { name: "Project views" })).toHaveLength(1);
+    expect(screen.getByRole("tab", { name: "Chat" })).toBeVisible();
+    expect(screen.getByRole("tab", { name: "Board" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Board actions" })).toBeVisible();
+    expect(screen.getByRole("link", { name: "New ticket" })).toBeVisible();
+  });
+
+  it("suppresses pointer-click outlines without losing keyboard focus feedback", async () => {
+    const user = userEvent.setup();
+    renderNavigation("chat");
+    const chat = screen.getByRole("tab", { name: "Chat" });
+    const board = screen.getByRole("tab", { name: "Board" });
+    await user.click(board);
+    expect(board).toHaveFocus();
+    expect(board).toHaveClass("focus-visible:ring-0", "focus-visible:outline-none");
+    await user.keyboard("{ArrowLeft}");
+    await waitFor(() => expect(chat).toHaveFocus());
+    expect(chat).not.toHaveClass("focus-visible:ring-0");
+    await user.click(chat);
+    expect(chat).toHaveClass("focus-visible:ring-0");
+    await user.click(screen.getByRole("button", { name: "Project settings" }));
+    expect(chat).not.toHaveClass("focus-visible:ring-0");
+  });
 
   it("opens project settings and offers only rename and delete in the overflow menu", () => {
     renderTitle();

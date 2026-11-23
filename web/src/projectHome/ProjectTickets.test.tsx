@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectTicketBoard } from "./ProjectTicketBoard";
 import { ProjectOrchestratorPanel, ProjectTicketPanel } from "./ProjectTicketPanel";
@@ -16,7 +16,7 @@ import * as projectsApi from "@/lib/projectsApi";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import type * as SessionsModule from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
-import { Link, useLocation, useSearchParams } from "@/lib/routing";
+import { useLocation, useParams, useSearchParams } from "@/lib/routing";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { ProjectTicketUpdates } from "./ProjectTicketUpdates";
 import { ticketSelectionIds } from "./projectHomeNavigation";
@@ -39,42 +39,8 @@ vi.mock("@/hooks/useConversations", () => ({
     error: null,
   }),
 }));
-vi.mock("@/projectHome/ProjectSessionPanel", () => ({
-  ProjectSessionPanel: ({
-    sessionId,
-    ticket,
-  }: {
-    sessionId: string;
-    ticket?: { id: string; title: string };
-  }) => (
-    <div>
-      <output aria-label="Existing session chat">{sessionId}</output>
-      {ticket && (
-        <Link to={`?ticket=${ticket.id}`} aria-label="Back to ticket">
-          {ticket.title}
-        </Link>
-      )}
-    </div>
-  ),
-}));
 vi.mock("./ProjectChat", () => ({
   ProjectChat: () => <output aria-label="Main chat composer" />,
-  ProjectAgentChat: ({
-    sessionId,
-    ticket,
-  }: {
-    sessionId: string;
-    ticket?: { id: string; title: string };
-  }) => (
-    <div>
-      <output aria-label="Existing session chat">{sessionId}</output>
-      {ticket && (
-        <Link to={`?view=board&ticket=${ticket.id}`} aria-label="Back to ticket">
-          {ticket.title}
-        </Link>
-      )}
-    </div>
-  ),
 }));
 vi.mock("@/hooks/useOpenSessionRow", () => ({ fetchConversationById: vi.fn() }));
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: vi.fn(() => false) }));
@@ -108,7 +74,11 @@ function LocationProbe() {
   return <output aria-label="Current location">{useLocation().search}</output>;
 }
 
-function renderBoard(element: React.ReactNode) {
+function SessionRoute() {
+  return <output aria-label="Existing session chat">{useParams().sessionId}</output>;
+}
+
+function renderBoard(element: React.ReactNode, entry = "/") {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -117,7 +87,12 @@ function renderBoard(element: React.ReactNode) {
     wrapper: ({ children }) => (
       <QueryClientProvider client={client}>
         <TooltipProvider>
-          <MemoryRouter>{children}</MemoryRouter>
+          <MemoryRouter initialEntries={[entry]}>
+            <Routes>
+              <Route path="/c/:sessionId" element={<SessionRoute />} />
+              <Route path="*" element={children} />
+            </Routes>
+          </MemoryRouter>
         </TooltipProvider>
       </QueryClientProvider>
     ),
@@ -276,7 +251,7 @@ describe("ticket updates in Chat", () => {
     expect(screen.queryByRole("link", { name: "Clear ticket filter" })).toBeNull();
   });
 
-  it("asks Maestro in the saved session and returns without losing the ticket comment draft", async () => {
+  it("opens Maestro directly in the normal session view", async () => {
     renderBoard(
       <ProjectTicketPanel
         projectName="Shipping"
@@ -288,11 +263,12 @@ describe("ticket updates in Chat", () => {
     fireEvent.change(await screen.findByLabelText("Add a comment"), {
       target: { value: "Keep this ticket draft" },
     });
-    fireEvent.click(screen.getByRole("link", { name: "Ask in Chat" }));
+    expect(screen.queryByText("Ask in Chat")).toBeNull();
+    fireEvent.click(await screen.findByRole("link", { name: "Open chat with: Maestro" }));
     expect(await screen.findByLabelText("Existing session chat")).toHaveTextContent("orchestrator");
     expect(projectsApi.createProject).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("link", { name: "Back to ticket" }));
-    expect(screen.getByLabelText("Add a comment")).toHaveValue("Keep this ticket draft");
+    expect(screen.queryByRole("link", { name: "Back to ticket" })).toBeNull();
+    expect(api.commentOnTicket).not.toHaveBeenCalled();
   });
 });
 
@@ -993,17 +969,27 @@ describe("Project ticket board", () => {
   });
 
   it.each([
-    { mobile: false, href: "/?ticket=ticket&session=worker" },
-    { mobile: true, href: "/?ticket=ticket&session=worker" },
+    { mobile: false, href: "/c/worker" },
+    { mobile: true, href: "/c/worker" },
   ])(
-    "names workers and actors using one shared lookup per session (mobile=$mobile)",
+    "uses agent names for activity authors and session titles for linked chats (mobile=$mobile)",
     async ({ mobile, href }) => {
       vi.mocked(useIsMobileViewport).mockReturnValue(mobile);
       const involvement =
         "Stage owner; independently research, build and test the panel, author findings and report evidence.";
-      const worker = conversation("worker", { title: "Build ticket panel", status: "running" });
+      const worker = conversation("worker", {
+        title: "Build ticket panel",
+        status: "running",
+        agent_name: "codex-native-ui",
+        harness: "codex-native",
+      });
+      const coordinator = conversation("orchestrator", {
+        title: "Main",
+        agent_name: "maestro",
+        harness: "claude-native",
+      });
       vi.mocked(fetchConversationById).mockImplementation(async (id) =>
-        id === "worker" ? worker : conversation(id, { title: "Shipping orchestrator" }),
+        id === "worker" ? worker : coordinator,
       );
       vi.mocked(api.listTicketSessions).mockResolvedValue({
         data: [{ session_id: "worker", created_at: 1000 }],
@@ -1057,9 +1043,17 @@ describe("Project ticket board", () => {
                     session_id: "worker",
                   },
                 },
+                {
+                  ...event,
+                  id: "comment",
+                  position: 6,
+                  kind: "comment",
+                  session_id: "worker",
+                  payload: { text: "The panel is ready." },
+                },
               ],
           has_more: false,
-          last_position: 5,
+          last_position: 6,
         }),
       );
       const { client } = renderBoard(
@@ -1072,18 +1066,24 @@ describe("Project ticket board", () => {
       );
       const sessions = await screen.findByRole("region", { name: "Agents" });
       expect(
-        await within(sessions).findByRole("link", { name: /Build ticket panel/ }),
+        await within(sessions).findByRole("link", { name: "Open chat with: Codex" }),
       ).toHaveAttribute("href", href);
       expect(within(sessions).getByRole("img", { name: "Session running" })).toBeInTheDocument();
       expect(within(sessions).getByText("Running")).toBeInTheDocument();
-      expect(await screen.findAllByRole("link", { name: "Shipping orchestrator" })).toHaveLength(4);
       const activity = screen.getByRole("region", { name: "Ticket activity" });
+      expect(await within(activity).findAllByRole("link", { name: "Maestro" })).toHaveLength(4);
+      expect(within(activity).getByRole("link", { name: "Codex" })).toHaveAttribute("href", href);
+      for (const actor of within(activity).getAllByRole("link", { name: "Maestro" })) {
+        expect(actor).toHaveAttribute("href", "/c/orchestrator");
+        expect(actor).toHaveAttribute("title", "Main (orchestrator)");
+      }
+      expect(activity).not.toHaveTextContent("Main");
       expect(activity).toHaveTextContent("updated the role for Build ticket panel");
       expect(activity).toHaveTextContent("updated labels");
       expect(activity).toHaveTextContent("unlinked Build ticket panel");
       expect(activity).not.toHaveTextContent("response contact");
       expect(activity).not.toHaveTextContent("lead session id");
-      expect(within(activity).getAllByRole("listitem")).toHaveLength(4);
+      expect(within(activity).getAllByRole("listitem")).toHaveLength(5);
       expect(within(activity).getAllByRole("link", { name: "Build ticket panel" })).toHaveLength(2);
       for (const link of within(activity).getAllByRole("link", { name: "Build ticket panel" })) {
         expect(link).toHaveAttribute("href", href);
@@ -1106,10 +1106,19 @@ describe("Project ticket board", () => {
         }),
       );
       expect(
-        await within(sessions).findByRole("link", { name: "Respond to: Build ticket panel" }),
+        await within(sessions).findByRole("link", { name: "Respond to: Codex" }),
       ).toHaveAttribute("href", href);
       expect(within(sessions).queryByText("Needs response")).toBeNull();
       expect(within(sessions).queryByText("Running")).toBeNull();
+      act(() =>
+        client.setQueryData(["conversation-backfill", "orchestrator"], {
+          ...coordinator,
+          agent_name: null,
+          harness: null,
+        }),
+      );
+      expect(await within(activity).findAllByRole("link", { name: "Agent" })).toHaveLength(4);
+      expect(activity).not.toHaveTextContent("Main");
       expect(api.updateTicket).not.toHaveBeenCalled();
     },
   );
@@ -1132,7 +1141,7 @@ describe("Project ticket board", () => {
     const sessions = await screen.findByRole("region", { name: "Agents" });
     const worker = await within(sessions).findByRole("link", { name: /Session worker/ });
     await waitFor(() => expect(worker).toHaveTextContent("Unavailable"));
-    expect(worker).toHaveAttribute("href", "/?ticket=ticket&session=worker");
+    expect(worker).toHaveAttribute("href", "/c/worker");
     expect(screen.queryByText("Idle")).toBeNull();
   });
 
@@ -1195,8 +1204,9 @@ describe("Project ticket board", () => {
   });
 
   it.each([false, true])(
-    "keeps earlier activity when loading another page (empty first page=%s)",
+    "keeps manual activity paging without a response request (empty first page=%s)",
     async (emptyFirstPage) => {
+      ticket.labels = [];
       const event: TicketEvent = {
         id: "comment",
         ticket_id: ticket.id,
@@ -1437,7 +1447,7 @@ describe("Project ticket board", () => {
   });
 
   it.each([false, true])(
-    "opens a linked planning chat and keeps ticket drafts (mobile=%s)",
+    "opens a linked planning chat in the normal session view (mobile=%s)",
     async (mobile) => {
       vi.mocked(useIsMobileViewport).mockReturnValue(mobile);
       ticket.stage_id = "planning";
@@ -1488,14 +1498,7 @@ describe("Project ticket board", () => {
       await user.click(chat);
       expect(screen.getByLabelText("Existing session chat")).toHaveTextContent("planner");
       expect(screen.queryByRole("textbox", { name: "Add a comment" })).toBeNull();
-      await user.click(screen.getByRole("link", { name: "Back to ticket" }));
-      expect(screen.getByLabelText("Add a comment")).toHaveValue("Comment draft");
-      if (!mobile) {
-        await user.click(screen.getByRole("button", { name: "Restore ticket panel" }));
-        expect(onExpandedChange).toHaveBeenLastCalledWith(false);
-        rerender(<ProjectTicketPanel {...props} expanded={false} />);
-        expect(screen.getByLabelText("Add a comment")).toHaveValue("Comment draft");
-      }
+      expect(screen.queryByRole("link", { name: "Back to ticket" })).toBeNull();
       expect(projectsApi.createProject).not.toHaveBeenCalled();
     },
   );
@@ -1547,12 +1550,12 @@ describe("Project ticket board", () => {
     const planner = await within(agents).findByRole("link", {
       name: "Open chat with: Claude Code",
     });
-    expect(planner).toHaveAttribute("href", "/?ticket=ticket&session=planner");
+    expect(planner).toHaveAttribute("href", "/c/planner");
     expect(planner).toHaveAttribute("title", "Plan the work (planner)");
     expect(planner.querySelector('[data-harness-icon="claude"]')).not.toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "More agents" }));
     const reviewer = await within(agents).findByRole("link", { name: "Open chat with: Codex" });
-    expect(reviewer).toHaveAttribute("href", "/?ticket=ticket&session=reviewer");
+    expect(reviewer).toHaveAttribute("href", "/c/reviewer");
     expect(reviewer.querySelector('[data-harness-icon="codex"]')).not.toBeNull();
     expect(await within(agents).findByText("Verifying the result")).toBeInTheDocument();
     expect(within(agents).getAllByRole("link", { name: /Maestro/ })).toHaveLength(1);
@@ -1576,7 +1579,7 @@ describe("Project ticket board", () => {
     expect(projectsApi.createProject).not.toHaveBeenCalled();
   });
 
-  it("opens the existing orchestrator with a return to the unassigned ticket", async () => {
+  it("opens the existing main session directly from an unassigned ticket", async () => {
     vi.mocked(projectsApi.getProject).mockResolvedValue({
       id: "project",
       name: "Shipping",
@@ -1593,10 +1596,7 @@ describe("Project ticket board", () => {
     );
     await user.click(await screen.findByRole("link", { name: "Open chat with: Maestro" }));
     expect(await screen.findByLabelText("Existing session chat")).toHaveTextContent("orchestrator");
-    expect(screen.getByRole("link", { name: "Back to ticket" })).toHaveAttribute(
-      "href",
-      "/?view=board&ticket=ticket",
-    );
+    expect(screen.queryByRole("link", { name: "Back to ticket" })).toBeNull();
     expect(projectsApi.createProject).not.toHaveBeenCalled();
   });
 
@@ -1617,58 +1617,116 @@ describe("Project ticket board", () => {
     );
     expect(
       await screen.findByRole("link", { name: "Open chat with: Session worker" }),
-    ).toHaveAttribute("href", "/?ticket=ticket&session=worker");
+    ).toHaveAttribute("href", "/c/worker");
     expect(screen.queryByRole("button", { name: "Edit agent involvement" })).toBeNull();
     expect(api.setTicketSessionInvolvement).not.toHaveBeenCalled();
     expect(screen.queryByRole("region", { name: "Response needed" })).toBeNull();
     expect(await screen.findByRole("link", { name: "Open chat with: Maestro" })).toHaveAttribute(
       "href",
-      "/?ticket=ticket&view=chat",
+      "/c/orchestrator",
     );
   });
 
-  it("routes responses to the prompt owner and does not treat a comment as a prompt answer", async () => {
-    vi.mocked(api.listTicketSessions).mockResolvedValue({
-      data: [{ session_id: "worker", created_at: 1000, involvement: "Awaiting plan approval" }],
-      has_more: false,
-      last_id: "worker",
-    });
-    vi.mocked(fetchConversationById).mockImplementation(async (id) =>
-      conversation(id, {
-        title: id === "worker" ? "Plan the work" : "Shipping orchestrator",
-        pending_elicitations_count: id === "worker" ? 1 : 0,
-      }),
-    );
-    const user = userEvent.setup();
-    renderBoard(
-      <ProjectTicketPanel
-        projectName="Shipping"
-        ticketId="ticket"
-        onClose={vi.fn()}
-        onCreated={vi.fn()}
-      />,
-    );
-    const agents = await screen.findByRole("region", { name: "Agents" });
-    const respond = await within(agents).findByRole("link", { name: "Respond to: Plan the work" });
-    expect(respond).toHaveTextContent("Respond");
-    expect(respond).not.toHaveTextContent("Needs response");
-    fireEvent.change(screen.getByLabelText("Add a comment"), { target: { value: "I approve" } });
-    await user.click(screen.getByRole("button", { name: "Comment" }));
-    await waitFor(() =>
-      expect(api.commentOnTicket).toHaveBeenCalledWith("project", "ticket", {
-        text: "I approve",
-        outputs: [],
-      }),
-    );
-    expect(
-      within(agents).getByRole("link", { name: "Respond to: Plan the work" }),
-    ).toHaveTextContent("Respond");
-    expect(within(agents).queryByText("Needs response")).toBeNull();
-    expect(api.updateTicket).not.toHaveBeenCalled();
-    await user.click(respond);
-    expect(screen.getByLabelText("Existing session chat")).toHaveTextContent("worker");
-    expect(projectsApi.createProject).not.toHaveBeenCalled();
-  });
+  it.each(["prompt", "ticket request"])(
+    "routes responses to the %s owner without resolving it from a comment or running status",
+    async (source) => {
+      const prompt = source === "prompt";
+      vi.mocked(api.listTicketSessions).mockResolvedValue({
+        data: [{ session_id: "worker", created_at: 1000, involvement: "Awaiting plan approval" }],
+        has_more: false,
+        last_id: "worker",
+      });
+      vi.mocked(fetchConversationById).mockImplementation(async (id) =>
+        conversation(id, {
+          title: id === "worker" ? "Plan the work" : "Shipping orchestrator",
+          status: id === "worker" ? "running" : "idle",
+          pending_elicitations_count: id === "worker" && prompt ? 1 : 0,
+        }),
+      );
+      if (!prompt) {
+        const event: TicketEvent = {
+          id: "created",
+          ticket_id: ticket.id,
+          position: 0,
+          kind: "created",
+          user_id: null,
+          session_id: "orchestrator",
+          agent_id: null,
+          payload: { labels: [] },
+          created_at: 1000,
+        };
+        vi.mocked(api.listTicketEvents).mockImplementation(
+          async (_project, _ticket, after, kind) =>
+            kind
+              ? { data: [], has_more: false, last_position: -1 }
+              : {
+                  data:
+                    after === -1
+                      ? [event]
+                      : [
+                          {
+                            ...event,
+                            id: "response-request",
+                            position: 1,
+                            kind: "updated",
+                            session_id: "worker",
+                            payload: { changes: { labels: ticket.labels } },
+                          },
+                        ],
+                  has_more: after === -1,
+                  last_position: after === -1 ? 0 : 1,
+                },
+        );
+      }
+      const user = userEvent.setup();
+      const { client } = renderBoard(
+        <ProjectTicketPanel
+          projectName="Shipping"
+          ticketId="ticket"
+          onClose={vi.fn()}
+          onCreated={vi.fn()}
+        />,
+      );
+      const agents = await screen.findByRole("region", { name: "Agents" });
+      const respond = await within(agents).findByRole("link", {
+        name: "Respond to: Plan the work",
+      });
+      expect(respond).toHaveTextContent("Respond");
+      expect(respond).toHaveClass("bg-tag-pink");
+      expect(respond).not.toHaveTextContent("Needs response");
+      if (!prompt) {
+        expect(respond).toHaveTextContent("Running");
+        expect(api.listTicketEvents).toHaveBeenCalledWith("project", "ticket", 0, undefined);
+      }
+      expect(
+        within(agents).getByRole("link", { name: "Open chat with: Shipping orchestrator" }),
+      ).not.toHaveClass("bg-tag-pink");
+      fireEvent.change(screen.getByLabelText("Add a comment"), { target: { value: "I approve" } });
+      await user.click(screen.getByRole("button", { name: "Comment" }));
+      await waitFor(() =>
+        expect(api.commentOnTicket).toHaveBeenCalledWith("project", "ticket", {
+          text: "I approve",
+          outputs: [],
+        }),
+      );
+      expect(
+        within(agents).getByRole("link", { name: "Respond to: Plan the work" }),
+      ).toHaveTextContent("Respond");
+      expect(within(agents).queryByText("Needs response")).toBeNull();
+      expect(api.updateTicket).not.toHaveBeenCalled();
+      act(() =>
+        client.setQueryData(["project-tickets", "project", "ticket"], { ...ticket, labels: [] }),
+      );
+      const chat = await within(agents).findByRole("link", {
+        name: `${prompt ? "Respond to" : "Open chat with"}: Plan the work`,
+      });
+      if (prompt) expect(chat).toHaveClass("bg-tag-pink");
+      else expect(chat).not.toHaveClass("bg-tag-pink");
+      await user.click(chat);
+      expect(screen.getByLabelText("Existing session chat")).toHaveTextContent("worker");
+      expect(projectsApi.createProject).not.toHaveBeenCalled();
+    },
+  );
 
   it.each(["hover", "focus"])(
     "tints the source and outlines direct related tickets across paginated results on %s",
@@ -1734,6 +1792,25 @@ describe("Project ticket board", () => {
 });
 
 describe("Legacy project chat panel", () => {
+  it.each([
+    "?view=chat&ticket=ticket",
+    "?ticket=ticket&orchestrator=1",
+    "?ticket=ticket&agent=primary",
+  ])("redirects the saved main-chat link %s to the normal session", async (entry) => {
+    renderBoard(
+      <ProjectTicketPanel
+        projectName="Shipping"
+        ticketId="ticket"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />,
+      entry,
+    );
+    expect(await screen.findByLabelText("Existing session chat")).toHaveTextContent("orchestrator");
+    expect(screen.queryByRole("link", { name: "Back to ticket" })).toBeNull();
+    expect(projectsApi.createProject).not.toHaveBeenCalled();
+  });
+
   it("opens the existing session component without creating another session", async () => {
     vi.mocked(projectsApi.getProject).mockResolvedValue({
       id: "project",

@@ -70,8 +70,10 @@ import {
 } from "@/components/chat/chatBubbleParts";
 import { usePeerSessionMessageDisplay } from "@/lib/peerSessionMessagePreferences";
 import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
+import { AssistantPresentationContext, type ChatPresentation } from "./assistantPresentation";
 
 export interface TranscriptProps {
+  presentation?: ChatPresentation;
   hostId: string | null | undefined;
   /** Ref callback for the conversation wrapper element (SelectionPopup scope +
    *  JumpToTopButton hover ancestor). Owned by the parent, forwarded here. */
@@ -164,6 +166,7 @@ export function isNativeFindShortcut(
  * dialogs bail out via React's normal prop-equality check.
  */
 function TranscriptImpl({
+  presentation,
   hostId,
   setConversationEl,
   containerEl,
@@ -413,6 +416,15 @@ function TranscriptImpl({
   const arcaWarning = useArcaShutdownBanner();
   const showArcaBanner = arcaWarning.showForHost(hostId);
   const hasPinnedBanner = display.hasTasks || showArcaBanner;
+  const hasAgentHeader = Boolean(presentation?.header);
+  const hasPinnedContent = hasPinnedBanner || hasAgentHeader;
+  const assistantPresentation = useMemo(
+    () => ({
+      identity: presentation?.assistant,
+      extras: presentation?.responseExtras?.(display.bubbles),
+    }),
+    [presentation, display.bubbles],
+  );
   return (
     <TaskMarkersProvider value={taskMarkers}>
       {/* Task preview pinned above the thread. Sibling of the viewport (not an
@@ -426,16 +438,28 @@ function TranscriptImpl({
         />
       )}
       {showArcaBanner && <ArcaShutdownBanner warning={arcaWarning} hasTasks={display.hasTasks} />}
+      {hasAgentHeader && (
+        <div
+          className={cn(
+            "shrink-0",
+            !hasPinnedBanner &&
+              "pt-[calc(var(--omnigent-header-height)+var(--omnigent-inset-top)-0.75rem)]",
+          )}
+        >
+          {presentation?.header?.(display.bubbles.length === 0)}
+        </div>
+      )}
       {/* Wrapper div gives us a ref to scope the SelectionPopup to the
       conversation area without requiring Conversation to forward refs. */}
       <div
         ref={setConversationEl}
+        data-agent-header={hasAgentHeader || undefined}
         className="session-chat-transcript @container/chat relative flex min-h-0 flex-1 overflow-hidden"
       >
         <Conversation
           className={cn(
             !isMobileViewport &&
-              (hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade"),
+              (hasPinnedContent ? "chat-scroll-composer-fade" : "chat-scroll-fade"),
             "flex-1",
           )}
         >
@@ -443,8 +467,9 @@ function TranscriptImpl({
             scrollClassName="transcript-hide-native-scrollbar"
             className={cn(
               "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6 md:px-[clamp(0px,calc((var(--chat-column-width)+3.5rem-100cqi)*0.5),1.75rem)]",
-              hasPinnedBanner ? "pt-4" : "pt-20",
+              hasPinnedContent ? "pt-4" : "pt-20",
               showArcaBanner && "chat-content-under-arca-banner",
+              hasAgentHeader && "chat-content-under-agent-header",
               CHAT_COLUMN_WIDTH,
             )}
           >
@@ -476,18 +501,20 @@ function TranscriptImpl({
               <>
                 {/* Older pages prepend here while their request is in flight. */}
                 {display.loadingMoreHistory && <HistoryLoadingIndicator />}
-                <VirtualBubbleList
-                  bubbles={display.streamBubbles}
-                  scrollEl={scroller?.el ?? null}
-                  lastAssistantIndex={lastAssistantIndex}
-                  showsWorking={display.showsWorking}
-                  sessionIdle={sessionStatus === "idle"}
-                  conversationId={display.conversationId}
-                  hasTasks={display.hasTasks}
-                  disableVirtualization={disableVirtualization}
-                  messageId={messageId}
-                  onGeometryChange={onGeometryChange}
-                />
+                <AssistantPresentationContext.Provider value={assistantPresentation}>
+                  <VirtualBubbleList
+                    bubbles={display.streamBubbles}
+                    scrollEl={scroller?.el ?? null}
+                    lastAssistantIndex={lastAssistantIndex}
+                    showsWorking={display.showsWorking}
+                    sessionIdle={sessionStatus === "idle"}
+                    conversationId={display.conversationId}
+                    hasTasks={display.hasTasks}
+                    disableVirtualization={disableVirtualization}
+                    messageId={messageId}
+                    onGeometryChange={onGeometryChange}
+                  />
+                </AssistantPresentationContext.Provider>
                 {/* Pending elicitation cards, floated to the bottom of the chat
                 so an outstanding question stays in view. Newest renders last,
                 nearest the composer. Above the Working… indicator. */}
@@ -527,7 +554,7 @@ function TranscriptImpl({
               blockCount={display.blockCount}
               committedUserIds={display.committedUserIds}
               hasCommittedAnchor={display.hasCommittedAnchor}
-              topGapPx={display.hasTasks ? 16 : undefined}
+              topGapPx={hasPinnedContent ? 16 : undefined}
               measureRef={spacerMeasureRef}
               remeasureNonce={spacerMeasureNonce}
             />
@@ -544,7 +571,7 @@ function TranscriptImpl({
         </Conversation>
         {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
         chat-scroll-fade mask. */}
-        <TranscriptScrollbar scroller={scroller} topInset={display.hasTasks ? 12 : undefined} />
+        <TranscriptScrollbar scroller={scroller} topInset={hasPinnedContent ? 12 : undefined} />
         {/* Hover the top edge to reveal a pill that loads all older history. */}
         <JumpToTopButton
           containerEl={containerEl}

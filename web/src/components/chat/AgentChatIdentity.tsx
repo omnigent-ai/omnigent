@@ -3,29 +3,34 @@ import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import type { Agent } from "@/hooks/useAgents";
 import { sessionAgentIdentity } from "@/lib/sessionAgentIdentity";
-import { projectAgentDescription } from "./projectAgentDefaults";
+import { cn } from "@/lib/utils";
 
-export function ProjectAgentIdentity({
+export function AgentChatIdentity({
   agent,
+  compact = false,
 }: {
   agent: Pick<Agent, "name" | "harness" | "description">;
+  compact?: boolean;
 }) {
   const identity = sessionAgentIdentity({ agentName: agent.name, harness: agent.harness });
-  const description = projectAgentDescription(agent);
+  const description = agent.description?.trim();
   const [open, setOpen] = useState(false);
   const cardId = useId();
   if (!identity) return null;
   const mark = (
     <span
       aria-hidden
-      className="flex size-20 items-center justify-center rounded-full border border-border/70 bg-radial from-background via-muted/30 to-muted shadow-sm ring-8 ring-muted/20 transition-shadow group-hover:ring-muted/35"
+      className={cn(
+        "flex items-center justify-center rounded-full border border-border/70 bg-background bg-radial from-background via-muted/30 to-muted shadow-sm ring-muted/20 transition-shadow group-hover:ring-muted/35",
+        compact ? "size-12 ring-4" : "size-20 ring-8",
+      )}
     >
-      <ComposerAgentIcon agent={identity} className="size-12" />
+      <ComposerAgentIcon agent={identity} className={compact ? "size-7" : "size-12"} />
     </span>
   );
   if (!description)
     return (
-      <span role="img" aria-label={identity.displayName} className="p-2">
+      <span role="img" aria-label={identity.displayName} className={compact ? "p-1" : "p-2"}>
         {mark}
       </span>
     );
@@ -43,7 +48,10 @@ export function ProjectAgentIdentity({
           onKeyDown={(event) => {
             if (event.key === "Escape") setOpen(false);
           }}
-          className="group inline-flex items-center rounded-full p-2 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className={cn(
+            "group inline-flex items-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring",
+            compact ? "p-1" : "p-2",
+          )}
         >
           {mark}
         </button>

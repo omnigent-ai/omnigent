@@ -12,7 +12,8 @@ import { sandboxOptionLabel } from "@/lib/capabilities";
 import { ApiError } from "@/lib/sessionsApi";
 import { testAgent } from "@/test/agentFixtures";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
-import { writeLastHarness } from "@/lib/harnessPreferences";
+import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
+import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
 import { NewProjectButton } from "./NewProjectButton";
 
 type Host = HostsModule.Host;
@@ -25,6 +26,7 @@ const mocks = vi.hoisted(() => ({
   projects: [] as { id: string | null; name: string }[],
   serverInfo: "loading" as unknown,
   agents: [] as AvailableAgentsModule.AvailableAgent[],
+  hostModelOptions: vi.fn(),
 }));
 
 vi.mock("@/lib/CapabilitiesContext", async (importOriginal) => ({
@@ -49,11 +51,7 @@ vi.mock("@/hooks/useAvailableAgents", async (importOriginal) => ({
 
 vi.mock("@/hooks/useHosts", async (importOriginal) => ({
   ...(await importOriginal<typeof HostsModule>()),
-  useHostModelOptions: () => ({
-    data: [{ id: "model-a", displayName: "Model A" }],
-    isLoading: false,
-    error: null,
-  }),
+  useHostModelOptions: mocks.hostModelOptions,
 }));
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
@@ -142,6 +140,19 @@ beforeEach(() => {
   mocks.projects = [];
   mocks.serverInfo = "loading";
   mocks.projectError = null;
+  mocks.hostModelOptions.mockReset();
+  mocks.hostModelOptions.mockReturnValue({
+    data: [
+      {
+        id: "model-a",
+        displayName: "Model A",
+        isDefault: true,
+        supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+      },
+    ],
+    isLoading: false,
+    error: null,
+  });
   mocks.agents = [
     testAgent("maestro-id", "maestro", {
       display_name: "Maestro",
@@ -185,7 +196,7 @@ describe("NewProjectButton", () => {
           idempotencyKey: expect.any(String),
           config: {
             agent_id: "maestro-id",
-            harness: "claude-sdk",
+            harness: "claude-native",
             host_id: "host_1",
             workspace: "/work/repo",
           },
@@ -250,7 +261,7 @@ describe("NewProjectButton", () => {
         idempotencyKey: expect.any(String),
         config: {
           agent_id: "maestro-id",
-          harness: "claude-sdk",
+          harness: "claude-native",
           host_id: "host_1",
           workspace: "/Users/me/Garden",
         },
@@ -374,30 +385,26 @@ describe("NewProjectButton", () => {
     );
   });
 
-  it("keeps Run on above Chat and submits the chosen SDK, model and effort", async () => {
+  it("keeps Run on above Main Agent and submits the chosen harness, model and effort", async () => {
     writeLastAgentId("codex-id");
-    writeLastHarness("maestro-id", "codex");
+    writeLastHarness("maestro-id", "codex-native");
     renderButton();
     expect(
       screen.getAllByRole("heading", { level: 3 }).map((heading) => heading.textContent),
-    ).toEqual(["Run on", "Chat"]);
-    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
-      /Maestro, SDK Codex/,
-    );
+    ).toEqual(["Run on", "Main Agent"]);
+    expect(screen.getByRole("button", { name: "Harness" })).toHaveTextContent("Codex");
     expect(
-      screen
-        .getByTestId("new-chat-landing-agent-select")
-        .querySelector('[data-agent-icon="maestro"]'),
+      screen.getByRole("button", { name: "Harness" }).querySelector('[data-harness-icon="codex"]'),
     ).not.toBeNull();
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-maestro-id"));
+    expect(screen.queryByTestId("new-chat-landing-agent-select")).toBeNull();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Model" }), { button: 0 });
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Model A" }));
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Effort" }), { button: 0 });
     fireEvent.click(
       within(screen.getByTestId("project-chat-efforts")).getByRole("menuitemcheckbox", {
         name: "High",
       }),
     );
-    fireEvent.keyDown(screen.getByTestId("project-chat-models"), { key: "Escape" });
     fireEvent.change(screen.getByPlaceholderText("Project name…"), { target: { value: "Garden" } });
     fireEvent.click(screen.getByTestId("new-project-confirm"));
     await waitFor(() =>
@@ -406,7 +413,7 @@ describe("NewProjectButton", () => {
           name: "Garden",
           config: {
             agent_id: "maestro-id",
-            harness: "codex",
+            harness: "codex-native",
             model: "model-a",
             effort: "high",
             host_id: "host_1",
@@ -419,21 +426,82 @@ describe("NewProjectButton", () => {
     expect(readLastAgentId()).toBe("codex-id");
   });
 
-  it("allows choosing another agent instead of Maestro", async () => {
+  it("offers only native harnesses with composer icons and ignores a remembered SDK choice", async () => {
+    writeLastHarness("maestro-id", "codex");
     renderButton();
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-codex-id"));
+    expect(screen.getByRole("button", { name: "Harness" })).toHaveTextContent("Claude Code");
+    expect(
+      screen.getByRole("button", { name: "Harness" }).querySelector('[data-harness-icon="claude"]'),
+    ).not.toBeNull();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
+    expect(screen.queryByText("Agents")).toBeNull();
+    const harnesses = [...NATIVE_CODING_AGENTS].sort(
+      (left, right) => left.sortRank - right.sortRank,
+    );
+    const items = screen.getAllByRole("menuitemcheckbox");
+    expect(items).toHaveLength(harnesses.length);
+    for (const [index, harness] of harnesses.entries()) {
+      expect(items[index]).toHaveAccessibleName(harness.displayName);
+    }
+    // The shared test setup stubs several secondary vendor glyphs.
+    expect(
+      screen
+        .getByRole("menuitemcheckbox", { name: "Claude Code" })
+        .querySelector('[data-harness-icon="claude"]'),
+    ).not.toBeNull();
+    expect(
+      screen
+        .getByRole("menuitemcheckbox", { name: "Codex" })
+        .querySelector('[data-harness-icon="codex"]'),
+    ).not.toBeNull();
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Codex" }));
+    expect(screen.getByRole("button", { name: "Harness" })).toHaveTextContent("Codex");
+    expect(
+      screen.getByRole("button", { name: "Harness" }).querySelector('[data-harness-icon="codex"]'),
+    ).not.toBeNull();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Claude Code" }));
+    expect(mocks.hostModelOptions).toHaveBeenCalledWith("host_1", "claude-native", true);
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Model" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Model A" }));
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Effort" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "High" }));
     fireEvent.change(screen.getByPlaceholderText("Project name…"), { target: { value: "Garden" } });
     fireEvent.click(screen.getByTestId("new-project-confirm"));
     await waitFor(() =>
       expect(mocks.createProject).toHaveBeenCalledWith(
         expect.objectContaining({
-          config: { agent_id: "codex-id", host_id: "host_1" },
+          config: {
+            agent_id: "maestro-id",
+            harness: "claude-native",
+            model: "model-a",
+            effort: "high",
+            host_id: "host_1",
+          },
         }),
         expect.any(Object),
       ),
     );
     expect(readLastAgentId()).toBeNull();
+    expect(readLastHarness("maestro-id")).toBe("codex");
+  });
+
+  it("does not offer an unavailable native harness or silently change the selected harness", () => {
+    writeLastHarness("maestro-id", "claude-native");
+    renderButton([{ ...laptop, configured_harnesses: { "claude-native": false } }]);
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
+    expect(screen.getByRole("menuitemcheckbox", { name: "Claude Code" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    expect(screen.getByRole("button", { name: "Harness" })).toHaveTextContent("Claude Code");
+    fireEvent.change(screen.getByPlaceholderText("Project name…"), { target: { value: "Garden" } });
+    fireEvent.click(screen.getByTestId("new-project-confirm"));
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "This harness is unavailable on the selected host.",
+    );
+    expect(mocks.createProject).not.toHaveBeenCalled();
   });
 
   it("reuses the operation key after an uncertain response even when the project appears in the list", async () => {
@@ -493,7 +561,7 @@ describe("NewProjectButton project repositories", () => {
   }
 
   function chooseRepositorySource() {
-    fireEvent.click(screen.getByRole("radio", { name: "Repository" }));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Repository" }), { button: 0 });
   }
 
   const repoUrl = "https://git.example.com/team/app.git";
@@ -524,7 +592,7 @@ describe("NewProjectButton project repositories", () => {
         idempotencyKey: expect.any(String),
         config: {
           agent_id: "maestro-id",
-          harness: "claude-sdk",
+          harness: "claude-native",
           host_id: "host_1",
           workspace: "/Users/me/app",
           repository: { url: repoUrl, branch: "main" },
@@ -768,7 +836,7 @@ describe("NewProjectButton project repositories", () => {
 
     nameProject("Garden");
     selectRunOn(sandboxHostChoice("modal"));
-    expect(screen.queryByRole("radio", { name: "Folder" })).toBeNull();
+    expect(screen.queryByRole("tab", { name: "Folder" })).toBeNull();
     typeRepository(repoUrl, "dev");
     fireEvent.click(screen.getByTestId("new-project-confirm"));
 
@@ -780,7 +848,7 @@ describe("NewProjectButton project repositories", () => {
         idempotencyKey: expect.any(String),
         config: {
           agent_id: "maestro-id",
-          harness: "claude-sdk",
+          harness: "claude-native",
           host_id: "__sandbox__",
           sandbox_provider: "modal",
           repository: { url: repoUrl, branch: "dev" },
@@ -802,7 +870,7 @@ describe("NewProjectButton project repositories", () => {
     expect(mocks.createProject).toHaveBeenCalledWith(
       {
         name: "Garden",
-        config: { agent_id: "maestro-id", harness: "claude-sdk", host_id: "host_2" },
+        config: { agent_id: "maestro-id", harness: "claude-native", host_id: "host_2" },
         idempotencyKey: expect.any(String),
       },
       expect.any(Object),
@@ -820,7 +888,7 @@ describe("NewProjectButton project repositories", () => {
     expect(mocks.createProject).toHaveBeenCalledWith(
       {
         name: "Garden",
-        config: { agent_id: "maestro-id", harness: "claude-sdk", host_id: "host_1" },
+        config: { agent_id: "maestro-id", harness: "claude-native", host_id: "host_1" },
         idempotencyKey: expect.any(String),
       },
       expect.any(Object),
@@ -841,7 +909,7 @@ describe("NewProjectButton project repositories", () => {
     expect(mocks.createProject).toHaveBeenCalledWith(
       {
         name: "Garden",
-        config: { agent_id: "maestro-id", harness: "claude-sdk", host_id: "host_2" },
+        config: { agent_id: "maestro-id", harness: "claude-native", host_id: "host_2" },
         idempotencyKey: expect.any(String),
       },
       expect.any(Object),
@@ -854,7 +922,7 @@ describe("NewProjectButton project repositories", () => {
     fireEvent.click(screen.getByRole("button", { name: "New project" }));
 
     expect(screen.getByRole("button", { name: "Run on" })).toHaveTextContent("Choose host");
-    expect(screen.queryByRole("radio", { name: "Repository" })).toBeNull();
+    expect(screen.queryByRole("tab", { name: "Repository" })).toBeNull();
     expect(screen.queryByLabelText("Repository URL")).toBeNull();
   });
 
@@ -866,7 +934,7 @@ describe("NewProjectButton project repositories", () => {
     renderButton([laptop]);
 
     expect(screen.getByRole("button", { name: "Run on" })).toBeInTheDocument();
-    expect(screen.queryByRole("radio", { name: "Repository" })).toBeNull();
+    expect(screen.queryByRole("tab", { name: "Repository" })).toBeNull();
     expect(screen.getByRole("button", { name: /Working directory/ })).toBeInTheDocument();
   });
 });

@@ -21,6 +21,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   DropdownMenu,
@@ -49,12 +51,15 @@ import { reuseCreationAttempt, type CreationAttempt } from "@/lib/creationAttemp
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import type { LastSandboxRepo } from "@/lib/repoPreferences";
 import { deriveRepoName, sandboxRepoProblem } from "@/lib/sandboxRepositories";
+import { cn } from "@/lib/utils";
 import { SandboxRepositoryPicker } from "./SandboxRepositoryPicker";
 import { joinPath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { HostOption } from "./NewChatDialog";
 import { RecentWorkspaceList } from "./RecentWorkspaceList";
 import { ProjectChatLaunchPicker, useProjectChatChoices } from "./ProjectChatLaunchPicker";
+
+const PROJECT_CONTROL_CLASS = "h-10 rounded-lg px-3 text-ui mobile-app:h-11";
 
 interface WorkspaceSelection {
   hostId: string;
@@ -289,7 +294,7 @@ export function NewProjectButton({
     const submission = ++submissionGeneration.current;
     setSubmitError(null);
     if (!chat.selected || chat.loading) {
-      setSubmitError("Choose an agent.");
+      setSubmitError("Maestro is unavailable.");
       return;
     }
     if (runOn === null) {
@@ -300,7 +305,7 @@ export function NewProjectButton({
       setSubmitError("The host is offline. Reconnect it and try again.");
       return;
     }
-    if (chat.options.unsupported) {
+    if (chat.unavailable || chat.options.unsupported) {
       setSubmitError("This harness is unavailable on the selected host.");
       return;
     }
@@ -477,7 +482,7 @@ export function NewProjectButton({
       }}
     >
       <DialogContent
-        className="sm:max-w-lg"
+        className="max-h-[85dvh] overflow-y-auto sm:max-w-lg"
         onPointerDownOutside={guardDialogDismiss}
         onInteractOutside={guardDialogDismiss}
         onClick={(e) => e.stopPropagation()}
@@ -503,7 +508,7 @@ export function NewProjectButton({
         <fieldset disabled={repositorySubmitting || isPending} className="contents">
           {/* One combined control: emoji tile (left) + name (right) share a
             single border, so it reads as a single input. */}
-          <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
+          <div className="flex h-10 items-stretch overflow-hidden rounded-lg border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 mobile-app:h-11">
             <Popover open={emojiOpen} onOpenChange={setEmojiOpen}>
               <PopoverTrigger asChild>
                 <button
@@ -549,9 +554,9 @@ export function NewProjectButton({
                 />
               </PopoverContent>
             </Popover>
-            <input
+            <Input
               autoFocus
-              className="w-full bg-transparent px-3 py-2 text-ui outline-none"
+              className="h-full rounded-none border-0 px-3 focus-visible:ring-0"
               placeholder="Project name…"
               value={name}
               onChange={(e) => setName(e.target.value)}
@@ -593,10 +598,16 @@ export function NewProjectButton({
                   }
                   status={runsOnSandbox ? undefined : (selectedHost?.status ?? "unknown")}
                   cloud={runsOnSandbox || !!selectedHost?.sandbox_provider}
-                  className="h-9 w-full justify-start gap-2 px-2 text-sm text-foreground md:h-9"
+                  className={cn(
+                    PROJECT_CONTROL_CLASS,
+                    "w-full justify-start gap-2 border border-input text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 md:h-10",
+                  )}
                 />
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="start" className="composer-host-menu min-w-64">
+              <DropdownMenuContent
+                align="start"
+                className="composer-host-menu w-(--radix-dropdown-menu-trigger-width)"
+              >
                 {(sandboxProviders.length > 0 || hosts.some((host) => host.sandbox_provider)) && (
                   <>
                     <div className="px-2 py-1 text-xs text-muted-foreground">Cloud</div>
@@ -643,36 +654,27 @@ export function NewProjectButton({
               </DropdownMenuContent>
             </DropdownMenu>
             {repositoryCreation && !runsOnSandbox && hostTarget !== null && (
-              <div role="radiogroup" aria-label="Project source" className="flex gap-4 text-ui">
-                <label className="flex cursor-pointer items-center gap-2">
-                  <input
-                    type="radio"
-                    name="new-project-source"
-                    value="folder"
-                    checked={sourceMode === "folder"}
-                    onChange={() => {
-                      submissionGeneration.current += 1;
-                      setSourceMode("folder");
-                      setSubmitError(null);
-                    }}
-                  />
-                  Folder
-                </label>
-                <label className="flex cursor-pointer items-center gap-2">
-                  <input
-                    type="radio"
-                    name="new-project-source"
-                    value="repository"
-                    checked={sourceMode === "repository"}
-                    onChange={() => {
-                      submissionGeneration.current += 1;
-                      setSourceMode("repository");
-                      setSubmitError(null);
-                    }}
-                  />
-                  Repository
-                </label>
-              </div>
+              <Tabs
+                value={sourceMode}
+                onValueChange={(value) => {
+                  if (value !== "folder" && value !== "repository") return;
+                  submissionGeneration.current += 1;
+                  setSourceMode(value);
+                  setSubmitError(null);
+                }}
+              >
+                <TabsList
+                  aria-label="Project source"
+                  className="w-full group-data-horizontal/tabs:h-10 mobile-app:min-h-11"
+                >
+                  <TabsTrigger value="folder" disabled={repositorySubmitting || isPending}>
+                    Folder
+                  </TabsTrigger>
+                  <TabsTrigger value="repository" disabled={repositorySubmitting || isPending}>
+                    Repository
+                  </TabsTrigger>
+                </TabsList>
+              </Tabs>
             )}
             {repositoryMode && (
               <div className="flex flex-col gap-2" data-testid="new-project-repository">
@@ -702,9 +704,11 @@ export function NewProjectButton({
                     setSubmitError(null);
                   }}
                   testIdPrefix="new-project-repo"
+                  controlClassName={PROJECT_CONTROL_CLASS}
+                  addButtonClassName="w-20 justify-center"
                 />
                 {repositories.length === 0 && (
-                  <input
+                  <Input
                     aria-label="Branch"
                     placeholder="Default branch"
                     value={pendingRepoBranch}
@@ -712,7 +716,7 @@ export function NewProjectButton({
                       setPendingRepoBranch(event.target.value);
                       setSubmitError(null);
                     }}
-                    className="h-10 rounded-lg border border-input bg-transparent px-3 text-ui outline-none"
+                    className={PROJECT_CONTROL_CLASS}
                   />
                 )}
                 {hostTarget !== null ? (
@@ -721,9 +725,9 @@ export function NewProjectButton({
                       Clone into
                     </label>
                     <div className="flex items-center gap-2">
-                      <input
+                      <Input
                         id="new-project-clone-into"
-                        className="h-10 min-w-0 flex-1 rounded-lg border border-input bg-transparent px-3 text-ui outline-none"
+                        className={cn(PROJECT_CONTROL_CLASS, "flex-1")}
                         placeholder="~/repository"
                         value={destinationShown}
                         onChange={(event) => {
@@ -734,6 +738,7 @@ export function NewProjectButton({
                       <Button
                         type="button"
                         variant="outline"
+                        className={cn(PROJECT_CONTROL_CLASS, "w-20 border-input")}
                         disabled={isPending}
                         onClick={() => setParentPickerOpen(true)}
                       >
@@ -758,17 +763,22 @@ export function NewProjectButton({
             )}
             {folderMode && (
               <Collapsible>
-                <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-1 rounded-sm text-left outline-none focus-visible:ring-3 focus-visible:ring-ring/50">
-                  <span className="text-sm">
+                <CollapsibleTrigger
+                  className={cn(
+                    PROJECT_CONTROL_CLASS,
+                    "group flex w-full cursor-pointer items-center gap-2 border border-input text-left outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50",
+                  )}
+                >
+                  <span>
                     Working directory{" "}
                     <span className="font-normal text-muted-foreground">(optional)</span>
                   </span>
-                  <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-out group-data-[state=open]:rotate-90" />
+                  <ChevronRightIcon className="ml-auto size-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-out group-data-[state=open]:rotate-90" />
                 </CollapsibleTrigger>
-                <CollapsibleContent className="new-project-working-directory-content mt-2 flex flex-col gap-1.5">
+                <CollapsibleContent className="new-project-working-directory-content mt-2 flex flex-col gap-2 [&>span]:w-full [&>span]:max-w-none">
                   <label
                     htmlFor="new-project-create-workspace"
-                    className={`flex h-10 items-center gap-2 rounded-lg border border-input bg-transparent px-3 text-ui ${
+                    className={`flex min-h-10 items-center gap-2 rounded-lg border border-input bg-transparent px-3 py-1.5 text-ui mobile-app:min-h-11 ${
                       folderCreationDisabled ? "cursor-not-allowed opacity-50" : "cursor-pointer"
                     }`}
                   >
@@ -805,7 +815,10 @@ export function NewProjectButton({
                         }
                         aria-label={`Working directory: ${createWorkspaceFolder ? joinPath("~", name.trim() || "Project name") : workspace?.path || "Not selected"}`}
                         disabled={createWorkspaceFolder || hostTarget === null || isPending}
-                        className="h-8 text-sm"
+                        className={cn(
+                          PROJECT_CONTROL_CLASS,
+                          "w-full justify-start gap-2 border-input outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 [&>svg:last-child]:ml-auto",
+                        )}
                       />
                     </PopoverTrigger>
                     <PopoverContent align="start" className="w-80 max-w-[calc(100vw-2rem)] p-1.5">
@@ -861,8 +874,8 @@ export function NewProjectButton({
               </Collapsible>
             )}
           </section>
-          <section aria-label="Chat" className="space-y-3 border-t pt-4">
-            <h3 className="text-xs font-medium text-muted-foreground">Chat</h3>
+          <section aria-label="Main Agent" className="space-y-3 border-t pt-4">
+            <h3 className="text-xs font-medium text-muted-foreground">Main Agent</h3>
             <ProjectChatLaunchPicker
               choices={chat}
               host={selectedHost}
@@ -880,6 +893,7 @@ export function NewProjectButton({
           <Button
             type="button"
             variant="ghost"
+            className={PROJECT_CONTROL_CLASS}
             onClick={() => setOpen(false)}
             disabled={isPending || repositorySubmitting}
           >
@@ -887,6 +901,7 @@ export function NewProjectButton({
           </Button>
           <Button
             type="button"
+            className={PROJECT_CONTROL_CLASS}
             data-testid="new-project-confirm"
             loading={isPending}
             disabled={

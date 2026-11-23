@@ -20,7 +20,7 @@ export function TicketRelatedTickets({
   if (related.isSuccess && tickets.length === 0 && !related.hasNextPage) return null;
   return (
     <section aria-label="Related tickets" className="space-y-2">
-      <h3 className="text-sm font-medium">Related tickets</h3>
+      <h3 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Related tickets</h3>
       <TicketError error={related.error} />
       {related.isPending && <Spinner aria-label="Loading related tickets" />}
       {tickets.length > 0 && (

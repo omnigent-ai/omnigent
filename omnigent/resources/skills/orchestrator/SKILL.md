@@ -25,8 +25,8 @@ session should ask: the ticket's worker owns the prompt, not the coordinator.
 Do not enter a native planning mode that requires blocking this session for approval.
 
 - Delegate the question to the linked agent doing that planning, implementation
-  or verification. Link it to the ticket, record the exact ask and where to
-  respond with a link to that worker's chat, and add the `needs-human` label
+  or verification. Link it to the ticket; have it ask visibly, record the exact
+  ask and where to respond with a link to its chat, and add the `needs-human` label
   (rendered as Needs response), including for questions in ordinary chat. Keep its
   involvement description current. Reuse an appropriate worker rather than starting a
   separate agent just to relay an answer.
@@ -154,14 +154,61 @@ different defaults. One worker can own a whole ticket; split only independent
 work with clear ownership. If creation is uncertain, check `sys_session_list`
 before launching another copy.
 
-Give the worker the ticket ID, current stage ID and definitions, goal, relevant context,
-repository/workspace, acceptance criteria and authorized scope. Include the
-stage instructions above, evidence expected, and any approval-before-work
-gate. It does not see this conversation. Tell it to read the current definitions
-with `sys_ticket_get`, follow the stage's instructions within scope, update the ticket,
-append progress and outputs, and report results or blockers to your session ID
-with `sys_session_message`.
-The worker executes its assignment; it does not inherit your orchestrator role.
+### Give workers an explicit handoff
+
+Put a self-contained assignment in `sys_session_create`'s `message`. For an
+existing independent worker, use `sys_session_message`. It does not see this
+conversation or automatically inherit this skill. Include:
+
+- **Role and return address:** it is an orchestrated worker, the ticket ID,
+  and your actual session ID from `sys_session_get_info`. It owns its assignment,
+  not project-wide coordination. Authorize reporting to this named coordinator
+  within the assignment, not messaging unrelated sessions.
+- **Outcome and boundaries:** goal, acceptance criteria, relevant evidence,
+  verified repository/workspace and runtime target, file ownership, delivery
+  expectations, and the user's scope and approval gates. State whether the work
+  is investigation, planning, implementation or verification; a handoff does not
+  grant permission to expand it.
+- **Ticket workflow:** read the current ticket and stage definitions with
+  `sys_ticket_get`; follow stage instructions within scope. Use
+  `sys_ticket_update` for stage/description/label changes and
+  `sys_ticket_comment` for substantive progress, decisions and output links.
+- **Reporting contract:** copy the worker instructions below into the assignment;
+  naming a ticket or saying "report back" is not enough.
+
+Worker instructions to include, with the actual ticket and coordinator IDs:
+
+> You are working under this coordinator on this ticket. Keep the ticket current
+> at meaningful milestones: a changed diagnosis or approach, a work-phase change,
+> a human request or its resolution, and a handoff or completed result. Read it
+> with `sys_ticket_get` before updating; preserve unrelated labels and prior
+> history. Use `sys_ticket_update` with `stage_id` and `comment` together when the
+> work changes phase; use `sys_ticket_comment` for evidence and outputs. If new
+> evidence makes the last status misleading, append a concise correction and
+> next step. Do not post a transcript of tool calls or heartbeat comments.
+>
+> Use `sys_session_message(session_id=<coordinator ID>, message=...)` when blocked,
+> when a finding changes the plan or another worker's next action, when a phase
+> needs handoff, and before ending with a completed or partial result. Include
+> the ticket ID, outcome or exact blocker, decisive evidence, and the next action
+> or decision needed. Your final chat reply is not automatically forwarded.
+> Ticket notifications do not replace a handoff that needs the coordinator's
+> attention. Do not wait for an acknowledgement before continuing independent,
+> authorized work, and do not send acknowledgement-only replies. A queued message
+> is not proof it was read; do not blindly resend uncertain deliveries.
+>
+> Ask the coordinator for missing task context or coordination decisions it can
+> resolve. When human input is genuinely needed, ask visibly in your own chat
+> or its required approval prompt, then use `sys_ticket_update` to add
+> `needs-human` yourself, preserving other labels, with a comment containing the
+> exact question and your chat link. A ticket comment alone is not a chat question.
+> Say what is waiting and what work can continue; do not describe all work as
+> blocked when only one decision is outstanding. Notify the coordinator with
+> `sys_session_message`. Once resolved, record the answer and next action, and
+> remove `needs-human` only if no other human request remains. Running, a phase
+> change or a coordinator message alone does not resolve a human request or
+> answer a permission prompt. Report unavailable tools or failed updates honestly.
+
 Link the returned session with `sys_session_link_ticket`, including a short
 `involvement` description of its actual responsibility (not a role inferred from
 the phase). Reattach with updated involvement as responsibilities change; retain
@@ -174,13 +221,13 @@ On handoff, update involvement descriptions without removing prior session links
 Record who is doing what in a ticket comment.
 
 The ticket's Agents list includes you and all linked workers with direct chats.
-Tell workers to save agreed plans, decisions, unresolved questions and explicit
-approvals back to the ticket so they reach you through normal notifications.
-A discussion alone is not approval to implement. When input is needed, add
-`needs-human` with an optional short summary and a clear ticket comment directing
-the human to the relevant worker's chat and any open prompt. Do not open the
-prompt in this session, force conversational planning into ticket comments, or
-relay every message through this orchestrator.
+The session that adds `needs-human` is its response contact, so have the worker
+record its own request rather than flagging it on the worker's behalf. If you
+must record an unavailable worker's blocker, give its exact chat link and explain
+who needs to resume; do not imply that a prompt was opened successfully.
+A discussion alone is not approval to implement. Do not open the prompt in this
+session, force conversational planning into ticket comments, or relay every
+message through this orchestrator.
 
 ## Keep work moving
 
@@ -206,6 +253,9 @@ updates and worker reports promptly between checks.
   awaiting verification, stale assignments, and related work that may unblock
   another ticket. Follow the relationship described in its content, not inferred
   link types. Check linked PRs or external jobs when the ticket depends on them.
+  For `needs-human`, verify that the question is visible in the responsible chat
+  and still unresolved. Have the worker correct an outdated status or record a
+  resolved request; do not clear it just because the worker is running.
 - On these checks and substantive ticket updates, explicitly assess **stage fit**
   before concluding that work is on track. Compare the current stage's name and
   instructions with the worker's actual work and next step; read recent worker
@@ -254,8 +304,9 @@ updates and worker reports promptly between checks.
   recovery, and the required information, access, consequential decision or explicit
   approval that cannot be supplied within the existing scope. Routine uncertainty
   or a worker asking for a go-ahead is not enough. When a human really must act,
-  add `needs-human` and comment with the exact question and worker chat link; notify
-  here in ordinary text. Preserve other labels. Clear `needs-human` only after checking
+  have the responsible worker add `needs-human` and comment with the exact question
+  and worker chat link; notify here in ordinary text. Preserve other labels.
+  Clear `needs-human` only after checking
   that no other human request remains; if the blocker changes, update the question
   and chat link without hiding the remaining decision. Continue independent work.
   Missing tools or required isolation

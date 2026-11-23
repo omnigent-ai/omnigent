@@ -1,5 +1,5 @@
 import type { NativeModelOption } from "./types";
-import { nativeCodingAgentForHarness } from "./nativeCodingAgents";
+import { effectiveNativeWrapperLabel, nativeCodingAgentForHarness } from "./nativeCodingAgents";
 import { codexEffortLevelsForModel } from "./codexNativeModels";
 import { findModelLabelOption } from "./composerModelLabel";
 import { effortLevelsForFamily, supportsEffortControl } from "./sessionCapabilities";
@@ -45,23 +45,6 @@ export function selectedModelForPicker(
   return requestedModel ?? (kind === "configured" ? reportedModel : null);
 }
 
-/** Resolve unlabeled native sessions from their harness; children keep their own capabilities. */
-function effectiveWrapperLabel(
-  conv:
-    | {
-        labels?: Record<string, string | null> | null;
-        harness?: string | null;
-        parentSessionId?: string | null;
-      }
-    | null
-    | undefined,
-): string | undefined {
-  const label = conv?.labels?.["omnigent.wrapper"];
-  if (label != null) return label;
-  if (conv?.parentSessionId != null) return undefined;
-  return nativeCodingAgentForHarness(conv?.harness)?.wrapperLabel;
-}
-
 /** Declared effort families apply to SDK harnesses; native bridges define their own support. */
 export function sdkEffortFamilyForHarness(
   harness: string | null | undefined,
@@ -83,7 +66,7 @@ export function effortLevelsForConv(
   currentModel: string | null = null,
   effortFamily: string | null = null,
 ): readonly string[] {
-  switch (effectiveWrapperLabel(conv)) {
+  switch (effectiveNativeWrapperLabel(conv)) {
     case "claude-code-native-ui":
       return CLAUDE_NATIVE_EFFORT_LEVELS;
     case "devin-native-ui":
@@ -118,7 +101,7 @@ export function modelPickerKindForConv(
     | undefined,
   modelOptions: readonly NativeModelOption[] = [],
 ): NativeModelPickerKind | null {
-  switch (effectiveWrapperLabel(conv)) {
+  switch (effectiveNativeWrapperLabel(conv)) {
     case "claude-code-native-ui":
       return "claude";
     case "codex-native-ui":
