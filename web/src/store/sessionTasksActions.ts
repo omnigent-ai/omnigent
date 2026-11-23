@@ -21,7 +21,7 @@ interface SessionTasksActionsState {
   tasksTabToOpen: string | null;
   /** The task the Tasks tab should scroll to and highlight; the tab clears it once shown. */
   taskToShow: { conversationId: string; stepId: string } | null;
-  /** True when the agent, not a click, asked for the tab: a phone's drawer then stays shut. */
+  /** True when the agent or a session's opening, not a click, asked: a collapsed rail or a phone's drawer stays shut. */
   tasksTabAutoOpen: boolean;
 }
 
@@ -133,8 +133,9 @@ export function openTasksTab(conversationId: string, stepId?: string): void {
 }
 
 /**
- * Show a session's Tasks tab beside the chat, not over it on a phone: when the
- * agent makes the session's first plan, or a session with tasks opens.
+ * Show a session's Tasks tab beside the chat, in a rail that's already open and
+ * not over the chat on a phone: when the agent makes the session's first plan,
+ * or a session with tasks opens.
  */
 export function showTasksTabBesideChat(conversationId: string): void {
   useSessionTasksActions.setState({

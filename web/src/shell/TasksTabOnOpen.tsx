@@ -6,9 +6,9 @@ import { showTasksTabBesideChat } from "@/store/sessionTasksActions";
 
 /**
  * Opening a session that has a plan or tasks, from anywhere, shows its Tasks
- * tab once they're known. Only the opening does: a tab picked afterwards stays
- * until the session is opened again. Renders nothing, so journal updates don't
- * re-render the shell.
+ * tab once they're known, if the session's rail is open. Only the opening does:
+ * a tab picked afterwards stays until the session is opened again. Renders
+ * nothing, so journal updates don't re-render the shell.
  */
 export function TasksTabOnOpen({
   conversationId,

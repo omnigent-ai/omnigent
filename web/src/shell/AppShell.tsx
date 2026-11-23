@@ -2479,9 +2479,10 @@ function AppShellImpl() {
     setRightPanelOpenAnimated,
     revealTabsSidebar,
   ]);
-  // The chat's task preview, a task's marker, or the agent's first plan asks
-  // for this session's Tasks tab: open the rail on it, or its drawer on a phone
-  // unless the agent asked, then clear the one-shot request.
+  // The chat's task preview or a task's marker asks for this session's Tasks
+  // tab: open the rail on it, or its drawer on a phone. Opening a session with
+  // tasks, or the agent's first plan, only picks the tab in a rail already open.
+  // Then clear the one-shot request.
   const tasksTabToOpen = useSessionTasksActions((state) => state.tasksTabToOpen);
   useEffect(() => {
     if (tasksTabToOpen === null || tasksTabToOpen !== conversationId) return;
@@ -2496,6 +2497,9 @@ function AppShellImpl() {
         return;
       }
     }
+    // The chat's saved open state, else the Workspace panel default, decides
+    // whether the rail shows; an automatic request doesn't override it.
+    if (automatic && !rightPanelOpenRef.current) return;
     selectRightRailTab("tasks");
     if (tabsModeRef.current) revealTabsSidebar();
     else setRightPanelOpenAnimated(true);

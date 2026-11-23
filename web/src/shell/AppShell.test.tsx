@@ -348,6 +348,11 @@ import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
 import { useChatStore } from "@/store/chatStore";
+import {
+  openTasksTab,
+  showTasksTabBesideChat,
+  useSessionTasksActions,
+} from "@/store/sessionTasksActions";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
 
@@ -3280,6 +3285,62 @@ describe("Right workspace card visibility", () => {
       expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
     },
   );
+
+  /** Render a session with native to-dos, so its Tasks tab is available, on a desktop. */
+  function renderSessionWithTasks(id: string) {
+    const baseMatchMedia = window.matchMedia;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      ...baseMatchMedia(query),
+      matches: query === "(min-width: 1181px)",
+    }));
+    onTestFinished(() => matchMedia.mockRestore());
+    mockConversations([{ id, permission_level: null }]);
+    useChatStore.setState({
+      todos: [{ content: "Only item", status: "pending", activeForm: "" }],
+    });
+    onTestFinished(() => useChatStore.setState({ todos: [] }));
+    writePinnedWorkspaceTabs(["files", "tasks"]);
+    renderShell(`/c/${id}`, serverInfo({ session_journal: false }));
+  }
+
+  it.each([
+    { saved: "no saved state", panelDefault: "collapsed", open: undefined },
+    { saved: "a collapsed saved state", panelDefault: "open", open: false },
+  ] as const)(
+    "keeps the rail collapsed when a session with tasks opens, with $saved",
+    ({ panelDefault, open }) => {
+      writeWorkspacePanelDefault(panelDefault);
+      if (open !== undefined) writeSessionWorkspaceState("conv_auto", { open });
+      renderSessionWithTasks("conv_auto");
+      expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+
+      act(() => showTasksTabBesideChat("conv_auto"));
+
+      expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+      expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+      expect(useSessionTasksActions.getState().tasksTabToOpen).toBeNull();
+    },
+  );
+
+  it("shows Tasks in a rail the session left open when it opens with tasks", () => {
+    writeWorkspacePanelDefault("collapsed");
+    writeSessionWorkspaceState("conv_auto_open", { open: true, rightRailTab: "subagents" });
+    renderSessionWithTasks("conv_auto_open");
+
+    act(() => showTasksTabBesideChat("conv_auto_open"));
+
+    expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("opens a collapsed rail on Tasks from the chat's task preview", () => {
+    writeWorkspacePanelDefault("collapsed");
+    renderSessionWithTasks("conv_explicit");
+
+    act(() => openTasksTab("conv_explicit"));
+
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
+  });
 
   it.each([true, false])(
     "waits for capabilities before validating restored search (enabled=%s)",
