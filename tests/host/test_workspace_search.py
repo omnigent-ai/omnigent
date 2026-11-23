@@ -6,6 +6,7 @@ Route and protocol parity with the REST search lives in ``test_workspace_service
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import os
 import shutil
@@ -1017,6 +1018,42 @@ async def test_a_focused_binary_file_is_searched_as_the_walk_searches_it(
     assert "focus/deep/image.bin" not in _paths_in_order(walked)
     assert sorted(_paths_in_order(prioritized)) == sorted(_paths_in_order(walked))
     assert _paths_in_order(prioritized)[0] == "focus/deep/open.txt"
+
+
+@needs_rg
+@pytest.mark.parametrize("failure", ["too-long", "refused"])
+async def test_a_reach_check_that_cant_run_leaves_the_files_to_the_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    root = _priority_workspace(tmp_path / "repo")
+    launch = workspace_text_priority.start_owned_process
+    checks: list[list[str]] = []
+
+    async def start(arguments: list[str], **options: object) -> object:
+        if "--files" in arguments:
+            checks.append(arguments)
+            if failure == "refused":
+                raise OSError(errno.E2BIG, "Argument list too long")
+        return await launch(arguments, **options)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(workspace_text_priority, "start_owned_process", start)
+    if failure == "too-long":
+        # A deep folder's globs past the bound aren't passed to ripgrep at all.
+        monkeypatch.setattr(workspace_text_priority, "_MAX_REACH_GLOB_BYTES", 10)
+
+    responses = await _search_text(
+        root, "needle", order=SEARCH_ORDER_PRIORITY, focused_paths=["focus/deep/open.txt"]
+    )
+
+    assert sorted(_paths_in_order(responses)) == [
+        "aaa/first.txt",
+        "changed/edited.txt",
+        "focus/deep/beside.txt",
+        "focus/deep/open.txt",
+        "zzz/last.txt",
+    ]
+    assert responses[-1].done and not responses[-1].truncated
+    assert bool(checks) is (failure == "refused")
 
 
 @needs_rg

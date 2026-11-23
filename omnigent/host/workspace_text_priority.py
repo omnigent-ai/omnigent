@@ -48,6 +48,9 @@ _CHANGES_REUSE_S = 30.0
 _MAX_CACHED_CHANGES = 16
 _LIST_FILES_BYTES = 4 * 1024 * 1024
 _REACH_DEADLINE_S = 5.0
+# The check's globs grow with the square of a folder's depth; past this many bytes
+# it isn't run, well inside every platform's argument limit.
+_MAX_REACH_GLOB_BYTES = 256 * 1024
 # A focused file is searched first only if this much of it, or all, is text.
 _TEXT_CHECK_BYTES = 1024 * 1024
 
@@ -178,24 +181,29 @@ async def _reached_files(
     for name in names:
         globs += _only_towards(parent, name)
         parent = f"{parent}/{name}" if parent else name
-    process = await start_owned_process(
-        [
-            "rg",
-            "--files",
-            "--null",  # a file name may hold a newline
-            "--no-config",
-            "--hidden",
-            *options,
-            *globs,  # later globs win, so the walk stays on the way
-            "--max-depth",
-            str(len(names) + 1),
-            "--",
-            f"./{start}" if start else ".",
-        ],
-        cwd=root,
-        env={**os.environ, "PATH": trusted_search_path()},
-        pipe_stderr=False,
-    )
+    if sum(len(glob.encode()) for glob in globs) > _MAX_REACH_GLOB_BYTES:
+        return set()  # unsure, so none of them is searched early
+    try:
+        process = await start_owned_process(
+            [
+                "rg",
+                "--files",
+                "--null",  # a file name may hold a newline
+                "--no-config",
+                "--hidden",
+                *options,
+                *globs,  # later globs win, so the walk stays on the way
+                "--max-depth",
+                str(len(names) + 1),
+                "--",
+                f"./{start}" if start else ".",
+            ],
+            cwd=root,
+            env={**os.environ, "PATH": trusted_search_path()},
+            pipe_stderr=False,
+        )
+    except OSError:  # e.g. ripgrep missing or arguments too long: search nothing early
+        return set()
     chunks: list[bytes] = []
     received = 0
     try:
