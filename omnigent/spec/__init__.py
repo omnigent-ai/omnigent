@@ -45,6 +45,7 @@ from omnigent.spec.types import (
     SkillSpec,
     ToolRuntime,
     ToolsConfig,
+    spec_dispatches_subagents,
 )
 from omnigent.spec.validator import ValidationResult, validate
 
@@ -86,6 +87,7 @@ __all__ = [
     "parse",
     "parse_default_policies",
     "parse_server_llm",
+    "spec_dispatches_subagents",
     "validate",
 ]
 
