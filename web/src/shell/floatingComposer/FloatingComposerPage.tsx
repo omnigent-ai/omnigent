@@ -94,8 +94,8 @@ export function FloatingComposerPage() {
       for (const listener of shownListeners.current) listener();
     };
     if (document.visibilityState === "visible") announce();
-    const unsubscribe = floatingComposerBridge()?.onShown?.(announce);
-    if (unsubscribe) return unsubscribe;
+    const onShown = floatingComposerBridge()?.onShown;
+    if (onShown) return onShown(announce);
     // An older shell never says so; a window taking focus with nothing focused in it stands in.
     const onWindowFocus = () => {
       if (document.activeElement === document.body) announce();

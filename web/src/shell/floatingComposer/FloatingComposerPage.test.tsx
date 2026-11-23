@@ -8,7 +8,8 @@ const bridge = vi.hoisted(() => ({
   filePicker: vi.fn(),
   announceSupport: vi.fn(),
   ready: vi.fn(),
-  onShown: vi.fn(),
+  // Like the shell's, it returns an unsubscribe.
+  onShown: vi.fn((_listener: () => void) => () => {}),
 }));
 const landing = vi.hoisted(() => ({ shown: 0 }));
 vi.mock("@/lib/nativeBridge", () => ({ floatingComposerBridge: () => bridge }));
