@@ -2188,6 +2188,7 @@ def register_core_routes(
                     git_branch=git_branch,
                     created_by=user_id,
                     agent_store=agent_store,
+                    parent=parent_conv,
                 )
             if parsed_metadata.sibling_source_id is not None:
                 from omnigent.server.session_families import complete_sibling_creation

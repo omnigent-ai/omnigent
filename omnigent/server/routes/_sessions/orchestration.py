@@ -306,6 +306,7 @@ from omnigent.server.routes._sessions.helpers import (
     _get_runner_client,
     _handle_advise_models_mcp,
     _HostRunnerStopAttempt,
+    _inherited_parent_permission_launch_args,
     _invalidate_runner_backed_snapshot_state,
     _is_codex_native_subagent,
     _is_kiro_native_session,
@@ -13646,6 +13647,14 @@ async def _create_session_from_existing_agent(
                 f"invalid terminal_launch_args in agent spec: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+    # A sub-agent nothing above configured starts in its parent's current mode.
+    if needs_launch_args_from_spec and validated_launch_args is None:
+        validated_launch_args = await asyncio.to_thread(
+            _inherited_parent_permission_launch_args,
+            _parent_for_routing,
+            selected_harness,
+            own_spec,
+        )
 
     # Inherit the creator's mode only when the request, automation and readable spec
     # select none.
@@ -14056,6 +14065,7 @@ def _create_session_from_bundle(
     git_branch: str | None = None,
     created_by: str | None = None,
     agent_store: AgentStore | None = None,
+    parent: Conversation | None = None,
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
@@ -14086,6 +14096,8 @@ def _create_session_from_bundle(
         owner. ``None`` in single-user mode.
     :param agent_store: Store holding the uploader's agents. ``None``
         gives every upload its own row.
+    :param parent: The authorized parent session row of a child upload. A
+        child whose spec sets no launch args starts in its current mode.
     :returns: Response with the new session id.
     :raises OmnigentError: If bundle validation or agent insert
         integrity checks fail, or the parent session vanished
@@ -14121,6 +14133,10 @@ def _create_session_from_bundle(
                 f"invalid terminal_launch_args in bundled child spec: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+        if terminal_launch_args is None:
+            terminal_launch_args = _inherited_parent_permission_launch_args(
+                parent, _spec_harness(spec), spec
+            )
         metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
     elif metadata.terminal_launch_args is None:
         # Top-level bundle create (the ``omnigent run <dir>`` shape): honor the
