@@ -6,10 +6,12 @@ const {
   FLOATING_COMPOSER_PRELOAD_DELAY_MS,
   FLOATING_COMPOSER_READY_FALLBACK_MS,
   FLOATING_COMPOSER_SHOWN_CHANNEL,
+  FLOATING_LAUNCH_MAX_FILE_BYTES,
   createFloatingComposerController,
   createFloatingComposerPreloader,
   fadeInFloatingComposer,
   floatingComposerAppPagePath,
+  floatingComposerLaunchMessage,
   floatingComposerSessionPath,
   floatingComposerWindowOptions,
 } = require("../src/floating_composer_window");
@@ -740,5 +742,61 @@ test("a panel gone before its page was ready is never told it took the keyboard"
   assert.equal(
     created[0].calls.some((call) => call.startsWith("send:")),
     false,
+  );
+});
+
+test("a launch's message is checked and capped in total before a main window can take it", () => {
+  const bytes = () => new ArrayBuffer(8);
+  const message = {
+    text: "Fix it",
+    skill: null,
+    files: [{ name: "a.txt", type: "text/plain", bytes: bytes() }],
+  };
+  assert.deepEqual(floatingComposerLaunchMessage(message), message);
+  assert.deepEqual(
+    floatingComposerLaunchMessage({
+      text: "/review",
+      skill: { name: "review", args: "1" },
+      files: [],
+    }),
+    {
+      text: "/review",
+      skill: { name: "review", args: "1" },
+      files: [],
+    },
+  );
+  const exactlyAtCap = new ArrayBuffer(FLOATING_LAUNCH_MAX_FILE_BYTES);
+  assert.ok(
+    floatingComposerLaunchMessage({
+      text: "",
+      skill: null,
+      files: [{ name: "big", type: "", bytes: exactlyAtCap }],
+    }),
+  );
+  const overCap = [
+    { name: "one", type: "", bytes: new ArrayBuffer(FLOATING_LAUNCH_MAX_FILE_BYTES) },
+    { name: "two", type: "", bytes: new ArrayBuffer(1) },
+  ];
+  assert.equal(
+    floatingComposerLaunchMessage({ text: "", skill: null, files: overCap }),
+    null,
+    "the cap is on the total",
+  );
+  assert.equal(floatingComposerLaunchMessage(null), null);
+  assert.equal(floatingComposerLaunchMessage({ text: 3, skill: null, files: [] }), null);
+  assert.equal(
+    floatingComposerLaunchMessage({ text: "x", skill: null }),
+    null,
+    "files must be a list",
+  );
+  assert.equal(floatingComposerLaunchMessage({ text: "x", skill: { name: "r" }, files: [] }), null);
+  assert.equal(
+    floatingComposerLaunchMessage({
+      text: "x",
+      skill: null,
+      files: [{ name: "a", type: "", bytes: new Uint8Array(2) }],
+    }),
+    null,
+    "bytes must be an ArrayBuffer",
   );
 });

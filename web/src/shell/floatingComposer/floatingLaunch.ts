@@ -1,11 +1,15 @@
 // How the floating New Agent panel hands off a session it created: open it in a main window,
-// then send the first message unless the create already carried it.
-import { floatingComposerBridge } from "@/lib/nativeBridge";
+// then send the first message unless the create already carried it or the window's page sends it.
+import {
+  type FloatingLaunchMessage,
+  type FloatingLaunchOffer,
+  floatingComposerBridge,
+} from "@/lib/nativeBridge";
 import { randomUUID } from "@/lib/randomUUID";
 import { ApiError, fetchSessionItemsPage, postEvent } from "@/lib/sessionsApi";
 import { sendVerdictFromServer } from "@/lib/userInputDelivery";
 import type { FloatingLaunchRequest } from "@/shell/composerPresentation";
-import { uploadFileBlocks } from "@/store/chatStore";
+import { setPendingInitialPrompt, uploadFileBlocks } from "@/store/chatStore";
 
 /** The panel's next state: an error to show, and whether to start a fresh composer. */
 export interface LaunchOutcome {
@@ -23,13 +27,17 @@ export const OPEN_FAILED_ERROR =
   "Your agent started, but Omnigent couldn't show it. Find it in the sidebar.";
 
 /**
- * Open the launched session in a main window, then deliver its first message. Never rejects:
- * the session already exists, so every failure becomes the panel's error.
+ * Open the launched session in a main window, then deliver its first message unless that window's
+ * page takes it. Never rejects: the session already exists, so every failure becomes the panel's
+ * error.
  */
 export async function launchFromPanel(request: FloatingLaunchRequest): Promise<LaunchOutcome> {
+  const message = request.inputAccepted ? null : await handOffMessage(request);
   const opened = await Promise.resolve()
-    .then(() => floatingComposerBridge()?.openInMainWindow(`/c/${request.sessionId}`))
+    .then(() => floatingComposerBridge()?.openInMainWindow(`/c/${request.sessionId}`, message))
     .catch(() => null);
+  // The window's page queued the message and sends it, so the panel has nothing left to post.
+  if (opened?.ok && opened.delivery === "page") return { error: null, freshComposer: true };
   const delivery: Delivery = request.inputAccepted
     ? "delivered"
     : await deliverFirstMessage(request).catch(() => "unknown" as const);
@@ -92,4 +100,73 @@ async function deliveryFromServer(sessionId: string, stableId: string): Promise<
   if (verdict === null) return "unknown";
   const page = await fetchSessionItemsPage(sessionId).catch(() => null);
   return page?.items.some((item) => item.id === stableId) ? "delivered" : "unknown";
+}
+
+/**
+ * The message to offer a main window's page, or null when the panel sends it: no page can take
+ * it, the attachments are over the shell's cap, or one can't be read. Reads files only once a
+ * page can take them.
+ */
+async function handOffMessage(
+  request: FloatingLaunchRequest,
+): Promise<FloatingLaunchMessage | null> {
+  const offer = await Promise.resolve()
+    .then(() => floatingComposerBridge()?.canHandOffLaunch?.())
+    .catch(() => null);
+  if (!offer) return null;
+  const files = request.skill ? [] : (request.files ?? []);
+  if (files.reduce((total, file) => total + file.size, 0) > offer.maxFileBytes) return null;
+  try {
+    const bytes = await Promise.all(
+      files.map(async (file) => ({
+        name: file.name,
+        type: file.type,
+        bytes: await file.arrayBuffer(),
+      })),
+    );
+    return { text: request.text, skill: request.skill, files: bytes };
+  } catch {
+    return null; // The panel sends the original files itself.
+  }
+}
+
+/**
+ * Takes a launch the panel offered this window: queues its first message for the session's chat,
+ * then opens that chat. An expired offer does nothing. Never rejects.
+ */
+export async function takeLaunchOffer(
+  offer: FloatingLaunchOffer,
+  navigate: (path: string) => void,
+): Promise<void> {
+  let message: FloatingLaunchMessage | null;
+  try {
+    message = (await floatingComposerBridge()?.takeLaunch?.(offer.id)) ?? null;
+  } catch (err) {
+    console.warn("[floatingComposer] couldn't take the launch:", err);
+    return;
+  }
+  if (message === null) return;
+  try {
+    setPendingInitialPrompt(offer.sessionId, {
+      text: message.text,
+      skill: message.skill,
+      files: launchFiles(message.files),
+    });
+  } catch (err) {
+    console.error("[floatingComposer] couldn't queue the launched message:", err);
+  }
+  // Taken, so the chat opens even if its message couldn't be queued.
+  navigate(offer.path);
+}
+
+/** The launch's attachments as files; one that can't be rebuilt is left out and logged. */
+function launchFiles(files: FloatingLaunchMessage["files"]): File[] {
+  return files.flatMap(({ name, type, bytes }) => {
+    try {
+      return [new File([bytes], name, { type })];
+    } catch (err) {
+      console.warn("[floatingComposer] couldn't rebuild an attachment:", err);
+      return [];
+    }
+  });
 }

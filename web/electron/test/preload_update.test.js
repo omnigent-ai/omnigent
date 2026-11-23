@@ -327,6 +327,38 @@ describe("global show shortcut bridge", () => {
     assert.equal(h.sends.at(-1).channel, "omnigent:floating-composer:ready");
   });
 
+  it("hands the panel's launch offers to the main window's page, which says it takes them", () => {
+    const h = loadPreload({ platform: "darwin" });
+    const channel = "omnigent:floating-composer:launch-offer";
+    const heard = [];
+    const unsubscribe = h.desktop.floatingComposer.onLaunchOffer((offer) => heard.push(offer));
+    assert.equal(h.sends.at(-1).channel, "omnigent:floating-composer:launch-takers");
+    const offer = { id: "offer-1", sessionId: "abc", path: "/c/abc" };
+    h.emit(channel, offer);
+    assert.deepEqual(heard, [offer]);
+    unsubscribe();
+    assert.equal(h.hasListener(channel), false);
+    assert.equal(typeof h.desktop.floatingComposer.onLaunchOffer("not a function"), "function");
+  });
+
+  it("sends the panel's launch message with its route, and asks main about hand-offs and takes", async () => {
+    const h = loadPreload({ platform: "darwin" });
+    const message = { text: "Fix it", skill: null, files: [] };
+    await h.desktop.floatingComposer.openInMainWindow("/c/abc", message);
+    assert.deepEqual(h.invokes.at(-1), {
+      channel: "omnigent:floating-composer:open-in-main-window",
+      args: "/c/abc",
+      rest: [message],
+    });
+    await h.desktop.floatingComposer.canHandOffLaunch();
+    assert.equal(h.invokes.at(-1).channel, "omnigent:floating-composer:can-hand-off");
+    await h.desktop.floatingComposer.takeLaunch("offer-1");
+    assert.deepEqual(h.invokes.at(-1), {
+      channel: "omnigent:floating-composer:take-launch",
+      args: "offer-1",
+    });
+  });
+
   it("names the shortcut by id for the shell to check, and drops ids that aren't strings", async () => {
     const h = loadPreload();
     const sent = () => JSON.parse(JSON.stringify(h.invokes.at(-1)));

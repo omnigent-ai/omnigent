@@ -306,11 +306,34 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     },
     /**
      * From the panel: open `/c/<id>` or a page it links to in a main window of its server,
-     * then hide. Resolves `{ ok: true }` or
+     * then hide. A launch's `message` goes to that window's page when it takes it. Resolves
+     * `{ ok: true, delivery: "page" }` when the page took it, `{ ok: true }` otherwise, or
      * `{ ok: false, error: "not-composer" | "bad-path" | "window-loading" }`.
      */
-    openInMainWindow: (path) =>
-      ipcRenderer.invoke("omnigent:floating-composer:open-in-main-window", path),
+    openInMainWindow: (path, message = null) =>
+      ipcRenderer.invoke("omnigent:floating-composer:open-in-main-window", path, message),
+    /**
+     * From the panel: whether a main window can take a launch's first message now. Resolves
+     * `{ maxFileBytes }` for the attachments it may carry, or null when none can take it.
+     */
+    canHandOffLaunch: () => ipcRenderer.invoke("omnigent:floating-composer:can-hand-off"),
+    /**
+     * From a main window: subscribes to the panel's launch offers, which also tells the shell this
+     * page takes them. Each offer is `{ id, sessionId, path }`, taken with `takeLaunch`. Returns
+     * an unsubscribe function.
+     */
+    onLaunchOffer: (callback) => {
+      if (typeof callback !== "function") return () => {};
+      const listener = (_event, offer) => callback(offer);
+      ipcRenderer.on("omnigent:floating-composer:launch-offer", listener);
+      ipcRenderer.send("omnigent:floating-composer:launch-takers");
+      return () => ipcRenderer.removeListener("omnigent:floating-composer:launch-offer", listener);
+    },
+    /**
+     * From a main window: takes an offered launch once. Resolves its `{ text, skill, files }`, or
+     * null when the offer already ended.
+     */
+    takeLaunch: (id) => ipcRenderer.invoke("omnigent:floating-composer:take-launch", id),
     /** From the panel: its native file picker opened or closed. */
     filePicker: (state) =>
       ipcRenderer.send(

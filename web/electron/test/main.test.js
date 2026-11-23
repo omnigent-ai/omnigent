@@ -4115,9 +4115,38 @@ describe("floating panel wiring", () => {
     assert.equal(panel.destroyed, true);
   });
 
-  const openFromPanel = async (h, routePath) => ({
-    ...(await h.ipc.get("omnigent:floating-composer:open-in-main-window")(fromPanel(h), routePath)),
+  const openFromPanel = async (h, routePath, launchMessage) => ({
+    ...(await h.ipc.get("omnigent:floating-composer:open-in-main-window")(
+      fromPanel(h),
+      routePath,
+      launchMessage,
+    )),
   });
+
+  /** A main window of the panel's server whose page announced support and takes launch offers. */
+  function addTakingMain(h, options) {
+    const main = addMain(h, options);
+    const frame = { url: main.url };
+    main.webContents.mainFrame = frame;
+    const event = { sender: main.webContents, senderFrame: frame };
+    h.ipc.get("omnigent:floating-composer:announce")(event, 1);
+    h.ipc.get("omnigent:floating-composer:launch-takers")(event);
+    return main;
+  }
+  const { FLOATING_LAUNCH_TAKE_TIMEOUT_MS } = require("../src/floating_launch_offers");
+  const { FLOATING_LAUNCH_MAX_FILE_BYTES } = require("../src/floating_composer_window");
+  /** The latest offer a main window was sent, or undefined. */
+  const offerTo = (main) =>
+    main.sent
+      .filter(([channel]) => channel === "omnigent:floating-composer:launch-offer")
+      .at(-1)?.[1];
+  /** The page of `main` calls take-launch for `id`. */
+  const takeFrom = (h, main, id, senderFrame = main.webContents.mainFrame) =>
+    h.ipc.get("omnigent:floating-composer:take-launch")(
+      { sender: main.webContents, senderFrame },
+      id,
+    );
+  const launchMessage = { text: "Fix the build", skill: null, files: [] };
 
   for (const routePath of ["/c/abc", "/settings/import"]) {
     it(`opens ${routePath} in its server's main window, then hides the panel`, async (t) => {
@@ -4213,6 +4242,187 @@ describe("floating panel wiring", () => {
     assert.deepEqual(signingIn.sent, []);
     assert.deepEqual(showing.sent, [["omnigent:open-path", "/c/abc"]]);
     assert.equal(h.calls.windowOptions.length, built);
+  });
+
+  it("hands a launch's message to the main window whose page takes it, and the page sends it", async (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const panel = openPanel(h);
+    const main = addTakingMain(h);
+    const opened = openFromPanel(h, "/c/abc", launchMessage);
+    const { id, sessionId, path: offerPath } = offerTo(main);
+    assert.deepEqual({ sessionId, offerPath }, { sessionId: "abc", offerPath: "/c/abc" });
+    assert.deepEqual(await takeFrom(h, main, id), launchMessage);
+    assert.deepEqual(await opened, { ok: true, delivery: "page" });
+    // The page navigates itself, so no route is sent, and the panel is put away at once.
+    assert.deepEqual(
+      main.sent.map(([channel]) => channel),
+      ["omnigent:floating-composer:launch-offer"],
+    );
+    assert.equal(panel.visible, false);
+    assert.equal(main.focused, 1);
+  });
+
+  it("opens the session in the window when no page takes the launch in time, and the panel sends it", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addTakingMain(h);
+    const built = h.calls.windowOptions.length;
+    const opened = openFromPanel(h, "/c/abc", launchMessage);
+    t.mock.timers.tick(FLOATING_LAUNCH_TAKE_TIMEOUT_MS);
+    assert.deepEqual(await opened, { ok: true });
+    assert.deepEqual(main.sent.at(-1), ["omnigent:open-path", "/c/abc"]);
+    assert.equal(h.calls.windowOptions.length, built);
+  });
+
+  for (const [what, end] of [
+    ["navigates away", (main) => (main.url = `${serverUrl}/login`)],
+    ["is destroyed", (main) => (main.isDestroyed = () => true)],
+  ]) {
+    it(`ends a pending offer at once when its window ${what}, and opens the session in a new window`, async (t) => {
+      const h = loadNavigationHarness({ platform: "darwin" });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      openPanel(h);
+      const main = addTakingMain(h);
+      const built = h.calls.windowOptions.length;
+      const opened = openFromPanel(h, "/c/abc", launchMessage);
+      end(main);
+      main.webContents.emit(what === "navigates away" ? "did-navigate" : "destroyed");
+      assert.deepEqual(await opened, { ok: true }, "no wait for the timeout");
+      assert.equal(h.calls.windowOptions.length, built + 1);
+      assert.equal(
+        main.sent.some(([channel]) => channel === "omnigent:open-path"),
+        false,
+      );
+    });
+  }
+
+  it("leaves a panel reopened during the wait shown, and focuses nothing when the wait ends", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const steals = [];
+    h.electron.app.focus = (options) => steals.push(options);
+    const panel = openPanel(h);
+    // Its page is the panel's, so reopening it reuses the window.
+    h.setUrl(`${serverUrl}/compose/floating`);
+    const main = addTakingMain(h);
+    const opened = openFromPanel(h, "/c/abc", launchMessage);
+    assert.equal(panel.visible, false);
+    // The user reopens the panel while the launch waits.
+    h.api.floatingComposer().show(serverUrl);
+    t.mock.timers.tick(FLOATING_LAUNCH_TAKE_TIMEOUT_MS);
+    assert.deepEqual(await opened, { ok: true });
+    assert.equal(panel.visible, true, "the late answer doesn't hide the panel");
+    assert.equal(steals.length, 1, "only the launch itself brings Omnigent forward");
+    assert.equal(main.focused, 1);
+    assert.deepEqual(main.sent.at(-1), ["omnigent:open-path", "/c/abc"]);
+  });
+
+  it("can't take an offer once it expired, and an offer taken in time doesn't expire into a route", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addTakingMain(h);
+    const expired = openFromPanel(h, "/c/abc", launchMessage);
+    const { id: expiredId } = offerTo(main);
+    t.mock.timers.tick(FLOATING_LAUNCH_TAKE_TIMEOUT_MS);
+    await expired;
+    assert.equal(await takeFrom(h, main, expiredId), null);
+    const taken = openFromPanel(h, "/c/def", launchMessage);
+    const { id } = offerTo(main);
+    assert.deepEqual(await takeFrom(h, main, id), launchMessage);
+    assert.deepEqual(await taken, { ok: true, delivery: "page" });
+    t.mock.timers.tick(FLOATING_LAUNCH_TAKE_TIMEOUT_MS);
+    assert.equal(
+      main.sent.filter(([channel]) => channel === "omnigent:open-path").length,
+      1,
+      "only the expired launch's route was sent",
+    );
+  });
+
+  it("only offers a launch to a window whose page announced support and subscribed", (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const probe = () => h.ipc.get("omnigent:floating-composer:can-hand-off")(fromPanel(h));
+    const older = addMain(h);
+    older.webContents.mainFrame = { url: older.url };
+    // Subscribing without announcing support doesn't make the window a taker.
+    h.ipc.get("omnigent:floating-composer:launch-takers")({
+      sender: older.webContents,
+      senderFrame: older.webContents.mainFrame,
+    });
+    assert.equal(probe(), null, "a window that never announced support doesn't take launches");
+  });
+
+  it("reports the attachment cap while the window that would take a launch is up, not connecting", (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const probe = () => h.ipc.get("omnigent:floating-composer:can-hand-off")(fromPanel(h));
+    const main = addTakingMain(h);
+    assert.deepEqual({ ...probe() }, { maxFileBytes: FLOATING_LAUNCH_MAX_FILE_BYTES });
+    // A window still connecting can't take one now.
+    h.api.beginConnectionAttempt(main);
+    assert.equal(probe(), null);
+  });
+
+  it("answers a take only from the document that was offered the launch", async (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addTakingMain(h);
+    openFromPanel(h, "/c/abc", launchMessage);
+    const { id } = offerTo(main);
+    const subframe = { url: `${serverUrl}/frame` };
+    assert.equal(await takeFrom(h, main, id, subframe), null, "not from a frame in the page");
+    assert.deepEqual(await takeFrom(h, main, id), launchMessage, "the offer is still open");
+  });
+
+  it("sends a launch's message only when a page can take it, with no wait for one that can't", async (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const panel = openPanel(h);
+    const older = addMain(h);
+    const settled = await Promise.race([
+      openFromPanel(h, "/c/abc", launchMessage),
+      new Promise((resolve) => {
+        setImmediate(() => resolve("still waiting"));
+      }),
+    ]);
+    assert.deepEqual(settled, { ok: true });
+    assert.deepEqual(older.sent, [["omnigent:open-path", "/c/abc"]]);
+    assert.equal(panel.visible, false);
+  });
+
+  it("doesn't hand off a launch whose attachments are over the cap; the window gets only the route", async (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addTakingMain(h);
+    const oversized = {
+      ...launchMessage,
+      files: [
+        { name: "big.bin", type: "", bytes: new ArrayBuffer(FLOATING_LAUNCH_MAX_FILE_BYTES + 1) },
+      ],
+    };
+    assert.deepEqual(await openFromPanel(h, "/c/abc", oversized), { ok: true });
+    assert.equal(offerTo(main), undefined);
+    assert.deepEqual(main.sent, [["omnigent:open-path", "/c/abc"]]);
   });
 
   it("keeps the panel up on a main-window focus only while its page says the picker is open", (t) => {

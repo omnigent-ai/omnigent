@@ -357,22 +357,46 @@ export interface RightSidebarWindowBridge {
 /** Why the shell didn't open a path from the floating panel in a main window. */
 export type FloatingComposerOpenError = "not-composer" | "bad-path" | "window-loading";
 
+/** A panel launch's first message, handed to a main window's page to send. */
+export interface FloatingLaunchMessage {
+  text: string;
+  skill: { name: string; args: string } | null;
+  files: { name: string; type: string; bytes: ArrayBuffer }[];
+}
+
+/** A panel launch a main window's page may take: its session, and the route it opens at. */
+export interface FloatingLaunchOffer {
+  id: string;
+  sessionId: string;
+  path: string;
+}
+
 /** The desktop shell's floating New Agent panel. */
 export interface FloatingComposerBridge {
   /** From a main window: this document can render the panel (version 1) for its server. */
   announceSupport: (version: number) => void;
   /** From the panel: hide it, keeping its draft. */
   dismiss: () => void;
-  /** From the panel: show `/c/<id>` or an app page in a main window, then hide. */
+  /**
+   * From the panel: show `/c/<id>` or an app page in a main window, then hide. A launch's
+   * message is taken by that window's page when `delivery` is "page"; otherwise the panel sends it.
+   */
   openInMainWindow: (
     path: string,
-  ) => Promise<{ ok: true } | { ok: false; error: FloatingComposerOpenError }>;
+    message?: FloatingLaunchMessage | null,
+  ) => Promise<{ ok: true; delivery?: "page" } | { ok: false; error: FloatingComposerOpenError }>;
   /** From the panel: its native file picker opened or closed. */
   filePicker: (state: "open" | "closed") => void;
   /** From the panel: its composer rendered, so the shell shows it without a loading state. Newer shells only. */
   ready?: () => void;
   /** To the panel: it came on screen or took the keyboard again. Returns an unsubscribe. Newer shells only. */
   onShown?: (callback: () => void) => () => void;
+  /** From the panel: the attachment cap a launch may carry, or null when no window can take it. Newer shells only. */
+  canHandOffLaunch?: () => Promise<{ maxFileBytes: number } | null>;
+  /** From a main window: takes the panel's launch offers, which also says this page takes them. Newer shells only. */
+  onLaunchOffer?: (callback: (offer: FloatingLaunchOffer) => void) => () => void;
+  /** From a main window: takes an offered launch once; null when its offer already ended. Newer shells only. */
+  takeLaunch?: (id: string) => Promise<FloatingLaunchMessage | null>;
 }
 
 /** Native menu commands the desktop shell hands to the page (see lib/desktopCommands). */

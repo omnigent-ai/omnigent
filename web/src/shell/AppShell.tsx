@@ -349,8 +349,6 @@ function AppShellImpl() {
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
   // here so it works on every chat route, regardless of where focus sits.
   useApproveHotkey();
-  // On macOS desktop with floating_composer on, ⇧⌘Space opens the New Agent panel.
-  useFloatingComposerSupport();
 
   // Lock the iOS shell to the visual viewport so the soft keyboard can't pan
   // the whole document (which would hide the header and break the layout).
@@ -395,6 +393,8 @@ function AppShellImpl() {
   }>();
   const location = useLocation();
   const navigateTo = useNavigate();
+  // On macOS desktop with floating_composer on, ⇧⌘Space opens the New Agent panel.
+  useFloatingComposerSupport(navigateTo);
   const rebasePath = useRebasePath();
   const serverInfo = useServerInfo();
   const canvasMode =

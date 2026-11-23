@@ -296,4 +296,24 @@ describe("FloatingComposerPage", () => {
     expect(screen.getByTestId("floating-launch-error")).toHaveTextContent("Couldn't send it.");
     expect(prompt().value).toBe("Fix the build");
   });
+
+  it("keeps what the user types after reopening the panel when a delivered launch settles", async () => {
+    let settle: (outcome: { error: string | null; freshComposer: boolean }) => void = () => {};
+    vi.mocked(launchFromPanel).mockReturnValueOnce(
+      new Promise((resolve) => {
+        settle = resolve;
+      }),
+    );
+    render(<FloatingComposerPage />);
+    fireEvent.change(prompt(), { target: { value: "Fix the build" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Launch" }));
+    });
+    // The user reopened the panel while the launch was still on its way, and started a new prompt.
+    fireEvent.change(prompt(), { target: { value: "Next prompt" } });
+
+    await act(async () => settle({ error: null, freshComposer: true }));
+
+    expect(prompt().value).toBe("Next prompt");
+  });
 });

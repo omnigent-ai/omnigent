@@ -27,10 +27,15 @@ off by default.
 - `launch`: ⌘↵ (shown beside the send button; plain ↵ adds a line) or the send
   button creates the session on This Mac in the chosen
   folder, or in a new sandbox. The session opens in an Omnigent window of the same
-  server, which comes forward, the panel hides, and the first message is
-  delivered once. A successful launch clears the panel for the next prompt.
+  server, which comes forward, and the panel hides. A main window of that server
+  whose page is showing its app takes the first message and sends it from its chat,
+  as New Chat does, so the message stays visible while the harness starts. The
+  panel sends it itself when no page takes it within 2 s, the page navigates away
+  first, or the attachments are over 25 MB in total. A successful launch clears the
+  panel for the next prompt, unless the user typed in it since reopening it.
 - `launch-failure`: when the first message can't be delivered (the server never
-  stored it, or the runner refused it), the panel keeps the prompt and says why.
+  stored it, or the runner refused it), the panel keeps the prompt and says why. A
+  message a main window's page sends reports its failure in that chat instead.
 - `locations`: the panel offers only This Mac and a new sandbox. Remote hosts,
   the import prompt and the page heading are hidden.
 - `links`: links in the panel to Settings pages open in an Omnigent window, which
@@ -76,8 +81,11 @@ Follow the [verification skill](skills/verify-omnigent/SKILL.md) for the server.
 Component and unit coverage for each part:
 
 - Flag default and `/v1/info` exposure: `tests/server/test_feature_flags.py`.
-- The main window announcing that it can show the panel:
-  `web/src/hooks/useFloatingComposerSupport.test.ts`.
+- The main window announcing that it can show the panel, and taking launch
+  offers: `web/src/hooks/useFloatingComposerSupport.test.ts`.
+- The launch offer's take, expiry and early end:
+  `web/electron/test/floating_launch_offers.test.js`, and the shell's open
+  handler in `web/electron/test/main.test.js`.
 - The route's flag and desktop gate: `web/src/App.test.tsx`.
 - The page, Escape and the launch's delivery, failure and reset:
   `web/src/shell/floatingComposer/FloatingComposerPage.test.tsx` and

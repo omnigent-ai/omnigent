@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as SessionsApi from "@/lib/sessionsApi";
 
 const bridge = vi.hoisted(() => ({
@@ -6,6 +6,8 @@ const bridge = vi.hoisted(() => ({
   dismiss: vi.fn(),
   filePicker: vi.fn(),
   announceSupport: vi.fn(),
+  canHandOffLaunch: vi.fn(),
+  takeLaunch: vi.fn(),
 }));
 const bridgeOf = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/nativeBridge", () => ({ floatingComposerBridge: bridgeOf }));
@@ -15,17 +17,21 @@ vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
   fetchSessionItemsPage: vi.fn(),
 }));
 vi.mock("@/lib/userInputDelivery", () => ({ sendVerdictFromServer: vi.fn() }));
-vi.mock("@/store/chatStore", () => ({ uploadFileBlocks: vi.fn() }));
+vi.mock("@/store/chatStore", () => ({
+  uploadFileBlocks: vi.fn(),
+  setPendingInitialPrompt: vi.fn(),
+}));
 
 import { ApiError, fetchSessionItemsPage, postEvent } from "@/lib/sessionsApi";
 import { sendVerdictFromServer } from "@/lib/userInputDelivery";
-import { uploadFileBlocks } from "@/store/chatStore";
+import { setPendingInitialPrompt, uploadFileBlocks } from "@/store/chatStore";
 import type { FloatingLaunchRequest } from "@/shell/composerPresentation";
 import {
   launchFromPanel,
   OPEN_FAILED_ERROR,
   SEND_FAILED_ERROR,
   SEND_UNKNOWN_ERROR,
+  takeLaunchOffer,
 } from "./floatingLaunch";
 
 const request = (overrides: Partial<FloatingLaunchRequest> = {}): FloatingLaunchRequest => ({
@@ -48,6 +54,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   bridgeOf.mockReturnValue(bridge);
   bridge.openInMainWindow.mockResolvedValue({ ok: true });
+  bridge.canHandOffLaunch.mockResolvedValue(null);
+  bridge.takeLaunch.mockResolvedValue(null);
   vi.mocked(uploadFileBlocks).mockResolvedValue([]);
   vi.mocked(postEvent).mockResolvedValue({ queued: false } as Awaited<
     ReturnType<typeof postEvent>
@@ -63,7 +71,7 @@ describe("launchFromPanel", () => {
 
     const outcome = await launchFromPanel(request({ files: [file] }));
 
-    expect(bridge.openInMainWindow).toHaveBeenCalledWith("/c/conv_1");
+    expect(bridge.openInMainWindow).toHaveBeenCalledWith("/c/conv_1", null);
     expect(uploadFileBlocks).toHaveBeenCalledWith("conv_1", [file]);
     expect(postEvent).toHaveBeenCalledTimes(1);
     // No hold for an offline host: the panel can't resend later.
@@ -84,7 +92,7 @@ describe("launchFromPanel", () => {
   it("posts nothing when the create already carried the message", async () => {
     const outcome = await launchFromPanel(request({ inputAccepted: true }));
 
-    expect(bridge.openInMainWindow).toHaveBeenCalledWith("/c/conv_1");
+    expect(bridge.openInMainWindow).toHaveBeenCalledWith("/c/conv_1", null);
     expect(postEvent).not.toHaveBeenCalled();
     expect(outcome).toEqual(delivered);
   });
@@ -219,5 +227,137 @@ describe("launchFromPanel", () => {
 
     expect(postEvent).toHaveBeenCalledTimes(1);
     expect(outcome).toEqual({ error: OPEN_FAILED_ERROR, freshComposer: true });
+  });
+});
+
+describe("launchFromPanel hand-off", () => {
+  const cap = 1000;
+  const note = () => new File(["notes"], "notes.txt", { type: "text/plain" });
+
+  beforeEach(() => {
+    bridge.canHandOffLaunch.mockResolvedValue({ maxFileBytes: cap });
+  });
+
+  it("offers the message with its attachments, and posts nothing when the page takes it", async () => {
+    bridge.openInMainWindow.mockResolvedValue({ ok: true, delivery: "page" });
+    const outcome = await launchFromPanel(request({ files: [note()] }));
+    expect(bridge.openInMainWindow).toHaveBeenCalledWith("/c/conv_1", {
+      text: "Fix the build",
+      skill: null,
+      files: [{ name: "notes.txt", type: "text/plain", bytes: expect.any(ArrayBuffer) }],
+    });
+    expect(uploadFileBlocks).not.toHaveBeenCalled();
+    expect(postEvent).not.toHaveBeenCalled();
+    expect(outcome).toEqual({ error: null, freshComposer: true });
+  });
+
+  it("sends the message itself, once, when the window's page doesn't take it", async () => {
+    const file = note();
+    bridge.openInMainWindow.mockResolvedValue({ ok: true });
+    const outcome = await launchFromPanel(request({ files: [file] }));
+    expect(uploadFileBlocks).toHaveBeenCalledWith("conv_1", [file]);
+    expect(postEvent).toHaveBeenCalledTimes(1);
+    expect(outcome).toEqual(delivered);
+  });
+
+  it("reads no attachments over the shell's cap, and the panel sends them", async () => {
+    const file = new File(["x".repeat(cap + 1)], "big.txt", { type: "text/plain" });
+    const read = vi.spyOn(file, "arrayBuffer");
+    bridge.openInMainWindow.mockResolvedValue({ ok: true });
+    await launchFromPanel(request({ files: [file] }));
+    expect(read).not.toHaveBeenCalled();
+    expect(bridge.openInMainWindow).toHaveBeenCalledWith("/c/conv_1", null);
+    expect(uploadFileBlocks).toHaveBeenCalledWith("conv_1", [file]);
+  });
+
+  it("falls back to the panel with the original files when an attachment can't be read", async () => {
+    const file = note();
+    vi.spyOn(file, "arrayBuffer").mockRejectedValue(new Error("unreadable"));
+    bridge.openInMainWindow.mockResolvedValue({ ok: true });
+    const outcome = await launchFromPanel(request({ files: [file] }));
+    expect(bridge.openInMainWindow).toHaveBeenCalledWith("/c/conv_1", null);
+    expect(uploadFileBlocks).toHaveBeenCalledWith("conv_1", [file]);
+    expect(postEvent).toHaveBeenCalledTimes(1);
+    expect(outcome).toEqual(delivered);
+  });
+
+  it("delivers as before in a shell that can't take hand-offs", async () => {
+    bridgeOf.mockReturnValue({ ...bridge, canHandOffLaunch: undefined });
+    await launchFromPanel(request());
+    expect(bridge.openInMainWindow).toHaveBeenCalledWith("/c/conv_1", null);
+    expect(postEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("never offers a message the create already carried", async () => {
+    await launchFromPanel(request({ inputAccepted: true }));
+    expect(bridge.canHandOffLaunch).not.toHaveBeenCalled();
+    expect(postEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe("takeLaunchOffer", () => {
+  const offer = { id: "offer-1", sessionId: "conv_1", path: "/c/conv_1" };
+  const taken = {
+    text: "Fix the build",
+    skill: null,
+    files: [
+      { name: "notes.txt", type: "text/plain", bytes: new TextEncoder().encode("notes").buffer },
+    ],
+  };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("queues the taken message for the session's chat, then opens that chat", async () => {
+    bridge.takeLaunch.mockResolvedValue(taken);
+    const navigate = vi.fn();
+    await takeLaunchOffer(offer, navigate);
+    expect(bridge.takeLaunch).toHaveBeenCalledWith("offer-1");
+    expect(setPendingInitialPrompt).toHaveBeenCalledWith("conv_1", {
+      text: "Fix the build",
+      skill: null,
+      files: [expect.any(File)],
+    });
+    expect(navigate).toHaveBeenCalledWith("/c/conv_1");
+  });
+
+  it("does nothing for an offer that already expired", async () => {
+    const navigate = vi.fn();
+    await takeLaunchOffer(offer, navigate);
+    expect(setPendingInitialPrompt).not.toHaveBeenCalled();
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("opens nothing and doesn't reject when taking the offer fails", async () => {
+    bridge.takeLaunch.mockRejectedValue(new Error("renderer went away"));
+    const navigate = vi.fn();
+    await expect(takeLaunchOffer(offer, navigate)).resolves.toBeUndefined();
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("still queues the text and opens the chat when an attachment can't be rebuilt", async () => {
+    bridge.takeLaunch.mockResolvedValue(taken);
+    vi.stubGlobal("File", function BrokenFile(): never {
+      throw new TypeError("can't build it");
+    });
+    const navigate = vi.fn();
+    await takeLaunchOffer(offer, navigate);
+    expect(setPendingInitialPrompt).toHaveBeenCalledWith("conv_1", {
+      text: "Fix the build",
+      skill: null,
+      files: [],
+    });
+    expect(navigate).toHaveBeenCalledWith("/c/conv_1");
+  });
+
+  it("still opens the chat when its message can't be queued", async () => {
+    bridge.takeLaunch.mockResolvedValue(taken);
+    vi.mocked(setPendingInitialPrompt).mockImplementationOnce(() => {
+      throw new Error("store unavailable");
+    });
+    const navigate = vi.fn();
+    await expect(takeLaunchOffer(offer, navigate)).resolves.toBeUndefined();
+    expect(navigate).toHaveBeenCalledWith("/c/conv_1");
   });
 });

@@ -21,6 +21,35 @@ const FRAME_SETTINGS_KEY = "floating_composer_frames";
 const SESSION_PATH = /^\/c\/[A-Za-z0-9_-]{1,128}$/;
 /** App pages the panel's own links lead to; they open in a main window. */
 const APP_PAGE_PATHS = new Set(["/settings/general", "/settings/import", "/settings/integrations"]);
+/** Attachment bytes one launch may hand to a main window in total; above it the panel delivers. */
+const FLOATING_LAUNCH_MAX_FILE_BYTES = 25 * 1024 * 1024;
+
+/**
+ * The first message a panel offers a main window, checked here at the IPC boundary, or null.
+ *
+ * @param {unknown} value
+ * @returns {{ text: string, skill: { name: string, args: string } | null, files: { name: string, type: string, bytes: ArrayBuffer }[] } | null}
+ */
+function floatingComposerLaunchMessage(value) {
+  if (typeof value !== "object" || value === null) return null;
+  const { text, files } = value;
+  const skill = value.skill ?? null;
+  if (typeof text !== "string" || !Array.isArray(files)) return null;
+  if (skill !== null && (typeof skill !== "object" || typeof skill.name !== "string")) return null;
+  if (skill !== null && typeof skill.args !== "string") return null;
+  let totalBytes = 0;
+  for (const file of files) {
+    if (typeof file?.name !== "string" || typeof file.type !== "string") return null;
+    if (!(file.bytes instanceof ArrayBuffer)) return null;
+    totalBytes += file.bytes.byteLength;
+  }
+  if (totalBytes > FLOATING_LAUNCH_MAX_FILE_BYTES) return null;
+  return {
+    text,
+    skill,
+    files: files.map(({ name, type, bytes }) => ({ name, type, bytes })),
+  };
+}
 
 /**
  * The route a launched session opens at, or null for anything else: the panel may only
@@ -486,11 +515,13 @@ module.exports = {
   FLOATING_COMPOSER_READY_FALLBACK_MS,
   FLOATING_COMPOSER_PATH,
   FLOATING_COMPOSER_SHOWN_CHANNEL,
+  FLOATING_LAUNCH_MAX_FILE_BYTES,
   FRAME_SETTINGS_KEY,
   createFloatingComposerController,
   createFloatingComposerPreloader,
   fadeInFloatingComposer,
   floatingComposerAppPagePath,
+  floatingComposerLaunchMessage,
   floatingComposerSessionPath,
   floatingComposerWindowOptions,
 };
