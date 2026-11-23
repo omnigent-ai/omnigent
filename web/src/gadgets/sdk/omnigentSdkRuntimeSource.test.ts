@@ -5,7 +5,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GadgetInitContext } from "./gadgetProtocol";
 import { GADGET_CONNECT_MESSAGE_TYPE, GADGET_LIMITS } from "./gadgetProtocol";
 import { buildOmnigentSdkBootstrapScript } from "./omnigentSdkRuntimeSource";
-import type { OmnigentClient, OmnigentSdk, OmnigentWatchSnapshot } from "./omnigentSdkTypes";
+import type {
+  OmnigentActionReceipt,
+  OmnigentClient,
+  OmnigentSdk,
+  OmnigentWatchSnapshot,
+} from "./omnigentSdkTypes";
 
 interface PortMessage {
   data: unknown;
@@ -700,22 +705,22 @@ describe("omnigent SDK runtime", () => {
       [
         "watch(actionId, listener)",
         (c: OmnigentClient, l: (snapshot: WatchedAction) => void) =>
-          callUntyped(c.agent.watch, c.agent, ["a1", l]),
+          c.agent.watch("a1", l),
       ],
       [
         "watch(listener, actionId)",
         (c: OmnigentClient, l: (snapshot: WatchedAction) => void) =>
-          callUntyped(c.agent.watch, c.agent, [l, "a1"]),
+          c.agent.watch(l, "a1"),
       ],
       [
         "watch(receipt, listener)",
         (c: OmnigentClient, l: (snapshot: WatchedAction) => void) =>
-          callUntyped(c.agent.watch, c.agent, [{ actionId: "a1", delivery: "sent" }, l]),
+          c.agent.watch({ actionId: "a1", delivery: "sent" } as OmnigentActionReceipt, l),
       ],
       [
         "watch(listener, { actionId })",
         (c: OmnigentClient, l: (snapshot: WatchedAction) => void) =>
-          callUntyped(c.agent.watch, c.agent, [l, { actionId: "a1" }]),
+          c.agent.watch(l, { actionId: "a1" }),
       ],
     ])("follows one action with %s, with that action on the snapshot", async (_form, start) => {
       const updates: WatchedAction[] = [];

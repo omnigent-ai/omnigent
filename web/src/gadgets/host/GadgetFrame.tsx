@@ -623,8 +623,8 @@ export function GadgetFrame({
             <DialogTitle>Let this gadget see your sessions?</DialogTitle>
             <DialogDescription>
               {app.name} wants to see the titles and status of your Omnigent sessions while this
-              page is open. It could save them where other people with access to this gadget can see
-              them.
+              page is open. Its code could save them where other people with access to this gadget
+              can see them, or send them out of Omnigent.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

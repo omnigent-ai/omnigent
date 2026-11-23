@@ -391,31 +391,6 @@ describe("gadget session", () => {
     expect(await (await delivered).json()).toEqual({ session_id: "s_new" });
   });
 
-  it("keeps a full screen gadget full screen and opens its Create session menu", async () => {
-    fillsScreen = true;
-    server.use(
-      rest.post(`${API}/app-1/actions`, (_req, res, ctx) => res(ctx.status(201), ctx.json(ENTRY))),
-      rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
-        res(ctx.json({ session_id: null, version: null })),
-      ),
-    );
-
-    const receipt = await requestGadgetAction(
-      EDITOR,
-      { action: "run_card", params: { cardId: "c1" } },
-      navigate,
-    );
-
-    expect(receipt).toEqual({ actionId: "act1", delivery: "starting" });
-    const opened = parse(navigate.mock.calls[0][0]);
-    expect(opened.searchParams.get("gadget_start")).toBe("app-1");
-    // The URL keeps the gadget full screen beside New session.
-    expect(opened.searchParams.get("gadget")).toBe("app-1");
-    expect(opened.searchParams.get("prompt")).toContain('"action_id":"act1"');
-    expect(requestGadgetCreateSessionMenu).toHaveBeenCalledTimes(1);
-    expect(exitGadgetRailFullScreen).not.toHaveBeenCalled();
-  });
-
   // Gadget full screen contract: an action from a gadget filling the screen keeps it filling the
   // screen. These pin intended behavior; change them only on purpose.
   describe("gadget full screen contract", () => {

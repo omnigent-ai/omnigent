@@ -111,6 +111,23 @@ This is a new persistence path beside the relational stores, so it asks for a ma
 design review before it is relied on; the `GadgetStore` interface keeps the choice
 replaceable either way.
 
+## Lifetime limits
+
+What a gadget keeps, and how long:
+
+- **Revisions** are kept as long as the gadget, each at most 1 MiB, so any earlier look can be
+  published again. There is no count limit; deleting the gadget removes them.
+- **Records** live in collections of at most 1,000 records each. A deleted record's history
+  answers retries for 7 days; after that, on a store that can delete files (the default one
+  can), a create that finds the collection full removes such records and reuses their room.
+- **Comments, the action ledger and the viewers' action records** are collections of at most
+  10,000 records. Actions are never deleted, so a gadget that has been asked for 10,000
+  actions refuses the next one; deleting the gadget (and building a new one) is the way out
+  today. Each record holds up to 10 million revisions, so records rewritten on every action
+  last far longer than that.
+- **Rule state** rotates every 100 writes and retires epochs two behind the current one, so it
+  stays a few records however many writes the gadget takes.
+
 ## Permissions
 
 | Grant | read | write_data | publish | manage |

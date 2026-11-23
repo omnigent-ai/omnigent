@@ -1,15 +1,6 @@
-// The full screen gadget's Open session button. It shows the session's harness, in grey while
-// the session is still New session, and leaves full screen when clicked. Hovering or focusing
-// it opens a menu with the session's own composer controls (host, permission mode, harness and
-// model), which the composer renders there through its session control slots, so a choice made
-// in the menu is the composer's.
-//
-// Before the session exists, the menu's main button is New session's own Create session button:
-// it starts the session with New session's prompt and settings while the gadget stays full
-// screen. A request from the gadget that needs the session opens the menu by itself, over a dimmed
-// screen, so the viewer sees what the request waits for.
-//
-// Beside the button, the session's status shows as in its sidebar row.
+// Full screen gadget controls reuse the session composer's portals: the Open session button,
+// with a menu holding the composer's own host, permission and harness controls and, before the
+// session exists, its Create session button.
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { MessagesSquareIcon } from "lucide-react";

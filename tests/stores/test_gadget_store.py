@@ -60,7 +60,7 @@ def test_gadgets_are_created_listed_renamed_and_deleted_per_owner(
         store.gadget_files(first.id).read_json("data/cards/one.json")
 
 
-@pytest.mark.parametrize("gadget_id", ["", "../x", "A" * 32, "a" * 31, 7])
+@pytest.mark.parametrize("gadget_id", ["", "../x", "A" * 32, "-a", "a" * 65, 7])
 def test_malformed_ids_name_no_gadget(store: LocalGadgetStore, gadget_id: object) -> None:
     assert store.get(gadget_id) is None  # type: ignore[arg-type]
 

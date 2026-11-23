@@ -272,12 +272,23 @@ export interface OmnigentAgent {
    *       }
    *     }, { actionIds: [receipt.actionId] });
    *
-   * `watch(actionId, listener)`, `watch(listener, actionId)` and `watch(receipt, listener)` work too.
+   * One action can also be named directly: `watch(actionId, listener)`,
+   * `watch(listener, actionId)`, `watch(receipt, listener)` or `watch(listener, { actionId })`.
    */
-  watch: (
-    listener: (snapshot: OmnigentActionWatchSnapshot) => void,
-    options?: { actionIds?: string[]; intervalMs?: number },
-  ) => OmnigentActionWatch;
+  watch: OmnigentWatch;
+}
+
+type OmnigentWatchListener = (snapshot: OmnigentActionWatchSnapshot) => void;
+
+/** The forms `agent.watch` takes. */
+export interface OmnigentWatch {
+  (
+    listener: OmnigentWatchListener,
+    options?: { actionIds?: string[]; actionId?: string; intervalMs?: number },
+  ): OmnigentActionWatch;
+  (actionId: string, listener: OmnigentWatchListener): OmnigentActionWatch;
+  (listener: OmnigentWatchListener, actionId: string): OmnigentActionWatch;
+  (receipt: OmnigentActionReceipt, listener: OmnigentWatchListener): OmnigentActionWatch;
 }
 
 /**
