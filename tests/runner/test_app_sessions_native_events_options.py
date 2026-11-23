@@ -1921,22 +1921,6 @@ async def test_events_model_change_requires_the_same_immediate_picker_receipt(
     assert _drain_session_event_queue(_session_event_queues_ref.get(_BOOT_SESSION_ID)) == []
 
 
-async def test_events_model_change_does_not_accept_old_status_without_a_receipt(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    monkeypatch.setattr(
-        claude_native_bridge, "read_claude_status_model", lambda _: "claude-opus-4-7"
-    )
-
-    def select(*args: Any, **kwargs: Any) -> Any:
-        return None
-
-    response = await _post_claude_control(monkeypatch, tmp_path, select)
-    assert response.status_code == 503, response.text
-    assert response.json()["error"] == "claude_native_model_failed"
-
-
 async def test_events_model_change_metadata_failure_refuses_before_the_picker(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2143,91 +2127,25 @@ async def test_events_empty_catalog_overrides_stale_bridge_picker_metadata(
     assert calls == [stale_model]
 
 
-_PASSWORD_PANE_TAIL = (
-    " Last terminal output:\n"
-    "✔ Unity Gateway connected\n"
-    "• Enter password to configure settings for Claude Code.\n"
-    "Password:"
-)
-
-
-@pytest.mark.parametrize(
-    ("error", "expected_detail", "waiting_on_person"),
-    [
-        pytest.param(
-            claude_native_bridge.ClaudePromptTimeout(
-                "Claude Code terminal did not become ready within 9.0s. "
-                "The message was not delivered." + _PASSWORD_PANE_TAIL
-            ),
-            "Claude Code's input box never appeared. It may still be starting, or waiting "
-            "on a prompt such as a password. Check the terminal, then switch models again."
-            + _PASSWORD_PANE_TAIL,
-            False,
-            id="launcher-password-prompt",
-        ),
-        pytest.param(
-            claude_native_bridge.ClaudeSignInPending(
-                "Claude Code is waiting for a sign-in in this session's terminal.",
-                title="Claude Code can't start until you sign in to Databricks",
-                remediation="Open the sign-in link and sign in.",
-            ),
-            "Claude Code can't start until you sign in to Databricks. "
-            "Finish the sign-in in the terminal, then switch models again.",
-            True,
-            id="sign-in",
-        ),
-        pytest.param(
-            claude_native_bridge.ClaudeUserPromptPending(
-                "Answer the pending Claude question or permission request before "
-                "changing settings."
-            ),
-            "Claude is waiting for an answer to a question or prompt. "
-            "Answer it, then switch models again.",
-            True,
-            id="permission-prompt",
-        ),
-        pytest.param(
-            claude_native_bridge.ClaudeTerminalDialog(
-                "Claude Code is waiting for an answer in its terminal (Trust this folder?), "
-                "so the message was not delivered." + _PASSWORD_PANE_TAIL
-            ),
-            "Claude Code's terminal is showing a prompt or dialog. Open the terminal, "
-            "answer or dismiss it, then switch models again." + _PASSWORD_PANE_TAIL,
-            True,
-            id="dialog",
-        ),
-        pytest.param(
-            claude_native_bridge.ClaudeTerminalExited(
-                "The Claude Code terminal has exited (status 1)." + _PASSWORD_PANE_TAIL,
-                exit_status="1",
-            ),
-            "The Claude Code terminal has exited. Relaunch it, then switch models again."
-            + _PASSWORD_PANE_TAIL,
-            False,
-            id="exited",
-        ),
-    ],
-)
 async def test_events_model_change_names_the_step_a_blocked_terminal_needs(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    error: Exception,
-    expected_detail: str,
-    waiting_on_person: bool,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    error = claude_native_bridge.ClaudeTerminalDialog(
+        "Claude Code is waiting for an answer in its terminal (Trust this folder?)."
+    )
+
     def refuse(*args: Any, **kwargs: Any) -> None:
         raise claude_native_bridge.ClaudeModelSwitchRefused(str(error)) from error
 
     response = await _post_claude_control(monkeypatch, tmp_path, refuse)
 
     assert response.status_code == 503, response.text
-    expected: dict[str, object] = {
+    assert response.json() == {
         "error": "claude_native_model_failed",
-        "detail": expected_detail,
+        "detail": "Claude Code's terminal is showing a prompt or dialog. Open the terminal, "
+        "answer or dismiss it, then switch models again.",
+        "waiting_on_person": True,
     }
-    if waiting_on_person:
-        expected["waiting_on_person"] = True
-    assert response.json() == expected
 
 
 def _injection_deadline() -> float | None:

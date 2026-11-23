@@ -265,18 +265,115 @@ async def test_bound_model_control_keeps_the_literal_through_the_real_actuator(
         ]
 
 
-@pytest.mark.parametrize("result_kind", ["different-session-only", "different-legacy"])
+_PASSWORD_PANE_TAIL = (
+    " Last terminal output:\n"
+    "✔ Unity Gateway connected\n"
+    "• Enter password to configure settings for Claude Code.\n"
+    "Password:"
+)
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_detail", "waiting_on_person"),
+    [
+        pytest.param(
+            bridge.ClaudePromptTimeout(
+                "Claude Code terminal did not become ready within 9.0s. "
+                "The message was not delivered." + _PASSWORD_PANE_TAIL
+            ),
+            "Claude Code's input box never appeared. It may still be starting, or waiting "
+            "on a prompt such as a password. Check the terminal, then switch models again."
+            + _PASSWORD_PANE_TAIL,
+            False,
+            id="launcher-password-prompt",
+        ),
+        pytest.param(
+            bridge.ClaudeSignInPending(
+                "Claude Code is waiting for a sign-in in this session's terminal.",
+                title="Claude Code can't start until you sign in to Databricks",
+                remediation="Open the sign-in link and sign in.",
+            ),
+            "Claude Code can't start until you sign in to Databricks. "
+            "Finish the sign-in in the terminal, then switch models again.",
+            True,
+            id="sign-in",
+        ),
+        pytest.param(
+            bridge.ClaudeUserPromptPending(
+                "Answer the pending Claude question or permission request before "
+                "changing settings."
+            ),
+            "Claude is waiting for an answer to a question or prompt. "
+            "Answer it, then switch models again.",
+            True,
+            id="permission-prompt",
+        ),
+        pytest.param(
+            bridge.ClaudeTerminalDialog(
+                "Claude Code is waiting for an answer in its terminal (Trust this folder?), "
+                "so the message was not delivered." + _PASSWORD_PANE_TAIL
+            ),
+            "Claude Code's terminal is showing a prompt or dialog. Open the terminal, "
+            "answer or dismiss it, then switch models again." + _PASSWORD_PANE_TAIL,
+            True,
+            id="dialog",
+        ),
+        pytest.param(
+            bridge.ClaudeTerminalExited(
+                "The Claude Code terminal has exited (status 1)." + _PASSWORD_PANE_TAIL,
+                exit_status="1",
+            ),
+            "The Claude Code terminal has exited. Relaunch it, then switch models again."
+            + _PASSWORD_PANE_TAIL,
+            False,
+            id="exited",
+        ),
+    ],
+)
+async def test_model_control_names_the_step_a_blocked_terminal_needs(
+    model_control: tuple[native_controls.NativeControls, _SessionModelComposer, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    expected_detail: str,
+    waiting_on_person: bool,
+) -> None:
+    controls, composer, _ = model_control
+
+    def refuse(*args: Any, **kwargs: Any) -> None:
+        raise bridge.ClaudeModelSwitchRefused(str(error)) from error
+
+    monkeypatch.setattr(bridge, "inject_model_command", refuse)
+    response = await controls.handle_claude_native_model_change("web-session", "private-glm[1m]")
+
+    assert response.status_code == 503
+    expected: dict[str, object] = {
+        "error": "claude_native_model_failed",
+        "detail": expected_detail,
+    }
+    if waiting_on_person:
+        expected["waiting_on_person"] = True
+    assert json.loads(response.body) == expected
+    assert composer.sends == []
+
+
+@pytest.mark.parametrize(
+    "result_kind", ["different-session-only", "different-legacy", "missing-with-stale-status"]
+)
 async def test_model_control_rejects_a_mismatched_result(
     model_control: tuple[native_controls.NativeControls, _SessionModelComposer, Path],
     monkeypatch: pytest.MonkeyPatch,
     result_kind: str,
 ) -> None:
     controls, composer, _ = model_control
-    result = (
-        bridge.ClaudeLegacyModelSwitchResult("another-model", "another-model")
-        if result_kind == "different-legacy"
-        else bridge.ClaudeModelSwitchResult("another-model", "x", "x", "x", "native-session")
-    )
+    if result_kind == "missing-with-stale-status":
+        result = None
+        monkeypatch.setattr(
+            bridge, "read_claude_status_model", Mock(return_value="private-glm[1m]")
+        )
+    elif result_kind == "different-legacy":
+        result = bridge.ClaudeLegacyModelSwitchResult("another-model", "another-model")
+    else:
+        result = bridge.ClaudeModelSwitchResult("another-model", "x", "x", "x", "native-session")
     monkeypatch.setattr(bridge, "inject_model_command", Mock(return_value=result))
 
     response = await controls.handle_claude_native_model_change("web-session", "private-glm[1m]")

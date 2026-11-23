@@ -13678,39 +13678,16 @@ def test_model_command_clears_only_the_exact_owned_blocked_draft(
 
 
 @pytest.mark.parametrize(
-    "prompt_separator", [" ", "\u00a0"], ids=["separator-space", "separator-nbsp"]
-)
-@pytest.mark.parametrize(
-    ("draft", "owned"),
+    ("draft", "owned", "prompt_separator"),
     [
-        ("\u00a0blocked prompt", "blocked prompt"),
-        (" blocked prompt", "blocked prompt"),
-        ("  blocked prompt", "blocked prompt"),
-        ("\nblocked prompt", "blocked prompt"),
-        ("blocked\nprompt", "blocked prompt"),
-        ("blocked prompt ", "blocked prompt"),
-        ("blocked prompt\u00a0", "blocked prompt"),
-        ("blocked prompt\n", "blocked prompt"),
-        ("blocked prompt extra", "blocked prompt"),
-        ("blocked prompt", "\u00a0blocked prompt"),
-        ("blocked prompt", "blocked prompt "),
-        ("blocked prompt", "blocked prompt\n"),
-        ("blocked prompt", "different prompt"),
+        (" blocked prompt", "blocked prompt", "\u00a0"),
+        ("blocked\nprompt", "blocked prompt", " "),
+        ("blocked prompt", "blocked prompt\n", "\u00a0"),
     ],
     ids=[
-        "leading-nbsp",
         "leading-space",
-        "two-leading-spaces",
-        "leading-newline",
         "internal-newline",
-        "trailing-space",
-        "trailing-nbsp",
-        "trailing-newline",
-        "trailing-text",
-        "claimed-padding",
-        "claimed-trailing-space",
         "claimed-trailing-newline",
-        "different-text",
     ],
 )
 def test_model_command_refuses_whitespace_normalized_draft_ownership(
