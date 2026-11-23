@@ -230,7 +230,10 @@ import {
   PROJECT_MOVE_MENU_LABELS,
 } from "./projectCommands/ordering";
 import { usePublishProjectOrdering } from "./projectCommands/projectOrderingStore";
-import { useQuickPickPaletteCommands } from "./screenCommands/useQuickPickPaletteCommands";
+import {
+  useQuickPickPaletteCommands,
+  useQuickPickPaletteEnabled,
+} from "./screenCommands/useQuickPickPaletteCommands";
 import { usePinOrderPaletteCommands } from "./PinOrder";
 import { useSidebarNavCommands, useSidebarNavDestinations } from "./sidebarNavCommands";
 import {
@@ -303,7 +306,6 @@ import { useSidebarSwipeToOpen } from "@/hooks/useSidebarSwipeToOpen";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
 import { usePublishSidebarSessionOrder } from "@/hooks/useSidebarSessionOrder";
-import { useQuickPickPaletteEnabled } from "./screenCommands/useQuickPickPaletteCommands";
 import { useCommandHoldStore, useCommandHoldTracking } from "@/hooks/useCommandHold";
 import { type DesktopCommand, useAvailableDesktopCommands } from "@/lib/desktopCommands";
 import {

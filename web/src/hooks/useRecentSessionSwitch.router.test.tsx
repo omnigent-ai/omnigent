@@ -21,7 +21,7 @@ let pathname = "";
 /** The sidebar's recency wiring on a session route, as Sidebar mounts it. */
 function SessionSidebar() {
   const { id } = useParams();
-  usePublishSidebarSessionOrder(rows, id ?? null);
+  usePublishSidebarSessionOrder(rows, id ?? null, true);
   useRegisterLiveSessions(readLiveRows);
   useRecordRecentSessionVisits(id);
   useRecentSessionHotkey(true);

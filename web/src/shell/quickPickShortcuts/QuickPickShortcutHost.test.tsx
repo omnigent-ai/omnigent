@@ -169,7 +169,7 @@ describe("QuickPickShortcutHost", () => {
 
   it("keeps a held chord's repeats from that listener, stepping only once", () => {
     shell.mac = false;
-    render(<QuickPickShortcutHost />);
+    renderHost();
     const pageListener = vi.fn();
     window.addEventListener("keydown", pageListener);
     press(NEXT);
