@@ -463,10 +463,12 @@ export function AskUserQuestionForm({
         className="flex flex-col gap-2 mb-2 focus:outline-none"
         data-testid="ask-user-question-section"
         onKeyDown={(event) => {
-          radioArrowKeyRef.current = event.key.startsWith("Arrow");
-        }}
-        onKeyUp={() => {
-          radioArrowKeyRef.current = false;
+          if (!event.key.startsWith("Arrow")) return;
+          radioArrowKeyRef.current = true;
+          // The radio changes in this keydown's default action, before the timeout runs.
+          setTimeout(() => {
+            radioArrowKeyRef.current = false;
+          });
         }}
       >
         <legend className="text-foreground text-ui font-medium flex items-center gap-2 mb-2">

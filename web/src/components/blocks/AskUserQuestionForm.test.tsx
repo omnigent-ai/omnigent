@@ -585,7 +585,8 @@ describe("AskUserQuestionForm — keyboard activity", () => {
     const toggle = screen.getByTestId("ask-user-question-custom-toggle");
     expect(toggle).toBeChecked();
     expect(toggle).toHaveFocus();
-    await user.keyboard("{ArrowDown}");
+    // Held down, so no keyup follows, as when the window loses focus mid-press.
+    await user.keyboard("{ArrowDown>}");
     expect(screen.getByLabelText("React")).toBeChecked();
     expect(screen.getByLabelText("React")).toHaveFocus();
     await user.click(toggle);
