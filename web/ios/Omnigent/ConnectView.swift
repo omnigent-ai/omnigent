@@ -33,12 +33,24 @@ struct ConnectView: View {
           .contentShape(Rectangle())
           .onTapGesture { isFieldFocused = false }
 
-        ScrollView {
-          form
+        // The title, field and Connect stay put and only the server lists scroll,
+        // except at compact height, where the header alone can exceed the space
+        // above the keyboard.
+        if verticalSizeClass != .compact {
+          header
             .frame(maxWidth: 384)
             .padding(.horizontal, 16)
-            .padding(.bottom, 24)
-            .frame(maxWidth: .infinity)
+        }
+
+        ScrollView {
+          VStack(spacing: 0) {
+            if verticalSizeClass == .compact { header }
+            serverLists
+          }
+          .frame(maxWidth: 384)
+          .padding(.horizontal, 16)
+          .padding(.bottom, 24)
+          .frame(maxWidth: .infinity)
         }
         .scrollDismissesKeyboard(.interactively)
       }
@@ -85,7 +97,7 @@ struct ConnectView: View {
     isFieldFocused || verticalSizeClass == .compact
   }
 
-  private var form: some View {
+  private var header: some View {
     VStack(spacing: 0) {
       Text("Meet Omnigent")
         .font(.system(size: 28))
@@ -118,6 +130,14 @@ struct ConnectView: View {
               .stroke(DesignTokens.border(colorScheme), lineWidth: 1)
           }
           .focused($isFieldFocused)
+          .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+              Spacer()
+              Button("Hide Keyboard", systemImage: "keyboard.chevron.compact.down") {
+                isFieldFocused = false
+              }
+            }
+          }
           .submitLabel(.go)
           .onSubmit(connect)
           .disabled(isConnecting)
@@ -148,7 +168,11 @@ struct ConnectView: View {
         .foregroundStyle(Color(red: 0.784, green: 0.196, blue: 0.298))
         .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
         .padding(.top, 12)
+    }
+  }
 
+  private var serverLists: some View {
+    VStack(spacing: 0) {
       // Preset servers sit above recents under their own heading, so an entry
       // the organization vouches for doesn't read as something the user
       // happened to type before.

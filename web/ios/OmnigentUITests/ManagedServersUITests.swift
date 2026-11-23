@@ -42,4 +42,25 @@ final class ManagedServersUITests: XCTestCase {
       app.webViews.staticTexts[marker].waitForExistence(timeout: 30),
       "Expected tapping a preset server to load it (marker \(marker)).")
   }
+
+  /// A long server list scrolls under the URL field without hiding it, and the
+  /// keyboard toolbar's Hide Keyboard button ends editing.
+  func testServerListScrollsUnderFieldAndKeyboardHides() throws {
+    let servers = (1...8).map { "https://team\($0).example.com" }.joined(separator: ",")
+    let app = XCUIApplication(bundleIdentifier: "ai.omnigent.ios")
+    app.launchArguments += ["--omnigent-managed-servers", servers, "--omnigent-reset-state"]
+    app.launch()
+
+    let field = app.textFields["server-url-field"]
+    XCTAssertTrue(field.waitForExistence(timeout: 15))
+    app.buttons.matching(identifier: "managed-servers-row").element(boundBy: 2).swipeUp()
+    XCTAssertTrue(app.buttons["https://team8.example.com"].isHittable)
+    XCTAssertTrue(field.isHittable, "The URL field must stay visible while the list scrolls.")
+
+    field.tap()
+    let hideKeyboard = app.buttons["Hide Keyboard"]
+    XCTAssertTrue(hideKeyboard.waitForExistence(timeout: 5))
+    hideKeyboard.tap()
+    XCTAssertEqual(field.value(forKey: "hasKeyboardFocus") as? Bool, false)
+  }
 }
