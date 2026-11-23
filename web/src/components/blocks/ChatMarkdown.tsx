@@ -55,6 +55,7 @@ import { isRemoteVideoUrl, isVideoFile } from "@/lib/video";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
 import { withBasePath } from "@/lib/basePath";
 import { copyText } from "@/lib/clipboard";
+import { usePullRequestLink } from "@/lib/codeHosts";
 import { absoluteWorkspacePath } from "@/lib/composerContext";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
@@ -367,6 +368,7 @@ function WorkspaceFileLink({
   // Scopes the desktop in-app browser route to this conversation's view.
   const conversationId = useFileViewerConversationId();
   const { root, home } = useWorkspacePaths();
+  const pullRequestLinkFor = usePullRequestLink();
 
   if (!path) {
     const pullRequestRef = parsePullRequestRefHref(href);
@@ -404,15 +406,16 @@ function WorkspaceFileLink({
     // fragments, and at the origin root. The router basename does not reach raw
     // markdown anchors, so they are prefixed here.
     const rebased = typeof href === "string" ? withBasePath(href) : href;
+    const linkHref = typeof rebased === "string" ? pullRequestLinkFor(rebased).href : rebased;
     // Streamdown renders external links with target="_blank"; those need the
     // popup fallback so a click still works where new tabs can't open.
-    const blankHref = props.target === "_blank" && typeof rebased === "string" ? rebased : null;
+    const blankHref = props.target === "_blank" && typeof linkHref === "string" ? linkHref : null;
     const pullRequest = githubPullRequest(rebased);
     return (
       <a
-        href={rebased}
+        href={linkHref}
         className={cn(STREAMDOWN_LINK_CLASS, className)}
-        title={title ?? (pullRequest ? rebased : undefined)}
+        title={title ?? (pullRequest ? linkHref : undefined)}
         data-streamdown="link"
         {...props}
         onClick={
@@ -548,20 +551,22 @@ function PullRequestRefLink({
   const scopedConversationId = useContext(ConversationScopeContext);
   const fileViewerConversationId = useFileViewerConversationId();
   const { data } = usePullRequestInfoSnapshot(scopedConversationId ?? fileViewerConversationId);
+  const pullRequestLinkFor = usePullRequestLink();
   const url = data ? pullRequestRefUrl(pullRequestRef, data) : null;
   if (!url) return <span className={className}>{children}</span>;
+  const { href } = pullRequestLinkFor(url);
   return (
     <a
       {...props}
-      href={url}
+      href={href}
       target="_blank"
       rel="noopener noreferrer"
       className={cn(STREAMDOWN_LINK_CLASS, className)}
-      title={title ?? url}
+      title={title ?? href}
       data-streamdown="link"
       onClick={(event) => {
         props.onClick?.(event);
-        followLinkWithPopupFallback(event, url, fileViewerConversationId);
+        followLinkWithPopupFallback(event, href, fileViewerConversationId);
       }}
     >
       <PullRequestLinkLabel>{children}</PullRequestLinkLabel>

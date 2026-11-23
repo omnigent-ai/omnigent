@@ -8,6 +8,8 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import type { PullRequestInfo } from "@/hooks/usePullRequests";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import type * as NativeBridge from "@/lib/nativeBridge";
 import { FileViewerContext } from "@/shell/FileViewerContext";
@@ -118,6 +120,43 @@ describe("pull request references in chat markdown", () => {
     const link = screen.getByRole("link", { name: /#4242/ });
     expect(link).toHaveAttribute("target", "_blank");
     expect(link).toHaveAttribute("rel", "noopener noreferrer");
+  });
+
+  it("opens references and written pull request links on the deployment's destination", () => {
+    seed(githubInfo());
+    renderMarkdown(
+      [
+        "Landed in #4242; see https://github.com/acme/app/pull/12,",
+        "[its files](https://github.com/acme/app/pull/13/files) and omnigent-ai/omnigent#9882.",
+      ].join(" "),
+      true,
+      (children) => (
+        <CapabilitiesProvider
+          info={{
+            ...FALLBACK_SERVER_INFO,
+            pull_request_links: {
+              url_template: "https://review.example.com/{owner}/{repo}/pull/{number}",
+              name: "Code Review",
+              applies_to: ["github.com/acme"],
+            },
+          }}
+        >
+          {children}
+        </CapabilitiesProvider>
+      ),
+    );
+
+    // A subpage, and a repo outside `applies_to`, stay on the code host.
+    expect(hrefs()).toEqual([
+      "https://review.example.com/acme/app/pull/4242",
+      "https://review.example.com/acme/app/pull/12",
+      "https://github.com/acme/app/pull/13/files",
+      "https://github.com/omnigent-ai/omnigent/pull/9882",
+    ]);
+    expect(screen.getByRole("link", { name: /#4242/ })).toHaveAttribute(
+      "title",
+      "https://review.example.com/acme/app/pull/4242",
+    );
   });
 
   it("leaves a bare reference as text when the session's repo is unknown", () => {

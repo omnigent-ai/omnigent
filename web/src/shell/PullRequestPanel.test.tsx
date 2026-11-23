@@ -3168,6 +3168,51 @@ describe("session PR selection", () => {
     expect(screen.queryByRole("button", { name: /All pull requests/ })).toBeNull();
   });
 
+  it("opens stored PRs on the deployment's pull request destination", async () => {
+    const user = userEvent.setup();
+    const moved = "https://github.com/example/one/pull/42";
+    const kept = "https://github.com/other/two/pull/7";
+    state.info = { isLoading: false, error: new RunnerOfflineError(), isFetching: false };
+    state.stored.conv_1 = [
+      { url: moved, host: "github.com", repository: "example/one", number: 42, title: "Ship it" },
+      { url: kept, host: "github.com", repository: "other/two", number: 7, title: null },
+    ].map((pr) => ({ ...pr, relationship: "created" as const }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const info = {
+      ...FALLBACK_SERVER_INFO,
+      pull_request_links: {
+        url_template: "https://review.example.com/{owner}/{repo}/pull/{number}",
+        name: "Code Review",
+        applies_to: ["github.com/example"],
+      },
+    };
+    render(
+      <CapabilitiesProvider info={info}>
+        <QueryClientProvider client={client}>
+          <PullRequestPanel conversationId="conv_1" />
+        </QueryClientProvider>
+      </CapabilitiesProvider>,
+    );
+    const destination = "https://review.example.com/example/one/pull/42";
+
+    await screen.findByRole("list", { name: "Pull requests" });
+    await user.click(screen.getByRole("button", { name: "Actions for other/two #7" }));
+    expect(screen.getByRole("menuitem", { name: "Open in GitHub" })).toHaveAttribute("href", kept);
+    await user.keyboard("{Escape}");
+    await user.click(screen.getByRole("button", { name: "Actions for example/one #42" }));
+    const open = screen.getByRole("menuitem", { name: "Open in Code Review" });
+    expect(open).toHaveAttribute("href", destination);
+    // The copied link stays the code-host URL, which pastes back into Link a PR.
+    await user.click(screen.getByRole("menuitem", { name: "Copy PR link" }));
+    expect(await navigator.clipboard.readText()).toBe(moved);
+    await user.click(screen.getByRole("button", { name: "example/one #42 — Ship it" }));
+    const stored = screen.getByTestId("github-stored-pr");
+    expect(within(stored).getByRole("link", { name: /Ship it/ })).toHaveAttribute(
+      "href",
+      destination,
+    );
+  });
+
   it("shows the server's stored PRs and lets them be unlinked while the host is offline", async () => {
     const user = userEvent.setup();
     const one = "https://github.com/example/one/pull/42";

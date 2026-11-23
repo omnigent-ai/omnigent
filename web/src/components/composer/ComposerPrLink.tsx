@@ -4,6 +4,7 @@ import { PullRequestStatusIcon } from "@/components/PullRequestStatusIcon";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ComposerPullRequest } from "@/hooks/useComposerGitStatus";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { type PullRequestLinkTarget, usePullRequestLink } from "@/lib/codeHosts";
 import { gitProviderCopy } from "@/lib/gitProviders";
 import { followLinkWithPopupFallback, parseHttpUrl } from "@/lib/openLinkInApp";
 import {
@@ -24,15 +25,19 @@ interface PreviewRow {
   href: string | undefined;
 }
 
-function previewRows(prs: readonly ComposerPullRequest[]): PreviewRow[] {
+function previewRows(
+  prs: readonly ComposerPullRequest[],
+  pullRequestLinkFor: (url: string) => PullRequestLinkTarget,
+): PreviewRow[] {
   return prs.map((pr) => {
     const copy = gitProviderCopy(pr.provider, undefined, pr.provider_display);
+    const href = parseHttpUrl(pr.url)?.href;
     return {
       pr,
       status: getPullRequestStatus(pr),
       identity: `${pr.repository} ${copy.prNumberPrefix}${pr.number}`.trim(),
       title: pr.title?.trim() ?? "",
-      href: parseHttpUrl(pr.url)?.href,
+      href: href && pullRequestLinkFor(href).href,
     };
   });
 }
@@ -106,6 +111,7 @@ export function ComposerPrLink({
   className?: string;
 }) {
   const isMobileViewport = useIsMobileViewport();
+  const pullRequestLinkFor = usePullRequestLink();
   const [previewOpen, setPreviewOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const previewRef = useRef<HTMLDivElement>(null);
@@ -188,7 +194,7 @@ export function ComposerPrLink({
   );
 
   if (!showPreview) return trigger;
-  const rows = previewRows(prs);
+  const rows = previewRows(prs, pullRequestLinkFor);
 
   return (
     <TooltipProvider delayDuration={200}>

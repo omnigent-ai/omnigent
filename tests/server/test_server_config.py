@@ -29,6 +29,7 @@ from omnigent.server.server_config import (
     config_str_list,
     load_branding_snapshot,
     load_picker_curation,
+    load_pull_request_links,
     load_server_config,
     resolve_config_path,
     session_title_instructions,
@@ -774,3 +775,111 @@ def test_a_default_without_any_restriction_is_kept() -> None:
 
     assert curation.restrict_to_agent_names == ()
     assert curation.default_agent_name == "polly"
+
+
+# ── Pull request links ────────────────────────────────────────────
+
+_REVIEW_TEMPLATE = "https://review.example.com/{host}/{owner}/{repo}/pull/{number}"
+
+
+def test_pull_request_links_are_unset_without_config() -> None:
+    """No block keeps every pull request on its code host, as on every existing deployment."""
+    assert load_pull_request_links({}) is None
+
+
+def test_pull_request_links_normalize_the_configured_block() -> None:
+    """Names and templates are trimmed; prefixes compare lowercase, once each, without a slash."""
+    links = load_pull_request_links(
+        {
+            "pull_request_links": {
+                "url_template": f"  {_REVIEW_TEMPLATE} ",
+                "name": " Code Review ",
+                "applies_to": [
+                    "GitHub.com/Example-Org/",
+                    "ghe.example.com",
+                    "github.com/example-org",
+                ],
+            }
+        }
+    )
+
+    assert links is not None
+    assert links.config() == {
+        "url_template": _REVIEW_TEMPLATE,
+        "name": "Code Review",
+        "applies_to": ["github.com/example-org", "ghe.example.com"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("block", "message"),
+    [
+        ("https://review.example.com/{number}", "must be a mapping"),
+        ({"applies_to": ["github.com"]}, "name must be a non-empty string"),
+        ({"name": "  ", "applies_to": ["github.com"]}, "name must be a non-empty string"),
+        ({"name": "Review", "applies_to": "github.com"}, "must be a list of strings"),
+        ({"name": "Review", "applies_to": [42]}, "must be a list of strings"),
+        ({"name": "Review", "applies_to": []}, "at least one prefix"),
+        ({"name": "Review", "applies_to": ["https://github.com"]}, "host/owner/repo"),
+        ({"name": "Review", "applies_to": ["github.com/o/r/pull"]}, "host/owner/repo"),
+        ({"name": "Review", "applies_to": ["github.com//r"]}, "host/owner/repo"),
+        ({"name": "Review", "applies_to": ["github.com"]}, "url_template"),
+        (
+            {
+                "name": "Review",
+                "applies_to": ["github.com"],
+                "url_template": "https://r.example.com/",
+            },
+            "url_template",
+        ),
+        (
+            {
+                "name": "Review",
+                "applies_to": ["github.com"],
+                "url_template": "https://r.example.com/{branch}/{number}",
+            },
+            "url_template",
+        ),
+        (
+            {
+                "name": "Review",
+                "applies_to": ["github.com"],
+                "url_template": "https://r.example.com/{{number}}",
+            },
+            "url_template",
+        ),
+        (
+            {
+                "name": "Review",
+                "applies_to": ["github.com"],
+                "url_template": "javascript:{number}",
+            },
+            "url_template",
+        ),
+        (
+            {"name": "Review", "applies_to": ["github.com"], "url_template": "/review/{number}"},
+            "url_template",
+        ),
+    ],
+    ids=[
+        "not-a-mapping",
+        "no-name",
+        "blank-name",
+        "prefixes-not-a-list",
+        "non-string-prefix",
+        "no-prefixes",
+        "prefix-with-scheme",
+        "prefix-too-deep",
+        "prefix-empty-segment",
+        "no-template",
+        "template-without-number",
+        "template-unknown-field",
+        "template-escaped-braces",
+        "template-not-http",
+        "template-relative",
+    ],
+)
+def test_malformed_pull_request_links_stop_startup(block: object, message: str) -> None:
+    """A malformed block fails loudly rather than silently sending links somewhere unintended."""
+    with pytest.raises(ValueError, match=message):
+        load_pull_request_links({"pull_request_links": block})

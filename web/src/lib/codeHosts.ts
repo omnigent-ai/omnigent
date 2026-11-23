@@ -2,6 +2,9 @@
 // evidence: github.com by name, a GitHub Enterprise host only when the caller
 // already knows it serves GitHub.
 
+import { useCallback } from "react";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+
 /** A code host the workspace links pull requests and files to. */
 export type CodeHostProviderId = "github";
 
@@ -67,4 +70,70 @@ export function parseCodeHostPullRequestUrl(
     number: Number(number),
     url: `https://${host}/${owner}/${repo}/pull/${number}`,
   };
+}
+
+/** Where a deployment opens pull requests instead of on their code host, from `/v1/info`. */
+export interface PullRequestLinks {
+  /** Destination with `{host}`, `{owner}`, `{repo}` and `{number}` fields. */
+  url_template: string;
+  /** What links call the destination, e.g. "Code Review" in "Open in Code Review". */
+  name: string;
+  /** Lowercase `host`, `host/owner` or `host/owner/repo` prefixes whose pull requests open there. */
+  applies_to: string[];
+}
+
+/** Where one pull request link opens. */
+export interface PullRequestLinkTarget {
+  href: string;
+  /** The configured destination's name, or null when the link stays on its code host. */
+  destination: string | null;
+}
+
+const PULL_REQUEST_LINK_FIELD = /\{(host|owner|repo|number)\}/g;
+
+/**
+ * Where a pull request link opens: the deployment's configured destination when
+ * `links` applies to the pull request, otherwise the link unchanged. Only a link to
+ * the pull request itself moves; one with a query, fragment or subpage stays put.
+ *
+ * @param url A pull request's code-host link, e.g. `https://github.com/acme/app/pull/7`.
+ * @param links The deployment's destination, or null/undefined for none.
+ */
+export function pullRequestLink(
+  url: string,
+  links: PullRequestLinks | null | undefined,
+): PullRequestLinkTarget {
+  const unchanged = { href: url, destination: null };
+  if (!links) return unchanged;
+  const pullRequest = parseCodeHostPullRequestUrl(
+    url,
+    links.applies_to.map((prefix) => prefix.split("/")[0]),
+  );
+  if (!pullRequest) return unchanged;
+  const { search, hash } = new URL(url);
+  if (search || hash) return unchanged;
+  const path = `${pullRequest.host}/${pullRequest.repository}`.toLowerCase();
+  if (!links.applies_to.some((prefix) => path === prefix || path.startsWith(`${prefix}/`))) {
+    return unchanged;
+  }
+  const [owner, repo] = pullRequest.repository.split("/");
+  const fields: Record<string, string> = {
+    host: pullRequest.host,
+    owner,
+    repo,
+    number: String(pullRequest.number),
+  };
+  return {
+    href: links.url_template.replace(PULL_REQUEST_LINK_FIELD, (_, field: string) =>
+      encodeURIComponent(fields[field]),
+    ),
+    destination: links.name,
+  };
+}
+
+/** Resolves pull request links against this deployment's configured destination. */
+export function usePullRequestLink(): (url: string) => PullRequestLinkTarget {
+  const info = useServerInfo();
+  const links = info === "loading" ? null : info.pull_request_links;
+  return useCallback((url: string) => pullRequestLink(url, links), [links]);
 }

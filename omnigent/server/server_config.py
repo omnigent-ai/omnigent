@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -39,6 +40,7 @@ from io import BytesIO
 from pathlib import Path, PurePath
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 import yaml
 from PIL import Image, ImageSequence, UnidentifiedImageError
@@ -236,6 +238,109 @@ def load_picker_curation(config: Mapping[str, Any]) -> PickerCuration:
         )
         default = None
     return PickerCuration(restrict_to_agent_names=names, default_agent_name=default)
+
+
+PULL_REQUEST_LINKS_KEY = "pull_request_links"
+_PULL_REQUEST_LINK_FIELD = re.compile(r"\{(?:host|owner|repo|number)\}")
+
+
+@dataclass(frozen=True)
+class PullRequestLinks:
+    """
+    Where a deployment opens pull requests instead of on their code host.
+
+    Display only: a pull request's code-host URL stays its identity everywhere else.
+    See "Pull request links" in ``deploy/README.md``.
+
+    :param url_template: Destination with ``{host}``, ``{owner}``, ``{repo}`` and
+        ``{number}`` fields, e.g. ``"https://review.example.com/{owner}/{repo}/pull/{number}"``.
+    :param name: What links call the destination, e.g. ``"Code Review"`` in
+        "Open in Code Review".
+    :param applies_to: Lowercase ``host``, ``host/owner`` or ``host/owner/repo``
+        prefixes whose pull requests open there, e.g. ``("github.com/acme",)``.
+    """
+
+    url_template: str
+    name: str
+    applies_to: tuple[str, ...]
+
+    def config(self) -> dict[str, Any]:
+        """
+        Return the public block surfaced by ``GET /v1/info``.
+        """
+        return {
+            "url_template": self.url_template,
+            "name": self.name,
+            "applies_to": list(self.applies_to),
+        }
+
+
+def _pull_request_link_template(raw: object) -> str:
+    """
+    Validate a pull request link template, returning it stripped.
+    """
+    template = raw.strip() if isinstance(raw, str) else ""
+    without_fields = _PULL_REQUEST_LINK_FIELD.sub("", template)
+    destination = urlsplit(_PULL_REQUEST_LINK_FIELD.sub("x", template))
+    if (
+        "{number}" not in template
+        or "{" in without_fields
+        or "}" in without_fields
+        or destination.scheme not in ("http", "https")
+        or not destination.netloc
+    ):
+        raise ValueError(
+            f"{PULL_REQUEST_LINKS_KEY}.url_template must be an http(s) URL with a {{number}}"
+            " field and no fields other than {host}, {owner}, {repo} and {number}"
+        )
+    return template
+
+
+def _pull_request_link_prefix(raw: str) -> str:
+    """
+    Validate one ``applies_to`` entry, returning it lowercased without a trailing slash.
+    """
+    prefix = raw.strip().strip("/").lower()
+    segments = prefix.split("/")
+    if "://" in prefix or len(segments) > 3 or not all(segments):
+        raise ValueError(
+            f"{PULL_REQUEST_LINKS_KEY}.applies_to entries must be host, host/owner or"
+            f" host/owner/repo, got {raw!r}"
+        )
+    return prefix
+
+
+def load_pull_request_links(config: Mapping[str, Any]) -> PullRequestLinks | None:
+    """
+    Read where pull request links open from the server config.
+
+    :param config: Loaded server config carrying the optional ``pull_request_links``
+        block with ``url_template``, ``name`` and ``applies_to``.
+    :returns: The destination, or ``None`` when the block is absent, so links
+        open on each pull request's code host.
+    :raises ValueError: If the block is present but malformed.
+    """
+    section = config.get(PULL_REQUEST_LINKS_KEY)
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        raise ValueError(f"{PULL_REQUEST_LINKS_KEY} must be a mapping")
+    name = section.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"{PULL_REQUEST_LINKS_KEY}.name must be a non-empty string")
+    raw_prefixes = section.get("applies_to")
+    if not isinstance(raw_prefixes, list) or not all(
+        isinstance(item, str) for item in raw_prefixes
+    ):
+        raise ValueError(f"{PULL_REQUEST_LINKS_KEY}.applies_to must be a list of strings")
+    applies_to = tuple(dict.fromkeys(_pull_request_link_prefix(item) for item in raw_prefixes))
+    if not applies_to:
+        raise ValueError(f"{PULL_REQUEST_LINKS_KEY}.applies_to must list at least one prefix")
+    return PullRequestLinks(
+        url_template=_pull_request_link_template(section.get("url_template")),
+        name=name.strip(),
+        applies_to=applies_to,
+    )
 
 
 def _config_positive_int(key: str, default: int) -> int:

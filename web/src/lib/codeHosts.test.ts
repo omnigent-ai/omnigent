@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { codeHostProvider, parseCodeHostPullRequestUrl } from "./codeHosts";
+import {
+  codeHostProvider,
+  parseCodeHostPullRequestUrl,
+  pullRequestLink,
+  type PullRequestLinks,
+} from "./codeHosts";
 
 const PULL_REQUEST = "https://github.com/example-org/app/pull/1234";
 
@@ -54,5 +59,61 @@ describe("parseCodeHostPullRequestUrl", () => {
     ["no number", "https://github.com/o/r/pull/x"],
   ])("reads nothing from %s", (_case, url) => {
     expect(parseCodeHostPullRequestUrl(url)).toBeNull();
+  });
+});
+
+describe("pullRequestLink", () => {
+  const REVIEW: PullRequestLinks = {
+    url_template: "https://review.example.com/{host}/{owner}/{repo}/pull/{number}",
+    name: "Code Review",
+    applies_to: ["github.com/example-org", "ghe.example.com"],
+  };
+
+  it.each([
+    [
+      "a github.com pull request under an owner prefix",
+      PULL_REQUEST,
+      "https://review.example.com/github.com/example-org/app/pull/1234",
+    ],
+    [
+      "an Enterprise pull request under a host prefix",
+      "https://ghe.example.com/team/svc/pull/7/",
+      "https://review.example.com/ghe.example.com/team/svc/pull/7",
+    ],
+    [
+      "an owner whose case differs from the prefix",
+      "https://github.com/Example-Org/app/pull/1234",
+      "https://review.example.com/github.com/Example-Org/app/pull/1234",
+    ],
+  ])("moves %s to the destination", (_case, url, href) => {
+    expect(pullRequestLink(url, REVIEW)).toEqual({ href, destination: "Code Review" });
+  });
+
+  it.each([
+    ["another owner on the same host", "https://github.com/other-org/app/pull/1"],
+    ["an owner that only starts with the prefix", "https://github.com/example-org-fork/app/pull/1"],
+    ["an unlisted Enterprise host", "https://ghe2.example.com/team/svc/pull/7"],
+    ["a pull request's files tab", `${PULL_REQUEST}/files`],
+    ["a comment on the pull request", `${PULL_REQUEST}#issuecomment-1`],
+    ["a pull request with a query", `${PULL_REQUEST}?w=1`],
+    ["an issue", "https://github.com/example-org/app/issues/7"],
+    ["a merge request", "https://gitlab.example.com/example-org/app/-/merge_requests/7"],
+    ["a relative link", "/c/session-id"],
+  ])("leaves %s on its code host", (_case, url) => {
+    expect(pullRequestLink(url, REVIEW)).toEqual({ href: url, destination: null });
+  });
+
+  it("leaves every link alone when the deployment sets no destination", () => {
+    expect(pullRequestLink(PULL_REQUEST, null)).toEqual({ href: PULL_REQUEST, destination: null });
+  });
+
+  it("encodes each field it fills in", () => {
+    const links = {
+      ...REVIEW,
+      url_template: "https://review.example.com/?pr={owner}%2F{repo}%23{number}",
+    };
+    expect(pullRequestLink("https://github.com/example-org/a%20b/pull/9", links).href).toBe(
+      "https://review.example.com/?pr=example-org%2Fa%2520b%239",
+    );
   });
 });

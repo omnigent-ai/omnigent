@@ -46,6 +46,7 @@ import type { AutomationFailure } from "@/lib/scheduledTasksApi";
 import { describeRunFailure } from "@/lib/scheduleText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
+import { usePullRequestLink } from "@/lib/codeHosts";
 import type { Query } from "@tanstack/react-query";
 import type { Session } from "@/lib/types";
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
@@ -1401,6 +1402,7 @@ function SuggestionOrigin({ sessionId, row }: { sessionId: string; row?: Convers
 /** What a suggestion is based on: sessions open here, other links in a new tab. */
 function SuggestionLinks({ item }: { item: Suggestion }) {
   const headingId = useId();
+  const pullRequestLinkFor = usePullRequestLink();
   const seen = new Set<string>();
   const links = item.links.flatMap((link) => {
     const target = suggestionLinkTarget(link);
@@ -1428,7 +1430,7 @@ function SuggestionLinks({ item }: { item: Suggestion }) {
               </Link>
             ) : (
               <a
-                href={target.href}
+                href={pullRequestLinkFor(target.href).href}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="underline underline-offset-2"
