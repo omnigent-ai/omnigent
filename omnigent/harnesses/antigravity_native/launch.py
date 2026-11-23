@@ -46,12 +46,9 @@ from omnigent.onboarding.gemini_auth import gemini_auth_has_credential
 
 _logger = logging.getLogger(__name__)
 
-# agy's coarse permission control. agy honors exactly one pre-emptive flag,
-# ``--dangerously-skip-permissions`` ("Auto-approve all tool permission requests
-# without prompting"); without it agy defaults to ``toolPermission=request-review``
-# and prompts in the TUI for each tool. Omnigent maps its ``permission_mode`` onto
-# this single flag; session policies are enforced separately by the PreToolUse
-# hook in the isolated ``hooks.json``, which agy runs even when this flag is set.
+# agy's only pre-emptive permission flag; without it agy prompts in the TUI for each
+# tool. Session policies are enforced separately by the isolated ``hooks.json``
+# PreToolUse hook, which agy runs even when this flag is set.
 _SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 # Omnigent permission mode that maps to agy's all-or-nothing bypass.
 _BYPASS_PERMISSION_MODE = "bypassPermissions"

@@ -44,6 +44,10 @@ _EVALUATE_POLICY_TIMEOUT_S = 86400.0
 # agy routes every MCP tool through this meta-tool.
 _MCP_META_TOOL = "call_mcp_tool"
 _DEFAULT_DENY_REASON = "Denied by Omnigent policy."
+# Every verdict the evaluate endpoint returns; any other ``result`` is a malformed reply.
+_POLICY_ACTIONS = frozenset(
+    {"POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED", "POLICY_ACTION_DENY", "POLICY_ACTION_ASK"}
+)
 _HOOK_LABEL = "antigravity evaluate-policy hook"
 
 
@@ -70,8 +74,9 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     agy runs this hook only when the launch registered it, so every invocation
     belongs to a governed session. A verdict that cannot be obtained (missing
     config, an unreadable payload, an unreachable or failing server, a
-    malformed response) therefore fails CLOSED with a deny. ``ALLOW`` and
-    ``mcp__omnigent__*`` tools, which the relay already gates, print nothing.
+    response without a recognized ``result``) therefore fails CLOSED with a
+    deny. ``ALLOW``, ``UNSPECIFIED`` and ``mcp__omnigent__*`` tools, which the
+    relay already gates, print nothing.
 
     :param argv: CLI argv after the ``evaluate-policy`` subcommand,
         e.g. ``["--bridge-dir", "/tmp/x"]``.
@@ -125,7 +130,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         eval_response = resp.json()
     except json.JSONDecodeError:
         eval_response = None
-    if not isinstance(eval_response, dict):
+    if not isinstance(eval_response, dict) or eval_response.get("result") not in _POLICY_ACTIONS:
         return _deny(_fail_closed_reason("malformed Omnigent response"))
 
     reason = _deny_reason(evaluation_response_to_hook_output(_PRE_TOOL_USE, eval_response))

@@ -7308,11 +7308,13 @@ async def _auto_create_antigravity_terminal(
     from omnigent.cli_auth import databricks_request_headers
 
     # The policy hook uses these one-shot headers when the session has no tool relay.
-    write_policy_hook_config(
-        bridge_dir,
-        server_url=server_url,
-        session_id=session_id,
-        auth_headers=databricks_request_headers(server_url, bearer_token=auth_token),
+    await _write_native_policy_hook(
+        lambda: write_policy_hook_config(
+            bridge_dir,
+            server_url=server_url,
+            session_id=session_id,
+            auth_headers=databricks_request_headers(server_url, bearer_token=auth_token),
+        )
     )
 
     # Seed bridge state with the id known so far (the real id on resume; on a

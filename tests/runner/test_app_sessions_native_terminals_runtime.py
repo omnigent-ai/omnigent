@@ -22,6 +22,7 @@ import httpx
 import pytest
 
 from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.antigravity_native import bridge as antigravity_native_bridge
 from omnigent.harnesses.antigravity_native.bridge import (
     is_placeholder_conversation_id as bridge_mod_is_placeholder,
 )
@@ -2892,6 +2893,12 @@ async def test_auto_create_antigravity_cold_starts_real_conversation(
     # The RPC reader spawns (it replaced the transcript forwarder).
     assert len(reader_calls) == 1
     assert token_calls == (["resolved"] if authenticated else [])
+    hook_config = antigravity_native_bridge.read_policy_hook_config(
+        antigravity_native_bridge.bridge_dir_for_bridge_id(session_id)
+    )
+    assert hook_config is not None
+    assert hook_config[:2] == ("http://ap.example", session_id)
+    assert (hook_config[2].get("Authorization") == "Bearer mock-reader-token") is authenticated
 
 
 @pytest.mark.asyncio
@@ -3796,6 +3803,10 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     workspace_key = str((tmp_path / "workspace").resolve())
     assert workspace_key in settings_data.get("trustedWorkspaces", [])
     assert settings_data.get("showFeedbackSurvey") is False
+
+    # 5) The isolated hooks.json registers Omnigent's PreToolUse policy hook for this bridge.
+    hooks = json.loads((iso_gemini / "config" / "hooks.json").read_text(encoding="utf-8"))
+    assert hooks[bridge_mod.AGY_POLICY_HOOK_NAME] == bridge_mod.build_policy_hook_entry(bridge_dir)
 
 
 @pytest.mark.asyncio

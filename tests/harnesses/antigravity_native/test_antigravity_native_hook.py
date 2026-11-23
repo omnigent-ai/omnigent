@@ -170,6 +170,24 @@ def test_evaluate_policy_blocks_constraining_verdicts(
     assert expected_reason in decision["reason"]
 
 
+@pytest.mark.parametrize("action", ["POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"])
+def test_evaluate_policy_lets_non_constraining_verdicts_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    action: str,
+) -> None:
+    out, _posts = _run_hook(
+        monkeypatch,
+        capsys,
+        _governed_bridge(tmp_path),
+        json.dumps({"toolCall": _WRITE_CALL}),
+        _verdict({"result": action}),
+    )
+
+    assert out == ""
+
+
 def test_evaluate_policy_leaves_relay_enforced_omnigent_tools_alone(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -192,6 +210,9 @@ def test_evaluate_policy_leaves_relay_enforced_omnigent_tools_alone(
     [
         ("unreachable", "connection error: simulated"),
         ("malformed_response", "malformed Omnigent response"),
+        ("missing_result", "malformed Omnigent response"),
+        ("null_result", "malformed Omnigent response"),
+        ("unknown_result", "malformed Omnigent response"),
         ("missing_config", "no Omnigent policy hook config"),
         ("invalid_payload", "unrecognized agy hook payload"),
         ("no_tool_call", "unrecognized agy hook payload"),
@@ -206,11 +227,17 @@ def test_evaluate_policy_fails_closed_without_a_verdict(
 ) -> None:
     bridge_dir = _governed_bridge(tmp_path)
     stdin = json.dumps({"toolCall": _WRITE_CALL})
+    malformed_bodies: dict[str, object] = {
+        "malformed_response": ["not", "an", "object"],
+        "missing_result": {"reason": "no action"},
+        "null_result": {"result": None},
+        "unknown_result": {"result": "POLICY_ACTION_MAYBE"},
+    }
     response: tuple[httpx.Response | None, str | None] | None = None
     if scenario == "unreachable":
         response = (None, "connection error: simulated")
-    elif scenario == "malformed_response":
-        response = _verdict(["not", "an", "object"])
+    elif scenario in malformed_bodies:
+        response = _verdict(malformed_bodies[scenario])
     elif scenario == "missing_config":
         (bridge_dir / "policy_hook.json").unlink()
     elif scenario == "invalid_payload":

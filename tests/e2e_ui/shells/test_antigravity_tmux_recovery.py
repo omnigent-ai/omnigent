@@ -467,14 +467,17 @@ def test_antigravity_survives_probe_outage_then_detects_exit(
     assert session.runner.poll() is None, "terminal exit killed the runner"
 
 
+@pytest.mark.skipif(
+    os.environ.get("OMNIGENT_E2E_ANTIGRAVITY") != "mock",
+    reason="the scripted file-write tool call needs OMNIGENT_E2E_ANTIGRAVITY=mock",
+)
 @pytest.mark.parametrize(
     "antigravity_session", [["--dangerously-skip-permissions"]], indirect=True, ids=["full-access"]
 )
 def test_full_access_session_applies_deny_policy_before_native_write(
     antigravity_session: AntigravitySession, antigravity_model: GeminiMock | None
 ) -> None:
-    if antigravity_model is None:
-        pytest.skip("the scripted file-write tool call needs OMNIGENT_E2E_ANTIGRAVITY=mock")
+    assert antigravity_model is not None
     session = antigravity_session
     probe = session.directory / "probe.txt"
     _wait_until(session.terminals, "runner did not start the Antigravity terminal", 120)
