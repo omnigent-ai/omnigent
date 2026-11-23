@@ -459,22 +459,25 @@ ${GADGET_KIT_HELPERS}
     return name === 'build_story' ? BUILD_TEXT : name === 'refresh_data' ? REFRESH_TEXT : name === 'restore_look' ? RESTORE_TEXT : FIND_TEXT;
   }
 
+  // Resolves whether the request reached the gadget session (or New session).
   function request(name, params, label) {
-    if (!canAct) return;
+    if (!canAct) return Promise.resolve(false);
     var entry = { at: Date.now(), text: 'Sending to your gadget session…', label: label || '' };
     pending[name] = entry;
     schedule();
-    client.agent.request(name, params).then(function (receipt) {
-      if (pending[name] !== entry) return;
+    return client.agent.request(name, params).then(function (receipt) {
+      if (pending[name] !== entry) return true;
       entry.actionId = receipt && receipt.actionId;
       entry.starting = Boolean(receipt && receipt.delivery === 'starting');
       entry.text = entry.starting ? textFor(name).pending : 'Sent to your gadget session.';
       schedule();
+      return true;
     }, function (error) {
-      if (pending[name] !== entry) return;
+      if (pending[name] !== entry) return false;
       delete pending[name];
       notice('Could not send that to your gadget session: ' + message(error), 'error');
       schedule();
+      return false;
     });
   }
 
@@ -482,9 +485,8 @@ ${GADGET_KIT_HELPERS}
   function buildIdea(idea) { request('build_story', { idea_id: idea.id, title: idea.title }, idea.title); }
   function buildCustom(textValue) {
     var asked = String(textValue || '').trim().slice(0, 500);
-    if (!asked) return false;
-    request('build_story', { request: asked }, asked);
-    return true;
+    if (!asked) return Promise.resolve(false);
+    return request('build_story', { request: asked }, asked);
   }
   function refreshData() { request('refresh_data', {}); }
 
@@ -1017,8 +1019,14 @@ ${GADGET_KIT_HELPERS}
     $('window').addEventListener('change', function () { $('window').dataset.touched = 'true'; });
     $('ideas').addEventListener('toggle', function () { if ($('ideas').open !== ideasOpenSet) $('ideas').dataset.touched = 'true'; });
     // Not a form: the sandboxed frame may not submit forms, so Chrome would drop the submission.
+    // The text stays until the request is sent, so a failed one can be sent again; text typed
+    // since then is kept.
     function submitCustom() {
-      if (!$('custom-go').disabled && buildCustom($('custom-text').value)) $('custom-text').value = '';
+      if ($('custom-go').disabled) return;
+      var submitted = $('custom-text').value;
+      buildCustom(submitted).then(function (sent) {
+        if (sent && $('custom-text').value === submitted) $('custom-text').value = '';
+      });
     }
     $('custom-go').addEventListener('click', submitCustom);
     $('custom-text').addEventListener('keydown', function (event) {

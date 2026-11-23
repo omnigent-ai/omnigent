@@ -114,6 +114,7 @@ function startStory({
   canAct = true,
   canWrite = true,
   allowErrors = false,
+  failRequests = false,
 }: {
   html?: string;
   preview?: boolean;
@@ -121,6 +122,8 @@ function startStory({
   canWrite?: boolean;
   /** A design that is meant to throw while the page loads. */
   allowErrors?: boolean;
+  /** Every action request fails, as when the gadget session can't be reached. */
+  failRequests?: boolean;
 } = {}) {
   const { listeners, writes, collection } = recordingCollections();
   let actionListener: Listener | null = null;
@@ -148,6 +151,7 @@ function startStory({
     agent: {
       request: (action: string, params: unknown) => {
         requests.push({ action, params });
+        if (failRequests) return Promise.reject(new Error("The gadget session is unreachable"));
         return Promise.resolve({ actionId: "a1", delivery: "sent" });
       },
       watch: (listener: Listener) => {
@@ -235,9 +239,10 @@ describe("data story template", () => {
     const field = byId("custom-text") as HTMLInputElement;
     field.value = "Weekly active users by plan";
     byId("custom-go").click();
-    expect(field.value).toBe("");
+    // Typed before the first one was sent: that text stays when the first clears.
     field.value = "Errors by service";
     field.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await waitFor(() => expect(field.value).toBe(""));
     expect(requests).toEqual([
       {
         action: "build_story",
@@ -246,6 +251,24 @@ describe("data story template", () => {
       { action: "build_story", params: { request: "Weekly active users by plan" } },
       { action: "build_story", params: { request: "Errors by service" } },
     ]);
+  });
+
+  it("keeps the described story's text when its request fails, by click or Enter", async () => {
+    const { load, requests, ready } = startStory({ failRequests: true });
+    await waitFor(() => expect(ready()).toBe(true));
+    load({ ideas: IDEAS });
+    await waitFor(() => expect(byId("ideas").hidden).toBe(false));
+    const field = byId("custom-text") as HTMLInputElement;
+
+    field.value = "Weekly active users by plan";
+    byId("custom-go").click();
+    await waitFor(() => expect(document.body.textContent).toContain("unreachable"));
+    expect(field.value).toBe("Weekly active users by plan");
+
+    field.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await waitFor(() => expect(requests).toHaveLength(2));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(field.value).toBe("Weekly active users by plan");
   });
 
   it("cites sessions with links that wrap with the text and open by click or Enter", async () => {
