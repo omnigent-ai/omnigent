@@ -781,11 +781,6 @@ async def test_child_flush_publishes_every_ancestor_from_one_tree_load(
         ),
         # Mid-turn enforcement cost while the displayed statusLine total is frozen.
         pytest.param({"context_tokens": 1234, "policy_cost_usd": 9.0}, id="policy-cost-only"),
-        # A delayed or forged lower total that the monotonic clamp holds.
-        pytest.param(
-            {"context_tokens": 1234, "cumulative_cost_usd": 3.0, "model": "m1"},
-            id="clamped-lower-cost",
-        ),
     ],
 )
 async def test_flush_that_leaves_displayed_usage_unchanged_skips_the_tree_load(
@@ -822,6 +817,49 @@ async def test_flush_that_leaves_displayed_usage_unchanged_skips_the_tree_load(
     assert after["by_model"] == before["by_model"]
     # The enforcement figure is still persisted for the cost gate.
     assert after.get("policy_cost_usd") == data.get("policy_cost_usd")
+
+
+@pytest.mark.asyncio
+async def test_retried_cost_report_publishes_totals_its_failed_flush_never_sent(
+    db_uri: str,
+    usage_events: list[dict],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cost report persisted before its roll-up failed still publishes when retried."""
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.schemas import SessionEventInput
+
+    store = SqlAlchemyConversationStore(db_uri)
+    tree = _seed_usage_tree(store)
+    report = SessionEventInput(
+        type="external_session_usage",
+        data={"cumulative_cost_usd": 4.5, "model": "m1"},
+    )
+    load_tree = orchestration.load_session_usage_and_tree
+    tree_loads: list[str] = []
+
+    def fail_first_tree_load(session_id: str, *args, **kwargs):
+        tree_loads.append(session_id)
+        if len(tree_loads) == 1:
+            raise OSError("tree read failed")
+        return load_tree(session_id, *args, **kwargs)
+
+    monkeypatch.setattr(orchestration, "load_session_usage_and_tree", fail_first_tree_load)
+
+    with pytest.raises(OSError, match="tree read failed"):
+        await orchestration._persist_external_session_usage(tree.leaf, report, store)
+    assert usage_events == []
+    # The own-usage persist committed before the roll-up failed.
+    assert _usage(store, tree.leaf)["total_cost_usd"] == pytest.approx(4.5)
+
+    # The forwarder retries the identical report, which no longer changes persisted usage.
+    await orchestration._persist_external_session_usage(tree.leaf, report, store)
+
+    assert [(e["conversation_id"], e["total_cost_usd"]) for e in usage_events] == [
+        (tree.leaf, 20.5),
+        (tree.mid, 22.5),
+        (tree.root, 31.5),
+    ]
 
 
 @pytest.mark.asyncio
