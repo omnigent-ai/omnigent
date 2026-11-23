@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -29,6 +30,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
@@ -36,7 +38,7 @@ from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskR
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 from omnigent.runtime import pending_elicitations
-from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
 from omnigent.server.managed_hosts import parse_repo_workspace
@@ -46,7 +48,7 @@ from omnigent.server.proactive_agent import (
     reject_proactive_agent_id,
 )
 from omnigent.server.routes._agent_origin import require_agent_origin
-from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._auth_helpers import require_access_and_level, require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
@@ -84,7 +86,11 @@ from omnigent.server.scheduled.rrule import (
 )
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.run_sharing import delete_task_grants
-from omnigent.server.scheduled.schedule import continued_sandbox_host_id, is_trigger_automation
+from omnigent.server.scheduled.schedule import (
+    continued_sandbox_host_id,
+    is_trigger_automation,
+    timer_rule,
+)
 from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.scheduled.workflow_automations import workflow_session_reuse_error
 from omnigent.server.session_mcp_selection import (
@@ -110,6 +116,8 @@ from omnigent.tools.browser_agent_tools import (
     BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS,
     browser_agent_tools_creation_labels,
 )
+from omnigent.tools.builtins.timer import DURABLE_TIMER_MIN_SECONDS, validate_timer_set_args
+from omnigent.util.session_lifecycle import is_session_closed
 from omnigent.util.uuid import normalize_uuid
 
 _logger = logging.getLogger(__name__)
@@ -746,6 +754,17 @@ def create_scheduled_tasks_router(
         return task
 
     _reject_proactive_agent = reject_proactive_agent_id
+
+    def _refuse_timer(task: ScheduledTask) -> None:
+        """Raise a 400 for a timer: it keeps the schedule its agent set until cancelled.
+
+        Its session's own sharing decides who can use it, so it has no grants either.
+        """
+        if task.kind == "timer":
+            raise OmnigentError(
+                "A timer can't be run, edited or shared; cancel it and set a new one",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
     async def _require_readable(
         request: Request, scheduled_task_id: str
@@ -1414,10 +1433,10 @@ def create_scheduled_tasks_router(
     ) -> dict[str, list[dict[str, Any]]]:
         """List the caller's scheduled tasks.
 
-        Lists automations unless *kind* is ``all``, so the reminders agents set for
-        their own sessions stay off the Automations page. There is no reminders-only
-        view: this list reads every task the owner has, and a selective filter needs
-        an indexed, paginated query first.
+        Lists automations unless *kind* is ``all``, so the reminders and timers agents
+        set for their own sessions stay off the Automations page. The kind filter runs
+        in the query, so listing automations never reads an agent's timers. There is no
+        reminders-only view; a selective view needs an indexed, paginated query first.
 
         Lazy-on-read stale backstop: before returning, force-fail any of this
         owner's runs still ``running`` past the 6h max age (``incomplete``), so
@@ -1432,8 +1451,12 @@ def create_scheduled_tasks_router(
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         tasks = [
             t
-            for t in store.list(owner_user_id=owner_id, exclude_agent_ids=PROACTIVE_AGENT_IDS)
-            if owns_scheduled_task(t, owner_id) and (kind == "all" or t.kind == "automation")
+            for t in store.list(
+                owner_user_id=owner_id,
+                exclude_agent_ids=PROACTIVE_AGENT_IDS,
+                kinds=None if kind == "all" else ("automation",),
+            )
+            if owns_scheduled_task(t, owner_id)
         ]
         task_ids = [t.id for t in tasks]
         running = store.list_running_runs_for_tasks(task_ids)
@@ -1844,6 +1867,7 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         task = _require_owned(scheduled_task_id, owner_id)
+        _refuse_timer(task)
         if getattr(request.app.state, "scheduled_task_dispatch_enabled", False):
             scheduler = _scheduler(request)
             if scheduler is None:
@@ -1889,6 +1913,7 @@ def create_scheduled_tasks_router(
         )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         stored = _require_owned(scheduled_task_id, owner_id)
+        _refuse_timer(stored)
         _reject_proactive_agent(body.agent_id)
         existing = without_legacy_sandbox_workspace(stored)
         legacy_workspace = existing.workspace != stored.workspace
@@ -2213,7 +2238,10 @@ def create_scheduled_tasks_router(
 
     def _load_owned_by_caller(request: Request, scheduled_task_id: str) -> ScheduledTask:
         owner = _owner(request)
-        return _require_owned(scheduled_task_id, None if owner == RESERVED_USER_LOCAL else owner)
+        task = _require_owned(scheduled_task_id, None if owner == RESERVED_USER_LOCAL else owner)
+        # A grant would also share the timer's session.
+        _refuse_timer(task)
+        return task
 
     register_scheduled_task_permissions_routes(
         router,
@@ -2221,4 +2249,163 @@ def create_scheduled_tasks_router(
         conversation_store=conversation_store,
         permission_store=permission_store,
     )
-    return router
+
+    # Agent timers are a session primitive, so the per-request automations gate
+    # doesn't hide them; they still need the database scheduler.
+    timers = APIRouter()
+
+    async def _timer_session(request: Request, session_id: str) -> tuple[str | None, Conversation]:
+        """Authorize a timer call as a message would be.
+
+        :returns: The timer owner, ``None`` for the local user as on every task, and
+            the session.
+        """
+        user_id = require_user(request, auth_provider)
+        access = await require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conv = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if conv is None:
+            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+        return (None if user_id == RESERVED_USER_LOCAL else user_id), conv
+
+    # Called by the runner's timer tools, so hidden from the public API reference.
+    @timers.post(
+        "/sessions/{session_id}/timers",
+        status_code=201,
+        include_in_schema=False,
+        # The reply is a saved timer, or a JSONResponse telling the runner to keep it.
+        response_model=None,
+    )
+    async def set_session_timer(
+        request: Request, session_id: str, body: dict[str, Any]
+    ) -> dict[str, Any] | JSONResponse:
+        """Save a ``sys_timer_set`` timer: a hidden wake into this session.
+
+        One scheduled task holds the timer, so it survives runner and server restarts,
+        and its ID is the ``timer_id``. The first firing falls on the whole second at or
+        after ``seconds`` from now, so it never comes early; a repeating timer then fires
+        every ``seconds`` rounded up to a whole second. Firings that come due while the
+        server is down make one late firing when it is back, not one each. A sub-agent's
+        or side chat's timer isn't saved: the reply, ``200`` with ``durable`` false and a
+        ``reason``, tells the runner to keep it in memory.
+
+        :param body: ``{"seconds": number, "repeat": bool, "note": str | null}``, checked
+            like the tool's arguments, e.g. ``{"seconds": 120, "repeat": true}``.
+        :returns: ``durable`` true, ``timer_id``, ``status`` ``"scheduled"``, the UTC
+            ``fire_at`` of the first firing, ``interval_seconds`` for a repeating timer
+            (else ``None``), and the ``seconds``, ``repeat`` and ``note`` it was set with.
+        :raises OmnigentError: 400 for bad arguments, a delay under
+            ``DURABLE_TIMER_MIN_SECONDS``, an archived or closed session, or a server with
+            timers off (no database scheduler, or the ``session_timers`` feature off);
+            403/404 as for posting a message.
+        """
+        if not getattr(request.app.state, "session_timers_enabled", False):
+            raise OmnigentError(
+                "Timers are off on this server: they need the database scheduler and the "
+                "session_timers feature",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        unknown = sorted(set(body) - {"seconds", "repeat", "note"})
+        if unknown:
+            raise OmnigentError(
+                f"unknown timer fields: {', '.join(unknown)}", code=ErrorCode.INVALID_INPUT
+            )
+        validated = validate_timer_set_args(body)
+        if isinstance(validated, str):
+            raise OmnigentError(validated, code=ErrorCode.INVALID_INPUT)
+        seconds, repeat, note = validated
+        if seconds < DURABLE_TIMER_MIN_SECONDS:
+            raise OmnigentError(
+                f"The server saves timers of at least {DURABLE_TIMER_MIN_SECONDS} seconds; "
+                "the runner keeps shorter ones",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        user_id, conv = await _timer_session(request, session_id)
+        if conv.archived:
+            raise OmnigentError(
+                "This session is archived, so it can't take timers",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if is_session_closed(conv.labels, conv.title):
+            raise OmnigentError(
+                "This session is closed to new messages, so it can't take timers",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if conv.agent_id is None:
+            raise OmnigentError(
+                "This session has no agent for a timer to wake", code=ErrorCode.INVALID_INPUT
+            )
+        from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
+
+        if conv.parent_conversation_id is not None or conv.labels.get(SIDE_CHAT_LABEL_KEY):
+            # It runs on another session's runner, so its timers stay in that runner.
+            return JSONResponse(
+                {"durable": False, "reason": "a sub-agent's or side chat's timers aren't saved"}
+            )
+        agent_id = conv.agent_id
+        interval = max(1, math.ceil(seconds))
+        fire_at = math.ceil(time.time() + seconds)
+        async with _allocated_task_id(user_id, "Timer") as task_id:
+            # Synchronous, so a cancel can't land after the save and release the saved ID.
+            task = store.create(
+                scheduled_task_id=task_id,
+                name=f"Timer: {note}"[:256] if note else "Timer",
+                # The hidden message each firing sends into the session.
+                prompt=f"[System: timer {task_id} fired]" + (f"\nnote: {note!r}" if note else ""),
+                rrule=timer_rule(interval, repeat=repeat),
+                user_id=user_id,
+                agent_id=agent_id,
+                timezone="UTC",
+                session_mode="continue",
+                session_id=conv.id,
+                # Runs route to the replica holding the session's host.
+                host_id=conv.host_id,
+                first_run_at=fire_at,
+                kind="timer",
+                # Firings fall at the anchor plus whole intervals, the first at fire_at.
+                schedule_anchor=fire_at - interval,
+            )
+        return {
+            "durable": True,
+            "timer_id": task.id,
+            "status": "scheduled",
+            "fire_at": datetime.fromtimestamp(fire_at, UTC).isoformat(),
+            "interval_seconds": interval if repeat else None,
+            "seconds": seconds,
+            "repeat": repeat,
+            "note": note,
+        }
+
+    @timers.delete("/sessions/{session_id}/timers/{timer_id}", include_in_schema=False)
+    async def cancel_session_timer(
+        request: Request, session_id: str, timer_id: str
+    ) -> dict[str, str]:
+        """Cancel one of this session's timers by deleting its scheduled task.
+
+        A firing still waiting to go out is suppressed; one already on its way still
+        arrives. Repeating is safe: a cancelled, fired or unknown timer is a 404.
+
+        :returns: ``{"timer_id": "...", "status": "cancelled"}``.
+        :raises OmnigentError: 404 unless the caller set this timer in this session and
+            it has not fired or been cancelled yet.
+        """
+        user_id, conv = await _timer_session(request, session_id)
+        task = await asyncio.to_thread(store.get, timer_id)
+        if (
+            task is None
+            or task.kind != "timer"
+            or task.state == "deleted"
+            or task.session_id != conv.id
+            or task.user_id != user_id
+            or not await asyncio.to_thread(store.delete, task.id)
+        ):
+            raise OmnigentError("Timer not found", code=ErrorCode.NOT_FOUND)
+        return {"timer_id": task.id, "status": "cancelled"}
+
+    combined = APIRouter()
+    combined.include_router(router)
+    combined.include_router(timers)
+    return combined
