@@ -126,7 +126,7 @@ _SERVED: dict[str, _Served] = {
         tool="git",
         optional_features=workspace_fuzzy.features,
     ),
-    "SearchText": _Served(tool="rg"),
+    "SearchText": _Served(features=("text_search_priority",), tool="rg"),
     "ResolveWorkingCopyBase": _Served(features=("revision_comparison",), tool="git"),
     "ListWorkingCopyChanges": _Served(tool="git"),
     "ReadBaseFile": _Served(tool="git"),

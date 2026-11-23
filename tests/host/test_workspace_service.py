@@ -79,7 +79,8 @@ from tests.server.routes.test_shell_permission_gate import _StubAgentStore, _Stu
 
 pytestmark = pytest.mark.asyncio
 
-_WITH_RG = {"SearchText"} if shutil.which("rg") else set()
+_RG_METHODS = {"SearchText", "text_search_priority"}
+_WITH_RG = _RG_METHODS if shutil.which("rg") else set()
 PROTOCOLS = pytest.mark.parametrize("protocol", [ProtocolType.CONNECT, ProtocolType.GRPC_WEB])
 _SESSION = "conv_ws"
 _SERVER_BASE = f"http://server/v1/sessions/{_SESSION}/workspace"
@@ -622,7 +623,7 @@ async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: 
     response = await client.get_capabilities(GetCapabilitiesRequest())
 
     # SearchText is listed exactly where ripgrep is installed.
-    assert set(response.capabilities) ^ ({"SearchText"} - _WITH_RG) == {
+    assert set(response.capabilities) ^ (_RG_METHODS - _WITH_RG) == {
         "ListDirectory",
         "ReadFile",
         "StatPath",
@@ -632,6 +633,7 @@ async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: 
         "search_files.fuzzy",
         "search_files.browse",
         "SearchText",
+        "text_search_priority",
         "ResolveWorkingCopyBase",
         "revision_comparison",
         "ListWorkingCopyChanges",

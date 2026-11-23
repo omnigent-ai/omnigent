@@ -6,6 +6,7 @@ Route and protocol parity with the REST search lives in ``test_workspace_service
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import os
 import shutil
@@ -24,12 +25,15 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     FILE_SEARCH_MODE_FUZZY,
     FILE_SEARCH_MODE_SUBSTRING,
     FILE_SEARCH_MODE_UNSPECIFIED,
+    SEARCH_ORDER_PRIORITY,
+    SEARCH_ORDER_UNSPECIFIED,
+    SEARCH_ORDER_WALK,
     SearchFilesRequest,
     SearchFilesResponse,
     SearchTextRequest,
     SearchTextResponse,
 )
-from omnigent.host import workspace_fuzzy, workspace_search
+from omnigent.host import workspace_fuzzy, workspace_search, workspace_text_priority
 from omnigent.host.workspace_git import files as files_module
 from omnigent.host.workspace_search import DirectoryScope, search_files, search_text
 from tests.host.test_workspace_git_runner import _alive, _fake_git, _git, _repository
@@ -44,8 +48,10 @@ def _fresh_listers() -> Iterator[None]:
     # Each test's repository gets its own listings and ranked file lists.
     files_module._by_root.clear()
     workspace_search._corpora = workspace_fuzzy.CorpusCache()
+    workspace_text_priority._changes.clear()
     yield
     files_module._by_root.clear()
+    workspace_text_priority._changes.clear()
 
 
 async def _search(root: Path, query: str, **fields: object) -> SearchFilesResponse:
@@ -603,8 +609,9 @@ async def test_an_invalid_pattern_is_the_users_to_fix(tmp_path: Path) -> None:
     assert "regex parse error" in refused.value.message
 
 
+@pytest.mark.parametrize("order", [SEARCH_ORDER_WALK, SEARCH_ORDER_PRIORITY])
 async def test_closing_a_text_search_early_stops_ripgrep(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, order: int
 ) -> None:
     """A client that goes away leaves no ripgrep or descendant running."""
     pids = tmp_path / "pids"
@@ -625,7 +632,7 @@ async def test_closing_a_text_search_early_stops_ripgrep(
     root = tmp_path / "workspace"
     root.mkdir()
 
-    stream = search_text(root, SearchTextRequest(query="needle"))
+    stream = search_text(root, SearchTextRequest(query="needle", order=order))  # type: ignore[arg-type]
     first = await anext(stream)
     await stream.aclose()
 
@@ -801,3 +808,446 @@ async def test_a_walk_that_runs_out_of_budget_says_the_list_is_incomplete(
     response = await _fuzzy(tmp_path, "")
 
     assert response.index_incomplete
+
+
+def _priority_workspace(root: Path) -> Path:
+    """Matches in a focused file, its folder, a changed folder, and elsewhere."""
+    _repository(root)
+    files = {
+        "aaa/first.txt": "needle\n",
+        "focus/deep/open.txt": "needle\n",
+        "focus/deep/beside.txt": "needle\n",
+        "changed/edited.txt": "needle\nold\n",
+        "zzz/last.txt": "needle\n",
+    }
+    for path, text in files.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text(text)
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "files")
+    (root / "changed" / "edited.txt").write_text("needle\nnew\nmore\n")
+    return root
+
+
+def _paths_in_order(responses: list[SearchTextResponse]) -> list[str]:
+    return [m.path for response in responses for m in response.matches]
+
+
+@pytest.fixture
+def _patient_for_changes(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A loaded machine may take longer than a search usually waits for the change list.
+    monkeypatch.setattr(workspace_text_priority, "_CHANGES_WAIT_S", 10.0)
+
+
+@needs_rg
+@pytest.mark.usefixtures("_patient_for_changes")
+async def test_priority_order_searches_focus_then_its_folder_then_changes_then_the_rest(
+    tmp_path: Path,
+) -> None:
+    root = _priority_workspace(tmp_path / "repo")
+
+    responses = await _search_text(
+        root,
+        "needle",
+        order=SEARCH_ORDER_PRIORITY,
+        focused_paths=["focus/deep/open.txt", "missing.txt", "../outside.txt"],
+    )
+
+    paths = _paths_in_order(responses)
+    assert paths[:3] == ["focus/deep/open.txt", "focus/deep/beside.txt", "changed/edited.txt"]
+    # Each pass's matches are sent before the next pass runs.
+    assert [m.path for m in responses[0].matches] == ["focus/deep/open.txt"]
+    assert sorted(paths[3:]) == ["aaa/first.txt", "zzz/last.txt"]
+    assert len(paths) == len(set(paths))  # each file once
+    assert responses[-1].done and not responses[-1].truncated
+
+
+@needs_rg
+async def test_the_first_sixteen_focused_files_are_searched_first_in_the_order_given(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "many").mkdir()
+    for index in range(17):
+        (tmp_path / "many" / f"f{index:02}.txt").write_text("needle\n")
+    (tmp_path / "rest.txt").write_text("needle\n")
+    focused = [f"many/f{index:02}.txt" for index in reversed(range(17))]
+
+    responses = await _search_text(
+        tmp_path, "needle", order=SEARCH_ORDER_PRIORITY, focused_paths=focused
+    )
+
+    assert [m.path for m in responses[0].matches] == focused[:16]
+    # The seventeenth comes with its folder, then the rest of the workspace.
+    assert _paths_in_order(responses)[16:] == ["many/f00.txt", "rest.txt"]
+
+
+@needs_rg
+@pytest.mark.parametrize("order", [SEARCH_ORDER_UNSPECIFIED, SEARCH_ORDER_WALK])
+async def test_walk_order_ignores_the_priority_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, order: int
+) -> None:
+    root = _priority_workspace(tmp_path / "repo")
+
+    def unplanned(*_arguments: object, **_options: object) -> None:
+        raise AssertionError("a walk plans no priority passes")
+
+    monkeypatch.setattr(workspace_search, "priority_runs", unplanned)
+
+    walked = await _search_text(root, "needle", order=order, focused_paths=["zzz/last.txt"])
+
+    assert sorted(_paths_in_order(walked)) == [
+        "aaa/first.txt",
+        "changed/edited.txt",
+        "focus/deep/beside.txt",
+        "focus/deep/open.txt",
+        "zzz/last.txt",
+    ]
+
+
+@needs_rg
+async def test_priority_passes_share_one_result_cap(tmp_path: Path) -> None:
+    root = _priority_workspace(tmp_path / "repo")
+
+    capped = await _search_text(
+        root,
+        "needle",
+        order=SEARCH_ORDER_PRIORITY,
+        focused_paths=["focus/deep/open.txt"],
+        maximum_results=2,
+    )
+
+    assert _paths_in_order(capped) == ["focus/deep/open.txt", "focus/deep/beside.txt"]
+    assert capped[-1].truncated
+
+
+@needs_rg
+async def test_focused_files_a_walk_would_skip_are_not_searched_first(tmp_path: Path) -> None:
+    root = _priority_workspace(tmp_path / "repo")
+    (root / ".gitignore").write_text("build/\n")
+    (root / "build").mkdir()
+    (root / "build" / "out.txt").write_text("needle\n")
+    (root / "notes.md").write_text("needle\n")
+
+    ignored = await _search_text(
+        root, "needle", order=SEARCH_ORDER_PRIORITY, focused_paths=["build/out.txt"]
+    )
+    excluded = await _search_text(
+        root,
+        "needle",
+        order=SEARCH_ORDER_PRIORITY,
+        focused_paths=["focus/deep/open.txt"],
+        exclude_directories=["focus"],
+    )
+    globbed = await _search_text(
+        root, "needle", order=SEARCH_ORDER_PRIORITY, focused_paths=["notes.md"], exclude="*.md"
+    )
+    asked = await _search_text(
+        root,
+        "needle",
+        order=SEARCH_ORDER_PRIORITY,
+        focused_paths=["build/out.txt"],
+        include_git_ignored=True,
+    )
+
+    assert "build/out.txt" not in _paths_in_order(ignored)
+    assert not any(path.startswith("focus/") for path in _paths_in_order(excluded))
+    assert "notes.md" not in _paths_in_order(globbed)
+    assert _paths_in_order(asked)[0] == "build/out.txt"
+
+
+@needs_rg
+@pytest.mark.usefixtures("_patient_for_changes")
+async def test_an_ignored_folder_of_tracked_files_is_not_searched_early(tmp_path: Path) -> None:
+    root = _priority_workspace(tmp_path / "repo")
+    (root / ".gitignore").write_text("gen/\n")
+    (root / "gen").mkdir()
+    (root / "gen" / "kept.txt").write_text("needle\nold\n")
+    _git(root, "add", "-f", ".gitignore", "gen/kept.txt")
+    _git(root, "commit", "-q", "-m", "generated")
+    (root / "gen" / "kept.txt").write_text("needle\n" + "new\n" * 50)  # the heaviest change
+
+    responses = await _search_text(
+        root, "needle", order=SEARCH_ORDER_PRIORITY, focused_paths=["gen/kept.txt"]
+    )
+
+    # A walk never enters gen/, so neither does any earlier pass.
+    assert "gen/kept.txt" not in _paths_in_order(responses)
+    assert _paths_in_order(responses)[0] == "changed/edited.txt"
+
+
+@needs_rg
+async def test_focused_files_in_folders_the_walk_prunes_are_not_searched_first(
+    tmp_path: Path,
+) -> None:
+    root = _priority_workspace(tmp_path / "repo")
+    (root / ".ignore").write_text("build/\n")
+    for path in ("build/deep/hit.txt", "node_modules/pkg/index.js"):
+        (root / path).parent.mkdir(parents=True)
+        (root / path).write_text("needle\n")
+    focus = {"order": SEARCH_ORDER_PRIORITY, "focused_paths": ["build/deep/hit.txt"]}
+
+    ignored = await _search_text(root, "needle", **focus)
+    still_ignored = await _search_text(root, "needle", **focus, include_git_ignored=True)
+    excluded = await _search_text(
+        root,
+        "needle",
+        order=SEARCH_ORDER_PRIORITY,
+        focused_paths=["node_modules/pkg/index.js"],
+        exclude="node_modules",
+    )
+
+    # Ripgrep's own ignore files and the user's globs prune the folders above, as in the walk.
+    assert "build/deep/hit.txt" not in _paths_in_order(ignored)
+    assert "build/deep/hit.txt" not in _paths_in_order(still_ignored)
+    assert "node_modules/pkg/index.js" not in _paths_in_order(excluded)
+
+
+@needs_rg
+@pytest.mark.parametrize("content", [b"needle\n\0rest\n", b"\0\nneedle\n"], ids=["late", "early"])
+async def test_a_focused_binary_file_is_searched_as_the_walk_searches_it(
+    tmp_path: Path, content: bytes
+) -> None:
+    root = _priority_workspace(tmp_path / "repo")
+    (root / "focus" / "deep" / "image.bin").write_bytes(content)
+    focused = {"focused_paths": ["focus/deep/image.bin", "focus/deep/open.txt"]}
+
+    walked = await _search_text(root, "needle", **focused)
+    prioritized = await _search_text(root, "needle", order=SEARCH_ORDER_PRIORITY, **focused)
+
+    # A walk skips a file with a NUL byte, though ripgrep searches one it's given by name.
+    assert "focus/deep/image.bin" not in _paths_in_order(walked)
+    assert sorted(_paths_in_order(prioritized)) == sorted(_paths_in_order(walked))
+    assert _paths_in_order(prioritized)[0] == "focus/deep/open.txt"
+
+
+@needs_rg
+@pytest.mark.parametrize("failure", ["too-long", "refused"])
+async def test_a_reach_check_that_cant_run_leaves_the_files_to_the_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    root = _priority_workspace(tmp_path / "repo")
+    launch = workspace_text_priority.start_owned_process
+    checks: list[list[str]] = []
+
+    async def start(arguments: list[str], **options: object) -> object:
+        if "--files" in arguments:
+            checks.append(arguments)
+            if failure == "refused":
+                raise OSError(errno.E2BIG, "Argument list too long")
+        return await launch(arguments, **options)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(workspace_text_priority, "start_owned_process", start)
+    if failure == "too-long":
+        # A deep folder's globs past the bound aren't passed to ripgrep at all.
+        monkeypatch.setattr(workspace_text_priority, "_MAX_REACH_GLOB_BYTES", 10)
+
+    responses = await _search_text(
+        root, "needle", order=SEARCH_ORDER_PRIORITY, focused_paths=["focus/deep/open.txt"]
+    )
+
+    assert sorted(_paths_in_order(responses)) == [
+        "aaa/first.txt",
+        "changed/edited.txt",
+        "focus/deep/beside.txt",
+        "focus/deep/open.txt",
+        "zzz/last.txt",
+    ]
+    assert responses[-1].done and not responses[-1].truncated
+    assert bool(checks) is (failure == "refused")
+
+
+@needs_rg
+async def test_a_file_name_holding_a_newline_never_lets_an_ignored_file_in_first(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".ignore").write_text("hidden.txt\n")
+    (tmp_path / "hidden.txt").write_text("needle\n")
+    (tmp_path / "visible\nhidden.txt").write_text("needle\n")
+
+    responses = await _search_text(
+        tmp_path, "needle", order=SEARCH_ORDER_PRIORITY, focused_paths=["hidden.txt"]
+    )
+
+    assert _paths_in_order(responses) == ["visible\nhidden.txt"]
+
+
+@needs_rg
+async def test_a_name_cut_off_by_the_listing_cap_never_lets_an_ignored_file_in_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / ".ignore").write_text("sub/notes.txt\n")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "notes.txt").write_text("needle\n")
+    (tmp_path / "sub" / "notes.txt-copy").write_text("x\n")
+    # The reach check's listing is cut off at the cap inside "./sub/notes.txt-copy".
+    real = shutil.which("rg")
+    cut = tmp_path / "bin" / "rg"
+    cut.parent.mkdir()
+    cut.write_text(
+        f"#!{sys.executable}\nimport os, sys, time\n"
+        'if "--files" in sys.argv:\n'
+        '    sys.stdout.write("./sub/notes.txt"); sys.stdout.flush(); time.sleep(60)\n'
+        f"os.execv({real!r}, [{real!r}, *sys.argv[1:]])\n"
+    )
+    cut.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{cut.parent}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(workspace_text_priority, "_LIST_FILES_BYTES", len("./sub/notes.txt"))
+
+    responses = await _search_text(
+        tmp_path, "needle", order=SEARCH_ORDER_PRIORITY, focused_paths=["sub/notes.txt"]
+    )
+
+    assert _paths_in_order(responses) == []
+
+
+@needs_rg
+async def test_ignored_focused_files_the_search_asks_for_are_searched_first(
+    tmp_path: Path,
+) -> None:
+    root = _priority_workspace(tmp_path / "repo")
+    (root / ".gitignore").write_text("*.log\nbuild/\n")
+    (root / "build").mkdir()
+    for name in ("a", "b", "c", "d", "z"):
+        (root / f"{name}.log").write_text("needle\n")
+        (root / "build" / f"{name}.txt").write_text("needle\n")
+
+    included = await _search_text(
+        root, "needle", order=SEARCH_ORDER_PRIORITY, focused_paths=["z.log"], include="*.log"
+    )
+    scoped = await _search_text(
+        root,
+        "needle",
+        order=SEARCH_ORDER_PRIORITY,
+        focused_paths=["build/z.txt"],
+        include_directories=["build"],
+    )
+
+    # An include glob and a scope inside an ignored folder both make the walk search them.
+    assert _paths_in_order(included)[0] == "z.log"
+    assert _paths_in_order(scoped)[0] == "build/z.txt"
+
+
+@needs_rg
+async def test_a_slow_change_list_is_skipped_then_used_by_the_next_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _priority_workspace(tmp_path / "repo")
+    released = asyncio.Event()
+    listing = workspace_text_priority._changed_directories
+
+    listings: list[object] = []
+
+    async def slow(*arguments: object) -> object:
+        listings.append(arguments)
+        await released.wait()
+        return await listing(*arguments)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(workspace_text_priority, "_changed_directories", slow)
+    monkeypatch.setattr(workspace_text_priority, "_CHANGES_WAIT_S", 0.01)
+    focus = {"order": SEARCH_ORDER_PRIORITY, "focused_paths": ["focus/deep/open.txt"]}
+
+    first = await _search_text(root, "needle", **focus)
+    released.set()
+    for _, task in list(workspace_text_priority._changes.values()):
+        await task
+    second = await _search_text(root, "needle", **focus)
+
+    assert len(_paths_in_order(first)) == 5  # complete without waiting for the changes
+    assert _paths_in_order(second)[2] == "changed/edited.txt"
+    assert len(listings) == 1  # the second search used the first one's list
+
+
+@needs_rg
+async def test_outside_git_priority_order_skips_the_changed_folders(tmp_path: Path) -> None:
+    (tmp_path / "b").mkdir()
+    (tmp_path / "b" / "focused.txt").write_text("needle\n")
+    (tmp_path / "a.txt").write_text("needle\n")
+
+    responses = await _search_text(
+        tmp_path, "needle", order=SEARCH_ORDER_PRIORITY, focused_paths=["b/focused.txt"]
+    )
+
+    assert _paths_in_order(responses) == ["b/focused.txt", "a.txt"]
+
+
+@needs_rg
+async def test_a_later_pass_out_of_time_ends_the_search_as_truncated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The focused file's pass runs at full speed; the whole-scope pass never finishes.
+    real = shutil.which("rg")
+    slow = tmp_path / "bin" / "rg"
+    slow.parent.mkdir()
+    slow.write_text(
+        f"#!{sys.executable}\nimport os, sys, time\n"
+        'if "--json" in sys.argv and sys.argv[-1] == ".":\n    time.sleep(60)\n'
+        f"os.execv({real!r}, [{real!r}, *sys.argv[1:]])\n"
+    )
+    slow.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{slow.parent}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(workspace_search, "SCRIPT_TIMEOUT_S", 4.0)
+    monkeypatch.setattr(workspace_search, "RIPGREP_TIME_LIMIT_S", 2.0)
+    workspace = tmp_path / "workspace"
+    (workspace / "rest").mkdir(parents=True)
+    (workspace / "focused.txt").write_text("needle\n")
+    (workspace / "rest" / "other.txt").write_text("needle\n")
+
+    responses = await _search_text(
+        workspace, "needle", order=SEARCH_ORDER_PRIORITY, focused_paths=["focused.txt"]
+    )
+
+    assert _paths_in_order(responses) == ["focused.txt"]
+    assert responses[-1].done and responses[-1].truncated
+
+
+@needs_rg
+@pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: 0)() == 0,
+    reason="root, or a platform without these permissions, reads the file anyway",
+)
+async def test_a_file_an_early_pass_cant_read_doesnt_stop_the_later_passes(
+    tmp_path: Path,
+) -> None:
+    root = _priority_workspace(tmp_path / "repo")
+    locked = root / "focus" / "deep" / "locked.txt"
+    locked.write_text("needle\n")
+    locked.chmod(0)
+
+    try:
+        responses = await _search_text(
+            root, "needle", order=SEARCH_ORDER_PRIORITY, focused_paths=["focus/deep/open.txt"]
+        )
+    finally:
+        locked.chmod(0o644)
+
+    assert {"aaa/first.txt", "zzz/last.txt"} <= set(_paths_in_order(responses))
+    assert responses[-1].done and responses[-1].truncated
+    assert "could not be read" in responses[-1].warning
+
+
+@needs_rg
+async def test_waiting_for_the_change_list_stops_at_the_end_of_the_search_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _priority_workspace(tmp_path / "repo")
+    released = asyncio.Event()
+
+    async def never_ready(*_arguments: object) -> list[str]:
+        await released.wait()
+        return []
+
+    monkeypatch.setattr(workspace_text_priority, "_changed_directories", never_ready)
+    monkeypatch.setattr(workspace_text_priority, "_CHANGES_WAIT_S", 60.0)
+    monkeypatch.setattr(workspace_search, "RIPGREP_TIME_LIMIT_S", 1.0)
+
+    try:
+        async with asyncio.timeout(10):
+            responses = await _search_text(
+                root, "needle", order=SEARCH_ORDER_PRIORITY, focused_paths=["focus/deep/open.txt"]
+            )
+    finally:
+        released.set()
+
+    # The focused file and its folder were searched before the time ran out.
+    assert _paths_in_order(responses) == ["focus/deep/open.txt", "focus/deep/beside.txt"]
+    assert responses[-1].done and responses[-1].truncated

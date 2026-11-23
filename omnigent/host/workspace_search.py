@@ -21,7 +21,8 @@ import os
 import re
 import stat
 import sys
-from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
+import time
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     FILE_SEARCH_MODE_FUZZY,
     FILE_SEARCH_MODE_SUBSTRING,
     FILE_SEARCH_MODE_UNSPECIFIED,
+    SEARCH_ORDER_PRIORITY,
     Entry,
     FileSearchResult,
     SearchFilesRequest,
@@ -53,6 +55,7 @@ from omnigent.host.workspace_git.runner import (
     start_owned_process,
     trusted_search_path,
 )
+from omnigent.host.workspace_text_priority import SearchRun, beneath, priority_runs
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
@@ -69,9 +72,12 @@ from omnigent.workspace_content_search import (
     MAX_MATCHES,
     MAX_QUERY_LENGTH,
     MAX_SCRIPT_OUTPUT,
+    RIPGREP_TIME_LIMIT_S,
     SCRIPT_TIMEOUT_S,
     ContentSearchError,
+    content_search_globs,
     content_search_script,
+    literal_glob,
     parse_record,
 )
 from omnigent.workspace_file_search import walk_search
@@ -84,18 +90,10 @@ _MAX_FILE_RESULTS = 10_000
 _FILE_SEARCH_DEADLINE_S = 20.0
 # Matching lines per SearchText message.
 _TEXT_MATCH_BATCH = 100
-# Backslash-escaped in an exclude, so ripgrep matches the directory's name literally;
-# a space too, since ripgrep reads globs as ignore lines, which drop a trailing one.
-_GLOB_METACHARACTERS = frozenset("\\*?[]{}! ")
 # Ranked paths beyond the limit, standing in for ones deleted since Git listed them.
 _SPARE_RANKED = 32
 # Fuzzy mode's file lists, reused while Git's listing is unchanged.
 _corpora = CorpusCache()
-
-
-def _beneath(path: str, directory: str) -> bool:
-    """Whether ``path`` is ``directory`` or inside it, by whole components."""
-    return not directory or path == directory or path.startswith(directory + "/")
 
 
 def _validated(path: str, field: str) -> str:
@@ -109,7 +107,7 @@ def _outermost(directories: Sequence[str]) -> tuple[str, ...]:
     """Drop directories inside another of ``directories``, and duplicates."""
     kept: list[str] = []
     for directory in sorted(set(directories), key=lambda d: (d.count("/"), d)):
-        if not any(_beneath(directory, outer) for outer in kept):
+        if not any(beneath(directory, outer) for outer in kept):
             kept.append(directory)
     return tuple(sorted(kept))
 
@@ -164,16 +162,16 @@ class DirectoryScope:
 
     def allows(self, path: str) -> bool:
         """Whether a result at ``path`` is in scope."""
-        if any(_beneath(path, excluded) for excluded in self.excludes):
+        if any(beneath(path, excluded) for excluded in self.excludes):
             return False
-        return not self.includes or any(_beneath(path, included) for included in self.includes)
+        return not self.includes or any(beneath(path, included) for included in self.includes)
 
     def may_enter(self, directory: str) -> bool:
         """Whether a walk must enter ``directory`` to reach in-scope results."""
-        if any(_beneath(directory, excluded) for excluded in self.excludes):
+        if any(beneath(directory, excluded) for excluded in self.excludes):
             return False
         return not self.includes or any(
-            _beneath(directory, included) or _beneath(included, directory)
+            beneath(directory, included) or beneath(included, directory)
             for included in self.includes
         )
 
@@ -480,10 +478,6 @@ async def _search_fuzzy(search: _FuzzySearch) -> SearchFilesResponse:
     )
 
 
-def _literal_glob(path: str) -> str:
-    return "".join(f"\\{c}" if c in _GLOB_METACHARACTERS else c for c in path)
-
-
 def text_search_arguments(
     root: Path, request: SearchTextRequest
 ) -> tuple[list[str], list[str]] | None:
@@ -518,15 +512,19 @@ def text_search_arguments(
     if request.include_git_ignored:
         options.append("--no-ignore-vcs")
     for directory in excluded:
-        literal = _literal_glob(directory)
+        literal = literal_glob(directory)
         options += [f"--glob=!/{literal}", f"--glob=!/{literal}/**"]
     return options, [f"./{d}" for d in present] or ["."]
 
 
-async def _content_search_records(root: Path, script: str) -> AsyncGenerator[dict[str, object]]:
+async def _content_search_records(
+    root: Path, script: str, timeout: float = SCRIPT_TIMEOUT_S
+) -> AsyncGenerator[dict[str, object]]:
     """Run the content search script in ``root``, yielding its records.
 
     Closing the iterator early kills and reaps the script and ripgrep.
+
+    :param timeout: Seconds the reads may take in all.
 
     :raises ContentSearchError: For ripgrep's own refusals, such as a bad regex.
     :raises ConnectError: UNAVAILABLE when the search couldn't run or finish.
@@ -543,7 +541,7 @@ async def _content_search_records(root: Path, script: str) -> AsyncGenerator[dic
     received = 0
     loop = asyncio.get_running_loop()
     # Only the reads count: a client slow to take the matches doesn't end the search.
-    remaining = float(SCRIPT_TIMEOUT_S)
+    remaining = float(timeout)
     try:
         while True:
             started = loop.time()
@@ -570,44 +568,139 @@ async def _content_search_records(root: Path, script: str) -> AsyncGenerator[dic
         await process.close()
 
 
+def _skip_globs(run: SearchRun) -> list[str]:
+    """Anchored, escaped excludes for what earlier runs of a search searched."""
+    files = [f"--glob=!/{literal_glob(path)}" for path in run.skip_files]
+    folders = [
+        glob
+        for directory in run.skip_directories
+        for glob in (
+            f"--glob=!/{literal_glob(directory)}",
+            f"--glob=!/{literal_glob(directory)}/**",
+        )
+    ]
+    return [*files, *folders]
+
+
+class _SearchBudget:
+    """Seconds a search spends waiting for its passes and their matches, out of ``seconds``.
+
+    The time a client takes to read the matches doesn't count.
+    """
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+        self._used = 0.0
+        self._since: float | None = None
+
+    async def timed[T](self, waiting: Awaitable[T]) -> T:
+        self._since = time.monotonic()
+        try:
+            return await waiting
+        finally:
+            self._used += time.monotonic() - self._since
+            self._since = None
+
+    def left(self) -> float:
+        """Seconds left, counting a wait still under way."""
+        waiting = time.monotonic() - self._since if self._since is not None else 0.0
+        return self.seconds - self._used - waiting
+
+
+async def _walk_run(start_paths: list[str]) -> AsyncGenerator[SearchRun]:
+    yield SearchRun(start_paths, [], [])
+
+
 async def search_text(
     root: Path, request: SearchTextRequest
 ) -> AsyncGenerator[SearchTextResponse]:
     """Stream a SearchText's matches in batches, then a final ``done`` message.
 
-    ``order``, ``focused_paths`` and ``changed_against`` are ignored, as this
-    host doesn't offer the ``text_search_priority`` feature.
+    In priority order (feature ``text_search_priority``), focused files come
+    first, then their folders, then the folders with the most changes against
+    ``changed_against``, then the rest of the scope. Each file is searched once,
+    and every pass shares the result cap and the time limit.
     """
     arguments = text_search_arguments(root, request)
     if arguments is None:
         yield SearchTextResponse(done=True)
         return
     options, start_paths = arguments
-    try:
-        script = content_search_script(
+    limit = min(request.maximum_results or MAX_MATCHES, MAX_MATCHES)
+
+    def script(run: SearchRun, remaining: int, time_limit: float = RIPGREP_TIME_LIMIT_S) -> str:
+        return content_search_script(
             request.query,
             case_sensitive=request.case_sensitive,
             regex=request.regular_expression,
             include=request.include,
             exclude=request.exclude,
-            limit=min(request.maximum_results or MAX_MATCHES, MAX_MATCHES),
-            extra_args=options,
-            search_paths=start_paths,
+            limit=remaining,
+            extra_args=[*options, *_skip_globs(run), *(["--threads=1"] if run.in_order else [])],
+            search_paths=run.start_paths,
+            time_limit=time_limit,
         )
+
+    budget = _SearchBudget(RIPGREP_TIME_LIMIT_S)
+    try:
+        # Invalid queries and filters are refused before anything runs.
+        script(SearchRun(start_paths, [], []), limit)
+        if request.order == SEARCH_ORDER_PRIORITY:
+            scope = DirectoryScope.parse(
+                root, request.include_directories, request.exclude_directories
+            )
+            walk_options = [
+                *content_search_globs(request.include, request.exclude),
+                "--glob=!.git",
+                *options,
+            ]
+            runs = priority_runs(
+                root,
+                request,
+                start_paths=start_paths,
+                in_scope=scope.allows,
+                walk_options=walk_options,
+                time_left=budget.left,
+            )
+        else:
+            runs = _walk_run(start_paths)
         batch: list[TextSearchMatch] = []
-        async with contextlib.aclosing(_content_search_records(root, script)) as records:
-            async for record in records:
-                if "match" not in record:
-                    yield SearchTextResponse(
-                        matches=batch,
-                        done=True,
-                        truncated=bool(record["truncated"]),
-                        warning=str(record["warning"] or ""),
-                    )
-                    return
-                batch.append(TextSearchMatch(**record["match"]))  # type: ignore[arg-type]
-                if len(batch) == _TEXT_MATCH_BATCH:
+        found = 0
+        truncated = False
+        warnings: list[str] = []
+        async with contextlib.aclosing(runs) as passes:
+            while (run := await budget.timed(anext(passes, None))) is not None:
+                left = budget.left()
+                if found == limit or left <= 0:
+                    truncated = True  # later passes may match more
+                    break
+                # Each script stops its ripgrep with time left to report the results cut short.
+                records = _content_search_records(
+                    root,
+                    script(run, limit - found, left),
+                    SCRIPT_TIMEOUT_S - RIPGREP_TIME_LIMIT_S + left,
+                )
+                async with contextlib.aclosing(records) as stream:
+                    while (record := await budget.timed(anext(stream, None))) is not None:
+                        if "match" not in record:
+                            # Files a pass couldn't read leave its results incomplete, but
+                            # later passes still run while results and time are left.
+                            truncated = truncated or bool(record["truncated"])
+                            note = str(record["warning"] or "")
+                            if note and note not in warnings:
+                                warnings.append(note)
+                            break
+                        batch.append(TextSearchMatch(**record["match"]))  # type: ignore[arg-type]
+                        found += 1
+                        if len(batch) == _TEXT_MATCH_BATCH:
+                            yield SearchTextResponse(matches=batch)
+                            batch = []
+                if batch and request.order == SEARCH_ORDER_PRIORITY:
+                    # A pass's matches go out before the next pass starts.
                     yield SearchTextResponse(matches=batch)
                     batch = []
+        yield SearchTextResponse(
+            matches=batch, done=True, truncated=truncated, warning=" ".join(warnings)
+        )
     except ContentSearchError as exc:
         raise ConnectError(Code.INVALID_ARGUMENT, exc.message) from exc
