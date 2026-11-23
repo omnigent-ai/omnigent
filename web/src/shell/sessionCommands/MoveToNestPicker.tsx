@@ -11,30 +11,11 @@ import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 
-import { conversationDisplayLabel, isOwnedByViewer } from "../sidebarNav";
+import { nestDestinations, nestLabel } from "../nestDestinations";
 
 /** Moving the session under `destination`, or out of its nest when it's `null`. */
 interface NestChoice {
   destination: Conversation | null;
-}
-
-function nestLabel(row: Conversation): string {
-  return row.family?.representative_title ?? conversationDisplayLabel(row);
-}
-
-/** One row per nest the viewer owns, other than the session's own. */
-function nestDestinations(
-  candidates: readonly Conversation[],
-  conversation: Conversation,
-  viewerId: string | null,
-): Conversation[] {
-  const byFamily = new Map<string, Conversation>();
-  for (const row of candidates) {
-    if (!row.family || row.archived || row.id === conversation.id) continue;
-    if (row.family.id === conversation.family?.id || !isOwnedByViewer(row, viewerId)) continue;
-    if (!byFamily.has(row.family.id)) byFamily.set(row.family.id, row);
-  }
-  return [...byFamily.values()];
 }
 
 export function MoveToNestPicker({
@@ -63,32 +44,32 @@ export function MoveToNestPicker({
   const searchHits =
     debouncedQuery === trimmed ? (search.data?.pages.flatMap((page) => page.data) ?? []) : [];
   const destinations = canJoin
-    ? nestDestinations(
-        [...loadedPages.flatMap((page) => page.data), ...searchHits],
+    ? nestDestinations({
         conversation,
+        loaded: loadedPages.flatMap((page) => page.data),
+        searchHits,
+        search: query,
         viewerId,
-      )
+      })
     : [];
-  const items: QuickPickItem<NestChoice>[] = [
-    ...(conversation.family
-      ? [
-          {
-            id: "remove",
-            label: "Remove from nest",
-            icon: <MinusIcon aria-hidden className="size-4 text-muted-foreground" />,
-            rememberInHistory: false,
-            value: { destination: null },
-          },
-        ]
-      : []),
-    ...destinations.map((row) => ({
-      id: `nest:${row.family!.id}`,
-      label: nestLabel(row),
-      icon: <GitBranchIcon aria-hidden className="size-4 text-muted-foreground" />,
-      rememberInHistory: false,
-      value: { destination: row },
-    })),
-  ];
+  const removal: QuickPickItem<NestChoice>[] = conversation.family
+    ? [
+        {
+          id: "remove",
+          label: "Remove from nest",
+          icon: <MinusIcon aria-hidden className="size-4 text-muted-foreground" />,
+          rememberInHistory: false,
+          value: { destination: null },
+        },
+      ]
+    : [];
+  const nests: QuickPickItem<NestChoice>[] = destinations.map((row) => ({
+    id: `nest:${row.family!.id}`,
+    label: nestLabel(row),
+    icon: <GitBranchIcon aria-hidden className="size-4 text-muted-foreground" />,
+    rememberInHistory: false,
+    value: { destination: row },
+  }));
   return (
     <QuickPickDialog<NestChoice>
       open
@@ -101,7 +82,11 @@ export function MoveToNestPicker({
       acceptLabel="Move"
       query={query}
       onQueryChange={setQuery}
-      segments={[{ sourceId: "nests", ranking: "client", items }]}
+      segments={[
+        { sourceId: "remove", ranking: "client", items: removal },
+        // Already matched to the query, including search hits on a member's title.
+        { sourceId: "nests", ranking: "provider", items: nests },
+      ]}
       onAccept={({ value }) => {
         onPick(value.destination);
         return undefined;
