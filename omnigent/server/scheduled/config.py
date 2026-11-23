@@ -11,7 +11,8 @@ class ScheduledTaskSchedulerConfig(BaseModel):
     model_config = ConfigDict(strict=True, frozen=True, extra="forbid", allow_inf_nan=False)
 
     startup_retry_seconds: float = Field(default=30, gt=0)
-    poll_seconds: float = Field(default=30, gt=0)
+    # Short enough for a timer of a few minutes to fire close to its time.
+    poll_seconds: float = Field(default=15, gt=0)
     renewal_seconds: float = Field(default=30, gt=0)
     lease_seconds: int = Field(default=120, gt=0)
     batch_size: int = Field(default=100, gt=0)

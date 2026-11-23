@@ -277,8 +277,8 @@ React app under `web/src/` (note: renamed from `ap-web/` upstream). TUI/REPL und
   autosave, download. Changed-files badge.
 - **Terminals** — `shell/TerminalsPanel.tsx` xterm.js → tmux; multiple per session; terminal-first sessions render
   inline (`InlineTerminalsSection.tsx`). [→ 2.C]
-- **Subagents rail** — `shell/SubagentsPanel.tsx`, `hooks/useChildSessions.ts`; tree by depth; click to navigate;
-  manual create via `AddAgentDialog.tsx`. [→ 2.F]
+- **Subagents rail** — `shell/SubagentsPanel.tsx`, `hooks/useChildSessions.ts`; tree by depth; click to navigate.
+  [→ 2.F]
 - **Switch agent / model / harness** — `SwitchAgentDialog.tsx`; `/model` & `/effort` slash commands
   (`SlashCommandMenu.tsx`); harness selector in NewChatDialog (localStorage per agent, `lib/modePreferences.ts`).
 - **Settings** — theme, keyboard shortcuts, account/password (`accounts_enabled`), archived sessions.

@@ -67,6 +67,7 @@ from omnigent.spec.types import (
     ToolsConfig,
 )
 from omnigent.spec.validator import _SKILL_NAME_MAX_LEN, _SKILL_NAME_PATTERN
+from omnigent.util.env_credentials import _ENV_REF_RE, env_names_with_omnigent_prefix
 
 _log = logging.getLogger(__name__)
 
@@ -350,6 +351,11 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         own_tool_names=_own_tool_names(root, local_tools, mcp_servers),
         agent_name=raw.get("name"),
     )
+    tool_groups = resolve_file_tool_group(
+        tool_groups,
+        raw.get("tool_groups"),
+        builtins=tools_config.builtins,
+    )
 
     return AgentSpec(
         spec_version=spec_version,
@@ -534,17 +540,18 @@ def parse_tool_groups(raw: object, *, spawn: bool) -> ToolGroupsConfig:
     Parse the top-level ``tool_groups:`` block into a
     :class:`ToolGroupsConfig`.
 
-    Strict on purpose: the block exists to *remove* tools, so a typo'd
-    group name or a non-boolean value fails the load rather than
-    silently leaving every group registered. Shared by the native parser
-    and the omnigent-dialect adapter so both loaders reject the same input.
+    Strict on purpose: the block mostly exists to *remove* tools, so a
+    typo'd group name or a non-boolean value fails the load rather than
+    silently leaving every group registered (or ``files`` off). Shared by
+    the native parser and the omnigent-dialect adapter so both loaders
+    reject the same input.
 
     :param raw: The raw ``tool_groups:`` value, or ``None`` if absent.
-        Example: ``{"browser": False, "scheduled_tasks": False}``.
+        Example: ``{"browser": False, "files": True}``.
     :param spawn: The spec's top-level ``spawn:`` flag, needed to reject
         disabling agent discovery while ``sys_session_create`` is granted.
-    :returns: A populated :class:`ToolGroupsConfig`; every group on
-        when *raw* is ``None``.
+    :returns: A populated :class:`ToolGroupsConfig`; every group but
+        ``files`` on when *raw* is ``None``.
     :raises OmnigentError: If *raw* is not a mapping, names an unknown
         group, maps a group to a non-boolean, or disables
         ``agent_discovery`` while a tool that needs it stays enabled.
@@ -636,6 +643,44 @@ def resolve_memory_tool_group(
     if hindsight or clashes:
         return replace(tool_groups, memory=False)
     return tool_groups
+
+
+_REMOVED_FILE_TOOLS = frozenset({"upload_file", "list_files", "download_file"})
+
+
+def resolve_file_tool_group(
+    tool_groups: ToolGroupsConfig,
+    raw_tool_groups: object,
+    *,
+    builtins: Iterable[BuiltinToolConfig],
+) -> ToolGroupsConfig:
+    """
+    Keep the file tools off for an agent that still declares their removed names.
+
+    ``upload_file``, ``list_files`` and ``download_file`` became the opt-in
+    ``sys_files_upload``, ``sys_files_list`` and ``sys_files_download``. A policy
+    written for an old name does not match the new one, so an agent that still
+    lists an old name cannot turn the file tools on until those entries are
+    removed.
+
+    :param tool_groups: The parsed groups.
+    :param raw_tool_groups: The raw ``tool_groups:`` value, to tell an explicit
+        ``files: true`` from the default.
+    :param builtins: The spec's ``tools.builtins`` entries.
+    :returns: *tool_groups*, with ``files`` off when a removed name is declared.
+    :raises OmnigentError: If ``files: true`` is set alongside a removed name.
+    """
+    removed = sorted({b.name for b in builtins} & _REMOVED_FILE_TOOLS)
+    if not removed:
+        return tool_groups
+    if isinstance(raw_tool_groups, dict) and raw_tool_groups.get("files") is True:
+        raise OmnigentError(
+            f"tool_groups.files: true conflicts with the removed {', '.join(removed)} "
+            "builtins: remove them from tools.builtins, and rename any policy selector "
+            "that names them to the sys_ tool.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return replace(tool_groups, files=False)
 
 
 def _reject_orphaned_agent_id_tools(groups: ToolGroupsConfig, *, spawn: bool) -> None:
@@ -904,6 +949,19 @@ def _parse_executor(
     )
 
 
+def _api_key_source_env_names(raw_key: str) -> tuple[str, ...]:
+    """Retain credential references before expanding a legacy API key."""
+    return tuple(
+        sorted(
+            {
+                name
+                for match in _ENV_REF_RE.finditer(raw_key)
+                for name in env_names_with_omnigent_prefix(match.group(1) or match.group(2))
+            }
+        )
+    )
+
+
 def _parse_executor_auth(
     raw: dict[str, object],
     *,
@@ -951,6 +1009,20 @@ def _parse_executor_auth(
                 "executor.auth.api_key is required when type is 'api_key'",
                 code=ErrorCode.INVALID_INPUT,
             )
+        source_env_names = set(_api_key_source_env_names(raw_key))
+        serialized_names = raw_auth.get("source_env_names", ())
+        if not isinstance(serialized_names, (list, tuple)):
+            raise OmnigentError(
+                "executor.auth.source_env_names must be a list of environment variable names",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        for name in serialized_names:
+            if not isinstance(name, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+                raise OmnigentError(
+                    "executor.auth.source_env_names must contain valid environment variable names",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            source_env_names.update(env_names_with_omnigent_prefix(name))
         api_key = expand_env_vars({"api_key": raw_key})["api_key"] if expand_env else raw_key
         raw_base_url = raw_auth.get("base_url")
         base_url: str | None = None
@@ -961,7 +1033,9 @@ def _parse_executor_auth(
                 if expand_env
                 else raw_base_url_str
             )
-        return ApiKeyAuth(api_key=api_key, base_url=base_url)
+        return ApiKeyAuth(
+            api_key=api_key, base_url=base_url, source_env_names=tuple(sorted(source_env_names))
+        )
     if auth_type == "databricks":
         profile_val = str(raw_auth.get("profile") or "")
         if not profile_val:

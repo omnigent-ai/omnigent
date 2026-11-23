@@ -109,7 +109,11 @@ export function compareSessionRows(
   return b[sortBy] - a[sortBy] || b.id.localeCompare(a.id);
 }
 
-/** Only the merged prefix above both unfinished scopes' tails is complete. */
+/**
+ * Only the merged prefix above both unfinished scopes' tails is complete, so a
+ * list mixing both scopes shows `rows`. `loaded` keeps every loaded row, for
+ * layouts that list each scope in its own section.
+ */
 export function mergeScopeRows(
   mine: Conversation[],
   shared: Conversation[],
@@ -120,7 +124,7 @@ export function mergeScopeRows(
   sortBy: SessionSortBy = "updated_at",
   mineBoundary?: ScopeBoundary,
   sharedBoundary?: ScopeBoundary,
-): { rows: Conversation[]; watermark: ScopeBoundary | undefined } {
+): { rows: Conversation[]; loaded: Conversation[]; watermark: ScopeBoundary | undefined } {
   const compare = (a: ScopeBoundary, b: ScopeBoundary) => compareSessionRows(a, b, sortBy);
   // Prefer the cursor as fetched: a pushed bump can lift the live cursor row,
   // and a watermark taken from it would hide every row below.
@@ -135,17 +139,18 @@ export function mergeScopeRows(
     .filter((row): row is ScopeBoundary => row !== undefined)
     .sort(compare);
   const watermark = tails[0];
-  const rows = dedupeSessionRows([...mine, ...shared]).sort(compare);
+  const loaded = dedupeSessionRows([...mine, ...shared]).sort(compare);
   const visibleFamilies = new Set(
-    rows.filter((row) => !watermark || compare(row, watermark) <= 0).map((row) => row.family?.id),
+    loaded.filter((row) => !watermark || compare(row, watermark) <= 0).map((row) => row.family?.id),
   );
   return {
     rows: watermark
-      ? rows.filter(
+      ? loaded.filter(
           (row) =>
             compare(row, watermark) <= 0 || (row.family && visibleFamilies.has(row.family.id)),
         )
-      : rows,
+      : loaded,
+    loaded,
     watermark,
   };
 }

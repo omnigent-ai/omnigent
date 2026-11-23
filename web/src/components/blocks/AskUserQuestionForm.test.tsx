@@ -3,7 +3,7 @@
 // is keyboardActive, and never while a text field, composer menu, dialog, or other
 // focused control owns them.
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { type ReactNode, useState } from "react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -87,6 +87,7 @@ function composerCard({
     >
       <textarea
         aria-label="Message the agent"
+        data-composer-input=""
         defaultValue={text}
         data-has-draft={hasDraft ? "true" : undefined}
       />
@@ -576,6 +577,22 @@ describe("AskUserQuestionForm — keyboard activity", () => {
     expect(document.activeElement).toBe(screen.getByTestId("ask-user-question-section"));
   });
 
+  it("arrows through the custom radio without moving focus into its input", async () => {
+    const user = userEvent.setup();
+    renderForm([framework]);
+    await user.click(screen.getByLabelText("Vue"));
+    await user.keyboard("{ArrowDown}");
+    const toggle = screen.getByTestId("ask-user-question-custom-toggle");
+    expect(toggle).toBeChecked();
+    expect(toggle).toHaveFocus();
+    // Held down, so no keyup follows, as when the window loses focus mid-press.
+    await user.keyboard("{ArrowDown>}");
+    expect(screen.getByLabelText("React")).toBeChecked();
+    expect(screen.getByLabelText("React")).toHaveFocus();
+    await user.click(toggle);
+    expect(screen.getByTestId("ask-user-question-custom-input")).toHaveFocus();
+  });
+
   it("ignores keys pressed outside a form that is not keyboard-active", () => {
     const { onReject } = renderForm([framework, snacks], { keyboardActive: false });
     pressOnPage({ key: "Enter" });
@@ -655,6 +672,40 @@ describe("AskUserQuestionForm — keyboard activity", () => {
     );
     expect(within(inboxCard!).getByLabelText("Vue")).not.toBeChecked();
     expect(within(chatCard!).getByLabelText("Vue")).toBeChecked();
+  });
+});
+
+describe("AskUserQuestionForm — disabled Submit", () => {
+  it("names the unanswered question that keeps Submit disabled", async () => {
+    renderForm([{ ...snacks, header: "Snacks" }, framework]);
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    expect(screen.getByRole("button", { name: "Submit" })).toBeDisabled();
+    act(() => screen.getByRole("group", { name: "Submit" }).focus());
+    await waitFor(() =>
+      expect(screen.getByRole("tooltip")).toHaveTextContent("Answer question 1 (Snacks) to submit"),
+    );
+
+    fireEvent.click(screen.getByTestId("ask-user-question-prev"));
+    fireEvent.click(screen.getByLabelText("Popcorn"));
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    expect(screen.getByRole("button", { name: "Submit" })).toBeEnabled();
+    expect(screen.queryByRole("group", { name: "Submit" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+  });
+
+  it("closes the reason on Escape before Escape cancels the questions", async () => {
+    const user = userEvent.setup();
+    const { onReject } = renderForm([snacks, framework]);
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    act(() => screen.getByRole("group", { name: "Submit" }).focus());
+    await waitFor(() => expect(screen.getByRole("tooltip")).toBeVisible());
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+    expect(onReject).not.toHaveBeenCalled();
+
+    await user.keyboard("{Escape}");
+    expect(onReject).toHaveBeenCalledTimes(1);
   });
 });
 

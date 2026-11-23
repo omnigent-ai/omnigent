@@ -12,6 +12,7 @@ import {
   getSelectionOffsets,
   indexToLine,
   getModelFormat,
+  hasNoTextDiff,
   isBinaryPath,
   isImageFile,
   isModelFile,
@@ -1052,6 +1053,11 @@ describe("resolveFileViewMode", () => {
     ],
     [{ preference: "editor", lang: "html" }, "preview"],
     [{ preference: "source", lang: "html" }, "source"],
+    [{ preference: "preview", lang: "csv" }, "preview"],
+    [
+      { preference: "preview", lang: "csv", deepLinkedComment: true, previewHidesComments: true },
+      "source",
+    ],
     [{ preference: "editor", lang: "python", isPreviewable: false }, "source"],
   ] as const)("resolves %o to %s", (overrides, expected) => {
     expect(resolveFileViewMode({ ...base, ...overrides })).toBe(expected);
@@ -1065,5 +1071,18 @@ describe("hasRawHtmlNode", () => {
     [{ type: "root" }, false],
   ])("detects raw HTML in case %#", (tree, expected) => {
     expect(hasRawHtmlNode(tree)).toBe(expected);
+  });
+});
+
+describe("hasNoTextDiff", () => {
+  it.each(["logo.png", "logo.svg", "report.pdf", "clip.mov", "part.stl", "archive.zip"])(
+    "has no text diff for %s",
+    (path) => {
+      expect(hasNoTextDiff(path)).toBe(true);
+    },
+  );
+
+  it.each(["src/app.ts", "README.md", "config.json"])("diffs %s as text", (path) => {
+    expect(hasNoTextDiff(path)).toBe(false);
   });
 });

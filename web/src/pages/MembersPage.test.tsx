@@ -35,10 +35,20 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
           single_user: mocks.singleUser,
         },
 }));
-vi.mock("@/lib/identity", () => ({
+const identityUpdates = vi.hoisted(() => new Set<() => void>());
+
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof identity>()),
   resolveIdentity: vi.fn(),
   getCurrentIsAdmin: vi.fn(),
+  getCurrentUserId: vi.fn(),
+  subscribeIdentity: (listener: () => void) => {
+    identityUpdates.add(listener);
+    return () => identityUpdates.delete(listener);
+  },
 }));
+
+beforeEach(() => identityUpdates.clear());
 vi.mock("@/lib/accountsApi", () => ({
   listUsers: vi.fn(),
   createInvite: vi.fn(),
@@ -117,6 +127,29 @@ describe("MembersPage gating", () => {
     vi.mocked(identity.resolveIdentity).mockReturnValue(new Promise(() => {})); // never resolves
     renderPage();
     expect(screen.getByText("Loading…")).toBeInTheDocument();
+  });
+
+  it("loads members when identity recovers while the page stays open", async () => {
+    vi.mocked(identity.resolveIdentity).mockResolvedValue(null);
+    vi.mocked(identity.getCurrentUserId).mockReturnValue(null);
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
+    const view = renderPage();
+    await waitFor(() => expect(identity.resolveIdentity).toHaveBeenCalled());
+    expect(accountsApi.listUsers).not.toHaveBeenCalled();
+
+    vi.mocked(identity.getCurrentUserId).mockReturnValue("admin");
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
+    act(() => {
+      for (const listener of identityUpdates) listener();
+    });
+
+    expect(await screen.findByRole("button", { name: /Invite member/ })).toBeInTheDocument();
+    act(() => {
+      for (const listener of identityUpdates) listener();
+    });
+    expect(accountsApi.listUsers).toHaveBeenCalledOnce();
+    view.unmount();
+    expect(identityUpdates.size).toBe(0);
   });
 
   it("blocks non-admins with a permission message and never lists users", async () => {

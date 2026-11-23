@@ -619,6 +619,49 @@ def test_render_status_tool_raw_error_prefix() -> None:
     assert "disk full" in rendered
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "output", "expected"),
+    [
+        (
+            "sys_files_upload",
+            {"file_id": "file_abc123", "filename": "chart.png", "content_type": "image/png"},
+            ["uploaded file", "chart.png", "image/png", "file_abc123"],
+        ),
+        (
+            "sys_files_download",
+            {"path": "notes.txt", "filename": "notes.txt", "bytes": 2048},
+            ["downloaded file", "notes.txt", "2.0 KB"],
+        ),
+    ],
+    ids=["upload", "in-process-download-metadata"],
+)
+def test_render_session_file_tools(
+    tool_name: str, output: dict[str, object], expected: list[str]
+) -> None:
+    """The session file tools render their status panel under their ``sys_`` names."""
+    raw = json.dumps(output)
+    ex = _tool_ex(tool_name, output=raw)
+    result = DEFAULT_TOOL_RENDERERS.render_tool(ex, parse_tool_output(raw), _theme())
+    rendered = _render_to_text(result)
+    for text in expected:
+        assert text in rendered, rendered
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["brief from the user\nsecond line", json.dumps({"name": "metrics", "rows": [1, 2]})],
+    ids=["text", "json-document"],
+)
+def test_runner_download_content_falls_through_to_the_generic_panel(content: str) -> None:
+    """
+    The runner's ``sys_files_download`` returns the file's own content, so even a
+    JSON document is shown as content rather than as a download status panel.
+    """
+    ex = _tool_ex("sys_files_download", output=content, arguments={"file_id": "file_abc123"})
+    result = DEFAULT_TOOL_RENDERERS.render_tool(ex, parse_tool_output(content), _theme())
+    assert result is None, _render_to_text(result)
+
+
 def test_render_terminal_launch_success() -> None:
     """sys_terminal_launch renders terminal name and status."""
     output = json.dumps(

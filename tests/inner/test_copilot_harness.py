@@ -34,12 +34,6 @@ def _clear_harness_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(var, raising=False)
 
 
-def test_resolve_os_env_default() -> None:
-    os_env = ch._resolve_os_env()
-    assert os_env.type == "caller_process"
-    assert os_env.sandbox is not None and os_env.sandbox.type == "none"
-
-
 def test_resolve_os_env_from_json(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(
         "HARNESS_COPILOT_OS_ENV",

@@ -16,6 +16,7 @@ import logging
 import re
 import secrets
 import time
+import traceback
 import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -26,6 +27,7 @@ from fastapi import Response
 from omnigent.debug_logging import phase_scope
 from omnigent.errors import ElicitationDeclinedError, ErrorPhase
 from omnigent.harnesses.codex_native.shell_input import native_shell_authorization
+from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 from omnigent.inner.executor import (
     CompactionComplete,
     CompactionStarted,
@@ -218,9 +220,13 @@ class ExecutorAdapter(HarnessApp):
         executor_factory: Callable[[], Executor],
         session_key: str | None = None,
         harness_label: str = "Claude",
+        executor_factory_on_thread: bool = False,
     ) -> None:
         super().__init__()
         self._executor_factory = executor_factory
+        self._executor_factory_on_thread = executor_factory_on_thread
+        self._executor_factory_lock = asyncio.Lock()
+        self._shutdown_started = False
         self._session_key = session_key or uuid.uuid4().hex
         # Harness label used in elicitation messages, e.g. "Claude wants to call **Bash**".
         self._harness_label = harness_label
@@ -267,7 +273,7 @@ class ExecutorAdapter(HarnessApp):
         Lazily constructs the executor on the first call; subsequent calls reuse the cached
         instance. Installs stable tool/elicitation/policy bridges once on first use.
         """
-        executor = self._ensure_executor()
+        executor = await self._ensure_executor_for_turn()
         messages = _translate_input_to_messages(
             request.input,
             include_tool_history=executor.replays_tool_history(),
@@ -1220,9 +1226,47 @@ class ExecutorAdapter(HarnessApp):
 
         :returns: The per-conversation inner :class:`Executor`.
         """
+        if self._shutdown_started:
+            raise RuntimeError("Executor adapter is shutting down")
         if self._executor is None:
             self._executor = self._executor_factory()
         return self._executor
+
+    async def _ensure_executor_for_turn(self) -> Executor:
+        if self._shutdown_started:
+            raise RuntimeError("Executor adapter is shutting down")
+        if not self._executor_factory_on_thread:
+            return self._ensure_executor()
+        async with self._executor_factory_lock:
+            if self._shutdown_started:
+                raise RuntimeError("Executor adapter is shutting down")
+            if self._executor is not None:
+                return self._executor
+            build_task = asyncio.create_task(asyncio.to_thread(self._executor_factory))
+            try:
+                executor = await asyncio.shield(build_task)
+            except BaseException:
+                # A cancelled turn still owns any proxy and launcher the factory created.
+                try:
+                    await await_cleanup_task(build_task)
+                except BaseException:
+                    pass
+                else:
+                    cleanup_task = asyncio.create_task(build_task.result().close())
+                    try:
+                        await await_cleanup_task(cleanup_task)
+                    except BaseException:
+                        _logger.exception("Failed to close executor built for a cancelled turn")
+                raise
+            if self._shutdown_started:
+                cleanup_task = asyncio.create_task(executor.close())
+                try:
+                    await await_cleanup_task(cleanup_task)
+                except BaseException:
+                    _logger.exception("Failed to close executor built during shutdown")
+                raise RuntimeError("Executor adapter is shutting down")
+            self._executor = executor
+            return executor
 
     def _translate_event(self, event: ExecutorEvent, ctx: TurnContext) -> None:
         """Translate one inner ExecutorEvent into Omnigent SSE events via ``ctx.emit``."""
@@ -1436,12 +1480,22 @@ class ExecutorAdapter(HarnessApp):
         """
         from omnigent.errors import OmnigentError
         from omnigent.inner.model_auth import ProviderAuthRequired
+        from omnigent.inner.sandbox import (
+            HarnessSandboxPreparationError,
+            HarnessSandboxValidationError,
+        )
         from omnigent.runner.launch_failure import (
             diagnose_client_update_required,
             diagnose_model_unavailable,
         )
         from omnigent.server.schemas import ErrorDetail
 
+        if isinstance(exception, (HarnessSandboxPreparationError, HarnessSandboxValidationError)):
+            # Launcher task frames can retain the entire worker state; omit locals.
+            _logger.warning(
+                "Harness sandbox setup failed:\n%s", "".join(traceback.format_exception(exception))
+            )
+            return ErrorDetail(code=type(exception).__name__, message=exception.client_message)
         if isinstance(exception, ProviderAuthRequired):
             return ErrorDetail(
                 code=exception.code,
@@ -1492,13 +1546,42 @@ class ExecutorAdapter(HarnessApp):
 
     async def on_shutdown(self) -> None:
         """Drain background interrupt tasks, then close the executor session and executor."""
-        if self._bg_tasks:
-            await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
-            self._bg_tasks.clear()
-        if self._executor is not None:
-            await self._executor.close_session(self._session_key)
-            await self._executor.close()
-            self._executor = None
+        self._shutdown_started = True
+
+        async def release_owned_resources() -> None:
+            first_error: BaseException | None = None
+            if self._bg_tasks:
+                try:
+                    await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
+                except BaseException as exc:
+                    first_error = exc
+                finally:
+                    self._bg_tasks.clear()
+            async with self._executor_factory_lock:
+                executor, self._executor = self._executor, None
+            if executor is not None:
+                try:
+                    await executor.close_session(self._session_key)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                try:
+                    await executor.close()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                raise first_error
+
+        cleanup_task = asyncio.create_task(release_owned_resources())
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            try:
+                await await_cleanup_task(cleanup_task)
+            except BaseException:
+                _logger.warning("Executor adapter cleanup failed after cancellation")
+            raise
 
 
 def _classify_openai_exception(exception: BaseException) -> str | None:

@@ -331,6 +331,8 @@ class Conversation:
     live_status: str | None = None
     pending_elicitation_count: int | None = None
     runner_last_seen: int | None = None
+    # Store snapshot used to fence recovery against concurrently accepted input.
+    next_position: int | None = None
     background_work_running: bool | None = None
     blocked_on: str | None = None
     project_id: str | None = None

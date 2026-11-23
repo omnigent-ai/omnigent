@@ -97,25 +97,35 @@ describe("usePaletteSessionSearch", () => {
     expect(fetchNextPage).toHaveBeenCalledTimes(1);
   });
 
-  it("remembers only rows that came from a search", () => {
-    useConversations.mockReturnValue({
-      data: { pages: [{ data: [conv("recent", "Recent session")] }] },
-      isFetching: false,
-    });
-    useSessionSearch.mockImplementation((_query: string, scope: string) => ({
-      isFetching: false,
-      data: scope === "title" ? { pages: [{ data: [conv("found", "Found session")] }] } : undefined,
-    }));
-    const queryClient = new QueryClient();
-    const { result } = renderSearch({ open: true, sessionsOnly: false }, queryClient);
+  it.each([false, true])(
+    "remembers search rows, and recent rows only from ⌘K's own list (sessionsOnly=%s)",
+    (sessionsOnly) => {
+      useConversations.mockImplementation((_query: string, includeArchived: boolean) => ({
+        data: {
+          pages: [{ data: [conv(includeArchived ? "recent" : "sidebar", "Recent session")] }],
+        },
+        isFetching: false,
+      }));
+      useSessionSearch.mockImplementation((_query: string, scope: string) => ({
+        isFetching: false,
+        data:
+          scope === "title" ? { pages: [{ data: [conv("found", "Found session")] }] } : undefined,
+      }));
+      const queryClient = new QueryClient();
+      const { result } = renderSearch({ open: true, sessionsOnly }, queryClient);
 
-    act(() => {
-      result.current.rememberSearchRow("found");
-      result.current.rememberSearchRow("recent");
-    });
-    expect(queryClient.getQueryData(["conversation-backfill", "found"])).toMatchObject({
-      id: "found",
-    });
-    expect(queryClient.getQueryData(["conversation-backfill", "recent"])).toBeUndefined();
-  });
+      act(() => {
+        result.current.rememberSearchRow("found");
+        result.current.rememberSearchRow("recent");
+        result.current.rememberSearchRow("sidebar");
+      });
+      expect(queryClient.getQueryData(["conversation-backfill", "found"])).toMatchObject({
+        id: "found",
+      });
+      expect(queryClient.getQueryData(["conversation-backfill", "recent"]) !== undefined).toBe(
+        !sessionsOnly,
+      );
+      expect(queryClient.getQueryData(["conversation-backfill", "sidebar"])).toBeUndefined();
+    },
+  );
 });

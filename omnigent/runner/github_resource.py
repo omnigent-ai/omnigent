@@ -66,6 +66,7 @@ import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
@@ -98,6 +99,8 @@ _DEFAULT_GH_TIMEOUT_SECONDS = 15.0
 # A request with its own time budget bounds every ``gh`` call by this monotonic
 # deadline (see :func:`_gh_deadline_scope`); ``_gh_timed_out`` records a cut-off call.
 _gh_deadline: ContextVar[float | None] = ContextVar("gh_deadline", default=None)
+# The host the current panel step's ``gh`` calls are for, set by the provider facet.
+_gh_target_host: ContextVar[str | None] = ContextVar("gh_target_host", default=None)
 _gh_timed_out: ContextVar[bool] = ContextVar("gh_timed_out", default=False)
 
 # Always pass --json (bare gh pr view opens a pager); body, comments,
@@ -183,17 +186,43 @@ def _in_sandbox() -> bool:
     return in_managed_sandbox()
 
 
-def _gh(
-    argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
-) -> tuple[int | None, str, str]:
-    # ``timeout`` replaces the per-call limit: higher for a slow call such as a video
-    # upload, lower for a best-effort one.
-    timeout = timeout or _gh_timeout_seconds()
-    if (deadline := _gh_deadline.get()) is not None:
-        timeout = min(timeout, deadline - time.monotonic())
-        if timeout <= 0:
-            _gh_timed_out.set(True)
-            return None, "", "gh deadline exceeded"
+@dataclass(frozen=True)
+class GhInvocation:
+    """The process one ``gh`` call starts.
+
+    :ivar argv: The command and its arguments.
+    :ivar env: The child's whole environment, or ``None`` to inherit this process's.
+    :ivar host: The code host the call is for, from :func:`gh_target_host_scope`;
+        ``None`` when the step didn't name one.
+    """
+
+    argv: list[str]
+    env: dict[str, str] | None
+    host: str | None = None
+
+
+@contextmanager
+def gh_target_host_scope(host: str | None) -> Iterator[None]:
+    """Mark every ``gh`` call in the block as being for *host*.
+
+    The value is per context, so concurrent steps in other threads keep their own.
+    """
+    token = _gh_target_host.set(host.lower() if host else None)
+    try:
+        yield
+    finally:
+        _gh_target_host.reset(token)
+
+
+def _gh_invocation(argv: list[str], *, token: str | None, host: str | None) -> GhInvocation:
+    """Return the command and environment that run ``gh`` with *argv*.
+
+    Every ``gh`` call the panel makes starts through here.
+
+    :param argv: Arguments after ``gh``.
+    :param token: A GitHub token to run this one call as a chosen account, or ``None``.
+    :param host: The code host the call is for, or ``None``; every host runs ``gh``.
+    """
     # In a managed sandbox the panel must authenticate as the connected owner via
     # the per-user hosts.yml that configure_host_gh writes — never an ambient
     # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
@@ -218,7 +247,22 @@ def _gh(
         env["GH_ENTERPRISE_TOKEN"] = token
         env.pop("GITHUB_TOKEN", None)
         env.pop("GITHUB_ENTERPRISE_TOKEN", None)
-    result = _run(["gh", *argv], cwd=cwd, timeout=timeout, env=env)
+    return GhInvocation(argv=["gh", *argv], env=env, host=host)
+
+
+def _gh(
+    argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
+) -> tuple[int | None, str, str]:
+    # ``timeout`` replaces the per-call limit: higher for a slow call such as a video
+    # upload, lower for a best-effort one.
+    timeout = timeout or _gh_timeout_seconds()
+    if (deadline := _gh_deadline.get()) is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            _gh_timed_out.set(True)
+            return None, "", "gh deadline exceeded"
+    invocation = _gh_invocation(argv, token=token, host=_gh_target_host.get())
+    result = _run(invocation.argv, cwd=cwd, timeout=timeout, env=invocation.env)
     if (
         deadline is not None
         and result[0] is None
@@ -319,6 +363,19 @@ def _list_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
     # Older gh (no --json hosts): fall back to the plain status exit code.
     rc, _, _ = _gh(["auth", "status"], cwd=root)
     return rc == 0, []
+
+
+def _gh_signed_in_to_host(root: str, host: str) -> bool:
+    """Whether ``gh`` reports a login on ``host``.
+
+    Some setups sign ``gh`` in to an enterprise host only when a command names that host,
+    so a host missing from the global listing is asked about directly.
+    """
+    _, accounts = _list_accounts(root)
+    if host in {account.get("host") for account in accounts}:
+        return True
+    rc, _, _ = _gh(["auth", "status", "-h", host], cwd=root)
+    return rc == 0
 
 
 def _resolved_base_nwo(root: str) -> str | None:
@@ -983,6 +1040,15 @@ def _pr_view_json(root: str, fields: str, *, token: str | None = None) -> dict[s
     return _gh_pr_view([str(number), "-R", base_repo], fields, cwd=root, token=token)
 
 
+def _repo_payload(name_with_owner: str | None, url: object) -> dict[str, Any]:
+    """The repo payload; the forge host (omitted when unknown) tells github.com from Enterprise."""
+    repo: dict[str, Any] = {"name_with_owner": name_with_owner}
+    host = host_of(url) if isinstance(url, str) else None
+    if host:
+        repo["host"] = host
+    return repo
+
+
 def _workspace_github_info(root: str) -> dict[str, Any]:
     """Resolve GitHub context for the workspace: repo, branch, base, and PR.
 
@@ -1061,19 +1127,23 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
             payload["pr"]["labels"] = _shape_labels(data["labels"])
         payload["authenticated"] = True
         payload["base_ref"] = data.get("baseRefName")
-        payload["repo"] = {"name_with_owner": _owner_repo_from_pr_url(data.get("url"))}
+        payload["repo"] = _repo_payload(_owner_repo_from_pr_url(data.get("url")), data.get("url"))
+        if payload["repo"]["name_with_owner"]:
+            payload["workspace_repo"] = dict(payload["repo"])
         return payload
 
     # No PR. Probe repo reachability to tell "no PR yet" from "can't reach repo".
-    rc, out, _ = _gh(["repo", "view", "--json", "nameWithOwner"], cwd=root, token=token)
+    rc, out, _ = _gh(["repo", "view", "--json", "nameWithOwner,url"], cwd=root, token=token)
     if rc == 0:
         try:
-            nwo = json.loads(out).get("nameWithOwner")
+            view = json.loads(out)
+            nwo, url = view.get("nameWithOwner"), view.get("url")
         except (ValueError, AttributeError):
-            nwo = None
+            nwo = url = None
         if nwo:
             payload["authenticated"] = True
-            payload["repo"] = {"name_with_owner": nwo}
+            payload["repo"] = _repo_payload(nwo, url)
+            payload["workspace_repo"] = dict(payload["repo"])
             return payload  # -> no-pr
 
     # Repo unreachable / not signed in — enumerate accounts so the panel can offer
@@ -1108,10 +1178,8 @@ def _pr_token(root: str, reference: PullRequestRef) -> str | None:
 
 
 def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any] | None:
-    if reference.host != "github.com":
-        _, accounts = _list_accounts(root)
-        if reference.host not in {account.get("host") for account in accounts}:
-            return None
+    if reference.host != "github.com" and not _gh_signed_in_to_host(root, reference.host):
+        return None
     return _gh_pr_view(
         [str(reference.number), "-R", _repo_argument(reference)],
         fields,
@@ -1137,7 +1205,7 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         "gh_available": shutil.which("gh") is not None,
         "authenticated": False,
         "pr": None,
-        "repo": {"name_with_owner": reference.repository},
+        "repo": {"name_with_owner": reference.repository, "host": reference.host},
         "selected_pr_url": reference.url,
     }
     if not info["gh_available"]:
@@ -1795,10 +1863,8 @@ def _pr_compare(
 
 
 def _host_args(root: str, reference: PullRequestRef) -> list[str]:
-    if reference.host != "github.com":
-        _, accounts = _list_accounts(root)
-        if reference.host not in {account.get("host") for account in accounts}:
-            raise ValueError("Sign in to this GitHub host with gh before viewing its PRs")
+    if reference.host != "github.com" and not _gh_signed_in_to_host(root, reference.host):
+        raise ValueError("Sign in to this GitHub host with gh before viewing its PRs")
     return ["--hostname", reference.host]
 
 

@@ -1,7 +1,14 @@
-import { useCallback, useId, useState } from "react";
+import { useCallback, useState } from "react";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import { SettingsLabel } from "@/components/SettingsLabel";
 import { Switch } from "@/components/ui/switch";
+import { BROWSER_AGENT_TOOLS_ENTRY } from "@/pages/settings/search/catalog/general";
+import { SettingsItem } from "@/pages/settings/search/SettingsItem";
+import {
+  settingsControlProps,
+  settingsDescriptionId,
+  settingsLabelId,
+} from "@/pages/settings/search/settingsControl";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import {
   desktopSupportsBrowserAgentTools,
@@ -19,8 +26,6 @@ export const UPDATE_DESKTOP_NOTE =
 export function BrowserAgentToolsSettingsGroup() {
   const supported = desktopSupportsBrowserAgentTools();
   const [enabled, setEnabled] = useState(() => supported && readBrowserAgentToolsEnabled());
-  const labelId = useId();
-  const descriptionId = useId();
   const toggle = useCallback((next: boolean) => {
     writeBrowserAgentToolsEnabled(next);
     // Show what was stored: a failed write leaves the previous mode in effect.
@@ -33,11 +38,14 @@ export function BrowserAgentToolsSettingsGroup() {
   if (!supportsBrowser()) return null;
   return (
     <SettingsGroup title="Browser" testId="settings-group-browser-agent-tools">
-      <div className="flex items-start justify-between gap-6">
+      <SettingsItem
+        entry={BROWSER_AGENT_TOOLS_ENTRY}
+        className="flex items-start justify-between gap-6"
+      >
         <SettingsLabel
-          label="Advanced browser tools for agents"
-          labelId={labelId}
-          descriptionId={descriptionId}
+          label={BROWSER_AGENT_TOOLS_ENTRY.label}
+          labelId={settingsLabelId(BROWSER_AGENT_TOOLS_ENTRY)}
+          descriptionId={settingsDescriptionId(BROWSER_AGENT_TOOLS_ENTRY)}
           className="flex-1"
           description={
             supported
@@ -47,8 +55,7 @@ export function BrowserAgentToolsSettingsGroup() {
           descriptionClassName="text-ui"
         />
         <Switch
-          aria-labelledby={labelId}
-          aria-describedby={descriptionId}
+          {...settingsControlProps(BROWSER_AGENT_TOOLS_ENTRY)}
           checked={enabled}
           disabled={!supported}
           onCheckedChange={toggle}
@@ -56,7 +63,7 @@ export function BrowserAgentToolsSettingsGroup() {
           className="mt-0.5 shrink-0"
           componentId="settings.general.browser_agent_tools"
         />
-      </div>
+      </SettingsItem>
     </SettingsGroup>
   );
 }

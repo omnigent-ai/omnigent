@@ -14,6 +14,7 @@ from omnigent.entities.conversation import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     USER_SESSION_TITLE_MAX_CHARS,
 )
+from omnigent.entities.workflow import WORKFLOW_NAME_MAX_CHARS
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import background_title_generators
 from omnigent.runner.background_titles.service import (
@@ -21,6 +22,7 @@ from omnigent.runner.background_titles.service import (
     FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION,
     LEGACY_BACKGROUND_TITLE_INSTRUCTIONS_MAX_CHARS,
 )
+from omnigent.server.scheduled.workflow_automations import saved_workflow_run_name
 from omnigent.stores.conversation_store import ConversationStore
 
 if TYPE_CHECKING:
@@ -551,6 +553,9 @@ def prepare_background_session_title(
     prompt = background_title_prompt(event)
     if not prompt:
         return None
+    # The deterministic seed already names the saved workflow the session runs.
+    if saved_workflow_run_title(_title_content_from_event(event, prompt)) is not None:
+        return None
 
     return PendingBackgroundSessionTitle(
         coordinator=coordinator,
@@ -582,6 +587,35 @@ def schedule_background_child_task_summary(
         agent_id=agent_id,
         sub_agent_name=sub_agent_name,
     )
+
+
+def saved_workflow_run_title(content: list[dict[str, Any]]) -> str | None:
+    """Title a session whose first message runs a saved workflow with the workflow's name.
+
+    :param content: The message's content blocks, e.g.
+        ``[{"type": "input_text", "text": '/workflow Run the saved workflow "Release" (ID …).'}]``.
+    :returns: The workflow's name, e.g. ``"Release"``, or ``None`` for any other message
+        or a name no saved workflow could have.
+    """
+    text = next(
+        (
+            block["text"]
+            for block in content
+            if block.get("type") == "input_text" and isinstance(block.get("text"), str)
+        ),
+        "",
+    )
+    # Saved names are one whitespace-collapsed line, kept literally, so read it the same way.
+    name = " ".join((saved_workflow_run_name(text) or "").split())
+    return name if 0 < len(name) <= WORKFLOW_NAME_MAX_CHARS else None
+
+
+def _title_content_from_event(event: SessionEventInput, prompt: str) -> list[dict[str, Any]]:
+    """The content blocks *event* seeds a title from; a slash command reads as its *prompt*."""
+    content = event.data.get("content")
+    if event.type == "slash_command" or not isinstance(content, list):
+        return [{"type": "input_text", "text": prompt}]
+    return [block for block in content if isinstance(block, dict)]
 
 
 def background_title_prompt(event: SessionEventInput) -> str:

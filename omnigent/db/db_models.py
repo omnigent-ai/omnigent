@@ -1665,10 +1665,13 @@ class SqlScheduledTask(OmnigentBase):
         continue (relates to ``conversations.id``; no DB foreign key, Rule R032).
         ``None`` until the first such firing creates it, unless a session was
         chosen.
-    :param kind: What the task is for — ``automation`` (1, the default) or
-        ``reminder`` (2), a one-time message an agent set for its own session.
-        Clients use it to list reminders apart from automations; scheduling
-        and firing do not depend on it.
+    :param kind: What the task is for — ``automation`` (1, the default),
+        ``reminder`` (2), a one-time message an agent set for its own session, or
+        ``timer`` (3), a hidden one-shot or repeating wake an agent set with
+        ``sys_timer_set``. Clients list only automations; timers also have their
+        own schedule arithmetic and delivery.
+    :param smart_routing: Whether the task's runs use Smart Routing instead of
+        a fixed model: on (1) or off (2). ``None`` until the owner chooses.
     :param created_at: Unix epoch seconds at row creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
@@ -1751,9 +1754,11 @@ class SqlScheduledTask(OmnigentBase):
     # The session each run's new session starts as a copy of. Relates to
     # conversations.id. No DB foreign key (Rule R032).
     source_session_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
-    # Stable int code: automation=1, reminder=2. Defaults to automation so
+    # Stable int code: automation=1, reminder=2, timer=3. Defaults to automation so
     # existing tasks keep listing as automations.
     kind: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
+    # Stable int code: on=1, off=2. NULL keeps "never chosen" apart from off.
+    smart_routing: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger)
     updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
@@ -1761,11 +1766,22 @@ class SqlScheduledTask(OmnigentBase):
         CheckConstraint("state IN (1, 2, 3, 4)", name="ck_scheduled_tasks_lifecycle_state"),
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
         CheckConstraint("session_mode IN (1, 2)", name="ck_scheduled_tasks_session_mode"),
-        CheckConstraint("kind IN (1, 2)", name="ck_scheduled_tasks_kind"),
+        CheckConstraint("kind IN (1, 2, 3)", name="ck_scheduled_tasks_task_kind"),
+        CheckConstraint("smart_routing IN (1, 2)", name="ck_scheduled_tasks_smart_routing"),
         Index("ix_scheduled_tasks_due", "state", "next_run_at", "workspace_id", "id"),
         # Covers a user's task listing ordered by creation time.
         Index(
             "ix_scheduled_tasks_user_scope",
+            "workspace_id",
+            "user_id",
+            "created_at",
+            "id",
+        ),
+        # Lists one kind of a user's tasks without reading other kinds' rows, and finds
+        # any task of a kind in one lookup, as the timer-kind downgrade does.
+        Index(
+            "ix_scheduled_tasks_kind_scope",
+            "kind",
             "workspace_id",
             "user_id",
             "created_at",
@@ -2053,7 +2069,8 @@ class SqlWorkflow(OmnigentBase):
     ``session_journal_entries.workflow_id``. Workflows have no versions: an edit
     rewrites the row, and each run's journal keeps the plan it ran.
 
-    :param id: UUID of the workflow, in the session ID's format (bare hex).
+    :param id: The workflow's ID from the store's allocator, in the session ID's format
+        (bare hex); by default a UUID4.
     :param user_id: The owning user, or the reserved ``local`` user in single-user mode.
     :param name: One line, e.g. ``"nightly-build"``; a run's plan takes this name.
     :param description: What the workflow is for; a run gives it to the agent as
@@ -2091,6 +2108,65 @@ class SqlWorkflow(OmnigentBase):
 
     __table_args__ = (
         Index("uq_workflows_user_id_name", "workspace_id", "user_id", "name", unique=True),
+    )
+
+
+class SqlWorkflowShare(OmnigentBase):
+    """
+    SQLAlchemy model for the ``workflow_shares`` table.
+
+    One row per user or group a saved workflow is shared with. They may view, run
+    and copy it, but not change it; a run is their own session, which stays theirs.
+    These rows are not session grants; those stay in ``session_permissions``. Public
+    shares (``__public__``) are never stored; the application enforces that.
+
+    :param workflow_id: The workflow this share belongs to (relates to
+        ``workflows.id``). Rows are deleted with their workflow by the application;
+        there is no DB foreign key (schema Rule R032).
+    :param user_id: The grantee, a user or group ID, e.g. ``"alice@example.com"``.
+        String(128) matches ``session_permissions.user_id``.
+    :param level: The permission level granted. No CHECK constraint: the permission
+        store owns the set of valid levels.
+    """
+
+    __tablename__ = "workflow_shares"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    # No database default; the ORM always supplies it.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        default=current_workspace_id,
+    )
+    workflow_id: Mapped[str] = mapped_column(Uuid16, primary_key=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True, nullable=False)
+    # Permission level code, stored as a small integer like scheduled_task_shares.level.
+    level: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+
+    __table_args__ = (
+        # SQLite and D1 ignore VARCHAR lengths: 128 characters at up to four bytes each.
+        CheckConstraint(
+            "length(CAST(user_id AS BLOB)) <= 512",
+            name="ck_workflow_shares_user_id_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # SQLite and D1 store any value in an integer column.
+        CheckConstraint(
+            "typeof(workspace_id) = 'integer'",
+            name="ck_workflow_shares_workspace_id_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "typeof(level) = 'integer'",
+            name="ck_workflow_shares_level_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # Looks up the workflows shared with one user; the primary key already
+        # covers the remaining columns.
+        Index(
+            "ix_workflow_shares_user_id",
+            "workspace_id",
+            "user_id",
+            "workflow_id",
+        ),
     )
 
 
