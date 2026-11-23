@@ -89,7 +89,7 @@ async function launchMessageForShell(
       ),
     };
   } catch (err) {
-    console.warn("[floatingComposer] couldn't prepare a launch's attachments:", err);
+    console.warn("[floatingComposer] couldn't prepare a launch's message:", err);
     return null;
   }
 }
@@ -105,21 +105,30 @@ export async function acceptLaunchOffer({
 }: FloatingLaunchOffer): Promise<void> {
   const bridge = floatingComposerBridge();
   if (!bridge?.takeLaunchOffer || !bridge.confirmLaunchOffer) return;
+  // Ends the offer now, so the panel delivers without waiting out the timeout.
+  const decline = () => {
+    Promise.resolve()
+      .then(() => bridge.declineLaunchOffer?.(offerId))
+      .catch((err) => console.warn("[floatingComposer] couldn't decline a launch:", err));
+  };
   try {
     const message = await bridge.takeLaunchOffer(offerId);
     if (message === null) return;
+    // No page shows the session to send it, so the panel delivers instead.
+    if (!isListeningForInitialPrompt(sessionId)) {
+      decline();
+      return;
+    }
     const prompt: PendingInitialPrompt = {
       text: message.text,
       skill: message.skill,
       files: message.files.map(({ name, type, bytes }) => new File([bytes], name, { type })),
     };
-    // No page shows the session to send it, so the panel delivers instead.
-    if (!isListeningForInitialPrompt(sessionId)) return;
     if (!(await bridge.confirmLaunchOffer(offerId))) return;
     setPendingInitialPrompt(sessionId, prompt);
   } catch (err) {
-    // The offer ends unconfirmed, so the panel delivers the message.
     console.warn("[floatingComposer] couldn't take a launch's message:", err);
+    decline();
   }
 }
 

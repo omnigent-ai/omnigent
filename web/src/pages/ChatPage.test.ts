@@ -31,6 +31,7 @@ import {
   useWorkingSignals,
   containsMarkdownTable,
   dispatchInitialPrompt,
+  initialPromptAgentId,
   useInitialPromptDispatch,
   failedSessionLastError,
   isComposerReadOnly,
@@ -2255,5 +2256,87 @@ describe("useInitialPromptDispatch", () => {
     expect(isListeningForInitialPrompt("conv_listen_1")).toBe(false);
     setPendingInitialPrompt("conv_listen_1", prompt);
     expect(consumePendingInitialPrompt("conv_listen_1")).toEqual(prompt);
+  });
+});
+
+describe("useInitialPromptDispatch queueing", () => {
+  const first: PendingInitialPrompt = { text: "first", skill: null };
+  const second: PendingInitialPrompt = { text: "second", skill: null };
+  const loaded = (conversationId: string) => ({
+    conversationId,
+    loadingConversation: false,
+    agentId: "agent_1",
+  });
+
+  it("sends a prompt stashed after an earlier one was sent", () => {
+    const dispatch = vi.fn();
+    renderHook((props) => useInitialPromptDispatch({ ...props, dispatch }), {
+      initialProps: loaded("conv_queue_after"),
+    });
+    act(() => setPendingInitialPrompt("conv_queue_after", first));
+    act(() => setPendingInitialPrompt("conv_queue_after", second));
+    expect(dispatch.mock.calls.map(([prompt]) => prompt)).toEqual([first, second]);
+  });
+
+  it("sends a prompt stashed while another is held, after it", () => {
+    const dispatch = vi.fn();
+    const { rerender } = renderHook((props) => useInitialPromptDispatch({ ...props, dispatch }), {
+      initialProps: {
+        conversationId: "conv_queue_held",
+        loadingConversation: true,
+        agentId: "agent_1",
+      },
+    });
+    act(() => setPendingInitialPrompt("conv_queue_held", first));
+    act(() => setPendingInitialPrompt("conv_queue_held", second));
+    expect(dispatch).not.toHaveBeenCalled();
+    rerender(loaded("conv_queue_held"));
+    expect(dispatch.mock.calls.map(([prompt]) => prompt)).toEqual([first, second]);
+  });
+
+  it("returns both held and waiting prompts in order when the page unmounts", () => {
+    const held = renderHook((props) => useInitialPromptDispatch({ ...props, dispatch: vi.fn() }), {
+      initialProps: {
+        conversationId: "conv_queue_unmount",
+        loadingConversation: true,
+        agentId: "agent_1",
+      },
+    });
+    act(() => setPendingInitialPrompt("conv_queue_unmount", first));
+    act(() => setPendingInitialPrompt("conv_queue_unmount", second));
+    held.unmount();
+    const dispatch = vi.fn();
+    renderHook((props) => useInitialPromptDispatch({ ...props, dispatch }), {
+      initialProps: loaded("conv_queue_unmount"),
+    });
+    expect(dispatch.mock.calls.map(([prompt]) => prompt)).toEqual([first, second]);
+  });
+});
+
+describe("initialPromptAgentId", () => {
+  it("uses the session's bound agent on a session route, not the selected one from another chat", () => {
+    expect(
+      initialPromptAgentId({
+        urlConvId: "conv_1",
+        boundAgentId: "agent_bound",
+        agentId: "agent_selected",
+      }),
+    ).toBe("agent_bound");
+  });
+
+  it("uses the selected agent on the landing page", () => {
+    expect(
+      initialPromptAgentId({
+        urlConvId: null,
+        boundAgentId: "agent_bound",
+        agentId: "agent_selected",
+      }),
+    ).toBe("agent_selected");
+  });
+
+  it("falls back to the selected agent when a session has no bound agent yet", () => {
+    expect(
+      initialPromptAgentId({ urlConvId: "conv_1", boundAgentId: null, agentId: "agent_selected" }),
+    ).toBe("agent_selected");
   });
 });

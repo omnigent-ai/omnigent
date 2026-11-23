@@ -1,11 +1,6 @@
 "use strict";
 
-/**
- * Offers a launch's first message to the main window the shell routed the new session to, so
- * that page can send it through its own chat store. The page takes the message, then confirms
- * it. Only a confirm while the offer is still open settles it "sent"; anything else ends the offer
- * and the panel delivers the message itself.
- */
+// Offers a launch to its routed document; unconfirmed offers fall back to the panel.
 
 /** How long a routed page has to take and confirm an offer before the panel delivers instead. */
 const FLOATING_LAUNCH_OFFER_TIMEOUT_MS = 2000;
@@ -94,6 +89,18 @@ function createFloatingLaunchOffers(options = {}) {
       const offer = offers.get(offerId);
       if (offer === undefined || offer.contents !== contents || !offer.taken) return false;
       end(offerId, true);
+      return true;
+    },
+    /**
+     * The page won't send the offered message, so the panel delivers it now rather than at the
+     * timeout. Only the offered document may end its offer.
+     *
+     * @returns {boolean} whether the offer was ended
+     */
+    decline(contents, offerId) {
+      const offer = offers.get(offerId);
+      if (offer === undefined || offer.contents !== contents) return false;
+      end(offerId, false);
       return true;
     },
   };

@@ -105,3 +105,36 @@ test("an offer whose page can't be reached settles false at once", async (t) => 
   offers.addTaker(destroyed);
   assert.equal(await offers.offer(destroyed, { sessionId: "conv_1", message }), false);
 });
+
+test("each offer to one taker has its own id, and settling one leaves the other open", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const offers = createFloatingLaunchOffers();
+  const taker = page();
+  offers.addTaker(taker);
+  const firstConfirmed = offers.offer(taker, { sessionId: "conv_1", message });
+  const secondConfirmed = offers.offer(taker, { sessionId: "conv_2", message });
+  const [first, second] = taker.sent.map(([, data]) => data.offerId);
+  assert.notEqual(first, second);
+  assert.equal(offers.take(taker, first), message);
+  assert.equal(offers.confirm(taker, first), true);
+  assert.equal(await firstConfirmed, true);
+  assert.equal(offers.take(taker, second), message, "the other offer is still open");
+  offers.forgetTaker(taker);
+  assert.equal(await secondConfirmed, false, "forgetting the page settles what's left");
+  assert.equal(offers.confirm(taker, second), false);
+});
+
+test("declining ends an offer at once, for its own page only", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const offers = createFloatingLaunchOffers();
+  const taker = page();
+  const stranger = page();
+  offers.addTaker(taker);
+  const declined = offers.offer(taker, { sessionId: "conv_1", message });
+  const { offerId } = taker.sent[0][1];
+  assert.equal(offers.decline(stranger, offerId), false, "another page can't decline it");
+  assert.equal(offers.decline(taker, offerId), true);
+  assert.equal(await declined, false);
+  assert.equal(offers.decline(taker, offerId), false, "a settled offer can't be declined again");
+  assert.equal(offers.take(taker, offerId), null);
+});

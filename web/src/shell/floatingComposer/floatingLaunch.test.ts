@@ -9,6 +9,7 @@ const bridge = vi.hoisted(() => ({
   canHandOffLaunch: vi.fn(),
   takeLaunchOffer: vi.fn(),
   confirmLaunchOffer: vi.fn(),
+  declineLaunchOffer: vi.fn(),
 }));
 const bridgeOf = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/nativeBridge", () => ({ floatingComposerBridge: bridgeOf }));
@@ -286,7 +287,16 @@ describe("launchFromPanel", () => {
       expect(postEvent).not.toHaveBeenCalled();
     });
 
-    it("reads no attachment bytes unless the shell says it can take the message", async () => {
+    it.each([
+      ["says it can't take the message", () => bridge.canHandOffLaunch.mockResolvedValue(false)],
+      [
+        "has no way to ask",
+        () => bridgeOf.mockReturnValue({ ...bridge, canHandOffLaunch: undefined }),
+      ],
+      ["fails to answer", () => bridge.canHandOffLaunch.mockRejectedValue(new Error("shell gone"))],
+    ])("reads no attachment bytes when the shell %s", async (_case, setUp) => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      setUp();
       const file = new File(["x"], "a.txt");
       const read = vi.spyOn(file, "arrayBuffer");
 
@@ -294,6 +304,7 @@ describe("launchFromPanel", () => {
 
       expect(read).not.toHaveBeenCalled();
       expect(bridge.openInMainWindow).toHaveBeenCalledWith("/c/conv_1", null);
+      warn.mockRestore();
     });
 
     it("reads no attachment bytes past the shared size cap", async () => {
@@ -322,8 +333,23 @@ describe("launchFromPanel", () => {
       expect(uploadFileBlocks).toHaveBeenCalledWith("conv_1", [file]);
       expect(postEvent).toHaveBeenCalledTimes(1);
       expect(warn).toHaveBeenCalledWith(
-        "[floatingComposer] couldn't prepare a launch's attachments:",
+        "[floatingComposer] couldn't prepare a launch's message:",
         expect.any(Error),
+      );
+      warn.mockRestore();
+    });
+
+    it("logs, and hands nothing over, when the shell fails to answer the probe", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const cause = new Error("shell gone");
+      bridge.canHandOffLaunch.mockRejectedValue(cause);
+
+      await launchFromPanel(request());
+
+      expect(bridge.openInMainWindow).toHaveBeenCalledWith("/c/conv_1", null);
+      expect(warn).toHaveBeenCalledWith(
+        "[floatingComposer] couldn't prepare a launch's message:",
+        cause,
       );
       warn.mockRestore();
     });
@@ -364,6 +390,7 @@ describe("acceptLaunchOffer", () => {
     await accepted;
 
     expect(bridge.takeLaunchOffer).toHaveBeenCalledWith(7);
+    expect(bridge.declineLaunchOffer).not.toHaveBeenCalled();
     expect(setPendingInitialPrompt).toHaveBeenCalledTimes(1);
     const [sessionId, prompt] = vi.mocked(setPendingInitialPrompt).mock.calls[0]!;
     expect(sessionId).toBe("conv_1");
@@ -396,6 +423,7 @@ describe("acceptLaunchOffer", () => {
     await acceptLaunchOffer(offer);
 
     expect(bridge.confirmLaunchOffer).not.toHaveBeenCalled();
+    expect(bridge.declineLaunchOffer).toHaveBeenCalledWith(7);
     expect(setPendingInitialPrompt).not.toHaveBeenCalled();
     expect(warn).toHaveBeenCalledWith(
       "[floatingComposer] couldn't take a launch's message:",
@@ -412,6 +440,7 @@ describe("acceptLaunchOffer", () => {
 
     expect(isListeningForInitialPrompt).toHaveBeenCalledWith("conv_1");
     expect(bridge.confirmLaunchOffer).not.toHaveBeenCalled();
+    expect(bridge.declineLaunchOffer).toHaveBeenCalledWith(7);
     expect(setPendingInitialPrompt).not.toHaveBeenCalled();
   });
 
@@ -430,6 +459,7 @@ describe("acceptLaunchOffer", () => {
     await acceptLaunchOffer(offer);
 
     expect(bridge.confirmLaunchOffer).not.toHaveBeenCalled();
+    expect(bridge.declineLaunchOffer).not.toHaveBeenCalled();
     expect(setPendingInitialPrompt).not.toHaveBeenCalled();
   });
 
@@ -445,14 +475,18 @@ describe("acceptLaunchOffer", () => {
     warn.mockRestore();
 
     expect(bridge.confirmLaunchOffer).not.toHaveBeenCalled();
+    expect(bridge.declineLaunchOffer).toHaveBeenCalledWith(7);
     expect(setPendingInitialPrompt).not.toHaveBeenCalled();
   });
 
-  it("does nothing on a shell too old to offer launches", async () => {
-    bridgeOf.mockReturnValueOnce({ ...bridge, takeLaunchOffer: undefined });
+  it.each([["takeLaunchOffer"], ["confirmLaunchOffer"]] as const)(
+    "does nothing on a shell without %s, so the panel delivers",
+    async (missing) => {
+      bridgeOf.mockReturnValueOnce({ ...bridge, [missing]: undefined });
 
-    await acceptLaunchOffer(offer);
+      await acceptLaunchOffer(offer);
 
-    expect(bridge.takeLaunchOffer).not.toHaveBeenCalled();
-  });
+      expect(bridge.takeLaunchOffer).not.toHaveBeenCalled();
+    },
+  );
 });

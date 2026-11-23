@@ -5586,7 +5586,7 @@ function registerIpc() {
       // After a launch the next open starts at the default placement again.
       floatingComposerController.hide(panel, { resetFrame: sessionPath !== null });
       if (offer === null) return { ok: true };
-      // The only wait: no window moves after it, so a reopened panel keeps its focus.
+      // Only the offer's outcome is awaited, and no window is focused after it, so a reopened panel keeps focus.
       return offer.then((confirmed) => (confirmed ? { ok: true, delivery: "page" } : { ok: true }));
     },
   );
@@ -5625,6 +5625,12 @@ function registerIpc() {
   ipcMain.handle("omnigent:floating-composer:launch-confirm", (event, offerId) => {
     if (!isPinnedOriginSender(event) || event.senderFrame !== event.sender.mainFrame) return false;
     return floatingLaunchOffers.confirm(event.sender, offerId);
+  });
+
+  // From a main window's top document: it won't send the offered message, so the panel delivers.
+  ipcMain.handle("omnigent:floating-composer:launch-decline", (event, offerId) => {
+    if (!isPinnedOriginSender(event) || event.senderFrame !== event.sender.mainFrame) return false;
+    return floatingLaunchOffers.decline(event.sender, offerId);
   });
 
   // Dock/taskbar badge. Each window's SPA reports ITS unread count; the

@@ -353,6 +353,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     /** From a main window: confirms the rebuilt offer; resolves whether it's still ours. */
     confirmLaunchOffer: (offerId) =>
       ipcRenderer.invoke("omnigent:floating-composer:launch-confirm", offerId),
+    /** From a main window: won't send the offered message, so the panel delivers it at once. */
+    declineLaunchOffer: (offerId) =>
+      ipcRenderer.invoke("omnigent:floating-composer:launch-decline", offerId),
     /** From the panel: its native file picker opened or closed. */
     filePicker: (state) =>
       ipcRenderer.send(

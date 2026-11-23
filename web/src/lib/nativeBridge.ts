@@ -395,6 +395,8 @@ export interface FloatingComposerBridge {
   takeLaunchOffer?: (offerId: number) => Promise<FloatingLaunchMessage | null>;
   /** From a main window: whether the taken offer is still ours, so it may be sent. Newer shells only. */
   confirmLaunchOffer?: (offerId: number) => Promise<boolean>;
+  /** From a main window: won't send the offer, so the panel delivers it now. Newer shells only. */
+  declineLaunchOffer?: (offerId: number) => Promise<boolean>;
 }
 
 /** Native menu commands the desktop shell hands to the page (see lib/desktopCommands). */

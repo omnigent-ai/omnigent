@@ -108,7 +108,7 @@ import {
   holdsInitialDraft,
   isStaleTempConvId,
   onPendingInitialPrompt,
-  setPendingInitialPrompt,
+  returnPendingInitialPrompt,
   isTempConvId,
   retryConversationLoad,
   type ChatState,
@@ -571,8 +571,7 @@ export function ChatPage() {
     }
   }, [boundAgentId, agents, refetchAgents]);
 
-  // The agent list isn't fetched on a session route; the bound agent sends when it's missing.
-  const sendAgentId = agentId ?? boundAgentId;
+  const sendAgentId = initialPromptAgentId({ urlConvId, boundAgentId, agentId });
   const dispatchFirstMessage = useCallback((prompt: PendingInitialPrompt, agent: string) => {
     const { send, sendSlashCommand } = useChatStore.getState();
     dispatchInitialPrompt(prompt, agent, send, sendSlashCommand);
@@ -5090,6 +5089,27 @@ export function dispatchInitialPrompt(
 }
 
 /**
+ * The agent a stashed first message is sent with. On a session route that's the session's bound
+ * agent, since the selected one can belong to the previous chat; elsewhere, the selected agent.
+ */
+export function initialPromptAgentId({
+  urlConvId,
+  boundAgentId,
+  agentId,
+}: {
+  urlConvId: string | null | undefined;
+  boundAgentId: string | null;
+  agentId: string | null;
+}): string | null {
+  return (urlConvId ? boundAgentId : null) ?? agentId;
+}
+
+interface HeldPrompt {
+  conversationId: string;
+  prompt: PendingInitialPrompt;
+}
+
+/**
  * Sends the first message a landing composer or a floating-panel launch stashed for
  * `conversationId`, exactly once. It waits for the session to load, because a send before the
  * stream binds loses the turn's events; it doesn't wait for the runner, since the server holds the
@@ -5107,45 +5127,44 @@ export function useInitialPromptDispatch({
   loadingConversation: boolean;
   dispatch: (prompt: PendingInitialPrompt, agentId: string) => void;
 }): void {
-  // The prompt consumed for this page but not yet sent. The ref mirrors it for cleanup.
-  const [held, setHeld] = useState<{
-    conversationId: string;
-    prompt: PendingInitialPrompt;
-  } | null>(null);
-  const heldRef = useRef<typeof held>(null);
-  // The conversation whose prompt was sent. Keyed by id so a later conversation in the same
-  // mounted page can still send; StrictMode's remount sees it and doesn't resend.
-  const sentForRef = useRef<string | null>(null);
+  // The prompt taken from the store for this page but not yet sent. The ref is the current one:
+  // a dispatched prompt is no longer in it, so a stale effect closure can't send it again.
+  const [held, setHeld] = useState<HeldPrompt | null>(null);
+  const heldRef = useRef<HeldPrompt | null>(null);
+
+  // Takes the next stashed prompt, unless one is already held; the rest wait in the store.
+  const takeNext = useCallback(() => {
+    if (!conversationId || heldRef.current !== null) return;
+    const prompt = consumePendingInitialPrompt(conversationId);
+    if (prompt === null) return;
+    heldRef.current = { conversationId, prompt };
+    setHeld(heldRef.current);
+  }, [conversationId]);
 
   useEffect(() => {
     if (!conversationId) return;
-    const hold = () => {
-      const prompt = consumePendingInitialPrompt(conversationId);
-      if (prompt === null) return;
-      heldRef.current = { conversationId, prompt };
-      setHeld(heldRef.current);
-    };
-    hold();
-    const stopListening = onPendingInitialPrompt(conversationId, hold);
+    takeNext();
+    const stopListening = onPendingInitialPrompt(conversationId, takeNext);
     return () => {
       stopListening();
       const unsent = heldRef.current;
       heldRef.current = null;
       setHeld(null);
-      // Stopped listening first, so the put-back doesn't consume itself again.
-      if (unsent?.conversationId === conversationId && sentForRef.current !== conversationId) {
-        setPendingInitialPrompt(conversationId, unsent.prompt);
+      if (unsent?.conversationId === conversationId) {
+        returnPendingInitialPrompt(conversationId, unsent.prompt);
       }
     };
-  }, [conversationId]);
+  }, [conversationId, takeNext]);
 
   useEffect(() => {
+    if (held === null || heldRef.current !== held) return;
+    // A held prompt hasn't been sent, so the predicate's sent-check doesn't apply.
     if (
       !shouldSendInitialPrompt({
-        initialPrompt: held?.prompt.text ?? null,
-        initialPromptFileCount: held?.prompt.files?.length ?? 0,
-        promptConversationId: held?.conversationId ?? null,
-        sentForConversationId: sentForRef.current,
+        initialPrompt: held.prompt.text,
+        initialPromptFileCount: held.prompt.files?.length ?? 0,
+        promptConversationId: held.conversationId,
+        sentForConversationId: null,
         conversationId,
         loadingConversation,
         agentId,
@@ -5154,12 +5173,13 @@ export function useInitialPromptDispatch({
       return;
     }
     // The predicate guarantees these; the re-check narrows the types for dispatch().
-    if (held === null || !agentId || !conversationId) return;
-    sentForRef.current = conversationId;
+    if (!agentId || !conversationId) return;
     heldRef.current = null;
     setHeld(null);
     dispatch(held.prompt, agentId);
-  }, [held, conversationId, loadingConversation, agentId, dispatch]);
+    // A prompt stashed while this one was held is next.
+    takeNext();
+  }, [held, conversationId, loadingConversation, agentId, dispatch, takeNext]);
 }
 
 /**

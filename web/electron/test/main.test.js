@@ -57,6 +57,7 @@ async function until(condition, label, deadline = Date.now() + 1000) {
   await until(condition, label, deadline);
 }
 const urlHelpers = require("../src/url");
+const { FLOATING_LAUNCH_OFFER_TIMEOUT_MS } = require("../src/floating_launch_offers");
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
@@ -4296,7 +4297,7 @@ describe("floating panel wiring", () => {
     const event = subscribeMain(h, main);
     const opened = openFromPanel(h, "/c/abc", launchMessage());
     const offer = offerTo(main);
-    t.mock.timers.tick(1999);
+    t.mock.timers.tick(FLOATING_LAUNCH_OFFER_TIMEOUT_MS - 1);
     const taken = h.ipc.get("omnigent:floating-composer:launch-take")(event, offer.offerId);
     assert.notEqual(taken, null, "still open a tick before the timeout");
     t.mock.timers.tick(1);
@@ -4335,6 +4336,71 @@ describe("floating panel wiring", () => {
     assert.equal(await probe(), false);
     subscribeMain(h, main);
     assert.equal(await probe(), true);
+  });
+
+  it("a decline from the offered page ends its offer at once, so the panel delivers", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addMain(h);
+    const event = subscribeMain(h, main);
+    const opened = openFromPanel(h, "/c/abc", launchMessage());
+    const offer = offerTo(main);
+    const decline = h.ipc.get("omnigent:floating-composer:launch-decline");
+    assert.equal(await decline(event, offer.offerId), true);
+    assert.deepEqual(await opened, { ok: true });
+    assert.equal(await confirmOffer(h, event, offer.offerId), false);
+  });
+
+  it("refuses take, confirm and decline from another window, a subframe or another origin", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addMain(h);
+    const event = subscribeMain(h, main);
+    const opened = openFromPanel(h, "/c/abc", launchMessage());
+    const offer = offerTo(main);
+    const take = h.ipc.get("omnigent:floating-composer:launch-take");
+    const decline = h.ipc.get("omnigent:floating-composer:launch-decline");
+    const foreign = addMain(h, { url: `${serverUrl}/` });
+    const foreignFrame = { url: foreign.url };
+    foreign.webContents.mainFrame = foreignFrame;
+    const refused = [
+      {
+        label: "another window",
+        event: { sender: foreign.webContents, senderFrame: foreignFrame },
+      },
+      { label: "a subframe", event: { sender: main.webContents, senderFrame: { url: main.url } } },
+      {
+        label: "another origin",
+        event: { sender: main.webContents, senderFrame: { url: "https://evil.example/" } },
+      },
+    ];
+    const answers = await Promise.all(
+      refused.map(async ({ label, event: foreignEvent }) => ({
+        label,
+        took: await take(foreignEvent, offer.offerId),
+        confirmed: await confirmOffer(h, foreignEvent, offer.offerId),
+        declined: await decline(foreignEvent, offer.offerId),
+      })),
+    );
+    for (const { label, took, confirmed, declined } of answers) {
+      assert.equal(took, null, label);
+      assert.equal(confirmed, false, label);
+      assert.equal(declined, false, label);
+    }
+    // Refusals leave the offer open for the page it was made to.
+    assert.deepEqual(await take(event, offer.offerId), {
+      text: "Fix the build",
+      skill: null,
+      files: [],
+    });
+    assert.equal(await confirmOffer(h, event, offer.offerId), true);
+    assert.deepEqual(await opened, { ok: true, delivery: "page" });
   });
 
   it("never offers a message that fails the shell's checks, or a page that isn't a session", async (t) => {
