@@ -82,16 +82,16 @@ describe("PendingAttachment", () => {
     expect(screen.queryByRole("button", { name: "Cancel upload of big.zip" })).toBeNull();
   });
 
-  it("shows a failed upload's reason with Retry and Dismiss", () => {
+  it("shows a failed upload's reason with Retry and Remove", () => {
     const retry = vi.fn();
-    const dismiss = vi.fn();
-    renderAttachment({ fileId, message: "Attachment quota reached", retry, dismiss });
+    const remove = vi.fn();
+    renderAttachment({ fileId, message: "Attachment quota reached", retry, remove });
 
     expect(screen.getByText("Attachment quota reached")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Retry upload of big.zip" }));
-    fireEvent.click(screen.getByRole("button", { name: "Dismiss failed upload of big.zip" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove failed upload of big.zip" }));
     expect(retry).toHaveBeenCalledTimes(1);
-    expect(dismiss).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledTimes(1);
   });
 
   it("leaves other attachments of a failed message on their fallback", () => {
@@ -99,7 +99,7 @@ describe("PendingAttachment", () => {
       fileId: "pending:other.zip",
       message: "Too big",
       retry: vi.fn(),
-      dismiss: vi.fn(),
+      remove: vi.fn(),
     });
     expect(screen.getByText("plain chip")).toBeInTheDocument();
   });

@@ -2895,8 +2895,8 @@ function ComposerImpl(
   // The restore effects below key off conversation state and reach the
   // attachment actions through a ref rather than widening their dependency
   // lists.
-  const attachmentsRef = useRef({ restoreFiles, replaceFiles, addFiles });
-  attachmentsRef.current = { restoreFiles, replaceFiles, addFiles };
+  const attachmentsRef = useRef({ restoreFiles, replaceFiles });
+  attachmentsRef.current = { restoreFiles, replaceFiles };
 
   useEffect(() => {
     const previousConversationId = draftConversationIdRef.current;
@@ -3342,7 +3342,6 @@ function ComposerImpl(
       const joined = appendReplyDraft(draft, restoreReplyDraft(merged.text, merged.replyDraft));
       replaceText(serializeReplyDraft(joined), snapshotReplyDraft(joined));
       restoreTaggedMentionsRef.current(merged.mentions);
-      if (failed.files.length > 0) attachmentsRef.current.addFiles(failed.files);
       dirtyRef.current = true;
       return;
     }

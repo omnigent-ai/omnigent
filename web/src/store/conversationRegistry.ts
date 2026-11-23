@@ -368,7 +368,7 @@ export class ConversationRegistry {
  *     the draft is the sole surviving copy of the user's text and files. It is
  *     held until the composer restores it on return; evicting first drops it;
  *   - a `failedUploads` entry — a send whose upload failed and whose bubble
- *     waits for Retry or Dismiss; the entry is the only copy of the message.
+ *     waits for Retry or Remove; the entry is the only copy of the message.
  */
 function hasUnsentWork(state: ConversationState): boolean {
   return (

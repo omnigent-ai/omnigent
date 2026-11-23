@@ -8,7 +8,7 @@ import type { UploadFailure } from "@/store/types";
 
 /**
  * A sent message's attachment that hasn't posted yet: its upload's bar and Cancel while it
- * uploads, or the failure with Retry and Dismiss. Otherwise `fallback`, the attachment as it renders
+ * uploads, or the failure with Retry and Remove. Otherwise `fallback`, the attachment as it renders
  * once its upload has ended.
  */
 export function PendingAttachment({
@@ -128,10 +128,10 @@ function FailedAttachment({
           variant="link"
           size="sm"
           className="h-auto shrink-0 p-0 text-xs"
-          aria-label={`Dismiss failed upload of ${name}`}
-          onClick={failure.dismiss}
+          aria-label={`Remove failed upload of ${name}`}
+          onClick={failure.remove}
         >
-          Dismiss
+          Remove
         </Button>
       </div>
       <span className="text-xs text-destructive">{failure.message}</span>

@@ -809,7 +809,7 @@ export interface ConversationState {
   /**
    * Sends whose upload failed before posting. Kept out of `pendingUserMessages`, so a
    * later message's consumed event can never pair with one. Each shows its failed
-   * attachment with Retry and Dismiss until the user picks one.
+   * attachment with Retry and Remove until the user picks one.
    */
   failedUploads: PendingUserMessage[];
   /**
@@ -3079,7 +3079,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     let postedSessionId: string | null = null;
     // Whether this attempt reached its POST: a failure before it can't have been delivered.
     let posting = false;
-    // A parked message keeps its reload-recovery record until Dismiss or Retry settles it.
+    // A parked message keeps its reload-recovery record until Remove or Retry settles it.
     let keepUnsentRecord = false;
     let initialDispatched = false;
     const initialSendPending = () => {
@@ -3336,9 +3336,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(sentOnScreen ? {} : { offScreen: true }),
         });
       }
-      const callerHandlesError = heldForHost || (opts?.onError !== undefined && !cancelled);
+      const callerHandlesError = heldForHost || opts?.onError !== undefined;
       // An external send hears of the failure below, once it's known.
-      if (!heldForHost && !opts?.external && !cancelled) opts?.onError?.(message);
+      if (!heldForHost && !opts?.external) opts?.onError?.(message);
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
       // it. Keyed by the session it was meant for, so it lands in the right
@@ -3362,13 +3362,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       let refusedThisAttempt = refusedByServer || !posting;
       const draftState =
         draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
-      // A composer send stopped during its upload (failed, or cancelled) keeps its message in
-      // `failedUploads`, or hands it back to the composer when Cancel can.
+      // A send whose owner already handles failure (its onError, a held first message, an
+      // external send) keeps the ordinary failure path. Any other send stopped during its upload
+      // (failed, or cancelled) keeps its message on its bubble until the user retries or removes it.
+      const owned =
+        opts?.onError !== undefined ||
+        heldForHost ||
+        opts?.external === true ||
+        (initialDraft !== undefined && !initialDispatched);
       const parkable =
+        !owned &&
         (cancelled || (uploads.uploading && opts?.signal?.aborted !== true)) &&
-        interactive &&
-        !heldForHost &&
-        opts?.onError === undefined &&
         draftSessionId !== null &&
         (files?.length ?? 0) > 0;
       const parkedEntry = parkable
@@ -3457,23 +3461,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const failGet = (): ChatState =>
         failTarget === null ? get() : (setterForState(failTarget) ?? get());
       let parked: PendingUserMessage | null = null;
-      const handback: HandBack = {
-        text,
-        files: files ?? [],
-        stableId,
-        serverRefused,
-        ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
-      };
-      // Cancel hands the message back when the composer can take it; otherwise it stays parked.
-      const handedBack =
-        cancelled &&
-        parkedEntry !== undefined &&
-        failTarget !== null &&
-        handBackToComposer(failTarget, handback);
-      if (parkedEntry !== undefined && failTarget !== null && !handedBack) {
+      if (parkable && parkedEntry !== undefined && failTarget !== null) {
         keepUnsentRecord = true;
         const parkedIn = failTarget;
-        // Dismiss and Retry each act on the message once, whichever comes first.
+        // Retry and Remove each act once, whichever comes first.
         let settled = false;
         const failedFile = uploads.file ?? files?.[0];
         parked = {
@@ -3495,14 +3486,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 keepComposerRetryState: true,
               });
             },
-            dismiss: () => {
+            remove: () => {
               if (settled) return;
-              if (!handBackToComposer(parkedIn, handback)) {
-                toast.warning(
-                  "Restore or clear the draft in the composer first, then dismiss this upload.",
-                );
-                return;
-              }
               settled = true;
               setterFor(parkedIn)((s) => ({
                 failedUploads: s.failedUploads.filter((p) => p.tempId !== tempId),
@@ -3523,7 +3508,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // or a parked upload already says what happened, so it adds none.
       const sentText = failGet().isNativeTerminalSession ? messageContentText(content) : "";
       const failureCard: ErrorBlock | null =
-        deliveredDespiteFailure || cancelled || parked !== null
+        deliveredDespiteFailure || parked !== null
           ? null
           : {
               ...makeClientErrorBlock(message, code),
@@ -8569,38 +8554,6 @@ export function takeFailedSendDraft(
     };
   setterFor(conversationId)(patch);
   return restore ? failed : null;
-}
-
-/** What a stopped upload's message carries back to a composer. */
-interface HandBack {
-  text: string;
-  files: File[];
-  stableId: string;
-  serverRefused: boolean;
-  replyDraft?: StoredReplyDraft;
-}
-
-/**
- * Hand a message back to a conversation's composer without dropping what the composer holds.
- * An empty slot, or a recovered draft already there, takes it: the two texts join and the files
- * append. Another failed send's draft keeps its own restore rules, so this returns false and the
- * caller keeps the message parked.
- */
-function handBackToComposer(conversationId: string, message: HandBack): boolean {
-  const existing = setterForState(conversationId)?.failedSendDraft ?? null;
-  if (existing !== null && existing.recovered !== true) return false;
-  const merged: NonNullable<ConversationState["failedSendDraft"]> =
-    existing === null
-      ? { conversationId, ...message, recovered: true }
-      : {
-          conversationId,
-          text: [existing.text, message.text].filter((part) => part.trim() !== "").join("\n\n"),
-          files: [...existing.files, ...message.files],
-          serverRefused: false,
-          recovered: true,
-        };
-  setterFor(conversationId)({ failedSendDraft: merged });
-  return true;
 }
 
 /**

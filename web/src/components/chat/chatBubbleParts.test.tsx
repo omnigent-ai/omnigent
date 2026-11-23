@@ -1263,7 +1263,7 @@ describe("ConversationScrollRefBridge", () => {
 });
 
 describe("withUncommittedUserBubbles with failed uploads", () => {
-  it("places a failed upload's bubble in send order, carrying its Retry and Dismiss", () => {
+  it("places a failed upload's bubble in send order, carrying its Retry and Remove", () => {
     const failed = {
       tempId: "pend_1",
       content: [{ type: "input_file" as const, file_id: "pending:a.zip", filename: "a.zip" }],
@@ -1272,7 +1272,7 @@ describe("withUncommittedUserBubbles with failed uploads", () => {
         fileId: "pending:a.zip",
         message: "Too big",
         retry: vi.fn(),
-        dismiss: vi.fn(),
+        remove: vi.fn(),
       },
     };
     const later = {
@@ -1300,7 +1300,7 @@ describe("withUncommittedUserBubbles with failed uploads", () => {
         fileId: "pending:big.zip",
         message: "Too big",
         retry: vi.fn(),
-        dismiss: vi.fn(),
+        remove: vi.fn(),
       },
     };
     const later = {
@@ -1322,7 +1322,7 @@ describe("withUncommittedUserBubbles with failed uploads", () => {
       fileId: "pending:a.png",
       message: "Too big",
       retry: vi.fn(),
-      dismiss: vi.fn(),
+      remove: vi.fn(),
     };
     render(
       <QueryClientProvider client={new QueryClient()}>

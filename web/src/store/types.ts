@@ -36,6 +36,6 @@ export interface UploadFailure {
   message: string;
   /** Re-uploads the same files and sends the message once they're in. */
   retry: () => void;
-  /** Gives the message back to the composer and drops the failed bubble. */
-  dismiss: () => void;
+  /** Drops the message: it is not restored anywhere. */
+  remove: () => void;
 }

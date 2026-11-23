@@ -2908,30 +2908,6 @@ it.each([false, true])(
   },
 );
 
-it("restores a recovered hand-back in an ordinary side chat, after newer input", async () => {
-  const entry = conversationRegistry.acquire(childId);
-  const file = new File(["notes"], "notes.txt", { type: "text/plain" });
-  entry.setState({ sessionStatus: "idle", abortController: new AbortController() });
-  useChatStore.setState({ send: initialStoreState.send });
-  renderPane(<SideChatPane childId={childId} fullSession={false} />);
-  fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "newer" } });
-
-  act(() =>
-    entry.setState({
-      failedSendDraft: {
-        conversationId: childId,
-        text: "handed back",
-        files: [file],
-        recovered: true,
-      },
-    }),
-  );
-
-  expect(screen.getByTestId("side-chat-input")).toHaveValue("newer\n\nhanded back");
-  expect(useChatStore.getState().sideChatComposers[childId].files).toEqual([file]);
-  expect(entry.getState().failedSendDraft).toBeNull();
-});
-
 it.each(["none", "text", "files", "quote", "rejected-file"] as const)(
   "retracts a delivered grid draft only while unchanged: %s",
   (edit) => {

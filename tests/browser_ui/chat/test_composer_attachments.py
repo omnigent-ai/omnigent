@@ -219,14 +219,14 @@ def test_landing_rejects_unsupported_type_and_keeps_message(
     expect(error).to_have_count(0, timeout=10_000)
 
 
-def test_failed_upload_keeps_the_message_until_dismissed(
+def test_failed_upload_keeps_the_message_until_removed(
     page: Page, chat_session_contract: ChatSessionContract, tmp_path: Path
 ) -> None:
     """A send whose upload fails keeps its message on the bubble until the user acts.
 
-    The failed attachment shows the server's reason with Retry and Dismiss. The
-    composer stays empty; Dismiss hands the text and the file back to it, so the
-    message is never lost.
+    The failed attachment shows the server's reason with Retry and Remove. The
+    message text stays on its bubble and the composer stays empty; Remove deletes
+    the unsent message, and nothing is restored to the composer.
 
     The failure is injected at the network boundary (the upload route responds
     415 with the server's real body) rather than by attaching an unsupported
@@ -259,16 +259,15 @@ def test_failed_upload_keeps_the_message_until_dismissed(
     expect(failed).to_be_visible(timeout=30_000)
     expect(failed).to_contain_text("Unsupported attachment type")
     expect(page.get_by_role("button", name=f"Retry upload of {_ATTACH_NAME}")).to_be_visible()
-    # The message waits on its bubble; the composer stays empty until Dismiss.
-    expect(
-        page.get_by_test_id("user-message-content").filter(has_text="look at this file")
-    ).to_be_visible()
+    # The message waits on its bubble; the composer stays empty.
+    message = page.get_by_test_id("user-message-content").filter(has_text="look at this file")
+    expect(message).to_be_visible()
     expect(composer).to_have_value("")
 
-    page.get_by_role("button", name=f"Dismiss failed upload of {_ATTACH_NAME}").click()
-    expect(composer).to_have_value("look at this file", timeout=10_000)
-    expect(page.get_by_role("button", name=f"Remove {_ATTACH_NAME}")).to_be_visible()
+    page.get_by_role("button", name=f"Remove failed upload of {_ATTACH_NAME}").click()
     expect(failed).to_have_count(0)
+    expect(message).to_have_count(0)
+    expect(composer).to_have_value("")
 
 
 # Samples the first painted frame of each image tile. A ResizeObserver's first
