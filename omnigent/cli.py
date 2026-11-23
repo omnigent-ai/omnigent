@@ -10609,8 +10609,7 @@ def _host_session_visibility(base_url: str) -> Literal["all", "mine"]:
     advertise ``session_list_scoped_archives`` in ``GET /v1/info`` drops archived
     rows from ``"mine"`` lists, so it keeps ``"all"``.
 
-    :param base_url: Omnigent server base URL, e.g.
-        ``"https://example.databricksapps.com"``.
+    :param base_url: Omnigent server base URL, e.g. ``"https://example.com"``.
     :returns: ``"mine"`` when the server keeps archived rows in owner-scoped
         lists, otherwise ``"all"``.
     """
