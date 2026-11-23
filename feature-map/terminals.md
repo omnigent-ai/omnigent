@@ -85,6 +85,13 @@ with their own terminal retain the switcher.
   In the Electron desktop app, Cmd/Ctrl+W also closes the selected visible
   workspace tab, using the same terminal confirmation. A read-only viewer's
   terminal stays open. Cmd/Ctrl+Shift+W closes the window.
+- Right-click any open workspace tab, or open the rail's panel picker (⌄), and
+  choose Close other tabs or Close all tabs. Shells in the batch close together
+  after one confirmation ("Close N shells?"). The batch's other tabs close
+  right away, so cancelling keeps only the shells open.
+  Closing the last open tab yourself hides the rail; tabs the agent closes
+  leave it open. In a grid, a cell's workspace stays open when its last tab
+  closes, since the workspace is shared across the grid's panes.
 - Tabs sidebar: with `workspace_sidebar_v2` on, in a desktop app or desktop browser (not a
   touch client), shells open as tabs in the workspace sidebar. The
   session-actions menu's **Shells** shows the session's selected or last shell tab,

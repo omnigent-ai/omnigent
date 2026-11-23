@@ -74,7 +74,7 @@ import {
 } from "@/shell/FileViewerContext";
 import type { RightRailTab } from "@/shell/railTabs";
 import type { ChangedSort } from "@/shell/FlatFileList";
-import { WorkspacePanel } from "@/shell/WorkspacePanel";
+import { type ShellCloseCallbacks, WorkspacePanel } from "@/shell/WorkspacePanel";
 import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
 import { citedFilePosition } from "@/shell/filePositionState";
@@ -242,8 +242,13 @@ export function GridSessionPane({
   }, [sessionId]);
   const deleteTerminal = useDeleteTerminal(sessionId);
   const closingTerminal = terminals.find((terminal) => terminal.id === deleteTerminal.variables);
-  const [pendingClose, setPendingClose] = useState<string | null>(null);
-  const terminalToClose = terminals.find((terminal) => terminalTabKey(terminal) === pendingClose);
+  const [pendingClose, setPendingClose] = useState<{
+    keys: string[];
+    callbacks?: ShellCloseCallbacks;
+  } | null>(null);
+  const terminalsToClose = terminals.filter((terminal) =>
+    pendingClose?.keys.includes(terminalTabKey(terminal)),
+  );
   const [workspace, setWorkspace] = useState<SessionWorkspaceState>(() => {
     const saved = readSessionWorkspaceState(sessionId);
     return {
@@ -342,18 +347,15 @@ export function GridSessionPane({
     },
     [navigateWorkspace, showTab],
   );
-  const closeFile = useCallback(
-    (path: string) => {
-      navigateWorkspace("", undefined, () =>
-        setWorkspace((previous) => ({
-          ...previous,
-          openFiles: previous.openFiles?.filter((file) => file !== path),
-          selectedFilePath: previous.selectedFilePath === path ? null : previous.selectedFilePath,
-        })),
-      );
-    },
-    [navigateWorkspace],
-  );
+  // The workspace panel already asks the file on screen about unsaved edits before closing
+  // it, and background tabs have no viewer, so closing a tab drops it without asking again.
+  const closeFile = useCallback((path: string) => {
+    setWorkspace((previous) => ({
+      ...previous,
+      openFiles: previous.openFiles?.filter((file) => file !== path),
+      selectedFilePath: previous.selectedFilePath === path ? null : previous.selectedFilePath,
+    }));
+  }, []);
   const openTerminal = useCallback(
     (key: string) => {
       if (tabsSidebar) {
@@ -561,16 +563,22 @@ export function GridSessionPane({
           )}
           <CloseShellDialog
             open={pendingClose !== null}
-            shellLabel={terminalToClose?.name ?? null}
+            shellCount={pendingClose?.keys.length}
+            shellLabel={terminalsToClose.length === 1 ? terminalsToClose[0].name : null}
             onCancel={() => setPendingClose(null)}
             onConfirm={() => {
-              if (terminalToClose)
-                deleteTerminal.mutate(terminalToClose.id, {
-                  onSuccess: () => {
-                    if (workspace.selectedTerminalKey === pendingClose)
+              pendingClose?.callbacks?.onConfirmed?.();
+              for (const terminal of terminalsToClose) {
+                const key = terminalTabKey(terminal);
+                // mutateAsync settles per call; mutate's own callbacks fire only for the last one.
+                deleteTerminal.mutateAsync(terminal.id).then(
+                  () => {
+                    if (workspace.selectedTerminalKey === key)
                       updateWorkspace({ selectedTerminalKey: null });
                   },
-                });
+                  () => pendingClose?.callbacks?.onFailed?.(key),
+                );
+              }
               setPendingClose(null);
             }}
           />
@@ -631,20 +639,17 @@ export function GridSessionPane({
                   onRightRailTabChange={selectTab}
                   openPanels={workspace.openPanels ?? []}
                   onClosePanel={(tab) => {
-                    navigateWorkspace("", undefined, () =>
-                      setWorkspace((previous) => {
-                        const remaining =
-                          previous.openPanels?.filter((panel) => panel !== tab) ?? [];
-                        return {
-                          ...previous,
-                          openPanels: remaining,
-                          rightRailTab:
-                            previous.rightRailTab === tab
-                              ? (remaining.at(-1) ?? readInitialWorkspaceTab())
-                              : previous.rightRailTab,
-                        };
-                      }),
-                    );
+                    setWorkspace((previous) => {
+                      const remaining = previous.openPanels?.filter((panel) => panel !== tab) ?? [];
+                      return {
+                        ...previous,
+                        openPanels: remaining,
+                        rightRailTab:
+                          previous.rightRailTab === tab
+                            ? (remaining.at(-1) ?? readInitialWorkspaceTab())
+                            : previous.rightRailTab,
+                      };
+                    });
                   }}
                   showFilesPanel={showFiles}
                   showGithubTab={showFiles}
@@ -679,7 +684,10 @@ export function GridSessionPane({
                       ? terminalTabKey(closingTerminal)
                       : null
                   }
-                  onCloseTerminal={setPendingClose}
+                  onCloseTerminal={(key, callbacks) => setPendingClose({ keys: [key], callbacks })}
+                  onCloseTerminals={(keys, callbacks) => {
+                    if (keys.length > 0) setPendingClose({ keys, callbacks });
+                  }}
                   maximized={selected && workspacePanel.maximized}
                   permissionLevel={permissionLevel}
                   filesPanelSort={sort}

@@ -19,20 +19,31 @@ interface CloseShellDialogProps {
   open: boolean;
   /** Display label of the shell being closed (name · session), for the copy. */
   shellLabel: string | null;
+  /** How many shells the confirmation closes; more than one uses plural copy. */
+  shellCount?: number;
   /** Confirm — kill the terminal. */
   onConfirm: () => void;
   /** Dismiss without closing the terminal. */
   onCancel: () => void;
 }
 
-export function CloseShellDialog({ open, shellLabel, onConfirm, onCancel }: CloseShellDialogProps) {
+export function CloseShellDialog({
+  open,
+  shellLabel,
+  shellCount = 1,
+  onConfirm,
+  onCancel,
+}: CloseShellDialogProps) {
+  const several = shellCount > 1;
   return (
     <Dialog open={open} onOpenChange={(next) => !next && onCancel()}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Close shell?</DialogTitle>
+          <DialogTitle>{several ? `Close ${shellCount} shells?` : "Close shell?"}</DialogTitle>
           <DialogDescription>
-            {shellLabel ? (
+            {several ? (
+              `This terminates ${shellCount} shells and ends any processes running in them. This can't be undone.`
+            ) : shellLabel ? (
               <>
                 This terminates <span className="text-foreground">{shellLabel}</span> and ends any
                 process running in it. This can't be undone.
@@ -47,7 +58,7 @@ export function CloseShellDialog({ open, shellLabel, onConfirm, onCancel }: Clos
             Cancel
           </Button>
           <Button variant="destructive" onClick={onConfirm}>
-            Close shell
+            {several ? "Close shells" : "Close shell"}
           </Button>
         </DialogFooter>
       </DialogContent>
