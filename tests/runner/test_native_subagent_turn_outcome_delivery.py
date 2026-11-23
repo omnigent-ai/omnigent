@@ -721,6 +721,53 @@ async def test_pane_running_edge_reopens_drained_dispatch(inferred: bool) -> Non
         _forget_drained_child(rig.child_id)
 
 
+@pytest.mark.parametrize("drain_first", [True, False], ids=["drained", "registered"])
+@pytest.mark.asyncio
+async def test_turn_answering_a_forwarded_message_is_not_reported(drain_first: bool) -> None:
+    """A peer's or user's message starts a turn that answers them, not the parent.
+
+    The next turn the child starts on its own still reports to the parent.
+    """
+    rig = _Rig("claude-native")
+    try:
+        async with _runner_client(rig.app) as client:
+            work_id = await _deliver_first_result(rig, client, drain=drain_first)
+            resp = await client.post(
+                f"/v1/sessions/{rig.child_id}/events",
+                json={
+                    "type": "message",
+                    "content": [{"type": "input_text", "text": "[Message from session s]\nhi"}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+            await poll_until_async(
+                lambda: rig.child_id not in rig.app.state.active_turns, timeout_s=5
+            )
+            answer_edges: list[dict[str, Any]] = [
+                {"status": "running"},
+                {"status": "waiting"},
+                {"status": "running"},
+                {"status": "idle", "turn_completed": True, "output": "hello, peer"},
+            ]
+            for data in answer_edges:
+                resp = await rig.post_status(client, data)
+                assert resp.status_code == 204, resp.text
+            assert rig.drained() == []
+
+            for data in (
+                {"status": "running"},
+                {"status": "idle", "turn_completed": True, "output": "open the PR?"},
+            ):
+                resp = await rig.post_status(client, data)
+                assert resp.status_code == 204, resp.text
+        assert [(item["output"], item["work_id"]) for item in rig.drained()] == [
+            ("open the PR?", work_id)
+        ]
+    finally:
+        rig.close()
+        _forget_drained_child(rig.child_id)
+
+
 def test_parent_teardown_drops_resumable_drained_dispatch() -> None:
     """A resumed child of a deleted parent does not re-register work for it."""
     parent_id = uuid.uuid4().hex

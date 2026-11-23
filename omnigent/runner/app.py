@@ -216,6 +216,7 @@ from omnigent.runner.subagent_work import (
     list_subagent_work,
     mark_subagent_work_started,
     mark_subagent_work_terminal,
+    note_subagent_child_messaged,
     note_subagent_child_resumed,
     note_subagent_child_start_reported,
     note_subagent_child_turn_settled,
@@ -8320,6 +8321,7 @@ def create_runner_app(
                             "detail": "Message already queued or running.",
                         },
                     )
+                note_subagent_child_messaged(conversation_id)
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
                     message_body["content"] = await _resolve_forwarded_message_content(

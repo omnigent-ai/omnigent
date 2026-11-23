@@ -155,6 +155,9 @@ class _SubagentWorkEntry:
     :param turn_resumed: Whether the child started a new turn on its own after
         this dispatch's result reached the parent, so that turn's confirmed
         result is delivered too.
+    :param message_turn_pending: Whether a message was forwarded to the child
+        after this dispatch's result reached the parent and the turn answering
+        it has not ended, so that turn is not taken as self-started.
     """
 
     parent_session_id: str
@@ -177,6 +180,7 @@ class _SubagentWorkEntry:
     awaiting_child_start_since: float | None = None
     native_acceptance: NativeTurnAcceptance | None = None
     turn_resumed: bool = False
+    message_turn_pending: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -404,6 +408,28 @@ def note_subagent_child_resumed(child_session_id: str) -> None:
     :param child_session_id: Child session id, e.g. ``"conv_child456"``.
     :returns: None.
     """
+    entry = _delivered_subagent_entry(child_session_id)
+    if entry is not None and not entry.message_turn_pending:
+        entry.turn_resumed = True
+
+
+def note_subagent_child_messaged(child_session_id: str) -> None:
+    """
+    Record that a message was forwarded to a child whose result reached the parent.
+
+    The turn answering it belongs to the message's sender, such as a user or a
+    peer session, so its running edges do not reopen the dispatch.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: None.
+    """
+    entry = _delivered_subagent_entry(child_session_id)
+    if entry is not None:
+        entry.message_turn_pending = True
+
+
+def _delivered_subagent_entry(child_session_id: str) -> _SubagentWorkEntry | None:
+    """Return the child's registered or drained dispatch whose result reached the parent."""
     entry = _subagent_work_by_child.get(child_session_id)
     if entry is None:
         entry = _drained_subagent_work.get(child_session_id)
@@ -413,7 +439,8 @@ def note_subagent_child_resumed(child_session_id: str) -> None:
         and entry.status in _SUBAGENT_TERMINAL_STATUSES
         and not entry.launch_timed_out
     ):
-        entry.turn_resumed = True
+        return entry
+    return None
 
 
 def begin_subagent_child_acceptance(child_session_id: str) -> _ChildAcceptanceRequest:
@@ -1024,7 +1051,9 @@ def mark_subagent_work_terminal(
             elif corrects_cancellation:
                 return _deliver_corrected_completion(provisional, output)
         drained = _drained_subagent_work.get(child_session_id)
-        if drained is not None and _reports_resumed_turn(drained, status, confirmed_completion):
+        if drained is not None and _take_resumed_turn_report(
+            drained, status, confirmed_completion
+        ):
             return _deliver_resumed_turn(drained, status=status, output=output)
         if child_session_id in _drained_delivered_subagent_children:
             return _SubagentDeliveryAck(
@@ -1063,8 +1092,7 @@ def mark_subagent_work_terminal(
             # The child survived an optimistic cancellation and finished; its
             # confirmed completion corrects the already-delivered record.
             return _deliver_corrected_completion(entry, output)
-        if entry.delivered and _reports_resumed_turn(entry, status, confirmed_completion):
-            entry.turn_resumed = False
+        if entry.delivered and _take_resumed_turn_report(entry, status, confirmed_completion):
             entry.status = status
             entry.output = output
             entry.completed_at = time.time()
@@ -1155,13 +1183,26 @@ def _deliver_corrected_completion(
     return _deliver_subagent_completion(entry)
 
 
-def _reports_resumed_turn(
+def _take_resumed_turn_report(
     entry: _SubagentWorkEntry, status: str, confirmed_completion: bool
 ) -> bool:
-    """Whether a terminal report is the outcome of a turn the child started itself."""
-    return entry.turn_resumed and (
-        status == "failed" or (status == "completed" and confirmed_completion)
-    )
+    """
+    Consume a confirmed turn end and say whether the child started that turn itself.
+
+    Any other confirmed end closes the turn answering a forwarded message.
+
+    :param entry: The delivered dispatch for the reporting child.
+    :param status: Reported terminal status, e.g. ``"completed"``.
+    :param confirmed_completion: Whether a ``completed`` report is a confirmed turn end.
+    :returns: Whether the report should be delivered as a resumed turn's result.
+    """
+    if status != "failed" and not (status == "completed" and confirmed_completion):
+        return False
+    if entry.turn_resumed:
+        entry.turn_resumed = False
+        return True
+    entry.message_turn_pending = False
+    return False
 
 
 def _deliver_resumed_turn(
@@ -1190,6 +1231,7 @@ def _deliver_resumed_turn(
     entry.output = output
     entry.completed_at = time.time()
     entry.child_start_reported = True
+    entry.message_turn_pending = drained_entry.message_turn_pending
     return _deliver_subagent_completion(entry)
 
 
