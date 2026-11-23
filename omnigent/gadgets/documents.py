@@ -49,8 +49,12 @@ Guarantees
   ``StoreLimits.tombstone_retention_s`` when its :class:`GadgetFiles` can delete
   (``supports_delete``). Removal first appends a ``purge``
   revision, which makes writers of that record wait, then releases the record's
-  capacity claim and deletes its directory. The guarantees above hold for the
-  retention period; a retry arriving after a record was removed is a new request.
+  capacity claim and deletes its directory. One remover at a time holds a
+  create-only removal ticket for that purge revision and deletes only while the
+  record's newest revision is still it, checked right before each delete, so a
+  remover that resumes late never deletes the record created again after it.
+  The guarantees above hold for the retention period; a retry arriving after a
+  record was removed is a new request.
 * ``get`` verifies the newest revision, its predecessor link and the revision
   numbering of the record directory. ``verify_record`` verifies the whole chain.
 * Version tokens and list cursors are opaque, versioned and scoped to the
@@ -537,7 +541,7 @@ class ImmutableDocumentStore:
                 raise Conflict(
                     "document is being removed; retry shortly", reason="concurrent_write"
                 )
-            self._finish_purge(ref)
+            self._finish_purge(ref, head.latest)
             head = self._load_head(ref)
             if head is not None:
                 raise Conflict("document changed while it was removed", reason="concurrent_write")
@@ -1055,12 +1059,15 @@ class ImmutableDocumentStore:
 
     # -- removing deleted records -------------------------------------------
 
-    def _older_than(self, revision: _Revision, seconds: int) -> bool:
-        written = datetime.strptime(revision.updated_at, _TIMESTAMP_FORMAT).replace(tzinfo=UTC)
+    def _seconds_since(self, timestamp: str) -> float:
+        written = datetime.strptime(timestamp, _TIMESTAMP_FORMAT).replace(tzinfo=UTC)
         moment = self._clock()
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=UTC)
-        return (moment - written).total_seconds() >= seconds
+        return (moment - written).total_seconds()
+
+    def _older_than(self, revision: _Revision, seconds: int) -> bool:
+        return self._seconds_since(revision.updated_at) >= seconds
 
     def _reclaim(self, collection: str, doc_id: str) -> bool:
         """Remove some records deleted longer than the retention ago; whether any went."""
@@ -1087,7 +1094,7 @@ class ImmutableDocumentStore:
                 elif head.latest.kind == _PURGE and self._older_than(
                     head.latest, self._limits.purge_abandon_s
                 ):
-                    self._finish_purge(ref)
+                    self._finish_purge(ref, head.latest)
                 else:
                     continue
             except (Conflict, CorruptData, NotFound):
@@ -1114,13 +1121,79 @@ class ImmutableDocumentStore:
         result = self._append(ref, head, _PURGE, None, operation_id, marker.updated_by, digest)
         if not isinstance(result, DeleteResult):
             raise Conflict("record changed before it could be removed", reason="concurrent_write")
-        self._finish_purge(ref)
+        purged = self._load_head(ref)
+        if purged is None or purged.latest.kind != _PURGE:
+            raise Conflict("record changed before it could be removed", reason="concurrent_write")
+        self._finish_purge(ref, purged.latest)
 
-    def _finish_purge(self, ref: _Ref) -> None:
+    def _finish_purge(self, ref: _Ref, marker: _Revision) -> None:
+        """Release a purged record's capacity slot and delete its directory.
+
+        Fenced by *marker*, the purge revision: only the holder of its newest removal
+        ticket deletes, and only while *marker* is still the record's newest revision.
+        A remover that finds another holding the ticket, or the record already gone or
+        created again, leaves it alone.
+        """
+        tickets = f"{self._root}/.removals/{ref.collection}/{ref.doc_id}/{marker.digest[:32]}"
+        ticket = self._take_removal_ticket(tickets)
+        if ticket is None:
+            return
         claim = self._claim_path(ref.collection, ref.doc_id)
-        if claim is not None:
-            self._files.delete_tree(claim)
-        self._files.delete_tree(ref.directory)
+        for path in (claim, ref.directory):
+            if path is None:
+                continue
+            if not self._still_removing(ref, marker, tickets, ticket):
+                break
+            self._files.delete_tree(path)
+        self._files.delete_tree(tickets)
+
+    def _removal_tickets(self, tickets: str) -> _IntList:
+        try:
+            names = self._files.list_paths(tickets)
+        except NotFound:
+            return []
+        numbers = []
+        for entry in names:
+            match = _REVISION_NAME_RE.fullmatch(posixpath.basename(str(entry).rstrip("/")))
+            if match is not None:
+                numbers.append(int(match.group(1)))
+        return sorted(numbers)
+
+    def _take_removal_ticket(self, tickets: str) -> int | None:
+        """A new removal ticket's number, or ``None`` while another remover holds one.
+
+        A ticket older than ``purge_abandon_s`` belongs to a remover that stopped; the
+        next number takes over, and the stopped remover then finds it is not the newest.
+        """
+        held = self._removal_tickets(tickets)
+        if held:
+            try:
+                taken = self._files.read_json(f"{tickets}/{held[-1]:0{_REVISION_DIGITS}d}.json")
+            except NotFound:
+                return None
+            at = taken.get("at") if isinstance(taken, dict) else None
+            if not isinstance(at, str) or _TIMESTAMP_RE.fullmatch(at) is None:
+                return None
+            if self._seconds_since(at) < self._limits.purge_abandon_s:
+                return None
+        number = (held[-1] if held else 0) + 1
+        self._files.mkdirs(tickets)
+        try:
+            self._files.create_json(
+                f"{tickets}/{number:0{_REVISION_DIGITS}d}.json", {"at": self._now()}
+            )
+        except Conflict:
+            return None
+        return number
+
+    def _still_removing(self, ref: _Ref, marker: _Revision, tickets: str, ticket: int) -> bool:
+        """Whether this remover may delete: *marker* is still the newest revision and
+        *ticket* the newest ticket."""
+        head = self._load_head(ref)
+        if head is None or head.latest.digest != marker.digest:
+            return False
+        held = self._removal_tickets(tickets)
+        return bool(held) and held[-1] == ticket
 
     # -- values, tokens and cursors ----------------------------------------
 

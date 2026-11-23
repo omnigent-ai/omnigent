@@ -209,6 +209,54 @@ def test_a_removed_record_can_be_created_again_from_scratch(env: Env) -> None:
     assert again.value == {"n": 2}
 
 
+def test_a_late_remover_never_deletes_the_record_created_again(env: Env) -> None:
+    a = env.docs.create("cards", "a", {"n": 1}, "op-a", ACTOR)
+    env.docs.delete("cards", "a", a.version, "del-a", ACTOR)
+    env.clock.advance(61)
+    ref = env.docs._ref("cards", "a")
+    head = env.docs._load_head(ref)
+    assert head is not None
+    # Two removers race: both write or see the same purge revision; the first finishes.
+    original = env.docs._finish_purge
+    env.docs._finish_purge = lambda ref, marker: None  # type: ignore[method-assign]
+    env.docs._purge(ref, head)
+    env.docs._finish_purge = original  # type: ignore[method-assign]
+    purged = env.docs._load_head(ref)
+    assert purged is not None
+    marker = purged.latest
+    env.docs._finish_purge(ref, marker)
+    again = env.docs.create("cards", "a", {"n": 2}, "op-a2", ACTOR)
+    # The slower remover resumes with the old purge revision: the new record survives.
+    env.docs._finish_purge(ref, marker)
+    assert env.docs.get("cards", "a") == again
+    assert env.docs.verify_record("cards", "a").revisions == 1  # type: ignore[union-attr]
+
+
+def test_only_the_ticket_holder_removes_a_record_until_it_stops(env: Env) -> None:
+    a = env.docs.create("cards", "a", {"n": 1}, "op-a", ACTOR)
+    env.docs.delete("cards", "a", a.version, "del-a", ACTOR)
+    env.clock.advance(61)
+    ref = env.docs._ref("cards", "a")
+    head = env.docs._load_head(ref)
+    assert head is not None
+    original = env.docs._finish_purge
+    env.docs._finish_purge = lambda ref, marker: None  # type: ignore[method-assign]
+    env.docs._purge(ref, head)
+    env.docs._finish_purge = original  # type: ignore[method-assign]
+    marker = env.docs._load_head(ref).latest  # type: ignore[union-attr]
+    tickets = f"{env.docs._root}/.removals/cards/a/{marker.digest[:32]}"
+    # A remover took the ticket and stopped before deleting anything.
+    assert env.docs._take_removal_ticket(tickets) == 1
+    env.docs._finish_purge(ref, marker)
+    assert env.docs.verify_record("cards", "a") is not None
+    # Once its ticket is older than the abandon time, the next remover takes over.
+    env.clock.advance(31)
+    env.docs._finish_purge(ref, marker)
+    assert env.docs.verify_record("cards", "a") is None
+    # The stopped remover resuming later finds nothing of its purge left to delete.
+    assert env.docs._still_removing(ref, marker, tickets, 1) is False
+
+
 def test_a_record_being_removed_makes_its_writers_wait(env: Env) -> None:
     a = env.docs.create("cards", "a", {"n": 1}, "op-a", ACTOR)
     env.docs.delete("cards", "a", a.version, "del-a", ACTOR)
@@ -218,7 +266,7 @@ def test_a_record_being_removed_makes_its_writers_wait(env: Env) -> None:
     assert head is not None
     # A removal that wrote its purge revision and stopped before deleting the record.
     original = env.docs._finish_purge
-    env.docs._finish_purge = lambda ref: None  # type: ignore[method-assign]
+    env.docs._finish_purge = lambda ref, marker: None  # type: ignore[method-assign]
     env.docs._purge(ref, head)
     env.docs._finish_purge = original  # type: ignore[method-assign]
     assert env.docs.get("cards", "a") is None
