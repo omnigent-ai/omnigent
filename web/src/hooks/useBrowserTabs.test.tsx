@@ -113,6 +113,7 @@ describe("browser tab titles", () => {
     "retried with a live update",
     "another window",
     "another window opened later",
+    "live view opened later",
   ] as const)("labels a tab whose view is gone with identity %s", async (identityState) => {
     let finishIdentity!: (userId: string) => void;
     const pendingIdentity = new Promise<string>((resolve) => {
@@ -120,8 +121,9 @@ describe("browser tab titles", () => {
     });
     const retried = identityState.startsWith("retried");
     const elsewhere = identityState === "another window";
-    const anotherWindow = identityState.startsWith("another window");
-    if (identityState !== "ready" && !anotherWindow) {
+    const refreshPage =
+      identityState.startsWith("another window") || identityState === "live view opened later";
+    if (identityState !== "ready" && !refreshPage) {
       vi.mocked(getCurrentUserId).mockReturnValue(null);
       vi.mocked(resolveIdentity).mockReturnValue(retried ? Promise.resolve(null) : pendingIdentity);
     }
@@ -132,24 +134,29 @@ describe("browser tab titles", () => {
       },
     });
     const onBrowserUrlChanged = vi.fn<(listener: Listener) => () => void>(() => () => {});
+    const browserHasView = vi.fn().mockResolvedValue({ exists: false, elsewhere });
     Object.assign(window, {
       omnigentDesktop: {
-        browserHasView: vi.fn().mockResolvedValue({ exists: false, elsewhere }),
+        browserHasView,
         onBrowserUrlChanged,
       },
     });
     const { result } = renderHook(() => useBrowserTabs("session-a"));
     const live = identityState.endsWith("with a live update");
-    if (anotherWindow) {
+    if (refreshPage) {
       await waitFor(() => expect(result.current.labelFor("restored", 0)).toBe("Guide"));
-      // The other window saves its new address without emitting a local URL event.
-      act(() =>
-        writeSessionWorkspaceState("session-a", {
-          browserPages: {
-            restored: { url: "https://docs.example/newer", title: "Newer", owner: "user-a" },
-          },
-        }),
-      );
+      if (identityState === "live view opened later") {
+        browserHasView.mockResolvedValue({ exists: true, url: "https://docs.example/newer" });
+      } else {
+        // The other window saves its new address without emitting a local URL event.
+        act(() =>
+          writeSessionWorkspaceState("session-a", {
+            browserPages: {
+              restored: { url: "https://docs.example/newer", title: "Newer", owner: "user-a" },
+            },
+          }),
+        );
+      }
       expect(await result.current.pageUrl("restored")).toBe("https://docs.example/newer");
       return;
     }
