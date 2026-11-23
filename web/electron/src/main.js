@@ -5422,7 +5422,8 @@ function registerIpc() {
     if (!isPinnedOriginSender(event) || !isMainWindow(win)) return;
     // Only the window's own page speaks for its sidebar, not a frame inside it.
     if (event.senderFrame !== event.sender.mainFrame) return;
-    if (report?.open === true) rightSidebarWindow.opened(win, report.width);
+    if (report?.reset === true) rightSidebarWindow.forget(win);
+    else if (report?.open === true) rightSidebarWindow.opened(win, report.width);
     else if (report?.open === false) rightSidebarWindow.closed(win);
   });
 

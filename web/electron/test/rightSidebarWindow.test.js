@@ -227,7 +227,7 @@ describe("createRightSidebarWindow", () => {
     assert.deepEqual(win.getBounds(), { x: 0, y: 25, width: 1420, height: 1055 });
   });
 
-  it("forgets a window's growth so a new page can't shrink it", () => {
+  it("forgets growth so a new page or session uses the current width as its baseline", () => {
     const { controller } = harness();
     for (const fullScreenClose of [false, true]) {
       const win = fakeWindow();
@@ -243,6 +243,9 @@ describe("createRightSidebarWindow", () => {
       assert.equal(win.getBounds().width, 1300);
       // The new page's first open widens the window again.
       assert.equal(controller.opened(win, 500), true);
+      assert.equal(win.getBounds().width, 1800);
+      assert.equal(controller.closed(win), true);
+      assert.equal(win.getBounds().width, 1300);
     }
   });
 

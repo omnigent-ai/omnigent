@@ -20,6 +20,7 @@ import {
   nativeNotify,
   refreshDbcert,
   reportRightSidebarVisibility,
+  resetRightSidebarWindowTracking,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
   PRE_MANIFEST_BASELINE,
@@ -952,5 +953,22 @@ describe("right sidebar window bridge", () => {
     expect(bridge.opened).toHaveBeenCalledWith(420);
     reportRightSidebarVisibility(false, 420);
     expect(bridge.closed).toHaveBeenCalledTimes(1);
+  });
+
+  it("resets growth tracking when supported and tolerates older shells and failed IPC", () => {
+    expect(() => resetRightSidebarWindowTracking()).not.toThrow();
+    installRightSidebarWindow();
+    expect(supportsWidenWindowForRightSidebar()).toBe(true);
+    expect(() => resetRightSidebarWindowTracking()).not.toThrow();
+
+    const reset = vi.fn();
+    installRightSidebarWindow({ reset });
+    resetRightSidebarWindowTracking();
+    expect(reset).toHaveBeenCalledOnce();
+
+    reset.mockImplementation(() => {
+      throw new Error("ipc down");
+    });
+    expect(() => resetRightSidebarWindowTracking()).not.toThrow();
   });
 });

@@ -73,6 +73,7 @@ import {
   isMacElectronShell,
   onNativeSidebarDrag,
   reportRightSidebarVisibility,
+  resetRightSidebarWindowTracking,
   supportsBrowser,
   updateBridge,
 } from "@/lib/nativeBridge";
@@ -704,6 +705,9 @@ function AppShellImpl() {
   );
   // Whether the rail can show here and how far it widens the window, for the shell's setting.
   const rightSidebarWindowRef = useRef({ canShow: false, width: (): number => 0 });
+  useEffect(() => {
+    resetRightSidebarWindowTracking();
+  }, [conversationId]);
   const setRightPanelOpenAnimated = useCallback((open: boolean) => {
     if (rightPanelOpenRef.current === open) return;
     rightPanelOpenRef.current = open;

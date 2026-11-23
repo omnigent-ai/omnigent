@@ -350,6 +350,8 @@ export interface RightSidebarWindowBridge {
   opened: (width: number) => void;
   /** The user closed the right sidebar. */
   closed: () => void;
+  /** Forget the previous session's growth without resizing; absent on older shells. */
+  reset?: () => void;
 }
 
 /** Why the shell didn't open a path from the floating panel in a main window. */
@@ -1069,6 +1071,15 @@ export async function setWidenWindowForRightSidebar(enabled: boolean): Promise<b
   } catch (err) {
     console.warn("[nativeBridge] electron setWidensWindow failed:", err);
     return false;
+  }
+}
+
+/** A session switch starts fresh window-growth tracking without resizing the window. */
+export function resetRightSidebarWindowTracking(): void {
+  try {
+    electronApi()?.rightSidebarWindow?.reset?.();
+  } catch (err) {
+    console.warn("[nativeBridge] electron right sidebar reset failed:", err);
   }
 }
 

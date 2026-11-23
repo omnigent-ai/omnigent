@@ -231,6 +231,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
       ipcRenderer.send("omnigent:right-sidebar-visibility", { open: true, width: Number(width) }),
     /** The user closed the right sidebar. Fire-and-forget. */
     closed: () => ipcRenderer.send("omnigent:right-sidebar-visibility", { open: false }),
+    /** Forget the previous session's growth without resizing the window. */
+    reset: () => ipcRenderer.send("omnigent:right-sidebar-visibility", { reset: true }),
   },
   /** The runner picked during onboarding for this server ("local" |
    *  "remote"), returned once, else null. */
