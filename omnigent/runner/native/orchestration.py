@@ -9338,7 +9338,16 @@ def _apply_claude_launcher(command: str, args: Sequence[str]) -> tuple[str, list
     """
     from omnigent.claude_launcher import resolve_claude_launch  # noqa: FlagLocalImports
 
-    return resolve_claude_launch(command, list(args))
+    launch_command, launch_args = resolve_claude_launch(command, list(args))
+    if launch_command != command and resolve_cli_binary(launch_command) is None:
+        # The preflight above validated the Claude binary, not the wrapper the
+        # plugin swapped in; without this the tmux pane just dies at launch.
+        _logger.error(
+            "Claude launcher plugin returned command %r, which is not on PATH; "
+            "the Claude terminal launch will fail",
+            launch_command,
+        )
+    return launch_command, launch_args
 
 
 async def _auto_create_claude_terminal(
