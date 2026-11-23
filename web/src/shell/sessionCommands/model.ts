@@ -27,6 +27,7 @@ export const SESSION_COMMAND_IDS = [
   "mark-read",
   "create-automation",
   "move-to-project",
+  "move-to-nest",
   "stop",
   "archive",
   "unarchive",
@@ -64,6 +65,8 @@ export interface SessionCommandFacts {
   canCreateAutomation: boolean;
   /** The project it's filed under, if any. */
   currentProject: string | null;
+  /** It can move into or out of a nest: a top-level session, on a server that moves nests. */
+  nestable: boolean;
   /** Its runner may still be running. */
   stoppable: boolean;
   /** Why Fork can't run here, if it can't. */
@@ -99,6 +102,7 @@ const OPENS_DIALOG: ReadonlySet<SessionCommandId> = new Set<SessionCommandId>([
   "rename",
   "create-automation",
   "move-to-project",
+  "move-to-nest",
   "stop",
   "archive",
   "delete",
@@ -141,6 +145,7 @@ const KEYWORDS: Record<SessionCommandId, readonly string[]> = {
   "mark-read": ["read", "seen", "clear"],
   "create-automation": ["automation", "schedule", "recurring"],
   "move-to-project": ["project", "folder", "file", "move"],
+  "move-to-nest": ["nest", "family", "group", "unnest", "remove from nest"],
   stop: ["terminate", "kill", "runner", "halt"],
   archive: ["hide", "done"],
   unarchive: ["restore", "unhide"],
@@ -207,6 +212,7 @@ const LABELS: Record<SessionCommandId, string> = {
   "mark-read": "Mark as read",
   "create-automation": "Create automation",
   "move-to-project": "Add to project",
+  "move-to-nest": "Move to nest",
   stop: "Stop session",
   archive: "Archive",
   unarchive: "Unarchive",
@@ -251,6 +257,9 @@ function availabilityOf(id: SessionCommandId, facts: SessionCommandFacts): Comma
     // Filing is the owner's own tool, and a nested family member files with its family.
     case "move-to-project":
       return when(owner && !facts.indentedSibling, AVAILABLE);
+    // As the row menu's Move session offers it: the owner's top-level, unarchived sessions.
+    case "move-to-nest":
+      return when(owner && facts.nestable, AVAILABLE);
     case "stop":
       return when(facts.stoppable, ownerOnly(facts, OWNER_ONLY_REASONS.stop));
     case "archive":
@@ -344,6 +353,11 @@ export const SESSION_COMMAND_PICKS: Partial<Record<SessionCommandId, SessionComm
     "Add a Session to a Project…",
     "Add which session to a project?",
     "Add to project",
+  ),
+  "move-to-nest": pick(
+    "Move a Session to a Nest…",
+    "Move which session to a nest?",
+    "Move to nest",
   ),
   stop: pick("Stop a Session…", "Stop which session?", "Stop"),
   archive: pick("Archive a Session…", "Archive which session?", "Archive"),

@@ -6,6 +6,7 @@ import { useQueryClient } from "@tanstack/react-query";
 
 import {
   type Conversation,
+  useMoveToNest,
   useMoveToProject,
   useSetConversationMuted,
   useTogglePinnedConversation,
@@ -24,6 +25,7 @@ import { useSessionActions } from "../useSessionActions";
 import { leaveSessionView } from "./archiveNavigation";
 import { currentSessionRow } from "./currentSession";
 import { sessionCommand } from "./model";
+import { MoveToNestPicker } from "./MoveToNestPicker";
 import { MoveToProjectPicker } from "./MoveToProjectPicker";
 import {
   type SessionActionRequest,
@@ -70,6 +72,7 @@ function SessionActionRunner({
   const setMuted = useSetConversationMuted();
   const openSessionWindow = useOpenSessionWindow();
   const moveToProject = useMoveToProject();
+  const moveToNest = useMoveToNest();
   const actions = useSessionActions({
     conversation,
     label: conversationDisplayLabel(conversation),
@@ -85,7 +88,7 @@ function SessionActionRunner({
     // A newer request can replace this runner before its Leave or Stop settles.
     reportsAfterUnmount: true,
   });
-  const [picker, setPicker] = useState<"rename" | "move-to-project" | null>(null);
+  const [picker, setPicker] = useState<"rename" | "move-to-project" | "move-to-nest" | null>(null);
   const latest = useRef({ actions, facts });
   latest.current = { actions, facts };
   useEffect(() => {
@@ -117,6 +120,7 @@ function SessionActionRunner({
         return;
       case "rename":
       case "move-to-project":
+      case "move-to-nest":
         setPicker(command);
         return;
       case "mute":
@@ -177,6 +181,16 @@ function SessionActionRunner({
           currentProject={facts?.currentProject ?? null}
           onPick={(project) => {
             moveToProject.mutate({ id: conversation.id, project });
+            setPicker(null);
+          }}
+          onClose={() => setPicker(null)}
+        />
+      )}
+      {picker === "move-to-nest" && (
+        <MoveToNestPicker
+          conversation={conversation}
+          onPick={(destination) => {
+            moveToNest.mutate({ id: conversation.id, destination });
             setPicker(null);
           }}
           onClose={() => setPicker(null)}

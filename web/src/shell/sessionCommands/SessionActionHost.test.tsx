@@ -10,8 +10,8 @@ import type * as UnseenModule from "@/hooks/useUnseenConversations";
 import type * as PermissionsApiModule from "@/lib/permissionsApi";
 import { LEVEL_READ } from "@/lib/permissionsApi";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { clearSessionMuteState, MUTED_LABEL_KEY, setMutedProjects } from "@/lib/sessionMute";
 
 import { useRecentSessionSwitchStore } from "@/hooks/useRecentSessionSwitch";
@@ -25,6 +25,7 @@ const writes = vi.hoisted(() => ({
   pin: vi.fn(),
   mute: vi.fn(),
   move: vi.fn(),
+  nest: vi.fn(),
   rename: vi.fn(),
   archive: vi.fn(),
 }));
@@ -41,6 +42,9 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
     useTogglePinnedConversation: mutation(writes.pin),
     useSetConversationMuted: mutation(writes.mute),
     useMoveToProject: mutation(writes.move),
+    useMoveToNest: mutation(writes.nest),
+    // The viewer's other nest, which the nest picker finds by searching.
+    useSessionSearch: () => ({ data: { pages: [{ data: [OTHER_NEST] }] } }),
     useRenameConversation: mutation(writes.rename),
     useArchiveConversation: mutation(writes.archive),
   };
@@ -87,6 +91,18 @@ const SESSION: Conversation = {
   owner: "viewer",
 };
 
+const OTHER_NEST: Conversation = {
+  ...SESSION,
+  id: "c2",
+  title: "Release prep",
+  family: {
+    id: "f2",
+    representative_id: "c2",
+    representative_title: "Release prep",
+    pinned: false,
+  },
+};
+
 function Location() {
   return <output data-testid="location">{useLocation().pathname}</output>;
 }
@@ -98,17 +114,17 @@ function OpenSessionShell() {
 }
 
 /** On the open session's page; `remountHost` mounts the host again in the same app. */
-function renderHost(queryClient = new QueryClient(), info = FALLBACK_SERVER_INFO) {
+function renderHost(queryClient = new QueryClient(), info: ServerInfo | "loading" = "loading") {
   const app = (hostMounted: boolean) => (
-    <QueryClientProvider client={queryClient}>
-      <CapabilitiesProvider info={info}>
+    <CapabilitiesProvider info={info}>
+      <QueryClientProvider client={queryClient}>
         <MemoryRouter initialEntries={["/c/c1"]}>
           <OpenSessionShell />
           {hostMounted && <SessionActionHost />}
           <Location />
         </MemoryRouter>
-      </CapabilitiesProvider>
-    </QueryClientProvider>
+      </QueryClientProvider>
+    </CapabilitiesProvider>
   );
   const { rerender } = render(app(true));
   return {
@@ -216,6 +232,42 @@ describe("SessionActionHost", () => {
     fireEvent.change(input, { target: { value: "payments" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(writes.move).toHaveBeenCalledWith({ id: "c1", project: "Payments" });
+  });
+
+  describe("on a server that moves nests", () => {
+    const nests = {
+      ...FALLBACK_SERVER_INFO,
+      session_nest_moves: true,
+      sibling_sessions: true,
+    } as ServerInfo;
+
+    it("moves the session into the nest picked from the nest picker", async () => {
+      renderHost(new QueryClient(), nests);
+      act(() => requestSessionAction(SESSION, "move-to-nest"));
+      const input = await screen.findByRole("combobox", { name: "Move session to a nest" });
+      fireEvent.change(input, { target: { value: "release" } });
+      await screen.findByRole("option", { name: /Release prep/ });
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(writes.nest).toHaveBeenCalledWith({ id: "c1", destination: OTHER_NEST });
+    });
+
+    it("takes a nested session out of its nest", async () => {
+      renderHost(new QueryClient(), nests);
+      const nested = { ...SESSION, family: { id: "f1", representative_id: "c0", pinned: false } };
+      act(() => requestSessionAction(nested, "move-to-nest"));
+      const input = await screen.findByRole("combobox", { name: "Move session to another nest" });
+      fireEvent.change(input, { target: { value: "remove" } });
+      await screen.findByRole("option", { name: /Remove from nest/ });
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(writes.nest).toHaveBeenCalledWith({ id: "c1", destination: null });
+    });
+  });
+
+  it("does nothing on a server that doesn't move nests", async () => {
+    renderHost();
+    act(() => requestSessionAction(SESSION, "move-to-nest"));
+    await act(async () => {});
+    expect(screen.queryByRole("combobox", { name: "Move session to a nest" })).toBeNull();
   });
 
   it("asks before deleting, with the row menu's dialog", async () => {

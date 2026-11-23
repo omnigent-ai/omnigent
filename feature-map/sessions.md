@@ -26,6 +26,8 @@ the header menu), and each place is a separate entry point.
   destination, or **Remove from nest** to detach just that session. Dragging a
   nested member into the session list above or below a nest removes it; a floating
   **Remove from nest** target is also available without shifting rows.
+  With the QuickPick ⌘K palette, **Move to nest** on a session's actions, or **Move a
+  Session to a Nest…** for one you pick, opens the same choices as a searchable picker.
   Ordinary forks remain standalone and may reuse the source host.
 
 - `session-grid`: with `grid_sessions_display_ui` (on by default), drag sidebar sessions into a
