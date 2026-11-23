@@ -891,6 +891,39 @@ def test_a_change_left_half_done_is_finished_by_the_next_writer(
         card(service, app, "c", "doing")
 
 
+def _stop_once_before_epoch_revision(monkeypatch: pytest.MonkeyPatch, epoch: str) -> list[str]:
+    """Make the first write of *epoch*'s first revision fail after its directory exists."""
+    real_create = LocalGadgetFiles.create_json
+    stopped: list[str] = []
+
+    def create_json(self, path: str, value: dict) -> None:
+        if not stopped and path.endswith(f"_guard/epochs/{epoch}/00000001.json"):
+            stopped.append(path)
+            raise RuntimeError("writer stopped")
+        real_create(self, path, value)
+
+    monkeypatch.setattr(LocalGadgetFiles, "create_json", create_json)
+    return stopped
+
+
+def test_an_epoch_left_without_its_first_revision_is_finished_by_the_next_writer(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = gadgets.service()
+    app = publish_ruled_board(service, [WIP_LIMIT])
+    stopped = _stop_once_before_epoch_revision(monkeypatch, "e000001")
+    with pytest.raises(RuntimeError):
+        card(service, app, "a", "doing")
+    assert stopped
+    assert gadgets.store.gadget_files(app["id"]).list_paths("data/_guard/epochs") == ["e000001"]
+    # A new service instance, as after a restart, finishes the epoch and keeps the rule.
+    restarted = gadgets.service()
+    card(restarted, app, "b", "doing")
+    card(restarted, app, "c", "doing")
+    with pytest.raises(ConstraintViolation):
+        card(restarted, app, "d", "doing")
+
+
 def test_the_rule_state_rotates_without_losing_counts(
     gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -916,6 +949,21 @@ def test_the_rule_state_rotates_without_losing_counts(
     epochs = gadgets.store.gadget_files(app["id"]).list_paths("data/_guard/epochs")
     assert 1 <= len(epochs) <= 3
     assert max(int(name[1:]) for name in epochs) > 3
+    # A writer that stops while rotating, before the next epoch's first revision, leaves an
+    # empty epoch; the next writer finishes it from its sealed predecessor.
+    newest = max(int(name[1:]) for name in epochs)
+    stopped = _stop_once_before_epoch_revision(monkeypatch, f"e{newest + 1:06d}")
+    restarted = gadgets.service()
+    for index, document in enumerate(todo[:3]):
+        try:
+            todo[index] = move(restarted, app, document, "todo", f"r-{index}")
+        except RuntimeError:
+            todo[index] = move(gadgets.service(), app, document, "todo", f"r-{index}")
+    assert stopped
+    for index, document in enumerate(todo[:3]):
+        todo[index] = move(gadgets.service(), app, document, "doing", f"d-{index}")
+    with pytest.raises(ConstraintViolation):
+        move(gadgets.service(), app, todo[3], "doing", "m-4")
 
 
 @pytest.mark.parametrize(

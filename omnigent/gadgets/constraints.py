@@ -82,6 +82,7 @@ _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _EPOCH = re.compile(r"^e[0-9]{6,12}$")
 _GUARD_COLLECTION = "epochs"
 _STALE = "stale"
+_INITIAL_STATE = {"rules": _STALE, "counts": {}, "unique": {}, "pending": None, "writes": 0}
 # The guard's own records; tests shrink it.
 GUARD_LIMITS: StoreLimits = DEFAULT_LIMITS
 # Records one rebuild step reads, and the steps one write may take before giving up as busy.
@@ -747,8 +748,7 @@ class ConstraintGuard:
     def _current(self) -> tuple[str, Document]:
         epochs = self._epochs()
         if not epochs:
-            initial = {"rules": _STALE, "counts": {}, "unique": {}, "pending": None, "writes": 0}
-            self._create_epoch("e000001", initial)
+            self._create_epoch("e000001", dict(_INITIAL_STATE))
             return self._current()
         # Sealed epochs two behind the current one have no readers left: retire a couple per
         # call, so the guard keeps a few records however many writes the gadget takes.
@@ -756,9 +756,34 @@ class ConstraintGuard:
             self.guard.retire(_GUARD_COLLECTION, old, "omnigent-gadget-rules")
         epoch = epochs[-1]
         state = self.guard.get(_GUARD_COLLECTION, epoch)
+        if state is None:
+            # A writer that stopped between making the epoch's directory and its first
+            # revision: publish that revision again, as the same idempotent create.
+            self._resume_epoch(epochs)
+            state = self.guard.get(_GUARD_COLLECTION, epoch)
         if state is None or not isinstance(state.value, dict):
             raise CorruptData("Gadget rule state is missing")
         return epoch, state
+
+    def _resume_epoch(self, epochs: list[str]) -> None:
+        """Finish creating the newest epoch, which has no committed revision yet.
+
+        The first epoch starts from the initial state; a later one from its sealed
+        predecessor, exactly as ``_advance`` writes it. A predecessor that is missing or
+        not sealed is damaged committed state, which stays an error.
+        """
+        if len(epochs) == 1:
+            self._create_epoch(epochs[0], dict(_INITIAL_STATE))
+            return
+        previous = self.guard.get(_GUARD_COLLECTION, epochs[-2])
+        if (
+            previous is None
+            or not isinstance(previous.value, dict)
+            or previous.value.get("sealed") is not True
+            or int(epochs[-1][1:]) != int(epochs[-2][1:]) + 1
+        ):
+            raise CorruptData("Gadget rule state is missing")
+        self._advance(epochs[-2], previous.value)
 
     def _create_epoch(self, epoch: str, value: dict) -> None:
         if len(_canonical(value)) > MAX_GUARD_BYTES:
