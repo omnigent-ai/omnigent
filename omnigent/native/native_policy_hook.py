@@ -244,7 +244,11 @@ class PolicyHookReauth:
             self.failure_reason = "auth factory returned empty token"
             return None
         self.failure_reason = None
-        return {**self._headers, "Authorization": f"Bearer {token}"}
+        # Headers saved from an httpx client are lowercase; drop every stale bearer variant.
+        headers = {
+            name: value for name, value in self._headers.items() if name.lower() != "authorization"
+        }
+        return {**headers, "Authorization": f"Bearer {token}"}
 
 
 def policy_hook_reauth(server_url: str, headers: dict[str, str]) -> PolicyHookReauth:
