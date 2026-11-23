@@ -2,7 +2,7 @@
 // so they survive the tree remounting: a narrow page's tree popover closing after
 // a pick, or the tree moving between docked and popover as the page resizes.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 
 import type { TreeFilterValues } from "./treeFilterSummary";
 
@@ -11,19 +11,39 @@ export const NO_TREE_FILTERS: TreeFilterValues = { nameContains: "", include: ""
 /** How long typing settles before the tree searches. */
 export const TREE_FILTER_DEBOUNCE_MS = 300;
 
-const rememberedFilters = new Map<string, TreeFilterValues>();
-
-function recall(conversationId: string | undefined): TreeFilterValues {
-  return (conversationId && rememberedFilters.get(conversationId)) || NO_TREE_FILTERS;
+/** A session's filters, and whether trees should search with them at once (a clear). */
+interface RememberedFilters {
+  values: TreeFilterValues;
+  immediate: boolean;
 }
 
-function remember(conversationId: string | undefined, filters: TreeFilterValues): void {
+const UNFILTERED: RememberedFilters = { values: NO_TREE_FILTERS, immediate: true };
+const rememberedFilters = new Map<string, RememberedFilters>();
+const listeners = new Set<() => void>();
+
+function recall(conversationId: string | undefined): RememberedFilters {
+  return (conversationId && rememberedFilters.get(conversationId)) || UNFILTERED;
+}
+
+function remember(
+  conversationId: string | undefined,
+  values: TreeFilterValues,
+  immediate: boolean,
+): void {
   if (!conversationId) return;
-  if (filters.nameContains || filters.include || filters.exclude) {
-    rememberedFilters.set(conversationId, filters);
+  if (values.nameContains || values.include || values.exclude) {
+    rememberedFilters.set(conversationId, { values, immediate });
   } else {
     rememberedFilters.delete(conversationId);
   }
+  listeners.forEach((listener) => listener());
+}
+
+function subscribe(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
 }
 
 /** Forgets every session's filters; for tests. */
@@ -43,47 +63,39 @@ export interface TreeFilters {
   clearNameContains: () => void;
 }
 
+/** The session's filters, shared by every tree that shows it, such as two mounted file tabs. */
 export function useTreeFilters(conversationId: string | undefined): TreeFilters {
-  const [edited, setEdited] = useState(() => recall(conversationId));
-  // A remount applies the remembered filters immediately rather than after the debounce.
+  const remembered = useSyncExternalStore(subscribe, () => recall(conversationId));
+  const edited = remembered.values;
+  // A mount, or a session switch, searches with the remembered filters at once.
   const [applied, setApplied] = useState(edited);
-  // On an in-place session switch, show the new session's filters, never the previous ones.
-  const filtersForRef = useRef(conversationId);
+  const [appliedFor, setAppliedFor] = useState(conversationId);
+  if (appliedFor !== conversationId) {
+    setAppliedFor(conversationId);
+    setApplied(edited);
+  }
   useEffect(() => {
-    if (filtersForRef.current === conversationId) return;
-    filtersForRef.current = conversationId;
-    const next = recall(conversationId);
-    setEdited(next);
-    setApplied(next);
-  }, [conversationId]);
-  useEffect(() => {
+    if (remembered.immediate) {
+      setApplied(edited);
+      return;
+    }
     const timer = setTimeout(() => setApplied(edited), TREE_FILTER_DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [edited]);
+  }, [remembered, edited]);
 
   const change = useCallback(
-    (fields: Partial<TreeFilterValues>) => {
-      setEdited((previous) => {
-        const next = { ...previous, ...fields };
-        remember(conversationId, next);
-        return next;
-      });
-    },
+    (fields: Partial<TreeFilterValues>) =>
+      remember(conversationId, { ...recall(conversationId).values, ...fields }, false),
     [conversationId],
   );
   const clear = useCallback(() => {
-    remember(conversationId, NO_TREE_FILTERS);
-    setEdited(NO_TREE_FILTERS);
+    remember(conversationId, NO_TREE_FILTERS, true);
     setApplied(NO_TREE_FILTERS);
   }, [conversationId]);
   const clearNameContains = useCallback(() => {
-    const withoutName = (filters: TreeFilterValues) => ({ ...filters, nameContains: "" });
-    setEdited((previous) => {
-      const next = withoutName(previous);
-      remember(conversationId, next);
-      return next;
-    });
-    setApplied(withoutName);
+    const next = { ...recall(conversationId).values, nameContains: "" };
+    remember(conversationId, next, true);
+    setApplied(next);
   }, [conversationId]);
   return { edited, applied, change, clear, clearNameContains };
 }

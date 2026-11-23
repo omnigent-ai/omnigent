@@ -54,6 +54,22 @@ describe("useTreeFilters", () => {
     expect(result.current.edited.nameContains).toBe("config");
   });
 
+  it("shares a session's filters between trees mounted at once, such as two file tabs", () => {
+    vi.useFakeTimers();
+    const first = renderHook(() => useTreeFilters("session-a"));
+    const second = renderHook(() => useTreeFilters("session-a"));
+
+    act(() => first.result.current.change({ nameContains: "config" }));
+    expect(second.result.current.edited.nameContains).toBe("config");
+    act(() => vi.advanceTimersByTime(TREE_FILTER_DEBOUNCE_MS));
+    expect(second.result.current.applied.nameContains).toBe("config");
+
+    // A clear in one tree reaches the other at once, with no debounce.
+    act(() => second.result.current.clear());
+    expect(first.result.current.edited).toEqual(NO_TREE_FILTERS);
+    expect(first.result.current.applied).toEqual(NO_TREE_FILTERS);
+  });
+
   it("forgets cleared filters, and keeps the globs when only name search ends", () => {
     vi.useFakeTimers();
     const { result, unmount } = renderHook(() => useTreeFilters("session-a"));
