@@ -8,8 +8,7 @@ and runs a ⌘K row.
 from __future__ import annotations
 
 import re
-import shutil
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -37,7 +36,7 @@ def session_workspace(base_url: str, session_id: str) -> Path:
 def seeded_workspace(
     session: tuple[str, str], files: Mapping[str, str]
 ) -> Iterator[tuple[str, str]]:
-    """Write ``files`` (path to text) into the session's workspace, and remove it after."""
+    """Write ``files`` (path to text) into the session's workspace, and remove them after."""
     base_url, session_id = session
     for path, content in files.items():
         httpx.put(
@@ -49,7 +48,24 @@ def seeded_workspace(
     try:
         yield session
     finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+        remove_seeded(workspace, files)
+
+
+def remove_seeded(workspace: Path, paths: Iterable[str]) -> None:
+    """Remove the seeded ``paths``, and the folders they leave empty, but nothing else.
+
+    The workspace may be a directory the runner was handed, holding files of its own.
+    """
+    for path in paths:
+        target = workspace / path
+        target.unlink(missing_ok=True)
+        folder = target.parent
+        while folder != workspace and folder.is_relative_to(workspace):
+            try:
+                folder.rmdir()
+            except OSError:
+                break  # Not empty: something else lives here.
+            folder = folder.parent
 
 
 def is_mac(page: Page) -> bool:
