@@ -131,6 +131,50 @@ describe("a gadget beside a session", () => {
     expect(retry).toEqual(first);
   });
 
+  it("loads the page again with what the viewer may do after their access changes", async () => {
+    const reader = gadgetFixture({
+      id: "board",
+      permissions: { read: true, write_data: false, publish: false, manage: false },
+    });
+    vi.mocked(getGadgetContent)
+      .mockResolvedValueOnce({
+        revision_id: "rev-1",
+        html: "<p>board</p>",
+        sdk_version: GADGET_SDK_VERSION,
+        capabilities: ["data.read"],
+      })
+      .mockResolvedValueOnce({
+        revision_id: "rev-1",
+        html: "<p>board</p>",
+        sdk_version: GADGET_SDK_VERSION,
+        capabilities: ["data.read", "data.write"],
+      });
+    const view = renderWithGadgets(
+      <GadgetView
+        gadget={reader}
+        sessionId="conv_1"
+        onReloadGadget={vi.fn()}
+        toolbarTarget={null}
+        renderToolbar={(commentsButton) => commentsButton}
+      />,
+    );
+    await waitFor(() => expect(frameProps?.content.capabilities).toEqual(["data.read"]));
+
+    view.rerender(
+      <GadgetView
+        gadget={{ ...reader, permissions: { ...reader.permissions, write_data: true } }}
+        sessionId="conv_1"
+        onReloadGadget={vi.fn()}
+        toolbarTarget={null}
+        renderToolbar={(commentsButton) => commentsButton}
+      />,
+    );
+    await waitFor(() =>
+      expect(frameProps?.content.capabilities).toEqual(["data.read", "data.write"]),
+    );
+    expect(getGadgetContent).toHaveBeenCalledTimes(2);
+  });
+
   it("explains a page written for a newer SDK", async () => {
     vi.mocked(getGadgetContent).mockResolvedValue({
       revision_id: "rev-1",

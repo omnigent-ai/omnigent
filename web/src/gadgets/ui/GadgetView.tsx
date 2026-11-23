@@ -19,14 +19,15 @@ import { gadgetErrorMessage, useGadgetNavigate } from "./gadgetNavigation";
 import { GADGETS_KEY } from "./gadgetQueries";
 import { useGadgetComments } from "./useGadgetComments";
 
-function gadgetContentKey(gadgetId: string, revision: string) {
-  return [...GADGETS_KEY, "content", gadgetId, revision] as const;
-}
-
 function permissionsKey({ permissions }: Gadget): string {
   return [permissions.read, permissions.write_data, permissions.publish, permissions.manage]
     .map(Number)
     .join("");
+}
+
+// The content's capabilities are the viewer's, so access that changes loads it again.
+function gadgetContentKey(gadget: Gadget, revision: string) {
+  return [...GADGETS_KEY, "content", gadget.id, revision, permissionsKey(gadget)] as const;
 }
 
 function PublishedGadget({
@@ -45,7 +46,7 @@ function PublishedGadget({
   onAddComment?: Parameters<typeof GadgetFrame>[0]["onAddComment"];
 }) {
   const content = useQuery({
-    queryKey: gadgetContentKey(gadget.id, revision),
+    queryKey: gadgetContentKey(gadget, revision),
     queryFn: ({ signal }) => getGadgetContent(gadget.id, signal),
     staleTime: Infinity,
   });
