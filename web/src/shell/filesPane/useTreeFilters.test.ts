@@ -72,16 +72,4 @@ describe("useTreeFilters", () => {
       NO_TREE_FILTERS,
     );
   });
-
-  it("resets the fields for a view that doesn't filter without forgetting them", () => {
-    const { result, unmount } = renderHook(() => useTreeFilters("session-a"));
-    act(() => result.current.change({ nameContains: "config" }));
-
-    act(() => result.current.reset());
-    expect(result.current.edited).toEqual(NO_TREE_FILTERS);
-    unmount();
-    expect(renderHook(() => useTreeFilters("session-a")).result.current.edited.nameContains).toBe(
-      "config",
-    );
-  });
 });

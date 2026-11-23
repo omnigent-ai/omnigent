@@ -41,8 +41,6 @@ export interface TreeFilters {
   clear: () => void;
   /** Leaves name search at once, keeping the globs. */
   clearNameContains: () => void;
-  /** Empties the fields without forgetting them, for a view that doesn't filter. */
-  reset: () => void;
 }
 
 export function useTreeFilters(conversationId: string | undefined): TreeFilters {
@@ -87,9 +85,5 @@ export function useTreeFilters(conversationId: string | undefined): TreeFilters 
     });
     setApplied(withoutName);
   }, [conversationId]);
-  const reset = useCallback(() => {
-    setEdited(NO_TREE_FILTERS);
-    setApplied(NO_TREE_FILTERS);
-  }, []);
-  return { edited, applied, change, clear, clearNameContains, reset };
+  return { edited, applied, change, clear, clearNameContains };
 }
