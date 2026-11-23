@@ -1,7 +1,7 @@
 """The ``gadget_shares`` table migration (e4c7a91b2d3f) and the model it must match.
 
 Checks both schema paths (the migration and the ORM metadata) for the table's
-columns, primary key, user index and SQLite-family checks, that it has no
+columns, primary key, indexes and SQLite-family checks, that it has no
 database-level foreign key (schema Rule R032), and that its downgrade drops it.
 """
 
@@ -9,13 +9,19 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from importlib import import_module
+from io import StringIO
 from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.schema import CreateIndex
 
 from omnigent.db.db_models import SqlGadgetShare
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache, get_or_create_engine
@@ -23,6 +29,7 @@ from omnigent.db.utils import _build_alembic_config, clear_engine_cache, get_or_
 _PREVIOUS = "bf30d7cbda61"
 _REVISION = "e4c7a91b2d3f"
 _TABLE = "gadget_shares"
+_LOWER_INDEX = "ix_gadget_shares_gadget_user_lower"
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -144,3 +151,34 @@ def test_downgrade_drops_the_table_and_upgrade_restores_it(tmp_path: Path) -> No
 
     engine.dispose()
     clear_engine_cache()
+
+
+# MySQL needs an expression key part in its own parentheses; the trailing user_id
+# completes the primary key, which lower(user_id) alone does not.
+_LOWER_INDEX_DDL = {
+    "sqlite": "(workspace_id, gadget_id, lower(user_id), user_id)",
+    "postgresql": "(workspace_id, gadget_id, lower(user_id), user_id)",
+    "mysql": "(workspace_id, gadget_id, (lower(user_id)), user_id)",
+}
+_DIALECTS = {"sqlite": sqlite.dialect, "postgresql": postgresql.dialect, "mysql": mysql.dialect}
+
+
+@pytest.mark.parametrize("dialect_name", sorted(_LOWER_INDEX_DDL))
+def test_case_insensitive_index_ddl_on_each_backend(dialect_name: str) -> None:
+    """The migration and the model emit the same, valid lower(user_id) index on every backend."""
+    dialect = _DIALECTS[dialect_name]()
+    expected = f"CREATE INDEX {_LOWER_INDEX} ON {_TABLE} {_LOWER_INDEX_DDL[dialect_name]}"
+
+    (index,) = [i for i in SqlGadgetShare.__table__.indexes if i.name == _LOWER_INDEX]
+    assert str(CreateIndex(index).compile(dialect=dialect)).strip() == expected
+
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect=dialect, opts={"as_sql": True, "output_buffer": output}
+    )
+    migration = import_module(
+        "omnigent.db.migrations.versions.e4c7a91b2d3f_add_gadget_shares_table"
+    )
+    with Operations.context(context):
+        migration.upgrade()
+    assert expected in output.getvalue()

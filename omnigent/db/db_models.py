@@ -2225,11 +2225,14 @@ class SqlGadgetShare(OmnigentBase):
         ),
         # Finds a grantee's existing grant on a gadget in any letter case, so sharing
         # with ``Bob@Example.com`` updates ``bob@example.com``'s grant in one lookup.
+        # A function expression (not text) lets MySQL wrap it in the parentheses its
+        # expression key parts need; ``user_id`` completes the primary key.
         Index(
             "ix_gadget_shares_gadget_user_lower",
             "workspace_id",
             "gadget_id",
-            text("lower(user_id)"),
+            func.lower(user_id),
+            "user_id",
         ),
     )
 

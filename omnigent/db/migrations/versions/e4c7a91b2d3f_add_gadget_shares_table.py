@@ -75,11 +75,12 @@ def upgrade() -> None:
         ["workspace_id", "user_id", "gadget_id"],
         unique=False,
     )
-    # Finds a grantee's existing grant on a gadget in any letter case.
+    # Finds a grantee's existing grant on a gadget in any letter case. A function
+    # expression (not text) gets MySQL's required parentheses; user_id completes the key.
     op.create_index(
         "ix_gadget_shares_gadget_user_lower",
         "gadget_shares",
-        ["workspace_id", "gadget_id", sa.text("lower(user_id)")],
+        ["workspace_id", "gadget_id", sa.func.lower(sa.column("user_id")), "user_id"],
         unique=False,
     )
 
