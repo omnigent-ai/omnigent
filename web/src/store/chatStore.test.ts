@@ -3643,6 +3643,44 @@ describe("chatStore — send (first-send ordering)", () => {
       expect(slots.heldByTab()).toBe(1);
     });
 
+    it("opens a session whose host lookup is never answered", async () => {
+      vi.useFakeTimers();
+      vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+      seedSession("conv_lost_lookup", []);
+      const lookups: AbortSignal[] = [];
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const lookup =
+          url.split("?")[0] === "/v1/sessions/conv_lost_lookup" &&
+          !url.includes("refresh_state=true");
+        // The host lookup before the stream opens is lost, like a request on a dead connection.
+        if (lookup && lookups.length === 0) {
+          lookups.push(init!.signal!);
+          return new Promise<Response>(() => {});
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      const switched = useChatStore.getState().switchTo("conv_lost_lookup");
+      await vi.advanceTimersByTimeAsync(SESSION_READ_TIMEOUT_MS - 1_000);
+      const entry = conversationRegistry.peek("conv_lost_lookup")!;
+      expect(entry.getState().loadingConversation).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      expect(entry.getState()).toMatchObject({
+        loadingConversation: false,
+        conversationLoadError: null,
+      });
+      expect(lookups[0]!.aborted).toBe(true);
+      expect(
+        fetchMock.mock.calls.some(
+          ([input]) => String(input).split("?")[0] === "/v1/sessions/conv_lost_lookup/stream",
+        ),
+      ).toBe(true);
+      await switched;
+    });
+
     it("stops retrying once the session is closed", async () => {
       vi.useFakeTimers();
       seedSession("conv_closed", []);
