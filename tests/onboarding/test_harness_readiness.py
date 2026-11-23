@@ -1068,6 +1068,42 @@ def test_unanswered_version_probe_still_requires_antigravity_credential(
     assert harness_is_configured("antigravity-native") is True
 
 
+def test_antigravity_native_accepts_selected_gcloud_adc_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``AGY_ADC_AUTH`` plus gcloud ADC is an agy credential for the native launch gate."""
+    import json
+
+    import omnigent.onboarding.gemini_auth as _ga
+
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setattr(
+        _ga,
+        "GEMINI_OAUTH_CRED_PATHS",
+        (tmp_path / "oauth-absent.json", tmp_path / "antigravity-oauth-token-absent"),
+    )
+    monkeypatch.setattr(_ga.harness_install, "harness_cli_logged_in", lambda *_a, **_k: False)
+    monkeypatch.delenv("AGY_ADC_AUTH", raising=False)
+    adc = tmp_path / ".config" / "gcloud" / "application_default_credentials.json"
+    adc.parent.mkdir(parents=True)
+    adc.write_text(
+        json.dumps(
+            {
+                "type": "authorized_user",
+                "client_id": "test-client-id",
+                "client_secret": "test-client-secret",
+                "refresh_token": "test-refresh-token",
+            }
+        )
+    )
+    # agy reads ADC only when the selector is set.
+    assert harness_is_configured("antigravity-native") is False
+
+    monkeypatch.setenv("AGY_ADC_AUTH", "true")
+    assert configured_harness_map()["antigravity"] is True
+    assert harness_is_configured("antigravity-native") is True
+
+
 def test_claude_ready_via_managed_gateway_without_provider_or_cli_login(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

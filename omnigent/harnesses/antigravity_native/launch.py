@@ -135,7 +135,8 @@ def resolve_native_antigravity_launch(
         )
     if not gemini_auth_has_credential():
         _logger.warning(
-            "No agy credential found (checked GEMINI_API_KEY, ~/.gemini/oauth_creds.json "
+            "No agy credential found (checked GEMINI_API_KEY, AGY_ADC_AUTH with gcloud ADC, "
+            "~/.gemini/oauth_creds.json "
             "and ~/.gemini/antigravity-cli/antigravity-oauth-token, plus "
             "`agy models` on macOS for a Keychain-stored login); "
             "agy will prompt for login on first run."

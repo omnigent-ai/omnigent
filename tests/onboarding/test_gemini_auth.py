@@ -136,6 +136,33 @@ def test_blank_gemini_api_key_not_detected(monkeypatch: pytest.MonkeyPatch) -> N
     assert ga.gemini_login_detected() is False
 
 
+@pytest.mark.parametrize(
+    ("selector", "payload", "expected"),
+    [
+        ("true", {"type": "authorized_user", "refresh_token": "1//0gabc"}, True),
+        ("1", {"type": "authorized_user", "refresh_token": "1//0gabc"}, True),
+        ("false", {"type": "authorized_user", "refresh_token": "1//0gabc"}, False),
+        ("0", {"type": "authorized_user", "refresh_token": "1//0gabc"}, False),
+        ("true", {}, False),
+        ("true", {"type": "authorized_user"}, False),
+    ],
+)
+def test_selected_gcloud_adc_detected(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    selector: str,
+    payload: object,
+    expected: bool,
+) -> None:
+    """``AGY_ADC_AUTH`` counts only when set truthy and the ADC file has credential material."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write(tmp_path / ".config" / "gcloud" / "application_default_credentials.json", payload)
+    monkeypatch.setenv("AGY_ADC_AUTH", selector)
+    assert ga.gemini_login_detected() is expected
+
+
 def test_non_json_file_not_detected(tmp_path: Path) -> None:
     """A non-JSON file reads as not-logged-in."""
     p = tmp_path / "oauth_creds.json"
