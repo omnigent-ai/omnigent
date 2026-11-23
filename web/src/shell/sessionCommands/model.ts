@@ -333,5 +333,5 @@ export const SESSION_COMMAND_PICKS: Partial<Record<SessionCommandId, SessionComm
   delete: pick("Delete a Session…", "Delete which session?", "Delete", {
     includesArchived: true,
   }),
-  leave: pick("Leave a Session…", "Leave which session?", "Leave"),
+  leave: pick("Leave a Session…", "Leave which session?", "Leave", { includesArchived: true }),
 };

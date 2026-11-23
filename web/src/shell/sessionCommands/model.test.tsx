@@ -21,6 +21,7 @@ import {
   OWNER_ONLY_REASONS,
   PIN_CAPACITY_REASON,
   PIN_SAVING_REASON,
+  SESSION_COMMAND_PICKS,
   type SessionCommandFacts,
   sessionCommand,
   sessionCommands,
@@ -256,6 +257,17 @@ function rowMenu(facts: SessionCommandFacts) {
       .map(name),
   };
 }
+
+describe("SESSION_COMMAND_PICKS", () => {
+  it("lists archived sessions to restore, delete or leave, as an archived row's menu offers them", () => {
+    const archivedShared = { ...FACTS, archived: true, owner: false };
+    expect(sessionCommand(archivedShared, "leave").availability.available).toBe(true);
+    const withArchived = Object.entries(SESSION_COMMAND_PICKS)
+      .filter(([, pick]) => pick?.includesArchived)
+      .map(([id]) => id);
+    expect(withArchived).toEqual(["unarchive", "delete", "leave"]);
+  });
+});
 
 describe("sessionOwnership", () => {
   it("trusts a named owner or an owner grant, and fails closed on a row that has neither", () => {
