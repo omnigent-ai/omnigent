@@ -1,4 +1,4 @@
-"""Native permission modes accepted by automations and their launch arguments."""
+"""Permission modes accepted by automations and their CLI launch arguments."""
 
 # Keep these mappings aligned with the web permission constants in
 # claudePermissionMode.ts and nativeHarnessModes.ts.
@@ -47,6 +47,10 @@ PERMISSION_LAUNCH_ARGS: dict[str, dict[str, list[str]]] = {
         "smart": ["--permission-mode", "smart"],
         "dangerous": ["--permission-mode", "dangerous"],
     },
+    "copilot": {
+        "default": [],
+        "bypassPermissions": [],
+    },
 }
 
 # Shared by every rejection of an automation's permission_mode.
@@ -57,7 +61,7 @@ AGENT_DEFAULT_PERMISSION_MODE_HINT = "JSON null (not the string 'null') for the 
 # through an agent default or a reused session's live mode.
 APPROVAL_SKIPPING_PERMISSION_MODES: frozenset[str] = frozenset(
     {
-        "bypassPermissions",  # claude-native, claude-sdk, acp
+        "bypassPermissions",  # claude-native, claude-sdk, acp, copilot
         "dontAsk",  # claude-native
         "full-access",  # codex-native
         "bypass",  # codex-native

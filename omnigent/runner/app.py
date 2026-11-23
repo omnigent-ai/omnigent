@@ -236,6 +236,7 @@ from omnigent.server.schemas import (
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
+from omnigent.stores.conversation_store import COPILOT_PERMISSION_MODE_LABEL_KEY
 from omnigent.util.dedicated_executor import DedicatedExecutor
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -735,6 +736,7 @@ class _SessionSnapshot:
     parent_session_id: str | None = None
     agent_name: str | None = None
     wrapper_label: str | None = None
+    copilot_permission_mode: str | None = None
     harness: str | None = None
 
 
@@ -2718,6 +2720,7 @@ def create_runner_app(
             parent_session_id: str | None = None
             agent_name: str | None = None
             wrapper_label: str | None = None
+            copilot_permission_mode: str | None = None
             harness: str | None = None
             try:
                 resp = await server_client.get(
@@ -2742,7 +2745,12 @@ def create_runner_app(
                     raw_agent_name = body.get("agent_name")
                     if isinstance(raw_agent_name, str) and raw_agent_name:
                         agent_name = raw_agent_name
-                    wrapper_label = wrapper_label_from_labels(body.get("labels"))
+                    raw_labels = body.get("labels")
+                    wrapper_label = wrapper_label_from_labels(raw_labels)
+                    if isinstance(raw_labels, Mapping):
+                        raw_copilot_mode = raw_labels.get(COPILOT_PERMISSION_MODE_LABEL_KEY)
+                        if isinstance(raw_copilot_mode, str) and raw_copilot_mode:
+                            copilot_permission_mode = raw_copilot_mode
                     raw_harness = body.get("harness")
                     if isinstance(raw_harness, str) and raw_harness != "auto":
                         harness = raw_harness
@@ -2758,6 +2766,7 @@ def create_runner_app(
                 parent_session_id=parent_session_id,
                 agent_name=agent_name,
                 wrapper_label=wrapper_label,
+                copilot_permission_mode=copilot_permission_mode,
                 harness=harness,
             )
             if snapshot.ok and snapshot.agent_id is not None:
@@ -2841,6 +2850,14 @@ def create_runner_app(
         await _get_server_version(server_client)
         return _SessionInitContext(envelope=None)
 
+    async def _session_copilot_permission_mode(
+        session_id: str | None, harness: str | None
+    ) -> str | None:
+        if not session_id or canonicalize_harness(harness) != "copilot":
+            return None
+        snapshot = await _session_snapshot(session_id)
+        return snapshot.copilot_permission_mode if snapshot.ok else None
+
     def _load_envelope_session_init_context(
         envelope: RunnerSessionInitEnvelope,
         *,
@@ -2870,6 +2887,9 @@ def create_runner_app(
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
             wrapper_label=wrapper_label_from_labels(snapshot.labels),
+            copilot_permission_mode=(
+                snapshot.labels.get(COPILOT_PERMISSION_MODE_LABEL_KEY) or None
+            ),
             harness=snapshot.harness_override,
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
@@ -3065,6 +3085,7 @@ def create_runner_app(
                 harness_override=body.harness_override,
                 sub_agent_name=sub_agent_name,
                 cwd=resolver_cwd,
+                permission_mode_resolver=_session_copilot_permission_mode,
             )
             generator_spec = generator_spec_for_harness(effective_harness)
             if generator_spec is None:
@@ -3080,6 +3101,7 @@ def create_runner_app(
                     harness_override=resolver_harness,
                     sub_agent_name=sub_agent_name,
                     cwd=resolver_cwd,
+                    permission_mode_resolver=_session_copilot_permission_mode,
                 )
                 if resolved_harness != resolver_harness:
                     return BackgroundSessionTitleResponse(status="unsupported")
@@ -3344,6 +3366,9 @@ def create_runner_app(
                 if init_context.envelope is not None
                 else await _fetch_session_model_override(session_id)
             )
+            _permission_mode_override = await _session_copilot_permission_mode(
+                session_id, harness_name
+            )
             try:
                 spawn_env = _build_spawn_env_from_spec(
                     spec,
@@ -3352,6 +3377,7 @@ def create_runner_app(
                     cwd=await _session_runtime_cwd(session_id),
                     session_id=session_id,
                     model_override=_model_override,
+                    permission_mode_override=_permission_mode_override,
                     resource_registry=resource_registry,
                 )
             except (OmnigentError, HarnessSandboxValidationError) as exc:
@@ -6432,6 +6458,9 @@ def create_runner_app(
                 workdir=cached_spec_workdir,
                 cwd=await _session_runtime_cwd(conv),
                 model_override=cast(str | None, msg_body.get("model_override")),
+                permission_mode_override=await _session_copilot_permission_mode(
+                    conv, harness_name
+                ),
                 session_id=conv,
                 resource_registry=resource_registry,
             )
@@ -6886,6 +6915,7 @@ def create_runner_app(
                     sub_agent_name=_sub_agent_name,
                     cwd=await _session_runtime_cwd(conv_id),
                     effective_spec_entry=_gated_session_spec_entry(conv_id, harness_name),
+                    permission_mode_resolver=_session_copilot_permission_mode,
                 )
                 harness_name, spawn_env = launch.harness, launch.spawn_env
                 selected_spec_entry = launch.spec_entry
@@ -9933,6 +9963,9 @@ async def _resolve_harness_config(
     cwd: Path | None = None,
     resource_registry: SessionResourceRegistry | None = None,
     effective_spec_entry: _SpecEntry | None = None,
+    permission_mode_resolver: (
+        Callable[[str | None, str | None], Awaitable[str | None]] | None
+    ) = None,
 ) -> tuple[str, dict[str, str] | None]:
     """Resolve worker settings for callers that do not dispatch a conversation turn."""
     launch = await _resolve_harness_launch(
@@ -10020,6 +10053,11 @@ async def _resolve_harness_launch(
                 harness_override or spec.executor.config.get("harness") or spec.executor.type
             )
             harness = canonicalize_harness(raw_harness) or raw_harness
+            permission_mode_override = (
+                await permission_mode_resolver(session_id, harness)
+                if permission_mode_resolver is not None
+                else None
+            )
             if needs_start_gate:
                 spec = await _apply_agent_start_gate(spec, harness)
             spawn_env = _build_spawn_env_from_spec(
@@ -10028,6 +10066,7 @@ async def _resolve_harness_launch(
                 cwd=cwd,
                 workdir=workdir,
                 model_override=model_override,
+                permission_mode_override=permission_mode_override,
                 session_id=session_id,
                 resource_registry=resource_registry,
             )
@@ -10159,6 +10198,7 @@ def _build_spawn_env_from_spec(
     cwd: Path | None = None,
     workdir: Path | None = None,
     model_override: str | None = None,
+    permission_mode_override: str | None = None,
     session_id: str | None = None,
     resource_registry: SessionResourceRegistry | None = None,
 ) -> dict[str, str] | None:
@@ -10376,6 +10416,10 @@ def _build_spawn_env_from_spec(
         model_key = _HARNESS_MODEL_ENV_KEY.get(harness)
         if model_key is not None:
             env[model_key] = model_override
+    # Session permission-mode override (e.g. from an automation firing) wins
+    # over any permission_mode configured on the Copilot agent spec.
+    if permission_mode_override and env is not None and harness == "copilot":
+        env["HARNESS_COPILOT_PERMISSION_MODE"] = permission_mode_override
 
     # Routing visibility: log the resolved gateway target so operators can
     # confirm which provider a turn actually hits (api.anthropic.com /

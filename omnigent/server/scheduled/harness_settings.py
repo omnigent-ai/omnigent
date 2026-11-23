@@ -21,7 +21,10 @@ from omnigent.server.routes._sessions.common import (
     _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
     _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY,
 )
-from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    COPILOT_PERMISSION_MODE_LABEL_KEY,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -50,7 +53,7 @@ def _permission_mode_choices(harness: str | None) -> str:
         # The null hint leads because the runner truncates the server errors it relays.
         return (
             f"Use {AGENT_DEFAULT_PERMISSION_MODE_HINT}; other harnesses, such as claude-sdk, "
-            f"have no automation permission modes. Native harness modes: {vocabularies}"
+            f"have no automation permission modes. Supported harness modes: {vocabularies}"
         )
     modes = PERMISSION_LAUNCH_ARGS.get(harness)
     if not modes:
@@ -111,6 +114,8 @@ def permission_mode_launch_options(
     labels = {}
     if harness == "codex-native" and permission_mode == "bypass":
         labels[CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
+    elif harness == "copilot":
+        labels[COPILOT_PERMISSION_MODE_LABEL_KEY] = permission_mode
     return list(args) or None, labels
 
 
