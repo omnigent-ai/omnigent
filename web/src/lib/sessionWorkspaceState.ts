@@ -43,7 +43,7 @@ export interface SessionWorkspaceState {
   selectedTerminalKey?: string | null;
   openBrowsers?: string[];
   selectedBrowserId?: string | null;
-  /** Last page of each open browser tab, keyed by tab ID, so a tab whose view is gone reopens it. */
+  /** Last page of each open browser tab, keyed by tab ID, for restoring its address and label. */
   browserPages?: Record<string, SavedBrowserPage>;
   /** Ordered list of open side-chat tabs (child conversation ids). */
   openSideChats?: string[];
@@ -78,10 +78,10 @@ const MAX_BROWSER_URL_LENGTH = 8192;
 const MAX_BROWSER_TITLE_LENGTH = 512;
 // Query and fragment parameters that can carry a credential (OAuth codes and tokens,
 // signed links, API keys), by part of their name (authkey, passcode) or by its last
-// word (auth_code, apiKey). An address carrying one is never saved or replayed.
+// word (auth_code, apiKey). This rejects known credential names, not arbitrary URL secrets.
 const CREDENTIAL_PARAM_PART = new RegExp(
   [
-    "token|secret|passw|signature|credential|verifier|api[-_]?key|session[-_]?id",
+    "token|secret|passw|signature|credential|verifier|api[-_]?key|sess(ion)?[-_]?id",
     "saml(request|response|art)",
     "(access|auth|login|pass|private|secure|signing)[-_.]?(code|key|pwd|sig|ticket)",
   ].join("|"),
@@ -138,7 +138,7 @@ function carriesCredential({ username, password, search, hash }: URL): boolean {
   return params.some(isCredentialParam);
 }
 
-/** A page a tab can reopen, or null without an owner or for a non-http(s), oversized, or credential-bearing URL. */
+/** A saved page, or null without an owner or for an invalid URL or recognized credential. */
 export function sanitizeSavedBrowserPage(value: unknown): SavedBrowserPage | null {
   if (typeof value !== "object" || value === null) return null;
   const { url, title, owner } = value as Record<string, unknown>;

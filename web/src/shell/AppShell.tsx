@@ -1266,7 +1266,7 @@ function AppShellImpl() {
     resyncBrowserSuppression();
   }, []);
 
-  // Remember each browser tab's page, so a tab whose view the shell destroyed reopens it.
+  // Keep each browser tab's address and title after the shell destroys its view.
   useEffect(() => startSavingBrowserPages(), []);
 
   // Design-mode submit routing. Lives here (with the hoisted relay) because the

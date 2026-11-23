@@ -276,7 +276,7 @@ describe("sessionWorkspaceState", () => {
       openSubagentTabs: ["subagent:a", "subagent:b"],
     });
 
-    // Saved browser pages keep only owned http(s) addresses without a credential.
+    // Stored browser pages are validated again when read.
     localStorage.setItem(
       STORAGE_KEY,
       `[{"id":"conv_d","state":{"browserPages":{
@@ -284,9 +284,7 @@ describe("sessionWorkspaceState", () => {
         "tab-2":{"url":"javascript:alert(1)","owner":"user-a"},
         "tab-3":"https://bare.example/",
         "tab-4":{"url":"https://unowned.example/"},
-        "tab-5":{"url":"https://app.example/?token=abc","owner":"user-a"},
-        "tab-6":{"url":"https://app.example/#/callback?code=abc","owner":"user-a"},
-        "tab-7":{"url":"https://app.example/consume?SAMLart=abc","owner":"user-a"},
+        "tab-5":{"url":"https://app.example/?PHPSESSID=synthetic","owner":"user-a"},
         "__proto__":{"url":"https://proto.example/","owner":"user-a"}
       }}}]`,
     );

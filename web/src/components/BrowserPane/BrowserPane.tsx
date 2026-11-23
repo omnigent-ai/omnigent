@@ -106,17 +106,8 @@ interface BrowserPaneBridge {
     conversationId: string,
     url: string,
     bounds: Bounds | undefined,
-    // `restore`: reopen a tab's saved page only if nothing else has opened, or is opening, it.
-    opts: (BrowserHostOptions & { force?: boolean; restore?: boolean }) | undefined,
-  ) => Promise<{
-    ok: boolean;
-    created?: boolean;
-    error?: string;
-    /** A newer navigation took the view, or a restore yielded to another page. */
-    superseded?: boolean;
-    /** The session's tabs are open in another window. */
-    elsewhere?: boolean;
-  }>;
+    opts: (BrowserHostOptions & { force?: boolean }) | undefined,
+  ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   browserGoBack?: (conversationId: string) => Promise<NavResult>;
   browserGoForward?: (conversationId: string) => Promise<NavResult>;
   browserReload?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
@@ -277,6 +268,7 @@ export function BrowserPane({
   const urlEditingRef = useRef(false);
   // Counts url-changed events, so an older view probe can't overwrite a newer URL.
   const urlEventsRef = useRef(0);
+  const urlEditsRef = useRef(0);
   const submitSequenceRef = useRef(0);
   useEffect(
     () => () => {
@@ -320,45 +312,22 @@ export function BrowserPane({
     let cancelled = false;
     let viewChanged = false;
     const urlEvents = urlEventsRef.current;
-
-    const submitSequence = submitSequenceRef.current;
-    // A later navigation (the user's or an agent's) owns the view.
-    const superseded = () =>
-      cancelled || viewChanged || submitSequenceRef.current !== submitSequence;
-    // The shell destroyed this tab's view (sign-out, a session-expiry reconnect, quit):
-    // reopen the page the signed-in user last had in it.
-    const reopenSavedPage = async () => {
-      const openOrNavigate = bridge.browserOpenOrNavigate;
-      if (!openOrNavigate) return;
+    const urlEdits = urlEditsRef.current;
+    // Recover the address after sign-out; loading it requires Reload or Enter.
+    const restoreSavedAddress = async () => {
       try {
         const saved = readSavedBrowserPage(conversationId, await resolveIdentity());
-        if (!saved || superseded()) return;
-        if (!urlEditingRef.current) setCurrentUrl(saved.url);
-        // Older shells ignore `restore` and could cancel a pending agent navigation.
-        const features = await getDesktopFeatures();
-        if (features?.browserPageRestore !== true || superseded()) return;
-        const hostId = await fetchSessionHostId(browserViewOwnerId(conversationId));
-        if (superseded()) return;
-        const options = await previewHostOptions(hostId, saved.url);
-        if (superseded()) return;
-        // The shell refuses a restore once the tab has, or is getting, another page.
-        const result = await openOrNavigate(conversationId, saved.url, undefined, {
-          ...options,
-          restore: true,
-        });
-        // This reopen's own view creation sets viewChanged, so only newer intent counts now.
-        const overtaken = cancelled || submitSequenceRef.current !== submitSequence;
-        if (result.ok || overtaken || result.superseded) return;
-        if (result.elsewhere) {
-          // The session's tabs are open in another window; the user wasn't navigating.
-          if (!urlEditingRef.current) setCurrentUrl((url) => (url === saved.url ? "" : url));
+        if (
+          !saved ||
+          cancelled ||
+          viewChanged ||
+          urlEventsRef.current !== urlEvents ||
+          urlEditsRef.current !== urlEdits
+        )
           return;
-        }
-        setNavigationError(result.error ?? "Unable to reopen this page.");
+        setCurrentUrl(saved.url);
       } catch {
-        if (!cancelled && submitSequenceRef.current === submitSequence) {
-          setNavigationError("Unable to reopen this page.");
-        }
+        // Identity lookup can fail while disconnected; manual navigation remains available.
       }
     };
 
@@ -367,7 +336,7 @@ export function BrowserPane({
       if (cancelled || viewChanged || !r) return;
       if (!r.exists) {
         // A page open in another window stays there.
-        if (!r.elsewhere) void reopenSavedPage();
+        if (!r.elsewhere) void restoreSavedAddress();
         return;
       }
       setHasView(true);
@@ -487,9 +456,13 @@ export function BrowserPane({
   }, [conversationId]);
 
   const handleReload = useCallback(() => {
+    if (!hasView) {
+      submitUrl();
+      return;
+    }
     const bridge = getBridge();
     void bridge?.browserReload?.(conversationId);
-  }, [conversationId]);
+  }, [conversationId, hasView, submitUrl]);
 
   // Desktop Reload (⌘R) from this toolbar reloads the page rather than the app;
   // Focus Address Bar (⌘L) selects the address. (A focused page reloads itself in the shell.)
@@ -792,8 +765,8 @@ export function BrowserPane({
   //     keep the native view positioned over the container. NO containerRef is
   //     mounted while !hasView, so nothing measures an empty div.
   //   - !hasView: a centered hint. Back/forward are already disabled off
-  //     canGoBack/canGoForward (both false with no view); reload + DevTools are
-  //     explicitly disabled (nothing to reload / no devtools target yet). The
+  //     canGoBack/canGoForward (both false with no view); Reload can open a saved
+  //     address, while DevTools stays disabled until a view exists. The
   //     URL bar stays editable so the user can open the first page.
   const cookieProfiles = cookieProfileOptions(cookiePreview);
   const selectedCookieProfile =
@@ -839,7 +812,7 @@ export function BrowserPane({
         <button
           type="button"
           onClick={handleReload}
-          disabled={!hasView}
+          disabled={!hasView && !currentUrl.trim()}
           aria-label="Reload"
           title={chord("Reload", RELOAD_KEYS)}
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
@@ -856,7 +829,10 @@ export function BrowserPane({
           placeholder="Enter a URL"
           aria-label="Address bar"
           title={chord("Address bar", ADDRESS_BAR_KEYS)}
-          onChange={(e) => setCurrentUrl(e.target.value)}
+          onChange={(e) => {
+            urlEditsRef.current++;
+            setCurrentUrl(e.target.value);
+          }}
           onFocus={() => {
             urlEditingRef.current = true;
           }}
@@ -941,8 +917,9 @@ export function BrowserPane({
       ) : (
         <div className="flex min-h-0 flex-1 items-center justify-center bg-card px-6 py-8 text-center text-muted-foreground text-ui">
           <OpenElsewhereHint viewId={conversationId}>
-            Enter a URL above to get started
-            {agentBrowser ? " — the agent will open pages here too." : "."}
+            {currentUrl.trim()
+              ? "Click Reload or press Enter in the address bar to load this page."
+              : `Enter a URL above to get started${agentBrowser ? " — the agent will open pages here too." : "."}`}
           </OpenElsewhereHint>
         </div>
       )}

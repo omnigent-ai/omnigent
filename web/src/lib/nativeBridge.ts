@@ -554,8 +554,6 @@ export interface DesktopFeatures {
   canRefreshDbcert?: boolean;
   /** Shell can restore Arca preview identity after a desktop restart. */
   arcaPreviewRecovery?: boolean;
-  /** Saved-page restoration yields to other navigations and never requests new host consent. */
-  browserPageRestore?: boolean;
   /** This shell can import the current site's cookies from local Google Chrome. */
   chromeCookieImport?: boolean;
   /** Shell can ask to verify a remote host over SSH before allowing localhost previews. */

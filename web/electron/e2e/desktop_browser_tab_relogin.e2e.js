@@ -1,6 +1,5 @@
-// Desktop e2e: a session's Browser tab keeps its page across a sign-out and
-// sign-in. Signing out destroys every embedded view, so the tab must reopen
-// the page it remembered rather than come back blank.
+// Desktop e2e: sign-out destroys embedded views, but the tab retains its address
+// and title. Reload opens the saved address only when the user requests it.
 
 "use strict";
 
@@ -56,7 +55,7 @@ async function signIn(window, serverUrl) {
 }
 
 it(
-  "reopens a session's Browser tab page after signing out and back in",
+  "keeps a Browser tab's address after re-login and opens it on Reload",
   { skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}`, timeout: 180_000 },
   async () => {
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "omni-browser-relogin-"));
@@ -126,19 +125,32 @@ it(
       assert.deepEqual(await embeddedPages(electronApp), [], "sign-out kept a browser view");
       await pause();
 
-      // 3. Sign back in and return to the session: the tab reopens its page.
+      // 3. Sign back in: metadata returns while the page stays unloaded.
       await signIn(window, server.serverUrl);
       await openSessionRail(window, server.serverUrl, sessionId);
       await eventually(
         async () => (await bar.inputValue()) === pageUrl,
         "the address bar to show the tab's page after signing back in",
       );
+      await window.getByRole("tab", { name: PAGE_TITLE }).waitFor({ timeout: 10_000 });
+      await window
+        .getByText("Click Reload or press Enter in the address bar to load this page.")
+        .waitFor();
+      assert.deepEqual(
+        await embeddedPages(electronApp),
+        [],
+        "re-login loaded a page automatically",
+      );
+      await pause();
+
+      // 4. Explicit Reload uses the normal navigation path to create the view.
+      await window.getByRole("button", { name: "Reload", exact: true }).click();
       const reopened = await eventually(
         async () =>
           (await embeddedPages(electronApp)).find(
             (page) => page.url === pageUrl && page.title === PAGE_TITLE,
           ),
-        "the Browser tab to reopen its page after signing back in",
+        "Reload to open the saved page",
       );
       assert.match(reopened.id, new RegExp(`^browser-tab:${sessionId}:`));
       await window.getByRole("tab", { name: PAGE_TITLE }).waitFor({ timeout: 10_000 });

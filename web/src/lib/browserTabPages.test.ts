@@ -92,7 +92,7 @@ describe("saved browser pages", () => {
     expect(readSavedBrowserPage(userTab, "user-b")).toBeNull();
   });
 
-  it("never saves an address that carries a credential", () => {
+  it("rejects recognized URL credentials without replacing the previous page", () => {
     writeSessionWorkspaceState("conv_a", { openBrowsers: ["tab-1"] });
     saveBrowserPage(
       userTab,
@@ -120,14 +120,18 @@ describe("saved browser pages", () => {
       "https://app.example/consume?SAMLart=abc",
       "https://app.example/#samlart=abc",
       "https://app.example/#/consume?SAMLart=abc",
+      ...["PHPSESSID", "phpsessid", "JSESSIONID", "ASP.NET_SessionId"].flatMap((name) => [
+        `https://app.example/?${name}=synthetic`,
+        `https://app.example/#${name}=synthetic`,
+        `https://app.example/#/callback?${name}=synthetic`,
+      ]),
     ]) {
       saveBrowserPage(userTab, url);
+      expect(readSavedBrowserPage(userTab), url).toEqual({
+        url: "https://docs.example/?q=release&page=2&author=jane&keyword=notes",
+        title: "Search",
+      });
     }
-
-    expect(readSavedBrowserPage(userTab)).toEqual({
-      url: "https://docs.example/?q=release&page=2&author=jane&keyword=notes",
-      title: "Search",
-    });
   });
 
   it("keeps a page's title when a navigation event to it has none", () => {

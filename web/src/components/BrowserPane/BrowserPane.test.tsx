@@ -9,8 +9,8 @@ import {
   within,
 } from "@testing-library/react";
 import type * as NativeBridge from "@/lib/nativeBridge";
-import type * as FetchSessionHostId from "@/lib/fetchSessionHostId";
 import type * as Identity from "@/lib/identity";
+import { resolveIdentity } from "@/lib/identity";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetDesktopCommandsForTests, useDesktopCommand } from "@/lib/desktopCommands";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
@@ -18,31 +18,11 @@ import { BrowserPane } from "./BrowserPane";
 
 const getSessionSlim = vi.fn();
 const identity = vi.hoisted(() => ({ userId: "user-a" as string | null }));
-// Lookups the pane awaits while reopening a saved page. A test that awaits one resumes
-// after the pane's own continuation, so its assertions see what that step did.
-const restoreLookups = vi.hoisted(() => ({
-  identity: [] as Promise<unknown>[],
-  host: [] as Promise<unknown>[],
-}));
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof Identity>()),
   getCurrentUserId: () => identity.userId,
-  resolveIdentity: () => {
-    const lookup = Promise.resolve(identity.userId);
-    restoreLookups.identity.push(lookup);
-    return lookup;
-  },
+  resolveIdentity: vi.fn(async () => identity.userId),
 }));
-vi.mock("@/lib/fetchSessionHostId", async (importOriginal) => {
-  const { fetchSessionHostId } = await importOriginal<typeof FetchSessionHostId>();
-  return {
-    fetchSessionHostId: (...args: Parameters<typeof fetchSessionHostId>) => {
-      const lookup = fetchSessionHostId(...args);
-      restoreLookups.host.push(lookup);
-      return lookup;
-    },
-  };
-});
 vi.mock("@/lib/sessionsApi", () => ({
   getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
 }));
@@ -93,7 +73,7 @@ vi.mock("sonner", () => ({ toast }));
 function installBridge(overrides: Record<string, unknown> = {}) {
   const noopUnsub = () => {};
   const bridge = {
-    getDesktopFeatures: vi.fn().mockResolvedValue({ browserPageRestore: true }),
+    getDesktopFeatures: vi.fn().mockResolvedValue({}),
     browserHasView: vi.fn().mockResolvedValue({ exists: false }),
     onBrowserViewCreated: vi.fn().mockReturnValue(noopUnsub),
     onBrowserHostActiveChanged: vi.fn().mockReturnValue(noopUnsub),
@@ -140,8 +120,9 @@ afterEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
   identity.userId = "user-a";
-  restoreLookups.identity = [];
-  restoreLookups.host = [];
+  vi.mocked(resolveIdentity)
+    .mockReset()
+    .mockImplementation(async () => identity.userId);
   (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = undefined;
 });
 
@@ -180,231 +161,118 @@ describe("BrowserPane cold-start (no view yet)", () => {
       openBrowsers: ["two"],
       browserPages: { two: { url, title: "Report", owner } },
     });
-  // Waits for promises the pane awaited, after the pane has handled them.
-  const handled = (promises: unknown[]) =>
-    act(async () => {
-      await Promise.allSettled(promises);
-    });
-  const firstResult = (mock: ReturnType<typeof vi.fn>) => handled([mock.mock.results[0]?.value]);
-  const deferredHost = () => {
-    let resolveHost: (session: unknown) => void = () => {};
-    getSessionSlim.mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          resolveHost = resolve;
-        }),
-    );
-    return (hostId: string | null = null) =>
-      act(async () => {
-        resolveHost({ id: "conv_a", hostId, parentSessionId: null });
-        await Promise.allSettled(restoreLookups.host);
+  it.each(["Reload", "Enter"] as const)(
+    "keeps the saved address unloaded until %s, including on older shells",
+    async (action) => {
+      getSessionSlim.mockResolvedValue({
+        id: "conv_a",
+        hostId: "local-host",
+        parentSessionId: null,
       });
-  };
-
-  it.each([
-    ["https://example.com/report", false],
-    ["http://localhost:5273/preview", true],
-    ["http://localhost:5273/preview", undefined],
-  ] as const)("reopens saved %s with SSH preview support %s", async (url, sshLocalhostPreview) => {
-    getSessionSlim.mockResolvedValue({ id: "conv_a", hostId: "local-host", parentSessionId: null });
-    savedReport("user-a", url);
-    const bridge = installBridge({
-      getDesktopFeatures: vi
-        .fn()
-        .mockResolvedValue({ browserPageRestore: true, sshLocalhostPreview }),
-    });
-    render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
-
-    expect(await screen.findByRole("textbox", { name: "Address bar" })).toHaveValue(url);
-    await waitFor(() =>
-      expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
-        "browser-tab:conv_a:two",
-        url,
-        undefined,
-        {
-          sourceHostId: "local-host",
-          sessionHostProtocol: 1,
-          ...(sshLocalhostPreview ? { sshPreviewProtocol: 1 } : {}),
-          restore: true,
-        },
-      ),
-    );
-  });
-
-  it.each([
-    ["no feature method", undefined],
-    ["no restore capability", {}],
-    ["restore disabled", { browserPageRestore: false }],
-  ])("leaves a saved URL for manual navigation with %s", async (_name, features) => {
-    savedReport();
-    const bridge = installBridge({
-      getDesktopFeatures: features === undefined ? undefined : vi.fn().mockResolvedValue(features),
-    });
-    await act(async () => {
-      render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
-    });
-
-    const bar = screen.getByRole("textbox", { name: "Address bar" });
-    expect(bar).toHaveValue("https://example.com/report");
-    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
-    expect(screen.queryByRole("alert")).toBeNull();
-
-    fireEvent.keyDown(bar, { key: "Enter" });
-    await waitFor(() =>
-      expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
-        "browser-tab:conv_a:two",
-        "https://example.com/report",
-        undefined,
-        expect.objectContaining({ force: true }),
-      ),
-    );
-  });
-
-  it("shows a reopen's failure after its own view was created", async () => {
-    savedReport();
-    let fireCreated: ((p: { conversationId: string }) => void) | undefined;
-    installBridge({
-      onBrowserViewCreated: vi.fn((cb: typeof fireCreated) => {
-        fireCreated = cb;
-        return () => {};
-      }),
-      browserOpenOrNavigate: vi.fn(async (viewId: string) => {
-        fireCreated?.({ conversationId: viewId });
-        return { ok: false, created: true, error: "loadURL failed: ERR_NAME_NOT_RESOLVED" };
-      }),
-    });
-    render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
-
-    expect(await screen.findByRole("alert")).toHaveTextContent("ERR_NAME_NOT_RESOLVED");
-  });
-
-  for (const [refusal, result, bar] of [
-    [
-      "gives the tab to another page",
-      { ok: false, superseded: true, error: "this tab already has a page" },
-      "https://example.com/report",
-    ],
-    [
-      "finds the session's tabs in another window",
-      { ok: false, elsewhere: true, error: "open in another Omnigent window" },
-      "",
-    ],
-  ] as const) {
-    it(`reopens quietly when the shell ${refusal}`, async () => {
       savedReport();
-      const browserOpenOrNavigate = vi.fn().mockResolvedValue(result);
-      installBridge({ browserOpenOrNavigate });
-      render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
-      await waitFor(() => expect(browserOpenOrNavigate).toHaveBeenCalledOnce());
-      await firstResult(browserOpenOrNavigate);
+      const bridge = installBridge({
+        getDesktopFeatures: action === "Enter" ? undefined : vi.fn().mockResolvedValue({}),
+      });
+      await act(async () => {
+        render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
+      });
+      const bar = screen.getByRole("textbox", { name: "Address bar" });
+      expect(bar).toHaveValue("https://example.com/report");
+      expect(screen.getByText(/Click Reload or press Enter/)).toBeInTheDocument();
+      expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+      expect(getSessionSlim).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Reload" })).toBeEnabled();
 
-      expect(screen.queryByRole("alert")).toBeNull();
-      expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(bar);
+      if (action === "Reload") fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+      else fireEvent.keyDown(bar, { key: "Enter" });
+      await waitFor(() =>
+        expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+          "browser-tab:conv_a:two",
+          "https://example.com/report",
+          undefined,
+          { force: true, sourceHostId: "local-host", sessionHostProtocol: 1 },
+        ),
+      );
+      expect(bridge.browserReload).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["another account", "another window"])(
+    "does not prefill a page for %s",
+    async (reason) => {
+      savedReport(reason === "another account" ? "user-b" : "user-a");
+      const bridge = installBridge({
+        browserHasView: vi
+          .fn()
+          .mockResolvedValue({ exists: false, elsewhere: reason === "another window" }),
+      });
+      await act(async () => {
+        render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
+      });
+      expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue("");
+      expect(screen.getByRole("button", { name: "Reload" })).toBeDisabled();
+      expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    "unchanged",
+    "focused",
+    "edited",
+    "cleared",
+    "navigated",
+    "created",
+    "unmounted",
+  ] as const)("handles delayed saved-address identity when the pane is %s", async (change) => {
+    savedReport();
+    let finishIdentity!: (userId: string) => void;
+    const pendingIdentity = new Promise<string>((resolve) => {
+      finishIdentity = resolve;
     });
-  }
-
-  it("does not show or reopen a page another account visited", async () => {
-    savedReport("user-b");
+    vi.mocked(resolveIdentity).mockReturnValue(pendingIdentity);
     const bridge = installBridge();
-    render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
-    await waitFor(() => expect(restoreLookups.identity).toHaveLength(1));
-    await handled(restoreLookups.identity);
-
-    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
-    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue("");
-  });
-
-  it("leaves a saved page that is open in another window there", async () => {
-    savedReport();
-    const bridge = installBridge({
-      browserHasView: vi.fn().mockResolvedValue({ exists: false, elsewhere: true }),
-    });
-    render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
-    await waitFor(() => expect(bridge.browserHasView).toHaveBeenCalled());
-    await firstResult(bridge.browserHasView);
-
-    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
-    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue("");
-  });
-
-  it("does not reopen a saved page over a view created while it looked", async () => {
-    savedReport();
-    let fireCreated: ((p: { conversationId: string }) => void) | undefined;
-    const resolveHost = deferredHost();
-    const bridge = installBridge({
-      onBrowserViewCreated: vi.fn((cb: typeof fireCreated) => {
-        fireCreated = cb;
-        return () => {};
-      }),
-    });
-    render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
-    await waitFor(() => expect(getSessionSlim).toHaveBeenCalled());
-    // An agent navigation opens the view before the saved page's host resolves.
-    act(() => fireCreated?.({ conversationId: "browser-tab:conv_a:two" }));
-    await resolveHost();
-
-    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
-  });
-
-  it("lets a URL the user submits while it looked win over the saved page", async () => {
-    savedReport();
-    const resolveHost = deferredHost();
-    const bridge = installBridge();
-    render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
-    const bar = await screen.findByRole("textbox", { name: "Address bar" });
-    await waitFor(() => expect(bar).toHaveValue("https://example.com/report"));
-    fireEvent.change(bar, { target: { value: "https://example.org/chosen" } });
-    fireEvent.keyDown(bar, { key: "Enter" });
-    await resolveHost();
-
-    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledOnce();
-    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
-      "browser-tab:conv_a:two",
-      "https://example.org/chosen",
-      undefined,
-      expect.anything(),
-    );
-  });
-
-  it("does not reopen a saved page after the pane unmounts", async () => {
-    savedReport();
-    const resolveHost = deferredHost();
-    const bridge = installBridge();
-    const { unmount } = render(
-      <BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />,
-    );
-    await waitFor(() => expect(getSessionSlim).toHaveBeenCalled());
-    unmount();
-    await resolveHost();
-
-    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
-  });
-
-  it("drops a superseded reopen's failure once the user's page loads", async () => {
-    savedReport();
-    let finishReopen: (result: unknown) => void = () => {};
-    const browserOpenOrNavigate = vi
-      .fn()
-      .mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            finishReopen = resolve;
-          }),
-      )
-      .mockResolvedValue({ ok: true, created: false });
-    installBridge({ browserOpenOrNavigate });
-    render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
-    await waitFor(() => expect(browserOpenOrNavigate).toHaveBeenCalledOnce());
+    const { unmount } = render(<BrowserPane conversationId="browser-tab:conv_a:two" />);
+    await waitFor(() => expect(resolveIdentity).toHaveBeenCalled());
     const bar = screen.getByRole("textbox", { name: "Address bar" });
-    fireEvent.change(bar, { target: { value: "https://example.org/chosen" } });
-    fireEvent.keyDown(bar, { key: "Enter" });
-    await waitFor(() => expect(browserOpenOrNavigate).toHaveBeenCalledTimes(2));
+    expect(bar).toHaveValue("");
+    if (change === "focused") {
+      fireEvent.focus(bar);
+    } else if (change === "edited" || change === "cleared") {
+      fireEvent.focus(bar);
+      fireEvent.change(bar, { target: { value: "https://example.org/chosen" } });
+      if (change === "cleared") fireEvent.change(bar, { target: { value: "" } });
+      fireEvent.blur(bar);
+    } else if (change === "navigated") {
+      act(() =>
+        bridge.onBrowserUrlChanged.mock.calls.at(-1)![0]({
+          conversationId: "browser-tab:conv_a:two",
+          url: "https://example.org/chosen",
+        }),
+      );
+    } else if (change === "created") {
+      act(() =>
+        bridge.onBrowserViewCreated.mock.calls.at(-1)![0]({
+          conversationId: "browser-tab:conv_a:two",
+        }),
+      );
+    } else if (change === "unmounted") {
+      unmount();
+    }
     await act(async () => {
-      finishReopen({ ok: false, error: "navigation superseded or closed" });
+      finishIdentity("user-a");
+      await pendingIdentity;
     });
-    await firstResult(browserOpenOrNavigate);
-
-    expect(screen.queryByRole("alert")).toBeNull();
+    if (change !== "unmounted") {
+      expect(bar).toHaveValue(
+        change === "unchanged" || change === "focused"
+          ? "https://example.com/report"
+          : change === "edited" || change === "navigated"
+            ? "https://example.org/chosen"
+            : "",
+      );
+    }
+    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+    expect(getSessionSlim).not.toHaveBeenCalled();
   });
 
   it("reattaches the retained page without navigating when its rail is reopened", async () => {
@@ -559,7 +427,7 @@ describe("BrowserPane retained-view lifecycle", () => {
     bridge.browserSetActive.mockClear();
 
     rerender(<BrowserPane conversationId="conv_closed" />);
-    expect(screen.getByRole("button", { name: "Reload" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reload" })).toBeEnabled();
     expect(bridge.browserSetActive).not.toHaveBeenCalled();
     expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
   });

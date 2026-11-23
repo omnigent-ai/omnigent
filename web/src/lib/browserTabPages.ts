@@ -1,6 +1,6 @@
 // Each open browser tab's last page, kept in the per-session workspace store.
 // The shell destroys its native views on sign-out, a session-expiry reconnect
-// and quit, so a tab that outlives its view reopens this page instead.
+// and quit; a tab that outlives its view retains the address for manual navigation.
 
 import { mainBrowserTabs } from "@/components/BrowserPane/agentTools/tabStore";
 import { parseBrowserViewId } from "./browserTabs";
