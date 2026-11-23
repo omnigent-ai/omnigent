@@ -5568,14 +5568,20 @@ def create_runner_app(
                     for body in all_bodies
                     if isinstance(pending_id := body.get("pending_id"), str)
                 }
+                # A native turn's inputs are stored later, from its transcript, so it
+                # names none rather than claiming the turn takes up no stored request.
                 _publish_turn_status(
                     session_id,
                     "running",
-                    input_item_ids=[
-                        item_id
-                        for body in all_bodies
-                        if isinstance(item_id := body.get("persisted_item_id"), str)
-                    ],
+                    input_item_ids=(
+                        None
+                        if _is_native_harness(session_id)
+                        else [
+                            item_id
+                            for body in all_bodies
+                            if isinstance(item_id := body.get("persisted_item_id"), str)
+                        ]
+                    ),
                 )
                 _turn_task = asyncio.create_task(
                     _run_turn_bg(next_body, session_id),

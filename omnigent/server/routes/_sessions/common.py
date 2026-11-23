@@ -684,6 +684,14 @@ _NO_TURN_REQUEST = ""
 # edge: a side chat counts the turn in flight before its running edge arrives.
 _session_dispatched_turns: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
+# Sessions holding more messages than _MAX_HELD_REQUESTS, until their turn ends: an
+# empty held map then does not show that no request still waits.
+_session_held_overflow: WorkspaceScopedSet[str] = WorkspaceScopedSet()
+
+# How many turns each session has ended, so an input stored while one ended is not
+# taken for the start of a later turn.
+_session_turn_ends: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+
 
 def _record_turn_request(session_id: str, item_id: str) -> None:
     """
@@ -724,6 +732,8 @@ def _record_sent_request(
     held = _session_held_request_cache.setdefault(session_id, {})
     if len(held) < _MAX_HELD_REQUESTS:
         held.setdefault(runner_item_id or item_id, item_id)
+    else:
+        _session_held_overflow.add(session_id)
 
 
 def _record_held_turn_start(session_id: str, input_item_ids: object, *, continued: bool) -> None:
@@ -747,9 +757,18 @@ def _record_held_turn_start(session_id: str, input_item_ids: object, *, continue
         held = _session_held_request_cache.get(session_id) or {}
         if not named:
             # The turn takes up no stored request, so only messages still held stay out.
-            _session_turn_request_cache[session_id] = next(iter(held.values()), _NO_TURN_REQUEST)
+            if held:
+                _session_turn_request_cache[session_id] = next(iter(held.values()))
+            elif session_id not in _session_held_overflow:
+                _session_turn_request_cache[session_id] = _NO_TURN_REQUEST
             return
         _session_turn_request_cache[session_id] = held.get(named[0], named[0])
+        if named[0] in held:
+            # The runner takes held messages up in order, so older ones were already taken up.
+            for runner_item_id in list(held):
+                del held[runner_item_id]
+                if runner_item_id == named[0]:
+                    break
         for item_id in named:
             held.pop(item_id, None)
         if not held:
@@ -1406,11 +1425,13 @@ __all__ = [
     "_session_background_tasks_cache",
     "_session_blocked_on_cache",
     "_session_dispatched_turns",
+    "_session_held_overflow",
     "_session_held_request_cache",
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",
     "_session_terminal_pending_cache",
+    "_session_turn_ends",
     "_session_turn_request_cache",
     "_unbound_managed_launch_tasks",
     "get_server_host_registry",

@@ -260,11 +260,13 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_tasks_cache,
     _session_blocked_on_cache,
     _session_dispatched_turns,
+    _session_held_overflow,
     _session_held_request_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
+    _session_turn_ends,
     _session_turn_request_cache,
     _unbound_managed_launch_tasks,
     build_policy_engine,
@@ -5380,9 +5382,11 @@ def _publish_status(
     # A ``waiting`` edge naming background agents ends a claude-native turn too.
     if status not in ("running", "waiting") or background_agents:
         _session_turn_request_cache.pop(session_id, None)
+        _session_turn_ends[session_id] = _session_turn_ends.get(session_id, 0) + 1
         # The ended turn took up any message still held; a turn the runner
         # starts with held messages names them on its running edge.
         _session_held_request_cache.pop(session_id, None)
+        _session_held_overflow.discard(session_id)
     # Keep the background-shell tally sticky alongside the status (see the
     # cache's declaration). A ``Stop`` hook reports an authoritative count
     # (``None`` is never sent by it): a positive count sets the tally, and

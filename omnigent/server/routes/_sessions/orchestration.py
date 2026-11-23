@@ -260,11 +260,13 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_tasks_cache,
     _session_blocked_on_cache,
     _session_dispatched_turns,
+    _session_held_overflow,
     _session_held_request_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
+    _session_turn_ends,
     _session_turn_request_cache,
     _unbound_managed_launch_tasks,
     get_caps,
@@ -3520,6 +3522,8 @@ async def _persist_external_conversation_item_unlocked(
     :returns: Store-assigned conversation item id.
     """
     item = _new_external_conversation_item(session_id, body)
+    # A turn that ends while this input is stored was the turn the input belonged to.
+    turn_ends = _session_turn_ends.get(session_id, 0)
     source_id = body.data.get("source_id")
     is_peer_wake_marker = (
         isinstance(source_id, str)
@@ -3688,7 +3692,7 @@ async def _persist_external_conversation_item_unlocked(
         )
         await record_claude_subagent_return(session_id, persisted, conversation_store)
         return persisted.id
-    if _begins_native_turn(item):
+    if _begins_native_turn(item) and _session_turn_ends.get(session_id, 0) == turn_ends:
         # Before the queue entry settles, so a side chat fork that saw it pending
         # finds the request it became.
         _record_turn_request(session_id, persisted.id)
@@ -9384,8 +9388,10 @@ async def _dispatch_session_event_to_runner_impl(
                 created_by=created_by,
                 stable_id=web_stable_id,
                 background_titles_enabled=background_titles_enabled,
+                # A turn that ended with background agents still running reads as running.
                 queued_during_turn=(
                     _session_status_from_cache(session_id, conv.live_status) == "running"
+                    and not _session_background_agents_cache.get(session_id)
                 ),
             )
             if queues_message
@@ -9780,6 +9786,7 @@ def _relinquish_session_live_state(session_id: str) -> None:
     _session_active_response_cache.pop(session_id, None)
     _session_turn_request_cache.pop(session_id, None)
     _session_held_request_cache.pop(session_id, None)
+    _session_held_overflow.discard(session_id)
     _session_dispatched_turns.discard(session_id)
     _session_blocked_on_cache.pop(session_id, None)
     session_live_state.forget_live_status(session_id)
