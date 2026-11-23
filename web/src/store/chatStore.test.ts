@@ -138,7 +138,9 @@ import {
   releaseConversation,
   withoutFailedInputs,
 } from "./chatStore";
+import { sentXhrs } from "@/test/fetchBackedXhr";
 import { conversationRegistry } from "./conversationRegistry";
+import { uploadProgressKey, useUploadProgressStore } from "./uploadProgress";
 import { markSessionCreated, resetInteractionTelemetryForTests } from "./interactionTelemetry";
 import {
   resetStreamSlotManager,
@@ -4717,6 +4719,134 @@ describe("chatStore — cancel first message during session creation", () => {
   });
 });
 
+describe("chatStore — upload progress, Cancel and Retry", () => {
+  const conversationId = "conv_existing";
+  const eventsUrl = `/v1/sessions/${conversationId}/events`;
+  // One macrotask lets every microtask the mocked upload and POST queued run first.
+  const flush = () =>
+    new Promise<void>((resolve) => {
+      setTimeout(resolve, 20);
+    });
+  const callsTo = (suffix: string, method: string) =>
+    fetchMock.mock.calls.filter(
+      ([input, init]) => String(input).endsWith(suffix) && init?.method === method,
+    );
+  const postedContents = () =>
+    callsTo(eventsUrl, "POST").map(([, init]) => JSON.parse(init!.body as string).data.content);
+  const pendingFileId = (message: PendingUserMessage) =>
+    (message.content[0] as { file_id: string }).file_id;
+
+  beforeEach(() => {
+    useUploadProgressStore.setState({ uploads: {} });
+    useChatStore.setState({ conversationId, abortController: new AbortController() });
+  });
+
+  it("shows an upload's progress on its attachment, and Cancel gives the message back once", async () => {
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/resources/files")) return new Promise<Response>(() => {});
+      return defaultFetchHandler(input, init);
+    });
+    const file = new File(["x".repeat(100)], "big.zip", { type: "application/zip" });
+    void useChatStore.getState().send("read this", "agent_xyz", [file]);
+    await flush();
+
+    const message = useChatStore.getState().pendingUserMessages[0]!;
+    const key = uploadProgressKey(message.tempId, pendingFileId(message));
+    sentXhrs.at(-1)!.progress(40, 100);
+    const upload = useUploadProgressStore.getState().uploads[key];
+    expect(upload).toMatchObject({ name: "big.zip", size: 100, loaded: 40, total: 100 });
+
+    upload!.cancel!();
+    await flush();
+
+    expect(postedContents()).toEqual([]);
+    expect(useUploadProgressStore.getState().uploads).toEqual({});
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(useChatStore.getState().failedUploads).toEqual([]);
+    expect(useChatStore.getState().blocks.some((b) => b.type === "error")).toBe(false);
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      conversationId,
+      text: "read this",
+      files: [file],
+    });
+  });
+
+  it("drops Cancel at the fence: a message that may have posted is never restored", async () => {
+    let answerUpload: (response: Response) => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/resources/files")) {
+        return new Promise<Response>((resolve) => {
+          answerUpload = resolve;
+        });
+      }
+      if (url.endsWith(eventsUrl) && init?.method === "POST")
+        return new Promise<Response>(() => {});
+      return defaultFetchHandler(input, init);
+    });
+    const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
+    void useChatStore.getState().send("read this", "agent_xyz", [file]);
+    await flush();
+    const message = useChatStore.getState().pendingUserMessages[0]!;
+    const cancel =
+      useUploadProgressStore.getState().uploads[
+        uploadProgressKey(message.tempId, pendingFileId(message))
+      ]!.cancel!;
+
+    answerUpload(mockResponse({ id: "file_notes" }));
+    await flush();
+    // The POST is out and unanswered: Cancel is gone from the chip and does nothing.
+    expect(callsTo(eventsUrl, "POST")).toHaveLength(1);
+    expect(useUploadProgressStore.getState().uploads).toEqual({});
+    cancel();
+    await flush();
+
+    expect(callsTo(eventsUrl, "POST")).toHaveLength(1);
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+  });
+
+  it("Retry re-uploads the same File and posts the message once", async () => {
+    let uploads = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/resources/files") && init?.method === "POST") {
+        uploads += 1;
+        return uploads === 1
+          ? mockResponse({ detail: "Upload interrupted" }, { ok: false, status: 500 })
+          : mockResponse({ id: "file_retried" });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
+    await useChatStore.getState().send("read this", "agent_xyz", [file]);
+
+    const failed = useChatStore.getState().failedUploads;
+    expect(failed).toHaveLength(1);
+    expect(failed[0]!.uploadFailure).toMatchObject({ message: "Upload interrupted" });
+    expect(postedContents()).toEqual([]);
+
+    failed[0]!.uploadFailure!.retry();
+    // A second press of either button does nothing once the first has acted.
+    failed[0]!.uploadFailure!.dismiss();
+    await flush();
+
+    expect(uploads).toBe(2);
+    const uploadBodies = callsTo("/resources/files", "POST").map(
+      ([, init]) => (init!.body as FormData).get("file") as File,
+    );
+    expect(uploadBodies.map((body) => body.name)).toEqual(["notes.txt", "notes.txt"]);
+    expect(postedContents()).toEqual([
+      [
+        { type: "input_file", file_id: "file_retried", filename: "notes.txt" },
+        { type: "input_text", text: "read this" },
+      ],
+    ]);
+    expect(useChatStore.getState().failedUploads).toEqual([]);
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+});
+
 describe("chatStore — first message during native model startup", () => {
   const sessionId = "conv_native_startup";
   const original = "unfinished first prompt";
@@ -7205,7 +7335,12 @@ describe("chatStore — send (file attachments)", () => {
       expect(stored.size).toBe(0);
       expect(posted).toEqual([]);
       if (path === "foreground") {
+        // The failed batch waits on its bubble; Dismiss hands the whole batch back once.
+        const parked = useChatStore.getState().failedUploads;
+        expect(parked).toHaveLength(1);
+        parked[0]!.uploadFailure!.dismiss();
         expect(useChatStore.getState().failedSendDraft?.files).toEqual(files);
+        expect(useChatStore.getState().failedUploads).toEqual([]);
       } else {
         expect(useChatStore.getState().queuedMessages[0]?.files).toEqual(files);
       }
@@ -7363,10 +7498,10 @@ describe("chatStore — send (file attachments)", () => {
     expect(onError).toHaveBeenCalledWith("Attachment quota reached");
   });
 
-  it("hands the message back for retry when the upload is rejected", async () => {
-    // A 415 on an unsupported attachment must not swallow the typed text: the
-    // optimistic bubble rolls back, so `failedSendDraft` is the only thing
-    // left holding it. The banner carries the server's reason, not "415".
+  it("keeps a rejected upload's message on its bubble until Dismiss hands it back", async () => {
+    // A 415 on an unsupported attachment must not swallow the typed text. The
+    // message waits on its bubble with the server's reason, not "415", and Dismiss
+    // hands the text and file back to the composer.
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
@@ -7390,9 +7525,19 @@ describe("chatStore — send (file attachments)", () => {
     await useChatStore.getState().send("summarize these photos", "agent_xyz", [zip]);
 
     const state = useChatStore.getState();
-    // Optimistic bubble rolled back — the send never reached the server.
+    // Never reached the server, so nothing is in the transcript's pending queue either.
     expect(state.pendingUserMessages).toEqual([]);
-    expect(state.failedSendDraft).toEqual({
+    expect(state.failedSendDraft).toBeNull();
+    expect(state.blocks.some((b) => b.type === "error")).toBe(false);
+    expect(state.failedUploads).toHaveLength(1);
+    expect(state.failedUploads[0]!.uploadFailure!.message).toContain(
+      "Unsupported attachment type 'application/zip'",
+    );
+    expect(state.failedUploads[0]!.content[0]).toMatchObject({ type: "input_file" });
+
+    state.failedUploads[0]!.uploadFailure!.dismiss();
+    expect(useChatStore.getState().failedUploads).toEqual([]);
+    expect(useChatStore.getState().failedSendDraft).toEqual({
       conversationId: "conv_existing",
       text: "summarize these photos",
       files: [zip],
@@ -7400,9 +7545,6 @@ describe("chatStore — send (file attachments)", () => {
       // A 415 carries no Omnigent error code: the message was never sent.
       serverRefused: false,
     });
-    const error = state.blocks.at(-1) as { type: string; message: string };
-    expect(error.type).toBe("error");
-    expect(error.message).toContain("Unsupported attachment type 'application/zip'");
   });
 
   it("keeps quote provenance client-side and returns it with a failed send", async () => {

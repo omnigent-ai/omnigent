@@ -23,6 +23,7 @@ import {
   hostFetch,
   isDatabricksWorkspace,
   isHostRoutingEnabled,
+  type UploadProgressListener,
 } from "./host";
 import { clientRoutingKey, SLICE_KEY_HEADER } from "./routingKey";
 import {
@@ -656,10 +657,17 @@ async function _wrongReplicaResendKey(res: Response): Promise<string | null> {
   return typeof sliceKey === "string" && sliceKey !== "" ? sliceKey : null;
 }
 
+/** A request through `authenticatedFetch`, with an optional upload-progress listener. */
+export interface AuthenticatedRequestInit extends RequestInit {
+  /** Told how much of the body each request this call sends has uploaded. */
+  onUploadProgress?: UploadProgressListener;
+}
+
 export async function authenticatedFetch(
   input: RequestInfo | URL,
-  init?: RequestInit,
+  options?: AuthenticatedRequestInit,
 ): Promise<Response> {
+  const { onUploadProgress, ...init } = options ?? {};
   const headers = new Headers(init?.headers);
   if (currentUserId && currentUserId !== RESERVED_USER_LOCAL && !headers.has("X-Forwarded-Email")) {
     headers.set("X-Forwarded-Email", currentUserId);
@@ -733,7 +741,7 @@ export async function authenticatedFetch(
       headers,
       cache: "no-store",
     },
-    { unkeyed },
+    { unkeyed, onUploadProgress },
   );
 
   // After a host switch this page can still key a session by its old host, which
@@ -762,7 +770,11 @@ export async function authenticatedFetch(
     if (sentKey === null) clearHostKeyless(resendKey);
     const keyedHeaders = new Headers(headers);
     keyedHeaders.set(SLICE_KEY_HEADER, resendKey);
-    res = await hostFetch(url, { ...init, headers: keyedHeaders, cache: "no-store" });
+    res = await hostFetch(
+      url,
+      { ...init, headers: keyedHeaders, cache: "no-store" },
+      { onUploadProgress },
+    );
     if (res.ok) clearHostKeyless(resendKey);
     derivedHostId = resendKey;
     stampedSliceKey = sentKey !== null;
@@ -788,7 +800,7 @@ export async function authenticatedFetch(
         headers: retryHeaders,
         cache: "no-store",
       },
-      { unkeyed: true },
+      { unkeyed: true, onUploadProgress },
     );
     // Only a successful keyless retry proves this host uses the default replica.
     // Failed retries must preserve the host key for subsequent requests.
@@ -818,7 +830,11 @@ export async function authenticatedFetch(
       if (hostId !== null && !demoted) {
         const retryHeaders = new Headers(headers);
         retryHeaders.set(SLICE_KEY_HEADER, hostId);
-        res = await hostFetch(url, { ...init, headers: retryHeaders, cache: "no-store" });
+        res = await hostFetch(
+          url,
+          { ...init, headers: retryHeaders, cache: "no-store" },
+          { onUploadProgress },
+        );
       }
     }
     if (await _isWrongReplica(res)) {
@@ -827,7 +843,7 @@ export async function authenticatedFetch(
       res = await hostFetch(
         url,
         { ...init, headers: retryHeaders, cache: "no-store" },
-        { unkeyed: true },
+        { unkeyed: true, onUploadProgress },
       );
       if (hostId !== null && res.ok) {
         markHostKeyless(hostId);
@@ -836,7 +852,11 @@ export async function authenticatedFetch(
         clearHostKeyless(hostId);
         const keyedHeaders = new Headers(headers);
         keyedHeaders.set(SLICE_KEY_HEADER, hostId);
-        res = await hostFetch(url, { ...init, headers: keyedHeaders, cache: "no-store" });
+        res = await hostFetch(
+          url,
+          { ...init, headers: keyedHeaders, cache: "no-store" },
+          { onUploadProgress },
+        );
       }
     }
   } else if (

@@ -27,3 +27,15 @@ export interface ActiveResponse {
    *  belong to the NEXT turn (no revive). */
   completedAt?: number;
 }
+
+/** The attachment whose upload failed, the server's reason, and the user's two choices. */
+export interface UploadFailure {
+  /** The failed file's pending id, as its chip names it. */
+  fileId: string;
+  /** The failure's text, as the send's error shows it. */
+  message: string;
+  /** Re-uploads the same files and sends the message once they're in. */
+  retry: () => void;
+  /** Gives the message back to the composer and drops the failed bubble. */
+  dismiss: () => void;
+}

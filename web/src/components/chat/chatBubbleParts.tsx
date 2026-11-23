@@ -5,6 +5,7 @@
 import {
   createContext,
   memo,
+  Fragment,
   useCallback,
   useContext,
   useEffect,
@@ -90,6 +91,7 @@ import {
   isPendingBlockingElicitation,
   isTextBlock,
   keyedAttachments,
+  PENDING_FILE_PREFIX,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { isCommandListed } from "@/store/paletteCommands";
@@ -113,6 +115,7 @@ import { useForkDialog } from "@/shell/ForkDialogContext";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/components/SessionImage";
+import { PendingAttachment } from "./PendingAttachment";
 import { UndeliveredMessageNotice } from "@/components/chat/UndeliveredMessageNotice";
 import { EditSentMessageContext } from "@/components/chat/editSentMessage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
@@ -310,6 +313,7 @@ export function buildPendingBubbles(
       // Stamped once at send time; absent for snapshot-replayed entries,
       // which show no timestamp rather than a re-stamped render time.
       ...(p.createdAtS !== undefined ? { createdAtS: p.createdAtS } : {}),
+      ...(p.uploadFailure !== undefined ? { uploadFailure: p.uploadFailure } : {}),
     };
   });
 }
@@ -364,20 +368,25 @@ export function placeUndeliveredBubbles(committed: Bubble[], undelivered: Bubble
  * @param pendingUserMessages - The conversation's optimistic sends.
  * @param failedInputs - The snapshot's undelivered startup messages.
  * @param selfAuthor - The viewer's attribution id, or null.
+ * @param failedUploads - Sends whose upload failed before posting, shown in send order.
  */
 export function withUncommittedUserBubbles(
   committed: Bubble[],
   pendingUserMessages: PendingUserMessage[],
   failedInputs: PendingInput[],
   selfAuthor: string | null,
+  failedUploads: PendingUserMessage[] = [],
 ): Bubble[] {
   const withUndelivered = placeUndeliveredBubbles(
     committed,
     buildUndeliveredBubbles(failedInputs, selfAuthor),
   );
-  const pending = withoutFailedInputs(pendingUserMessages, failedInputs);
-  if (pending.length === 0) return withUndelivered;
-  return mergePendingBubbles(withUndelivered, buildPendingBubbles(pending, selfAuthor));
+  const uncommitted = [
+    ...withoutFailedInputs(pendingUserMessages, failedInputs),
+    ...failedUploads,
+  ].sort((a, b) => (a.createdAtS ?? 0) - (b.createdAtS ?? 0));
+  if (uncommitted.length === 0) return withUndelivered;
+  return mergePendingBubbles(withUndelivered, buildPendingBubbles(uncommitted, selfAuthor));
 }
 
 // A committed bubble that exists ONLY to render one or more
@@ -1244,11 +1253,18 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                       />
                     );
                   }
+                  if (preview.kind !== "pending") {
+                    return <ImageAttachmentPlaceholder key={key} label={preview.label} />;
+                  }
                   return (
-                    <ImageAttachmentPlaceholder
+                    <PendingAttachment
                       key={key}
-                      label={preview.label}
-                      pending={preview.kind === "pending"}
+                      messageId={bubble.itemId}
+                      fileId={img.file_id ?? ""}
+                      name={preview.label}
+                      image
+                      failure={bubble.uploadFailure}
+                      fallback={<ImageAttachmentPlaceholder label={preview.label} pending />}
                     />
                   );
                 })}
@@ -1288,13 +1304,24 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 {fileChips.length > 0 && (
                   <div className="flex flex-wrap gap-1.5">
                     {keyedAttachments(fileChips, (att) => att.file_id ?? att.filename).map(
-                      ({ key, item: att }) => (
-                        <AttachmentChip
-                          key={key}
-                          icon={FileTextIcon}
-                          label={attachmentLabel(att)}
-                        />
-                      ),
+                      ({ key, item: att }) => {
+                        const chip = (
+                          <AttachmentChip icon={FileTextIcon} label={attachmentLabel(att)} />
+                        );
+                        if (!att.file_id?.startsWith(PENDING_FILE_PREFIX)) {
+                          return <Fragment key={key}>{chip}</Fragment>;
+                        }
+                        return (
+                          <PendingAttachment
+                            key={key}
+                            messageId={bubble.itemId}
+                            fileId={att.file_id}
+                            name={attachmentLabel(att)}
+                            failure={bubble.uploadFailure}
+                            fallback={chip}
+                          />
+                        );
+                      },
                     )}
                   </div>
                 )}

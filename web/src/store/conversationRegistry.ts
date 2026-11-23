@@ -366,10 +366,16 @@ export class ConversationRegistry {
  *   - an unsettled optimistic bubble (`send`'s POST hasn't returned); and
  *   - a `failedSendDraft` — a send that failed AND rolled its bubble back, so
  *     the draft is the sole surviving copy of the user's text and files. It is
- *     held until the composer restores it on return; evicting first drops it.
+ *     held until the composer restores it on return; evicting first drops it;
+ *   - a `failedUploads` entry — a send whose upload failed and whose bubble
+ *     waits for Retry or Dismiss; the entry is the only copy of the message.
  */
 function hasUnsentWork(state: ConversationState): boolean {
-  return state.pendingUserMessages.some((m) => m.posted !== true) || state.failedSendDraft !== null;
+  return (
+    state.pendingUserMessages.some((m) => m.posted !== true) ||
+    state.failedUploads.length > 0 ||
+    state.failedSendDraft !== null
+  );
 }
 
 /** The app's registry. Module-scope, like the store it backs. */

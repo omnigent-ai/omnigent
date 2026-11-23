@@ -176,8 +176,14 @@ import type {
 } from "@/lib/types";
 import { deleteSessionFile, downloadSessionFile, uploadFile } from "@/lib/filesApi";
 import { attachmentKey } from "@/lib/attachments";
+import {
+  beginUploadProgress,
+  endUploadProgress,
+  reportUploadProgress,
+  uploadProgressKey,
+} from "./uploadProgress";
 import { sendVerdictFromServer, snapshotRefusesSend } from "@/lib/userInputDelivery";
-import type { ActiveResponse } from "./types";
+import type { ActiveResponse, UploadFailure } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
@@ -694,6 +700,8 @@ export interface PendingUserMessage {
    * it. Unset on snapshot-replayed entries.
    */
   sentMidTurn?: boolean;
+  /** Set on a send whose upload failed before posting; see `failedUploads`. */
+  uploadFailure?: UploadFailure;
 }
 
 /**
@@ -793,6 +801,12 @@ export interface ConversationState {
   blocks: AnyBlock[];
   /** User messages POSTed but not yet acked via session.input.consumed. */
   pendingUserMessages: PendingUserMessage[];
+  /**
+   * Sends whose upload failed before posting. Kept out of `pendingUserMessages`, so a
+   * later message's consumed event can never pair with one. Each shows its failed
+   * attachment with Retry and Dismiss until the user picks one.
+   */
+  failedUploads: PendingUserMessage[];
   /**
    * Recent shell mirrors and the bubbles they settled. Retaining both client
    * and server ids protects later inputs from duplicate or legacy receipts.
@@ -2006,15 +2020,34 @@ const backgroundFlushCooldownUntil = new Map<string, number>();
 type UploadedFileBlock = Extract<ContentBlock, { file_id: string }>;
 const uploadedFileBlockCache = new WeakMap<File, Map<string, UploadedFileBlock>>();
 
+/** The placeholder id an attachment carries until its upload returns the real one. */
+function pendingFileIdOf(file: File): string {
+  return `${PENDING_FILE_PREFIX}${attachmentKey(file)}`;
+}
+
+/** How a batch upload is observed and stopped: see `uploadFileBlocks`. */
+export interface UploadBatchGuard {
+  signal?: AbortSignal;
+  /** Told when each file's upload begins, so a failure can name the file. */
+  onFileStart?: (file: File) => void;
+  onProgress?: (file: File, loaded: number, total: number | null) => void;
+}
+
 /** Keep new uploads private to their batch until every file succeeds. */
 async function uploadFileBlock(
   sessionId: string,
   file: File,
   newUploads: Map<File, UploadedFileBlock>,
+  guard: UploadBatchGuard,
 ): Promise<UploadedFileBlock> {
   const cached = newUploads.get(file) ?? uploadedFileBlockCache.get(file)?.get(sessionId);
   if (cached !== undefined) return cached;
-  const uploaded = await uploadFile(sessionId, file);
+  guard.onFileStart?.(file);
+  const { onProgress } = guard;
+  const uploaded = await uploadFile(sessionId, file, {
+    signal: guard.signal,
+    onUploadProgress: onProgress && ((loaded, total) => onProgress(file, loaded, total)),
+  });
   const block: UploadedFileBlock = file.type.startsWith("image/")
     ? { type: "input_image", file_id: uploaded.id, filename: uploaded.filename }
     : { type: "input_file", file_id: uploaded.id, filename: uploaded.filename };
@@ -2065,10 +2098,14 @@ async function rewindAttachmentFiles(
   return downloads.filter((file): file is File => file !== null);
 }
 
-/** Upload `files` to a session in order, as the content blocks a user message carries. */
+/**
+ * Upload `files` to a session in order, as the content blocks a user message carries.
+ * A failure removes the batch's earlier uploads and rejects with the first failure's error.
+ */
 export async function uploadFileBlocks(
   sessionId: string,
   files: readonly File[],
+  guard: UploadBatchGuard = {},
 ): Promise<ContentBlock[]> {
   const blocks: ContentBlock[] = [];
   const newUploads = new Map<File, UploadedFileBlock>();
@@ -2076,7 +2113,7 @@ export async function uploadFileBlocks(
     // Stop at the first failure so later uploads cannot outlive a requeued send.
     for (const file of files) {
       // oxlint-disable-next-line no-await-in-loop
-      blocks.push(await uploadFileBlock(sessionId, file, newUploads));
+      blocks.push(await uploadFileBlock(sessionId, file, newUploads, guard));
     }
   } catch (error) {
     await Promise.all(
@@ -2352,6 +2389,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   rewindPrefill: null,
   blocks: [],
   pendingUserMessages: [],
+  failedUploads: [],
   settledShellInputs: [],
   btwSidechat: null,
   queuedMessages: [],
@@ -2975,7 +3013,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // id would collide across attachments and strand a ghost chip (React
       // dedupes on the shared key) until a refresh replaces it with the
       // server's unique file_id.
-      const fileId = `${PENDING_FILE_PREFIX}${attachmentKey(file)}`;
+      const fileId = pendingFileIdOf(file);
       return file.type.startsWith("image/")
         ? { type: "input_image" as const, file_id: fileId, filename }
         : { type: "input_file" as const, file_id: fileId, filename };
@@ -3041,6 +3079,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       return state?.pendingUserMessages.some((p) => p.tempId === tempId && p.initialDraft);
     };
 
+    // Upload progress and Cancel belong to a composer send; Cancel stops the upload and, until
+    // the fence below, gives the message back to the composer instead of posting it.
+    const interactive = !opts?.external;
+    const uploadAbort = new AbortController();
+    const uploads = { uploading: false, cancelled: false, file: undefined as File | undefined };
+    const uploadKeyOf = (file: File) => uploadProgressKey(tempId, pendingFileIdOf(file));
+    const cancelUpload = () => {
+      if (posting) return;
+      uploads.cancelled = true;
+      uploadAbort.abort();
+    };
+    const endProgress = () => {
+      for (const file of files ?? []) endUploadProgress(uploadKeyOf(file));
+    };
+
     inFlightSends.set(stableId, false);
     try {
       await waitForPrior();
@@ -3080,10 +3133,28 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // otherwise). Plain text (if any) appended last. uploadFileBlock reuses
       // a prior successful upload of the same File so a retry after a
       // post-phase failure doesn't re-upload — and orphan — blobs that landed.
+      if (interactive) {
+        for (const file of files ?? []) {
+          beginUploadProgress(uploadKeyOf(file), {
+            name: file.name || "image.png",
+            size: file.size,
+            cancel: cancelUpload,
+          });
+        }
+      }
+      uploads.uploading = true;
       const fileBlocks = await unlessAborted(
-        uploadFileBlocks(sessionId, files ?? []),
+        uploadFileBlocks(sessionId, files ?? [], {
+          signal: uploadAbort.signal,
+          onFileStart: (file) => {
+            uploads.file = file;
+          },
+          onProgress: (file, loaded, total) =>
+            reportUploadProgress(uploadKeyOf(file), loaded, total),
+        }),
         opts?.signal,
       );
+      uploads.uploading = false;
       const serverContent: ContentBlock[] = [
         ...fileBlocks,
         ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
@@ -3093,6 +3164,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const heldBack = opts?.beforePost ? await opts.beforePost() : null;
       if (heldBack !== null) throw new Error(heldBack);
       opts?.signal?.throwIfAborted();
+      if (uploads.cancelled) throw new DOMException("Upload cancelled", "AbortError");
 
       // Promote "pending:<filename>" to real file_ids. Claude-native's
       // session.input.consumed is text-only (transcript round-trip
@@ -3123,6 +3195,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
         initialDispatched = true;
       }
+      // The fence: no await since the cancel check above, so Cancel can't race the POST.
+      endProgress();
       posting = true;
       const postResult = await withStillSendingMark(sessionId, tempId, () => {
         const post = postEvent(
@@ -3206,6 +3280,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     } catch (err) {
       if (initialDraft && !initialDispatched && !initialSendPending()) return;
       const { message, code } = describeSendFailure(err);
+      endProgress();
+      const cancelled = uploads.cancelled;
       if (opts?.external && !posting) {
         // Never posted (held back, or its upload failed or was stopped): drop only this
         // attempt's bubble and latch. A turn seen starting since isn't this send's to end.
@@ -3251,9 +3327,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(sentOnScreen ? {} : { offScreen: true }),
         });
       }
-      const callerHandlesError = heldForHost || opts?.onError !== undefined;
+      const callerHandlesError = heldForHost || (opts?.onError !== undefined && !cancelled);
       // An external send hears of the failure below, once it's known.
-      if (!heldForHost && !opts?.external) opts?.onError?.(message);
+      if (!heldForHost && !opts?.external && !cancelled) opts?.onError?.(message);
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
       // it. Keyed by the session it was meant for, so it lands in the right
@@ -3277,6 +3353,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       let refusedThisAttempt = refusedByServer || !posting;
       const draftState =
         draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
+      // A failed upload keeps its bubble, with Retry, instead of handing the draft back.
+      const parkedEntry =
+        uploads.uploading &&
+        !cancelled &&
+        interactive &&
+        !heldForHost &&
+        opts?.onError === undefined &&
+        opts?.signal?.aborted !== true &&
+        draftSessionId !== null &&
+        (files?.length ?? 0) > 0
+          ? draftState.pendingUserMessages.find((p) => p.tempId === tempId)
+          : undefined;
       // A live `session_input_consumed` for this very attempt proves the runner
       // took it, whatever became of the POST's answer.
       let deliveredDespiteFailure = inFlightSends.get(stableId) === true;
@@ -3327,6 +3415,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (
         !callerHandlesError &&
         !deliveredDespiteFailure &&
+        parkedEntry === undefined &&
         draftSessionId !== null &&
         (text.trim() !== "" || (files?.length ?? 0) > 0)
       ) {
@@ -3354,21 +3443,70 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const failSet = failTarget === null ? setActive : setterFor(failTarget);
       const failGet = (): ChatState =>
         failTarget === null ? get() : (setterForState(failTarget) ?? get());
-      // Roll back the optimistic bubble — no server idle will fire.
+      let parked: PendingUserMessage | null = null;
+      if (parkedEntry !== undefined && failTarget !== null) {
+        const parkedIn = failTarget;
+        // Retry and Dismiss each act once, whichever comes first.
+        let settled = false;
+        const settle = (): boolean => {
+          if (settled) return false;
+          settled = true;
+          return true;
+        };
+        const failedFile = uploads.file ?? files?.[0];
+        parked = {
+          ...parkedEntry,
+          initialDraft: undefined,
+          uploadFailure: {
+            fileId: pendingFileIdOf(failedFile!),
+            message,
+            retry: () => {
+              if (!settle()) return;
+              setterFor(parkedIn)((s) => ({
+                failedUploads: s.failedUploads.filter((p) => p.tempId !== tempId),
+              }));
+              void get().send(text, agentId, files, {
+                stableId,
+                replyDraft: opts?.replyDraft,
+                pinnedConversationId: parkedIn,
+              });
+            },
+            dismiss: () => {
+              if (!settle()) return;
+              setterFor(parkedIn)((s) => ({
+                failedUploads: s.failedUploads.filter((p) => p.tempId !== tempId),
+                failedSendDraft: {
+                  conversationId: parkedIn,
+                  text,
+                  files: files ?? [],
+                  stableId,
+                  serverRefused,
+                  ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+                },
+              }));
+            },
+          },
+        };
+      }
+      // Roll back the optimistic bubble — no server idle will fire. A parked send moves to
+      // `failedUploads` instead, so the consumed-event FIFO never sees it.
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+        ...(parked !== null ? { failedUploads: [...s.failedUploads, parked] } : {}),
       }));
       // A delivered send needs no card. One the server never answered may still
-      // arrive, so its card names the send for the commit that retracts it.
+      // arrive, so its card names the send for the commit that retracts it. A cancel
+      // or a parked upload already says what happened, so it adds none.
       const sentText = failGet().isNativeTerminalSession ? messageContentText(content) : "";
-      const failureCard: ErrorBlock | null = deliveredDespiteFailure
-        ? null
-        : {
-            ...makeClientErrorBlock(message, code),
-            ...(serverRefused
-              ? {}
-              : { unansweredSend: { stableId, ...(sentText ? { text: sentText } : {}) } }),
-          };
+      const failureCard: ErrorBlock | null =
+        deliveredDespiteFailure || cancelled || parked !== null
+          ? null
+          : {
+              ...makeClientErrorBlock(message, code),
+              ...(serverRefused
+                ? {}
+                : { unansweredSend: { stableId, ...(sentText ? { text: sentText } : {}) } }),
+            };
       if (!alreadyStreaming) {
         if (failGet().activeResponse !== null) {
           // A response bubble already exists (the turn started, then failed)
@@ -3401,6 +3539,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }
       }
     } finally {
+      endProgress();
       inFlightSends.delete(stableId);
       if (postedSessionId !== null) forgetUnsentSend(postedSessionId, stableId);
       // Release the next queued send regardless of success/failure so one

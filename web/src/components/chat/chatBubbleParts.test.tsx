@@ -25,6 +25,7 @@ import {
   containsMermaidDiagram,
   keyboardActiveQuestionId,
   placeUndeliveredBubbles,
+  withUncommittedUserBubbles,
 } from "./chatBubbleParts";
 
 const fetchMock = vi.fn();
@@ -1258,5 +1259,35 @@ describe("ConversationScrollRefBridge", () => {
     );
     expect(seenBeforePaint).toBeInstanceOf(HTMLElement);
     expect(seenBeforePaint).toBe(screen.getByText("row").parentElement?.parentElement);
+  });
+});
+
+describe("withUncommittedUserBubbles with failed uploads", () => {
+  it("places a failed upload's bubble in send order, carrying its Retry and Dismiss", () => {
+    const failed = {
+      tempId: "pend_1",
+      content: [{ type: "input_file" as const, file_id: "pending:a.zip", filename: "a.zip" }],
+      createdAtS: 100,
+      uploadFailure: {
+        fileId: "pending:a.zip",
+        message: "Too big",
+        retry: vi.fn(),
+        dismiss: vi.fn(),
+      },
+    };
+    const later = {
+      tempId: "pend_2",
+      content: [{ type: "input_text" as const, text: "later" }],
+      createdAtS: 200,
+    };
+
+    const bubbles = withUncommittedUserBubbles([], [later], [], null, [failed]);
+
+    expect(bubbles.map((bubble) => (bubble.kind === "user" ? bubble.itemId : null))).toEqual([
+      "pend_1",
+      "pend_2",
+    ]);
+    expect(bubbles[0]).toMatchObject({ pending: true, uploadFailure: failed.uploadFailure });
+    expect(bubbles[1]).not.toHaveProperty("uploadFailure");
   });
 });

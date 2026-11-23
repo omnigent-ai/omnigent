@@ -377,6 +377,9 @@ export function withRoutingKeyParam(path: string, options?: RoutingOptions): str
   return `${base}?${params}`;
 }
 
+/** Told how many bytes of a request body have been sent; `total` is null when unknown. */
+export type UploadProgressListener = (loaded: number, total: number | null) => void;
+
 /**
  * Single network choke point. Delegates to the host fetcher when embedded,
  * otherwise calls native `fetch` with the path unchanged (standalone).
@@ -384,15 +387,78 @@ export function withRoutingKeyParam(path: string, options?: RoutingOptions): str
 export function hostFetch(
   path: string,
   init?: RequestInit,
-  options?: RoutingOptions,
+  options?: RoutingOptions & { onUploadProgress?: UploadProgressListener },
 ): Promise<Response> {
   const routedInit = withRoutingKey(init, options);
   if (hostConfig.fetcher) {
     // The host owns path rebasing (it proxies onto its own API surface), so
     // the path is passed through untouched — `withBasePath` is standalone-only.
+    // An embedding's fetcher reports no upload progress, so callers show it as indeterminate.
     return hostConfig.fetcher(path, routedInit);
   }
+  if (options?.onUploadProgress) {
+    return fetchReportingUpload(withBasePath(path), routedInit, options.onUploadProgress);
+  }
   return fetch(withBasePath(path), routedInit);
+}
+
+/**
+ * `fetch` for a request whose upload progress matters. XMLHttpRequest is the only way to see
+ * it, so this answers with a `Response` like `fetch` and rejects the same way.
+ */
+function fetchReportingUpload(
+  url: string,
+  init: RequestInit | undefined,
+  onUploadProgress: UploadProgressListener,
+): Promise<Response> {
+  const signal = init?.signal ?? undefined;
+  if (signal?.aborted) return Promise.reject(abortReason(signal));
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open(init?.method ?? "GET", url);
+    request.responseType = "arraybuffer";
+    request.withCredentials = init?.credentials === "include";
+    new Headers(init?.headers).forEach((value, name) => request.setRequestHeader(name, value));
+    const onAbort = () => request.abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const settle = () => signal?.removeEventListener("abort", onAbort);
+    request.upload.onprogress = (event) =>
+      onUploadProgress(event.loaded, event.lengthComputable ? event.total : null);
+    request.onload = () => {
+      settle();
+      const headers = new Headers();
+      for (const line of request
+        .getAllResponseHeaders()
+        .trim()
+        .split(/[\r\n]+/)) {
+        const at = line.indexOf(":");
+        if (at > 0) headers.append(line.slice(0, at).trim(), line.slice(at + 1).trim());
+      }
+      // A Response can't carry a body with a null-body status.
+      const nullBody = [101, 204, 205, 304].includes(request.status);
+      resolve(
+        new Response(nullBody ? null : (request.response as ArrayBuffer), {
+          status: request.status,
+          statusText: request.statusText,
+          headers,
+        }),
+      );
+    };
+    request.onerror = () => {
+      settle();
+      reject(new TypeError("Failed to fetch"));
+    };
+    request.onabort = () => {
+      settle();
+      reject(abortReason(signal));
+    };
+    request.send((init?.body ?? null) as XMLHttpRequestBodyInit | null);
+  });
+}
+
+/** What an aborted request rejects with, as `fetch` does: the signal's reason when it has one. */
+function abortReason(signal: AbortSignal | undefined): unknown {
+  return signal?.reason ?? new DOMException("The operation was aborted.", "AbortError");
 }
 
 export function resolveWebSocketUrl(path: string, options?: RoutingOptions): string {
