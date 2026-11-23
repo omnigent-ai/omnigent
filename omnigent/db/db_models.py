@@ -2179,7 +2179,8 @@ class SqlGadgetShare(OmnigentBase):
     so the application deletes these rows when it deletes the gadget. Public
     shares (``__public__``) are never stored; the application enforces that.
 
-    :param gadget_id: The gadget this share belongs to, a UUID stored as 16 bytes.
+    :param gadget_id: The gadget this share belongs to, as the gadget store names it:
+        at most 64 lowercase letters, digits, ``_`` and ``-`` (a store need not use UUIDs).
     :param user_id: The grantee, a user or group ID, e.g. ``"alice@example.com"``.
         String(128) matches ``session_permissions.user_id``.
     :param level: The permission level granted. No CHECK constraint: the permission
@@ -2196,7 +2197,7 @@ class SqlGadgetShare(OmnigentBase):
         nullable=False,
         default=current_workspace_id,
     )
-    gadget_id: Mapped[str] = mapped_column(Uuid16, primary_key=True, nullable=False)
+    gadget_id: Mapped[str] = mapped_column(String(64), primary_key=True, nullable=False)
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True, nullable=False)
     level: Mapped[int] = mapped_column(SmallInteger, nullable=False)
 
@@ -2205,6 +2206,11 @@ class SqlGadgetShare(OmnigentBase):
         CheckConstraint(
             "length(CAST(user_id AS BLOB)) <= 512",
             name="ck_gadget_shares_user_id_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # Gadget IDs are ASCII, so 64 bytes is the 64-character width SQLite ignores.
+        CheckConstraint(
+            "length(CAST(gadget_id AS BLOB)) <= 64",
+            name="ck_gadget_shares_gadget_id_bytes",
         ).ddl_if(callable_=_on_sqlite_family),
         # SQLite and D1 store any value in an integer column.
         CheckConstraint(

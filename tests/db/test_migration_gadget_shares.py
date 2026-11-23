@@ -62,7 +62,7 @@ def db_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[Engine
 
 
 def _share(shares: sa.Table, **values: object) -> sa.Insert:
-    row = {"workspace_id": 1, "gadget_id": b"a" * 16, "user_id": "alice", "level": 1}
+    row = {"workspace_id": 1, "gadget_id": "board-1", "user_id": "alice", "level": 1}
     return shares.insert().values(**{**row, **values})
 
 
@@ -76,6 +76,8 @@ def test_columns_primary_key_and_index(db_engine: Engine) -> None:
     assert all(column["nullable"] is False for column in columns.values())
     assert all(column["default"] is None for column in columns.values())
     assert columns["user_id"]["type"].length == 128
+    # The gadget store's own ID, which need not be a UUID.
+    assert columns["gadget_id"]["type"].length == 64
     if db_engine.dialect.name == "cockroachdb":
         # CockroachDB reflects INT2 as INTEGER and drops the width, so read the stored type.
         with db_engine.connect() as conn:
@@ -122,6 +124,22 @@ def test_rows_are_unique_per_grantee_and_bounded(db_engine: Engine) -> None:
         conn.execute(_share(shares, user_id="😀" * 128 + "a"))
     with db_engine.begin() as conn:
         conn.execute(_share(shares, user_id="😀" * 128))
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_gadget_ids_are_the_stores_own_and_bounded(db_engine: Engine) -> None:
+    """A UUID-hex, decimal or slug gadget ID is stored as given; a 65th character is
+    refused, by the column width or, on SQLite and D1, by the byte check."""
+    shares = sa.Table(_TABLE, sa.MetaData(), autoload_with=db_engine)
+    ids = ["0123456789abcdef0123456789abcdef", "102717306144392", "b" * 64]
+    with db_engine.begin() as conn:
+        for gadget_id in ids:
+            conn.execute(_share(shares, gadget_id=gadget_id))
+    with db_engine.connect() as conn:
+        stored = conn.execute(sa.select(shares.c.gadget_id)).scalars().all()
+    assert sorted(stored) == sorted(ids)
+    with pytest.raises(DBAPIError), db_engine.begin() as conn:
+        conn.execute(_share(shares, gadget_id="c" * 65))
 
 
 @pytest.mark.parametrize("column", ["workspace_id", "level"])

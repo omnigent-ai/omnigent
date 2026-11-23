@@ -27,8 +27,6 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-from omnigent.db.db_models import Uuid16
-
 revision: str = "e4c7a91b2d3f"
 down_revision: str | None = "bf30d7cbda61"
 branch_labels: str | Sequence[str] | None = None
@@ -47,6 +45,11 @@ def upgrade() -> None:
                 "length(CAST(user_id AS BLOB)) <= 512",
                 name="ck_gadget_shares_user_id_bytes",
             ),
+            # Gadget IDs are ASCII, so 64 bytes is the 64-character width.
+            sa.CheckConstraint(
+                "length(CAST(gadget_id AS BLOB)) <= 64",
+                name="ck_gadget_shares_gadget_id_bytes",
+            ),
             sa.CheckConstraint(
                 "typeof(workspace_id) = 'integer'",
                 name="ck_gadget_shares_workspace_id_integer",
@@ -59,8 +62,8 @@ def upgrade() -> None:
     op.create_table(
         "gadget_shares",
         sa.Column("workspace_id", sa.BigInteger(), nullable=False),
-        # The gadget's ID as 16 raw bytes (Uuid16), read back as bare hex.
-        sa.Column("gadget_id", Uuid16(), nullable=False),
+        # The gadget store's ID: up to 64 of [a-z0-9_-], not necessarily a UUID.
+        sa.Column("gadget_id", sa.String(64), nullable=False),
         # String(128) matches session_permissions.user_id; a user or group ID.
         sa.Column("user_id", sa.String(128), nullable=False),
         sa.Column("level", sa.SmallInteger(), nullable=False),
