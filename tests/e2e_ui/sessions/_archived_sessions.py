@@ -15,11 +15,7 @@ _PROJECT_LABEL_KEY = "omni_project"
 
 
 def seed_archived_session(base_url: str, *, title: str, project: str | None) -> str:
-    """Create a session, file it under *project*, and archive it.
-
-    Creation goes through the same multipart ``POST /v1/sessions`` path as
-    the ``seeded_session`` fixture; a single ``PATCH`` then sets the title,
-    the ``omni_project`` label, and the archived flag.
+    """Create and archive a titled session in an optional project.
 
     :param base_url: The live server base URL.
     :param title: Unique title so the row is easy to spot among other tests'
