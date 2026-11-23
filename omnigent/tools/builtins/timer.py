@@ -9,7 +9,7 @@ Two tools:
   previously scheduled timer by ``timer_id``.
 
 Both tools are gated on the agent spec's top-level ``timers:`` flag
-(see :attr:`AgentSpec.timers`, defaulting to ``False``).
+(see :attr:`AgentSpec.timers`, defaulting to ``True``).
 
 These classes own the LLM-facing schema and argument validation.
 The runner's ``execute_tool`` intercepts ``sys_timer_set`` /

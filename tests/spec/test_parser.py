@@ -3446,38 +3446,34 @@ def test_parse_mcp_unknown_transport_raises(agent_dir: Path) -> None:
 # ─── Top-level ``timers:`` flag (step 10 of harness contract) ─
 
 
-def test_parse_timers_defaults_to_false_when_omitted(agent_dir: Path) -> None:
+def test_parse_timers_defaults_to_true_when_omitted(agent_dir: Path) -> None:
     """
     Without a top-level ``timers:`` key the parsed ``AgentSpec.timers``
-    is ``False``.
-
-    Default-off matches the inner stack (``AgentDef.timers`` is also
-    ``False`` by default) — agents authored before step 10 must keep
-    their pre-step-10 tool surface unchanged. A regression that
-    flipped the default to ``True`` would silently expose the timer
-    builtins to every agent.
+    is ``True``, as ``AgentDef.timers`` is in the inner stack, so every
+    agent can set timers, e.g. a workflow run's progress timer.
 
     :param agent_dir: Temporary agent directory fixture.
     """
     spec = parse(agent_dir)
-    assert spec.timers is False
+    assert spec.timers is True
 
 
-def test_parse_timers_true_sets_flag(tmp_path: Path) -> None:
+@pytest.mark.parametrize("timers", [True, False])
+def test_parse_timers_sets_flag(tmp_path: Path, timers: bool) -> None:
     """
-    ``timers: true`` in config.yaml round-trips to
-    ``AgentSpec.timers == True``.
+    ``timers:`` in config.yaml round-trips to ``AgentSpec.timers``.
 
     The flag is the gate for ``ToolManager._register_timer_tools``
     (see step 10) — a regression where the parser dropped the
-    field would mean the YAML opt-in had no effect at runtime.
+    field would mean ``timers: false`` no longer removed the tools.
 
     :param tmp_path: pytest-provided temporary directory.
+    :param timers: The YAML value, e.g. ``False`` to turn the tools off.
     """
-    config = {"spec_version": 1, "name": "timer-agent", "timers": True}
+    config = {"spec_version": 1, "name": "timer-agent", "timers": timers}
     (tmp_path / "config.yaml").write_text(yaml.dump(config))
     spec = parse(tmp_path)
-    assert spec.timers is True
+    assert spec.timers is timers
 
 
 # ─── Top-level ``tool_groups:`` block (framework tool opt-out) ─

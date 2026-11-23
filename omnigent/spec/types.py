@@ -1587,16 +1587,11 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     :param timers: Whether the LLM-callable timer builtins
         (``sys_timer_set``, ``sys_timer_cancel``) are
         registered. YAML key is ``timers:``. **Defaults to
-        ``False``** to match the legacy inner-stack default at
-        ``omnigent/inner/datamodel.py::AgentDef.timers`` —
-        agents opt into the timer surface explicitly. Step 10
-        of the harness contract migration adds the AP-side
-        port; firings durable across server restarts via the
-        the legacy background-timer workflow (the inner
-        stack uses in-memory asyncio tasks; Omnigent supersedes that
-        with a workflow per timer pinned to the timer_id). See
-        ``designs/SERVER_HARNESS_CONTRACT.md`` §Timers and
-        step 10.
+        ``True``**, like ``omnigent/inner/datamodel.py::AgentDef.timers``;
+        an agent drops the tools with ``timers: false``. A timer of at
+        least two minutes in a top-level session is saved on the
+        server, and others run in the runner (see
+        ``omnigent/tools/builtins/timer.py``).
     :param spawn: Whether the agent may spawn child sessions
         OUTSIDE any declared sub-agent list: registers
         ``sys_session_create`` (launch an existing agent by id or
@@ -1680,7 +1675,7 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     # egress_rules so generic network access cannot authorize credentials.
     model_egress: list[str] | None = None
     terminals: dict[str, TerminalEnvSpec] | None = None
-    timers: bool = False
+    timers: bool = True
     spawn: bool = False
     tool_groups: ToolGroupsConfig = field(default_factory=ToolGroupsConfig)
     # Not read from YAML: the runner clears it when the server's memory backend

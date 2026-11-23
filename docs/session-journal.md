@@ -62,7 +62,12 @@ The newest status for a step is its current one:
 
 The workflow skill keeps the agent working while any step is ready or started:
 it ends its turn only once everything left is done, failed or waiting for the
-user, unless told to stop sooner.
+user, unless told to stop sooner. While a run has work pending, the agent also
+keeps a progress timer: `sys_timer_set` repeating every 3 minutes, which brings
+it back to the run if its turn ends early. On a server with the
+`session_timers` feature on, a top-level session's timer is saved there and
+survives the runner restarting. The agent cancels it when the run finishes,
+waits only on you, or is stopped.
 
 A status belongs to a step ID within a run, not to a plan version. Replanning
 or saving the plan keeps that progress. Starting another invocation resets it;
@@ -180,9 +185,9 @@ reasoning effort for the step's complexity, starting from its own.
 For a saved workflow, the agent passes `workflow_id` to `sys_session_create`,
 so that session starts with the workflow's plan and appears in the workflow's
 runs. That session reports back with `sys_session_message` when its plan
-finishes, and the agent also checks on it periodically with a background timer
-of its own. Workers get the relevant inputs, decisions, authorization and
-limits, and report blockers to their coordinating session. That session
+finishes, and the agent also checks on it each time its progress timer fires.
+Workers get the relevant inputs, decisions, authorization and limits, and
+report blockers to their coordinating session. That session
 resolves them or consolidates the remaining human question instead of sending
 the user to each worker. With the `sibling_sessions` feature on, these sessions
 are grouped with the session that started them.

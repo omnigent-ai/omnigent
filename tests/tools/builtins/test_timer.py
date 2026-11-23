@@ -291,25 +291,19 @@ def test_cancel_malformed_json_returns_parse_error() -> None:
 
 def test_timers_false_does_not_register() -> None:
     """
-    With ``timers=False`` (the default) the manager does NOT
-    register either timer tool.
-
-    The default-off behavior matches the inner stack
-    (``AgentDef.timers`` defaults to False there too) — agents
-    that don't declare ``timers: true`` get the same minimal tool
-    surface they did pre-step-10. A regression that flipped the
-    default to True would surprise existing agents.
+    With ``timers=False`` the manager does NOT register either timer tool,
+    so an agent can still turn off the tools every other agent has.
     """
-    spec = AgentSpec(spec_version=1)  # timers defaults to False
+    spec = AgentSpec(spec_version=1, timers=False)
     manager = ToolManager(spec=spec)
     names = manager.get_tool_names()
     assert SysTimerSetTool.name() not in names
     assert SysTimerCancelTool.name() not in names
 
 
-def test_timers_true_registers_both_tools_and_schemas() -> None:
+def test_timers_register_both_tools_and_schemas_by_default() -> None:
     """
-    With ``timers=True`` the manager registers both tools and
+    By default (``timers=True``) the manager registers both tools and
     surfaces them in ``get_tool_schemas``.
 
     The schema visibility is what the LLM sees in its function
@@ -318,7 +312,7 @@ def test_timers_true_registers_both_tools_and_schemas() -> None:
     tool name it can't actually use (the runtime would still
     dispatch on call_tool, but the LLM never knew to call it).
     """
-    spec = AgentSpec(spec_version=1, timers=True)
+    spec = AgentSpec(spec_version=1)
     manager = ToolManager(spec=spec)
     names = manager.get_tool_names()
     assert SysTimerSetTool.name() in names

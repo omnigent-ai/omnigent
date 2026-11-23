@@ -65,7 +65,13 @@ def test_metadata_survives_deleted_cwd(
         schema_names = [schema["name"] for schema in schemas]
         assert len(schema_names) == len(set(schema_names))
         assert set(schema_names).isdisjoint(tool_dispatch._OS_ENV_TOOLS)
-        for tool_name in ("sys_call_async", "sys_session_create", "sys_terminal_launch"):
+        for tool_name in (
+            "sys_call_async",
+            "sys_session_create",
+            "sys_terminal_launch",
+            "sys_timer_set",
+            "sys_timer_cancel",
+        ):
             assert (tool_name in schema_names) is enabled
 
         for harness in (
