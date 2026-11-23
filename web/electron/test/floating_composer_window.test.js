@@ -748,7 +748,7 @@ test("a launch's message is checked and capped in total before a main window can
   assert.deepEqual(
     floatingComposerLaunchMessage({
       text: "/review",
-      skill: { name: "review", args: "1" },
+      skill: { name: "review", args: "1", extra: "not passed on" },
       files: [],
     }),
     {

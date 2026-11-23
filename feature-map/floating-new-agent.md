@@ -25,14 +25,15 @@ off by default.
   opening over another app, the panel goes back to that app instead of raising an
   Omnigent window.
 - `launch`: ⌘↵ (shown beside the send button; plain ↵ adds a line) or the send
-  button creates the session on This Mac in the chosen
-  folder, or in a new sandbox. The session opens in an Omnigent window of the same
-  server, which comes forward, and the panel hides. A main window of that server
-  whose page is showing its app takes the first message and sends it from its chat,
-  as New Chat does, so the message stays visible while the harness starts. The
-  panel sends it itself when no page takes it within 2 s, the page navigates away
-  first, or the attachments are over 25 MB in total. A successful launch clears the
-  panel for the next prompt, unless the user typed in it since reopening it.
+  button creates the session on This Mac in the chosen folder, or in a new sandbox.
+  The session opens in an Omnigent window of the same server, which comes forward,
+  and the panel hides. A main window of that server whose page is showing its app
+  and subscribed to launch offers takes the offer, queues the first message and
+  its attachments whole, and confirms it; then that page sends the message from its
+  chat, as New Chat does, so it stays visible while the harness starts. The panel
+  sends it itself when no page takes and confirms the offer within 2 s, when the
+  page's window goes or unsubscribes first, or when the attachments are over 25 MB
+  in total. A successful launch clears the panel for the next prompt.
 - `launch-failure`: when the first message can't be delivered (the server never
   stored it, or the runner refused it), the panel keeps the prompt and says why. A
   message a main window's page sends reports its failure in that chat instead.

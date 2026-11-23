@@ -2043,8 +2043,41 @@ function showsAppOf(win, serverUrl) {
  * @returns {BrowserWindow | undefined}
  */
 function appWindowOfServer(serverUrl) {
-  return mainWindowsByRecency(mainWindowFocusOrder, mainWindows()).find((win) =>
-    showsAppOf(win, serverUrl),
+  return mainWindowsByRecency(mainWindowFocusOrder, mainWindows()).find(
+    (win) => showsAppOf(win, serverUrl) && !win.webContents.isCrashed(),
+  );
+}
+
+/**
+ * Whether `win` can take a route now: it shows its server's app, isn't connecting, and its
+ * renderer is alive.
+ *
+ * @param {BrowserWindow} win
+ * @param {string} serverUrl
+ * @returns {boolean}
+ */
+function isReadyAppWindow(win, serverUrl) {
+  return (
+    showsAppOf(win, serverUrl) &&
+    !win.webContents.isCrashed() &&
+    connectionAttempts.get(win)?.pending !== true
+  );
+}
+
+/**
+ * The window a launch's route falls back to once its offer ends unconfirmed: the most recent ready
+ * window of the server, other than `excluded`. `excluded` is the window whose page holds the
+ * message, which must not also navigate to the session.
+ *
+ * @param {string} serverUrl
+ * @param {BrowserWindow | null} excluded
+ * @returns {BrowserWindow | null}
+ */
+function fallbackAppWindow(serverUrl, excluded) {
+  return (
+    mainWindowsByRecency(mainWindowFocusOrder, mainWindows()).find(
+      (win) => win !== excluded && isReadyAppWindow(win, serverUrl),
+    ) ?? null
   );
 }
 
@@ -2057,7 +2090,7 @@ function appWindowOfServer(serverUrl) {
  */
 function launchHandOffTarget(serverUrl) {
   const target = appWindowOfServer(serverUrl);
-  if (!target || connectionAttempts.get(target)?.pending === true) return null;
+  if (!target || !isReadyAppWindow(target, serverUrl)) return null;
   return floatingLaunchOffers.canOffer(target.webContents) ? target : null;
 }
 
@@ -5573,14 +5606,15 @@ function registerIpc() {
     else floatingComposerController.filePickerClosed(panel);
   });
 
-  // From a main window's page, once it subscribes: it can take the first message of a launch.
-  ipcMain.on("omnigent:floating-composer:launch-takers", (event) => {
+  // From a main window's page: it subscribes to launch offers (`true`), or stops (`false`).
+  ipcMain.on("omnigent:floating-composer:launch-takers", (event, subscribed) => {
     const win = BrowserWindow.fromWebContents(event.sender);
     if (!isPinnedOriginSender(event) || !isMainWindow(win)) return;
     // Only the window's top document, on its server's app and announced as supporting the panel.
     if (event.senderFrame !== event.sender.mainFrame || serverPageShown(win) !== "app") return;
     if (!floatingComposerSupport.supports(event.sender.id, windows.get(win).serverUrl)) return;
-    floatingLaunchOffers.registerTaker(event.sender);
+    if (subscribed === false) floatingLaunchOffers.forget(event.sender);
+    else floatingLaunchOffers.registerTaker(event.sender);
   });
 
   // From the panel: the largest attachments a launch may carry now, or null when no page can take it.
@@ -5591,15 +5625,23 @@ function registerIpc() {
     return target === null ? null : { maxFileBytes: FLOATING_LAUNCH_MAX_FILE_BYTES };
   });
 
-  // From a main window's page: takes the launch offered to it. Null once that offer has ended.
+  // From a main window's page: takes the launch offered to it. The offer stays open until the
+  // page confirms. Null for an offer that isn't open for this document.
   ipcMain.handle("omnigent:floating-composer:take-launch", (event, id) => {
     if (!isPinnedOriginSender(event) || event.senderFrame !== event.sender.mainFrame) return null;
     return floatingLaunchOffers.take(event.sender, id);
   });
 
+  // From a main window's page: it has queued the message it took. True only while that offer is
+  // still open for this document, which then settles as the page's to send.
+  ipcMain.handle("omnigent:floating-composer:confirm-launch", (event, id) => {
+    if (!isPinnedOriginSender(event) || event.senderFrame !== event.sender.mainFrame) return false;
+    return floatingLaunchOffers.confirm(event.sender, id);
+  });
+
   // From the panel: a session it launched, or an app page it links to, in a main window of
   // its server. The panel then hides. A launch's first message goes to that window's page when
-  // the page takes it, and the answer says so; otherwise the panel sends it.
+  // the page confirms it queued it, and the answer says so; otherwise the panel sends it.
   ipcMain.handle(
     "omnigent:floating-composer:open-in-main-window",
     async (event, routePath, launchMessage) => {
@@ -5625,18 +5667,21 @@ function registerIpc() {
         app.focus({ steal: true });
         floatingComposerController.hide(panel, { resetFrame: true });
         const sessionId = sessionPath.slice("/c/".length);
-        const taken = await floatingLaunchOffers.offer(
+        const outcome = await floatingLaunchOffers.offer(
           handOffTarget.webContents,
           { sessionId, path: openPath },
           message,
         );
-        if (taken) return { ok: true, delivery: "page" };
-        // Not taken in time: the session still opens, and the panel delivers the message.
-        if (
-          showsAppOf(handOffTarget, serverUrl) &&
-          connectionAttempts.get(handOffTarget)?.pending !== true
-        ) {
-          sendOpenPath(handOffTarget, openPath);
+        if (outcome === "confirmed") return { ok: true, delivery: "page" };
+        // The panel delivers. A window whose page took the message must not also navigate to the
+        // session, or the queued message would be sent twice; another window takes the route.
+        const fallback = fallbackAppWindow(
+          serverUrl,
+          outcome === "handed-out" ? handOffTarget : null,
+        );
+        if (fallback !== null) {
+          if (fallback !== handOffTarget) focusAndRestore(fallback);
+          sendOpenPath(fallback, openPath);
         } else {
           createWindow(undefined, { serverUrl, path: openPath });
         }

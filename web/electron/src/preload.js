@@ -16,6 +16,9 @@
 
 const { contextBridge, ipcRenderer, webFrame, webUtils } = require("electron");
 
+/** Launch-offer listeners this page holds; main is told when the last one goes. */
+let launchOfferSubscribers = 0;
+
 // Native window controls stay in window pixels while the page zooms.
 if (process.platform === "darwin") {
   const setFullScreenAttribute = (fullScreen) => {
@@ -326,14 +329,29 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
       if (typeof callback !== "function") return () => {};
       const listener = (_event, offer) => callback(offer);
       ipcRenderer.on("omnigent:floating-composer:launch-offer", listener);
-      ipcRenderer.send("omnigent:floating-composer:launch-takers");
-      return () => ipcRenderer.removeListener("omnigent:floating-composer:launch-offer", listener);
+      if (launchOfferSubscribers++ === 0)
+        ipcRenderer.send("omnigent:floating-composer:launch-takers", true);
+      let subscribed = true;
+      return () => {
+        if (!subscribed) return;
+        subscribed = false;
+        ipcRenderer.removeListener("omnigent:floating-composer:launch-offer", listener);
+        // The last listener gone: main stops offering launches to this page.
+        if (--launchOfferSubscribers === 0) {
+          ipcRenderer.send("omnigent:floating-composer:launch-takers", false);
+        }
+      };
     },
     /**
-     * From a main window: takes an offered launch once. Resolves its `{ text, skill, files }`, or
-     * null when the offer already ended.
+     * From a main window: takes an offered launch. Resolves its `{ text, skill, files }`, or null
+     * when the offer isn't open for this page. Queue the message, then `confirmLaunch`.
      */
     takeLaunch: (id) => ipcRenderer.invoke("omnigent:floating-composer:take-launch", id),
+    /**
+     * From a main window: says the taken message is queued. Resolves true when the panel has not
+     * delivered it, so this page sends it; false when the offer ended, so it must drop its queue.
+     */
+    confirmLaunch: (id) => ipcRenderer.invoke("omnigent:floating-composer:confirm-launch", id),
     /** From the panel: its native file picker opened or closed. */
     filePicker: (state) =>
       ipcRenderer.send(

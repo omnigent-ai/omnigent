@@ -9,7 +9,11 @@ import { randomUUID } from "@/lib/randomUUID";
 import { ApiError, fetchSessionItemsPage, postEvent } from "@/lib/sessionsApi";
 import { sendVerdictFromServer } from "@/lib/userInputDelivery";
 import type { FloatingLaunchRequest } from "@/shell/composerPresentation";
-import { setPendingInitialPrompt, uploadFileBlocks } from "@/store/chatStore";
+import {
+  consumePendingInitialPrompt,
+  setPendingInitialPrompt,
+  uploadFileBlocks,
+} from "@/store/chatStore";
 
 /** The panel's next state: an error to show, and whether to start a fresh composer. */
 export interface LaunchOutcome {
@@ -131,16 +135,19 @@ async function handOffMessage(
 }
 
 /**
- * Takes a launch the panel offered this window: queues its first message for the session's chat,
- * then opens that chat. An expired offer does nothing. Never rejects.
+ * Takes a launch the panel offered this window and sends it from this window's chat. The whole
+ * message is queued, or none of it: any failure before the confirm leaves delivery to the panel.
+ * Once confirmed, the chat opens; if the offer ended meanwhile, the queued message is dropped so
+ * only the panel sends it. Never rejects.
  */
 export async function takeLaunchOffer(
   offer: FloatingLaunchOffer,
   navigate: (path: string) => void,
 ): Promise<void> {
+  const bridge = floatingComposerBridge();
   let message: FloatingLaunchMessage | null;
   try {
-    message = (await floatingComposerBridge()?.takeLaunch?.(offer.id)) ?? null;
+    message = (await bridge?.takeLaunch?.(offer.id)) ?? null;
   } catch (err) {
     console.warn("[floatingComposer] couldn't take the launch:", err);
     return;
@@ -154,19 +161,23 @@ export async function takeLaunchOffer(
     });
   } catch (err) {
     console.error("[floatingComposer] couldn't queue the launched message:", err);
+    return; // Not confirmed, so the panel sends it.
   }
-  // Taken, so the chat opens even if its message couldn't be queued.
-  navigate(offer.path);
+  let confirmed = false;
+  try {
+    confirmed = (await bridge?.confirmLaunch?.(offer.id)) === true;
+  } catch (err) {
+    // Unknown whether the offer still stands; dropping the queue keeps the message from going twice.
+    console.warn("[floatingComposer] couldn't confirm the launch:", err);
+  }
+  if (confirmed) {
+    navigate(offer.path);
+    return;
+  }
+  consumePendingInitialPrompt(offer.sessionId);
 }
 
-/** The launch's attachments as files; one that can't be rebuilt is left out and logged. */
+/** The launch's attachments rebuilt as files. Throws if any can't be, so none is sent alone. */
 function launchFiles(files: FloatingLaunchMessage["files"]): File[] {
-  return files.flatMap(({ name, type, bytes }) => {
-    try {
-      return [new File([bytes], name, { type })];
-    } catch (err) {
-      console.warn("[floatingComposer] couldn't rebuild an attachment:", err);
-      return [];
-    }
-  });
+  return files.map(({ name, type, bytes }) => new File([bytes], name, { type }));
 }

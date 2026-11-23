@@ -379,7 +379,7 @@ export interface FloatingComposerBridge {
   dismiss: () => void;
   /**
    * From the panel: show `/c/<id>` or an app page in a main window, then hide. A launch's
-   * message is taken by that window's page when `delivery` is "page"; otherwise the panel sends it.
+   * message is sent by that window's page when `delivery` is "page"; otherwise the panel sends it.
    */
   openInMainWindow: (
     path: string,
@@ -393,10 +393,12 @@ export interface FloatingComposerBridge {
   onShown?: (callback: () => void) => () => void;
   /** From the panel: the attachment cap a launch may carry, or null when no window can take it. Newer shells only. */
   canHandOffLaunch?: () => Promise<{ maxFileBytes: number } | null>;
-  /** From a main window: takes the panel's launch offers, which also says this page takes them. Newer shells only. */
+  /** From a main window: subscribes to the panel's launch offers, and says this page takes them. Newer shells only. */
   onLaunchOffer?: (callback: (offer: FloatingLaunchOffer) => void) => () => void;
-  /** From a main window: takes an offered launch once; null when its offer already ended. Newer shells only. */
+  /** From a main window: takes an offered launch; null when the offer isn't open for this page. Newer shells only. */
   takeLaunch?: (id: string) => Promise<FloatingLaunchMessage | null>;
+  /** From a main window: confirms the taken message is queued. True when this page sends it. Newer shells only. */
+  confirmLaunch?: (id: string) => Promise<boolean>;
 }
 
 /** Native menu commands the desktop shell hands to the page (see lib/desktopCommands). */

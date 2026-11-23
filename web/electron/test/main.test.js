@@ -4000,6 +4000,7 @@ describe("floating panel wiring", () => {
       webContents: Object.assign(new EventEmitter(), {
         id: 9 + h.api.windows.size,
         getURL: () => main.url,
+        isCrashed: () => main.crashed === true,
         send: (channel, data) => main.sent.push([channel, data]),
       }),
     };
@@ -4146,6 +4147,20 @@ describe("floating panel wiring", () => {
       { sender: main.webContents, senderFrame },
       id,
     );
+  /** The page of `main` confirms it queued the message it took for `id`. */
+  const confirmFrom = (h, main, id) =>
+    h.ipc.get("omnigent:floating-composer:confirm-launch")(
+      { sender: main.webContents, senderFrame: main.webContents.mainFrame },
+      id,
+    );
+  /** Whether `value` settles before the next macrotask, i.e. without waiting on a timer. */
+  const settlesNow = (value) =>
+    Promise.race([
+      value,
+      new Promise((resolve) => {
+        setImmediate(() => resolve("still waiting"));
+      }),
+    ]);
   const launchMessage = { text: "Fix the build", skill: null, files: [] };
 
   for (const routePath of ["/c/abc", "/settings/import"]) {
@@ -4254,6 +4269,7 @@ describe("floating panel wiring", () => {
     const { id, sessionId, path: offerPath } = offerTo(main);
     assert.deepEqual({ sessionId, offerPath }, { sessionId: "abc", offerPath: "/c/abc" });
     assert.deepEqual(await takeFrom(h, main, id), launchMessage);
+    assert.equal(await confirmFrom(h, main, id), true);
     assert.deepEqual(await opened, { ok: true, delivery: "page" });
     // The page navigates itself, so no route is sent, and the panel is put away at once.
     assert.deepEqual(
@@ -4325,7 +4341,7 @@ describe("floating panel wiring", () => {
     assert.deepEqual(main.sent.at(-1), ["omnigent:open-path", "/c/abc"]);
   });
 
-  it("can't take an offer once it expired, and an offer taken in time doesn't expire into a route", async (t) => {
+  it("can't take or confirm an offer once it expired, and a confirmed one doesn't expire into a route", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout"] });
     const h = loadNavigationHarness({ platform: "darwin" });
     t.after(h.cleanup);
@@ -4340,6 +4356,7 @@ describe("floating panel wiring", () => {
     const taken = openFromPanel(h, "/c/def", launchMessage);
     const { id } = offerTo(main);
     assert.deepEqual(await takeFrom(h, main, id), launchMessage);
+    assert.equal(await confirmFrom(h, main, id), true);
     assert.deepEqual(await taken, { ok: true, delivery: "page" });
     t.mock.timers.tick(FLOATING_LAUNCH_TAKE_TIMEOUT_MS);
     assert.equal(
@@ -4350,19 +4367,33 @@ describe("floating panel wiring", () => {
   });
 
   it("only offers a launch to a window whose page announced support and subscribed", (t) => {
+    // Negative: a window that subscribed without announcing support is never a taker.
+    const plain = loadNavigationHarness({ platform: "darwin" });
+    t.after(plain.cleanup);
+    plain.api.registerIpc();
+    openPanel(plain);
+    const plainWindow = addMain(plain);
+    plainWindow.webContents.mainFrame = { url: plainWindow.url };
+    plain.ipc.get("omnigent:floating-composer:launch-takers")({
+      sender: plainWindow.webContents,
+      senderFrame: plainWindow.webContents.mainFrame,
+    });
+    assert.equal(
+      plain.ipc.get("omnigent:floating-composer:can-hand-off")(fromPanel(plain)),
+      null,
+      "a window that never announced support doesn't take launches",
+    );
+    // Positive: once it announced support and subscribed, the probe answers with the cap.
     const h = loadNavigationHarness({ platform: "darwin" });
     t.after(h.cleanup);
     h.api.registerIpc();
     openPanel(h);
-    const probe = () => h.ipc.get("omnigent:floating-composer:can-hand-off")(fromPanel(h));
-    const older = addMain(h);
-    older.webContents.mainFrame = { url: older.url };
-    // Subscribing without announcing support doesn't make the window a taker.
-    h.ipc.get("omnigent:floating-composer:launch-takers")({
-      sender: older.webContents,
-      senderFrame: older.webContents.mainFrame,
-    });
-    assert.equal(probe(), null, "a window that never announced support doesn't take launches");
+    const main = addTakingMain(h);
+    assert.deepEqual(
+      { ...h.ipc.get("omnigent:floating-composer:can-hand-off")(fromPanel(h)) },
+      { maxFileBytes: FLOATING_LAUNCH_MAX_FILE_BYTES },
+    );
+    assert.ok(main);
   });
 
   it("reports the attachment cap while the window that would take a launch is up, not connecting", (t) => {
@@ -4423,6 +4454,102 @@ describe("floating panel wiring", () => {
     assert.deepEqual(await openFromPanel(h, "/c/abc", oversized), { ok: true });
     assert.equal(offerTo(main), undefined);
     assert.deepEqual(main.sent, [["omnigent:open-path", "/c/abc"]]);
+  });
+
+  it("refuses a confirm for an offer its page never took, which then expires to the panel", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addTakingMain(h);
+    const opened = openFromPanel(h, "/c/abc", launchMessage);
+    const { id } = offerTo(main);
+    assert.equal(await confirmFrom(h, main, id), false);
+    t.mock.timers.tick(FLOATING_LAUNCH_TAKE_TIMEOUT_MS);
+    assert.deepEqual(await opened, { ok: true });
+    assert.deepEqual(main.sent.at(-1), ["omnigent:open-path", "/c/abc"]);
+  });
+
+  it("hands the route to another window when the page that took the message goes before confirming", async (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addTakingMain(h);
+    const other = addMain(h);
+    const opened = openFromPanel(h, "/c/abc", launchMessage);
+    const { id } = offerTo(main);
+    assert.deepEqual(await takeFrom(h, main, id), launchMessage);
+    main.webContents.emit("did-navigate");
+    assert.deepEqual(await opened, { ok: true });
+    assert.deepEqual(
+      main.sent.map(([channel]) => channel),
+      ["omnigent:floating-composer:launch-offer"],
+    );
+    assert.deepEqual(other.sent, [["omnigent:open-path", "/c/abc"]]);
+    assert.equal(await confirmFrom(h, main, id), false, "a late confirm is refused");
+  });
+
+  it("stops offering launches when its page unsubscribes, and ends the offer it holds", async (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addTakingMain(h);
+    const opened = openFromPanel(h, "/c/abc", launchMessage);
+    h.ipc.get("omnigent:floating-composer:launch-takers")(
+      { sender: main.webContents, senderFrame: main.webContents.mainFrame },
+      false,
+    );
+    assert.deepEqual(await settlesNow(opened), { ok: true }, "no wait for the timeout");
+    assert.deepEqual(main.sent.at(-1), ["omnigent:open-path", "/c/abc"]);
+    assert.equal(
+      h.ipc.get("omnigent:floating-composer:can-hand-off")(fromPanel(h)),
+      null,
+      "an unsubscribed window takes no launch",
+    );
+  });
+
+  it("opens the session in a working window when the page's renderer crashed before confirming", async (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const crashing = addTakingMain(h);
+    const working = addMain(h);
+    const opened = openFromPanel(h, "/c/abc", launchMessage);
+    const built = h.calls.windowOptions.length;
+    // The renderer dies, but the window isn't destroyed and still shows the same URL.
+    crashing.webContents.crashed = true;
+    crashing.crashed = true;
+    crashing.webContents.emit("render-process-gone");
+    assert.deepEqual(await opened, { ok: true });
+    assert.deepEqual(working.sent, [["omnigent:open-path", "/c/abc"]]);
+    assert.equal(
+      crashing.sent.some(([channel]) => channel === "omnigent:open-path"),
+      false,
+      "a crashed renderer gets no route",
+    );
+    assert.equal(h.calls.windowOptions.length, built);
+  });
+
+  it("opens a new window when the only window's renderer crashed before confirming", async (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const crashing = addTakingMain(h);
+    const opened = openFromPanel(h, "/c/abc", launchMessage);
+    const built = h.calls.windowOptions.length;
+    crashing.crashed = true;
+    crashing.webContents.emit("render-process-gone");
+    assert.deepEqual(await opened, { ok: true });
+    assert.equal(h.calls.windowOptions.length, built + 1);
+    assert.equal(
+      crashing.sent.some(([channel]) => channel === "omnigent:open-path"),
+      false,
+    );
   });
 
   it("keeps the panel up on a main-window focus only while its page says the picker is open", (t) => {

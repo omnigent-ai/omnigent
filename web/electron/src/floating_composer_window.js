@@ -46,7 +46,7 @@ function floatingComposerLaunchMessage(value) {
   if (totalBytes > FLOATING_LAUNCH_MAX_FILE_BYTES) return null;
   return {
     text,
-    skill,
+    skill: skill === null ? null : { name: skill.name, args: skill.args },
     files: files.map(({ name, type, bytes }) => ({ name, type, bytes })),
   };
 }

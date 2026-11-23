@@ -341,6 +341,43 @@ describe("global show shortcut bridge", () => {
     assert.equal(typeof h.desktop.floatingComposer.onLaunchOffer("not a function"), "function");
   });
 
+  it("tells main when its page starts and stops taking launch offers, once per last listener", () => {
+    const h = loadPreload({ platform: "darwin" });
+    const channel = "omnigent:floating-composer:launch-takers";
+    const first = h.desktop.floatingComposer.onLaunchOffer(() => {});
+    const second = h.desktop.floatingComposer.onLaunchOffer(() => {});
+    assert.deepEqual(
+      h.sends.filter((send) => send.channel === channel).map((send) => send.args),
+      [true],
+      "the second listener doesn't announce again",
+    );
+    first();
+    assert.equal(
+      h.sends.filter((send) => send.channel === channel).length,
+      1,
+      "a listener remains, so main keeps the page as a taker",
+    );
+    first();
+    second();
+    second();
+    assert.deepEqual(
+      h.sends.filter((send) => send.channel === channel).map((send) => send.args),
+      [true, false],
+      "the last one to go says so, once",
+    );
+    h.desktop.floatingComposer.onLaunchOffer(() => {});
+    assert.equal(h.sends.at(-1).args, true, "a new subscription says it takes launches again");
+  });
+
+  it("confirms a taken launch through main", async () => {
+    const h = loadPreload({ platform: "darwin" });
+    await h.desktop.floatingComposer.confirmLaunch("offer-1");
+    assert.deepEqual(h.invokes.at(-1), {
+      channel: "omnigent:floating-composer:confirm-launch",
+      args: "offer-1",
+    });
+  });
+
   it("sends the panel's launch message with its route, and asks main about hand-offs and takes", async () => {
     const h = loadPreload({ platform: "darwin" });
     const message = { text: "Fix it", skill: null, files: [] };

@@ -53,25 +53,17 @@ export function FloatingComposerPage() {
   const [error, setError] = useState<string | null>(null);
   // Only the latest launch's outcome counts, so an older one can't clear a newer prompt.
   const latestLaunch = useRef(0);
-  // Typing since the launch: a fresh composer then would discard what the user started.
-  const editedSinceLaunch = useRef(false);
-  const markEdited = () => {
-    editedSinceLaunch.current = true;
-  };
   const shownListeners = useRef(new Set<() => void>());
   const presentation = useMemo<ComposerPresentation>(
     () => ({
       kind: "floating",
       launch: (request) => {
         const launchNumber = ++latestLaunch.current;
-        editedSinceLaunch.current = false;
         setError(null);
         // Never rejects: every failure comes back as the outcome's error.
         void launchFromPanel(request).then((outcome) => {
           if (launchNumber !== latestLaunch.current) return;
-          if (outcome.freshComposer && !editedSinceLaunch.current) {
-            setGeneration((current) => current + 1);
-          }
+          if (outcome.freshComposer) setGeneration((current) => current + 1);
           setError(outcome.error);
         });
       },
@@ -135,7 +127,7 @@ export function FloatingComposerPage() {
           <AlertDescription>{error}</AlertDescription>
         </Alert>
       )}
-      <main className="flex min-h-0 flex-1 flex-col" onInput={markEdited} onChange={markEdited}>
+      <main className="flex min-h-0 flex-1 flex-col">
         <ComposerPresentationContext.Provider value={presentation}>
           <NewChatLandingScreen key={generation} />
         </ComposerPresentationContext.Provider>

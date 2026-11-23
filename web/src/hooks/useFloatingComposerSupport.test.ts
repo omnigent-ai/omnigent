@@ -11,6 +11,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: vi.fn() }));
 const announceSupport = vi.fn();
 const navigate = vi.fn();
 const takeLaunch = vi.fn();
+const confirmLaunch = vi.fn();
 const unsubscribeOffers = vi.fn();
 const onLaunchOffer = vi.fn(() => unsubscribeOffers);
 let getDesktopFeatures: ReturnType<typeof vi.fn>;
@@ -37,6 +38,7 @@ beforeEach(() => {
   announceSupport.mockReset();
   navigate.mockReset();
   takeLaunch.mockReset();
+  confirmLaunch.mockReset().mockResolvedValue(true);
   onLaunchOffer.mockClear();
   unsubscribeOffers.mockReset();
   getDesktopFeatures = vi.fn().mockResolvedValue({ floatingComposer: true });
@@ -50,6 +52,7 @@ beforeEach(() => {
       filePicker: vi.fn(),
       onLaunchOffer,
       takeLaunch,
+      confirmLaunch,
     },
   });
   flag(true);
@@ -140,7 +143,7 @@ describe("useFloatingComposerSupport", () => {
     renderHook(() => useFloatingComposerSupport(navigate));
     await waitFor(() =>
       expect(warn).toHaveBeenCalledWith(
-        "[floatingComposer] couldn't announce support:",
+        "[floatingComposer] couldn't announce support or subscribe to launches:",
         expect.any(Error),
       ),
     );
@@ -155,15 +158,21 @@ describe("useFloatingComposerSupport launch offers", () => {
     await settle();
     expect(announceSupport).toHaveBeenCalledTimes(1);
     expect(onLaunchOffer).toHaveBeenCalledTimes(1);
+    // The shell hears the announcement first, and only then that this page takes launches.
+    expect(announceSupport.mock.invocationCallOrder[0]).toBeLessThan(
+      onLaunchOffer.mock.invocationCallOrder[0]!,
+    );
     const [heard] = onLaunchOffer.mock.calls[0] as unknown as [(offer: unknown) => void];
     takeLaunch.mockResolvedValueOnce(null);
     heard(offer);
     await settle();
     expect(takeLaunch).toHaveBeenCalledWith("offer-1");
+    expect(confirmLaunch).not.toHaveBeenCalled();
     expect(navigate).not.toHaveBeenCalled();
     takeLaunch.mockResolvedValueOnce({ text: "Fix the build", skill: null, files: [] });
     heard(offer);
     await settle();
+    expect(confirmLaunch).toHaveBeenCalledWith("offer-1");
     expect(navigate).toHaveBeenCalledWith("/c/conv_1");
   });
 

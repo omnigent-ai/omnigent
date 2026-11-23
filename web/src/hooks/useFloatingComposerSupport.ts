@@ -36,7 +36,9 @@ export function useFloatingComposerSupport(navigate: (path: string) => void): vo
         });
       })
       // The bridge call can throw while the page or its preload is going away.
-      .catch((err: unknown) => console.warn("[floatingComposer] couldn't announce support:", err));
+      .catch((err: unknown) =>
+        console.warn("[floatingComposer] couldn't announce support or subscribe to launches:", err),
+      );
     return () => {
       cancelled = true;
       unsubscribeOffers?.();

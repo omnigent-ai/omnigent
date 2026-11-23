@@ -8,6 +8,7 @@ const bridge = vi.hoisted(() => ({
   announceSupport: vi.fn(),
   canHandOffLaunch: vi.fn(),
   takeLaunch: vi.fn(),
+  confirmLaunch: vi.fn(),
 }));
 const bridgeOf = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/nativeBridge", () => ({ floatingComposerBridge: bridgeOf }));
@@ -20,11 +21,16 @@ vi.mock("@/lib/userInputDelivery", () => ({ sendVerdictFromServer: vi.fn() }));
 vi.mock("@/store/chatStore", () => ({
   uploadFileBlocks: vi.fn(),
   setPendingInitialPrompt: vi.fn(),
+  consumePendingInitialPrompt: vi.fn(),
 }));
 
 import { ApiError, fetchSessionItemsPage, postEvent } from "@/lib/sessionsApi";
 import { sendVerdictFromServer } from "@/lib/userInputDelivery";
-import { setPendingInitialPrompt, uploadFileBlocks } from "@/store/chatStore";
+import {
+  consumePendingInitialPrompt,
+  setPendingInitialPrompt,
+  uploadFileBlocks,
+} from "@/store/chatStore";
 import type { FloatingLaunchRequest } from "@/shell/composerPresentation";
 import {
   launchFromPanel,
@@ -56,6 +62,7 @@ beforeEach(() => {
   bridge.openInMainWindow.mockResolvedValue({ ok: true });
   bridge.canHandOffLaunch.mockResolvedValue(null);
   bridge.takeLaunch.mockResolvedValue(null);
+  bridge.confirmLaunch.mockResolvedValue(false);
   vi.mocked(uploadFileBlocks).mockResolvedValue([]);
   vi.mocked(postEvent).mockResolvedValue({ queued: false } as Awaited<
     ReturnType<typeof postEvent>
@@ -297,11 +304,14 @@ describe("launchFromPanel hand-off", () => {
 
 describe("takeLaunchOffer", () => {
   const offer = { id: "offer-1", sessionId: "conv_1", path: "/c/conv_1" };
+  const notes = new TextEncoder().encode("notes").buffer;
+  const photo = new TextEncoder().encode("png-bytes").buffer;
   const taken = {
     text: "Fix the build",
     skill: null,
     files: [
-      { name: "notes.txt", type: "text/plain", bytes: new TextEncoder().encode("notes").buffer },
+      { name: "notes.txt", type: "text/plain", bytes: notes },
+      { name: "photo.png", type: "image/png", bytes: photo },
     ],
   };
 
@@ -309,55 +319,97 @@ describe("takeLaunchOffer", () => {
     vi.unstubAllGlobals();
   });
 
-  it("queues the taken message for the session's chat, then opens that chat", async () => {
+  it("queues every file with its bytes, name and type, confirms, then opens the chat", async () => {
     bridge.takeLaunch.mockResolvedValue(taken);
+    bridge.confirmLaunch.mockResolvedValue(true);
     const navigate = vi.fn();
     await takeLaunchOffer(offer, navigate);
     expect(bridge.takeLaunch).toHaveBeenCalledWith("offer-1");
-    expect(setPendingInitialPrompt).toHaveBeenCalledWith("conv_1", {
-      text: "Fix the build",
-      skill: null,
-      files: [expect.any(File)],
-    });
+    expect(setPendingInitialPrompt).toHaveBeenCalledTimes(1);
+    const [sessionId, prompt] = vi.mocked(setPendingInitialPrompt).mock.calls[0]!;
+    expect(sessionId).toBe("conv_1");
+    expect(prompt).toMatchObject({ text: "Fix the build", skill: null });
+    const files = prompt.files!;
+    expect(files.map((file) => [file.name, file.type])).toEqual([
+      ["notes.txt", "text/plain"],
+      ["photo.png", "image/png"],
+    ]);
+    expect(Array.from(new Uint8Array(await files[0]!.arrayBuffer()))).toEqual(
+      Array.from(new Uint8Array(notes)),
+    );
+    expect(Array.from(new Uint8Array(await files[1]!.arrayBuffer()))).toEqual(
+      Array.from(new Uint8Array(photo)),
+    );
+    expect(bridge.confirmLaunch).toHaveBeenCalledWith("offer-1");
     expect(navigate).toHaveBeenCalledWith("/c/conv_1");
+    // Queued first, confirmed, and only then navigated to.
+    const queued = vi.mocked(setPendingInitialPrompt).mock.invocationCallOrder[0]!;
+    const confirmed = bridge.confirmLaunch.mock.invocationCallOrder[0]!;
+    expect(queued).toBeLessThan(confirmed);
+    expect(confirmed).toBeLessThan(navigate.mock.invocationCallOrder[0]!);
+    expect(consumePendingInitialPrompt).not.toHaveBeenCalled();
   });
 
-  it("does nothing for an offer that already expired", async () => {
+  it("does nothing when the offer isn't open for this page", async () => {
     const navigate = vi.fn();
     await takeLaunchOffer(offer, navigate);
     expect(setPendingInitialPrompt).not.toHaveBeenCalled();
+    expect(bridge.confirmLaunch).not.toHaveBeenCalled();
     expect(navigate).not.toHaveBeenCalled();
   });
 
-  it("opens nothing and doesn't reject when taking the offer fails", async () => {
+  it("doesn't confirm, and doesn't reject, when taking the offer fails", async () => {
     bridge.takeLaunch.mockRejectedValue(new Error("renderer went away"));
     const navigate = vi.fn();
     await expect(takeLaunchOffer(offer, navigate)).resolves.toBeUndefined();
+    expect(bridge.confirmLaunch).not.toHaveBeenCalled();
     expect(navigate).not.toHaveBeenCalled();
   });
 
-  it("still queues the text and opens the chat when an attachment can't be rebuilt", async () => {
+  it("queues nothing and doesn't confirm when any attachment can't be rebuilt", async () => {
     bridge.takeLaunch.mockResolvedValue(taken);
-    vi.stubGlobal("File", function BrokenFile(): never {
-      throw new TypeError("can't build it");
+    let built = 0;
+    vi.stubGlobal("File", function FlakyFile(_bytes: unknown, name: string) {
+      built += 1;
+      if (name === "photo.png") throw new TypeError("can't build it");
     });
     const navigate = vi.fn();
     await takeLaunchOffer(offer, navigate);
-    expect(setPendingInitialPrompt).toHaveBeenCalledWith("conv_1", {
-      text: "Fix the build",
-      skill: null,
-      files: [],
-    });
-    expect(navigate).toHaveBeenCalledWith("/c/conv_1");
+    expect(built).toBe(2);
+    expect(setPendingInitialPrompt).not.toHaveBeenCalled();
+    expect(bridge.confirmLaunch).not.toHaveBeenCalled();
+    expect(navigate).not.toHaveBeenCalled();
   });
 
-  it("still opens the chat when its message can't be queued", async () => {
+  it("doesn't confirm when the message can't be queued", async () => {
     bridge.takeLaunch.mockResolvedValue(taken);
     vi.mocked(setPendingInitialPrompt).mockImplementationOnce(() => {
       throw new Error("store unavailable");
     });
     const navigate = vi.fn();
     await expect(takeLaunchOffer(offer, navigate)).resolves.toBeUndefined();
-    expect(navigate).toHaveBeenCalledWith("/c/conv_1");
+    expect(bridge.confirmLaunch).not.toHaveBeenCalled();
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("drops its queued message when the offer ended before the confirm, leaving the panel to send it", async () => {
+    bridge.takeLaunch.mockResolvedValue(taken);
+    bridge.confirmLaunch.mockResolvedValue(false);
+    const navigate = vi.fn();
+    await takeLaunchOffer(offer, navigate);
+    expect(navigate).not.toHaveBeenCalled();
+    expect(consumePendingInitialPrompt).toHaveBeenCalledWith("conv_1");
+    expect(vi.mocked(consumePendingInitialPrompt).mock.invocationCallOrder[0]!).toBeGreaterThan(
+      bridge.confirmLaunch.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("drops its queued message when the confirm can't be delivered, so it isn't sent twice", async () => {
+    bridge.takeLaunch.mockResolvedValue(taken);
+    bridge.confirmLaunch.mockRejectedValue(new Error("renderer went away"));
+    const navigate = vi.fn();
+    await expect(takeLaunchOffer(offer, navigate)).resolves.toBeUndefined();
+    expect(navigate).not.toHaveBeenCalled();
+    expect(consumePendingInitialPrompt).toHaveBeenCalledWith("conv_1");
   });
 });
