@@ -6202,7 +6202,7 @@ function ConversationRowImpl({
   // First-class projects can carry a chosen emoji; label-only projects have
   // none, so the flyout and meta line fall back to the folder glyph for those.
   const projectIconsById = useContext(ProjectIconsContext);
-  const currentProjectIcon =
+  const projectFlyoutIcon =
     conversation.project_id != null
       ? (projectIconsById.get(conversation.project_id) ?? null)
       : null;
@@ -6331,7 +6331,7 @@ function ConversationRowImpl({
   const metaBranch = useSessionBranch(conversation, show.includes("branch"));
   const metaProject =
     useContext(ShowRowProjectContext) && currentProject !== null
-      ? { name: currentProject, icon: currentProjectIcon }
+      ? { name: currentProject, icon: projectFlyoutIcon }
       : null;
   // Overlays (checkbox, badges, controls; each also `-translate-y-1/2`) center on
   // the row, or on the title line — padding + half its 20px box — above a meta line.
@@ -6748,7 +6748,7 @@ function ConversationRowImpl({
             <PinnedProjectFlyoutContent
               title={conversation.title ?? conversation.id}
               projectName={projectFlyoutName}
-              projectIcon={currentProjectIcon}
+              projectIcon={projectFlyoutIcon}
               gitBranch={gitBranch}
               hasError={sessionState?.kind === "error"}
               shared={sharing}
@@ -6787,7 +6787,7 @@ function ConversationRowImpl({
           <PinnedProjectFlyoutContent
             title={conversation.title ?? conversation.id}
             projectName={projectFlyoutName}
-            projectIcon={currentProjectIcon}
+            projectIcon={projectFlyoutIcon}
             gitBranch={gitBranch}
             hasError={sessionState?.kind === "error"}
             shared={sharing}
@@ -7921,7 +7921,7 @@ function ProjectPickerMenu({
   const filtered = projectsMatching(projects, search);
   // Offer create only when the typed name isn't already an exact project.
   const canCreate = canCreateProject(projects, search);
-  const currentProjectIcon = projects.find((p) => p.name === currentProject)?.icon;
+  const projectFlyoutIcon = projects.find((p) => p.name === currentProject)?.icon;
 
   // Keep keystrokes inside the inputs from reaching the menu's typeahead /
   // navigation handlers (which would otherwise steal letters and arrows).
@@ -7978,7 +7978,7 @@ function ProjectPickerMenu({
             textValue={`Remove from ${currentProject}`}
             onSelect={() => onSelect("")}
           >
-            <ProjectRowIcon icon={currentProjectIcon} />
+            <ProjectRowIcon icon={projectFlyoutIcon} />
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {currentProject}
