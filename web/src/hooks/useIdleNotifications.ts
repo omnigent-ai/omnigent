@@ -61,7 +61,7 @@ import {
 } from "@/lib/idleTransitions";
 import { isConversationUnseen, useUnseenTick } from "@/hooks/useUnseenConversations";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
-import { isConversationMuted, isInMutedProject, useMutedProjects } from "@/lib/sessionMute";
+import { isInMutedProject, isSessionMuted, useMutedProjects } from "@/lib/sessionMute";
 
 const IDLE_BODY = "Agent finished and is ready for your input.";
 const ELICITATION_BODY = "Agent is asking for your input.";
@@ -153,8 +153,8 @@ export function useIdleNotifications(activeConversationId?: string): void {
   // then reporting back) into one beep. Cleared when the user views the session
   // or it drops off the list, so a later finish can notify again.
   const notifiedSessions = useRef<Set<string>>(new Set());
-  // Last observed mute state, kept after a row leaves the list so a preview
-  // still loading for a muted session stays silent.
+  // Each session's own last observed mute, kept after a row leaves the list so a
+  // preview still loading for a muted session stays silent. Project mutes are read live.
   const mutedSessions = useRef<Set<string>>(new Set());
 
   useLazyPermissionRequest();
@@ -282,7 +282,7 @@ export function useIdleNotifications(activeConversationId?: string): void {
     const conversations = data.pages.flatMap((page) => page.data);
     latestConversations.current = conversations;
     for (const conversation of conversations) {
-      if (isConversationMuted(conversation)) mutedSessions.current.add(conversation.id);
+      if (isSessionMuted(conversation)) mutedSessions.current.add(conversation.id);
       else mutedSessions.current.delete(conversation.id);
     }
 

@@ -2918,6 +2918,32 @@ describe("useSyncMutedProjects", () => {
     await act(() => queryClient.refetchQueries({ queryKey: ["projects"] }));
     await waitFor(() => expect(isConversationMuted(mine)).toBe(false));
   });
+
+  it("keeps the last list when the projects reply isn't one, instead of throwing at the app root", async () => {
+    let reply: unknown = [{ id: "p_factory", name: "Factory", muted: true }];
+    fetchMock.mockImplementation(async (url: string) =>
+      url === "/v1/sessions/projects"
+        ? mockResponse(reply)
+        : mockResponse({}, { ok: false, status: 404 }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(
+      () => {
+        useSyncMutedProjects();
+        return useProjects().data;
+      },
+      { wrapper },
+    );
+    const filed = { id: "a", labels: {}, project_id: "p_factory" };
+    await waitFor(() => expect(isConversationMuted(filed)).toBe(true));
+
+    reply = { error: "unexpected" };
+    await act(() => queryClient.refetchQueries({ queryKey: ["projects"] }));
+    await waitFor(() => expect(result.current).toEqual({ error: "unexpected" }));
+    expect(isConversationMuted(filed)).toBe(true);
+  });
 });
 
 describe("useProjectConfig", () => {

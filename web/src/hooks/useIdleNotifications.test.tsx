@@ -394,6 +394,51 @@ describe("useIdleNotifications turn-end transitions", () => {
     },
   );
 
+  it.each(["its cue settles", "its preview loads"] as const)(
+    "delivers when the project is unmuted again while %s, even after a poll saw it muted",
+    async (phase) => {
+      let resolvePreview: (text: string) => void = () => {};
+      fetchPreviewMock.mockReturnValue(
+        new Promise<string>((resolve) => {
+          resolvePreview = resolve;
+        }),
+      );
+      const filed = (status: Conversation["status"], updatedAt = 0) => ({
+        ...conv("a", status),
+        project_id: "p",
+        updated_at: updatedAt,
+      });
+      setConversations([filed("running")]);
+      const { rerender } = renderHook(() => useIdleNotifications());
+      const finished = [filed("idle")];
+      serverRowsOverride.rows = finished;
+      setConversations(finished);
+      rerender();
+
+      const muteThenPollThenUnmute = () => {
+        act(() => setMutedProjects([{ id: "p", name: "Factory", muted: true }], null));
+        // A poll lands while the project is muted: a changed row, but no new transition.
+        const polled = [filed("idle", 1)];
+        serverRowsOverride.rows = polled;
+        setConversations(polled);
+        rerender();
+        act(() => setMutedProjects([{ id: "p", name: "Factory", muted: false }], null));
+      };
+      if (phase === "its cue settles") muteThenPollThenUnmute();
+      await settle();
+      if (phase === "its preview loads") {
+        expect(fetchPreviewMock).toHaveBeenCalledWith("a");
+        muteThenPollThenUnmute();
+      }
+      await act(async () => {
+        resolvePreview("Finished the worker task.");
+        await Promise.resolve();
+      });
+
+      expect(showMock).toHaveBeenCalledOnce();
+    },
+  );
+
   it("cancels the deferred cue when the agent resumes (a step, not the end)", async () => {
     setConversations([conv("a", "running")]);
     const { rerender } = renderHook(() => useIdleNotifications());
