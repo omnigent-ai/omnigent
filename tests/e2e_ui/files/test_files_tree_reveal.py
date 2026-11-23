@@ -11,7 +11,6 @@ tests (``revealActiveFile``, ``FilesPageTree``).
 
 from __future__ import annotations
 
-import re
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
@@ -21,7 +20,7 @@ import pytest
 from playwright.sync_api import Locator, Page, expect
 
 from tests._helpers.polling import poll_until
-from tests.e2e_ui.files._files_page import open_workspace
+from tests.e2e_ui.files._files_page import open_workspace, run_palette
 from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app
 
 # Hundreds of folders sort before the target's, so its row starts far below the fold.
@@ -111,15 +110,6 @@ def _open_owners(tree: Locator) -> None:
     owners.click()
 
 
-def _reveal_from_palette(page: Page) -> None:
-    page.keyboard.press("ControlOrMeta+k")
-    palette = page.get_by_test_id("command-palette-input")
-    expect(palette).to_be_focused(timeout=10_000)
-    palette.fill("Reveal Active File")
-    page.get_by_role("option", name=re.compile(r"^Reveal Active File in Files Tree")).click()
-    expect(palette).to_have_count(0)
-
-
 def test_the_viewed_file_is_revealed_from_the_tree_header_and_the_palette(
     page: Page, large_tree_session: tuple[str, str]
 ) -> None:
@@ -150,7 +140,7 @@ def test_the_viewed_file_is_revealed_from_the_tree_header_and_the_palette(
     # A click on the folder's row toggles it.
     _row(place, "packages").click()
     expect(_row(place, "packages")).to_have_attribute("aria-expanded", "false")
-    _reveal_from_palette(page)
+    run_palette(page, "Reveal Active File in Files Tree")
     _expect_row_in_view(place, "OWNERS")
 
     # From a folder that doesn't hold the file, the tree returns to the workspace to show it.
@@ -177,7 +167,7 @@ def test_the_palette_opens_a_hidden_tree_to_reveal_the_file_on_a_narrow_page(
     expect(place.get_by_text("owner-sentinel")).to_be_visible(timeout=30_000)
     expect(page.get_by_role("dialog", name="Workspace files")).to_have_count(0)
 
-    _reveal_from_palette(page)
+    run_palette(page, "Reveal Active File in Files Tree")
     tree = page.get_by_role("dialog", name="Workspace files")
     expect(tree).to_be_visible(timeout=30_000)
     _expect_row_in_view(tree, "OWNERS")

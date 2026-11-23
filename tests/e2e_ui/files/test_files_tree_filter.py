@@ -17,7 +17,7 @@ from collections.abc import Iterator
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
-from tests.e2e_ui.files._files_page import open_workspace, seeded_workspace
+from tests.e2e_ui.files._files_page import open_workspace, run_palette, seeded_workspace
 from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app
 
 _FILES = {
@@ -87,11 +87,7 @@ def test_the_tree_filters_by_name_narrows_by_globs_and_clears(
     # ⌘K opens the filter with focus in it; Escape empties the name, then closes the filter.
     sidebar.get_by_role("button", name="Filter Files Tree by Name").click()
     expect(name).to_have_count(0)
-    page.keyboard.press("ControlOrMeta+k")
-    palette = page.get_by_test_id("command-palette-input")
-    expect(palette).to_be_focused(timeout=10_000)
-    palette.fill("Filter Files Tree by Name")
-    page.get_by_role("option", name=re.compile(r"^Filter Files Tree by Name")).click()
+    run_palette(page, "Filter Files Tree by Name")
     expect(name).to_be_focused(timeout=10_000)
     name.fill("readme")
     expect(
