@@ -285,7 +285,7 @@ async def test_source_errors_are_reported_without_writes(status, project_id, nam
 
 
 def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
-    assert len(TICKET_TOOLS) == 9
+    assert len(TICKET_TOOLS) == 10
     for tool in TICKET_TOOLS.values():
         properties = tool().get_schema()["function"]["parameters"]["properties"]
         assert (

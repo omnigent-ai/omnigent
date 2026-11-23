@@ -492,6 +492,7 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_session_link_ticket",
         "sys_ticket_link",
         "sys_project_mandate_propose",
+        "sys_project_artifact_save",
         "ui_open_file",
         "sys_agent_list",
         "sys_agent_get",

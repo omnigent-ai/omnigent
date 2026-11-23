@@ -74,10 +74,11 @@ def test_comment_guidance_keeps_decisions_local_and_requires_real_message_target
     assert "Do not pack setup, diagnostics and next steps into one dense paragraph" in (
         PROJECT_TICKET_WORK_INSTRUCTION
     )
-    assert "user-facing progress and impact, not a transcript of tool activity" in (
+    assert "write a transcript of tool activity" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "A worker's comments default to agent notes for the coordinator" in (
         PROJECT_TICKET_WORK_INSTRUCTION
     )
-    assert "session unless needed for a decision or action" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "unless the reader needs them to act" in PROJECT_TICKET_WORK_INSTRUCTION
     assert "State a blocker's impact and the exact action needed in the ticket" in (
         PROJECT_TICKET_WORK_INSTRUCTION
     )
