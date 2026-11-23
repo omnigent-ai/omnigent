@@ -91,8 +91,7 @@ export function SettingsSearch({ query, onQueryChange, onNavigate }: SettingsSea
     }
   };
 
-  // The wrapper only listens for Escape; `contents` keeps the results in the sidebar's flex
-  // column, so a short window scrolls them instead of cutting them off.
+  // `contents` keeps the results in the sidebar's flex column, so a short window scrolls them.
   return (
     <div className="contents" onKeyDown={handleKeyDown}>
       <QuickPick<SettingsSearchTarget>

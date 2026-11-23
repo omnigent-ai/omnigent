@@ -554,7 +554,7 @@ function MCPServerRow({
   onChange: (patch: Partial<MCPFormEntry>) => void;
   onRemove: () => void;
 }) {
-  // Every server shows the same fields, so each is named after its own server.
+  // Until it's named, a server is identified by its position.
   const serverName = entry.name.trim() || `server ${position}`;
   return (
     <div
