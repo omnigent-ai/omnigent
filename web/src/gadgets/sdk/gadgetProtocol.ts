@@ -22,8 +22,6 @@ export const GADGET_LIMITS = {
   maxRequestsPerMinute: 240,
   /** Malformed or out-of-budget messages tolerated before the host closes the port. */
   maxProtocolViolations: 20,
-  /** Times one mount may perform the hello handshake (the frame can reload itself). */
-  maxHandshakesPerMount: 3,
   defaultDeadlineMs: 15_000,
   maxDeadlineMs: 60_000,
   minDeadlineMs: 100,

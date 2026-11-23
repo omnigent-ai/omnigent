@@ -1,4 +1,4 @@
-import { act, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -253,7 +253,7 @@ describe("GadgetFrame", () => {
     });
   });
 
-  it("gives a reloaded or navigated frame a fresh document and nonce", () => {
+  it("stops a frame that navigates and says so, then reloads it on request", () => {
     const { frame } = renderFrame();
     const first = mountOf(frame());
     const frameWindow = frame().contentWindow as Window;
@@ -261,15 +261,23 @@ describe("GadgetFrame", () => {
     greet(frameWindow, { type: GADGET_HELLO_MESSAGE_TYPE, ...first });
     fireEvent.load(frame());
 
+    // A second load is the gadget's document reloading or leaving its page.
     fireEvent.load(frame());
 
     const channel = FakeMessageChannel.created[0];
     expect(channel.port1.close).toHaveBeenCalled();
+    expect(document.querySelector("iframe")).toBeNull();
+    expect(
+      screen.getByText("This gadget tried to leave its page, so Omnigent stopped it"),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Reload gadget" }));
     const second = mountOf(frame());
     expect(second.nonce).not.toBe(first.nonce);
     const posted = vi
       .spyOn(frame().contentWindow as Window, "postMessage")
       .mockImplementation(() => {});
+    // The old document's hello can't take over the new mount.
     greet(frame().contentWindow, { type: GADGET_HELLO_MESSAGE_TYPE, ...first });
     expect(posted).not.toHaveBeenCalled();
   });

@@ -56,7 +56,6 @@ import type {
 import {
   GADGET_CONNECT_MESSAGE_TYPE,
   GADGET_HELLO_MESSAGE_TYPE,
-  GADGET_LIMITS,
   GADGET_PROTOCOL_VERSION,
 } from "../sdk/gadgetProtocol";
 import { buildOmnigentSdkBootstrapScript } from "../sdk/omnigentSdkRuntimeSource";
@@ -92,8 +91,9 @@ const LEADING_DOCTYPE = /^\s*<!doctype[^>]*>/i;
  * its doctype so the page keeps standards mode. A policy applies only to content after it, so
  * both come first. DNS prefetching is off too, since CSP does not cover it.
  *
- * Known limit: CSP cannot stop the frame from navigating itself, which sends one request. The
- * host notices the new document, closes its port and stops the frame after a few loads.
+ * Known limit: CSP cannot stop the frame from navigating itself, and that navigation's request
+ * can carry anything the gadget read. The host notices the new document, closes its port at once
+ * and stops the frame until the viewer reloads it (see `handleFrameLoad`).
  */
 export function buildGadgetFrameDocument(html: string, bootstrapScript: string): string {
   const doctype = LEADING_DOCTYPE.exec(html)?.[0].trim() ?? "<!DOCTYPE html>";
@@ -211,7 +211,6 @@ export function GadgetFrame({
   // document and nonce, so a page the frame navigated to can never take over the port.
   const handshakeDoneRef = useRef(false);
   const loadsRef = useRef(0);
-  const remountsRef = useRef(0);
   const [mount, setMount] = useState(newMount);
   const [confirmation, setConfirmation] = useState<PendingConfirmation | null>(null);
   const confirmationRef = useRef<PendingConfirmation | null>(null);
@@ -505,15 +504,12 @@ export function GadgetFrame({
       frameWindowRef.current = frameWindow;
       loadsRef.current += 1;
       if (loadsRef.current > 1) {
-        // The document reloaded or navigated away; its port is gone with it.
+        // The document reloaded or navigated away. Its request has already left, so stop the
+        // frame and say so rather than reload it quietly: a gadget that does this again on
+        // every load would otherwise keep sending what it can read.
         bridgeRef.current?.dispose();
         bridgeRef.current = null;
-        if (remountsRef.current + 1 >= GADGET_LIMITS.maxHandshakesPerMount) {
-          setClosedReason("navigated");
-          return;
-        }
-        remountsRef.current += 1;
-        setMount(newMount());
+        setClosedReason("navigated");
         return;
       }
       if (pendingHelloRef.current !== undefined) {
@@ -571,13 +567,34 @@ export function GadgetFrame({
           onAddComment={onAddComment && selection ? () => onAddComment(selection) : undefined}
         />
       )}
-      {closedReason !== null && (
+      {closedReason === "protocol_violations" && (
         <Alert>
           <AlertTitle>Omnigent stopped answering this gadget</AlertTitle>
           <AlertDescription>
-            {closedReason === "protocol_violations"
-              ? "It sent too many invalid requests. Reload the page to try again."
-              : "It kept reloading or tried to leave its page. Reload the page to try again."}
+            It sent too many invalid requests. Reload the page to try again.
+          </AlertDescription>
+        </Alert>
+      )}
+      {closedReason === "navigated" && (
+        <Alert>
+          <AlertTitle>This gadget tried to leave its page, so Omnigent stopped it</AlertTitle>
+          <AlertDescription>
+            <p>
+              A gadget can’t reach the network, but leaving its page sends one request, which can
+              carry what the gadget could read. Ask its session to fix the page if you didn’t expect
+              this.
+            </p>
+            <Button
+              size="sm"
+              variant="outline"
+              className="mt-2"
+              onClick={() => {
+                setClosedReason(null);
+                setMount(newMount());
+              }}
+            >
+              Reload gadget
+            </Button>
           </AlertDescription>
         </Alert>
       )}

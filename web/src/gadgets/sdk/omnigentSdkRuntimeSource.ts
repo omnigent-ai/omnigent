@@ -1,6 +1,6 @@
 // Portable implementation of `window.omnigent`, injected as an inline script ahead of an
-// uploaded app's HTML inside the isolated frame. The frame has no network access
-// (`connect-src 'none'`) and loads no external scripts, so the SDK travels as source
+// uploaded app's HTML inside the isolated frame. The frame's CSP blocks network requests
+// (`connect-src 'none'`) and it loads no external scripts, so the SDK travels as source
 // text. It is plain ES2018 with no imports: bundler helpers or coverage counters would
 // not exist inside the frame. `omnigentSdkTypes.ts` declares its public surface.
 //

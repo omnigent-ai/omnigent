@@ -49,7 +49,8 @@ for one gadget to.
 - The page shows each action's status, which Omnigent derives from the sessions
   doing the work. An action whose sessions stop without your report shows as
   `finished_unreported`, so always report how it ended.
-- Comments: read them with `sys_gadget_comment_list` (each has the commented
+- Comments: read every page of them with `sys_gadget_comment_list`, passing
+  `next_cursor` back as `cursor` until it is null (each has the commented
   text in `anchor.text`, and `anchor.ref` naming the record when the page set
   one), address the `draft` ones by changing the gadget or its records, then mark
   each `addressed` with `sys_gadget_comment_update`.
@@ -143,8 +144,8 @@ real data unless the person gives it to you.
 ### Rules for the page
 
 The page is one self-contained HTML document with inline script and styles. It
-runs in a sandboxed frame without an origin of its own and without network
-access, which silently blocks:
+runs in a sandboxed frame without an origin of its own and whose CSP blocks
+network requests, which silently blocks:
 
 - form submission: use `type="button"` buttons with click handlers, and handle
   Enter in inputs with `keydown`;
@@ -154,6 +155,11 @@ access, which silently blocks:
 - `window.open` and links that navigate: use `client.navigation`;
 - any network request, external script, font or image: inline them or use
   `data:` URIs.
+
+Never set `location` or otherwise make the page leave or reload itself: the
+CSP cannot block that one request, so Omnigent stops a gadget that does it and
+tells the viewer. Anything the page can read (its records, and the viewer's
+sessions once they allow it) must stay in the page.
 
 And:
 
