@@ -1124,46 +1124,92 @@ def test_unpinned_family_alias_passes_through_on_the_anthropic_api() -> None:
     assert claude_native.resolve_claude_native_model_selection("opus", config) == "opus"
 
 
-def test_launch_model_takes_the_custom_slot_when_no_alias_names_it() -> None:
-    """A routed older generation gets its own spelling for later ``/model``."""
+@pytest.mark.parametrize(
+    ("launch_model", "alias_env", "alias_model", "custom_slot", "display_name"),
+    [
+        (
+            "databricks-claude-opus-4-8",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "databricks-claude-opus-5",
+            None,
+            "Opus 4.8",
+        ),
+        (
+            "databricks-claude-sonnet-5[1m]",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "databricks-claude-sonnet-6",
+            "databricks-claude-sonnet-5",
+            "Sonnet 5",
+        ),
+        (
+            "databricks-claude-opus-5[1m]",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "databricks-claude-opus-5",
+            None,
+            "Opus 5",
+        ),
+        (
+            "databricks-claude-sonnet-5[1m]",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "databricks-claude-sonnet-5",
+            None,
+            "Sonnet 5",
+        ),
+    ],
+    ids=["older-generation", "bare-custom-slot", "bare-opus-alias", "bare-sonnet-alias"],
+)
+def test_launch_model_takes_the_custom_slot_when_no_alias_names_it(
+    launch_model: str, alias_env: str, alias_model: str, custom_slot: str | None, display_name: str
+) -> None:
+    """A launch model gets a slot preserving its exact generation and context."""
     from omnigent.models.claude_model_vocabulary import claude_model_command_arg
 
     config = claude_native.ClaudeNativeUcodeConfig(
         env={
-            "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5",
+            "ANTHROPIC_BASE_URL": "https://gateway.example/anthropic",
+            alias_env: alias_model,
         },
-        model="databricks-claude-opus-5",
+        model=alias_model,
     )
+    if custom_slot is not None:
+        config.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = custom_slot
+    initial_env = dict(config.env)
 
-    pinned = claude_native.claude_config_with_launch_model_pinned(
-        config, "databricks-claude-opus-4-8"
-    )
+    pinned = claude_native.claude_config_with_launch_model_pinned(config, launch_model)
 
     assert pinned is not None
-    assert pinned.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-8"
-    assert pinned.env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] == "Opus 4.8"
-    assert config.env.get("ANTHROPIC_CUSTOM_MODEL_OPTION") is None
-    assert (
-        claude_model_command_arg("databricks-claude-opus-4-8", pinned.env)
-        == "databricks-claude-opus-4-8"
-    )
+    assert pinned.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == launch_model
+    assert pinned.env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] == display_name
+    assert config.env == initial_env
+    assert claude_model_command_arg(launch_model, pinned.env) == launch_model
 
 
 @pytest.mark.parametrize(
-    "launch_model",
-    ["opus", "databricks-claude-opus-5", None, ""],
+    ("launch_model", "opus_pin"),
+    [
+        ("opus", "databricks-claude-opus-5"),
+        ("databricks-claude-opus-5", "databricks-claude-opus-5"),
+        ("databricks-claude-opus-5[1m]", "databricks-claude-opus-5[1m]"),
+        (None, "databricks-claude-opus-5"),
+        ("", "databricks-claude-opus-5"),
+    ],
 )
 def test_launch_model_needs_no_custom_slot_when_already_speakable(
     launch_model: str | None,
+    opus_pin: str,
 ) -> None:
     """Aliases and the pinned id resolve without the extra slot."""
     config = claude_native.ClaudeNativeUcodeConfig(
-        env={"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5"},
-        model="databricks-claude-opus-5",
+        env={
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": opus_pin,
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": "other-picker-model",
+        },
+        model=opus_pin,
     )
+    initial_env = dict(config.env)
 
     assert claude_native.claude_config_with_launch_model_pinned(config, launch_model) is config
+    assert config.env == initial_env
     assert claude_native.claude_config_with_launch_model_pinned(None, "x") is None
 
 
@@ -6179,6 +6225,147 @@ async def test_resolve_cold_resume_args_replaces_existing_local_claude_transcrip
     assert [record["message"]["content"] for record in records] == ["fresh Omnigent text"]
 
 
+@pytest.mark.parametrize("resume_cost_usd", [1.25, None], ids=["cost", "no-cost"])
+@pytest.mark.asyncio
+async def test_ensure_local_claude_resume_transcript_restores_the_session_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    resume_cost_usd: float | None,
+) -> None:
+    """
+    The rebuilt transcript ends with the record Claude restores its cost from.
+
+    ``claude --resume`` reads its running cost back only from a ``cost-state``
+    record and skips a partial one. Without the record a cold-resumed session
+    counts from zero, and its reports stay below the session's stored total,
+    which only moves up. The bridge dir records the seeded cost for the
+    forwarder's check, replacing an earlier launch's, and drops the previous
+    process's statusLine snapshot, which would read as the new process's cost.
+    """
+    from omnigent.harnesses.claude_native import bridge as claude_bridge
+
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    bridge_dir = claude_bridge.bridge_dir_for_conversation_id("conv_abc")
+    claude_bridge.record_resume_cost_baseline(
+        bridge_dir, claude_session_id="sid-earlier", cost_usd=0.5
+    )
+    snapshots = [bridge_dir / "context.json", bridge_dir / "context_raw.json"]
+    for snapshot in snapshots:
+        snapshot.write_text('{"total_cost_usd": 0.5}', encoding="utf-8")
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
+    client = await _httpx_client_with_canned_response(None, 200)
+    async with client:
+        written = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv_abc",
+            external_session_id="sid123",
+            workspace=tmp_path / "workspace",
+            resume_cost_usd=resume_cost_usd,
+        )
+
+    assert written is not None
+    records = [json.loads(line) for line in written.read_text(encoding="utf-8").splitlines()]
+    cost_states = [record for record in records if record.get("type") == "cost-state"]
+    if resume_cost_usd is None:
+        assert cost_states == []
+        assert claude_bridge.read_resume_cost_baseline(bridge_dir) is None
+        assert all(snapshot.exists() for snapshot in snapshots)
+        return
+    assert claude_bridge.read_resume_cost_baseline(bridge_dir) == (
+        claude_bridge.ResumeCostBaseline(claude_session_id="sid123", cost_usd=1.25)
+    )
+    assert not any(snapshot.exists() for snapshot in snapshots)
+    assert cost_states == [records[-1]]
+    assert set(records[-1]) == {
+        "type",
+        "sessionId",
+        "totalCostUSD",
+        "totalAPIDuration",
+        "totalAPIDurationWithoutRetries",
+        "totalToolDuration",
+        "totalLinesAdded",
+        "totalLinesRemoved",
+        "totalDuration",
+        "startTime",
+        "hasUnknownModelCost",
+        "modelUsage",
+    }
+    assert records[-1]["sessionId"] == "sid123"
+    assert records[-1]["totalCostUSD"] == 1.25
+
+
+@pytest.mark.asyncio
+async def test_resolve_cold_resume_args_restores_the_session_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A CLI cold resume carries the server's own-session cost into the transcript."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    projects = tmp_path / "projects"
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    snapshot = _conversation_response_body(
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+        external_session_id="claude-uuid-abc",
+    )
+    snapshot["native_usage_baseline"] = {"cumulative_cost_usd": 2.5}
+    client = await _httpx_client_with_canned_response(snapshot, 200)
+    async with client:
+        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+
+    assert args == ("--resume", "claude-uuid-abc")
+    transcript = (
+        projects
+        / claude_native._sanitize_claude_project_name(str(workspace.resolve()))
+        / "claude-uuid-abc.jsonl"
+    )
+    last_record = json.loads(transcript.read_text(encoding="utf-8").splitlines()[-1])
+    assert last_record["type"] == "cost-state"
+    assert last_record["totalCostUSD"] == 2.5
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "expected"),
+    [
+        ({"native_usage_baseline": {"cumulative_cost_usd": 2.5}}, 2.5),
+        ({"native_usage_baseline": {"cumulative_cost_usd": 3}}, 3.0),
+        ({"native_usage_baseline": {"cumulative_cost_usd": 0}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": -1.0}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": float("nan")}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": float("inf")}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": 10**400}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": True}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": "2.5"}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": None}}, None),
+        ({"native_usage_baseline": None}, None),
+        ({}, None),
+        (None, None),
+    ],
+    ids=[
+        "float",
+        "int",
+        "zero",
+        "negative",
+        "nan",
+        "inf",
+        "overflow",
+        "bool",
+        "string",
+        "null-cost",
+        "null-baseline",
+        "older-server",
+        "not-a-dict",
+    ],
+)
+def test_claude_resume_cost_from_snapshot_accepts_only_a_positive_cost(
+    snapshot: object, expected: float | None
+) -> None:
+    """Only a positive, finite own-session cost is restored into Claude."""
+    assert claude_native._claude_resume_cost_from_snapshot(snapshot) == expected
+
+
 @pytest.mark.asyncio
 async def test_resolve_cold_resume_args_resumes_a_copy_while_a_background_job_runs_it(
     monkeypatch: pytest.MonkeyPatch,
@@ -8411,6 +8598,57 @@ def test_copy_transcript_with_cwd_keeps_background_handles_for_the_same_session(
     moved = json.loads(target.read_text(encoding="utf-8"))
     assert moved["toolUseResult"] == _BACKGROUND_AGENT_HANDLE
     assert moved["cwd"] == str(tmp_path)
+
+
+def test_clone_claude_transcript_drops_the_source_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A fork counts its own spend, so its clone drops the source's ``cost-state``.
+
+    Claude restores its running cost from that record on ``--resume``; a clone
+    that kept it would start the fork at the source's total and count that
+    spend twice. Moving a session's own transcript keeps the record.
+    """
+    projects_dir = tmp_path / ".claude" / "projects"
+    source_workspace = tmp_path / "source"
+    source_workspace.mkdir()
+    clone_workspace = tmp_path / "clone"
+    clone_workspace.mkdir()
+    source_uuid = "11111111-1111-1111-1111-111111111111"
+    source_path = (
+        projects_dir
+        / claude_native._sanitize_claude_project_name(str(source_workspace.resolve()))
+        / f"{source_uuid}.jsonl"
+    )
+    source_path.parent.mkdir(parents=True)
+    turn = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u1",
+        "parentUuid": None,
+    }
+    cost_state = claude_native._claude_cost_state_record(source_uuid, 2.5)
+    source_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in (turn, cost_state)), encoding="utf-8"
+    )
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+
+    clone = claude_native._clone_claude_transcript(
+        source_external_session_id=source_uuid,
+        target_external_session_id="22222222-2222-2222-2222-222222222222",
+        clone_workspace=clone_workspace.resolve(),
+    )
+    moved = tmp_path / "moved.jsonl"
+    claude_native._copy_transcript_with_cwd(source=source_path, target=moved, current=tmp_path)
+
+    assert clone is not None
+    cloned_types = [json.loads(line)["type"] for line in clone.read_text().splitlines()]
+    assert cloned_types == ["user"]
+    moved_records = [json.loads(line) for line in moved.read_text().splitlines()]
+    assert moved_records[-1] == cost_state
 
 
 def test_clone_claude_transcript_repairs_stale_image_duplication(

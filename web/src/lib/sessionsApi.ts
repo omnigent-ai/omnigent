@@ -22,6 +22,7 @@ import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitles
 import { browserAgentToolsRequestHeaders } from "@/components/BrowserPane/agentTools/preferences";
 import { timezoneRequestHeaders } from "./timezones";
 import { parseBackgroundTasks } from "./sse";
+import { muteReadMarker, reconcileMuteLabel } from "./sessionMute";
 import type {
   BackgroundTaskInfo,
   ModelUsage,
@@ -162,6 +163,8 @@ interface SessionResponseWire {
    */
   background_agents?: BackgroundTaskInfo[] | null;
   created_at: number;
+  /** Unix seconds of the last persisted change; absent on older servers. */
+  updated_at?: number | null;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
    * sub-agent or a user-supplied string for a top-level session.
@@ -383,6 +386,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     backgroundTasks: parseBackgroundTasks(wire.background_tasks),
     backgroundAgents: parseBackgroundTasks(wire.background_agents),
     createdAt: wire.created_at,
+    updatedAt: wire.updated_at ?? null,
     title: wire.title ?? null,
     labels: wire.labels,
     projectId: wire.project_id ?? null,
@@ -1554,8 +1558,12 @@ export async function bindOnlyOnlineRunner(sessionId: string): Promise<Session |
  * with no transient (delta) coverage.
  */
 export async function getSession(sessionId: string): Promise<Session> {
+  const readMarker = muteReadMarker();
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}`);
-  return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+  return reconcileMuteLabel(
+    sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res)),
+    readMarker,
+  );
 }
 
 export interface SessionRepositoryBranch {
@@ -1613,11 +1621,15 @@ export async function getSessionSlim(
     include_usage: "false",
   });
   if (options.refreshState === true) params.set("refresh_state", "true");
+  const readMarker = muteReadMarker();
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}?${params.toString()}`,
     { signal: options.signal },
   );
-  return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+  return reconcileMuteLabel(
+    sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res)),
+    readMarker,
+  );
 }
 
 export interface SessionSignInLink {

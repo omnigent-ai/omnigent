@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import type { QuickPickItem, QuickPickRow } from "./model";
-import { buildQuickPickRows, navigateQuickPick, reconcileActiveIndex } from "./presentation";
+import {
+  buildQuickPickRows,
+  navigateQuickPick,
+  RECENT_HEADING_LABEL,
+  reconcileActiveIndex,
+} from "./presentation";
 
 function item(id: string, overrides: Partial<QuickPickItem<string>> = {}): QuickPickItem<string> {
   return { id, label: id, value: id, ...overrides };
@@ -230,6 +235,221 @@ describe("buildQuickPickRows", () => {
     });
     expect(describeRows(rows)).toEqual(["# B", "b1", "# B", "b2"]);
     expect(new Set(rows.map((row) => row.key)).size).toBe(rows.length);
+  });
+});
+
+describe("buildQuickPickRows with recents", () => {
+  it("lists recents first under a Recent heading when the query is empty", () => {
+    const rows = buildQuickPickRows({
+      segments: [{ sourceId: "commands", ranking: "client", items: commands }],
+      query: "",
+      recentIds: ["open-settings", "missing", "new-session"],
+    });
+    expect(describeRows(rows)).toEqual([
+      `# ${RECENT_HEADING_LABEL}`,
+      "open-settings",
+      "new-session",
+      "# Sessions",
+      "archive-session",
+      "# View",
+      "toggle-sidebar",
+    ]);
+  });
+
+  it("moves from the Recent group to the next group with the group keys", () => {
+    const rows = buildQuickPickRows({
+      segments: [{ sourceId: "commands", ranking: "client", items: commands }],
+      query: "",
+      recentIds: ["open-settings", "new-session"],
+    });
+    const next = navigateQuickPick(rows, 1, { type: "nextGroup" });
+    expect(rows[next]?.kind === "item" && rows[next].item.id).toBe("archive-session");
+  });
+
+  it("does not list items excluded from history as recents", () => {
+    const rows = buildQuickPickRows({
+      segments: [
+        {
+          sourceId: "commands",
+          ranking: "client",
+          items: [item("a", { rememberInHistory: false }), item("b")],
+        },
+      ],
+      query: "",
+      recentIds: ["a"],
+    });
+    expect(describeRows(rows)).toEqual(["a", "b"]);
+  });
+
+  it("never lists a provider-ranked row as recent", () => {
+    const rows = buildQuickPickRows({
+      segments: [{ sourceId: "search", ranking: "provider", items: [item("a"), item("b")] }],
+      query: "",
+      recentIds: ["b"],
+    });
+    expect(describeRows(rows)).toEqual(["a", "b"]);
+  });
+
+  it("uses recency only to break ties between equal matches", () => {
+    const items = [item("alpha one"), item("alpha two"), item("beta alpha")];
+    const rows = buildQuickPickRows({
+      segments: [{ sourceId: "s", ranking: "client", items }],
+      query: "alpha",
+      recentIds: ["beta alpha", "alpha two"],
+    });
+    expect(describeRows(rows)).toEqual(["alpha two", "alpha one", "beta alpha"]);
+  });
+});
+
+describe("buildQuickPickRows ranked across groups", () => {
+  const items = [
+    item("appearance", { label: "Appearance", keywords: ["theme"] }),
+    item("comments", { label: "Show the comments column", group: "File" }),
+    item("terminal-theme", { label: "Terminal theme", group: "Settings" }),
+    item("select-theme", { label: "Select theme…" }),
+    item("settings-appearance", {
+      label: "Settings: Appearance",
+      group: "Settings",
+      keywords: ["theme"],
+    }),
+  ];
+  const rows = (groupOrder?: "source" | "match") =>
+    buildQuickPickRows({
+      segments: [
+        { sourceId: "commands", ranking: "client", groupOrder, fuzzyMatching: "words", items },
+      ],
+      query: "theme",
+    });
+
+  it("keeps each group together by default", () => {
+    // "Show the comments column" is too scattered to match.
+    expect(describeRows(rows())).toEqual([
+      "select-theme",
+      "appearance",
+      "# Settings",
+      "terminal-theme",
+      "settings-appearance",
+    ]);
+  });
+
+  it("can rank rows across groups, each naming its group, so a group never buries a better match", () => {
+    expect(
+      rows("match").map((row) =>
+        row.kind === "item" ? `${row.sectionLabel ?? ""}/${row.item.id}` : `# ${row.label}`,
+      ),
+    ).toEqual([
+      "/select-theme",
+      "Settings/terminal-theme",
+      "/appearance",
+      "Settings/settings-appearance",
+    ]);
+  });
+
+  it("keeps the first row for an ID that an earlier segment listed", () => {
+    const ranked = buildQuickPickRows({
+      segments: [
+        { sourceId: "first", ranking: "client", items: [item("select-theme")] },
+        { sourceId: "commands", ranking: "client", groupOrder: "match", items },
+      ],
+      query: "theme",
+    });
+    expect(describeRows(ranked).filter((id) => id === "select-theme")).toHaveLength(1);
+  });
+});
+
+describe("buildQuickPickRows with a free-text item", () => {
+  it("puts it first and drops a duplicate suggestion with its ID", () => {
+    const rows = buildQuickPickRows({
+      segments: [
+        {
+          sourceId: "prs",
+          ranking: "client",
+          items: [item("pr:12", { label: "#12 Fix", group: "Suggested" })],
+        },
+      ],
+      query: "12",
+      freeTextItem: item("pr:12", { label: "Attach #12" }),
+    });
+    expect(describeRows(rows)).toEqual(["pr:12"]);
+    expect(rows[0]?.kind === "item" && rows[0].isFreeText).toBe(true);
+  });
+});
+
+describe("buildQuickPickRows with sources first", () => {
+  const commandSegment = {
+    sourceId: "commands",
+    ranking: "client" as const,
+    fuzzyMatching: "words" as const,
+    items: [item("Zoom In"), item("Go to Settings"), item("Toggle sidebar")],
+  };
+  // A provider-ranked source, such as session search, whose rows arrive already matched.
+  const sessions = (ids: string[]) => ({
+    sourceId: "sessions",
+    ranking: "provider" as const,
+    origin: "source" as const,
+    items: ids.map((id) => item(id)),
+  });
+  const rows = (
+    query: string,
+    sessionIds: string[],
+    sourcesFirst = true,
+    recentIds: string[] = [],
+  ) =>
+    describeRows(
+      buildQuickPickRows({
+        segments: [commandSegment, sessions(sessionIds)],
+        query,
+        recentIds,
+        sourcesFirst,
+      }),
+    );
+
+  it("lists the sources' rows above the items before anything is typed", () => {
+    expect(rows("", ["Recent session"])).toEqual([
+      "Recent session",
+      "Zoom In",
+      "Go to Settings",
+      "Toggle sidebar",
+    ]);
+  });
+
+  it("keeps them above recently picked items too, which still lead the other items", () => {
+    expect(rows("", ["Recent session"], true, ["Toggle sidebar"])).toEqual([
+      "Recent session",
+      `# ${RECENT_HEADING_LABEL}`,
+      "Toggle sidebar",
+      "Zoom In",
+      "Go to Settings",
+    ]);
+  });
+
+  it("keeps them above the items when no item's label starts with the whole query", () => {
+    expect(rows("parser", ["Parser rewrite"])).toEqual(["Parser rewrite"]);
+    // "ebar" is inside "sidebar", not at a word's start, so it doesn't name the command.
+    expect(rows("ebar", ["Rebar plan"]).slice(0, 1)).toEqual(["Rebar plan"]);
+  });
+
+  it("puts the items first when one's label matches the whole query from a word's start", () => {
+    // A session that matches "zoom in" loosely mustn't take Enter from the command it names.
+    expect(rows("Zoom In", ["Room in the zoo"])).toEqual(["Zoom In", "Room in the zoo"]);
+    expect(rows("settings", ["Settings migration"])[0]).toBe("Go to Settings");
+  });
+
+  it("keeps the sources first when only an item that doesn't lead them matches", () => {
+    const pullRequestAction = item("Remove #12 Fix the rich prompt from this session", {
+      leadsSources: false,
+    });
+    const segments = [
+      { ...commandSegment, items: [...commandSegment.items, pullRequestAction] },
+      sessions(["Rich prompt editing"]),
+    ];
+    expect(
+      describeRows(buildQuickPickRows({ segments, query: "rich", sourcesFirst: true })),
+    ).toEqual(["Rich prompt editing", "Remove #12 Fix the rich prompt from this session"]);
+  });
+
+  it("leaves the given order alone without sourcesFirst", () => {
+    expect(rows("", ["Recent session"], false)[0]).toBe("Zoom In");
   });
 });
 

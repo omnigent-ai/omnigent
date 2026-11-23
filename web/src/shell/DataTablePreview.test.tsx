@@ -1,7 +1,11 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DataTablePreview } from "./DataTablePreview";
-import { DATA_TABLE_MAX_COLUMNS, DATA_TABLE_MAX_ROWS } from "./dataTable";
+import {
+  DATA_TABLE_MAX_NAME_CHARS,
+  DATA_TABLE_MAX_COLUMNS,
+  DATA_TABLE_MAX_ROWS,
+} from "./dataTable";
 
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
 vi.mock("sonner", () => ({ toast }));
@@ -167,11 +171,21 @@ describe("DataTablePreview", () => {
 
   it("says how many rows it shows when the file has more", () => {
     const rows = Array.from({ length: DATA_TABLE_MAX_ROWS + 500 }, (_, i) => `${i}`);
-    renderTable(["id", ...rows].join("\n"));
+    const { container } = renderTable(["id", ...rows].join("\n"));
     expect(screen.getByRole("note")).toHaveTextContent(
       "Showing the first 1,000 of 1,500 rows. Download the file to see every row.",
     );
-    expect(columnValues(0)).toHaveLength(DATA_TABLE_MAX_ROWS);
+    const body = container.querySelector("tbody")!;
+    expect(body.rows).toHaveLength(DATA_TABLE_MAX_ROWS);
+    expect(body.rows[0]).toHaveTextContent(/^0$/);
+    expect(body.rows[DATA_TABLE_MAX_ROWS - 1]).toHaveTextContent(/^999$/);
+  });
+
+  it("says when text past the limit is cut", () => {
+    renderTable(`${"h".repeat(DATA_TABLE_MAX_NAME_CHARS + 1)},b\n1,2\n`);
+    expect(screen.getByRole("note")).toHaveTextContent(
+      "Text past the preview's limit is cut short. Download the file to see all of it.",
+    );
   });
 
   it("gives only a lower bound when the server sent part of the file", () => {

@@ -2,7 +2,10 @@ import { renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const navigate = vi.fn();
-vi.mock("@/lib/routing", () => ({ useNavigate: () => navigate }));
+vi.mock("@/lib/routing", () => ({
+  useNavigate: () => navigate,
+  useLocation: () => ({ pathname: "/", search: "", hash: "", state: null, key: "default" }),
+}));
 
 import { SHORTCUT_BINDINGS, type ShortcutId, shortcutKeys } from "@/lib/shortcuts/registry";
 
@@ -25,6 +28,7 @@ describe("useAppCommands", () => {
       "Go to Inbox",
       "Go to Automations",
       "Go to Settings",
+      "Search settings…",
       "Toggle conversations sidebar",
       "Toggle workspace sidebar",
     ]);
@@ -55,7 +59,10 @@ describe("filterAppCommands", () => {
   });
 
   it("matches the label or a keyword, ignoring case and outer spaces", () => {
-    expect(filterAppCommands(all, " SETT ").map((command) => command.id)).toEqual(["go-settings"]);
+    expect(filterAppCommands(all, " SETT ").map((command) => command.id)).toEqual([
+      "go-settings",
+      "settings-search",
+    ]);
     expect(filterAppCommands(all, "cron").map((command) => command.id)).toEqual(["go-tasks"]);
     expect(filterAppCommands(all, "zzz")).toEqual([]);
   });

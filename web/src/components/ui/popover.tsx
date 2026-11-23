@@ -20,10 +20,14 @@ function PopoverContent({
   children,
   align = "center",
   sideOffset = 4,
+  container,
   ...props
-}: React.ComponentProps<typeof PopoverPrimitive.Content>) {
+}: React.ComponentProps<typeof PopoverPrimitive.Content> & {
+  /** Where it opens; default the app's portal root. */
+  container?: HTMLElement | null;
+}) {
   return (
-    <PopoverPrimitive.Portal container={getEmbedRoot() ?? undefined}>
+    <PopoverPrimitive.Portal container={container ?? getEmbedRoot() ?? undefined}>
       <PopoverPrimitive.Content
         data-slot="popover-content"
         align={align}

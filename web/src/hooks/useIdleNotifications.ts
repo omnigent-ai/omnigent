@@ -61,6 +61,7 @@ import {
 } from "@/lib/idleTransitions";
 import { isConversationUnseen, useUnseenTick } from "@/hooks/useUnseenConversations";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
+import { isConversationMuted } from "@/lib/sessionMute";
 
 const IDLE_BODY = "Agent finished and is ready for your input.";
 const ELICITATION_BODY = "Agent is asking for your input.";
@@ -152,6 +153,9 @@ export function useIdleNotifications(activeConversationId?: string): void {
   // then reporting back) into one beep. Cleared when the user views the session
   // or it drops off the list, so a later finish can notify again.
   const notifiedSessions = useRef<Set<string>>(new Set());
+  // Last observed mute state, kept after a row leaves the list so a preview
+  // still loading for a muted session stays silent.
+  const mutedSessions = useRef<Set<string>>(new Set());
 
   useLazyPermissionRequest();
 
@@ -275,6 +279,10 @@ export function useIdleNotifications(activeConversationId?: string): void {
     if (data === undefined) return;
     const conversations = data.pages.flatMap((page) => page.data);
     latestConversations.current = conversations;
+    for (const conversation of conversations) {
+      if (isConversationMuted(conversation)) mutedSessions.current.add(conversation.id);
+      else mutedSessions.current.delete(conversation.id);
+    }
 
     // Badge first, before the empty-list bail below: an empty list must
     // still send 0 so a stale nonzero badge clears.
@@ -352,13 +360,21 @@ export function useIdleNotifications(activeConversationId?: string): void {
           setTimeout(() => {
             timers.delete(id);
             // Re-check suppression at fire time — the user may have opened the
-            // session (or refocused the window) during the settle window.
+            // session (or refocused the window), or muted it, during the settle window.
             if (windowFocusedRef.current && id === activeIdRef.current) return;
+            const mutedNow = () => mutedSessions.current.has(id);
+            if (mutedNow()) return;
             // Mark it beeped so a later finish stays silent until the user has
             // viewed this session.
             notifiedSessions.current.add(id);
             // Agent's final words as the body when fetchable, else IDLE_BODY.
-            notifyWithPreview(conversation, navigateRef.current);
+            // Muting while the preview loads still silences it.
+            notifyWithPreview(
+              conversation,
+              navigateRef.current,
+              mutedNow,
+              notifiedSessions.current,
+            );
           }, IDLE_SETTLE_MS),
         );
       }
@@ -451,8 +467,14 @@ function notify(
 function notifyWithPreview(
   conversation: Conversation,
   navigate: ReturnType<typeof useNavigate>,
+  muted: () => boolean,
+  notified: Set<string>,
 ): void {
   void fetchLastAssistantText(conversation.id).then((preview) => {
+    if (muted()) {
+      notified.delete(conversation.id);
+      return;
+    }
     notify(conversation, preview ?? IDLE_BODY, navigate);
   });
 }

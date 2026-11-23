@@ -46,7 +46,7 @@ export function useSettingsNavigationClock() {
 }
 
 /** Reveals the row in `rowRef` when the URL names `entry`; a newer navigation cancels it. */
-function useSettingsRowReveal(entry: SettingsEntry, rowRef: RefObject<HTMLElement | null>) {
+export function useSettingsRowReveal(entry: SettingsEntry, rowRef: RefObject<HTMLElement | null>) {
   // A new location object per navigation, so the same hash chosen again, or reached by Back,
   // reveals again.
   const location = useLocation();

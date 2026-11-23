@@ -1612,6 +1612,25 @@
         "title": "CloneRepositoryRequest",
         "type": "object"
       },
+      "CloneScheduledTaskRequest": {
+        "additionalProperties": false,
+        "description": "Optional body for `POST /v1/scheduled-tasks/{id}/clone`.",
+        "properties": {
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          }
+        },
+        "title": "CloneScheduledTaskRequest",
+        "type": "object"
+      },
       "CodexGoalObject": {
         "description": "Current Codex goal state for a Codex-native session.\n\nMirrors Codex app-server's `ThreadGoal` shape using Omnigent's\nsnake-case API convention. `created_at` and `updated_at` are optional\nbecause older app-server documentation examples omit them even though the\ncurrent protocol includes them.",
         "properties": {
@@ -2624,9 +2643,16 @@
             "title": "Source Session Id"
           },
           "timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "default": "UTC",
-            "title": "Timezone",
-            "type": "string"
+            "title": "Timezone"
           },
           "workspace": {
             "anyOf": [
@@ -8167,6 +8193,16 @@
             "title": "Scheduled Task Approval Skipping Modes",
             "type": "boolean"
           },
+          "scheduled_task_clone": {
+            "default": false,
+            "title": "Scheduled Task Clone",
+            "type": "boolean"
+          },
+          "scheduled_task_default_timezone": {
+            "default": true,
+            "title": "Scheduled Task Default Timezone",
+            "type": "boolean"
+          },
           "scheduled_task_harness_settings": {
             "default": true,
             "title": "Scheduled Task Harness Settings",
@@ -8305,6 +8341,11 @@
             "title": "Session Move Source Checks",
             "type": "boolean"
           },
+          "session_mute": {
+            "default": true,
+            "title": "Session Mute",
+            "type": "boolean"
+          },
           "session_nest_moves": {
             "default": false,
             "title": "Session Nest Moves",
@@ -8328,6 +8369,11 @@
           "session_search_scope": {
             "default": true,
             "title": "Session Search Scope",
+            "type": "boolean"
+          },
+          "session_timers": {
+            "default": false,
+            "title": "Session Timers",
             "type": "boolean"
           },
           "session_title_instructions": {
@@ -13084,7 +13130,7 @@
                 "type": "null"
               }
             ],
-            "description": "Own cumulative token baseline for Pi and Codex side chats, excluding descendants. Available even when display usage aggregation is skipped; `None` for other harnesses or older servers."
+            "description": "Own cumulative usage baseline for Pi, Claude native and Codex side chats, excluding descendants. Available even when display usage aggregation is skipped; `None` for other harnesses or older servers."
           },
           "parent_session_id": {
             "anyOf": [
@@ -13128,6 +13174,18 @@
             ],
             "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage. `None` when permissions are disabled (single-user mode without a permission store).",
             "title": "Permission Level"
+          },
+          "permission_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The permission mode the session is in, in its harness's vocabulary, e.g. `\"auto\"` or `\"approve-for-me\"` (the names `sys_session_create` takes). Follows a switch made while it runs to a mode that keeps approval; a mode that skips approval shows only when the session's launch settings select it. `None` when the harness has no permission modes or the mode cannot be told.",
+            "title": "Permission Mode"
           },
           "project_id": {
             "anyOf": [
@@ -14666,6 +14724,21 @@
           "objective"
         ],
         "title": "SetCodexGoalRequest",
+        "type": "object"
+      },
+      "SetDefaultTimezoneRequest": {
+        "additionalProperties": false,
+        "description": "Body for `PUT /v1/scheduled-tasks/default-timezone`.",
+        "properties": {
+          "timezone": {
+            "title": "Timezone",
+            "type": "string"
+          }
+        },
+        "required": [
+          "timezone"
+        ],
+        "title": "SetDefaultTimezoneRequest",
         "type": "object"
       },
       "SetProactiveAgentPrompt": {
@@ -21213,7 +21286,7 @@
     },
     "/v1/scheduled-tasks": {
       "get": {
-        "description": "List the caller's scheduled tasks.\n\nLists automations unless *kind* is `all`, so the reminders agents set for\ntheir own sessions stay off the Automations page. There is no reminders-only\nview: this list reads every task the owner has, and a selective filter needs\nan indexed, paginated query first.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
+        "description": "List the caller's scheduled tasks.\n\nLists automations unless *kind* is `all`, so the reminders and timers agents\nset for their own sessions stay off the Automations page. The kind filter runs\nin the query, so listing automations never reads an agent's timers. There is no\nreminders-only view; a selective view needs an indexed, paginated query first.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
         "operationId": "list_scheduled_tasks_v1_scheduled_tasks_get",
         "parameters": [
           {
@@ -21304,6 +21377,52 @@
           }
         },
         "summary": "Create Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/default-timezone": {
+      "put": {
+        "description": "Record the caller's local zone for tasks that explicitly request the default.",
+        "operationId": "set_default_timezone_v1_scheduled_tasks_default_timezone_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetDefaultTimezoneRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Set Default Timezone V1 Scheduled Tasks Default Timezone Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Default Timezone",
         "tags": [
           "scheduled_tasks"
         ]
@@ -21576,6 +21695,68 @@
           }
         },
         "summary": "Update Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/{scheduled_task_id}/clone": {
+      "post": {
+        "description": "Copy an owned automation under a new ID, without its runs or continued session.\n\nNeeds the database scheduler: the legacy timer re-anchors an interval\nschedule whenever it arms one, so it can't run the clone on the original's days.",
+        "operationId": "clone_scheduled_task_v1_scheduled_tasks__scheduled_task_id__clone_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/CloneScheduledTaskRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Clone Scheduled Task V1 Scheduled Tasks  Scheduled Task Id  Clone Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clone Scheduled Task",
         "tags": [
           "scheduled_tasks"
         ]
