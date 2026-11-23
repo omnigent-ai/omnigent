@@ -162,4 +162,16 @@ describe("Sidebar selection in ⌘K", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(writes.move.mutate).not.toHaveBeenCalled();
   });
+
+  it("moves nothing from a project picked once the selection changed", async () => {
+    renderSidebar({ features: QUICK_PICK });
+    await screen.findByRole("link", { name: /Alpha/ });
+    startSelecting();
+    fireEvent.click(screen.getByRole("link", { name: /Alpha/ }));
+    // The project list stays open while the user selects another session.
+    const [payments] = command("Move selected to project").options?.() ?? [];
+    fireEvent.click(screen.getByRole("link", { name: /Beta/ }));
+    act(() => payments?.run());
+    expect(writes.move.mutate).not.toHaveBeenCalled();
+  });
 });

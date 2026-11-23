@@ -19,6 +19,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   AVAILABLE,
   HIDDEN,
+  isCommandAvailable,
   type PaletteCommand,
   usePaletteCommands,
 } from "@/store/paletteCommands";
@@ -52,8 +53,7 @@ function useQuickPickPalette(): boolean {
   return isFeatureEnabled(useServerInfo(), "quick_pick_palette");
 }
 
-// Each selection Set gets its own key, so a row accepted after the selection changed
-// names a selection that no longer exists, and the palette does nothing.
+// Each selection Set gets its own key, which names the selection each action acts on.
 const selectionKeys = new WeakMap<ReadonlySet<string>, number>();
 let nextSelectionKey = 0;
 function selectionKey(selection: ReadonlySet<string>): number {
@@ -87,6 +87,13 @@ export function useBulkSessionPaletteCommands(actions: BulkSessionActions): void
   const commands = useMemo<PaletteCommand[]>(() => {
     if (!enabled) return NO_COMMANDS;
     const current = latest.current;
+    // A row accepted after the selection changed, or once its action stopped applying, does nothing.
+    const stillApplies = (id: BulkSessionCommandId): boolean => {
+      const now = latest.current;
+      if (selectionKey(now.selection) !== key) return false;
+      const action = bulkSessionCommands(now.facts).find((candidate) => candidate.id === id);
+      return action !== undefined && isCommandAvailable(action.availability);
+    };
     return bulkSessionCommands(current.facts).map((command) => ({
       id: `sidebar.selection.${command.id}:${key}`,
       label: command.label,
@@ -101,13 +108,17 @@ export function useBulkSessionPaletteCommands(actions: BulkSessionActions): void
               latest.current.projects.map((project) => ({
                 id: project,
                 label: project,
-                run: () => latest.current.moveToProject(project),
+                run: () => {
+                  if (stillApplies(command.id)) latest.current.moveToProject(project);
+                },
               })),
             optionsEmptyMessage: "No projects yet.",
           }
         : {}),
       run: () => {
-        if (command.id !== "move-to-project") latest.current.run[command.id]();
+        if (command.id !== "move-to-project" && stillApplies(command.id)) {
+          latest.current.run[command.id]();
+        }
       },
     }));
     // `signature` stands in for the facts and projects read through `latest`.
