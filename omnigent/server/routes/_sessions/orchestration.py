@@ -2587,11 +2587,8 @@ async def _persist_external_session_usage(
     event = SessionUsageEvent(**event_payload)
     session_stream.publish(session_id, event.model_dump(exclude_none=True))
     if tree is not None:
-        # This session's usage also moves its ANCESTORS' subtree cost (its spend
-        # rolls up into every ancestor), so re-publish each ancestor's subtree
-        # cost too — otherwise a grandparent's badge wouldn't reflect a deep
-        # descendant. Reuses the tree summed above, so a flush loads it once.
-        # No-op for a top-level session. Threaded: it sums the tree per ancestor.
+        # Spend rolls up into every ancestor, so re-publish their subtree costs
+        # from the tree loaded above (a no-op for a top-level session).
         await asyncio.to_thread(_publish_ancestor_subtree_costs, tree, session_id)
     return raw_tokens
 
