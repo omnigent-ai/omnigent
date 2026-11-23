@@ -101,7 +101,7 @@ export function resolveFileViewMode({
   largeMarkdownVisitMode?: "preview" | "source";
   /** A ?comment= link targets this file and needs a surface that shows anchors. */
   deepLinkedComment: boolean;
-  /** The preview can't show comment anchors (a data table), so such a link opens source. */
+  /** The preview can't show comment anchors (a data table or chart), so such a link opens source. */
   previewHidesComments?: boolean;
   preference: PreviewableViewMode;
 }): PreviewableViewMode {

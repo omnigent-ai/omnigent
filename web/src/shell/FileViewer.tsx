@@ -394,6 +394,11 @@ interface FileViewerProps {
   sort?: ChangedSort;
 }
 
+/** The preview can't show comment anchors, so a linked or picked comment opens Source. */
+function previewHidesComments(path: string): boolean {
+  return isDataTablePath(path) || isVegaLitePath(path);
+}
+
 /**
  * Outer wrapper that resolves the agentId and provides a
  * `CommentSenderContext`. The body lives in `FileViewerBody`, which
@@ -973,13 +978,15 @@ function FileViewerBody({
   const [deepLinkBiasPath, setDeepLinkBiasPath] = useState<string | null>(() =>
     initialCommentIdRef.current ? path : null,
   );
-  // A data table's pull toward Source (from a picked comment) belongs to one
-  // visit: opening another file or conversation ends it, so coming back opens the
-  // table again. Other files keep their deep-link bias as before.
+  // A data table's or chart's pull toward Source (from a picked comment) belongs
+  // to one visit: opening another file or conversation ends it, so coming back
+  // opens the preview again. Other files keep their deep-link bias as before.
   const [biasVisit, setBiasVisit] = useState({ conversationId, path });
   if (biasVisit.conversationId !== conversationId || biasVisit.path !== path) {
     setBiasVisit({ conversationId, path });
-    if (deepLinkBiasPath !== null && isDataTablePath(deepLinkBiasPath)) setDeepLinkBiasPath(null);
+    if (deepLinkBiasPath !== null && previewHidesComments(deepLinkBiasPath)) {
+      setDeepLinkBiasPath(null);
+    }
   }
 
   // Switch a markdown file to the rich-text editor — the surface where text-
@@ -1022,7 +1029,7 @@ function FileViewerBody({
     largeMarkdown: markdownSourceFallback ?? false,
     largeMarkdownVisitMode,
     deepLinkedComment: deepLinkBiasPath === path,
-    previewHidesComments: isDataTablePath(path),
+    previewHidesComments: previewHidesComments(path),
     preference: previewableViewMode,
   });
   // Local state triggers rendering; the WeakSet preserves dismissal across remounts.
@@ -2129,9 +2136,9 @@ function FileViewerBody({
               sender.mutate({ comment_ids: addressableCommentIds });
             }}
             onClickComment={(comment) => {
-              // A data table can't show comment anchors, so picking a comment
-              // opens Source as a ?comment= link does; the toggle still reaches the table.
-              if (isDataTablePath(path)) setDeepLinkBiasPath(path);
+              // A data table or chart can't show comment anchors, so picking a comment
+              // opens Source as a ?comment= link does; the toggle still reaches the preview.
+              if (previewHidesComments(path)) setDeepLinkBiasPath(path);
               handleSetActiveSelection({
                 start_index: comment.start_index,
                 end_index: comment.end_index,
