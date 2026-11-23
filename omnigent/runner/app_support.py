@@ -161,12 +161,16 @@ class _CommentRelayBinding:
         the spec could not be resolved and the fallback surface was used.
     :param bridge_dir: Directory the relay wrote ``tool_relay.json`` into,
         e.g. ``Path("/tmp/omnigent-bridge/conv_abc123")``.
+    :param workflows_enabled: Whether the workflow tools were advertised.
+    :param routing_available: The routing stamp the advertised surface was built
+        under; the advisor is advertised only while it is ``True``.
     """
 
     relay: ClaudeNativeToolRelay
     spec_entry: _SpecEntry | None
     bridge_dir: Path
     workflows_enabled: bool = False
+    routing_available: bool = False
 
 
 def _require_full_native_lock_coverage(

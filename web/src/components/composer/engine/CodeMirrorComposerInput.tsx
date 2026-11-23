@@ -75,6 +75,15 @@ const COMPOSER_MAX_HEIGHT_PX = 180;
 /** Marks a transaction that syncs the controlled value in, which isn't a user edit. */
 const controlledUpdate = Annotation.define<true>();
 
+/** The undo or redo that made these transactions' edit, if either did. */
+function historyDirectionOfTransactions(
+  transactions: readonly Transaction[],
+): "undo" | "redo" | undefined {
+  if (transactions.some((transaction) => transaction.isUserEvent("undo"))) return "undo";
+  if (transactions.some((transaction) => transaction.isUserEvent("redo"))) return "redo";
+  return undefined;
+}
+
 /** The mention tokens the editor paints; reconfigured through a compartment when they change. */
 const mentionTokensFacet = Facet.define<readonly string[], readonly string[]>({
   combine: (inputs) => inputs[inputs.length - 1] ?? [],
@@ -517,10 +526,8 @@ function CodeMirrorComposer({
               transaction.annotation(controlledUpdate),
             );
             if (update.docChanged && fromUser) {
-              const fromHistory = update.transactions.some(
-                (transaction) => transaction.isUserEvent("undo") || transaction.isUserEvent("redo"),
-              );
-              latest.current.onChange?.({ ...event(), fromHistory });
+              const historyDirection = historyDirectionOfTransactions(update.transactions);
+              latest.current.onChange?.({ ...event(), historyDirection });
             }
             if ((update.docChanged || update.selectionSet) && fromUser) {
               latest.current.onSelect?.(event());

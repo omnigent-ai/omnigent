@@ -133,11 +133,14 @@ const {
   settingsMenuItem,
 } = require("./settingsNavigation");
 const { createQuitConfirmation } = require("./quitConfirmation");
+const { createRightSidebarWindow } = require("./rightSidebarWindow");
 const { acceleratorLabel, createGlobalShortcuts } = require("./globalShowShortcut");
 const {
   FLOATING_COMPOSER_PATH,
   FRAME_SETTINGS_KEY,
+  FLOATING_COMPOSER_PRELOAD_DELAY_MS,
   createFloatingComposerController,
+  createFloatingComposerPreloader,
   fadeInFloatingComposer,
   floatingComposerAppPagePath,
   floatingComposerSessionPath,
@@ -1106,6 +1109,9 @@ function scheduleReconnect(
   returnUrl,
   { hint, finalMessage, network = false, blocked = false, interactive = false },
 ) {
+  // A panel never retries behind the overlay: the failure then loads setup, which closes a panel
+  // instead (see loadSetupPage), and the next open builds it again.
+  if (!isMainWindow(win)) return false;
   restartReconnectsOnWake();
   const previous = reconnects.get(win);
   const same = previous?.serverUrl === serverUrl;
@@ -1392,7 +1398,8 @@ function rememberOidcServer(serverUrl, cookieName) {
 
 /** Bring a window back to the front after the user signed in in their browser. */
 function focusAfterBrowserSignIn(win) {
-  if (win.isDestroyed()) return;
+  // A panel comes on screen only through ⇧⌘Space, and never activates the app.
+  if (win.isDestroyed() || !isMainWindow(win)) return;
   if (win.isMinimized()) win.restore();
   win.show();
   win.focus();
@@ -1842,6 +1849,14 @@ const quitConfirmation = createQuitConfirmation({
   quit: () => app.quit(),
 });
 
+// Settings → "Widen window when opening the right sidebar" (opt-in).
+const rightSidebarWindow = createRightSidebarWindow({
+  loadSettings,
+  saveSettings,
+  workAreaFor: (bounds) => screen.getDisplayMatching(bounds).workArea,
+  animate: process.platform === "darwin",
+});
+
 // Main-window documents that can render the floating New Agent panel (see registerIpc).
 const floatingComposerSupport = createFloatingComposerSupport();
 
@@ -1931,6 +1946,28 @@ function floatingComposer() {
   return floatingComposerController;
 }
 
+// Builds the panel hidden once the app is quiet, so ⇧⌘Space shows a loaded page.
+const floatingComposerPreloader = createFloatingComposerPreloader({
+  target: floatingComposerPreloadTarget,
+  preload: (serverUrl) => floatingComposer().preload(serverUrl),
+});
+
+/** The server whose panel to build ahead: the one ⇧⌘Space would open now, if it can open. */
+function floatingComposerPreloadTarget() {
+  if (process.platform !== "darwin" || appQuitting) return null;
+  if (!globalShortcuts.floatingComposer.current().enabled) return null;
+  return floatingComposerTarget({
+    focused: null,
+    panelServerUrl: () => null,
+    mainWindowsByRecency: mainWindowsByRecency(mainWindowFocusOrder, mainWindows()),
+    serverUrlOf: (win) => windows.get(win)?.serverUrl ?? null,
+    supported: floatingComposerSupported,
+  });
+}
+
+/** Each server's pending release of its panel built ahead; an announcement clears it. */
+const floatingComposerReleases = new Map();
+
 /** Whether a panel still shows the panel page of `serverUrl`, or is still loading it. */
 function floatingComposerPanelIsCurrent(panel, serverUrl) {
   if (panel.isDestroyed() || panel.webContents.isCrashed()) return false;
@@ -1956,7 +1993,10 @@ function floatingComposerServerUrl() {
 
 /** ⇧⌘Space: the panel for the most recent server, else Omnigent comes forward. */
 function openFloatingComposerFromShortcut() {
-  const serverUrl = floatingComposerServerUrl();
+  // The press builds the panel itself if it isn't there yet.
+  floatingComposerPreloader.cancel();
+  // A panel the user has open takes the press, so it never falls through to raising a window.
+  const serverUrl = floatingComposerController?.openServerUrl() ?? floatingComposerServerUrl();
   if (serverUrl !== null) {
     floatingComposer().show(serverUrl);
     return;
@@ -2024,6 +2064,14 @@ const aboutWindow = createAboutWindow({
 });
 
 const connectionLoading = createConnectionLoading({ BrowserWindow });
+
+/**
+ * The shell's connection indicator, over main windows only. It's a window of its own that shows
+ * even while its parent is hidden, and a panel loads hidden and shows once its page is ready.
+ */
+function showConnectionLoading(win, attempt, label) {
+  if (isMainWindow(win)) connectionLoading.show(win, attempt, label);
+}
 
 // Shell-owned update toast: renders the reused web UpdateBanner in a transparent
 // corner window so it shows even against servers running old omnigent web.
@@ -2577,7 +2625,7 @@ async function loadServerUrl(
       win.webContents.stop();
       // The reconnect overlay already says what's happening.
       if (!isSetupPageUrl(win.webContents.getURL()) && !reconnectOverlay.isShown(win)) {
-        connectionLoading.show(win, attempt, "Signing in…");
+        showConnectionLoading(win, attempt, "Signing in…");
       }
       try {
         const entered = new URL(serverUrl);
@@ -2659,7 +2707,7 @@ async function loadServerUrl(
         }
         updateSignOutMenuItem();
         if (!isSetupPageUrl(win.webContents.getURL())) {
-          connectionLoading.show(win, attempt, "Signing in…");
+          showConnectionLoading(win, attempt, "Signing in…");
         }
         const auth = getOidcAuth();
         try {
@@ -2694,7 +2742,7 @@ async function loadServerUrl(
         if (current()) setWindowServerManifest(win, nextManifest);
       });
     }
-    if (!reconnectOverlay.isShown(win)) connectionLoading.show(win, attempt, "Opening Omnigent…");
+    if (!reconnectOverlay.isShown(win)) showConnectionLoading(win, attempt, "Opening Omnigent…");
     await loadServerDocument(win, target, signal);
     assertCurrent();
     diagnostics.record("connection_result", { origin: originOf(serverUrl), outcome: "loaded" });
@@ -2995,6 +3043,16 @@ function createWindow(targetUrl, opts = {}) {
   };
   win.on("enter-full-screen", sendFullScreenState);
   win.on("leave-full-screen", sendFullScreenState);
+  // A right sidebar closed while full screen or maximized shrinks the window once it's restored.
+  const restoreRightSidebarWindow = () => rightSidebarWindow.restored(win);
+  win.on("leave-full-screen", restoreRightSidebarWindow);
+  win.on("unmaximize", restoreRightSidebarWindow);
+  win.on("resize", restoreRightSidebarWindow);
+  // A new page doesn't know about the window's growth, so it mustn't shrink by it later.
+  win.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) rightSidebarWindow.forget(win);
+  });
+  win.webContents.on("render-process-gone", () => rightSidebarWindow.forget(win));
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
   // CLI config stores the API mount; Electron boots the browser-facing SPA.
@@ -5380,6 +5438,34 @@ function registerIpc() {
     return true;
   });
 
+  // Settings → "Widen window when opening the right sidebar", and the page's reports of that
+  // sidebar opening and closing, which resize only the reporting window.
+  ipcMain.handle("omnigent:get-right-sidebar-widens-window", (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error(
+        "get-right-sidebar-widens-window is only available to a connected server page",
+      );
+    }
+    return rightSidebarWindow.enabled();
+  });
+  ipcMain.handle("omnigent:set-right-sidebar-widens-window", (event, enabled) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error(
+        "set-right-sidebar-widens-window is only available to a connected server page",
+      );
+    }
+    return rightSidebarWindow.setEnabled(enabled === true);
+  });
+  ipcMain.on("omnigent:right-sidebar-visibility", (event, report) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!isPinnedOriginSender(event) || !isMainWindow(win)) return;
+    // Only the window's own page speaks for its sidebar, not a frame inside it.
+    if (event.senderFrame !== event.sender.mainFrame) return;
+    if (report?.reset === true) rightSidebarWindow.forget(win);
+    else if (report?.open === true) rightSidebarWindow.opened(win, report.width);
+    else if (report?.open === false) rightSidebarWindow.closed(win);
+  });
+
   // A main window's document can render the floating panel for its server, until it's replaced.
   ipcMain.on("omnigent:floating-composer:announce", (event, version) => {
     const win = BrowserWindow.fromWebContents(event.sender);
@@ -5390,21 +5476,45 @@ function registerIpc() {
     const contents = win.webContents;
     const hadSupport = floatingComposerSupport.any();
     if (!floatingComposerSupport.announce(contents.id, serverUrl)) return;
+    // A new announcement means a reload finished, so the panel built ahead stays.
+    clearTimeout(floatingComposerReleases.get(serverUrl));
+    floatingComposerReleases.delete(serverUrl);
     // Support ends with this document: when another one commits, or its renderer goes away.
     const revoke = () => {
       contents.removeListener("did-navigate", revoke);
       contents.removeListener("render-process-gone", revoke);
       contents.removeListener("destroyed", revoke);
       floatingComposerSupport.revoke(contents.id);
+      // A panel built ahead goes once its server has had no supporting page for a while; a
+      // reload announces again within moments, which calls the release off.
+      if (!floatingComposerSupport.serves(serverUrl)) {
+        clearTimeout(floatingComposerReleases.get(serverUrl));
+        const release = setTimeout(() => {
+          floatingComposerReleases.delete(serverUrl);
+          floatingComposerController?.releaseUnshown(serverUrl);
+        }, FLOATING_COMPOSER_PRELOAD_DELAY_MS);
+        release.unref?.();
+        floatingComposerReleases.set(serverUrl, release);
+      }
       if (!floatingComposerSupport.any()) applyFloatingComposerShortcut();
     };
     contents.on("did-navigate", revoke);
     contents.on("render-process-gone", revoke);
     contents.on("destroyed", revoke);
     if (!hadSupport) applyFloatingComposerShortcut();
+    floatingComposerPreloader.schedule();
   });
 
-  // From the panel: hide it, keeping its draft.
+  // From the panel: its composer rendered, so an open shows it at once.
+  ipcMain.on("omnigent:floating-composer:ready", (event) => {
+    const panel = BrowserWindow.fromWebContents(event.sender);
+    if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) return;
+    // Only the panel's own top document, still on its panel page, speaks for it.
+    if (event.senderFrame !== event.sender.mainFrame || serverPageShown(panel) !== "panel") return;
+    floatingComposerController.markReady(panel);
+  });
+
+  // From the panel: put it away, keeping its draft; the keyboard goes back to the app it had.
   ipcMain.on("omnigent:floating-composer:dismiss", (event) => {
     const panel = BrowserWindow.fromWebContents(event.sender);
     if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) return;
@@ -5439,16 +5549,14 @@ function registerIpc() {
     if (target && connectionAttempts.get(target)?.pending === true) {
       return { ok: false, error: "window-loading" };
     }
+    // A launched session or a linked page comes forward, over the app the user was in.
     if (target) {
       sendOpenPath(target, openPath);
-      // A linked page comes forward; a launched session waits behind the app the user is in.
-      if (sessionPath === null) {
-        focusAndRestore(target);
-        app.focus({ steal: true });
-      }
+      focusAndRestore(target);
     } else {
       createWindow(undefined, { serverUrl, path: openPath });
     }
+    app.focus({ steal: true });
     // After a launch the next open starts at the default placement again.
     floatingComposerController.hide(panel, { resetFrame: sessionPath !== null });
     return { ok: true };

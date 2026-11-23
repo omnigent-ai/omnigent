@@ -120,9 +120,17 @@ const SettingsPage = withPaneLoading(
 // A release-feature route stays registered so a hard load never falls through
 // to the catch-all "Page not found" while the /v1/info probe is in flight; the
 // gate is decided inside once the probe resolves.
-function FeatureGatedPage({ feature, children }: { feature: FeatureKey; children: ReactNode }) {
+function FeatureGatedPage({
+  feature,
+  children,
+  loading,
+}: {
+  feature: FeatureKey;
+  children: ReactNode;
+  loading?: ReactNode;
+}) {
   const info = useServerInfo();
-  if (info === "loading") return <PaneLoading />;
+  if (info === "loading") return loading !== undefined ? loading : <PaneLoading />;
   return isFeatureEnabled(info, feature) ? children : <NotFoundPage />;
 }
 
@@ -234,8 +242,18 @@ function AppRoutes({ basename }: AppProps) {
         <Route
           path={`${prefix}${FLOATING_COMPOSER_PATH}`}
           element={
-            <FeatureGatedPage feature="floating_composer">
-              {isElectronShell() ? <FloatingComposerPage /> : <NotFoundPage />}
+            <FeatureGatedPage
+              feature="floating_composer"
+              loading={isElectronShell() ? <PageLoading quiet /> : undefined}
+            >
+              {isElectronShell() ? (
+                // The panel boots out of sight, so it shows no loading screen of its own.
+                <Suspense fallback={<PageLoading quiet />}>
+                  <FloatingComposerPage />
+                </Suspense>
+              ) : (
+                <NotFoundPage />
+              )}
             </FeatureGatedPage>
           }
         />

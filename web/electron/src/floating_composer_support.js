@@ -37,6 +37,11 @@ function createFloatingComposerSupport() {
     any() {
       return documents.size > 0;
     },
+    /** Whether any document can render the panel for `serverUrl` now. */
+    serves(serverUrl) {
+      for (const announced of documents.values()) if (announced === serverUrl) return true;
+      return false;
+    },
   };
 }
 

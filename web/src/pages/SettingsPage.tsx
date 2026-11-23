@@ -395,6 +395,7 @@ import {
   resetCliPath,
   supportsBrowser,
   supportsGlobalShortcut,
+  supportsWidenWindowForRightSidebar,
   type UpdateConfig,
   type UpdateMode,
   updateBridge,
@@ -410,6 +411,7 @@ import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
 import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSection";
 import { PickerVisibilitySetting } from "./settings/PickerVisibilitySetting";
 import { GlobalShortcutControl } from "./settings/GlobalShortcutControl";
+import { WidenWindowForRightSidebarControl } from "./settings/WidenWindowForRightSidebarControl";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -2175,6 +2177,8 @@ function ProactiveAgentGroup() {
 function GeneralSection() {
   const info = useServerInfo();
   const titleInstructions = info !== "loading" && info.session_title_instructions === true;
+  const globalShortcut = supportsGlobalShortcut();
+  const widenWindowForRightSidebar = supportsWidenWindowForRightSidebar();
   return (
     <Section title="General" description="Configure general Omnigent behavior.">
       <div className="flex flex-col gap-6">
@@ -2210,13 +2214,18 @@ function GeneralSection() {
           </SettingsGroup>
         )}
         <BrowserAgentToolsSettingsGroup />
-        {supportsGlobalShortcut() && (
+        {(globalShortcut || widenWindowForRightSidebar) && (
           <SettingsGroup title="Desktop app" testId="settings-group-desktop-app">
-            <GlobalShortcutControl />
-            {isFeatureEnabled(info, "floating_composer") && (
+            {globalShortcut && <GlobalShortcutControl />}
+            {globalShortcut && isFeatureEnabled(info, "floating_composer") && (
               // Empty, and hidden, unless the shell can change the panel's shortcut by id.
               <div className="mt-4 border-t border-border pt-4 empty:hidden">
                 <GlobalShortcutControl shortcutId="floatingComposer" />
+              </div>
+            )}
+            {widenWindowForRightSidebar && (
+              <div className={cn(globalShortcut && "mt-4 border-t border-border pt-4")}>
+                <WidenWindowForRightSidebarControl />
               </div>
             )}
           </SettingsGroup>
