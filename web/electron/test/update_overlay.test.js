@@ -40,6 +40,7 @@ class FakeWindow extends EventEmitter {
     this.destroyed = false;
     this.visible = false;
     this.bounds = null;
+    this.boundsLog = [];
     this.ignoreMouse = [];
   }
 
@@ -53,6 +54,7 @@ class FakeWindow extends EventEmitter {
 
   setBounds(bounds) {
     this.bounds = bounds;
+    this.boundsLog.push(bounds);
   }
 
   setIgnoreMouseEvents(ignore, options) {
@@ -238,6 +240,34 @@ describe("update overlay", () => {
       ignore: true,
       options: { forward: true },
     });
+  });
+
+  it("keeps the collapsed overlay at least 1px tall when the parent resizes or moves", () => {
+    const { controller, onHandlers } = makeOverlay();
+    const parent = new FakeWindow();
+    const overlay = controller.ensureOverlay(parent);
+    // The startup update check settles with nothing to show.
+    onHandlers.get("omnigent:overlay-height")({ sender: overlay.webContents }, 0);
+
+    // Maximizing the parent fires resize; Wayland traps on a 0-height geometry.
+    parent.emit("resize");
+    assert.deepEqual(overlay.bounds, {
+      x: 10 + 1000 - OVERLAY_WIDTH - OVERLAY_INSET,
+      y: 20 + 700 - 1 - OVERLAY_INSET,
+      width: OVERLAY_WIDTH,
+      height: 1,
+    });
+    parent.emit("move");
+    assert.equal(overlay.bounds.height, 1);
+    assert.ok(
+      overlay.boundsLog.every((bounds) => bounds.height >= 1),
+      `zero-height overlay bounds: ${JSON.stringify(overlay.boundsLog)}`,
+    );
+
+    // A visible card keeps its reported height through the same events.
+    onHandlers.get("omnigent:overlay-height")({ sender: overlay.webContents }, 180);
+    parent.emit("resize");
+    assert.equal(overlay.bounds.height, 180);
   });
 
   it("opens About before starting a download from Update now", async () => {
