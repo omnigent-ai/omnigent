@@ -171,7 +171,8 @@ the header menu), and each place is a separate entry point.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
   For a native target, the fork dialog also offers model, reasoning effort,
-  and permission mode pickers. A long model list from several creators (Pi)
+  and permission mode pickers. Forking onto a new sandbox lists the sandbox's
+  models as New Chat does. A long model list from several creators (Pi)
   shows creator headings; it has no search or collapsible groups.
   Closing the dialog mid-clone keeps the clone running: a toast reports it
   (with **Open** on success), and reopening the dialog shows it again.
@@ -986,6 +987,11 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/fork_session/test_fork_switch_agent.py::test_fork_switch_agent_carries_history`.
   Its SDK-to-SDK target is a built-in agent that only the test's own server
   loads; run it with plain `uv run pytest` so that target is available.
+- **`fork`, models on a new sandbox:**
+  `tests/e2e_ui/fork_session/test_fork_sandbox_gateway_models.py::test_fork_onto_new_sandbox_lists_its_gateway_models`
+  forks a hostless Claude Code session from a message onto a new sandbox whose
+  gateway lists the models, keeping Claude Code and switching to Codex. The
+  server and its model discovery are real; nothing is provisioned.
 - **`fork`, sidebar row while the session list lags:**
   `tests/e2e_ui/fork_session/test_fork_appears_in_sidebar.py::test_fork_row_while_list_lags_and_push_misses_fork`
   hides the fork from list reads and pushes; the row must appear after Clone and
