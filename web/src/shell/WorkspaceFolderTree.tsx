@@ -40,7 +40,8 @@ export function WorkspaceFolderTree(props: WorkspaceFolderTreeProps) {
       enabled: serveable !== false,
     })),
   });
-  const failed = listings.filter((listing) => listing.isError);
+  // A failed refetch keeps its data, so only a listing never loaded fails the tree.
+  const failed = listings.filter((listing) => listing.isError && listing.data === undefined);
   const showLoading = useDelayedFlag(listings.some((listing) => listing.isPending));
 
   if (serveable === false) {
@@ -153,7 +154,7 @@ function LoadedFolderTree({
     .map((listing, index) => ({ listing, folder: expandedFolders[index] }))
     .filter(({ listing }) => listing.data === undefined);
   const failedLoad = firstLoads.find(({ listing }) => listing.isError);
-  const pendingLoad = firstLoads.find(({ listing }) => listing.isPending && !listing.isError);
+  const pendingLoad = firstLoads.find(({ listing }) => listing.isPending);
 
   // A refresh can fold the revealed folder into a chain row, or unfold it. The
   // tree then moves focus on its own, so follow the row until the reader acts.

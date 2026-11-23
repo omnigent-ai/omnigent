@@ -382,6 +382,29 @@ describe("WorkspaceFolderTree", () => {
       ]),
     );
   });
+
+  it("keeps the shown tree when a refresh of its listing fails", async () => {
+    const queryClient = testQueryClient();
+    cacheStaleListing(queryClient, "src", "", [
+      cachedEntry("shell", "directory"),
+      cachedEntry("app.ts", "file"),
+    ]);
+    cacheStaleListing(queryClient, "src", "shell", [cachedEntry("shell/viewer.ts", "file")]);
+    // Every refetch answers 503.
+    serveListings({});
+
+    renderTree("src", "shell/viewer.ts", queryClient);
+
+    expect(await screen.findByTestId("file-tree")).toBeInTheDocument();
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(
+        queryClient.getQueryState(workspaceDirectoryQuery("conv_1", "", "src").queryKey)?.status,
+      ).toBe("error"),
+    );
+    expect(screen.getByTestId("file-tree")).toBeInTheDocument();
+    expect(screen.queryByText("Couldn’t load this folder.")).toBeNull();
+  });
 });
 
 describe("WorkspaceFolderTree refreshing a single-folder chain", () => {
