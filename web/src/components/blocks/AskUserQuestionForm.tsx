@@ -540,11 +540,12 @@ export function AskUserQuestionForm({
                   id={customRowId}
                   name={current.multiSelect ? undefined : currentKey}
                   checked={customRowChecked}
-                  onChange={() =>
-                    current.multiSelect
-                      ? handleCustomToggleMulti(currentKey)
-                      : handleCustomToggleSingle(currentKey)
-                  }
+                  onChange={() => {
+                    if (current.multiSelect) handleCustomToggleMulti(currentKey);
+                    else handleCustomToggleSingle(currentKey);
+                    // Choosing the custom row means its answer is typed next.
+                    if (!customRowChecked) customInputRef.current?.focus();
+                  }}
                   aria-label="Select custom answer"
                   className="mt-1 mobile-app:mt-0"
                   data-testid="ask-user-question-custom-toggle"

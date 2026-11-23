@@ -2808,17 +2808,19 @@ describe("question custom selection and editing", () => {
       expect(toggle).not.toBeChecked();
       await user.click(selectionLabel);
       expect(toggle).toBeChecked();
-      expect(editor).not.toHaveFocus();
+      expect(editor).toHaveFocus();
       if (multiSelect) {
         await user.click(selectionLabel);
         expect(toggle).not.toBeChecked();
+        expect(editor).not.toHaveFocus();
         await user.click(selectionLabel);
         expect(toggle).toBeChecked();
       }
+      await user.keyboard("Custom text");
+      expect(editor).toHaveValue("Custom text");
       await user.click(editor);
       expect(editor).toHaveFocus();
       expect(toggle).toBeChecked();
-      await user.type(editor, "Custom text");
       expect(submit).not.toHaveBeenCalled();
       await user.click(screen.getByRole("button", { name: "Next" }));
       expect(screen.getByLabelText("Done")).toBeChecked();
