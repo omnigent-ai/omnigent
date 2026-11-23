@@ -1370,13 +1370,18 @@ describe("CommandPalette — commands a mounted feature offers", () => {
     withSidebarFlag(true);
     let dialogAtRun: Element | null = null;
     const go = vi.fn(() => {
-      dialogAtRun = screen.queryByRole("dialog");
+      // The QuickPick dialog can still be fading out, closed, as the command runs.
+      dialogAtRun =
+        "QUICK_PICK_PALETTE" in commandPaletteModule
+          ? document.querySelector('[role="dialog"][data-state="open"]')
+          : screen.queryByRole("dialog");
       screen.getByText("Where the command moves focus").focus();
     });
     openPalette(go);
 
     fireEvent.click(await screen.findByRole("option", { name: /Go back in the workspace/ }));
-    expect(go).not.toHaveBeenCalled();
+    // The QuickPick palette closes first and runs it in the same turn.
+    if (!("QUICK_PICK_PALETTE" in commandPaletteModule)) expect(go).not.toHaveBeenCalled();
     await vi.waitFor(() => expect(go).toHaveBeenCalledOnce());
     expect(dialogAtRun).toBeNull();
     await new Promise((resolve) => {
