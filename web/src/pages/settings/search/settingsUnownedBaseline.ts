@@ -4,11 +4,6 @@
  * may find no more than the baseline allows.
  */
 export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: string }>> = {
-  "src/components/McpRegistry.tsx › ServiceConnection › Button": {
-    count: 2,
-    reason:
-      "Services row's connect button; its action depends on the connection, which the guard can't read as one row action.",
-  },
   "src/components/ModelValueCombobox.tsx › ModelValueCombobox › button": {
     count: 1,
     reason: 'Model field\'s combobox; its accessible name includes "*".',
