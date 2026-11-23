@@ -91,6 +91,26 @@ workflow shares. Moving the documents to SQL would be worth it if gadgets needed
 across gadgets or users (search over records, reporting), or transactions across records;
 both are out of scope below.
 
+Alternatives considered:
+
+- **Fixed metadata and index tables, with record values in the `ArtifactStore`.** A table of
+  `(gadget, collection, record, revision)` rows plus artifact blobs splits each write across
+  two systems: the create-only revision slot that makes `if_version` and `operation_id` safe
+  would become a SQL insert, the value an artifact write, and a failure between them leaves a
+  row without its value or an orphan blob, which the file store never does. It also puts
+  every record write of every gadget on the shared database, for data no server query reads.
+- **Revisions' HTML in the `ArtifactStore`.** Artifacts are keyed blobs without create-only
+  writes, ordering or a link between versions; a revision would still need a document naming
+  it, its capabilities and its digest, which is exactly the revision file. The HTML is part of
+  that one immutable file (at most 1 MiB), so publishing never points at a missing blob.
+- **Session-style tables per gadget concept** (revisions, records, comments, actions, shelf).
+  The record values remain app-defined JSON, so the tables would hold opaque JSON columns
+  with the same bounds, while adding migrations and cross-dialect work for each concept.
+
+This is a new persistence path beside the relational stores, so it asks for a maintainer
+design review before it is relied on; the `GadgetStore` interface keeps the choice
+replaceable either way.
+
 ## Permissions
 
 | Grant | read | write_data | publish | manage |
