@@ -1,10 +1,11 @@
-"""E2E: the session's main view as panes, behind ``workspace_sidebar_v2``.
+"""E2E: the panes view behind ``workspace_sidebar_v2``.
 
 With the flag on, a desktop owner's Terminal view is the panes view: the agent's terminal is
 one pane, ⌘D splits it with a shell, the pane keys move between panes, ⌘K lists the pane
 commands, and a pane's title strip has a menu that closes it. With a split shown, Chat keeps
-the panes on screen and the web chat is the agent's pane. With the flag off, the same session
-keeps the classic Terminal view.
+the panes on screen and the web chat is the agent's pane. A shell tab in the workspace sidebar
+splits the same way, and its split shows as one strip entry that closes whole. With the flag
+off, the same session keeps the classic Terminal view.
 
 The session is terminal-first (``omnigent.ui = terminal``), so the runner starts the agent's
 own terminal, and its agent declares a ``zsh`` shell, running ``bash``, for splits. The flag is
@@ -24,7 +25,7 @@ import pytest
 from playwright.sync_api import Locator, Page, Route, expect
 
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
-from tests.e2e_ui.conftest import _ensure_runner_online, _server_state
+from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, open_right_rail
 
 _AGENT_NAME = "panes_demo"
 _SHELL_OS_ENV = """
@@ -200,6 +201,44 @@ def test_chat_keeps_a_split_on_screen_and_splits_from_its_composer(
     expect(panes.get_by_role("toolbar", name=re.compile(r"^zsh · .* pane$"))).to_have_count(
         2, timeout=60_000
     )
+
+
+def test_a_tabs_sidebar_shell_splits_keeps_both_shells_through_a_reload_and_closes_whole(
+    page: Page, panes_session: tuple[str, str]
+) -> None:
+    """A sidebar shell tab splits with ⌘D, keeps both shells over a reload, and closes as one."""
+    base_url, session_id = panes_session
+    _open(page, base_url, session_id)
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    sidebar.get_by_role("button", name="New tab", exact=True).click()
+    expect(sidebar.get_by_role("combobox", name="Open an app in this tab")).to_be_focused(
+        timeout=10_000
+    )
+    sidebar.get_by_role("option", name=re.compile(r"^Terminal", re.IGNORECASE)).click()
+    first = _connected(sidebar.get_by_test_id("terminal-view").last)
+
+    second = _split_from(page, sidebar, first)
+    page.keyboard.type("echo second")
+    page.keyboard.press("Enter")
+    # The split shows as one strip entry, named for its focused shell.
+    entry = sidebar.get_by_role("tab", name=re.compile(r"^zsh · .* \+1"))
+    expect(entry).to_have_count(1, timeout=30_000)
+    expect(second).to_be_focused()
+
+    page.reload()
+    open_right_rail(page)
+    expect(sidebar.get_by_test_id("terminal-view")).to_have_count(2, timeout=60_000)
+    for index in range(2):
+        expect(sidebar.get_by_test_id("terminal-view").nth(index)).to_have_attribute(
+            "data-state", "connected", timeout=60_000
+        )
+
+    sidebar.get_by_role("button", name=re.compile(r"^Close zsh · .* \+1$")).click()
+    page.get_by_role("button", name="Close shells").click()
+    expect(sidebar.get_by_test_id("terminal-view")).to_have_count(0, timeout=30_000)
+    expect(sidebar.get_by_role("tab", name=re.compile(r"^zsh · "))).to_have_count(0)
 
 
 def test_flag_off_keeps_the_classic_terminal_view(
