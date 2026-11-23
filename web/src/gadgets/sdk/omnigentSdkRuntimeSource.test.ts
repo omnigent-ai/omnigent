@@ -704,13 +704,11 @@ describe("omnigent SDK runtime", () => {
       ],
       [
         "watch(actionId, listener)",
-        (c: OmnigentClient, l: (snapshot: WatchedAction) => void) =>
-          c.agent.watch("a1", l),
+        (c: OmnigentClient, l: (snapshot: WatchedAction) => void) => c.agent.watch("a1", l),
       ],
       [
         "watch(listener, actionId)",
-        (c: OmnigentClient, l: (snapshot: WatchedAction) => void) =>
-          c.agent.watch(l, "a1"),
+        (c: OmnigentClient, l: (snapshot: WatchedAction) => void) => c.agent.watch(l, "a1"),
       ],
       [
         "watch(receipt, listener)",

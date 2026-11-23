@@ -152,7 +152,11 @@ describe("a gadget beside a session", () => {
     await waitFor(() => expect(frameProps?.onAddComment).toBeDefined());
     const select = (text: string) =>
       act(() =>
-        frameProps?.onAddComment?.({ text, occurrence: 1, rect: { x: 0, y: 0, width: 1, height: 1 } }),
+        frameProps?.onAddComment?.({
+          text,
+          occurrence: 1,
+          rect: { x: 0, y: 0, width: 1, height: 1 },
+        }),
       );
     select("Ship it");
     fireEvent.change(screen.getByPlaceholderText("Add a comment…"), {

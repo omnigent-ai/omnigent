@@ -309,7 +309,9 @@ class GadgetStore(ABC):
             Deleting gadgets already returned does not move the cursor.
         """
 
-    def iter_owned(self, owner_id: str, *, owner_generation: str | None = None) -> Iterator[Gadget]:
+    def iter_owned(
+        self, owner_id: str, *, owner_generation: str | None = None
+    ) -> Iterator[Gadget]:
         """Every gadget *owner_id* owns, read one page at a time as the caller goes.
 
         For work that visits them all, such as deleting an account, without holding the
@@ -318,7 +320,10 @@ class GadgetStore(ABC):
         cursor: str | None = None
         while True:
             page, cursor = self.list_owned_page(
-                owner_id, limit=MAX_OWNED_PAGE_SIZE, after=cursor, owner_generation=owner_generation
+                owner_id,
+                limit=MAX_OWNED_PAGE_SIZE,
+                after=cursor,
+                owner_generation=owner_generation,
             )
             yield from page
             if cursor is None:

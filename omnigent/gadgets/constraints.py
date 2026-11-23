@@ -521,7 +521,9 @@ class ConstraintGuard:
             for name in names:
                 after = name
                 record = (
-                    self.data.get(rule["collection"], name) if _IDENTIFIER.fullmatch(name) else None
+                    self.data.get(rule["collection"], name)
+                    if _IDENTIFIER.fullmatch(name)
+                    else None
                 )
                 if record is not None and record.value.get(rule["field"]) == target_id:
                     found.append(record)
@@ -648,8 +650,11 @@ class ConstraintGuard:
                 "unique": {name: dict(keys) for name, keys in progress["unique"].items()},
             }
             if progress["todo"]:
-                collection = progress["todo"][0]
-                page = self.data.list(collection, REBUILD_PAGE, progress["cursor"])
+                collection = str(progress["todo"][0])
+                cursor = progress["cursor"]
+                page = self.data.list(
+                    collection, REBUILD_PAGE, cursor if isinstance(cursor, str) else None
+                )
                 for record in page.items:
                     self._rebuild_record(progress, collection, record)
                 if page.next_cursor is not None:

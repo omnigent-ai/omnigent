@@ -105,7 +105,12 @@ function claimGadgetStart(gadgetId: string): void {
   unbuilt.delete(gadgetId);
 }
 
-function adopt(gadgetId: string, sessionId: string, firstMessage: string | null, fullScreen: boolean) {
+function adopt(
+  gadgetId: string,
+  sessionId: string,
+  firstMessage: string | null,
+  fullScreen: boolean,
+) {
   const pair = `${gadgetId}\n${sessionId}`;
   if (adopted.has(pair)) return;
   adopted.add(pair);
@@ -186,7 +191,12 @@ export function useAdoptStartedGadgetSession(): void {
     const claim = submitted.get(gadgetId);
     const after = claim?.after ?? (starting?.gadgetId === gadgetId ? starting.after : null);
     if (creation !== undefined && after !== null && creation.seq > after) {
-      adopt(gadgetId, sessionId, creation.firstMessage, claim?.fullScreen ?? fullScreenStarts.has(gadgetId));
+      adopt(
+        gadgetId,
+        sessionId,
+        creation.firstMessage,
+        claim?.fullScreen ?? fullScreenStarts.has(gadgetId),
+      );
       return;
     }
     // An existing session the viewer opened instead never got the gadget's requests. A sent

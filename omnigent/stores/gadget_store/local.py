@@ -413,7 +413,9 @@ class LocalGadgetStore(GadgetStore):
                 return  # A gadget was added to it meanwhile.
             if number == first:
                 following = first + 1
-                while following < last and not (owner_dir / self._segment_name(following)).exists():
+                while (
+                    following < last and not (owner_dir / self._segment_name(following)).exists()
+                ):
                     following += 1
                 self._write_head(owner_dir, following, last)
 

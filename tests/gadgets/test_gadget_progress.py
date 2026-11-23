@@ -221,7 +221,9 @@ def test_an_action_stays_running_while_not_every_session_could_be_read(
     service.set_gadget_session(app["id"], {"session_id": "s_gadget"})
     action_id = request_and_deliver(service, app, "c1")
     # An older worker the action started, then newer, idle children that fill the listing.
-    conversations.add("s_worker", parent="s_gadget", created=NOW + 1, status="running", updated=NOW + 5)
+    conversations.add(
+        "s_worker", parent="s_gadget", created=NOW + 1, status="running", updated=NOW + 5
+    )
     for n in range(3):
         conversations.add(f"s_new{n}", parent="s_gadget", created=NOW + 10 + n, updated=NOW + 12)
     conversations.set("s_gadget", updated=NOW + 20)

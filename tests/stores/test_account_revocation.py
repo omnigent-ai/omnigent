@@ -1679,7 +1679,7 @@ def test_a_cleanup_that_resumes_after_reregistration_leaves_the_new_accounts_gad
     db_uri: str, tmp_path, monkeypatch
 ) -> None:
     accounts = SqlAlchemyAccountStore(db_uri)
-    store, access, service = _gadgets(db_uri, tmp_path, accounts)
+    store, _access, service = _gadgets(db_uri, tmp_path, accounts)
     accounts.create_user_with_password("alice", "alice-hash")
     old_alice = service("alice")
     board = old_alice.create("Synthetic board")

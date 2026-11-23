@@ -673,10 +673,10 @@ export async function linkGadgetToSession(
   // Showing a gadget beside a session also sends it the gadget's actions, unless the session
   // is only one the gadget points to.
   const body = handlesActions ? { linked } : { linked, handles_actions: false };
-  const answer = await gadgetRequest(
-    appPath(appId, `/sessions/${encodeURIComponent(sessionId)}`),
-    { method: "PUT", body: JSON.stringify(body) },
-  );
+  const answer = await gadgetRequest(appPath(appId, `/sessions/${encodeURIComponent(sessionId)}`), {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
   // The answer is the first page of the session's gadgets; read the rest when there is more.
   if (isRecord(answer) && typeof answer.next_cursor === "string") {
     return getSessionGadgets(sessionId);

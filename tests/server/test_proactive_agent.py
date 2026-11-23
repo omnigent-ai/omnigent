@@ -39,13 +39,13 @@ from omnigent.server.seeded_agents import SEEDED_AGENTS_ENV
 from omnigent.spec import load
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
-from omnigent.tools.builtins.gadgets import GADGET_TOOL_NAMES
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+from omnigent.tools.builtins.gadgets import GADGET_TOOL_NAMES
 from tests.server.helpers import FakeSandboxLauncher
 
 _BUNDLE = Path(proactive_agent.__file__).parent.parent / "resources" / "proactive" / "bundle"

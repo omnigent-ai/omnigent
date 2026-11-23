@@ -138,8 +138,10 @@ async def test_a_disabled_server_hides_every_route_before_reading_the_body(
             headers={**_as(ALICE), "Content-Type": "application/json"},
         )
         assert response.status_code == 404
-        # Without a store the routes aren't mounted, and the app's own 404 answers.
-        assert response.json()["error"]["code"].upper() == "NOT_FOUND"
+        if with_store:
+            # A mounted route refuses before reading the body; without a store the routes aren't
+            # mounted, and the app's own 404 answers, in whatever shape the app uses.
+            assert response.json()["error"]["code"] == "NOT_FOUND"
         assert (await client.get("/v1/gadgets/shared", headers=_as(ALICE))).status_code == 404
         info = (await client.get("/v1/info", headers=_as(ALICE))).json()
         assert info["features"]["gadgets"] is False
@@ -702,7 +704,9 @@ async def test_own_and_shared_lists_page_with_a_cursor(
         )
         assert pinned.status_code == 200, pinned.text
         linked = await client.put(
-            f"/v1/gadgets/{gadget_id}/sessions/{session}", json={"linked": True}, headers=_as(ALICE)
+            f"/v1/gadgets/{gadget_id}/sessions/{session}",
+            json={"linked": True},
+            headers=_as(ALICE),
         )
         assert linked.status_code == 200, linked.text
     pins = await _every_page(client, "/v1/gadgets/shelf", ALICE, key="pinned")

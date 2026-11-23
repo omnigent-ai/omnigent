@@ -310,7 +310,8 @@ def derive_ledger_progress(
                 (
                     later[0]
                     for later in delivered[index + 1 :]
-                    if later[2].get("state") in _STARTED or isinstance(later[2].get("session_id"), str)
+                    if later[2].get("state") in _STARTED
+                    or isinstance(later[2].get("session_id"), str)
                 ),
                 None,
             )

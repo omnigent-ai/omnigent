@@ -267,7 +267,9 @@ describe("data story template", () => {
 
     field.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
     await waitFor(() => expect(requests).toHaveLength(2));
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
     expect(field.value).toBe("Weekly active users by plan");
   });
 

@@ -87,14 +87,13 @@ consistently can forge history.
 from __future__ import annotations
 
 import base64
-import bisect
 import copy
 import hashlib
 import json
 import math
 import posixpath
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final
@@ -519,7 +518,9 @@ class ImmutableDocumentStore:
                 more = False
         return DocumentPage(
             items=tuple(items),
-            next_cursor=self._encode_cursor(collection, last) if more and last is not None else None,
+            next_cursor=self._encode_cursor(collection, last)
+            if more and last is not None
+            else None,
         )
 
     def _record_name(self, collection: str, name: str) -> str:
@@ -1070,7 +1071,7 @@ class ImmutableDocumentStore:
                 raise
             self._claim_capacity(collection, doc_id)
 
-    def _probe_slots(self, collection: str, doc_id: str) -> list[str]:
+    def _probe_slots(self, collection: str, doc_id: str) -> Sequence[str]:
         """The capacity slots *doc_id* may claim: a short run from its hash, in order."""
         capacity = self._limits.max_records_per_collection
         directory = f"{self._root}/.capacity/{collection}"
@@ -1154,7 +1155,9 @@ class ImmutableDocumentStore:
         if not self._files.supports_delete:
             return False
         directory = f"{self._root}/{collection}"
-        start = _ID_ALPHABET[int(hashlib.sha256(doc_id.encode()).hexdigest(), 16) % len(_ID_ALPHABET)]
+        start = _ID_ALPHABET[
+            int(hashlib.sha256(doc_id.encode()).hexdigest(), 16) % len(_ID_ALPHABET)
+        ]
         budget = self._limits.max_scan_per_list
         candidates: list[str] = []
         for after in (start, None):

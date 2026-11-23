@@ -355,7 +355,9 @@ WIDE = StoreLimits(
 )
 
 
-def _counting(tmp_path: Path, limits: StoreLimits = WIDE) -> tuple[CountingFiles, ImmutableDocumentStore, Clock]:
+def _counting(
+    tmp_path: Path, limits: StoreLimits = WIDE
+) -> tuple[CountingFiles, ImmutableDocumentStore, Clock]:
     store = LocalGadgetStore(str(tmp_path / "gadgets"))
     files = CountingFiles(store.gadget_files(store.create(ACTOR, "Board").id))
     clock = Clock()
