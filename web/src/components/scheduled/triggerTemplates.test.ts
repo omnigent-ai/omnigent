@@ -814,8 +814,11 @@ describe("Slack thread replies", () => {
       ...overrides,
     });
   /** The numbered step of `prompt` that starts with `start`, e.g. 6 for "6. Then send". */
-  const stepNumber = (prompt: string, start: string) =>
-    Number(new RegExp(`\\n(\\d+)\\. ${start}`).exec(prompt)?.[1]);
+  const stepNumber = (prompt: string, start: string) => {
+    const match = new RegExp(`\\n(\\d+)\\. ${start}`).exec(prompt);
+    if (match === null) throw new Error(`No step starts with: ${start}`);
+    return Number(match[1]);
+  };
 
   it("sends new replies in a channel trigger's threads to the session the thread's message went to", () => {
     const prompt = renderTriggerPrompt("slack", channel(), CTX);
@@ -836,12 +839,16 @@ describe("Slack thread replies", () => {
     expect(threads).toBe(create + 1);
     expect(stepNumber(prompt, "Reply with the title and session ID")).toBe(threads + 1);
 
+    // Thread state comes from the same reply as the check time, so a reply without it can't
+    // drop the followed threads.
     expect(prompt).toContain(
-      `Your most recent reply's "Slack threads:" line, when there is one, lists those threads as one-line JSON: each key is "<channel ID> <thread ts>"`,
+      `The reply you read your check time from, when it has a "Slack threads:" line, lists those threads as one-line JSON: each key is "<channel ID> <thread ts>"`,
     );
     expect(prompt).toContain(
       "Add the thread of each message this run started a session for with its task delivered, with session set to that session's conversation_id and through set to the message's own ts",
     );
+    // Re-adding a followed thread mustn't rewind it and send its replies again.
+    expect(prompt).toContain("a thread you already follow keeps its through.");
     expect(prompt).toContain(
       `Drop a thread whose through is more than ${FOLLOWED_SLACK_THREAD_HOURS} hours before the time you noted, then keep at most the ${MAX_FOLLOWED_SLACK_THREADS} with the newest through.`,
     );
@@ -856,10 +863,7 @@ describe("Slack thread replies", () => {
     // Slack sets bot_id on what a person posts through an app (such as a Slack MCP), so a
     // bot_id alone mustn't drop a person's follow-up.
     expect(prompt).toContain(
-      "a reply with a bot_id is a bot's only when its user is a bot: check each such user once with users.info",
-    );
-    expect(prompt).toContain(
-      "bot_user_ids and person_user_ids (the users of replies with a bot_id that you checked with users.info)",
+      "a reply with a bot_id is a bot's only when its user is a bot: check each such user with users.info",
     );
     expect(prompt).toContain(
       "The conditions above apply only to the message that starts a thread, so every other reply counts.",
@@ -879,20 +883,24 @@ describe("Slack thread replies", () => {
       "to name the message that started the thread, not a reply, wherever a Slack tool asks which message to reply to",
     );
     expect(prompt).toContain("between <slack-replies> and </slack-replies> lines");
-    // Dedupe: an accepted or uncertain send moves the thread past those replies for good.
+    // Dedupe: an accepted or uncertain send, or a thread whose new replies were all left out,
+    // moves the thread past those replies for good.
     expect(prompt).toContain(
-      "Once a send is accepted, set the thread's through to its newest reply's ts.",
+      "Once a send is accepted, or when you left out every new reply in a thread, set the thread's through to the ts of the newest reply you read in it, so no reply is read twice.",
     );
     expect(prompt).toContain(
-      'list it on a "Delivery pending:" line as "<title> <conversation_id>", set the thread\'s through to its newest reply\'s ts so those replies are never sent again',
+      "If a send times out or its result is unclear, don't retry it: set the thread's through as for an accepted send, so those replies are never sent twice, say in your reply that they may not have reached that session",
     );
+    // Pending entries name top-level messages; a thread send there would be read back as one.
+    const threadStep = prompt.split("\n").find((line) => line.includes("Then send new replies"));
+    expect(threadStep).not.toContain("Delivery pending:");
     expect(prompt).toContain("stop following that thread and say so in your reply");
     expect(prompt).toContain(
       "Stopping means starting no more sessions in this run; still send new thread replies and write your reply.",
     );
     expect(prompt).toContain("Do this step even if you stopped starting sessions above");
     expect(prompt).toContain(
-      'above "Checked through:" write a "Slack threads:" line followed by one-line JSON of the threads you follow after this run\'s changes, or {} when you follow none.',
+      'above "Checked through:" write a "Slack threads:" line followed by one-line JSON of the threads you follow after this run\'s changes, carried over unchanged when you skipped that step, or {} when you follow none.',
     );
   });
 
