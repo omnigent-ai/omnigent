@@ -24,7 +24,6 @@ const moduleLoader = require("node:module");
 const path = require("node:path");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
-const { FLOATING_COMPOSER_LAUNCH_TAKE_MS } = require("../src/floating_composer_window");
 
 const { createRequire } = moduleLoader;
 const electronStub = {
@@ -4120,156 +4119,6 @@ describe("floating panel wiring", () => {
     ...(await h.ipc.get("omnigent:floating-composer:open-in-main-window")(fromPanel(h), routePath)),
   });
 
-  /** The main window's top document says it sends the panel's first messages, or stops. */
-  const listenForLaunches = (h, main, listening = true) => {
-    const frame = { url: main.url };
-    main.webContents.mainFrame = frame;
-    h.ipc.get("omnigent:floating-composer:launch-listener")(
-      { sender: main.webContents, senderFrame: frame },
-      listening,
-    );
-  };
-  const firstMessage = {
-    text: "Fix the build",
-    skill: null,
-    files: [
-      { name: "notes.txt", type: "text/plain", lastModified: 1, data: new Uint8Array([120]) },
-    ],
-  };
-  const launchFromPanel = async (h, message = firstMessage) => ({
-    ...(await h.ipc.get("omnigent:floating-composer:open-in-main-window")(
-      fromPanel(h),
-      "/c/abc",
-      message,
-    )),
-  });
-
-  /** A main window's document asks to take launch `id`, from its top frame or a subframe. */
-  const take = (h, main, id, { subframe = false } = {}) => {
-    const frame = { url: main.url };
-    main.webContents.mainFrame = subframe ? { url: "top" } : frame;
-    return h.ipc.get("omnigent:floating-composer:take-launch")(
-      { sender: main.webContents, senderFrame: frame },
-      id,
-    );
-  };
-
-  it("hands a launched session to a main window, and its first message once that page takes it", async (t) => {
-    const h = loadNavigationHarness({ platform: "darwin" });
-    t.after(h.cleanup);
-    h.api.registerIpc();
-    const panel = openPanel(h);
-    const main = addMain(h);
-    listenForLaunches(h, main);
-    const result = launchFromPanel(h);
-    assert.equal(main.sent.length, 1);
-    const [channel, launch] = main.sent[0];
-    assert.equal(channel, "omnigent:floating-composer:launch");
-    assert.equal(launch.path, "/c/abc");
-    assert.equal(launch.firstMessage, undefined, "the message goes only to the page that takes it");
-    assert.equal(panel.visible, true, "the panel waits for the page");
-
-    const taken = await take(h, main, launch.id);
-    assert.equal(taken.text, "Fix the build");
-    assert.equal(taken.files[0].name, "notes.txt");
-    assert.equal(taken.files[0].data[0], 120);
-    assert.equal(await take(h, main, launch.id), null, "a message is taken once");
-    assert.deepEqual(await result, { ok: true, handedOff: true });
-    assert.equal(main.sent.length, 1, "the page opens the session itself");
-    assert.equal(main.focused, 1);
-    assert.equal(panel.visible, false);
-  });
-
-  it("opens the session without its first message when the page doesn't take it in time", async (t) => {
-    t.mock.timers.enable({ apis: ["setTimeout"] });
-    const h = loadNavigationHarness({ platform: "darwin" });
-    t.after(h.cleanup);
-    h.api.registerIpc();
-    const panel = openPanel(h);
-    const main = addMain(h);
-    listenForLaunches(h, main);
-    const result = launchFromPanel(h);
-    const [, launch] = main.sent[0];
-    t.mock.timers.tick(FLOATING_COMPOSER_LAUNCH_TAKE_MS - 1);
-    assert.equal(panel.visible, true);
-    t.mock.timers.tick(1);
-    // The panel sends the message, so a late take gets nothing and it's sent once.
-    assert.deepEqual(await result, { ok: true });
-    assert.deepEqual(main.sent.at(-1), ["omnigent:open-path", "/c/abc"]);
-    assert.equal(await take(h, main, launch.id), null);
-    assert.equal(panel.visible, false);
-  });
-
-  for (const [who, takeAs] of [
-    ["another window", (h, main, other, id) => take(h, other, id)],
-    ["a subframe of that window", (h, main, _other, id) => take(h, main, id, { subframe: true })],
-  ]) {
-    it(`keeps a launch's first message from ${who}`, async (t) => {
-      t.mock.timers.enable({ apis: ["setTimeout"] });
-      const h = loadNavigationHarness({ platform: "darwin" });
-      t.after(h.cleanup);
-      h.api.registerIpc();
-      openPanel(h);
-      const main = addMain(h);
-      const other = addMain(h);
-      listenForLaunches(h, main);
-      listenForLaunches(h, other);
-      const result = launchFromPanel(h);
-      const [, launch] = main.sent[0];
-      assert.equal(await takeAs(h, main, other, launch.id), null);
-      assert.deepEqual(other.sent, []);
-      t.mock.timers.tick(FLOATING_COMPOSER_LAUNCH_TAKE_MS);
-      assert.deepEqual(await result, { ok: true });
-    });
-  }
-
-  for (const [what, arrange, message] of [
-    ["never said it sends them", () => {}, firstMessage],
-    [
-      "said so from a subframe",
-      (h, main) => {
-        main.webContents.mainFrame = { url: "top" };
-        h.ipc.get("omnigent:floating-composer:launch-listener")(
-          { sender: main.webContents, senderFrame: { url: main.url } },
-          true,
-        );
-      },
-      firstMessage,
-    ],
-    [
-      "stopped listening",
-      (h, main) => {
-        listenForLaunches(h, main);
-        listenForLaunches(h, main, false);
-      },
-      firstMessage,
-    ],
-    [
-      "has a new document since",
-      (h, main) => {
-        listenForLaunches(h, main);
-        main.webContents.emit("did-navigate");
-      },
-      firstMessage,
-    ],
-    [
-      "would get a message not shaped like one",
-      (h, main) => listenForLaunches(h, main),
-      { text: "Fix the build", skill: null, files: [{ name: "notes.txt" }] },
-    ],
-  ]) {
-    it(`leaves the first message to the panel when the main window ${what}`, async (t) => {
-      const h = loadNavigationHarness({ platform: "darwin" });
-      t.after(h.cleanup);
-      h.api.registerIpc();
-      openPanel(h);
-      const main = addMain(h);
-      arrange(h, main);
-      assert.deepEqual(await launchFromPanel(h, message), { ok: true });
-      assert.deepEqual(main.sent, [["omnigent:open-path", "/c/abc"]]);
-    });
-  }
-
   for (const routePath of ["/c/abc", "/settings/import"]) {
     it(`opens ${routePath} in its server's main window, then hides the panel`, async (t) => {
       t.mock.timers.enable({ apis: ["setTimeout"] });
@@ -4326,13 +4175,9 @@ describe("floating panel wiring", () => {
       t.after(h.cleanup);
       h.api.registerIpc();
       openPanel(h);
-      const main = addMain(h);
-      // It said it sends first messages, then left its server's app without a new document.
-      listenForLaunches(h, main);
-      main.url = url;
+      const main = addMain(h, { url });
       const built = h.calls.windowOptions.length;
-      // A new window can't take the first message, so the panel keeps sending it.
-      assert.deepEqual(await launchFromPanel(h), { ok: true });
+      assert.deepEqual(await openFromPanel(h, "/c/abc"), { ok: true });
       assert.deepEqual(main.sent, []);
       assert.equal(h.calls.windowOptions.length, built + 1);
       // The new window is the panel's server, opened at the session.

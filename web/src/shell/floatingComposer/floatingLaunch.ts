@@ -1,7 +1,6 @@
 // How the floating New Agent panel hands off a session it created: open it in a main window,
-// which sends the first message as its own New Chat would. Without such a window, the panel
-// sends it, unless the create already carried it.
-import { floatingComposerBridge, type FloatingComposerFirstMessage } from "@/lib/nativeBridge";
+// then send the first message unless the create already carried it.
+import { floatingComposerBridge } from "@/lib/nativeBridge";
 import { randomUUID } from "@/lib/randomUUID";
 import { ApiError, fetchSessionItemsPage, postEvent } from "@/lib/sessionsApi";
 import { sendVerdictFromServer } from "@/lib/userInputDelivery";
@@ -24,45 +23,19 @@ export const OPEN_FAILED_ERROR =
   "Your agent started, but Omnigent couldn't show it. Find it in the sidebar.";
 
 /**
- * Open the launched session in a main window, which sends its first message, or deliver it
- * here when that window can't. Never rejects: the session already exists, so every failure
- * becomes the panel's error.
+ * Open the launched session in a main window, then deliver its first message. Never rejects:
+ * the session already exists, so every failure becomes the panel's error.
  */
 export async function launchFromPanel(request: FloatingLaunchRequest): Promise<LaunchOutcome> {
-  const firstMessage = request.inputAccepted
-    ? undefined
-    : await firstMessageFor(request).catch(() => undefined);
   const opened = await Promise.resolve()
-    .then(() => floatingComposerBridge()?.openInMainWindow(`/c/${request.sessionId}`, firstMessage))
+    .then(() => floatingComposerBridge()?.openInMainWindow(`/c/${request.sessionId}`))
     .catch(() => null);
-  // That window now sends it, and shows any failure in its chat as its own New Chat would.
-  if (opened?.ok && opened.handedOff === true) return { error: null, freshComposer: true };
   const delivery: Delivery = request.inputAccepted
     ? "delivered"
     : await deliverFirstMessage(request).catch(() => "unknown" as const);
   if (delivery === "failed") return { error: SEND_FAILED_ERROR, freshComposer: false };
   if (delivery === "unknown") return { error: SEND_UNKNOWN_ERROR, freshComposer: false };
   return { error: opened?.ok ? null : OPEN_FAILED_ERROR, freshComposer: true };
-}
-
-/** The first message with its files read, so it can cross to a main window. */
-async function firstMessageFor({
-  text,
-  skill,
-  files = [],
-}: FloatingLaunchRequest): Promise<FloatingComposerFirstMessage> {
-  return {
-    text,
-    skill,
-    files: await Promise.all(
-      files.map(async (file) => ({
-        name: file.name,
-        type: file.type,
-        lastModified: file.lastModified,
-        data: await file.arrayBuffer(),
-      })),
-    ),
-  };
 }
 
 async function deliverFirstMessage({

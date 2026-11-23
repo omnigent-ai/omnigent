@@ -306,36 +306,11 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     },
     /**
      * From the panel: open `/c/<id>` or a page it links to in a main window of its server,
-     * then hide. A launched session's `firstMessage` goes along. Resolves `{ ok: true }`, with
-     * `handedOff: true` when that window sends the message, or
+     * then hide. Resolves `{ ok: true }` or
      * `{ ok: false, error: "not-composer" | "bad-path" | "window-loading" }`.
      */
-    openInMainWindow: (path, firstMessage) =>
-      ipcRenderer.invoke("omnigent:floating-composer:open-in-main-window", path, firstMessage),
-    /**
-     * In a main window: hear a session the panel launched, with its first message to send.
-     * Returns an unsubscribe function; until then the shell offers launches to this page.
-     */
-    onLaunch: (callback) => {
-      if (typeof callback !== "function") return () => {};
-      const listener = async (_event, launch) => {
-        // The shell's session-path rule, checked before taking so a taken message is never dropped.
-        if (typeof launch?.path !== "string" || !/^\/c\/[A-Za-z0-9_-]{1,128}$/.test(launch.path)) {
-          return;
-        }
-        const firstMessage = await ipcRenderer
-          .invoke("omnigent:floating-composer:take-launch", launch.id)
-          .catch(() => null);
-        // Taken, so it's this page's to send, even if it stopped listening meanwhile.
-        if (firstMessage) callback({ path: launch.path, firstMessage });
-      };
-      ipcRenderer.on("omnigent:floating-composer:launch", listener);
-      ipcRenderer.send("omnigent:floating-composer:launch-listener", true);
-      return () => {
-        ipcRenderer.removeListener("omnigent:floating-composer:launch", listener);
-        ipcRenderer.send("omnigent:floating-composer:launch-listener", false);
-      };
-    },
+    openInMainWindow: (path) =>
+      ipcRenderer.invoke("omnigent:floating-composer:open-in-main-window", path),
     /** From the panel: its native file picker opened or closed. */
     filePicker: (state) =>
       ipcRenderer.send(

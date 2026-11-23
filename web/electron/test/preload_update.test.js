@@ -3,11 +3,10 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const { floatingComposerSessionPath } = require("../src/floating_composer_window");
 
 const PRELOAD = fs.readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
 
-function loadPreload({ platform = "linux", fullScreen = false, answers = {} } = {}) {
+function loadPreload({ platform = "linux", fullScreen = false } = {}) {
   const exposed = new Map();
   const listeners = new Map();
   const windowListeners = new Map();
@@ -20,7 +19,7 @@ function loadPreload({ platform = "linux", fullScreen = false, answers = {} } = 
       invokes.push({ channel, args, ...(rest.some((arg) => arg !== undefined) ? { rest } : {}) });
       if (channel === "omnigent:get-update-status") return updateStatus;
       if (channel === "omnigent:is-full-screen") return fullScreen;
-      return answers[channel] ? answers[channel](args) : null;
+      return null;
     },
     send: (channel, args) => sends.push({ channel, args }),
     on: (channel, listener) => listeners.set(channel, listener),
@@ -320,75 +319,6 @@ describe("global show shortcut bridge", () => {
     assert.equal(heard, 1);
     unsubscribe();
     assert.equal(h.hasListener(channel), false);
-  });
-
-  it("lets a main window take the panel's launches, telling the shell while it listens", async () => {
-    const message = { text: "hi", skill: null, files: [] };
-    let answer = (id) => (id === 0 ? message : null);
-    const h = loadPreload({
-      platform: "darwin",
-      answers: { "omnigent:floating-composer:take-launch": (id) => answer(id) },
-    });
-    const channel = "omnigent:floating-composer:launch";
-    const takes = () =>
-      h.invokes.filter(({ channel: name }) => name === "omnigent:floating-composer:take-launch");
-    assert.equal(typeof h.desktop.floatingComposer.onLaunch("not a function"), "function");
-    assert.equal(h.hasListener(channel), false);
-    const heard = [];
-    const stop = h.desktop.floatingComposer.onLaunch((launch) => heard.push(launch));
-    assert.equal(h.sends.at(-1).channel, "omnigent:floating-composer:launch-listener");
-    assert.equal(h.sends.at(-1).args, true);
-
-    // Taken: the page gets the message. Nothing to take (expired, or another page's): nothing.
-    await h.emit(channel, { id: 0, path: "/c/abc" });
-    await h.emit(channel, { id: 1, path: "/c/def" });
-    assert.equal(heard.length, 1);
-    assert.equal(heard[0].path, "/c/abc");
-    assert.equal(heard[0].firstMessage, message);
-
-    // Only what the shell opens as a session is taken, so a taken message always has a chat.
-    await h.emit(channel, undefined);
-    const routes = [
-      "/c/conv_A-1",
-      `/c/${"a".repeat(128)}`,
-      `/c/${"a".repeat(129)}`,
-      "/c/",
-      "/c/a b",
-      "/c/abc/",
-      "/settings/general",
-      "https://evil.example/c/abc",
-    ];
-    await Promise.all(
-      routes.map((route, index) => h.emit(channel, { id: index + 10, path: route })),
-    );
-    const taken = new Set(takes().map(({ args }) => args));
-    for (const [index, route] of routes.entries()) {
-      assert.equal(taken.has(index + 10), floatingComposerSessionPath(route) !== null, route);
-    }
-
-    // A message taken as the page stops listening is still handed to it.
-    let release = () => {};
-    answer = () =>
-      new Promise((resolve) => {
-        release = () => resolve(message);
-      });
-    const pending = h.emit(channel, { id: 20, path: "/c/late" });
-    stop();
-    assert.equal(h.hasListener(channel), false);
-    assert.equal(h.sends.at(-1).args, false);
-    release();
-    await pending;
-    assert.equal(heard.at(-1).path, "/c/late");
-  });
-
-  it("sends a launched session's first message along when the panel opens it", async () => {
-    const h = loadPreload({ platform: "darwin" });
-    const message = { text: "hi", skill: null, files: [] };
-    await h.desktop.floatingComposer.openInMainWindow("/c/abc", message);
-    const call = h.invokes.at(-1);
-    assert.equal(call.channel, "omnigent:floating-composer:open-in-main-window");
-    assert.equal(call.args, "/c/abc");
-    assert.equal(call.rest[0], message);
   });
 
   it("forwards the floating panel's ready signal on its own channel", () => {

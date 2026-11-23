@@ -10,7 +10,6 @@ const {
   createFloatingComposerPreloader,
   fadeInFloatingComposer,
   floatingComposerAppPagePath,
-  floatingComposerFirstMessage,
   floatingComposerSessionPath,
   floatingComposerWindowOptions,
 } = require("../src/floating_composer_window");
@@ -583,11 +582,6 @@ for (const [how, end] of [
     t.mock.timers.tick(FLOATING_COMPOSER_READY_FALLBACK_MS);
     assert.equal(panel.calls.includes("showInactive"), false);
     assert.equal(panel.calls.includes("webContents.focus"), false);
-    // Nor is its page told it took the keyboard.
-    assert.equal(
-      panel.calls.some((call) => call.startsWith("send:")),
-      false,
-    );
   });
 }
 
@@ -684,20 +678,10 @@ test("every open takes the keyboard the same way, and none of them activates the
   t.mock.timers.tick(FLOATING_COMPOSER_READY_FALLBACK_MS);
   // A second press while it's up.
   controller.show("https://c.example");
-  const shown = `send:${FLOATING_COMPOSER_SHOWN_CHANNEL}`;
-  for (const [panel, opens] of [
-    [created[0], 1],
-    [created[1], 1],
-    [created[2], 2],
-  ]) {
+  for (const panel of created) {
     assert.equal(panel.visible, true);
     assert.deepEqual(activating(panel), [], `${panel.serverUrl} must not activate the app`);
     assert.ok(panel.calls.includes("webContents.focus"));
-    // Its page hears it right after each one, so the prompt takes the keyboard too.
-    assert.equal(panel.calls.filter((call) => call === shown).length, opens, panel.serverUrl);
-    panel.calls.forEach((call, index) => {
-      if (call === shown) assert.equal(panel.calls[index - 1], "webContents.focus");
-    });
   }
 });
 
@@ -721,40 +705,40 @@ test("a press while a panel is open goes back to it, until the open ends", (t) =
   }
 });
 
-test("only a first message shaped like the panel's crosses to a main window, rebuilt", () => {
-  const file = { name: "a.txt", type: "text/plain", lastModified: 1, data: new ArrayBuffer(1) };
-  assert.deepEqual(
-    floatingComposerFirstMessage({
-      text: "/review 1",
-      skill: { name: "review", args: "1", extra: true },
-      files: [{ ...file, extra: true }],
-      extra: true,
-    }),
-    { text: "/review 1", skill: { name: "review", args: "1" }, files: [file] },
-  );
-  // A typed array is binary too, as a Buffer arrives from the renderer.
-  assert.ok(
-    floatingComposerFirstMessage({
-      text: "",
-      skill: null,
-      files: [{ ...file, data: new Uint8Array(1) }],
-    }),
-  );
-  for (const bad of [
-    undefined,
-    null,
-    "hi",
-    { skill: null, files: [] },
-    { text: 1, skill: null, files: [] },
-    { text: "hi", files: [] },
-    { text: "hi", skill: { name: "review" }, files: [] },
-    { text: "hi", skill: null },
-    { text: "hi", skill: null, files: [null] },
-    { text: "hi", skill: null, files: [{ ...file, name: undefined }] },
-    { text: "hi", skill: null, files: [{ ...file, lastModified: Number.NaN }] },
-    { text: "hi", skill: null, files: [{ ...file, data: "x" }] },
-    { text: "hi", skill: null, files: [{ ...file, data: [1] }] },
+test("each way the panel takes the keyboard tells its page right after, once", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { controller, created } = setup({ autoReady: false });
+  const shown = `send:${FLOATING_COMPOSER_SHOWN_CHANNEL}`;
+  // Ready at once, after ready, by fallback, and a second press.
+  controller.preload("https://a.example");
+  controller.markReady(created[0]);
+  controller.show("https://a.example");
+  controller.show("https://b.example");
+  controller.markReady(created[1]);
+  controller.show("https://c.example");
+  t.mock.timers.tick(FLOATING_COMPOSER_READY_FALLBACK_MS);
+  controller.show("https://c.example");
+  for (const [panel, opens] of [
+    [created[0], 1],
+    [created[1], 1],
+    [created[2], 2],
   ]) {
-    assert.equal(floatingComposerFirstMessage(bad), null, JSON.stringify(bad));
+    assert.equal(panel.calls.filter((call) => call === shown).length, opens, panel.serverUrl);
+    panel.calls.forEach((call, index) => {
+      if (call === shown) assert.equal(panel.calls[index - 1], "webContents.focus");
+    });
   }
+});
+
+test("a panel gone before its page was ready is never told it took the keyboard", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { controller, created } = setup({ autoReady: false });
+  controller.show("https://a.example");
+  controller.close(created[0]);
+  controller.markReady(created[0]);
+  t.mock.timers.tick(FLOATING_COMPOSER_READY_FALLBACK_MS);
+  assert.equal(
+    created[0].calls.some((call) => call.startsWith("send:")),
+    false,
+  );
 });

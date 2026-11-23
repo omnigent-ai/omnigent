@@ -43,51 +43,6 @@ function floatingComposerAppPagePath(pagePath) {
   return typeof pagePath === "string" && APP_PAGE_PATHS.has(pagePath) ? pagePath : null;
 }
 
-/** Binary data as it crosses IPC: an ArrayBuffer, or a typed array such as a Buffer. */
-function isBinary(data) {
-  return (
-    ArrayBuffer.isView(data) || Object.prototype.toString.call(data) === "[object ArrayBuffer]"
-  );
-}
-
-/**
- * The panel's first message for a main window to send, rebuilt from its known fields, or null
- * for anything not shaped like one.
- *
- * @param {unknown} message
- * @returns {{
- *   text: string,
- *   skill: { name: string, args: string } | null,
- *   files: { name: string, type: string, lastModified: number, data: ArrayBuffer | ArrayBufferView }[],
- * } | null}
- */
-function floatingComposerFirstMessage(message) {
-  if (message === null || typeof message !== "object") return null;
-  const { text, skill, files } = /** @type {Record<string, unknown>} */ (message);
-  if (typeof text !== "string" || !Array.isArray(files)) return null;
-  const skillOk =
-    skill === null ||
-    (typeof skill === "object" && typeof skill.name === "string" && typeof skill.args === "string");
-  if (!skillOk) return null;
-  const filesOk = files.every(
-    (file) =>
-      file !== null &&
-      typeof file === "object" &&
-      typeof file.name === "string" &&
-      typeof file.type === "string" &&
-      Number.isFinite(file.lastModified) &&
-      isBinary(file.data),
-  );
-  if (!filesOk) return null;
-  return {
-    text,
-    skill: skill === null ? null : { name: skill.name, args: skill.args },
-    files: files.map(({ name, type, lastModified, data }) => ({ name, type, lastModified, data })),
-  };
-}
-
-/** How long a main window has to take a launch's first message before the panel sends it. */
-const FLOATING_COMPOSER_LAUNCH_TAKE_MS = 2000;
 /** How long the panel takes to fade in when it opens; closing is instant. */
 const FLOATING_COMPOSER_FADE_MS = 120;
 /** How long an open waits for a page still loading to say it's ready before showing anyway. */
@@ -527,7 +482,6 @@ function createFloatingComposerPreloader(deps) {
 
 module.exports = {
   FLOATING_COMPOSER_FADE_MS,
-  FLOATING_COMPOSER_LAUNCH_TAKE_MS,
   FLOATING_COMPOSER_PRELOAD_DELAY_MS,
   FLOATING_COMPOSER_READY_FALLBACK_MS,
   FLOATING_COMPOSER_PATH,
@@ -537,7 +491,6 @@ module.exports = {
   createFloatingComposerPreloader,
   fadeInFloatingComposer,
   floatingComposerAppPagePath,
-  floatingComposerFirstMessage,
   floatingComposerSessionPath,
   floatingComposerWindowOptions,
 };
