@@ -189,6 +189,7 @@ import { AppShellWorkspacePanels } from "./AppShellWorkspacePanels";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { AppShellOverlays } from "./AppShellOverlays";
 import { MarkAllReadPaletteCommand } from "./markAllReadPaletteCommand";
+import { ResumeSandboxPaletteCommand } from "./resumeSandboxCommand";
 import { AppShellRootProviders } from "./AppShellRootProviders";
 import { replaceThemePicker } from "@/store/themePicker";
 import { commandViewForPath, useCommandSession } from "./commandContext";
@@ -3903,6 +3904,7 @@ function AppShellImpl() {
               <MarkAllReadPaletteCommand />
               {/* Read by ⌘K's actions that settle after their host has gone, such as a Leave. */}
               <OpenSessionPublisher sessionId={serverConversationId ?? null} />
+              <ResumeSandboxPaletteCommand />
             </>
           )}
         </ForkDialogContextProvider>
