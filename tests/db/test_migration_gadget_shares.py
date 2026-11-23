@@ -103,6 +103,18 @@ def test_columns_primary_key_and_index(db_engine: Engine) -> None:
         "gadget_id",
     ]
     assert not indexes["ix_gadget_shares_user_id"]["unique"]
+    if db_engine.dialect.name == "sqlite":
+        # The migration created the functional index too, with user_id after the expression.
+        with db_engine.connect() as conn:
+            created = conn.execute(
+                sa.text(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' "
+                    "AND name = 'ix_gadget_shares_gadget_user_lower'"
+                )
+            ).scalar_one()
+        assert " ".join(created.split()).endswith(
+            "(workspace_id, gadget_id, lower(user_id), user_id)"
+        )
     assert inspector.get_foreign_keys(_TABLE) == []
 
 
