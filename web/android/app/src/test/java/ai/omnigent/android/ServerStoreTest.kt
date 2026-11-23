@@ -6,6 +6,7 @@ import android.os.Bundle
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -87,6 +88,39 @@ class ServerStoreTest {
 
         assertFalse(store.hasServer())
         assertTrue(store.recentServers().contains("https://workspace.example.com"))
+    }
+
+    @Test
+    fun `only servers the user connected to are recent for an origin`() {
+        val store = storeWithPresets("https://managed.example.com")
+        store.connect("https://proxy.example.com/omnigent")
+
+        assertEquals(
+            "https://proxy.example.com/omnigent",
+            store.recentServer("https://proxy.example.com"),
+        )
+        assertNull(store.recentServer("https://managed.example.com"))
+        store.connect("https://managed.example.com")
+        assertEquals(
+            "https://managed.example.com",
+            store.recentServer("https://managed.example.com"),
+        )
+    }
+
+    @Test
+    fun `a selected server joins recents only once remembered`() {
+        val store = storeWithPresets()
+        store.connect("https://mine.example.com")
+
+        store.select("https://new.example.com")
+
+        assertEquals("https://new.example.com", store.currentServerUrl())
+        assertEquals(listOf("https://mine.example.com"), store.recentServers())
+        store.rememberCurrent()
+        assertEquals(
+            listOf("https://new.example.com", "https://mine.example.com"),
+            store.recentServers(),
+        )
     }
 
     @Test

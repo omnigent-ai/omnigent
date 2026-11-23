@@ -3,6 +3,7 @@ package ai.omnigent.android
 import android.os.Bundle
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -92,5 +93,16 @@ class ManagedConfigTest {
         assertTrue(config.includes("https://OMNIGENT.example.com"))
         assertFalse(config.includes("https://other.example.com"))
         assertFalse(config.includes("not a url"))
+    }
+
+    @Test
+    fun `serverFor finds the preset on an origin with its mount`() {
+        val config = configOf("https://corp.example.com/omnigent")
+
+        assertEquals(
+            "https://corp.example.com/omnigent",
+            config.serverFor("https://corp.example.com"),
+        )
+        assertNull(config.serverFor("https://other.example.com"))
     }
 }
