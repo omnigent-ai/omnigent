@@ -2,11 +2,14 @@
 // loads, to pick its macOS bindings; vi.hoisted sets the platform before any import runs.
 
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { useRef, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { COMPOSER_EDITING_KEYMAP } from "./CodeMirrorComposerInput";
 import { READLINE_BINDINGS } from "./codeMirrorReadline";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
 import { insertComposerText } from "@/lib/composerText";
+import { useMentionBrowser, type MentionBrowser } from "@/hooks/useMentionBrowser";
+import type { MentionState } from "@/lib/composerMentions";
 import type { ComposerTextTarget } from "./composerInput";
 
 vi.hoisted(() => {
@@ -34,6 +37,47 @@ function mount(value: string, caret: number, mentionTokens?: readonly string[]) 
   });
   const press = (init: KeyboardEventInit) => fireEvent.keyDown(content, init);
   return { target: () => box.target!, press };
+}
+
+/** The editor wired to the mention hook, with `token` already tagged in the draft. */
+function mountTaggedDraft(draft: string, token: string) {
+  const hooks: { current: MentionBrowser | null } = { current: null };
+  const box: { target: ComposerTextTarget | null } = { target: null };
+  function TaggedDraft() {
+    const [text, setText] = useState(draft);
+    const [mention, setMention] = useState<MentionState | null>(null);
+    const textareaRef = useRef<ComposerTextTarget | null>(null);
+    const browser = useMentionBrowser({
+      mention,
+      setMention,
+      mentionEntries: [],
+      text,
+      setText,
+      textareaRef,
+      initialMentions: { files: [{ path: token.slice(1), isDir: false, token }], sessions: [] },
+    });
+    hooks.current = browser;
+    return (
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value={text}
+        mentionTokens={browser.mentionTokens}
+        ref={(target) => {
+          textareaRef.current = target;
+          box.target = target;
+        }}
+        onChange={(event) => {
+          browser.noteTextChange(event);
+          setText(event.currentTarget.value);
+        }}
+      />
+    );
+  }
+  const { container } = render(<TaggedDraft />);
+  const content = container.querySelector<HTMLElement>(".cm-content")!;
+  act(() => box.target!.setSelectionRange(draft.length, draft.length));
+  const press = (init: KeyboardEventInit) => fireEvent.keyDown(content, init);
+  return { target: () => box.target!, press, tags: () => hooks.current!.mentionTokens };
 }
 
 afterEach(cleanup);
@@ -83,6 +127,35 @@ describe("CodeMirror composer keys on macOS", () => {
     expect(target().value).toBe("ask ");
     press({ key: "y", code: "KeyY", ctrlKey: true });
     expect(target().value).toBe(draft);
+  });
+
+  it.each([
+    // Caret at the end: ⌃W kills the pill and its trailing space; ⌃U kills the whole line.
+    { key: "w", caret: 20, killed: "ask " },
+    { key: "u", caret: 20, killed: "" },
+    // Caret before the pill: ⌃K kills to the line end, which takes the pill whole.
+    { key: "k", caret: 4, killed: "ask " },
+  ])("restores a pill's tag when ⌘Z undoes a ⌃$key kill of it", ({ key, caret, killed }) => {
+    const draft = "ask @Alpha planning ";
+    const { target, press, tags } = mountTaggedDraft(draft, "@Alpha planning");
+    act(() => target().setSelectionRange(caret, caret));
+    expect(tags()).toEqual(["@Alpha planning"]);
+
+    press({ key, code: `Key${key.toUpperCase()}`, ctrlKey: true });
+    expect(target().value).toBe(killed);
+    expect(tags()).toEqual([]);
+    press({ key: "z", code: "KeyZ", metaKey: true });
+    expect(target().value).toBe(draft);
+    expect(tags()).toEqual(["@Alpha planning"]);
+  });
+
+  it("yanks a killed pill back as literal text, without its tag", () => {
+    const draft = "ask @Alpha planning ";
+    const { target, press, tags } = mountTaggedDraft(draft, "@Alpha planning");
+    press({ key: "w", code: "KeyW", ctrlKey: true });
+    press({ key: "y", code: "KeyY", ctrlKey: true });
+    expect(target().value).toBe(draft);
+    expect(tags()).toEqual([]);
   });
 
   it("yanks both words after two ⌃W kills in a row", () => {
