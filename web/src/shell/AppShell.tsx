@@ -1,5 +1,6 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
+import { ContentLoading } from "@/components/PageLoading";
 import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContext";
 import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
@@ -3499,7 +3500,11 @@ function AppShellImpl() {
                   <SubagentPanelOpenerContext.Provider value={openSubagentInPanel}>
                     <RenderErrorBoundary name="this page" resetKey={location.pathname}>
                       <ShellCommandContext.Provider value={shellCommandAction}>
-                        <Outlet />
+                        {/* A page that suspends outside a navigation transition (as after a
+                            chunk-recovery reload) must not fall back to the app-wide loader. */}
+                        <Suspense fallback={<ContentLoading />}>
+                          <Outlet />
+                        </Suspense>
                       </ShellCommandContext.Provider>
                     </RenderErrorBoundary>
                   </SubagentPanelOpenerContext.Provider>
