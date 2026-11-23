@@ -2,7 +2,7 @@
 // the split, its maximized pane or the panes' size change, and as their terminals fit, so a split
 // with no room to move a pane lists the command greyed with why, as the drag offers no spot there.
 
-import { useLayoutEffect, useRef, useState } from "react";
+import { type RefObject, useLayoutEffect, useRef, useState } from "react";
 
 import type { TerminalLayout } from "@/lib/paneSplitLayout";
 import type { CommandAvailability } from "@/store/paletteCommands";
@@ -17,8 +17,11 @@ export interface PaneMoveAvailabilityOptions {
   paneKey: string | null;
   /** The panes' size rule, measured now. */
   sizing: () => PaneSizing | null;
-  /** The element the panes are laid out in, watched for size changes and terminals fitting. */
-  root: HTMLElement | null;
+  /**
+   * The element the panes are laid out in, watched for size changes and terminals fitting. Read
+   * as the effect runs, since on the first mount it's attached only after this render.
+   */
+  rootRef: RefObject<HTMLElement | null>;
 }
 
 /** A session terminal's fitted grid, which its pane's size rule reads. */
@@ -34,7 +37,7 @@ export function usePaneMoveAvailability({
   zoomedKey,
   paneKey,
   sizing,
-  root,
+  rootRef,
 }: PaneMoveAvailabilityOptions): CommandAvailability | null {
   const measure = () => movePaneAvailability({ layout, zoomedKey, key: paneKey, sizing: sizing() });
   const latest = useRef(measure);
@@ -50,6 +53,7 @@ export function usePaneMoveAvailability({
         return sameAvailability(previous, next) ? previous : next;
       });
     update();
+    const root = rootRef.current;
     if (!root) return;
     const resizes = new ResizeObserver(update);
     resizes.observe(root);
@@ -61,7 +65,7 @@ export function usePaneMoveAvailability({
       resizes.disconnect();
       fits.disconnect();
     };
-  }, [shape, paneKey, root]);
+  }, [shape, paneKey, rootRef]);
   // Not offered at all, as for a lone or maximized pane, at once; room is what's measured.
   if (movable === null) return null;
   return measured;
