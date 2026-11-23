@@ -27,7 +27,11 @@ vi.mock("./WorkspaceFolderTree", () => ({
   ),
 }));
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  // The tree's root is kept per session, so a test that roots it can't leak into the next.
+  rememberBrowseLocation("conv_1", null);
+});
 
 function renderBreadcrumbs(path: string, { canOpen = true } = {}) {
   const onOpenFile = vi.fn();
@@ -224,6 +228,22 @@ describe("FileBreadcrumbs", () => {
     }
   });
 
+  it.each([
+    ["a drive", "C:\\Users\\dev\\notes.txt", ["C:", "Users", "dev"]],
+    ["a network share", "\\\\server\\share\\notes.txt", ["server", "share"]],
+  ])(
+    "shows plain segments for a file on %s, whose folders it can't list",
+    (_case, path, folders) => {
+      const { breadcrumbs } = renderBreadcrumbs(path);
+
+      for (const folder of folders) {
+        expect(within(breadcrumbs).getByText(folder).tagName).toBe("SPAN");
+      }
+      expect(within(breadcrumbs).getByText("notes.txt")).toHaveAttribute("aria-current", "page");
+      expect(within(breadcrumbs).queryByRole("button", { name: "Users" })).toBeNull();
+    },
+  );
+
   it("shows plain segments when the viewer can't open other files", () => {
     const { breadcrumbs } = renderBreadcrumbs("src/viewer.ts", { canOpen: false });
 
@@ -247,12 +267,23 @@ describe("FileBreadcrumbs copy button", () => {
     );
   }
 
-  it("copies the relative path the breadcrumbs show", async () => {
-    renderInWorkspace("src/shell/viewer.ts");
+  it.each(["src/shell/viewer.ts", "/repo/src/shell/viewer.ts"])(
+    "copies the relative path of %s",
+    async (path) => {
+      renderInWorkspace(path);
 
-    fireEvent.click(screen.getByRole("button", { name: "Copy relative path: viewer.ts" }));
+      fireEvent.click(screen.getByRole("button", { name: "Copy relative path: viewer.ts" }));
 
-    await waitFor(() => expect(copyText).toHaveBeenCalledWith("src/shell/viewer.ts"));
+      await waitFor(() => expect(copyText).toHaveBeenLastCalledWith("src/shell/viewer.ts"));
+    },
+  );
+
+  it("says it copies the full path of a file outside the workspace", async () => {
+    renderInWorkspace("/etc/hosts");
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy path: hosts" }));
+
+    await waitFor(() => expect(copyText).toHaveBeenLastCalledWith("/etc/hosts"));
   });
 });
 
@@ -292,7 +323,6 @@ describe("FileBreadcrumbs segment menu", () => {
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
     fireEvent.contextMenu(within(breadcrumbs).getByRole("button", { name: "lib" }));
     expect(menuItems()).not.toContain("Open folder as root");
-    rememberBrowseLocation("conv_1", null);
   });
 
   it("offers no root for a file segment", () => {

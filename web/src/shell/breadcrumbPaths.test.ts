@@ -3,6 +3,7 @@ import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import {
   breadcrumbSegments,
   breadcrumbText,
+  canBrowseBreadcrumbs,
   folderTitle,
   listingTreePaths,
   parentFolder,
@@ -148,5 +149,17 @@ describe("workspaceFolderName", () => {
     [undefined, "Workspace"],
   ])("names root %s %s", (root, expected) => {
     expect(workspaceFolderName(root)).toBe(expected);
+  });
+});
+
+describe("canBrowseBreadcrumbs", () => {
+  it.each([
+    ["src/app.ts", true],
+    ["/home/dev/app.ts", true],
+    ["C:\\Users\\dev\\app.ts", false],
+    ["C:/Users/dev/app.ts", false],
+    ["\\\\server\\share\\app.ts", false],
+  ])("lists the folders of %s: %s", (path, browsable) => {
+    expect(canBrowseBreadcrumbs(path)).toBe(browsable);
   });
 });

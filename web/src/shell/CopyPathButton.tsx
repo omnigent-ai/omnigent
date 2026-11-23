@@ -47,12 +47,16 @@ interface CopyPathButtonProps {
 export function CopyPathButton({
   path,
   command,
-  label = command ? COPY_PATH_LABELS[command] : "Copy path",
+  label: labelProp,
   revealOnHover = false,
 }: CopyPathButtonProps) {
   // With a menu action, the same text as the menu copies, with feedback in place on the row.
   const target = useFileCommandTarget(path);
-  const copiedPath = (command && target && pathToCopy(target, command)?.text) || path;
+  const copy = command && target ? pathToCopy(target, command) : null;
+  const copiedPath = copy?.text || path;
+  // A relative copy of a file outside the workspace copies its absolute path, and says so.
+  const label =
+    labelProp ?? (command ? COPY_PATH_LABELS[copy?.absolute ? "copy-path" : command] : "Copy path");
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState(false);
   const timerRef = useRef<number>(0);

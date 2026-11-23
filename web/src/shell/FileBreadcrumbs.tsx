@@ -1,7 +1,5 @@
-// The file viewer's full path as breadcrumbs, scrolling sideways to keep the file
-// name in view. Each segment lists its siblings, the folder holding it with the
-// segment selected, and a copy button copies the path. Right-clicking a segment
-// offers its file actions; a folder's include rooting the Files tree there.
+// The viewed file's path as breadcrumbs: each segment lists its siblings and, on
+// right-click, offers its file actions, including rooting the Files tree at a folder.
 
 import { Fragment, useLayoutEffect, useRef, useState } from "react";
 import { XIcon } from "lucide-react";
@@ -17,6 +15,7 @@ import { planFolderAsTreeRoot, showTreeRoot } from "./fileTree/treeRoot";
 import {
   type BreadcrumbSegment,
   breadcrumbSegments,
+  canBrowseBreadcrumbs,
   folderTitle,
   pathWithinFolder,
   segmentFolder,
@@ -47,6 +46,7 @@ export function FileBreadcrumbs({
   canBrowseOutside = false,
 }: FileBreadcrumbsProps) {
   const segments = breadcrumbSegments(path);
+  const browsable = onOpenFile !== undefined && canBrowseBreadcrumbs(path);
   // The segment whose tree is open; another file or conversation closes it for good.
   const viewedFile = `${conversationId}\0${path}`;
   const [openSegment, setOpenSegment] = useState<string | null>(null);
@@ -100,7 +100,7 @@ export function FileBreadcrumbs({
 
   const renderSegment = (segment: BreadcrumbSegment) => {
     const className = cn(SEGMENT_CLASS, segment.isFile && "text-foreground");
-    if (!onOpenFile) {
+    if (!browsable) {
       return (
         <span className={className} aria-current={segment.isFile ? "page" : undefined}>
           {segment.label}
