@@ -599,6 +599,6 @@ async def test_both_harnesses_record_their_offers_in_one_runner_directory(
 
     offers = tmp_path / "omnigent-data" / "runners" / "memory-import-offers"
     assert sorted(marker.name.split("-")[0] for marker in offers.iterdir()) == ["claude", "codex"]
-    # Codex versions its memory directory, so a marker there would reach its own consolidation.
+    # Codex versions its memory directory, so a marker there could reach its own consolidation.
     assert [path.name for path in (codex_home / "memories").iterdir()] == ["MEMORY.md"]
     assert [path.name for path in (claude_config / "projects").iterdir()] == ["-home-me-repo"]

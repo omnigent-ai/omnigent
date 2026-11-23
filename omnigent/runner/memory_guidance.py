@@ -480,7 +480,7 @@ def _import_offer_marker(harness: str, notes_home: Path) -> Path:
     The runner's per-machine marker that the import offer was made for *notes_home*.
 
     It stays in the runner's data directory, not beside the notes: Codex versions
-    its memory directory and hands every file in it to its own consolidation.
+    its memory directory and passes what changes there to its own consolidation.
     """
     digest = hashlib.sha256(str(notes_home.resolve()).encode("utf-8")).hexdigest()[:32]
     return data_dir() / "runners" / _IMPORT_OFFER_DIR_NAME / f"{harness}-{digest}"
