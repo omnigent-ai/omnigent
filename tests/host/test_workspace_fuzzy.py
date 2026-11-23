@@ -226,7 +226,8 @@ def test_older_corpora_are_dropped_past_the_path_budget(
 
     rebuilt = cache.corpus("older", (older,), lambda: list(older))
 
-    assert rebuilt is not first  # 4 paths were over the budget, so "older" went
+    # Each corpus holds 2 paths and keeps its 2-path source: 8 in all, past 3, so "older" went.
+    assert rebuilt is not first
 
 
 def test_the_source_lists_corpora_keep_count_toward_the_budget(
