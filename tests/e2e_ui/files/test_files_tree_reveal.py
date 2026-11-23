@@ -86,18 +86,21 @@ def _scroller(container: Locator) -> Locator:
 
 
 def _row_in_view(container: Locator, name: str) -> bool:
-    """Whether the row is rendered and lies wholly inside the tree's viewport."""
-    row = _row(container, name)
-    if row.count() == 0:
-        return False
-    box = _scroller(container).bounding_box()
-    row_box = row.bounding_box()
-    return (
-        box is not None
-        and row_box is not None
-        and row_box["y"] >= box["y"] - 1
-        and row_box["y"] + row_box["height"] <= box["y"] + box["height"] + 1
+    """Whether the row is rendered and lies wholly inside the tree's viewport.
+
+    Read in one pass: the virtualized tree can drop the row between two separate reads.
+    """
+    rows = _row(container, name).evaluate_all(
+        "rows => rows.map(row => { const box = row.getBoundingClientRect();"
+        " return { top: box.top, bottom: box.bottom }; })"
     )
+    if not rows:
+        return False
+    view = _scroller(container).evaluate(
+        "element => { const box = element.getBoundingClientRect();"
+        " return { top: box.top, bottom: box.bottom }; }"
+    )
+    return rows[0]["top"] >= view["top"] - 1 and rows[0]["bottom"] <= view["bottom"] + 1
 
 
 def _expect_row_in_view(container: Locator, name: str) -> None:
