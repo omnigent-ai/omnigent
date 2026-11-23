@@ -215,6 +215,16 @@ describe("QuickPick group headings", () => {
     },
   ];
 
+  it("keeps the plain caption, exactly, without counts or heading buttons", () => {
+    renderPicker({ segments: grouped });
+    const group = screen.getByRole("group", { name: "Files" });
+    const heading = document.getElementById(group.getAttribute("aria-labelledby")!)!;
+    expect(heading.outerHTML).toBe(
+      `<div id="${heading.id}" role="presentation" class="px-2 py-1.5 text-sm font-medium text-muted-foreground">Files</div>`,
+    );
+    expect(document.querySelector("[data-slot=quick-pick-group-heading]")).toBeNull();
+  });
+
   it("shows counts in the heading and its buttons beside it, outside the listbox", () => {
     const run = vi.fn();
     const actions = (group: string): QuickPickGroupAction[] =>

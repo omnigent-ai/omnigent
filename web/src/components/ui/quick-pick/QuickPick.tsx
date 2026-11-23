@@ -802,6 +802,18 @@ export function QuickPick<Value>({
   // A group's heading: its label, which names the group, then any count. Its buttons sit
   // outside the listbox, laid over the heading's trailing edge.
   const renderHeading = (heading: { key: string; label: string }, labelId?: string) => {
+    // A picker without counts or heading buttons keeps the plain caption.
+    if (!groupCounts && !groupActions) {
+      return (
+        <div
+          id={labelId}
+          role="presentation"
+          className="px-2 py-1.5 text-sm font-medium text-muted-foreground"
+        >
+          {heading.label}
+        </div>
+      );
+    }
     const count = groupCounts ? headingCounts.get(heading.key) : undefined;
     // The label gives way to the buttons laid over the heading, and the count stays whole.
     const barWidth = headingActionBars.find((bar) => bar.key === heading.key)?.width ?? 0;
