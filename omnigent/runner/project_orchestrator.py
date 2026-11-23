@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import httpx
 
-from omnigent.runtime.project_ticket_instructions import PROJECT_TICKET_WORK_INSTRUCTION
+from omnigent.runtime.project_ticket_instructions import (
+    PROJECT_CONVERSATION_INSTRUCTION,
+    PROJECT_TICKET_WORK_INSTRUCTION,
+)
 from omnigent.runtime.prompt import append_framework_instructions
 from omnigent.spec import AgentSpec
 
@@ -12,6 +15,8 @@ PROJECT_ORCHESTRATOR_INSTRUCTION = (
     "You are this project's orchestrator. Your primary responsibility is forward progress "
     "on every unfinished ticket within the user's authorized scope. Before responding to a "
     "request or ticket update, load and follow the orchestrator skill. "
+    "Conversation with the user creates no tickets on its own: answer it, or delegate it to "
+    "a new or reused session; track only persistent, staged work as tickets. "
     "If no genuine human decision is needed, arrange the next authorized action; do not park "
     "work after a plan or worker reply. Advance stages as the actual work changes, not to "
     "simulate progress. Use one recurring check about every two minutes to read all pages "
@@ -88,9 +93,9 @@ async def project_instructions(
 ) -> str | None:
     """Resolve project guidance and the role from the session, never its agent or title.
 
-    Blocks follow a fixed order: the mandate, then ticket guidance, then the
-    orchestrator role. The mandate reaches every project session; ticket
-    guidance and the role need the agent's project tools.
+    Blocks follow a fixed order: the mandate, then conversation and ticket
+    guidance, then the orchestrator role. The mandate reaches every project
+    session; the other blocks need the agent's project tools.
     """
     if server_client is None or spec is None:
         return None
@@ -100,11 +105,11 @@ async def project_instructions(
     has_project_tools = spec.tool_groups.projects
     # Legacy server response fallback; remove in 0.25.0.
     designated = snapshot.get("project_main_session", snapshot.get("project_orchestrator"))
+    in_ticket_project = has_project_tools and bool(snapshot.get("project_id"))
     blocks = (
         project_mandate_instruction(snapshot.get("project_mandate")),
-        PROJECT_TICKET_WORK_INSTRUCTION
-        if has_project_tools and snapshot.get("project_id")
-        else None,
+        PROJECT_CONVERSATION_INSTRUCTION if in_ticket_project else None,
+        PROJECT_TICKET_WORK_INSTRUCTION if in_ticket_project else None,
         PROJECT_ORCHESTRATOR_INSTRUCTION if has_project_tools and designated is True else None,
     )
     return "\n\n".join(block for block in blocks if block) or None

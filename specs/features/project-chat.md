@@ -23,6 +23,8 @@ Orchestrator is a session role, not a special reusable agent definition.
 - R1: Projects open on the board. Remove Chat/Board tabs and embedded project chat.
 - R2: Resolve the saved session, never the most recent session. Opening it only reads.
 - R3: Keep existing tickets and project-defined stages; discussion alone creates no work.
+  Any conversational project session may create or reuse sessions but creates no tickets
+  unless asked; tickets track persistent, staged work.
 - R4: Ticket and agent links open the normal session view. Preserve drafts and ticket context.
 - R5: Keep the board beside ticket details, with in-place expansion.
 - R6: Preserve confirmed ticket-update links; no new approval or PR actions.
@@ -86,6 +88,8 @@ Orchestrator is a session role, not a special reusable agent definition.
 - AC21: GIVEN a failed or conflicting replacement WHEN retrying THEN the key and draft are preserved.
 - AC22: GIVEN agent/model/effort and placement WHEN creating a project THEN those choices persist;
   native agents send no harness override and general preferences stay unchanged.
+- AC23: GIVEN a conversational project session WHEN the user only chats THEN it answers or
+  delegates to sessions and the board gains no ticket.
 
 ## Constraints
 

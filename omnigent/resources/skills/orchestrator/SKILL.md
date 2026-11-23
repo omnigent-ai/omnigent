@@ -1,6 +1,6 @@
 ---
 name: orchestrator
-description: Coordinate a project's ticket board when this session is designated as its orchestrator. Turn requests into tickets, delegate work to nested Omnigent agents, and follow it through to completion.
+description: Coordinate a project's ticket board when this session is designated as its orchestrator. Answer conversation directly or through sessions, track persistent staged work as tickets, delegate it to nested Omnigent agents, and follow it through to completion.
 ---
 
 # Orchestrate the project
@@ -12,8 +12,9 @@ A finished plan or worker reply is a handoff, not a reason to park a ticket.
 Advance its stage when the actual work changes; moving a card alone is not progress.
 
 Keep this session available for the human; delegate substantive investigation,
-implementation and verification instead of doing ticket work yourself. Answer
-brief questions and discuss scope directly; not every chat message needs a ticket.
+implementation and verification instead of doing ticket work yourself. Talking
+with the user is ordinary conversation, as in any Omnigent session: it can create
+or reuse sessions, but it creates no tickets on its own (see *Talk or ticket*).
 
 ## Mandatory: never block this orchestrator on human input
 
@@ -100,15 +101,35 @@ do not assume that Working or Planning exists. `sys_ticket_update` can append
 never authorize execution on entry, satisfy approval gates, or bypass prompts.
 Clear `needs-human` only when its request is resolved.
 
-## Capture the work
+## Talk or ticket
+
+Questions, discussion, brainstorming, scoping, status requests and quick one-off
+tasks are conversation. Answer them here, or delegate them to a new or reused
+session (see *Delegate without a ticket*) and relay the result. Never create a
+ticket just to record a conversation or to give a helper something to link.
+
+Tickets are for persistent work that moves through the project's stages.
+Create one only when:
+
+- the user asks to track, file or add the work to the board;
+- the work needs several phases or handoffs, such as planning, implementation
+  and review, or must outlive this conversation; or
+- it arrives from intake automation, another agent or an existing ticket.
+
+When unsure, do the conversational part and offer to track it; don't create a
+ticket speculatively. Conversation that grows into persistent work can become a
+ticket later: record the context gathered so far in its description and link any
+sessions already working on it.
+
+## Capture ticket work
 
 - Read relevant tickets with `sys_ticket_list` and `sys_ticket_get` before
   creating work. Reuse an existing ticket when the request belongs to it.
-- For a work request, create or update the ticket **before investigating or
-  delegating**. Give it a clear title and describe the requested outcome and
+- Once work qualifies for a ticket, create or update it **before investigating
+  or delegating**. Give it a clear title and describe the requested outcome and
   what counts as done. Keep the board as the source of truth, not a second
   private task list.
-- Resolve routine choices from the project and conversation. If the request
+- Resolve routine choices from the project and conversation. If ticket work
   needs research to become concrete, delegate discovery on that ticket rather
   than starting the investigation yourself or asking the human to research it.
 - Create separate tickets only for meaningful independently trackable outcomes.
@@ -154,7 +175,18 @@ different defaults. One worker can own a whole ticket; split only independent
 work with clear ownership. If creation is uncertain, check `sys_session_list`
 before launching another copy.
 
-### Give workers an explicit handoff
+### Delegate without a ticket
+
+For conversational work, create or reuse a session with the same placement and
+model rules, but link no ticket. Its `message` still needs a self-contained
+assignment: it is a helper for this conversation, your session ID as its return
+address, the outcome and boundaries, and that it must report back with
+`sys_session_message` and must not create tickets. It is not board work: don't add
+it to board reconciliation. If you are waiting on its reply, reuse the existing
+check or a background wake-up. If the work turns persistent, create the ticket
+then and link the session.
+
+### Give ticket workers an explicit handoff
 
 Put a self-contained assignment in `sys_session_create`'s `message`. For an
 existing independent worker, use `sys_session_message`. It does not see this

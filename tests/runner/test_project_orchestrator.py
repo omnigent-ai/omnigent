@@ -9,8 +9,12 @@ from omnigent.runner.project_orchestrator import (
     append_project_instructions,
     project_mandate_instruction,
 )
-from omnigent.runtime.project_ticket_instructions import PROJECT_TICKET_WORK_INSTRUCTION
+from omnigent.runtime.project_ticket_instructions import (
+    PROJECT_CONVERSATION_INSTRUCTION,
+    PROJECT_TICKET_WORK_INSTRUCTION,
+)
 from omnigent.spec.types import AgentSpec, ToolGroupsConfig
+from omnigent.tools.builtins.project_tickets import SysTicketCreateTool
 
 
 @pytest.mark.parametrize("role", [True, False, None, "true"])
@@ -49,6 +53,7 @@ async def test_project_guidance_and_designated_role_in_native_and_sdk_prompts(
     assert native.startswith(spec.instructions)
     assert sdk.startswith("Shared agent instructions\n\nRequest instructions")
     for prompt in (native, sdk):
+        assert (PROJECT_CONVERSATION_INSTRUCTION in prompt) is (project_id is not None)
         assert (PROJECT_TICKET_WORK_INSTRUCTION in prompt) is (project_id is not None)
         assert (PROJECT_ORCHESTRATOR_INSTRUCTION in prompt) is (role is True)
     assert spec.instructions == "Shared agent instructions"
@@ -108,6 +113,22 @@ def test_stage_fit_contract_requires_a_decision_without_phase_or_approval_shortc
     assert "resolve an ambiguous boundary" in PROJECT_TICKET_WORK_INSTRUCTION
 
 
+def test_conversation_in_any_project_session_creates_no_ticket_unless_work_persists():
+    assert "project session is ordinary conversation" in PROJECT_CONVERSATION_INSTRUCTION
+    assert "orchestrator" not in PROJECT_CONVERSATION_INSTRUCTION.lower()
+    assert "creating or reusing sessions" in PROJECT_CONVERSATION_INSTRUCTION
+    assert "do not create tickets to record a conversation" in PROJECT_CONVERSATION_INSTRUCTION
+    assert "persistent work that moves through the project's stages" in (
+        PROJECT_CONVERSATION_INSTRUCTION
+    )
+    assert "when the user asks to track or file the work" in PROJECT_CONVERSATION_INSTRUCTION
+    assert "instead of creating a ticket speculatively" in PROJECT_CONVERSATION_INSTRUCTION
+    assert "Conversation with the user creates no tickets on its own" in (
+        PROJECT_ORCHESTRATOR_INSTRUCTION
+    )
+    assert "not to record a conversation" in SysTicketCreateTool.help_text
+
+
 @pytest.mark.parametrize("projects_tools", [True, False])
 async def test_mandate_is_labeled_and_ordered_before_ticket_guidance_and_role(projects_tools):
     spec = AgentSpec(
@@ -141,6 +162,7 @@ async def test_mandate_is_labeled_and_ordered_before_ticket_guidance_and_role(pr
         if projects_tools:
             assert (
                 prompt.index(mandate)
+                < prompt.index(PROJECT_CONVERSATION_INSTRUCTION)
                 < prompt.index(PROJECT_TICKET_WORK_INSTRUCTION)
                 < prompt.index(PROJECT_ORCHESTRATOR_INSTRUCTION)
             )

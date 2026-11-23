@@ -1,5 +1,16 @@
 """Shared ticket-work guidance for project prompts and fresh agent ticket reads."""
 
+PROJECT_CONVERSATION_INSTRUCTION = (
+    "Talking with a user in a project session is ordinary conversation, as in any Omnigent "
+    "session, not ticket work. Answer, discuss, scope or do the requested work here, creating "
+    "or reusing sessions when useful, but do not create tickets to record a conversation, "
+    "question or quick task. Tickets are for persistent work that moves through the project's "
+    "stages: create one only when the user asks to track or file the work, or when you "
+    "coordinate work that needs several phases or handoffs or must outlive this conversation. "
+    "When unsure, do the conversational work and offer to track it instead of creating a "
+    "ticket speculatively."
+)
+
 PROJECT_TICKET_WORK_INSTRUCTION = (
     "Tickets use a description, project-defined stages and ordinary comments, not dedicated "
     "plan, review or completion-summary fields or ticket approval actions. Save the goal and "

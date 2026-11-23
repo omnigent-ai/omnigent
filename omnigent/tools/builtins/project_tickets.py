@@ -129,7 +129,9 @@ class SysTicketCreateTool(_TicketTool):
     tool_name = "sys_ticket_create"
     help_text = (
         "Create a ticket in the project's first stage; only title is required. "
-        "Tickets persist independently of sessions and cannot be deleted."
+        "Tickets persist independently of sessions and cannot be deleted. Use them for "
+        "persistent work that moves through stages, not to record a conversation, question "
+        "or quick task."
     )
     arguments = CreateTicket
 
