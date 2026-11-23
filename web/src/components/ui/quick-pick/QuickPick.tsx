@@ -1,23 +1,44 @@
 import {
   type KeyboardEvent,
+  type MouseEvent,
   type MutableRefObject,
   type ReactNode,
   useCallback,
+  useEffect,
   useId,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
-import { SearchIcon, XIcon } from "lucide-react";
+import {
+  AlertCircleIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  SearchIcon,
+  XIcon,
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
+import { Spinner } from "@/components/ui/spinner";
+import { pickListInputProps, readlineListStep } from "@/lib/listNavigationKeys";
+import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { cn } from "@/lib/utils";
 
+import { readQuickPickHistory, recordQuickPickHistory } from "./history";
 import { HighlightedText, type MatchHighlight } from "./HighlightedText";
-import type { QuickPickItem, QuickPickItemRow, QuickPickRow } from "./model";
+import type {
+  QuickPickAcceptDetails,
+  QuickPickAcceptResult,
+  QuickPickInputError,
+  QuickPickItem,
+  QuickPickItemRow,
+  QuickPickRow,
+  QuickPickSource,
+  QuickPickStats,
+} from "./model";
 import {
   buildQuickPickRows,
   navigateQuickPick,
@@ -25,16 +46,70 @@ import {
   type QuickPickSegment,
   reconcileActiveIndex,
 } from "./presentation";
+import { useQuickPickSources } from "./useQuickPickSources";
+
+const NO_SEGMENTS: readonly QuickPickSegment<never>[] = [];
+const NO_SOURCES: readonly QuickPickSource<never>[] = [];
 
 export interface QuickPickProps<Value> {
   /** Accessible name for the query field and results, such as "Command palette". */
   label: string;
   placeholder?: string;
   /** Runs of items in display order, such as search results and then commands. */
-  segments: readonly QuickPickSegment<Value>[];
+  segments?: readonly QuickPickSegment<Value>[];
+  /** Loaders for items that arrive asynchronously, listed after `segments`. */
+  sources?: readonly QuickPickSource<Value>[];
+  /**
+   * List `sources`' rows before `segments`, for a picker whose async results lead, unless an
+   * item matches the whole query from a word's start, such as a typed command name.
+   */
+  sourcesFirst?: boolean;
   query: string;
   onQueryChange: (query: string) => void;
-  onAccept: (item: QuickPickItem<Value>) => void;
+  onAccept: (item: QuickPickItem<Value>, details: QuickPickAcceptDetails) => QuickPickAcceptResult;
+  /**
+   * ⌘↵ for the whole picker instead of the active row, such as handing its search to a
+   * panel; it works with no row active. Without it, ⌘↵ accepts the active row as alternate.
+   */
+  onAlternate?: () => QuickPickAcceptResult;
+  /** Called for Escape when the picker is not inside a dialog. */
+  onDismiss?: () => void;
+  /** The footer's Close button, for a picker whose Escape is handled around it, such as a dialog. */
+  onClose?: () => void;
+  /** Footer text summarizing results, such as `formatQuickPickSummary`. */
+  summary?: (stats: QuickPickStats) => ReactNode;
+  /** Footer hint for Enter; defaults to Select. */
+  acceptLabel?: string;
+  /**
+   * Footer hint for ⌘↵ / Ctrl+↵; omit when there is no alternate action. A function names the
+   * active row's alternate, or returns undefined for a row without one.
+   */
+  alternateLabel?: string | ((item: QuickPickItem<Value>) => string | undefined);
+  /**
+   * Shown on a child page, such as one opened from a row: a back button, and
+   * Escape or Backspace in an empty query return to the parent page.
+   */
+  onBack?: () => void;
+  /** Accessible name for the back button, such as "Back to themes". */
+  backLabel?: string;
+  /**
+   * What the rows are, such as one opening of a child page. A new scope forgets the row the
+   * user picked, as a new query does, so a page doesn't inherit another page's pick.
+   */
+  selectionScope?: string;
+  /**
+   * Right Arrow with the caret at the end of the query: return true to have handled it for
+   * the active item, such as opening a related child page. Rows that `opensPage` open their
+   * page on Right Arrow even without this.
+   */
+  onExpand?: (item: QuickPickItem<Value>) => boolean;
+  /**
+   * Turns typed text into a selectable first row, such as a new project's name.
+   * Return `{ error }` to explain why the text can't be used, or null to ignore it.
+   */
+  createItem?: (query: string) => QuickPickItem<Value> | QuickPickInputError | null;
+  /** Remembers accepted items under this namespace and lists them first while the query is empty. */
+  historyKey?: string;
   /** How rows' matched text stands out, unless a row sets its own. */
   matchHighlight?: MatchHighlight;
   /** Shown and announced when no row is listed, such as "No results found"; null shows nothing. */
@@ -55,6 +130,16 @@ export interface QuickPickProps<Value> {
    */
   activeId?: string | null;
   onActiveIdChange?: (id: string) => void;
+  /**
+   * Called whenever a different row becomes active, by the user or as results change, such
+   * as a query filtering the active one out, for a caller previewing it. Not while none is.
+   */
+  onActiveRowShown?: (id: string) => void;
+  /**
+   * Ctrl-N/Ctrl-P step through rows instead of moving the caret, as macOS text fields do.
+   * Off by default, so the query keeps its readline caret keys.
+   */
+  stepsWithCtrlNP?: boolean;
   /** `data-testid` for the query field. */
   inputTestId?: string;
   /** Arrow keys wrap around at the ends; off by default, as in a menu. */
@@ -73,6 +158,14 @@ export interface QuickPickProps<Value> {
 
 export type QuickPickPresentation = "default" | "sidebar";
 
+function readRecents(historyKey: string | undefined): string[] {
+  return historyKey ? readQuickPickHistory(historyKey) : [];
+}
+
+function isInputError(value: unknown): value is QuickPickInputError {
+  return typeof value === "object" && value !== null && "error" in value;
+}
+
 interface RowSection<Value> {
   heading?: { key: string; label: string };
   rows: { row: QuickPickItemRow<Value>; index: number }[];
@@ -88,15 +181,80 @@ function sectionsOf<Value>(rows: readonly QuickPickRow<Value>[]): RowSection<Val
       return;
     }
     const current = sections.at(-1);
-    const belongs = current && (current.heading?.label ?? undefined) === row.item.group;
+    // Consecutive ungrouped rows share one unnamed section, as a heading's rows share its.
+    const belongs = current !== undefined && (current.heading?.key ?? undefined) === row.headingKey;
     if (current && belongs) current.rows.push({ row, index });
     else sections.push({ rows: [{ row, index }] });
   });
   return sections;
 }
 
+interface RowRun<Value> {
+  cards: boolean;
+  rows: RowSection<Value>["rows"];
+}
+
+// Consecutive card items form one run, laid out as a grid; every other row stands alone.
+function runsOf<Value>(rows: RowSection<Value>["rows"], cardsShown: boolean): RowRun<Value>[] {
+  const runs: RowRun<Value>[] = [];
+  for (const entry of rows) {
+    const card = cardsShown && entry.row.item.layout === "card";
+    const last = runs.at(-1);
+    if (card && last?.cards) last.rows.push(entry);
+    else runs.push({ cards: card, rows: [entry] });
+  }
+  return runs;
+}
+
 function resultCountText(resultCount: number): string {
   return resultCount === 1 ? "1 result" : `${resultCount.toLocaleString()} results`;
+}
+
+/** Default footer summary, such as "2,000 results · 42 ms". */
+export function formatQuickPickSummary({
+  resultCount,
+  elapsedMs,
+  loading,
+}: QuickPickStats): string {
+  const count = resultCountText(resultCount);
+  if (loading) return `${count} · Searching…`;
+  return elapsedMs === undefined ? count : `${count} · ${Math.round(elapsedMs)} ms`;
+}
+
+/** A footer hint that also works by click: it does what its keys do, keeping focus in the query. */
+function FooterAction({
+  keys,
+  shortcut,
+  label,
+  onClick,
+  disabled = false,
+}: {
+  keys: readonly string[];
+  /** The keys as `aria-keyshortcuts` names them, such as "Meta+Enter". */
+  shortcut: string;
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+}) {
+  // The key caps are hidden from assistive tech, so the name says the key.
+  const spokenKey = shortcut.replace("Meta+", "⌘").replace("Control+", "Ctrl+");
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      size="xs"
+      data-slot="quick-pick-footer-action"
+      aria-label={`${label} (${spokenKey})`}
+      aria-keyshortcuts={shortcut}
+      disabled={disabled}
+      onMouseDown={(event) => event.preventDefault()}
+      onClick={onClick}
+      className="-mx-1 shrink-0 gap-1.5 px-1 font-normal text-muted-foreground hover:text-foreground"
+    >
+      <CompactShortcutKeys keys={keys} />
+      <span>{label}</span>
+    </Button>
+  );
 }
 
 /**
@@ -107,7 +265,11 @@ function resultCountText(resultCount: number): string {
 function navigationFor(
   event: KeyboardEvent<HTMLInputElement>,
   pageSize: () => number,
+  stepsWithCtrlNP: boolean,
 ): QuickPickNavigation | null {
+  // An opted-in picker steps with Ctrl-N/Ctrl-P, as menus with a filter do.
+  const readlineStep = stepsWithCtrlNP ? readlineListStep(event) : null;
+  if (readlineStep) return { type: readlineStep };
   switch (event.key) {
     case "ArrowDown":
     case "ArrowUp": {
@@ -132,10 +294,24 @@ function navigationFor(
 export function QuickPick<Value>({
   label,
   placeholder,
-  segments,
+  segments = NO_SEGMENTS,
+  sources = NO_SOURCES,
+  sourcesFirst = false,
   query,
   onQueryChange,
   onAccept,
+  onAlternate,
+  onDismiss,
+  onClose = onDismiss,
+  onBack,
+  backLabel = "Back",
+  onExpand,
+  selectionScope,
+  summary,
+  acceptLabel = "Select",
+  alternateLabel,
+  createItem,
+  historyKey,
   matchHighlight = "emphasis",
   emptyMessage,
   status,
@@ -144,6 +320,8 @@ export function QuickPick<Value>({
   autoFocus = true,
   activeId = null,
   onActiveIdChange,
+  onActiveRowShown,
+  stepsWithCtrlNP = false,
   inputTestId,
   loop = false,
   fillHeight = false,
@@ -153,6 +331,7 @@ export function QuickPick<Value>({
 }: QuickPickProps<Value>) {
   const baseId = useId();
   const listId = `${baseId}-list`;
+  const errorId = `${baseId}-error`;
   // Keyed by the row, not its position, so an option keeps its ID when results above it change.
   const optionId = (row: QuickPickRow<Value>) => `${baseId}-option-${encodeURIComponent(row.key)}`;
   const sidebar = presentation === "sidebar";
@@ -160,11 +339,54 @@ export function QuickPick<Value>({
   // no row is listed (or can be picked) while collapsed.
   const collapsed = sidebar && query.trim().length === 0;
 
-  const rows = useMemo(
-    () => (collapsed ? [] : buildQuickPickRows({ segments, query })),
-    [collapsed, segments, query],
+  // Recents are read again when the namespace changes, such as switching scopes,
+  // and after an accept that keeps the picker open.
+  const [history, setHistory] = useState(() => ({ key: historyKey, ids: readRecents(historyKey) }));
+  if (history.key !== historyKey) setHistory({ key: historyKey, ids: readRecents(historyKey) });
+  const recentIds = history.ids;
+  const { states, retry } = useQuickPickSources(sources, query);
+  const allSegments = useMemo(
+    () => [
+      ...segments,
+      ...sources.map((source): QuickPickSegment<Value> => ({
+        sourceId: source.id,
+        ranking: source.ranking ?? "client",
+        origin: "source",
+        items: states[source.id]?.items ?? [],
+      })),
+    ],
+    [segments, sources, states],
   );
+  const freeText = useMemo(() => {
+    const trimmed = query.trim();
+    if (!createItem || trimmed.length === 0) return { item: null, error: null };
+    const created = createItem(trimmed);
+    if (isInputError(created)) return { item: null, error: created.error };
+    return { item: created, error: null };
+  }, [createItem, query]);
+  const rows = useMemo(
+    () =>
+      collapsed
+        ? []
+        : buildQuickPickRows({
+            segments: allSegments,
+            query,
+            recentIds,
+            freeTextItem: freeText.item,
+            sourcesFirst,
+          }),
+    [collapsed, allSegments, query, recentIds, freeText.item, sourcesFirst],
+  );
+  const sourceStates = sources.map((source) => states[source.id]);
+  const loading = sourceStates.some((state) => !state || state.status === "loading");
+  const sourceError = sourceStates.find((state) => state?.status === "error")?.error ?? null;
+  const elapsedValues = sourceStates.flatMap((state) =>
+    state?.elapsedMs === undefined ? [] : [state.elapsedMs],
+  );
+  const isMac = useMemo(() => isMacPlatform(), []);
   const sections = useMemo(() => sectionsOf(rows), [rows]);
+  // Card items show as cards only until the user types; results are plain rows in rank order.
+  const cardsShown = query.trim().length === 0;
   const resultCount = rows.filter((row) => row.kind === "item").length;
   const showEmpty = !collapsed && resultCount === 0;
   const queryFieldRef = useRef<HTMLInputElement | null>(null);
@@ -177,21 +399,29 @@ export function QuickPick<Value>({
   );
 
   // Until the user picks a row for this query, the top row stays active as results arrive.
-  // Any query change forgets the pick, so returning to an earlier query starts at the top.
-  const [activeChoice, setActiveChoice] = useState<{ query: string; id: string | null }>({
-    query,
-    id: null,
-  });
-  if (activeChoice.query !== query) setActiveChoice({ query, id: null });
+  // Any query or scope change forgets the pick, so returning to an earlier query starts at the top.
+  const [activeChoice, setActiveChoice] = useState<{
+    query: string;
+    scope: string | undefined;
+    id: string | null;
+  }>({ query, scope: selectionScope, id: null });
+  const choiceCurrent = activeChoice.query === query && activeChoice.scope === selectionScope;
+  if (!choiceCurrent) setActiveChoice({ query, scope: selectionScope, id: null });
   const activeIndex = reconcileActiveIndex(
     rows,
-    activeId ?? (activeChoice.query === query ? activeChoice.id : null),
+    activeId ?? (choiceCurrent ? activeChoice.id : null),
   );
   const pick = (id: string) => {
-    setActiveChoice({ query, id });
+    setActiveChoice({ query, scope: selectionScope, id });
     onActiveIdChange?.(id);
   };
   const activeRow = activeIndex === -1 ? null : (rows[activeIndex] as QuickPickItemRow<Value>);
+  const shownRowId = activeRow?.item.id ?? null;
+  const onActiveRowShownRef = useRef(onActiveRowShown);
+  onActiveRowShownRef.current = onActiveRowShown;
+  useEffect(() => {
+    if (shownRowId !== null) onActiveRowShownRef.current?.(shownRowId);
+  }, [shownRowId]);
 
   // Whenever the active row changes, by keys, a new query or new results, scroll it
   // into view; a row the pointer picked is already visible, so the list stays put.
@@ -226,53 +456,208 @@ export function QuickPick<Value>({
     return Math.max(1, Math.floor(list.clientHeight / option.offsetHeight) - 1);
   };
 
-  const accept = (row: QuickPickItemRow<Value>) => {
-    if (!row.item.disabledReason) onAccept(row.item);
+  const accept = (row: QuickPickItemRow<Value>, alternate = false) => {
+    if (row.item.disabledReason) return;
+    if (historyKey && !row.isFreeText && row.item.rememberInHistory !== false) {
+      recordQuickPickHistory(historyKey, row.item.id);
+    }
+    if (onAccept(row.item, { alternate }) === "keepOpen") {
+      setHistory({ key: historyKey, ids: readRecents(historyKey) });
+    }
+  };
+  // ⌘↵ or a modified click runs the picker's own alternate where there is one.
+  const acceptWith = (row: QuickPickItemRow<Value> | null, alternate: boolean) => {
+    if (alternate && onAlternate) onAlternate();
+    else if (row) accept(row, alternate);
+  };
+
+  // The back button leaves with the child page, so focus returns to the query field.
+  const goBack = () => {
+    onBack?.();
+    queryFieldRef.current?.focus();
+  };
+
+  /** Escape goes back on a child page, else dismisses, wherever focus is in the picker. */
+  const handleEscape = (event: KeyboardEvent<HTMLElement>) => {
+    // A dialog around the picker already handled it, such as going back.
+    if (event.defaultPrevented) return;
+    if (onBack) {
+      event.preventDefault();
+      goBack();
+    } else if (onDismiss) {
+      event.preventDefault();
+      onDismiss();
+    }
+  };
+
+  // Right Arrow at the end of the query opens the active row's page, so it still moves the caret.
+  const handleExpand = (event: KeyboardEvent<HTMLInputElement>) => {
+    const field = event.currentTarget;
+    const atEnd = field.selectionStart === query.length && field.selectionEnd === query.length;
+    if (!atEnd || event.shiftKey || event.altKey || event.metaKey || event.ctrlKey) return;
+    if (!activeRow || activeRow.item.disabledReason) return;
+    if (onExpand?.(activeRow.item)) {
+      event.preventDefault();
+    } else if (activeRow.item.opensPage) {
+      event.preventDefault();
+      accept(activeRow);
+    }
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     // Keys that drive an IME composition, including its Enter, belong to the composition.
     if (isImeCompositionKeyEvent(event)) return;
-    const navigation = navigationFor(event, pageSize);
+    const navigation = navigationFor(event, pageSize, stepsWithCtrlNP);
     if (navigation) {
       event.preventDefault();
       navigate(navigation);
     } else if (event.key === "Enter") {
       event.preventDefault();
-      if (activeRow) accept(activeRow);
+      acceptWith(activeRow, hasCommandModifier(event, isMac));
+    } else if (event.key === "Escape") {
+      handleEscape(event);
+    } else if (event.key === "ArrowRight") {
+      handleExpand(event);
+    } else if (event.key === "Backspace" && onBack && query === "") {
+      event.preventDefault();
+      goBack();
     }
+  };
+
+  // The back and clear buttons take Tab too; the query handles its own Escape before this.
+  const handleHeaderKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Escape" || isImeCompositionKeyEvent(event)) return;
+    if (event.target === queryFieldRef.current) return;
+    handleEscape(event);
+    // Escape may remove the button that had focus, so focus returns to the query.
+    if (event.defaultPrevented) queryFieldRef.current?.focus();
+  };
+
+  // The footer's buttons take focus from Tab, so Escape works from them as from the query.
+  const handleFooterKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape" && !isImeCompositionKeyEvent(event)) handleEscape(event);
+  };
+
+  // Controls among the results, such as Try again or Show more, take Tab too. Escape from
+  // one may remove it, so focus returns to the query.
+  const handleResultsKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Escape" || isImeCompositionKeyEvent(event)) return;
+    handleEscape(event);
+    if (event.defaultPrevented) queryFieldRef.current?.focus();
+  };
+
+  const stats: QuickPickStats = {
+    resultCount,
+    loading,
+    elapsedMs: elapsedValues.length > 0 ? Math.max(...elapsedValues) : undefined,
+  };
+  // An inline picker with no way to close, and nothing to summarize, keeps to its rows.
+  const showFooter =
+    !sidebar &&
+    (onClose !== undefined ||
+      onBack !== undefined ||
+      summary !== undefined ||
+      freeText.error !== null);
+  // The footer's accept buttons do what Enter does, so they need a row Enter would accept.
+  const canAcceptActive = activeRow !== null && !activeRow.item.disabledReason;
+  const shownAlternateLabel =
+    typeof alternateLabel === "function"
+      ? activeRow
+        ? alternateLabel(activeRow.item)
+        : undefined
+      : alternateLabel;
+
+  const optionProps = (row: QuickPickItemRow<Value>, index: number) => {
+    const { item } = row;
+    const isActive = index === activeIndex;
+    const disabled = Boolean(item.disabledReason);
+    return {
+      key: row.key,
+      id: optionId(row),
+      role: "option",
+      "aria-selected": isActive,
+      "aria-disabled": disabled || undefined,
+      "data-active": isActive || undefined,
+      // Hovering an enabled row makes it the user's pick, as in a menu, even when it
+      // is already the top row, so a result arriving above it doesn't take over.
+      onPointerMove: () => {
+        if (disabled || (activeId ?? (choiceCurrent ? activeChoice.id : null)) === item.id) return;
+        pointerPickRef.current = true;
+        pick(item.id);
+      },
+      // Keep focus in the query field.
+      onMouseDown: (event: { preventDefault: () => void }) => event.preventDefault(),
+      onClick: (event: MouseEvent<HTMLDivElement>) =>
+        acceptWith(row, hasCommandModifier(event, isMac)),
+    };
+  };
+
+  const renderCard = (row: QuickPickItemRow<Value>, index: number) => {
+    const { item } = row;
+    const { key, ...props } = optionProps(row, index);
+    return (
+      <div
+        key={key}
+        {...props}
+        data-layout="card"
+        className={cn(
+          "@container/card flex cursor-pointer items-start gap-2.5 rounded-lg border border-border bg-muted/30 p-2.5 text-ui select-none",
+          "data-active:border-ring/50 data-active:bg-muted data-active:text-foreground",
+          item.disabledReason && "cursor-default opacity-50",
+        )}
+      >
+        {item.icon && (
+          <span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-muted text-foreground [&_svg]:size-4">
+            {item.icon}
+          </span>
+        )}
+        <span className="flex min-w-0 flex-1 flex-col">
+          <span className="flex items-center gap-1.5">
+            <span data-slot="quick-pick-label" className="min-w-0 truncate font-medium">
+              {item.label}
+            </span>
+            {/* A tight card keeps its name whole; ⌘K and the menus still show the chord. */}
+            {item.shortcut && (
+              <CompactShortcutKeys
+                keys={item.shortcut}
+                className="ml-auto hidden shrink-0 @[13rem]/card:flex"
+              />
+            )}
+          </span>
+          {/* Two lines are kept for every hint, so the cards in a line match. */}
+          <span
+            data-slot={item.disabledReason ? "quick-pick-disabled-reason" : undefined}
+            title={item.disabledReason ?? item.description}
+            className="line-clamp-2 min-h-[2lh] text-xs text-muted-foreground"
+          >
+            {item.disabledReason ?? item.description}
+          </span>
+        </span>
+      </div>
+    );
   };
 
   const renderOption = (row: QuickPickItemRow<Value>, index: number) => {
     const { item } = row;
-    const isActive = index === activeIndex;
     const disabled = Boolean(item.disabledReason);
     const highlight = item.matchHighlight ?? matchHighlight;
+    const { key, ...props } = optionProps(row, index);
     return (
       <div
-        key={row.key}
-        id={optionId(row)}
-        role="option"
-        aria-selected={isActive}
-        aria-disabled={disabled || undefined}
-        data-active={isActive || undefined}
-        // Hovering an enabled row makes it the user's pick, as in a menu, even when it
-        // is already the top row, so a result arriving above it doesn't take over.
-        onPointerMove={() => {
-          if (disabled || (activeId ?? activeChoice.id) === item.id) return;
-          pointerPickRef.current = true;
-          pick(item.id);
-        }}
-        // Keep focus in the query field.
-        onMouseDown={(event) => event.preventDefault()}
-        onClick={() => accept(row)}
+        key={key}
+        {...props}
         className={cn(
           "flex cursor-pointer select-none rounded-lg px-2 text-ui",
           sidebar
             ? "items-center gap-2 py-1.5 data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)]"
             : "items-start gap-2 py-1.5 data-active:bg-muted data-active:text-foreground",
+          // Matches the menus' destructive item: red text, a red tint while active.
+          !sidebar &&
+            item.destructive &&
+            "text-destructive data-active:bg-destructive/10 data-active:text-destructive dark:data-active:bg-destructive/20",
           disabled && "cursor-default opacity-50",
         )}
+        data-variant={item.destructive ? "destructive" : undefined}
       >
         {sidebar ? (
           <>
@@ -310,14 +695,43 @@ export function QuickPick<Value>({
         {!sidebar && (
           <>
             {item.icon ? (
-              <span className="flex size-4 shrink-0 items-center justify-center self-center text-muted-foreground [&_svg]:size-4">
+              <span
+                className={cn(
+                  "flex size-4 shrink-0 items-center justify-center self-center text-muted-foreground [&_svg]:size-4",
+                  item.destructive && "text-destructive",
+                )}
+              >
                 {item.icon}
               </span>
             ) : null}
             <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-              <span data-slot="quick-pick-label" className="truncate">
-                <HighlightedText text={item.label} ranges={row.labelRanges} highlight={highlight} />
-              </span>
+              {row.sectionLabel ? (
+                <span className="flex min-w-0 items-baseline gap-1">
+                  {/* Rows ranked across groups name theirs, as a heading would; the heading isn't announced either. */}
+                  <span
+                    aria-hidden
+                    data-slot="quick-pick-section"
+                    className="shrink-0 text-muted-foreground"
+                  >
+                    {row.sectionLabel}:
+                  </span>
+                  <span data-slot="quick-pick-label" className="min-w-0 truncate">
+                    <HighlightedText
+                      text={item.label}
+                      ranges={row.labelRanges}
+                      highlight={highlight}
+                    />
+                  </span>
+                </span>
+              ) : (
+                <span data-slot="quick-pick-label" className="truncate">
+                  <HighlightedText
+                    text={item.label}
+                    ranges={row.labelRanges}
+                    highlight={highlight}
+                  />
+                </span>
+              )}
               {item.context}
               {item.description && (
                 <span className="truncate text-sm text-muted-foreground">
@@ -338,11 +752,22 @@ export function QuickPick<Value>({
                 {item.disabledReason}
               </span>
             )}
+            {!item.disabledReason && item.detail && (
+              <span className="shrink-0 self-center text-sm text-muted-foreground">
+                {item.detail}
+              </span>
+            )}
             {item.accessory && (
               <span className="flex shrink-0 items-center gap-2 self-center">{item.accessory}</span>
             )}
             {item.shortcut && (
               <CompactShortcutKeys keys={item.shortcut} className="shrink-0 self-center" />
+            )}
+            {item.opensPage && (
+              <ChevronRightIcon
+                aria-hidden
+                className="size-4 shrink-0 self-center text-muted-foreground"
+              />
             )}
           </>
         )}
@@ -361,19 +786,39 @@ export function QuickPick<Value>({
       )}
     >
       <div
+        onKeyDown={handleHeaderKeyDown}
         className={cn(
           "flex items-center gap-2",
           sidebar ? "rounded-lg bg-muted px-2" : "border-b border-border px-3 py-2",
         )}
       >
-        <SearchIcon aria-hidden className="size-4 shrink-0 text-muted-foreground" />
+        {onBack ? (
+          // No tooltip: an open tooltip would take Escape from the dialog. The footer shows esc Back.
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label={backLabel}
+            data-slot="quick-pick-back"
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={goBack}
+            className="-ml-1 text-muted-foreground"
+          >
+            <ChevronLeftIcon />
+          </Button>
+        ) : (
+          <SearchIcon aria-hidden className="size-4 shrink-0 text-muted-foreground" />
+        )}
         <input
           ref={setQueryField}
           role="combobox"
+          {...pickListInputProps(stepsWithCtrlNP)}
           aria-label={label}
           aria-expanded={!collapsed}
           aria-controls={collapsed ? undefined : listId}
           aria-autocomplete="list"
+          aria-invalid={freeText.error ? true : undefined}
+          aria-describedby={freeText.error && showFooter ? errorId : undefined}
           data-testid={inputTestId}
           aria-activedescendant={activeRow === null ? undefined : optionId(activeRow)}
           autoFocus={autoFocus}
@@ -409,6 +854,7 @@ export function QuickPick<Value>({
       <div
         ref={scrollRef}
         data-slot="quick-pick-scroll"
+        onKeyDown={handleResultsKeyDown}
         className={cn(
           "overflow-y-auto p-1",
           fillHeight ? "min-h-0 flex-1" : "max-h-72",
@@ -416,15 +862,56 @@ export function QuickPick<Value>({
         )}
       >
         {status && <div data-slot="quick-pick-status">{status}</div>}
-        {/* Announces the empty message, shown, or the result count, visually hidden. */}
+        {/* Announces the empty message, shown, or the result count, visually hidden, with a
+            failure beside rows that remain. */}
         <div
           role="status"
           aria-live="polite"
           data-slot={showEmpty ? "quick-pick-empty" : undefined}
-          className={showEmpty && emptyMessage ? "py-6 text-center text-ui" : "sr-only"}
+          className={
+            showEmpty && (loading || sourceError || emptyMessage)
+              ? "flex items-center justify-center gap-2 py-6 text-center text-ui"
+              : "sr-only"
+          }
         >
-          {collapsed ? null : showEmpty ? emptyMessage : resultCountText(resultCount)}
+          {collapsed ? null : showEmpty ? (
+            loading ? (
+              <>
+                <Spinner aria-hidden role="presentation" />
+                Loading results…
+              </>
+            ) : (
+              (sourceError ?? emptyMessage)
+            )
+          ) : sourceError ? (
+            `${resultCountText(resultCount)}. ${sourceError}`
+          ) : (
+            resultCountText(resultCount)
+          )}
         </div>
+        {sourceError && !collapsed && (
+          // Outside the status region, which announces the failure itself.
+          <div
+            className={cn(
+              "flex items-center justify-center gap-2 text-sm",
+              showEmpty ? "pb-4" : "px-2 py-1.5 text-destructive",
+            )}
+          >
+            {!showEmpty && <span>{sourceError}</span>}
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                retry();
+                // The button leaves once the retry starts, so the query keeps the keys.
+                queryFieldRef.current?.focus();
+              }}
+            >
+              Try again
+            </Button>
+          </div>
+        )}
         <div id={listId} role="listbox" aria-label={label}>
           {sections.map((section, sectionIndex) => {
             const headingId = section.heading ? `${baseId}-heading-${sectionIndex}` : undefined;
@@ -444,13 +931,75 @@ export function QuickPick<Value>({
                     {section.heading.label}
                   </div>
                 )}
-                {section.rows.map(({ row, index }) => renderOption(row, index))}
+                {runsOf(section.rows, cardsShown).map((run) =>
+                  run.cards ? (
+                    // Cards flow two to a line where the list is wide enough; arrows keep reading order.
+                    <div
+                      key={run.rows[0].row.key}
+                      role="presentation"
+                      data-slot="quick-pick-cards"
+                      className="@container/cards"
+                    >
+                      <div className="grid grid-cols-1 gap-1 p-0.5 @[22rem]/cards:grid-cols-2">
+                        {run.rows.map(({ row, index }) => renderCard(row, index))}
+                      </div>
+                    </div>
+                  ) : (
+                    run.rows.map(({ row, index }) => renderOption(row, index))
+                  ),
+                )}
               </div>
             );
           })}
         </div>
         {listEnd}
       </div>
+      {showFooter && (
+        <div
+          onKeyDown={handleFooterKeyDown}
+          data-slot="quick-pick-footer"
+          className="flex min-h-9 items-center gap-3 border-t border-border px-3 py-1.5 text-sm text-muted-foreground"
+        >
+          <span data-slot="quick-pick-summary" className="min-w-0 flex-1 truncate">
+            {/* An error shares the summary's fixed slot, so it never shifts the list. */}
+            {freeText.error ? (
+              <span
+                id={errorId}
+                title={freeText.error}
+                className="flex items-center gap-1.5 text-destructive"
+              >
+                <AlertCircleIcon aria-hidden className="size-3.5 shrink-0" />
+                <span className="truncate">{freeText.error}</span>
+              </span>
+            ) : (
+              summary?.(stats)
+            )}
+          </span>
+          <FooterAction
+            keys={["↵"]}
+            shortcut="Enter"
+            label={acceptLabel}
+            disabled={!canAcceptActive}
+            onClick={() => activeRow && accept(activeRow)}
+          />
+          {shownAlternateLabel && (
+            <FooterAction
+              keys={[isMac ? "⌘" : "Ctrl", "↵"]}
+              shortcut={isMac ? "Meta+Enter" : "Control+Enter"}
+              label={shownAlternateLabel}
+              disabled={!onAlternate && !canAcceptActive}
+              onClick={() => acceptWith(activeRow, true)}
+            />
+          )}
+          <FooterAction
+            keys={["esc"]}
+            shortcut="Escape"
+            label={onBack ? "Back" : "Close"}
+            disabled={!onBack && !onClose}
+            onClick={() => (onBack ? goBack() : onClose?.())}
+          />
+        </div>
+      )}
     </div>
   );
 }

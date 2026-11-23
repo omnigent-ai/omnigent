@@ -28,7 +28,6 @@ import { sendableQueuedHead, useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
-import { DbcertBanner } from "@/components/DbcertBanner";
 import { useSessionTasks } from "@/hooks/useSessionTasks";
 import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
@@ -66,11 +65,11 @@ import {
   userMessageOrigin,
   withUncommittedUserBubbles,
 } from "@/components/chat/chatBubbleParts";
+import { TranscriptPaletteCommands } from "@/components/chat/TranscriptPaletteCommands";
 import { usePeerSessionMessageDisplay } from "@/lib/peerSessionMessagePreferences";
 import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
 
 export interface TranscriptProps {
-  hostId: string | null | undefined;
   /** Ref callback for the conversation wrapper element (SelectionPopup scope +
    *  JumpToTopButton hover ancestor). Owned by the parent, forwarded here. */
   setConversationEl: (el: HTMLDivElement | null) => void;
@@ -162,7 +161,6 @@ export function isNativeFindShortcut(
  * dialogs bail out via React's normal prop-equality check.
  */
 function TranscriptImpl({
-  hostId,
   setConversationEl,
   containerEl,
   scroller,
@@ -528,6 +526,10 @@ function TranscriptImpl({
           </ConversationContent>
           {/* After the content, so the scroll element's ref is attached when its layout effect runs. */}
           <ConversationScrollRefBridge onScroller={setScroller} />
+          <TranscriptPaletteCommands
+            conversationId={display.conversationId}
+            bubbles={display.streamBubbles}
+          />
           <ConversationScrollButton
             className={
               isMobileViewport
@@ -545,10 +547,9 @@ function TranscriptImpl({
           scroller={scroller}
           hasMoreHistory={display.hasMoreHistory}
         />
-        {/* Too-many-tabs, dbcert, and sandbox-launch warnings, siblings of Conversation. */}
+        {/* Too-many-tabs and sandbox-launch warnings, siblings of Conversation. */}
         <FloatingBannerStack>
           <StreamBudgetBanner />
-          <DbcertBanner conversationId={conversationId} hostId={hostId} />
           <SandboxActionBanner />
         </FloatingBannerStack>
         {/* Left-edge minimap: one tick per turn. Desktop-only. */}

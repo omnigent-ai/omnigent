@@ -485,6 +485,7 @@ function ChatTable({ children, className, node: _node, ...props }: ChatTableProp
           aria-label="View fullscreen"
           aria-modal="true"
           className="fixed inset-0 z-50 flex flex-col bg-background"
+          data-fullscreen-overlay=""
           data-streamdown="table-fullscreen"
           onClick={closeFullscreen}
           role="dialog"

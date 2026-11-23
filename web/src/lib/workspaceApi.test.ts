@@ -322,6 +322,7 @@ describe("readFileViaWorkspaceApi", () => {
                 path: "src/a",
                 type: EntryType.DIRECTORY,
                 modifyTime: { seconds: 1700000000n },
+                leafDirectoryPath: "src/a/b",
               },
             ],
             nextPageToken: "src/a",
@@ -343,6 +344,7 @@ describe("readFileViaWorkspaceApi", () => {
           type: "directory",
           bytes: null,
           modified_at: 1700000000,
+          leaf_directory_path: "src/a/b",
         },
         {
           id: "src/b.ts",
@@ -974,6 +976,42 @@ describe("Git comparisons through the workspace API", () => {
     expect(base).toMatchObject({ path: "src/a.ts", encoding: "utf-8", content: "hi", bytes: 2 });
   });
 
+  it("does not send REVISIONS when revision_comparison is absent", async () => {
+    enable("workspace_api_server_access");
+    const kinds: unknown[] = [];
+    serveMethods({
+      // The methods, without the optional features that REVISIONS and commit lists need.
+      GetCapabilities: () =>
+        new Response(
+          capabilitiesBody("ResolveWorkingCopyBase", "ListWorkingCopyChanges", "ListBranchCommits"),
+          { headers: PROTO_HEADERS },
+        ),
+      ListWorkingCopyChanges: (body) => {
+        kinds.push(fromBinary(ListWorkingCopyChangesRequestSchema, body).comparison?.kind);
+        const changes = create(ListWorkingCopyChangesResponseSchema, {
+          base: { kind: ComparisonKind.BRANCH_POINT, base: "b".repeat(40) },
+        });
+        return new Response(toBinary(ListWorkingCopyChangesResponseSchema, changes), {
+          headers: PROTO_HEADERS,
+        });
+      },
+    });
+    const revisions = { kind: ComparisonKind.REVISIONS, baseRevision: "main" };
+
+    expect(await listWorkingCopyChangesViaWorkspaceApi("s-git-features", revisions)).toBeNull();
+    expect(await resolveWorkingCopyBaseViaWorkspaceApi("s-git-features", revisions)).toBeNull();
+    expect(await listBranchCommitsViaWorkspaceApi("s-git-features", "main")).toBeNull();
+    // The comparison the host does serve still goes through.
+    const branchPoint = await listWorkingCopyChangesViaWorkspaceApi("s-git-features", {
+      kind: ComparisonKind.BRANCH_POINT,
+    });
+
+    expect(branchPoint?.base?.base).toBe("b".repeat(40));
+    expect(kinds).toEqual([ComparisonKind.BRANCH_POINT]);
+    expect(methodCalls("ResolveWorkingCopyBase")).toHaveLength(0);
+    expect(methodCalls("ListBranchCommits")).toHaveLength(0);
+  });
+
   it("answers null when the host doesn't serve the method", async () => {
     enable("workspace_api_server_access");
     serveMethods({
@@ -1019,7 +1057,7 @@ describe("Git comparisons through the workspace API", () => {
     enable("workspace_api_server_access");
     serveMethods({
       GetCapabilities: () =>
-        new Response(capabilitiesBody("ListBranchCommits", "ReadBaseFile"), {
+        new Response(capabilitiesBody("ListBranchCommits", "branch_commits", "ReadBaseFile"), {
           headers: PROTO_HEADERS,
         }),
       ListBranchCommits: () =>

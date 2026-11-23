@@ -505,8 +505,8 @@ def _render_task_list(
     "sys_call_async",
     "sys_cancel_async",
     "sys_cancel_task",
-    "upload_file",
-    "download_file",
+    "sys_files_upload",
+    "sys_files_download",
 )
 def _render_status_tool(
     ex: ToolExecution,
@@ -517,6 +517,10 @@ def _render_status_tool(
     if obj is None:
         if parsed.raw.startswith("Error:"):
             return _status_panel(ex.name, parsed.raw, theme, border_style=theme.error)
+        return None
+    # A runner download returns the file's own content, even a JSON document;
+    # only the in-process tool returns saved-file metadata with a path.
+    if ex.name == "sys_files_download" and "path" not in obj:
         return None
 
     try:
@@ -873,12 +877,12 @@ def _status_title_message(
     if "cancel" in name:
         message = f"{fields.task_id} · cancelled={fields.cancelled}"
         return "task cancellation", message
-    if name == "upload_file":
+    if name == "sys_files_upload":
         message = " · ".join(
             bit for bit in (fields.filename, fields.content_type, fields.file_id) if bit
         )
         return "uploaded file", message
-    if name == "download_file":
+    if name == "sys_files_download":
         message = " · ".join(
             bit
             for bit in (

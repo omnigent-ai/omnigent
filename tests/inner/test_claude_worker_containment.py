@@ -33,7 +33,7 @@ from omnigent.inner.datamodel import (
 )
 from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.proxy import EgressProxy
-from omnigent.inner.sandbox import SandboxPolicy
+from omnigent.inner.sandbox import HarnessSandboxValidationError, SandboxPolicy
 from tests._helpers.egress_ca import prepare_isolated_egress_ca
 from tests._helpers.live_server import terminate_process
 from tests._helpers.polling import poll_until
@@ -115,16 +115,6 @@ def worker_policy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SandboxPol
         ),
     )
     return policy
-
-
-def test_backend_that_does_not_wrap_is_rejected(
-    worker_policy: SandboxPolicy, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    backend = Mock()
-    backend.wrap_launcher_argv.side_effect = lambda argv, *a, **k: argv
-    monkeypatch.setattr(claude, "get_backend", lambda _: backend)
-    with pytest.raises(OSError, match="cannot contain"):
-        claude.prepare_claude_cli_path("/bin/claude", OSEnvSpec())
 
 
 def test_inactive_policy_cannot_silently_disable_a_requested_sandbox(
@@ -225,17 +215,20 @@ def test_brokered_model_access_requires_worker_environment(
     monkeypatch.setattr(claude, "create_private_tmpdir", create_runtime)
     access = ClaudeModelAccess("https://model.test", "x-api-key", lambda: "synthetic")
 
-    with pytest.raises(ValueError, match="owned worker environment"):
+    with pytest.raises(HarnessSandboxValidationError, match="owned worker environment") as failure:
         claude.prepare_claude_cli_path("/bin/claude", OSEnvSpec(), model_access=access)
+    assert failure.value.reason == "model_access"
 
-    with pytest.raises(ValueError, match="owned worker environment"):
+    with pytest.raises(HarnessSandboxValidationError, match="egress_rules") as failure:
         claude.prepare_claude_cli_path(
             "/bin/claude",
             OSEnvSpec(sandbox=OSEnvSandboxSpec(egress_rules=["POST model.test/v1/messages"])),
         )
+    assert failure.value.reason == "egress_rules"
 
-    with pytest.raises(OSError, match="caller_process"):
+    with pytest.raises(HarnessSandboxValidationError, match=r"os_env\.type") as failure:
         claude.prepare_claude_cli_path("/bin/claude", OSEnvSpec(type="none"), model_access=access)
+    assert failure.value.reason == "type"
 
     create_runtime.assert_not_called()
 
@@ -814,10 +807,8 @@ def cli_model_server(
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             requests.append({"path": self.path, "headers": dict(self.headers), "body": body})
-            nested_terminal = not body.get("tools") and "TERMINAL_NESTED_PROBE" in json.dumps(
-                body["messages"]
-            )
-            if replies and not nested_terminal:
+            # Titles also advertise built-in tools; only the foreground model consumes the script.
+            if replies and body.get("tools") and body["model"] == "claude-sonnet-4-6":
                 next_reply = replies.pop(0)
                 blocks = next_reply() if callable(next_reply) else next_reply
             else:
@@ -1460,9 +1451,9 @@ def test_omnigent_run_cli_with_contained_claude(
                 "prompt": "Reply with the test marker. Execute any requested Bash tool.",
                 "executor": {
                     "type": "omnigent",
+                    "model": "claude-sonnet-4-6",
                     "config": {
                         "harness": "claude-sdk",
-                        "model": "claude-sonnet-4-6",
                         "permission_mode": "bypassPermissions",
                     },
                     "auth": {"type": "api_key", "api_key": "parent-only-cli-secret"},

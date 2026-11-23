@@ -32,7 +32,7 @@ prompt: |
   Test fixture tools available when requested: `word_count`, `add_task`,
   `list_tasks`, and `update_task_status`. When the user explicitly asks you
   to call one of these tools, call the tool instead of solving the task from
-  memory. You can also use `sys_os_shell` to create files and `upload_file`
+  memory. You can also use `sys_os_shell` to create files and `sys_files_upload`
   to attach generated outputs.
 
   When you don't have enough context, ask a short clarifying question
@@ -44,12 +44,10 @@ os_env:
   type: caller_process
   cwd: .
 
-tools:
-  builtins:
-    - upload_file
-    - list_files
-    - download_file
+tool_groups:
+  files: true
 
+tools:
   fact_checker:
     type: agent
     description: Verifies claims by searching for corroborating or contradicting evidence.

@@ -13,26 +13,14 @@ import os
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
-_MAC_SHELL_INIT_SCRIPT = """
-    Object.defineProperty(navigator, "platform", { value: "MacIntel" });
-    Object.defineProperty(navigator, "userAgentData", { value: { platform: "macOS" } });
-    Object.defineProperty(navigator, "userAgent", { value: "Mozilla/5.0 (Macintosh)" });
-    window.omnigentDesktop = {
-        kind: "electron",
-        setBadgeCount() {},
-        notify() { return Promise.resolve(false); },
-        onNotificationActivated() { return () => {}; },
-        getServerPicker() { return Promise.resolve(null); },
-        switchServer() { return Promise.resolve(); },
-        openServerSetup() {},
-    };
-"""
+from tests.e2e_ui.desktop._mac_shell import (
+    MAC_SHELL_INIT_SCRIPT,
+    WINDOW_CONTROLS_STRIP,
+    intersects_window_controls,
+)
 
 _WIDE_VIEWPORT = {"width": 1280, "height": 860}
 _NARROW_VIEWPORT = {"width": 740, "height": 860}
-
-# macOS paints the traffic lights outside the DOM; index.css reserves this strip for them.
-_WINDOW_CONTROLS_STRIP = {"x": 0, "y": 0, "width": 88, "height": 48}
 
 # Electron applies app-region rects in document order, ignoring stacking, opacity
 # and pointer-events, so the last rendered region over a point decides dragging.
@@ -70,20 +58,9 @@ _EMPTY_TITLE_BAR_POINTS_SCRIPT = """
 
 
 def _undraggable_empty_title_bar_points(page: Page) -> list[dict[str, object]]:
-    sample = page.evaluate(_EMPTY_TITLE_BAR_POINTS_SCRIPT, _WINDOW_CONTROLS_STRIP["height"])
+    sample = page.evaluate(_EMPTY_TITLE_BAR_POINTS_SCRIPT, WINDOW_CONTROLS_STRIP["height"])
     assert sample["empty"] > 0, "no empty title-bar points were sampled"
     return sample["undraggable"]
-
-
-def _intersects_window_controls(box: dict[str, float] | None) -> bool:
-    assert box is not None and box["width"] > 0 and box["height"] > 0, f"no rendered box: {box}"
-    strip = _WINDOW_CONTROLS_STRIP
-    return (
-        box["x"] < strip["x"] + strip["width"]
-        and strip["x"] < box["x"] + box["width"]
-        and box["y"] < strip["y"] + strip["height"]
-        and strip["y"] < box["y"] + box["height"]
-    )
 
 
 def _hold_for_recording(page: Page) -> None:
@@ -95,7 +72,7 @@ def _open_session_in_mac_shell(
     request: pytest.FixtureRequest, base_url: str, session_id: str
 ) -> Page:
     page: Page = request.getfixturevalue("page")
-    page.add_init_script(_MAC_SHELL_INIT_SCRIPT)
+    page.add_init_script(MAC_SHELL_INIT_SCRIPT)
     page.set_viewport_size(_WIDE_VIEWPORT)
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=30_000)
@@ -139,13 +116,13 @@ def test_narrow_window_keeps_the_desktop_layout(
     title_bar_actions = page.locator(".electron-sidebar-header-actions")
     close_sidebar = title_bar_actions.get_by_role("button", name="Close sidebar", exact=True)
     expect(close_sidebar).to_be_visible()
-    assert not _intersects_window_controls(close_sidebar.bounding_box()), (
+    assert not intersects_window_controls(close_sidebar.bounding_box()), (
         f"Close sidebar button {close_sidebar.bounding_box()} sits under the window controls"
     )
     expect(page.locator(".chat-header-sidebar-toggle")).to_be_hidden()
     brand = aside.get_by_test_id("sidebar-brand")
     expect(brand).to_be_visible()
-    assert not _intersects_window_controls(brand.bounding_box()), (
+    assert not intersects_window_controls(brand.bounding_box()), (
         f"sidebar wordmark {brand.bounding_box()} sits under the window controls"
     )
     expect(
@@ -166,7 +143,7 @@ def test_narrow_window_keeps_the_desktop_layout(
     expect(aside).to_have_attribute("data-collapsed", "true")
     open_sidebar = title_bar_actions.get_by_role("button", name="Open sidebar", exact=True)
     expect(open_sidebar).to_be_visible()
-    assert not _intersects_window_controls(open_sidebar.bounding_box()), (
+    assert not intersects_window_controls(open_sidebar.bounding_box()), (
         f"Open sidebar button {open_sidebar.bounding_box()} sits under the window controls"
     )
     open_sidebar.click()
@@ -186,7 +163,7 @@ def test_narrow_window_command_palette_clears_window_controls(
     expect(search_field).to_be_visible()
     _hold_for_recording(page)
 
-    assert not _intersects_window_controls(search_field.bounding_box()), (
+    assert not intersects_window_controls(search_field.bounding_box()), (
         f"palette search field {search_field.bounding_box()} sits under the window controls"
     )
     # The desktop palette is a centered dialog, not the mobile layout's full-window sheet.
@@ -208,7 +185,7 @@ def test_narrow_window_settings_back_row_clears_window_controls(
     expect(back).to_be_visible()
     _hold_for_recording(page)
 
-    assert not _intersects_window_controls(back.bounding_box()), (
+    assert not intersects_window_controls(back.bounding_box()), (
         f"settings Back link {back.bounding_box()} sits under the window controls"
     )
 

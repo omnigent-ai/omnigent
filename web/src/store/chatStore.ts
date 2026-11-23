@@ -6594,6 +6594,49 @@ async function rehydrateWindowOnReconnect(
   return "applied";
 }
 
+/** A tool call or result's identity within its turn, e.g. ``resp_1/result/call_9``. */
+function toolBlockKey(responseId: string, kind: "call" | "result", callId: string): string {
+  return `${responseId}/${kind}/${callId}`;
+}
+
+/**
+ * Keys of the tool calls and results already on screen. The stream names tool
+ * items by provisional ids, so their saved copies can't be matched by item id.
+ */
+function shownToolBlockKeys(blocks: AnyBlock[]): Set<string> {
+  const keys = new Set<string>();
+  for (const block of blocks) {
+    if (block.type === "tool_group") {
+      for (const execution of block.executions) {
+        if (execution.callId)
+          keys.add(toolBlockKey(block.ctx.responseId, "call", execution.callId));
+      }
+    } else if (block.type === "tool_result" && block.callId) {
+      keys.add(toolBlockKey(block.ctx.responseId, "result", block.callId));
+    }
+  }
+  return keys;
+}
+
+/** Whether saved tool *block* repeats a call or result in *shown*, from {@link shownToolBlockKeys}. */
+function repeatsShownToolBlock(block: AnyBlock, shown: Set<string>): boolean {
+  const { responseId } = block.ctx;
+  if (block.type === "tool_group") {
+    return (
+      block.executions.length > 0 &&
+      block.executions.every(
+        (execution) =>
+          Boolean(execution.callId) &&
+          shown.has(toolBlockKey(responseId, "call", execution.callId)),
+      )
+    );
+  }
+  if (block.type === "tool_result" && block.callId) {
+    return shown.has(toolBlockKey(responseId, "result", block.callId));
+  }
+  return false;
+}
+
 /** A reconnect backfill's outcome; only a failed read leaves history owed. */
 type ReconnectBackfill = "applied" | "failed" | "skipped";
 
@@ -6608,7 +6651,8 @@ type ReconnectBackfill = "applied" | "failed" | "skipped";
  * than one page can't leave an unreachable hole between the window and the
  * live tail; if `RECONNECT_BACKFILL_MAX_PAGES` is hit without overlap, the
  * window is re-hydrated wholesale instead (see
- * `rehydrateWindowOnReconnect`). Dedupes by `itemId` and runs concurrently
+ * `rehydrateWindowOnReconnect`). Dedupes by `itemId` (tool calls and results
+ * also by turn and call id) and runs concurrently
  * with the live pump — the same race-safe "stream-then-snapshot" shape
  * `bindStream` uses, so a turn that completes between the fetch and the
  * reopen is still caught by one or the other.
@@ -6738,7 +6782,10 @@ async function reconcileOnReconnect(
     const seen = new Set(
       currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
-    const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
+    const shownTools = shownToolBlockKeys(currentBlocks);
+    const unseen = snapshotBlocks.filter(
+      (b) => b.ctx.itemId && !seen.has(b.ctx.itemId) && !repeatsShownToolBlock(b, shownTools),
+    );
     const reconciledBlocks =
       s.isNativeTerminalSession && unseen.some((b) => b.type === "text_done" && b.ctx.itemId)
         ? withoutInterruptedNativePreviews(currentBlocks, ignoredNativeMessageIds)

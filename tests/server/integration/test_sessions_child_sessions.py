@@ -461,6 +461,86 @@ async def test_parent_session_snapshot_replays_child_pending_elicitation(
     assert prompts[0]["params"]["target_session_id"] == child.id
 
 
+async def test_session_snapshot_replays_only_visible_descendant_pending_elicitations(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A snapshot replays prompts from every visible sub-agent below the session.
+
+    Prompts are found by walking up from the pending sessions, so the walk
+    must stop where listing the sub-agent tree would: an archived sub-agent
+    hides its subtree, sessions beside or above the snapshotted one are not
+    its descendants, and neither are sessions in another tree. An
+    intermediate sub-agent with no prompt of its own still links its
+    descendants to the snapshotted session.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    from omnigent.runtime import pending_elicitations
+
+    session = await _create_parent_session(client, agent_name="snapshot-nested-pending")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    def seed(title: str, parent_id: str) -> Conversation:
+        return _seed_child(
+            conv_store=conv_store,
+            parent_id=parent_id,
+            title=title,
+            agent_id=session["agent_id"],
+        )
+
+    worker = seed("researcher:worker", session["id"])
+    worker_task = seed("researcher:worker-task", worker.id)
+    archived = seed("researcher:archived", session["id"])
+    archived_task = seed("researcher:archived-task", archived.id)
+    conv_store.update_conversation(archived.id, archived=True)
+    sibling = seed("researcher:sibling", session["id"])
+    quiet = seed("researcher:quiet", session["id"])
+    quiet_task = seed("researcher:quiet-task", quiet.id)
+    other = await _create_parent_session(client, agent_name="snapshot-other-tree")
+    other_task = _seed_child(
+        conv_store=conv_store,
+        parent_id=other["id"],
+        title="researcher:other-task",
+        agent_id=other["agent_id"],
+    )
+    for prompted in (
+        worker,
+        worker_task,
+        archived,
+        archived_task,
+        sibling,
+        quiet_task,
+        other_task,
+    ):
+        pending_elicitations.record_publish(
+            prompted.id,
+            {
+                "type": "response.elicitation_request",
+                "elicitation_id": f"elicit_{prompted.id}",
+                "params": {"mode": "form", "message": f"Approve {prompted.title}"},
+            },
+        )
+
+    async def replayed(session_id: str) -> set[str]:
+        resp = await client.get(f"/v1/sessions/{session_id}")
+        assert resp.status_code == 200, resp.text
+        return {
+            prompt["params"]["target_session_id"]
+            for prompt in resp.json()["pending_elicitations"]
+            if "target_session_id" in prompt["params"]
+        }
+
+    assert await replayed(session["id"]) == {worker.id, worker_task.id, sibling.id, quiet_task.id}
+    assert await replayed(worker.id) == {worker_task.id}
+    assert await replayed(sibling.id) == set()
+    assert await replayed(worker_task.id) == set()
+    assert await replayed(quiet.id) == {quiet_task.id}
+    assert await replayed(other["id"]) == {other_task.id}
+
+
 async def test_late_ancestor_mirror_keeps_child_current_elicitation(
     client: httpx.AsyncClient,
     db_uri: str,

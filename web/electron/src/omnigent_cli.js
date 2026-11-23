@@ -869,15 +869,32 @@ async function stopHost(cliPath, serverUrl) {
   return { ok: res.code === 0, output: (res.stdout || res.stderr).trim() };
 }
 
-/** True when any recorded server URL matches, including loopback aliases.
+/** Canonicalize a workspace UI or API mount to the same-origin UI mount that windows pin. */
+function workspaceUiServerUrl(value) {
+  const normalized = normalizeServerUrl(value);
+  try {
+    const parsed = new URL(normalized);
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    const isWorkspaceMount =
+      pathname === url.WORKSPACE_UI_PATH || url.WORKSPACE_API_PATHS.has(pathname);
+    if (!isWorkspaceMount) return normalized;
+    parsed.pathname = url.WORKSPACE_UI_PATH;
+    return normalizeServerUrl(parsed.href);
+  } catch {
+    return normalized;
+  }
+}
+
+/** True when any recorded server URL matches, including loopback and workspace-mount aliases.
  * Local-mode records may carry the URL only in resolved_server_url. */
 function matchesServer(daemon, serverUrl) {
   if (!daemon || typeof daemon !== "object") return false;
-  const want = normalizeServerUrl(serverUrl);
+  const want = workspaceUiServerUrl(serverUrl);
   if (want === "") return false;
-  return [daemon.server_url, daemon.target, daemon.resolved_server_url].some(
-    (field) => normalizeServerUrl(field) === want || sameLoopbackServer(field, serverUrl),
-  );
+  return [daemon.server_url, daemon.target, daemon.resolved_server_url].some((field) => {
+    const candidate = workspaceUiServerUrl(field);
+    return candidate === want || sameLoopbackServer(candidate, want);
+  });
 }
 
 /**

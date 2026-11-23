@@ -374,6 +374,42 @@ describe("workspace panel content border", () => {
   });
 });
 
+describe("workspace rail open motion", () => {
+  // The rule that shows an open rail; the classic rail names its state data-state, the tabs
+  // rail data-rail-state, so a toggle there doesn't restyle everything Radix styles by data-state.
+  const openRule = indexCssSource.match(/([^{}]*\[data-rail-state="open"\][^{}]*)\{/)?.[1] ?? "";
+
+  it.each([
+    ["data-state", "the classic rail"],
+    ["data-rail-state", "the tabs rail"],
+  ])("shows an open rail that names its state %s (%s)", (attribute) => {
+    const rail = document.createElement("aside");
+    rail.className = "workspace-panel-motion";
+    rail.setAttribute(attribute, "open");
+    expect(rail.matches(openRule.trim())).toBe(true);
+    rail.setAttribute(attribute, "closed");
+    expect(rail.matches(openRule.trim())).toBe(false);
+  });
+
+  // Where an animated open starts from; the selector list inside @starting-style.
+  const startingRule =
+    indexCssSource.match(/@starting-style\s*\{([^{}]*\.workspace-panel-motion[^{}]*)\{/)?.[1] ?? "";
+
+  it.each([
+    ["data-state", "the classic rail"],
+    ["data-rail-state", "the tabs rail"],
+  ])("animates an open rail that names its state %s (%s) from its start", (attribute) => {
+    const rail = document.createElement("aside");
+    rail.className = "workspace-panel-motion";
+    rail.setAttribute(attribute, "open");
+    expect(rail.matches(startingRule.trim())).toBe(false);
+    rail.setAttribute("data-animate-visibility", "");
+    expect(rail.matches(startingRule.trim())).toBe(true);
+    rail.setAttribute(attribute, "closed");
+    expect(rail.matches(startingRule.trim())).toBe(false);
+  });
+});
+
 describe("index.css app-shell viewport lock", () => {
   const rule = cssBlocks
     .map(([block]) => block)
@@ -1497,7 +1533,14 @@ describe("index.css electron-mac sidebar header", () => {
       /html\[data-electron-mac\][^{}]*\{\s*@(?:variant (?:max-)?md\b|media [^{]*width)/,
     );
     for (const block of rawMdMediaBlocks) expect(block).not.toContain("[data-electron-mac]");
-    expect(cssSource).not.toMatch(/\.electron-sidebar-header-actions \{\s*display: none;/);
+    // The cluster steps aside only while a full-window view covers the app.
+    const clusterHidingSelectors = cssBlocks
+      .map(([block]) => block.replace(/\/\*[\s\S]*?\*\//g, ""))
+      .filter((block) => /\.electron-sidebar-header-actions \{\s*display: none;/.test(block))
+      .map((block) => block.slice(0, block.indexOf("{")).trim());
+    expect(clusterHidingSelectors).toEqual([
+      "html[data-electron-mac]:has([data-fullscreen-overlay]) .electron-sidebar-header-actions",
+    ]);
   });
 
   it("keeps every header rule scoped to the desktop shell", () => {
@@ -1679,3 +1722,31 @@ function extractInsetRule(css: string): { selectors: string; body: string } | nu
   if (bodyStart === -1 || bodyEnd === -1) return null;
   return { selectors, body: css.slice(bodyStart + 1, bodyEnd) };
 }
+
+// The lights are painted outside the page, so the corner pane row's room for them is pinned here.
+describe("index.css pane strip window-corner inset", () => {
+  const blocks = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).map((block) =>
+    block.replace(/\/\*[\s\S]*?\*\//g, "").trim(),
+  );
+  const ruleFor = (selector: string) =>
+    blocks.find((block) => block.slice(0, block.indexOf("{")).trim().endsWith(selector));
+
+  it("is hidden by default and shown on the Mac with the sidebar closed, clearing the header's room", () => {
+    expect(ruleFor(".pane-strip-window-inset")).toContain("display: none");
+    const shown = ruleFor(
+      "html[data-electron-mac] .app-shell:not([data-sidebar-open]) .pane-strip-window-inset",
+    );
+    expect(shown).toContain("display: block");
+    expect(shown).toContain("width: var(--mac-header-actions-clearance)");
+  });
+
+  it("makes a row under the title bar as tall as the title bar, as the chat body's offset reads it", () => {
+    const macRoot = blocks.filter(
+      (block) => block.slice(0, block.indexOf("{")).trim() === "html[data-electron-mac]",
+    );
+    expect(macRoot.join("\n")).toContain("--pane-window-top-row: var(--mac-titlebar-height)");
+    expect(
+      ruleFor("html[data-electron-mac] [data-pane-strip][data-pane-strip-title-bar-row]"),
+    ).toContain("height: var(--pane-window-top-row)");
+  });
+});

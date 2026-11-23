@@ -27,12 +27,26 @@
  */
 export type SidebarDragPhase = "begin" | "move" | "open" | "close";
 
-// Mirrors SESSION_HOST_PROTOCOL in electron/src/hostIdentity.js.
+// Mirrors the protocol versions in electron/src/hostIdentity.js.
 export const SESSION_HOST_PROTOCOL = 1;
+export const SSH_PREVIEW_PROTOCOL = 1;
 
 export interface BrowserHostOptions {
   sourceHostId?: string | null;
   sessionHostProtocol?: number;
+  sshPreviewProtocol?: number;
+  navigationRetryToken?: string;
+  sourceSshTarget?: string;
+}
+
+export interface BrowserNavigationResult {
+  ok: boolean;
+  created?: boolean;
+  hostIsThisMachine?: boolean;
+  sshPreviewHost?: boolean;
+  retryWithFreshHost?: boolean;
+  navigationRetryToken?: string;
+  error?: string;
 }
 
 export function navigationHostOptions(hostId: string | null): BrowserHostOptions {
@@ -251,7 +265,7 @@ interface ElectronDesktopApi extends NativeShellApi {
       rememberedArcaHostId?: string;
       sourceIsArcaHost?: boolean;
     },
-  ) => Promise<{ ok: boolean; created?: boolean; hostIsThisMachine?: boolean; error?: string }>;
+  ) => Promise<BrowserNavigationResult>;
   /**
    * Hide/show the active embedded browser view while a DOM overlay is open.
    * The native view paints above the renderer, so this is how overlays
@@ -271,14 +285,16 @@ interface ElectronDesktopApi extends NativeShellApi {
   browserCancelRecentSessionSwitch?: () => Promise<{ ok: boolean; error?: string }>;
   /**
    * Inspect the local Google Chrome profiles for cookies in the site tree the
-   * conversation's view is on. Metadata only (profile + per-scope counts): no
-   * Keychain access and no cookie values. Absent on shells predating the feature.
+   * conversation's view is on, and across every website. Metadata only (profile
+   * + counts): no Keychain access and no cookie values. Absent on shells
+   * predating the feature.
    */
   browserChromeCookiePreview?: (conversationId: string) => Promise<ChromeCookiePreviewResult>;
   /**
-   * Copy that site's cookies out of one Chrome profile into the conversation's
-   * own in-memory browser session. Decrypts via the Keychain (system prompt on
-   * the first import); `expectedHost` must still match the view's current site.
+   * Copy one Chrome profile's cookies into the conversation's own in-memory
+   * browser session: every website's for {@link CHROME_COOKIE_ALL_SITES_SCOPE},
+   * else one site tree, for which `expectedHost` must still match the view's
+   * current site. Decrypts via the Keychain (system prompt on the first import).
    */
   browserChromeCookieImport?: (
     conversationId: string,
@@ -319,8 +335,23 @@ interface ElectronDesktopApi extends NativeShellApi {
   cancelGlobalShortcutRecording?: () => Promise<boolean>;
   /** The attached browser page's view id if it has keyboard focus; absent on older shells. */
   browserFocusedView?: () => Promise<string | null>;
+  /** "Widen window when opening the right sidebar"; absent on shells predating it. */
+  rightSidebarWindow?: RightSidebarWindowBridge;
   /** The floating New Agent panel; absent on shells predating it. */
   floatingComposer?: FloatingComposerBridge;
+}
+
+/** The shell's setting that widens the window for the right sidebar, and the page's reports. */
+export interface RightSidebarWindowBridge {
+  getWidensWindow: () => Promise<boolean>;
+  /** Resolves false when the shell couldn't save it. */
+  setWidensWindow: (enabled: boolean) => Promise<boolean>;
+  /** The user opened the right sidebar, `width` CSS px wide. */
+  opened: (width: number) => void;
+  /** The user closed the right sidebar. */
+  closed: () => void;
+  /** Forget the previous session's growth without resizing; absent on older shells. */
+  reset?: () => void;
 }
 
 /** Why the shell didn't open a path from the floating panel in a main window. */
@@ -416,6 +447,16 @@ export interface ChromeCookieProfile {
   scopes?: ChromeCookieScopeCount[];
 }
 
+/** The import scope for every website in a Chrome profile, not one site tree. */
+export const CHROME_COOKIE_ALL_SITES_SCOPE = "*";
+
+/** One local Chrome profile and how many cookies it holds across every website. */
+export interface ChromeCookieAllSitesProfile {
+  id: string;
+  name: string;
+  cookieCount: number;
+}
+
 export interface ChromeCookiePreviewResult {
   ok: boolean;
   /** Host whose page asked for the import (main-derived from the real URL). */
@@ -425,6 +466,9 @@ export interface ChromeCookiePreviewResult {
   scopes?: string[];
   /** Profiles with at least one cookie for any scope; empty when none match. */
   profiles?: ChromeCookieProfile[];
+  /** Profiles with at least one cookie for any website. Absent on shells that
+   *  can only import one site. */
+  allSitesProfiles?: ChromeCookieAllSitesProfile[];
   error?: string;
 }
 
@@ -433,7 +477,7 @@ export interface ChromeCookieImportResult {
   /** The user declined the shell's own confirmation; nothing was read. */
   cancelled?: boolean;
   host?: string;
-  /** The site tree actually copied (the page's host unless the user widened it). */
+  /** The site tree actually copied, or {@link CHROME_COOKIE_ALL_SITES_SCOPE}. */
   scope?: string;
   profileId?: string;
   profileName?: string;
@@ -531,6 +575,8 @@ export interface DesktopFeatures {
   arcaPreviewRecovery?: boolean;
   /** This shell can import the current site's cookies from local Google Chrome. */
   chromeCookieImport?: boolean;
+  /** Shell can ask to verify a remote host over SSH before allowing localhost previews. */
+  sshLocalhostPreview?: boolean;
   /** This shell can show the floating New Agent panel (macOS). */
   floatingComposer?: boolean;
   /** This shell's shortcut calls take the "floatingComposer" id (macOS). */
@@ -997,6 +1043,60 @@ export function cancelGlobalShortcutRecording(): void {
   void electronApi()
     ?.cancelGlobalShortcutRecording?.()
     .catch(() => {});
+}
+
+/** Whether the shell can widen the window when the right sidebar opens. */
+export function supportsWidenWindowForRightSidebar(): boolean {
+  const bridge = electronApi()?.rightSidebarWindow;
+  return (
+    typeof bridge?.getWidensWindow === "function" &&
+    typeof bridge.setWidensWindow === "function" &&
+    typeof bridge.opened === "function" &&
+    typeof bridge.closed === "function"
+  );
+}
+
+/** Whether "Widen window when opening the right sidebar" is on; null outside the shell or on failure. */
+export async function getWidenWindowForRightSidebar(): Promise<boolean | null> {
+  if (!supportsWidenWindowForRightSidebar()) return null;
+  try {
+    return (await electronApi()?.rightSidebarWindow?.getWidensWindow()) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] electron getWidensWindow failed:", err);
+    return null;
+  }
+}
+
+/** Saves the setting; resolves false when the shell is absent or couldn't save it. */
+export async function setWidenWindowForRightSidebar(enabled: boolean): Promise<boolean> {
+  if (!supportsWidenWindowForRightSidebar()) return false;
+  try {
+    return (await electronApi()?.rightSidebarWindow?.setWidensWindow(enabled)) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] electron setWidensWindow failed:", err);
+    return false;
+  }
+}
+
+/** A session switch starts fresh window-growth tracking without resizing the window. */
+export function resetRightSidebarWindowTracking(): void {
+  try {
+    electronApi()?.rightSidebarWindow?.reset?.();
+  } catch (err) {
+    console.warn("[nativeBridge] electron right sidebar reset failed:", err);
+  }
+}
+
+/** Tell a supporting shell the user opened (`width` CSS px) or closed the right sidebar. */
+export function reportRightSidebarVisibility(open: boolean, width: number): void {
+  if (!supportsWidenWindowForRightSidebar()) return;
+  const bridge = electronApi()?.rightSidebarWindow;
+  try {
+    if (open) bridge?.opened(width);
+    else bridge?.closed();
+  } catch (err) {
+    console.warn("[nativeBridge] electron right sidebar report failed:", err);
+  }
 }
 
 /** The browser page (its view id) that has keyboard focus in this window, if any. */

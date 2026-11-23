@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from omnigent.errors import OmnigentError
 from omnigent.runner.native.orchestration import (
     _codex_native_launch_config,
+    _load_legacy_claude_launch_metadata,
     _pi_native_launch_config,
 )
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
@@ -212,6 +213,32 @@ async def test_pi_launch_restores_only_own_usage_without_loading_display_usage(
     if complete is True:
         expected["cumulative_cost_usd"] = 0.25
     assert launch.native_usage_baseline == expected
+
+
+async def test_claude_launch_restores_only_own_cost_without_loading_display_usage(
+    usage_app: _UsageApp,
+    usage_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cold resume seeds Claude with the parent's own cost, not its tree's.
+
+    Claude-native stores Claude Code's own billing total, so the cost needs no
+    completeness flag. A child's spend is already counted under the child.
+    """
+    monkeypatch.setattr(
+        orchestration, "_resolve_harness", lambda *_args, **_kwargs: "claude-native"
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "load_session_usage",
+        Mock(side_effect=AssertionError("native launch must not aggregate the tree")),
+    )
+    usage_app.conversations.set_session_usage(usage_app.parent_id, {"total_cost_usd": 0.25})
+    usage_app.conversations.set_session_usage(usage_app.child_id, {"total_cost_usd": 99.5})
+
+    metadata = await _load_legacy_claude_launch_metadata(usage_client, usage_app.parent_id)
+
+    assert metadata.resume_cost_usd == 0.25
 
 
 @pytest.mark.parametrize("side_chat", [True, False], ids=["side-chat", "worker"])

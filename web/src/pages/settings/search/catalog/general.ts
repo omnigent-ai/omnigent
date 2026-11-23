@@ -172,6 +172,17 @@ export const FLOATING_COMPOSER_SHORTCUT_ENTRY = settingsEntry({
   nameTemplates: { recorder: { before: "New Agent shortcut: " } },
 });
 
+/** The desktop app's opt-in to make room for the right sidebar; a row only desktop builds show. */
+export const WIDEN_WINDOW_FOR_RIGHT_SIDEBAR_ENTRY = settingsEntry({
+  id: "widen-window-for-right-sidebar",
+  available: (availability) => availability.widenWindowForRightSidebar,
+  section: "general",
+  label: "Widen window when opening the right sidebar",
+  description:
+    "Opening the right sidebar makes the window wider, so the chat keeps its width. Closing it shrinks the window back. Maximized and full-screen windows keep their size.",
+  keywords: ["window", "resize", "wider", "width", "sidebar", "workspace", "panel", "desktop"],
+});
+
 /** Both system-wide shortcuts' rows, by the shell's shortcut id; one control renders either. */
 export const GLOBAL_SHORTCUT_ENTRIES = settingsEntryFamily({
   key: "global-shortcuts",
@@ -195,4 +206,5 @@ export const GENERAL_SETTINGS = [
 
   GLOBAL_SHORTCUT_ENTRY,
   FLOATING_COMPOSER_SHORTCUT_ENTRY,
+  WIDEN_WINDOW_FOR_RIGHT_SIDEBAR_ENTRY,
 ] as const;

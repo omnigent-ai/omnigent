@@ -577,6 +577,22 @@ describe("AskUserQuestionForm — keyboard activity", () => {
     expect(document.activeElement).toBe(screen.getByTestId("ask-user-question-section"));
   });
 
+  it("arrows through the custom radio without moving focus into its input", async () => {
+    const user = userEvent.setup();
+    renderForm([framework]);
+    await user.click(screen.getByLabelText("Vue"));
+    await user.keyboard("{ArrowDown}");
+    const toggle = screen.getByTestId("ask-user-question-custom-toggle");
+    expect(toggle).toBeChecked();
+    expect(toggle).toHaveFocus();
+    // Held down, so no keyup follows, as when the window loses focus mid-press.
+    await user.keyboard("{ArrowDown>}");
+    expect(screen.getByLabelText("React")).toBeChecked();
+    expect(screen.getByLabelText("React")).toHaveFocus();
+    await user.click(toggle);
+    expect(screen.getByTestId("ask-user-question-custom-input")).toHaveFocus();
+  });
+
   it("ignores keys pressed outside a form that is not keyboard-active", () => {
     const { onReject } = renderForm([framework, snacks], { keyboardActive: false });
     pressOnPage({ key: "Enter" });

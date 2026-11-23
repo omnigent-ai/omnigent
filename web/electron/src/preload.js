@@ -219,6 +219,21 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.invoke("omnigent:record-global-shortcut", shortcutId(id)),
   cancelGlobalShortcutRecording: () =>
     ipcRenderer.invoke("omnigent:cancel-global-shortcut-recording"),
+  /** The opt-in "widen window for the right sidebar" setting and the page's sidebar reports. */
+  rightSidebarWindow: {
+    /** Resolves whether the setting is on. */
+    getWidensWindow: () => ipcRenderer.invoke("omnigent:get-right-sidebar-widens-window"),
+    /** Resolves false when the shell couldn't save it. */
+    setWidensWindow: (enabled) =>
+      ipcRenderer.invoke("omnigent:set-right-sidebar-widens-window", enabled === true),
+    /** The user opened the right sidebar, `width` CSS px wide. Fire-and-forget. */
+    opened: (width) =>
+      ipcRenderer.send("omnigent:right-sidebar-visibility", { open: true, width: Number(width) }),
+    /** The user closed the right sidebar. Fire-and-forget. */
+    closed: () => ipcRenderer.send("omnigent:right-sidebar-visibility", { open: false }),
+    /** Forget the previous session's growth without resizing the window. */
+    reset: () => ipcRenderer.send("omnigent:right-sidebar-visibility", { reset: true }),
+  },
   /** The runner picked during onboarding for this server ("local" |
    *  "remote"), returned once, else null. */
   takeOnboardingRunner: () => ipcRenderer.invoke("omnigent:take-onboarding-runner"),
@@ -600,22 +615,23 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   openBrowserDevTools: (conversationId) =>
     ipcRenderer.invoke("omnigent:open-browser-devtools", { conversationId }),
   /**
-   * Inspect the user's local Google Chrome profiles for cookies in the site
-   * tree the conversation's view is currently on. Metadata only (profile name +
-   * per-scope counts): no Keychain access and no cookie values. macOS only.
+   * Inspect the user's local Google Chrome profiles for cookies: in the site
+   * tree the conversation's view is currently on (`profiles`), and across every
+   * website (`allSitesProfiles`). Metadata only (profile name + counts): no
+   * Keychain access and no cookie values. macOS only.
    * @param {string} conversationId
-   * @returns {Promise<{ ok: boolean, host?: string, scopes?: string[], profiles?: Array<{ id: string, name: string, cookieCount: number, scopes?: Array<{ host: string, cookieCount: number }> }>, error?: string }>}
+   * @returns {Promise<{ ok: boolean, host?: string, scopes?: string[], profiles?: Array<{ id: string, name: string, cookieCount: number, scopes?: Array<{ host: string, cookieCount: number }> }>, allSitesProfiles?: Array<{ id: string, name: string, cookieCount: number }>, error?: string }>}
    */
   browserChromeCookiePreview: (conversationId) =>
     ipcRenderer.invoke("omnigent:browser-chrome-cookie-preview", { conversationId }),
   /**
-   * Copy ONLY that site's cookies out of one Chrome profile into the
-   * conversation's own (in-memory) session. Decrypts via the Keychain, so the
-   * first import shows a system approval prompt. `expectedHost` must still match
-   * the view's site.
+   * Copy one Chrome profile's cookies into the conversation's own (in-memory)
+   * session. Decrypts via the Keychain, so the first import shows a system
+   * approval prompt.
    * @param {string} conversationId
-   * `scope` is the site tree to copy (the page's host or a parent domain); main
-   * rejects anything that isn't an ancestor of the page.
+   * `scope` is `"*"` for every website, or the site tree to copy (the page's
+   * host or a parent domain); main rejects a site that isn't an ancestor of the
+   * page, and `expectedHost` must then still match the view's site.
    * @param {{ profileId: string, expectedHost: string, scope?: string }} args
    * @returns {Promise<{ ok: boolean, imported?: number, skipped?: number, failed?: number, error?: string }>}
    */
