@@ -265,7 +265,7 @@ function createGlobalShowShortcut({
    *   registers, since the page asking can't grant itself system-wide keys.
    * @returns {Promise<
    *   | { ok: true, setting: { enabled: boolean, accelerator: string } }
-   *   | { ok: false, error: string }
+   *   | { ok: false, error: string, suggestion?: string }
    * >}
    */
   async function set(change, approve) {
@@ -441,17 +441,23 @@ function createGlobalShortcuts({ presses, active = {}, ...deps }) {
 }
 
 /**
- * The chord as the user reads it: ⌃⌥⇧⌘ glyphs on macOS, `Ctrl+Alt+Space` elsewhere. Reads the
- * canonical `chordKey` form, so aliases such as `CommandOrControl` resolve for the platform.
+ * The chord as the user reads it: ⌃⌥⇧⌘ glyphs on macOS, `Ctrl+Alt+Space` elsewhere. Modifiers
+ * come from `chordKey`, so aliases resolve for the platform; the key keeps its own spelling.
  */
 function acceleratorLabel(accelerator, isMac) {
-  const parts = chordKey(accelerator, isMac).split("+");
-  const key = capitalized(parts.pop());
-  const modifiers = parts.map((name) =>
-    isMac
-      ? (MAC_MODIFIER_GLYPHS.get(name) ?? capitalized(name))
-      : (OTHER_MODIFIER_LABELS.get(name) ?? capitalized(name)),
-  );
+  // `chordKey` lowercases the key, so only its modifiers are read from it.
+  const modifiers = chordKey(accelerator, isMac)
+    .split("+")
+    .slice(0, -1)
+    .map((name) =>
+      isMac
+        ? (MAC_MODIFIER_GLYPHS.get(name) ?? capitalized(name))
+        : (OTHER_MODIFIER_LABELS.get(name) ?? capitalized(name)),
+    );
+  const typed = accelerator.split("+").pop().trim();
+  const alias = KEY_ALIASES.get(typed.toLowerCase());
+  const key =
+    alias !== undefined ? capitalized(alias) : typed.length === 1 ? typed.toUpperCase() : typed;
   return isMac ? [...modifiers, key].join("") : [...modifiers, key].join("+");
 }
 

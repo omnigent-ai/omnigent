@@ -89,6 +89,8 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
   const [suggestion, setSuggestion] = useState<{ accelerator: string; enabled: boolean } | null>(
     null,
   );
+  // A save in flight; the shell serialises the save, so a second one would race it.
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -118,19 +120,24 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
 
   const save = useCallback(
     async (next: GlobalShortcutChange) => {
-      const result = await setGlobalShortcut(next, shortcutId);
-      if (result.ok) {
-        // Turning off keeps the shell's saved chord, which another window may have changed.
-        setSetting(
-          (current) => result.setting ?? { accelerator: current?.accelerator ?? "", ...next },
-        );
-        setError(null);
-        setSuggestion(null);
-      } else {
-        setError(result.error ?? "Couldn't save the shortcut.");
-        setSuggestion(
-          result.suggestion ? { accelerator: result.suggestion, enabled: next.enabled } : null,
-        );
+      setSaving(true);
+      try {
+        const result = await setGlobalShortcut(next, shortcutId);
+        if (result.ok) {
+          // Turning off keeps the shell's saved chord, which another window may have changed.
+          setSetting(
+            (current) => result.setting ?? { accelerator: current?.accelerator ?? "", ...next },
+          );
+          setError(null);
+          setSuggestion(null);
+        } else {
+          setError(result.error ?? "Couldn't save the shortcut.");
+          setSuggestion(
+            result.suggestion ? { accelerator: result.suggestion, enabled: next.enabled } : null,
+          );
+        }
+      } finally {
+        setSaving(false);
       }
     },
     [shortcutId],
@@ -239,6 +246,7 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
           {...settingsControlProps(entry, "suggestion", {
             runtime: formatAccelerator(suggestion.accelerator),
           })}
+          disabled={saving}
           data-testid={`${ids.testIdPrefix}-suggestion`}
           onClick={() =>
             void save({ enabled: suggestion.enabled, accelerator: suggestion.accelerator })

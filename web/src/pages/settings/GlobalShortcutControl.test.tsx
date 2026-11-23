@@ -379,6 +379,34 @@ describe("GlobalShortcutControl", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("ignores a second click on the proposed chord while its save is pending", async () => {
+    const bridge = installBridge({
+      enabled: true,
+      accelerator: "Alt+Space",
+      error: "Alt+Space isn't working. Another app may be using it.",
+      suggestion: "Control+Alt+Shift+Space",
+    });
+    let finish: ((result: GlobalShortcutSaveResult) => void) | undefined;
+    bridge.setGlobalShortcut.mockImplementationOnce(
+      () =>
+        new Promise<GlobalShortcutSaveResult>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    renderControl();
+    const proposal = await screen.findByRole("button", { name: /^Use .+ instead$/ });
+
+    fireEvent.click(proposal);
+    fireEvent.click(proposal);
+
+    expect(proposal).toBeDisabled();
+    expect(bridge.setGlobalShortcut).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      finish?.({ ok: true, setting: { enabled: true, accelerator: "Control+Alt+Shift+Space" } });
+    });
+    expect(bridge.setGlobalShortcut).toHaveBeenCalledTimes(1);
+  });
+
   it("still records a chord while off after a refused enable", async () => {
     const bridge = installBridge({ enabled: false, accelerator: "Alt+Space" });
     bridge.setGlobalShortcut.mockResolvedValueOnce({

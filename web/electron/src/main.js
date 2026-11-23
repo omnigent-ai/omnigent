@@ -5413,7 +5413,7 @@ function registerIpc() {
       throw new Error("get-global-shortcut is only available to a connected server page");
     }
     const shortcut = requireSettingsShortcut(id);
-    // Retries a chord the shell doesn't hold, in case another app has since released it.
+    // Opening Settings is the user's cue to retry a chord another app may have released.
     shortcut.refresh();
     return shortcut.current();
   });

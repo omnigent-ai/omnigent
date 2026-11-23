@@ -839,6 +839,19 @@ describe("acceleratorLabel", () => {
     assert.equal(acceleratorLabel("Cmd+Ctrl+Option+k", true), "⌃⌥⌘K");
     assert.equal(acceleratorLabel("CmdOrCtrl+Option+k", false), "Ctrl+Alt+K");
   });
+
+  it("keeps a multi-letter key's own spelling, so PageUp and media keys read as typed", () => {
+    assert.equal(acceleratorLabel("PageUp", false), "PageUp");
+    assert.equal(acceleratorLabel("Control+PageUp", true), "⌃PageUp");
+    assert.equal(acceleratorLabel("Control+MediaPlayPause", false), "Ctrl+MediaPlayPause");
+    assert.equal(acceleratorLabel("Shift+Command+PrintScreen", true), "⇧⌘PrintScreen");
+  });
+
+  it("maps a key alias to its name and capitalizes a lone letter", () => {
+    assert.equal(acceleratorLabel("Control+esc", false), "Ctrl+Escape");
+    assert.equal(acceleratorLabel("Alt+return", false), "Alt+Enter");
+    assert.equal(acceleratorLabel("Control+k", false), "Ctrl+K");
+  });
 });
 
 describe("the New Agent shortcut's default chord on macOS", () => {
