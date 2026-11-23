@@ -160,8 +160,6 @@ def _install_doubles(context, monkeypatch: pytest.MonkeyPatch, *, handoff=False,
             scratch.mkdir(mode=0o700)
             final = Mock(return_value=SimpleNamespace(returncode=0))
             bootstrap = dict(env)
-            if policy.active:
-                bootstrap[sb._LAUNCHER_WRAPPED_ENV] = "1"
             launcher_os = SimpleNamespace(**{**vars(os), "environ": bootstrap})
 
             def activate_without_target_environment(_policy):
@@ -190,11 +188,13 @@ def _install_doubles(context, monkeypatch: pytest.MonkeyPatch, *, handoff=False,
                         list(args),
                         cwd=str(context.cwd),
                         target_environment_path=str(context.payload_paths[-1]),
+                        _spawn_wrapped=policy.active,
                     )
                     == 0
                 )
                 assert "EXAMPLE_TARGET_ONLY" not in bootstrap
             activate.assert_called_once()
+            assert final.call_args.kwargs["cwd"] == str(context.cwd)
             context.finals.append(final.call_args.kwargs["env"])
         if "--help" in args:
             return _HELP, ""
