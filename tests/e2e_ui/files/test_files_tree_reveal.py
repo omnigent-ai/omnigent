@@ -21,7 +21,7 @@ import pytest
 from playwright.sync_api import Locator, Page, expect
 
 from tests._helpers.polling import poll_until
-from tests.e2e_ui.files.test_file_breadcrumbs import _open_workspace
+from tests.e2e_ui.files._files_page import open_workspace
 from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app
 
 # Hundreds of folders sort before the target's, so its row starts far below the fold.
@@ -124,7 +124,7 @@ def test_the_viewed_file_is_revealed_from_the_tree_header_and_the_palette(
     page: Page, large_tree_session: tuple[str, str]
 ) -> None:
     base_url, session_id = large_tree_session
-    sidebar = _open_workspace(page, base_url, session_id)
+    sidebar = open_workspace(page, base_url, session_id)
     _open_app(page, sidebar, "Files")
     # A full-screen workspace docks the tree beside the file.
     page.get_by_role("button", name="Full screen", exact=True).click()
@@ -167,7 +167,7 @@ def test_the_palette_opens_a_hidden_tree_to_reveal_the_file_on_a_narrow_page(
     page: Page, large_tree_session: tuple[str, str]
 ) -> None:
     base_url, session_id = large_tree_session
-    sidebar = _open_workspace(page, base_url, session_id)
+    sidebar = open_workspace(page, base_url, session_id)
     _open_app(page, sidebar, "Files")
     expect(_row(sidebar, "packages")).to_be_visible(timeout=30_000)
 

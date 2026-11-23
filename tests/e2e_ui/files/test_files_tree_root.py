@@ -12,17 +12,16 @@ filesystem PUT endpoint (no agent run); which folders can be roots is in the uni
 from __future__ import annotations
 
 import re
-import shutil
 from collections.abc import Iterator
 
-import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
-from tests.e2e_ui.files.test_file_breadcrumbs import (
-    _open_from_tree,
-    _open_workspace,
-    _session_workspace,
+from tests.e2e_ui.files._files_page import (
+    open_from_tree,
+    open_workspace,
+    run_palette,
+    seeded_workspace,
 )
 from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app
 
@@ -37,39 +36,17 @@ _FILES = {
 
 @pytest.fixture
 def nested_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
-    base_url, session_id = seeded_session
-    for path, content in _FILES.items():
-        httpx.put(
-            f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{path}",
-            json={"content": content, "encoding": "utf-8"},
-            timeout=10.0,
-        ).raise_for_status()
-    workspace = _session_workspace(base_url, session_id)
-    try:
-        yield (base_url, session_id)
-    finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+    with seeded_workspace(seeded_session, _FILES) as session:
+        yield session
 
 
 def _row(container: Locator, name: str) -> Locator:
     return container.get_by_role("treeitem", name=name, exact=True)
 
 
-def _run_palette(page: Page, label: str) -> None:
-    page.keyboard.press("ControlOrMeta+k")
-    palette = page.get_by_test_id("command-palette-input")
-    expect(palette).to_be_focused(timeout=10_000)
-    palette.fill(label)
-    # Exactly one page offers the command, so the palette lists it once.
-    option = page.get_by_role("option", name=re.compile(rf"^{re.escape(label)}"))
-    expect(option).to_have_count(1)
-    option.click()
-    expect(palette).to_have_count(0)
-
-
 def _open_owners(page: Page, sidebar: Locator) -> Locator:
     """Opens ``OWNERS`` from the Files tree and returns its viewer."""
-    _open_from_tree(sidebar, f"{_FOLDER}/OWNERS")
+    open_from_tree(sidebar, f"{_FOLDER}/OWNERS")
     viewer = sidebar.locator('[data-testid="workspace-files-place"]:visible')
     expect(viewer.get_by_text("owner-sentinel")).to_be_visible(timeout=30_000)
     return viewer
@@ -79,7 +56,7 @@ def test_a_breadcrumb_folder_becomes_the_tree_root_and_the_tree_returns(
     page: Page, nested_session: tuple[str, str]
 ) -> None:
     base_url, session_id = nested_session
-    sidebar = _open_workspace(page, base_url, session_id)
+    sidebar = open_workspace(page, base_url, session_id)
     _open_app(page, sidebar, "Files")
     # A full-screen workspace docks the tree beside the file.
     page.get_by_role("button", name="Full screen", exact=True).click()
@@ -120,10 +97,10 @@ def test_a_breadcrumb_folder_becomes_the_tree_root_and_the_tree_returns(
     expect(header.get_by_role("button", name="Back to working folder")).to_have_count(0)
 
     # ⌘K roots the tree at the viewed file's folder, and returns it.
-    _run_palette(page, "Show Active File’s Folder as Tree Root")
+    run_palette(page, "Show Active File’s Folder as Tree Root")
     expect(_row(place, "OWNERS")).to_be_visible(timeout=30_000)
     expect(_row(place, "README.md")).to_have_count(0)
-    _run_palette(page, "Back to working folder")
+    run_palette(page, "Back to working folder")
     expect(_row(place, "README.md")).to_be_visible(timeout=30_000)
 
 
@@ -131,7 +108,7 @@ def test_a_breadcrumb_root_opens_the_hidden_tree_on_a_narrow_page(
     page: Page, nested_session: tuple[str, str]
 ) -> None:
     base_url, session_id = nested_session
-    sidebar = _open_workspace(page, base_url, session_id)
+    sidebar = open_workspace(page, base_url, session_id)
     _open_app(page, sidebar, "Files")
     expect(_row(sidebar, "README.md")).to_be_visible(timeout=30_000)
     place = _open_owners(page, sidebar)

@@ -12,14 +12,12 @@ filter's states are in the unit tests (``FilesPageTree``, ``useTreeFilters``).
 from __future__ import annotations
 
 import re
-import shutil
 from collections.abc import Iterator
 
-import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
-from tests.e2e_ui.files.test_file_breadcrumbs import _open_workspace, _session_workspace
+from tests.e2e_ui.files._files_page import open_workspace, seeded_workspace
 from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app
 
 _FILES = {
@@ -32,18 +30,8 @@ _FILES = {
 
 @pytest.fixture
 def filter_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
-    base_url, session_id = seeded_session
-    for path, content in _FILES.items():
-        httpx.put(
-            f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{path}",
-            json={"content": content, "encoding": "utf-8"},
-            timeout=10.0,
-        ).raise_for_status()
-    workspace = _session_workspace(base_url, session_id)
-    try:
-        yield (base_url, session_id)
-    finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+    with seeded_workspace(seeded_session, _FILES) as session:
+        yield session
 
 
 def _row(container: Locator, path: str) -> Locator:
@@ -54,7 +42,7 @@ def test_the_tree_filters_by_name_narrows_by_globs_and_clears(
     page: Page, filter_session: tuple[str, str]
 ) -> None:
     base_url, session_id = filter_session
-    sidebar = _open_workspace(page, base_url, session_id)
+    sidebar = open_workspace(page, base_url, session_id)
     _open_app(page, sidebar, "Files")
     expect(sidebar.get_by_role("treeitem", name="README.md", exact=True)).to_be_visible(
         timeout=30_000
@@ -121,7 +109,7 @@ def test_closing_the_filter_in_the_narrow_popover_keeps_focus_in_it(
     page: Page, filter_session: tuple[str, str]
 ) -> None:
     base_url, session_id = filter_session
-    sidebar = _open_workspace(page, base_url, session_id)
+    sidebar = open_workspace(page, base_url, session_id)
     _open_app(page, sidebar, "Files")
     sidebar.get_by_role("treeitem", name="README.md", exact=True).click(timeout=30_000)
     # With a file open, the narrow page's tree is a popover.

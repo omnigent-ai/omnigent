@@ -9,16 +9,13 @@ actions. Hidden files show until they're hidden. Seeded via the filesystem PUT e
 
 from __future__ import annotations
 
-import re
-import shutil
 from collections.abc import Iterator
 
-import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
 from tests._helpers.polling import poll_until
-from tests.e2e_ui.files.test_file_breadcrumbs import _open_workspace, _session_workspace
+from tests.e2e_ui.files._files_page import open_workspace, run_palette, seeded_workspace
 from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app
 
 # Alphabetical and size order disagree, and one file is hidden (shown by default). The
@@ -28,18 +25,8 @@ _FILES = {"zulu.txt": "z" * 4000 + "\n", "alpha.txt": "a\n", ".env": "SECRET=1\n
 
 @pytest.fixture
 def options_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
-    base_url, session_id = seeded_session
-    for path, content in _FILES.items():
-        httpx.put(
-            f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{path}",
-            json={"content": content, "encoding": "utf-8"},
-            timeout=10.0,
-        ).raise_for_status()
-    workspace = _session_workspace(base_url, session_id)
-    try:
-        yield (base_url, session_id)
-    finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+    with seeded_workspace(seeded_session, _FILES) as session:
+        yield session
 
 
 def _names(sidebar: Locator) -> list[str]:
@@ -57,20 +44,11 @@ def _expect_order(sidebar: Locator, first: str, second: str) -> None:
     poll_until(ordered, timeout_s=15.0, interval_s=0.2)
 
 
-def _run_palette(page: Page, label: str) -> None:
-    page.keyboard.press("ControlOrMeta+k")
-    palette = page.get_by_test_id("command-palette-input")
-    expect(palette).to_be_focused(timeout=10_000)
-    palette.fill(label)
-    page.get_by_role("option", name=re.compile(re.escape(label))).click()
-    expect(palette).to_have_count(0)
-
-
 def test_the_tree_sorts_and_shows_hidden_files_from_its_menu_and_the_palette(
     page: Page, options_session: tuple[str, str]
 ) -> None:
     base_url, session_id = options_session
-    sidebar = _open_workspace(page, base_url, session_id)
+    sidebar = open_workspace(page, base_url, session_id)
     _open_app(page, sidebar, "Files")
     expect(sidebar.locator('[role="treeitem"][data-item-path="alpha.txt"]')).to_be_visible(
         timeout=30_000
@@ -89,7 +67,7 @@ def test_the_tree_sorts_and_shows_hidden_files_from_its_menu_and_the_palette(
     expect(hidden).to_have_count(0)
 
     # ⌘K runs the same actions: it shows them again and sorts by name.
-    _run_palette(page, "Show Hidden Files")
+    run_palette(page, "Show Hidden Files")
     expect(hidden).to_be_visible(timeout=15_000)
-    _run_palette(page, "Sort Files Tree by Filename")
+    run_palette(page, "Sort Files Tree by Filename")
     _expect_order(sidebar, "alpha.txt", "zulu.txt")

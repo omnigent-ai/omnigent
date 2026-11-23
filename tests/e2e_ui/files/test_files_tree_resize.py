@@ -10,15 +10,12 @@ the filesystem PUT endpoint (no agent run); the width rules are in the unit test
 
 from __future__ import annotations
 
-import re
-import shutil
 from collections.abc import Iterator
 
-import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
-from tests.e2e_ui.files.test_file_breadcrumbs import _mac, _open_workspace, _session_workspace
+from tests.e2e_ui.files._files_page import is_mac, open_workspace, run_palette, seeded_workspace
 from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app
 
 _HANDLE = "Resize the file tree"
@@ -26,30 +23,12 @@ _HANDLE = "Resize the file tree"
 
 @pytest.fixture
 def readme_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
-    base_url, session_id = seeded_session
-    httpx.put(
-        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/README.md",
-        json={"content": "readme-sentinel\n", "encoding": "utf-8"},
-        timeout=10.0,
-    ).raise_for_status()
-    workspace = _session_workspace(base_url, session_id)
-    try:
-        yield (base_url, session_id)
-    finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+    with seeded_workspace(seeded_session, {"README.md": "readme-sentinel\n"}) as session:
+        yield session
 
 
 def _toggle_tree_chord(page: Page) -> str:
-    return "Meta+Shift+e" if _mac(page) else "Control+Shift+e"
-
-
-def _run_palette(page: Page, label: str) -> None:
-    page.keyboard.press("ControlOrMeta+k")
-    palette = page.get_by_test_id("command-palette-input")
-    expect(palette).to_be_focused(timeout=10_000)
-    palette.fill(label)
-    page.get_by_role("option", name=re.compile(rf"^{re.escape(label)}")).click()
-    expect(palette).to_have_count(0)
+    return "Meta+Shift+e" if is_mac(page) else "Control+Shift+e"
 
 
 def _open_readme(page: Page, sidebar: Locator, *, full_screen: bool) -> Locator:
@@ -71,7 +50,7 @@ def test_the_docked_tree_resizes_and_keeps_its_width(
     page: Page, readme_session: tuple[str, str]
 ) -> None:
     base_url, session_id = readme_session
-    sidebar = _open_workspace(page, base_url, session_id)
+    sidebar = open_workspace(page, base_url, session_id)
     _open_readme(page, sidebar, full_screen=True)
     handle = page.get_by_role("separator", name=_HANDLE)
     expect(handle).to_be_visible(timeout=30_000)
@@ -112,7 +91,7 @@ def test_the_tree_shows_and_hides_from_the_chord_the_palette_and_the_toolbar(
     page: Page, readme_session: tuple[str, str]
 ) -> None:
     base_url, session_id = readme_session
-    sidebar = _open_workspace(page, base_url, session_id)
+    sidebar = open_workspace(page, base_url, session_id)
     place = _open_readme(page, sidebar, full_screen=True)
     header = place.get_by_test_id("files-page-tree-header")
     expect(header).to_be_visible(timeout=30_000)
@@ -120,11 +99,11 @@ def test_the_tree_shows_and_hides_from_the_chord_the_palette_and_the_toolbar(
     page.keyboard.press(_toggle_tree_chord(page))
     expect(header).to_have_count(0)
     expect(place.get_by_role("button", name="Show Files Tree")).to_be_visible()
-    _run_palette(page, "Show Files Tree")
+    run_palette(page, "Show Files Tree")
     expect(header).to_be_visible()
     place.get_by_role("button", name="Hide Files Tree").click()
     expect(header).to_have_count(0)
-    _run_palette(page, "Show Files Tree")
+    run_palette(page, "Show Files Tree")
     expect(header).to_be_visible()
 
 
@@ -132,7 +111,7 @@ def test_a_narrow_page_opens_the_tree_popover_from_the_chord(
     page: Page, readme_session: tuple[str, str]
 ) -> None:
     base_url, session_id = readme_session
-    sidebar = _open_workspace(page, base_url, session_id)
+    sidebar = open_workspace(page, base_url, session_id)
     _open_readme(page, sidebar, full_screen=False)
     popover = page.get_by_role("dialog", name="Workspace files")
     expect(popover).to_have_count(0)
@@ -144,5 +123,5 @@ def test_a_narrow_page_opens_the_tree_popover_from_the_chord(
 
     page.keyboard.press(_toggle_tree_chord(page))
     expect(popover).to_have_count(0)
-    _run_palette(page, "Show Files Tree")
+    run_palette(page, "Show Files Tree")
     expect(popover).to_be_visible()

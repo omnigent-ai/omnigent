@@ -1,0 +1,93 @@
+"""Shared mechanics for the tabs sidebar's Files page journeys.
+
+Each journey keeps its own files, faults and assertions; this module only seeds a
+session's workspace, opens the sidebar with ``workspace_sidebar_v2`` on, walks the tree
+and runs a ⌘K row.
+"""
+
+from __future__ import annotations
+
+import re
+import shutil
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from pathlib import Path
+
+import httpx
+from playwright.sync_api import Locator, Page, expect
+
+from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _set_flag
+
+_DESKTOP = {"width": 1440, "height": 900}
+
+
+def session_workspace(base_url: str, session_id: str) -> Path:
+    """The session's workspace on its host, where the filesystem PUTs write."""
+    response = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/shell",
+        json={"command": "pwd", "timeout": 30},
+        timeout=60.0,
+    )
+    response.raise_for_status()
+    return Path(response.json()["stdout"].strip().splitlines()[-1])
+
+
+@contextmanager
+def seeded_workspace(
+    session: tuple[str, str], files: Mapping[str, str]
+) -> Iterator[tuple[str, str]]:
+    """Write ``files`` (path to text) into the session's workspace, and remove it after."""
+    base_url, session_id = session
+    for path, content in files.items():
+        httpx.put(
+            f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{path}",
+            json={"content": content, "encoding": "utf-8"},
+            timeout=10.0,
+        ).raise_for_status()
+    workspace = session_workspace(base_url, session_id)
+    try:
+        yield session
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def is_mac(page: Page) -> bool:
+    return bool(page.evaluate("() => /Mac|iPhone|iPad/.test(navigator.platform)"))
+
+
+def open_workspace(page: Page, base_url: str, session_id: str) -> Locator:
+    """Open the session with ``workspace_sidebar_v2`` on; returns its Workspace sidebar."""
+    _set_flag(page, True)
+    page.set_viewport_size(_DESKTOP)
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    return sidebar
+
+
+def open_from_tree(tree: Locator, path: str) -> None:
+    """Open the folders above ``path`` in a Files tree, then the file itself."""
+    parts = path.split("/")
+    for depth in range(1, len(parts)):
+        folder_path = "/".join(parts[:depth]) + "/"
+        folder = tree.locator(f'[role="treeitem"][data-item-path="{folder_path}"]')
+        expect(folder).to_be_visible(timeout=30_000)
+        if folder.get_attribute("aria-expanded") != "true":
+            folder.click()
+    row = tree.locator(f'[role="treeitem"][data-item-path="{path}"]')
+    expect(row).to_be_visible(timeout=30_000)
+    row.click()
+
+
+def run_palette(page: Page, label: str) -> None:
+    """Run the one ⌘K row starting with ``label``, and wait for the palette to close."""
+    page.keyboard.press("ControlOrMeta+k")
+    palette = page.get_by_test_id("command-palette-input")
+    expect(palette).to_be_focused(timeout=10_000)
+    palette.fill(label)
+    option = page.get_by_role("option", name=re.compile(rf"^{re.escape(label)}"))
+    expect(option).to_have_count(1)
+    option.click()
+    expect(palette).to_have_count(0)
