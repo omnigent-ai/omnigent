@@ -67,7 +67,7 @@ const mocks = vi.hoisted(() => {
     moveToProject: { mutate: vi.fn() },
     moveToNest: { mutate: vi.fn(), isPending: false },
     searchRows: [] as Conversation[],
-    leave: { mutateAsync: vi.fn(), isPending: false },
+    leave: { mutate: vi.fn(), isPending: false },
     // The signed-in viewer. Rows with no `owner` read as owned by them; a row
     // owned by someone else is the shared case Leave applies to.
     viewerId: "viewer@example.com" as string | null,
@@ -318,7 +318,7 @@ beforeEach(() => {
   mocks.moveToProject.mutate.mockReset();
   mocks.moveToNest.mutate.mockReset();
   mocks.searchRows = [];
-  mocks.leave.mutateAsync.mockReset().mockResolvedValue(undefined);
+  mocks.leave.mutate.mockReset();
   mocks.projects = [];
   mocks.projectIcons = {};
   // Default every test to the desktop viewport; the mobile flyout test opts in.
@@ -921,15 +921,15 @@ describe("leave a shared session", () => {
     fireEvent.click(screen.getByTestId("leave-conversation"));
 
     // Destructive, and the row vanishes on success — so it confirms first.
-    expect(mocks.leave.mutateAsync).not.toHaveBeenCalled();
+    expect(mocks.leave.mutate).not.toHaveBeenCalled();
     fireEvent.click(screen.getByTestId("confirm-leave-conversation"));
     // Leaving revokes the VIEWER's own grant, so the mutation carries their id
     // — not the owner's. Sending the owner's id would be a revoke attempt the
     // server rejects for lack of manage access.
-    expect(mocks.leave.mutateAsync).toHaveBeenCalledWith({
-      id: "conv_1",
-      viewerId: "viewer@example.com",
-    });
+    expect(mocks.leave.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", viewerId: "viewer@example.com" },
+      expect.anything(),
+    );
   });
 
   it("shows Delete instead of Leave on a row the viewer owns", () => {

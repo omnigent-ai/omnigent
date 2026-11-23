@@ -10,7 +10,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import { usePublishOpenSession } from "./openSession";
 import { useSessionActions } from "./useSessionActions";
 
-const leave = { mutateAsync: vi.fn(), isPending: false };
+const leave = { mutate: vi.fn(), mutateAsync: vi.fn(), isPending: false };
 const idle = { mutate: vi.fn(), mutateAsync: vi.fn(), isPending: false };
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof ConversationsModule>()),
@@ -34,8 +34,14 @@ const SHARED: Conversation = {
   owner: "owner@example.com",
 };
 
-/** One row's actions, opening its Leave confirmation once mounted. */
-function Row({ onLeave }: { onLeave?: () => void }) {
+/** One row's actions, opening its Leave confirmation once mounted, reporting as ⌘K's host does. */
+function Row({
+  onLeave,
+  reportsAfterUnmount = true,
+}: {
+  onLeave?: () => void;
+  reportsAfterUnmount?: boolean;
+}) {
   const actions = useSessionActions({
     conversation: SHARED,
     label: "Session A",
@@ -43,6 +49,7 @@ function Row({ onLeave }: { onLeave?: () => void }) {
     serverInfo: "loading",
     onLeave,
     componentIdPrefix: "test.conversation",
+    reportsAfterUnmount,
   });
   const { setLeaveOpen } = actions;
   useEffect(() => setLeaveOpen(true), [setLeaveOpen]);
@@ -84,6 +91,7 @@ function renderAt(path: string, onLeave: () => void) {
 
 let finishLeave: () => void = () => {};
 beforeEach(() => {
+  leave.mutate.mockReset();
   leave.mutateAsync.mockReset().mockReturnValue(
     new Promise<void>((resolve) => {
       finishLeave = resolve;
@@ -92,7 +100,7 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
-describe("useSessionActions Leave", () => {
+describe("useSessionActions Leave, reporting after its caller unmounts", () => {
   it("leaves the view if the session is still the open one when the Leave succeeds", async () => {
     const goHome = vi.fn();
     renderAt("/c/conv_a", goHome);
@@ -120,5 +128,26 @@ describe("useSessionActions Leave", () => {
     fireEvent.click(await screen.findByTestId("confirm-leave-conversation"));
     await act(async () => finishLeave());
     expect(closeQuickView).toHaveBeenCalledOnce();
+  });
+});
+
+describe("useSessionActions Leave, by default", () => {
+  it("reports through the row's own mutate callbacks, as the sidebar always has", async () => {
+    const goHome = vi.fn();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={["/c/conv_a"]}>
+          <Row onLeave={goHome} reportsAfterUnmount={false} />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(await screen.findByTestId("confirm-leave-conversation"));
+    expect(leave.mutateAsync).not.toHaveBeenCalled();
+    expect(leave.mutate).toHaveBeenCalledWith(
+      { id: "conv_a", viewerId: "viewer@example.com" },
+      expect.objectContaining({ onSuccess: expect.any(Function), onError: expect.any(Function) }),
+    );
+    act(() => leave.mutate.mock.calls[0]![1].onSuccess());
+    expect(goHome).toHaveBeenCalledOnce();
   });
 });

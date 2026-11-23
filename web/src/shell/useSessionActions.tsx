@@ -58,6 +58,8 @@ export interface SessionActions {
  *     left, e.g. to navigate off a view that shows it.
  * :param componentIdPrefix: Analytics prefix for the confirm buttons, e.g.
  *     ``"sidebar.conversation"``.
+ * :param reportsAfterUnmount: Whether a Leave or Stop still reports how it went once the
+ *     caller has unmounted, as ⌘K's action host needs: it can be replaced before they settle.
  */
 export function useSessionActions({
   conversation,
@@ -66,6 +68,7 @@ export function useSessionActions({
   serverInfo,
   onLeave,
   componentIdPrefix,
+  reportsAfterUnmount = false,
 }: {
   conversation: Conversation;
   label: string;
@@ -73,6 +76,7 @@ export function useSessionActions({
   serverInfo: ReturnType<typeof useServerInfo>;
   onLeave?: () => void;
   componentIdPrefix: string;
+  reportsAfterUnmount?: boolean;
 }): SessionActions {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -169,6 +173,18 @@ export function useSessionActions({
     // nothing left to show progress against. A failure surfaces as a toast
     // (the row is still there to retry from).
     setLeaveOpen(false);
+    const reportFailure = (err: unknown) => {
+      const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
+      showToast(`Couldn't leave the session${detail}`);
+    };
+    if (!reportsAfterUnmount) {
+      leave.mutate(
+        { id: conversation.id, viewerId },
+        // The session 404s for this user now, so don't leave them staring at it.
+        { onSuccess: () => onLeave?.(), onError: reportFailure },
+      );
+      return;
+    }
     // The promise settles even once the caller has unmounted, which a per-call
     // mutate callback wouldn't.
     // A row's callback can't see a switch that unmounts it, so the open session is read live.
@@ -179,10 +195,7 @@ export function useSessionActions({
       () => {
         if (!leftFromItsView || isOpenSession(conversation.id)) onLeave?.();
       },
-      (err: unknown) => {
-        const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
-        showToast(`Couldn't leave the session${detail}`);
-      },
+      reportFailure,
     );
   }
 
@@ -368,11 +381,16 @@ export function useSessionActions({
                   // for the whole kill blocks the rest of the page. A failure
                   // surfaces as a toast since the dialog is already gone.
                   setStopOpen(false);
-                  // As for Leave, the promise reports even once the caller has unmounted.
-                  stopSession.mutateAsync(conversation.id).catch((err: unknown) => {
+                  const reportFailure = (err: unknown) => {
                     const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
                     showToast(`Couldn't stop the session${detail}`);
-                  });
+                  };
+                  // As for Leave, the promise reports even once the caller has unmounted.
+                  if (reportsAfterUnmount) {
+                    stopSession.mutateAsync(conversation.id).catch(reportFailure);
+                  } else {
+                    stopSession.mutate(conversation.id, { onError: reportFailure });
+                  }
                 }}
                 componentId={`${componentIdPrefix}.stop`}
               >

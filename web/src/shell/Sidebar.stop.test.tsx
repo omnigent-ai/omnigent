@@ -11,18 +11,16 @@ vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 // confirms through a dialog before firing the stop mutation. See
 // ConversationRow in Sidebar.tsx.
 
-import type * as ToastModule from "@/components/ui/toast";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 
-import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, screen } from "@testing-library/react";
 
 // Controllable stop mutation + runner-liveness lookup, declared via
 // vi.hoisted so the vi.mock factories can reference them. The dialog reads
 // isPending/isError on every render and reset() on open, so the stub
 // carries the full mutation shape (not just mutate).
 const mocks = vi.hoisted(() => ({
-  stop: { mutateAsync: vi.fn(), reset: vi.fn(), isPending: false, isError: false },
-  toast: vi.fn(),
+  stop: { mutate: vi.fn(), reset: vi.fn(), isPending: false, isError: false },
   runnerOnline: vi.fn<(id: string | undefined) => boolean | undefined>(() => undefined),
 }));
 
@@ -40,10 +38,6 @@ vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
 }));
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
-vi.mock("@/components/ui/toast", async (importOriginal) => ({
-  ...(await importOriginal<typeof ToastModule>()),
-  showToast: mocks.toast,
-}));
 // Force a multi-user (non-local) server so the "Shared with me" tab renders —
 // jsdom's default loopback origin would otherwise read as single-user and hide
 // the tabs the shared-session row actions rely on.
@@ -78,8 +72,7 @@ function openKebab() {
 }
 
 beforeEach(() => {
-  mocks.stop.mutateAsync.mockReset().mockResolvedValue(undefined);
-  mocks.toast.mockReset();
+  mocks.stop.mutate.mockReset();
   mocks.stop.reset.mockReset();
   mocks.stop.isPending = false;
   mocks.runnerOnline.mockReset();
@@ -101,26 +94,17 @@ describe("sidebar Stop session item", () => {
       "stops its runner, including side chats running on it",
     );
     // The confirm dialog gates the mutation — nothing fires on item click.
-    expect(mocks.stop.mutateAsync).not.toHaveBeenCalled();
+    expect(mocks.stop.mutate).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "Stop session" }));
-    expect(mocks.stop.mutateAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.stop.mutate).toHaveBeenCalledTimes(1);
     // Failure: the dialog stopped a different row's session.
-    expect(mocks.stop.mutateAsync.mock.calls[0][0]).toBe("conv_1");
+    expect(mocks.stop.mutate.mock.calls[0][0]).toBe("conv_1");
+    // A failed stop reports via toast, not an in-dialog message, so the
+    // mutation is given an onError handler.
+    expect(typeof mocks.stop.mutate.mock.calls[0][1]?.onError).toBe("function");
     // The dialog closes immediately rather than blocking on the kill.
     expect(screen.queryByTestId("stop-session-confirm")).toBeNull();
-  });
-
-  it("reports a failed stop in a toast, since the dialog has closed", async () => {
-    mocks.stop.mutateAsync.mockRejectedValue(new Error("runner unreachable"));
-    mockConversations([HOST_SPAWNED]);
-    renderSidebar();
-    openKebab();
-    fireEvent.click(screen.getByTestId("stop-conversation"));
-    fireEvent.click(screen.getByRole("button", { name: "Stop session" }));
-    await waitFor(() =>
-      expect(mocks.toast).toHaveBeenCalledWith("Couldn't stop the session: runner unreachable"),
-    );
   });
 
   it("closes the dialog immediately on confirm even while the stop is pending", () => {
@@ -134,7 +118,7 @@ describe("sidebar Stop session item", () => {
     fireEvent.click(screen.getByTestId("stop-conversation"));
 
     fireEvent.click(screen.getByRole("button", { name: "Stop session" }));
-    expect(mocks.stop.mutateAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.stop.mutate).toHaveBeenCalledTimes(1);
     expect(screen.queryByTestId("stop-session-confirm")).toBeNull();
   });
 

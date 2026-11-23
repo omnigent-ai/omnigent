@@ -75,6 +75,8 @@ function SessionActionRunner({
     // Leaving the open session, or one of its sub-agents' root, leaves its view too.
     onLeave: useLeaveOpenSessionView(conversation.id),
     componentIdPrefix: "palette.conversation",
+    // A newer request can replace this runner before its Leave or Stop settles.
+    reportsAfterUnmount: true,
   });
   const [picker, setPicker] = useState<"rename" | "move-to-project" | null>(null);
   const latest = useRef({ actions, facts });
