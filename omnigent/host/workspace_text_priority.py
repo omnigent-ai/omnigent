@@ -168,6 +168,7 @@ async def _reached_files(
         [
             "rg",
             "--files",
+            "--null",  # a file name may hold a newline
             "--no-config",
             "--hidden",
             *options,
@@ -192,8 +193,9 @@ async def _reached_files(
         chunks = []  # unsure, so none of them is searched early
     finally:
         await process.close()
-    output = b"".join(chunks)
-    paths = (line.decode(errors="replace").removeprefix("./") for line in output.split(b"\n"))
+    # Each name ends in a NUL, so one cut off at the byte cap is left out.
+    records = b"".join(chunks)[:_LIST_FILES_BYTES].split(b"\0")[:-1]
+    paths = (os.fsdecode(record).removeprefix("./") for record in records)
     return {path for path in paths if path and _parent(path) == directory}
 
 

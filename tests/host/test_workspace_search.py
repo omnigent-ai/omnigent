@@ -972,6 +972,39 @@ async def test_focused_files_in_folders_the_walk_prunes_are_not_searched_first(
 
 
 @needs_rg
+async def test_a_file_name_holding_a_newline_never_lets_an_ignored_file_in_first(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".ignore").write_text("hidden.txt\n")
+    (tmp_path / "hidden.txt").write_text("needle\n")
+    (tmp_path / "visible\nhidden.txt").write_text("needle\n")
+
+    responses = await _search_text(
+        tmp_path, "needle", order=SEARCH_ORDER_PRIORITY, focused_paths=["hidden.txt"]
+    )
+
+    assert _paths_in_order(responses) == ["visible\nhidden.txt"]
+
+
+@needs_rg
+async def test_a_name_cut_off_by_the_listing_cap_never_lets_an_ignored_file_in_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / ".ignore").write_text("sub/notes.txt\n")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "notes.txt").write_text("needle\n")
+    (tmp_path / "sub" / "notes.txt-copy").write_text("x\n")
+    # The listing of sub/ stops right after "./sub/notes.txt", inside the other name.
+    monkeypatch.setattr(workspace_text_priority, "_LIST_FILES_BYTES", len("./sub/notes.txt"))
+
+    responses = await _search_text(
+        tmp_path, "needle", order=SEARCH_ORDER_PRIORITY, focused_paths=["sub/notes.txt"]
+    )
+
+    assert _paths_in_order(responses) == []
+
+
+@needs_rg
 async def test_ignored_focused_files_the_search_asks_for_are_searched_first(
     tmp_path: Path,
 ) -> None:
