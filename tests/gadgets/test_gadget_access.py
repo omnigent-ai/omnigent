@@ -125,24 +125,32 @@ def test_the_shared_list_pages_through_every_grant(
     )
 
 
-def test_grants_left_by_a_deleted_gadget_are_skipped_and_dropped(
-    setup: tuple[LocalGadgetStore, _GroupStore],
+def test_grants_for_gadgets_this_store_lacks_are_skipped_and_kept(
+    setup: tuple[LocalGadgetStore, _GroupStore], tmp_path: Path
 ) -> None:
     store, grants = setup
     access = PermissionStoreGadgetAccess(store, grants)
-    dead = [store.create(ALICE, f"Gone {n}") for n in range(4)]
+    gone = [store.create(ALICE, f"Gone {n}") for n in range(2)]
     live = [store.create(ALICE, f"Live {n}") for n in range(2)]
-    for gadget in [*dead, *live]:
+    # Another server's gadgets, granted in the same permission store.
+    other = LocalGadgetStore(str(tmp_path / "other"))
+    elsewhere = [other.create(ALICE, f"Elsewhere {n}") for n in range(2)]
+    for gadget in [*gone, *live, *elsewhere]:
         grants.grant_for_gadget(CAROL, gadget.id, LEVEL_READ)
-    for gadget in dead:
-        # As if a grant raced the deletion and landed after it.
+    for gadget in gone:
+        # Deleted as the routes do: the grants go first.
+        access.forget(gadget.id)
         store.delete(gadget.id)
 
     # Short or empty pages still continue, so every live gadget is reached.
     shared = {item for page in _all_shared(access, CAROL, limit=2) for item in page}
     assert shared == {gadget.id for gadget in live}
-    for gadget in dead:
+    for gadget in gone:
         assert grants.list_for_gadget(gadget.id) == ([], None)
+    # A read that misses here doesn't delete the other server's grants.
+    other_access = PermissionStoreGadgetAccess(other, grants)
+    shared_there = {item for page in _all_shared(other_access, CAROL, limit=2) for item in page}
+    assert shared_there == {gadget.id for gadget in elsewhere}
 
 
 def test_permissions_for_several_gadgets_match_one_at_a_time(

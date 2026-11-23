@@ -24,6 +24,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from starlette.responses import JSONResponse, Response
 
+from omnigent.db.account_authority import account_generation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.gadgets.access import GadgetAccess
 from omnigent.gadgets.actions import ACTION_STATES
@@ -259,7 +260,8 @@ def create_gadgets_router(
     router = APIRouter(route_class=_GadgetRoute)
 
     def _viewer(request: Request) -> GadgetViewer:
-        return GadgetViewer(require_user(request, auth_provider) or RESERVED_USER_LOCAL)
+        user_id = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        return GadgetViewer(user_id, account_generation(user_id))
 
     def _sessions(user_id: str) -> SessionStateReader:
         def can_read(session_id: str) -> bool:

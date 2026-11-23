@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from omnigent.db.account_authority import account_generation
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.stores.gadget_store import Gadget, GadgetStore
 from omnigent.stores.permission_store import MAX_SHARED_GADGETS_PAGE_SIZE, PermissionStore
@@ -64,6 +65,16 @@ def permissions_for_level(level: int | None) -> GadgetPermissions:
     if level >= LEVEL_EDIT:
         return GadgetPermissions(read=True, write_data=True, publish=True)
     return GadgetPermissions(read=True)
+
+
+def owned_by(gadget: Gadget, user_id: str, generation: str | None) -> bool:
+    """Whether the account *user_id* (*generation*) owns *gadget*.
+
+    The generation tells a username registered again from the deleted account that held
+    it before, so the new account never reaches the old one's gadgets, even where a copy
+    of them survived (another server's gadget directory).
+    """
+    return gadget.owner_id == user_id and gadget.owner_generation == generation
 
 
 @dataclass(frozen=True)
@@ -141,7 +152,10 @@ class PermissionStoreGadgetAccess(GadgetAccess):
     def permissions_many(
         self, viewer_id: str, gadgets: Sequence[Gadget]
     ) -> dict[str, GadgetPermissions]:
-        result = {gadget.id: FULL_ACCESS for gadget in gadgets if gadget.owner_id == viewer_id}
+        generation = account_generation(viewer_id)
+        result = {
+            gadget.id: FULL_ACCESS for gadget in gadgets if owned_by(gadget, viewer_id, generation)
+        }
         others = [gadget for gadget in gadgets if gadget.id not in result]
         grants = self._grants()
         if not others or grants is None or viewer_id == RESERVED_USER_LOCAL:
@@ -164,15 +178,14 @@ class PermissionStoreGadgetAccess(GadgetAccess):
         if grants is None or viewer_id == RESERVED_USER_LOCAL:
             return SharedPage([], None)
         principals = grants.caller_principals(viewer_id)
-        # One page of grants per call; grants whose gadget is gone (one that raced its
-        # deletion) are dropped, so a page can come back short and still continue.
+        # One page of grants per call. A grant whose gadget this store doesn't have is passed
+        # over, so a page can come back short and still continue; it is not deleted, as the
+        # gadget may live on (in another server's directory sharing this permission store).
+        # Deleting a gadget, or its owner's account, removes its grants.
         ids, next_cursor = grants.list_gadgets_shared_with(
             principals, limit=limit, after_gadget_id=cursor
         )
         found = self._store.get_many(ids)
-        for gadget_id in ids:
-            if gadget_id not in found:
-                grants.delete_for_gadget(gadget_id)
         owners = sorted({gadget.owner_id for gadget in found.values()})
         deleted = grants.deleted_accounts(owners) if owners else set()
         shared: list[SharedGadget] = []

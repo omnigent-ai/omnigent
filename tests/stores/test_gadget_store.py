@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 from pathlib import Path
 
@@ -351,6 +352,7 @@ def test_a_page_of_owned_gadgets_reads_a_bounded_part_of_a_large_account(
     made = [store.create(ALICE, f"Board {n}").id for n in range(10)]
     owner_dir = next((tmp_path / "gadgets" / "owners").iterdir())
     assert sorted(path.name for path in owner_dir.iterdir()) == [
+        "head.json",
         "s00000000",
         "s00000001",
         "s00000002",
@@ -365,16 +367,55 @@ def test_a_page_of_owned_gadgets_reads_a_bounded_part_of_a_large_account(
 
     monkeypatch.setattr(local_module.os, "listdir", counting_listdir)
     page, cursor = store.list_owned_page(ALICE, limit=2)
-    # The segment names, and only the first segment's markers.
-    assert listed == [owner_dir.name, "s00000000"] and len(page) == 2 and cursor
+    # Only the first segment's markers: the head names where the segments start and end.
+    assert listed == ["s00000000"] and len(page) == 2 and cursor
     listed.clear()
 
     # Deleting every gadget in the next two segments leaves them empty: a page lists at
     # most two of them, returns short, and still continues.
     for gadget_id in made[3:9]:
         store.delete(gadget_id)
+    listed.clear()
     page, cursor = store.list_owned_page(ALICE, limit=2, after=cursor)
-    assert len(listed) <= 3 and cursor is not None
+    assert len(listed) <= 2 and cursor is not None
     monkeypatch.setattr(local_module.os, "listdir", real_listdir)
     seen = [gadget_id for page in _owned_pages(store, ALICE, limit=2) for gadget_id in page]
     assert sorted(seen) == sorted([*made[:3], made[9]])
+    # The emptied segments are gone, so later pages don't read them again.
+    assert sorted(path.name for path in owner_dir.iterdir()) == [
+        "head.json",
+        "s00000000",
+        "s00000003",
+    ]
+
+
+def test_emptied_segments_and_markers_a_deletion_left_dont_count_as_owned(
+    store: LocalGadgetStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(local_module, "_OWNER_SEGMENT_SIZE", 3)
+    made = [store.create(ALICE, f"Board {n}").id for n in range(10)]
+    # Three segments emptied, and in the newest a deletion that stopped after moving the
+    # gadget away, leaving its marker.
+    for gadget_id in made[:9]:
+        store.delete(gadget_id)
+    shutil.rmtree(tmp_path / "gadgets" / "gadgets" / made[9])
+    assert store.owns_any(ALICE) is False
+    owner_dir = next((tmp_path / "gadgets" / "owners").iterdir())
+    assert sorted(path.name for path in owner_dir.iterdir()) == ["head.json", "s00000003"]
+    assert list((owner_dir / "s00000003").iterdir()) == []
+    # A new gadget is owned again.
+    store.create(ALICE, "Again")
+    assert store.owns_any(ALICE) is True
+
+
+def test_an_owner_generation_is_its_own_account(store: LocalGadgetStore) -> None:
+    old = store.create(ALICE, "Old", owner_generation="g1")
+    store.user_files(ALICE, owner_generation="g1").mkdirs("shelf")
+    new = store.create(ALICE, "New", owner_generation="g2")
+
+    assert [g.id for g in store.iter_owned(ALICE, owner_generation="g2")] == [new.id]
+    assert store.get(old.id).owner_generation == "g1"
+    with pytest.raises(NotFound):
+        store.user_files(ALICE, owner_generation="g2").list_paths("shelf")
+    store.delete_user_files(ALICE, owner_generation="g2")
+    assert store.user_files(ALICE, owner_generation="g1").list_paths("shelf") == []

@@ -34,6 +34,7 @@ __all__ = [
     "MAX_FILE_BYTES",
     "MAX_GADGET_NAME_CHARS",
     "MAX_OWNED_PAGE_SIZE",
+    "OWNS_ANY_PAGES",
     "CapacityExceeded",
     "Conflict",
     "CorruptData",
@@ -52,6 +53,8 @@ MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_GADGET_NAME_CHARS = 120
 # The most gadgets one page of a user's own gadgets holds.
 MAX_OWNED_PAGE_SIZE = 200
+# Pages of a user's gadgets one owns_any call reads before it answers that some may remain.
+OWNS_ANY_PAGES = 64
 
 
 # ---------------------------------------------------------------------------
@@ -149,12 +152,16 @@ class Gadget:
     :param owner_id: The owner's user ID, e.g. ``"alice@example.com"``.
     :param name: Display name, 1 to :data:`MAX_GADGET_NAME_CHARS` characters.
     :param created_at: Epoch seconds.
+    :param owner_generation: The owner account's generation when it was created, for a
+        server with built-in accounts, or ``None``. A username registered again gets a new
+        generation, so the new account never owns the old one's gadgets.
     """
 
     id: str
     owner_id: str
     name: str
     created_at: float
+    owner_generation: str | None = None
 
 
 class GadgetFiles(ABC):
@@ -255,8 +262,13 @@ class GadgetStore(ABC):
         self.storage_location = storage_location
 
     @abstractmethod
-    def create(self, owner_id: str, name: str) -> Gadget:
-        """Create a gadget with a new ID (see :data:`GADGET_ID_PATTERN`), owned by *owner_id*."""
+    def create(self, owner_id: str, name: str, *, owner_generation: str | None = None) -> Gadget:
+        """Create a gadget with a new ID (see :data:`GADGET_ID_PATTERN`), owned by *owner_id*.
+
+        IDs are never reused, even after a delete: grants and cleanup rely on that.
+
+        :param owner_generation: See :attr:`Gadget.owner_generation`.
+        """
 
     @abstractmethod
     def get(self, gadget_id: str) -> Gadget | None:
@@ -276,9 +288,16 @@ class GadgetStore(ABC):
 
     @abstractmethod
     def list_owned_page(
-        self, owner_id: str, *, limit: int, after: str | None = None
+        self,
+        owner_id: str,
+        *,
+        limit: int,
+        after: str | None = None,
+        owner_generation: str | None = None,
     ) -> tuple[list[Gadget], str | None]:
         """One page of the gadgets *owner_id* owns, in an order the store keeps stable.
+
+        Only gadgets created with *owner_generation* count as that owner's.
 
         Each page must cost bounded work, whatever the owner's count (an ordered index,
         not a scan of every gadget they own).
@@ -290,7 +309,7 @@ class GadgetStore(ABC):
             Deleting gadgets already returned does not move the cursor.
         """
 
-    def iter_owned(self, owner_id: str) -> Iterator[Gadget]:
+    def iter_owned(self, owner_id: str, *, owner_generation: str | None = None) -> Iterator[Gadget]:
         """Every gadget *owner_id* owns, read one page at a time as the caller goes.
 
         For work that visits them all, such as deleting an account, without holding the
@@ -298,10 +317,31 @@ class GadgetStore(ABC):
         """
         cursor: str | None = None
         while True:
-            page, cursor = self.list_owned_page(owner_id, limit=MAX_OWNED_PAGE_SIZE, after=cursor)
+            page, cursor = self.list_owned_page(
+                owner_id, limit=MAX_OWNED_PAGE_SIZE, after=cursor, owner_generation=owner_generation
+            )
             yield from page
             if cursor is None:
                 return
+
+    def owns_any(self, owner_id: str, *, owner_generation: str | None = None) -> bool:
+        """Whether *owner_id* still owns a gadget, for registering a deleted username again.
+
+        Bounded per call: pages that hold no live gadget (stale index entries) are passed
+        over up to :data:`OWNS_ANY_PAGES`; past that it answers ``True`` and a later call
+        goes on, as an implementation that repairs its index as it reads (the local store
+        does) gets closer each time.
+        """
+        cursor: str | None = None
+        for _ in range(OWNS_ANY_PAGES):
+            page, cursor = self.list_owned_page(
+                owner_id, limit=1, after=cursor, owner_generation=owner_generation
+            )
+            if page:
+                return True
+            if cursor is None:
+                return False
+        return True
 
     @abstractmethod
     def rename(self, gadget_id: str, name: str) -> Gadget | None:
@@ -322,9 +362,9 @@ class GadgetStore(ABC):
         """The file scope of an existing gadget."""
 
     @abstractmethod
-    def user_files(self, user_id: str) -> GadgetFiles:
-        """One user's own file scope, for their shelf."""
+    def user_files(self, user_id: str, *, owner_generation: str | None = None) -> GadgetFiles:
+        """One user's own file scope, for their shelf; one per account generation."""
 
     @abstractmethod
-    def delete_user_files(self, user_id: str) -> None:
+    def delete_user_files(self, user_id: str, *, owner_generation: str | None = None) -> None:
         """Delete every file in one user's scope, as when their account is deleted."""

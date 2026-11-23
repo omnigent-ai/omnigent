@@ -37,6 +37,7 @@ from omnigent.gadgets.access import (
     NO_ACCESS,
     GadgetAccess,
     GadgetPermissions,
+    owned_by,
 )
 from omnigent.gadgets.actions import (
     validate_actions,
@@ -160,9 +161,12 @@ class GadgetViewer:
     """The caller.
 
     :param user_id: e.g. ``"alice@example.com"``; ``"local"`` in single-user mode.
+    :param generation: The account's generation on a server with built-in accounts,
+        else ``None``; the viewer owns only the gadgets created under it.
     """
 
     user_id: str
+    generation: str | None = None
 
     @property
     def key(self) -> str:
@@ -457,7 +461,9 @@ class GadgetService:
     # -- gadgets ---------------------------------------------------------------
 
     def create(self, name: Any) -> dict:
-        gadget = self.store.create(self.viewer.user_id, _gadget_name(name))
+        gadget = self.store.create(
+            self.viewer.user_id, _gadget_name(name), owner_generation=self.viewer.generation
+        )
         return self._app(gadget, self.access.permissions(self.viewer.user_id, gadget))
 
     def list_owned(self, limit: Any = 100, cursor: Any = None) -> dict:
@@ -466,7 +472,10 @@ class GadgetService:
         :returns: ``{"items", "next_cursor"}``.
         """
         owned, next_cursor = self.store.list_owned_page(
-            self.viewer.user_id, limit=_page_limit(limit, MAX_OWNED_PAGE_SIZE), after=cursor
+            self.viewer.user_id,
+            limit=_page_limit(limit, MAX_OWNED_PAGE_SIZE),
+            after=cursor,
+            owner_generation=self.viewer.generation,
         )
         return {
             "items": [
@@ -492,7 +501,7 @@ class GadgetService:
         names = self._display_names(owners) if self._display_names and owners else {}
         items = []
         for item in shared:
-            if item.gadget.owner_id == self.viewer.user_id:
+            if owned_by(item.gadget, self.viewer.user_id, self.viewer.generation):
                 continue
             permissions = self.access.permissions(self.viewer.user_id, item.gadget)
             if not permissions.read:
@@ -552,7 +561,9 @@ class GadgetService:
     @property
     def _shelf(self) -> ImmutableDocumentStore:
         return ImmutableDocumentStore(
-            self.store.user_files(self.viewer.user_id), SHELF_ROOT, limits=_STATE_STORE_LIMITS
+            self.store.user_files(self.viewer.user_id, owner_generation=self.viewer.generation),
+            SHELF_ROOT,
+            limits=_STATE_STORE_LIMITS,
         )
 
     @staticmethod
@@ -593,8 +604,7 @@ class GadgetService:
         }
 
     def _owns_any(self) -> bool:
-        page, cursor = self.store.list_owned_page(self.viewer.user_id, limit=1)
-        return bool(page) or cursor is not None
+        return self.store.owns_any(self.viewer.user_id, owner_generation=self.viewer.generation)
 
     def shelf(self) -> dict:
         """The viewer's pinned gadgets, and whether they own any, for the sidebar."""

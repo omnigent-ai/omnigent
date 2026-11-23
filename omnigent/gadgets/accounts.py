@@ -25,19 +25,25 @@ class DeletedAccountGadgets:
         self._store = store
         self._access = access
 
-    def delete_owned(self, user_id: str) -> None:
-        """Delete every gadget *user_id* owns, with its grants, then their shelf.
+    def delete_owned(self, user_id: str, generation: str | None = None) -> None:
+        """Delete every gadget the deleted account *user_id* (*generation*) owns, with its
+        grants, then its shelf.
 
-        Grants go first, so a gadget whose deletion fails half-way is shared with no
-        one; a retry finishes it. Works through one page of gadgets at a time, so a
-        large account costs bounded memory and starts deleting at once.
+        Only that generation's: a cleanup that runs late, after the username was registered
+        again, never touches the new account's gadgets or shelf. Grants go first, so a gadget
+        whose deletion fails half-way is shared with no one; a retry finishes it. Works
+        through one page of gadgets at a time, so a large account costs bounded memory and
+        starts deleting at once.
         """
-        for gadget in self._store.iter_owned(user_id):
+        for gadget in self._store.iter_owned(user_id, owner_generation=generation):
             self._access.forget(gadget.id)
             self._store.delete(gadget.id)
-        self._store.delete_user_files(user_id)
+        self._store.delete_user_files(user_id, owner_generation=generation)
 
-    def owns_any(self, user_id: str) -> bool:
-        """Whether *user_id* still owns a gadget."""
-        page, cursor = self._store.list_owned_page(user_id, limit=1)
-        return bool(page) or cursor is not None
+    def owns_any(self, user_id: str, generation: str | None = None) -> bool:
+        """Whether the deleted account *user_id* (*generation*) still owns a live gadget.
+
+        Stale entries of its index (an emptied segment, a marker a deletion left) don't
+        count; see :meth:`GadgetStore.owns_any`.
+        """
+        return self._store.owns_any(user_id, owner_generation=generation)

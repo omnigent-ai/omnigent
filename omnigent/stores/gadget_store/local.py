@@ -4,16 +4,20 @@ Layout under ``storage_location`` (by default ``<data_dir>/gadgets``)::
 
     gadgets/<id>/gadget.json        # metadata, replaced atomically on rename
     gadgets/<id>/files/...          # the gadget's GadgetFiles scope
+    owners/<owner key>/head.json    # the owner's first and newest marker segments
     owners/<owner key>/sNNNNNNNN/<id>  # empty marker: which gadgets a user owns
     users/<user key>/...             # one user's GadgetFiles scope (their shelf)
     .tmp/                            # staging for atomic writes; never listed
     .trash/                          # deleted scopes being removed; emptied on start
 
-Owner and user keys are SHA-256 prefixes of the user ID, so any ID is a safe
-directory name. Owner markers fill numbered segments of about
+Owner and user keys are SHA-256 prefixes of the user ID and, for an account with a
+generation, that generation, so any ID is a safe directory name and a username
+registered again starts with nothing. Owner markers fill numbered segments of about
 :data:`_OWNER_SEGMENT_SIZE` in creation order (the gadget's metadata names its
-segment), so a page of a user's gadgets lists the segment names and at most two
-segments, however many gadgets the user has.
+segment), and ``head.json`` names the first and newest segments, so a page of a user's
+gadgets reads at most two segments, however many gadgets the user has. Reading a page
+repairs the index: a marker whose gadget is gone is removed, and so is an emptied
+segment before the newest.
 
 A create-only write stages the file in ``.tmp`` and hard-links it into place,
 which fails when the target exists and never exposes a partly written file, so
@@ -57,13 +61,15 @@ _OWNER_SEGMENT_SIZE = 1000
 # A page cursor: the segment, and the last gadget ID read in it (none: start of the segment).
 _OWNER_CURSOR = re.compile(rf"({_OWNER_SEGMENT.pattern})/((?:{GADGET_ID_PATTERN.pattern})?)")
 _METADATA_FILE = "gadget.json"
+_OWNER_HEAD = "head.json"
 _METADATA_KIND = "omnigent.gadget.v1"
 # A gadget directory without metadata this old is left over from an interrupted creation.
 _ORPHAN_AGE_S = 60 * 60
 
 
-def _user_key(user_id: str) -> str:
-    return hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:32]
+def _user_key(user_id: str, generation: str | None = None) -> str:
+    material = user_id if generation is None else f"{user_id}\n{generation}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
 def _reject_nonfinite(value: str) -> None:
@@ -278,8 +284,8 @@ class LocalGadgetStore(GadgetStore):
     def _gadget_dir(self, gadget_id: str) -> Path:
         return self._root / "gadgets" / gadget_id
 
-    def _owner_dir(self, owner_id: str) -> Path:
-        return self._root / "owners" / _user_key(owner_id)
+    def _owner_dir(self, owner_id: str, generation: str | None = None) -> Path:
+        return self._root / "owners" / _user_key(owner_id, generation)
 
     def _read_metadata(self, gadget_id: str) -> Gadget | None:
         found = self._read_record(gadget_id)
@@ -295,7 +301,7 @@ class LocalGadgetStore(GadgetStore):
         except NotFound:
             return None
         owner, name, created_at = raw.get("owner_id"), raw.get("name"), raw.get("created_at")
-        segment = raw.get("owner_segment")
+        segment, generation = raw.get("owner_segment"), raw.get("owner_generation")
         if (
             raw.get("kind") != _METADATA_KIND
             or raw.get("id") != gadget_id
@@ -304,9 +310,16 @@ class LocalGadgetStore(GadgetStore):
             or not isinstance(created_at, int | float)
             or not isinstance(segment, str)
             or _OWNER_SEGMENT.fullmatch(segment) is None
+            or not (generation is None or isinstance(generation, str))
         ):
             raise CorruptData("Invalid gadget metadata")
-        gadget = Gadget(id=gadget_id, owner_id=owner, name=name, created_at=float(created_at))
+        gadget = Gadget(
+            id=gadget_id,
+            owner_id=owner,
+            name=name,
+            created_at=float(created_at),
+            owner_generation=generation,
+        )
         return gadget, segment
 
     @staticmethod
@@ -318,6 +331,7 @@ class LocalGadgetStore(GadgetStore):
             "name": gadget.name,
             "created_at": gadget.created_at,
             "owner_segment": segment,
+            "owner_generation": gadget.owner_generation,
         }
 
     def _new_id(self) -> str:
@@ -325,27 +339,51 @@ class LocalGadgetStore(GadgetStore):
         return uuid.uuid4().hex
 
     @staticmethod
-    def _owner_segments(owner_dir: Path) -> list[str]:
-        """The owner's segment names in order: one per :data:`_OWNER_SEGMENT_SIZE` created."""
+    def _segment_name(number: int) -> str:
+        return f"s{number:08d}"
+
+    def _read_head(self, owner_dir: Path) -> tuple[int, int]:
+        """The owner's first and newest segment numbers; ``(0, 0)`` for a new owner."""
         try:
-            return sorted(n for n in os.listdir(owner_dir) if _OWNER_SEGMENT.fullmatch(n))
+            raw = json.loads((owner_dir / _OWNER_HEAD).read_text())
         except FileNotFoundError:
-            return []
+            return 0, 0
+        except (OSError, ValueError) as exc:
+            raise CorruptData("Invalid gadget owner index") from exc
+        first, last = raw.get("first") if isinstance(raw, dict) else None, None
+        if isinstance(raw, dict):
+            last = raw.get("last")
+        if type(first) is not int or type(last) is not int or not 0 <= first <= last:
+            raise CorruptData("Invalid gadget owner index")
+        return first, last
+
+    def _write_head(self, owner_dir: Path, first: int, last: int) -> None:
+        owner_dir.mkdir(parents=True, exist_ok=True)
+        _replace_file(self._tmp_dir, owner_dir / _OWNER_HEAD, {"first": first, "last": last})
 
     def _segment_with_room(self, owner_dir: Path) -> str:
-        segments = self._owner_segments(owner_dir)
-        if not segments:
-            return "s00000000"
-        newest = segments[-1]
+        first, last = self._read_head(owner_dir)
+        newest = self._segment_name(last)
         try:
             used = len(os.listdir(owner_dir / newest))
         except FileNotFoundError:
             used = 0
-        return newest if used < _OWNER_SEGMENT_SIZE else f"s{int(newest[1:]) + 1:08d}"
+        if used < _OWNER_SEGMENT_SIZE:
+            if not (owner_dir / _OWNER_HEAD).exists():
+                self._write_head(owner_dir, first, last)
+            return newest
+        self._write_head(owner_dir, first, last + 1)
+        return self._segment_name(last + 1)
 
-    def create(self, owner_id: str, name: str) -> Gadget:
-        gadget = Gadget(id=self._new_id(), owner_id=owner_id, name=name, created_at=time.time())
-        owner_dir = self._owner_dir(owner_id)
+    def create(self, owner_id: str, name: str, *, owner_generation: str | None = None) -> Gadget:
+        gadget = Gadget(
+            id=self._new_id(),
+            owner_id=owner_id,
+            name=name,
+            created_at=time.time(),
+            owner_generation=owner_generation,
+        )
+        owner_dir = self._owner_dir(owner_id, owner_generation)
         with self._owner_lock:
             segment = self._segment_with_room(owner_dir)
             (owner_dir / segment).mkdir(parents=True, exist_ok=True)
@@ -360,45 +398,81 @@ class LocalGadgetStore(GadgetStore):
     def get(self, gadget_id: str) -> Gadget | None:
         return self._read_metadata(gadget_id)
 
+    def _drop_empty_segment(self, owner_dir: Path, segment: str) -> None:
+        """Remove an emptied segment before the newest, moving the first one on past it."""
+        with self._owner_lock:
+            first, last = self._read_head(owner_dir)
+            number = int(segment[1:])
+            if number >= last:
+                return
+            try:
+                (owner_dir / segment).rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return  # A gadget was added to it meanwhile.
+            if number == first:
+                following = first + 1
+                while following < last and not (owner_dir / self._segment_name(following)).exists():
+                    following += 1
+                self._write_head(owner_dir, following, last)
+
     def list_owned_page(
-        self, owner_id: str, *, limit: int, after: str | None = None
+        self,
+        owner_id: str,
+        *,
+        limit: int,
+        after: str | None = None,
+        owner_generation: str | None = None,
     ) -> tuple[list[Gadget], str | None]:
         if type(limit) is not int or not 1 <= limit <= MAX_OWNED_PAGE_SIZE:
             raise InvalidInput(f"limit must be an integer in 1..{MAX_OWNED_PAGE_SIZE}")
-        start_segment, start_id = "", ""
+        owner_dir = self._owner_dir(owner_id, owner_generation)
+        first, last = self._read_head(owner_dir)
+        start_number, start_id = first, ""
         if after is not None:
             match = _OWNER_CURSOR.fullmatch(after) if isinstance(after, str) else None
             if match is None:
                 raise InvalidInput("Invalid cursor")
-            start_segment, start_id = match.group(1), match.group(2)
-        owner_dir = self._owner_dir(owner_id)
-        segments = [s for s in self._owner_segments(owner_dir) if s >= start_segment]
+            start_number, start_id = max(int(match.group(1)[1:]), first), match.group(2)
+            if int(match.group(1)[1:]) < first:
+                start_id = ""
         owned: list[Gadget] = []
-        # Markers can outlive a deletion that stopped half-way; they cost a read but no slot.
+        # Markers can outlive a deletion that stopped half-way; they cost a read but no slot,
+        # and are removed as they are found.
         reads_left = 2 * limit
         # Bounded work per page: at most two segments listed and 2 * limit metadata reads;
         # a page can come back short or empty and still continue.
-        for position, segment in enumerate(segments[:2]):
+        for number in range(start_number, min(start_number + 2, last + 1)):
+            segment = self._segment_name(number)
             try:
                 names = sorted(
                     n for n in os.listdir(owner_dir / segment) if _GADGET_ID.fullmatch(n)
                 )
             except FileNotFoundError:
                 names = []
-            last = start_id if segment == start_segment else ""
-            if last:
-                names = [n for n in names if n > last]
+            last_read = start_id if number == start_number else ""
+            if last_read:
+                names = [n for n in names if n > last_read]
+            elif not names:
+                self._drop_empty_segment(owner_dir, segment)
             for gadget_id in names:
                 if len(owned) == limit or reads_left == 0:
-                    return owned, f"{segment}/{last}"
+                    return owned, f"{segment}/{last_read}"
                 reads_left -= 1
-                last = gadget_id
+                last_read = gadget_id
                 gadget = self._read_metadata(gadget_id)
-                if gadget is not None and gadget.owner_id == owner_id:
+                if (
+                    gadget is not None
+                    and gadget.owner_id == owner_id
+                    and gadget.owner_generation == owner_generation
+                ):
                     owned.append(gadget)
-            later = segments[position + 1 :]
-            if later and (len(owned) == limit or reads_left == 0 or position == 1):
-                return owned, f"{later[0]}/"
+                else:
+                    with contextlib.suppress(FileNotFoundError):
+                        (owner_dir / segment / gadget_id).unlink()
+            if number < last and (len(owned) == limit or reads_left == 0 or number > start_number):
+                return owned, f"{self._segment_name(number + 1)}/"
         return owned, None
 
     def rename(self, gadget_id: str, name: str) -> Gadget | None:
@@ -407,7 +481,9 @@ class LocalGadgetStore(GadgetStore):
             if found is None:
                 return None
             current, segment = found
-            renamed = Gadget(current.id, current.owner_id, name, current.created_at)
+            renamed = Gadget(
+                current.id, current.owner_id, name, current.created_at, current.owner_generation
+            )
             try:
                 _replace_file(
                     self._tmp_dir,
@@ -433,8 +509,12 @@ class LocalGadgetStore(GadgetStore):
                 os.replace(self._gadget_dir(gadget_id), trash)
             except FileNotFoundError:
                 return False
+        owner_dir = self._owner_dir(gadget.owner_id, gadget.owner_generation)
         with contextlib.suppress(FileNotFoundError):
-            (self._owner_dir(gadget.owner_id) / segment / gadget_id).unlink()
+            (owner_dir / segment / gadget_id).unlink()
+        with contextlib.suppress(OSError):
+            if not os.listdir(owner_dir / segment):
+                self._drop_empty_segment(owner_dir, segment)
         shutil.rmtree(trash, ignore_errors=True)
         return True
 
@@ -445,17 +525,18 @@ class LocalGadgetStore(GadgetStore):
             self._gadget_dir(gadget_id) / "files", self._tmp_dir, create_root=False
         )
 
-    def _user_dir(self, user_id: str) -> Path:
-        return self._root / "users" / _user_key(user_id)
+    def _user_dir(self, user_id: str, generation: str | None = None) -> Path:
+        return self._root / "users" / _user_key(user_id, generation)
 
-    def user_files(self, user_id: str) -> GadgetFiles:
-        return LocalGadgetFiles(self._user_dir(user_id), self._tmp_dir)
+    def user_files(self, user_id: str, *, owner_generation: str | None = None) -> GadgetFiles:
+        return LocalGadgetFiles(self._user_dir(user_id, owner_generation), self._tmp_dir)
 
-    def delete_user_files(self, user_id: str) -> None:
-        trash = self._root / ".trash" / f"user-{_user_key(user_id)}-{uuid.uuid4().hex}"
+    def delete_user_files(self, user_id: str, *, owner_generation: str | None = None) -> None:
+        key = _user_key(user_id, owner_generation)
+        trash = self._root / ".trash" / f"user-{key}-{uuid.uuid4().hex}"
         trash.parent.mkdir(parents=True, exist_ok=True)
         try:
-            os.replace(self._user_dir(user_id), trash)
+            os.replace(self._user_dir(user_id, owner_generation), trash)
         except FileNotFoundError:
             return
         shutil.rmtree(trash, ignore_errors=True)

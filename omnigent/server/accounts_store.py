@@ -73,11 +73,11 @@ _logger = logging.getLogger(__name__)
 class DeletedAccountResources(Protocol):
     """An account's resources kept outside this database (its gadgets)."""
 
-    def delete_owned(self, user_id: str) -> None:
-        """Delete everything *user_id* owns there."""
+    def delete_owned(self, user_id: str, generation: str | None = None) -> None:
+        """Delete everything the deleted account *user_id* (*generation*) owns there."""
 
-    def owns_any(self, user_id: str) -> bool:
-        """Whether anything *user_id* owns is left there."""
+    def owns_any(self, user_id: str, generation: str | None = None) -> bool:
+        """Whether anything the deleted account *user_id* (*generation*) owns is left there."""
 
 
 _HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
@@ -344,7 +344,7 @@ class SqlAlchemyAccountStore:
             if (
                 existing is not None
                 and self._gadgets is not None
-                and self._gadgets.owns_any(user_id)
+                and self._gadgets.owns_any(user_id, existing.account_generation)
             ):
                 raise OmnigentError(
                     "A deleted account's gadgets are still being removed. Try again.",
@@ -648,16 +648,17 @@ class SqlAlchemyAccountStore:
     def _delete_deleted_gadgets(self, user_id: str) -> None:
         """Delete a tombstoned account's gadgets and shelf, which live in the gadget store.
 
-        Checks the tombstone first, so late cleanup never deletes a re-registered
-        account's new gadgets.
+        Deletes only the gadgets of the tombstoned account's generation, so a cleanup that
+        resumes after the username was registered again never deletes the new account's.
         """
         if self._gadgets is None:
             return
         with self._session("select_user_by_id") as session:
             row = session.get(SqlUser, (current_workspace_id(), user_id))
             tombstoned = row is not None and row.deleted_at is not None
+            generation = row.account_generation if row is not None else None
         if tombstoned:
-            self._gadgets.delete_owned(user_id)
+            self._gadgets.delete_owned(user_id, generation)
 
     def _owned_workflow_ids(
         self, session: Session, user_id: str, *, limit: int, lock: bool = False

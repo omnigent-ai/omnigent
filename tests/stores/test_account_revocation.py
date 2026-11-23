@@ -1568,7 +1568,26 @@ def _gadgets(db_uri: str, tmp_path, accounts: SqlAlchemyAccountStore):
     store = LocalGadgetStore(str(tmp_path / "gadgets"))
     access = PermissionStoreGadgetAccess(store, SqlAlchemyPermissionStore(db_uri))
     accounts.attach_gadgets(DeletedAccountGadgets(store, access))
-    return store, access, lambda user: GadgetService(store, access, GadgetViewer(user))
+
+    class AsAccount:
+        """A user's gadget service, each call made as a request of their account would be."""
+
+        def __init__(self, user: str) -> None:
+            account = accounts.get_user(user)
+            self.generation = account.account_generation if account is not None else None
+            self.user = user
+            self.service = GadgetService(store, access, GadgetViewer(user, self.generation))
+
+        def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+            method = getattr(self.service, name)
+
+            def call(*args, **kwargs):  # type: ignore[no-untyped-def]
+                with account_authority_scope(self.user, self.generation):
+                    return method(*args, **kwargs)
+
+            return call
+
+    return store, access, AsAccount
 
 
 def test_deletion_removes_the_accounts_gadgets_and_who_they_were_shared_with(
@@ -1579,14 +1598,16 @@ def test_deletion_removes_the_accounts_gadgets_and_who_they_were_shared_with(
     store, access, service = _gadgets(db_uri, tmp_path, accounts)
     accounts.create_user_with_password("alice", "alice-hash")
     permissions.ensure_user("bob")
-    board = service("alice").create("Synthetic board")
+    alice = service("alice")
+    board = alice.create("Synthetic board")
     kept = service("bob").create("Bob's board")
     permissions.grant_for_gadget("bob", board["id"], 2)
     permissions.grant_for_gadget("alice", kept["id"], 1)
-    service("alice").pin(kept["id"], {"pinned": True})
+    alice.pin(kept["id"], {"pinned": True})
 
     assert accounts.delete_user("alice") is True
-    assert list(store.iter_owned("alice")) == [] and store.get(board["id"]) is None
+    assert list(store.iter_owned("alice", owner_generation=alice.generation)) == []
+    assert store.get(board["id"]) is None
     assert permissions.list_for_gadget(board["id"]) == ([], None)
     assert access.shared_with("bob").items == []
 
@@ -1652,3 +1673,72 @@ def test_reregistration_waits_until_the_deleted_accounts_gadgets_are_gone(
     mine = service("alice").create("New board")
     accounts._delete_deleted_gadgets("alice")
     assert store.get(mine["id"]) is not None
+
+
+def test_a_cleanup_that_resumes_after_reregistration_leaves_the_new_accounts_gadgets(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    accounts = SqlAlchemyAccountStore(db_uri)
+    store, access, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    old_alice = service("alice")
+    board = old_alice.create("Synthetic board")
+    old_alice.pin(board["id"], {"pinned": True})
+    gadgets = accounts._gadgets
+    paused: list[tuple] = []
+    original = type(gadgets).delete_owned
+    # The first cleanup read the tombstone, then stopped before deleting anything.
+    monkeypatch.setattr(
+        type(gadgets), "delete_owned", lambda self, *args: paused.append((self, *args))
+    )
+    assert accounts.delete_user("alice") is True
+    monkeypatch.setattr(type(gadgets), "delete_owned", original)
+    # Another cleanup finishes, and the name is registered again and used.
+    accounts._delete_deleted_gadgets("alice")
+    assert accounts.create_user_with_password("alice", "replacement-hash").id == "alice"
+    new_alice = service("alice")
+    mine = new_alice.create("New board")
+    new_alice.pin(mine["id"], {"pinned": True})
+
+    # The first cleanup resumes with what it read: the deleted account's generation.
+    assert len(paused) == 1
+    original(*paused[0])
+
+    assert store.get(mine["id"]) is not None
+    assert [pin["id"] for pin in new_alice.shelf()["pinned"]] == [mine["id"]]
+    assert new_alice.list_owned()["items"][0]["id"] == mine["id"]
+
+
+def test_a_username_registered_again_cannot_reach_a_copy_of_the_old_accounts_gadget(
+    db_uri: str, tmp_path
+) -> None:
+    from omnigent.gadgets.access import PermissionStoreGadgetAccess
+    from omnigent.gadgets.service import GadgetService, GadgetViewer
+    from omnigent.stores.gadget_store import NotFound as StoreNotFound
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    # Two servers share the accounts and permissions database, each with its own gadgets;
+    # only server B cleans up after deleted accounts here.
+    root_a = LocalGadgetStore(str(tmp_path / "a"))
+    root_b, _, _ = _gadgets(db_uri, tmp_path / "b", accounts)
+    old = accounts.create_user_with_password("alice", "alice-hash")
+    with account_authority_scope("alice", old.account_generation):
+        board = GadgetService(
+            root_a,
+            PermissionStoreGadgetAccess(root_a, permissions),
+            GadgetViewer("alice", old.account_generation),
+        ).create("Synthetic board")
+
+    # Deleted and registered again through server B, which never had the gadget.
+    assert accounts.delete_user("alice") is True
+    new = accounts.create_user_with_password("alice", "replacement-hash")
+
+    access_a = PermissionStoreGadgetAccess(root_a, permissions)
+    service_a = GadgetService(root_a, access_a, GadgetViewer("alice", new.account_generation))
+    with account_authority_scope("alice", new.account_generation):
+        with pytest.raises(StoreNotFound):
+            service_a.get(board["id"])
+        assert service_a.list_owned() == {"items": [], "next_cursor": None}
+    assert root_b.get(board["id"]) is None
