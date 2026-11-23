@@ -409,22 +409,6 @@ def _transcript_shape(transcript_path: Path) -> str:
     return _TRANSCRIPT_FILE
 
 
-def _transcript_path_present(path: Path) -> bool:
-    """
-    Whether anything exists at ``path``; an error that hides the answer counts as present.
-
-    :param path: Transcript path from this session's cursor or hook history.
-    :returns: ``False`` only when the path is definitely absent.
-    """
-    try:
-        os.stat(path)
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return True
-    return True
-
-
 def _transcript_write_blocker(transcript_path: Path) -> str:
     """
     Name why a not-yet-present transcript's directory has not taken the file.
@@ -455,54 +439,78 @@ def _unwritable_directory_errno(
     return "EROFS" if mount_is_read_only(directory) else "EACCES"
 
 
-@dataclass(frozen=True)
-class _LostTranscript:
+def _loss_shape(transcript_path: Path) -> str:
     """
-    A hook-reported transcript that is definitely absent under a searchable directory.
+    Return the shape a loss decision may rely on for a hook-reported transcript path.
 
-    :param path: Transcript path Claude Code reported for the turn.
-    :param blocker: Why the directory has not taken the file, e.g.
-        ``"/home/u/.claude/projects/-work is not writable (EACCES)"``.
+    A missing file counts as ``not_yet_present`` only when its immediate directory
+    exists and can be searched, so a loss is never claimed for a directory that is
+    itself missing.
+
+    :param transcript_path: Transcript path carried by a ``Stop`` hook record.
+    :returns: The shape from :func:`_transcript_shape`, downgraded to
+        ``"unusable"`` when the file is absent but its directory is not searchable.
     """
+    shape = _transcript_shape(transcript_path)
+    if shape != _TRANSCRIPT_NOT_YET_PRESENT:
+        return shape
+    try:
+        parent = transcript_path.parent
+        searchable = parent.is_dir() and os.access(parent, os.X_OK)
+    except OSError:
+        searchable = False
+    return _TRANSCRIPT_NOT_YET_PRESENT if searchable else _TRANSCRIPT_UNUSABLE
 
-    path: Path
-    blocker: str
 
-
-def _transcript_loss(
-    bridge_dir: Path, stop_path: Path | None, saved_path: Path | None
-) -> _LostTranscript | None:
+def _transcript_never_appeared(
+    *,
+    stop_path: Path | None,
+    saved_path: Path | None,
+    advertised_path: Path | None,
+    saved_byte_offset: int | None,
+    saved_line_cursor: int | None,
+    shape: str | None,
+) -> bool:
     """
-    Return the loss a ``Stop`` proves, or ``None`` when the evidence is not unambiguous.
+    Decide whether a finished turn's transcript provably never appeared.
 
-    Deliberately conservative: a missed warning is acceptable, a false "transcript
-    lost" is not. The loss is reported only when the Stop's path is still the path
-    hooks advertise now, the file is absent under a searchable directory, and no
-    other transcript path this session has is present. A relocation, or a later
-    hook that advertised another path, leaves the evidence ambiguous, so the
-    function returns ``None``; a readable later path is processed normally.
+    Every positive piece of evidence must agree: the ``Stop``'s path, the saved
+    checkpoint's path, and the path hooks advertise now are the same path (compared
+    by ``Path`` equality, the identity rule ``_ensure_state_for_transcript`` uses),
+    the file is absent under a searchable directory, and the checkpoint shows no
+    cursor progress on that path. Any other outcome is ``False``: a missing
+    checkpoint, a path mismatch whatever the files' presence, progress, or an
+    unusable or unknown shape. A missed warning is acceptable; a false one is not.
+
+    :param stop_path: Transcript path carried by the ``Stop`` hook record.
+    :param saved_path: Transcript path of the checkpoint captured before this poll's
+        initialization, or ``None`` when there was no checkpoint.
+    :param advertised_path: Transcript path hooks advertise now.
+    :param saved_byte_offset: Checkpoint byte offset, or ``None`` for a legacy checkpoint.
+    :param saved_line_cursor: Checkpoint line cursor, or ``None`` when absent.
+    :param shape: :func:`_loss_shape` of ``stop_path``.
+    :returns: ``True`` only when the turn's transcript provably never appeared.
+    """
+    if stop_path is None or saved_path is None or advertised_path is None:
+        return False
+    if not stop_path == saved_path == advertised_path:
+        return False
+    if shape != _TRANSCRIPT_NOT_YET_PRESENT:
+        return False
+    if saved_byte_offset not in (None, 0) or saved_line_cursor not in (None, 0):
+        return False
+    return True
+
+
+def _loss_evidence_now(bridge_dir: Path, stop_path: Path) -> tuple[Path | None, str]:
+    """
+    Read the evidence that changes between polls: the advertised path and the shape.
 
     :param bridge_dir: Native Claude bridge directory.
     :param stop_path: Transcript path carried by the ``Stop`` hook record.
-    :param saved_path: Transcript path the saved cursor followed before this
-        poll's initialization.
-    :returns: The lost transcript, or ``None``.
+    :returns: The advertised path and :func:`_loss_shape` of ``stop_path``.
     """
-    if stop_path is None or read_transcript_path(bridge_dir) != stop_path:
-        return None
-    if _transcript_shape(stop_path) != _TRANSCRIPT_NOT_YET_PRESENT:
-        return None
-    # The loss is claimed only where the transcript's own directory exists and can be searched.
-    try:
-        parent_searchable = stop_path.parent.is_dir() and os.access(stop_path.parent, os.X_OK)
-    except OSError:
-        parent_searchable = False
-    if not parent_searchable:
-        return None
-    if saved_path is not None and saved_path != stop_path:
-        if _transcript_path_present(saved_path):
-            return None
-    return _LostTranscript(stop_path, _transcript_write_blocker(stop_path))
+    return read_transcript_path(bridge_dir), _loss_shape(stop_path)
 
 
 async def _log_missing_transcript(
@@ -511,33 +519,42 @@ async def _log_missing_transcript(
     bridge_dir: Path,
     record: ClaudeHookRecord,
     dedupe: _ForwardDedupeState,
-    saved_path: Path | None,
+    saved_state: TranscriptForwardState | None,
 ) -> None:
     """
-    Log once per path when a finished turn's transcript never appeared.
+    Log once per path when a finished turn's transcript provably never appeared.
 
-    Log-only by design: nothing is posted to the session or the parent, so a
-    false positive cannot reach the chat, and the turn settles as it did before.
+    The only caller of the warning. Log-only by design: nothing is posted to the
+    session or the parent, so the turn settles as it did before.
 
     :param session_id: Omnigent session/conversation id.
     :param bridge_dir: Native Claude bridge directory.
     :param record: The ``Stop`` hook record ending the turn.
     :param dedupe: Per-run baseline holding the once-per-path log latch.
-    :param saved_path: Transcript path the saved cursor followed before this
-        poll's initialization, so a legacy checkpoint naming another path is seen.
+    :param saved_state: Checkpoint captured before this poll's initialization.
     :returns: None.
     """
-    lost = await asyncio.to_thread(
-        _transcript_loss, bridge_dir, record.transcript_path, saved_path
-    )
-    if lost is None or lost.path in dedupe.missing_transcript_warned_paths:
+    stop_path = record.transcript_path
+    if stop_path is None:
         return
-    dedupe.missing_transcript_warned_paths.add(lost.path)
+    advertised_path, shape = await asyncio.to_thread(_loss_evidence_now, bridge_dir, stop_path)
+    if not _transcript_never_appeared(
+        stop_path=stop_path,
+        saved_path=saved_state.transcript_path if saved_state is not None else None,
+        advertised_path=advertised_path,
+        saved_byte_offset=saved_state.byte_offset if saved_state is not None else None,
+        saved_line_cursor=saved_state.line_cursor if saved_state is not None else None,
+        shape=shape,
+    ):
+        return
+    if stop_path in dedupe.missing_transcript_warned_paths:
+        return
+    dedupe.missing_transcript_warned_paths.add(stop_path)
     _logger.warning(
         "Claude transcript %s reported by hooks never appeared before the turn's Stop (%s); "
         "the turn's prompt and replies were not mirrored; session=%s",
-        lost.path,
-        lost.blocker,
+        stop_path,
+        _transcript_write_blocker(stop_path),
         session_id,
         extra={"session_id": session_id},
     )
@@ -1744,8 +1761,8 @@ async def forward_claude_transcript_to_session(
                         transcript_path=transcript_path,
                         diagnostics=transcript_diagnostics,
                     )
-                    # Initialization below can replace the saved cursor; keep its path.
-                    prior_transcript_path = state.transcript_path if state is not None else None
+                    # Initialization below can replace the saved cursor; keep the snapshot.
+                    prior_transcript_state = state
                     if (
                         transcript_path is not None
                         and _transcript_shape(transcript_path) == _TRANSCRIPT_UNUSABLE
@@ -1768,7 +1785,7 @@ async def forward_claude_transcript_to_session(
                             response_id=state.current_response_id if state is not None else None,
                             diagnostic_health=diagnostic_health,
                             hooks_cutoff_byte_offset=None,
-                            saved_transcript_path=prior_transcript_path,
+                            saved_state=prior_transcript_state,
                         )
                     elif transcript_path is not None:
                         state = await _ensure_state_for_transcript(
@@ -1834,7 +1851,7 @@ async def forward_claude_transcript_to_session(
                             response_id=state.current_response_id,
                             diagnostic_health=diagnostic_health,
                             hooks_cutoff_byte_offset=hooks_cutoff_byte_offset,
-                            saved_transcript_path=prior_transcript_path,
+                            saved_state=prior_transcript_state,
                         )
                         # Deferred ``/compact``-refusal dismissal: runs AFTER
                         # the hook phase so the ``failed`` post always follows
@@ -4638,7 +4655,7 @@ async def _forward_available_status_events(
     response_id: str | None = None,
     diagnostic_health: Callable[[], FailureContext] | None = None,
     hooks_cutoff_byte_offset: int | None = None,
-    saved_transcript_path: Path | None = None,
+    saved_state: TranscriptForwardState | None = None,
 ) -> HookForwardState:
     """
     Forward currently available hook events as ``session.status``.
@@ -4688,8 +4705,8 @@ async def _forward_available_status_events(
         transcript read; only records ending at or before it are forwarded, so a
         ``Stop`` written mid-poll waits until its reply is mirrored. ``None``
         forwards every available record.
-    :param saved_transcript_path: Transcript path the saved cursor followed before
-        this poll's initialization, so a diagnostic can still see a legacy checkpoint.
+    :param saved_state: Checkpoint captured before this poll's initialization, read by
+        the never-appeared decision.
     :returns: Updated state. On post failure, returns the last
         durable state so successfully-posted statuses are not
         retried and the failing event is retried later.
@@ -5153,7 +5170,7 @@ async def _forward_available_status_events(
                     bridge_dir=bridge_dir,
                     record=record,
                     dedupe=dedupe,
-                    saved_path=saved_transcript_path,
+                    saved_state=saved_state,
                 )
             except Exception:
                 _logger.warning(
