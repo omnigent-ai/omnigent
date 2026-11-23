@@ -153,6 +153,7 @@ from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.scheduled_task_permissions import scheduled_task_sharing_supported
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
+from omnigent.server.routes.session_documents import create_session_documents_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
 from omnigent.server.routes.sessions import (
@@ -214,6 +215,7 @@ from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSetting
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 from omnigent.stores.scheduled_task_store.dispatch import ScheduledTaskDispatchStore
+from omnigent.stores.session_document_store import SessionDocumentStore
 from omnigent.stores.user_settings_store import (
     open_user_settings_store,
     session_owner_title_instructions,
@@ -4131,6 +4133,9 @@ def create_app(
         current_harness_install_enabled = harness_install_enabled(app.state.harness_install)
         frontend_features = app.state.feature_flags.frontend_dict()
         frontend_features[Feature.HARNESS_INSTALL.value] = current_harness_install_enabled
+        frontend_features[Feature.GOOGLE_DOCS.value] = (
+            frontend_features[Feature.GOOGLE_DOCS.value] and session_documents is not None
+        )
         # installable_harnesses: the exact harness ids the install route accepts
         # (bare ids + native spellings resolving to an npm-installable family),
         # so the SPA offers setup only where it will succeed and never has to
@@ -4614,6 +4619,22 @@ def create_app(
             prefix="/v1",
             tags=["memory"],
         )
+    document_location = getattr(conversation_store, "storage_location", None)
+    session_documents = (
+        SessionDocumentStore(document_location)
+        if isinstance(document_location, str) and document_location
+        else None
+    )
+    app.include_router(
+        create_session_documents_router(
+            conversations=conversation_store,
+            documents=session_documents,
+            auth_provider=auth_provider,
+            permissions=permission_store,
+        ),
+        prefix="/v1",
+        tags=["session-documents"],
+    )
     # Admin control for the server-wide sharing settings. Always mounted (the
     # handlers self-gate on admin); PUT is a no-op-reject unless this server
     # resolves the setting from the editable file-backed default.
