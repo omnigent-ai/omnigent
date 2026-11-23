@@ -1286,12 +1286,6 @@ aside[aria-label="Workspace"][data-maximized] {
   /* The extra room a card keeps inside its slot. */
   --pane-cell-gap: 3px;
   --pane-card-border: color-mix(in srgb, var(--border) 60%, transparent);
-  /* The dark card surface: the page color under the centre glow beside the sidebar, pinned to
-   * the window so every card paints one continuous canvas. */
-  --floating-card-canvas:
-    url("./assets/omnigent-center-glow.svg") right center /
-      calc(100% - var(--app-sidebar-width, 0px)) 100% no-repeat fixed,
-    var(--app-shell-bg);
 }
 
 /* Every floating rule shares one gate: windows 48rem and wider, in a browser or the desktop app. */
@@ -1340,6 +1334,12 @@ aside[aria-label="Workspace"][data-maximized] {
   /* One top row runs across the session column and the workspace sidebar, on the backdrop. */
   .app-shell[data-floating-panes] {
     --shell-top-row: 48px;
+    /* The dark card surface: the page color under the centre glow beside the sidebar, pinned to
+     * the window so every card paints one canvas. Set here, where the sidebar's width is. */
+    --floating-card-canvas:
+      url("./assets/omnigent-center-glow.svg") right center /
+        calc(100% - var(--app-sidebar-width, 0px)) 100% no-repeat fixed,
+      var(--app-shell-bg);
   }
   /* Beside the macOS window buttons the row is the title bar, in window pixels at any page zoom. */
   html[data-electron-mac] .app-shell[data-floating-panes] {

@@ -1028,6 +1028,14 @@ describe("index.css floating panes", () => {
     );
   });
 
+  it("sets the cards' canvas on the shell, where the sidebar width it is placed by is known", () => {
+    // A token declared on :root would read the width there, where it is never set.
+    expect(indexCssSource.match(/--floating-card-canvas:/g)).toHaveLength(1);
+    expect(ruleFor(".app-shell[data-floating-panes]")).toContain(
+      '--floating-card-canvas: url("./assets/omnigent-center-glow.svg") right center / calc(100% - var(--app-sidebar-width, 0px)) 100% no-repeat fixed, var(--app-shell-bg);',
+    );
+  });
+
   it("sits a full-screen workspace on the backdrop, opaque over the chat it covers", () => {
     const maximized =
       '.app-shell[data-floating-panes] [data-main-view] aside[aria-label="Workspace"][data-maximized]';
