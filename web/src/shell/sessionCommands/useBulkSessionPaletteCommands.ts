@@ -14,16 +14,14 @@ import {
 } from "lucide-react";
 import { useMemo, useRef } from "react";
 
-import { isFeatureEnabled } from "@/lib/capabilities";
-import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   AVAILABLE,
   HIDDEN,
   isCommandAvailable,
   type PaletteCommand,
-  usePaletteCommands,
 } from "@/store/paletteCommands";
 
+import { useQuickPickPaletteCommands } from "../screenCommands/useQuickPickPaletteCommands";
 import { type BulkSessionCommandId, type BulkSessionFacts, bulkSessionCommands } from "./bulkModel";
 
 const ICONS: Record<BulkSessionCommandId, LucideIcon> = {
@@ -46,12 +44,6 @@ const KEYWORDS: Record<BulkSessionCommandId, string[]> = {
 
 // Run once the palette closes, so the dialog they may open keeps the focus it takes.
 const OPENS_DIALOG = new Set<BulkSessionCommandId>(["archive", "delete"]);
-
-const NO_COMMANDS: PaletteCommand[] = [];
-
-function useQuickPickPalette(): boolean {
-  return isFeatureEnabled(useServerInfo(), "quick_pick_palette");
-}
 
 // Each selection Set gets its own key, which names the selection each action acts on.
 const selectionKeys = new WeakMap<ReadonlySet<string>, number>();
@@ -77,7 +69,6 @@ export interface BulkSessionActions {
 
 /** Offers the selection bar's actions in ⌘K while the bar is mounted. */
 export function useBulkSessionPaletteCommands(actions: BulkSessionActions): void {
-  const enabled = useQuickPickPalette();
   const latest = useRef(actions);
   latest.current = actions;
   const { facts, selection, projects } = actions;
@@ -85,7 +76,6 @@ export function useBulkSessionPaletteCommands(actions: BulkSessionActions): void
   // Rebuilt when a label, availability or project changes, not on every bar render.
   const signature = JSON.stringify([facts, projects]);
   const commands = useMemo<PaletteCommand[]>(() => {
-    if (!enabled) return NO_COMMANDS;
     const current = latest.current;
     // A row accepted after the selection changed, or once its action stopped applying, does nothing.
     const stillApplies = (id: BulkSessionCommandId): boolean => {
@@ -123,8 +113,8 @@ export function useBulkSessionPaletteCommands(actions: BulkSessionActions): void
     }));
     // `signature` stands in for the facts and projects read through `latest`.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled, key, signature]);
-  usePaletteCommands("sidebar.selection", "Selection", commands);
+  }, [key, signature]);
+  useQuickPickPaletteCommands("sidebar.selection", "Selection", commands);
 }
 
 export interface SessionSelection {
@@ -136,13 +126,12 @@ export interface SessionSelection {
 
 /** Offers Select all and Deselect all in ⌘K while the sidebar is selecting sessions. */
 export function useSessionSelectionPaletteCommands(selection: SessionSelection): void {
-  const enabled = useQuickPickPalette();
   const latest = useRef(selection);
   latest.current = selection;
   const { selecting, selected } = selection;
   const commands = useMemo<PaletteCommand[]>(
     () =>
-      enabled && selecting
+      selecting
         ? [
             {
               id: "sidebar.selection.select-all",
@@ -160,8 +149,8 @@ export function useSessionSelectionPaletteCommands(selection: SessionSelection):
               run: () => latest.current.deselectAll(),
             },
           ]
-        : NO_COMMANDS,
-    [enabled, selecting, selected],
+        : [],
+    [selecting, selected],
   );
-  usePaletteCommands("sidebar.selection.scope", "Selection", commands);
+  useQuickPickPaletteCommands("sidebar.selection.scope", "Selection", commands);
 }
