@@ -79,6 +79,7 @@ export const GADGET_CONTENT_SECURITY_POLICY = [
   "form-action 'none'",
   "manifest-src 'none'",
   "base-uri 'none'",
+  "webrtc 'none'",
 ].join("; ");
 
 /** Scripts only: an opaque origin, no forms, pop-ups, top navigation, or same-origin access. */
@@ -87,13 +88,9 @@ export const GADGET_FRAME_SANDBOX = "allow-scripts";
 const LEADING_DOCTYPE = /^\s*<!doctype[^>]*>/i;
 
 /**
- * The frame's document: the CSP meta tag and the SDK bootstrap ahead of the gadget's HTML, after
- * its doctype so the page keeps standards mode. A policy applies only to content after it, so
- * both come first. DNS prefetching is off too, since CSP does not cover it.
- *
- * Known limit: CSP cannot stop the frame from navigating itself, and that navigation's request
- * can carry anything the gadget read. The host notices the new document, closes its port at once
- * and stops the frame until the viewer reloads it (see `handleFrameLoad`).
+ * The frame's document: the CSP and SDK bootstrap precede the gadget's content (after its
+ * doctype, for standards mode), and DNS prefetching is off. A later frame navigation closes the
+ * bridge (`handleFrameLoad`).
  */
 export function buildGadgetFrameDocument(html: string, bootstrapScript: string): string {
   const doctype = LEADING_DOCTYPE.exec(html)?.[0].trim() ?? "<!DOCTYPE html>";

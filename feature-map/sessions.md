@@ -330,7 +330,10 @@ the header menu), and each place is a separate entry point.
   **Create session** menu over a dimmed page, and the session created there is
   linked to the gadget and gets the action. On a phone, the session header's menu
   lists each linked gadget by name; choosing one opens it in a drawer over the
-  session, and **Close** shows the session again.
+  session, and **Close** shows the session again. New gadgets start on the
+  Gadget page's **New** button (also at `/gadget/new`): describe one and press
+  **Build**, or open a template's **Preview** and press **Use template**; Blank
+  is made in one click.
 
 ## How to get to it (user POV)
 

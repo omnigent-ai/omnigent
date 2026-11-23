@@ -1,22 +1,12 @@
 // Decides whether a frame call that acts for the viewer (an action request or a navigation)
-// follows a real gesture inside the gadget. It reads only host-side state: the gadget's own script
-// runs in the frame and can call the SDK at any time, so nothing the frame reports counts.
-//
-// A call is allowed only when all of these hold:
-// - The browser reports transient user activation (`navigator.userActivation.isActive`). A click
-//   or key press anywhere in the page sets it for a few seconds, so on its own it proves nothing.
-//   A browser without the API gets the same few seconds from the moment the frame took focus,
-//   so a gadget left focused can't act for the viewer later.
-// - The gadget's frame is the focused element. A click or Tab into the frame focuses it, a click
-//   elsewhere in Omnigent moves focus away, and a cross-origin frame cannot take focus by script
-//   without a gesture of its own.
-// - No gesture reached Omnigent's own document since the frame took focus. Some host controls
-//   keep focus where it was on mousedown, so focus alone could outlast a click elsewhere.
-// - The gesture has not been used yet. The host cannot see clicks inside the frame, so after each
-//   decision it moves focus out of the frame (to the frame's container, so Tab goes back in); the
-//   next gesture inside focuses the frame again, which the host does see. A frame that refocuses
-//   itself needs its own recent activation, and calls are spaced at least `MIN_CALL_INTERVAL_MS`
-//   apart, which bounds what one real click can start.
+// follows a real gesture inside the gadget, from host-side state only. A call is allowed when:
+// - the browser reports transient user activation, or, without that API, the frame took focus in
+//   the last few seconds;
+// - the gadget's frame is the focused element, and no gesture reached Omnigent's own document
+//   since it took focus;
+// - the gesture has not been used: after each decision focus moves to the frame's container, and
+//   calls are at least `MIN_CALL_INTERVAL_MS` apart.
+// designs/GADGETS.md explains why each condition is needed.
 
 const MIN_CALL_INTERVAL_MS = 1000;
 // About how long browsers keep transient activation after a click.

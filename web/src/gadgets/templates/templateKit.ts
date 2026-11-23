@@ -151,7 +151,8 @@ footer { margin-top: 26px; font-size: 12px; color: var(--muted); }
  * DOM and text helpers: el and svg build elements, $ finds one by ID, keyed keeps one element
  * per key and animates moves (unless the viewer prefers reduced motion, `calm`), ago and elapsed
  * format times, hash gives a stable number for a string, wrap splits text for SVG, plain drops
- * Markdown marks, clause drops a closing period and message reads an error.
+ * Markdown marks, clause drops a closing period, message reads an error, and watchEveryPage
+ * watches every page of a collection.
  */
 export const GADGET_KIT_HELPERS = `
   var SVG_NS = 'http://www.w3.org/2000/svg';
@@ -281,5 +282,43 @@ export const GADGET_KIT_HELPERS = `
     var seconds = Math.max(0, Math.round((Date.now() - since) / 1000));
     var rest = seconds % 60;
     return Math.floor(seconds / 60) + ':' + (rest < 10 ? '0' : '') + rest;
+  }
+  function byIdOf(items) {
+    var out = {};
+    (items || []).forEach(function (doc) { out[doc.id] = doc; });
+    return out;
+  }
+  // A watch sees one page. For a collection the page looks records up in, watchEveryPage
+  // follows its continuation pages before calling handler(items, complete), so a record on a
+  // later page never reads as deleted, and drops a page set a newer snapshot replaced; on a
+  // failed page it keeps what is known until the next poll. Past MAX_EXTRA_PAGES it stops with
+  // complete false, and mergeKnown keeps the records already known.
+  var MAX_EXTRA_PAGES = 9;
+  function watchEveryPage(collection, handler, options) {
+    var latest = 0;
+    return collection.watch(function (snapshot) {
+      if (snapshot.status === 'loading') return;
+      var mine = ++latest;
+      if (!snapshot.nextCursor) { handler(snapshot.items || [], true); return; }
+      var items = (snapshot.items || []).slice();
+      var pages = 0;
+      (function more(cursor) {
+        collection.list({ limit: options.limit, cursor: cursor }).then(function (page) {
+          if (mine !== latest) return;
+          items = items.concat(page.items || []);
+          pages += 1;
+          if (page.nextCursor && pages < MAX_EXTRA_PAGES) { more(page.nextCursor); return; }
+          handler(items, !page.nextCursor);
+        }, function () {
+          // Keep what is known; the next poll tries again.
+        });
+      })(snapshot.nextCursor);
+    }, options);
+  }
+  function mergeKnown(known, items, complete) {
+    var next = byIdOf(items);
+    if (complete) return next;
+    Object.keys(known).forEach(function (id) { if (!next[id]) next[id] = known[id]; });
+    return next;
   }
 `;

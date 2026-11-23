@@ -125,7 +125,7 @@ function startStory({
   /** Every action request fails, as when the gadget session can't be reached. */
   failRequests?: boolean;
 } = {}) {
-  const { listeners, writes, collection } = recordingCollections();
+  const { listeners, writes, pages, collection } = recordingCollections();
   let actionListener: Listener | null = null;
   const requests: { action: string; params: unknown }[] = [];
   const opened: string[] = [];
@@ -161,7 +161,8 @@ function startStory({
     },
   };
   bootTemplatePage(html, client, { allowErrors });
-  const emit = (name: string, items: Doc[]) => listeners[name]?.({ status: "live", items });
+  const emit = (name: string, items: Doc[], nextCursor: string | null = null) =>
+    listeners[name]?.({ status: "live", items, nextCursor } as never);
   const emitActions = (items: unknown[]) => actionListener?.({ status: "live", items });
   /** Loads the page with these records, as the first polls answer. */
   const load = ({ ideas = null, story = null, series = {}, layout = null }: Records = {}) => {
@@ -177,6 +178,7 @@ function startStory({
     emit,
     emitActions,
     load,
+    pages,
     writes,
     requests,
     opened,
@@ -352,6 +354,33 @@ describe("data story template", () => {
     expect((byId("ideas") as HTMLDetailsElement).open).toBe(false);
     expect(byId("ideas-title").textContent).toBe("Other stories you could tell (2)");
     expect(byId("refresh").hidden).toBe(false);
+  });
+
+  it("draws every chart when the series take more than one page", async () => {
+    const { emit, load, pages, ready } = startStory();
+    await waitFor(() => expect(ready()).toBe(true));
+    const story = {
+      ...STORY,
+      sections: [STORY.sections[0], { ...STORY.sections[1], chart: "referrals" }],
+    };
+    const referrals = { id: "referrals", version: "v1", value: { ...WEEKLY, title: "Referrals" } };
+    const weekly = { id: "weekly", version: "v1", value: WEEKLY };
+    load({ ideas: IDEAS, story });
+    // Pages end at a byte budget, so a page can stop short and continue.
+    pages.series = { p2: { items: [referrals], nextCursor: null } };
+    emit("series", [weekly], "p2");
+    const chart = (section: string) => byId("view").querySelector(`#section-${section} svg.chart`);
+    await waitFor(() => expect(chart("where")).not.toBeNull());
+    expect(chart("trend")).not.toBeNull();
+
+    // A continuation that fails keeps the chart it found before; the next poll tries again.
+    pages.series = { p3: new Error("The connection dropped") };
+    emit("series", [{ ...weekly, version: "v2" }], "p3");
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 20);
+    });
+    expect(chart("where")).not.toBeNull();
+    expect(byId("view").textContent).not.toContain("No data for this chart yet");
   });
 
   it("refreshes the data and shows the refresh running", async () => {

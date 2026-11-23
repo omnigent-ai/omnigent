@@ -555,6 +555,11 @@ describe("startGadgetBridge", () => {
       ["params that are not an object", { action: "run_card", params: ["c1"] }],
       ["an extra parameter", { action: "run_card", session: "s1" }],
       ["params over the size limit", { action: "run_card", params: { notes: "x".repeat(9000) } }],
+      // Fewer characters than the limit, but more UTF-8 bytes.
+      [
+        "multibyte params over the size limit",
+        { action: "run_card", params: { notes: "é".repeat(5000) } },
+      ],
     ])("rejects %s without asking the host", async (_case, params) => {
       const requestAction = vi.fn(() => Promise.resolve({}));
       const { port } = start({ requestAction });

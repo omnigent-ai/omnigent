@@ -212,7 +212,7 @@ export function toActionRequest(params: Record<string, unknown>): GadgetActionRe
   if (!isRecord(actionParams) || !isJsonDocumentValue(actionParams)) {
     throw new BridgeError("INVALID_ARGUMENT", '"params" must be a JSON object');
   }
-  if (JSON.stringify(actionParams).length > MAX_ACTION_PARAMS_BYTES) {
+  if ((serializedByteLength(actionParams) ?? Infinity) > MAX_ACTION_PARAMS_BYTES) {
     throw new BridgeError(
       "INVALID_ARGUMENT",
       `"params" must be at most ${MAX_ACTION_PARAMS_BYTES / 1024} KiB`,

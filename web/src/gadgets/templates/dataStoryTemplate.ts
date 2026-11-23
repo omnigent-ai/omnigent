@@ -985,15 +985,21 @@ ${GADGET_KIT_HELPERS}
     if (name === 'ideas') ideasDoc = current(items) || (preview ? ideasDoc : null);
     else if (name === 'story') storyDoc = current(items) || (preview ? storyDoc : null);
     else if (name === 'layout') layoutDoc = current(items);
-    else if (name === 'series' && (!preview || items.length)) {
-      var next = {};
-      items.forEach(function (doc) { next[doc.id] = doc; });
-      seriesDocs = next;
-    }
     loaded[name] = true;
     if (preview && !previewSeeded && loaded.ideas && loaded.story && !ideasDoc && !storyDoc && snapshot.status === 'live') seedPreview();
     var found = ideas();
     if (found && !$('window').dataset.touched && [3, 7, 14, 30].indexOf(found.window_days) !== -1) $('window').value = String(found.window_days);
+    schedule();
+  }
+
+  // Charts can fill more than one page (pages end at a byte budget, not only a count), so the
+  // series watch follows every page before redrawing.
+  function onSeries(items, complete) {
+    var key = stamp(items) + (complete ? '' : '+');
+    if (loaded.series && key === seen.series) return;
+    seen.series = key;
+    if (!preview || items.length) seriesDocs = mergeKnown(seriesDocs, items, complete);
+    loaded.series = true;
     schedule();
   }
 
@@ -1057,7 +1063,7 @@ ${GADGET_KIT_HELPERS}
       if (viewFailure) report('failed', viewFailure.text);
       collections.ideas.watch(function (snapshot) { onSnapshot('ideas', snapshot); }, { intervalMs: 4000, limit: 5 });
       collections.story.watch(function (snapshot) { onSnapshot('story', snapshot); }, { intervalMs: 4000, limit: 5 });
-      collections.series.watch(function (snapshot) { onSnapshot('series', snapshot); }, { intervalMs: 6000, limit: 50 });
+      watchEveryPage(collections.series, onSeries, { intervalMs: 6000, limit: 50 });
       collections.layout.watch(function (snapshot) { onSnapshot('layout', snapshot); }, { intervalMs: 8000, limit: 5 });
       if (canAct && typeof client.agent.watch === 'function') client.agent.watch(onActions, { intervalMs: 3000 });
       schedule();

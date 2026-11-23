@@ -744,10 +744,7 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
     }
   }
 
-  // Controls marked data-omnigent-requires="write" (change records) or "action" (run a declared
-  // action) are disabled, with the reason as their tooltip, for a viewer who lacks that access.
-  // Permissions do not change within a mount, so a blocked control stays blocked; the app's own
-  // code re-enabling it (button.disabled = false after a pending call) is undone.
+  // Keep marked controls disabled, with a reason, when the viewer lacks access.
   var BLOCKED_REASONS = {
     write: 'You can view this gadget but not change it.',
     writeCapability: 'This gadget cannot change its records.',

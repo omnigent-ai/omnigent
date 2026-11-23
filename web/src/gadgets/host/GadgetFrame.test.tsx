@@ -98,6 +98,7 @@ describe("buildGadgetFrameDocument", () => {
   it("sets a content security policy with no network sources", () => {
     expect(GADGET_CONTENT_SECURITY_POLICY).toContain("connect-src 'none'");
     expect(GADGET_CONTENT_SECURITY_POLICY).toContain("default-src 'none'");
+    expect(GADGET_CONTENT_SECURITY_POLICY).toContain("webrtc 'none'");
   });
 });
 
