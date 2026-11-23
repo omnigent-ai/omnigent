@@ -429,13 +429,14 @@ describe("gadget session", () => {
     ])(
       "sends an action to %s without leaving full screen or opening anything",
       async (_case, railSessionId) => {
+        // A session the gadget is shown beside and linked to is the viewer's gadget session.
         const sessionId = railSessionId ?? "s_1";
         server.use(
           rest.post(`${API}/app-1/actions`, (_req, res, ctx) =>
             res(ctx.status(201), ctx.json(ENTRY)),
           ),
           rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
-            res(ctx.json({ session_id: "s_1", version: "v" })),
+            res(ctx.json({ session_id: sessionId, version: "v" })),
           ),
           rest.post(`${API}/app-1/actions/act1/delivery`, (_req, res, ctx) =>
             res(ctx.json({ items: [] })),
@@ -597,6 +598,37 @@ describe("gadget session", () => {
     expect(await (await delivered).json()).toEqual({ session_id: "s_rail" });
     expect(queueGadgetComposerQuote).toHaveBeenCalledWith("s_rail", "reply", "Fix login");
     // The session is already on screen beside the gadget.
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("sends an action from beside a cited session to the viewer's gadget session", async () => {
+    server.use(
+      rest.post(`${API}/app-1/actions`, (_req, res, ctx) => res(ctx.status(201), ctx.json(ENTRY))),
+      rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
+        res(ctx.json({ session_id: "s_actions", version: "v" })),
+      ),
+      rest.post(`${API}/app-1/actions/act1/delivery`, (_req, res, ctx) =>
+        res(ctx.json({ items: [] })),
+      ),
+    );
+    const delivered = waitForRequest("post", `${API}/app-1/actions/act1/delivery`);
+
+    // The gadget is shown beside s_cited, which its page cited; s_actions handles its actions.
+    const receipt = await requestGadgetAction(
+      EDITOR,
+      { action: "run_card", params: { cardId: "c1" } },
+      navigate,
+      "s_cited",
+    );
+
+    expect(receipt).toEqual({ actionId: "act1", delivery: "sent" });
+    expect(sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(sendUserMessage).toHaveBeenCalledWith(
+      "s_actions",
+      expect.stringContaining("Gadget action"),
+    );
+    expect(await (await delivered).json()).toEqual({ session_id: "s_actions" });
+    // The viewer stays on the session they are reading.
     expect(navigate).not.toHaveBeenCalled();
   });
 

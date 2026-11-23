@@ -922,7 +922,10 @@ export function GadgetNewSessionPanel({
   // Like the side panel's full screen, this one closes the sidebar and opens it again after,
   // unless the link that opened the gadget says to leave the sidebar as it was (an open from
   // inside Omnigent; see gadgetOpenKeepsSidebar). The Full screen button closes it.
-  const keepSidebar = (location.state as GadgetOpenState | null)?.keepSidebar === true;
+  const keepSidebarNow = (location.state as GadgetOpenState | null)?.keepSidebar === true;
+  // The choice the cover opened with lasts while it does: creating the session moves to pages
+  // that carry no navigation state.
+  const keepSidebarLatchRef = useRef<{ gadgetId: string; keep: boolean } | null>(null);
   const sidebarStashRef = useRef<boolean | null>(null);
   const sidebarOpenRef = useRef(sidebarOpen);
   sidebarOpenRef.current = sidebarOpen;
@@ -932,16 +935,22 @@ export function GadgetNewSessionPanel({
   const coverId = fullScreenId ?? handoffGadgetId;
   useEffect(() => {
     if (coverId !== null) {
-      if (sidebarStashRef.current !== null || keepSidebar || mobile) return;
+      if (keepSidebarLatchRef.current?.gadgetId !== coverId) {
+        keepSidebarLatchRef.current = { gadgetId: coverId, keep: keepSidebarNow };
+      }
+      if (sidebarStashRef.current !== null || keepSidebarLatchRef.current.keep || mobile) return;
       sidebarStashRef.current = sidebarOpenRef.current ?? true;
       onSidebarOpenChangeRef.current?.(false);
-    } else if (sidebarStashRef.current !== null) {
-      const reopen = sidebarStashRef.current && !handedOverRef.current;
-      sidebarStashRef.current = null;
-      if (reopen) onSidebarOpenChangeRef.current?.(true);
+    } else {
+      keepSidebarLatchRef.current = null;
+      if (sidebarStashRef.current !== null) {
+        const reopen = sidebarStashRef.current && !handedOverRef.current;
+        sidebarStashRef.current = null;
+        if (reopen) onSidebarOpenChangeRef.current?.(true);
+      }
     }
     handedOverRef.current = false;
-  }, [coverId, keepSidebar, mobile]);
+  }, [coverId, keepSidebarNow, mobile]);
 
   if (coverGadgetId === null) return null;
   const panelMaximized = covering || maximized;

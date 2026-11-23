@@ -585,6 +585,39 @@ describe("the gadget beside New session", () => {
       expect(screen.queryByTestId("gadget-new-session-panel")).toBeNull();
     });
 
+    it("leaves the sidebar as it was through creating the session from an in-app open", async () => {
+      vi.mocked(getGadget).mockResolvedValue(BOARD);
+      const onSidebarOpenChange = vi.fn();
+      function Shell() {
+        const location = useLocation();
+        return (
+          <GadgetNewSessionPanel
+            active={!location.pathname.startsWith("/c/")}
+            sidebarOpen
+            onSidebarOpenChange={onSidebarOpenChange}
+          />
+        );
+      }
+      renderWithGadgets(
+        <>
+          <Shell />
+          <CaptureNavigate />
+        </>,
+        {
+          path: { pathname: "/", search: "?gadget_start=1&gadget=1", state: { keepSidebar: true } },
+        },
+      );
+      const panel = await screen.findByRole("complementary", { name: "Board" });
+      await waitFor(() => expect(panel).toHaveAttribute("data-maximized", "true"));
+
+      // Create session: the session's pages carry no navigation state.
+      act(() => navigate!("/c/temp:abc?gadget_start=1"));
+      act(() => navigate!("/c/conv_9", true));
+
+      expect(screen.getByTestId("gadget-new-session-panel")).toBeInTheDocument();
+      expect(onSidebarOpenChange).not.toHaveBeenCalled();
+    });
+
     it("doesn't cover a session opened another way", async () => {
       vi.mocked(getGadget).mockResolvedValue(BOARD);
       useGadgetRailRequest.setState({ newSessionMaximized: true });

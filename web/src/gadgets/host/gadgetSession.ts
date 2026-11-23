@@ -271,7 +271,9 @@ function sessionGone(error: unknown): boolean {
 
 /**
  * Delivers `message` to the session the gadget is shown beside (`railSessionId`), or else to the
- * viewer's gadget session, then opens that session with `reveal`. Opens New session with the
+ * viewer's gadget session, then opens that session with `reveal`. An action requested beside a
+ * session that isn't the viewer's gadget session (one the gadget only cites) still goes to the
+ * gadget session, without leaving the page. Opens New session with the
  * coordinator instructions followed by `message` when the viewer has no gadget session yet (or
  * theirs is gone): they have to start it there.
  */
@@ -298,6 +300,16 @@ export async function openGadgetSession(
     onDelivered?: (sessionId: string) => void;
   },
 ): Promise<"sent" | "starting"> {
+  // Beside a session that only cites the gadget, its actions still go to the viewer's gadget
+  // session, and the viewer stays on the session they are reading.
+  let registered: string | null | undefined;
+  if (railSessionId !== undefined && deliver && actionId !== undefined) {
+    registered = await getGadgetGadgetSession(app.id).catch(() => null);
+    if (registered !== null && registered !== railSessionId) {
+      railSessionId = undefined;
+      reveal = false;
+    }
+  }
   if (railSessionId !== undefined) {
     if (deliver) {
       try {
@@ -311,7 +323,7 @@ export async function openGadgetSession(
     }
     return "sent";
   }
-  const sessionId = await getGadgetGadgetSession(app.id);
+  const sessionId = registered ?? (await getGadgetGadgetSession(app.id));
   if (sessionId !== null) {
     try {
       if (deliver) {
