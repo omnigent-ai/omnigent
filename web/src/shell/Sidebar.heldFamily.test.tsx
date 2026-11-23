@@ -1,7 +1,5 @@
-// A collapsed project folder holds the open session and its family under its header,
-// so nested agents stay reachable: folders start collapsed on a new device, such as a
-// phone, and navigation never opens them. Drives the real Sidebar and its data hooks
-// against a fetch stub at phone and desktop widths.
+// A collapsed project folder holds the open session's family so nested agents stay
+// reachable. Drives the real Sidebar and its data hooks against a fetch stub.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -11,6 +9,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { LEVEL_OWNER } from "@/lib/permissionsApi";
 import { Sidebar } from "./Sidebar";
 import { COLLAPSED_SESSION_FAMILIES_STORAGE_KEY } from "./sidebarNav";
 
@@ -27,7 +26,7 @@ function row(id: string, updatedAt: number, extra: Record<string, unknown> = {})
     created_at: updatedAt,
     updated_at: updatedAt,
     labels: {},
-    permission_level: "owner",
+    permission_level: LEVEL_OWNER,
     status: "idle",
     project_id: PROJECT.id,
     ...extra,
@@ -119,13 +118,12 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe.each([
-  ["phone", true],
-  ["desktop", false],
-])("a collapsed project folder on the %s layout", (_layout, mobile) => {
-  beforeEach(() => setViewport(mobile));
-
-  it("lists the open coordinator's nested agents without opening the folder", async () => {
+describe("a collapsed project folder", () => {
+  it.each([
+    ["phone", true],
+    ["desktop", false],
+  ])("lists the open coordinator's nested agents without opening (%s)", async (_layout, mobile) => {
+    setViewport(mobile);
     await openAt("conv_coordinator");
 
     expect(screen.getByRole("button", { name: /^Oncall/ })).toHaveAttribute(
@@ -138,13 +136,16 @@ describe.each([
     ).toBeInTheDocument();
   });
 
+  // The remaining cases exercise shared family logic, so they run at the reported phone width.
   it("lists the family around an open nested agent", async () => {
+    setViewport(true);
     await openAt("conv_nested_b");
 
     expect(listedIds()).toEqual(["conv_coordinator", "conv_nested_a", "conv_nested_b"]);
   });
 
   it("keeps a family the user collapsed collapsed, with its expand control", async () => {
+    setViewport(true);
     localStorage.setItem(COLLAPSED_SESSION_FAMILIES_STORAGE_KEY, JSON.stringify([FAMILY.id]));
     await openAt("conv_coordinator");
 
@@ -158,6 +159,7 @@ describe.each([
   });
 
   it("still lists an open nested agent whose family the user collapsed", async () => {
+    setViewport(true);
     localStorage.setItem(COLLAPSED_SESSION_FAMILIES_STORAGE_KEY, JSON.stringify([FAMILY.id]));
     await openAt("conv_nested_a");
 
@@ -165,6 +167,7 @@ describe.each([
   });
 
   it("badges the folder header for a nested agent its collapsed family hides", async () => {
+    setViewport(true);
     localStorage.setItem(COLLAPSED_SESSION_FAMILIES_STORAGE_KEY, JSON.stringify([FAMILY.id]));
     sessions = projectSessions({ pending_elicitations_count: 1 });
     await openAt("conv_coordinator");

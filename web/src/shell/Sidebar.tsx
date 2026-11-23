@@ -3293,10 +3293,8 @@ function ConversationList({
     onExitSelectionMode,
   ]);
 
-  // Navigating never opens a folder: a collapsed folder lists only the rows it holds
-  // for the open session, so folders open and close only when the user says so.
-  // A folder's rows in render order: those above "Show more" while expanded,
-  // otherwise its held rows (see ProjectFolder).
+  // Navigating never opens a folder. A folder's rows in render order: those above
+  // "Show more" while expanded, otherwise those it holds for the open session.
   const folderListedRows = useCallback(
     (group: { name: string; conversations: Conversation[] }) => {
       if (expandedProjects.includes(group.name)) return folderVisibleRows(group);
