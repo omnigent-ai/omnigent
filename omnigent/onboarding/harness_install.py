@@ -1405,6 +1405,10 @@ def install_harness_cli(key: str) -> bool:
     return try_install_harness_cli(key).installed
 
 
+# Login-probe budget when Claude runs through an ``OMNIGENT_CLAUDE_PATH`` launcher.
+LAUNCHER_PROBE_TIMEOUT_S = 30.0
+
+
 def _claude_launcher_override(key: str) -> str | None:
     """Return the ``OMNIGENT_CLAUDE_PATH`` launcher for Claude's login probe, if set.
 
@@ -1482,11 +1486,17 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     spec = harness_install_spec(key)
     if spec is None or spec.status_args is None:
         return False
-    binary = _claude_launcher_override(key) or (
+    launcher = _claude_launcher_override(key)
+    binary = launcher or (
         resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
     )
     if binary is None:
         return False
+    if launcher is not None:
+        # A launcher may do its own startup (auth refresh, local proxy) before
+        # Claude answers, so a cold first probe can outlast the plain-CLI budget
+        # and read as "needs-auth" until the next refresh.
+        timeout = max(timeout, LAUNCHER_PROBE_TIMEOUT_S)
     probe_cwd = _cli_probe_cwd()
     if probe_cwd is not None and not os.path.isabs(binary):
         # The daemon's starting cwd is gone, so the probe would run under a
