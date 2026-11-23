@@ -168,12 +168,6 @@ def test_ticket_pages_seek_indexes_without_sorting(ticket_engine):
             "ix_project_tickets_stage",
         ),
         (
-            "project_tickets",
-            f"{project} AND stage_id IS NULL AND status = 0 AND {cursor}",
-            "created_at, id",
-            "ix_project_tickets_legacy_stage",
-        ),
-        (
             "project_ticket_events",
             f"{ticket} AND position > 0",
             "position, id",

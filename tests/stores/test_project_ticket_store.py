@@ -92,7 +92,7 @@ def test_atomic_edits_and_append_only_outputs(board):
     assert reopened["labels"] == []
     history = tickets.events(project.id, ticket["id"], user_id="alice")["data"]
     assert len(history) == 9
-    assert history[-2]["payload"] == {"text": "Delivered and tested"}
+    assert history[-2]["payload"] == {"text": "Delivered and tested", "audience": "human"}
 
 
 def test_unseen_activity_counts_others_after_the_forward_only_marker(board):
@@ -109,10 +109,11 @@ def test_unseen_activity_counts_others_after_the_forward_only_marker(board):
             text="Done",
             kind="execution",
             outputs=[{"type": "link", "url": "https://example.com/evidence"}],
+            audience="human",
         ),
         agent,
     )
-    tickets.update(project.id, mine["id"], UpdateTicket(stage_id="planning"), agent)
+    tickets.update(project.id, mine["id"], UpdateTicket(stage_id="review"), agent)
     ids = [mine["id"], theirs["id"]]
 
     unseen = tickets.unseen_activity(project.id, ids, user_id="alice")
@@ -146,9 +147,10 @@ def test_unseen_activity_counts_others_after_the_forward_only_marker(board):
     assert tickets.mark_seen(
         project.id, mine["id"], MarkTicketSeen(seen_position=99), user_id="alice"
     ) == {"viewer_seen_position": 4}
-    assert tickets.unseen_activity(project.id, ids, user_id="alice")[mine["id"]][
-        "new_update_count"
-    ] == 0
+    assert (
+        tickets.unseen_activity(project.id, ids, user_id="alice")[mine["id"]]["new_update_count"]
+        == 0
+    )
     with pytest.raises(OmnigentError):
         tickets.mark_seen(project.id, mine["id"], MarkTicketSeen(seen_position=4), user_id="bob")
     with pytest.raises(OmnigentError):
@@ -170,7 +172,7 @@ def test_labels_project_existing_storage_and_history_without_rewriting_it(board,
         ticket["id"],
         UpdateTicket(
             labels=labels,
-            stage_id="planning",
+            stage_id="review",
             description="Keep `tags` in this description.",
             comment="**Tags**\n\nKeep this authored text.",
         ),
@@ -523,7 +525,7 @@ def test_description_stages_and_feedback_change_atomically(board, monkeypatch):
         project.id,
         ticket_id,
         UpdateTicket(
-            stage_id="planning",
+            stage_id="review",
             description="## Approach\n\n- [ ] Verified outcome",
             comment="Agreed in chat",
         ),
@@ -582,7 +584,7 @@ def test_description_stages_and_feedback_change_atomically(board, monkeypatch):
         "Adjust spacing",
     ]
     assert [event["kind"] for event in events[-2:]] == ["updated", "comment"]
-    assert events[-1]["payload"] == {"text": "Adjust spacing"}
+    assert events[-1]["payload"] == {"text": "Adjust spacing", "audience": "human"}
 
 
 def test_related_links_are_symmetric_idempotent_and_paginated(board):
@@ -814,7 +816,7 @@ def test_reordering_occupied_stages_needs_no_summary_and_preserves_project_bound
     original = tickets.stages(project.id, user_id="alice")
     configuration = {**original, "stages": original["stages"][1:] + original["stages"][:1]}
     saved = tickets.update_stages(project.id, UpdateTicketStages(**configuration), actor)
-    assert saved["initial_stage_id"] == "planning"
+    assert saved["initial_stage_id"] == "in_progress"
     assert [stage["id"] for stage in saved["stages"] if stage["is_complete"]] == ["open"]
     other = projects.create(uuid4().hex, "Other", "alice")
     tickets.update_stages(
@@ -878,38 +880,43 @@ def test_failed_stage_move_and_bounded_edit_roll_back_the_entire_configuration(b
         assert len(tickets.events(project.id, ticket["id"], user_id="alice")["data"]) == 1
 
 
-def test_mixed_legacy_and_stage_id_tickets_paginate_once_and_move_together(board, db_uri):
+def test_stage_pages_paginate_once_with_the_last_stage_newest_first_and_move_together(board):
     tickets, _, project = board
     actor = TicketActor("alice")
     records = [
         tickets.create(project.id, CreateTicket(title=str(index)), actor) for index in range(6)
     ]
-    with get_or_create_engine(db_uri).begin() as connection:
-        connection.execute(
-            update(SqlProjectTicket)
-            .where(
-                SqlProjectTicket.project_id == project.id,
-                SqlProjectTicket.id.in_([ticket["id"] for ticket in records[::2]]),
+
+    def pages(stage_id):
+        found, after = [], None
+        for _ in range(3):
+            page = tickets.list(
+                project.id, user_id="alice", stage_id=stage_id, after=after, limit=2
             )
-            .values(stage_id=None)
-        )
-    found = []
-    after = None
-    for _ in range(3):
-        page = tickets.list(project.id, user_id="alice", stage_id="open", after=after, limit=2)
-        found.extend(page["data"])
-        after = page["last_id"]
-    assert not page["has_more"]
-    assert [ticket["id"] for ticket in found] == sorted(ticket["id"] for ticket in records)
+            found.extend(page["data"])
+            after = page["last_id"]
+        assert not page["has_more"]
+        return [ticket["id"] for ticket in found]
+
+    oldest_first = [
+        ticket["id"]
+        for ticket in sorted(records, key=lambda ticket: (ticket["created_at"], ticket["id"]))
+    ]
+    assert pages("open") == oldest_first
+    for ticket in records:
+        tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="done"), actor)
+    assert pages("done") == oldest_first[::-1]
     tickets.update_stages(
         project.id,
         UpdateTicketStages(
-            stages=[{"id": "queued", "name": "Queued"}],
+            stages=[{"id": "queued", "name": "Queued"}, {"id": "done", "name": "Done"}],
             initial_stage_id="queued",
-            moves={"open": "queued"},
+            moves={"open": "queued", "in_progress": "queued", "review": "queued"},
         ),
         actor,
     )
+    for ticket in records:
+        tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="queued"), actor)
     assert len(tickets.list(project.id, user_id="alice", stage_id="queued")["data"]) == 6
     for ticket in records:
         assert tickets.get(project.id, ticket["id"], user_id="alice")["stage_id"] == "queued"

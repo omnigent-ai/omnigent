@@ -100,7 +100,6 @@ def test_stage_definitions_have_stable_defaults_and_trimmed_content():
     defaults = default_ticket_stages()
     assert [stage.id for stage in defaults.stages] == [
         "open",
-        "planning",
         "in_progress",
         "review",
         "done",
