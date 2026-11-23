@@ -86,7 +86,7 @@ const CREDENTIAL_PARAM_PART = new RegExp(
   ].join("|"),
   "i",
 );
-const CREDENTIAL_PARAM_NAME = /^(auth|authorization|code|jwt|key|otp|pass|pwd|sig|ticket)$/i;
+const CREDENTIAL_PARAM_NAME = /^(auth|authorization|code|jwt|key|otp|pass|pwd|sid|sig|ticket)$/i;
 
 function isValidWidth(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
@@ -129,13 +129,12 @@ function carriesCredential({ username, password, pathname, search, hash }: URL):
   const pathParams = decodeURIComponent(pathname)
     .split("/")
     .flatMap((segment) => segment.split(";").slice(1));
-  // A hash-routed app's fragment holds its own query (`#/callback?code=…`).
-  const fragmentQueries = hash
-    .slice(1)
-    .split("?")
+  // Hash routes can carry query or semicolon-delimited path parameters.
+  const fragmentQueries = decodeURIComponent(hash.slice(1))
+    .split(/[?;]/)
     .filter((part) => part.includes("="));
   const params = [search, ...fragmentQueries, ...pathParams].flatMap((query) => [
-    ...new URLSearchParams(query).keys(),
+    ...new URLSearchParams(query.replaceAll(";", "&")).keys(),
   ]);
   return params.some(isCredentialParam);
 }

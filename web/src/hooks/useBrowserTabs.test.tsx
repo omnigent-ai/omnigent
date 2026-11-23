@@ -163,25 +163,58 @@ describe("browser tab titles", () => {
     );
   });
 
-  it("saves the page a live view already shows when its tab is added", async () => {
-    openBrowserTab("session-a", "opened");
-    Object.assign(window, {
-      omnigentDesktop: {
-        browserHasView: vi.fn().mockResolvedValue({
-          exists: true,
-          url: "about:blank",
-          pendingUrl: "https://docs.example/guide",
-          title: "",
-        }),
-      },
-    });
-    renderHook(() => useBrowserTabs("session-a"));
-    await waitFor(() =>
-      expect(readSessionWorkspaceState("session-a").browserPages).toEqual({
-        opened: { url: "https://docs.example/guide", owner: "user-a" },
-      }),
-    );
-  });
+  it.each(["ready", "recovered", "newer", "closed", "unmounted"])(
+    "saves the initial live-view page with identity %s",
+    async (scenario) => {
+      if (scenario !== "ready") {
+        vi.mocked(getCurrentUserId).mockReturnValue(null);
+        vi.mocked(resolveIdentity).mockResolvedValue(null);
+      }
+      openBrowserTab("session-a", "opened");
+      let changed!: Listener;
+      let closed!: (view: { conversationId: string }) => void;
+      Object.assign(window, {
+        omnigentDesktop: {
+          browserHasView: vi.fn().mockResolvedValue({
+            exists: true,
+            url: "about:blank",
+            pendingUrl: "https://docs.example/guide",
+            title: "",
+          }),
+          onBrowserUrlChanged: (callback: Listener) => {
+            changed = callback;
+            return () => {};
+          },
+          onBrowserViewClosed: (callback: typeof closed) => {
+            closed = callback;
+            return () => {};
+          },
+        },
+      });
+      const { result, unmount } = renderHook(() => useBrowserTabs("session-a"));
+      await waitFor(() => expect(result.current.labelFor("opened", 0)).toBe("docs.example"));
+      if (scenario !== "ready") {
+        expect(readSessionWorkspaceState("session-a").browserPages).toBeUndefined();
+      }
+      act(() => {
+        const conversationId = browserViewId("session-a", "opened");
+        if (scenario === "newer") changed({ conversationId, url: "https://docs.example/newer" });
+        if (scenario === "closed") closed({ conversationId });
+        if (scenario === "unmounted") unmount();
+        vi.mocked(getCurrentUserId).mockReturnValue("user-a");
+        for (const listener of identityListeners) listener();
+      });
+      await waitFor(() =>
+        expect(readSessionWorkspaceState("session-a").browserPages).toEqual(
+          scenario === "ready" || scenario === "recovered"
+            ? {
+                opened: { url: "https://docs.example/guide", owner: "user-a" },
+              }
+            : undefined,
+        ),
+      );
+    },
+  );
 
   it("updates a background title without changing selection or accepting an older probe", async () => {
     openBrowserTab("session-a", "background");

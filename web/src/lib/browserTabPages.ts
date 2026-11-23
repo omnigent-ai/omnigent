@@ -4,7 +4,7 @@
 
 import { mainBrowserTabs } from "@/components/BrowserPane/agentTools/tabStore";
 import { parseBrowserViewId } from "./browserTabs";
-import { getCurrentUserId } from "./identity";
+import { getCurrentUserId, resolveIdentity, subscribeIdentity } from "./identity";
 import {
   readSessionWorkspaceState,
   sanitizeSavedBrowserPage,
@@ -19,6 +19,7 @@ interface BrowserUrlChange {
 
 interface BrowserPagesBridge {
   onBrowserUrlChanged?: (callback: (change: BrowserUrlChange) => void) => () => void;
+  onBrowserViewClosed?: (callback: (view: { conversationId: string }) => void) => () => void;
 }
 
 /** A tab's page as shown to the user who visited it. */
@@ -62,8 +63,42 @@ export function saveBrowserPage(viewId: string, url: string | undefined, title?:
 export function startSavingBrowserPages(): () => void {
   if (typeof window === "undefined") return () => {};
   const bridge = (window as unknown as { omnigentDesktop?: BrowserPagesBridge }).omnigentDesktop;
-  const unsubscribe = bridge?.onBrowserUrlChanged?.((change) => {
+  if (!bridge?.onBrowserUrlChanged) return () => {};
+  let active = true;
+  // Keep unowned events in memory only, until this app's identity resolves.
+  const pending = new Map<string, BrowserUrlChange>();
+  const savePending = () => {
+    if (!active || !getCurrentUserId()) return;
+    for (const change of pending.values()) {
+      saveBrowserPage(change.conversationId, change.url, change.title);
+    }
+    pending.clear();
+  };
+  const unsubscribeIdentity = subscribeIdentity(savePending);
+  void resolveIdentity()
+    .then(savePending)
+    .catch(() => {});
+  const unsubscribe = bridge.onBrowserUrlChanged((change) => {
+    if (!active) return;
+    if (!getCurrentUserId()) {
+      const previous = pending.get(change.conversationId);
+      pending.set(change.conversationId, {
+        ...change,
+        title: change.title || (previous?.url === change.url ? previous.title : undefined),
+      });
+      return;
+    }
+    pending.delete(change.conversationId);
     saveBrowserPage(change.conversationId, change.url, change.title);
   });
-  return () => unsubscribe?.();
+  const unsubscribeClosed = bridge.onBrowserViewClosed?.(({ conversationId }) => {
+    pending.delete(conversationId);
+  });
+  return () => {
+    active = false;
+    pending.clear();
+    unsubscribeIdentity();
+    unsubscribe();
+    unsubscribeClosed?.();
+  };
 }

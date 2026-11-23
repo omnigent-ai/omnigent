@@ -286,6 +286,9 @@ describe("sessionWorkspaceState", () => {
         "tab-4":{"url":"https://unowned.example/"},
         "tab-5":{"url":"https://app.example/?PHPSESSID=synthetic","owner":"user-a"},
         "tab-6":{"url":"https://app.example/report;jsessionid=synthetic","owner":"user-a"},
+        "tab-7":{"url":"https://app.example/#/callback;code=synthetic","owner":"user-a"},
+        "tab-8":{"url":"https://app.example/?sid=synthetic","owner":"user-a"},
+        "tab-9":{"url":"https://app.example/report;sid=synthetic","owner":"user-a"},
         "__proto__":{"url":"https://proto.example/","owner":"user-a"}
       }}}]`,
     );

@@ -52,6 +52,7 @@ interface BrowserTabsBridge {
   onBrowserUrlChanged?: (
     callback: (page: BrowserPage & { conversationId: string }) => void,
   ) => () => void;
+  onBrowserViewClosed?: (callback: (view: { conversationId: string }) => void) => () => void;
   onBrowserOpenTab?: (
     callback: (request: { conversationId: string; url: string }) => void,
   ) => () => void;
@@ -306,20 +307,26 @@ export function useBrowserTabs(conversationId: string) {
     if (!bridge || viewIds.size === 0) return;
     let active = true;
     const updated = new Set<string>();
-    const missingViews = new Set<string>();
+    const snapshots = new Map<string, BrowserPage | null>();
     const setPage = (viewId: string, page: BrowserPage) => {
       setPages((current) => ({ ...current, [viewId]: page }));
     };
-    const restoreSavedLabel = (viewId: string) => {
-      if (active && !updated.has(viewId)) setPage(viewId, readSavedBrowserPage(viewId) ?? {});
+    const syncSavedPage = (viewId: string) => {
+      if (!active || updated.has(viewId)) return;
+      const page = snapshots.get(viewId);
+      if (page) saveBrowserPage(viewId, page.url, page.title);
+      else setPage(viewId, readSavedBrowserPage(viewId) ?? {});
     };
     const unsubscribeIdentity = subscribeIdentity(() => {
-      for (const viewId of missingViews) restoreSavedLabel(viewId);
+      for (const viewId of snapshots.keys()) syncSavedPage(viewId);
     });
     const unsubscribe = bridge.onBrowserUrlChanged?.((page) => {
       if (!active || !viewIds.has(page.conversationId)) return;
       updated.add(page.conversationId);
       setPage(page.conversationId, { url: page.url, title: page.title });
+    });
+    const unsubscribeClosed = bridge.onBrowserViewClosed?.(({ conversationId: viewId }) => {
+      if (viewIds.has(viewId)) updated.add(viewId);
     });
     const restore = async (viewId: string) => {
       try {
@@ -328,15 +335,18 @@ export function useBrowserTabs(conversationId: string) {
         if (!active || updated.has(viewId) || !page) return;
         if (!page.exists) {
           // A tab whose view the shell destroyed keeps its saved page's label.
-          missingViews.add(viewId);
+          snapshots.set(viewId, null);
           await resolveIdentity();
-          restoreSavedLabel(viewId);
+          syncSavedPage(viewId);
           return;
         }
         const url = page.url && page.url !== "about:blank" ? page.url : page.pendingUrl;
         // A tab added after its view's first navigation saves that page here.
-        saveBrowserPage(viewId, url, page.title);
+        snapshots.set(viewId, { url, title: page.title });
+        syncSavedPage(viewId);
         setPage(viewId, { url, title: page.title });
+        await resolveIdentity();
+        syncSavedPage(viewId);
       } catch {
         // A closed view or an older shell can leave the default tab label.
       }
@@ -346,6 +356,7 @@ export function useBrowserTabs(conversationId: string) {
       active = false;
       unsubscribeIdentity();
       unsubscribe?.();
+      unsubscribeClosed?.();
     };
   }, [viewIdsKey]);
 

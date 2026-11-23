@@ -2,10 +2,24 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mainBrowserTabs } from "@/components/BrowserPane/agentTools/tabStore";
 import { readSavedBrowserPage, saveBrowserPage, startSavingBrowserPages } from "./browserTabPages";
 import { AGENT_BROWSER_TAB_ID, browserViewId, parseBrowserViewId } from "./browserTabs";
-import { readSessionWorkspaceState, writeSessionWorkspaceState } from "./sessionWorkspaceState";
+import {
+  readSessionWorkspaceState,
+  SESSION_WORKSPACE_STATE_KEY,
+  writeSessionWorkspaceState,
+} from "./sessionWorkspaceState";
 
-const identity = vi.hoisted(() => ({ userId: "user-a" as string | null }));
-vi.mock("./identity", () => ({ getCurrentUserId: () => identity.userId }));
+const identity = vi.hoisted(() => ({
+  userId: "user-a" as string | null,
+  listeners: new Set<() => void>(),
+}));
+vi.mock("./identity", () => ({
+  getCurrentUserId: () => identity.userId,
+  resolveIdentity: async () => identity.userId,
+  subscribeIdentity: (listener: () => void) => {
+    identity.listeners.add(listener);
+    return () => identity.listeners.delete(listener);
+  },
+}));
 vi.mock("@/components/BrowserPane/agentTools/tabStore", () => ({
   mainBrowserTabs: vi.fn(() => null),
 }));
@@ -13,6 +27,7 @@ vi.mock("@/components/BrowserPane/agentTools/tabStore", () => ({
 afterEach(() => {
   localStorage.clear();
   identity.userId = "user-a";
+  identity.listeners.clear();
   vi.mocked(mainBrowserTabs).mockReturnValue(null);
   Reflect.deleteProperty(window, "omnigentDesktop");
 });
@@ -92,11 +107,13 @@ describe("saved browser pages", () => {
       `https://docs.example/#${ordinaryParams}`,
       `https://docs.example/#/guide?${ordinaryParams}`,
       "https://docs.example/reports;country_code=US;sort_key=date/summary",
+      "https://docs.example/#/reports;country_code=US;sort_key=date/summary",
     ]) {
       saveBrowserPage(userTab, url, "Search");
       expect(readSavedBrowserPage(userTab), url).toEqual({ url, title: "Search" });
     }
     const previousPage = readSavedBrowserPage(userTab);
+    const previousStorage = localStorage.getItem(SESSION_WORKSPACE_STATE_KEY);
     for (const url of [
       "https://app.example/callback?code=abc&state=xyz",
       "https://app.example/#access_token=abc&token_type=bearer",
@@ -120,19 +137,28 @@ describe("saved browser pages", () => {
       "https://app.example/consume?SAMLart=abc",
       "https://app.example/#samlart=abc",
       "https://app.example/#/consume?SAMLart=abc",
-      ...["PHPSESSID", "phpsessid", "JSESSIONID", "ASP.NET_SessionId"].flatMap((name) => [
-        `https://app.example/?${name}=synthetic`,
-        `https://app.example/#${name}=synthetic`,
-        `https://app.example/#/callback?${name}=synthetic`,
-        `https://app.example/report;${name}=synthetic`,
-      ]),
+      ...["PHPSESSID", "phpsessid", "JSESSIONID", "ASP.NET_SessionId", "sid", "SID"].flatMap(
+        (name) => [
+          `https://app.example/?${name}=synthetic`,
+          `https://app.example/#${name}=synthetic`,
+          `https://app.example/#/callback?${name}=synthetic`,
+          `https://app.example/report;${name}=synthetic`,
+          `https://app.example/#/report;${name}=synthetic`,
+        ],
+      ),
       "https://app.example/reports;lang=en;jsessionid=synthetic/details",
       "https://app.example/report;%6Asessionid=synthetic",
       "https://app.example/report%3Bjsessionid%3Dsynthetic",
       "https://app.example/report;code=synthetic",
+      "https://app.example/#/callback;code=synthetic",
+      "https://app.example/#/callback%3Bcode%3Dsynthetic",
+      "https://app.example/#/callback;lang=en;code=synthetic",
+      "https://app.example/?lang=en;sid=synthetic",
+      "https://app.example/#/callback?lang=en;sid=synthetic",
     ]) {
       saveBrowserPage(userTab, url);
       expect(readSavedBrowserPage(userTab), url).toEqual(previousPage);
+      expect(localStorage.getItem(SESSION_WORKSPACE_STATE_KEY), url).toBe(previousStorage);
     }
   });
 
@@ -171,26 +197,63 @@ describe("saved browser pages", () => {
     });
   });
 
-  it("saves navigations from the shell's URL event until stopped", () => {
-    writeSessionWorkspaceState("conv_a", { openBrowsers: ["tab-1"] });
-    let listener:
-      ((change: { conversationId: string; url: string; title?: string }) => void) | null = null;
-    const unsubscribe = vi.fn();
-    Object.assign(window, {
-      omnigentDesktop: {
-        onBrowserUrlChanged: (callback: typeof listener) => {
-          listener = callback;
-          return unsubscribe;
+  it.each(["ready", "recovered", "newer", "closed", "replaced", "tab removed", "stopped"])(
+    "saves navigations from the shell's URL event with identity %s",
+    async (scenario) => {
+      writeSessionWorkspaceState("conv_a", { openBrowsers: ["tab-1"] });
+      saveBrowserPage(userTab, "https://docs.example/previous");
+      if (scenario !== "ready") identity.userId = null;
+      let listener:
+        ((change: { conversationId: string; url: string; title?: string }) => void) | null = null;
+      let closed!: (view: { conversationId: string }) => void;
+      const unsubscribe = vi.fn();
+      const unsubscribeClosed = vi.fn();
+      Object.assign(window, {
+        omnigentDesktop: {
+          onBrowserUrlChanged: (callback: typeof listener) => {
+            listener = callback;
+            return unsubscribe;
+          },
+          onBrowserViewClosed: (callback: typeof closed) => {
+            closed = callback;
+            return unsubscribeClosed;
+          },
         },
-      },
-    });
+      });
 
-    const stop = startSavingBrowserPages();
-    listener!({ conversationId: userTab, url: "https://docs.example/", title: "Docs" });
-    expect(readSavedBrowserPage(userTab)).toEqual({ url: "https://docs.example/", title: "Docs" });
-    stop();
-    expect(unsubscribe).toHaveBeenCalledOnce();
-  });
+      const stop = startSavingBrowserPages();
+      listener!({ conversationId: userTab, url: "https://docs.example/", title: "Docs" });
+      listener!({ conversationId: userTab, url: "https://docs.example/", title: "" });
+      await Promise.resolve();
+      if (scenario !== "ready") {
+        expect(readSavedBrowserPage(userTab, "user-a")).toEqual({
+          url: "https://docs.example/previous",
+        });
+      }
+      if (scenario === "closed" || scenario === "replaced") closed({ conversationId: userTab });
+      if (scenario === "tab removed") writeSessionWorkspaceState("conv_a", { openBrowsers: [] });
+      if (scenario === "stopped") stop();
+      if (scenario === "newer") identity.userId = "user-a";
+      if (scenario === "newer" || scenario === "replaced" || scenario === "stopped") {
+        listener!({ conversationId: userTab, url: "https://docs.example/newer", title: "Newer" });
+      }
+      identity.userId = "user-a";
+      for (const onIdentity of identity.listeners) onIdentity();
+      expect(readSavedBrowserPage(userTab)).toEqual(
+        scenario === "tab removed"
+          ? null
+          : scenario === "closed" || scenario === "stopped"
+            ? { url: "https://docs.example/previous" }
+            : scenario === "newer" || scenario === "replaced"
+              ? { url: "https://docs.example/newer", title: "Newer" }
+              : { url: "https://docs.example/", title: "Docs" },
+      );
+      if (scenario !== "stopped") stop();
+      expect(identity.listeners.size).toBe(0);
+      expect(unsubscribe).toHaveBeenCalledOnce();
+      expect(unsubscribeClosed).toHaveBeenCalledOnce();
+    },
+  );
 
   it("is a no-op on a shell without the URL event", () => {
     Object.assign(window, { omnigentDesktop: {} });
