@@ -85,7 +85,9 @@ const {
   useSessionWorktreesMock,
 } = vi.hoisted(() => ({
   projectsMock: [] as string[],
-  projectRowsRef: { current: undefined as { id: string; name: string }[] | undefined },
+  projectRowsRef: {
+    current: undefined as { id: string; name: string; icon?: string }[] | undefined,
+  },
   moveToProjectSpy: vi.fn(),
   deleteProjectSpy: vi.fn(),
   renameProjectSpy: vi.fn(),
@@ -5046,6 +5048,47 @@ describe("Sidebar view options", () => {
       "environment",
       "branch",
     ]);
+  });
+
+  it("names each row's project under its title when Project is shown, except in its folder", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ show: ["project"] }));
+    projectRowsRef.current = [
+      { id: "p_Alpha", name: "Alpha", icon: "🧪" },
+      { id: "p_Plain", name: "Plain" },
+    ];
+    const filed = (project: string) => ({
+      project_id: `p_${project}`,
+      labels: { omni_project: project },
+    });
+    seedPins(["conv_pinned"]);
+    mockConversations([
+      conv("conv_pinned", "Codex", filed("Alpha")),
+      conv("conv_alpha", "Codex", filed("Alpha")),
+      conv("conv_plain", "Codex", filed("Plain")),
+      conv("conv_unfiled", "Codex"),
+    ]);
+    renderGroupingSidebar();
+    const meta = (id: string) =>
+      within(screen.getByText(id).closest("li")!).queryByTestId("session-row-meta");
+
+    // Default grouping: a pin has left its folder, so it names the project; folder rows don't.
+    expect(meta("conv_pinned")).toHaveTextContent(/^🧪Alpha$/);
+    fireEvent.click(screen.getByRole("button", { name: /^🧪Alpha/ }));
+    expect(meta("conv_alpha")).toBeNull();
+
+    // Grouped by Updated there are no folders, so every filed row names its project.
+    openViewSubmenu("session-grouping-menu");
+    fireEvent.click(screen.getByTestId("session-grouping-updated"));
+    expect(meta("conv_alpha")).toHaveTextContent(/^🧪Alpha$/);
+    // Without an emoji, the folder glyph stands beside the name.
+    expect(meta("conv_plain")).toHaveTextContent(/^Plain$/);
+    expect(within(meta("conv_plain")!).queryByTestId("project-icon")).toBeNull();
+    expect(meta("conv_unfiled")).toBeNull();
+
+    openViewSubmenu("session-show-menu");
+    fireEvent.click(screen.getByTestId("session-show-project"));
+    expect(meta("conv_alpha")).toBeNull();
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).show).toEqual([]);
   });
 
   it("leads each row with its harness icon when Harness is shown", () => {

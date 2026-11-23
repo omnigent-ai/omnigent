@@ -449,6 +449,8 @@ const ProjectIconsContext = createContext<Map<string, string>>(new Map());
 const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
 // The filter menu's "Show" toggles: which optional metadata each row renders.
 const SidebarShowContext = createContext<readonly SidebarShowField[]>([]);
+// True for rows listed inside their project's folder, which already names the project.
+const InProjectFolderContext = createContext(false);
 // Row-invariant values resolved once at the list owner and shared, so a row
 // doesn't run `useIsMobileViewport` (a matchMedia-on-every-render store) or
 // `useViewerId` (an identity-resolve effect) per instance.
@@ -2034,108 +2036,115 @@ function ProjectFolder({
           style={ordering.insertion === "before" ? { top: 0 } : { bottom: 0 }}
         />
       )}
-      <ConversationSection
-        headerDrag={placeholder ? undefined : headerDrag}
-        title={name}
-        icon={
-          icon ? (
-            <span className="text-[14px] leading-none">{icon}</span>
-          ) : expanded ? (
-            <FolderOpenIcon
-              className={cn(
-                "ui-icon",
-                headerActive ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
-              )}
-            />
-          ) : (
-            <FolderIcon
-              className={cn(
-                "ui-icon",
-                headerActive ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
-              )}
-            />
-          )
-        }
-        active={headerActive}
-        marker={marker}
-        headerStatus={
-          menuActions.mute?.muted ? (
-            <BellOffIcon
-              role="img"
-              aria-label="Muted"
-              data-testid="project-muted-icon"
-              className="size-3.5 shrink-0 text-muted-foreground"
-            />
-          ) : undefined
-        }
-        conversations={draftRow ? [draftRow, ...display.rows] : display.rows}
-        heldConversations={expanded ? undefined : [...(draftRow ? [draftRow] : []), ...heldRows]}
-        listRef={listRef}
-        activeConversationId={activeConversationId}
-        pinnedConversationIds={pinnedConversationIds}
-        sessionShortcutSlots={sessionShortcutSlots}
-        // Projects default collapsed: shown only when explicitly expanded.
-        collapsed={!expanded}
-        onToggleCollapsed={onToggleCollapsed}
-        onActivate={onActivate}
-        collapsedFamilies={collapsedFamilies}
-        onToggleFamily={onToggleFamily}
-        onRowClick={onRowClick}
-        onTogglePinned={onTogglePinned}
-        selectionMode={selectionMode}
-        selectedIds={selectedIds}
-        onToggleSelected={onToggleSelected}
-        onProjectAssigned={onProjectAssigned}
-        reorderGroup={reorderable ? `project:${name}` : undefined}
-        emptyMessage={
-          loadingFirstPage ? undefined : archived ? (
-            "No archived sessions"
-          ) : placeholder ? (
-            "No sessions"
-          ) : (
-            <span className="block">
-              No sessions. Start a{" "}
-              <Link
-                to={`/?project=${encodeURIComponent(name)}`}
-                className="font-medium text-primary underline-offset-4 hover:underline"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onRowClick(e);
-                }}
-              >
-                new session
-              </Link>
-              .
-            </span>
-          )
-        }
-        indentRows
-        headerAction={
-          placeholder ? undefined : (
-            <ProjectFolderActions
-              projectName={name}
-              onNavigate={onRowClick}
-              actions={orderedMenuActions}
-            />
-          )
-        }
-        headerContextMenu={
-          placeholder ? undefined : (
-            <ContextMenuContent
-              className="min-w-40"
-              onCloseAutoFocus={menuActions.onCloseAutoFocus}
-            >
-              <ProjectFolderMenuItems
-                components={contextBundle}
+      {/* Rows here sit under the project's name, so they don't repeat it. */}
+      <InProjectFolderContext.Provider value={true}>
+        <ConversationSection
+          headerDrag={placeholder ? undefined : headerDrag}
+          title={name}
+          icon={
+            icon ? (
+              <span className="text-[14px] leading-none">{icon}</span>
+            ) : expanded ? (
+              <FolderOpenIcon
+                className={cn(
+                  "ui-icon",
+                  headerActive
+                    ? "text-[var(--sidebar-active-foreground)]"
+                    : "text-muted-foreground",
+                )}
+              />
+            ) : (
+              <FolderIcon
+                className={cn(
+                  "ui-icon",
+                  headerActive
+                    ? "text-[var(--sidebar-active-foreground)]"
+                    : "text-muted-foreground",
+                )}
+              />
+            )
+          }
+          active={headerActive}
+          marker={marker}
+          headerStatus={
+            menuActions.mute?.muted ? (
+              <BellOffIcon
+                role="img"
+                aria-label="Muted"
+                data-testid="project-muted-icon"
+                className="size-3.5 shrink-0 text-muted-foreground"
+              />
+            ) : undefined
+          }
+          conversations={draftRow ? [draftRow, ...display.rows] : display.rows}
+          heldConversations={expanded ? undefined : [...(draftRow ? [draftRow] : []), ...heldRows]}
+          listRef={listRef}
+          activeConversationId={activeConversationId}
+          pinnedConversationIds={pinnedConversationIds}
+          sessionShortcutSlots={sessionShortcutSlots}
+          // Projects default collapsed: shown only when explicitly expanded.
+          collapsed={!expanded}
+          onToggleCollapsed={onToggleCollapsed}
+          onActivate={onActivate}
+          collapsedFamilies={collapsedFamilies}
+          onToggleFamily={onToggleFamily}
+          onRowClick={onRowClick}
+          onTogglePinned={onTogglePinned}
+          selectionMode={selectionMode}
+          selectedIds={selectedIds}
+          onToggleSelected={onToggleSelected}
+          onProjectAssigned={onProjectAssigned}
+          reorderGroup={reorderable ? `project:${name}` : undefined}
+          emptyMessage={
+            loadingFirstPage ? undefined : archived ? (
+              "No archived sessions"
+            ) : placeholder ? (
+              "No sessions"
+            ) : (
+              <span className="block">
+                No sessions. Start a{" "}
+                <Link
+                  to={`/?project=${encodeURIComponent(name)}`}
+                  className="font-medium text-primary underline-offset-4 hover:underline"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onRowClick(e);
+                  }}
+                >
+                  new session
+                </Link>
+                .
+              </span>
+            )
+          }
+          indentRows
+          headerAction={
+            placeholder ? undefined : (
+              <ProjectFolderActions
                 projectName={name}
                 onNavigate={onRowClick}
                 actions={orderedMenuActions}
               />
-            </ContextMenuContent>
-          )
-        }
-        footer={footer}
-      />
+            )
+          }
+          headerContextMenu={
+            placeholder ? undefined : (
+              <ContextMenuContent
+                className="min-w-40"
+                onCloseAutoFocus={menuActions.onCloseAutoFocus}
+              >
+                <ProjectFolderMenuItems
+                  components={contextBundle}
+                  projectName={name}
+                  onNavigate={onRowClick}
+                  actions={orderedMenuActions}
+                />
+              </ContextMenuContent>
+            )
+          }
+          footer={footer}
+        />
+      </InProjectFolderContext.Provider>
       {menuDialogs}
     </div>
   );
@@ -4366,6 +4375,7 @@ const ORDERING_LABELS: Record<SidebarOrdering, string> = {
 };
 const SHOW_LABELS: Record<SidebarShowField, string> = {
   harness: "Harness",
+  project: "Project",
   updated: "Updated",
   environment: "Environment",
   repo: "Repo",
@@ -5677,31 +5687,41 @@ function SessionSharedHint({ sharing }: { sharing: SessionSharing }) {
   );
 }
 
-// A row's second line: the "Show" environment and branch, each omitted when empty.
+// A row's second line: the "Show" project, environment, repo and branch, each omitted when empty.
 function SessionMetaLine({
+  project,
   environment,
   repo,
   branch,
 }: {
+  project: { name: string; icon: string | null } | null;
   environment: ReactNode;
   repo: string | null;
   branch: string | null;
 }) {
-  const parts: { key: string; icon: LucideIcon; value: ReactNode }[] = [];
-  if (environment != null) parts.push({ key: "environment", icon: LaptopIcon, value: environment });
-  if (repo !== null) parts.push({ key: "repo", icon: FolderGit2Icon, value: repo });
-  if (branch !== null) parts.push({ key: "branch", icon: GitBranchIcon, value: branch });
+  const metaIcon = (Icon: LucideIcon) => <Icon aria-hidden className="size-3.5 shrink-0" />;
+  const parts: { key: string; icon: ReactNode; value: ReactNode }[] = [];
+  if (project !== null)
+    parts.push({
+      key: "project",
+      icon: <ProjectRowIcon icon={project.icon} />,
+      value: project.name,
+    });
+  if (environment != null)
+    parts.push({ key: "environment", icon: metaIcon(LaptopIcon), value: environment });
+  if (repo !== null) parts.push({ key: "repo", icon: metaIcon(FolderGit2Icon), value: repo });
+  if (branch !== null) parts.push({ key: "branch", icon: metaIcon(GitBranchIcon), value: branch });
   if (parts.length === 0) return null;
   return (
     <span
       data-testid="session-row-meta"
       className="flex w-full min-w-0 items-center gap-1.5 text-sm text-muted-foreground"
     >
-      {parts.map(({ key, icon: Icon, value }, i) => (
+      {parts.map(({ key, icon, value }, i) => (
         <Fragment key={key}>
           {i > 0 && <span aria-hidden>·</span>}
           <span className="flex min-w-0 items-center gap-1">
-            <Icon aria-hidden className="size-3.5 shrink-0" />
+            {icon}
             <span className={key === "environment" ? "sr-only" : "truncate"}>{value}</span>
           </span>
         </Fragment>
@@ -6299,6 +6319,12 @@ function ConversationRowImpl({
   const trailingLayout =
     TRAILING_SLOT_LAYOUT[trailingSlotKind(sessionState, hasSessionIndicator, showUpdated)];
   const showHarness = show.includes("harness");
+  // Folder rows sit under their project's name; pins and other groupings don't.
+  const inProjectFolder = useContext(InProjectFolderContext);
+  const metaProject =
+    show.includes("project") && !inProjectFolder && currentProject !== null
+      ? { name: currentProject, icon: projectFlyoutIcon }
+      : null;
   const metaEnvironment = show.includes("environment") ? (
     <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
   ) : null;
@@ -6307,7 +6333,7 @@ function ConversationRowImpl({
   // Overlays (checkbox, badges, controls; each also `-translate-y-1/2`) center on
   // the row, or on the title line — padding + half its 20px box — above a meta line.
   const overlayTop =
-    metaEnvironment !== null || metaRepo !== null || metaBranch !== null
+    metaProject !== null || metaEnvironment !== null || metaRepo !== null || metaBranch !== null
       ? "top-4 md:top-3.5"
       : "top-1/2";
 
@@ -6498,7 +6524,12 @@ function ConversationRowImpl({
         </span>
       </div>
       {/* Row 2: the "Show" metadata, each part omitted when it has no value. */}
-      <SessionMetaLine environment={metaEnvironment} repo={metaRepo} branch={metaBranch} />
+      <SessionMetaLine
+        project={metaProject}
+        environment={metaEnvironment}
+        repo={metaRepo}
+        branch={metaBranch}
+      />
     </>
   );
 
