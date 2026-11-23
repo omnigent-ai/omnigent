@@ -33,10 +33,14 @@ MCP independent creation.
   shows only when the session launched in it, since anyone who can edit the
   session can write the reported mode; `null` when the harness has no
   permission modes or the mode is unknown. Coverage: `tests/e2e/test_session_info_permission_mode_e2e.py`.
-- `created-by`: independent workers record their creating session. The worker's
-  Chat/Terminal header rechecks access when opened, hides attribution during the
-  lookup, and links to the creator when accessible; otherwise it says "Created by
-  another session". `sys_session_list` and `sys_session_get_info` expose
+- `created-by`: independent workers record their creating session. The session
+  header does not show it. The worker's sidebar card looks the creator up through
+  an access-checked read each time it opens: its "Created by" row names the
+  creator with a bot icon, adds "· archived" for an archived one, or reads
+  "Another session"; the owner moves to an "Owner" row, and "Nested in" is
+  omitted when it would name the creator again
+  (`tests/e2e_ui/sessions/test_sidebar_session_creator.py`).
+  `sys_session_list` and `sys_session_get_info` expose
   `created_by_session_id` so managers can identify their workers across restarts;
   `sys_session_list` with `include_archived` also lists archived workers, each
   marked `archived`. With `created_by_this_session`, the runner pages the global
@@ -71,6 +75,17 @@ MCP independent creation.
   host. An automation that sets a mode gives it to its run's workers first (see
   `scheduled`), and a worker whose agent sets a mode keeps it. Coverage:
   `tests/e2e/test_nested_agent_permission_mode_e2e.py`.
+  A child (`parent_session_id`, also one created by `POST /v1/sessions`) of a
+  Claude Code parent starts in the parent's current mode, mapped to its own harness
+  (Claude Code Auto → Codex Approve for me), unless its agent spec or an automation
+  sets a mode. Approval-skipping, plan and default parent modes aren't passed on,
+  and Claude Code flags after `--` are prompt text, not options. A child of a Codex
+  or other parent keeps its agent's default.
+  A `config_path` child gets the same, except an undeclared Codex or Cursor child
+  keeps its headless full-bypass default. A named sub-agent (`sub_agent_name`) keeps
+  the launch settings its sub-spec declares.
+  Covered by `tests/server/integration/test_session_orchestration.py::test_sub_agent_starts_in_its_parents_permission_mode`
+  and `::test_uploaded_child_starts_in_its_parents_permission_mode`.
   An optional `workflow_id` (agent_id only) starts the session as a run of one
   of the owner's saved workflows, with that workflow's plan already in its
   journal. With workflows disabled, or on a server that doesn't advertise
@@ -148,7 +163,12 @@ MCP independent creation.
   chats, so only the server could tell that a project is empty, and it has no
   check for that yet. Sub-agents follow their parent and a
   family follows its representative for filing; each refusal names the
-  session to update instead. An edit-shared caller cannot change a project or
+  session to update instead. `archived: true` is the one change that applies
+  to a sub-agent: the tool archives any of the owner's sub-agents, in another
+  tree or the caller's own on its runner (the server never stops an
+  ancestor's runner; servers must advertise `session_archive_runner_checks`
+  for sub-agent archives), and closes it like `sys_session_close` so its parent
+  can reuse the name. A sub-agent cannot archive itself. An edit-shared caller cannot change a project or
   create or rename one, or rename, pin or archive a session, while
   listing stays an ordinary owner read. A session shared with the caller
   but owned by someone else is refused, even when it is already in the target
@@ -159,7 +179,8 @@ MCP independent creation.
   `tests/server/integration/test_session_orchestration_projects.py::test_project_tools_list_and_file_running_sessions`,
   `::test_organizing_tools_rename_pin_archive_and_manage_projects`,
   `::test_organizing_tools_refuse_a_source_shared_with_edit_access`,
-  `::test_a_child_cannot_archive_its_rebound_parent`
+  `::test_a_child_cannot_archive_its_parent`,
+  `::test_the_tool_archives_sub_agents_in_any_of_the_owners_trees`
   and the browser journeys in
   `tests/e2e_ui/sessions/test_agent_files_sessions_into_projects.py`.
 - `refusal`: disabled orchestration, another owner, edit-shared sender or wrong runner binding
@@ -210,9 +231,9 @@ MCP independent creation.
   coverage: `tests/browser_ui/chat/test_nested_agent_workspace.py` (desktop/mobile,
   mocked backend); default and explicit worktree payloads:
   `web/src/shell/NewChatDialog.flow.test.tsx`.
-- Open an independent worker in Chat or Terminal and follow its "Created by"
-  link. On mobile web, the same link is in the header. Ask the manager to list
-  its sessions and match `created_by_session_id` to its own session ID.
+- Open an independent worker in Chat or Terminal; its header shows no "Created
+  by" label. Ask the manager to list its sessions and match
+  `created_by_session_id` to its own session ID.
 - On Automations, pick a _Jira tickets_, _Slack messages_, or _GitHub issues_
   card from suggestions on **Your automations** or the **Templates** tab at
   `/tasks?view=templates`. Suggestions appear below saved automations or the
@@ -270,14 +291,14 @@ owned host/workspace. Managed creation requires a launch-capable provider in the
 server's sandbox configuration (for example, Modal or Daytona). Other deployments
 can supply their own provider through the existing launcher interface.
 
-For `created-by`, extend the creation journey below: open the worker, reload,
-and follow its creator link. Share only the worker with a second viewer and
-verify they see "Created by another session" with no creator link or title.
-Also revoke creator access after that viewer has visited the creator, then open
-the worker through in-app navigation: no cached creator title or link should appear.
-Fork the worker and verify the fork has no "Created by" label. The API/runner
-contract is covered by `tests/server/integration/test_session_orchestration.py`;
-the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
+For `created-by`, extend the creation journey below: open the worker and verify
+its header has no "Created by" label, and that its sidebar card names the manager
+under "Created by" ("· archived" once the manager is archived, "Another session"
+once it is deleted). Then ask the manager for its sessions and
+match `created_by_session_id`. Fork the worker and verify `sys_session_get_info`
+reports a null `created_by_session_id` for the fork. The API/runner contract is
+covered by `tests/server/integration/test_session_orchestration.py`; the header's
+omission is covered by `web/src/shell/AppShell.test.tsx`.
 
 - Own environment: `uv run --no-sync pytest
 tests/e2e/test_private_session_orchestration.py --reruns 0` uses real local
@@ -334,10 +355,10 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
 ## Gotchas
 
 - "Created by" records origin only: workers remain independent and have their own
-  permissions and lifecycle. Sharing a worker does not share its creator; the
-  opaque creator ID remains in worker metadata, but the UI resolves its title
-  through a separate authorized read. Forks drop the creator label. Older
-  workers have no label; there is no backfill or automatic completion reply.
+  permissions and lifecycle. Sharing a worker does not share its creator; only
+  the opaque creator ID remains in worker metadata, never the creator's title.
+  Forks drop the creator label. Older workers have no label; there is no
+  backfill or automatic completion reply.
 
 - Same host also means the same workspace, inherited together from the host-bound
   ancestor for child managers. Separate sessions do not isolate filesystem edits.

@@ -50,10 +50,10 @@ _REPO_ROOT = str(Path(__file__).resolve().parents[2])
 _HEALTH_TIMEOUT_S = 45.0
 _POLL_INTERVAL_S = 0.2
 
-# The system tool the tool/policy probes drive: read-only, zero setup, registered
-# on every agent, server-dispatched, and gated at the tool_call phase. Its denial
-# output carries _DENY_REASON so a blocked call is unambiguous.
-_TOOL_NAME = "sys_list_files"
+# The system tool the tool/policy probes drive: read-only, zero setup, server-
+# dispatched, and gated at the tool_call phase. Its denial output carries
+# _DENY_REASON so a blocked call is unambiguous.
+_TOOL_NAME = "sys_files_list"
 _DENY_REASON = "bench-policy-deny"
 
 
@@ -167,6 +167,10 @@ def _build_bench_agent_config(
         "name": name,
         "prompt": "You are a helpful assistant used for capability testing.",
         "executor": executor,
+        # The tool/policy probes drive a call to _TOOL_NAME, which only an agent
+        # that turns the files group on gets; harmless for basic turns (the
+        # model just won't call it).
+        "tool_groups": {"files": True},
     }
     if policy_action:
         config["guardrails"] = {

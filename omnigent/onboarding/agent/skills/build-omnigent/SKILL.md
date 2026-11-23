@@ -33,9 +33,9 @@ Include if needed:
 - `tools.builtins` — built-in tools. The current set is `export_agent`,
   `search_conversations`, `web_fetch`, `web_search`. If the
   `list_builtin_tools` tool is available, call it for the authoritative live
-  set rather than trusting this list. File sharing needs no entry: every agent
-  gets `sys_upload_file`, `sys_list_files` and `sys_download_file` unless it
-  sets `tool_groups.files: false`.
+  set rather than trusting this list. File sharing needs no entry here: an
+  agent gets `sys_files_upload`, `sys_files_list` and `sys_files_download` by
+  setting `tool_groups.files: true`; they are off by default.
 - `tools.agents` — sub-agents, by the `name` each declares under `agents/`
   (a sub-agent's directory name may differ from its name).
 - `os_env` — filesystem/shell access for harness agents (see the

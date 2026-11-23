@@ -94,7 +94,11 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
-from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
+from omnigent.native.permission_modes import (
+    PERMISSION_LAUNCH_ARGS,
+    created_session_launch_args,
+    inherited_permission_mode,
+)
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
@@ -1545,6 +1549,177 @@ async def _collect_descendant_conversation_ids(
                     next_frontier.append(child_id)
         frontier = next_frontier
     return descendant_ids
+
+
+_DESCENDANT_PAGE_SIZE = 128
+_SESSION_FILE_DELETE_BATCH_SIZE = 100
+
+
+async def _collect_descendant_conversation_ids_paged(
+    conversation_store: ConversationStore,
+    root_id: str,
+) -> list[str]:
+    """
+    Return every sub-agent descendant of ``root_id`` that can be listed,
+    reading each parent's children in bounded pages.
+
+    A parent whose children can't be listed is logged and skipped; the
+    descendants already found and the rest of the tree are kept.
+
+    :param conversation_store: Store for child-id lookup.
+    :param root_id: Root session/conversation identifier.
+    :returns: Descendant ids in breadth-first order.
+    """
+    descendant_ids: list[str] = []
+    seen = {root_id}
+    frontier = [root_id]
+    while frontier:
+        next_frontier: list[str] = []
+        for parent_id in frontier:
+            after: tuple[int, str] | None = None
+            while True:
+                try:
+                    page = await asyncio.to_thread(
+                        conversation_store.list_child_conversation_ids_page,
+                        parent_id,
+                        after=after,
+                        limit=_DESCENDANT_PAGE_SIZE,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _logger.warning(
+                        "Failed to list the sub-agents of session %s for file cleanup: %s",
+                        parent_id,
+                        type(exc).__name__,
+                    )
+                    break
+                for child_id, _created_at in page:
+                    if child_id not in seen:
+                        seen.add(child_id)
+                        descendant_ids.append(child_id)
+                        next_frontier.append(child_id)
+                if len(page) < _DESCENDANT_PAGE_SIZE:
+                    break
+                last_id, last_created_at = page[-1]
+                after = (last_created_at, last_id)
+        frontier = next_frontier
+    return descendant_ids
+
+
+async def _delete_one_session_files(
+    file_store: FileStore,
+    artifact_store: ArtifactStore,
+    owner_id: str,
+    *,
+    deleting_session_id: str,
+) -> tuple[int, int]:
+    """
+    Delete one session's file rows in bounded batches, then its unshared blobs.
+
+    Blobs are checked only once the session's rows are gone, so no check
+    scans them. A row-deletion failure propagates after the blobs of the rows
+    already deleted are handled; a blob that can't be checked or deleted is
+    logged and skipped.
+
+    :param file_store: Store of the session's file rows.
+    :param artifact_store: Store of the file bytes.
+    :param owner_id: The session whose files go, e.g. ``"conv_abc123"``.
+    :param deleting_session_id: The session being deleted, for log lines.
+    :returns: How many orphaned blobs were attempted, and how many failed.
+    """
+    blob_keys: set[str] = set()
+    failure: Exception | None = None
+    try:
+        while True:
+            deleted, batch_blob_keys = await asyncio.to_thread(
+                file_store.delete_session_files_batch,
+                owner_id,
+                limit=_SESSION_FILE_DELETE_BATCH_SIZE,
+            )
+            blob_keys.update(batch_blob_keys)
+            if deleted < _SESSION_FILE_DELETE_BATCH_SIZE:
+                break
+    except Exception as exc:  # noqa: BLE001
+        failure = exc
+    attempted_blob_count = 0
+    failed_blob_count = 0
+    for blob_key in sorted(blob_keys):
+        try:
+            orphaned = await asyncio.to_thread(file_store.is_blob_key_orphaned, blob_key)
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "Failed to check attachment blob %s for session %s: %s",
+                blob_key,
+                deleting_session_id,
+                type(exc).__name__,
+            )
+            continue
+        if not orphaned:
+            continue
+        attempted_blob_count += 1
+        try:
+            await asyncio.to_thread(artifact_store.delete, blob_key)
+        except Exception as exc:  # noqa: BLE001
+            failed_blob_count += 1
+            _logger.warning(
+                "Failed to delete attachment blob %s for session %s: %s",
+                blob_key,
+                deleting_session_id,
+                type(exc).__name__,
+            )
+    if failure is not None:
+        raise failure
+    return attempted_blob_count, failed_blob_count
+
+
+async def _delete_session_tree_files(
+    conversation_store: ConversationStore,
+    file_store: FileStore,
+    artifact_store: ArtifactStore,
+    session_id: str,
+) -> None:
+    """
+    Delete the files of *session_id* and every sub-agent under it, before the
+    subtree itself is deleted.
+
+    Each session's rows go in bounded batches, then its blobs no other row
+    still uses, so a blob a fork shares survives. A failure deleting the
+    session's own rows propagates, so the caller keeps the session for a
+    retry; a sub-agent's failure, or a blob's, is logged.
+
+    :param conversation_store: Store for the sub-agent lookup.
+    :param file_store: Store of the sessions' file rows.
+    :param artifact_store: Store of the file bytes.
+    :param session_id: The session being deleted, e.g. ``"conv_abc123"``.
+    :raises Exception: Whatever the file store raised for the session's own rows.
+    """
+    descendant_ids = await _collect_descendant_conversation_ids_paged(
+        conversation_store, session_id
+    )
+    attempted_blob_count, failed_blob_count = await _delete_one_session_files(
+        file_store, artifact_store, session_id, deleting_session_id=session_id
+    )
+    for owner_id in descendant_ids:
+        try:
+            attempted, failed = await _delete_one_session_files(
+                file_store, artifact_store, owner_id, deleting_session_id=session_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "Failed to delete the file rows of session %s while deleting %s: %s",
+                owner_id,
+                session_id,
+                type(exc).__name__,
+            )
+            continue
+        attempted_blob_count += attempted
+        failed_blob_count += failed
+    if failed_blob_count:
+        _logger.warning(
+            "Session %s deleted with %d of %d attachment blobs left behind",
+            session_id,
+            failed_blob_count,
+            attempted_blob_count,
+        )
 
 
 @dataclass(frozen=True)
@@ -11306,6 +11481,63 @@ def _derive_terminal_launch_args_from_spec(
     return None
 
 
+# Spec keys that declare a native session's own approval stance.
+_SPEC_PERMISSION_KEYS = ("permission_mode", "exec_mode", "yolo")
+
+
+def _session_live_permission_mode(conv: Conversation) -> tuple[str, str] | None:
+    """
+    The harness and permission mode a Claude Code session is running in now.
+
+    The mode label tracks switches made after launch, so it wins over the launch
+    flags it may have replaced. Other harnesses, Codex included, report nothing:
+    their recorded mode can go stale or be left to config, so it isn't passed on.
+
+    :param conv: The session row, e.g. a sub-agent's parent.
+    :returns: ``(harness, mode)``, e.g. ``("claude-native", "auto")``, or ``None``
+        when the session isn't a Claude Code session with a known mode.
+    """
+    from omnigent.harnesses.claude_native.bridge import claude_launch_permission_mode
+
+    native_agent = _native_coding_agent_for_session(conv)
+    if native_agent is None or native_agent.harness != _CLAUDE_NATIVE_HARNESS:
+        return None
+    mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+    mode = mode or claude_launch_permission_mode(list(conv.terminal_launch_args or []))
+    return (_CLAUDE_NATIVE_HARNESS, mode) if mode else None
+
+
+def _inherited_parent_permission_launch_args(
+    parent: Conversation | None, harness: str | None, spec: AgentSpec | None
+) -> list[str] | None:
+    """
+    Launch args that start a sub-agent in the closest match to its parent's mode.
+
+    A child spec that declares its own stance keeps it. A parent mode that skips
+    approval isn't inherited, the same as one the creating agent requests.
+
+    :param parent: The child's parent session, or ``None``.
+    :param harness: The child's canonical harness, e.g. ``"codex-native"``.
+    :param spec: The child's own agent spec, when it loaded.
+    :returns: The CLI args, or ``None`` to keep the harness default.
+    """
+    if parent is None or harness is None:
+        return None
+    if spec is not None and _spec_harness(spec) == harness:
+        if any(spec.executor.config.get(key) is not None for key in _SPEC_PERMISSION_KEYS):
+            return None
+    live = _session_live_permission_mode(parent)
+    if live is None:
+        return None
+    mode = inherited_permission_mode(live[0], live[1], harness)
+    if mode is None:
+        return None
+    try:
+        return created_session_launch_args(harness, mode)
+    except ValueError:
+        return None
+
+
 def _native_subagent_wrapper_labels_from_spec(sub_spec: AgentSpec) -> dict[str, str]:
     """
     Resolve terminal-first wrapper labels from an already-loaded sub-spec.
@@ -13129,11 +13361,13 @@ __all__ = [
     "_codex_subagent_labels_from_body",
     "_coerce_cumulative_field",
     "_collect_descendant_conversation_ids",
+    "_collect_descendant_conversation_ids_paged",
     "_consume_pre_resolved_harness_elicitation",
     "_create_and_publish_antigravity_child",
     "_create_and_publish_codex_child",
     "_create_and_publish_devin_child",
     "_create_session_worktree",
+    "_delete_session_tree_files",
     "_delete_stored_session_bundle_after_failure",
     "_derive_terminal_launch_args_from_spec",
     "_devin_subagent_display_tool",
@@ -13166,6 +13400,7 @@ __all__ = [
     "_handle_mcp_tools_list",
     "_host_model_options_via_registry",
     "_if_none_match_matches",
+    "_inherited_parent_permission_launch_args",
     "_invalidate_runner_backed_snapshot_state",
     "_is_claude_native_subagent",
     "_is_codex_native_subagent",

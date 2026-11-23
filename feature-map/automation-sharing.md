@@ -69,6 +69,19 @@ runs' sessions in their own Omnigent Automation folder.
   left says so (Its schedule has no runs left.); otherwise the toast says to pause
   or delete the original so they don't both run. A refused clone shows the
   server's reason in a toast and stays put.
+- `palette-automation-list`: with `quick_pick_palette` on (off by default), the
+  Automations list offers its actions in ⌘K on Your automations: New automation…,
+  an Automations filter setting (All, Active, Paused) while the filter tabs show,
+  and for each of your automations Run “name” now (not for trigger automations),
+  Edit “name”…, Share “name”…, Clone “name” (where the server clones) and Pause or
+  Resume “name”. Each runs the row menu's own handler, greyed by the same rules as
+  the automation's header: while a change to it is saving, every row but Share is
+  greyed, and Share stays available, as the header's button does. Delete stays on
+  the row menu, which deletes without asking, and automations shared with you add
+  no rows. With the flag off the page mounts none of it
+  (`web/src/components/scheduled/automationListPaletteCommands.test.tsx`,
+  `web/src/pages/TasksPage.test.tsx`,
+  `tests/e2e_ui/scheduled/test_quick_pick_automation_commands.py`).
 - `read-only-view`: on those cards' ⋯ and right-click menus and on the
   automation's page, Run now, Edit, Share, Clone (menus only), Pause/Resume and Delete are visible
   but disabled, each with a tooltip such as Only the automation's owner can edit
@@ -126,6 +139,8 @@ runs' sessions in their own Omnigent Automation folder.
   sidebar's filter menu and expand Omnigent Automation.
 - **Mobile web / managed embedded:** the same page, row menu and dialog, under the
   host's mount path.
+- **⌘K on the list:** with `quick_pick_palette` on, open Automations, press
+  Cmd/Ctrl+K and type an action and the automation's name, such as "pause digest".
 
 ## Driving it with the repro environment
 

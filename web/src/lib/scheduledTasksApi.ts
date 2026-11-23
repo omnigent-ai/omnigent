@@ -47,8 +47,11 @@ export interface ScheduledTask {
   id: string;
   name: string;
   prompt: string;
-  /** RFC-5545 recurrence rule, e.g. `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0`. */
-  rrule: string;
+  /**
+   * RFC-5545 recurrence rule, e.g. `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0`.
+   * Null for a trigger automation when the server decides when it polls (automations v2).
+   */
+  rrule: string | null;
   /** Owning user, or `null` in single-user / auth-disabled deployments. */
   ownerUserId: string | null;
   agentId: string;
@@ -259,7 +262,7 @@ interface ScheduledTaskWire {
   id: string;
   name: string;
   prompt: string;
-  rrule: string;
+  rrule: string | null;
   owner_user_id: string | null;
   agent_id: string;
   timezone: string;

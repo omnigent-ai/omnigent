@@ -10408,6 +10408,7 @@ def _daemon_session_request_params(
     connected_only: bool,
     after: str | None,
     kind: Literal["default", "sub_agent"] = "default",
+    visibility: Literal["all", "mine"] = "all",
 ) -> dict[str, str | int]:
     """
     Build query parameters for one sessions page.
@@ -10417,12 +10418,14 @@ def _daemon_session_request_params(
     :param after: Optional cursor from the prior page, e.g.
         ``"conv_abc123"``.
     :param kind: Session kind to fetch; the server omits sub-agents by default.
+    :param visibility: Which sessions to list: ``"mine"`` for the caller's
+        own, ``"all"`` for every session the caller can read.
     :returns: Query parameters for ``GET /v1/sessions``.
     """
     params: dict[str, str | int] = {
         "limit": 1000,
         "include_archived": "true",
-        "visibility": "all",
+        "visibility": visibility,
     }
     if kind != "default":
         params["kind"] = kind
@@ -10491,6 +10494,7 @@ def _fetch_session_pages(
     base_url: str,
     connected_only: bool,
     kind: Literal["default", "sub_agent"] = "default",
+    visibility: Literal["all", "mine"] = "all",
 ) -> _SessionPagesResult:
     """
     Fetch every available session page from a server.
@@ -10500,6 +10504,8 @@ def _fetch_session_pages(
     :param connected_only: When ``True``, ask the server for connected
         sessions only.
     :param kind: Session kind to fetch, e.g. ``"sub_agent"``.
+    :param visibility: Which sessions to list, e.g. ``"mine"``; see
+        :func:`_daemon_session_request_params`.
     :returns: Accumulated sessions result. ``error`` is ``None`` on success.
     """
     after: str | None = None
@@ -10513,6 +10519,7 @@ def _fetch_session_pages(
                 connected_only=connected_only,
                 after=after,
                 kind=kind,
+                visibility=visibility,
             ),
         )
         page = _decode_sessions_page(page_result)
@@ -10592,6 +10599,32 @@ def _daemon_owned_sessions(
     return owned
 
 
+def _host_session_visibility(base_url: str) -> Literal["all", "mine"]:
+    """
+    Pick the session-list scope that finds a daemon's host sessions.
+
+    Launching a runner on a host takes owner access to the session, so an
+    ordinary user's host sessions are all in their own ``"mine"`` list, while
+    ``"all"`` makes the server read every session they can see, everyone's
+    shared ones included. Administrators pass that check for sessions they
+    don't own, so they keep ``"all"``, as does a caller ``GET /v1/me`` doesn't
+    confirm as a non-administrator. So does a server that doesn't advertise
+    ``session_list_scoped_archives`` in ``GET /v1/info``, because it drops
+    archived rows from ``"mine"`` lists.
+
+    :param base_url: Omnigent server base URL, e.g. ``"https://example.com"``.
+    :returns: ``"mine"`` when the server keeps archived rows in owner-scoped
+        lists and the caller is not an administrator, otherwise ``"all"``.
+    """
+    info = _host_http_json(base_url=base_url, method="GET", path="/v1/info")
+    info_body = info.body if info.status_code == 200 else None
+    if not (isinstance(info_body, dict) and info_body.get("session_list_scoped_archives") is True):
+        return "all"
+    me = _host_http_json(base_url=base_url, method="GET", path="/v1/me")
+    me_body = me.body if me.status_code == 200 else None
+    return "mine" if isinstance(me_body, dict) and me_body.get("is_admin") is False else "all"
+
+
 def _sessions_for_daemon(
     record: _HostDaemonRecord,
     *,
@@ -10627,9 +10660,11 @@ def _sessions_for_daemon(
             sessions=[],
             error="host id is not available in local config",
         )
+    visibility = _host_session_visibility(base_url)
     pages = _fetch_session_pages(
         base_url=base_url,
         connected_only=connected_only,
+        visibility=visibility,
     )
     if pages.error is not None:
         return _DaemonSessionsResult(
@@ -10644,6 +10679,7 @@ def _sessions_for_daemon(
             base_url=base_url,
             connected_only=connected_only,
             kind="sub_agent",
+            visibility=visibility,
         )
         if children.error is not None:
             # The root listing succeeded, so a child-list failure is not proof

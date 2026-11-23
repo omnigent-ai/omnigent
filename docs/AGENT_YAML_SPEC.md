@@ -1347,7 +1347,8 @@ launcher weaken the sandbox at launch time.
 Several framework-owned tool groups register on every agent without any
 declaration. Each one has a `tool_groups` key so an agent can drop a group it
 cannot use — a headless sub-agent has no embedded browser to drive, and a
-byte-bounded provider counts every advertised tool against its limit.
+byte-bounded provider counts every advertised tool against its limit. The
+`files` group is the exception: it is off until an agent turns it on.
 
 ```yaml
 tool_groups:
@@ -1360,10 +1361,12 @@ tool_groups:
   projects: false         # sys_project_* / sys_session_update
   user_inbox: false       # sys_user_inbox_post / sys_user_inbox_list
   memory: false           # memory_search / _get / _list / _write / _delete
-  files: false            # sys_upload_file / sys_list_files / sys_download_file
+  files: true             # sys_files_upload / sys_files_list / sys_files_download (off by default)
 ```
 
-Every group defaults to `true`, so omitting the block changes nothing. Values
+Every group except `files` defaults to `true`, so omitting the block changes
+nothing; `files` defaults to `false`, so an agent that shares files with the
+user sets `files: true`. Values
 must be booleans and group names must match exactly; a typo fails the load
 rather than silently leaving the group registered. The `journal` group also
 requires the server's `workflows` feature flag, which defaults off; enable it
@@ -1391,17 +1394,16 @@ on them is an error:
   keep that tool. See [MEMORY.md](MEMORY.md).
 
 The `files` group shares files through the current session's file resources
-(`/v1/sessions/{id}/resources/files`). `sys_upload_file` stores a file from
-inside the session workspace, `sys_list_files` lists the session's files, and
-`sys_download_file` returns a stored file's content as text, so it suits text
-files rather than binary ones. These tools cannot be listed under
-`tools.builtins`. They don't need `os_env` either: an agent without one can
-still upload from its session workspace, so turn them off with
-`tool_groups.files: false`. A spec that still lists the removed `upload_file`,
-`list_files` or `download_file` builtins gets none of the three, with a
-warning, because a policy written for the old names would not match the new
-ones. Remove those entries and rename such policy selectors to the `sys_`
-names; `files: true` alongside a removed name is an error.
+(`/v1/sessions/{id}/resources/files`). `sys_files_upload` stores a file from
+inside the session workspace, `sys_files_list` lists the session's files, and
+`sys_files_download` returns a stored file's content as text, so it suits text
+files rather than binary ones. The group is off by default: an agent turns the
+tools on with `tool_groups.files: true`, and they cannot be listed under
+`tools.builtins`. They don't need `os_env`: an agent without one can still
+upload from its session workspace. `files: true` alongside the removed
+`upload_file`, `list_files` or `download_file` builtins is an error, because a
+policy written for the old names would not match the new ones. Remove those
+entries and rename such policy selectors to the `sys_` names.
 
 `agent_discovery: false` is rejected while `spawn: true` or the
 `scheduled_tasks` group is on: `sys_session_create` and

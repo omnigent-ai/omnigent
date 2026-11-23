@@ -55,8 +55,10 @@ the header menu), and each place is a separate entry point.
 - `search`: the sidebar's Search or ⌘K / Ctrl+K opens the command palette.
   Sessions whose title matches list under **Sessions**, then sessions matching
   only in chat content under **In messages** with a snippet; each group has its
-  own Show more. Archived sessions match too, marked **Archived**; the recent
-  sessions shown before typing leave them out. Results show project and parent
+  own Show more. Archived sessions match too, marked **Archived**. Before typing,
+  ⌘K lists the five most recently updated sessions, archived ones included and
+  marked, so a just-archived session leads the list; Find a session by name
+  (⌘⌥S / Ctrl+Alt+S) lists active sessions only. Results show project and parent
   session breadcrumbs when available, including when the parent did not match
   the search. Desktop and mobile search use the same context.
 - `palette-session-commands`: ⌘K lists the open session's header-menu actions
@@ -443,9 +445,10 @@ then click Show more under its rows. Opening one of its older sessions from
 the ⌘K / Ctrl+K palette or a link also lists down to that session, once the
 sidebar has loaded it. To change the count or list every session instead,
 use Settings → Appearance → Sidebar. Opening a session never opens its folder:
-a collapsed folder holding the open, unpinned session lists just that row under
-its header until you open another session. Moving a session into a project
-still opens that folder.
+a collapsed folder holding the open, unpinned session lists that session and
+its family under its header until you open another session, so nested agents
+stay reachable; a family you collapsed stays collapsed. Moving a session into a
+project still opens that folder.
 
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
@@ -961,6 +964,10 @@ plain `uv run pytest`, which starts a private server for the test.
   Drag into the nest, then onto **Remove from nest** in the footer. Repeat through
   the sidebar kebab and right-click **Move session → Nests**, search by a nest or
   member title, and reload to confirm membership. **Projects** retains its own search.
+- **`siblings`, collapsed project folder:** component coverage at phone and
+  desktop widths in `web/src/shell/Sidebar.heldFamily.test.tsx`. Open a nested
+  session's parent while its project folder is collapsed and expect its nested
+  rows under the folder header, on a phone and on desktop.
 - **Right-click menu:**
   `tests/e2e_ui/sessions/test_sidebar_context_menu.py::test_right_click_opens_session_actions_menu`
 - **`project-rename`, project header right-click and three-dot menus:**

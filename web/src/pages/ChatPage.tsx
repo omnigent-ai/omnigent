@@ -1235,7 +1235,6 @@ export function ChatPage() {
   const mainAgent = (
     <MainAgentSurface
       conversationId={urlConvId ?? null}
-      hostId={activeSession?.hostId ?? activeConv?.host_id ?? null}
       status={status}
       isWorking={isWorking}
       showsWorking={showsWorking}
@@ -1379,7 +1378,6 @@ interface MainAgentSurfaceProps {
    * session in terminal-first mode.
    */
   conversationId: string | null;
-  hostId: string | null | undefined;
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. Gates the
    *  composer's Stop/Interrupt button — the parent's OWN turn only. */
@@ -1575,7 +1573,6 @@ export function updateWarmTerminalSurfaces(
  */
 const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   conversationId,
-  hostId,
   status,
   isWorking,
   showsWorking,
@@ -1891,7 +1888,6 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           alone — this surface's composer and chrome below bail out. */}
           <EditSentMessageContext.Provider value={composerReadOnly ? null : editSentMessage}>
             <Transcript
-              hostId={hostId}
               setConversationEl={setConversationEl}
               containerEl={containerEl}
               scroller={scroller}
@@ -4856,6 +4852,12 @@ function ComposerImpl(
                     setBusy={setConfigBusy}
                     openNonce={pickerOpenNonce}
                     modelPickerShortcutEnabled={modelPickerHotkeyEnabled}
+                    paletteSettingsSource={
+                      composerSessionId &&
+                      isFeatureEnabled(composerServerInfo, "quick_pick_palette")
+                        ? `composer:${composerSessionId}`
+                        : undefined
+                    }
                     {...sessionHarnessPicker}
                   />
                 </div>

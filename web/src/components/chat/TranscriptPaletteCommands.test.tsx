@@ -202,7 +202,6 @@ describe("TranscriptPaletteCommands in the transcript", () => {
         <MemoryRouter initialEntries={["/c/c1"]}>
           <FlagOn>
             <Transcript
-              hostId={null}
               setConversationEl={vi.fn()}
               containerEl={null}
               scroller={null}

@@ -367,17 +367,20 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   each message once. If the sandbox never comes up, each saved message stays in
   the transcript marked **Not delivered**, live and after reload. **Copy message
   to new session** opens New Chat with its text and attachments.
-- `arclet-dbcert`: desktop Arclet launches check laptop credentials first. A
-  missing or expired dbcert preserves the draft and shows a yellow refresh
-  banner instead of provisioning. Skip continues the current launch without
-  waiting for the check. Refresh is explicit; launch needs another submit after
-  renewal. States: valid, invalid, checking, skipped, refreshing, failed, and
-  CLI not installed.
 - `launch-action-required`: while a managed launch needs the user to do
   something, such as a sandbox still waiting for its owner's credentials, the session's chat
   transcript shows a yellow banner with the deployment's instructions. Provisioning
   continues, and the banner leaves when the launch moves on. Dismissing hides
   only that warning; a later one shows again.
+- `palette-model-effort`: with `quick_pick_palette` on (off by default), ⌘K lists
+  the open session composer's **Model** and **Reasoning Effort** (**Thinking
+  Level** for Pi) under **Composer**, each showing its current value. Enter opens
+  the menu's choices; picking one runs the menu's own handler. Model lists Smart
+  Routing first where the composer offers it, and the whole effort row is greyed
+  while Smart Routing picks the effort. A value the menu greys says why. With the
+  flag off the picker mounts none of it
+  (`web/src/components/composer/composerSectionSettings.test.tsx`,
+  `web/src/components/composer/SessionHarnessPicker.test.tsx`).
 - `custom-agent-placement`: New session and Add nested agent can launch an uploaded
   custom agent on a fresh sandbox with repositories when `session_bundle_workspaces`
   is advertised. Nested custom agents can also use new or existing worktrees on a
@@ -492,6 +495,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   `quick_pick_palette` on, ⌘K also lists Always steer as a setting row: type
   "always steer", press Enter, and pick On or Off
   (`web/src/shell/QuickPickCommandPalette.appCommands.test.tsx`).
+- With `quick_pick_palette` on, in an open session press Cmd/Ctrl+K, type
+  "model" or "reasoning effort", press Enter, then pick a value.
 
 **New-session composer** (landing page, or New session):
 
@@ -514,12 +519,6 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   Component proof: `web/src/pages/InboxPage.test.tsx` (`takes an agent action
 and opens the composer with its prompt`).
 
-- In the managed desktop app, choose **Arclet Sandbox** and submit a task with
-  missing or expired laptop credentials. Click **Refresh dbcert** in the yellow
-  banner, finish browser sign-in, then submit the preserved task again. Sending
-  alone must not open the browser, and renewal alone must not create a sandbox.
-  While **Checking laptop credentials…** is visible, **Skip** starts that launch
-  without waiting for verification or opening sign-in. Later launches check again.
 - On a deployment whose launches can report that the user needs to act, start a
   managed session whose launch needs you, e.g. a sandbox still waiting for its
   owner's credentials. The session's chat
@@ -1170,16 +1169,6 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   `tests/server/integration/test_managed_startup_inputs.py` checks native
   transcript ownership, bundle uploads, recovery, access revocation and deletion,
   plus failed inputs in the snapshot.
-- **`arclet-dbcert`, desktop new-session composer (own environment):**
-  `web/electron/e2e/desktop_dbcert_preflight.e2e.js` exercises the real desktop,
-  native bridge, CLI process, and local server with a fake dbcert executable and
-  machine policy. Follow `web/electron/e2e/README.md` for build and recording
-  prerequisites. It proves explicit refresh and launch, preserved input, skipping
-  a pending check, and skipped kubeconfig updates and host sync; macOS sign-in
-  needs a manual managed-desktop check. Component tests in
-  `web/src/shell/NewChatDialog.test.tsx` and
-  `web/src/components/DbcertBanner.test.tsx` cover leaving during a check, late
-  results after skipping, retry, dismissal, check errors, and older shells.
 - **`launch-action-required`, session chat transcript:**
   `tests/browser_ui/chat/test_status_indicators.py::test_action_banner_follows_the_launch`
   shows the snapshot's instructions in the banner and clears it when the stream
@@ -1204,12 +1193,6 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
 - Test touch sizing with a real touch device or browser touch emulation; resizing
   a mouse browser alone does not enable it.
 
-- The Arclet dbcert preflight needs the updated desktop shell and web UI, with
-  managed features enabled on the server. Browsers, older shells, other sandbox
-  providers, and already-connected hosts skip this check. Refreshing a host's
-  credential from the session banner does not prove new-session gating works.
-  Skip bypasses only this launch's check; it does not renew credentials or
-  guarantee that sandbox authentication will succeed.
 - The launch action banner appears only on deployments whose launch code
   reports it; Omnigent's own sandbox providers never do. Its text comes from the
   deployment, so check the wording there rather than in the web UI.

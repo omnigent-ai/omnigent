@@ -360,14 +360,26 @@ _SHARDED_HOST_ID = "c1b2c3d4e5f61234567890abcdef0123"
 
 
 @pytest.mark.parametrize(
-    ("host_state", "status"),
-    [("on_other_replica", 400), ("on_this_replica", 200), ("offline", 200)],
+    ("target", "host_state", "status"),
+    [
+        *(
+            (target, host_state, status)
+            for target in ("host_bound", "inherited_host")
+            for host_state, status in (
+                ("on_other_replica", 400),
+                ("on_this_replica", 200),
+                ("offline", 200),
+            )
+        ),
+        ("rebound_child", "on_other_replica", 200),
+    ],
 )
 async def test_sharded_archive_requires_the_host_replica(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    target: str,
     host_state: str,
     status: int,
 ) -> None:
@@ -377,14 +389,33 @@ async def test_sharded_archive_requires_the_host_replica(
     The teardown reaches the host-launched runner over the host's tunnel. On a
     replica without it, committing ``archived`` would hide a session whose
     runner keeps running, so a live host elsewhere gets ``wrong_replica``
-    (the client re-addresses with the slice key) and the session is untouched.
-    An offline host has no runner to stop, so its archive still succeeds.
+    naming the host's slice key, and the session is untouched. A sub-agent
+    with no host of its own runs on its parent's, so it is routed the same way,
+    unless it was rebound to another runner. An offline host has no runner to
+    stop, so its archive still succeeds.
     """
-    session = await create_test_session(client, name=f"archive-sharded-{host_state}")
-    session_id = session["id"]
+    session = await create_test_session(client, name=f"archive-sharded-{host_state}-{target}")
+    parent_id = session["id"]
+    runner_id = "d1b2c3d4e5f61234567890abcdef0123"
     conv_store = SqlAlchemyConversationStore(db_uri)
-    conv_store.set_host_id(session_id, _SHARDED_HOST_ID, workspace="/tmp/archive-ws")
-    conv_store.set_runner_id(session_id, "d1b2c3d4e5f61234567890abcdef0123")
+    conv_store.set_host_id(parent_id, _SHARDED_HOST_ID, workspace="/tmp/archive-ws")
+    conv_store.set_runner_id(parent_id, runner_id)
+    session_id = parent_id
+    if target != "host_bound":
+        parent = conv_store.get_conversation(parent_id)
+        assert parent is not None
+        child = conv_store.create_conversation(
+            kind="sub_agent",
+            title="worker",
+            parent_conversation_id=parent_id,
+            agent_id=parent.agent_id,
+            runner_id=runner_id
+            if target == "inherited_host"
+            else "e1b2c3d4e5f61234567890abcdef0123",
+            sub_agent_name="worker",
+        )
+        assert child.host_id is None
+        session_id = child.id
     host_store = HostStore(db_uri)
     host_store.upsert_on_connect(_SHARDED_HOST_ID, "archive-host", "local")
     if host_state == "offline":
@@ -399,12 +430,12 @@ async def test_sharded_archive_requires_the_host_replica(
     )
 
     mock_teardown = AsyncMock(return_value=True)
+    mock_stop = AsyncMock(return_value=True)
+    _sessions_common._session_status_cache[session_id] = "running"
     try:
         with (
             local_tunnel,
-            patch.object(
-                _sessions_orchestration, "_stop_session_via_runner", AsyncMock(return_value=True)
-            ),
+            patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop),
             patch.object(_sessions_facade, "_stop_session_host_runner", mock_teardown),
         ):
             resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
@@ -412,11 +443,19 @@ async def test_sharded_archive_requires_the_host_replica(
         assert resp.status_code == status, resp.text
         archived = (await client.get(f"/v1/sessions/{session_id}")).json()["archived"]
         if status == 400:
-            assert resp.json()["error"]["code"] == "wrong_replica"
+            error = resp.json()["error"]
+            assert error["code"] == "wrong_replica"
+            assert error["slice_key"] == _SHARDED_HOST_ID
             assert archived is False
+            mock_stop.assert_not_awaited()
             mock_teardown.assert_not_awaited()
         else:
             assert archived is True
+            assert session_id in [call.args[0] for call in mock_stop.await_args_list]
+        if target != "host_bound":
+            # Archiving the sub-agent leaves its parent and the parent's runner alone.
+            assert (await client.get(f"/v1/sessions/{parent_id}")).json()["archived"] is False
+            mock_teardown.assert_not_awaited()
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
         _sessions_common._intentional_stop_sessions.pop(session_id, None)

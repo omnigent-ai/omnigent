@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
+import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
@@ -30,8 +32,15 @@ from tests._helpers.compat import (
     server_pythonpath,
 )
 from tests._helpers.live_server import isolated_local_server
+from tests._helpers.polling import poll_until
+from tests.e2e_ui._claude_sdk_session import create_claude_sdk_session
 from tests.e2e_ui._quick_pick_palette import enable_quick_pick_palette, run_palette_command
-from tests.e2e_ui.conftest import _BUILD_OUTPUT, _REPO_ROOT
+from tests.e2e_ui.conftest import (
+    _BUILD_OUTPUT,
+    _REPO_ROOT,
+    _ensure_runner_online,
+    _server_state,
+)
 
 _PALETTE_INPUT = "command-palette-input"
 # "Go to Settings" navigates to /settings, which redirects to the general section.
@@ -182,3 +191,54 @@ def test_quick_pick_on_an_open_session(
     rename = page.get_by_role("dialog", name="Rename session")
     expect(rename).to_be_visible(timeout=10_000)
     expect(rename.get_by_role("textbox", name="Session name")).to_be_focused()
+
+
+def test_quick_pick_sets_the_open_sessions_reasoning_effort(
+    page: Page,
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """⌘K's Reasoning Effort row opens its levels, and picking one changes the session."""
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    session_id: str | None = None
+    try:
+        session_id, _agent_name = create_claude_sdk_session(
+            live_server,
+            str(_server_state["runner_id"]),
+            mock_llm_server_url,
+            name_prefix="quick-pick-effort",
+        )
+        enable_quick_pick_palette(page)
+        page.goto(f"{live_server}/c/{session_id}")
+        expect(page.get_by_placeholder("Send a message…")).to_be_visible(timeout=30_000)
+        expect(page.get_by_test_id("composer-config-gear")).to_be_enabled(timeout=30_000)
+
+        run_palette_command(page, "reasoning effort", "Reasoning Effort")
+        heading = page.locator('[data-slot="quick-pick-heading"]')
+        expect(heading).to_have_text("Reasoning Effort")
+        # The values page names its query after the setting, so find it by role alone.
+        page.get_by_role("dialog").get_by_role("combobox").fill("max")
+        expect(page.get_by_role("dialog").get_by_role("option").first).to_contain_text("Max")
+        page.keyboard.press("Enter")
+        expect(heading).to_have_count(0)
+
+        def effort() -> object:
+            response = httpx.get(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+            response.raise_for_status()
+            return response.json().get("reasoning_effort") == "max"
+
+        poll_until(effort, timeout_s=15.0)
+    finally:
+        try:
+            if session_id is not None:
+                httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        finally:
+            # A respawned runner must not outlive the test, even if the delete fails.
+            if respawned is not None:
+                respawned.terminate()
+                try:
+                    respawned.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    respawned.kill()
+                    respawned.wait(timeout=5)

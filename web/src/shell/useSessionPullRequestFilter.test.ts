@@ -43,4 +43,30 @@ describe("useSessionPullRequestFilter", () => {
     rerender({ enabled: true });
     expect(result.current.value).toBe("closed");
   });
+
+  it("reads the stored choice only once the flag turns on", () => {
+    localStorage.setItem(STORAGE_KEY, "draft");
+    const getItem = vi.spyOn(Storage.prototype, "getItem");
+    const { result, rerender } = renderHook(({ enabled }) => useSessionPullRequestFilter(enabled), {
+      initialProps: { enabled: false },
+    });
+    expect(result.current.value).toBe("all");
+    expect(getItem).not.toHaveBeenCalledWith(STORAGE_KEY);
+    rerender({ enabled: true });
+    expect(result.current).toMatchObject({ enabled: true, value: "draft" });
+  });
+
+  it("stores nothing chosen while the flag is off, keeping the choice made before", () => {
+    const { result, rerender } = renderHook(({ enabled }) => useSessionPullRequestFilter(enabled), {
+      initialProps: { enabled: true },
+    });
+    act(() => result.current.choose("open"));
+    rerender({ enabled: false });
+    const setItem = vi.spyOn(Storage.prototype, "setItem");
+    act(() => result.current.choose("none"));
+    expect(setItem).not.toHaveBeenCalled();
+    expect(localStorage.getItem(STORAGE_KEY)).toBe("open");
+    rerender({ enabled: true });
+    expect(result.current.value).toBe("open");
+  });
 });
