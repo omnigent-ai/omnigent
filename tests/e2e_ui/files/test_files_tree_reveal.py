@@ -147,7 +147,8 @@ def test_the_viewed_file_is_revealed_from_the_tree_header_and_the_palette(
 
     # ⌘K runs the same command, even with the folder above the file closed meanwhile.
     _scroll_to_top(place)
-    _row(place, "packages").click(position={"x": 16, "y": 12})
+    # A click on the folder's row toggles it.
+    _row(place, "packages").click()
     expect(_row(place, "packages")).to_have_attribute("aria-expanded", "false")
     _reveal_from_palette(page)
     _expect_row_in_view(place, "OWNERS")

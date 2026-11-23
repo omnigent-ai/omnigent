@@ -4,8 +4,9 @@ With ``workspace_sidebar_v2`` on, right-clicking a folder in the open file's bre
 offers Open folder as root beside Copy path. The tree then lists only that folder, its
 header names it, and the header's Back to working folder returns it. ⌘K roots the tree at
 the viewed file's folder and returns it too, and on a narrow page the rooted tree opens
-as a popover. Seeded via the filesystem PUT endpoint (no agent run); which folders can
-be roots is in the unit tests (``treeRoot``, ``FileBreadcrumbs``).
+as a popover with focus in the tree, where it stays after Back. Seeded via the
+filesystem PUT endpoint (no agent run); which folders can be roots is in the unit tests
+(``treeRoot``, ``FileBreadcrumbs``).
 """
 
 from __future__ import annotations
@@ -140,4 +141,11 @@ def test_a_breadcrumb_root_opens_the_hidden_tree_on_a_narrow_page(
     tree = page.get_by_role("dialog", name="Workspace files")
     expect(_row(tree, "notes.md")).to_be_visible(timeout=30_000)
     expect(_row(tree, "README.md")).to_have_count(0)
-    expect(tree.get_by_role("button", name="Back to working folder")).to_be_visible()
+    # The popover starts in the rooted tree, so the keyboard can move through it at once.
+    focused_row = tree.locator('[role="treeitem"]:focus')
+    expect(focused_row).to_have_count(1, timeout=10_000)
+
+    # Back to working folder leaves focus in the tree it returns to.
+    tree.get_by_role("button", name="Back to working folder").click()
+    expect(_row(tree, "README.md")).to_be_visible(timeout=30_000)
+    expect(focused_row).to_have_count(1, timeout=10_000)

@@ -1,14 +1,17 @@
 // The workspace Files tab's tree: the folder the session's tree browses (the workspace
 // root unless rooted elsewhere) and its uncommitted changes, under a header naming the
-// folder with Back to working folder and Reveal Active File.
+// folder with its name filter, Back to working folder and Reveal Active File. While a
+// name filter is set, the tree shows its matches instead.
 
-import { FolderDotIcon, LocateFixedIcon } from "lucide-react";
+import { FolderDotIcon, ListFilterIcon, LocateFixedIcon } from "lucide-react";
+import { type RefObject, useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ChangedSort } from "@/lib/changedSort";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { cn } from "@/lib/utils";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useSession } from "@/hooks/useSession";
 import {
   RunnerOfflineError,
@@ -17,12 +20,17 @@ import {
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
   useWorkspaceEnvironment,
+  useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
+import { usePaletteCommands } from "@/store/paletteCommands";
 import { breadcrumbSegments, workspaceFolderName } from "@/shell/breadcrumbPaths";
 import { useRememberedBrowseLocation } from "@/shell/filesPane/browseLocations";
+import { treeFilterSummary } from "@/shell/filesPane/treeFilterSummary";
+import { useTreeFilters } from "@/shell/filesPane/useTreeFilters";
 import { activeFileTreePath } from "@/shell/fileTree/activeFileTreePath";
 import { changesWithinFolder, visibleEntries } from "@/shell/fileTree/filesTreeListings";
 import { FilesTree } from "@/shell/fileTree/FilesTree";
+import { FilesTreeMatches } from "@/shell/fileTree/FilesTreeMatches";
 import { REVEAL_ACTIVE_FILE_LABEL } from "@/shell/fileTree/revealActiveFile";
 import {
   BACK_TO_WORKING_FOLDER_LABEL,
@@ -30,7 +38,14 @@ import {
   planWorkingFolderReturn,
   showTreeRoot,
 } from "@/shell/fileTree/treeRoot";
+import {
+  CLEAR_TREE_FILTER_LABEL,
+  FILTER_TREE_BY_NAME_LABEL,
+  useTreeNameFilterRequests,
+} from "@/shell/fileTree/treeNameFilter";
 import { useTreeActiveReveal } from "@/shell/fileTree/useTreeActiveReveal";
+
+import { FilesTreeFilterBar } from "./FilesTreeFilterBar";
 
 export interface FilesPageTreeProps {
   conversationId: string;
@@ -78,12 +93,18 @@ function HeaderButton({
   label,
   tooltip,
   disabled = false,
+  pressed,
+  marked = false,
   onClick,
   children,
 }: {
   label: string;
   tooltip: string;
   disabled?: boolean;
+  /** A toggle's state, for a button that opens and closes something. */
+  pressed?: boolean;
+  /** Shows a dot, as while a filter narrows the tree. */
+  marked?: boolean;
   onClick: () => void;
   children: React.ReactNode;
 }) {
@@ -97,12 +118,24 @@ function HeaderButton({
           size="icon-xs"
           aria-label={label}
           aria-disabled={disabled || undefined}
-          className="shrink-0 text-muted-foreground hover:text-foreground aria-disabled:opacity-50 aria-disabled:hover:text-muted-foreground"
+          aria-pressed={pressed}
+          data-tree-filter-toggle={pressed === undefined ? undefined : ""}
+          className={cn(
+            "relative shrink-0 text-muted-foreground hover:text-foreground aria-disabled:opacity-50 aria-disabled:hover:text-muted-foreground",
+            (pressed || marked) && "text-foreground",
+          )}
           onClick={() => {
             if (!disabled) onClick();
           }}
         >
           {children}
+          {marked ? (
+            <span
+              aria-hidden
+              data-testid="tree-filter-dot"
+              className="absolute top-0.5 right-0.5 size-1.5 rounded-full bg-primary"
+            />
+          ) : null}
         </Button>
       </TooltipTrigger>
       <TooltipContent side="bottom">{tooltip}</TooltipContent>
@@ -145,6 +178,79 @@ export function FilesPageTree({
       ? workspaceFolderName(workspaceRoot)
       : (breadcrumbSegments(browsed).at(-1)?.label ?? browsed);
 
+  // The name filter, remembered per session so a popover closing after a pick keeps it.
+  const filters = useTreeFilters(conversationId);
+  const summary = treeFilterSummary(filters.applied);
+  const [filterOpen, setFilterOpen] = useState(() =>
+    Boolean(filters.edited.nameContains || filters.edited.include || filters.edited.exclude),
+  );
+  const filterInput = useRef<HTMLInputElement>(null);
+  const [focusFilterToken, setFocusFilterToken] = useState(0);
+  const openFilter = () => {
+    setFilterOpen(true);
+    setFocusFilterToken((token) => token + 1);
+  };
+  useEffect(() => {
+    if (focusFilterToken > 0) filterInput.current?.focus();
+  }, [focusFilterToken]);
+  // Closing the filter takes away the field that had focus, so focus goes to its button.
+  const root = useRef<HTMLDivElement>(null);
+  const [focusToggleToken, setFocusToggleToken] = useState(0);
+  useEffect(() => {
+    if (focusToggleToken === 0) return;
+    root.current?.querySelector<HTMLElement>("[data-tree-filter-toggle]")?.focus();
+  }, [focusToggleToken]);
+  const closeFilter = () => {
+    filters.clear();
+    setFilterOpen(false);
+    setFocusToggleToken((token) => token + 1);
+  };
+  useTreeNameFilterRequests(active ? conversationId : undefined, openFilter);
+  // A reveal shows the file in the whole tree, so it ends a name filter, even one still
+  // waiting to apply; the matches never take a reveal.
+  const revealPending = reveal.activeReveal !== null;
+  const filterName = filters.applied.nameContains || filters.edited.nameContains;
+  const { clearNameContains } = filters;
+  useEffect(() => {
+    if (revealPending && filterName) clearNameContains();
+  }, [revealPending, filterName, clearNameContains]);
+  const clearCommands = useMemo(
+    () =>
+      active && summary.active
+        ? [
+            {
+              id: "files.clear-tree-filter",
+              label: CLEAR_TREE_FILTER_LABEL,
+              icon: ListFilterIcon,
+              keywords: ["files", "tree", "filter", "clear", "name"],
+              run: () => filters.clear(),
+            },
+          ]
+        : [],
+    // The command only needs to exist while a filter is on; `clear` is stable per session.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [active, summary.active, conversationId],
+  );
+  usePaletteCommands(`files-page-tree-filter:${conversationId}`, "Files", clearCommands);
+  const search = useWorkspaceFileSearch(
+    conversationId,
+    filters.applied.nameContains,
+    filters.applied.include,
+    filters.applied.exclude,
+    { enabled: summary.active },
+    location,
+  );
+  // Typing keeps the previous matches in view, but a new root's search starts from none:
+  // matches from the old folder would open the wrong paths.
+  const settledLocation = useRef<string | null>(null);
+  useEffect(() => {
+    if (search.data && !search.isPlaceholderData) settledLocation.current = location;
+  });
+  const matchesFromOtherFolder = search.isPlaceholderData && settledLocation.current !== location;
+  const dark = useResolvedThemeMode() === "dark";
+  const treeArea = useRef<HTMLDivElement>(null);
+  useFocusTreeAfterRootChange(treeArea, location);
+
   const header = (
     <div
       className="flex h-8 shrink-0 items-center gap-0.5 border-b border-border pr-1 pl-3"
@@ -159,6 +265,15 @@ export function FilesPageTree({
       >
         {folderName}
       </span>
+      <HeaderButton
+        label={FILTER_TREE_BY_NAME_LABEL}
+        tooltip={summary.active ? `${FILTER_TREE_BY_NAME_LABEL}: on` : FILTER_TREE_BY_NAME_LABEL}
+        pressed={filterOpen}
+        marked={summary.active}
+        onClick={() => (filterOpen ? closeFilter() : openFilter())}
+      >
+        <ListFilterIcon />
+      </HeaderButton>
       {away ? (
         <HeaderButton
           label={BACK_TO_WORKING_FOLDER_LABEL}
@@ -183,7 +298,66 @@ export function FilesPageTree({
     </div>
   );
 
+  const filteredBody = () => {
+    if (!summary.active) return null;
+    const strip = (
+      <div
+        role="status"
+        className="mx-2 mt-2 flex shrink-0 items-center gap-1.5 rounded-md bg-muted py-1 pr-1 pl-2 text-xs text-muted-foreground"
+        data-testid="tree-filter-strip"
+      >
+        <ListFilterIcon className="size-3.5 shrink-0" aria-hidden />
+        <span className="min-w-0 flex-1 truncate" title={summary.text}>
+          {summary.text}
+        </span>
+        <Button type="button" variant="ghost" size="xs" onClick={() => filters.clear()}>
+          Clear
+        </Button>
+      </div>
+    );
+    const result = matchesFromOtherFolder ? undefined : search.data;
+    let content: React.ReactNode;
+    if (search.isError && !result) {
+      content = (
+        <TreeMessage alert>{`Couldn’t search the files: ${search.error.message}`}</TreeMessage>
+      );
+    } else if (!result) {
+      content = <TreeMessage>Searching…</TreeMessage>;
+    } else {
+      const matches = result.files.filter(
+        (match) => showHidden || !match.path.split("/").some((part) => part.startsWith(".")),
+      );
+      content =
+        matches.length === 0 ? (
+          <TreeMessage>{summary.emptyText}</TreeMessage>
+        ) : (
+          <>
+            <FilesTreeMatches
+              matches={matches}
+              activeFile={activeFileTreePath(activePath, location, workspaceRoot)}
+              onFileSelect={(path) => onFileSelect(joinBrowseLocation(location, path))}
+              label="Matching workspace files"
+              dark={dark}
+            />
+            {!search.isPlaceholderData && (result.truncated || result.hasMore) ? (
+              <p className="shrink-0 border-t border-border px-3 py-1.5 text-xs text-muted-foreground">
+                Showing the first matches. Type more of the name to narrow them.
+              </p>
+            ) : null}
+          </>
+        );
+    }
+    return (
+      <>
+        {strip}
+        {content}
+      </>
+    );
+  };
+
   const body = (() => {
+    const filtered = filteredBody();
+    if (filtered) return filtered;
     if (files.isPending) return <TreeMessage>Loading files…</TreeMessage>;
     if (files.isError) {
       return files.error instanceof RunnerOfflineError ? (
@@ -258,9 +432,63 @@ export function FilesPageTree({
   })();
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div ref={root} className="flex min-h-0 flex-1 flex-col">
       {header}
-      <div className="flex min-h-0 flex-1 flex-col">{body}</div>
+      {filterOpen ? (
+        <FilesTreeFilterBar
+          filters={filters}
+          inertGlobs={!summary.active && summary.inertGlobs}
+          inputRef={filterInput}
+          onClose={closeFilter}
+        />
+      ) : null}
+      <div
+        ref={treeArea}
+        // A tree popover starts here, and the area hands focus to the tree's current row.
+        data-sidebar-initial-focus
+        tabIndex={-1}
+        className="flex min-h-0 flex-1 flex-col outline-none"
+        onFocus={(event) => {
+          if (event.target !== event.currentTarget) return;
+          const area = event.currentTarget;
+          focusTreeRow(area, () => document.activeElement === area);
+        }}
+      >
+        {body}
+      </div>
     </div>
   );
+}
+
+/** Focuses the tree's current row in `area` once its rows have rendered. */
+function focusTreeRow(area: HTMLElement | null, stillWanted: () => boolean): () => void {
+  let frame = 0;
+  let attempts = 0;
+  const focusRow = () => {
+    if (!stillWanted()) return;
+    const row = area?.querySelector<HTMLElement>('[role="treeitem"][tabindex="0"]');
+    if (row) row.focus({ preventScroll: true });
+    else if (++attempts < 60) frame = requestAnimationFrame(focusRow);
+  };
+  frame = requestAnimationFrame(focusRow);
+  return () => cancelAnimationFrame(frame);
+}
+
+/**
+ * After the tree moves to another root, focus that was in it, or left with the
+ * control that moved it (Back in the header), lands on the new tree's current row.
+ */
+function useFocusTreeAfterRootChange(area: RefObject<HTMLDivElement | null>, location: string) {
+  const shown = useRef(location);
+  useEffect(() => {
+    if (shown.current === location) return;
+    shown.current = location;
+    const page = area.current?.parentElement;
+    return focusTreeRow(area.current, () => {
+      const focused = document.activeElement;
+      if (!focused || focused === document.body) return true;
+      // Typing in the filter keeps its focus.
+      return page?.contains(focused) === true && !(focused instanceof HTMLInputElement);
+    });
+  }, [area, location]);
 }

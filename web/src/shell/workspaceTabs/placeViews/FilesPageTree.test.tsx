@@ -8,6 +8,7 @@ import {
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
   useWorkspaceEnvironment,
+  useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
 import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -20,6 +21,15 @@ import {
   forgetActiveFileRevealsForTests,
   requestActiveFileReveal,
 } from "@/shell/fileTree/revealActiveFile";
+import {
+  forgetTreeNameFilterRequestsForTests,
+  requestTreeNameFilter,
+} from "@/shell/fileTree/treeNameFilter";
+import {
+  TREE_FILTER_DEBOUNCE_MS,
+  forgetTreeFiltersForTests,
+} from "@/shell/filesPane/useTreeFilters";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
 
 import { FilesPageTree } from "./FilesPageTree";
 
@@ -30,6 +40,21 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
   useWorkspaceAllFiles: vi.fn(),
   useWorkspaceChangedFiles: vi.fn(),
   useWorkspaceEnvironment: vi.fn(),
+  useWorkspaceFileSearch: vi.fn(),
+}));
+vi.mock("@/shell/fileTree/FilesTreeMatches", () => ({
+  FilesTreeMatches: (props: {
+    matches: { path: string }[];
+    onFileSelect: (path: string) => void;
+  }) => (
+    <div data-testid="files-tree-matches">
+      {props.matches.map((match) => (
+        <button key={match.path} type="button" onClick={() => props.onFileSelect(match.path)}>
+          {match.path}
+        </button>
+      ))}
+    </div>
+  ),
 }));
 vi.mock("@/hooks/useSession", () => ({
   useSession: () => ({ session: { permissionLevel: null } }),
@@ -86,6 +111,7 @@ const listedLocations = () => vi.mocked(useWorkspaceAllFiles).mock.calls.map((ca
 beforeEach(() => {
   captured.tree = null;
   vi.mocked(useWorkspaceAllFiles).mockClear();
+  vi.mocked(useWorkspaceFileSearch).mockReturnValue({ data: undefined } as never);
   vi.mocked(useWorkspaceEnvironment).mockReturnValue({
     data: { available: true, root: "/work/repo" },
     isError: false,
@@ -98,6 +124,9 @@ afterEach(() => {
   cleanup();
   rememberBrowseLocation("conv_1", null);
   forgetActiveFileRevealsForTests();
+  forgetTreeNameFilterRequestsForTests();
+  forgetTreeFiltersForTests();
+  vi.useRealTimers();
 });
 
 describe("FilesPageTree", () => {
@@ -279,5 +308,187 @@ describe("FilesPageTree", () => {
     expect(button).toHaveAttribute("aria-disabled", "true");
     fireEvent.click(button);
     expect(captured.tree?.activeReveal).toBeNull();
+  });
+
+  describe("name filter", () => {
+    const filterButton = () => screen.getByRole("button", { name: "Filter Files Tree by Name" });
+    const nameField = () => screen.getByRole("textbox", { name: "Name contains" });
+    const typeName = (name: string) => {
+      fireEvent.change(nameField(), { target: { value: name } });
+      act(() => vi.advanceTimersByTime(TREE_FILTER_DEBOUNCE_MS));
+    };
+    const searches = () => vi.mocked(useWorkspaceFileSearch).mock.calls;
+    const paletteLabels = () =>
+      Object.values(usePaletteCommandsStore.getState().groups)
+        .flatMap((group) => group.commands)
+        .map((command) => command.label);
+
+    it("searches the browsed folder for a name once typing settles, and shows the matches", () => {
+      vi.useFakeTimers();
+      rememberBrowseLocation("conv_1", "/work/repo/src");
+      vi.mocked(useWorkspaceFileSearch).mockReturnValue({
+        data: {
+          files: [entry("lib/button.ts"), entry(".hidden/button.ts")],
+          truncated: false,
+          hasMore: false,
+        },
+      } as never);
+      const { onFileSelect } = renderTree(listed([entry("src/a.ts")]));
+      fireEvent.click(filterButton());
+      expect(filterButton()).toHaveAttribute("aria-pressed", "true");
+      expect(nameField()).toHaveFocus();
+      typeName("button");
+      expect(searches().at(-1)).toEqual(["conv_1", "button", "", "", { enabled: true }, "src"]);
+      expect(screen.getByTestId("tree-filter-strip")).toHaveTextContent(
+        "Names containing “button”",
+      );
+      expect(screen.queryByTestId("files-tree")).toBeNull();
+      // Hidden matches stay hidden while hidden files are.
+      expect(screen.queryByRole("button", { name: ".hidden/button.ts" })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "lib/button.ts" }));
+      expect(onFileSelect).toHaveBeenCalledWith("src/lib/button.ts");
+      expect(paletteLabels()).toContain("Clear Files Tree Filter");
+    });
+
+    it("ends the filter for the header's Reveal, so the whole tree shows the viewed file", () => {
+      vi.useFakeTimers();
+      vi.mocked(useWorkspaceFileSearch).mockReturnValue({
+        data: { files: [entry("src/a.ts")], truncated: false, hasMore: false },
+      } as never);
+      renderTree(listed([entry("src")]));
+      fireEvent.click(filterButton());
+      typeName("a.ts");
+      expect(screen.getByTestId("files-tree-matches")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "Reveal Active File" }));
+      expect(screen.queryByTestId("files-tree-matches")).toBeNull();
+      expect(nameField()).toHaveValue("");
+      expect(captured.tree?.activeReveal).toMatchObject({ file: "src/a.ts" });
+    });
+
+    it("ends a name still waiting to apply for a ⌘K reveal", () => {
+      vi.useFakeTimers();
+      vi.mocked(useWorkspaceFileSearch).mockReturnValue({
+        data: { files: [entry("src/a.ts")], truncated: false, hasMore: false },
+      } as never);
+      renderTree(listed([entry("src")]));
+      fireEvent.click(filterButton());
+      fireEvent.change(nameField(), { target: { value: "a.ts" } });
+      act(() => {
+        requestActiveFileReveal("conv_1", "src/a.ts");
+      });
+      act(() => vi.advanceTimersByTime(TREE_FILTER_DEBOUNCE_MS));
+      expect(screen.queryByTestId("files-tree-matches")).toBeNull();
+      expect(captured.tree?.activeReveal).toMatchObject({ file: "src/a.ts" });
+    });
+
+    it("narrows the search with globs, which do nothing until a name is set", () => {
+      vi.useFakeTimers();
+      renderTree(listed([entry("src")]));
+      fireEvent.click(filterButton());
+      fireEvent.click(screen.getByRole("button", { name: "Files to include or exclude" }));
+      fireEvent.change(screen.getByRole("textbox", { name: "Files to include" }), {
+        target: { value: "*.ts" },
+      });
+      act(() => vi.advanceTimersByTime(TREE_FILTER_DEBOUNCE_MS));
+      expect(screen.getByText("Applies once a name is set.")).toBeInTheDocument();
+      expect(screen.getByTestId("files-tree")).toBeInTheDocument();
+      typeName("app");
+      expect(searches().at(-1)?.slice(1, 4)).toEqual(["app", "*.ts", ""]);
+      expect(screen.getByTestId("tree-filter-strip")).toHaveTextContent(
+        "Names containing “app” in *.ts",
+      );
+    });
+
+    it("says what it's doing while it searches, finds nothing, or fails", () => {
+      vi.useFakeTimers();
+      renderTree(listed([entry("src")]));
+      fireEvent.click(filterButton());
+      typeName("zzz");
+      expect(screen.getByText("Searching…")).toBeInTheDocument();
+      cleanup();
+      vi.mocked(useWorkspaceFileSearch).mockReturnValue({
+        data: { files: [], truncated: false, hasMore: false },
+      } as never);
+      renderTree(listed([entry("src")]));
+      expect(screen.getByText("No files match “zzz”.")).toBeInTheDocument();
+      cleanup();
+      vi.mocked(useWorkspaceFileSearch).mockReturnValue({
+        isError: true,
+        error: new Error("timed out"),
+      } as never);
+      renderTree(listed([entry("src")]));
+      expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t search the files: timed out");
+    });
+
+    it("keeps the filter across a remount, and clears it from the strip", () => {
+      vi.useFakeTimers();
+      renderTree(listed([entry("src")]));
+      fireEvent.click(filterButton());
+      typeName("app");
+      cleanup();
+      renderTree(listed([entry("src")]));
+      expect(nameField()).toHaveValue("app");
+      expect(screen.getByTestId("tree-filter-dot")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+      expect(screen.getByTestId("files-tree")).toBeInTheDocument();
+      expect(screen.queryByTestId("tree-filter-dot")).toBeNull();
+      expect(paletteLabels()).not.toContain("Clear Files Tree Filter");
+    });
+
+    it("empties the name on Escape, then closes the filter", () => {
+      vi.useFakeTimers();
+      renderTree(listed([entry("src")]));
+      fireEvent.click(filterButton());
+      typeName("app");
+      fireEvent.keyDown(nameField(), { key: "Escape" });
+      expect(nameField()).toHaveValue("");
+      fireEvent.keyDown(nameField(), { key: "Escape" });
+      expect(screen.queryByRole("textbox", { name: "Name contains" })).toBeNull();
+      expect(filterButton()).toHaveAttribute("aria-pressed", "false");
+      // The field that had focus is gone, so focus lands on the filter's button.
+      expect(filterButton()).toHaveFocus();
+      fireEvent.click(filterButton());
+      expect(nameField()).toHaveFocus();
+      fireEvent.click(screen.getByRole("button", { name: "Close filter" }));
+      expect(filterButton()).toHaveFocus();
+    });
+
+    it("shows no matches from the folder it browsed before a root change", () => {
+      vi.useFakeTimers();
+      const found = { files: [entry("button.ts")], truncated: true, hasMore: true };
+      vi.mocked(useWorkspaceFileSearch).mockReturnValue({
+        data: found,
+        isPlaceholderData: false,
+      } as never);
+      renderTree(listed([entry("button.ts")]));
+      fireEvent.click(filterButton());
+      typeName("button");
+      expect(screen.getByRole("button", { name: "button.ts" })).toBeInTheDocument();
+      expect(screen.getByText(/Showing the first matches/)).toBeInTheDocument();
+
+      // Typing in the same folder keeps its matches in view, without the note.
+      vi.mocked(useWorkspaceFileSearch).mockReturnValue({
+        data: found,
+        isPlaceholderData: true,
+      } as never);
+      typeName("butto");
+      expect(screen.getByRole("button", { name: "button.ts" })).toBeInTheDocument();
+      expect(screen.queryByText(/Showing the first matches/)).toBeNull();
+
+      // A new root's placeholder still holds the old folder's matches: show none.
+      act(() => rememberBrowseLocation("conv_1", "/work/repo/src"));
+      expect(screen.queryByRole("button", { name: "button.ts" })).toBeNull();
+      expect(screen.getByText("Searching…")).toBeInTheDocument();
+    });
+
+    it("opens and focuses the filter for a ⌘K request, only while on screen", () => {
+      requestTreeNameFilter("conv_1");
+      renderTree(listed([entry("src")]), false, { active: false });
+      expect(screen.queryByRole("textbox", { name: "Name contains" })).toBeNull();
+      cleanup();
+      renderTree(listed([entry("src")]));
+      expect(nameField()).toHaveFocus();
+    });
   });
 });
