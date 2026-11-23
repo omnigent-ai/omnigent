@@ -936,6 +936,47 @@ describe("rankFilesViaWorkspaceApi", () => {
 
     expect(listed?.files.map((file) => file.entry.path)).toEqual(["src/workspaceFastTrack.ts"]);
   });
+
+  it("leaves the search to another route while the host's file list is being built", async () => {
+    enable("workspace_api_server_access");
+    const refreshing = create(SearchFilesResponseSchema, { refreshing: true });
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("SearchFiles", "search_files.fuzzy"), {
+          headers: PROTO_HEADERS,
+        }),
+      SearchFiles: () =>
+        new Response(toBinary(SearchFilesResponseSchema, refreshing), { headers: PROTO_HEADERS }),
+    });
+
+    expect(await rankFilesViaWorkspaceApi("s-rank-refreshing", "wsft", RANKED_OPTIONS)).toBeNull();
+    expect(methodCalls("SearchFiles")).toHaveLength(1);
+  });
+
+  it.each([
+    ["the walk ran out of budget", { indexIncomplete: true }],
+    ["the untracked files couldn't be listed", { untrackedUnavailable: true }],
+  ])("keeps the files but says some weren't searched when %s", async (_case, status) => {
+    enable("workspace_api_server_access");
+    const incomplete = create(SearchFilesResponseSchema, {
+      results: [{ entry: { name: "a.ts", path: "src/a.ts", type: EntryType.FILE }, score: 9 }],
+      ...status,
+    });
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("SearchFiles", "search_files.fuzzy"), {
+          headers: PROTO_HEADERS,
+        }),
+      SearchFiles: () =>
+        new Response(toBinary(SearchFilesResponseSchema, incomplete), { headers: PROTO_HEADERS }),
+    });
+
+    const sessionId = `s-rank-incomplete-${Object.keys(status)[0]}`;
+    const ranked = await rankFilesViaWorkspaceApi(sessionId, "a", RANKED_OPTIONS);
+
+    expect(ranked?.files.map((file) => file.entry.path)).toEqual(["src/a.ts"]);
+    expect(ranked).toMatchObject({ hasMore: false, truncated: true });
+  });
 });
 
 describe("searchTextViaWorkspaceApi", () => {
