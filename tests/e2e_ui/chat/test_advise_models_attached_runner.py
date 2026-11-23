@@ -169,7 +169,7 @@ def _settle_turn(page: Page) -> str | None:
 
 
 @pytest.mark.timeout(240)
-@pytest.mark.min_server_version("0.19.0")
+@pytest.mark.min_server_version("0.24.0")
 def test_host_launched_runner_offers_advise_models_when_server_routes(
     browser: Browser, routing_stack: RoutingStack
 ) -> None:
