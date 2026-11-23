@@ -624,6 +624,38 @@ class ConstraintGuard:
                 self.actor,
             )
 
+    def mark_stale(self) -> None:
+        """Mark the derived state stale after a write the rules didn't see.
+
+        A revision without rules writes records directly. Publishing rules again must recount
+        them, even when the rules match the digest the state last saw, so the state is marked
+        stale (after finishing any change left pending). A gadget that never had rules has no
+        state, and nothing is written.
+        """
+        if not self._epochs():
+            return
+        for attempt in range(GUARD_ATTEMPTS):
+            epoch, state = self._current()
+            current = state.value
+            if current.get("rules") == _STALE:
+                return
+            if current.get("pending") is not None:
+                self._finish(epoch, state)
+                continue
+            try:
+                self.guard.replace(
+                    _GUARD_COLLECTION,
+                    epoch,
+                    {**current, "rules": _STALE, "rebuild": None},
+                    state.version,
+                    self._guard_operation(state, "stale"),
+                    self.actor,
+                )
+                return
+            except Conflict:
+                _back_off(attempt)
+        raise Conflict("The gadget's rule state is busy; try again")
+
     # -- derived state and rotation -------------------------------------------
 
     def _rebuild_step(self, epoch: str, state: Document) -> None:

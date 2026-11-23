@@ -686,6 +686,84 @@ def test_a_reference_rule_checks_targets_and_applies_its_delete_rule(
     assert rpc(service, app, "get", collection="runs", id="r2")["value"] == {"state": "done"}
 
 
+def _republish(service: GadgetService, app: dict, revision_id: str) -> dict:
+    return service.publish(app["id"], {"revision_id": revision_id, "if_version": app["version"]})
+
+
+@pytest.mark.parametrize("case", ["count", "unique", "restrict", "cascade", "unset"])
+def test_rules_published_again_count_the_writes_made_without_them(
+    gadgets: Fixture, case: str
+) -> None:
+    # Rules R, then a revision without rules, then R again: the state R left behind never saw
+    # the writes in between, so R must recount them instead of reusing it.
+    service = gadgets.service()
+    if case == "count":
+        rule = {"name": "few", "kind": "max_records", "collection": "cards", "max": 2}
+    elif case == "unique":
+        rule = {"name": "one_title", "kind": "unique", "collection": "cards", "fields": ["title"]}
+    else:
+        rule = {
+            "name": "run_card",
+            "kind": "reference",
+            "collection": "runs",
+            "field": "cardId",
+            "target": "cards",
+            "on_delete": case,
+        }
+    app = publish_ruled_board(service, [rule])
+    ruled = app["published_revision"]
+    target = card(service, app, "a", "todo")
+    app = _republish(service, app, ruled_revision(service, app["id"], []))
+    if case == "count":
+        card(service, app, "b", "todo")
+    elif case == "unique":
+        card(service, app, "b", "todo")
+        rpc(
+            service,
+            app,
+            "create",
+            id="c",
+            value={"title": "b", "column": "doing"},
+            operation_id="c-dup",
+        )
+    else:
+        rpc(
+            service,
+            app,
+            "create",
+            collection="runs",
+            id="r1",
+            value={"cardId": "a", "state": "done"},
+            operation_id="r1",
+        )
+    app = _republish(service, app, ruled)
+
+    if case == "count":
+        with pytest.raises(ConstraintViolation):
+            card(service, app, "c", "todo")
+    elif case == "unique":
+        # Recounting finds the duplicate made without the rule; a further one is refused.
+        with pytest.raises(ConstraintViolation):
+            rpc(
+                service,
+                app,
+                "create",
+                id="d",
+                value={"title": "b", "column": "todo"},
+                operation_id="c-d",
+            )
+    elif case == "restrict":
+        with pytest.raises(ConstraintViolation):
+            rpc(service, app, "delete", id="a", if_version=target["version"], operation_id="d-a")
+    else:
+        rpc(service, app, "delete", id="a", if_version=target["version"], operation_id="d-a")
+        run = rpc(service, app, "get", collection="runs", id="r1")
+        if case == "cascade":
+            assert run is None
+        else:
+            assert run["value"] == {"state": "done"}
+
+
 def test_deleting_a_referenced_record_reads_only_the_records_that_name_it(
     gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:

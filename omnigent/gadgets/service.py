@@ -1423,13 +1423,16 @@ class GadgetService:
             )
         actor = self.viewer.user_id
         if method == "data.v1.create":
-            return store.create(
-                collection, record_id, params.get("value"), operation_id, actor
-            ).to_dict()
-        # Checked above: every write but a create names the version it expects.
-        expected = cast(str, version)
-        if method == "data.v1.replace":
-            return store.replace(
-                collection, record_id, params.get("value"), expected, operation_id, actor
-            ).to_dict()
-        return store.delete(collection, record_id, expected, operation_id, actor).to_dict()
+            result = store.create(collection, record_id, params.get("value"), operation_id, actor)
+        elif method == "data.v1.replace":
+            # Checked above: every write but a create names the version it expects.
+            result = store.replace(
+                collection, record_id, params.get("value"), cast(str, version), operation_id, actor
+            )
+        else:
+            result = store.delete(collection, record_id, cast(str, version), operation_id, actor)
+        if guard is None:
+            # Rules published again later must count this write: the state they would reuse
+            # never saw it.
+            ConstraintGuard(files, "data/_guard", store, [], actor).mark_stale()
+        return result.to_dict()
