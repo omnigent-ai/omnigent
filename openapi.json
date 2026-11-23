@@ -909,6 +909,42 @@
         "title": "Body_update_session_agent_v1_sessions__session_id__agent_put",
         "type": "object"
       },
+      "Body_upload_project_file_v1_projects__project_id__files_post": {
+        "properties": {
+          "file": {
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "type": "string"
+          },
+          "ticket_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ticket Id"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "title": "Body_upload_project_file_v1_projects__project_id__files_post",
+        "type": "object"
+      },
       "Body_upload_session_file_v1_sessions__session_id__resources_files_post": {
         "properties": {
           "file": {
@@ -940,6 +976,20 @@
           "file"
         ],
         "title": "Body_upload_session_github_attachment_v1_sessions__session_id__resources_github_attachments_post",
+        "type": "object"
+      },
+      "Body_upload_ticket_image_v1_projects__project_id__ticket_attachments_post": {
+        "properties": {
+          "file": {
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "title": "Body_upload_ticket_image_v1_projects__project_id__ticket_attachments_post",
         "type": "object"
       },
       "BrandingInfo": {
@@ -1847,6 +1897,22 @@
       "CommentOnTicket": {
         "additionalProperties": false,
         "properties": {
+          "audience": {
+            "anyOf": [
+              {
+                "enum": [
+                  "human",
+                  "agents"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Who the comment is for. Omit for the default: comments from people and the project orchestrator are for the human, worker comments are agent notes that the board folds away. A worker sets human only for a question or request the human must answer.",
+            "title": "Audience"
+          },
           "kind": {
             "default": "comment",
             "enum": [
@@ -5101,6 +5167,24 @@
         "title": "MCPServerSummary",
         "type": "object"
       },
+      "MarkTicketSeen": {
+        "additionalProperties": false,
+        "description": "The latest activity position the viewer has seen; later positions read as new.",
+        "properties": {
+          "seen_position": {
+            "format": "int64",
+            "maximum": 2147483647.0,
+            "minimum": -1.0,
+            "title": "Seen Position",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "seen_position"
+        ],
+        "title": "MarkTicketSeen",
+        "type": "object"
+      },
       "McpServerEnabledRequest": {
         "properties": {
           "enabled": {
@@ -6632,6 +6716,94 @@
           "enabled"
         ],
         "title": "ProactiveAgentToggle",
+        "type": "object"
+      },
+      "ProjectIdentityRequest": {
+        "additionalProperties": false,
+        "description": "Create or edit a project identity (a named persistent role).",
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Default agent for its sessions; empty clears it.",
+            "title": "Agent Id"
+          },
+          "effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Default reasoning effort; empty clears it.",
+            "title": "Effort"
+          },
+          "instructions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Persona appended to the identity's sessions.",
+            "title": "Instructions"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Default model override; empty clears it.",
+            "title": "Model"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Display name, unique within the project, e.g. `\"PM\"`.",
+            "title": "Name"
+          }
+        },
+        "title": "ProjectIdentityRequest",
+        "type": "object"
+      },
+      "ProjectIdentitySessionRequest": {
+        "additionalProperties": false,
+        "description": "Open an identity's session, starting one when it has none.",
+        "properties": {
+          "expected_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The active session the caller saw, so two clicks cannot each start a session (single-tracked).",
+            "title": "Expected Session Id"
+          }
+        },
+        "title": "ProjectIdentitySessionRequest",
         "type": "object"
       },
       "ProjectOrderRequest": {
@@ -8442,6 +8614,11 @@
           "server_version": {
             "title": "Server Version",
             "type": "string"
+          },
+          "session_attention": {
+            "default": false,
+            "title": "Session Attention",
+            "type": "boolean"
           },
           "session_bundle_model_override": {
             "default": true,
@@ -11322,6 +11499,12 @@
             "title": "Archived",
             "type": "boolean"
           },
+          "attention_at": {
+            "default": 0,
+            "format": "int64",
+            "title": "Attention At",
+            "type": "integer"
+          },
           "background_work_running": {
             "default": false,
             "description": "`True` while work outlives the session's ended turn, such as a background shell or a Codex goal that keeps running between turns. The sidebar shows such a session as working; `status` stays as reported, so the session still takes a new message. `False` while the session's runner is offline.",
@@ -13348,6 +13531,20 @@
               }
             ],
             "title": "Project Id"
+          },
+          "project_identity": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Identity"
           },
           "project_main_session": {
             "default": false,
@@ -15501,7 +15698,8 @@
           "type": {
             "enum": [
               "pull_request",
-              "link"
+              "link",
+              "artifact"
             ],
             "title": "Type",
             "type": "string"
@@ -16543,6 +16741,22 @@
       "UpdateTicket": {
         "additionalProperties": false,
         "properties": {
+          "audience": {
+            "anyOf": [
+              {
+                "enum": [
+                  "human",
+                  "agents"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Who the comment is for. Omit for the default: comments from people and the project orchestrator are for the human, worker comments are agent notes that the board folds away. A worker sets human only for a question or request the human must answer.",
+            "title": "Audience"
+          },
           "comment": {
             "anyOf": [
               {
@@ -21247,6 +21461,524 @@
         ]
       }
     },
+    "/v1/projects/{project_id}/files": {
+      "get": {
+        "operationId": "list_project_files_v1_projects__project_id__files_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Project Files V1 Projects  Project Id  Files Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Project Files",
+        "tags": [
+          "project files"
+        ]
+      },
+      "post": {
+        "operationId": "upload_project_file_v1_projects__project_id__files_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_project_file_v1_projects__project_id__files_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Upload Project File V1 Projects  Project Id  Files Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upload Project File",
+        "tags": [
+          "project files"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/files/{file_id}": {
+      "delete": {
+        "operationId": "delete_project_file_v1_projects__project_id__files__file_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "file_id",
+            "required": true,
+            "schema": {
+              "title": "File Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Project File",
+        "tags": [
+          "project files"
+        ]
+      },
+      "get": {
+        "operationId": "get_project_file_v1_projects__project_id__files__file_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "file_id",
+            "required": true,
+            "schema": {
+              "title": "File Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Project File V1 Projects  Project Id  Files  File Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Project File",
+        "tags": [
+          "project files"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/files/{file_id}/content": {
+      "get": {
+        "operationId": "project_file_content_v1_projects__project_id__files__file_id__content_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "file_id",
+            "required": true,
+            "schema": {
+              "title": "File Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Project File Content",
+        "tags": [
+          "project files"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/identities": {
+      "get": {
+        "description": "List the project's identities, the built-in Orchestrator first.",
+        "operationId": "list_identities_v1_projects__project_id__identities_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Identities V1 Projects  Project Id  Identities Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Identities",
+        "tags": [
+          "projects"
+        ]
+      },
+      "post": {
+        "description": "Add a named role to the project, e.g. a PM with its own persona.",
+        "operationId": "create_identity_v1_projects__project_id__identities_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectIdentityRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Identity V1 Projects  Project Id  Identities Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Identity",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/identities/{identity_id}": {
+      "delete": {
+        "description": "Remove an identity; its past sessions stay in the project.",
+        "operationId": "delete_identity_v1_projects__project_id__identities__identity_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "identity_id",
+            "required": true,
+            "schema": {
+              "title": "Identity Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Identity V1 Projects  Project Id  Identities  Identity Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Identity",
+        "tags": [
+          "projects"
+        ]
+      },
+      "patch": {
+        "description": "Edit an identity's name, persona or session defaults; empty strings clear.",
+        "operationId": "update_identity_v1_projects__project_id__identities__identity_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "identity_id",
+            "required": true,
+            "schema": {
+              "title": "Identity Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectIdentityRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Identity V1 Projects  Project Id  Identities  Identity Id  Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Identity",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/identities/{identity_id}/session": {
+      "post": {
+        "description": "Return the identity's active session, starting one only when it has none.\n\nSingle-tracked: a live (idle or busy) session is reused, never doubled.\nA missing or archived one is replaced, guarded by `expected_session_id`.",
+        "operationId": "open_identity_session_v1_projects__project_id__identities__identity_id__session_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "identity_id",
+            "required": true,
+            "schema": {
+              "title": "Identity Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectIdentitySessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Open Identity Session V1 Projects  Project Id  Identities  Identity Id  Session Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Open Identity Session",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
     "/v1/projects/{project_id}/mandate/proposals": {
       "post": {
         "description": "Queue a mandate addition for the owner; agents may propose but never apply one.\n\n**Parameters**\n\n- `body` \u2014 The proposed text.\n\n**Returns:** `{\"proposal\": ..., \"project\": ...}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if not found / not owned, 400 for blank or oversized text, 409 when the pending list is full.",
@@ -21408,6 +22140,109 @@
         "summary": "Accept Mandate Proposal",
         "tags": [
           "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/ticket-attachments": {
+      "post": {
+        "operationId": "upload_ticket_image_v1_projects__project_id__ticket_attachments_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_ticket_image_v1_projects__project_id__ticket_attachments_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Upload Ticket Image V1 Projects  Project Id  Ticket Attachments Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upload Ticket Image",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/ticket-attachments/{file_id}/content": {
+      "get": {
+        "operationId": "ticket_image_content_v1_projects__project_id__ticket_attachments__file_id__content_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "file_id",
+            "required": true,
+            "schema": {
+              "title": "File Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ticket Image Content",
+        "tags": [
+          "project tickets"
         ]
       }
     },
@@ -21975,6 +22810,69 @@
           }
         },
         "summary": "Events",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/tickets/{ticket_id}/read-state": {
+      "put": {
+        "operationId": "mark_seen_v1_projects__project_id__tickets__ticket_id__read_state_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "title": "Ticket Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarkTicketSeen"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Mark Seen V1 Projects  Project Id  Tickets  Ticket Id  Read State Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mark Seen",
         "tags": [
           "project tickets"
         ]
