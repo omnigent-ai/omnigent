@@ -37,6 +37,7 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { Toaster } from "@/components/ui/sonner";
 import { useRecentSessionSwitchStore } from "@/hooks/useRecentSessionSwitch";
+import { setSessionParent } from "@/lib/sessionHost";
 import { Sidebar } from "./Sidebar";
 import { resetArchiveNavigationForTests } from "./sessionCommands/archiveNavigation";
 
@@ -364,7 +365,8 @@ describe("archiving the open session", () => {
   ];
 
   function LocationProbe() {
-    return <output data-testid="location">{useLocation().pathname}</output>;
+    const { pathname, search } = useLocation();
+    return <output data-testid="location">{pathname + search}</output>;
   }
 
   // On a session route, so the sidebar knows which session is open.
@@ -406,6 +408,7 @@ describe("archiving the open session", () => {
 
   afterEach(() => {
     resetArchiveNavigationForTests();
+    setSessionParent("child", null);
     useRecentSessionSwitchStore.setState({
       history: [],
       readLiveSessionIds: null,
@@ -438,6 +441,36 @@ describe("archiving the open session", () => {
 
     expect(mocks.bulkArchive.mutate).toHaveBeenCalledTimes(1);
     expect(location()).toBe("/c/conv_a");
+  });
+
+  it("starts New session in an open sub-agent's root's project when a bulk archive leaves none", () => {
+    const other = {
+      ...CONV,
+      id: "conv_a",
+      title: "Alpha",
+      labels: { omni_project: "Acme" },
+      updated_at: CONV.updated_at + 60,
+    };
+    const root = { ...CONV, id: "conv_c", title: "Charlie", labels: { omni_project: "Zephyr" } };
+    mockConversations([other, root]);
+    useRecentSessionSwitchStore.setState({
+      history: ["child", "conv_a"],
+      readLiveSessionIds: () => new Set(["conv_a", "conv_c"]),
+      sessionsKnown: true,
+      sessionsFailed: false,
+    });
+    // The open sub-agent isn't a sidebar row; its root is.
+    setSessionParent("child", "conv_c");
+    renderOnSession("child");
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+    fireEvent.click(screen.getByRole("link", { name: /Alpha/ }));
+    fireEvent.click(screen.getByRole("link", { name: /Charlie/ }));
+    fireEvent.click(screen.getByTestId("bulk-archive"));
+
+    expect(mocks.bulkArchive.mutate).toHaveBeenCalledTimes(1);
+    // Another project's session comes first, so the first selected row would pick its project.
+    expect(mocks.bulkArchive.mutate.mock.calls[0][0].ids).toEqual(["conv_a", "conv_c"]);
+    expect(location()).toBe("/?project=Zephyr");
   });
 
   it("goes home, as before, without quick_pick_palette's recent-session host", () => {

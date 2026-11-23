@@ -11,7 +11,7 @@ import {
   useSidebarSessionOrderStore,
 } from "@/hooks/useSidebarSessionOrder";
 import type { Conversation, ProjectSummary } from "@/hooks/useConversations";
-import { archiveLanding, type ArchiveLanding, isInLeavingSubtree } from "@/lib/archiveLanding";
+import { archiveLanding, type ArchiveLanding, leavingAncestorOf } from "@/lib/archiveLanding";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { getSessionParent } from "@/lib/sessionHost";
 import type { Session } from "@/lib/types";
@@ -81,14 +81,17 @@ function parentOf(queryClient: QueryClient, entryId: string): string | null {
   );
 }
 
-/** Whether the open session is one of `leavingIds` or sits under one of them. */
-export function isLeavingOpenSession(
+/**
+ * Which of `leavingIds` takes the open session with it: the session itself, or the ancestor
+ * of an open sub-agent. Null when the open session stays.
+ */
+export function leavingRowOfOpenSession(
   queryClient: QueryClient,
   openSessionId: string | null | undefined,
   leavingIds: readonly string[],
-): boolean {
-  if (!openSessionId) return false;
-  return isInLeavingSubtree(openSessionId, new Set(leavingIds), (entryId) =>
+): string | null {
+  if (!openSessionId) return null;
+  return leavingAncestorOf(openSessionId, new Set(leavingIds), (entryId) =>
     parentOf(queryClient, entryId),
   );
 }

@@ -249,7 +249,7 @@ import {
   sidebarEntryPaletteCommands,
 } from "./sidebarEntryCommands";
 import {
-  isLeavingOpenSession,
+  leavingRowOfOpenSession,
   leaveSessionView,
   navigateAfterArchiving,
   newSessionPathFor,
@@ -8271,15 +8271,15 @@ function BulkActionBar({
     // and it would carry a stale `activeId` that could jump the user off a
     // session they switched to meanwhile. Mirrors handleDelete.
     const leavingIds = toArchive.map((c) => c.id);
-    if (isLeavingOpenSession(queryClient, activeId, leavingIds)) {
+    // An open sub-agent leaves with its selected ancestor, so New session follows that row.
+    const leavingOpenRow = leavingRowOfOpenSession(queryClient, activeId, leavingIds);
+    const openRow = toArchive.find((c) => c.id === leavingOpenRow);
+    if (openRow) {
       navigateAfterArchiving({
         leavingIds,
         source: "bulk",
         navigate,
-        newSessionPath: newSessionPathFor(
-          queryClient,
-          toArchive.find((c) => c.id === activeId) ?? toArchive[0],
-        ),
+        newSessionPath: newSessionPathFor(queryClient, openRow),
         queryClient,
       });
     }
