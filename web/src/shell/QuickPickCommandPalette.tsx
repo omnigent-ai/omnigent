@@ -242,6 +242,19 @@ export function QuickPickCommandPalette({
       : [];
 
   const { visibleSessions, contentSessions, showingServerMatches } = search;
+  // The search's rows, as the root and the session picker both list them.
+  const sessionSearchItems = {
+    sessions: [
+      ...visibleSessions.map((session) => sessionItem(session, "Sessions")),
+      ...(showingServerMatches
+        ? showMoreItem("title", titleSearch, visibleSessions, "Sessions")
+        : []),
+    ],
+    messages: [
+      ...contentSessions.map((session) => sessionItem(session, "In messages")),
+      ...showMoreItem("content", contentSearch, contentSessions, "In messages"),
+    ],
+  };
   const activePage = (() => {
     switch (childPage?.kind) {
       case "setting-choices":
@@ -252,14 +265,7 @@ export function QuickPickCommandPalette({
         return optionsPage;
       case "pick-session":
         return {
-          items: [
-            ...visibleSessions.map((session) => sessionItem(session, "Sessions")),
-            ...(showingServerMatches
-              ? showMoreItem("title", titleSearch, visibleSessions, "Sessions")
-              : []),
-            ...contentSessions.map((session) => sessionItem(session, "In messages")),
-            ...showMoreItem("content", contentSearch, contentSessions, "In messages"),
-          ],
+          items: [...sessionSearchItems.sessions, ...sessionSearchItems.messages],
           back: leavePaletteChildPage,
         };
       default:
@@ -272,21 +278,13 @@ export function QuickPickCommandPalette({
       sourceId: "sessions",
       ranking: "provider",
       origin: "source",
-      items: [
-        ...visibleSessions.map((session) => sessionItem(session, "Sessions")),
-        ...(showingServerMatches
-          ? showMoreItem("title", titleSearch, visibleSessions, "Sessions")
-          : []),
-      ],
+      items: sessionSearchItems.sessions,
     },
     {
       sourceId: "messages",
       ranking: "provider",
       origin: "source",
-      items: [
-        ...contentSessions.map((session) => sessionItem(session, "In messages")),
-        ...showMoreItem("content", contentSearch, contentSessions, "In messages"),
-      ],
+      items: sessionSearchItems.messages,
     },
     {
       // One segment for every command, so the best match leads whichever group it's in: an
@@ -439,11 +437,12 @@ export function QuickPickCommandPalette({
         )}
       </p>
     ) : null;
-  // As in today's palette, a load error or loading message stands in for the empty one.
-  const rootEmptyMessage = (): string | null => {
+  // As in today's palette, a load error or loading message stands in for the empty one; the
+  // session picker searches as the root does, so it says the same while it waits.
+  const searchEmptyMessage = (nothingFound: string): string | null => {
     if (loadStatus) return null;
     if (search.pullRequestLookup) return PULL_REQUEST_NOT_FOUND;
-    return search.searchFetching ? "Searching…" : "No results found";
+    return search.searchFetching ? "Searching…" : nothingFound;
   };
   // The cap stays visible with a load message, so hidden matches are never a surprise.
   const capStatus = sessionsOnly && search.sessions.length > search.visibleSessions.length && (
@@ -540,7 +539,13 @@ export function QuickPickCommandPalette({
       activeId={parkedId}
       onActiveIdChange={() => setParkedId(null)}
       inputTestId="command-palette-input"
-      emptyMessage={childPage ? (optionsPage.empty ?? pageCopy?.empty) : rootEmptyMessage()}
+      emptyMessage={
+        !childPage
+          ? searchEmptyMessage("No results found")
+          : picking
+            ? searchEmptyMessage(CHILD_PAGE_COPY["pick-session"].empty)
+            : (optionsPage.empty ?? pageCopy?.empty)
+      }
       status={childPage && !picking ? undefined : status}
       listEnd={childPage ? undefined : olderSessions}
       inputEnd={

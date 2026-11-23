@@ -13,7 +13,7 @@ import { openPaletteDialog } from "@/test/paletteCommands";
 
 import { usePaletteCommands, usePaletteCommandsStore } from "@/store/paletteCommands";
 
-import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
+import { PULL_REQUEST_NOT_FOUND, QuickPickCommandPalette } from "./QuickPickCommandPalette";
 import { OWNER_ONLY_REASONS, UNKNOWN_OWNER_REASON } from "./sessionCommands/model";
 import {
   latestSessionActionRequest,
@@ -493,6 +493,20 @@ describe("QuickPick ⌘K verb-first session actions", () => {
         expect.objectContaining({ enabled: true }),
       ),
     );
+  });
+
+  it("says Searching… while the server looks, and when no session links a pasted pull request", async () => {
+    useSessionSearch.mockImplementation((...args: unknown[]) => ({
+      isFetching: args[0] === "quarterly",
+    }));
+    const { input } = renderWithPicks();
+    fireEvent.change(input, { target: { value: "rename a session" } });
+    fireEvent.click(await screen.findByRole("option", { name: /^Rename a Session…/ }));
+    await waitFor(() => expect(heading()).toBe("Rename which session?"));
+    fireEvent.change(input, { target: { value: "quarterly" } });
+    expect(await screen.findByText("Searching…")).toBeInTheDocument();
+    fireEvent.change(input, { target: { value: "#999" } });
+    expect(await screen.findByText(PULL_REQUEST_NOT_FOUND)).toBeInTheDocument();
   });
 
   it("goes back from the session picker to the row that opened it, with its query", async () => {
