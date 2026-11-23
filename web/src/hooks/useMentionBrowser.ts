@@ -1,7 +1,9 @@
 import { type RefObject, useEffect, useRef, useState } from "react";
-import type {
-  ComposerKeyboardEvent,
-  ComposerTextTarget,
+import {
+  type ComposerInputEvent,
+  type ComposerKeyboardEvent,
+  type ComposerTextTarget,
+  isHistoryInput,
 } from "@/components/composer/engine/composerInput";
 
 import {
@@ -18,6 +20,7 @@ import {
   sessionMentionToken,
   type TaggedMentions,
 } from "@/lib/composerMentions";
+import { insertComposerText } from "@/lib/composerText";
 import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 
@@ -104,6 +107,8 @@ export interface MentionBrowser {
   mentionTokens: string[];
   /** Backspace at or inside a token deletes it whole; returns true when it did. */
   handleTokenBackspace: (e: ComposerKeyboardEvent) => boolean;
+  /** Untag a pick that an undo reverted; call it from the input's change handler. */
+  untagUndonePicks: (event: ComposerInputEvent) => void;
   /** Handle a key event for the open menu; returns true when it consumed it. */
   handleKeyDown: (e: ComposerKeyboardEvent) => boolean;
   /** Dismiss the menu (e.g. on blur). */
@@ -230,6 +235,34 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [segmentsKey, mentionedItems, mentionedSessions]);
 
+  // Edit the input as typed text so Undo can restore what was replaced; a new value set
+  // through state would clear the undo history.
+  const replaceText = (start: number, end: number, replacement: string) => {
+    const target = textareaRef.current;
+    if (target) {
+      target.focus();
+      if (insertComposerText(target, replacement, start, end)) return;
+    }
+    setText(text.slice(0, start) + replacement + text.slice(end));
+  };
+
+  // The draft each tagging pick replaced. Undo can restore a typed name that is already the
+  // token, so returning to that draft is what untags the pick.
+  const draftBeforePickRef = useRef(new Map<string, string>());
+
+  const untagUndonePicks = (event: ComposerInputEvent) => {
+    if (!isHistoryInput(event)) return;
+    const value = event.currentTarget.value;
+    const undone = new Set<string>();
+    for (const [token, draft] of draftBeforePickRef.current) {
+      if (draft === value) undone.add(token);
+    }
+    if (undone.size === 0) return;
+    for (const token of undone) draftBeforePickRef.current.delete(token);
+    setMentionedItems((prev) => prev.filter((it) => !undone.has(fileMentionToken(it))));
+    setMentionedSessions((prev) => prev.filter((it) => !undone.has(it.token ?? `@${it.title}`)));
+  };
+
   const placeCaret = (caret: number) =>
     queueMicrotask(() => {
       const ta = textareaRef.current;
@@ -238,10 +271,13 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     });
 
   // Swap the typed "@query" for the token plus one space, caret after it.
-  const insertToken = (active: MentionState, token: string) => {
+  const insertToken = (active: MentionState, token: string, addsTag: boolean) => {
     const after = text.slice(active.end);
     const gap = /^\s/.test(after) ? "" : " ";
-    setText(text.slice(0, active.start) + token + gap + after);
+    if (addsTag && text.slice(active.start, active.end) !== token + gap) {
+      draftBeforePickRef.current.set(token, text);
+    }
+    replaceText(active.start, active.end, token + gap);
     setMention(null);
     setMentionIndex(-1);
     placeCaret(active.start + token.length + 1);
@@ -252,7 +288,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     const existing = mentionedSessions.find((it) => it.id === session.id);
     const token = existing?.token ?? sessionMentionToken(session, mentionTokens);
     if (!existing) setMentionedSessions((prev) => [...prev, { ...session, token }]);
-    insertToken(mention, token);
+    insertToken(mention, token, !existing);
   };
 
   const handleTokenBackspace = (e: ComposerKeyboardEvent): boolean => {
@@ -263,7 +299,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     if (!range) return false;
     e.preventDefault();
     const next = text.slice(0, range.start) + text.slice(range.end);
-    setText(next);
+    replaceText(range.start, range.end, "");
     // The deleted token may have been the active "@" query; recompute it so a
     // following Enter can't complete a mention that no longer exists.
     setMention(detectMentionAt(next, range.start));
@@ -285,14 +321,13 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
       token: newFileMentionToken({ path, isDir }, mentionTokens),
     };
     if (!existing) setMentionedItems((prev) => [...prev, item]);
-    insertToken(mention, fileMentionToken(item));
+    insertToken(mention, fileMentionToken(item), !existing);
   };
 
   const openMentionDir = (path: string) => {
     if (!mention) return;
     const inserted = `@${path}/`;
-    const next = text.slice(0, mention.start) + inserted + text.slice(mention.end);
-    setText(next);
+    replaceText(mention.start, mention.end, inserted);
     const caret = mention.start + inserted.length;
     setMention({ query: `${path}/`, start: mention.start, end: caret });
     setMentionIndex(0);
@@ -395,6 +430,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     attachSession,
     mentionTokens,
     handleTokenBackspace,
+    untagUndonePicks,
     handleKeyDown,
     dismiss,
   };

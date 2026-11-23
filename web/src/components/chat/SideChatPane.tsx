@@ -1227,6 +1227,7 @@ function SideChatComposer({
     attachSession,
     handleKeyDown: handleMentionKeyDown,
     handleTokenBackspace,
+    untagUndonePicks,
     dismiss: dismissMention,
   } = useMentionBrowser({
     mention,
@@ -1567,6 +1568,7 @@ function SideChatComposer({
             if (commandNotice !== null) setCommandNotice(null);
             slashCompletion.onSelectionChange(event.currentTarget);
             setText(event.currentTarget.value);
+            untagUndonePicks(event);
             if (gridCell)
               setTypedMention(
                 detectMentionAt(

@@ -5650,6 +5650,7 @@ function NewChatLandingContent({
     attachSession,
     mentionTokens,
     handleTokenBackspace,
+    untagUndonePicks,
     handleKeyDown: handleMentionKeyDown,
     dismiss: dismissMention,
   } = useMentionBrowser({
@@ -7651,6 +7652,7 @@ function NewChatLandingContent({
                 onChange: (e) => {
                   slashCompletion.onSelectionChange(e.currentTarget);
                   setMessage(e.currentTarget.value);
+                  untagUndonePicks(e);
                   // A rejected attachment is never added, so there's no chip to
                   // remove and nothing else would ever clear this. Left sticky it
                   // reads as a blocker on a composer the user can actually submit.

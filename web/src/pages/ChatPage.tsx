@@ -3212,6 +3212,7 @@ function ComposerImpl(
     attachSession,
     mentionTokens,
     handleTokenBackspace,
+    untagUndonePicks,
     handleKeyDown: handleMentionKeyDown,
     dismiss: dismissMention,
   } = useMentionBrowser({
@@ -4400,6 +4401,7 @@ function ComposerImpl(
     const input = e.currentTarget;
     slashCompletion.onSelectionChange(input);
     editText(id, input.value);
+    untagUndonePicks(e);
     dirtyRef.current = true;
     if (commandError !== null) setCommandError(null);
     if (attachmentError !== null) clearError();
