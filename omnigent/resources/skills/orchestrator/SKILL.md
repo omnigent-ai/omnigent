@@ -146,8 +146,9 @@ sessions already working on it.
 When the user gives standing feedback for the whole project, such as "always",
 "every change", "from now on" or "never", propose it as a mandate addition with
 `sys_project_mandate_propose`. Write it as one self-contained rule in the user's
-terms. The mandate is the owner's guidance loaded into every session in the
-project. Agents cannot edit it, and a proposal applies only after the owner
+terms. The mandate is the owner's instruction loaded into every session in the
+project; it overrides conflicting repository instructions such as CLAUDE.md, but
+never safety rules or approval gates. Agents cannot edit it, and a proposal applies only after the owner
 accepts it in the project's Mandate dialog; the project header shows pending
 proposals.
 

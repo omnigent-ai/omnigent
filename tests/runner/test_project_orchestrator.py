@@ -150,7 +150,9 @@ async def test_mandate_is_labeled_and_ordered_before_ticket_guidance_and_role(pr
     mandate = project_mandate_instruction(snapshot["project_mandate"])
     assert mandate is not None
     assert mandate.startswith("## Project mandate\n")
-    assert "stay within the mandate" in mandate
+    assert "the project owner's instruction" in mandate
+    assert "takes precedence over conflicting instructions" in mandate
+    assert "never overrides safety rules, permission prompts or approval gates" in mandate
     assert "cannot widen it" in mandate
     assert mandate.endswith(
         "<project_mandate>\nOnly edit files under docs/.\n\n## Style\n"
