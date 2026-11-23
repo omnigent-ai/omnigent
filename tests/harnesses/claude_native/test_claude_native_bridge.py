@@ -13821,6 +13821,7 @@ def test_managed_model_status_check_preserves_exact_context_identity(
         (True, True, True, 1, "missing-catalog"),
         (True, False, None, 1, "missing-catalog"),
         (True, True, True, 1, "empty-catalog"),
+        (True, True, True, 4, "captured-context"),
     ],
     ids=[
         "fresh-same-model",
@@ -13833,6 +13834,7 @@ def test_managed_model_status_check_preserves_exact_context_identity(
         "undiscovered-current",
         "undiscovered-stale-target-hint",
         "empty-catalog-current",
+        "consecutive-unmarked-context-with-native-picker",
     ],
 )
 def test_model_command_uses_a_fresh_status_for_same_model_requests(
@@ -13846,10 +13848,15 @@ def test_model_command_uses_a_fresh_status_for_same_model_requests(
 ) -> None:
     owned_draft = "blocked prompt" if catalog == "configured-default" else None
     composer = _SessionModelComposer(draft=owned_draft or "")
+    captured_context = catalog == "captured-context"
+    if captured_context:
+        composer.options[-1] = "opus"
+        composer.resolved_models["opus"] = "system.ai.claude-opus-4-8[1m]"
+        composer.highlight = 1
     if catalog in {"observed-default", "missing-catalog", "empty-catalog"}:
         composer.options[-1] = "system.ai.claude-sonnet-4-6"
     bridge_dir = _session_model_bridge(tmp_path, composer)
-    target = composer.options[-1]
+    target = composer.resolved_models.get(composer.options[-1], composer.options[-1])
     if catalog == "missing-catalog":
         config_path = bridge_dir / claude_native_bridge._CONFIG_FILE
         config = json.loads(config_path.read_text())
@@ -13867,7 +13874,7 @@ def test_model_command_uses_a_fresh_status_for_same_model_requests(
             picker_options=[],
         )
         assert target not in claude_native_bridge.read_model_picker_values(bridge_dir)
-    elif catalog != "picker":
+    elif catalog not in {"picker", "captured-context"}:
         descriptors = claude_native_bridge.read_model_picker_options(bridge_dir)
         assert descriptors is not None
         rows = [
@@ -13890,6 +13897,24 @@ def test_model_command_uses_a_fresh_status_for_same_model_requests(
     if actual_target:
         composer.model = target
     composer.install(monkeypatch)
+    reported = target
+    attempts = 2 if captured_context else 1
+    if captured_context:
+        recorded = json.loads(
+            (
+                Path(__file__).parent / "fixtures" / "claude-model-picker-current-context.json"
+            ).read_text()
+        )
+        reported = "opus (system.ai.claude-opus-4-8)"
+
+        def capture(socket_path: str, target: str) -> str:
+            if composer.overlay == "picker":
+                return recorded["picker"]
+            pane = composer._capture_pane(socket_path, target)
+            return pane.replace(f"Model: {composer.model}", f"Model: {reported}")
+
+        monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    saved_default = composer.saved_default
 
     if already_selected is None:
         with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
@@ -13904,16 +13929,22 @@ def test_model_command_uses_a_fresh_status_for_same_model_requests(
             assert "automatic model changes" in str(caught.value)
         assert composer.model == (target if actual_target else composer.options[0])
     else:
-        result = claude_native_bridge.inject_model_command(
-            bridge_dir, model=target, owned_draft=owned_draft
-        )
-        assert result.already_selected is already_selected
-        assert result.resolved_model == result.status_model == composer.model == target
-        assert result.session_id == composer.session
-        assert composer.text == ""
+        for _ in range(attempts):
+            result = claude_native_bridge.inject_model_command(
+                bridge_dir, model=target, owned_draft=owned_draft
+            )
+            assert result.already_selected is already_selected
+            assert result.resolved_model == composer.model == target
+            assert result.status_model == reported
+            assert result.session_id == composer.session
+            assert composer.text == ""
 
     assert composer.status_queries == status_queries
-    if catalog != "picker":
+    assert composer.saved_default == saved_default
+    if captured_context:
+        assert composer.submitted == ["/status", "/model", "/status"] * attempts
+        assert [args[-1] for args in composer.sends].count("s") == attempts
+    elif catalog != "picker":
         assert [args[-1] for args in composer.sends] == (
             ([_CLEAR_ONE_ROW_COMPOSER] if owned_draft else [])
             + (["/status", "Enter", "Escape"] if status_queries else [])
@@ -13921,6 +13952,76 @@ def test_model_command_uses_a_fresh_status_for_same_model_requests(
     else:
         assert composer.submitted[-1] == "/status"
         assert [args[-1] for args in composer.sends].count("s") == (0 if already_selected else 1)
+
+
+@pytest.mark.parametrize(
+    "variation",
+    [
+        "exact",
+        "exact-private",
+        "no-marker",
+        "marker-in-description",
+        "two-current-rows",
+        "two-marks",
+        "other-current-row",
+        "wrong-context",
+        "private-case",
+        "public-caption",
+        "unstructured-caption",
+        "private-caption",
+        "glyph-in-label",
+    ],
+)
+def test_current_context_requires_a_unique_exact_active_picker_row(
+    tmp_path: Path, variation: str
+) -> None:
+    recorded = json.loads(
+        (
+            Path(__file__).parent / "fixtures" / "claude-model-picker-current-context.json"
+        ).read_text()
+    )
+    model = "system.ai.claude-opus-4-8[1m]"
+    label = "Opus 4.8"
+    pane = recorded["picker"]
+    if variation == "no-marker":
+        pane = pane.replace(" ✔", "")
+    elif variation == "marker-in-description":
+        pane = pane.replace("Opus 4.8 ✔", "Opus 4.8").replace("Custom Opus", "✔ Custom Opus")
+    elif variation == "two-current-rows":
+        pane = pane.replace("Sonnet 4 ", "Sonnet 4 ✔ ")
+    elif variation == "two-marks":
+        pane = pane.replace("Opus 4.8 ✔", "Opus 4.8 ✔ ✔")
+    elif variation == "other-current-row":
+        pane = pane.replace("Opus 4.8 ✔", "Opus 4.8").replace("Sonnet 4 ", "Sonnet 4 ✔ ")
+    elif variation == "wrong-context":
+        pane = pane.replace(model, model.removesuffix("[1m]"))
+    elif variation in {"private-case", "exact-private"}:
+        pane = pane.replace(model, "Private-Model[1M]")
+        model = "private-model[1M]" if variation == "private-case" else "Private-Model[1M]"
+    elif variation.endswith("caption"):
+        label = "Opus 4.8 (1M context)"
+        row = next(line for line in pane.splitlines() if "❯ 2." in line)
+        pane = pane.replace(row, f"  ❯ 2. {label} ✔  Available model")
+        if variation == "private-caption":
+            model = "private-model[1m]"
+    elif variation == "glyph-in-label":
+        label += " ✔"
+    picker = claude_model_switch._picker(pane)
+    assert picker is not None
+    switch = claude_model_switch.SessionOnlyModelSwitch(
+        tmp_path,
+        model=model,
+        deadline=claude_model_switch.ModelSwitchDeadline(1, None, time.monotonic),
+        ready_timeout_s=None,
+        owned_draft=None,
+    )
+    switch.choice = claude_model_switch._Target(
+        model, model, label, variation != "unstructured-caption"
+    )
+
+    assert switch.current_picker_confirms_context(picker) is (
+        variation in {"exact", "exact-private", "public-caption"}
+    )
 
 
 @pytest.mark.parametrize(
@@ -14054,6 +14155,7 @@ def test_model_command_requires_exact_fresh_status_for_a_descriptorless_current_
 )
 @pytest.mark.parametrize("initial_model", ["marked", "plain", "different"])
 @pytest.mark.parametrize("selection_applied", [False, True])
+@pytest.mark.parametrize("current_marker", [False, True])
 def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -14062,8 +14164,10 @@ def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
     reported: str,
     initial_model: str,
     selection_applied: bool,
+    current_marker: bool,
 ) -> None:
     composer = _SessionModelComposer()
+    composer.show_current_selection = current_marker
     composer.options[-1] = model
     bare_model = model.removesuffix("[1m]").removesuffix("[1M]")
     if initial_model != "different":
@@ -14104,9 +14208,10 @@ def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
     if not selection_applied:
         monkeypatch.setattr(claude_native_bridge, "_run_tmux", close_without_applying)
 
-    if initial_model == "different" and selection_applied:
+    context_was_active = initial_model == "marked" and current_marker
+    if (initial_model == "different" and selection_applied) or context_was_active:
         result = claude_native_bridge.inject_model_command(bridge_dir, model=model)
-        assert not result.already_selected
+        assert result.already_selected is context_was_active
         assert result.resolved_model == model
         assert result.status_model == reported
     else:

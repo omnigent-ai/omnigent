@@ -1,0 +1,11 @@
+{
+  "source_run": "https://github.com/omnigent-ai/omnigent/actions/runs/45214301504",
+  "source_head": "566f1c157c4370045326d8ae267d57b0358443ca",
+  "deployment": "isolated OSS CI",
+  "provider": "scripted mock",
+  "workflow_cli_version": "2.1.323",
+  "running_cli_version": "2.1.323",
+  "columns": 105,
+  "capture": "Native picker panel after the first successful 1M selection and user turn; transcript and paths omitted.",
+  "picker": "  Select model\n  Switch between Claude models. Your pick becomes the default for new sessions. For other/previous\n  model names, specify with --model.\n\n    1. Default (recommended)  Use the default model (currently Opus 4.8) · $5/$25 per Mtok\n  ❯ 2. Opus 4.8 ✔             Custom Opus model (system.ai.claude-opus-4-8[1m])\n    3. Fable                  Fable 5.2 · Most capable for your hardest and longest-running tasks ·\n                              $8/$40 per Mtok\n    4. Sonnet 4               Custom Sonnet model (claude-sonnet-4-20250514)\n    5. Haiku                  Haiku 5.5 · Fastest for quick answers · $0.10/$0.50 per Mtok ($0.50/$2.50\n                              for prompts over 100k)\n\n  ● High effort (default) ←/→ to adjust\n\n  Enter to set as default · s to use this session only · Esc to cancel\n"
+}

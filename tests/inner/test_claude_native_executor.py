@@ -1379,6 +1379,7 @@ async def test_run_turn_passes_the_exact_required_model_to_the_shared_picker(
         "undiscovered-stale",
         "context-public-not-applied",
         "context-private-not-applied",
+        "context-already-active",
     ],
 )
 async def test_run_turn_requires_a_matching_model_selection_result(
@@ -1396,10 +1397,13 @@ async def test_run_turn_requires_a_matching_model_selection_result(
         elif receipt_kind.startswith("context-"):
             target = (
                 "claude-sonnet-5-5[1m]"
-                if receipt_kind == "context-public-not-applied"
+                if receipt_kind in {"context-public-not-applied", "context-already-active"}
                 else "private-model[1m]"
             )
-            composer.model = target.removesuffix("[1m]")
+            composer.model = (
+                target if receipt_kind == "context-already-active" else target.removesuffix("[1m]")
+            )
+            composer.show_current_selection = True
         else:
             target = "system.ai.claude-sonnet-4-6"
         composer.options[-1] = target
@@ -1419,6 +1423,16 @@ async def test_run_turn_requires_a_matching_model_selection_result(
                 composer.model = composer.options[0]
         composer.install(monkeypatch)
         if receipt_kind.startswith("context-"):
+
+            def capture(socket_path: str, tmux_target: str) -> str:
+                pane = composer._capture_pane(socket_path, tmux_target)
+                if composer.overlay == "status":
+                    return pane.replace(
+                        f"Model: {composer.model}", f"Model: {target.removesuffix('[1m]')}"
+                    )
+                return pane
+
+            monkeypatch.setattr(claude_bridge, "_capture_pane", capture)
 
             def close_without_applying(socket_path: str, *args: str) -> None:
                 if composer.overlay == "picker" and args[-1] == "s":
@@ -1452,20 +1466,29 @@ async def test_run_turn_requires_a_matching_model_selection_result(
         "inject_user_message",
         lambda _bridge, *, content, timeout_s=30.0: delivered.append(content),
     )
-    events = [
-        event
-        async for event in ClaudeNativeExecutor(bridge_dir).run_turn(
-            messages=[{"role": "user", "content": "hello"}],
-            tools=[],
-            system_prompt="",
-            config=ExecutorConfig(model=target),
+    attempts = 2 if receipt_kind == "context-already-active" else 1
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = []
+    for attempt in range(attempts):
+        events.extend(
+            [
+                event
+                async for event in executor.run_turn(
+                    messages=[{"role": "user", "content": f"hello {attempt}"}],
+                    tools=[],
+                    system_prompt="",
+                    config=ExecutorConfig(model=target),
+                )
+            ]
         )
-    ]
 
-    accepted = receipt_kind.startswith("older-cli-") or receipt_kind == "undiscovered-current"
+    accepted = receipt_kind.startswith("older-cli-") or receipt_kind in {
+        "undiscovered-current",
+        "context-already-active",
+    }
     if accepted:
-        assert events == [TurnComplete(response=None)]
-        assert delivered == ["hello"]
+        assert events == [TurnComplete(response=None)] * attempts
+        assert delivered == [f"hello {attempt}" for attempt in range(attempts)]
     else:
         assert len(events) == 1 and isinstance(events[0], ExecutorError)
         assert events[0].undelivered and events[0].preserve_session
@@ -1485,9 +1508,10 @@ async def test_run_turn_requires_a_matching_model_selection_result(
         assert composer.saved_default == initial_default
         assert [command for command in composer.submitted if command] == ["/status"]
     elif receipt_kind.startswith("context-"):
-        assert composer.model == target.removesuffix("[1m]")
-        assert composer.submitted == ["/status", "/model", "/status"]
-        assert [args[-1] for args in composer.sends].count("s") == 1
+        assert composer.model == (target if accepted else target.removesuffix("[1m]"))
+        assert composer.saved_default == initial_default
+        assert composer.submitted == ["/status", "/model", "/status"] * attempts
+        assert [args[-1] for args in composer.sends].count("s") == attempts
 
 
 @pytest.mark.asyncio

@@ -194,6 +194,11 @@ def _row_label(row: _PickerRow) -> str:
     return re.split(r"\s{2,}", row.text, maxsplit=1)[0].replace("✔", "").strip()
 
 
+def _row_is_current(row: _PickerRow) -> bool:
+    caption = re.split(r"\s{2,}", row.text, maxsplit=1)[0]
+    return caption.endswith(" ✔") and row.text.count("✔") == 1
+
+
 def _cache_cost_model_label(model: object) -> str | None:
     """Read the native confirmation name from one exact versioned Claude ID."""
     if not isinstance(model, str):
@@ -726,6 +731,26 @@ class SessionOnlyModelSwitch:
             already_selected,
         )
 
+    def current_picker_confirms_context(self, picker: _Picker) -> bool:
+        """Require the active marker and an explicit matching context identity."""
+        if any(
+            "✔" in text for text in (self.choice.model, self.choice.value, self.choice.label or "")
+        ):
+            return False
+        current = [row for row in picker.rows if _row_is_current(row)]
+        if current != [picker.selected] or sum(self.row_matches(row) for row in picker.rows) != 1:
+            return False
+        identities = re.findall(r"\(([^()\r\n]+)\)", picker.selected.text)
+        if any(self.status_matches(identity, exact_context=True) for identity in identities):
+            return True
+        caption = _row_label(picker.selected)
+        return bool(
+            self.choice.structured
+            and public_claude_model_id(self.choice.model)
+            and self.choice.label == caption
+            and re.search(r"\(1M context\)$", caption, re.IGNORECASE)
+        )
+
     def run(self) -> ClaudeModelSwitchResult:
         try:
             return self._run()
@@ -852,6 +877,7 @@ class SessionOnlyModelSwitch:
             lambda text: _picker(text) is not None, seconds=_IMMEDIATE_PICKER_TIMEOUT_S
         )
         visited: set[tuple[int, str]] = set()
+        context_was_active = False
         while True:
             picker = _picker(pane)
             assert picker is not None
@@ -870,6 +896,11 @@ class SessionOnlyModelSwitch:
                         "The highlighted model changed before selection. Retry explicitly."
                     )
                 self.owned_picker = latest
+                context_was_active = (
+                    before_selection is not None
+                    and self.status_matches(before_selection, exact_context=False)
+                    and self.current_picker_confirms_context(latest)
+                )
                 self.phase = "commit"
                 self.commit_attempted = True
                 self.send("s", literal=True)
@@ -893,6 +924,7 @@ class SessionOnlyModelSwitch:
         ambiguous_context = (
             claude_picker_model_key(self.choice.model).endswith("[1m]")
             and not self.status_matches(current, exact_context=True)
+            and not context_was_active
             and (
                 before_selection is None
                 or self.status_matches(before_selection, exact_context=False)
@@ -903,4 +935,4 @@ class SessionOnlyModelSwitch:
                 f"Claude's fresh status reports {current}, so the switch to {self.model} "
                 "is unconfirmed. The dependent prompt was not sent."
             )
-        return self.result(current)
+        return self.result(current, already_selected=context_was_active)

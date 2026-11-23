@@ -235,6 +235,7 @@ class _SessionModelComposer(_EditableComposer):
         self.prompt_separator = prompt_separator
         self.sends: list[tuple[str, ...]] = []
         self.status_queries = 0
+        self.show_current_selection = False
         self.session = "native-session"
         self.version = "2.1.323"
         self.cache_cost_label = cache_cost_label
@@ -321,14 +322,19 @@ class _SessionModelComposer(_EditableComposer):
             assert self.cache_cost_label is not None
             return _cache_cost_confirmation_pane(self.cache_cost_label)
         if self.overlay == "picker":
-            rows = "\n".join(
-                f"   {'❯' if index == self.highlight else ' '} {index + 1}.  "
-                f"{self.picker_labels.get(model, f'Choice {index}')}  "
-                f"Managed by your organization ({model})"
-                for index, model in enumerate(self.options)
-            )
+            rows = []
+            for index, model in enumerate(self.options):
+                current = (
+                    self.show_current_selection
+                    and self.resolved_models.get(model, model) == self.model
+                )
+                label = self.picker_labels.get(model, f"Choice {index}")
+                rows.append(
+                    f"   {'❯' if index == self.highlight else ' '} {index + 1}.  "
+                    f"{label}{' ✔' if current else ''}  Managed by your organization ({model})"
+                )
             return (
-                "   Select model\n" + rows + "\n"
+                "   Select model\n" + "\n".join(rows) + "\n"
                 "   Enter to set as default · s to use this session only · Esc to cancel\n"
             )
         if self.overlay == "status":
