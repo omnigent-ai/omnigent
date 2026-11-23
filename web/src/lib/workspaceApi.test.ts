@@ -1002,7 +1002,14 @@ describe("searchTextViaWorkspaceApi", () => {
     const found = await searchTextViaWorkspaceApi("s-text", "needle", TEXT_OPTIONS);
 
     expect(requests).toEqual([
-      expect.objectContaining({ query: "needle", caseSensitive: true, include: "src/**" }),
+      expect.objectContaining({
+        query: "needle",
+        caseSensitive: true,
+        include: "src/**",
+        // Walk order unless the caller asks for priority.
+        order: SearchOrder.UNSPECIFIED,
+        focusedPaths: [],
+      }),
     ]);
     expect(found).toEqual({
       matches: [1, 2, 3].map((line) => ({
@@ -1019,19 +1026,13 @@ describe("searchTextViaWorkspaceApi", () => {
   });
 
   it.each([
-    [
-      "sends the priority order when asked",
-      { focusedPaths: ["src/a.ts"], changedAgainst: ComparisonKind.BRANCH_POINT },
-    ],
-    ["keeps walk order otherwise", undefined],
-  ])("%s", async (_case, priority) => {
+    ["a host that searches in priority order", ["SearchText", "text_search_priority"]],
+    ["an older host, which searches in walk order instead", ["SearchText"]],
+  ])("sends the priority order to %s", async (_case, listed) => {
     enable("workspace_api_server_access", "workspace_content_search");
     const requests: object[] = [];
     serveMethods({
-      GetCapabilities: () =>
-        new Response(capabilitiesBody("SearchText", "text_search_priority"), {
-          headers: PROTO_HEADERS,
-        }),
+      GetCapabilities: () => new Response(capabilitiesBody(...listed), { headers: PROTO_HEADERS }),
       SearchText: (body) => {
         requests.push(fromBinary(SearchTextRequestSchema, envelopePayload(body)));
         return new Response(textMatches({ matches: [match(1)], done: true }), {
@@ -1040,19 +1041,20 @@ describe("searchTextViaWorkspaceApi", () => {
       },
     });
 
-    const sessionId = priority ? "s-text-priority" : "s-text-walk";
-    await searchTextViaWorkspaceApi(sessionId, "needle", { ...TEXT_OPTIONS, priority });
+    const priority = { focusedPaths: ["src/a.ts"], changedAgainst: ComparisonKind.BRANCH_POINT };
+    const found = await searchTextViaWorkspaceApi(`s-text-priority-${listed.length}`, "needle", {
+      ...TEXT_OPTIONS,
+      priority,
+    });
 
-    expect(requests).toHaveLength(1);
-    expect(requests[0]).toMatchObject(
-      priority
-        ? {
-            order: SearchOrder.PRIORITY,
-            focusedPaths: ["src/a.ts"],
-            changedAgainst: ComparisonKind.BRANCH_POINT,
-          }
-        : { order: SearchOrder.UNSPECIFIED, focusedPaths: [] },
-    );
+    expect(requests).toEqual([
+      expect.objectContaining({
+        order: SearchOrder.PRIORITY,
+        focusedPaths: ["src/a.ts"],
+        changedAgainst: ComparisonKind.BRANCH_POINT,
+      }),
+    ]);
+    expect(found?.matches).toHaveLength(1);
   });
 
   it("leaves a stream that ends without its last message to REST, then stops asking", async () => {
