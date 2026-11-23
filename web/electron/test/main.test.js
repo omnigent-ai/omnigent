@@ -3830,7 +3830,7 @@ function asPanelWindow(h) {
       h.emitWindow("closed");
     },
   });
-  Object.assign(h.webContents, { isCrashed: () => false, focus() {} });
+  Object.assign(h.webContents, { isCrashed: () => false, focus() {}, isDestroyed: () => false });
   const display = { id: 1, workArea: { x: 0, y: 0, width: 1440, height: 900 } };
   Object.assign(h.electron.screen, {
     getAllDisplays: () => [display],

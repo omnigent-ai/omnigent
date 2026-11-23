@@ -371,6 +371,8 @@ export interface FloatingComposerBridge {
   filePicker: (state: "open" | "closed") => void;
   /** From the panel: its composer rendered, so the shell shows it without a loading state. Newer shells only. */
   ready?: () => void;
+  /** To the panel: it came on screen or took the keyboard again. Returns an unsubscribe. Newer shells only. */
+  onShown?: (callback: () => void) => () => void;
 }
 
 /** Native menu commands the desktop shell hands to the page (see lib/desktopCommands). */

@@ -15,6 +15,8 @@
 const { FLOATING_COMPOSER_SIZE, placeFloatingComposer } = require("./floating_composer_frame");
 
 const FLOATING_COMPOSER_PATH = "/compose/floating";
+/** Sent to the panel's page each time the panel takes the keyboard, so its prompt does too. */
+const FLOATING_COMPOSER_SHOWN_CHANNEL = "omnigent:floating-composer:shown";
 const FRAME_SETTINGS_KEY = "floating_composer_frames";
 const SESSION_PATH = /^\/c\/[A-Za-z0-9_-]{1,128}$/;
 /** App pages the panel's own links lead to; they open in a main window. */
@@ -229,7 +231,10 @@ function createFloatingComposerController(deps) {
    * to whatever app had it.
    */
   function takeKeyboard(panel) {
+    if (panel.isDestroyed()) return;
     panel.webContents.focus();
+    // To its current document only; a page still loading focuses its prompt once it renders.
+    if (!panel.webContents.isDestroyed()) panel.webContents.send(FLOATING_COMPOSER_SHOWN_CHANNEL);
   }
 
   function serverUrlFor(win) {
@@ -480,6 +485,7 @@ module.exports = {
   FLOATING_COMPOSER_PRELOAD_DELAY_MS,
   FLOATING_COMPOSER_READY_FALLBACK_MS,
   FLOATING_COMPOSER_PATH,
+  FLOATING_COMPOSER_SHOWN_CHANNEL,
   FRAME_SETTINGS_KEY,
   createFloatingComposerController,
   createFloatingComposerPreloader,

@@ -11,7 +11,8 @@ off by default.
 
 - `open`: ⇧⌘Space from any app shows the panel on the pointer's display without
   activating Omnigent; pressing it again while the panel is up focuses it rather
-  than hiding it.
+  than hiding it. Whenever the panel takes the keyboard, the prompt does too,
+  with the caret after any kept draft, so the user can type at once.
 - `preload`: a few seconds after an Omnigent window can open the panel, the app
   builds it out of sight, so the first ⇧⌘Space shows a composer that's already
   loaded. The panel comes on screen once its page has rendered, or after a second

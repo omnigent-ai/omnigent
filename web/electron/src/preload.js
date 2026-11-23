@@ -295,6 +295,16 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     /** From the panel: its composer rendered, so the shell can show it without a loading state. */
     ready: () => ipcRenderer.send("omnigent:floating-composer:ready"),
     /**
+     * To the panel: it came on screen or took the keyboard again, so its prompt should too.
+     * Returns an unsubscribe function.
+     */
+    onShown: (callback) => {
+      if (typeof callback !== "function") return () => {};
+      const listener = () => callback();
+      ipcRenderer.on("omnigent:floating-composer:shown", listener);
+      return () => ipcRenderer.removeListener("omnigent:floating-composer:shown", listener);
+    },
+    /**
      * From the panel: open `/c/<id>` or a page it links to in a main window of its server,
      * then hide. Resolves `{ ok: true }` or
      * `{ ok: false, error: "not-composer" | "bad-path" | "window-loading" }`.

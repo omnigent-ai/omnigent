@@ -308,6 +308,19 @@ describe("global show shortcut bridge", () => {
     assert.equal(h.invokes.at(-1).channel, "omnigent:cancel-global-shortcut-recording");
   });
 
+  it("lets the floating panel hear that it took the keyboard, until it stops listening", () => {
+    const h = loadPreload({ platform: "darwin" });
+    const channel = "omnigent:floating-composer:shown";
+    assert.equal(typeof h.desktop.floatingComposer.onShown("not a function"), "function");
+    assert.equal(h.hasListener(channel), false);
+    let heard = 0;
+    const unsubscribe = h.desktop.floatingComposer.onShown(() => (heard += 1));
+    h.emit(channel);
+    assert.equal(heard, 1);
+    unsubscribe();
+    assert.equal(h.hasListener(channel), false);
+  });
+
   it("forwards the floating panel's ready signal on its own channel", () => {
     const h = loadPreload({ platform: "darwin" });
     h.desktop.floatingComposer.ready();
