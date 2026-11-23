@@ -357,16 +357,31 @@ export interface RightSidebarWindowBridge {
 /** Why the shell didn't open a path from the floating panel in a main window. */
 export type FloatingComposerOpenError = "not-composer" | "bad-path" | "window-loading";
 
+/** A launched session's first message, as it crosses to the main window that sends it. */
+export interface FloatingComposerFirstMessage {
+  text: string;
+  skill: { name: string; args: string } | null;
+  files: { name: string; type: string; lastModified: number; data: BufferSource }[];
+}
+
 /** The desktop shell's floating New Agent panel. */
 export interface FloatingComposerBridge {
   /** From a main window: this document can render the panel (version 1) for its server. */
   announceSupport: (version: number) => void;
   /** From the panel: hide it, keeping its draft. */
   dismiss: () => void;
-  /** From the panel: show `/c/<id>` or an app page in a main window, then hide. */
+  /**
+   * From the panel: show `/c/<id>` or an app page in a main window, then hide. With a first
+   * message, `handedOff` says that window sends it; older shells ignore the message.
+   */
   openInMainWindow: (
     path: string,
-  ) => Promise<{ ok: true } | { ok: false; error: FloatingComposerOpenError }>;
+    firstMessage?: FloatingComposerFirstMessage,
+  ) => Promise<{ ok: true; handedOff?: boolean } | { ok: false; error: FloatingComposerOpenError }>;
+  /** In a main window: hear a session the panel launched, and send its first message. Newer shells only. */
+  onLaunch?: (
+    callback: (launch: { path: string; firstMessage: FloatingComposerFirstMessage }) => void,
+  ) => () => void;
   /** From the panel: its native file picker opened or closed. */
   filePicker: (state: "open" | "closed") => void;
   /** From the panel: its composer rendered, so the shell shows it without a loading state. Newer shells only. */

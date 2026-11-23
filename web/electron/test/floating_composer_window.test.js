@@ -10,6 +10,7 @@ const {
   createFloatingComposerPreloader,
   fadeInFloatingComposer,
   floatingComposerAppPagePath,
+  floatingComposerFirstMessage,
   floatingComposerSessionPath,
   floatingComposerWindowOptions,
 } = require("../src/floating_composer_window");
@@ -741,4 +742,42 @@ test("a panel gone before its page was ready is never told it took the keyboard"
     created[0].calls.some((call) => call.startsWith("send:")),
     false,
   );
+});
+
+test("only a first message shaped like the panel's crosses to a main window, rebuilt", () => {
+  const file = { name: "a.txt", type: "text/plain", lastModified: 1, data: new ArrayBuffer(1) };
+  assert.deepEqual(
+    floatingComposerFirstMessage({
+      text: "/review 1",
+      skill: { name: "review", args: "1", extra: true },
+      files: [{ ...file, extra: true }],
+      extra: true,
+    }),
+    { text: "/review 1", skill: { name: "review", args: "1" }, files: [file] },
+  );
+  // A typed array is binary too, as a Buffer arrives from the renderer.
+  assert.ok(
+    floatingComposerFirstMessage({
+      text: "",
+      skill: null,
+      files: [{ ...file, data: new Uint8Array(1) }],
+    }),
+  );
+  for (const bad of [
+    undefined,
+    null,
+    "hi",
+    { skill: null, files: [] },
+    { text: 1, skill: null, files: [] },
+    { text: "hi", files: [] },
+    { text: "hi", skill: { name: "review" }, files: [] },
+    { text: "hi", skill: null },
+    { text: "hi", skill: null, files: [null] },
+    { text: "hi", skill: null, files: [{ ...file, name: undefined }] },
+    { text: "hi", skill: null, files: [{ ...file, lastModified: Number.NaN }] },
+    { text: "hi", skill: null, files: [{ ...file, data: "x" }] },
+    { text: "hi", skill: null, files: [{ ...file, data: [1] }] },
+  ]) {
+    assert.equal(floatingComposerFirstMessage(bad), null, JSON.stringify(bad));
+  }
 });

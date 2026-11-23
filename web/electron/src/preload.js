@@ -306,11 +306,28 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     },
     /**
      * From the panel: open `/c/<id>` or a page it links to in a main window of its server,
-     * then hide. Resolves `{ ok: true }` or
+     * then hide. A launched session's `firstMessage` goes along. Resolves `{ ok: true }`, with
+     * `handedOff: true` when that window sends the message, or
      * `{ ok: false, error: "not-composer" | "bad-path" | "window-loading" }`.
      */
-    openInMainWindow: (path) =>
-      ipcRenderer.invoke("omnigent:floating-composer:open-in-main-window", path),
+    openInMainWindow: (path, firstMessage) =>
+      ipcRenderer.invoke("omnigent:floating-composer:open-in-main-window", path, firstMessage),
+    /**
+     * In a main window: hear a session the panel launched, with its first message to send.
+     * Returns an unsubscribe function; until then the shell hands launches to this page.
+     */
+    onLaunch: (callback) => {
+      if (typeof callback !== "function") return () => {};
+      const listener = (_event, launch) => {
+        if (typeof launch?.path === "string" && launch.path.startsWith("/")) callback(launch);
+      };
+      ipcRenderer.on("omnigent:floating-composer:launch", listener);
+      ipcRenderer.send("omnigent:floating-composer:launch-listener", true);
+      return () => {
+        ipcRenderer.removeListener("omnigent:floating-composer:launch", listener);
+        ipcRenderer.send("omnigent:floating-composer:launch-listener", false);
+      };
+    },
     /** From the panel: its native file picker opened or closed. */
     filePicker: (state) =>
       ipcRenderer.send(

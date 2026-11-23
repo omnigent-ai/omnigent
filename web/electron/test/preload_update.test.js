@@ -321,6 +321,35 @@ describe("global show shortcut bridge", () => {
     assert.equal(h.hasListener(channel), false);
   });
 
+  it("lets a main window hear the panel's launches, telling the shell while it listens", () => {
+    const h = loadPreload({ platform: "darwin" });
+    const channel = "omnigent:floating-composer:launch";
+    assert.equal(typeof h.desktop.floatingComposer.onLaunch("not a function"), "function");
+    assert.equal(h.hasListener(channel), false);
+    const heard = [];
+    const stop = h.desktop.floatingComposer.onLaunch((launch) => heard.push(launch));
+    assert.equal(h.sends.at(-1).channel, "omnigent:floating-composer:launch-listener");
+    assert.equal(h.sends.at(-1).args, true);
+    h.emit(channel, undefined);
+    h.emit(channel, { path: "https://evil.example/c/abc", firstMessage: {} });
+    h.emit(channel, { path: "/c/abc", firstMessage: { text: "hi" } });
+    assert.equal(heard.length, 1);
+    assert.equal(heard[0].path, "/c/abc");
+    stop();
+    assert.equal(h.hasListener(channel), false);
+    assert.equal(h.sends.at(-1).args, false);
+  });
+
+  it("sends a launched session's first message along when the panel opens it", async () => {
+    const h = loadPreload({ platform: "darwin" });
+    const message = { text: "hi", skill: null, files: [] };
+    await h.desktop.floatingComposer.openInMainWindow("/c/abc", message);
+    const call = h.invokes.at(-1);
+    assert.equal(call.channel, "omnigent:floating-composer:open-in-main-window");
+    assert.equal(call.args, "/c/abc");
+    assert.equal(call.rest[0], message);
+  });
+
   it("forwards the floating panel's ready signal on its own channel", () => {
     const h = loadPreload({ platform: "darwin" });
     h.desktop.floatingComposer.ready();

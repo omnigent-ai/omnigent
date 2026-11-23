@@ -143,6 +143,7 @@ const {
   createFloatingComposerPreloader,
   fadeInFloatingComposer,
   floatingComposerAppPagePath,
+  floatingComposerFirstMessage,
   floatingComposerSessionPath,
   floatingComposerWindowOptions,
 } = require("./floating_composer_window");
@@ -1859,6 +1860,9 @@ const rightSidebarWindow = createRightSidebarWindow({
 
 // Main-window documents that can render the floating New Agent panel (see registerIpc).
 const floatingComposerSupport = createFloatingComposerSupport();
+// Main-window documents that send a launched session's first message themselves: webContents
+// id → the cleanup that forgets it when that document goes.
+const floatingComposerLaunchListeners = new Map();
 
 // "Show Omnigent from anywhere" (opt-in). macOS needs app-level activation to
 // come forward from another app. The floating panel's ⇧⌘Space is held only while a
@@ -5514,6 +5518,29 @@ function registerIpc() {
     floatingComposerController.markReady(panel);
   });
 
+  // A main window's document sends the panel's first message itself, until it's replaced.
+  ipcMain.on("omnigent:floating-composer:launch-listener", (event, listening) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!isPinnedOriginSender(event) || !isMainWindow(win)) return;
+    if (event.senderFrame !== event.sender.mainFrame) return;
+    const contents = win.webContents;
+    if (listening !== true) {
+      floatingComposerLaunchListeners.get(contents.id)?.();
+      return;
+    }
+    if (serverPageShown(win) !== "app" || floatingComposerLaunchListeners.has(contents.id)) return;
+    const forget = () => {
+      contents.removeListener("did-navigate", forget);
+      contents.removeListener("render-process-gone", forget);
+      contents.removeListener("destroyed", forget);
+      floatingComposerLaunchListeners.delete(contents.id);
+    };
+    contents.on("did-navigate", forget);
+    contents.on("render-process-gone", forget);
+    contents.on("destroyed", forget);
+    floatingComposerLaunchListeners.set(contents.id, forget);
+  });
+
   // From the panel: put it away, keeping its draft; the keyboard goes back to the app it had.
   ipcMain.on("omnigent:floating-composer:dismiss", (event) => {
     const panel = BrowserWindow.fromWebContents(event.sender);
@@ -5531,7 +5558,7 @@ function registerIpc() {
 
   // From the panel: a session it launched, or an app page it links to, in a main window of
   // its server. The panel then hides.
-  ipcMain.handle("omnigent:floating-composer:open-in-main-window", (event, routePath) => {
+  ipcMain.handle("omnigent:floating-composer:open-in-main-window", (event, routePath, message) => {
     const panel = BrowserWindow.fromWebContents(event.sender);
     if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) {
       return { ok: false, error: "not-composer" };
@@ -5549,17 +5576,25 @@ function registerIpc() {
     if (target && connectionAttempts.get(target)?.pending === true) {
       return { ok: false, error: "window-loading" };
     }
+    // A window that sends first messages takes the launch's, as if typed there.
+    const firstMessage =
+      sessionPath !== null && target && floatingComposerLaunchListeners.has(target.webContents.id)
+        ? floatingComposerFirstMessage(message)
+        : null;
+    let handedOff = false;
     // A launched session or a linked page comes forward, over the app the user was in.
     if (target) {
-      sendOpenPath(target, openPath);
+      if (firstMessage) handedOff = sendFloatingComposerLaunch(target, openPath, firstMessage);
+      else sendOpenPath(target, openPath);
       focusAndRestore(target);
     } else {
+      // shortcut: a new window can't take the first message yet, so the panel still sends it.
       createWindow(undefined, { serverUrl, path: openPath });
     }
     app.focus({ steal: true });
     // After a launch the next open starts at the default placement again.
     floatingComposerController.hide(panel, { resetFrame: sessionPath !== null });
-    return { ok: true };
+    return handedOff ? { ok: true, handedOff: true } : { ok: true };
   });
 
   // Dock/taskbar badge. Each window's SPA reports ITS unread count; the
@@ -6549,6 +6584,17 @@ function focusAppAndSend(command) {
   const browserViewId = focusedBrowserViewId(target);
   target.webContents.focus();
   sendDesktopCommand(target, command, { browserViewId });
+}
+
+/** Hand a main window a launched session to open and its first message to send. */
+function sendFloatingComposerLaunch(win, routePath, firstMessage) {
+  try {
+    win.webContents.send("omnigent:floating-composer:launch", { path: routePath, firstMessage });
+    return true;
+  } catch {
+    // Torn down mid-send: the panel then sends the message itself.
+    return false;
+  }
 }
 
 /**

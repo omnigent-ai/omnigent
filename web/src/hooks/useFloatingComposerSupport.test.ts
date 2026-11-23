@@ -3,12 +3,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import type { FloatingComposerFirstMessage } from "@/lib/nativeBridge";
+import { setPendingInitialPrompt } from "@/store/chatStore";
 
 import { useFloatingComposerSupport } from "./useFloatingComposerSupport";
 
+const navigate = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: vi.fn() }));
+vi.mock("@/lib/routing", () => ({ useNavigate: () => navigate }));
+vi.mock("@/store/chatStore", () => ({ setPendingInitialPrompt: vi.fn() }));
 
+interface Launch {
+  path: string;
+  firstMessage: FloatingComposerFirstMessage;
+}
 const announceSupport = vi.fn();
+const onLaunch = vi.fn();
 let getDesktopFeatures: ReturnType<typeof vi.fn>;
 
 function stubShell(shell: Record<string, unknown> | undefined): void {
@@ -31,6 +41,9 @@ function flag(on: boolean): void {
 
 beforeEach(() => {
   announceSupport.mockReset();
+  onLaunch.mockReset();
+  navigate.mockReset();
+  vi.mocked(setPendingInitialPrompt).mockReset();
   getDesktopFeatures = vi.fn().mockResolvedValue({ floatingComposer: true });
   stubShell({
     kind: "electron",
@@ -40,6 +53,7 @@ beforeEach(() => {
       dismiss: vi.fn(),
       openInMainWindow: vi.fn(),
       filePicker: vi.fn(),
+      onLaunch,
     },
   });
   flag(true);
@@ -67,6 +81,51 @@ describe("useFloatingComposerSupport", () => {
     await settle();
     expect(getDesktopFeatures).not.toHaveBeenCalled();
     expect(announceSupport).not.toHaveBeenCalled();
+    expect(onLaunch).not.toHaveBeenCalled();
+  });
+
+  it("opens a session the panel launched with its first message, as New Chat does", async () => {
+    let launch: (launch: Launch) => void = () => {};
+    const stopListening = vi.fn();
+    onLaunch.mockImplementation((callback: (launch: Launch) => void) => {
+      launch = callback;
+      return stopListening;
+    });
+    const { unmount } = renderHook(() => useFloatingComposerSupport());
+    await waitFor(() => expect(onLaunch).toHaveBeenCalledTimes(1));
+
+    const firstMessage: FloatingComposerFirstMessage = {
+      text: "Fix the build",
+      skill: null,
+      files: [
+        {
+          name: "notes.txt",
+          type: "text/plain",
+          lastModified: 7,
+          data: new TextEncoder().encode("x"),
+        },
+      ],
+    };
+    // Only a session's route takes a first message.
+    launch({ path: "/settings/general", firstMessage });
+    expect(setPendingInitialPrompt).not.toHaveBeenCalled();
+    expect(navigate).not.toHaveBeenCalled();
+
+    launch({ path: "/c/conv_1", firstMessage });
+    const [sessionId, prompt] = vi.mocked(setPendingInitialPrompt).mock.calls[0]!;
+    expect(sessionId).toBe("conv_1");
+    expect(prompt).toMatchObject({ text: "Fix the build", skill: null });
+    const [file] = prompt.files!;
+    expect([file!.name, file!.type, file!.lastModified]).toEqual(["notes.txt", "text/plain", 7]);
+    expect(await file!.text()).toBe("x");
+    // The chat finds the message waiting when it opens.
+    expect(navigate).toHaveBeenCalledWith("/c/conv_1");
+    expect(vi.mocked(setPendingInitialPrompt).mock.invocationCallOrder[0]).toBeLessThan(
+      navigate.mock.invocationCallOrder[0]!,
+    );
+
+    unmount();
+    expect(stopListening).toHaveBeenCalledTimes(1);
   });
 
   it("announces nothing while server info is loading", async () => {

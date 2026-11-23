@@ -55,7 +55,26 @@ beforeEach(() => {
 });
 
 describe("launchFromPanel", () => {
-  it("opens the session in a main window, then posts the message once with its files", async () => {
+  it("hands the first message to the main window that sends it, and posts nothing itself", async () => {
+    bridge.openInMainWindow.mockResolvedValue({ ok: true, handedOff: true });
+    const file = new File(["x"], "notes.txt", { type: "text/plain", lastModified: 7 });
+
+    const outcome = await launchFromPanel(request({ files: [file] }));
+
+    const [path, message] = bridge.openInMainWindow.mock.calls[0]!;
+    expect(path).toBe("/c/conv_1");
+    expect(message).toMatchObject({
+      text: "Fix the build",
+      skill: null,
+      files: [{ name: "notes.txt", type: "text/plain", lastModified: 7 }],
+    });
+    expect(new TextDecoder().decode(message.files[0].data)).toBe("x");
+    expect(uploadFileBlocks).not.toHaveBeenCalled();
+    expect(postEvent).not.toHaveBeenCalled();
+    expect(outcome).toEqual(delivered);
+  });
+
+  it("posts the message once with its files when no main window took it", async () => {
     const file = new File(["x"], "notes.txt", { type: "text/plain" });
     vi.mocked(uploadFileBlocks).mockResolvedValue([
       { type: "input_file", file_id: "file_1", filename: "notes.txt" },
@@ -63,7 +82,10 @@ describe("launchFromPanel", () => {
 
     const outcome = await launchFromPanel(request({ files: [file] }));
 
-    expect(bridge.openInMainWindow).toHaveBeenCalledWith("/c/conv_1");
+    expect(bridge.openInMainWindow).toHaveBeenCalledWith(
+      "/c/conv_1",
+      expect.objectContaining({ text: "Fix the build" }),
+    );
     expect(uploadFileBlocks).toHaveBeenCalledWith("conv_1", [file]);
     expect(postEvent).toHaveBeenCalledTimes(1);
     // No hold for an offline host: the panel can't resend later.
@@ -84,7 +106,8 @@ describe("launchFromPanel", () => {
   it("posts nothing when the create already carried the message", async () => {
     const outcome = await launchFromPanel(request({ inputAccepted: true }));
 
-    expect(bridge.openInMainWindow).toHaveBeenCalledWith("/c/conv_1");
+    // Nothing to hand to the main window either.
+    expect(bridge.openInMainWindow).toHaveBeenCalledWith("/c/conv_1", undefined);
     expect(postEvent).not.toHaveBeenCalled();
     expect(outcome).toEqual(delivered);
   });

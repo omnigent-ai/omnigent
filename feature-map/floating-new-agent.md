@@ -28,9 +28,13 @@ off by default.
   button creates the session on This Mac in the chosen
   folder, or in a new sandbox. The session opens in an Omnigent window of the same
   server, which comes forward, the panel hides, and the first message is
-  delivered once. A successful launch clears the panel for the next prompt.
-- `launch-failure`: when the first message can't be delivered (the server never
-  stored it, or the runner refused it), the panel keeps the prompt and says why.
+  delivered once. That window sends it, as its own New Chat would, so the message
+  stays on screen while the agent starts. A successful launch clears the panel for
+  the next prompt.
+- `launch-failure`: when that window can't deliver the first message, it keeps it
+  in that chat, as New Chat does. When the session opens in a new window instead,
+  the panel sends the message itself and, if that fails (the server never stored
+  it, or the runner refused it), keeps the prompt and says why.
 - `locations`: the panel offers only This Mac and a new sandbox. Remote hosts,
   the import prompt and the page heading are hidden.
 - `links`: links in the panel to Settings pages open in an Omnigent window, which
@@ -65,7 +69,8 @@ Follow the [verification skill](skills/verify-omnigent/SKILL.md) for the server.
 2. Type a prompt and press Escape. The panel hides. Press ⇧⌘Space again: the
    prompt is still there.
 3. Pick This Mac and a folder, then press ⌘↵. The panel hides, and the Omnigent
-   window comes forward showing the new session, which receives the prompt.
+   window comes forward showing the new session, which receives the prompt. The
+   message stays visible while the agent starts, as with the in-app New Chat.
 4. Repeat with a new sandbox when the server has a sandbox provider.
 5. In Settings → General, turn **Open New Agent from anywhere** off: ⇧⌘Space
    reaches other apps. Turn it on, record ⌃⌥Space and allow it: ⌃⌥Space opens the
