@@ -60,3 +60,14 @@ describe("useSettingsSearchTargets and harness curation", () => {
     expect(targets.filter((target) => target.entry.section === "harnesses")).toEqual([]);
   });
 });
+
+describe("useSettingsSearchTargets and the Keyboard shortcuts page", () => {
+  it("offers every row the page lists, the composer's and slash menu's keys included", () => {
+    const { targets, shortcutRows } = searchTargets();
+    const shortcutIds = targets.flatMap((target) => target.entry.shortcutId ?? []);
+    expect(shortcutIds.toSorted()).toEqual([...shortcutRows.keys()].toSorted());
+    expect(shortcutIds).toEqual(
+      expect.arrayContaining(["composer.send", "slash.apply", "response.stop"]),
+    );
+  });
+});

@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import type { Conversation } from "@/hooks/useConversations";
+import { useAddSiblingSessionHotkey } from "@/hooks/useAddSiblingSessionHotkey";
 import { useApprovalPromptOnScreen, useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 import { useComposerConfigCycleHotkeys } from "@/hooks/useComposerConfigCycleHotkeys";
@@ -235,6 +236,7 @@ const HANDLERS: Partial<Record<ShortcutId, HandlerCase>> = {
       return navigatedTo("/");
     },
   },
+  "session.addSibling": spyCase((spy) => renderHook(() => useAddSiblingSessionHotkey(spy, true))),
   "session.rename": spyCase((spy) => renderHook(() => useRenameSessionHotkey(spy))),
   "session.toggleUnread": {
     mount: () => {
@@ -471,7 +473,7 @@ describe("shortcut registry handlers", () => {
       Object.keys(import.meta.glob("/src/**/*.{ts,tsx}")).map((path) => path.slice(5)),
     );
     for (const { id, handler } of ALL_BINDINGS) {
-      if (handler.scope === "unhandled") continue;
+      if (handler.scope === "unhandled" || handler.scope === "menu") continue;
       expect(modules.has(handler.module), `${id}: ${handler.module}`).toBe(true);
     }
   });
@@ -479,6 +481,7 @@ describe("shortcut registry handlers", () => {
   it("leaves only the listed bindings without a handler", () => {
     const unhandled = ALL_BINDINGS.filter(({ handler }) => handler.scope === "unhandled");
     expect(unhandled.map(({ id }) => id)).toEqual([
+      "workspace.searchContents",
       "workspace.toggleFullScreen",
       "palette.text",
       "palette.files",
