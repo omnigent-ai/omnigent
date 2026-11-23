@@ -177,7 +177,21 @@ describe("navigateAfterArchiving", () => {
 });
 
 describe("leaveSessionView", () => {
-  const conversation = { id: "a", labels: { omni_project: "Payments" } };
+  const conversation = { id: "a", labels: { omni_project: "Payments" }, project_id: null };
+
+  it("starts New session in a filed session's project when it was the last one live", () => {
+    // Filing sets project_id and clears the project label.
+    queryClient.setQueryData(["projects"], [{ id: "p-7", name: "Q3 plans", icon: null }]);
+    registerSessions();
+    useRecentSessionSwitchStore.setState({ readLiveSessionIds: () => new Set(["a"]) });
+    leaveSessionView("archive", {
+      conversation: { id: "a", labels: {}, project_id: "p-7" },
+      source: "header_menu",
+      navigate,
+      queryClient,
+    });
+    expect(navigate).toHaveBeenCalledExactlyOnceWith("/?project=Q3%20plans", { replace: true });
+  });
 
   it("opens the session ⌃[ would after an archive", () => {
     registerSessions();
@@ -197,11 +211,23 @@ describe("leaveSessionView", () => {
 });
 
 describe("helpers", () => {
-  it("starts a new session in the archived session's project, or at home", () => {
-    expect(newSessionPathFor({ labels: { omni_project: "Q3 plans" } })).toBe(
+  it("starts a new session in the archived session's project, by id or by its older label", () => {
+    queryClient.setQueryData(["projects"], [{ id: "p-7", name: "Q3 plans", icon: null }]);
+    expect(newSessionPathFor(queryClient, { labels: {}, project_id: "p-7" })).toBe(
       "/?project=Q3%20plans",
     );
-    expect(newSessionPathFor({ labels: {} })).toBe("/");
+    expect(
+      newSessionPathFor(queryClient, { labels: { omni_project: "Payments" }, project_id: null }),
+    ).toBe("/?project=Payments");
+    expect(newSessionPathFor(queryClient, { labels: {}, project_id: null })).toBe("/");
+  });
+
+  it("falls back to the label, then home, for a project the list doesn't have", () => {
+    queryClient.setQueryData(["projects"], []);
+    expect(
+      newSessionPathFor(queryClient, { labels: { omni_project: "Payments" }, project_id: "p-9" }),
+    ).toBe("/?project=Payments");
+    expect(newSessionPathFor(queryClient, { labels: {}, project_id: "p-9" })).toBe("/");
   });
 
   it("knows the open session leaves with its archived parent", () => {

@@ -275,7 +275,7 @@ export function HeaderConversationMenu({
       leavingIds: [conversation.id],
       source: "header_menu",
       navigate,
-      newSessionPath: newSessionPathFor(conversation),
+      newSessionPath: newSessionPathFor(queryClient, conversation),
       queryClient,
     });
     archive.mutate({ id: conversation.id, archived: true, deleteWorktree });

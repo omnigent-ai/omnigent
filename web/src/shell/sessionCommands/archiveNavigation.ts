@@ -10,11 +10,13 @@ import {
   currentSidebarSessionId,
   useSidebarSessionOrderStore,
 } from "@/hooks/useSidebarSessionOrder";
-import type { Conversation } from "@/hooks/useConversations";
+import type { Conversation, ProjectSummary } from "@/hooks/useConversations";
 import { archiveLanding, type ArchiveLanding, isInLeavingSubtree } from "@/lib/archiveLanding";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { getSessionParent } from "@/lib/sessionHost";
 import type { Session } from "@/lib/types";
+
+import { newSessionInProjectPath } from "../projectCommands/useProjectPaletteCommands";
 
 /** Where an archive was asked from, for its diagnostics record; ⌘K's host also runs ⇧⌘A. */
 export type ArchiveNavigationSource = "palette" | "header_menu" | "sidebar_menu" | "bulk";
@@ -53,10 +55,22 @@ interface PendingNavigation {
 
 let pending: PendingNavigation | null = null;
 
-/** New session in `conversation`'s project, as New session from its page opens it. */
-export function newSessionPathFor(conversation: Pick<Conversation, "labels">): string {
-  const project = conversation.labels?.[PROJECT_LABEL_KEY];
-  return project ? `/?project=${encodeURIComponent(project)}` : "/";
+/**
+ * New session in `conversation`'s project, as New session from its page opens it. A filed
+ * session names its project by id, from the cached project list; an older one by its label.
+ */
+export function newSessionPathFor(
+  queryClient: QueryClient,
+  conversation: Pick<Conversation, "labels" | "project_id">,
+): string {
+  const projectId = conversation.project_id;
+  const project =
+    (projectId != null
+      ? queryClient
+          .getQueryData<ProjectSummary[]>(["projects"])
+          ?.find((summary) => summary.id === projectId)?.name
+      : undefined) ?? conversation.labels?.[PROJECT_LABEL_KEY];
+  return project ? newSessionInProjectPath(project) : "/";
 }
 
 function parentOf(queryClient: QueryClient, entryId: string): string | null {
@@ -205,7 +219,7 @@ export function leaveSessionView(
     navigate,
     queryClient,
   }: {
-    conversation: Pick<Conversation, "id" | "labels">;
+    conversation: Pick<Conversation, "id" | "labels" | "project_id">;
     source: ArchiveNavigationSource;
     navigate: Navigate;
     queryClient: QueryClient;
@@ -219,7 +233,7 @@ export function leaveSessionView(
     leavingIds: [conversation.id],
     source,
     navigate,
-    newSessionPath: newSessionPathFor(conversation),
+    newSessionPath: newSessionPathFor(queryClient, conversation),
     queryClient,
   });
 }
