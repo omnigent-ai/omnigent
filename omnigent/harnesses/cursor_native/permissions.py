@@ -492,7 +492,8 @@ def _pending_started_ms(obj: dict[str, object]) -> int | None:
 # the part shows the call committed or resolved.
 _BlobToolCallParts = tuple[tuple[str, CursorPendingToolCall | None], ...]
 
-# Blobs read per statement, and statements per poll, while classifying a store.
+# Blobs per data statement, and data statements per poll (after one MAX(rowid)
+# probe), while classifying a store.
 _PENDING_SCAN_BATCH_ROWS = 256
 _PENDING_SCAN_MAX_BATCHES = 8
 
@@ -501,19 +502,20 @@ _PENDING_SCAN_MAX_BATCHES = 8
 class _PendingScan:
     """Tool-call classification of one store's blobs through ``last_rowid``.
 
-    :param identity: ``(st_dev, st_ino)`` of the store file this describes.
+    :param identity: ``(st_dev, st_ino)`` of the store file classified so far.
     :param last_rowid: Highest ``blobs.rowid`` already classified.
     :param pending: Marker'd calls not yet committed or resolved, first-seen order.
     :param finished: ``toolCallId`` values seen committed or resolved.
-    :param reported: Pending calls as of the last poll that reached the newest blob.
+    :param reported: Result of the last poll that reached the newest blob; kept
+        across restarts so a reread does not drop an open card.
     :param lock: Serializes polls of this store across supervisor threads.
     """
 
-    identity: tuple[int, int]
+    identity: tuple[int, int] | None = None
     last_rowid: int = 0
     pending: dict[str, CursorPendingToolCall] = field(default_factory=dict)
     finished: set[str] = field(default_factory=set)
-    reported: set[str] = field(default_factory=set)
+    reported: dict[str, CursorPendingToolCall] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def restart(self) -> None:
@@ -521,7 +523,6 @@ class _PendingScan:
         self.last_rowid = 0
         self.pending.clear()
         self.finished.clear()
-        self.reported.clear()
 
     def classify(self, parts: _BlobToolCallParts) -> None:
         """Fold one blob's tool-call parts into the classification."""
@@ -533,10 +534,22 @@ class _PendingScan:
                 self.pending[tool_call_id] = call
 
 
-# Shared by every session's supervisor thread (hence the lock); LRU stores age out.
+# Progress for callers that do not keep their own scan; LRU stores age out.
 _PENDING_SCANS: dict[Path, _PendingScan] = {}
 _PENDING_SCANS_LOCK = threading.Lock()
 _PENDING_SCANS_MAX_STORES = 64
+
+
+def _cached_pending_scan(store_path: Path) -> _PendingScan:
+    """Return the shared scan for *store_path*, marking it most recently used."""
+    with _PENDING_SCANS_LOCK:
+        scan = _PENDING_SCANS.pop(store_path, None)
+        if scan is None:
+            scan = _PendingScan()
+        _PENDING_SCANS[store_path] = scan
+        while len(_PENDING_SCANS) > _PENDING_SCANS_MAX_STORES:
+            _PENDING_SCANS.pop(next(iter(_PENDING_SCANS)))
+    return scan
 
 
 def _blob_tool_call_parts(data: object) -> _BlobToolCallParts:
@@ -577,7 +590,8 @@ def _blob_tool_call_parts(data: object) -> _BlobToolCallParts:
 
 
 def _classify_new_blobs(con: sqlite3.Connection, scan: _PendingScan) -> bool:
-    """Classify blobs past ``scan.last_rowid``, a bounded number of batches.
+    """Classify blobs past ``scan.last_rowid`` with one ``MAX(rowid)`` probe and
+    at most ``_PENDING_SCAN_MAX_BATCHES`` data statements.
 
     Each statement is its own short read transaction. cursor's store is
     append-only, so a newest rowid below the mark means the table was rewritten
@@ -603,7 +617,9 @@ def _classify_new_blobs(con: sqlite3.Connection, scan: _PendingScan) -> bool:
     return max_rowid is None or scan.last_rowid >= max_rowid
 
 
-def read_cursor_pending_tool_calls(store_path: Path) -> list[CursorPendingToolCall]:
+def read_cursor_pending_tool_calls(
+    store_path: Path, scan: _PendingScan | None = None
+) -> list[CursorPendingToolCall]:
     """Return the gated tool calls currently awaiting a human in *store_path*.
 
     Scans blobs for embedded JSON messages and classifies each ``toolCallId`` by
@@ -624,10 +640,13 @@ def read_cursor_pending_tool_calls(store_path: Path) -> list[CursorPendingToolCa
 
     Each poll classifies only blobs added since the previous one, in bounded
     batches; a replaced store file is classified again from its first blob.
-    Until a poll reaches the newest blob it reports only calls already reported,
-    so a call answered in a blob not yet read is never surfaced.
+    Until a poll reaches the newest blob it reports the last complete result
+    minus calls whose answer it has read, so a call answered in a blob not yet
+    read is never surfaced and an open card survives a reread.
 
     :param store_path: This session's cursor ``store.db``.
+    :param scan: The caller's progress through this store, reused on every poll.
+        Without one, progress is kept in a small shared per-path cache.
     :returns: Active pending tool calls (cursor shows them one at a time, but the
         list supports more than one defensively), in first-seen order.
     """
@@ -635,21 +654,20 @@ def read_cursor_pending_tool_calls(store_path: Path) -> list[CursorPendingToolCa
         stat = store_path.stat()
     except OSError:
         return []
-    identity = (stat.st_dev, stat.st_ino)
-    with _PENDING_SCANS_LOCK:
-        scan = _PENDING_SCANS.pop(store_path, None)
-        if scan is None or scan.identity != identity:
-            scan = _PendingScan(identity=identity)
-        _PENDING_SCANS[store_path] = scan
-        while len(_PENDING_SCANS) > _PENDING_SCANS_MAX_STORES:
-            _PENDING_SCANS.pop(next(iter(_PENDING_SCANS)))
+    if scan is None:
+        scan = _cached_pending_scan(store_path)
     with scan.lock:
+        identity = (stat.st_dev, stat.st_ino)
+        if scan.identity != identity:
+            scan.restart()
+            scan.identity = identity
         caught_up = _query_store(store_path, lambda con: _classify_new_blobs(con, scan))
         if caught_up is None:
             return []
         if caught_up:
-            scan.reported = set(scan.pending)
-        return [call for tcid, call in scan.pending.items() if tcid in scan.reported]
+            scan.reported = dict(scan.pending)
+            return list(scan.reported.values())
+        return [call for tcid, call in scan.reported.items() if tcid not in scan.finished]
 
 
 def _preview_for_args(args: dict[str, object]) -> str:
@@ -979,6 +997,7 @@ async def supervise_cursor_transcript_elicitations(
     auto_accept_attempts: dict[str, _YoloAcceptRetry] = {}
     next_auto_accept_at = 0.0
     store_path: Path | None = None
+    pending_scan = _PendingScan()
     loop = asyncio.get_running_loop()
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     from omnigent.cli_auth import open_server_client
@@ -991,7 +1010,9 @@ async def supervise_cursor_transcript_elicitations(
                         _resolve_elicitation_store, bridge_dir, workspace, launch_epoch_ms
                     )
                 pending_calls = (
-                    await asyncio.to_thread(read_cursor_pending_tool_calls, store_path)
+                    await asyncio.to_thread(
+                        read_cursor_pending_tool_calls, store_path, pending_scan
+                    )
                     if store_path is not None
                     else []
                 )
