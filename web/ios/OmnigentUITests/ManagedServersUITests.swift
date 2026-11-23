@@ -53,9 +53,14 @@ final class ManagedServersUITests: XCTestCase {
 
     let field = app.textFields["server-url-field"]
     XCTAssertTrue(field.waitForExistence(timeout: 15))
+    let fieldFrame = field.frame
+    let firstRow = app.buttons["https://team1.example.com"]
+    let firstRowY = firstRow.frame.minY
     app.buttons.matching(identifier: "managed-servers-row").element(boundBy: 2).swipeUp()
+    XCTAssertLessThan(firstRow.frame.minY, firstRowY, "The server list should have scrolled.")
     XCTAssertTrue(app.buttons["https://team8.example.com"].isHittable)
-    XCTAssertTrue(field.isHittable, "The URL field must stay visible while the list scrolls.")
+    XCTAssertEqual(
+      field.frame, fieldFrame, "The URL field must stay pinned while the list scrolls.")
 
     // Rotating flips the size class; the field must keep focus across it.
     field.tap()
