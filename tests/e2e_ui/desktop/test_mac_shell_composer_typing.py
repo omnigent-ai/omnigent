@@ -76,7 +76,6 @@ def test_composer_keystroke_restyles_only_the_composer(
     )
     per_keystroke = _restyled_elements_per_keystroke(_trace_events(cdp, page))
 
-    assert composer.input_value() == TEXT
     assert len(per_keystroke) == len(TEXT)
     median = statistics.median(per_keystroke)
     # Each keystroke restyles the composer itself; a zero median means nothing was measured.

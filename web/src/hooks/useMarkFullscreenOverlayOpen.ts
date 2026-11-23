@@ -4,7 +4,7 @@ import { getStyleRoot } from "@/lib/host";
 
 export const FULLSCREEN_OVERLAY_OPEN_ATTRIBUTE = "data-fullscreen-overlay-open";
 
-let openFullscreenOverlays = 0;
+const openFullscreenOverlays = new WeakMap<HTMLElement, number>();
 
 /**
  * Mark the style root while a full-window view (`data-fullscreen-overlay`) is
@@ -15,11 +15,12 @@ export function useMarkFullscreenOverlayOpen(open: boolean): void {
   useLayoutEffect(() => {
     const root = getStyleRoot();
     if (!open || !root) return;
-    openFullscreenOverlays += 1;
+    openFullscreenOverlays.set(root, (openFullscreenOverlays.get(root) ?? 0) + 1);
     root.setAttribute(FULLSCREEN_OVERLAY_OPEN_ATTRIBUTE, "");
     return () => {
-      openFullscreenOverlays -= 1;
-      if (openFullscreenOverlays === 0) root.removeAttribute(FULLSCREEN_OVERLAY_OPEN_ATTRIBUTE);
+      const remaining = (openFullscreenOverlays.get(root) ?? 1) - 1;
+      openFullscreenOverlays.set(root, remaining);
+      if (remaining === 0) root.removeAttribute(FULLSCREEN_OVERLAY_OPEN_ATTRIBUTE);
     };
   }, [open]);
 }

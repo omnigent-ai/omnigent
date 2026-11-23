@@ -38,3 +38,18 @@ it("marks the embed scope root, which the scoped stylesheet matches for html", (
   unmount();
   expect(scope).not.toHaveAttribute(FULLSCREEN_OVERLAY_OPEN_ATTRIBUTE);
 });
+
+it("clears each root when its own views close, even after the scope root changes", () => {
+  const scope = document.createElement("div");
+  setEmbedScopeRoot(scope);
+  const first = renderHook(() => useMarkFullscreenOverlayOpen(true));
+  const nextScope = document.createElement("div");
+  setEmbedScopeRoot(nextScope);
+  const second = renderHook(() => useMarkFullscreenOverlayOpen(true));
+
+  first.unmount();
+  expect(scope).not.toHaveAttribute(FULLSCREEN_OVERLAY_OPEN_ATTRIBUTE);
+  expect(nextScope).toHaveAttribute(FULLSCREEN_OVERLAY_OPEN_ATTRIBUTE);
+  second.unmount();
+  expect(nextScope).not.toHaveAttribute(FULLSCREEN_OVERLAY_OPEN_ATTRIBUTE);
+});
