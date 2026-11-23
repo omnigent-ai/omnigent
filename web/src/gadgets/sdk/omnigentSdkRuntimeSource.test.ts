@@ -652,6 +652,39 @@ describe("omnigent SDK runtime", () => {
       expect(progressRequests()).toHaveLength(2);
     });
 
+    it("keeps one poll running when its listener refreshes the watch", async () => {
+      const progressRequests = () =>
+        (hostPort.peer?.posted ?? []).filter(
+          (message) =>
+            typeof message === "object" &&
+            message !== null &&
+            "method" in message &&
+            message.method === "agent.v1.progress",
+        );
+      let refreshed = false;
+      let watch: { refresh: () => void; dispose: () => void } | null = null;
+      watch = client.agent.watch(
+        (snapshot) => {
+          if (snapshot.status === "live" && !refreshed) {
+            refreshed = true;
+            watch?.refresh();
+          }
+        },
+        { intervalMs: 3_000 },
+      );
+      respond(hostPort, { id: lastRequestId(hostPort), ok: true, result: { items: [] } });
+      await vi.advanceTimersByTimeAsync(0);
+      // The listener's refresh asked again; that answer is still on its way.
+      expect(progressRequests()).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(progressRequests()).toHaveLength(2);
+
+      respond(hostPort, { id: lastRequestId(hostPort), ok: true, result: { items: [] } });
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(progressRequests()).toHaveLength(3);
+      watch.dispose();
+    });
+
     interface WatchedAction {
       status: string;
       action: unknown;

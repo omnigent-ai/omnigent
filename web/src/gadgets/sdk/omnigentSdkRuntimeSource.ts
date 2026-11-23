@@ -651,23 +651,30 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
       var hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
       timer = setTimeout(poll, hidden ? Math.min(delay * 5, LIMITS.maxWatchIntervalMs) : delay);
     }
+    // Each poll's number; only the latest may emit and schedule the next, so a listener that
+    // calls refresh() leaves one poll running.
+    var generation = 0;
     function poll() {
       if (!active) {
         return;
       }
+      generation += 1;
+      var mine = generation;
       controller = new AbortController();
       call('agent.v1.progress', { actionIds: actionIds }, { signal: controller.signal }).then(
         function (result) {
-          if (!active) {
+          if (!active || mine !== generation) {
             return;
           }
           failures = 0;
           snapshot = { status: 'live', items: result.items, updatedAt: new Date().toISOString(), error: null };
           emit();
-          schedule(intervalMs);
+          if (mine === generation) {
+            schedule(intervalMs);
+          }
         },
         function (error) {
-          if (!active || (error && (error.code === 'DISPOSED' || error.code === 'CANCELLED'))) {
+          if (!active || mine !== generation || (error && (error.code === 'DISPOSED' || error.code === 'CANCELLED'))) {
             return;
           }
           failures += 1;
@@ -679,7 +686,7 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
             error: error instanceof OmnigentError ? error : new OmnigentError('INTERNAL', String(error)),
           };
           emit();
-          if (!terminal) {
+          if (!terminal && mine === generation) {
             schedule(Math.min(intervalMs * Math.pow(2, failures), LIMITS.maxWatchBackoffMs));
           }
         }
