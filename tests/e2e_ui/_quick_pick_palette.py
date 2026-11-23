@@ -10,13 +10,17 @@ from playwright.sync_api import Locator, Page, Route, expect
 from tests.e2e_ui.conftest import fetch_with_retry
 
 
-def enable_quick_pick_palette(page: Page) -> None:
-    """Report ``quick_pick_palette`` on from ``/v1/info``, keeping the server's other flags."""
+def enable_quick_pick_palette(page: Page, *also: str) -> None:
+    """Report ``quick_pick_palette``, and the features in ``also``, on from ``/v1/info``.
+
+    The server's other flags are kept.
+    """
 
     def info(route: Route) -> None:
         response = fetch_with_retry(route)
         body = response.json()
-        body["features"] = {**(body.get("features") or {}), "quick_pick_palette": True}
+        enabled = dict.fromkeys(("quick_pick_palette", *also), True)
+        body["features"] = {**(body.get("features") or {}), **enabled}
         route.fulfill(response=response, body=json.dumps(body))
 
     page.route("**/v1/info", info)
