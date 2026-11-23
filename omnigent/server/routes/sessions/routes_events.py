@@ -92,7 +92,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.content_resolver import _resolve_message_content
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
-from omnigent.server import presence
+from omnigent.server import presence, session_live_state
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -1575,6 +1575,9 @@ def register_events_routes(
             from omnigent.server.session_orchestration import orchestration_message
 
             body = orchestration_message(source.id, body.data.get("message"))
+        if human_input:
+            # The turn answering this person is the one worth an Inbox entry.
+            session_live_state.mark_attention_pending(session_id)
         native_shell_authorized = False
         if (
             body.type == "message"

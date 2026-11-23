@@ -84,6 +84,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server import session_live_state
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -697,6 +698,11 @@ def register_core_routes(
                     }
                 )
             await startup.enqueue(session_id, event, user_id=user_id, headers=request.headers)
+            # A person's first message, not an agent's or runner's, is worth an Inbox entry.
+            if not request.headers.get(ORCHESTRATION_SOURCE_HEADER) and not request.headers.get(
+                RUNNER_TUNNEL_TOKEN_HEADER
+            ):
+                session_live_state.mark_attention_pending(session_id)
         except Exception:
             # The create fails, so leave no session (or uploaded file) for a retry
             # to duplicate.

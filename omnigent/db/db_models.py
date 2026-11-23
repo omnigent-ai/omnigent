@@ -809,6 +809,11 @@ class SqlConversationMetadata(OmnigentBase):
     background_work_reported_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Why a running session's agent is parked on a terminal prompt; NULL = not parked.
     blocked_on: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # A person wrote to the session and the turn answering them hasn't ended.
+    attention_pending: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Epoch seconds the session last needed its owner's eyes: the end of a
+    # person-started turn or a request for human input. NULL = never.
+    attention_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # First-class project membership. Relates to projects.id; no DB FK
     # (Rule R032). NULL = unfiled. Coexists with the implicit ``omni_project``
     # label via the store's dual-read until labels are consolidated.
@@ -844,6 +849,14 @@ class SqlConversationMetadata(OmnigentBase):
             "background_work_reported_at IS NULL "
             "OR typeof(background_work_reported_at) = 'integer'",
             name="ck_conversation_metadata_reported_at_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "attention_pending IS NULL OR attention_pending IN (0, 1)",
+            name="ck_conversation_metadata_attention_pending_boolean",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "attention_at IS NULL OR typeof(attention_at) = 'integer'",
+            name="ck_conversation_metadata_attention_at_integer",
         ).ddl_if(callable_=_on_sqlite_family),
         # Supports list_conversations_by_runner_id and get_runner_ids.
         Index("ix_conversation_metadata_runner_id", "workspace_id", "runner_id", "id"),

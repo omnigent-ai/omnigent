@@ -71,23 +71,33 @@ export interface UnreadInboxItem {
 }
 
 /**
- * Collect sessions with unseen agent output, newest first.
+ * Collect sessions with unseen output that needs the viewer, newest first.
  *
  * `isUnseen` is the sidebar dot's predicate (injected to keep this module
- * free of the read-state store), so both surfaces agree on what's unread.
+ * free of the read-state store). A session qualifies only when its
+ * `attention_at` (a person-started turn ended, or it asked for human input)
+ * is unseen, so automatic orchestrator and worker turns stay out of the Inbox
+ * and its badge; one the viewer marked unread still counts. Older servers
+ * without `attention_at` fall back to any unseen output.
  * Rows with pending approvals are skipped — they're already listed as
  * approval items, and one session shouldn't appear twice.
  */
 export function collectUnreadInboxItems(
   rows: Conversation[],
   isUnseen: (id: string, updatedAt: number, status: string | undefined) => boolean,
+  isMarkedUnread: (id: string) => boolean = () => false,
 ): UnreadInboxItem[] {
+  const needsViewer = (row: Conversation) =>
+    row.attention_at === undefined ||
+    isMarkedUnread(row.id) ||
+    (row.attention_at !== null && isUnseen(row.id, row.attention_at, row.status));
   return rows
     .filter(
       (row) =>
         !row.archived &&
         (row.pending_elicitations_count ?? 0) === 0 &&
-        isUnseen(row.id, row.updated_at, row.status),
+        isUnseen(row.id, row.updated_at, row.status) &&
+        needsViewer(row),
     )
     .sort((a, b) => b.updated_at - a.updated_at)
     .map((row) => ({ row, kind: row.status === "failed" ? "error" : "done" }));

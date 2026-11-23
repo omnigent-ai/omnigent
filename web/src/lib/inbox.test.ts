@@ -290,6 +290,19 @@ describe("collectUnreadInboxItems", () => {
     ]);
   });
 
+  it("lists only sessions whose attention is unseen, unless marked unread", () => {
+    // Automatic turns move updated_at without attention_at; they stay out.
+    const rows = [
+      makeRow({ id: "asked", status: "idle", updated_at: 3_000, attention_at: 2_500 }),
+      makeRow({ id: "automatic", status: "idle", updated_at: 3_000, attention_at: 900 }),
+      makeRow({ id: "never", status: "idle", updated_at: 3_000, attention_at: null }),
+      makeRow({ id: "flagged", status: "idle", updated_at: 3_000, attention_at: null }),
+      makeRow({ id: "legacy", status: "idle", updated_at: 3_000 }),
+    ];
+    const items = collectUnreadInboxItems(rows, unseenAfter(1_000), (id) => id === "flagged");
+    expect(items.map((i) => i.row.id).sort()).toEqual(["asked", "flagged", "legacy"]);
+  });
+
   it("skips archived rows and rows already listed as approvals", () => {
     // A session with a pending prompt shows as its approval card; listing it
     // again as unread would put one session in the inbox twice.

@@ -329,7 +329,9 @@ updates and worker reports promptly between checks.
   new output alone does not mean a worker is stuck. External jobs and dependencies
   are waits to monitor, not human blockers; keep independent work moving.
 - Reuse the existing monitor rather than adding one per update or ticket.
-  Stay quiet when nothing changed; don't post heartbeat comments. Before declaring
+  Stay quiet when nothing changed; don't post heartbeat comments. After an
+  automatic wake (ticket update, worker message, timer), end with at most one
+  line unless the user must act; never post status to the user's Inbox. Before declaring
   "waiting on you" or cancelling checks, reconcile every remaining ticket: it must
   be complete, explicitly paused by the user, or have a substantiated human blocker
   with its exact question and worker chat link recorded. A planning-only assignment

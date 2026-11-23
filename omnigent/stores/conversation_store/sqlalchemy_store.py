@@ -405,6 +405,7 @@ def _to_conversation(
         next_position=row.next_position,
         background_work_running=meta.background_work_running if meta else None,
         blocked_on=meta.blocked_on if meta else None,
+        attention_at=meta.attention_at if meta else None,
         project_id=meta.project_id if meta else None,
         side_chat_parent_id=meta.side_chat_parent_id if meta else None,
         family_id=meta.family_id if meta else None,
@@ -5521,6 +5522,72 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
         run_write_transaction(self._session_immediate, "set_blocked_on", write)
+
+    def mark_attention_pending(self, conversation_id: str) -> None:
+        """
+        Record that a person awaits the session's answer. See the abstract method.
+
+        :param conversation_id: Session/conversation identifier.
+        """
+        def write(session: Session) -> None:
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+                .values(attention_pending=True)
+            )
+
+        run_write_transaction(self._session_immediate, "mark_attention_pending", write)
+
+    def settle_attention(self, conversation_id: str, at: int) -> bool:
+        """
+        Stamp ``attention_at`` for an ended person-started turn. See the abstract method.
+
+        :param conversation_id: Session/conversation identifier.
+        :param at: Epoch seconds the turn ended.
+        :returns: Whether a pending person-started turn was settled.
+        """
+        def write(session: Session) -> bool:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                        SqlConversationMetadata.attention_pending.is_(True),
+                    )
+                    .values(attention_pending=False, attention_at=at)
+                ),
+            )
+            return result.rowcount > 0
+
+        return run_write_transaction(self._session_immediate, "settle_attention", write)
+
+    def set_attention_at(self, conversation_id: str, at: int) -> None:
+        """
+        Stamp ``attention_at`` for a request for human input. See the abstract method.
+
+        :param conversation_id: Session/conversation identifier.
+        :param at: Epoch seconds of the request.
+        """
+        def write(session: Session) -> None:
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                    or_(
+                        SqlConversationMetadata.attention_at.is_(None),
+                        SqlConversationMetadata.attention_at < at,
+                    ),
+                )
+                .values(attention_at=at)
+            )
+
+        run_write_transaction(self._session_immediate, "set_attention_at", write)
 
     def replace_runner_id(
         self,

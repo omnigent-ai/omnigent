@@ -1994,6 +1994,44 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def mark_attention_pending(self, conversation_id: str) -> None:
+        """
+        Record that a person wrote to the session and awaits its answer.
+
+        The end of the next turn then stamps ``attention_at`` (see
+        :meth:`settle_attention`). Must NOT bump ``updated_at``.
+
+        :param conversation_id: Session/conversation identifier.
+        """
+        ...
+
+    @abstractmethod
+    def settle_attention(self, conversation_id: str, at: int) -> bool:
+        """
+        Stamp ``attention_at`` when a turn ends that a person started.
+
+        Writes only while ``attention_pending`` is set and clears it, so the
+        end of an automatic turn changes nothing. Must NOT bump ``updated_at``.
+
+        :param conversation_id: Session/conversation identifier.
+        :param at: Epoch seconds the turn ended.
+        :returns: Whether a pending person-started turn was settled.
+        """
+        ...
+
+    @abstractmethod
+    def set_attention_at(self, conversation_id: str, at: int) -> None:
+        """
+        Stamp ``attention_at`` directly, e.g. when the session asks for human input.
+
+        Never moves it backwards. Must NOT bump ``updated_at``.
+
+        :param conversation_id: Session/conversation identifier.
+        :param at: Epoch seconds of the request.
+        """
+        ...
+
+    @abstractmethod
     def replace_runner_id(
         self,
         conversation_id: str,

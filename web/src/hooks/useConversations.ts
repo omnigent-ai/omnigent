@@ -303,6 +303,12 @@ export interface Conversation {
    */
   viewer_unread?: boolean;
   /**
+   * Epoch seconds the session last needed its owner's eyes: a person-started
+   * turn ended, or it asked for human input. `null` = never; absent on older
+   * servers. The Inbox lists only sessions whose attention is unseen.
+   */
+  attention_at?: number | null;
+  /**
    * Excerpt of the chat content that matched the current `search_query`,
    * centered on the match with `…` marking elided ends. Present only on
    * search responses where the query hit a message body rather than the

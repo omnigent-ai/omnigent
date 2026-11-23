@@ -1471,6 +1471,7 @@ def _build_session_list_item(
         ),
         viewer_last_seen=viewer_last_seen,
         viewer_unread=viewer_unread,
+        attention_at=conv.attention_at,
         # Transient; set by the store only on a content search. The WS
         # push-stream path leaves it None (no query in flight there).
         search_snippet=conv.search_snippet,

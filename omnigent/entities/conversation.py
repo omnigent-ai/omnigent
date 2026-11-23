@@ -335,6 +335,8 @@ class Conversation:
     next_position: int | None = None
     background_work_running: bool | None = None
     blocked_on: str | None = None
+    # Epoch seconds the session last needed its owner's eyes; None = never.
+    attention_at: int | None = None
     project_id: str | None = None
     side_chat_parent_id: str | None = None
     family_id: str | None = None

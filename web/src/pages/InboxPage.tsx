@@ -89,6 +89,7 @@ import { useSidebarData } from "@/hooks/useSidebarData";
 import {
   clearUnreadOverride,
   isConversationUnseen,
+  isExplicitlyUnread,
   markConversationRead,
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
@@ -338,7 +339,11 @@ export function InboxPage() {
   // Subscribed to the read-state mirror so "Mark as read" (here or in the
   // sidebar) drops the row immediately instead of on the next list poll.
   useUnseenTick();
-  const unreadItems = collectUnreadInboxItems(allRows, isConversationUnseen);
+  const unreadItems = collectUnreadInboxItems(
+    allRows,
+    isConversationUnseen,
+    isExplicitlyUnread,
+  );
   const showApprovals = filter === "all" || filter === "awaiting";
   // Unread sessions, file comments, and automation results.
   const showUnread = filter === "all" || filter === "unread";

@@ -5260,6 +5260,11 @@ def _publish_status(
     # runner tunnel serve the same sidebar status.
     if persist_live_status:
         session_live_state.persist_live_status(session_id, status)
+        # Only the end of a person-started turn puts the session in the Inbox.
+        if status in ("idle", "failed") and (
+            previous_status in ("running", "waiting") or turn_completed
+        ):
+            session_live_state.settle_attention(session_id)
     # Event-driven scheduled-run completion. A terminal edge (idle = the turn
     # completed; failed = it errored/disconnected) flips the conversation's
     # still-``running`` scheduled_task_run to succeeded/failed. This is the

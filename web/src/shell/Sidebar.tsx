@@ -904,6 +904,7 @@ function SidebarImpl({
         (id, updatedAt, status) =>
           isConversationUnseen(id, updatedAt, status) &&
           (id !== activeConversationId || isExplicitlyUnread(id)),
+        isExplicitlyUnread,
       ).length,
   );
   const inboxCount = sidebarData.inboxCount + unreadInboxCount;

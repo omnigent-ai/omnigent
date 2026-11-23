@@ -536,6 +536,38 @@ def persist_blocked_on(session_id: str, blocked_on: str | None) -> None:
     )
 
 
+def mark_attention_pending(session_id: str) -> None:
+    """
+    Record that a person wrote to the session, so its next turn end needs their eyes.
+
+    Runs on the ordered worker, so it lands before that turn's settle.
+
+    :param session_id: Session/conversation identifier.
+    """
+    if _store is not None:
+        submit("attention_pending", _store.mark_attention_pending, session_id)
+
+
+def settle_attention(session_id: str) -> None:
+    """
+    Stamp ``attention_at`` if the turn that just ended was person-started.
+
+    :param session_id: Session/conversation identifier.
+    """
+    if _store is not None:
+        submit("attention_settle", _store.settle_attention, session_id, int(time.time()))
+
+
+def raise_attention(session_id: str) -> None:
+    """
+    Stamp ``attention_at`` now, e.g. when the session asks for human input.
+
+    :param session_id: Session/conversation identifier.
+    """
+    if _store is not None:
+        submit("attention_raise", _store.set_attention_at, session_id, int(time.time()))
+
+
 def touch_runner_liveness(runner_ids: list[str]) -> None:
     """
     Stamp ``runner_last_seen`` (now) for sessions bound to live runners.
