@@ -26,6 +26,9 @@ from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY
 # Pending inputs share the item store, but are not harness transcript history yet.
 PENDING_INPUT_RESPONSE_ID = "pending_input"
 MAX_PENDING_INPUTS = 100
+# Most sub-agents of one spawn tree read in a single bounded read; a bigger
+# tree is read in pages or not at all, depending on the reader.
+SPAWN_TREE_READ_CAP = 2000
 
 if TYPE_CHECKING:
     from omnigent.db.account_authority import AccountAuthority
@@ -132,6 +135,10 @@ class DailyCostState(TypedDict):
 # mirrors the canonical key as ``PINNED_LABEL_KEY``.
 PINNED_LABEL_KEY = "omnigent.pinned"
 
+# A viewer's mute (dimmed row, no notifications). Stored per-user and presented
+# under this bare key exactly like ``PINNED_LABEL_KEY``; deleted on unmute.
+MUTED_LABEL_KEY = "omnigent.muted"
+
 # Marks a top-level fork created as a side chat. A side chat surfaces only as a
 # Workspace-rail tab, so a conversation carrying this label is hidden from the
 # left sidebar (the ``GET /v1/sessions`` list filters it out). The fork
@@ -174,6 +181,17 @@ def pinned_label_key(user_id: str | None) -> str:
         the id is too long).
     """
     return _scoped_pin_key(PINNED_LABEL_KEY + ".", user_id)
+
+
+def muted_label_key(user_id: str | None) -> str:
+    """
+    The per-user muted-label key for ``user_id``, derived like :func:`pinned_label_key`.
+
+    :param user_id: Authenticated user id, e.g. ``"alice@example.com"``, or
+        ``None`` in single-user / no-auth mode (→ the ``local`` sentinel).
+    :returns: ``"omnigent.muted.<suffix>"``.
+    """
+    return _scoped_pin_key(MUTED_LABEL_KEY + ".", user_id)
 
 
 # Epoch-SECONDS time a session was archived, written on archive and deleted on

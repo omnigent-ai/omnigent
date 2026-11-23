@@ -29,6 +29,7 @@ export const POLICIES_ADD_ENTRY = settingsEntry({
   regions: {
     registry: { rowActions: { choose: { dataName: true } } },
     parameters: { rowFields: { value: { before: "Parameter " } } },
+    values: { rowActions: { remove: { dataName: true } } },
   },
   focus: "add",
 });

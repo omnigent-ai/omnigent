@@ -149,6 +149,79 @@ async def test_session_creation_snapshots_workflow_before_initial_items(
     assert len((await client.get(runs_url, headers=_headers())).json()["data"]) == 2
 
 
+async def test_a_run_is_titled_for_its_workflow_until_someone_renames_it(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    agent = await create_test_agent(client, user=ALICE)
+    workflow = await _save_workflow(client, "Blah borgus")
+    opening = f'"{workflow["name"]}" (ID {workflow["id"]}).'
+
+    def message(text: str) -> dict[str, Any]:
+        # As a native harness's transcript records the message the session page sent.
+        content = [{"type": "input_text", "text": text}]
+        item_data = {"role": "user", "content": content}
+        return {
+            "type": "external_conversation_item",
+            "data": {"item_type": "message", "item_data": item_data},
+        }
+
+    async def create(first_message: str | None = None, **body: Any) -> str:
+        response = await client.post(
+            "/v1/sessions", json={"agent_id": agent["id"], **body}, headers=_headers()
+        )
+        assert response.status_code == 201, response.text
+        session_id = response.json()["id"]
+        if first_message is not None:
+            sent = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json=message(first_message),
+                headers=_headers(),
+            )
+            assert sent.status_code == 202, sent.text
+        return session_id
+
+    # The Workflows page passes workflow_id, as does an agent's sys_session_create.
+    page_run = await create(
+        f"Use the workflow skill to run the saved workflow {opening}", workflow_id=workflow["id"]
+    )
+    # The composer's workflow picker sends only the workflow skill's message.
+    picked_run = await create(f"/workflow Run the saved workflow {opening}\n\nThe upload tests")
+    named_run = await create(workflow_id=workflow["id"], title="Hotfix release")
+    # A first message that reads like the workflow's name doesn't make the title a seed.
+    echoed_run = await create(workflow["name"], workflow_id=workflow["id"])
+    # A child's title is its sub-agent name, unique under its parent, so children keep theirs.
+    children = [await create(workflow_id=workflow["id"], parent_session_id=page_run) for _ in "ab"]
+    conversations = SqlAlchemyConversationStore(db_uri)
+
+    def title(session_id: str) -> str | None:
+        conversation = conversations.get_conversation(session_id)
+        assert conversation is not None
+        return conversation.title
+
+    assert [title(run) for run in (page_run, picked_run, named_run, echoed_run)] == [
+        "Blah borgus",
+        "Blah borgus",
+        "Hotfix release",
+        "Blah borgus",
+    ]
+    assert [title(child) for child in children] == [f"untitled:{child}" for child in children]
+
+    # A harness's automatic title replaces only a seed taken from the message itself.
+    for run in (page_run, picked_run, echoed_run):
+        declined = await client.post(
+            f"/v1/sessions/{run}/auto-title",
+            json={"title": "Run Saved Workflow"},
+            headers=_headers(),
+        )
+        assert declined.status_code == 200, declined.text
+        assert declined.json()["reason"] == "title_changed"
+    renamed = await client.patch(
+        f"/v1/sessions/{picked_run}", json={"title": "My rename"}, headers=_headers()
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert title(picked_run) == "My rename"
+
+
 @pytest.mark.parametrize("too_large", [False, True])
 async def test_workflow_journal_failure_removes_the_unreturned_session(
     client: httpx.AsyncClient,

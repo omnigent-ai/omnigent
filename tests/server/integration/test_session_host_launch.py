@@ -2128,6 +2128,79 @@ async def test_message_relaunch_never_connected_names_phase_and_logs_error(
     )
 
 
+@pytest.mark.parametrize("status", ["dead", "unknown"])
+async def test_message_relaunch_reports_exit_cause_when_status_beats_exit_report(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    """A runner the host already forgot still reports why it exited.
+
+    The host drops a dead runner before it sends its exit report, so the
+    status verdict can arrive first. The 503 must carry the reported cause,
+    not the generic never-connected message.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+    daemon_report = "The server rejected this host's credentials, so the runner could not connect."
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    set_runner_client(None)
+
+    async def _launch_then_verdict_then_report() -> None:
+        launch = await _serve_one_launch(comm, launch_status="launched")
+        deadline = Deadline(30.0)
+        for _ in range(40):
+            output = await comm.receive_output(timeout=deadline.next_wait(30.0))
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostRunnerStatusFrame):
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostRunnerStatusResultFrame(request_id=frame.request_id, status=status)
+                        ),
+                    }
+                )
+                break
+        await asyncio.sleep(0.05)
+        report = HostRunnerExitedFrame(
+            runner_id=token_bound_runner_id(launch.binding_token),
+            error=daemon_report,
+        )
+        await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(report)})
+
+    responder = asyncio.create_task(_launch_then_verdict_then_report())
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi?"}]},
+            },
+        )
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await responder
+
+    assert msg_resp.status_code == 503, msg_resp.text
+    error = msg_resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert daemon_report in error["message"], error["message"]
+    assert "never connected" not in error["message"], error["message"]
+
+
 async def _relaunch_then_report_exit(
     client: httpx.AsyncClient,
     comm: ApplicationCommunicator,

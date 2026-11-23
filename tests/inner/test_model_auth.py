@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import stat
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -13,14 +15,290 @@ from omnigent.inner._proc import process_alive
 from omnigent.inner.model_auth import (
     PROVIDER_AUTH_REQUIRED,
     ProviderAuthRequired,
-    _resolve_ucode_executable,
+    _auth_base_runtime_trees,
+    _pin_auth_python_runtime,
+    _profile_token_argv,
+    _resolve_auth_executable,
     _TrustedExecutable,
-    _ucode_auth_token_argv,
-    mint_ucode_token,
+    _validate_auth_executable_path,
+    _validate_auth_runtime,
+    mint_profile_token,
 )
+from omnigent.inner.sandbox import SandboxPolicy
 
 _HOST = "https://workspace.cloud.databricks.com"
 _PROFILE = "agent-profile"
+
+
+@pytest.fixture
+def trusted_python_helper(tmp_path: Path) -> tuple[_TrustedExecutable, Path, Path, Path]:
+    # Disposable native-file stand-in: rejection tests must never modify host Python.
+    binary_dir = tmp_path / "native-runtime"
+    binary_dir.mkdir()
+    binary = binary_dir / "python-real"
+    binary.write_bytes(b"\x7fELF-disposable-runtime")
+    binary.chmod(0o700)
+    hop_dir = tmp_path / "interpreter-links"
+    hop_dir.mkdir()
+    hop = hop_dir / "python"
+    hop.symlink_to(binary)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    runtime_bin = tmp_path / "runtime-bin"
+    runtime_bin.mkdir()
+    (runtime / "bin").symlink_to(runtime_bin, target_is_directory=True)
+    interpreter = runtime / "bin/python"
+    interpreter.symlink_to(hop)
+    helper = tmp_path / "profile-auth"
+    helper.write_text(f"#!{interpreter}\nprint('unused')\n")
+    helper.chmod(0o700)
+    info = helper.stat()
+    return _TrustedExecutable(helper, (info.st_dev, info.st_ino)), interpreter, hop, binary
+
+
+def test_pinned_interpreter_keeps_original_invocation_path(
+    trusted_python_helper: tuple[_TrustedExecutable, Path, Path, Path],
+) -> None:
+    executable, interpreter, _, binary = trusted_python_helper
+    pinned = _pin_auth_python_runtime(executable)
+
+    assert pinned.interpreter == interpreter
+    assert pinned.interpreter != binary
+    info = binary.stat()
+    assert pinned.interpreter_identity == (info.st_dev, info.st_ino)
+
+
+@pytest.mark.parametrize("target", ["helper", "interpreter"])
+def test_auth_runtime_rejects_writable_hardlink_alias(
+    trusted_python_helper: tuple[_TrustedExecutable, Path, Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    from omnigent.inner import sandbox
+
+    executable, _, _, binary = trusted_python_helper
+    pinned = _pin_auth_python_runtime(executable)
+    trusted = pinned.path if target == "helper" else binary
+    original_identity = (trusted.stat().st_dev, trusted.stat().st_ino)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    alias = workspace / "editable"
+    os.link(trusted, alias)
+    alias.write_bytes(b"modified in place")
+    assert (trusted.stat().st_dev, trusted.stat().st_ino) == original_identity
+
+    monkeypatch.setattr(sandbox, "_validate_launcher_runtime", lambda _policy: None)
+    monkeypatch.setattr(sandbox, "_isolated_launcher_import_roots", lambda _python, *, sandbox: ())
+    policy = SandboxPolicy("linux_bwrap", True, None, [workspace], [], False)
+    with pytest.raises(ValueError, match="outside sandbox-writable paths"):
+        _validate_auth_runtime(pinned, policy)
+
+
+@pytest.mark.parametrize("failure_call", [1, 3])
+def test_auth_runtime_hides_symlink_chain_errors_during_variant_expansion(
+    trusted_python_helper: tuple[_TrustedExecutable, Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    failure_call: int,
+) -> None:
+    from omnigent.inner import sandbox
+
+    executable, _, _, _ = trusted_python_helper
+    pinned = _pin_auth_python_runtime(executable)
+    original_variants = sandbox._launcher_path_variants
+    calls = 0
+
+    def fail_variant(path: Path) -> set[Path]:
+        nonlocal calls
+        calls += 1
+        if calls == failure_call:
+            raise OSError("private symlink path")
+        return original_variants(path)
+
+    monkeypatch.setattr(sandbox, "_launcher_path_variants", fail_variant)
+    policy = SandboxPolicy("linux_bwrap", True, None, [], [], False)
+    with pytest.raises(ValueError, match="outside sandbox-writable paths") as error:
+        _validate_auth_runtime(pinned, policy)
+    assert "private symlink path" not in str(error.value)
+
+
+@pytest.mark.parametrize("trusted_source", ["site", "shared_runtime"])
+def test_auth_runtime_rejects_copied_interpreter_base_runtime_alias_before_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trusted_source: str
+) -> None:
+    from omnigent.inner import sandbox
+
+    base_bin = tmp_path / "base" / "bin"
+    base_bin.mkdir(parents=True)
+    base_python = base_bin / "python"
+    base_python.write_bytes(b"\x7fELF-disposable-runtime")
+    base_python.chmod(0o700)
+    stdlib = base_bin.parent / "lib" / "python3.12"
+    (stdlib / "json").mkdir(parents=True)
+    (stdlib / "json" / "__init__.py").write_text("# disposable stdlib\n")
+    site = stdlib / "site.py"
+    site.write_text("# disposable stdlib\n")
+    shared_runtime = stdlib.parent / "libpython3.12.so"
+    shared_runtime.write_bytes(b"disposable shared runtime")
+    runtime = tmp_path / "auth-venv"
+    (runtime / "bin").mkdir(parents=True)
+    interpreter = runtime / "bin" / "python"
+    shutil.copy2(base_python, interpreter)
+    (runtime / "pyvenv.cfg").write_text(f"home = {base_bin}\nversion = 3.12.0\n")
+    helper = tmp_path / "profile-auth"
+    helper.write_text(f"#!{interpreter}\nprint('unused')\n")
+    helper.chmod(0o700)
+    info = helper.stat()
+    pinned = _pin_auth_python_runtime(_TrustedExecutable(helper, (info.st_dev, info.st_ino)))
+    assert not interpreter.is_symlink()
+    assert interpreter.stat().st_ino != base_python.stat().st_ino
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    alias = workspace / "editable.py"
+    os.link(site if trusted_source == "site" else shared_runtime, alias)
+    alias.write_text("worker can change trusted runtime\n")
+    probe = Mock(side_effect=AssertionError("auth interpreter probe ran"))
+    monkeypatch.setattr(sandbox, "_validate_launcher_runtime", lambda _policy: None)
+    monkeypatch.setattr(sandbox, "_isolated_launcher_import_roots", probe)
+
+    policy = SandboxPolicy("linux_bwrap", True, None, [workspace], [], False)
+    with pytest.raises(ValueError, match="outside sandbox-writable paths"):
+        _validate_auth_runtime(pinned, policy)
+    probe.assert_not_called()
+
+    alias.unlink()
+    unrelated = base_bin.parent / "lib" / "ssl" / "private"
+    unrelated.mkdir(parents=True)
+    unrelated.chmod(0)
+    monkeypatch.setattr(sandbox, "_isolated_launcher_import_roots", lambda _python, *, sandbox: ())
+    try:
+        _validate_auth_runtime(pinned, policy)
+    finally:
+        unrelated.chmod(0o700)
+
+
+def test_auth_base_runtime_accepts_venv_without_optional_version(tmp_path: Path) -> None:
+    base_bin = tmp_path / "base" / "bin"
+    base_bin.mkdir(parents=True)
+    stdlib = base_bin.parent / "lib" / "python3.12"
+    (stdlib / "json").mkdir(parents=True)
+    (stdlib / "json" / "__init__.py").write_text("# disposable stdlib\n")
+    (stdlib / "site.py").write_text("# disposable stdlib\n")
+    interpreter = tmp_path / "runtime" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_bytes(b"\x7fELF-disposable-runtime")
+    (interpreter.parent.parent / "pyvenv.cfg").write_text(f"home = {base_bin}\n")
+
+    roots = _auth_base_runtime_trees(interpreter)
+    assert roots and all(path.name == stdlib.name and path.samefile(stdlib) for path in roots)
+
+
+@pytest.mark.parametrize(
+    "config_text",
+    ["version = 3.12.0\n", "home = relative/bin\nversion = 3.12.0\n"],
+)
+def test_auth_runtime_rejects_indeterminate_venv_home_before_probe(
+    trusted_python_helper: tuple[_TrustedExecutable, Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    config_text: str,
+) -> None:
+    from omnigent.inner import sandbox
+
+    executable, interpreter, _, _ = trusted_python_helper
+    (interpreter.parent.parent / "pyvenv.cfg").write_text(config_text)
+    probe = Mock(side_effect=AssertionError("auth interpreter probe ran"))
+    monkeypatch.setattr(sandbox, "_validate_launcher_runtime", lambda _policy: None)
+    monkeypatch.setattr(sandbox, "_isolated_launcher_import_roots", probe)
+
+    policy = SandboxPolicy("linux_bwrap", True, None, [], [], False)
+    with pytest.raises(ValueError, match="outside sandbox-writable paths"):
+        _validate_auth_runtime(_pin_auth_python_runtime(executable), policy)
+    probe.assert_not_called()
+
+
+@pytest.mark.parametrize("stage", ["pin", "mint"])
+@pytest.mark.parametrize(
+    "component", ["directory-target", "hop-parent", "resolved-parent", "leaf"]
+)
+async def test_interpreter_rejects_writable_provenance_before_launch(
+    trusted_python_helper: tuple[_TrustedExecutable, Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    component: str,
+) -> None:
+    executable, interpreter, hop, binary = trusted_python_helper
+    if stage == "mint":
+        executable = _pin_auth_python_runtime(executable)
+    unsafe = {
+        "directory-target": interpreter.parent.resolve(),
+        "hop-parent": hop.parent,
+        "resolved-parent": binary.parent,
+        "leaf": binary,
+    }[component]
+    unsafe.chmod(0o777)
+    spawn = AsyncMock()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+    if stage == "pin":
+        with pytest.raises(PermissionError, match="unsafe"):
+            _pin_auth_python_runtime(executable)
+    else:
+        with pytest.raises(ProviderAuthRequired):
+            await mint_profile_token(host=_HOST, profile=_PROFILE, _executable=executable)
+    spawn.assert_not_awaited()
+
+
+@pytest.mark.parametrize("component", ["symlink", "leaf"])
+def test_interpreter_rejects_foreign_owned_leaf_and_symlink(
+    trusted_python_helper: tuple[_TrustedExecutable, Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+) -> None:
+    executable, _, hop, binary = trusted_python_helper
+    foreign = hop if component == "symlink" else binary
+    original_lstat = Path.lstat
+
+    def foreign_lstat(path: Path) -> os.stat_result:
+        info = original_lstat(path)
+        if path == foreign:
+            fields = list(info)
+            fields[4] = os.getuid() + 1
+            return os.stat_result(fields)
+        return info
+
+    monkeypatch.setattr(Path, "lstat", foreign_lstat)
+    with pytest.raises(
+        PermissionError, match="trusted authentication executable has unsafe ownership"
+    ):
+        _pin_auth_python_runtime(executable)
+
+
+@pytest.mark.parametrize("change", ["replace-binary", "retarget-link", "missing-identity"])
+async def test_interpreter_identity_rechecked_before_mint(
+    trusted_python_helper: tuple[_TrustedExecutable, Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    executable, interpreter, hop, binary = trusted_python_helper
+    if change == "missing-identity":
+        executable = _TrustedExecutable(executable.path, executable.identity, interpreter)
+    else:
+        executable = _pin_auth_python_runtime(executable)
+        replacement = binary.with_name("replacement")
+        replacement.write_bytes(binary.read_bytes())
+        replacement.chmod(0o700)
+        if change == "replace-binary":
+            replacement.replace(binary)
+        else:
+            hop.unlink()
+            hop.symlink_to(replacement)
+    spawn = AsyncMock()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+    with pytest.raises(ProviderAuthRequired):
+        await mint_profile_token(host=_HOST, profile=_PROFILE, _executable=executable)
+    spawn.assert_not_awaited()
 
 
 def _write_ucode(path: Path, body: str) -> Path:
@@ -32,7 +310,7 @@ def _write_ucode(path: Path, body: str) -> Path:
 def test_ucode_argv_is_fixed_and_contains_only_validated_authority(tmp_path: Path) -> None:
     executable = _write_ucode(tmp_path / "ucode", "exit 0\n").resolve()
 
-    assert _ucode_auth_token_argv(executable, host=_HOST, profile=_PROFILE) == [
+    assert _profile_token_argv(executable, host=_HOST, profile=_PROFILE) == [
         str(executable),
         "auth-token",
         "--host",
@@ -54,7 +332,7 @@ def test_ucode_resolution_rejects_writable_parent(
     monkeypatch.setenv("PATH", str(unsafe_bin))
 
     with pytest.raises(PermissionError, match="unsafe"):
-        _resolve_ucode_executable()
+        _resolve_auth_executable()
 
 
 def test_ucode_resolution_rejects_unsafe_symlink_chain(
@@ -72,7 +350,16 @@ def test_ucode_resolution_rejects_unsafe_symlink_chain(
     monkeypatch.setenv("PATH", str(unsafe_links))
 
     with pytest.raises(PermissionError, match="unsafe"):
-        _resolve_ucode_executable()
+        _resolve_auth_executable()
+
+
+def test_auth_executable_symlink_loop_reports_a_path_free_error(tmp_path: Path) -> None:
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+
+    with pytest.raises(PermissionError, match="cannot validate trusted authentication") as error:
+        _validate_auth_executable_path(loop)
+    assert str(loop) not in str(error.value)
 
 
 async def test_ucode_replacement_after_validation_fails_before_exec(
@@ -81,7 +368,7 @@ async def test_ucode_replacement_after_validation_fails_before_exec(
 ) -> None:
     executable = _write_ucode(tmp_path / "ucode", "printf 'first-token\\n'\n")
     monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}/usr/bin:/bin")
-    original_resolve = _resolve_ucode_executable
+    original_resolve = _resolve_auth_executable
 
     def _resolve_then_replace() -> _TrustedExecutable:
         resolved = original_resolve()
@@ -90,11 +377,11 @@ async def test_ucode_replacement_after_validation_fails_before_exec(
         return resolved
 
     monkeypatch.setattr(
-        "omnigent.inner.model_auth._resolve_ucode_executable", _resolve_then_replace
+        "omnigent.inner.model_auth._resolve_auth_executable", _resolve_then_replace
     )
 
     with pytest.raises(ProviderAuthRequired):
-        await mint_ucode_token(host=_HOST, profile=_PROFILE)
+        await mint_profile_token(host=_HOST, profile=_PROFILE)
 
 
 @pytest.mark.parametrize(
@@ -118,7 +405,7 @@ async def test_ucode_adapter_rejects_untrusted_host_and_profile(
     monkeypatch.setenv("PATH", str(tmp_path))
 
     with pytest.raises(ValueError):
-        await mint_ucode_token(host=host, profile=profile)
+        await mint_profile_token(host=host, profile=profile)
 
 
 async def test_ucode_adapter_uses_hermetic_environment_and_fixed_argv(
@@ -149,10 +436,11 @@ printf 'opaque-token-value\\n'
         "SSL_CERT_DIR",
         "CURL_HOME",
         "COOKIE",
+        "DATABRICKS_CONFIG_FILE",
     ):
         monkeypatch.setenv(name, "attacker-controlled")
 
-    assert await mint_ucode_token(host=_HOST, profile=_PROFILE) == "opaque-token-value"
+    assert await mint_profile_token(host=_HOST, profile=_PROFILE) == "opaque-token-value"
     assert args_file.read_text(encoding="utf-8").splitlines() == [
         "auth-token",
         "--host",
@@ -181,7 +469,7 @@ async def test_ucode_helper_gets_an_owned_process_group(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
 
-    assert await mint_ucode_token(host=_HOST, profile=_PROFILE) == "opaque-token-value"
+    assert await mint_profile_token(host=_HOST, profile=_PROFILE) == "opaque-token-value"
     if os.name == "posix":
         assert observed_kwargs["start_new_session"] is True
     else:
@@ -199,7 +487,7 @@ async def test_cancelled_ucode_mint_terminates_helper(
     )
     monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}/usr/bin:/bin")
 
-    mint = asyncio.create_task(mint_ucode_token(host=_HOST, profile=_PROFILE))
+    mint = asyncio.create_task(mint_profile_token(host=_HOST, profile=_PROFILE))
     while not started.exists():
         await asyncio.sleep(0)
     mint.cancel()
@@ -223,7 +511,7 @@ async def test_nonzero_helper_leader_exit_does_not_leave_descendants(
     monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}/usr/bin:/bin")
 
     with pytest.raises(ProviderAuthRequired):
-        await mint_ucode_token(host=_HOST, profile=_PROFILE)
+        await mint_profile_token(host=_HOST, profile=_PROFILE)
 
     child_pid = int(child_pid_path.read_text(encoding="utf-8"))
     for _ in range(100):
@@ -257,7 +545,7 @@ async def test_ucode_adapter_rejects_noncanonical_stdout(
     monkeypatch.setenv("PATH", str(tmp_path))
 
     with pytest.raises(ProviderAuthRequired) as raised:
-        await mint_ucode_token(host=_HOST, profile=_PROFILE)
+        await mint_profile_token(host=_HOST, profile=_PROFILE)
 
     assert raised.value.code == PROVIDER_AUTH_REQUIRED
     assert "token" not in str(raised.value).lower()
@@ -275,7 +563,7 @@ async def test_ucode_adapter_bounds_stdout_and_hides_stderr(
     monkeypatch.setenv("PATH", str(tmp_path))
 
     with pytest.raises(ProviderAuthRequired) as raised:
-        await mint_ucode_token(host=_HOST, profile=_PROFILE)
+        await mint_profile_token(host=_HOST, profile=_PROFILE)
 
     message = str(raised.value)
     assert raised.value.code == PROVIDER_AUTH_REQUIRED

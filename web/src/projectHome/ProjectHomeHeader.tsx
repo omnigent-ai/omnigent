@@ -7,9 +7,10 @@ import {
   Trash2Icon,
   XIcon,
 } from "lucide-react";
-import { useRef } from "react";
+import { useCallback, useRef } from "react";
 import { create } from "zustand";
 import { ProjectLandingIcon } from "@/components/ProjectIconPicker";
+import { useProjectHomePaletteCommands } from "@/projectHome/useProjectHomePaletteCommands";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -108,6 +109,16 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
     config?.icon,
     (_oldName, newName) => navigate(projectHomePath(newName), { replace: true }),
     () => navigate("/", { replace: true }),
+  );
+  const setComposerOpen = useProjectComposerStore((state) => state.setOpen);
+  useProjectHomePaletteCommands(
+    projectName,
+    actions,
+    // As the New session button: the floating composer, or the full-screen one on phones.
+    useCallback(() => {
+      if (isMobile) void navigate(`/?project=${encodeURIComponent(projectName)}`);
+      else setComposerOpen(true);
+    }, [isMobile, navigate, projectName, setComposerOpen]),
   );
   const buttonClass = cn("text-muted-foreground", isMobile && "mobile-touch-target");
   const iconClass = isMobile ? "size-5" : undefined;

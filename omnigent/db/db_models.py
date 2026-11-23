@@ -1665,10 +1665,13 @@ class SqlScheduledTask(OmnigentBase):
         continue (relates to ``conversations.id``; no DB foreign key, Rule R032).
         ``None`` until the first such firing creates it, unless a session was
         chosen.
-    :param kind: What the task is for — ``automation`` (1, the default) or
-        ``reminder`` (2), a one-time message an agent set for its own session.
-        Clients use it to list reminders apart from automations; scheduling
-        and firing do not depend on it.
+    :param kind: What the task is for — ``automation`` (1, the default),
+        ``reminder`` (2), a one-time message an agent set for its own session, or
+        ``timer`` (3), a hidden one-shot or repeating wake an agent set with
+        ``sys_timer_set``. Clients list only automations; timers also have their
+        own schedule arithmetic and delivery.
+    :param smart_routing: Whether the task's runs use Smart Routing instead of
+        a fixed model: on (1) or off (2). ``None`` until the owner chooses.
     :param created_at: Unix epoch seconds at row creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
@@ -1751,9 +1754,11 @@ class SqlScheduledTask(OmnigentBase):
     # The session each run's new session starts as a copy of. Relates to
     # conversations.id. No DB foreign key (Rule R032).
     source_session_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
-    # Stable int code: automation=1, reminder=2. Defaults to automation so
+    # Stable int code: automation=1, reminder=2, timer=3. Defaults to automation so
     # existing tasks keep listing as automations.
     kind: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
+    # Stable int code: on=1, off=2. NULL keeps "never chosen" apart from off.
+    smart_routing: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger)
     updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
@@ -1761,11 +1766,22 @@ class SqlScheduledTask(OmnigentBase):
         CheckConstraint("state IN (1, 2, 3, 4)", name="ck_scheduled_tasks_lifecycle_state"),
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
         CheckConstraint("session_mode IN (1, 2)", name="ck_scheduled_tasks_session_mode"),
-        CheckConstraint("kind IN (1, 2)", name="ck_scheduled_tasks_kind"),
+        CheckConstraint("kind IN (1, 2, 3)", name="ck_scheduled_tasks_task_kind"),
+        CheckConstraint("smart_routing IN (1, 2)", name="ck_scheduled_tasks_smart_routing"),
         Index("ix_scheduled_tasks_due", "state", "next_run_at", "workspace_id", "id"),
         # Covers a user's task listing ordered by creation time.
         Index(
             "ix_scheduled_tasks_user_scope",
+            "workspace_id",
+            "user_id",
+            "created_at",
+            "id",
+        ),
+        # Lists one kind of a user's tasks without reading other kinds' rows, and finds
+        # any task of a kind in one lookup, as the timer-kind downgrade does.
+        Index(
+            "ix_scheduled_tasks_kind_scope",
+            "kind",
             "workspace_id",
             "user_id",
             "created_at",

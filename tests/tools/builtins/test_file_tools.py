@@ -1,4 +1,4 @@
-"""Unit tests for list_files and download_file builtin tools."""
+"""Unit tests for the sys_files_list and sys_files_download tools."""
 
 from __future__ import annotations
 
@@ -149,7 +149,7 @@ def tool_ctx(tmp_path: Path) -> ToolContext:
     )
 
 
-# ── list_files tests ─────────────────────────────────────
+# ── sys_files_list tests ─────────────────────────────────────
 
 
 def test_list_files_returns_metadata(
@@ -157,7 +157,7 @@ def test_list_files_returns_metadata(
     tool_ctx: ToolContext,
 ) -> None:
     """
-    list_files returns file metadata for session-owned files.
+    sys_files_list returns file metadata for session-owned files.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tool_ctx: Tool execution context.
@@ -187,7 +187,7 @@ def test_list_files_empty(
     tool_ctx: ToolContext,
 ) -> None:
     """
-    list_files returns empty list when no files exist.
+    sys_files_list returns empty list when no files exist.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tool_ctx: Tool execution context.
@@ -208,7 +208,7 @@ def test_list_files_allows_empty_arguments(
     tool_ctx: ToolContext,
 ) -> None:
     """
-    list_files has no required arguments, so an empty argument
+    sys_files_list has no required arguments, so an empty argument
     string should behave like an empty JSON object.
 
     :param monkeypatch: Pytest monkeypatch fixture.
@@ -259,7 +259,7 @@ def test_list_files_respects_limit(
     tool_ctx: ToolContext,
 ) -> None:
     """
-    list_files caps at the requested limit.
+    sys_files_list caps at the requested limit.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tool_ctx: Tool execution context.
@@ -284,7 +284,7 @@ def test_list_files_caps_limit_at_100(
     tool_ctx: ToolContext,
 ) -> None:
     """
-    list_files clamps oversized limits to the documented maximum.
+    sys_files_list clamps oversized limits to the documented maximum.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tool_ctx: Tool execution context.
@@ -340,7 +340,7 @@ def test_list_files_requires_conversation_id() -> None:
 
     result = json.loads(tool.invoke("{}", ctx))
 
-    assert result == {"error": "list_files requires a conversation_id"}
+    assert result == {"error": "sys_files_list requires a conversation_id"}
 
 
 def test_list_files_excludes_other_sessions(
@@ -348,7 +348,7 @@ def test_list_files_excludes_other_sessions(
     tool_ctx: ToolContext,
 ) -> None:
     """
-    list_files only returns files belonging to the calling
+    sys_files_list only returns files belonging to the calling
     conversation — files from other sessions are invisible.
 
     Regression test for file enumeration across sessions.
@@ -377,7 +377,20 @@ def test_list_files_excludes_other_sessions(
     assert "file_g" in returned_ids, "Global (unscoped) files must be visible"
 
 
-# ── download_file tests ──────────────────────────────────
+# ── sys_files_download tests ──────────────────────────────────
+
+
+def test_download_schema_describes_the_text_result_agents_receive() -> None:
+    """
+    The advertised description matches the runner's result, the file's content as
+    text, and promises neither a saved local path nor intact binary content.
+    """
+    function = DownloadFileTool().get_schema()["function"]
+
+    assert function["description"] == DownloadFileTool.description()
+    assert "return its content as text" in function["description"]
+    assert "binary content is not returned intact" in function["description"]
+    assert "path" not in function["description"]
 
 
 def test_download_file_saves_to_workspace(
@@ -385,7 +398,7 @@ def test_download_file_saves_to_workspace(
     tool_ctx: ToolContext,
 ) -> None:
     """
-    download_file retrieves content and writes it to the workspace.
+    sys_files_download retrieves content and writes it to the workspace.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tool_ctx: Tool execution context.
@@ -521,7 +534,7 @@ def test_download_file_not_found(
     tool_ctx: ToolContext,
 ) -> None:
     """
-    download_file returns error for unknown file_id.
+    sys_files_download returns error for unknown file_id.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tool_ctx: Tool execution context.
@@ -581,7 +594,7 @@ def test_download_file_missing_content(
     tool_ctx: ToolContext,
 ) -> None:
     """
-    download_file returns error when metadata exists but content is missing.
+    sys_files_download returns error when metadata exists but content is missing.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tool_ctx: Tool execution context.
@@ -618,7 +631,7 @@ def test_download_file_rejects_cross_session_file(
     tool_ctx: ToolContext,
 ) -> None:
     """
-    download_file rejects a file that belongs to a different session.
+    sys_files_download rejects a file that belongs to a different session.
 
     Regression test for cross-user file download via
     leaked file_id.
@@ -660,7 +673,7 @@ def test_download_file_allows_global_file(
     tool_ctx: ToolContext,
 ) -> None:
     """
-    download_file allows access to global (unscoped) files from
+    sys_files_download allows access to global (unscoped) files from
     any session.
 
     :param monkeypatch: Pytest monkeypatch fixture.

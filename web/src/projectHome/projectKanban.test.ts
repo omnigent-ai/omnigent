@@ -4,6 +4,7 @@ import {
   DEFAULT_AUTOMATION_PROJECT,
   SCHEDULED_TASK_LAUNCH_LABEL_KEY,
 } from "@/lib/automationSessions";
+import { MUTED_LABEL_KEY } from "@/lib/sessionMute";
 import type { StatusBucket } from "@/shell/sidebarNav";
 import {
   filterKanbanCards,
@@ -52,6 +53,17 @@ describe("project kanban", () => {
     expect(kanbanDropAction(card("Unread"), "Working")).toBeNull();
     expect(kanbanDropAction(card("Done"), "Draft")).toBeNull();
     expect(kanbanDropAction(card("Needs attention"), "Done")).toBeNull();
+  });
+
+  it("never drops a muted session into Unread", () => {
+    const muted = { ...row("a", 1), labels: { [MUTED_LABEL_KEY]: "1" } } as Conversation;
+    expect(
+      kanbanDropAction({ conversation: muted, members: [muted], column: "Done" }, "Unread"),
+    ).toBeNull();
+    // Clearing unread output stays available.
+    expect(
+      kanbanDropAction({ conversation: muted, members: [muted], column: "Unread" }, "Done"),
+    ).toBe("mark_read");
   });
 
   it("keeps cards with any session matching the search, ignoring case and padding", () => {

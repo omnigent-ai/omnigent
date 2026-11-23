@@ -9,9 +9,17 @@
 // dispatch preference — no account or session state changes — so it lives in
 // localStorage like the other `*Preferences` helpers.
 
+import { createStoredChoicePreference } from "./storedChoicePreference";
+
 const STORAGE_KEY = "omnigent:always-steer";
 
 export const DEFAULT_ALWAYS_STEER = true;
+
+const preference = createStoredChoicePreference(
+  STORAGE_KEY,
+  ["false", "true"],
+  DEFAULT_ALWAYS_STEER ? "true" : "false",
+);
 
 /**
  * Read the persisted "always steer" preference. Returns the default (on) when
@@ -19,26 +27,18 @@ export const DEFAULT_ALWAYS_STEER = true;
  * is malformed — never throws, so a corrupt entry can't break the app.
  */
 export function readAlwaysSteer(): boolean {
-  if (typeof window === "undefined") return DEFAULT_ALWAYS_STEER;
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (raw === "true") return true;
-    if (raw === "false") return false;
-    return DEFAULT_ALWAYS_STEER;
-  } catch {
-    return DEFAULT_ALWAYS_STEER;
-  }
+  return preference.read() === "true";
 }
 
 /**
- * Persist the "always steer" preference. Swallows quota/access errors so a
- * failed write can't break the app.
+ * Persist the "always steer" preference and notify readers on screen. Swallows
+ * quota/access errors so a failed write can't break the app.
  */
 export function writeAlwaysSteer(value: boolean): void {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(STORAGE_KEY, value ? "true" : "false");
-  } catch {
-    // localStorage quota or access errors shouldn't break the app.
-  }
+  preference.write(value ? "true" : "false");
+}
+
+/** Live value of the preference, including changes from ⌘K or another window. */
+export function useAlwaysSteer(): boolean {
+  return preference.use() === "true";
 }

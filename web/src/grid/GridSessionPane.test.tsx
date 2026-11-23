@@ -56,6 +56,7 @@ const fixture = vi.hoisted(() => ({
   terminals: [] as TerminalsModule.TerminalInfo[],
   terminalPending: false,
   composerDisabled: false,
+  transcriptField: false,
   hostOnline: undefined as boolean | undefined,
   livenessKind: "online",
   failedChat: "",
@@ -193,12 +194,14 @@ vi.mock("@/components/chat/SideChatPane", () => ({
       <>
         <textarea
           aria-label="Message"
+          data-composer-input=""
           disabled={fixture.composerDisabled}
           onKeyDown={(event) => {
             if (event.key === "Tab" && event.shiftKey && gridComposer?.cyclePermissionMode?.())
               event.preventDefault();
           }}
         />
+        {fixture.transcriptField && <textarea aria-label="Transcript field" />}
         <button type="button" onClick={() => terminal?.setView("terminal")}>
           Open terminal dialog
         </button>
@@ -228,6 +231,44 @@ vi.mock("@/components/chat/SideChatPane", () => ({
         {gridComposer?.trailing}
       </>
     );
+  },
+}));
+// The tabs sidebar's routing: off unless a test turns the flag on.
+const tabsRouting = vi.hoisted(() => ({
+  enabled: false,
+  routes: [] as [string, ...unknown[]][],
+  hosts: [] as {
+    conversationId: string;
+    bindsHistory?: boolean;
+    open?: boolean;
+    openTerminalTab?: (key: string) => void;
+  }[],
+}));
+vi.mock("@/shell/workspaceTabsRouting", () => ({
+  useTabsSidebar: () => tabsRouting.enabled,
+  LazyWorkspaceTabsHost: (props: {
+    conversationId: string;
+    bindsHistory?: boolean;
+    open?: boolean;
+    openTerminalTab?: (key: string) => void;
+  }) => {
+    tabsRouting.hosts.push(props);
+    return <aside aria-label="Workspace tabs" data-testid={`tabs-${props.conversationId}`} />;
+  },
+  routeToWorkspaceTabs: async (open: (tabs: Record<string, unknown>) => Promise<unknown>) => {
+    const record =
+      (name: string) =>
+      async (...args: unknown[]) => {
+        tabsRouting.routes.push([name, ...args]);
+        return { ok: true };
+      };
+    await open({
+      isWorkspacePage: (value: string | null) => value === "files" || value === "github",
+      openWorkspacePage: record("openWorkspacePage"),
+      openWorkspaceFileLink: record("openWorkspaceFileLink"),
+      openWorkspaceTerminal: record("openWorkspaceTerminal"),
+      showWorkspacePullRequests: record("showWorkspacePullRequests"),
+    });
   },
 }));
 vi.mock("@/shell/WorkspacePanel", () => ({
@@ -277,6 +318,7 @@ afterEach(() => {
   fixture.terminals = [];
   fixture.terminalPending = false;
   fixture.composerDisabled = false;
+  fixture.transcriptField = false;
   fixture.hostOnline = undefined;
   fixture.livenessKind = "online";
   fixture.failedChat = "";
@@ -707,6 +749,7 @@ it.each(["chat", "terminal"])(
 );
 
 it("cycles keyboard focus through cells and toggles the grid workspace from the keyboard", () => {
+  fixture.transcriptField = true;
   fixture.labels = { "omnigent.ui": "terminal" };
   fixture.terminals = [{ id: "terminal_tui_main", name: "tui", session: "main", running: true }];
   const layout = splitGrid(
@@ -765,6 +808,7 @@ it("cycles keyboard focus through cells and toggles the grid workspace from the 
 
 it("focuses the cell itself when its composer is not ready", () => {
   fixture.composerDisabled = true;
+  fixture.transcriptField = true;
   render(
     <MemoryRouter>
       <RearrangeableGrid
@@ -842,6 +886,9 @@ it("shares one workspace, preserves per-session files and drafts, and persists g
   fireEvent.click(within(first).getByText("Open citation"));
   let workspace = screen.getByRole("complementary", { name: "Workspace" });
   expect(workspace).toHaveAttribute("data-width", "480");
+  const flyoutBoundary = first.closest<HTMLElement>("[data-flyout-boundary]");
+  expect(flyoutBoundary).toBe(screen.getByTestId("session-grid"));
+  expect(flyoutBoundary).not.toContainElement(workspace);
   expect(workspace).toHaveTextContent("notes.md7agent-first");
   expect(workspace).toHaveAttribute("data-end-line", "9");
   fireEvent.change(within(workspace).getByRole("textbox", { name: "File draft" }), {
@@ -985,4 +1032,41 @@ it("keeps a Claude Code sub-agent child's picker disabled, with no PATCH, even w
   expect(screen.queryByTestId("composer-agent-edit")).not.toBeInTheDocument();
   expect(updateSession).not.toHaveBeenCalled();
   view.unmount();
+});
+
+it("shows each cell's sidebar as tabs with the flag on, routing its links there", async () => {
+  tabsRouting.enabled = true;
+  tabsRouting.routes = [];
+  tabsRouting.hosts = [];
+  vi.mocked(selectPullRequestInPanel).mockClear();
+  onTestFinished(() => {
+    tabsRouting.enabled = false;
+    // Later cases assert this reveal was never asked for their cells.
+    vi.mocked(revealFolderInFilesPanel).mockClear();
+  });
+  render(twoCellGrid());
+
+  expect(screen.queryByTestId("workspace-first")).toBeNull();
+  expect(screen.getByTestId("tabs-first")).toBeInTheDocument();
+  // Only the selected cell binds Back and Forward.
+  const latest = (id: string) =>
+    tabsRouting.hosts.filter((host) => host.conversationId === id).at(-1);
+  expect(latest("first")?.bindsHistory).toBe(true);
+  expect(latest("second")?.bindsHistory).toBe(false);
+
+  const first = within(screen.getByRole("region", { name: "first (active)" }));
+  fireEvent.click(first.getByText("Open citation"));
+  fireEvent.click(first.getByText("Open PR"));
+  fireEvent.click(first.getByText("Open folder"));
+  // A shell the tabs ask for opens in the cell's own tabs.
+  act(() => latest("first")!.openTerminalTab!("terminal:t1"));
+  await waitFor(() =>
+    expect(tabsRouting.routes).toEqual([
+      ["openWorkspaceFileLink", "first", "notes.md", { line: 7, endLine: 9 }, "user"],
+      ["showWorkspacePullRequests", "first", { kind: "pull", url: LINKED_PR, overview: true }],
+      ["openWorkspacePage", "first", "files"],
+      ["openWorkspaceTerminal", "first", "terminal:t1"],
+    ]),
+  );
+  expect(selectPullRequestInPanel).not.toHaveBeenCalled();
 });

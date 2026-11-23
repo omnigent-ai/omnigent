@@ -19,6 +19,7 @@ from fastapi.routing import APIRoute
 
 from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.utils import builtin_agent_id
+from omnigent.runner.policy import RunnerToolPolicyGate
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import proactive_agent
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
@@ -85,6 +86,25 @@ def test_bundle_opts_into_the_inbox_tools_only() -> None:
     # A new framework group defaults to on, so the bundle must turn it off explicitly.
     assert groups.pop("user_inbox") is True
     assert not any(groups.values()), groups
+
+
+@pytest.mark.parametrize(
+    ("tool", "action"),
+    [
+        ("sys_files_upload", "deny"),
+        ("sys_files_list", "deny"),
+        ("sys_files_download", "deny"),
+        ("sys_session_list", "allow"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_bundle_denies_the_session_file_tools(tool: str, action: str) -> None:
+    """The bundle's policies refuse the session file tools and nothing else here."""
+    gate = RunnerToolPolicyGate.from_spec(load(_BUNDLE))
+
+    verdict = await gate.evaluate_tool_call(tool, {})
+
+    assert verdict.action == action, verdict
 
 
 def test_seeded_outside_the_seeded_agents_allowlist(
@@ -319,7 +339,11 @@ _PROBE_BODIES: dict[tuple[str, str], dict[str, Any]] = {
 
 
 # Create is not probed: test_users_cannot_schedule_the_proactive_agent covers it.
-_UNPROBED_ROUTES = {("POST", "/v1/scheduled-tasks")}
+# The default-timezone route reads no task and echoes only the caller's zone.
+_UNPROBED_ROUTES = {
+    ("POST", "/v1/scheduled-tasks"),
+    ("PUT", "/v1/scheduled-tasks/default-timezone"),
+}
 
 _SHARING_USER = "alice@example.com"
 _RECIPIENT = "bob@example.com"

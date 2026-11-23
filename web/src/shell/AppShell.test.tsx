@@ -878,6 +878,39 @@ describe("AppShell header", () => {
     expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
   });
 
+  it("leaves an agent-created session's creator out of the header", async () => {
+    mockConversations([]);
+    getSessionSlimMock.mockResolvedValue({ id: "conv_manager", title: "Manager" } as Session);
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_worker",
+        agentId: "ag_owner",
+        agentName: "developer",
+        runnerId: null,
+        status: "idle",
+        createdAt: 1_700_000_000,
+        title: "Docs worker",
+        labels: { "omnigent.created_by_session_id": "conv_manager" },
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: null,
+        subAgentName: null,
+        kind: "default",
+      },
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_worker");
+    // Let any creator lookup settle so a late label would have rendered.
+    await act(async () => {});
+
+    expect(screen.getByText("Docs worker")).toBeInTheDocument();
+    expect(screen.queryByText(/Created by/)).toBeNull();
+    expect(getSessionSlimMock).not.toHaveBeenCalledWith("conv_manager");
+  });
+
   it.each([
     { title: "Off-window owner session", archived: false, sibling: false },
     { title: null, archived: true, sibling: false },
@@ -2158,6 +2191,8 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
     expect(rail().className).toContain("md:shrink-0");
     expect(rail().className).not.toContain("md:absolute");
+    expect(screen.getByRole("main")).toHaveAttribute("data-flyout-boundary");
+    expect(screen.getByRole("main")).not.toContainElement(rail());
     fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
 
     // Maximize → the rail breaks out to cover the content region, and the left
@@ -6978,7 +7013,8 @@ describe("AppShell desktop Close", () => {
       renderShell("/c/conv_shell_fail");
       expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
       if (layout === "fullscreen") {
-        fireEvent.click(screen.getByRole("button", { name: "Open sidebar" }));
+        // The desktop app starts with the sidebar docked open at any window width.
+        expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
         fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
       } else if (layout === "collapsed") {
         fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));

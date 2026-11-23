@@ -26,6 +26,7 @@ import pytest
 from omnigent_client import OmnigentClient, SessionsChat
 
 from tests._helpers.live_server import find_free_port
+from tests._helpers.polling import poll_until
 from tests.e2e.omnigent._pexpect_harness import (
     PROMPT_READY,
     STATE_SLEEPING,
@@ -298,6 +299,25 @@ def _wait_session_runner_online(
         f"session {session_id} did not get an online runner within {timeout}s; "
         f"last_runner_id={last_runner_id!r}",
     )
+
+
+def _wait_session_idle(base_url: str, session_id: str, *, timeout: float = 60.0) -> None:
+    """
+    Poll until the session's current turn has finished on the server.
+
+    The REPL can render a reply before the server records the turn as done,
+    so a test that kills the runner waits here first.
+
+    :param base_url: Omnigent server URL.
+    :param session_id: Session id.
+    :param timeout: Max seconds to wait.
+    """
+
+    def idle() -> bool:
+        response = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=5.0)
+        return response.status_code == 200 and response.json().get("status") == "idle"
+
+    poll_until(idle, timeout_s=timeout, interval_s=0.25)
 
 
 def _newest_session_id(base_url: str, agent_name: str) -> str:
@@ -821,16 +841,19 @@ def test_repl_recover_after_runner_death(
                     base_url=server.base_url,
                     agent_name="repl_session_recover",
                 )
+                # Kill between turns: a kill mid-turn fails that turn instead.
+                _wait_session_idle(server.base_url, first_result.session_id)
                 runner_pid = _runner_pid_from_daemon_log(home, first_result.runner_id)
                 os.kill(runner_pid, signal.SIGKILL)
 
+                # A marker of its own, so the first turn's output can't satisfy the match.
                 configure_mock_llm(
                     mock_llm_server_url,
-                    [{"text": "SESSION_RECOVER_OK"}],
+                    [{"text": "SESSION_RECOVERED_AGAIN_OK"}],
                     key=_MODEL,
                 )
                 submit_prompt(child, "respond with the configured marker again")
-                child.expect(re.escape("SESSION_RECOVER_OK"), timeout=_TURN_TIMEOUT)
+                child.expect(re.escape("SESSION_RECOVERED_AGAIN_OK"), timeout=_TURN_TIMEOUT)
                 child.expect([STATE_SLEEPING, PROMPT_READY], timeout=60)
                 recovered_runner_id = _wait_session_runner_online(
                     server.base_url,

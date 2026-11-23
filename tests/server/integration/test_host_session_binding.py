@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from omnigent.entities import Conversation
+from omnigent.entities.conversation import ErrorData
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HostHelloFrame,
@@ -56,6 +57,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
@@ -1149,9 +1151,14 @@ async def test_managed_create_returns_during_provision_and_message_rendezvouses(
     # cleanup path), so nothing leaks until the provider lifetime cap.
     assert fake.terminated == ["sb-fake-1"]
 
-    # The failure is retained on the snapshot (mirroring the tracker's
-    # failed-entry retention) so a client reloading the dead session
-    # still sees why the sandbox never came up, not a blank chat.
+    # The persisted diagnostic can follow the failure label; a reload must retain it.
+    await poll_until_async(
+        lambda: any(
+            isinstance(item.data, ErrorData) and "host startup failed" in item.data.message
+            for item in env.conv_store.list_items(session_id, type="error").data
+        ),
+        timeout_s=budget(5.0),
+    )
     failed_snapshot = await env.client.get(f"/v1/sessions/{session_id}")
     assert failed_snapshot.status_code == 200, failed_snapshot.text
     sandbox_status = failed_snapshot.json()["sandbox_status"]
@@ -1300,12 +1307,14 @@ async def test_message_sent_while_a_moved_session_provisions_waits_for_the_sandb
     assert again.json()["error"]["code"] == "conflict"
 
     gate.set()
-    tracker = env.app.state.managed_launches
-    for _ in range(150):
-        launch = tracker.get(session_id)
-        if launch is not None and launch.settled.is_set():
-            break
-        await asyncio.sleep(0.1)
+
+    def claim_released() -> bool:
+        current = env.conv_store.get_conversation(session_id)
+        return current is not None and current.runner_id is None
+
+    # The launch settles before the move releases its claim, so wait for the release.
+    await poll_until_async(claim_released)
+    launch = env.app.state.managed_launches.get(session_id)
     assert launch is not None and launch.error is not None
     snapshot = await env.client.get(f"/v1/sessions/{session_id}")
     assert snapshot.status_code == 200, snapshot.text
@@ -4490,7 +4499,7 @@ async def test_runner_exited_before_connect_fails_idle_session(
 
     caplog.set_level("WARNING", logger="omnigent")
     _comm = await _report_runner_exited(app, "runner_never_connected", had_connected=had_connected)
-    async with asyncio.timeout(5.0):
+    async with asyncio.timeout(budget(5.0)):
         while _persisted_task_error(conv_store, conv.id) is None:
             await asyncio.sleep(0.01)
 
@@ -4535,7 +4544,7 @@ async def test_runner_exited_after_connect_fails_mid_turn_session(
     _comm = await _report_runner_exited(
         app, "runner_ran_mid_turn", had_connected=True if connection_source == "host" else None
     )
-    async with asyncio.timeout(5.0):
+    async with asyncio.timeout(budget(5.0)):
         while _persisted_task_error(conv_store, conv.id) is None:
             await asyncio.sleep(0.01)
 
@@ -4556,7 +4565,8 @@ async def _answer_host_launch(comm: ApplicationCommunicator) -> None:
     from omnigent.host.frames import HostStatFrame, HostStatResultFrame
 
     for _ in range(40):
-        output = await comm.receive_output(timeout=5.0)
+        # No receive timeout: asgiref cancels the app (the host tunnel) when a receive times out.
+        output = await comm.receive_output(timeout=None)
         if output["type"] != "websocket.send":
             continue
         frame = decode_host_frame(output["text"])
@@ -4661,7 +4671,7 @@ async def test_runner_exited_keeps_existing_failure_cause(
         collector = await start_session_stream_collector(session_id)
         caplog.set_level("WARNING", logger="omnigent")
         _comm = await _report_runner_exited(app, runner_id)
-        async with asyncio.timeout(5.0):
+        async with asyncio.timeout(budget(5.0)):
             while not _disconnect_decisions(caplog, session_id):
                 await asyncio.sleep(0.01)
         await asyncio.sleep(0.5)

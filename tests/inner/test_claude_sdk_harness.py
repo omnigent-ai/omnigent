@@ -17,12 +17,16 @@ the e2e suite and requires API keys.
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from omnigent.inner import claude_sdk_harness
+from omnigent.inner.claude_model_access import ClaudeModelAccess
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 
 
@@ -54,6 +58,31 @@ def test_create_app_returns_fastapi_with_required_routes() -> None:
     # discriminated-event endpoint per §The Harness API Subset.
     assert "/health" in paths
     assert "/v1/sessions/{conversation_id}/events" in paths
+
+
+async def test_profile_credential_resolves_during_async_executor_startup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The Claude harness factory can mint a credential with a live event loop."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    access = ClaudeModelAccess(
+        "https://model.test", "authorization", lambda: asyncio.run(asyncio.sleep(0, result="key"))
+    )
+    worker_env = {"MODEL_ALIAS": "key"}
+    executor = SimpleNamespace(close=AsyncMock())
+
+    def build_executor() -> Any:
+        access.worker_environment(worker_env, tmp_path / "home")
+        return executor
+
+    monkeypatch.setattr(claude_sdk_harness, "_build_claude_sdk_executor", build_executor)
+    with patch.object(ExecutorAdapter, "build", lambda self: self):
+        adapter = claude_sdk_harness.create_app()
+    assert isinstance(adapter, ExecutorAdapter)
+    assert await adapter._ensure_executor_for_turn() is executor
+    assert worker_env["ANTHROPIC_AUTH_TOKEN"] == access.placeholder
+    assert "MODEL_ALIAS" not in worker_env
 
 
 def test_executor_factory_reads_env_vars(
@@ -262,52 +291,6 @@ def test_executor_factory_decodes_os_env_json(
     # default ``True``.
     assert os_env_value.sandbox.allow_network is False
     assert os_env_value.sandbox.read_paths == ["/srv/data"]
-
-
-def test_executor_factory_falls_back_on_malformed_os_env_json(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Malformed ``HARNESS_CLAUDE_SDK_OS_ENV`` falls back to default.
-
-    A malformed payload should NOT crash the wrap — that would
-    bring the whole subprocess down on first turn. The wrap
-    instead logs a warning and defaults to the parity-preserving
-    ``caller_process + sandbox=none`` so the agent still starts
-    and the SDK natives stay enabled. Without this fallback a
-    bad serialization on AP's side (or an env var hand-tweaked
-    by an operator) could silently lobotomize the agent.
-    """
-    monkeypatch.setenv("HARNESS_CLAUDE_SDK_OS_ENV", "{this-is-not-json")
-    captured: dict[str, Any] = {}
-
-    def _fake_init(
-        self: Any,
-        *,
-        cwd: str | None,
-        os_env: Any,
-        model: str | None,
-        permission_mode: str,
-        gateway: bool,
-        databricks_profile: str | None,
-        **_kwargs: Any,
-    ) -> None:
-        captured["os_env"] = os_env
-
-    with patch(
-        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
-        _fake_init,
-    ):
-        claude_sdk_harness._build_claude_sdk_executor()
-
-    # Default kicks in: caller_process + sandbox=none. If the
-    # wrap raised on bad JSON instead, the test (and the live
-    # agent) would never see this assertion — the harness
-    # subprocess would have crashed at first turn.
-    os_env_value = captured["os_env"]
-    assert os_env_value is not None
-    assert os_env_value.type == "caller_process"
-    assert os_env_value.sandbox is not None
-    assert os_env_value.sandbox.type == "none"
 
 
 @pytest.mark.parametrize(

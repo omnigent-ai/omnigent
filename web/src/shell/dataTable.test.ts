@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   DATA_TABLE_MAX_CELLS,
   DATA_TABLE_MAX_CHARS,
+  DATA_TABLE_MAX_NAME_CHARS,
   DATA_TABLE_MAX_COLUMNS,
   DATA_TABLE_MAX_ROWS,
   compareCells,
@@ -10,6 +11,8 @@ import {
   inferColumnType,
   isDataTablePath,
   parseDataTable,
+  tableFromRecords,
+  type DataTable,
 } from "./dataTable";
 
 /** Base64 of raw bytes, as the server sends a file that isn't UTF-8. */
@@ -91,13 +94,13 @@ describe("parseDataTable", () => {
     ["a row that fills the budget", "x".repeat(DATA_TABLE_MAX_CHARS), "wide.csv", ","],
     [
       "one cell bigger than the whole budget",
-      "x".repeat(DATA_TABLE_MAX_CHARS * 2),
+      "x".repeat(DATA_TABLE_MAX_CHARS + 1),
       "wide.csv",
       ",",
     ],
     [
       "one tab-separated cell bigger than the budget",
-      "x".repeat(DATA_TABLE_MAX_CHARS * 2),
+      "x".repeat(DATA_TABLE_MAX_CHARS + 1),
       "wide.tsv",
       "\t",
     ],
@@ -108,13 +111,59 @@ describe("parseDataTable", () => {
     expect(table?.totalColumns).toBe(3);
   });
 
-  it("keeps an oversized header as the header, its text cut at the budget", () => {
+  it("keeps an oversized header as the header, each name cut to the name limit", () => {
     const wideHeader = "h".repeat(DATA_TABLE_MAX_CHARS + 1);
     const table = parseDataTable(`${wideHeader},b\n1,2\n`, "wide.csv");
-    expect(table?.header.map((name) => name.length)).toEqual([DATA_TABLE_MAX_CHARS, 0]);
-    // The header spent the budget, so no row is kept, though every row is counted.
-    expect(table?.rows).toEqual([]);
+    // Only the kept part of a name counts, so the rest of the file still fits.
+    expect(table?.header).toEqual(["h".repeat(DATA_TABLE_MAX_NAME_CHARS), "b"]);
+    expect(table?.rows).toEqual([["1", "2"]]);
+    expect(table?.textCut).toBe(true);
     expect(table?.totalRows).toBe(1);
+  });
+
+  it("charges a cut header name only what the table keeps of it", () => {
+    const name = "h".repeat(1_500_000);
+    const row = "r".repeat(600_000);
+    const table = parseDataTable(`${name}\n${row}\n`, "x.csv");
+    expect(table?.header[0]).toHaveLength(DATA_TABLE_MAX_NAME_CHARS);
+    expect(table?.rows).toEqual([[row]]);
+  });
+
+  it("doesn't cut a character in half when it cuts a row", () => {
+    const cell = `${"x".repeat(DATA_TABLE_MAX_CHARS - 3)}😀😀`;
+    const table = tableFromRecords([["a"], [cell]], 1, 1, "test");
+    const kept = table?.rows[0]?.[0] ?? "";
+    expect(kept.endsWith("x…")).toBe(true);
+  });
+
+  // Text after the cut follows the emoji, so a cut that freed room for it would show.
+  it.each([
+    ["a row", `h\n${"x".repeat(DATA_TABLE_MAX_CHARS - 2)}😀yz\n`, (t: DataTable) => t.rows[0][0]],
+    ["a column name", `${"x".repeat(999)}😀yz,b\n1,2\n`, (t: DataTable) => t.header[0]],
+  ])(
+    "cuts %s before a character it can't keep whole, and keeps nothing after",
+    (_l, text, pick) => {
+      const kept = pick(parseDataTable(text, "data.csv")!);
+      expect(kept).toMatch(/^x+$/);
+    },
+  );
+
+  it("keeps generated column labels within the text budget", () => {
+    const table = parseDataTable(
+      `${"h".repeat(DATA_TABLE_MAX_CHARS)}\n${",".repeat(499)}\n`,
+      "x.csv",
+    );
+    const kept = [table?.header ?? [], ...(table?.rows ?? [])].flat().join("").length;
+    expect(table?.header).toHaveLength(DATA_TABLE_MAX_COLUMNS);
+    expect(kept).toBeLessThanOrEqual(DATA_TABLE_MAX_CHARS);
+  });
+
+  it("keeps a CSV's oversized first row cut, as the other readers do", () => {
+    const table = parseDataTable(`a,b\n${"x".repeat(DATA_TABLE_MAX_CHARS)},1\n2,3\n`, "x.csv");
+    expect(table?.rows).toHaveLength(1);
+    expect(table?.rows[0]?.[0]).toHaveLength(DATA_TABLE_MAX_CHARS - "ab".length);
+    expect(table?.textCut).toBe(true);
+    expect(table?.totalRows).toBe(2);
   });
 
   it("infers each column's type", () => {
@@ -125,6 +174,66 @@ describe("parseDataTable", () => {
       "number",
       "text",
     ]);
+  });
+});
+
+describe("tableFromRecords", () => {
+  it("keeps the header and rows within the text budget, however often a value repeats", () => {
+    // One string shared by every cell, as a workbook's shared strings or a
+    // Parquet dictionary give it: 500 columns × 1,000 rows of it.
+    const value = "v".repeat(10_000);
+    const row = Array<string>(DATA_TABLE_MAX_COLUMNS).fill(value);
+    const records = [row, ...Array.from({ length: DATA_TABLE_MAX_ROWS }, () => row)];
+
+    const table = tableFromRecords(records, DATA_TABLE_MAX_ROWS, DATA_TABLE_MAX_COLUMNS, "test");
+
+    const kept = [table?.header ?? [], ...(table?.rows ?? [])].flat().join("").length;
+    expect(kept).toBe(DATA_TABLE_MAX_CHARS);
+    // Each name is cut to the name limit; the first row is cut to the rest.
+    expect(new Set(table?.header.map((name) => name.length))).toEqual(
+      new Set([DATA_TABLE_MAX_NAME_CHARS]),
+    );
+    expect(table?.rows).toHaveLength(1);
+    expect(table?.textCut).toBe(true);
+    expect(table?.totalRows).toBe(DATA_TABLE_MAX_ROWS);
+  });
+
+  it("keeps a first row bigger than the budget, cutting only the cell that overflows", () => {
+    const wide = "x".repeat(DATA_TABLE_MAX_CHARS);
+    const table = tableFromRecords(
+      [
+        ["id", "note", "amount"],
+        ["1", wide, "1234"],
+        ["2", "b", "5"],
+      ],
+      2,
+      3,
+      "test",
+    );
+
+    const [id, note, amount] = table?.rows[0] ?? [];
+    expect(table?.rows).toHaveLength(1);
+    expect(id).toBe("1");
+    // The overflowing cell ends in an ellipsis; a cell after it is blank, not shortened.
+    expect(note).toHaveLength(DATA_TABLE_MAX_CHARS - "idnoteamount1".length);
+    expect(note?.endsWith("…")).toBe(true);
+    expect(amount).toBe("");
+    expect(table?.textCut).toBe(true);
+    expect(table?.totalRows).toBe(2);
+  });
+
+  it("labels a blank or whitespace column name and marks no text cut", () => {
+    const table = tableFromRecords(
+      [
+        ["id", "", "  "],
+        ["1", "2", "3"],
+      ],
+      1,
+      3,
+      "test",
+    );
+    expect(table?.header).toEqual(["id", "column 2", "column 3"]);
+    expect(table?.textCut).toBeUndefined();
   });
 });
 
@@ -259,6 +368,16 @@ describe("inferColumnType and compareCells", () => {
         compareCells(a, b, "date"),
       ),
     ).toEqual(["2025-12-31T23:00:00Z", "2026-01-15", "2026-03-01", ""]);
+  });
+
+  it("sorts Excel's phantom 1900-02-29 between Feb 28 and Mar 1", () => {
+    expect(
+      ["1900-03-01", "1900-02-29 12:00:00", "1900-02-28 23:00:00", "1900-02-29"].sort((a, b) =>
+        compareCells(a, b, "date"),
+      ),
+    ).toEqual(["1900-02-28 23:00:00", "1900-02-29", "1900-02-29 12:00:00", "1900-03-01"]);
+    // An offset can't move it past Mar 1.
+    expect(compareCells("1900-02-29T23:00:00-12:00", "1900-03-01", "date")).toBeLessThan(0);
   });
 
   it("orders a date before a time later that day, whatever the viewer's time zone", () => {
