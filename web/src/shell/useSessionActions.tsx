@@ -2,7 +2,7 @@
 // fork, automation, stop, archive, delete, leave), shared by the sidebar row and
 // the project board's cards so both menus confirm and act the same way.
 
-import { useState, type ReactNode } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import { GitBranchIcon } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { PermissionsModal } from "@/components/PermissionsModal";
@@ -75,6 +75,10 @@ export function useSessionActions({
 }): SessionActions {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  // A Leave that settles later asks the row as it is then, so it doesn't leave a session
+  // the user has switched to since.
+  const latestOnLeave = useRef(onLeave);
+  latestOnLeave.current = onLeave;
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
   const archivePrompt = useArchivePrompt();
@@ -172,7 +176,7 @@ export function useSessionActions({
     // mutate callback wouldn't.
     leave.mutateAsync({ id: conversation.id, viewerId }).then(
       // The session 404s for this user now, so don't leave them staring at it.
-      () => onLeave?.(),
+      () => latestOnLeave.current?.(),
       (err: unknown) => {
         const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
         showToast(`Couldn't leave the session${detail}`);
