@@ -48,6 +48,15 @@ from tests.server.routes.test_projects_crud import project_app as project_app
 from tests.server.routes.test_projects_crud import project_client as project_client
 
 
+# Viewer seen state on reads after the viewer's own direct edits.
+NOTHING_NEW = {
+    "viewer_seen_position": None,
+    "new_comment_count": 0,
+    "new_update_count": 0,
+    "first_new_position": None,
+}
+
+
 async def test_project_creation_has_one_normal_main_session(project_client, db_uri):
     headers = {"Idempotency-Key": str(uuid4())}
     project = (
@@ -847,6 +856,7 @@ async def test_board_api_lifecycle_and_no_deletion(project_client):
         "agents": [],
         "agents_has_more": False,
         "has_running_agents": False,
+        **NOTHING_NEW,
     }
     assert (await project_client.get(path + "/events")).json() == events_before
     assert len((await project_client.get(base)).json()["data"]) == 1
@@ -919,6 +929,7 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
         "agents": [],
         "agents_has_more": False,
         "has_running_agents": False,
+        **NOTHING_NEW,
     }
     assert (await project_client.get(f"{base}/{ticket['id']}/events")).json() == events_before
     configured = json.loads(
@@ -1242,7 +1253,7 @@ async def test_lifecycle_related_and_session_links_api(project_client, db_uri):
     related = (await project_client.post(base, json={"title": "Related work"})).json()
     path, other_path = f"{base}/{ticket['id']}", f"{base}/{related['id']}"
     planned = await project_client.patch(
-        path, json={"stage_id": "planning", "description": "## Approach\n\n- Acceptance"}
+        path, json={"stage_id": "in_progress", "description": "## Approach\n\n- Acceptance"}
     )
     assert planned.status_code == 200 and planned.json()["description"].startswith("## Approach")
     assert (await project_client.patch(path, json={"stage_id": "review"})).status_code == 200
