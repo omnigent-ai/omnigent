@@ -1388,14 +1388,17 @@ async def test_refused_codex_startup_effort_follows_the_server_rollback_contract
 async def test_buffered_continuation_skips_transient_idle(stored: bool) -> None:
     """End-of-turn `idle` is suppressed when a buffered message will start a new turn.
 
-    The new turn's running edge names the stored items it takes up instead, oldest first,
-    and names none for messages the server did not store.
+    Each turn's running edge names the stored items it takes up instead, oldest first: the
+    request item the server cuts before, e.g. a skill's visible command, else the stored
+    message, and none for messages the server did not store.
     """
     import asyncio as _aio
 
     gate = _aio.Event()
     app, _pm, _hc = _build_blocking_app(gate)
+    first_item = "c7e2f8a3b4d5c6e7f8a9b0c1d2e3f4a5"
     held_items = ["a5c0d6e1f2b3a4c5d6e7f8a9b0c1d2e3", "b6d1e7f2a3c4b5d6e7f8a9b0c1d2e3f4"]
+    skill_command = "d8f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7"
 
     async with _runner_client(app) as client:
         await client.post(
@@ -1431,6 +1434,7 @@ async def test_buffered_continuation_skips_transient_idle(stored: bool) -> None:
                     "model": "test-agent",
                     "content": [{"type": "input_text", "text": "first"}],
                     "harness": "openai-agents",
+                    **({"persisted_item_id": first_item} if stored else {}),
                 },
             )
             async for _ in resp.aiter_text():
@@ -1449,6 +1453,8 @@ async def test_buffered_continuation_skips_transient_idle(stored: bool) -> None:
                     "content": [{"type": "input_text", "text": text}],
                     "harness": "openai-agents",
                     **({"persisted_item_id": item_id} if stored else {}),
+                    # The third stands in for a skill: its request is the visible command.
+                    **({"request_item_id": skill_command} if stored and text == "third" else {}),
                 },
             )
 
@@ -1472,7 +1478,8 @@ async def test_buffered_continuation_skips_transient_idle(stored: bool) -> None:
         for event in collected
         if event.get("type") == "session.status" and event.get("status") == "running"
     ]
-    assert starts == [None, held_items if stored else []]
+    expected = [[first_item], [held_items[0], skill_command]] if stored else [[], []]
+    assert starts == expected
 
 
 @pytest.mark.asyncio

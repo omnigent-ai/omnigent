@@ -192,6 +192,20 @@ async def test_side_chat_leaves_out_a_turn_with_a_follow_up(
     assert await _side_chat_history(client, native_session) == [_CODENAME, _NOTED]
 
 
+async def test_side_chat_leaves_out_a_request_mirrored_before_its_running_edge(
+    client: httpx.AsyncClient, native_session: str
+) -> None:
+    """A request whose transcript reaches the server before its running edge stays out."""
+    await _exchange(client, native_session)
+    await _send(client, native_session, "Run the long command")
+    await _mirror(client, native_session, "user", "Run the long command", "claude_turn_2")
+    assert await _side_chat_history(client, native_session) == [_CODENAME, _NOTED]
+    await _status(client, native_session, "running")
+    await _mirror(client, native_session, "assistant", "Running it now", "claude_turn_2")
+
+    assert await _side_chat_history(client, native_session) == [_CODENAME, _NOTED]
+
+
 @pytest.mark.parametrize("turn_end", ["idle", "waiting_on_background_agents"])
 async def test_side_chat_keeps_the_exchange_before_a_task_notification_turn(
     client: httpx.AsyncClient, native_session: str, turn_end: str
@@ -379,8 +393,10 @@ class _TurnRunner:
     def __init__(self) -> None:
         self.running: set[str] = set()
         self.held: dict[str, list[str]] = {}
+        self.started: dict[str, str] = {}
         self.message_received = asyncio.Event()
         self._next_reply_gate: asyncio.Event | None = None
+        self._next_delivery_gate: asyncio.Event | None = None
 
     def hold_next_reply(self) -> asyncio.Event:
         """Hold the reply to the next message the runner takes until the returned event is set."""
@@ -388,23 +404,43 @@ class _TurnRunner:
         self.message_received.clear()
         return self._next_reply_gate
 
+    def hold_next_delivery(self) -> asyncio.Event:
+        """Keep the next message from reaching the runner until the returned event is set."""
+        self._next_delivery_gate = asyncio.Event()
+        self.message_received.clear()
+        return self._next_delivery_gate
+
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         if request.method != "POST" or not request.url.path.endswith("/events"):
             return _runner(request)
         session_id = request.url.path.split("/")[3]
+        delivery, self._next_delivery_gate = self._next_delivery_gate, None
+        if delivery is not None:
+            self.message_received.set()
+            await delivery.wait()
+        body = json.loads(request.content)
+        # The runner names a turn's inputs by the item the server cuts before.
+        item_id = body.get("request_item_id") or body["persisted_item_id"]
         if session_id in self.running:
-            item_id = json.loads(request.content)["persisted_item_id"]
             self.held.setdefault(session_id, []).append(item_id)
             detail = "Message buffered; active turn will process it."
             reply = httpx.Response(202, json={"status": "buffered", "detail": detail})
         else:
             self.running.add(session_id)
+            self.started[session_id] = item_id
             reply = httpx.Response(202, json={"status": "accepted", "detail": "Turn started."})
         gate, self._next_reply_gate = self._next_reply_gate, None
         self.message_received.set()
         if gate is not None:
             await gate.wait()
         return reply
+
+    async def report_start(self, session_id: str, store: SqlAlchemyConversationStore) -> None:
+        """Publish the running edge of the turn the last accepted message started."""
+        item_id = self.started.pop(session_id)
+        edge = {"type": "session.status", "status": "running", "input_item_ids": [item_id]}
+        stream = _RunnerStream([edge])
+        await _relay_runner_stream_once(session_id, stream, store)  # type: ignore[arg-type]
 
     def steer(self, session_id: str) -> None:
         """Take the oldest held message into the running turn."""
@@ -617,3 +653,60 @@ async def test_sdk_side_chat_leaves_out_a_held_message_beyond_the_tracked_ones(
     await turn_runner.continue_turn(session_id, store, take=0)
 
     assert "And the docs" not in await _side_chat_history(client, session_id)
+
+
+async def test_sdk_side_chat_leaves_out_a_held_skill_beyond_the_tracked_ones(
+    client: httpx.AsyncClient,
+    turn_runner: _TurnRunner,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A held skill past the tracking cap cuts no later than its visible command."""
+    monkeypatch.setattr(sessions_common, "_MAX_HELD_REQUESTS", 1)
+    session_id = await _session(client, native=False)
+    await _sdk_turn(client, session_id, lambda: _send(client, session_id, _CODENAME), _NOTED, "r1")
+    turn_runner.end_turn(session_id)
+    await _sdk_turn(
+        client, session_id, lambda: _send(client, session_id, "Review the parser"), "On it", "r2"
+    )
+    await _send(client, session_id, "Also check the lexer")
+    turn_runner.steer(session_id)
+    skill = {"kind": "skill", "name": "grill-me", "arguments": "the parser"}
+    await _post(client, session_id, {"type": "slash_command", "data": skill})
+    await _mirror(client, session_id, "assistant", "Both look fine", "r2")
+    await turn_runner.continue_turn(session_id, SqlAlchemyConversationStore(db_uri))
+    await _mirror(client, session_id, "assistant", "Grilling it", "r3")
+
+    assert "/grill-me the parser" not in await _side_chat_history(client, session_id)
+
+
+@pytest.mark.parametrize("delayed_kind", ["message", "skill"])
+async def test_sdk_side_chat_leaves_out_a_request_delivered_after_the_turn_it_waited_for(
+    client: httpx.AsyncClient, turn_runner: _TurnRunner, db_uri: str, delayed_kind: str
+) -> None:
+    """A request the runner receives only after the turn before it ended starts its own turn."""
+    session_id = await _session(client, native=False)
+    await _sdk_turn(client, session_id, lambda: _send(client, session_id, _CODENAME), _NOTED, "r1")
+    turn_runner.end_turn(session_id)
+    await _sdk_turn(
+        client, session_id, lambda: _send(client, session_id, "Review the parser"), "On it", "r2"
+    )
+    delivery = turn_runner.hold_next_delivery()
+    if delayed_kind == "message":
+        sending = asyncio.create_task(_send(client, session_id, "Also check the lexer"))
+    else:
+        skill = {"kind": "skill", "name": "grill-me", "arguments": "the parser"}
+        sending = asyncio.create_task(
+            _post(client, session_id, {"type": "slash_command", "data": skill})
+        )
+    await asyncio.wait_for(turn_runner.message_received.wait(), timeout=30)
+    await _mirror(client, session_id, "assistant", "The parser looks fine", "r2")
+    turn_runner.end_turn(session_id)
+    delivery.set()
+    await sending
+    await turn_runner.report_start(session_id, SqlAlchemyConversationStore(db_uri))
+    await _mirror(client, session_id, "assistant", "Working on it", "r3")
+    await _send(client, session_id, "Then summarize")
+
+    history = await _side_chat_history(client, session_id)
+    assert history == [_CODENAME, _NOTED, "Review the parser", "On it"]
