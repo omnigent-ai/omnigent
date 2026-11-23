@@ -1,7 +1,5 @@
-// The Files tree's change marks: each changed file's own status, and for each
-// folder the strongest status of anything inside it (created, then modified,
-// then deleted), in the shape the file tree draws. Listed entries Git ignores
-// are marked too; the tree dims them and everything inside an ignored folder.
+// The Files tree's marks: each change, each folder's strongest change inside it,
+// and the listed entries Git ignores, which the tree dims with their contents.
 
 import type { GitStatusEntry } from "@/components/file-tree/vendored";
 import type { WorkspaceChangedFile, WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";

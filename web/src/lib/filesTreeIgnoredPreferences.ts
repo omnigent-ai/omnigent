@@ -13,11 +13,6 @@ const preference = createStoredChoicePreference(
   DEFAULT_SHOW_IGNORED_FILES ? "true" : "false",
 );
 
-/** Read the preference; the default when nothing valid is stored or storage can't be read. */
-export function readShowIgnoredFiles(): boolean {
-  return preference.read() === "true";
-}
-
 /** Persist the preference and update every Files tree on screen. */
 export function writeShowIgnoredFiles(show: boolean): void {
   preference.write(show ? "true" : "false");
