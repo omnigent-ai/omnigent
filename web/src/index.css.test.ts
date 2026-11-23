@@ -1281,6 +1281,13 @@ describe("index.css electron-mac window drag region", () => {
     expect(controlsSelector).not.toContain(":has(");
   });
 
+  it("anchors no descendant selector on a root :has() so DOM edits stay cheap", () => {
+    const uncommentedCss = cssSource.replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(uncommentedCss).not.toMatch(
+      /(?<![\w.#-])(?:html|body|:root)(?:\[[^\]]*\])*:has\([^)]*\)\s+[^\s{,]/,
+    );
+  });
+
   it("covers the full width and height of the desktop header", () => {
     expect(dragRule).toContain("inset: 0 0 auto 0");
     expect(dragRule).toContain("height: var(--mac-titlebar-height)");
@@ -1539,7 +1546,7 @@ describe("index.css electron-mac sidebar header", () => {
       .filter((block) => /\.electron-sidebar-header-actions \{\s*display: none;/.test(block))
       .map((block) => block.slice(0, block.indexOf("{")).trim());
     expect(clusterHidingSelectors).toEqual([
-      "html[data-electron-mac]:has([data-fullscreen-overlay]) .electron-sidebar-header-actions",
+      "html[data-electron-mac][data-fullscreen-overlay-open] .electron-sidebar-header-actions",
     ]);
   });
 
