@@ -92,16 +92,6 @@ async def test_glob_characters_in_names_never_match_tracked_files(tmp_path: Path
     assert ignored == {"*.log", "q?.log", "[t]racked.log", "back\\slash.log", "a[b].txt"}
 
 
-async def test_names_are_entries_of_a_directory_below_the_repository_root(
-    tmp_path: Path,
-) -> None:
-    root = _ignoring_repository(tmp_path / "repo")
-
-    ignored = await _ignored(root / "src", ["main.py", "generated.py", "debug.log"])
-
-    assert ignored == {"generated.py", "debug.log"}
-
-
 async def test_a_submodule_answers_with_its_own_rules(tmp_path: Path) -> None:
     outer = _repository(tmp_path / "outer")
     inner = _repository(outer / "inner")

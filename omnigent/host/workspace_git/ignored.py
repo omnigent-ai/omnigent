@@ -20,10 +20,8 @@ from omnigent.host.workspace_git.runner import (
     failure,
 )
 
-# "./" keeps a leading ":" from reading as pathspec magic. Names go to check-ignore as
-# they are, so its ignore rules see the real name; --no-index stops it from also matching
-# them as globs against the index, and ls-files, which reads pathspecs literally, finds
-# the tracked ones instead.
+# "./" keeps a leading ":" from reading as pathspec magic; names are otherwise raw, so
+# ignore rules see them as they are. ls-files, with literal pathspecs, finds tracked ones.
 _PREFIX = "./"
 
 
