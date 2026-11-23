@@ -71,6 +71,7 @@ interface TextFieldCaretMeasurer {
 //
 // The mirror stays attached: inserting a node under <body> restyles the whole
 // document, which takes WebKit tens of ms, so a keystroke only rewrites its text.
+// The text is cleared again after every measurement.
 function createTextFieldCaretMeasurer(): TextFieldCaretMeasurer {
   let host: HTMLDivElement | null = null;
   let mirror: HTMLDivElement | null = null;
@@ -110,50 +111,56 @@ function createTextFieldCaretMeasurer(): TextFieldCaretMeasurer {
     const borderLeft = parseFloat(cs.borderLeftWidth) || 0;
     const borderTop = parseFloat(cs.borderTopWidth) || 0;
 
-    const { mirror: mirrorDiv, text: node } = syncMirror(el, cs);
+    try {
+      const { mirror: mirrorDiv, text: node } = syncMirror(el, cs);
 
-    // Default to the content box's top-left (caret at the very start, empty
-    // field, or a layout-less environment like jsdom where Range rects are
-    // unavailable). A real character rect overrides it below.
-    let localLeft = 0;
-    let localTop = 0;
-    let caretHeight = parseFloat(cs.lineHeight) || 0;
+      // Default to the content box's top-left (caret at the very start, empty
+      // field, or a layout-less environment like jsdom where Range rects are
+      // unavailable). A real character rect overrides it below.
+      let localLeft = 0;
+      let localTop = 0;
+      let caretHeight = parseFloat(cs.lineHeight) || 0;
 
-    // Clamp against the mirrored text length: selectionStart can momentarily
-    // lead el.value (controlled inputs, IME composition), and an out-of-range
-    // index would make Range.setStart throw.
-    const caretIndex = Math.min(el.selectionStart ?? el.value.length, node.length);
-    if (caretIndex > 0) {
-      const mirrorRect = mirrorDiv.getBoundingClientRect();
-      // The character before the caret; its trailing edge is where the caret
-      // rides, so the caret only drops to the next line once that glyph wraps.
-      // getClientRects() splits at a line wrap \u2014 the last rect is on the caret's
-      // line.
-      const range = doc.createRange();
-      range.setStart(node, caretIndex - 1);
-      range.setEnd(node, caretIndex);
-      const rects = typeof range.getClientRects === "function" ? range.getClientRects() : null;
-      const r =
-        rects && rects.length > 0
-          ? rects[rects.length - 1]
-          : typeof range.getBoundingClientRect === "function"
-            ? range.getBoundingClientRect()
-            : null;
-      if (r && (r.width > 0 || r.height > 0 || r.right > 0 || r.top > 0)) {
-        localLeft = r.right - mirrorRect.left;
-        localTop = r.top - mirrorRect.top;
-        caretHeight = r.height;
+      // Clamp against the mirrored text length: selectionStart can momentarily
+      // lead el.value (controlled inputs, IME composition), and an out-of-range
+      // index would make Range.setStart throw.
+      const caretIndex = Math.min(el.selectionStart ?? el.value.length, node.length);
+      if (caretIndex > 0) {
+        const mirrorRect = mirrorDiv.getBoundingClientRect();
+        // The character before the caret; its trailing edge is where the caret
+        // rides, so the caret only drops to the next line once that glyph wraps.
+        // getClientRects() splits at a line wrap \u2014 the last rect is on the
+        // caret's line.
+        const range = doc.createRange();
+        range.setStart(node, caretIndex - 1);
+        range.setEnd(node, caretIndex);
+        const rects = typeof range.getClientRects === "function" ? range.getClientRects() : null;
+        const r =
+          rects && rects.length > 0
+            ? rects[rects.length - 1]
+            : typeof range.getBoundingClientRect === "function"
+              ? range.getBoundingClientRect()
+              : null;
+        if (r && (r.width > 0 || r.height > 0 || r.right > 0 || r.top > 0)) {
+          localLeft = r.right - mirrorRect.left;
+          localTop = r.top - mirrorRect.top;
+          caretHeight = r.height;
+        }
       }
-    }
 
-    const rect = el.getBoundingClientRect();
-    // The mirror's zero-padding/zero-border content box starts at its own
-    // top-left, so a local offset maps to the field's content origin (border +
-    // padding inside the field's border box), adjusted for the field's scroll.
-    return {
-      x: rect.left + borderLeft + padLeft + localLeft - el.scrollLeft,
-      y: rect.top + borderTop + padTop + localTop - el.scrollTop + caretHeight / 2,
-    };
+      const rect = el.getBoundingClientRect();
+      // The mirror's zero-padding/zero-border content box starts at its own
+      // top-left, so a local offset maps to the field's content origin (border +
+      // padding inside the field's border box), adjusted for the field's scroll.
+      return {
+        x: rect.left + borderLeft + padLeft + localLeft - el.scrollLeft,
+        y: rect.top + borderTop + padTop + localTop - el.scrollTop + caretHeight / 2,
+      };
+    } finally {
+      // The field may be a password input, and the host outlives the field, so
+      // its value must not stay in the document between measurements.
+      if (text) text.data = "";
+    }
   };
 
   return {
