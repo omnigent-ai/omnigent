@@ -80,7 +80,7 @@ def test_on_an_agents_page_a_link_reaches_the_control_it_names(
     instructions = row.get_by_role("textbox", name="Instructions", exact=True)
     expect(instructions).to_have_value("Follow the links.\n")
 
-    # As choosing a search result does while the page is open.
+    # A same-page link to the control: only the hash changes, so the page stays open.
     page.evaluate("() => { window.location.hash = 'custom-agent-detail:instructions'; }")
     expect(instructions).to_be_focused(timeout=10_000)
     # Its Back names where it goes, and still goes there.
@@ -150,7 +150,7 @@ def test_on_the_create_page_a_link_reaches_its_field_and_servers_are_named_by_th
     instructions = row.get_by_role("textbox", name="System instructions", exact=True)
     expect(instructions).to_be_visible(timeout=30_000)
 
-    # As choosing a search result does while the page is open.
+    # A same-page link to the control: only the hash changes, so the page stays open.
     page.evaluate("() => { window.location.hash = 'custom-agent-create:instructions'; }")
     expect(instructions).to_be_focused(timeout=10_000)
 
