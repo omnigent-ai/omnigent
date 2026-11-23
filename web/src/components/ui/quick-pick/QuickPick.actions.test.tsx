@@ -142,6 +142,57 @@ describe("QuickPick row buttons", () => {
     expect(active()).toBe("alpha");
   });
 
+  it("hands the selection to the closed row's neighbour when it was highlighted by default", () => {
+    function Reordering() {
+      const [ids, setIds] = useState(["alpha", "beta", "gamma"]);
+      return (
+        <TooltipProvider>
+          <Picker
+            label="Things"
+            segments={[
+              {
+                sourceId: "items",
+                ranking: "client",
+                items: ids.map((id) => ({
+                  id,
+                  label: id,
+                  value: id,
+                  actions: [
+                    {
+                      id: "close",
+                      label: "Close",
+                      icon: <span />,
+                      chord: closeChord,
+                      // Like a tab list that moves the tab now on screen to the top.
+                      run: () =>
+                        setIds((current) => {
+                          const rest = current.filter((each) => each !== id);
+                          return [rest[rest.length - 1]!, ...rest.slice(0, -1)];
+                        }),
+                    },
+                  ],
+                })),
+              },
+            ]}
+            onAccept={() => {}}
+            emptyMessage="No things"
+          />
+        </TooltipProvider>
+      );
+    }
+    render(<Reordering />);
+    const input = screen.getByRole("combobox", { name: "Things" });
+    const active = () =>
+      document.getElementById(input.getAttribute("aria-activedescendant") ?? "")?.textContent;
+    expect(active()).toBe("alpha");
+    fireEvent.keyDown(input, { key: "Backspace", ctrlKey: true });
+    expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual([
+      "gamma",
+      "beta",
+    ]);
+    expect(active()).toBe("beta");
+  });
+
   it("keeps a newer pointer pick when a row's close finishes later", () => {
     let finishClose: () => void = () => {};
     function SlowClose() {
@@ -266,10 +317,8 @@ describe("QuickPick group headings", () => {
     expect(screen.getByRole("group", { name: "Files 2" })).toBeTruthy();
     expect(screen.getByRole("group", { name: "Pages 1" })).toBeTruthy();
     const button = screen.getByRole("button", { name: "Close all files" });
-    // The listbox holds only its groups and options.
     expect(button.closest('[role="listbox"]')).toBeNull();
     expect(screen.getByRole("listbox").querySelectorAll("button")).toHaveLength(0);
-    // A real button in the tab order, which keeps the query's focus when clicked.
     expect(button.tabIndex).not.toBe(-1);
     expect(fireEvent.mouseDown(button)).toBe(false);
     button.focus();

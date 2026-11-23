@@ -598,6 +598,8 @@ export function QuickPick<Value>({
       const after = rows.slice(index + 1).find(isItem);
       const before = rows.slice(0, index).reverse().find(isItem);
       const successor = (after ?? before) as QuickPickItemRow<Value> | undefined;
+      // A row highlighted only by default becomes the pick, so the handoff applies to it too.
+      if (wantedId !== row.item.id) pick(row.item.id);
       setLeavingRow({ id: row.item.id, successorId: successor?.item.id ?? null });
     }
     action.run();
