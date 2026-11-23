@@ -1079,7 +1079,18 @@ async def test_a_name_cut_off_by_the_listing_cap_never_lets_an_ignored_file_in_f
     (tmp_path / "sub").mkdir()
     (tmp_path / "sub" / "notes.txt").write_text("needle\n")
     (tmp_path / "sub" / "notes.txt-copy").write_text("x\n")
-    # The listing of sub/ stops right after "./sub/notes.txt", inside the other name.
+    # The reach check's listing is cut off at the cap inside "./sub/notes.txt-copy".
+    real = shutil.which("rg")
+    cut = tmp_path / "bin" / "rg"
+    cut.parent.mkdir()
+    cut.write_text(
+        f"#!{sys.executable}\nimport os, sys, time\n"
+        'if "--files" in sys.argv:\n'
+        '    sys.stdout.write("./sub/notes.txt"); sys.stdout.flush(); time.sleep(60)\n'
+        f"os.execv({real!r}, [{real!r}, *sys.argv[1:]])\n"
+    )
+    cut.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{cut.parent}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setattr(workspace_text_priority, "_LIST_FILES_BYTES", len("./sub/notes.txt"))
 
     responses = await _search_text(
@@ -1190,7 +1201,10 @@ async def test_a_later_pass_out_of_time_ends_the_search_as_truncated(
 
 
 @needs_rg
-@pytest.mark.skipif(os.geteuid() == 0, reason="root reads files without permission")
+@pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: 0)() == 0,
+    reason="root, or a platform without these permissions, reads the file anyway",
+)
 async def test_a_file_an_early_pass_cant_read_doesnt_stop_the_later_passes(
     tmp_path: Path,
 ) -> None:
