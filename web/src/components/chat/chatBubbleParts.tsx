@@ -361,6 +361,13 @@ export function placeUndeliveredBubbles(committed: Bubble[], undelivered: Bubble
 }
 
 /**
+/** Submission order within one second: the optimistic bubble's sequence number from its temp id. */
+function sendSequence(message: PendingUserMessage): number {
+  const match = /_(\d+)$/.exec(message.tempId);
+  return match ? Number(match[1]) : 0;
+}
+
+/**
  * Add a conversation's uncommitted user messages to its committed bubbles: the
  * undelivered startup messages, and the optimistic sends they don't replace.
  *
@@ -384,7 +391,7 @@ export function withUncommittedUserBubbles(
   const uncommitted = [
     ...withoutFailedInputs(pendingUserMessages, failedInputs),
     ...failedUploads,
-  ].sort((a, b) => (a.createdAtS ?? 0) - (b.createdAtS ?? 0));
+  ].sort((a, b) => (a.createdAtS ?? 0) - (b.createdAtS ?? 0) || sendSequence(a) - sendSequence(b));
   if (uncommitted.length === 0) return withUndelivered;
   return mergePendingBubbles(withUndelivered, buildPendingBubbles(uncommitted, selfAuthor));
 }
@@ -1264,7 +1271,13 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                       name={preview.label}
                       image
                       failure={bubble.uploadFailure}
-                      fallback={<ImageAttachmentPlaceholder label={preview.label} pending />}
+                      fallback={
+                        // Siblings of a failed message are not uploading: no spinner.
+                        <ImageAttachmentPlaceholder
+                          label={preview.label}
+                          pending={bubble.uploadFailure === undefined}
+                        />
+                      }
                     />
                   );
                 })}
@@ -1308,7 +1321,10 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                         const chip = (
                           <AttachmentChip icon={FileTextIcon} label={attachmentLabel(att)} />
                         );
-                        if (!att.file_id?.startsWith(PENDING_FILE_PREFIX)) {
+                        if (
+                          typeof att.file_id !== "string" ||
+                          !att.file_id.startsWith(PENDING_FILE_PREFIX)
+                        ) {
                           return <Fragment key={key}>{chip}</Fragment>;
                         }
                         return (

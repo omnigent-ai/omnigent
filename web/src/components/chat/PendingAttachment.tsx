@@ -54,9 +54,9 @@ function UploadingAttachment({
       ? null
       : Math.min(100, Math.floor((upload.loaded / upload.total) * 100));
   const sizeLabel =
-    upload.total === null
+    percent === null
       ? formatFileSize(upload.size)
-      : `${formatFileSize(upload.loaded)} of ${formatFileSize(upload.total)}`;
+      : `${formatFileSize(upload.loaded)} of ${formatFileSize(upload.total ?? 0)}`;
   return (
     <div
       data-testid="uploading-attachment"

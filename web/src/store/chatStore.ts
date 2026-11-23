@@ -287,6 +287,11 @@ export interface SendOptions {
   retriesRefused?: boolean;
   /** Asked once uploads are done, just before posting: a reason given fails the send unposted. */
   beforePost?: () => Promise<string | null>;
+  /**
+   * A parked upload's Retry: its message isn't the composer's, so the composer's restored-send
+   * tracker (its retry id and delivery watch) stays as it is.
+   */
+  keepComposerRetryState?: boolean;
 }
 
 // Who hears of each send the runner takes, by its committed item's id and by the pending
@@ -2019,6 +2024,8 @@ const backgroundFlushCooldownUntil = new Map<string, number>();
 // dropped from the queue/pending state.
 type UploadedFileBlock = Extract<ContentBlock, { file_id: string }>;
 const uploadedFileBlockCache = new WeakMap<File, Map<string, UploadedFileBlock>>();
+/** The error a stopped upload's send reports; a parked one shows it in place of a server reason. */
+const UPLOAD_CANCELLED_MESSAGE = "Upload cancelled";
 
 /** The placeholder id an attachment carries until its upload returns the real one. */
 function pendingFileIdOf(file: File): string {
@@ -2876,7 +2883,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Submitting consumes what the composer held, a restored failed send
     // included: drop its tracker too, or delivery evidence for that send could
     // later retract a NEW draft that merely repeats the same text.
-    if (retryId !== null || restoredDraft !== null) {
+    if ((retryId !== null || restoredDraft !== null) && opts?.keepComposerRetryState !== true) {
       pinnedSetter({ pendingRetryStableId: null, restoredSendDraft: null });
     }
     // A restored failed send keeps its stable id only when resent untouched:
@@ -3072,6 +3079,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     let postedSessionId: string | null = null;
     // Whether this attempt reached its POST: a failure before it can't have been delivered.
     let posting = false;
+    // A parked message keeps its reload-recovery record until Dismiss or Retry settles it.
+    let keepUnsentRecord = false;
     let initialDispatched = false;
     const initialSendPending = () => {
       const id = postedSessionId ?? submitConversationId;
@@ -3164,7 +3173,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const heldBack = opts?.beforePost ? await opts.beforePost() : null;
       if (heldBack !== null) throw new Error(heldBack);
       opts?.signal?.throwIfAborted();
-      if (uploads.cancelled) throw new DOMException("Upload cancelled", "AbortError");
+      if (uploads.cancelled) throw new DOMException(UPLOAD_CANCELLED_MESSAGE, "AbortError");
 
       // Promote "pending:<filename>" to real file_ids. Claude-native's
       // session.input.consumed is text-only (transcript round-trip
@@ -3353,18 +3362,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       let refusedThisAttempt = refusedByServer || !posting;
       const draftState =
         draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
-      // A failed upload keeps its bubble, with Retry, instead of handing the draft back.
-      const parkedEntry =
-        uploads.uploading &&
-        !cancelled &&
+      // A composer send stopped during its upload (failed, or cancelled) keeps its message in
+      // `failedUploads`, or hands it back to the composer when Cancel can.
+      const parkable =
+        (cancelled || (uploads.uploading && opts?.signal?.aborted !== true)) &&
         interactive &&
         !heldForHost &&
         opts?.onError === undefined &&
-        opts?.signal?.aborted !== true &&
         draftSessionId !== null &&
-        (files?.length ?? 0) > 0
-          ? draftState.pendingUserMessages.find((p) => p.tempId === tempId)
-          : undefined;
+        (files?.length ?? 0) > 0;
+      const parkedEntry = parkable
+        ? (draftState.pendingUserMessages.find((p) => p.tempId === tempId) ?? {
+            tempId,
+            content,
+            createdAtS: Math.floor(Date.now() / 1000),
+          })
+        : undefined;
       // A live `session_input_consumed` for this very attempt proves the runner
       // took it, whatever became of the POST's answer.
       let deliveredDespiteFailure = inFlightSends.get(stableId) === true;
@@ -3415,7 +3428,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (
         !callerHandlesError &&
         !deliveredDespiteFailure &&
-        parkedEntry === undefined &&
+        !parkable &&
         draftSessionId !== null &&
         (text.trim() !== "" || (files?.length ?? 0) > 0)
       ) {
@@ -3444,24 +3457,34 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const failGet = (): ChatState =>
         failTarget === null ? get() : (setterForState(failTarget) ?? get());
       let parked: PendingUserMessage | null = null;
-      if (parkedEntry !== undefined && failTarget !== null) {
+      const handback: HandBack = {
+        text,
+        files: files ?? [],
+        stableId,
+        serverRefused,
+        ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+      };
+      // Cancel hands the message back when the composer can take it; otherwise it stays parked.
+      const handedBack =
+        cancelled &&
+        parkedEntry !== undefined &&
+        failTarget !== null &&
+        handBackToComposer(failTarget, handback);
+      if (parkedEntry !== undefined && failTarget !== null && !handedBack) {
+        keepUnsentRecord = true;
         const parkedIn = failTarget;
-        // Retry and Dismiss each act once, whichever comes first.
+        // Dismiss and Retry each act on the message once, whichever comes first.
         let settled = false;
-        const settle = (): boolean => {
-          if (settled) return false;
-          settled = true;
-          return true;
-        };
         const failedFile = uploads.file ?? files?.[0];
         parked = {
           ...parkedEntry,
           initialDraft: undefined,
           uploadFailure: {
             fileId: pendingFileIdOf(failedFile!),
-            message,
+            message: cancelled ? UPLOAD_CANCELLED_MESSAGE : message,
             retry: () => {
-              if (!settle()) return;
+              if (settled) return;
+              settled = true;
               setterFor(parkedIn)((s) => ({
                 failedUploads: s.failedUploads.filter((p) => p.tempId !== tempId),
               }));
@@ -3469,21 +3492,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 stableId,
                 replyDraft: opts?.replyDraft,
                 pinnedConversationId: parkedIn,
+                keepComposerRetryState: true,
               });
             },
             dismiss: () => {
-              if (!settle()) return;
+              if (settled) return;
+              if (!handBackToComposer(parkedIn, handback)) {
+                toast.warning(
+                  "Restore or clear the draft in the composer first, then dismiss this upload.",
+                );
+                return;
+              }
+              settled = true;
               setterFor(parkedIn)((s) => ({
                 failedUploads: s.failedUploads.filter((p) => p.tempId !== tempId),
-                failedSendDraft: {
-                  conversationId: parkedIn,
-                  text,
-                  files: files ?? [],
-                  stableId,
-                  serverRefused,
-                  ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
-                },
               }));
+              forgetUnsentSend(parkedIn, stableId);
             },
           },
         };
@@ -3541,7 +3565,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     } finally {
       endProgress();
       inFlightSends.delete(stableId);
-      if (postedSessionId !== null) forgetUnsentSend(postedSessionId, stableId);
+      if (postedSessionId !== null && !keepUnsentRecord)
+        forgetUnsentSend(postedSessionId, stableId);
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
       releaseSend();
@@ -8544,6 +8569,38 @@ export function takeFailedSendDraft(
     };
   setterFor(conversationId)(patch);
   return restore ? failed : null;
+}
+
+/** What a stopped upload's message carries back to a composer. */
+interface HandBack {
+  text: string;
+  files: File[];
+  stableId: string;
+  serverRefused: boolean;
+  replyDraft?: StoredReplyDraft;
+}
+
+/**
+ * Hand a message back to a conversation's composer without dropping what the composer holds.
+ * An empty slot, or a recovered draft already there, takes it: the two texts join and the files
+ * append. Another failed send's draft keeps its own restore rules, so this returns false and the
+ * caller keeps the message parked.
+ */
+function handBackToComposer(conversationId: string, message: HandBack): boolean {
+  const existing = setterForState(conversationId)?.failedSendDraft ?? null;
+  if (existing !== null && existing.recovered !== true) return false;
+  const merged: NonNullable<ConversationState["failedSendDraft"]> =
+    existing === null
+      ? { conversationId, ...message, recovered: true }
+      : {
+          conversationId,
+          text: [existing.text, message.text].filter((part) => part.trim() !== "").join("\n\n"),
+          files: [...existing.files, ...message.files],
+          serverRefused: false,
+          recovered: true,
+        };
+  setterFor(conversationId)({ failedSendDraft: merged });
+  return true;
 }
 
 /**

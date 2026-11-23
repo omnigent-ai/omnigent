@@ -770,6 +770,8 @@ export async function authenticatedFetch(
     if (sentKey === null) clearHostKeyless(resendKey);
     const keyedHeaders = new Headers(headers);
     keyedHeaders.set(SLICE_KEY_HEADER, resendKey);
+    // A retried attempt re-sends the whole body: restart the bar with it.
+    onUploadProgress?.(0, null);
     res = await hostFetch(
       url,
       { ...init, headers: keyedHeaders, cache: "no-store" },
@@ -793,6 +795,8 @@ export async function authenticatedFetch(
     // (callers/tests hold it by reference).
     const retryHeaders = new Headers(headers);
     retryHeaders.delete(SLICE_KEY_HEADER);
+    // A retried attempt re-sends the whole body: restart the bar with it.
+    onUploadProgress?.(0, null);
     res = await hostFetch(
       url,
       {
@@ -830,6 +834,8 @@ export async function authenticatedFetch(
       if (hostId !== null && !demoted) {
         const retryHeaders = new Headers(headers);
         retryHeaders.set(SLICE_KEY_HEADER, hostId);
+        // A retried attempt re-sends the whole body: restart the bar with it.
+        onUploadProgress?.(0, null);
         res = await hostFetch(
           url,
           { ...init, headers: retryHeaders, cache: "no-store" },
@@ -840,6 +846,8 @@ export async function authenticatedFetch(
     if (await _isWrongReplica(res)) {
       const retryHeaders = new Headers(headers);
       retryHeaders.delete(SLICE_KEY_HEADER);
+      // A retried attempt re-sends the whole body: restart the bar with it.
+      onUploadProgress?.(0, null);
       res = await hostFetch(
         url,
         { ...init, headers: retryHeaders, cache: "no-store" },
@@ -852,6 +860,8 @@ export async function authenticatedFetch(
         clearHostKeyless(hostId);
         const keyedHeaders = new Headers(headers);
         keyedHeaders.set(SLICE_KEY_HEADER, hostId);
+        // A retried attempt re-sends the whole body: restart the bar with it.
+        onUploadProgress?.(0, null);
         res = await hostFetch(
           url,
           { ...init, headers: keyedHeaders, cache: "no-store" },

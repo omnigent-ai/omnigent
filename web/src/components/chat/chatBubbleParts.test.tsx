@@ -1290,4 +1290,60 @@ describe("withUncommittedUserBubbles with failed uploads", () => {
     expect(bubbles[0]).toMatchObject({ pending: true, uploadFailure: failed.uploadFailure });
     expect(bubbles[1]).not.toHaveProperty("uploadFailure");
   });
+
+  it("keeps send order when a failed upload and a later message share a second", () => {
+    const failed = {
+      tempId: "pend_9",
+      content: [{ type: "input_file" as const, file_id: "pending:big.zip", filename: "big.zip" }],
+      createdAtS: 100,
+      uploadFailure: {
+        fileId: "pending:big.zip",
+        message: "Too big",
+        retry: vi.fn(),
+        dismiss: vi.fn(),
+      },
+    };
+    const later = {
+      tempId: "pend_10",
+      content: [{ type: "input_text" as const, text: "later" }],
+      createdAtS: 100,
+    };
+
+    const bubbles = withUncommittedUserBubbles([], [later], [], null, [failed]);
+
+    expect(bubbles.map((bubble) => (bubble.kind === "user" ? bubble.itemId : null))).toEqual([
+      "pend_9",
+      "pend_10",
+    ]);
+  });
+
+  it("gives a sibling of a failed upload a settled placeholder, not a spinner", () => {
+    const failure = {
+      fileId: "pending:a.png",
+      message: "Too big",
+      retry: vi.fn(),
+      dismiss: vi.fn(),
+    };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{
+            kind: "user",
+            itemId: "pend_3",
+            pending: true,
+            uploadFailure: failure,
+            content: [
+              { type: "input_image", file_id: "pending:a.png", filename: "a.png" },
+              { type: "input_image", file_id: "pending:b.png", filename: "b.png" },
+            ],
+          }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByRole("button", { name: "Retry upload of a.png" })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "b.png" })).toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "Uploading image: b.png" })).toBeNull();
+  });
 });

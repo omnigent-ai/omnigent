@@ -4847,6 +4847,137 @@ describe("chatStore — upload progress, Cancel and Retry", () => {
   });
 });
 
+describe("chatStore — hand-back keeps every message the composer holds", () => {
+  const conversationId = "conv_existing";
+  const eventsUrl = `/v1/sessions/${conversationId}/events`;
+  const flush = () =>
+    new Promise<void>((resolve) => {
+      setTimeout(resolve, 20);
+    });
+  const failingUploads = (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input).endsWith("/resources/files")) {
+      return mockResponse({ detail: "Upload interrupted" }, { ok: false, status: 500 });
+    }
+    return defaultFetchHandler(input, init);
+  };
+  /** Sends `text` with `file`, whose upload fails, and returns the parked message. */
+  async function parkFailedUpload(text: string, file: File) {
+    fetchMock.mockImplementation(failingUploads);
+    await useChatStore.getState().send(text, "agent_xyz", [file]);
+    const parked = useChatStore.getState().failedUploads[0];
+    expect(parked?.uploadFailure).toBeDefined();
+    return parked!;
+  }
+
+  beforeEach(() => {
+    useUploadProgressStore.setState({ uploads: {} });
+    useChatStore.setState({ conversationId, abortController: new AbortController() });
+  });
+
+  it("Dismiss merges into a recovered draft the composer has not taken yet", async () => {
+    const earlier = new File(["earlier"], "earlier.txt", { type: "text/plain" });
+    const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
+    const parked = await parkFailedUpload("read this", file);
+    useChatStore.setState({
+      failedSendDraft: {
+        conversationId,
+        text: "earlier message",
+        files: [earlier],
+        recovered: true,
+      },
+    });
+
+    parked.uploadFailure!.dismiss();
+
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      conversationId,
+      text: "earlier message\n\nread this",
+      files: [earlier, file],
+      recovered: true,
+    });
+    expect(useChatStore.getState().failedUploads).toEqual([]);
+  });
+
+  it("Dismiss leaves another failed send's draft alone and keeps its own message parked", async () => {
+    const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
+    const parked = await parkFailedUpload("read this", file);
+    const normal = { conversationId, text: "a normal failure", files: [] };
+    useChatStore.setState({ failedSendDraft: { ...normal, serverRefused: false } });
+
+    parked.uploadFailure!.dismiss();
+
+    expect(useChatStore.getState().failedSendDraft).toMatchObject(normal);
+    expect(useChatStore.getState().failedUploads).toHaveLength(1);
+    expect(useChatStore.getState().failedUploads[0]!.content).toEqual(parked.content);
+  });
+
+  it("Cancel the composer cannot take keeps the message parked as cancelled", async () => {
+    let answerUpload: (response: Response) => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/resources/files")) {
+        return new Promise<Response>((resolve) => {
+          answerUpload = resolve;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
+    const normal = { conversationId, text: "a normal failure", files: [], serverRefused: false };
+    void useChatStore.getState().send("read this", "agent_xyz", [file]);
+    await flush();
+    const message = useChatStore.getState().pendingUserMessages[0]!;
+    const cancel =
+      useUploadProgressStore.getState().uploads[
+        uploadProgressKey(message.tempId, (message.content[0] as { file_id: string }).file_id)
+      ]!.cancel!;
+    useChatStore.setState({ failedSendDraft: normal });
+
+    cancel();
+    answerUpload(mockResponse({ id: "file_late" }));
+    await flush();
+
+    expect(useChatStore.getState().failedSendDraft).toEqual(normal);
+    expect(useChatStore.getState().failedUploads[0]?.uploadFailure?.message).toBe(
+      "Upload cancelled",
+    );
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+  });
+
+  it("Retry does not clear the composer's own restored-send tracker", async () => {
+    const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
+    const parked = await parkFailedUpload("read this", file);
+    useChatStore.setState({ pendingRetryStableId: "composer-held" });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) =>
+      String(input).endsWith("/resources/files")
+        ? mockResponse({ id: "file_retry" })
+        : defaultFetchHandler(input, init),
+    );
+
+    parked.uploadFailure!.retry();
+
+    expect(useChatStore.getState().pendingRetryStableId).toBe("composer-held");
+    await flush();
+    expect(callsToEvents()).toHaveLength(1);
+  });
+
+  it("a parked message keeps its reload record until Dismiss settles it", async () => {
+    vi.mocked(getCurrentUserId).mockReturnValue("user_a");
+    const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
+    const parked = await parkFailedUpload("read this", file);
+    expect(peekUnsentSend(conversationId)).not.toBeNull();
+
+    parked.uploadFailure!.dismiss();
+
+    expect(peekUnsentSend(conversationId)).toBeNull();
+  });
+
+  function callsToEvents() {
+    return fetchMock.mock.calls.filter(
+      ([input, init]) => String(input).endsWith(eventsUrl) && init?.method === "POST",
+    );
+  }
+});
+
 describe("chatStore — first message during native model startup", () => {
   const sessionId = "conv_native_startup";
   const original = "unfinished first prompt";
@@ -7544,6 +7675,7 @@ describe("chatStore — send (file attachments)", () => {
       stableId: expect.any(String),
       // A 415 carries no Omnigent error code: the message was never sent.
       serverRefused: false,
+      recovered: true,
     });
   });
 

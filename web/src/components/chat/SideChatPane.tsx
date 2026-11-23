@@ -953,22 +953,31 @@ function SideChatComposer({
     errors.forEach((message) => toast.error(message));
   }, [attachmentPolicy, composerKey, info, updateComposer]);
   const { failedSendDraft, restoredSendDraft } = useConversationEntryState(
-    fullSession ? childId : null,
+    pending ? null : childId,
   );
   useEffect(() => {
-    if (!fullSession || !failedSendDraft) return;
+    // An ordinary side chat takes only a recovered draft (an upload handed back); other failures stay put.
+    if (!failedSendDraft || (!fullSession && failedSendDraft.recovered !== true)) return;
     const current =
       useChatStore.getState().sideChatComposers[composerKey] ?? EMPTY_SIDE_CHAT_COMPOSER;
-    const failed = takeFailedSendDraft(
-      childId,
-      !!(current.text.trim() || current.files.length || current.quotes?.length),
-    );
+    const hasDraft = !!(current.text.trim() || current.files.length || current.quotes?.length);
+    const failed = takeFailedSendDraft(childId, hasDraft, true);
     if (!failed) return;
     const { accepted, errors } = validateAttachments(failed.files, attachmentPolicy);
     errors.forEach((message) => toast.error(message));
     // A grid cell restores its tags as tokens, as its edit-and-resend does.
     const recalled = gridCell ? recallGridDraft(failed.text) : null;
-    updateComposer(composerKey, () => ({ text: recalled?.text ?? failed.text, files: accepted }));
+    const restoredText = recalled?.text ?? failed.text;
+    // Newer input stays: the recovered message joins after it, its files appended.
+    updateComposer(composerKey, (draft) =>
+      hasDraft
+        ? {
+            ...draft,
+            text: [draft.text, restoredText].filter((part) => part.trim() !== "").join("\n\n"),
+            files: [...draft.files, ...accepted],
+          }
+        : { text: restoredText, files: accepted },
+    );
     if (recalled) setSessionMentions(childId, recalled.mentions);
     // Track the displayed draft for delivery; filtered files require a fresh send ID.
     const entry = conversationRegistry.peek(childId)!;

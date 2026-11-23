@@ -8401,6 +8401,28 @@ describe("Composer failed-send attachment restore", () => {
     expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 
+  it("appends a recovered hand-back's text and files beside newer composer input", () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "newer words" } });
+    const notes = new File(["hello"], "notes.txt", { type: "text/plain" });
+
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "handed back text",
+          files: [notes],
+          recovered: true,
+        },
+      }),
+    );
+
+    expect(textarea().value).toContain("newer words");
+    expect(textarea().value).toContain("handed back text");
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
   it("skips the restore when the user attached a file while the send was in flight", () => {
     render(<Composer {...composerProps()} />);
     fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {

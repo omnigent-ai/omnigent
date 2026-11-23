@@ -436,13 +436,18 @@ function fetchReportingUpload(
       }
       // A Response can't carry a body with a null-body status.
       const nullBody = [101, 204, 205, 304].includes(request.status);
-      resolve(
-        new Response(nullBody ? null : (request.response as ArrayBuffer), {
-          status: request.status,
-          statusText: request.statusText,
-          headers,
-        }),
-      );
+      try {
+        resolve(
+          new Response(nullBody ? null : (request.response as ArrayBuffer), {
+            status: request.status,
+            statusText: request.statusText,
+            headers,
+          }),
+        );
+      } catch {
+        // `new Response` throws for a status outside 200–599; reject as a network failure does.
+        reject(new TypeError("Failed to fetch"));
+      }
     };
     request.onerror = () => {
       settle();

@@ -62,6 +62,18 @@ describe("PendingAttachment", () => {
     expect(screen.getByRole("button", { name: "Cancel upload of big.zip" })).toBeInTheDocument();
   });
 
+  it("labels a zero-byte total by the file's size, matching its indeterminate bar", () => {
+    useUploadProgressStore.setState({
+      uploads: { [key]: { name: "big.zip", size: 2048, loaded: 0, total: 0, cancel: vi.fn() } },
+    });
+    renderAttachment();
+    expect(screen.getByRole("progressbar", { name: "Uploading big.zip" })).toHaveAttribute(
+      "aria-valuetext",
+      "Uploading",
+    );
+    expect(screen.getByText("2 KB")).toBeInTheDocument();
+  });
+
   it("omits Cancel once the owner no longer allows it", () => {
     useUploadProgressStore.setState({
       uploads: { [key]: { name: "big.zip", size: 10, loaded: 0, total: 10 } },

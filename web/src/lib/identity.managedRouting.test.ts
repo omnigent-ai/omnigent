@@ -155,6 +155,20 @@ describe("managed first-message routing", () => {
     },
   );
 
+  it("forwards an upload's progress listener to each retry and restarts the bar", async () => {
+    const { authenticatedFetch } = await setup();
+    const onUploadProgress = vi.fn();
+    fetchMock.mockImplementation(async () => wrongReplica());
+
+    await authenticatedFetch(EVENTS_URL, { method: "POST", body: "{}", onUploadProgress });
+
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+    for (const call of fetchMock.mock.calls) {
+      expect(call[2]).toMatchObject({ onUploadProgress });
+    }
+    expect(onUploadProgress).toHaveBeenCalledWith(0, null);
+  });
+
   it("does not loop when every retry reports wrong_replica", async () => {
     const { authenticatedFetch, resolve } = await setup();
     fetchMock.mockImplementation(async () => wrongReplica());

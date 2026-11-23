@@ -254,6 +254,33 @@ describe("hostFetch upload progress", () => {
     expect(await res.json()).toEqual({ detail: "Too big" });
   });
 
+  it("rejects as a network failure when the response status cannot form a Response", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      status: 0,
+      statusText: "",
+      headers: new Headers(),
+      arrayBuffer: async () => new ArrayBuffer(0),
+    } as unknown as Response);
+
+    await expect(
+      hostFetch("/v1/upload", { method: "POST", body: "x" }, { onUploadProgress: vi.fn() }),
+    ).rejects.toThrow(TypeError);
+  });
+
+  it("passes the request's credentials mode through to the request", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 200 }));
+
+    await hostFetch(
+      "/v1/upload",
+      { method: "POST", body: "x", credentials: "include" },
+      { onUploadProgress: vi.fn() },
+    );
+
+    expect(fetchSpy.mock.calls[0]![1]).toMatchObject({ credentials: "include" });
+  });
+
   it("rejects with the signal's reason when the caller aborts", async () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(() => new Promise<Response>(() => {}));
     const controller = new AbortController();

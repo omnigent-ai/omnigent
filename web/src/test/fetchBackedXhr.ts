@@ -58,19 +58,25 @@ export class FetchBackedXhr {
       try {
         const res = await globalThis.fetch(this.url, {
           method: this.method,
-          headers: this.requestHeaders,
+          headers: Object.fromEntries(this.requestHeaders.entries()),
           body: body as BodyInit | null,
+          credentials: this.withCredentials ? "include" : "same-origin",
           signal: this.controller.signal,
         });
         if (this.finished) return;
-        const text = await res.text();
+        // Test fetch mocks often return a Response-shaped object with only `text()` or `json()`.
+        const bytes =
+          typeof res.arrayBuffer === "function"
+            ? await res.arrayBuffer()
+            : new TextEncoder().encode(typeof res.text === "function" ? await res.text() : "")
+                .buffer;
         if (this.finished) return;
         this.progress(size, size);
         this.status = res.status;
         this.statusText = res.statusText;
         this.responseHeaders = new Headers(res.headers);
         this.response =
-          this.responseType === "arraybuffer" ? new TextEncoder().encode(text).buffer : text;
+          this.responseType === "arraybuffer" ? bytes : new TextDecoder().decode(bytes);
         this.finish(this.onload);
       } catch {
         if (!this.finished) this.finish(this.onerror);
