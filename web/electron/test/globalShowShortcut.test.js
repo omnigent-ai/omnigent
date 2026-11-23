@@ -23,10 +23,11 @@ function harness({
   isMac = false,
 } = {}) {
   let stored = structuredClone(settings);
-  const calls = { registered: [], unregistered: [], saved: [], shown: 0 };
+  const calls = { attempts: [], registered: [], unregistered: [], saved: [], shown: 0 };
   const live = new Set();
   const globalShortcut = {
     register: (accelerator, press) => {
+      calls.attempts.push(accelerator);
       if (throws.includes(accelerator)) throw new TypeError(`Invalid accelerator: ${accelerator}`);
       if (refused.includes(accelerator)) return false;
       calls.registered.push({ accelerator, press });
@@ -296,35 +297,24 @@ describe("createGlobalShowShortcut", () => {
     ["refuses", { refused: ["Alt+Space"] }],
     ["throws on", { throws: ["Alt+Space"] }],
   ]) {
-    it(`reports a saved shortcut that Electron ${failure} at launch as not working`, async () => {
+    it(`reports a saved shortcut that Electron ${failure} at launch, and proposes a free replacement`, () => {
       const h = harness({
         settings: { global_shortcut: { enabled: true, accelerator: "Alt+Space" } },
         ...options,
       });
       h.shortcut.apply();
 
-      const status = h.shortcut.current();
-      assert.equal(status.enabled, true);
-      assert.match(status.error, /isn't working/);
+      assert.deepEqual(h.shortcut.current(), {
+        enabled: true,
+        accelerator: "Alt+Space",
+        error: "Alt+Space isn't working. Another app may be using it.",
+        suggestion: "Control+Alt+Shift+Space",
+      });
       assert.deepEqual(h.registered(), []);
+      // The probe releases its replacement at once.
+      assert.deepEqual(h.calls.unregistered, ["Control+Alt+Shift+Space"]);
     });
   }
-
-  it("names the taken chord and proposes a free replacement, which it releases", () => {
-    const h = harness({
-      settings: { global_shortcut: { enabled: true, accelerator: "Alt+Space" } },
-      refused: ["Alt+Space"],
-    });
-    h.shortcut.apply();
-
-    assert.deepEqual(h.shortcut.current(), {
-      enabled: true,
-      accelerator: "Alt+Space",
-      error: "Alt+Space isn't working. Another app may be using it.",
-      suggestion: "Control+Alt+Shift+Space",
-    });
-    assert.deepEqual(h.registered(), []);
-  });
 
   it("skips a replacement another app holds, and proposes the next free one", () => {
     const h = harness({
@@ -361,6 +351,48 @@ describe("createGlobalShowShortcut", () => {
 
     assert.deepEqual(h.registered(), ["Alt+Space"]);
     assert.deepEqual(h.shortcut.current(), { enabled: true, accelerator: "Alt+Space" });
+    // Repeated refreshes leave the held chord alone: no register or release.
+    const { attempts, registered, unregistered } = h.calls;
+    const before = {
+      attempts: attempts.length,
+      registered: registered.length,
+      unregistered: unregistered.length,
+    };
+    h.shortcut.refresh();
+    h.shortcut.refresh();
+    assert.deepEqual(
+      {
+        attempts: attempts.length,
+        registered: registered.length,
+        unregistered: unregistered.length,
+      },
+      before,
+    );
+  });
+
+  it("doesn't probe the failed chord as its own replacement", () => {
+    const h = harness({
+      settings: { global_shortcut: { enabled: true, accelerator: "Control+Alt+Shift+Space" } },
+      refused: ["Control+Alt+Shift+Space"],
+    });
+    h.shortcut.apply();
+
+    assert.equal(h.shortcut.current().suggestion, "Control+Alt+Shift+K");
+    assert.deepEqual(h.calls.attempts, ["Control+Alt+Shift+Space", "Control+Alt+Shift+K"]);
+  });
+
+  it("doesn't probe the chord it holds as a replacement for a refused one", async () => {
+    const h = harness({
+      settings: { global_shortcut: { enabled: true, accelerator: "Control+Alt+Shift+Space" } },
+      refused: ["Alt+K"],
+    });
+    h.shortcut.apply();
+
+    const result = await h.shortcut.set({ enabled: true, accelerator: "Alt+K" });
+
+    assert.equal(result.suggestion, "Control+Alt+Shift+K");
+    assert.deepEqual(h.calls.attempts, ["Control+Alt+Shift+Space", "Alt+K", "Control+Alt+Shift+K"]);
+    assert.deepEqual(h.registered(), ["Control+Alt+Shift+Space"]);
   });
 
   it("probes nothing for a shortcut that was never turned on", () => {
@@ -508,10 +540,12 @@ describe("createGlobalShortcuts", () => {
   ) {
     let stored = structuredClone(settings);
     const live = new Map();
+    const attempts = [];
     const pressed = { show: 0, floatingComposer: 0 };
     const built = createGlobalShortcuts({
       globalShortcut: {
         register: (accelerator, press) => {
+          attempts.push(accelerator);
           if (external.includes(accelerator) || live.has(electronChord(accelerator, isMac))) {
             return false;
           }
@@ -534,6 +568,7 @@ describe("createGlobalShortcuts", () => {
       rewrite: (next) => {
         stored = structuredClone(next);
       },
+      attempts: () => [...attempts],
       registered: () => [...live.values()].map(({ accelerator }) => accelerator),
       press: (accelerator) => {
         const entry = live.get(electronChord(accelerator, isMac));
@@ -708,6 +743,8 @@ describe("createGlobalShortcuts", () => {
     s.show.apply();
 
     assert.equal(s.show.current().suggestion, "Control+Alt+Shift+K");
+    // The chord the other shortcut holds is skipped without a register attempt.
+    assert.deepEqual(s.attempts(), ["Control+Alt+Shift+Space", "Alt+K", "Control+Alt+Shift+K"]);
   });
 
   it("lets the shortcut that won a chord save it again, in another spelling or off", async () => {

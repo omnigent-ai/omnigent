@@ -49,6 +49,9 @@ off by default.
   System-wide, turns ⇧⌘Space off or records another chord. The row shows only with the flag on, in a
   desktop app that can show the panel. A chord **Show Omnigent from anywhere**
   already uses is refused.
+- When another app holds the chord, the row says which chord is taken and offers
+  **Use ⌃⌥⇧Space instead**, a free chord the app checked. Allowing it in the macOS
+  dialog saves that chord and turns the shortcut on. Declining saves nothing.
 - The same Desktop app group also holds **Widen window when opening the right
   sidebar**; see [sessions](sessions.md).
 - There is no menu, Dock or command-palette entry yet.
