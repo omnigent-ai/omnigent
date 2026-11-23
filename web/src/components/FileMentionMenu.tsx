@@ -107,7 +107,7 @@ export function FileMentionMenu({
         "absolute left-0 z-30 flex gap-2",
         placement === "above"
           ? "bottom-full mb-2 items-end"
-          : "top-11 max-h-[calc(100%-2.75rem)] items-stretch overflow-hidden",
+          : "top-11 max-h-[calc(100%-2.75rem)] items-stretch",
       )}
     >
       <div

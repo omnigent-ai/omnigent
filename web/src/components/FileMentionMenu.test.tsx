@@ -23,8 +23,8 @@ describe("placement", () => {
     const belowWrapper = screen.getByTestId("file-mention-menu").parentElement;
     expect(belowWrapper?.className).toContain("top-11");
     expect(belowWrapper?.className).not.toContain("bottom-full");
-    // Capped to the window, it clips rather than scrolls, leaving its list the only scroller.
-    expect(belowWrapper?.className).toContain("overflow-hidden");
+    // Capped to the window, the card shrinks to fit and its list is the only scroller.
+    expect(belowWrapper?.className).toContain("max-h-[calc(100%-2.75rem)]");
     expect(belowWrapper?.className).not.toContain("overflow-y-auto");
   });
 });
