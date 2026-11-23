@@ -179,6 +179,14 @@ class CreateTicket(BaseModel):
         return labels
 
 
+TicketCommentAudience = Literal["human", "agents"]
+AUDIENCE_DESCRIPTION = (
+    "Who the comment is for. Omit for the default: comments from people and the project "
+    "orchestrator are for the human, worker comments are agent notes that the board folds "
+    "away. A worker sets human only for a question or request the human must answer."
+)
+
+
 class UpdateTicket(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -190,6 +198,7 @@ class UpdateTicket(BaseModel):
     )
     labels: list[TicketLabel] | None = Field(default=None, max_length=20)
     comment: str | None = Field(default=None, min_length=1, max_length=2000)
+    audience: TicketCommentAudience | None = Field(default=None, description=AUDIENCE_DESCRIPTION)
 
     @field_validator("title", "comment")
     @classmethod
@@ -218,6 +227,7 @@ class CommentOnTicket(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
     kind: Literal["comment", "execution"] = "comment"
     outputs: list[TicketOutput] = Field(default_factory=list, max_length=10)
+    audience: TicketCommentAudience | None = Field(default=None, description=AUDIENCE_DESCRIPTION)
 
     @field_validator("text")
     @classmethod

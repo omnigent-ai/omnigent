@@ -877,19 +877,51 @@ function TicketActivity({ projectId, ticket }: { projectId: string; ticket: Proj
     isFetching: query.isFetching,
     fetchNextPage: query.fetchNextPage,
   });
+  const [showAgentNotes, setShowAgentNotes] = useState(false);
   if (!query.isPending && !query.error && !query.hasNextPage && events.length === 0) return null;
+  const entries = groupAgentNotes(events);
+  const hasAgentNotes = entries.some((entry) => Array.isArray(entry));
+  const renderItem = (event: TicketEvent) => (
+    <TicketActivityItem key={event.id} event={event} nowMs={now.getTime()} viewerId={viewerId} />
+  );
   return (
     <section aria-label="Ticket activity" className="space-y-4 border-t border-border/60 pt-5">
-      <h3 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Activity</h3>
+      <div className="flex items-center justify-between gap-3">
+        <h3 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Activity</h3>
+        {hasAgentNotes && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="text-xs text-muted-foreground"
+            aria-pressed={showAgentNotes}
+            onClick={() => setShowAgentNotes(!showAgentNotes)}
+          >
+            {showAgentNotes ? "Hide agent notes" : "Show agent notes"}
+          </Button>
+        )}
+      </div>
       <TicketError error={query.error} />
       {query.isPending && <Spinner aria-label="Loading activity" />}
       <ol>
-        {events.map((event) => (
-          <Fragment key={event.id}>
-            {event.position === dividerPosition && <TicketNewDivider dividerRef={dividerRef} />}
-            <TicketActivityItem event={event} nowMs={now.getTime()} viewerId={viewerId} />
-          </Fragment>
-        ))}
+        {entries.map((entry) => {
+          const group = Array.isArray(entry) ? entry : [entry];
+          const divider =
+            dividerPosition !== null &&
+            group.some((event) => event.position === dividerPosition) ? (
+              <TicketNewDivider dividerRef={dividerRef} />
+            ) : null;
+          return (
+            <Fragment key={group[0].id}>
+              {divider}
+              {!Array.isArray(entry) || showAgentNotes ? (
+                group.map(renderItem)
+              ) : (
+                <TicketAgentNotesFold notes={entry} renderItem={renderItem} />
+              )}
+            </Fragment>
+          );
+        })}
       </ol>
       {query.hasNextPage && (
         <Button
@@ -902,6 +934,56 @@ function TicketActivity({ projectId, ticket }: { projectId: string; ticket: Proj
         </Button>
       )}
     </section>
+  );
+}
+
+/** Agent notes are written for the coordinator; the human sees them folded by default. */
+function isAgentNote(event: TicketEvent): boolean {
+  return (
+    (event.kind === "comment" || event.kind === "execution") && event.payload.audience === "agents"
+  );
+}
+
+/** Activity in order, with each run of consecutive agent notes collected into one array. */
+function groupAgentNotes(events: TicketEvent[]): (TicketEvent | TicketEvent[])[] {
+  const entries: (TicketEvent | TicketEvent[])[] = [];
+  for (const event of events) {
+    const last = entries.at(-1);
+    if (!isAgentNote(event)) entries.push(event);
+    else if (Array.isArray(last)) last.push(event);
+    else entries.push([event]);
+  }
+  return entries;
+}
+
+function TicketAgentNotesFold({
+  notes,
+  renderItem,
+}: {
+  notes: TicketEvent[];
+  renderItem: (event: TicketEvent) => ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const label = `${notes.length} agent ${notes.length === 1 ? "note" : "notes"}`;
+  return (
+    <>
+      <li className="relative flex min-w-0 gap-3 pb-4 last:pb-0 before:absolute before:top-6 before:bottom-0 before:left-3 before:w-px before:bg-border/60 last:before:hidden">
+        <span className="relative flex size-6 shrink-0 items-center justify-center bg-background text-muted-foreground">
+          <BotIcon aria-hidden className="size-3.5" />
+        </span>
+        <Button
+          type="button"
+          variant="link"
+          size="sm"
+          className="h-6 px-0 text-sm text-muted-foreground hover:text-foreground"
+          aria-expanded={open}
+          onClick={() => setOpen(!open)}
+        >
+          {open ? `Hide ${label}` : label}
+        </Button>
+      </li>
+      {open && notes.map(renderItem)}
+    </>
   );
 }
 

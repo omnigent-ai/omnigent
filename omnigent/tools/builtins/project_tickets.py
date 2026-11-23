@@ -162,7 +162,8 @@ class SysTicketUpdateTool(_TicketTool):
         "Optional comment is appended atomically. "
         "Labels replace the whole key/value list: use labels with key needs-human plus a comment "
         "with the exact ask and a link to the responsible worker's chat when a person must act, "
-        "in any stage, and remove that label only when its request is resolved."
+        "in any stage, and remove that label only when its request is resolved. Set audience "
+        "human on that ask; other worker comments stay agent notes by default."
     )
     arguments = EditTicket
 
@@ -193,6 +194,8 @@ class SysTicketCommentTool(_TicketTool):
         "Append a comment or execution summary, optionally with outputs such as "
         "{type: pull_request, url: ...}. When progress changes the ticket's stage, use "
         "sys_ticket_update with stage_id and comment together instead. "
+        "Worker comments default to terse agent notes that the board folds away; the "
+        "orchestrator's and people's comments are for the human. "
         "Activity cannot be edited or deleted."
     )
     arguments = AddTicketComment

@@ -109,6 +109,44 @@ def _ticket(row: SqlProjectTicket) -> dict[str, Any]:
     }
 
 
+def _orchestrator_session_id(project: SqlProject) -> str | None:
+    return project.main_session_id or project.legacy_orchestrator_session_id
+
+
+def _author_audience(
+    session_id: str | None, agent_id: str | None, orchestrator_session_id: str | None
+) -> str:
+    """People and the orchestrator write for the human; worker sessions write agent notes."""
+    if session_id is None and agent_id is None:
+        return "human"
+    if session_id is not None and session_id == orchestrator_session_id:
+        return "human"
+    return "agents"
+
+
+def _note_audience(
+    row: SqlProjectTicketEvent, payload: dict[str, Any], orchestrator_session_id: str | None
+) -> str:
+    audience = payload.get("audience")
+    if audience in ("human", "agents"):
+        return audience
+    return _author_audience(row.session_id, row.agent_id, orchestrator_session_id)
+
+
+def _labeled_event(
+    row: SqlProjectTicketEvent, orchestrator_session_id: str | None
+) -> dict[str, Any]:
+    """An event whose comment payload always says who it is for, including older comments."""
+    event = _event(row)
+    if row.kind in NEW_COMMENT_KINDS:
+        payload = event["payload"]
+        event["payload"] = {
+            **payload,
+            "audience": _note_audience(row, payload, orchestrator_session_id),
+        }
+    return event
+
+
 def _event(row: SqlProjectTicketEvent) -> dict[str, Any]:
     payload = dict(row.payload)
     # Project historical field names without changing the stored event.
@@ -202,8 +240,7 @@ class ProjectTicketStore:
                 created_at=now_epoch(),
                 notification_state=NOTIFICATION_SKIPPED
                 if actor.session_id is not None
-                and actor.session_id
-                == (project.main_session_id or project.legacy_orchestrator_session_id)
+                and actor.session_id == _orchestrator_session_id(project)
                 else NOTIFICATION_PENDING,
             )
         )
@@ -214,6 +251,12 @@ class ProjectTicketStore:
         """Raise NOT_FOUND unless ``user_id`` owns the project."""
         with self._session("require_project_access") as session:
             self._project(session, project_id, user_id)
+
+    @staticmethod
+    def _comment_audience(project: SqlProject, actor: TicketActor, requested: str | None) -> str:
+        if requested is not None:
+            return requested
+        return _author_audience(actor.session_id, actor.agent_id, _orchestrator_session_id(project))
 
     def create(self, project_id: str, body: CreateTicket, actor: TicketActor) -> dict[str, Any]:
         def write(session: Session) -> dict[str, Any]:
@@ -417,34 +460,43 @@ class ProjectTicketStore:
                 )
             ):
                 result[ticket_id]["viewer_seen_position"] = seen_position
-            counts = session.execute(
-                select(event.ticket_id, event.kind, func.count(), func.min(event.position))
-                .select_from(event)
-                .outerjoin(
-                    read,
-                    and_(
-                        read.workspace_id == event.workspace_id,
-                        read.project_id == event.project_id,
-                        read.ticket_id == event.ticket_id,
-                        read.user_id == viewer,
-                    ),
-                )
-                .where(
-                    event.workspace_id == project.workspace_id,
-                    event.project_id == project.id,
-                    event.ticket_id.in_(ids),
-                    event.kind.in_(NEW_COMMENT_KINDS + NEW_UPDATE_KINDS),
-                    event.position > func.coalesce(read.seen_position, -1),
-                    by_others,
-                )
-                .group_by(event.ticket_id, event.kind)
+            unseen = and_(
+                event.workspace_id == project.workspace_id,
+                event.project_id == project.id,
+                event.ticket_id.in_(ids),
+                event.position > func.coalesce(read.seen_position, -1),
+                by_others,
             )
-            for ticket_id, kind, count, first_position in counts:
+            seen_marker = and_(
+                read.workspace_id == event.workspace_id,
+                read.project_id == event.project_id,
+                read.ticket_id == event.ticket_id,
+                read.user_id == viewer,
+            )
+
+            def count_new(ticket_id: str, field: str, count: int, first_position: int) -> None:
                 entry = result[ticket_id]
-                field = "new_comment_count" if kind in NEW_COMMENT_KINDS else "new_update_count"
                 entry[field] += count
                 if entry["first_new_position"] is None or first_position < entry["first_new_position"]:
                     entry["first_new_position"] = first_position
+
+            for ticket_id, count, first_position in session.execute(
+                select(event.ticket_id, func.count(), func.min(event.position))
+                .select_from(event)
+                .outerjoin(read, seen_marker)
+                .where(unseen, event.kind.in_(NEW_UPDATE_KINDS))
+                .group_by(event.ticket_id)
+            ):
+                count_new(ticket_id, "new_update_count", count, first_position)
+            # Who a comment is for lives in its payload, so agent notes are filtered here.
+            orchestrator_session_id = _orchestrator_session_id(project)
+            for row in session.scalars(
+                select(event)
+                .outerjoin(read, seen_marker)
+                .where(unseen, event.kind.in_(NEW_COMMENT_KINDS))
+            ):
+                if _note_audience(row, row.payload, orchestrator_session_id) == "human":
+                    count_new(row.ticket_id, "new_comment_count", 1, row.position)
             return result
 
     def mark_seen(
@@ -560,7 +612,7 @@ class ProjectTicketStore:
     def update(
         self, project_id: str, ticket_id: str, body: UpdateTicket, actor: TicketActor
     ) -> dict[str, Any]:
-        changes = body.model_dump(exclude_none=True, exclude={"comment"})
+        changes = body.model_dump(exclude_none=True, exclude={"comment", "audience"})
 
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)
@@ -583,9 +635,18 @@ class ProjectTicketStore:
                     {"changes": changes, **({"stage": _stage_snapshot(target)} if target else {})},
                 )
             if body.comment:
-                self._append(session, project, row, actor, "comment", {"text": body.comment})
+                audience = self._comment_audience(project, actor, body.audience)
+                self._append(
+                    session,
+                    project,
+                    row,
+                    actor,
+                    "comment",
+                    {"text": body.comment, "audience": audience},
+                )
                 row.comment_count += 1
-                row.latest_update = body.comment[:300]
+                if audience == "human":
+                    row.latest_update = body.comment[:300]
             return _ticket(row)
 
         return run_write_transaction(self._write, "update_ticket", write)
@@ -596,11 +657,16 @@ class ProjectTicketStore:
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)
             row = self._row(session, project_id, ticket_id, write=True)
-            self._append(session, project, row, actor, body.kind, {"text": body.text})
+            audience = self._comment_audience(project, actor, body.audience)
+            self._append(
+                session, project, row, actor, body.kind, {"text": body.text, "audience": audience}
+            )
             for output in body.outputs:
                 self._append(session, project, row, actor, "output", output.model_dump())
             row.comment_count += 1
-            row.latest_update = body.text[:300]
+            # The card previews what the human should read, not the latest agent note.
+            if audience == "human":
+                row.latest_update = body.text[:300]
             return _ticket(row)
 
         return run_write_transaction(self._write, "comment_on_ticket", write)
@@ -617,7 +683,8 @@ class ProjectTicketStore:
     ) -> dict[str, Any]:
         limit = max(1, min(limit, TICKET_PAGE_MAX))
         with self._session("list_ticket_events") as session:
-            self._project(session, project_id, user_id)
+            project = self._project(session, project_id, user_id)
+            orchestrator_session_id = _orchestrator_session_id(project)
             self._row(session, project_id, ticket_id)
             stmt = select(SqlProjectTicketEvent).where(
                 SqlProjectTicketEvent.workspace_id == current_workspace_id(),
@@ -636,7 +703,7 @@ class ProjectTicketStore:
                 .limit(limit + 1)
             ).all()
             return {
-                "data": [_event(row) for row in rows[:limit]],
+                "data": [_labeled_event(row, orchestrator_session_id) for row in rows[:limit]],
                 "has_more": len(rows) > limit,
                 "last_position": rows[min(limit, len(rows)) - 1].position if rows else after,
             }
