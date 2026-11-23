@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { hasCommandModifier, isEscapeOwnerOpen, isKeyOwningOverlayOpen } from "./hotkeys";
+import {
+  hasCommandModifier,
+  isCommandEnterSubmitKey,
+  isEscapeOwnerOpen,
+  isKeyOwningOverlayOpen,
+} from "./hotkeys";
 
 describe("hasCommandModifier", () => {
   it("requires Meta exclusively on macOS", () => {
@@ -13,6 +18,40 @@ describe("hasCommandModifier", () => {
     expect(hasCommandModifier({ metaKey: false, ctrlKey: true }, false)).toBe(true);
     expect(hasCommandModifier({ metaKey: true, ctrlKey: false }, false)).toBe(false);
     expect(hasCommandModifier({ metaKey: true, ctrlKey: true }, false)).toBe(false);
+  });
+});
+
+describe("isCommandEnterSubmitKey", () => {
+  const enter = {
+    key: "Enter",
+    metaKey: false,
+    ctrlKey: false,
+    altKey: false,
+    shiftKey: false,
+    repeat: false,
+    isComposing: false,
+    keyCode: 13,
+  };
+
+  it("accepts the platform command modifier with Enter", () => {
+    expect(isCommandEnterSubmitKey({ ...enter, ctrlKey: true }, false)).toBe(true);
+    expect(isCommandEnterSubmitKey({ ...enter, metaKey: true }, true)).toBe(true);
+    expect(isCommandEnterSubmitKey({ ...enter, metaKey: true }, false)).toBe(false);
+    expect(isCommandEnterSubmitKey({ ...enter, ctrlKey: true }, true)).toBe(false);
+  });
+
+  it("ignores plain Enter, extra modifiers, repeats and IME composition", () => {
+    expect(isCommandEnterSubmitKey(enter, false)).toBe(false);
+    for (const extra of [
+      { shiftKey: true },
+      { altKey: true },
+      { repeat: true },
+      { isComposing: true },
+      { keyCode: 229 },
+      { key: "a" },
+    ]) {
+      expect(isCommandEnterSubmitKey({ ...enter, ctrlKey: true, ...extra }, false)).toBe(false);
+    }
   });
 });
 

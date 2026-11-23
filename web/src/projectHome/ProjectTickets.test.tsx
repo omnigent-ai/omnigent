@@ -799,6 +799,56 @@ describe("Project ticket board", () => {
     expect(projectsApi.createProject).not.toHaveBeenCalled();
   });
 
+  it("submits the new ticket and a comment with Ctrl+Enter but not plain Enter", async () => {
+    const onCreated = vi.fn();
+    const { unmount } = renderBoard(
+      <ProjectTicketPanel
+        projectName="Shipping"
+        ticketId="new"
+        onClose={vi.fn()}
+        onCreated={onCreated}
+      />,
+    );
+    const description = screen.getByLabelText(/Description/);
+    fireEvent.keyDown(description, { key: "Enter", ctrlKey: true });
+    expect(api.createTicket).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Keyboard task" } });
+    fireEvent.change(description, { target: { value: "Line one" } });
+    fireEvent.keyDown(description, { key: "Enter" });
+    fireEvent.keyDown(description, { key: "Enter", ctrlKey: true, shiftKey: true });
+    expect(api.createTicket).not.toHaveBeenCalled();
+    fireEvent.keyDown(description, { key: "Enter", ctrlKey: true });
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith("ticket"));
+    expect(api.createTicket).toHaveBeenCalledTimes(1);
+    expect(api.createTicket).toHaveBeenCalledWith("project", {
+      title: "Keyboard task",
+      description: "Line one",
+    });
+    unmount();
+
+    renderBoard(
+      <ProjectTicketPanel
+        projectName="Shipping"
+        ticketId="ticket"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />,
+    );
+    const box = await screen.findByLabelText("Add a comment");
+    fireEvent.keyDown(box, { key: "Enter", ctrlKey: true });
+    fireEvent.change(box, { target: { value: "Looks good" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(api.commentOnTicket).not.toHaveBeenCalled();
+    fireEvent.keyDown(box, { key: "Enter", ctrlKey: true });
+    await waitFor(() =>
+      expect(api.commentOnTicket).toHaveBeenCalledWith("project", "ticket", {
+        text: "Looks good",
+        outputs: [],
+      }),
+    );
+    expect(api.commentOnTicket).toHaveBeenCalledTimes(1);
+  });
+
   it.each([false, true])(
     "groups and deduplicates attachments without losing activity (links=%s)",
     async (includeLink) => {

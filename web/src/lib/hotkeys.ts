@@ -31,6 +31,28 @@ export function hasCommandModifier(
   return isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
 }
 
+/**
+ * True for the form-submit chord: Mod+Enter (⌘ on macOS, Ctrl elsewhere) without
+ * Alt/Shift, excluding auto-repeat and IME composition so plain Enter keeps its newline.
+ */
+export function isCommandEnterSubmitKey(
+  e: Pick<
+    globalThis.KeyboardEvent,
+    "key" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey" | "repeat" | "isComposing" | "keyCode"
+  >,
+  isMac: boolean = isMacPlatform(),
+): boolean {
+  return (
+    e.key === "Enter" &&
+    hasCommandModifier(e, isMac) &&
+    !e.altKey &&
+    !e.shiftKey &&
+    !e.repeat &&
+    !e.isComposing &&
+    e.keyCode !== 229
+  );
+}
+
 /** True while keyboard focus is in a dialog or menu, which keeps its own keys. */
 export function isFocusInDialogOrMenu(): boolean {
   return !!document.activeElement?.closest('[role="dialog"], [role="alertdialog"], [role="menu"]');

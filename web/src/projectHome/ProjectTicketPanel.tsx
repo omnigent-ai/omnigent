@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useState, type KeyboardEvent, type ReactNode } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   BotIcon,
@@ -30,6 +30,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useNow } from "@/hooks/useNow";
 import { useViewerId } from "@/hooks/useViewerId";
+import { isCommandEnterSubmitKey } from "@/lib/hotkeys";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { Link, useSearchParams, useReplaceSearchParams } from "@/lib/routing";
@@ -212,6 +213,14 @@ export function ProjectTicketPanel({
   );
 }
 
+/** Mod+Enter submits through `requestSubmit`, so native validation and `onSubmit` guards still apply. */
+function submitOnCommandEnter(event: KeyboardEvent<HTMLFormElement>) {
+  if (!isCommandEnterSubmitKey(event.nativeEvent)) return;
+  event.preventDefault();
+  event.stopPropagation();
+  event.currentTarget.requestSubmit();
+}
+
 function TicketEditor({
   ticket,
   onSave,
@@ -233,6 +242,7 @@ function TicketEditor({
   return (
     <form
       className="space-y-4"
+      onKeyDown={submitOnCommandEnter}
       onSubmit={(event) => {
         event.preventDefault();
         if (!title.trim() || pending || disabled) return;
@@ -473,6 +483,7 @@ function TicketCommentComposer({
   return (
     <form
       className="space-y-2"
+      onKeyDown={submitOnCommandEnter}
       onSubmit={(event) => {
         event.preventDefault();
         if (!text.trim() || comment.isPending) return;

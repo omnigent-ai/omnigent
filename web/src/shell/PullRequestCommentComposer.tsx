@@ -4,7 +4,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { MessageResponse } from "@/components/ai-elements/message";
-import { hasCommandModifier } from "@/lib/hotkeys";
+import { isCommandEnterSubmitKey } from "@/lib/hotkeys";
 import {
   MAX_PULL_REQUEST_COMMENT_CHARACTERS,
   pullRequestCommentTooLong,
@@ -80,16 +80,7 @@ export function PullRequestCommentForm({
         if (canSubmit) post();
       }}
       onKeyDown={(event) => {
-        if (
-          event.key !== "Enter" ||
-          !hasCommandModifier(event) ||
-          event.altKey ||
-          event.shiftKey ||
-          event.repeat ||
-          event.nativeEvent.isComposing ||
-          event.keyCode === 229
-        )
-          return;
+        if (!isCommandEnterSubmitKey(event.nativeEvent)) return;
         event.preventDefault();
         event.stopPropagation();
         formRef.current?.requestSubmit();
