@@ -10388,6 +10388,31 @@ describe("NewChatLandingScreen @-file-mention", () => {
     expect((payload as { text: string }).text).toBe("[Attached: omnigent/cli.py] explain this");
   });
 
+  it("keeps a tag when text is typed right after its token", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(input(), { target: { value: "@RE", selectionStart: 3 } });
+    fireEvent.click(screen.getByTitle("Attach README.md"));
+    expect((input() as HTMLTextAreaElement).value).toBe("@README.md ");
+
+    // A key as a browser sends it: beforeinput first, then the insert unless it was cancelled.
+    const field = input() as HTMLTextAreaElement;
+    act(() => {
+      field.setSelectionRange("@README.md".length, "@README.md".length);
+      const beforeInput = new InputEvent("beforeinput", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "insertText",
+        data: "x",
+      });
+      if (field.dispatchEvent(beforeInput)) insertComposerText(field, "x");
+    });
+    expect((input() as HTMLTextAreaElement).value).toBe("@README.md x ");
+    expect(screen.getByTestId("composer-mention-token").textContent).toBe("@README.md");
+  });
+
   it("suppresses stale parent rows while a drilled directory is still loading", async () => {
     // ``useHostFilesystem`` keeps the previous directory's rows on screen as
     // placeholder data while the next fetch is in flight (keepPreviousData):

@@ -1,5 +1,9 @@
 import type { ComposerAttachment } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
+import type {
+  ComposerInsert,
+  ComposerInsertAdjustment,
+} from "@/components/composer/engine/composerInput";
 
 /**
  * Pure ``@``-mention utilities (workspace files and other sessions) shared by the in-session composer
@@ -287,6 +291,26 @@ export function findMentionTokens(text: string, tokens: readonly string[]): Ment
     }
   }
   return ranges.sort((a, b) => a.start - b.start);
+}
+
+/**
+ * The insert with a space added where it would break a token it touches: right after one, or
+ * right before one. ``caret`` stays after the inserted text. Null when the tokens stay matched.
+ */
+export function separateMentionEdges(
+  value: string,
+  insert: ComposerInsert,
+  tokens: readonly string[],
+): ComposerInsertAdjustment | null {
+  const { start, end, text } = insert;
+  if (text === "") return null;
+  const ranges = findMentionTokens(value, tokens);
+  const lead =
+    ranges.some((range) => range.end === start) && !TOKEN_END_RE.test(text[0]!) ? " " : "";
+  const trail =
+    ranges.some((range) => range.start === end) && !/\s/.test(text[text.length - 1]!) ? " " : "";
+  if (lead === "" && trail === "") return null;
+  return { text: lead + text + trail, caret: lead.length + text.length };
 }
 
 /** Token the caret is at the end of, or inside, so Backspace removes it whole. */

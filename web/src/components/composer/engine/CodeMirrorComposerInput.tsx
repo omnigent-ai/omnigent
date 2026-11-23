@@ -11,6 +11,7 @@ import {
   StateField,
   Transaction,
   type Extension,
+  type TransactionSpec,
 } from "@codemirror/state";
 import {
   Decoration,
@@ -38,6 +39,7 @@ import type {
   ComposerEditorSurface,
   ComposerInputEvent,
   ComposerInputHeightMode,
+  ComposerInsertAdjuster,
   ComposerInputProps,
   ComposerKeyboardEvent,
   ComposerTextTarget,
@@ -82,6 +84,41 @@ function historyDirectionOfTransactions(
   if (transactions.some((transaction) => transaction.isUserEvent("undo"))) return "undo";
   if (transactions.some((transaction) => transaction.isUserEvent("redo"))) return "redo";
   return undefined;
+}
+
+/**
+ * Rewrites a single typed or pasted insert in the same transaction, so undo removes the insert and
+ * the space it added together. IME composition is skipped, so its commit is not adjusted.
+ */
+function adjustedInsertTransaction(
+  transaction: Transaction,
+  adjust: ComposerInsertAdjuster | undefined,
+): TransactionSpec | Transaction {
+  if (
+    !adjust ||
+    !transaction.docChanged ||
+    !transaction.isUserEvent("input") ||
+    transaction.isUserEvent("input.type.compose")
+  ) {
+    return transaction;
+  }
+  const inserts: { start: number; end: number; text: string }[] = [];
+  transaction.changes.iterChanges((start, end, _fromB, _toB, inserted) => {
+    inserts.push({ start, end, text: inserted.toString() });
+  });
+  const insert = inserts.length === 1 ? inserts[0] : undefined;
+  if (!insert) return transaction;
+  const adjusted = adjust(transaction.startState.doc.toString(), insert);
+  if (!adjusted) return transaction;
+  const isolation = transaction.annotation(isolateHistory);
+  return {
+    changes: { from: insert.start, to: insert.end, insert: adjusted.text },
+    selection: EditorSelection.cursor(insert.start + adjusted.caret),
+    userEvent: transaction.annotation(Transaction.userEvent),
+    annotations: isolation === undefined ? undefined : isolateHistory.of(isolation),
+    effects: transaction.effects,
+    scrollIntoView: transaction.scrollIntoView,
+  };
 }
 
 /** The mention tokens the editor paints; reconfigured through a compartment when they change. */
@@ -514,6 +551,9 @@ function CodeMirrorComposer({
           keymap.of(COMPOSER_EDITING_KEYMAP),
           compartments.history.of(history()),
           EditorView.lineWrapping,
+          EditorState.transactionFilter.of((transaction) =>
+            adjustedInsertTransaction(transaction, latest.current.adjustInsert),
+          ),
           compartments.attributes.of(attributes(initial, environment)),
           compartments.placeholder.of(placeholderText(initial.placeholder ?? "")),
           compartments.theme.of(theme(initial.heightMode ?? "compact")),

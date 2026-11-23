@@ -1175,6 +1175,19 @@ describe.each(["textarea", "codemirror"] as const)(
       act(() => composerTargetOf(composerInput())!.setSelectionRange(offset, offset));
     const typeAt = (text: string, offset = valueOf().length) =>
       act(() => insertComposerText(composerTargetOf(composerInput())!, text, offset, offset));
+    /** A key at the caret. A textarea gets beforeinput first and inserts only if it isn't cancelled. */
+    const typeKey = (text: string) =>
+      act(() => {
+        const beforeInput = new InputEvent("beforeinput", {
+          bubbles: true,
+          cancelable: true,
+          inputType: "insertText",
+          data: text,
+        });
+        if (engine === "codemirror" || composerInput().dispatchEvent(beforeInput)) {
+          insertComposerText(composerTargetOf(composerInput())!, text);
+        }
+      });
 
     /** ⌘Z. jsdom has no native textarea undo, so its browser undo is the input event it fires. */
     function undoTo(text: string) {
@@ -1267,6 +1280,46 @@ describe.each(["textarea", "codemirror"] as const)(
 
       expect(valueOf()).toBe("Read @readme.md more");
       expect(caretOf()).toBe("Read @readme.md ".length);
+    });
+
+    it("keeps a pill when text is typed right after it, and still attaches it on send", async () => {
+      const props = composerProps();
+      await renderComposer(props);
+      typeAt("Read @rea");
+      fireEvent.click(screen.getByTitle("Attach readme.md"));
+      caretAt("Read @readme.md".length);
+      typeKey("x");
+
+      expect(valueOf()).toBe("Read @readme.md x ");
+      expect(tokens()).toEqual(["@readme.md"]);
+      fireEvent.submit(composerInput().closest("form")!);
+      expect(props.onSend).toHaveBeenCalledWith("Read [Attached: readme.md] x", undefined);
+    });
+
+    it("keeps a pill when text is typed right before it, with the caret after the typed text", async () => {
+      const props = composerProps();
+      await renderComposer(props);
+      typeAt("Read @rea");
+      fireEvent.click(screen.getByTitle("Attach readme.md"));
+      caretAt("Read ".length);
+      typeKey("x");
+
+      expect(valueOf()).toBe("Read x @readme.md ");
+      expect(caretOf()).toBe("Read x".length);
+      expect(tokens()).toEqual(["@readme.md"]);
+      fireEvent.submit(composerInput().closest("form")!);
+      expect(props.onSend).toHaveBeenCalledWith("Read x [Attached: readme.md]", undefined);
+    });
+
+    it("undoes text typed beside a pill, and the space it added, in one step with the pill kept", async () => {
+      await renderComposer(composerProps());
+      typeAt("Read @rea");
+      fireEvent.click(screen.getByTitle("Attach readme.md"));
+      caretAt("Read @readme.md".length);
+      typeKey("x");
+
+      undoTo("Read @readme.md ");
+      expect(tokens()).toEqual(["@readme.md"]);
     });
 
     it.runIf(engine === "codemirror")(

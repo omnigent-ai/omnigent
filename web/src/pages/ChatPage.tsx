@@ -3143,6 +3143,7 @@ function ComposerImpl(
     ownedMentionTokens,
     resetMentions,
     noteTextChange: noteMentionTextChange,
+    adjustInsert,
     handleTokenBackspace,
     handleKeyDown: handleMentionKeyDown,
     dismiss: dismissMention,
@@ -4468,6 +4469,7 @@ function ComposerImpl(
           // Same rules as the textarea mirror: quoted replies get no pills, and files stop the command tint.
           commandToken: highlight.input.commandToken,
           mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
+          adjustInsert,
           onChange: (e) => handleTextChange(null, e),
           onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
           onFocus: (e) => {
@@ -4538,6 +4540,7 @@ function ComposerImpl(
                   onFocus: (e) => handleTextFocus(quote.id, e.currentTarget),
                   onBlur: dismissMention,
                   onKeyDown: handleKeyDown,
+                  adjustInsert,
                   onPaste,
                   "data-has-draft": hasDraft ? "true" : undefined,
                 })}

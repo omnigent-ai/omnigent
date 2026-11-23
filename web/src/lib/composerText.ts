@@ -29,12 +29,14 @@ export function insertComposerText(
   // Chromium merges an insert into the typing around it unless the selection moved since.
   if (options?.separateUndo) breakTypingGroup(textarea);
   textarea.setSelectionRange(start, end);
+  const valueBefore = textarea.value;
   const inserted =
     typeof document.execCommand === "function" &&
     (text || start === end
       ? document.execCommand("insertText", false, text)
       : document.execCommand("delete"));
-  if (!inserted) {
+  // A beforeinput handler that cancels this command may have inserted an adjusted text itself.
+  if (!inserted && textarea.value === valueBefore) {
     textarea.setRangeText(text, start, end, "end");
     textarea.dispatchEvent(new Event("input", { bubbles: true }));
   }

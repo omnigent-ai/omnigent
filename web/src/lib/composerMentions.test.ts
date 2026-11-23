@@ -15,6 +15,7 @@ import {
   rankSessionMentions,
   readableSentText,
   replaceSentMentions,
+  separateMentionEdges,
   SESSION_MENTION_HINT,
   sessionMentionMarker,
   sessionMentionToken,
@@ -48,6 +49,68 @@ describe("mentionTokenAtCaret", () => {
     expect(mentionTokenAtCaret(text, 10, ["@Alpha planning"])?.start).toBe(4);
     expect(mentionTokenAtCaret(text, 4, ["@Alpha planning"])).toBeNull();
     expect(mentionTokenAtCaret(text, 20, ["@Alpha planning"])).toBeNull();
+  });
+});
+
+describe("separateMentionEdges", () => {
+  const tokens = ["@readme.md", "@Alpha planning"];
+  // Inserts ``text`` at ``at`` (a collapsed caret) in ``value``.
+  const typeAt = (value: string, at: number, text: string) =>
+    separateMentionEdges(value, { start: at, end: at, text }, tokens);
+
+  it("adds a space when text is typed right after a token", () => {
+    expect(typeAt("Read @readme.md", 15, "x")).toEqual({ text: " x", caret: 2 });
+    expect(typeAt("@Alpha planning", 15, "x")).toEqual({ text: " x", caret: 2 });
+  });
+
+  it("adds a space when text is typed right before a token, keeping the caret after the text", () => {
+    expect(typeAt("Read @readme.md", 5, "x")).toEqual({ text: "x ", caret: 1 });
+  });
+
+  it("adds both spaces when text replaces the gap between two tokens", () => {
+    expect(
+      separateMentionEdges("@readme.md @Alpha planning", { start: 10, end: 11, text: "x" }, tokens),
+    ).toEqual({ text: " x ", caret: 2 });
+  });
+
+  it("leaves punctuation that a token may end with, and whitespace, untouched", () => {
+    expect(typeAt("Read @readme.md", 15, ",")).toBeNull();
+    expect(typeAt("Read @readme.md", 15, " ")).toBeNull();
+    expect(typeAt("Read @readme.md", 15, "\n")).toBeNull();
+    expect(typeAt("Read @readme.md", 5, " ")).toBeNull();
+  });
+
+  it("adds a space for punctuation a token may not end with", () => {
+    expect(typeAt("Read @readme.md", 15, "(")).toEqual({ text: " (", caret: 2 });
+    expect(typeAt("Read @readme.md", 5, "(")).toEqual({ text: "( ", caret: 1 });
+  });
+
+  it("works in the middle of text, next to a token that has words on both sides", () => {
+    expect(typeAt("Read @readme.md more", 15, "x")).toEqual({ text: " x", caret: 2 });
+    expect(typeAt("see the @readme.md file", 8, "x")).toEqual({ text: "x ", caret: 1 });
+  });
+
+  it("checks each end of a multi-character paste on its own", () => {
+    expect(typeAt("Read @readme.md", 15, "foo bar")).toEqual({ text: " foo bar", caret: 8 });
+    expect(typeAt("Read @readme.md", 5, "foo bar")).toEqual({ text: "foo bar ", caret: 7 });
+    expect(typeAt("Read @readme.md", 15, "foo ")).toEqual({ text: " foo ", caret: 5 });
+    expect(typeAt("Read @readme.md", 5, "foo ")).toBeNull();
+  });
+
+  it("leaves an insert that replaces the token itself alone", () => {
+    expect(
+      separateMentionEdges("Read @readme.md", { start: 5, end: 15, text: "x" }, tokens),
+    ).toBeNull();
+  });
+
+  it("does nothing without tokens or with a deletion", () => {
+    expect(typeAt("Read plain text", 15, "x")).toBeNull();
+    expect(
+      separateMentionEdges("Read @readme.md", { start: 15, end: 15, text: "" }, tokens),
+    ).toBeNull();
+    expect(
+      separateMentionEdges("Read @readme.md", { start: 15, end: 15, text: "x" }, []),
+    ).toBeNull();
   });
 });
 

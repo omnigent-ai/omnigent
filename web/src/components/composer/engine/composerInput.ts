@@ -152,12 +152,33 @@ export interface ComposerTokenAt {
   start: number;
 }
 
+/** Text landing in `[start, end)` of a draft, as a typed or pasted insert. */
+export interface ComposerInsert {
+  start: number;
+  end: number;
+  text: string;
+}
+
+/** The text to insert instead, and where the caret lands inside it. */
+export interface ComposerInsertAdjustment {
+  text: string;
+  caret: number;
+}
+
+/** Rewrites an insert before it lands in `value`; null keeps it as typed. */
+export type ComposerInsertAdjuster = (
+  value: string,
+  insert: ComposerInsert,
+) => ComposerInsertAdjustment | null;
+
 /** What every input engine accepts: the subset of textarea props the composer uses. */
 export interface ComposerInputProps {
   ref?: Ref<ComposerTextTarget>;
   value?: string;
   /** The starting text of an uncontrolled input. */
   defaultValue?: string;
+  /** Adjusts typed or pasted text before it lands, e.g. to keep a mention tag matched. */
+  adjustInsert?: ComposerInsertAdjuster;
   placeholder?: string;
   disabled?: boolean;
   readOnly?: boolean;

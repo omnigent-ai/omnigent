@@ -3,6 +3,7 @@ import {
   forwardRef,
   useCallback,
   useContext,
+  useEffect,
   useLayoutEffect,
   useRef,
   useState,
@@ -24,6 +25,7 @@ import {
   COMPOSER_TAIL_INPUT_ID,
   type ComposerInputEngine,
   type ComposerInputProps,
+  type ComposerInsertAdjuster,
   type ComposerKeyboardEvent,
   type ComposerTextTarget,
 } from "@/components/composer/engine/composerInput";
@@ -654,15 +656,53 @@ export function ComposerFeedbackRow({
 
 export const ComposerTextarea = forwardRef<
   HTMLTextAreaElement,
-  ComponentPropsWithoutRef<"textarea">
+  ComponentPropsWithoutRef<"textarea"> & { adjustInsert?: ComposerInsertAdjuster }
 >(function ComposerTextarea(
-  { className, onKeyDown, onCompositionStart, onCompositionEnd, ...props },
+  { className, onKeyDown, onCompositionStart, onCompositionEnd, adjustInsert, ...props },
   ref,
 ) {
   const isComposingRef = useRef(false);
+  const elementRef = useRef<HTMLTextAreaElement | null>(null);
+  const adjustRef = useRef(adjustInsert);
+  useLayoutEffect(() => {
+    adjustRef.current = adjustInsert;
+  });
+  const setElement = useCallback(
+    (element: HTMLTextAreaElement | null) => {
+      elementRef.current = element;
+      assignRef(ref, element);
+    },
+    [ref],
+  );
+  // Native beforeinput: React's onBeforeInput does not carry the inserted text for every input.
+  useEffect(() => {
+    const element = elementRef.current;
+    if (!element) return;
+    let inserting = false;
+    const onBeforeInput = (event: InputEvent) => {
+      const adjust = adjustRef.current;
+      if (inserting || !adjust || event.isComposing || event.inputType !== "insertText") return;
+      if (event.data === null) return;
+      const { selectionStart: start, selectionEnd: end, value } = element;
+      const adjusted = adjust(value, { start, end, text: event.data });
+      if (!adjusted) return;
+      // Insert the adjusted text as one edit, so undo removes it whole.
+      event.preventDefault();
+      inserting = true;
+      try {
+        if (insertComposerText(element, adjusted.text, start, end, { separateUndo: true })) {
+          element.setSelectionRange(start + adjusted.caret, start + adjusted.caret);
+        }
+      } finally {
+        inserting = false;
+      }
+    };
+    element.addEventListener("beforeinput", onBeforeInput);
+    return () => element.removeEventListener("beforeinput", onBeforeInput);
+  }, []);
   return (
     <textarea
-      ref={ref}
+      ref={setElement}
       className={cn(
         "composer-input-text relative max-h-[180px] w-full resize-none overflow-y-auto border-none bg-transparent p-0 text-ui text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 md:min-h-[42px] md:select-text [&::-webkit-scrollbar]:hidden",
         className,
