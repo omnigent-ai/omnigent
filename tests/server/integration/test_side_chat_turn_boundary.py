@@ -21,6 +21,7 @@ import pytest_asyncio
 
 from omnigent.runtime import pending_inputs
 from omnigent.server.routes import sessions as sessions_module
+from omnigent.server.routes._sessions import common as sessions_common
 from omnigent.server.routes._sessions.helpers import _NativeTerminalEnsureOutcome
 from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
 from omnigent.server.routes.sessions import routes_core
@@ -217,6 +218,53 @@ async def test_side_chat_keeps_the_exchange_before_a_task_notification_turn(
     await _mirror(client, native_session, "assistant", "The survey is done", "claude_turn_3")
 
     assert await _side_chat_history(client, native_session) == [_CODENAME, _NOTED, request, reply]
+
+
+async def test_side_chat_keeps_the_exchange_before_a_request_sent_while_agents_run(
+    client: httpx.AsyncClient, native_session: str
+) -> None:
+    """A request sent while only background agents run starts a turn, not a follow-up."""
+    request, reply = "Survey the repo in the background", "Started a background agent"
+    await _exchange(client, native_session)
+    await _send(client, native_session, request)
+    await _status(client, native_session, "running")
+    await _mirror(client, native_session, "user", request, "claude_turn_2")
+    await _mirror(client, native_session, "assistant", reply, "claude_turn_2")
+    survey = BackgroundTaskInfo(id="agent_1", type="subagent", status="running")
+    sessions_module._publish_status(native_session, "waiting", background_agents=[survey])
+    await _send(client, native_session, "Now write the docs")
+    # Its running edge reaches the server before Claude Code's transcript does.
+    await _status(client, native_session, "running")
+
+    assert await _side_chat_history(client, native_session) == [_CODENAME, _NOTED, request, reply]
+
+
+async def test_side_chat_ignores_an_input_stored_as_its_turn_ends(
+    client: httpx.AsyncClient, native_session: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An input whose mirror finishes storing after its turn ended starts no later turn."""
+    await _exchange(client, native_session)
+    await _send(client, native_session, "Run the long command")
+    await _status(client, native_session, "running")
+    append = SqlAlchemyConversationStore.append
+
+    def stop_then_append(
+        store: SqlAlchemyConversationStore, session_id: str, *args: Any, **kwargs: Any
+    ) -> Any:
+        # The session is stopped while the mirror waits to store its input.
+        sessions_module._publish_status(session_id, "idle")
+        return append(store, session_id, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "append", stop_then_append)
+    await _mirror(client, native_session, "user", "Run the long command", "claude_turn_2")
+    monkeypatch.setattr(SqlAlchemyConversationStore, "append", append)
+    await _send(client, native_session, "Try the short one")
+    await _status(client, native_session, "running")
+    await _mirror(client, native_session, "user", "Try the short one", "claude_turn_3")
+    await _mirror(client, native_session, "assistant", "Running it", "claude_turn_3")
+
+    history = await _side_chat_history(client, native_session)
+    assert history == [_CODENAME, _NOTED, "Run the long command"]
 
 
 async def test_side_chat_leaves_out_a_request_delivered_while_it_reads_history(
@@ -449,11 +497,16 @@ async def test_sdk_side_chat_cuts_before_a_held_skill_that_follows_a_steered_mes
     skill = {"kind": "skill", "name": "grill-me", "arguments": "the parser"}
     await _post(client, session_id, {"type": "slash_command", "data": skill})
     await _mirror(client, session_id, "assistant", "Both look fine", "r2")
-    await turn_runner.continue_turn(session_id, SqlAlchemyConversationStore(db_uri))
+    store = SqlAlchemyConversationStore(db_uri)
+    await turn_runner.continue_turn(session_id, store)
     await _mirror(client, session_id, "assistant", "Grilling it", "r3")
 
     history = await _side_chat_history(client, session_id)
     assert history == [_CODENAME, _NOTED, "Review the parser", "On it", "Also check the lexer"]
+    # A compaction turn after it answers no request, so both finished turns stay.
+    await turn_runner.continue_turn(session_id, store, take=0)
+    history = await _side_chat_history(client, session_id)
+    assert {"Both look fine", "/grill-me the parser", "Grilling it"} <= set(history)
 
 
 async def test_sdk_side_chat_keeps_a_message_a_runner_steered_into_a_finished_turn(
@@ -539,3 +592,28 @@ async def test_sdk_side_chat_keeps_the_exchange_before_a_compaction_turn(
     # A message sent during it waits for a later turn, so it stays out.
     await _send(client, session_id, "Then add tests")
     assert await _side_chat_history(client, session_id) == finished
+
+
+async def test_sdk_side_chat_leaves_out_a_held_message_beyond_the_tracked_ones(
+    client: httpx.AsyncClient,
+    turn_runner: _TurnRunner,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A held message past the tracking cap still stays out of a compaction turn's side chat."""
+    monkeypatch.setattr(sessions_common, "_MAX_HELD_REQUESTS", 1)
+    session_id = await _session(client, native=False)
+    await _sdk_turn(client, session_id, lambda: _send(client, session_id, _CODENAME), _NOTED, "r1")
+    turn_runner.end_turn(session_id)
+    await _sdk_turn(
+        client, session_id, lambda: _send(client, session_id, "Review the parser"), "On it", "r2"
+    )
+    await _send(client, session_id, "Also check the lexer")
+    await _send(client, session_id, "And the docs")
+    await _mirror(client, session_id, "assistant", "The parser looks fine", "r2")
+    store = SqlAlchemyConversationStore(db_uri)
+    await turn_runner.continue_turn(session_id, store, take=1)
+    await _mirror(client, session_id, "assistant", "The lexer looks fine", "r3")
+    await turn_runner.continue_turn(session_id, store, take=0)
+
+    assert "And the docs" not in await _side_chat_history(client, session_id)

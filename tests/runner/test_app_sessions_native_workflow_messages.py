@@ -161,14 +161,20 @@ async def test_native_input_identity_reaches_the_harness_request(harness: str) -
 
 
 def _build_blocking_app(
-    gate: asyncio.Event,
+    gate: asyncio.Event, *, executor: str | None = None
 ) -> tuple[FastAPI, _FakeProcessManager, _BlockingHarnessClient]:
     """Build a runner app with a blocking harness for concurrency tests.
 
     :param gate: Event that unblocks the harness mid-stream.
+    :param executor: Executor type for the agent, e.g. ``"codex-native"``; the
+        default executor when ``None``.
     :returns: ``(app, process_manager, harness_client)`` tuple.
     """
-    spec = AgentSpec(spec_version=1, name="t")
+    spec = (
+        AgentSpec(spec_version=1, name="t")
+        if executor is None
+        else AgentSpec(spec_version=1, name="t", executor=ExecutorSpec(type=executor))
+    )
     sse_frames = [
         _sse({"type": "response.created", "response": {"id": "resp_1"}}),
         _sse({"type": "response.output_text.delta", "delta": "hi"}),
@@ -1467,6 +1473,68 @@ async def test_buffered_continuation_skips_transient_idle(stored: bool) -> None:
         if event.get("type") == "session.status" and event.get("status") == "running"
     ]
     assert starts == [None, held_items if stored else []]
+
+
+@pytest.mark.asyncio
+async def test_native_buffered_continuation_names_no_stored_items() -> None:
+    """A native continuation leaves the stored items out: the transcript stores them later."""
+    import asyncio as _aio
+
+    gate = _aio.Event()
+    app, _pm, _hc = _build_blocking_app(gate, executor="codex-native")
+    session_id = "6a2d1f0b8c4e4d3f9b7a1c0e2d4f6b8a"
+
+    def message(text: str) -> dict[str, Any]:
+        return {
+            "type": "message",
+            "role": "user",
+            "model": "test-agent",
+            "content": [{"type": "input_text", "text": text}],
+            "harness": "codex-native",
+        }
+
+    async with _runner_client(app) as client:
+        await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        collected: list[dict[str, Any]] = []
+
+        async def _sub() -> None:
+            async with client.stream("GET", f"/v1/sessions/{session_id}/stream") as stream:
+                async for line in stream.aiter_lines():
+                    if line.startswith("data: "):
+                        payload = line[6:]
+                        if payload == "[DONE]":
+                            return
+                        collected.append(json.loads(payload))
+
+        sub_task = _aio.create_task(_sub())
+        await _aio.sleep(0.05)
+
+        async def _first() -> None:
+            resp = await client.post(f"/v1/sessions/{session_id}/events", json=message("first"))
+            async for _ in resp.aiter_text():
+                pass
+
+        turn_task = _aio.create_task(_first())
+        await _aio.sleep(0.05)
+        await client.post(f"/v1/sessions/{session_id}/events", json=message("second"))
+
+        gate.set()
+        await _aio.wait_for(turn_task, timeout=5.0)
+        await _aio.sleep(0.3)
+
+        await client.delete(f"/v1/sessions/{session_id}")
+        await _aio.wait_for(sub_task, timeout=5.0)
+
+    starts = [
+        event
+        for event in collected
+        if event.get("type") == "session.status" and event.get("status") == "running"
+    ]
+    assert len(starts) == 2, f"Expected a turn and its continuation; got {collected}"
+    assert all("input_item_ids" not in event for event in starts)
 
 
 @pytest.mark.asyncio
