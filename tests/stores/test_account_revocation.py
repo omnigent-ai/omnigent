@@ -1859,3 +1859,85 @@ def test_a_username_registered_again_cannot_reach_a_copy_of_the_old_accounts_gad
             service_a.get(board["id"])
         assert service_a.list_owned() == {"items": [], "next_cursor": None}
     assert root_b.get(board["id"]) is None
+
+
+def test_a_name_registered_again_is_not_the_author_of_the_old_accounts_comments_or_actions(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    from omnigent.gadgets.service import GadgetError
+    from tests.gadgets.test_gadget_service import publish_actions_board
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    store, access, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("bob", "bob-hash")
+    accounts.create_user_with_password("alice", "alice-hash")
+    board = publish_actions_board(service("bob").service)
+    permissions.grant_for_gadget("alice", board["id"], 2)
+    old_alice = service("alice")
+    comment = old_alice.create_comment(
+        board["id"], {"body": "Synthetic note", "anchor": {"text": "board"}, "operation_id": "c1"}
+    )
+    action = old_alice.request_action(
+        board["id"], {"action": "run_card", "params": {"cardId": "c1"}, "operation_id": "a1"}
+    )
+    assert comment["yours"] is True
+
+    # Alice's account goes, its name is registered again, and Bob shares the board afresh.
+    assert accounts.delete_user("alice") is True
+    accounts.create_user_with_password("alice", "replacement-hash")
+    permissions.grant_for_gadget("alice", board["id"], 2)
+    alice = service("alice")
+    assert alice.registration != old_alice.registration
+
+    # The comment and the action survive on Bob's board, but are not the new Alice's.
+    [listed] = alice.list_comments(board["id"])["items"]
+    assert listed["id"] == comment["id"] and listed["yours"] is False
+    with pytest.raises(GadgetError) as denied:
+        alice.update_comment(board["id"], comment["id"], {"body": "Changed"})
+    assert denied.value.status == 403
+    with pytest.raises(GadgetError):
+        alice.delete_comment(board["id"], comment["id"])
+    [entry] = alice.list_actions(board["id"])["items"]
+    assert entry["id"] == action["id"] and entry["yours"] is False
+    with pytest.raises(GadgetError):
+        alice.update_action(
+            board["id"],
+            {"id": action["id"], "if_version": action["version"], "operation_id": "u1",
+             "state": "running", "session_id": "s1"},
+        )
+    # Retrying the old account's requests makes new records, not replays of the old ones.
+    again = alice.create_comment(
+        board["id"], {"body": "Synthetic note", "anchor": {"text": "board"}, "operation_id": "c1"}
+    )
+    assert again["id"] != comment["id"] and again["yours"] is True
+
+
+def test_a_password_change_keeps_the_accounts_comments_and_actions_its_own(
+    db_uri: str, tmp_path
+) -> None:
+    from tests.gadgets.test_gadget_service import publish_actions_board
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    _, _, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("bob", "bob-hash")
+    accounts.create_user_with_password("alice", "alice-hash")
+    board = publish_actions_board(service("bob").service)
+    permissions.grant_for_gadget("alice", board["id"], 2)
+    comment = service("alice").create_comment(
+        board["id"], {"body": "Synthetic note", "anchor": {"text": "board"}, "operation_id": "c1"}
+    )
+    action = service("alice").request_action(
+        board["id"], {"action": "run_card", "params": {"cardId": "c1"}, "operation_id": "a1"}
+    )
+    accounts.update_password("alice", "new-hash", revoke_sessions=True)
+    alice = service("alice")
+    assert alice.update_comment(board["id"], comment["id"], {"body": "Changed"})["yours"] is True
+    [entry] = alice.list_actions(board["id"])["items"]
+    assert entry["yours"] is True
+    alice.update_action(
+        board["id"],
+        {"id": action["id"], "if_version": action["version"], "operation_id": "u1",
+         "state": "running", "session_id": "s1"},
+    )

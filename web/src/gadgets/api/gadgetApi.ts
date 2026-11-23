@@ -698,6 +698,8 @@ export interface GadgetComment {
   status: "draft" | "addressed";
   anchor: GadgetCommentAnchor;
   createdBy: string;
+  /** Whether the viewer wrote it: their user and registration, which the server decides. */
+  yours?: boolean;
   /** Unix seconds. */
   createdAt: number;
   updatedAt: number;
@@ -726,6 +728,7 @@ function parseComment(value: unknown): GadgetComment {
       occurrence: typeof anchor.occurrence === "number" ? anchor.occurrence : 1,
     },
     createdBy: typeof value.created_by === "string" ? value.created_by : "",
+    yours: typeof value.yours === "boolean" ? value.yours : undefined,
     createdAt: typeof value.created_at === "number" ? value.created_at : 0,
     updatedAt: typeof value.updated_at === "number" ? value.updated_at : 0,
   };

@@ -170,9 +170,21 @@ class GadgetViewer:
     registration: str | None = None
 
     @property
+    def principal(self) -> list[str]:
+        """Who the viewer is across a gadget's records: the user and their registration, so
+        a name registered again is someone else while a password change is not."""
+        if self.registration is None:
+            return [self.user_id]
+        return [self.user_id, self.registration]
+
+    @property
     def key(self) -> str:
         """A record ID that stands for the viewer; user IDs may hold any characters."""
-        return hashlib.sha256(self.user_id.encode("utf-8")).hexdigest()[:32]
+        return hashlib.sha256(canonical_bytes(self.principal)).hexdigest()[:32]
+
+    def wrote(self, by: str | None, registration: Any) -> bool:
+        """Whether a record written by *by* under *registration* is the viewer's."""
+        return by == self.user_id and registration == self.registration
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -188,6 +200,14 @@ def _requested_by(value: Any) -> str | None:
     """Who asked for a ledger entry, or ``None`` for one that doesn't say."""
     requester = value.get("requested_by") if isinstance(value, dict) else None
     return requester if isinstance(requester, str) and requester else None
+
+
+def _requested_by_viewer(value: Any, viewer: GadgetViewer) -> bool:
+    """Whether *viewer* asked for a ledger entry; one that names no requester is anyone's."""
+    requester = _requested_by(value)
+    if requester is None:
+        return True
+    return viewer.wrote(requester, value.get("requester_registration"))
 
 
 def _digest(value: Any, length: int = 32) -> str:
@@ -744,8 +764,7 @@ class GadgetService:
             self._files(gadget), "data/_comments", limits=_STATE_STORE_LIMITS
         )
 
-    @staticmethod
-    def _comment(app_id: str, document: Document) -> dict:
+    def _comment(self, app_id: str, document: Document) -> dict:
         value = document.value
         anchor = value.get("anchor") if isinstance(value.get("anchor"), dict) else {}
         return {
@@ -756,6 +775,7 @@ class GadgetService:
             "anchor": anchor,
             "version": document.version,
             "created_by": document.created_by,
+            "yours": self.viewer.wrote(document.created_by, value.get("author_registration")),
             "created_at": _epoch(document.created_at),
             "updated_at": _epoch(document.updated_at),
         }
@@ -805,11 +825,14 @@ class GadgetService:
         if type(clean["occurrence"]) is not int or clean["occurrence"] < 1:
             raise InvalidInput("anchor.occurrence must be a positive integer")
         operation_id = _operation_id(body.get("operation_id"))
-        comment_id = _digest([self.viewer.user_id, operation_id])
+        comment_id = _digest([*self.viewer.principal, operation_id])
+        value: dict[str, Any] = {"body": text.strip(), "status": "draft", "anchor": clean}
+        if self.viewer.registration is not None:
+            value["author_registration"] = self.viewer.registration
         document = self._comments(gadget).create(
             "comments",
             comment_id,
-            {"body": text.strip(), "status": "draft", "anchor": clean},
+            value,
             operation_id,
             self.viewer.user_id,
         )
@@ -826,7 +849,7 @@ class GadgetService:
         value = dict(current.value)
         if "body" in body:
             text = body["body"]
-            if current.created_by != self.viewer.user_id:
+            if not self.viewer.wrote(current.created_by, value.get("author_registration")):
                 raise GadgetError("PERMISSION_DENIED", "Only its author can edit a comment", 403)
             if not isinstance(text, str) or not text.strip() or len(text) > MAX_COMMENT_CHARS:
                 raise InvalidInput(f"A comment needs 1–{MAX_COMMENT_CHARS} characters")
@@ -851,7 +874,7 @@ class GadgetService:
         current = store.get("comments", _identifier(comment_id, "comment id"))
         if current is None:
             return {"id": comment_id, "deleted": True}
-        if current.created_by != self.viewer.user_id:
+        if not self.viewer.wrote(current.created_by, current.value.get("author_registration")):
             self._require(permissions, "manage")
         store.delete(
             "comments",
@@ -1183,7 +1206,7 @@ class GadgetService:
             revision.get("actions", []), body.get("action"), body.get("params")
         )
         operation_id = _operation_id(body.get("operation_id"))
-        record_id = _digest([self.viewer.user_id, operation_id])
+        record_id = _digest([*self.viewer.principal, operation_id])
         digest = _digest([name, params])
         viewer = self._sessions(gadget).get("viewers", self.viewer.key)
         open_records = self._open_records(viewer)
@@ -1213,6 +1236,8 @@ class GadgetService:
             "requested_by": self.viewer.user_id,
             "revision_id": revision["id"],
         }
+        if self.viewer.registration is not None:
+            value["requester_registration"] = self.viewer.registration
         document = self._ledger(gadget).create(
             "actions", record_id, value, operation_id, self.viewer.user_id
         )
@@ -1321,7 +1346,7 @@ class GadgetService:
         gadget, _ = self._resolve(app_id)
         page = self._ledger(gadget).list("actions", limit, cursor).to_dict()
         for item in page["items"]:
-            item["yours"] = _requested_by(item["value"]) in (None, self.viewer.user_id)
+            item["yours"] = _requested_by_viewer(item["value"], self.viewer)
         return page
 
     def update_action(self, app_id: str, body: dict) -> dict:
@@ -1337,7 +1362,7 @@ class GadgetService:
             raise NotFound("The action was deleted")
         # An action runs in its requester's gadget session, with their access: another
         # person's session (even the owner's) may read it but not take it on.
-        if _requested_by(current.value) not in (None, self.viewer.user_id):
+        if not _requested_by_viewer(current.value, self.viewer):
             raise GadgetError(
                 "PERMISSION_DENIED",
                 "Someone else requested this action; only their gadget session carries it out",
@@ -1408,7 +1433,7 @@ class GadgetService:
         if method == "data.v1.create" and record_id is None:
             # Stable across retries of one logical operation, unlike a fresh record ID.
             operation_id = _operation_id(params.get("operation_id"))
-            record_id = _digest([self.viewer.user_id, operation_id])
+            record_id = _digest([*self.viewer.principal, operation_id])
         record_id = _identifier(record_id, "record ID")
         if method == "data.v1.get":
             document = store.get(collection, record_id)

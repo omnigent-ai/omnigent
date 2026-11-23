@@ -58,7 +58,8 @@ function toPanelComment(
   comment: GadgetComment,
   position: number,
 ): Comment {
-  const own = comment.createdBy === gadget.viewer_id;
+  // The server says whose a comment is; an older server leaves it to the user name.
+  const own = comment.yours ?? comment.createdBy === gadget.viewer_id;
   return {
     id: comment.id,
     conversation_id: "",
