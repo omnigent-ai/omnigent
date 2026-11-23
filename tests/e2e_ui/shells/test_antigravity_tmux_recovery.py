@@ -113,6 +113,11 @@ def antigravity_model(
                     parts = [{"text": matches[-1]}]
                     break
                 if write and request.get("tools"):
+                    declared = {
+                        declaration["name"]: declaration
+                        for tool in request["tools"]
+                        for declaration in tool.get("functionDeclarations", [])
+                    }
                     call = {
                         "name": "write_to_file",
                         "args": {
@@ -124,6 +129,24 @@ def antigravity_model(
                             "toolAction": "Creating file",
                         },
                     }
+                    if "write_to_file" not in declared:
+                        # agy 1.5 renamed the tool to write_file {Path, Content, Overwrite}.
+                        schema = declared.get("write_file", {})
+                        properties = schema.get(
+                            "parametersJsonSchema", schema.get("parameters", {})
+                        ).get("properties", {})
+                        args: dict[str, object] = {
+                            "Path": write[1],
+                            "Content": write[2],
+                            "Overwrite": False,
+                        }
+                        for key, value in (
+                            ("toolSummary", "Create file"),
+                            ("toolAction", "Creating file"),
+                        ):
+                            if key in properties:
+                                args[key] = value
+                        call = {"name": "write_file", "args": args}
                     mock.tool_calls.append(call)
                     parts = [{"functionCall": call}]
                     break
