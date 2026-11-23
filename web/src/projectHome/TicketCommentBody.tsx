@@ -1,8 +1,8 @@
 import { useId, useMemo, useState } from "react";
 import { parseMarkdownIntoBlocks } from "streamdown";
-import { ProseMarkdown } from "@/components/blocks/ChatMarkdown";
 import { Button } from "@/components/ui/button";
 import { markdownPreviewText } from "@/lib/markdownPreviewText";
+import { TicketMarkdown } from "./ticketImages";
 
 const PREVIEW_CHARACTERS = 600;
 const PREVIEW_LINES = 8;
@@ -50,9 +50,9 @@ export function TicketCommentBody({ body }: { body: string }) {
     <div className="space-y-1">
       <div id={contentId}>
         {visible.markdown ? (
-          <ProseMarkdown key={expanded ? "full" : "preview"} className="text-ui leading-relaxed">
+          <TicketMarkdown key={expanded ? "full" : "preview"} className="text-ui leading-relaxed">
             {visible.text}
-          </ProseMarkdown>
+          </TicketMarkdown>
         ) : (
           <p className="text-ui leading-relaxed wrap-anywhere">{visible.text}</p>
         )}

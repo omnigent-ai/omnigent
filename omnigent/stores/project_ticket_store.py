@@ -212,6 +212,11 @@ class ProjectTicketStore:
         ticket.next_event_position += 1
         ticket.updated_at = now_epoch()
 
+    def require_project(self, project_id: str, *, user_id: str | None) -> None:
+        """Raise NOT_FOUND unless ``user_id`` owns the project."""
+        with self._session("require_project_access") as session:
+            self._project(session, project_id, user_id)
+
     def create(self, project_id: str, body: CreateTicket, actor: TicketActor) -> dict[str, Any]:
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)

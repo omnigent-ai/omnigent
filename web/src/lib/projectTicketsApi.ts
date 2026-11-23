@@ -1,3 +1,4 @@
+import { attachmentFilename } from "./attachments";
 import { authenticatedFetch } from "./identity";
 import { apiErrorFromResponse } from "./sessionsApi";
 
@@ -319,4 +320,22 @@ export function ticketEventStage(event: TicketEvent): TicketStage | null {
       is_complete: changes.status === "done",
     };
   return null;
+}
+
+export interface TicketImage {
+  id: string;
+  filename: string;
+  url: string;
+}
+
+/** Upload a pasted or dropped image for use in a ticket comment or description. */
+export async function uploadTicketImage(projectId: string, file: File): Promise<TicketImage> {
+  const form = new FormData();
+  form.append("file", file, attachmentFilename(file));
+  const response = await authenticatedFetch(
+    `/v1/projects/${encodeURIComponent(projectId)}/ticket-attachments`,
+    { method: "POST", body: form },
+  );
+  if (!response.ok) throw await apiErrorFromResponse(response);
+  return (await response.json()) as TicketImage;
 }

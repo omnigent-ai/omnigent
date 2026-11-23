@@ -13,7 +13,6 @@ import {
   UserRoundIcon,
   XIcon,
 } from "lucide-react";
-import { ProseMarkdown } from "@/components/blocks/ChatMarkdown";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -49,6 +48,7 @@ import { ProjectSessionPanel } from "./ProjectSessionPanel";
 import { ticketPanelSearch } from "./projectHomeNavigation";
 import { TicketAgents } from "./TicketAgents";
 import { TicketCommentBody } from "./TicketCommentBody";
+import { TicketMarkdown, useTicketImageUpload } from "./ticketImages";
 import { TicketSessionLink } from "./TicketSessionLink";
 import { TicketError, TicketStageIcon, TicketLabels } from "./TicketControls";
 import { TicketRelatedTickets } from "./TicketRelatedTickets";
@@ -177,6 +177,7 @@ export function ProjectTicketPanel({
         onExpandedChange={onExpandedChange}
       >
         <TicketEditor
+          resolveProjectId={async () => projectId ?? (await ensure.mutateAsync())}
           onSave={(body) => create.mutate(body)}
           pending={create.isPending}
           error={create.error}
@@ -229,7 +230,9 @@ function TicketEditor({
   pending,
   error,
   disabled = false,
+  resolveProjectId,
 }: {
+  resolveProjectId: () => Promise<string>;
   ticket?: ProjectTicket;
   onSave: (body: { title: string; description: string }) => void;
   onCancel?: () => void;
@@ -240,13 +243,14 @@ function TicketEditor({
   const [title, setTitle] = useState(ticket?.title ?? "");
   const [description, setDescription] = useState(ticket?.description ?? "");
   const mobile = useIsMobileViewport();
+  const images = useTicketImageUpload(resolveProjectId, setDescription);
   return (
     <form
       className="space-y-4"
       onKeyDown={submitOnCommandEnter}
       onSubmit={(event) => {
         event.preventDefault();
-        if (!title.trim() || pending || disabled) return;
+        if (!title.trim() || pending || disabled || images.uploading) return;
         onSave({ title: title.trim(), description });
       }}
     >
@@ -276,10 +280,15 @@ function TicketEditor({
           maxLength={3000}
           value={description}
           onChange={(event) => setDescription(event.target.value)}
+          onPaste={images.onPaste}
+          onDragOver={images.onDragOver}
+          onDrop={images.onDrop}
           placeholder="What should change? Done when…"
           disabled={pending}
         />
       </label>
+      {images.uploading && <p className="text-xs text-muted-foreground">Uploading image…</p>}
+      <TicketError error={images.error} />
       <TicketError error={error} />
       <div className="flex justify-end gap-2">
         {onCancel && (
@@ -287,7 +296,11 @@ function TicketEditor({
             Cancel
           </Button>
         )}
-        <Button type="submit" loading={pending} disabled={disabled || !title.trim()}>
+        <Button
+          type="submit"
+          loading={pending}
+          disabled={disabled || images.uploading || !title.trim()}
+        >
           {ticket ? "Save changes" : "Create ticket"}
         </Button>
       </div>
@@ -357,11 +370,14 @@ function TicketDetails({
           onClose={onClose}
           expanded={expanded}
           onExpandedChange={onExpandedChange}
-          footer={<TicketCommentComposer ticketId={ticketId} comment={comment} />}
+          footer={
+            <TicketCommentComposer projectId={projectId} ticketId={ticketId} comment={comment} />
+          }
         >
           {editing ? (
             <TicketEditor
               ticket={ticket}
+              resolveProjectId={async () => projectId}
               pending={update.isPending}
               error={update.error}
               onCancel={() => setEditing(false)}
@@ -433,9 +449,9 @@ function TicketDetails({
               <section aria-label="Description" className="space-y-2">
                 <h3 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Description</h3>
                 {ticket.description ? (
-                  <ProseMarkdown className="text-ui leading-relaxed">
+                  <TicketMarkdown className="text-ui leading-relaxed">
                     {ticket.description}
-                  </ProseMarkdown>
+                  </TicketMarkdown>
                 ) : (
                   <Button
                     variant="ghost"
@@ -471,9 +487,11 @@ function TicketDetails({
 }
 
 function TicketCommentComposer({
+  projectId,
   ticketId,
   comment,
 }: {
+  projectId: string;
   ticketId: string;
   comment: ReturnType<typeof useTicketActions>["comment"];
 }) {
@@ -481,13 +499,14 @@ function TicketCommentComposer({
   const [attaching, setAttaching] = useState(false);
   const [outputUrl, setOutputUrl] = useState("");
   const [outputType, setOutputType] = useState<TicketOutput["type"]>("pull_request");
+  const images = useTicketImageUpload(async () => projectId, setText);
   return (
     <form
       className="space-y-2"
       onKeyDown={submitOnCommandEnter}
       onSubmit={(event) => {
         event.preventDefault();
-        if (!text.trim() || comment.isPending) return;
+        if (!text.trim() || comment.isPending || images.uploading) return;
         comment.mutate(
           {
             id: ticketId,
@@ -518,7 +537,10 @@ function TicketCommentComposer({
           value={text}
           disabled={comment.isPending}
           onChange={(event) => setText(event.target.value)}
-          placeholder="Add a comment…"
+          onPaste={images.onPaste}
+          onDragOver={images.onDragOver}
+          onDrop={images.onDrop}
+          placeholder="Add a comment… (paste or drop images)"
         />
         {attaching && (
           <div className="flex flex-wrap items-center gap-2 border-t border-border/60 p-2">
@@ -577,11 +599,18 @@ function TicketCommentComposer({
             <LinkIcon aria-hidden />
             Attach link
           </Button>
-          <Button type="submit" size="sm" loading={comment.isPending} disabled={!text.trim()}>
+          <Button
+            type="submit"
+            size="sm"
+            loading={comment.isPending}
+            disabled={!text.trim() || images.uploading}
+          >
             Comment
           </Button>
         </div>
       </div>
+      {images.uploading && <p className="text-xs text-muted-foreground">Uploading image…</p>}
+      <TicketError error={images.error} />
       <TicketError error={comment.error} />
       <span role="status" className="sr-only">
         {comment.isSuccess ? "Comment added" : ""}
