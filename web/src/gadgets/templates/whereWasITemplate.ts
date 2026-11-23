@@ -1317,6 +1317,37 @@ ${GADGET_KIT_HELPERS}
     (items || []).forEach(function (doc) { out[doc.id] = doc; });
     return out;
   }
+  // A watch sees one page. For a collection the page looks records up in (runs, hidden steps),
+  // follow its continuation pages before replacing what the page knows, so a record on a later
+  // page never reads as deleted. Past MAX_EXTRA_PAGES, records already known are kept.
+  var MAX_EXTRA_PAGES = 9;
+  function watchEveryPage(collection, handler, options) {
+    var latest = 0;
+    return collection.watch(function (snapshot) {
+      if (snapshot.status === 'loading') return;
+      var mine = ++latest;
+      if (!snapshot.nextCursor) { handler(snapshot.items || [], true); return; }
+      var items = (snapshot.items || []).slice();
+      var pages = 0;
+      (function more(cursor) {
+        collection.list({ limit: options.limit, cursor: cursor }).then(function (page) {
+          if (mine !== latest) return;
+          items = items.concat(page.items || []);
+          pages += 1;
+          if (page.nextCursor && pages < MAX_EXTRA_PAGES) { more(page.nextCursor); return; }
+          handler(items, !page.nextCursor);
+        }, function () {
+          // Keep what is known; the next poll tries again.
+        });
+      })(snapshot.nextCursor);
+    }, options);
+  }
+  function mergeKnown(known, items, complete) {
+    var next = byIdOf(items);
+    if (complete) return next;
+    Object.keys(known).forEach(function (id) { if (!next[id]) next[id] = known[id]; });
+    return next;
+  }
   function onRadar(snapshot) {
     if (snapshot.status === 'loading') return;
     // A newer revision means the session published a look; Omnigent loads it in a moment.
@@ -1341,12 +1372,11 @@ ${GADGET_KIT_HELPERS}
     layoutDoc = (snapshot.items || []).filter(function (doc) { return doc.id === 'current'; })[0] || null;
     schedule();
   }
-  function onRuns(snapshot) {
-    if (snapshot.status === 'loading') return;
-    var key = stamp(snapshot.items);
+  function onRuns(items, complete) {
+    var key = stamp(items) + (complete ? '' : '+');
     if (key === seen.runs) return;
     seen.runs = key;
-    var next = byIdOf(snapshot.items);
+    var next = mergeKnown(runDocs, items, complete);
     Object.keys(next).forEach(function (stepId) {
       var before = runDocs[stepId] && runDocs[stepId].value;
       var now = next[stepId].value;
@@ -1355,12 +1385,11 @@ ${GADGET_KIT_HELPERS}
     runDocs = next;
     schedule();
   }
-  function onDismissed(snapshot) {
-    if (snapshot.status === 'loading') return;
-    var key = stamp(snapshot.items);
+  function onDismissed(items, complete) {
+    var key = stamp(items) + (complete ? '' : '+');
     if (key === seen.dismissed) return;
     seen.dismissed = key;
-    dismissedDocs = byIdOf(snapshot.items);
+    dismissedDocs = mergeKnown(dismissedDocs, items, complete);
     schedule();
   }
 
@@ -1423,8 +1452,8 @@ ${GADGET_KIT_HELPERS}
       if (viewFailure) report('failed', viewFailure.text);
       radarCollection.watch(onRadar, { intervalMs: 4000, limit: 5 });
       layoutCollection.watch(onLayout, { intervalMs: 8000, limit: 5 });
-      stepRuns.watch(onRuns, { intervalMs: 4000, limit: 100 });
-      dismissed.watch(onDismissed, { intervalMs: 8000, limit: 100 });
+      watchEveryPage(stepRuns, onRuns, { intervalMs: 4000, limit: 100 });
+      watchEveryPage(dismissed, onDismissed, { intervalMs: 8000, limit: 100 });
       patternsCollection.watch(onPatterns, { intervalMs: 8000, limit: 5 });
       if (canAct && typeof client.agent.watch === 'function') client.agent.watch(onActions, { intervalMs: 3000 });
       schedule();

@@ -57,6 +57,11 @@ export function recordingCollections() {
   const listeners: Record<string, TemplateListener> = {};
   const stored: Record<string, Record<string, TemplateDoc>> = {};
   const writes: TemplateWrite[] = [];
+  /** Continuation pages a test serves, by collection and cursor. */
+  const pages: Record<
+    string,
+    Record<string, { items: TemplateDoc[]; nextCursor: string | null }>
+  > = {};
   const collection = (name: string) => {
     const docs = (stored[name] ??= {});
     return {
@@ -64,6 +69,8 @@ export function recordingCollections() {
         listeners[name] = listener;
         return { dispose: () => undefined };
       },
+      list: (page: { cursor?: string }) =>
+        Promise.resolve(pages[name]?.[page?.cursor ?? ""] ?? { items: [], nextCursor: null }),
       get: (id: string) => Promise.resolve(docs[id] ?? null),
       create: (value: unknown, options: { id?: string }) => {
         const doc = { id: options?.id ?? "x", version: "v1", value };
@@ -80,7 +87,7 @@ export function recordingCollections() {
       delete: () => Promise.resolve({ deleted: true }),
     };
   };
-  return { listeners, writes, collection };
+  return { listeners, writes, pages, collection };
 }
 
 /**

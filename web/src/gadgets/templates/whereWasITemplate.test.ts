@@ -110,7 +110,7 @@ function startRadar({
   /** A design that is meant to throw while the page loads. */
   allowErrors?: boolean;
 } = {}) {
-  const { listeners, writes, collection } = recordingCollections();
+  const { listeners, writes, pages, collection } = recordingCollections();
   let actionListener: Listener | null = null;
   const requests: { action: string; params: unknown }[] = [];
   const automations: unknown[] = [];
@@ -155,6 +155,7 @@ function startRadar({
     emit,
     emitSnapshot,
     emitActions,
+    pages,
     writes,
     reports,
     requests,
@@ -444,6 +445,42 @@ describe("where was I template", () => {
     );
     expect(byId("card-rollout").textContent).not.toContain("Check p95 after the ramp");
     expect(byId("next-section").textContent).not.toContain("Check p95 after the ramp");
+  });
+
+  it("reads hidden steps and runs on later pages instead of taking them as gone", async () => {
+    const { emitSnapshot, emit, pages, writes, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("radar", [{ id: "current", version: "v1", value: RADAR }]);
+    // A short first page: the server's budget can end a page before its limit.
+    pages.dismissed = {
+      p2: {
+        items: [{ id: "check-p95", version: "v1", value: { at: "2026-11-19T11:00:00Z" } }],
+        nextCursor: null,
+      },
+    };
+    emitSnapshot("dismissed", { status: "live", items: [], nextCursor: "p2" } as never);
+
+    await waitFor(() =>
+      expect(byId("card-rollout").textContent).toContain("You hid a next step here."),
+    );
+    expect(byId("next-section").textContent).not.toContain("Check p95 after the ramp");
+    // Known as hidden, so nothing creates it again.
+    expect(writes.filter((write) => write.collection === "dismissed")).toEqual([]);
+
+    pages.step_runs = {
+      p2: {
+        items: [
+          {
+            id: "ramp-10",
+            version: "v1",
+            value: { label: "Ramp the flag to 10%", state: "running" },
+          },
+        ],
+        nextCursor: null,
+      },
+    };
+    emitSnapshot("step_runs", { status: "live", items: [], nextCursor: "p2" } as never);
+    await waitFor(() => expect(document.body.textContent).toContain("Working on it"));
   });
 
   it("tells a viewer without edit access that scanning is the owner's", async () => {
