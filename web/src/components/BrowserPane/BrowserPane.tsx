@@ -897,16 +897,14 @@ export function BrowserPane({
       >
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>Import cookies from Chrome</DialogTitle>
+            <DialogTitle>Import Chrome cookies</DialogTitle>
             <DialogDescription>
-              {allSitesCookieScope
-                ? "Copies every website's cookies from this Chrome profile into this conversation's browser, so sites reuse the sign-ins you already have in Chrome."
-                : `Copies ${activeCookieScope}'s cookies into this conversation's browser, so the site reuses the sign-in you already have in Chrome.`}{" "}
-              Nothing is written back to Chrome, and the copy disappears when Omnigent quits.
+              Agent-controlled tabs share these cookies and can act as you on{" "}
+              {allSitesCookieScope ? "every imported site." : "this site."}
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-3">
-            <div className="flex flex-col gap-1">
+            <div className="flex min-w-0 flex-col gap-1">
               <span className="text-muted-foreground text-xs">Site</span>
               {cookieScopes.length > 1 ? (
                 <Select value={activeCookieScope} onValueChange={setCookieScope}>
@@ -927,12 +925,20 @@ export function BrowserPane({
                 </span>
               )}
             </div>
-            <div className="flex flex-col gap-1">
+            <div className="flex min-w-0 flex-col gap-1">
               <span className="text-muted-foreground text-xs">Chrome profile</span>
               {cookieProfiles.length > 1 ? (
                 <Select value={cookieProfileId} onValueChange={setCookieProfileId}>
                   <SelectTrigger aria-label="Chrome profile" className="w-full">
-                    <SelectValue>{selectedCookieProfile?.name}</SelectValue>
+                    <SelectValue>
+                      {selectedCookieProfile?.name} (
+                      {cookieCountInPicker(
+                        cookiePreview,
+                        selectedCookieProfile?.id ?? "",
+                        activeCookieScope,
+                      )}
+                      )
+                    </SelectValue>
                   </SelectTrigger>
                   <SelectContent>
                     {cookieProfiles.map((profile) => (
@@ -944,37 +950,22 @@ export function BrowserPane({
                   </SelectContent>
                 </Select>
               ) : (
-                <span className="font-medium text-sm">{selectedCookieProfile?.name}</span>
+                <span className="font-medium text-sm">
+                  {selectedCookieProfile?.name} (
+                  {cookieCountInPicker(
+                    cookiePreview,
+                    selectedCookieProfile?.id ?? "",
+                    activeCookieScope,
+                  )}
+                  )
+                </span>
               )}
             </div>
-            <p className="text-muted-foreground text-xs">
-              {countForScope(activeCookieScope)}{" "}
-              {countForScope(activeCookieScope) === 1 ? "cookie" : "cookies"} for{" "}
-              {allSitesCookieScope
-                ? "every website in this Chrome profile. Each cookie stays bound to its own site."
-                : `${activeCookieScope} and its subdomains. Other sites' cookies stay out of Omnigent entirely.`}
-            </p>
-            {!allSitesCookieScope && activeCookieScope !== cookiePreview?.host && (
-              <p className="text-muted-foreground text-xs">
-                Cookies from other subdomains stay bound to their own host, so they only apply once
-                the tab visits them.
-              </p>
-            )}
-            <p className="text-muted-foreground text-xs">
-              macOS asks for permission to read Chrome's key from your login Keychain. Choose Allow,
-              not Always Allow: Always Allow lets any local process read the key.
-            </p>
-            <p className="text-destructive text-xs">
-              {/* Agent and user tabs share one jar per conversation: the agent can
-                  act as you on these sites whether or not it drives this tab. */}
-              This conversation's tabs share one cookie jar, including any tab the agent controls,
-              so the agent can act as you on{" "}
-              {allSitesCookieScope
-                ? "every site you're signed in to in this Chrome profile"
-                : "this site"}{" "}
-              while these cookies are loaded.
-            </p>
           </div>
+          <p className="text-sm text-muted-foreground">
+            In Keychain, choose <strong className="text-foreground">Allow</strong>, not Always
+            Allow.
+          </p>
           <DialogFooter>
             <Button variant="outline" onClick={() => setCookiePreview(null)} disabled={cookieBusy}>
               Cancel
