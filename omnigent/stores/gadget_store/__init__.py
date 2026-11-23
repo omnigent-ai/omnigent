@@ -12,7 +12,8 @@ The default implementation keeps everything under ``<data_dir>/gadgets``
 can pass another implementation to ``create_app(gadget_store=...)``, for example
 one backed by a database table of ``(scope, path, value)`` rows: ``create_json``
 then maps to an insert that fails on a duplicate key, ``list_paths`` to a
-prefix query and ``delete`` to a delete of every row under the gadget's scope.
+prefix query, :meth:`GadgetFiles.delete_tree` to a delete of the rows under a
+path, and ``delete`` to a delete of every row under the gadget's scope.
 
 Paths given to :class:`GadgetFiles` are relative POSIX paths such as
 ``"data/cards/c1/00000001.json"``; implementations reject absolute paths,
@@ -155,9 +156,21 @@ class Gadget:
 class GadgetFiles(ABC):
     """Create-only JSON files in one scope (a gadget's, or one user's shelf).
 
-    There is no overwrite or delete: the document store derives every change as
-    a new file, so implementations only need an atomic create.
+    There is no overwrite: the document store derives every change as a new
+    file, so implementations only need an atomic create. Deleting is optional
+    (:meth:`delete_tree`); it lets the document store give a deleted record's
+    capacity back, and without it a collection's record IDs are used up for good.
     """
+
+    #: Whether :meth:`delete_tree` is implemented.
+    supports_delete: bool = False
+
+    def delete_tree(self, path: str) -> None:
+        """Delete a file, or a directory with everything under it; nothing if it is missing.
+
+        Readers see the whole tree disappear at once, never part of it.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def read_json(self, path: str) -> dict:

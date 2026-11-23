@@ -295,3 +295,20 @@ def test_deleting_a_users_files_empties_their_scope(store: LocalGadgetStore) -> 
 )
 def test_gadget_ids_follow_the_store_contract(value: object, valid: bool) -> None:
     assert is_gadget_id(value) is valid
+
+
+def test_delete_tree_removes_a_file_or_a_directory_at_once(store: LocalGadgetStore) -> None:
+    files = store.gadget_files(store.create(ALICE, "Board").id)
+    assert files.supports_delete
+    files.mkdirs("data/cards/c1")
+    files.create_json("data/cards/c1/00000001.json", {"n": 1})
+    files.create_json("data/cards/one.json", {"n": 1})
+    files.delete_tree("data/cards/one.json")
+    assert files.list_paths("data/cards") == ["c1"]
+    files.delete_tree("data/cards/c1")
+    assert files.list_paths("data/cards") == []
+    files.delete_tree("data/cards/missing")  # nothing to delete is not an error
+    # The emptied path can be used again.
+    files.mkdirs("data/cards/c1")
+    files.create_json("data/cards/c1/00000001.json", {"n": 2})
+    assert files.read_json("data/cards/c1/00000001.json") == {"n": 2}

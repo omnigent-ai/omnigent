@@ -75,6 +75,13 @@ class HookedFiles(GadgetFiles):
     def mkdirs(self, path: str) -> None:
         self.inner.mkdirs(path)
 
+    @property
+    def supports_delete(self) -> bool:  # type: ignore[override]
+        return self.inner.supports_delete
+
+    def delete_tree(self, path: str) -> None:
+        self.inner.delete_tree(path)
+
 
 class HookedStore(LocalGadgetStore):
     before_create: Callable[[str], None] | None = None

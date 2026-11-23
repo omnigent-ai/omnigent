@@ -11,6 +11,12 @@ Layout under ``root_path``::
     <collection>/<id>/00000002.json   # replace
     <collection>/<id>/00000003.json   # delete (tombstone)
     <collection>/<id>/00000004.json   # re-create after a tombstone
+    <collection>/<id>/s00000002/00001001.json   # later revisions, one directory per segment
+
+A record's revisions are numbered across segments of
+``StoreLimits.revisions_per_segment`` files: the first segment sits in the
+record directory itself and each later one in an ``sNNNNNNNN`` subdirectory, so
+finding the head lists at most two directories however long the history grows.
 
 There is no mutable head file and no overwrite or delete primitive in
 :class:`GadgetFiles`. A writer reads the record, derives the single successor
@@ -38,6 +44,13 @@ Guarantees
 * Tombstones are revisions, so creation can never reset a record's history, a
   stale ``if_version`` from a deleted generation cannot touch a re-created
   record, and a stale ``create`` retry cannot resurrect a deleted record.
+* Deleted records give their capacity back. When a create finds the collection
+  full, the store removes records whose tombstone is older than
+  ``StoreLimits.tombstone_retention_s`` when its :class:`GadgetFiles` can delete
+  (``supports_delete``). Removal first appends a ``purge``
+  revision, which makes writers of that record wait, then releases the record's
+  capacity claim and deletes its directory. The guarantees above hold for the
+  retention period; a retry arriving after a record was removed is a new request.
 * ``get`` verifies the newest revision, its predecessor link and the revision
   numbering of the record directory. ``verify_record`` verifies the whole chain.
 * Version tokens and list cursors are opaque, versioned and scoped to the
@@ -51,12 +64,13 @@ Limits (see :class:`StoreLimits`; nothing is silently truncated)
 * Collection and record ids: ``[a-z0-9][a-z0-9_-]{0,63}`` (lowercase only so
   case-insensitive stores cannot alias records). Operation ids:
   ``[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}``.
-* At most 1000 revisions per record and 10000 reserved record IDs per
-  collection, enforced by create-only slots under ``.capacity`` even with
-  concurrent creates. A page limit of 1..200 with at most 500 records examined
-  per ``list`` call and at most 48 KiB per page; when a budget runs out ``list``
-  returns the items found so far with a ``next_cursor``, so an empty page with a
-  cursor is possible and a silently cut page is not.
+* At most 10 million revisions per record (in segments of 1000) and 10000
+  record IDs per collection, enforced by create-only slots under ``.capacity``
+  even with concurrent creates; removed records free their slots. A page
+  limit of 1..200 with at most 500 records examined per ``list`` call and at
+  most 48 KiB per page; when a budget runs out ``list`` returns the items found
+  so far with a ``next_cursor``, so an empty page with a cursor is possible and a
+  silently cut page is not.
 
 The digests protect against accidental damage and partial edits; they are not
 authentication. Someone with write access to the storage who recomputes digests
@@ -111,11 +125,15 @@ FORMAT_VERSION: Final = 1
 _CREATE: Final = "create"
 _REPLACE: Final = "replace"
 _DELETE: Final = "delete"
-_KINDS: Final = frozenset({_CREATE, _REPLACE, _DELETE})
+# Appended to a tombstone before the record is removed; writers wait for the removal.
+_PURGE: Final = "purge"
+_KINDS: Final = frozenset({_CREATE, _REPLACE, _DELETE, _PURGE})
+_GONE: Final = frozenset({_DELETE, _PURGE})
 
 _IDENTIFIER_RE: Final = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _OPERATION_ID_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 _REVISION_NAME_RE: Final = re.compile(r"([0-9]{8})\.json")
+_SEGMENT_NAME_RE: Final = re.compile(r"s([0-9]{8})")
 _HEX64_RE: Final = re.compile(r"[0-9a-f]{64}")
 _TIMESTAMP_RE: Final = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z"
@@ -165,13 +183,24 @@ class StoreLimits:
     max_document_bytes: int = 32 * 1024
     max_json_depth: int = 16
     max_json_nodes: int = 16_384
-    max_revisions_per_record: int = 1000
+    max_revisions_per_record: int = 10_000_000
+    revisions_per_segment: int = 1000
     max_records_per_collection: int = 10_000
     max_list_entries: int = 20_000
     max_list_limit: int = 200
     max_scan_per_list: int = 500
     max_page_bytes: int = 48 * 1024
     idempotency_window: int = 16
+    # A deleted record keeps its history (and answers retries) this long before a create
+    # that needs its capacity may remove it.
+    tombstone_retention_s: int = 7 * 24 * 60 * 60
+    # A removal that stopped this long ago is finished by the next writer of the record.
+    purge_abandon_s: int = 10 * 60
+    max_reclaim_per_create: int = 16
+
+    @property
+    def max_segments_per_record(self) -> int:
+        return -(-self.max_revisions_per_record // self.revisions_per_segment)
 
     def __post_init__(self) -> None:
         for name, value in vars(self).items():
@@ -179,6 +208,8 @@ class StoreLimits:
                 raise ValueError(f"{name} must be a positive integer")
         if self.max_revisions_per_record > _MAX_REVISION_NUMBER:
             raise ValueError("max_revisions_per_record exceeds the revision file name width")
+        if self.revisions_per_segment > self.max_revisions_per_record:
+            raise ValueError("revisions_per_segment exceeds max_revisions_per_record")
         if self.max_list_entries < self.max_records_per_collection:
             raise ValueError("max_list_entries must be at least max_records_per_collection")
 
@@ -410,7 +441,7 @@ class ImmutableDocumentStore:
         """Newest live version of a document, or ``None`` if absent or deleted."""
         ref = self._ref(collection, id)
         head = self._load_head(ref)
-        if head is None or head.latest.kind == _DELETE:
+        if head is None or head.latest.kind in _GONE:
             return None
         return self._document(ref, head.latest)
 
@@ -426,7 +457,7 @@ class ImmutableDocumentStore:
             raise InvalidInput("The requested version does not match its stored revision")
         if number > 1:
             self._check_link(ref, self._read_revision(ref, number - 1), revision)
-        return None if revision.kind == _DELETE else self._document(ref, revision)
+        return None if revision.kind in _GONE else self._document(ref, revision)
 
     def list(self, collection: str, limit: int = 100, cursor: str | None = None) -> DocumentPage:
         """One page of live documents ordered by id; not a snapshot across records."""
@@ -447,7 +478,7 @@ class ImmutableDocumentStore:
             position += 1
             scanned += 1
             head = self._load_head(ref)
-            if head is None or head.latest.kind == _DELETE:
+            if head is None or head.latest.kind in _GONE:
                 continue
             document = self._document(ref, head.latest)
             item_bytes = _encoded_size(document.to_dict()) + 1  # +1 for the separating comma
@@ -478,7 +509,7 @@ class ImmutableDocumentStore:
         return RecordSummary(
             revisions=head.count,
             generation=head.latest.generation,
-            deleted=head.latest.kind == _DELETE,
+            deleted=head.latest.kind in _GONE,
             version=self._version_of(ref, head.latest),
         )
 
@@ -501,6 +532,15 @@ class ImmutableDocumentStore:
             has_value=True,
         )
         head = self._load_head(ref)
+        if head is not None and head.latest.kind == _PURGE:
+            if not self._older_than(head.latest, self._limits.purge_abandon_s):
+                raise Conflict(
+                    "document is being removed; retry shortly", reason="concurrent_write"
+                )
+            self._finish_purge(ref)
+            head = self._load_head(ref)
+            if head is not None:
+                raise Conflict("document changed while it was removed", reason="concurrent_write")
         if head is None:
             self._ensure_record_capacity(collection, id)
         else:
@@ -598,7 +638,7 @@ class ImmutableDocumentStore:
         if replay is not None:
             return self._replay(ref, replay, digest)
         current = self._version_of(ref, head.latest)
-        deleted = head.latest.kind == _DELETE
+        deleted = head.latest.kind in _GONE
         if deleted or current != if_version:
             replay = self._find_operation(ref, head, operation_id, self._limits.idempotency_window)
             if replay is not None:
@@ -635,6 +675,11 @@ class ImmutableDocumentStore:
                 )
             previous = head.latest
             prev_digest = previous.digest
+            if (
+                self._segment_of(number) > 1
+                and (number - 1) % self._limits.revisions_per_segment == 0
+            ):
+                self._files.mkdirs(self._segment_directory(ref, self._segment_of(number)))
             if kind == _CREATE:
                 generation, created_at, created_by = previous.generation + 1, now, actor
             else:
@@ -658,7 +703,7 @@ class ImmutableDocumentStore:
             "operation_id": operation_id,
             "request_digest": digest,
         }
-        if kind != _DELETE:
+        if kind not in _GONE:
             body["value"] = copy.deepcopy(value)
         body["digest"] = compute_envelope_digest(body)
         if head is None:
@@ -711,7 +756,7 @@ class ImmutableDocumentStore:
         return self._result(ref, revision)
 
     def _result(self, ref: _Ref, revision: _Revision) -> Document | DeleteResult:
-        if revision.kind == _DELETE:
+        if revision.kind in _GONE:
             return DeleteResult(id=ref.doc_id, version=self._version_of(ref, revision))
         return self._document(ref, revision)
 
@@ -733,8 +778,17 @@ class ImmutableDocumentStore:
         _validate_identifier(doc_id, "id")
         return _Ref(collection, doc_id, f"{self._root}/{collection}/{doc_id}")
 
+    def _segment_of(self, number: int) -> int:
+        return (number - 1) // self._limits.revisions_per_segment + 1
+
+    def _segment_directory(self, ref: _Ref, segment: int) -> str:
+        if segment == 1:
+            return ref.directory
+        return f"{ref.directory}/s{segment:0{_REVISION_DIGITS}d}"
+
     def _revision_path(self, ref: _Ref, number: int) -> str:
-        return f"{ref.directory}/{number:0{_REVISION_DIGITS}d}.json"
+        directory = self._segment_directory(ref, self._segment_of(number))
+        return f"{directory}/{number:0{_REVISION_DIGITS}d}.json"
 
     def _corrupt(self, ref: _Ref, message: str) -> CorruptData:
         return CorruptData(
@@ -759,17 +813,46 @@ class ImmutableDocumentStore:
             entries = self._files.list_paths(ref.directory)
         except NotFound:
             return 0
-        if len(entries) > self._limits.max_revisions_per_record:
+        per_segment = self._limits.revisions_per_segment
+        if len(entries) > per_segment + self._limits.max_segments_per_record:
             raise self._corrupt(ref, "record has more revisions than the store allows")
         numbers: set[int] = set()
+        segments: set[int] = set()
         for entry in entries:
+            name = posixpath.basename(str(entry).rstrip("/"))
+            if (match := _REVISION_NAME_RE.fullmatch(name)) is not None:
+                numbers.add(int(match.group(1)))
+            elif (match := _SEGMENT_NAME_RE.fullmatch(name)) is not None:
+                segments.add(int(match.group(1)))
+            else:
+                raise self._corrupt(ref, "unexpected entry in record directory")
+        if numbers != set(range(1, len(numbers) + 1)) or len(numbers) > per_segment:
+            raise self._corrupt(ref, "revision numbering has a gap or duplicate")
+        if not segments:
+            return len(numbers)
+        last = max(segments)
+        if (
+            len(numbers) != per_segment
+            or segments != set(range(2, last + 1))
+            or last > self._limits.max_segments_per_record
+        ):
+            raise self._corrupt(ref, "revision segments have a gap")
+        # Earlier segments are full by construction; reading a revision in one fails closed.
+        base = (last - 1) * per_segment
+        try:
+            names = self._files.list_paths(self._segment_directory(ref, last))
+        except NotFound:
+            raise self._corrupt(ref, "revision segment is listed but cannot be read") from None
+        later: set[int] = set()
+        for entry in names:
             match = _REVISION_NAME_RE.fullmatch(posixpath.basename(str(entry).rstrip("/")))
             if match is None:
-                raise self._corrupt(ref, "unexpected entry in record directory")
-            numbers.add(int(match.group(1)))
-        if len(numbers) != len(entries) or numbers != set(range(1, len(numbers) + 1)):
+                raise self._corrupt(ref, "unexpected entry in revision segment")
+            later.add(int(match.group(1)))
+        # An empty newest segment is a writer that stopped after creating it.
+        if later != set(range(base + 1, base + len(later) + 1)) or len(later) > per_segment:
             raise self._corrupt(ref, "revision numbering has a gap or duplicate")
-        return len(numbers)
+        return base + len(later)
 
     def _read_revision(self, ref: _Ref, number: int) -> _Revision:
         try:
@@ -788,7 +871,7 @@ class ImmutableDocumentStore:
         kind = raw.get("kind")
         if not isinstance(kind, str) or kind not in _KINDS:
             raise bad("unknown kind")
-        expected_keys = _ENVELOPE_KEYS if kind == _DELETE else _ENVELOPE_KEYS | {"value"}
+        expected_keys = _ENVELOPE_KEYS if kind in _GONE else _ENVELOPE_KEYS | {"value"}
         if set(raw) != expected_keys:
             raise bad("unexpected or missing fields")
 
@@ -835,7 +918,7 @@ class ImmutableDocumentStore:
         ):
             raise bad("create revision must have equal created and updated fields")
         value = None
-        if kind != _DELETE:
+        if kind not in _GONE:
             try:
                 value = self._validate_value(raw["value"])
             except InvalidInput as error:
@@ -868,8 +951,16 @@ class ImmutableDocumentStore:
         if current.kind == _CREATE:
             if previous.kind != _DELETE or current.generation != previous.generation + 1:
                 raise self._corrupt(ref, f"revision {current.revision} re-creates a live record")
+        elif current.kind == _PURGE:
+            if (
+                previous.kind != _DELETE
+                or current.generation != previous.generation
+                or current.created_at != previous.created_at
+                or current.created_by != previous.created_by
+            ):
+                raise self._corrupt(ref, f"revision {current.revision} removes a live record")
         elif (
-            previous.kind == _DELETE
+            previous.kind in _GONE
             or current.generation != previous.generation
             or current.created_at != previous.created_at
             or current.created_by != previous.created_by
@@ -900,6 +991,14 @@ class ImmutableDocumentStore:
         return sorted(ids)
 
     def _ensure_record_capacity(self, collection: str, doc_id: str) -> None:
+        try:
+            self._claim_capacity(collection, doc_id)
+        except CapacityExceeded:
+            if not self._reclaim(collection, doc_id):
+                raise
+            self._claim_capacity(collection, doc_id)
+
+    def _claim_capacity(self, collection: str, doc_id: str) -> None:
         capacity = self._limits.max_records_per_collection
         try:
             entries = self._files.list_paths(f"{self._root}/{collection}")
@@ -936,6 +1035,92 @@ class ImmutableDocumentStore:
             ):
                 raise CorruptData("Invalid record capacity claim", collection=collection)
         raise CapacityExceeded(f"collection has reserved all {capacity} record slots")
+
+    def _claim_path(self, collection: str, doc_id: str) -> str | None:
+        """The capacity slot *doc_id* holds, or ``None`` if it holds none."""
+        capacity = self._limits.max_records_per_collection
+        directory = f"{self._root}/.capacity/{collection}"
+        start = int(hashlib.sha256(doc_id.encode()).hexdigest(), 16) % capacity
+        claim = {"collection": collection, "id": doc_id}
+        for offset in range(capacity):
+            path = f"{directory}/{(start + offset) % capacity:08d}.json"
+            try:
+                owner = self._files.read_json(path)
+            except NotFound:
+                # Released slots leave holes, so keep probing; claims never move.
+                continue
+            if owner == claim:
+                return path
+        return None
+
+    # -- removing deleted records -------------------------------------------
+
+    def _older_than(self, revision: _Revision, seconds: int) -> bool:
+        written = datetime.strptime(revision.updated_at, _TIMESTAMP_FORMAT).replace(tzinfo=UTC)
+        moment = self._clock()
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        return (moment - written).total_seconds() >= seconds
+
+    def _reclaim(self, collection: str, doc_id: str) -> bool:
+        """Remove some records deleted longer than the retention ago; whether any went."""
+        if not self._files.supports_delete:
+            return False
+        ids = self._list_ids(collection)
+        if not ids:
+            return False
+        start = int(hashlib.sha256(doc_id.encode()).hexdigest(), 16) % len(ids)
+        removed = 0
+        for offset in range(min(len(ids), self._limits.max_scan_per_list)):
+            candidate = ids[(start + offset) % len(ids)]
+            if candidate == doc_id:
+                continue
+            ref = self._ref(collection, candidate)
+            try:
+                head = self._load_head(ref)
+                if head is None:
+                    continue
+                if head.latest.kind == _DELETE and self._older_than(
+                    head.latest, self._limits.tombstone_retention_s
+                ):
+                    self._purge(ref, head)
+                elif head.latest.kind == _PURGE and self._older_than(
+                    head.latest, self._limits.purge_abandon_s
+                ):
+                    self._finish_purge(ref)
+                else:
+                    continue
+            except (Conflict, CorruptData, NotFound):
+                continue  # written to meanwhile, or not ours to repair: leave it
+            removed += 1
+            if removed >= self._limits.max_reclaim_per_create:
+                break
+        return removed > 0
+
+    def _purge(self, ref: _Ref, head: _Head) -> None:
+        marker = head.latest
+        operation_id = f"purge.{marker.digest[:32]}"
+        digest = _request_digest(
+            method=_PURGE,
+            collection=ref.collection,
+            doc_id=ref.doc_id,
+            if_version=self._version_of(ref, marker),
+            actor=marker.updated_by,
+            value=None,
+            has_value=False,
+        )
+        # The purge revision fences the record: a writer racing it collides on this slot,
+        # and later writers see it and wait until the directory is gone.
+        result = self._append(ref, head, _PURGE, None, operation_id, marker.updated_by, digest)
+        if not isinstance(result, DeleteResult):
+            raise Conflict("record changed before it could be removed", reason="concurrent_write")
+        self._finish_purge(ref)
+
+    def _finish_purge(self, ref: _Ref) -> None:
+        claim = self._claim_path(ref.collection, ref.doc_id)
+        if claim is not None:
+            self._files.delete_tree(claim)
+        self._files.delete_tree(ref.directory)
 
     # -- values, tokens and cursors ----------------------------------------
 

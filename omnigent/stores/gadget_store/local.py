@@ -159,6 +159,23 @@ class LocalGadgetFiles(GadgetFiles):
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
 
+    supports_delete = True
+
+    def delete_tree(self, path: str) -> None:
+        target = self._resolve(path)
+        trash = self._tmp_dir.parent / ".trash" / f"tree-{uuid.uuid4().hex}"
+        trash.parent.mkdir(parents=True, exist_ok=True)
+        # Moved out in one rename, so readers never see a partly removed directory.
+        try:
+            os.replace(target, trash)
+        except (FileNotFoundError, NotADirectoryError):
+            return
+        if trash.is_dir():
+            shutil.rmtree(trash, ignore_errors=True)
+        else:
+            with contextlib.suppress(OSError):
+                trash.unlink()
+
     def list_paths(self, path: str) -> list[str]:
         target = self._resolve(path)
         try:

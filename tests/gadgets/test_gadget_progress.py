@@ -9,6 +9,7 @@ import pytest
 
 from omnigent.gadgets import progress as progress_module
 from omnigent.gadgets import service as service_module
+from omnigent.gadgets.documents import StoreLimits
 from omnigent.gadgets.progress import (
     Delivery,
     SessionState,
@@ -576,3 +577,22 @@ def test_a_repeat_of_an_undelivered_action_says_it_was_never_delivered(
         app["id"], {"action": "run_card", "params": params, "operation_id": "r4"}
     )
     assert fresh["merged"] is False and fresh["id"] != first["id"]
+
+
+def test_routine_action_delivery_never_runs_out_of_viewer_state(
+    gadgets: Fixture, clock: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Segments of two revisions; the viewer's record is rewritten twice per action.
+    monkeypatch.setattr(
+        service_module,
+        "_STATE_STORE_LIMITS",
+        StoreLimits(max_revisions_per_record=10_000, revisions_per_segment=2),
+    )
+    conversations = FakeConversations()
+    conversations.add("s_gadget")
+    service = progress_service(gadgets, conversations)
+    app = publish_actions_board(service)
+    service.set_gadget_session(app["id"], {"session_id": "s_gadget"})
+    for n in range(6):
+        request_and_deliver(service, app, f"c{n}")
+    assert len(service.list_actions(app["id"])["items"]) == 6

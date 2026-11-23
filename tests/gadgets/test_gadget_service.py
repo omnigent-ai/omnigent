@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 
 import pytest
 
 from omnigent.gadgets import constraints as constraints_module
+from omnigent.gadgets import documents as documents_module
 from omnigent.gadgets import service as service_module
 from omnigent.gadgets.constraints import ConstraintGuard, ConstraintViolation
 from omnigent.gadgets.documents import StoreLimits
@@ -303,6 +305,56 @@ def test_data_store_limit_leaves_existing_records_listable_at_capacity(
     with pytest.raises(CapacityExceeded):
         rpc(service, app, "create", id="overflow", value={"title": "S"}, operation_id="overflow")
     assert len(rpc(service, app, "list", limit=3)["items"]) == 3
+
+
+class _TwoMinutesLater(datetime):
+    @classmethod
+    def now(cls, tz=None):  # type: ignore[override]
+        return datetime.now(tz) + timedelta(minutes=2)
+
+
+# Segments of two revisions: every record below is rewritten far more often than that.
+_TINY_SEGMENTS = StoreLimits(max_revisions_per_record=10_000, revisions_per_segment=2)
+
+
+def test_publishing_and_pinning_many_times_never_run_out_of_revisions(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(service_module, "_STATE_STORE_LIMITS", _TINY_SEGMENTS)
+    service = gadgets.service()
+    app = publish_board(service)
+    for n in range(5):
+        revision = make_revision(service, app, {})
+        app = service.publish(
+            app["id"], {"revision_id": revision["id"], "if_version": app["version"]}
+        )
+    assert app["published_revision"] == revision["id"]
+    for n in range(5):
+        service.pin(app["id"], {"pinned": n % 2 == 0})
+    assert [pin["id"] for pin in service.shelf()["pinned"]] == [app["id"]]
+
+
+def test_deleted_records_free_their_place_once_retention_passes(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        service_module,
+        "_DATA_STORE_LIMITS",
+        StoreLimits(max_records_per_collection=2, max_list_entries=4, tombstone_retention_s=60),
+    )
+    service = gadgets.service()
+    app = publish_board(service)
+    first = rpc(service, app, "create", id="card0", value={"title": "S"}, operation_id="c0")
+    rpc(service, app, "create", id="card1", value={"title": "S"}, operation_id="c1")
+    rpc(service, app, "delete", id="card0", if_version=first["version"], operation_id="d0")
+    with pytest.raises(CapacityExceeded):
+        rpc(service, app, "create", id="card2", value={"title": "S"}, operation_id="c2")
+    monkeypatch.setattr(documents_module, "datetime", _TwoMinutesLater)
+    rpc(service, app, "create", id="card2", value={"title": "S"}, operation_id="c2")
+    assert [item["id"] for item in rpc(service, app, "list", limit=10)["items"]] == [
+        "card1",
+        "card2",
+    ]
 
 
 def test_schema_validation_and_session_capability_fail_closed(gadgets: Fixture) -> None:

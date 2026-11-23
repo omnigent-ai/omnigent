@@ -74,6 +74,9 @@ MAX_SCHEMA_BYTES = 16 * 1024
 _DATA_STORE_LIMITS = StoreLimits(
     max_records_per_collection=1000, max_list_entries=MAX_NAMESPACE_ENTRIES
 )
+# The gadget's own bookkeeping (publication, comments, sessions, the action ledger) and
+# each viewer's shelf. Records rewritten on every action roll into new revision segments.
+_STATE_STORE_LIMITS = StoreLimits()
 _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _OPERATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _REVISION = re.compile(r"^[0-9a-f]{32}$")
@@ -402,7 +405,9 @@ class GadgetService:
         return self.store.gadget_files(gadget.id)
 
     def _state(self, gadget: Gadget) -> ImmutableDocumentStore:
-        return ImmutableDocumentStore(self._files(gadget), "code/state")
+        return ImmutableDocumentStore(
+            self._files(gadget), "code/state", limits=_STATE_STORE_LIMITS
+        )
 
     def _publication(self, gadget: Gadget) -> dict | None:
         publication = self._state(gadget).get("publication", "current")
@@ -522,7 +527,9 @@ class GadgetService:
 
     @property
     def _shelf(self) -> ImmutableDocumentStore:
-        return ImmutableDocumentStore(self.store.user_files(self.viewer.user_id), SHELF_ROOT)
+        return ImmutableDocumentStore(
+            self.store.user_files(self.viewer.user_id), SHELF_ROOT, limits=_STATE_STORE_LIMITS
+        )
 
     @staticmethod
     def _session_key(session_id: str) -> str:
@@ -649,7 +656,9 @@ class GadgetService:
     # session or host running. Commenting needs the same access as changing its data.
 
     def _comments(self, gadget: Gadget) -> ImmutableDocumentStore:
-        return ImmutableDocumentStore(self._files(gadget), "data/_comments")
+        return ImmutableDocumentStore(
+            self._files(gadget), "data/_comments", limits=_STATE_STORE_LIMITS
+        )
 
     @staticmethod
     def _comment(app_id: str, document: Document) -> dict:
@@ -959,10 +968,14 @@ class GadgetService:
     # gadget session.
 
     def _sessions(self, gadget: Gadget) -> ImmutableDocumentStore:
-        return ImmutableDocumentStore(self._files(gadget), "data/_sessions")
+        return ImmutableDocumentStore(
+            self._files(gadget), "data/_sessions", limits=_STATE_STORE_LIMITS
+        )
 
     def _ledger(self, gadget: Gadget) -> ImmutableDocumentStore:
-        return ImmutableDocumentStore(self._files(gadget), "data/_actions")
+        return ImmutableDocumentStore(
+            self._files(gadget), "data/_actions", limits=_STATE_STORE_LIMITS
+        )
 
     def get_gadget_session(self, app_id: str) -> dict:
         """The viewer's own gadget session for this gadget, if they registered one."""
