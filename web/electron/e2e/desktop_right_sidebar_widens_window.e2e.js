@@ -16,6 +16,7 @@ const deps = desktopDepsAvailable();
 // The native shell's Toggle Right Sidebar accelerator.
 const TOGGLE_RIGHT_SIDEBAR =
   process.platform === "darwin" ? "Meta+Shift+KeyB" : "Control+Shift+KeyB";
+const TOGGLE_RIGHT_SIDEBAR_LABEL = process.platform === "darwin" ? "⌘⇧B" : "Ctrl+Shift+B";
 
 function pause(ms = 1_500) {
   return new Promise((resolve) => {
@@ -50,11 +51,22 @@ async function filmJourney(name, journey) {
   }
 }
 
+/** Gives the main process one lookup for the shell window, failing clearly when it's missing. */
+async function installShellWindowLookup(electronApp) {
+  await electronApp.evaluate(({ BrowserWindow }) => {
+    globalThis.shellWindow = () => {
+      const win = BrowserWindow.getAllWindows().find((candidate) =>
+        candidate.webContents.getURL().startsWith("http"),
+      );
+      if (!win) throw new Error("shell window not found");
+      return win;
+    };
+  });
+}
+
 async function windowState(electronApp) {
-  return electronApp.evaluate(({ BrowserWindow, screen }) => {
-    const win = BrowserWindow.getAllWindows().find((candidate) =>
-      candidate.webContents.getURL().startsWith("http"),
-    );
+  return electronApp.evaluate(({ screen }) => {
+    const win = globalThis.shellWindow();
     const bounds = win.getBounds();
     return {
       bounds,
@@ -65,19 +77,13 @@ async function windowState(electronApp) {
 }
 
 async function setWindowBounds(electronApp, bounds) {
-  await electronApp.evaluate(({ BrowserWindow }, next) => {
-    BrowserWindow.getAllWindows()
-      .find((candidate) => candidate.webContents.getURL().startsWith("http"))
-      .setBounds(next);
-  }, bounds);
+  await electronApp.evaluate((_electron, next) => globalThis.shellWindow().setBounds(next), bounds);
 }
 
 /** Counts the shell window's `setBounds` calls from now on; resolves a reader for the count. */
 async function countSetBounds(electronApp) {
-  await electronApp.evaluate(({ BrowserWindow }) => {
-    const win = BrowserWindow.getAllWindows().find((candidate) =>
-      candidate.webContents.getURL().startsWith("http"),
-    );
+  await electronApp.evaluate(() => {
+    const win = globalThis.shellWindow();
     globalThis.setBoundsCalls = 0;
     const original = win.setBounds.bind(win);
     win.setBounds = (...args) => {
@@ -89,11 +95,10 @@ async function countSetBounds(electronApp) {
 }
 
 async function setFullScreen(electronApp, fullScreen) {
-  await electronApp.evaluate(({ BrowserWindow }, next) => {
-    BrowserWindow.getAllWindows()
-      .find((candidate) => candidate.webContents.getURL().startsWith("http"))
-      .setFullScreen(next);
-  }, fullScreen);
+  await electronApp.evaluate(
+    (_electron, next) => globalThis.shellWindow().setFullScreen(next),
+    fullScreen,
+  );
 }
 
 async function waitForBounds(electronApp, expected, label) {
@@ -149,6 +154,7 @@ it(
         displayCapture: false,
       });
       const { window: page, electronApp } = app;
+      await installShellWindowLookup(electronApp);
       const { workArea } = await windowState(electronApp);
       const home = { x: workArea.x + 40, y: workArea.y + 40, width: 960, height: 760 };
       await setWindowBounds(electronApp, home);
@@ -236,12 +242,12 @@ it(
           "chat kept its width on the second open",
           10_000,
         );
-        step("sidebar open with Ctrl+Shift+B, window widened");
+        step(`sidebar open with ${TOGGLE_RIGHT_SIDEBAR_LABEL}, window widened`);
         await pause(2_500);
         await page.keyboard.press(TOGGLE_RIGHT_SIDEBAR);
         await expand.waitFor();
         await waitForBounds(electronApp, home, "hotkey narrowed the window");
-        step("sidebar closed with Ctrl+Shift+B, window back");
+        step(`sidebar closed with ${TOGGLE_RIGHT_SIDEBAR_LABEL}, window back`);
         await pause(2_500);
       });
 
