@@ -340,6 +340,14 @@ def _available_exit_watchers() -> list[Callable[[int], Awaitable[None]]]:
 _EXIT_WATCHERS = _available_exit_watchers()
 
 
+def runs_on_this_host() -> bool:
+    """Whether this host can own Git's processes: POSIX process groups and an exit watcher.
+
+    Native Windows has neither, so callers that can do without Git skip it there.
+    """
+    return hasattr(os, "killpg") and bool(_EXIT_WATCHERS)
+
+
 async def _exit_of(pid: int) -> None:
     """Return once ``pid`` has exited, without reaping it.
 

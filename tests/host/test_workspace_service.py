@@ -358,6 +358,26 @@ async def test_list_directory_answers_with_nothing_marked_when_git_cant_say(
     assert not any(_listed(listed.entries).values())
 
 
+async def test_list_directory_lists_plainly_where_git_cant_run(
+    tmp_path: Path, client_for: ClientFor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a host whose Git runner can't own processes, as on native Windows, nothing asks Git."""
+
+    async def unusable_runner(*_args: object) -> None:
+        raise AttributeError("module 'os' has no attribute 'killpg'")
+
+    monkeypatch.setattr("omnigent.host.workspace_service.runs_on_this_host", lambda: False)
+    monkeypatch.setattr(DirectoryIgnores, "for_directory", unusable_runner)
+    client = client_for(_ignoring_workspace(tmp_path / "repo"))
+
+    listed = await client.list_directory(ListDirectoryRequest(hide_ignored=False))
+    capabilities = await client.get_capabilities(GetCapabilitiesRequest())
+
+    assert "build" in _listed(listed.entries)
+    assert not any(_listed(listed.entries).values())
+    assert "gitignore" not in capabilities.capabilities
+
+
 async def test_list_directory_resumes_after_the_last_entry_it_returned(
     tmp_path: Path, client_for: ClientFor
 ) -> None:
