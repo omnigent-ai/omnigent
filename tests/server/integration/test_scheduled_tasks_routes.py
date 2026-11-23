@@ -41,6 +41,7 @@ from omnigent.server.auth import SharingMode
 from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
 from omnigent.server.routes import scheduled_tasks as scheduled_tasks_routes
+from omnigent.server.scheduled import harness_settings
 from omnigent.server.scheduled.dispatch_scheduler import (
     PersistentTaskScheduler,
     ScheduledTaskDispatchHooks,
@@ -3870,11 +3871,12 @@ async def test_create_can_continue_a_session_the_owner_picked(
     # The task runs the session's own agent rather than taking a copy.
     assert body["agent_id"] == builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
 
-    # A session that skips approval takes only a task that selects such a mode itself.
+    # A session that skips approval takes a task without a mode, which wakes it in that
+    # mode, or one selecting such a mode; a task asking for approval is refused.
     bypassing = _owned_session(
         db_uri, labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
     )
-    for permission_mode, status in ((None, 400), ("auto", 400), ("bypassPermissions", 200)):
+    for permission_mode, status in ((None, 200), ("auto", 400), ("bypassPermissions", 200)):
         picked = await auth_client.post(
             "/v1/scheduled-tasks",
             json=_create_body(
@@ -3885,6 +3887,34 @@ async def test_create_can_continue_a_session_the_owner_picked(
         assert picked.status_code == status, (permission_mode, picked.text)
         if status == 400:
             assert "which skips approval" in picked.json()["error"]["message"]
+
+
+async def test_only_a_task_without_a_session_inherits_its_agents_mode(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new session would run in the spec's mode unseen; a picked one keeps its own."""
+    # This suite's agents are native, whose specs set no mode: stand in an SDK agent's
+    # spec that skips approval.
+    spec_mode = AsyncMock(return_value="bypassPermissions")
+    monkeypatch.setattr(harness_settings, "scheduled_agent_default_permission_mode", spec_mode)
+    session_id = _owned_session(db_uri)
+    for body, status in (
+        (_create_body(), 400),
+        # Without a picked session, its first run starts one in the spec's mode.
+        (_create_body(session_mode="continue"), 400),
+        (_create_body(session_mode="continue", session_id=session_id), 200),
+    ):
+        created = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+        assert created.status_code == status, (body, created.text)
+        if status == 400:
+            assert "cannot inherit it" in created.json()["error"]["message"]
+    # Saving it again without a mode keeps waking the session in the session's own mode.
+    cleared = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created.json()['id']}",
+        json={"permission_mode": None},
+        headers=_headers(),
+    )
+    assert cleared.status_code == 200, cleared.text
 
 
 async def test_a_picked_session_must_run_the_saved_mcp_services(
@@ -4766,7 +4796,8 @@ async def test_a_patch_that_picks_a_session_takes_no_agent_copy(
         ({"permission_mode": "full-access"}, 200),
         ({}, 200),
         ({"permission_mode": "approve-for-me"}, 400),
-        ({"permission_mode": None}, 400),
+        # Without a mode, the task wakes the session in its own mode.
+        ({"permission_mode": None}, 200),
     ):
         picked = await auth_client.patch(
             f"/v1/scheduled-tasks/{created['id']}",
@@ -4777,7 +4808,7 @@ async def test_a_patch_that_picks_a_session_takes_no_agent_copy(
         if status == 400:
             assert "which skips approval" in picked.json()["error"]["message"]
     # Changing only the mode is checked against the session the task continues.
-    for permission_mode, status in (("approve-for-me", 400), (None, 400), ("bypass", 200)):
+    for permission_mode, status in (("approve-for-me", 400), (None, 200), ("bypass", 200)):
         changed = await auth_client.patch(
             f"/v1/scheduled-tasks/{created['id']}",
             json={"permission_mode": permission_mode},

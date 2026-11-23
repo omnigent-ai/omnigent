@@ -628,8 +628,13 @@ def create_scheduled_tasks_router(
         reasoning_effort: str | None,
         permission_mode: str | None,
         execution_target: str = "connected_host",
+        continues_session: bool = False,
     ) -> tuple[Agent, str | None, str | None, str | None]:
         """Validate inputs that scheduled tasks persist into future sessions.
+
+        A task that continues a session (*continues_session*) and selects no
+        permission mode wakes it in the session's own mode, even one that skips
+        approval.
 
         Workspace is always optional. When it is unset the canonical workspace
         persists as ``None`` and the fire path defaults it to the launch host's
@@ -661,6 +666,7 @@ def create_scheduled_tasks_router(
             permission_mode=permission_mode,
             agent=agent,
             agent_cache=agent_cache,
+            continues_session=continues_session,
         )
         if execution_target == "managed_sandbox":
             sandbox_config = getattr(request.app.state, "sandbox_config", None)
@@ -1253,6 +1259,7 @@ def create_scheduled_tasks_router(
             reasoning_effort=body.reasoning_effort,
             permission_mode=permission_mode,
             execution_target=body.execution_target,
+            continues_session=body.session_id is not None,
         )
         project_owner = _project_owner(owner)
         # Known before the task exists, since a sandbox session must run on the
@@ -1949,6 +1956,8 @@ def create_scheduled_tasks_router(
             if fields.get("session_id") is not None:
                 raise OmnigentError(_SESSION_ID_WITHOUT_CONTINUE_MSG, code=ErrorCode.INVALID_INPUT)
             fields["session_id"] = None
+        # A task continuing a session wakes it in the session's own mode.
+        continues_session = fields.get("session_id", existing.session_id) is not None
         target_agent_id = fields.get("agent_id") or existing.agent_id
         agent_changed = target_agent_id != existing.agent_id
         if existing.source_session_id is not None and target_session_mode != "new":
@@ -1974,8 +1983,8 @@ def create_scheduled_tasks_router(
             new_mode = validate_scheduled_permission_mode(fields["permission_mode"])
             fields["permission_mode"] = new_mode
             # Gate the mode on the agent's harness. Clearing to null falls back to the
-            # agent's own default, which must not skip approval; an agent switch
-            # revalidates that default with the launch inputs below.
+            # agent's own default, which must not skip approval unless the task continues
+            # a session; an agent switch revalidates that default with the launch inputs.
             if new_mode is not None or not agent_changed:
                 agent = await validate_session_agent(
                     user_id=owner_id,
@@ -1988,6 +1997,7 @@ def create_scheduled_tasks_router(
                     permission_mode=new_mode,
                     agent=agent,
                     agent_cache=agent_cache,
+                    continues_session=continues_session,
                 )
         if "mcp_services" in fields or (
             existing.mcp_services
@@ -2068,6 +2078,7 @@ def create_scheduled_tasks_router(
                 reasoning_effort=fields.get("reasoning_effort", existing.reasoning_effort),
                 permission_mode=None,
                 execution_target=target_execution,
+                continues_session=continues_session,
             )
             if agent_changed and existing.source_session_id is not None:
                 # Runs rebuild the copied history in the new agent, so it must carry one

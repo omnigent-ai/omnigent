@@ -1348,20 +1348,24 @@ def session_approval_skipping_mode(conv: Conversation) -> str | None:
     return None
 
 
+def _asks_for_approval(task: ScheduledTask) -> bool:
+    """Whether *task* selects a permission mode that keeps approval."""
+    return (
+        task.permission_mode is not None
+        and task.permission_mode not in APPROVAL_SKIPPING_PERMISSION_MODES
+    )
+
+
 async def _inherited_permission_problem(
     deps: FireDeps, task: ScheduledTask, agent: Any, *, continued: bool = False
 ) -> tuple[str, str] | None:
     """Why *task* may not run in its agent's default permission mode.
 
     A new session applies the task's own mode over that default, so any selected mode
-    opts out of it. A continued session keeps the agent's default, so only a task that
-    selects an approval-skipping mode itself opts in to running in one.
+    opts out of it. A continued session wakes in its own mode, the agent's default, so
+    only a task that selects a mode keeping approval objects to one that skips it.
     """
-    opted_in = (
-        task.permission_mode in APPROVAL_SKIPPING_PERMISSION_MODES
-        if continued
-        else task.permission_mode is not None
-    )
+    opted_in = not _asks_for_approval(task) if continued else task.permission_mode is not None
     if opted_in:
         return None
     problem = await inherited_approval_skipping_problem(agent, deps.agent_cache)
@@ -1394,12 +1398,13 @@ async def continued_session_problem(
         return "the session is a sub-agent's session", "continued_session_incompatible"
     if conv.agent_id != task.agent_id:
         return "the session runs a different agent", "continued_session_incompatible"
+    # A task without a mode wakes the session in whatever mode it is in.
     session_mode = session_approval_skipping_mode(conv)
-    if session_mode is not None and task.permission_mode not in APPROVAL_SKIPPING_PERMISSION_MODES:
+    if session_mode is not None and _asks_for_approval(task):
         return (
             f"the session is in permission mode {session_mode!r}, which skips approval, but the "
-            "automation does not select such a mode; switch the session to a mode that asks for "
-            "approval or uses the auto classifier",
+            f"automation selects {task.permission_mode!r}, which asks for it; switch the session "
+            "to a mode that asks for approval, or clear the automation's mode",
             UNATTENDED_PERMISSION_ERROR_CODE,
         )
     # A pin the task changed since would otherwise be ignored silently: the
