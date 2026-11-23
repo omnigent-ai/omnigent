@@ -6,6 +6,7 @@ import {
   nestedSessionSidebarKey,
 } from "@/lib/nestedSessionDrafts";
 import {
+  heldFolderRows,
   orderSessionFamilies,
   isIndentedSibling,
   isSessionPinned,
@@ -1912,10 +1913,14 @@ function ProjectFolder({
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
   );
-  // A collapsed folder keeps showing the open session until you navigate away; that
-  // row owns its badge, so the header summarizes only the rows it hides.
-  const heldIndex = expanded ? -1 : conversations.findIndex((c) => c.id === activeConversationId);
-  const isHidden = (_row: unknown, index: number) => index !== heldIndex;
+  // A collapsed folder keeps showing the open session and its family until you navigate
+  // away, so nested sessions stay reachable. Listed rows own their badges, so the header
+  // summarizes only the rows it hides.
+  const heldRows = expanded
+    ? []
+    : heldFolderRows(conversations, activeConversationId, collapsedFamilies);
+  const heldIds = new Set(orderSessionFamilies(heldRows, collapsedFamilies).map((row) => row.id));
+  const isHidden = (_row: unknown, index: number) => !heldIds.has(conversations[index].id);
   const marker = projectMarkerState(
     conversations.filter(isHidden),
     states.filter(isHidden),
@@ -2043,14 +2048,7 @@ function ProjectFolder({
         active={headerActive}
         marker={marker}
         conversations={draftRow ? [draftRow, ...display.rows] : display.rows}
-        heldConversations={
-          expanded
-            ? undefined
-            : [
-                ...(draftRow ? [draftRow] : []),
-                ...conversations.filter((_row, index) => index === heldIndex),
-              ]
-        }
+        heldConversations={expanded ? undefined : [...(draftRow ? [draftRow] : []), ...heldRows]}
         listRef={listRef}
         activeConversationId={activeConversationId}
         pinnedConversationIds={pinnedConversationIds}
@@ -3295,17 +3293,21 @@ function ConversationList({
     onExitSelectionMode,
   ]);
 
-  // Navigating never opens a folder: a collapsed folder lists only the open
-  // session (its held row), so folders open and close only when the user says so.
-  // A folder's rows in render order: those above "Show more" while expanded,
-  // otherwise the open session it holds under its collapsed header.
+  // Navigating never opens a folder. A folder's rows in render order: those above
+  // "Show more" while expanded, otherwise those it holds for the open session.
   const folderListedRows = useCallback(
     (group: { name: string; conversations: Conversation[] }) => {
       if (expandedProjects.includes(group.name)) return folderVisibleRows(group);
       const rows = folderConversations.get(group.name)?.conversations ?? group.conversations;
-      return rows.filter((c) => c.id === displayedActiveId);
+      return heldFolderRows(rows, displayedActiveId, collapsedFamilies);
     },
-    [expandedProjects, folderVisibleRows, folderConversations, displayedActiveId],
+    [
+      expandedProjects,
+      folderVisibleRows,
+      folderConversations,
+      displayedActiveId,
+      collapsedFamilies,
+    ],
   );
 
   // Visible rows in render order (collapsed sections excluded) for the numbered
