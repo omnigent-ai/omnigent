@@ -224,7 +224,6 @@ export interface WorkspaceTabsPanelProps {
   onHistoryGo?: (direction: WorkspaceHistoryDirection) => void;
 }
 
-/** Why a split's entry has no Pin. */
 const SPLIT_PIN_REASON = "A split can't be pinned.";
 
 type ShellGroupEntry = Extract<StripEntry<TabId>, { kind: "group" }>;

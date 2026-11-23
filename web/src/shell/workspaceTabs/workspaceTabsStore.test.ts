@@ -386,6 +386,14 @@ describe("closing and reopening", () => {
   });
 });
 
+/** A shell's tab the user opened, `id` showing shell `key`. */
+const userShellTab = (id: string, key: string): WorkspaceTab => ({
+  id,
+  place: { kind: "terminal", key },
+  binding: { kind: "terminal", key },
+  openedBy: "user",
+});
+
 describe("shells", () => {
   const shell: WorkspaceTab = {
     id: "T",
@@ -419,13 +427,11 @@ describe("shells", () => {
   });
 
   describe("moving between a split's shells", () => {
-    const shellTab = (id: string, key: string): WorkspaceTab => ({
-      id,
-      place: { kind: "terminal", key },
-      binding: { kind: "terminal", key },
-      openedBy: "user",
-    });
-    const [left, right, other] = [shellTab("A", "a"), shellTab("B", "b"), shellTab("C", "c")];
+    const [left, right, other] = [
+      userShellTab("A", "a"),
+      userShellTab("B", "b"),
+      userShellTab("C", "c"),
+    ];
     const split = ["A", "B"];
 
     it("selects the other shell's tab in place of the current step", async () => {
@@ -475,13 +481,12 @@ describe("shells", () => {
 });
 
 describe("split groups of shells", () => {
-  const shellTab = (id: string, key: string): WorkspaceTab => ({
-    id,
-    place: { kind: "terminal", key },
-    binding: { kind: "terminal", key },
-    openedBy: "user",
-  });
-  const shells = [files, shellTab("T1", "k1"), shellTab("T2", "k2"), shellTab("T2b", "k2")];
+  const shells = [
+    files,
+    userShellTab("T1", "k1"),
+    userShellTab("T2", "k2"),
+    userShellTab("T2b", "k2"),
+  ];
 
   it("asks once, ends each shell once in order, then removes all their tabs", async () => {
     const { store } = makeStore({ initial: initial(shells, "T1") });
@@ -607,7 +612,7 @@ describe("split groups of shells", () => {
   });
 
   it("stops when the shell list drops a shell outside the split while it closes", async () => {
-    const other = shellTab("T3", "k3");
+    const other = userShellTab("T3", "k3");
     const { store } = makeStore({ initial: initial([...shells, other], "F") });
     store.setTerminalInventory({ status: "loaded", keys: ["k1", "k2", "k3"] });
     const ended: string[] = [];
