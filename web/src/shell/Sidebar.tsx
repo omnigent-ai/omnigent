@@ -7921,7 +7921,7 @@ function ProjectPickerMenu({
   const filtered = projectsMatching(projects, search);
   // Offer create only when the typed name isn't already an exact project.
   const canCreate = canCreateProject(projects, search);
-  const projectFlyoutIcon = projects.find((p) => p.name === currentProject)?.icon;
+  const currentProjectIcon = projects.find((p) => p.name === currentProject)?.icon;
 
   // Keep keystrokes inside the inputs from reaching the menu's typeahead /
   // navigation handlers (which would otherwise steal letters and arrows).
@@ -7978,7 +7978,7 @@ function ProjectPickerMenu({
             textValue={`Remove from ${currentProject}`}
             onSelect={() => onSelect("")}
           >
-            <ProjectRowIcon icon={projectFlyoutIcon} />
+            <ProjectRowIcon icon={currentProjectIcon} />
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {currentProject}

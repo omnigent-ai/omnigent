@@ -5198,8 +5198,10 @@ describe("Sidebar view options", () => {
     );
     // A label-only project has no emoji, so it takes the folder glyph.
     const labelRow = within(screen.getByText("conv_label").closest("li")!);
-    expect(labelRow.getByTestId("session-row-meta")).toHaveTextContent(/^Project: Customer X$/);
+    const labelMeta = labelRow.getByTestId("session-row-meta");
+    expect(labelMeta).toHaveTextContent(/^Project: Customer X$/);
     expect(labelRow.queryByTestId("project-icon")).toBeNull();
+    expect(labelMeta.querySelector(".lucide-folder")).not.toBeNull();
     // An unfiled session stays a single line.
     const unfiled = within(screen.getByText("conv_unfiled").closest("li")!);
     expect(unfiled.queryByTestId("session-row-meta")).toBeNull();
