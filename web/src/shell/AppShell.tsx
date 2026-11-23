@@ -702,14 +702,14 @@ function AppShellImpl() {
     },
     [cancelRightPanelVisibilityMotion],
   );
-  // Whether the rail can show here and its preferred width, for the shell's "widen window" setting.
-  const rightSidebarWindowRef = useRef({ canShow: false, width: 0 });
+  // Whether the rail can show here and how far it widens the window, for the shell's setting.
+  const rightSidebarWindowRef = useRef({ canShow: false, width: (): number => 0 });
   const setRightPanelOpenAnimated = useCallback((open: boolean) => {
     if (rightPanelOpenRef.current === open) return;
     rightPanelOpenRef.current = open;
     // Only in-session opens and closes resize the window; a session switch restores its rail.
     const rail = rightSidebarWindowRef.current;
-    if (rail.canShow) reportRightSidebarVisibility(open, rail.width);
+    if (rail.canShow) reportRightSidebarVisibility(open, open ? rail.width() : 0);
     if (rightPanelMotionTimerRef.current !== null) {
       window.clearTimeout(rightPanelMotionTimerRef.current);
     }
@@ -1194,7 +1194,7 @@ function AppShellImpl() {
   }, [rootSessionId, rootSessionResolved]);
   const {
     panelWidth: inlinePanelWidth,
-    preferredWidth: preferredInlinePanelWidth,
+    widthInWiderWindow: inlinePanelWidthInWiderWindow,
     preferredContentWidth: preferredConversationWidth,
     handleProps: inlinePanelHandleProps,
     isDragging: inlinePanelResizing,
@@ -1256,7 +1256,7 @@ function AppShellImpl() {
   const hasRailContent = Object.values(railTabsAvailable).some(Boolean);
   rightSidebarWindowRef.current = {
     canShow: Boolean(conversationId) && hasRailContent,
-    width: preferredInlinePanelWidth,
+    width: inlinePanelWidthInWiderWindow,
   };
   const initialWorkspaceTab = readInitialWorkspaceTab();
   const fallbackWorkspaceTab =
