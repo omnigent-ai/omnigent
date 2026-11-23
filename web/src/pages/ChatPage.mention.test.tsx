@@ -13,7 +13,7 @@ import type * as UseSidebarDataModule from "@/hooks/useSidebarData";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { useChatStore } from "@/store/chatStore";
+import { handleSessionEvent, useChatStore } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 
@@ -168,6 +168,8 @@ import { SESSION_MENTION_CAP, SESSION_MENTION_HINT } from "@/lib/composerMention
 import * as CodeMirrorModule from "@/components/composer/engine/CodeMirrorComposerInput";
 import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
+import { redo, undo } from "@codemirror/commands";
+import { EditorView } from "@codemirror/view";
 import { insertComposerText } from "@/lib/composerText";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
@@ -589,6 +591,31 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     );
   });
 
+  it("re-adds a file on 'Attach to agent' when a released session's longer spelling stays literal", () => {
+    const onSend = vi.fn();
+    sessions.loaded = [sessionRow("s_readme", "readme.md")];
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("compare @readme");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    append("with @readme");
+    fireEvent.click(screen.getByTitle("Tag session readme.md"));
+    const [, sessionToken] = tokens();
+    // Clear the draft, which releases both tags, then paste the session's spelling back by hand.
+    type("");
+    type(`see ${sessionToken} `);
+    expect(tokens()).toEqual([]);
+    act(() => {
+      useChatStore.setState({ pendingComposerAttachments: [{ path: "readme.md", isDir: false }] });
+    });
+    // The file is tagged again instead of lost; no session rides along.
+    expect(tokens()).toContain("@readme.md");
+    fireEvent.submit(textarea().closest("form")!);
+    const sent = onSend.mock.calls[0]![0] as string;
+    expect(sent).toContain("[Attached: readme.md]");
+    expect(sent).not.toContain("[Session:");
+    expect(sent).not.toContain(SESSION_MENTION_HINT);
+  });
+
   it("keeps the highlighted file when session results land above it", async () => {
     sessions.searchHits = [sessionRow("s_readme", "readme cleanup")];
     renderWithTooltips(<Composer {...composerProps()} />);
@@ -902,6 +929,32 @@ describe("Composer @-session mentions", () => {
       );
     });
 
+    it("forgets a retracted restore's tags, so the next draft tags a same-title session plainly", () => {
+      renderWithTooltips(<Composer {...composerProps()} />);
+      const stableId = "9".repeat(32);
+      const failed = `Ask [Session: "Alpha planning" id=s_other subagent=no] to review\n\n${SESSION_MENTION_HINT}`;
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: { conversationId: currentId, text: failed, files: [], stableId },
+        }),
+      );
+      expect(tokens()).toEqual(["@Alpha planning"]);
+      // The send was delivered after all, so the untouched restored draft is retracted.
+      act(() =>
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: stableId,
+          itemType: "message",
+          data: { role: "user", content: [{ type: "input_text", text: failed }] },
+        }),
+      );
+      expect(textarea().value).toBe("");
+
+      type("@alpha");
+      fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+      expect(tokens()).toEqual(["@Alpha planning"]);
+    });
+
     it("merges a failed send into newer input without retargeting either tag", () => {
       const onSend = vi.fn();
       renderWithTooltips(<Composer {...composerProps({ onSend })} />);
@@ -1076,3 +1129,189 @@ describe("Composer @-file mentions with the CodeMirror composer", () => {
     ).toEqual(["@readme.md"]);
   });
 });
+
+describe.each(["textarea", "codemirror"] as const)(
+  "Composer @-mention edits and undo on the %s engine",
+  (engine) => {
+    const codeMirrorInfo = {
+      ...FALLBACK_SERVER_INFO,
+      features: { chat_composer_codemirror: true },
+    };
+    let convSeq = 0;
+    beforeEach(() => {
+      resetWorkspaceMock();
+      declaredMentions.harnesses = new Set();
+      localStorage.clear();
+      useChatStore.setState({
+        conversationId: `conv_undo_${engine}_${++convSeq}`,
+        sessionHarness: "claude-native",
+        pendingComposerAttachments: [],
+      });
+      resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    });
+    afterEach(() => {
+      cleanup();
+      resetCodeMirrorComposerLoadForTests();
+      vi.restoreAllMocks();
+    });
+
+    async function renderComposer(props: ReturnType<typeof composerProps>) {
+      const ui = (
+        <TooltipProvider>
+          <Composer {...props} />
+        </TooltipProvider>
+      );
+      if (engine === "textarea") {
+        render(ui);
+        return;
+      }
+      render(<CapabilitiesProvider info={codeMirrorInfo}>{ui}</CapabilitiesProvider>);
+      await waitFor(() => expect(composerInput()).toHaveClass("cm-content"));
+    }
+    const composerInput = () => screen.getByLabelText("Message the agent");
+    const valueOf = () => composerTargetOf(composerInput())!.value;
+    const caretOf = () => composerTargetOf(composerInput())!.selectionStart;
+    const caretAt = (offset: number) =>
+      act(() => composerTargetOf(composerInput())!.setSelectionRange(offset, offset));
+    const typeAt = (text: string, offset = valueOf().length) =>
+      act(() => insertComposerText(composerTargetOf(composerInput())!, text, offset, offset));
+
+    /** ⌘Z. jsdom has no native textarea undo, so its browser undo is the input event it fires. */
+    function undoTo(text: string) {
+      stepHistory(text, "historyUndo", (editor) => undo(editor));
+    }
+    /** ⌘⇧Z. */
+    function redoTo(text: string) {
+      stepHistory(text, "historyRedo", (editor) => redo(editor));
+    }
+    function stepHistory(
+      text: string,
+      inputType: string,
+      stepCodeMirror: (editor: EditorView) => boolean,
+    ) {
+      if (engine === "codemirror") {
+        act(() => void stepCodeMirror(EditorView.findFromDOM(composerInput())!));
+      } else {
+        act(() => {
+          const field = composerInput() as HTMLTextAreaElement;
+          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(
+            field,
+            text,
+          );
+          field.dispatchEvent(new InputEvent("input", { bubbles: true, inputType }));
+        });
+      }
+      expect(valueOf()).toBe(text);
+    }
+
+    it("brings a deleted pill back on ⌘Z, still tagged, so the file attaches on send", async () => {
+      const props = composerProps();
+      await renderComposer(props);
+      typeAt("Read @rea");
+      fireEvent.click(screen.getByTitle("Attach readme.md"));
+      expect(tokens()).toEqual(["@readme.md"]);
+
+      caretAt("Read @readme.md".length);
+      fireEvent.keyDown(composerInput(), { key: "Backspace" });
+      expect(valueOf()).toBe("Read  ");
+      expect(tokens()).toEqual([]);
+
+      undoTo("Read @readme.md ");
+      expect(tokens()).toEqual(["@readme.md"]);
+
+      fireEvent.submit(composerInput().closest("form")!);
+      expect(props.onSend).toHaveBeenCalledWith("Read [Attached: readme.md]", undefined);
+    });
+
+    it("re-picks a deleted file from the menu, then undoes and redoes its next deletion", async () => {
+      const props = composerProps();
+      await renderComposer(props);
+      typeAt("Read @rea");
+      fireEvent.click(screen.getByTitle("Attach readme.md"));
+      caretAt("Read @readme.md".length);
+      fireEvent.keyDown(composerInput(), { key: "Backspace" });
+
+      typeAt("@rea", "Read ".length);
+      fireEvent.click(screen.getByTitle("Attach readme.md"));
+      expect(tokens()).toEqual(["@readme.md"]);
+      caretAt("Read @readme.md".length);
+      fireEvent.keyDown(composerInput(), { key: "Backspace" });
+      expect(tokens()).toEqual([]);
+
+      undoTo("Read @readme.md ");
+      expect(tokens()).toEqual(["@readme.md"]);
+      redoTo("Read  ");
+      expect(tokens()).toEqual([]);
+      undoTo("Read @readme.md ");
+      fireEvent.submit(composerInput().closest("form")!);
+      expect(props.onSend).toHaveBeenCalledWith("Read [Attached: readme.md]", undefined);
+    });
+
+    it("takes the pill away again on ⌘⇧Z redo", async () => {
+      await renderComposer(composerProps());
+      typeAt("Read @rea");
+      fireEvent.click(screen.getByTitle("Attach readme.md"));
+      caretAt("Read @readme.md".length);
+      fireEvent.keyDown(composerInput(), { key: "Backspace" });
+      undoTo("Read @readme.md ");
+
+      redoTo("Read  ");
+      expect(tokens()).toEqual([]);
+    });
+
+    it("leaves the caret after the token and its space when a file is picked mid-text", async () => {
+      await renderComposer(composerProps());
+      typeAt("Read more");
+      typeAt("@rea", "Read ".length);
+      fireEvent.click(screen.getByTitle("Attach readme.md"));
+
+      expect(valueOf()).toBe("Read @readme.md more");
+      expect(caretOf()).toBe("Read @readme.md ".length);
+    });
+
+    it.runIf(engine === "codemirror")(
+      "steps undo and redo back through a completed mention and a folder drill-in",
+      async () => {
+        await renderComposer(composerProps());
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        typeAt("then @sr");
+        fireEvent.click(screen.getByTitle("Open src"));
+        const drilled = "Read @readme.md then @src/";
+        expect(valueOf()).toBe(drilled);
+
+        undoTo("Read @readme.md then @sr");
+        expect(caretOf()).toBe("Read @readme.md then @sr".length);
+        undoTo("Read @readme.md ");
+        expect(caretOf()).toBe("Read @readme.md ".length);
+        undoTo("Read @rea");
+        expect(caretOf()).toBe("Read @rea".length);
+
+        redoTo("Read @readme.md ");
+        expect(caretOf()).toBe("Read @readme.md ".length);
+        redoTo("Read @readme.md then @sr");
+        expect(caretOf()).toBe("Read @readme.md then @sr".length);
+        redoTo(drilled);
+        expect(caretOf()).toBe(drilled.length);
+      },
+    );
+
+    it.runIf(engine === "codemirror")(
+      "keeps a deleted pill's retyped text literal rather than re-tagging it",
+      async () => {
+        const props = composerProps();
+        await renderComposer(props);
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        caretAt("Read @readme.md".length);
+        fireEvent.keyDown(composerInput(), { key: "Backspace" });
+
+        typeAt("@readme.md ");
+        expect(valueOf()).toBe("Read  @readme.md ");
+        expect(tokens()).toEqual([]);
+        fireEvent.submit(composerInput().closest("form")!);
+        expect(props.onSend).toHaveBeenCalledWith("Read  @readme.md", undefined);
+      },
+    );
+  },
+);
