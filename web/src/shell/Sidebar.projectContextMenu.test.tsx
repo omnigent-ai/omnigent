@@ -22,6 +22,14 @@ const mocks = vi.hoisted(() => ({
     isError: false,
     error: null,
   },
+  updateProjectConfig: {
+    mutate: vi.fn(),
+    mutateAsync: vi.fn(() => Promise.resolve()),
+    isPending: false,
+    isError: false,
+    error: null,
+  },
+  projectConfig: { host_id: "h1" } as Record<string, unknown>,
 }));
 
 vi.mock("@/hooks/useHosts", () => ({
@@ -44,14 +52,8 @@ vi.mock("@/hooks/useConversations", async () => {
     }),
     useDeleteProject: () => mocks.deleteProject,
     useRenameProject: () => mocks.renameProject,
-    useProjectConfig: () => ({ data: {}, isLoading: false, isError: false }),
-    useUpdateProjectConfig: () => ({
-      mutate: vi.fn(),
-      mutateAsync: vi.fn(() => Promise.resolve()),
-      isPending: false,
-      isError: false,
-      error: null,
-    }),
+    useProjectConfig: () => ({ data: mocks.projectConfig, isLoading: false, isError: false }),
+    useUpdateProjectConfig: () => mocks.updateProjectConfig,
   };
 });
 
@@ -62,6 +64,8 @@ vi.mock("./ProjectSettingsDialog", () => ({
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { clearSessionMuteState, setMutedProjects } from "@/lib/sessionMute";
 
 const useConversationsMock = vi.mocked(useConversations);
 
@@ -124,12 +128,16 @@ function expectProjectMenuActions() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.projectConfig = { host_id: "h1" };
   useConversationsMock.mockReset();
   localStorage.clear();
   mockConversations([FILED_CONVERSATION]);
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  act(() => clearSessionMuteState());
+});
 
 describe("project folder header context menu", () => {
   it("opens the kebab's exact action set on right-click", () => {
@@ -492,5 +500,59 @@ describe("project folder header context menu", () => {
     fireEvent.click(selectionHeader);
 
     expect(selectionHeader).toHaveAttribute("aria-expanded", before === "true" ? "false" : "true");
+  });
+});
+
+describe("project mute", () => {
+  const MUTE_SERVER = { ...FALLBACK_SERVER_INFO, session_mute: true, project_mute: true };
+
+  it("mutes the project by merging onto its stored config", () => {
+    renderSidebar({ info: MUTE_SERVER });
+    expect(screen.queryByTestId("project-muted-icon")).toBeNull();
+
+    fireEvent.contextMenu(folderHeader());
+    fireEvent.click(screen.getByRole("menuitem", { name: "Mute project" }));
+
+    expect(mocks.updateProjectConfig.mutate).toHaveBeenCalledWith(
+      { id: PROJECT_ID, name: PROJECT_NAME, config: { host_id: "h1", muted: true } },
+      expect.anything(),
+    );
+  });
+
+  it("marks a muted project and unmutes it from the same menu", () => {
+    act(() => setMutedProjects([{ id: PROJECT_ID, name: PROJECT_NAME, muted: true }]));
+    mocks.projectConfig = { host_id: "h1", muted: true };
+    renderSidebar({ info: MUTE_SERVER });
+    expect(screen.getByTestId("project-muted-icon")).toBeInTheDocument();
+
+    fireEvent.contextMenu(folderHeader());
+    fireEvent.click(screen.getByRole("menuitem", { name: "Unmute project" }));
+
+    expect(mocks.updateProjectConfig.mutate).toHaveBeenCalledWith(
+      { id: PROJECT_ID, name: PROJECT_NAME, config: { host_id: "h1" } },
+      expect.anything(),
+    );
+  });
+
+  it("points a member session's own Mute at the project that muted it", () => {
+    act(() => setMutedProjects([{ id: PROJECT_ID, name: PROJECT_NAME, muted: true }]));
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify([PROJECT_NAME]));
+    renderSidebar({ info: MUTE_SERVER });
+
+    const row = screen.getByRole("link", { name: /My Session/ }).closest("li") as HTMLElement;
+    expect(row.querySelector('[data-testid="conversation-muted-icon"]')).not.toBeNull();
+    fireEvent.pointerDown(row.querySelector('[data-testid="conversation-actions"]')!, {
+      button: 0,
+    });
+    expect(screen.getByRole("menuitem", { name: "Muted with project" })).toHaveAttribute(
+      "data-disabled",
+    );
+  });
+
+  it("offers no project mute on a server that can't read it back", () => {
+    renderSidebar({ info: { ...MUTE_SERVER, project_mute: false } });
+    fireEvent.contextMenu(folderHeader());
+    expect(screen.getByTestId("project-settings")).toBeInTheDocument();
+    expect(screen.queryByTestId("mute-project")).toBeNull();
   });
 });

@@ -2879,7 +2879,9 @@ describe("useUpdateProjectConfig cache seeding", () => {
     // The config cache holds the fresh value keyed by the NEW id.
     expect(queryClient.getQueryData(["project-config", "p_new"])).toEqual({ agent_id: "ag_x" });
     // The projects list now resolves "Work" → the promoted first-class id.
-    expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_new", name: "Work" }]);
+    expect(queryClient.getQueryData(["projects"])).toEqual([
+      { id: "p_new", name: "Work", muted: false },
+    ]);
   });
 });
 

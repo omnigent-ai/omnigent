@@ -435,6 +435,14 @@ Failed output from a muted automation session is also hidden from Unread;
 its failure remains visible on the automation card and in run history.
 Automation failures that never created a session keep their separate Inbox cards.
 
+**Mute a project:** in the project folder's menu (three-dot or right-click) or
+the project home's menu, choose Mute project. Every session filed in the
+project, including ones added later and workers its sessions start, then
+behaves as muted above, and the folder header shows a muted bell. A member
+session's own menu reads Muted with project; choose Unmute project to undo.
+Sessions outside the project, such as one coordinating it, still notify.
+The item appears only on servers that advertise `project_mute` in `/v1/info`.
+
 **Project folder:** right-click its header or open its three-dot menu, then
 choose Rename project. Start typing as soon as the dialog opens. Delete project
 archives every session in the folder; when any of them has an agent working,

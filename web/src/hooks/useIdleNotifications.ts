@@ -61,7 +61,7 @@ import {
 } from "@/lib/idleTransitions";
 import { isConversationUnseen, useUnseenTick } from "@/hooks/useUnseenConversations";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
-import { isConversationMuted } from "@/lib/sessionMute";
+import { isConversationMuted, useMutedProjects } from "@/lib/sessionMute";
 
 const IDLE_BODY = "Agent finished and is ready for your input.";
 const ELICITATION_BODY = "Agent is asking for your input.";
@@ -259,6 +259,8 @@ export function useIdleNotifications(activeConversationId?: string): void {
   // recompute the dock badge from the current list so it agrees with the
   // dot immediately, without waiting for the next conversations poll.
   const unseenTick = useUnseenTick();
+  // Muting a project changes no row, so the badge recomputes on it directly.
+  const mutedProjects = useMutedProjects();
   useEffect(() => {
     const convs = latestConversations.current;
     if (convs === null) return;
@@ -269,8 +271,8 @@ export function useIdleNotifications(activeConversationId?: string): void {
       isConversationUnseen,
     );
     pushBadge(next, convs);
-    // pushBadge and the focus state are refs; rerun only when the map changes.
-  }, [unseenTick]);
+    // pushBadge and the focus state are refs; rerun only when the map or mutes change.
+  }, [unseenTick, mutedProjects]);
 
   useEffect(() => {
     // Still loading — don't compute a badge from an absent list (and don't

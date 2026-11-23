@@ -4,14 +4,20 @@ import {
   canFlagUnread,
   clearSessionMuteState,
   isConversationMuted,
+  isInMutedProject,
+  isSessionMuted,
   MUTE_REINDEX_GRACE_MS,
   muteReadMarker,
   MUTED_LABEL_KEY,
   onMuteRecheck,
   reconcileMuteLabel,
+  setMutedProjects,
   settleMuteSave,
   showsUnreadFor,
+  useMutedProjects,
 } from "./sessionMute";
+import { act, renderHook } from "@testing-library/react";
+import { PROJECT_LABEL_KEY } from "./sessionListCache";
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -138,5 +144,47 @@ describe("session mute store", () => {
     expect(showsUnreadFor(row(true), true)).toBe(false);
     expect(canFlagUnread(row(false))).toBe(true);
     expect(canFlagUnread(row(true))).toBe(false);
+  });
+});
+
+describe("project mute", () => {
+  const projects = [
+    { id: "p-muted", name: "Factory", muted: true },
+    { id: "p-loud", name: "Coordination", muted: false },
+    // A label-only folder can't store a mute, so it never counts.
+    { id: null, name: "Legacy", muted: true },
+  ];
+
+  it("mutes sessions filed in a muted project by id or legacy label", () => {
+    setMutedProjects(projects);
+    const filed = { id: "a", labels: {}, project_id: "p-muted" };
+    const labeled = { id: "b", labels: { [PROJECT_LABEL_KEY]: "Factory" } };
+    for (const session of [filed, labeled]) {
+      expect(isInMutedProject(session)).toBe(true);
+      expect(isConversationMuted(session)).toBe(true);
+      expect(isSessionMuted(session)).toBe(false);
+      expect(showsUnreadFor(session, true)).toBe(false);
+      expect(canFlagUnread(session)).toBe(false);
+    }
+    // A first-class membership outranks a leftover label naming the muted project.
+    const moved = { id: "c", labels: { [PROJECT_LABEL_KEY]: "Factory" }, project_id: "p-loud" };
+    const unfiled = { id: "d", labels: {} };
+    const legacy = { id: "e", labels: { [PROJECT_LABEL_KEY]: "Legacy" } };
+    for (const session of [moved, unfiled, legacy]) {
+      expect(isConversationMuted(session)).toBe(false);
+    }
+  });
+
+  it("re-renders subscribers only when the muted set changes", () => {
+    const { result } = renderHook(() => useMutedProjects());
+    expect(result.current).toEqual([]);
+    act(() => setMutedProjects(projects));
+    const first = result.current;
+    expect(first).toEqual([{ id: "p-muted", name: "Factory" }]);
+    act(() => setMutedProjects(projects.map((project) => ({ ...project }))));
+    expect(result.current).toBe(first);
+    act(() => setMutedProjects(projects.map((project) => ({ ...project, muted: false }))));
+    expect(result.current).toEqual([]);
+    expect(isConversationMuted({ id: "a", labels: {}, project_id: "p-muted" })).toBe(false);
   });
 });
