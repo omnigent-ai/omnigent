@@ -30,6 +30,19 @@ function withPageView<P extends object>(id: string, Component: ComponentType<P>)
   };
 }
 
+// A lazy page inside the shell gets its own boundary. A router transition keeps
+// already-visible content, but a newly mounted boundary shows its fallback, so
+// an in-app click shows the pane spinner instead of leaving the old page up.
+function withPaneLoading<P extends object>(Page: ComponentType<P>): ComponentType<P> {
+  return function WithPaneLoading(props: P) {
+    return (
+      <Suspense fallback={<PaneLoading />}>
+        <Page {...props} />
+      </Suspense>
+    );
+  };
+}
+
 // Every `*Page` here is wrapped with its page-view id. Accounts pages stay lazy
 // so a non-accounts (header / OIDC) deploy doesn't ship them in the main chunk —
 // their routes aren't registered there, so the chunk never downloads. (Members /
@@ -62,34 +75,46 @@ const FloatingComposerPage = withPageView(
 );
 const InboxPage = withPageView(
   "inbox",
-  lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage }))),
+  withPaneLoading(lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage })))),
 );
 // The shell owns the board so selecting a conversation never unmounts it.
 const CanvasLandingPage = withPageView("canvas", () => null);
 const GridPage = withPageView("grid", () => null);
 const ProjectHomePage = withPageView(
   "project_home",
-  lazy(() => import("@/pages/ProjectHomePage").then((m) => ({ default: m.ProjectHomePage }))),
+  withPaneLoading(
+    lazy(() => import("@/pages/ProjectHomePage").then((m) => ({ default: m.ProjectHomePage }))),
+  ),
 );
-const TasksPage = lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage })));
+const TasksPage = withPaneLoading(
+  lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage }))),
+);
 const UsagePage = withPageView(
   "usage",
-  lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
+  withPaneLoading(lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage })))),
 );
 const TaskDetailPage = withPageView(
   "tasks.detail",
-  lazy(() => import("@/pages/TaskDetailPage").then((m) => ({ default: m.TaskDetailPage }))),
+  withPaneLoading(
+    lazy(() => import("@/pages/TaskDetailPage").then((m) => ({ default: m.TaskDetailPage }))),
+  ),
 );
 const WorkflowsPage = withPageView(
   "workflows",
-  lazy(() => import("@/pages/WorkflowsPage").then((m) => ({ default: m.WorkflowsPage }))),
+  withPaneLoading(
+    lazy(() => import("@/pages/WorkflowsPage").then((m) => ({ default: m.WorkflowsPage }))),
+  ),
 );
 const WorkflowDetailPage = withPageView(
   "workflows.detail",
-  lazy(() => import("@/pages/WorkflowDetailPage").then((m) => ({ default: m.WorkflowDetailPage }))),
+  withPaneLoading(
+    lazy(() =>
+      import("@/pages/WorkflowDetailPage").then((m) => ({ default: m.WorkflowDetailPage })),
+    ),
+  ),
 );
-const SettingsPage = lazy(() =>
-  import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
+const SettingsPage = withPaneLoading(
+  lazy(() => import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage }))),
 );
 
 // A release-feature route stays registered so a hard load never falls through

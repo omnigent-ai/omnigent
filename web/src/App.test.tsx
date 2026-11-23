@@ -14,6 +14,7 @@ vi.mock("@/shell/AppShell", () => ({
   AppShell: () => (
     <div>
       <span>app shell</span>
+      <Link to="/inbox">Inbox</Link>
       <Outlet />
     </div>
   ),
@@ -36,6 +37,12 @@ vi.mock("@/pages/ChatPage", async () => {
 });
 vi.mock("@/pages/ProjectHomePage", () => ({
   ProjectHomePage: () => <div>project home page</div>,
+}));
+// Stays suspended, like a page whose code is still downloading.
+vi.mock("@/pages/InboxPage", () => ({
+  InboxPage: () => {
+    throw new Promise(() => {});
+  },
 }));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
@@ -302,6 +309,17 @@ describe("Project home route", () => {
     renderRoute("/projects/My%20Project", { project_kanban: true });
     expect(await screen.findByTestId("chat-location")).toHaveTextContent("/?project=My%20Project");
     expect(screen.queryByText("project home page")).toBeNull();
+  });
+});
+
+describe("Shell page loading", () => {
+  it("shows the pane spinner when an in-app click opens a page still loading", async () => {
+    renderRoute("/");
+    fireEvent.click(await screen.findByRole("link", { name: "Inbox" }));
+
+    expect(await screen.findByRole("status", { name: "Loading" })).toBeInTheDocument();
+    expect(screen.queryByText("chat page")).toBeNull();
+    expect(screen.getByText("app shell")).toBeInTheDocument();
   });
 });
 
