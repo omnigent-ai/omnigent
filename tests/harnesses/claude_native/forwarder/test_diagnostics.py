@@ -448,50 +448,6 @@ async def _forward_stop_edge(client: httpx.AsyncClient, bridge_dir: Path, sessio
     )
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
-def test_transcript_write_blocker_names_an_unwritable_parent(tmp_path: Path) -> None:
-    """A searchable but unwritable directory is named with its errno for a not-yet-present file."""
-    projects = tmp_path / "projects"
-    projects.mkdir()
-    projects.chmod(0o555)
-    try:
-        blocker = forwarder._transcript_write_blocker(projects / "claude-session.jsonl")
-    finally:
-        projects.chmod(0o755)
-    assert blocker == f"{projects} is not writable (EACCES)"
-
-
-@pytest.mark.parametrize(
-    ("relative_path", "expected"),
-    [
-        pytest.param(
-            Path("projects") / "claude-session.jsonl",
-            "{parent} is writable but the file was never created",
-            id="writable-parent-file-never-created",
-        ),
-    ],
-)
-def test_transcript_write_blocker_names_a_writable_directory(
-    tmp_path: Path, relative_path: Path, expected: str
-) -> None:
-    """Without a permission problem the diagnostic says the file was never created."""
-    (tmp_path / "projects").mkdir()
-    transcript_path = tmp_path / relative_path
-    assert forwarder._transcript_write_blocker(transcript_path) == expected.format(
-        parent=transcript_path.parent
-    )
-
-
-def test_unwritable_directory_errno_names_a_read_only_mount(tmp_path: Path) -> None:
-    """An unwritable directory on a read-only mount is EROFS; otherwise it is EACCES."""
-    read_only = forwarder._unwritable_directory_errno(tmp_path, mount_is_read_only=lambda p: True)
-    writable_mount = forwarder._unwritable_directory_errno(
-        tmp_path, mount_is_read_only=lambda p: False
-    )
-    assert (read_only, writable_mount) == ("EROFS", "EACCES")
-    assert forwarder._unwritable_directory_errno(tmp_path) == "EACCES"
-
-
 @pytest.mark.asyncio
 async def test_readable_transcript_with_a_partial_trailing_line_is_not_flagged(
     tmp_path: Path,
@@ -736,96 +692,6 @@ def _write_state_path(bridge_dir: Path, transcript_path: Path) -> None:
     )
 
 
-def _transcript_setup(name: str, tmp_path: Path) -> tuple[Path, Path, Path, bool]:
-    """Build one transcript shape.
-
-    Returns the checkpoint path (A), the Stop's path, the path hooks advertise after the
-    Stop, and whether a loss warning is expected.
-    """
-    projects = tmp_path / "projects"
-    projects.mkdir(exist_ok=True)
-    if name == "absent-under-searchable-dir":
-        slug = projects / "slug"
-        slug.mkdir()
-        path = slug / "claude-session.jsonl"
-        return path, path, path, True
-    if name == "parent-is-a-regular-file":
-        (projects / "slug").write_text("", encoding="utf-8")
-        path = projects / "slug" / "claude-session.jsonl"
-        return path, path, path, False
-    if name == "directory-at-the-path":
-        path = projects / "claude-session.jsonl"
-        path.mkdir()
-        return path, path, path, False
-    if name == "unreadable-existing-file":
-        path = projects / "claude-session.jsonl"
-        path.write_text("", encoding="utf-8")
-        path.chmod(0o000)
-        return path, path, path, False
-    if name in ("relocated-b-readable", "relocated-b-missing"):
-        # A's directory is searchable and A is absent: only the later hook says it moved.
-        (projects / "a").mkdir()
-        (projects / "b").mkdir()
-        a_path = projects / "a" / "claude-session.jsonl"
-        b_path = projects / "b" / "claude-session.jsonl"
-        if name == "relocated-b-readable":
-            b_path.write_text(_priced_assistant_line("b1") + "\n", encoding="utf-8")
-        return a_path, a_path, b_path, False
-    raise AssertionError(name)
-
-
-@pytest.mark.parametrize(
-    "shape",
-    [
-        "absent-under-searchable-dir",
-        "parent-is-a-regular-file",
-        "directory-at-the-path",
-        "unreadable-existing-file",
-        "relocated-b-readable",
-        "relocated-b-missing",
-    ],
-)
-def test_forwarder_loop_reports_only_unambiguous_transcript_loss(
-    tmp_path: Path, shape: str, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Table of transcript shapes at the forwarder-loop level.
-
-    An earlier poll forwards a checkpoint for path A; the Stop then arrives. Only a
-    never-appeared transcript with no cursor progress and no path mismatch logs a
-    warning. Every shape must still reach the Stop edge without a chat item.
-    """
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
-    checkpoint_path, stop_path, advertised_path, expect_warning = _transcript_setup(
-        shape, tmp_path
-    )
-    try:
-        _write_state_path(bridge_dir, checkpoint_path)
-        asyncio.run(_run_forwarder_until_idle(bridge_dir, idle_count=0))
-        _record_turn(bridge_dir, stop_path)
-        if advertised_path != stop_path:
-            _write_state_path(bridge_dir, advertised_path)
-        caplog.set_level(logging.WARNING, logger=forwarder.__name__)
-        posts = asyncio.run(_run_forwarder_until_idle(bridge_dir, idle_count=1))
-    finally:
-        if shape == "unreadable-existing-file":
-            checkpoint_path.chmod(0o644)
-
-    # The Stop always reaches the idle edge; no shape stalls it or adds a chat notice.
-    [edge] = _idle_edges(posts)
-    assert edge["turn_completed"] is True
-    assert "output" not in edge
-    assert [post for post in posts if _is_error_item_post(post)] == []
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    if not expect_warning:
-        assert warnings == []
-    else:
-        [warning] = warnings
-        assert warning.levelno == logging.WARNING
-        assert str(stop_path) in warning.getMessage()
-
-
 @pytest.mark.parametrize(
     ("shape", "expected"),
     [
@@ -876,100 +742,6 @@ def test_transcript_shape_treats_unsearchable_ancestor_and_unreadable_file_as_un
     finally:
         locked.chmod(0o755)
         unreadable.chmod(0o644)
-
-
-@pytest.mark.asyncio
-async def test_failed_missing_transcript_diagnostic_does_not_block_the_idle_edge(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A loss probe that raises is logged; the turn's confirmed idle edge still posts."""
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    _record_turn(bridge_dir, tmp_path / "claude-session.jsonl")
-
-    def exploding_probe(bridge_dir: Path, stop_path: Path | None) -> None:
-        raise PermissionError("probe denied")
-
-    monkeypatch.setattr(forwarder, "_loss_evidence_now", exploding_probe)
-    caplog.set_level(logging.INFO, logger=forwarder.__name__)
-    requests: list[dict[str, Any]] = []
-    async with httpx.AsyncClient(
-        transport=_recording_transport(requests), base_url="http://test"
-    ) as client:
-        await _forward_stop_edge(client, bridge_dir, "conv_probe_failed")
-
-    assert requests == [
-        {
-            "type": "external_session_status",
-            "data": {"status": "idle", "background_task_count": 0, "turn_completed": True},
-        }
-    ]
-    failures = [
-        record
-        for record in caplog.records
-        if "missing-transcript diagnostic failed" in record.getMessage()
-    ]
-    assert len(failures) == 1
-    assert failures[0].levelno == logging.WARNING
-    assert failures[0].session_id == "conv_probe_failed"
-
-
-def test_known_transcript_path_that_never_appears_is_logged_once_per_path(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """An absent transcript under a searchable directory is logged once, with no chat notice."""
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
-    slug = tmp_path / "projects" / "-home-user-workspace"
-    slug.mkdir(parents=True)
-    transcript_path = slug / "claude-session.jsonl"
-    # An earlier poll forwards the checkpoint; then two Stops arrive for the absent file.
-    _write_state_path(bridge_dir, transcript_path)
-    asyncio.run(_run_forwarder_until_idle(bridge_dir, idle_count=0))
-    _record_turn(bridge_dir, transcript_path)
-    _record_turn(bridge_dir, transcript_path)
-    caplog.set_level(logging.WARNING, logger=forwarder.__name__)
-
-    posts = asyncio.run(_run_forwarder_until_idle(bridge_dir, idle_count=2))
-
-    edges = _idle_edges(posts)
-    assert len(edges) == 2
-    assert all(edge["turn_completed"] is True and "output" not in edge for edge in edges)
-    assert [post for post in posts if _is_error_item_post(post)] == []
-    [warning] = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert str(transcript_path) in warning.getMessage()
-    assert "is writable but the file was never created" in warning.getMessage()
-
-
-def test_legacy_checkpoint_naming_another_path_stays_quiet(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A line-cursor-only checkpoint names a readable A; hooks now advertise an absent B.
-
-    Initialization replaces the checkpoint with B, so the loss decision must read the
-    path the checkpoint followed before that replacement, and stay quiet.
-    """
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
-    readable = tmp_path / "projects" / "a" / "claude-session.jsonl"
-    readable.parent.mkdir(parents=True)
-    readable.write_text(_priced_assistant_line("a1") + "\n", encoding="utf-8")
-    absent = tmp_path / "projects" / "b" / "claude-session.jsonl"
-    absent.parent.mkdir(parents=True)
-    (bridge_dir / forwarder._FORWARDER_STATE_FILE).write_text(
-        json.dumps({"transcript_path": str(readable), "line_cursor": 1}), encoding="utf-8"
-    )
-    _record_turn(bridge_dir, absent)
-    caplog.set_level(logging.WARNING, logger=forwarder.__name__)
-
-    posts = asyncio.run(_run_forwarder_until_idle(bridge_dir, idle_count=1))
-
-    assert len(_idle_edges(posts)) == 1
-    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
 def test_clear_after_directory_removal_delivers_the_first_new_turn(tmp_path: Path) -> None:
@@ -1049,121 +821,87 @@ def test_clear_after_directory_removal_delivers_the_first_new_turn(tmp_path: Pat
     assert "reply" in json.dumps(posts) or "priced reply" in json.dumps(posts)
 
 
-_NEVER_APPEARED_A = Path("/work/projects/slug/claude-session.jsonl")
-_NEVER_APPEARED_B = Path("/work/projects/moved/claude-session.jsonl")
-_NEVER_APPEARED_ALL_POSITIVE: dict[str, Any] = {
-    "stop_path": _NEVER_APPEARED_A,
-    "saved_path": _NEVER_APPEARED_A,
-    "advertised_path": _NEVER_APPEARED_A,
-    "saved_byte_offset": None,
-    "saved_line_cursor": None,
-    "shape": "not_yet_present",
-}
-
-
 @pytest.mark.parametrize(
-    ("overrides", "expected"),
+    "shape",
     [
-        pytest.param({}, True, id="all-positive"),
-        pytest.param({"saved_byte_offset": 0}, True, id="byte-offset-zero-is-no-progress"),
-        pytest.param({"saved_line_cursor": 0}, True, id="line-cursor-zero-is-no-progress"),
-        pytest.param({"saved_byte_offset": 470}, False, id="byte-offset-progress"),
-        pytest.param({"saved_line_cursor": 2}, False, id="legacy-line-cursor-progress"),
+        "parent-is-a-regular-file",
+        "directory-at-the-path",
         pytest.param(
-            {"saved_byte_offset": 470, "saved_line_cursor": 2},
-            False,
-            id="both-cursor-formats-progress",
-        ),
-        pytest.param(
-            {
-                "stop_path": _NEVER_APPEARED_B,
-                "saved_path": _NEVER_APPEARED_B,
-                "advertised_path": _NEVER_APPEARED_B,
-            },
-            True,
-            id="all-positive-on-another-path",
-        ),
-        pytest.param({"stop_path": _NEVER_APPEARED_B}, False, id="stop-differs-from-saved"),
-        pytest.param({"saved_path": _NEVER_APPEARED_B}, False, id="saved-differs-from-stop"),
-        pytest.param({"advertised_path": _NEVER_APPEARED_B}, False, id="advertised-relocated"),
-        pytest.param({"advertised_path": None}, False, id="advertised-missing"),
-        pytest.param({"saved_path": None}, False, id="checkpoint-missing"),
-        pytest.param({"stop_path": None}, False, id="stop-missing"),
-        pytest.param({"shape": "file"}, False, id="shape-readable-file"),
-        pytest.param({"shape": "unusable"}, False, id="shape-unusable"),
-        pytest.param({"shape": None}, False, id="shape-unknown"),
-        pytest.param(
-            {"stop_path": _NEVER_APPEARED_B, "advertised_path": _NEVER_APPEARED_B},
-            False,
-            id="ab-mismatch-both-absent",
+            "unreadable-existing-file",
+            marks=pytest.mark.skipif(os.geteuid() == 0, reason="root reads unreadable files"),
         ),
     ],
 )
-def test_transcript_never_appeared_truth_table(overrides: dict[str, Any], expected: bool) -> None:
-    """Every positive column must agree; flipping any one column withholds the warning."""
-    inputs = {**_NEVER_APPEARED_ALL_POSITIVE, **overrides}
-    assert forwarder._transcript_never_appeared(**inputs) is expected
-
-
-@pytest.mark.parametrize("cursor", ["byte-offset", "legacy-line-cursor"])
-@pytest.mark.parametrize("change", ["removed", "relocated"])
-def test_stop_deferred_past_a_read_transcript_stays_quiet(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, cursor: str, change: str
+def test_unusable_transcript_reaches_the_stop_edge_without_crash_or_chat_item(
+    tmp_path: Path, shape: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A transcript read by an earlier poll, then removed or relocated before its Stop.
+    """An unusable transcript path must not restart the forwarder loop or stall its Stop.
 
-    The checkpoint shows progress on A, so the absence of A must not be reported as a
-    transcript that never appeared, in either cursor format.
+    The poll forwards hook records only, so the turn settles. Nothing is posted to the
+    chat and the loop logs no failure.
     """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    if shape == "parent-is-a-regular-file":
+        (projects / "slug").write_text("", encoding="utf-8")
+        transcript = projects / "slug" / "claude-session.jsonl"
+    elif shape == "directory-at-the-path":
+        transcript = projects / "claude-session.jsonl"
+        transcript.mkdir()
+    else:
+        transcript = projects / "claude-session.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        transcript.chmod(0o000)
+    _record_turn(bridge_dir, transcript)
+    caplog.set_level(logging.WARNING, logger=forwarder.__name__)
+    try:
+        posts = asyncio.run(_run_forwarder_until_idle(bridge_dir, idle_count=1))
+    finally:
+        if shape == "unreadable-existing-file":
+            transcript.chmod(0o644)
+
+    [edge] = _idle_edges(posts)
+    assert edge["turn_completed"] is True
+    assert "output" not in edge
+    assert [post for post in posts if _is_error_item_post(post)] == []
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads unreadable files")
+async def test_unusable_transcript_keeps_the_saved_checkpoint(tmp_path: Path) -> None:
+    """A checkpoint read from A survives a poll whose transcript path became unusable."""
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
     slug = tmp_path / "projects" / "slug"
     slug.mkdir(parents=True)
     transcript = slug / "claude-session.jsonl"
-    content = _priced_assistant_line("a1") + "\n" + _priced_assistant_line("a2") + "\n"
-    transcript.write_text(content, encoding="utf-8")
+    transcript.write_text(
+        _priced_assistant_line("a1") + "\n" + _priced_assistant_line("a2") + "\n",
+        encoding="utf-8",
+    )
     _write_state_path(bridge_dir, transcript)
-    asyncio.run(_run_forwarder_until_idle(bridge_dir, idle_count=0))
+    await _run_forwarder_until_idle(bridge_dir, idle_count=0)
     state_file = bridge_dir / forwarder._FORWARDER_STATE_FILE
-    assert json.loads(state_file.read_text())["byte_offset"] > 0
-    if cursor == "legacy-line-cursor":
-        state_file.write_text(
-            json.dumps({"transcript_path": str(transcript), "line_cursor": 2}), encoding="utf-8"
-        )
-    moved = tmp_path / "projects" / "moved" / "claude-session.jsonl"
-    if change == "relocated":
-        moved.parent.mkdir(parents=True)
-        moved.write_text(content, encoding="utf-8")
+    before = json.loads(state_file.read_text())
+    assert before["byte_offset"] > 0
+
     transcript.unlink()
+    transcript.mkdir()
     _record_turn(bridge_dir, transcript)
-    if change == "relocated":
-        _write_state_path(bridge_dir, moved)
-    caplog.set_level(logging.WARNING, logger=forwarder.__name__)
-
-    posts = asyncio.run(_run_forwarder_until_idle(bridge_dir, idle_count=1))
+    posts = await _run_forwarder_until_idle(bridge_dir, idle_count=1)
 
     assert len(_idle_edges(posts)) == 1
-    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
-
-
-def test_checkpoint_naming_another_path_stays_quiet_when_both_are_absent(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A checkpoint on A and a Stop on B, with both absent, is a path mismatch, not a loss."""
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
-    a_path = tmp_path / "projects" / "a" / "claude-session.jsonl"
-    b_path = tmp_path / "projects" / "b" / "claude-session.jsonl"
-    a_path.parent.mkdir(parents=True)
-    b_path.parent.mkdir(parents=True)
-    _write_state_path(bridge_dir, a_path)
-    asyncio.run(_run_forwarder_until_idle(bridge_dir, idle_count=0))
-    _record_turn(bridge_dir, b_path)
-    caplog.set_level(logging.WARNING, logger=forwarder.__name__)
-
-    posts = asyncio.run(_run_forwarder_until_idle(bridge_dir, idle_count=1))
-
-    assert len(_idle_edges(posts)) == 1
-    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+    after = json.loads(state_file.read_text())
+    keys = (
+        "transcript_path",
+        "line_cursor",
+        "byte_offset",
+        "cursor_fingerprint",
+        "seen_source_ids",
+    )
+    assert {k: after.get(k) for k in keys} == {k: before.get(k) for k in keys}
