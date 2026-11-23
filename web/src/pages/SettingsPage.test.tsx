@@ -24,6 +24,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
+import { INBOX_BADGE_COUNT_STORAGE_KEY } from "@/lib/inboxBadgePreferences";
 import { PROJECT_KANBAN_BOARD_STORAGE_KEY } from "@/lib/projectKanbanPreferences";
 import { fetchDatabricksStatus } from "@/lib/databricksIntegration";
 import { fetchGithubStatus } from "@/lib/githubIntegration";
@@ -547,6 +548,7 @@ describe("SettingsPage", () => {
   beforeEach(() => {
     localStorage.removeItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY);
     localStorage.removeItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY);
+    localStorage.removeItem(INBOX_BADGE_COUNT_STORAGE_KEY);
   });
 
   it("groups General settings into titled outlined cards and hides its description on mobile", () => {
@@ -724,6 +726,31 @@ describe("SettingsPage", () => {
 
     expect(toggle).not.toBeChecked();
     expect(localStorage.getItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY)).toBe("off");
+  });
+
+  it("counts unread sessions in the Inbox badge by default and persists turning it off", async () => {
+    renderPage("/settings/general");
+    const toggle = await screen.findByTestId("inbox-badge-unread-toggle");
+    expect(screen.getByTestId("settings-group-sessions")).toContainElement(toggle);
+    expect(toggle).toHaveAccessibleName("Count unread sessions in the Inbox badge");
+    expect(toggle).toBeChecked();
+
+    fireEvent.click(toggle);
+    expect(toggle).not.toBeChecked();
+    expect(localStorage.getItem(INBOX_BADGE_COUNT_STORAGE_KEY)).toBe("attention");
+
+    fireEvent.click(toggle);
+    expect(toggle).toBeChecked();
+    expect(localStorage.getItem(INBOX_BADGE_COUNT_STORAGE_KEY)).toBeNull();
+
+    // A save that storage refuses leaves the switch showing what is stored.
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("Quota exceeded", "QuotaExceededError");
+    });
+    const toastError = vi.spyOn(toast, "error").mockImplementation(() => "");
+    fireEvent.click(toggle);
+    expect(toggle).toBeChecked();
+    expect(toastError).toHaveBeenCalledTimes(1);
   });
 
   it("opens sub-agents full screen by default and persists the panel setting", async () => {

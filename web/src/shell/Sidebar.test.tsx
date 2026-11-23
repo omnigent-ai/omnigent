@@ -39,6 +39,7 @@ import { useEffect } from "react";
 import { GridSessionsProvider } from "@/grid/GridSessionsContext";
 import * as readStateHooks from "@/hooks/useUnseenConversations";
 import { getOmnigentServerIdentity } from "@/lib/host";
+import { writeInboxBadgeCount } from "@/lib/inboxBadgePreferences";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { ARIA_MOD_KEY, MOD_KEY, SHIFT_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -1316,6 +1317,41 @@ describe("Sidebar session list", () => {
     expect(
       within(screen.getByTestId("inbox-button")).getByLabelText("1 inbox item waiting"),
     ).toHaveTextContent("1");
+  });
+
+  it("leaves unread sessions out of the Inbox badge when Settings says so", () => {
+    writeInboxBadgeCount("attention");
+    seedReadState([{ id: "conv_unread", viewer_last_seen: 199 }]);
+    mockConversations([
+      conv("conv_unread", "Codex", { status: "idle", updated_at: 200 }),
+      conv("conv_awaiting", "Claude Code", { pending_elicitations_count: 2 }),
+    ]);
+    renderSidebar(true, "/inbox");
+
+    // The row dot stays; only the badge number drops the unread session.
+    const row = screen.getByRole("link", { name: /conv_unread/ }).closest("li")!;
+    expect(within(row).getByRole("img", { name: "New messages" })).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("inbox-button")).getByLabelText("2 inbox items waiting"),
+    ).toHaveTextContent("2");
+  });
+
+  it("updates the Inbox badge as soon as the badge setting changes", () => {
+    seedReadState([{ id: "conv_unread", viewer_last_seen: 199 }]);
+    mockConversations([conv("conv_unread", "Codex", { status: "idle", updated_at: 200 })]);
+    renderSidebar(true, "/");
+    const inbox = screen.getByTestId("inbox-button");
+    expect(within(inbox).getByLabelText("1 inbox item waiting")).toHaveTextContent("1");
+
+    act(() => {
+      writeInboxBadgeCount("attention");
+    });
+    expect(within(inbox).queryByLabelText(/inbox items? waiting/)).toBeNull();
+
+    act(() => {
+      writeInboxBadgeCount("all");
+    });
+    expect(within(inbox).getByLabelText("1 inbox item waiting")).toHaveTextContent("1");
   });
 
   it("lets the active Inbox row show through the count badge", () => {

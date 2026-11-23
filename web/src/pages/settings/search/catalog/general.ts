@@ -64,6 +64,15 @@ export const OPEN_SUBAGENTS_IN_PANEL_ENTRY = settingsEntry({
   keywords: ["sessions", "sub-agents", "subagents", "workspace", "panel", "side by side"],
 });
 
+export const INBOX_BADGE_UNREAD_ENTRY = settingsEntry({
+  id: "inbox-badge-unread",
+  section: "general",
+  label: "Count unread sessions in the Inbox badge",
+  description:
+    "Off: the badge counts only approvals, comments and failed automations. Unread sessions still appear in the Inbox.",
+  keywords: ["inbox", "badge", "unread", "count", "done", "notifications"],
+});
+
 export const TERMINAL_CLIPBOARD_ENTRY = settingsEntry({
   id: "terminal-clipboard",
   section: "general",
@@ -197,6 +206,7 @@ export const GENERAL_SETTINGS = [
   BACKGROUND_SESSION_TITLES_ENTRY,
   SESSION_TITLE_INSTRUCTIONS_ENTRY,
   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
+  INBOX_BADGE_UNREAD_ENTRY,
   TERMINAL_CLIPBOARD_ENTRY,
   OPEN_LINKS_IN_APP_ENTRY,
   ADMIN_VIEW_ENTRY,

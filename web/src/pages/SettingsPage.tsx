@@ -109,6 +109,7 @@ import {
   ADMIN_VIEW_ENTRY,
   ALWAYS_STEER_ENTRY,
   BACKGROUND_SESSION_TITLES_ENTRY,
+  INBOX_BADGE_UNREAD_ENTRY,
   OPEN_LINKS_IN_APP_ENTRY,
   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
   PROJECT_KANBAN_BOARD_ENTRY,
@@ -333,6 +334,7 @@ import {
   readOpenSubagentsInPanel,
   writeOpenSubagentsInPanel,
 } from "@/lib/subagentPanelPreferences";
+import { useInboxBadgeCount, writeInboxBadgeCount } from "@/lib/inboxBadgePreferences";
 import {
   useProjectKanbanBoardPreference,
   writeProjectKanbanBoard,
@@ -2070,6 +2072,34 @@ function OpenSubagentsInPanelControl() {
   );
 }
 
+function InboxBadgeUnreadControl() {
+  // Follows saves from other tabs too, so the switch always shows what the badge uses.
+  const count = useInboxBadgeCount();
+
+  const toggle = useCallback((next: boolean) => {
+    if (!writeInboxBadgeCount(next ? "all" : "attention")) {
+      toast.error("Couldn't save this setting. Check that your browser allows site storage.");
+    }
+  }, []);
+
+  return (
+    <SettingsItem
+      entry={INBOX_BADGE_UNREAD_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={INBOX_BADGE_UNREAD_ENTRY} className="flex-1" />
+      <Switch
+        {...settingsControlProps(INBOX_BADGE_UNREAD_ENTRY)}
+        checked={count === "all"}
+        onCheckedChange={toggle}
+        data-testid="inbox-badge-unread-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.inbox_badge_unread"
+      />
+    </SettingsItem>
+  );
+}
+
 function TerminalClipboardControl() {
   const canRemember = canRememberTerminalClipboardPreference();
   const [preference, setPreference] = useState<TerminalClipboardPreference>(
@@ -2202,6 +2232,9 @@ function GeneralSection() {
           )}
           <div className="mt-4 border-t border-border pt-4">
             <OpenSubagentsInPanelControl />
+          </div>
+          <div className="mt-4 border-t border-border pt-4">
+            <InboxBadgeUnreadControl />
           </div>
         </SettingsGroup>
         <SettingsGroup title="Terminal" testId="settings-group-terminal">

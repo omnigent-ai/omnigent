@@ -246,6 +246,7 @@ import {
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { collectUnreadInboxItems } from "@/lib/inbox";
+import { useInboxBadgeCount } from "@/lib/inboxBadgePreferences";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -932,7 +933,9 @@ function SidebarImpl({
           (id !== activeConversationId || isExplicitlyUnread(id)),
       ).length,
   );
-  const inboxCount = sidebarData.inboxCount + unreadInboxCount;
+  // Settings › General can keep unread sessions out of the badge (they stay in the Inbox).
+  const inboxBadgeCount = useInboxBadgeCount();
+  const inboxCount = sidebarData.inboxCount + (inboxBadgeCount === "all" ? unreadInboxCount : 0);
   const inboxCountIncomplete = sidebarData.inboxCountIncomplete;
   const inboxCountCapped = sidebarData.inboxCountCapped;
 
