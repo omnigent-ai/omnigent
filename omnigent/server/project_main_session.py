@@ -231,14 +231,34 @@ async def create_initial_main_session(
         return project
     if create_session is None:
         return project
+    payload = await project_session_payload(
+        request,
+        project,
+        {
+            "project_id": project.id,
+            "title": "Orchestrator",
+            "agent_id": project.config.get("agent_id"),
+            "project_main_session": True,
+            "expected_main_session_id": None,
+        },
+    )
+    await create_session(request, project.user_id, payload, None)
+    updated = await asyncio.to_thread(projects.get, project.id, user_id=project.user_id)
+    if updated is None:
+        raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+    return updated
+
+
+async def project_session_payload(
+    request: Request, project: Project, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Apply the project's saved session defaults and host placement to *payload*.
+
+    Explicit *payload* keys win over the project's config, so a caller (for
+    example an identity's own model) can override a project default.
+    """
+    payload = dict(payload)
     config = project.config
-    payload: dict[str, Any] = {
-        "project_id": project.id,
-        "title": "Orchestrator",
-        "agent_id": config.get("agent_id"),
-        "project_main_session": True,
-        "expected_main_session_id": None,
-    }
     for source, target in (
         ("harness", "harness_override"),
         ("model", "model_override"),
@@ -252,7 +272,7 @@ async def create_initial_main_session(
         ("permission_mode", "permission_mode"),
         ("terminal_launch_args", "terminal_launch_args"),
     ):
-        if source in config:
+        if source in config and payload.get(target) is None:
             payload[target] = config[source]
     host_id = config.get("host_id")
     registry = getattr(request.app.state, "host_registry", None)
@@ -290,8 +310,4 @@ async def create_initial_main_session(
                     "Project host home is unavailable", code=ErrorCode.INVALID_INPUT
                 )
             payload["workspace"] = home.get("canonical_path")
-    await create_session(request, project.user_id, payload, None)
-    updated = await asyncio.to_thread(projects.get, project.id, user_id=project.user_id)
-    if updated is None:
-        raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-    return updated
+    return payload

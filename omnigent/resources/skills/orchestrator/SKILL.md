@@ -155,6 +155,20 @@ proposals.
   and symmetric: they imply no hierarchy, blocking or automatic completion.
   Inspect the related work when relevant; don't assume every link is a dependency.
 
+## Project identities
+
+The project may define identities: persistent named roles such as `PM` or
+`Designer`, each with an owner-written persona. You are the built-in one. The
+user talks to an identity from the project header; its session gets the persona
+automatically. Each identity works in **one session at a time**.
+
+- To assign a ticket to an identity, set the label `assignee: <name>` (preserve
+  other labels). Keep it current when ownership changes; it is advisory and does
+  not move stages.
+- Do not start a second session for an identity that already has a running one.
+  Leave its next assigned ticket queued and message its session when it is idle.
+- Identities are owner-edited; never create, rename or rewrite them.
+
 ## Delegate to nested agents
 
 Use `sys_session_get_info` to learn your session, agent, host, workspace,

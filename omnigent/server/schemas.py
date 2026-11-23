@@ -2710,6 +2710,9 @@ class SessionResponse(BaseModel):
     project_orchestrator: bool = False
     # The project's mandate, only when requested with ``include_project_mandate``.
     project_mandate: str | None = None
+    # The identity this session works for, when it is that identity's active
+    # session: ``{"id", "name"}``, plus ``instructions`` for runner requests.
+    project_identity: dict[str, str] | None = None
 
 
 class UpdateSessionRequest(BaseModel):
@@ -6593,3 +6596,34 @@ class UpdateProjectRequest(BaseModel):
         if len(trimmed) > 100:
             raise ValueError("name must be at most 100 characters")
         return trimmed
+
+
+class ProjectIdentityRequest(BaseModel):
+    """Create or edit a project identity (a named persistent role).
+
+    :param name: Display name, unique within the project, e.g. ``"PM"``.
+    :param instructions: Persona appended to the identity's sessions.
+    :param agent_id: Default agent for its sessions; empty clears it.
+    :param model: Default model override; empty clears it.
+    :param effort: Default reasoning effort; empty clears it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    instructions: str | None = None
+    agent_id: str | None = None
+    model: str | None = None
+    effort: str | None = None
+
+
+class ProjectIdentitySessionRequest(BaseModel):
+    """Open an identity's session, starting one when it has none.
+
+    :param expected_session_id: The active session the caller saw, so two
+        clicks cannot each start a session (single-tracked).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_session_id: str | None = None

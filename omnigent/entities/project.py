@@ -75,3 +75,43 @@ PROJECT_MANDATE_MAX_BYTES = 12_000
 # Most UTF-8 bytes in one proposed addition, and how many may wait for review.
 MANDATE_PROPOSAL_MAX_BYTES = 2_000
 MANDATE_PROPOSALS_MAX_PENDING = 5
+
+
+# Most UTF-8 bytes an identity's persona may hold; added to its sessions' instructions.
+PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES = 8_000
+# Most identities one project may define, besides its built-in Orchestrator.
+PROJECT_IDENTITY_MAX_COUNT = 20
+# Server-owned label naming the identity a session was started for.
+PROJECT_IDENTITY_LABEL_KEY = "omnigent.project_identity_id"
+
+
+@dataclass
+class ProjectIdentity:
+    """
+    A named, persistent role in a project, such as a PM or designer.
+
+    Sessions come and go; the identity keeps its persona and points at the one
+    session currently working for it (single-tracked).
+
+    :param id: UUID primary key (bare 32-char hex string).
+    :param project_id: The owning project.
+    :param name: Display name, unique within the project, e.g. ``"PM"``.
+    :param instructions: Persona text appended to its sessions' instructions.
+    :param agent_id: Default agent for new sessions, or ``None`` for the project's.
+    :param model: Default model override, or ``None``.
+    :param effort: Default reasoning effort, or ``None``.
+    :param active_session_id: The identity's current session, or ``None``.
+    :param created_at: Unix epoch seconds at creation.
+    :param updated_at: Unix epoch seconds of the last write, or ``None``.
+    """
+
+    id: str
+    project_id: str
+    name: str
+    instructions: str = ""
+    agent_id: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    active_session_id: str | None = None
+    created_at: int = 0
+    updated_at: int | None = None

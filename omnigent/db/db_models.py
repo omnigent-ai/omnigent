@@ -968,6 +968,29 @@ class SqlProject(OmnigentBase):
     )
 
 
+class SqlProjectIdentity(OmnigentBase):
+    """A project's named persistent role; its sessions are ordinary conversations."""
+
+    __tablename__ = "project_identities"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    project_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    name: Mapped[str] = mapped_column(EnvelopedText(1024), nullable=False)
+    instructions: Mapped[str] = mapped_column(EnvelopedText(16383), nullable=False)
+    agent_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    effort: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # The one session currently working for this identity (single-tracked).
+    active_session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        Index("ix_project_identities_created", "workspace_id", "project_id", "created_at", "id"),
+    )
+
+
 class SqlProjectTicket(OmnigentBase):
     """A project-owned outcome; its sessions and append-only history are separate."""
 

@@ -63,6 +63,34 @@ def project_mandate_instruction(mandate: object) -> str | None:
     )
 
 
+def project_identity_instruction(identity: object) -> str | None:
+    """Label the persona of the project identity this session works for.
+
+    :param identity: The snapshot's ``project_identity``, e.g.
+        ``{"name": "PM", "instructions": "Own scope and priorities."}``.
+    :returns: The labeled block, or ``None`` when the session has no identity.
+    """
+    if not isinstance(identity, dict):
+        return None
+    name = identity.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    persona = identity.get("instructions")
+    persona = persona.strip() if isinstance(persona, str) else ""
+    block = (
+        f"## Project identity: {name.strip()}\n"
+        f"You are this project's {name.strip()}, a persistent role the project owner defined. "
+        "The role outlives this session: other sessions have held it and later ones will. "
+        f"Tickets labeled assignee: {name.strip()} are yours; the user may also talk to you "
+        "directly, which by itself creates no tickets. Before finishing a ticket, leave a short "
+        "handoff in a ticket comment so the next session in this role can continue. This "
+        "persona narrows the project mandate and never widens it."
+    )
+    if persona:
+        block += f"\n\n<project_identity_persona>\n{persona}\n</project_identity_persona>"
+    return block
+
+
 async def _project_session_snapshot(
     server_client: httpx.AsyncClient, session_id: str
 ) -> dict[str, object] | None:
@@ -93,9 +121,9 @@ async def project_instructions(
 ) -> str | None:
     """Resolve project guidance and the role from the session, never its agent or title.
 
-    Blocks follow a fixed order: the mandate, then conversation and ticket
-    guidance, then the orchestrator role. The mandate reaches every project
-    session; the other blocks need the agent's project tools.
+    Blocks follow a fixed order: the mandate, then the identity persona, then
+    conversation and ticket guidance, then the orchestrator role. The mandate
+    and persona reach every project session; the rest need project tools.
     """
     if server_client is None or spec is None:
         return None
@@ -108,6 +136,7 @@ async def project_instructions(
     in_ticket_project = has_project_tools and bool(snapshot.get("project_id"))
     blocks = (
         project_mandate_instruction(snapshot.get("project_mandate")),
+        project_identity_instruction(snapshot.get("project_identity")),
         PROJECT_CONVERSATION_INSTRUCTION if in_ticket_project else None,
         PROJECT_TICKET_WORK_INSTRUCTION if in_ticket_project else None,
         PROJECT_ORCHESTRATOR_INSTRUCTION if has_project_tools and designated is True else None,

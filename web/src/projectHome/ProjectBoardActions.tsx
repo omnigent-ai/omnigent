@@ -3,6 +3,7 @@ import { MessageSquareIcon, PlusIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Link, useSearchParams } from "@/lib/routing";
+import { ProjectIdentityRoster } from "./ProjectIdentityRoster";
 import { ProjectTicketSources } from "./ProjectTicketSources";
 import { projectOrchestratorPath, ticketPanelSearch } from "./projectHomeNavigation";
 import { useTicketProject } from "./useProjectTickets";
@@ -25,6 +26,9 @@ export function ProjectBoardActions({
           {!isMobile && "Orchestrator"}
         </Link>
       </Button>
+      {!projects.isLoading && !projects.isError && (
+        <ProjectIdentityRoster projectId={projectId} projectName={projectName} />
+      )}
       {!projects.isLoading && !projects.isError && (
         <ProjectTicketSources projectId={projectId} projectName={projectName} />
       )}

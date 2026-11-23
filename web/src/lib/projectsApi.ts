@@ -214,6 +214,104 @@ export async function dismissMandateProposal(
   return (await res.json()) as Project;
 }
 
+/** Lifecycle of an identity's active session; `busy` means a turn is in flight. */
+export type ProjectIdentitySessionState =
+  "absent" | "missing" | "archived" | "idle" | "busy" | "active" | "unavailable";
+
+/**
+ * A named persistent role in a project, such as a PM. The built-in
+ * Orchestrator is listed first with `builtin: true` and cannot be edited here.
+ */
+export interface ProjectIdentity {
+  id: string;
+  project_id: string;
+  name: string;
+  builtin: boolean;
+  instructions: string;
+  agent_id: string | null;
+  model: string | null;
+  effort: string | null;
+  active_session_id: string | null;
+  active_session_state: ProjectIdentitySessionState;
+}
+
+/** Fields an owner edits; an empty string clears `agent_id`, `model` or `effort`. */
+export interface ProjectIdentityInput {
+  name?: string;
+  instructions?: string;
+  agent_id?: string;
+  model?: string;
+  effort?: string;
+}
+
+/** Most UTF-8 bytes a persona may hold; mirrors the server bound. */
+export const PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES = 8_000;
+
+function identitiesPath(projectId: string, identityId?: string): string {
+  const base = `/v1/projects/${encodeURIComponent(projectId)}/identities`;
+  return identityId ? `${base}/${encodeURIComponent(identityId)}` : base;
+}
+
+/** List the project's identities, the built-in Orchestrator first. */
+export async function listProjectIdentities(projectId: string): Promise<ProjectIdentity[]> {
+  const res = await authenticatedFetch(identitiesPath(projectId));
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return ((await res.json()) as { data: ProjectIdentity[] }).data;
+}
+
+export async function createProjectIdentity(
+  projectId: string,
+  input: ProjectIdentityInput,
+): Promise<ProjectIdentity> {
+  const res = await authenticatedFetch(identitiesPath(projectId), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as ProjectIdentity;
+}
+
+export async function updateProjectIdentity(
+  projectId: string,
+  identityId: string,
+  input: ProjectIdentityInput,
+): Promise<ProjectIdentity> {
+  const res = await authenticatedFetch(identitiesPath(projectId, identityId), {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as ProjectIdentity;
+}
+
+export async function deleteProjectIdentity(projectId: string, identityId: string): Promise<void> {
+  const res = await authenticatedFetch(identitiesPath(projectId, identityId), {
+    method: "DELETE",
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+}
+
+/**
+ * Open an identity's session: its live one, or a new one when it has none.
+ * `expectedSessionId` is the session the caller saw, so double clicks never
+ * start two sessions for one identity.
+ */
+export async function openProjectIdentitySession(
+  projectId: string,
+  identityId: string,
+  expectedSessionId: string | null,
+): Promise<{ session_id: string; created: boolean }> {
+  const res = await authenticatedFetch(`${identitiesPath(projectId, identityId)}/session`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ expected_session_id: expectedSessionId }),
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as { session_id: string; created: boolean };
+}
+
 /**
  * Delete a project. Only the container is removed; member sessions are kept
  * (never cascade-deleted). Their `project_id` is left dangling server-side, but

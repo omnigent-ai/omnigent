@@ -57,6 +57,7 @@ from omnigent.entities import (
 from omnigent.entities.conversation import MessageData
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.permission import SessionPermission
+from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY
 from omnigent.errors import (
     ErrorCategory,
     ErrorCode,
@@ -2759,6 +2760,16 @@ def register_core_routes(
             snapshot.project_orchestrator = snapshot.project_main_session
             if include_project_mandate and project is not None:
                 snapshot.project_mandate = project.mandate
+            identity_id = (conv.labels or {}).get(PROJECT_IDENTITY_LABEL_KEY)
+            if project is not None and identity_id and not conv.archived:
+                identity = await asyncio.to_thread(
+                    project_store.get_identity, project.id, identity_id, user_id=project.user_id
+                )
+                if identity is not None and identity.active_session_id == conv.id:
+                    snapshot.project_identity = {"id": identity.id, "name": identity.name}
+                    if include_project_mandate:
+                        # Runners compose the persona with the mandate.
+                        snapshot.project_identity["instructions"] = identity.instructions
         return snapshot
 
     @router.get(

@@ -1,4 +1,5 @@
 import { useId } from "react";
+import { UserRoundIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { NeedsResponseBadge } from "@/components/NeedsResponseBadge";
@@ -14,10 +15,12 @@ export function TicketLabels({
   labels: TicketLabel[];
   compact?: boolean;
 }) {
+  const leading = (key: string) => key === "needs-human" || key === ASSIGNEE_LABEL_KEY;
   const ordered = compact
     ? [
         ...labels.filter((label) => label.key === "needs-human"),
-        ...labels.filter((label) => label.key !== "needs-human"),
+        ...labels.filter((label) => label.key === ASSIGNEE_LABEL_KEY),
+        ...labels.filter((label) => !leading(label.key)),
       ]
     : labels;
   const visible = compact ? ordered.slice(0, 2) : ordered;
@@ -27,6 +30,8 @@ export function TicketLabels({
       {visible.map((label) =>
         label.key === "needs-human" ? (
           <NeedsResponseBadge key={label.key} title={label.value || undefined} />
+        ) : label.key === ASSIGNEE_LABEL_KEY && label.value ? (
+          <AssigneeBadge key={label.key} name={label.value} />
         ) : (
           <TicketLabelBadge key={label.key} label={label} compact={compact} />
         ),
@@ -40,6 +45,25 @@ export function TicketLabels({
         </span>
       )}
     </div>
+  );
+}
+
+/** Ticket label naming the project identity that owns the ticket, e.g. `assignee: PM`. */
+export const ASSIGNEE_LABEL_KEY = "assignee";
+
+/** The owning identity, shown as a person chip rather than a plain label. */
+function AssigneeBadge({ name }: { name: string }) {
+  return (
+    <Badge
+      variant="outline"
+      title={`Assigned to ${name}`}
+      aria-label={`Assigned to ${name}`}
+      data-testid="ticket-assignee"
+      className="h-5 min-w-0 max-w-36 shrink gap-1 rounded-full border-primary/40 bg-primary/10 px-1.5 py-0 text-xs font-medium text-primary"
+    >
+      <UserRoundIcon className="size-3 shrink-0" />
+      <span className="truncate">{name}</span>
+    </Badge>
   );
 }
 

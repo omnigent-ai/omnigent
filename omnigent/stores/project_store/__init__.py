@@ -18,7 +18,7 @@ from collections.abc import Callable
 from typing import Any, Literal, TypedDict, TypeVar
 
 from omnigent.entities import Project
-from omnigent.entities.project import MandateProposal
+from omnigent.entities.project import MandateProposal, ProjectIdentity
 
 
 class ProjectOrderPreference(TypedDict):
@@ -195,6 +195,74 @@ class ProjectStore(ABC):
         :returns: The updated project, or ``None`` if not found / not owned.
         :raises OmnigentError: ``NOT_FOUND`` for an unknown proposal,
             ``INVALID_INPUT`` when accepting would exceed the mandate limit.
+        """
+        raise NotImplementedError
+
+    # -- Identities: named persistent roles, each with one active session --
+
+    def list_identities(
+        self, project_id: str, *, user_id: str | None
+    ) -> builtins.list[ProjectIdentity]:
+        """List an owned project's identities, oldest first; empty if not owned."""
+        raise NotImplementedError
+
+    def get_identity(
+        self, project_id: str, identity_id: str, *, user_id: str | None
+    ) -> ProjectIdentity | None:
+        """Return one identity of an owned project, or ``None``."""
+        raise NotImplementedError
+
+    def create_identity(
+        self,
+        project_id: str,
+        identity_id: str,
+        *,
+        user_id: str | None,
+        name: str,
+        instructions: str = "",
+        agent_id: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> ProjectIdentity:
+        """Insert an identity; names are unique within the project.
+
+        :raises OmnigentError: ``NOT_FOUND`` for an unowned project,
+            ``ALREADY_EXISTS`` for a duplicate name, ``INVALID_INPUT`` for bounds.
+        """
+        raise NotImplementedError
+
+    def update_identity(
+        self,
+        project_id: str,
+        identity_id: str,
+        *,
+        user_id: str | None,
+        name: str | None = None,
+        instructions: str | None = None,
+        agent_id: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+        clear: frozenset[str] = frozenset(),
+    ) -> ProjectIdentity | None:
+        """Update fields; ``None`` leaves one unchanged and *clear* names fields to null."""
+        raise NotImplementedError
+
+    def delete_identity(self, project_id: str, identity_id: str, *, user_id: str | None) -> bool:
+        """Delete an identity; its sessions remain ordinary project conversations."""
+        raise NotImplementedError
+
+    def set_identity_session(
+        self,
+        project_id: str,
+        identity_id: str,
+        session_id: str,
+        *,
+        user_id: str | None,
+        expected_session_id: str | None,
+    ) -> ProjectIdentity:
+        """Compare-and-set the identity's active session; a repeat is idempotent.
+
+        :raises OmnigentError: ``NOT_FOUND`` or ``CONFLICT`` when the pointer moved.
         """
         raise NotImplementedError
 

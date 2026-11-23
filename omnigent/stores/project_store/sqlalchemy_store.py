@@ -14,7 +14,13 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.compression import decode, encode
-from omnigent.db.db_models import SqlPreference, SqlProject, SqlProjectTicket, current_workspace_id
+from omnigent.db.db_models import (
+    SqlPreference,
+    SqlProject,
+    SqlProjectIdentity,
+    SqlProjectTicket,
+    current_workspace_id,
+)
 from omnigent.db.preference_rows import upsert_preference_row
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -26,8 +32,11 @@ from omnigent.entities import Project
 from omnigent.entities.project import (
     MANDATE_PROPOSAL_MAX_BYTES,
     MANDATE_PROPOSALS_MAX_PENDING,
+    PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES,
+    PROJECT_IDENTITY_MAX_COUNT,
     PROJECT_MANDATE_MAX_BYTES,
     MandateProposal,
+    ProjectIdentity,
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
@@ -135,6 +144,52 @@ def _encode_proposals(proposals: list[MandateProposal]) -> list[dict[str, Any]] 
         }
         for proposal in proposals
     ] or None
+
+
+_IDENTITY_NAME_MAX_CHARS = 60
+
+
+def _normalize_identity_name(name: str) -> str:
+    """Trim an identity name; it must be non-empty and short enough for the roster."""
+    trimmed = " ".join(name.split())
+    if not trimmed or len(trimmed) > _IDENTITY_NAME_MAX_CHARS:
+        raise OmnigentError(
+            f"identity name must be 1-{_IDENTITY_NAME_MAX_CHARS} characters",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if trimmed.casefold() == "orchestrator":
+        raise OmnigentError(
+            "Orchestrator is the project's built-in identity", code=ErrorCode.INVALID_INPUT
+        )
+    return trimmed
+
+
+def _normalize_identity_instructions(instructions: str) -> str:
+    """Trim persona text and bound its UTF-8 size."""
+    trimmed = instructions.strip()
+    size = len(trimmed.encode("utf-8"))
+    if size > PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES:
+        raise OmnigentError(
+            f"identity instructions too large ({size} bytes; "
+            f"max {PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES})",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return trimmed
+
+
+def _identity_entity(row: SqlProjectIdentity) -> ProjectIdentity:
+    return ProjectIdentity(
+        id=row.id,
+        project_id=row.project_id,
+        name=row.name,
+        instructions=row.instructions,
+        agent_id=row.agent_id,
+        model=row.model,
+        effort=row.effort,
+        active_session_id=row.active_session_id,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
 
 
 def _to_entity(row: SqlProject) -> Project:
@@ -444,6 +499,8 @@ class SqlAlchemyProjectStore(ProjectStore):
                     "Projects with tickets cannot be deleted; ticket history is retained.",
                     code=ErrorCode.CONFLICT,
                 )
+            for identity in self._identity_rows(session, project_id):
+                session.delete(identity)
             session.delete(row)
             return True
 
@@ -535,6 +592,211 @@ class SqlAlchemyProjectStore(ProjectStore):
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         return project
+
+    # -- Identities --
+
+    def _owned_project(self, session: Session, project_id: str, user_id: str | None) -> bool:
+        row = session.get(SqlProject, (current_workspace_id(), project_id))
+        return row is not None and row.user_id == user_id
+
+    def _identity_rows(
+        self, session: Session, project_id: str
+    ) -> builtins.list[SqlProjectIdentity]:
+        stmt = (
+            select(SqlProjectIdentity)
+            .where(
+                SqlProjectIdentity.workspace_id == current_workspace_id(),
+                SqlProjectIdentity.project_id == project_id,
+            )
+            .order_by(asc(SqlProjectIdentity.created_at), asc(SqlProjectIdentity.id))
+        )
+        return builtins.list(session.execute(stmt).scalars().all())
+
+    def list_identities(
+        self, project_id: str, *, user_id: str | None
+    ) -> builtins.list[ProjectIdentity]:
+        with self._session("list_project_identities") as session:
+            if not self._owned_project(session, project_id, user_id):
+                return []
+            return [_identity_entity(row) for row in self._identity_rows(session, project_id)]
+
+    def get_identity(
+        self, project_id: str, identity_id: str, *, user_id: str | None
+    ) -> ProjectIdentity | None:
+        with self._session("select_project_identity") as session:
+            if not self._owned_project(session, project_id, user_id):
+                return None
+            row = session.get(
+                SqlProjectIdentity, (current_workspace_id(), project_id, identity_id)
+            )
+            return _identity_entity(row) if row is not None else None
+
+    @staticmethod
+    def _require_unique_name(
+        rows: builtins.list[SqlProjectIdentity], name: str, exclude_id: str | None
+    ) -> None:
+        folded = name.casefold()
+        if any(row.id != exclude_id and row.name.casefold() == folded for row in rows):
+            raise OmnigentError(
+                f"An identity named {name!r} already exists", code=ErrorCode.ALREADY_EXISTS
+            )
+
+    def create_identity(
+        self,
+        project_id: str,
+        identity_id: str,
+        *,
+        user_id: str | None,
+        name: str,
+        instructions: str = "",
+        agent_id: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> ProjectIdentity:
+        stored_name = _normalize_identity_name(name)
+        stored_instructions = _normalize_identity_instructions(instructions)
+        created_at = now_epoch()
+
+        def write(session: Session) -> ProjectIdentity:
+            require_active_account(session, user_id)
+            project = session.get(
+                SqlProject, (current_workspace_id(), project_id), with_for_update=True
+            )
+            if project is None or project.user_id != user_id:
+                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+            existing = session.get(
+                SqlProjectIdentity, (current_workspace_id(), project_id, identity_id)
+            )
+            if existing is not None:
+                return _identity_entity(existing)
+            rows = self._identity_rows(session, project_id)
+            if len(rows) >= PROJECT_IDENTITY_MAX_COUNT:
+                raise OmnigentError(
+                    f"A project can define at most {PROJECT_IDENTITY_MAX_COUNT} identities",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            self._require_unique_name(rows, stored_name, None)
+            row = SqlProjectIdentity(
+                workspace_id=current_workspace_id(),
+                project_id=project_id,
+                id=identity_id,
+                name=stored_name,
+                instructions=stored_instructions,
+                agent_id=agent_id or None,
+                model=model or None,
+                effort=effort or None,
+                active_session_id=None,
+                created_at=created_at,
+                updated_at=None,
+            )
+            session.add(row)
+            session.flush()
+            return _identity_entity(row)
+
+        return run_write_transaction(self._session_immediate, "insert_project_identity", write)
+
+    def update_identity(
+        self,
+        project_id: str,
+        identity_id: str,
+        *,
+        user_id: str | None,
+        name: str | None = None,
+        instructions: str | None = None,
+        agent_id: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+        clear: frozenset[str] = frozenset(),
+    ) -> ProjectIdentity | None:
+        stored_name = _normalize_identity_name(name) if name is not None else None
+        stored_instructions = (
+            _normalize_identity_instructions(instructions) if instructions is not None else None
+        )
+        updated_at = now_epoch()
+
+        def write(session: Session) -> ProjectIdentity | None:
+            require_active_account(session, user_id)
+            project = session.get(
+                SqlProject, (current_workspace_id(), project_id), with_for_update=True
+            )
+            if project is None or project.user_id != user_id:
+                return None
+            row = session.get(
+                SqlProjectIdentity, (current_workspace_id(), project_id, identity_id)
+            )
+            if row is None:
+                return None
+            if stored_name is not None and stored_name != row.name:
+                self._require_unique_name(
+                    self._identity_rows(session, project_id), stored_name, identity_id
+                )
+                row.name = stored_name
+            if stored_instructions is not None:
+                row.instructions = stored_instructions
+            for field_name, value in (
+                ("agent_id", agent_id),
+                ("model", model),
+                ("effort", effort),
+            ):
+                if field_name in clear:
+                    setattr(row, field_name, None)
+                elif value is not None:
+                    setattr(row, field_name, value or None)
+            row.updated_at = updated_at
+            session.flush()
+            return _identity_entity(row)
+
+        return run_write_transaction(self._session_immediate, "update_project_identity", write)
+
+    def delete_identity(self, project_id: str, identity_id: str, *, user_id: str | None) -> bool:
+        def write(session: Session) -> bool:
+            require_active_account(session, user_id)
+            if not self._owned_project(session, project_id, user_id):
+                return False
+            row = session.get(
+                SqlProjectIdentity, (current_workspace_id(), project_id, identity_id)
+            )
+            if row is None:
+                return False
+            session.delete(row)
+            return True
+
+        return run_write_transaction(self._session_immediate, "delete_project_identity", write)
+
+    def set_identity_session(
+        self,
+        project_id: str,
+        identity_id: str,
+        session_id: str,
+        *,
+        user_id: str | None,
+        expected_session_id: str | None,
+    ) -> ProjectIdentity:
+        def write(session: Session) -> ProjectIdentity:
+            require_active_account(session, user_id)
+            if not self._owned_project(session, project_id, user_id):
+                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+            row = session.get(
+                SqlProjectIdentity,
+                (current_workspace_id(), project_id, identity_id),
+                with_for_update=True,
+            )
+            if row is None:
+                raise OmnigentError("Identity not found", code=ErrorCode.NOT_FOUND)
+            if row.active_session_id != session_id:
+                if row.active_session_id != expected_session_id:
+                    raise OmnigentError(
+                        "The identity's session changed; reload the project",
+                        code=ErrorCode.CONFLICT,
+                    )
+                row.active_session_id = session_id
+                row.updated_at = now_epoch()
+            session.flush()
+            return _identity_entity(row)
+
+        return run_write_transaction(
+            self._session_immediate, "set_project_identity_session", write
+        )
 
     def get_order(self, *, user_id: str | None) -> builtins.list[str] | None:
         """Return the active order used by project-list endpoints."""
