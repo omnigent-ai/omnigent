@@ -179,6 +179,7 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, signOutOfBrowserSession } from "@/lib/accountsApi";
 import {
   beginGithubConnect,
@@ -2704,9 +2705,11 @@ function StepperButton({
 }
 
 function ShortcutsSection() {
+  // The search field comes with ⌘K's QuickPick; without it the page lists as it did.
+  const quickPick = isFeatureEnabled(useServerInfo(), "quick_pick_palette");
   return (
     <Section title="Keyboard shortcuts" description="Speed up common actions with the keyboard.">
-      <SearchableShortcutsList />
+      {quickPick ? <SearchableShortcutsList /> : <KeyboardShortcutsList variant="settings" />}
     </Section>
   );
 }

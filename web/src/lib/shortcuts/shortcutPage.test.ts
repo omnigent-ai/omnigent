@@ -146,6 +146,24 @@ describe("shortcutPageGroups", () => {
     expect(labelsIn(BROWSER_TAB, "In chats").slice(0, 1)).toEqual(["Send message"]);
   });
 
+  it("ties the session number and workspace tab rows to a shortcut only with quickPick", () => {
+    const shortcutIds = (context: ShortcutPageContext) =>
+      shortcutPageGroups(context)
+        .flatMap((group) => group.items)
+        .filter((item) =>
+          [
+            shortcutBinding("session.number").label,
+            shortcutBinding("workspace.tab").label,
+          ].includes(item.label),
+        )
+        .map((item) => item.shortcutId);
+    expect(shortcutIds(BROWSER_TAB)).toEqual([undefined, undefined]);
+    expect(shortcutIds({ ...BROWSER_TAB, quickPick: true })).toEqual([
+      "session.number",
+      "workspace.tab",
+    ]);
+  });
+
   it("widens the workspace tab digits when content search adds a tab", () => {
     const tabRow = (context: ShortcutPageContext) =>
       shortcutPageGroups(context)

@@ -73,6 +73,7 @@ const mocks = vi.hoisted(() => ({
   sessionTitleInstructions: false,
   projectKanban: false,
   floatingComposer: false,
+  quickPickPalette: false,
   nestedAgents: false,
   advisorAvailable: false,
   authenticatedFetch: vi.fn(),
@@ -117,6 +118,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
           features: {
             project_kanban: mocks.projectKanban,
             floating_composer: mocks.floatingComposer,
+            quick_pick_palette: mocks.quickPickPalette,
           },
         },
 }));
@@ -361,6 +363,7 @@ beforeEach(() => {
   mocks.sessionTitleInstructions = false;
   mocks.projectKanban = false;
   mocks.floatingComposer = false;
+  mocks.quickPickPalette = false;
   mocks.nestedAgents = false;
   mocks.advisorAvailable = false;
   mocks.authenticatedFetch.mockReset();
@@ -391,6 +394,18 @@ afterEach(() => {
     if (property.startsWith("--custom-")) document.documentElement.style.removeProperty(property);
   }
   delete (window as unknown as Record<string, unknown>).omnigentDesktop;
+});
+
+describe("Keyboard shortcuts", () => {
+  it.each([false, true])("offers a search field only with quick_pick_palette (%s)", (quickPick) => {
+    mocks.quickPickPalette = quickPick;
+    renderPage("/settings/shortcuts");
+
+    expect(screen.getByRole("heading", { name: "Keyboard shortcuts" })).toBeTruthy();
+    expect(screen.queryAllByRole("searchbox", { name: "Search shortcuts" })).toHaveLength(
+      quickPick ? 1 : 0,
+    );
+  });
 });
 
 describe("Import sessions", () => {

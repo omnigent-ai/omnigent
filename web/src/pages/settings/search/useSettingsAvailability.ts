@@ -48,6 +48,7 @@ export function useSettingsAvailability(): SettingsAvailability {
   const projectKanban = isFeatureEnabled(info, "project_kanban");
   const sessionTitleInstructions = loaded?.session_title_instructions === true;
   const proactiveAgent = loaded?.proactive_agent_available === true;
+  const quickPickPalette = isFeatureEnabled(info, "quick_pick_palette");
   return useMemo(
     () => ({
       globalShortcut,
@@ -63,6 +64,7 @@ export function useSettingsAvailability(): SettingsAvailability {
       projectKanban,
       sessionTitleInstructions,
       proactiveAgent,
+      quickPickPalette,
     }),
     [
       globalShortcut,
@@ -79,6 +81,7 @@ export function useSettingsAvailability(): SettingsAvailability {
       projectKanban,
       sessionTitleInstructions,
       proactiveAgent,
+      quickPickPalette,
     ],
   );
 }

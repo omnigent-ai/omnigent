@@ -194,6 +194,8 @@ export interface SettingsAvailability {
   sessionTitleInstructions: boolean;
   /** The server offers the proactive agent. */
   proactiveAgent: boolean;
+  /** ⌘K is the QuickPick palette, whose Keyboard shortcuts page has a search field. */
+  quickPickPalette: boolean;
 }
 
 export interface SettingsEntry {
