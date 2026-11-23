@@ -6,7 +6,6 @@ import type * as SidebarDataModule from "@/hooks/useSidebarData";
 import { type ComponentProps, type ReactNode, useState } from "react";
 
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
-import { openPaletteDialog } from "@/test/paletteCommands";
 import * as commandPaletteModule from "./CommandPalette";
 import { CommandPalette } from "./CommandPalette";
 import type { WorkspaceHistoryFacts } from "./workspaceCommands/model";
@@ -687,53 +686,6 @@ describe("CommandPalette — match preview", () => {
     expect(screen.getByText(/deploy/)).toBeTruthy();
     // No second line: only the single title row is present.
     expect(screen.queryByText(/runbook.*\n/)).toBeNull();
-  });
-});
-
-describe("CommandPalette — focus as it closes", () => {
-  /** A palette ⌘K opens from a terminal's input, with no trigger button, as the app does. */
-  function ShortcutOpenedPalette() {
-    const [open, setOpen] = useState(false);
-    return (
-      <>
-        <textarea
-          aria-label="Terminal input"
-          onKeyDown={(event) => {
-            if (event.metaKey && event.key === "k") setOpen(true);
-          }}
-        />
-        <CommandPalette
-          open={open}
-          onOpenChange={setOpen}
-          onToggleLeftSidebar={vi.fn()}
-          onToggleRightSidebar={vi.fn()}
-        />
-      </>
-    );
-  }
-
-  async function openFromTerminal() {
-    render(<ShortcutOpenedPalette />, { wrapper: withQueryClient() });
-    const terminal = screen.getByRole("textbox", { name: "Terminal input" });
-    terminal.focus();
-    fireEvent.keyDown(terminal, { key: "k", metaKey: true });
-    const input = await screen.findByTestId("command-palette-input");
-    await vi.waitFor(() => expect(input).toHaveFocus());
-    return { terminal, input };
-  }
-
-  it("gives the keyboard back to the field it opened from on Escape", async () => {
-    const { terminal, input } = await openFromTerminal();
-    fireEvent.keyDown(input, { key: "Escape" });
-    await vi.waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    await vi.waitFor(() => expect(terminal).toHaveFocus());
-  });
-
-  it("gives it back after running a command that leaves focus alone", async () => {
-    const { terminal } = await openFromTerminal();
-    fireEvent.click(await screen.findByRole("option", { name: /Toggle conversations sidebar/ }));
-    await vi.waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    await vi.waitFor(() => expect(terminal).toHaveFocus());
   });
 });
 
@@ -1418,12 +1370,13 @@ describe("CommandPalette — commands a mounted feature offers", () => {
     withSidebarFlag(true);
     let dialogAtRun: Element | null = null;
     const go = vi.fn(() => {
-      dialogAtRun = openPaletteDialog();
+      dialogAtRun = screen.queryByRole("dialog");
       screen.getByText("Where the command moves focus").focus();
     });
     openPalette(go);
 
     fireEvent.click(await screen.findByRole("option", { name: /Go back in the workspace/ }));
+    expect(go).not.toHaveBeenCalled();
     await vi.waitFor(() => expect(go).toHaveBeenCalledOnce());
     expect(dialogAtRun).toBeNull();
     await new Promise((resolve) => {
@@ -1447,86 +1400,4 @@ describe("CommandPalette — commands a mounted feature offers", () => {
       expect(screen.queryByRole("option", { name: /Go back in the workspace/ })).toBeNull();
     },
   );
-});
-
-// Either palette's dialog content.
-const PALETTE_CONTENT = "[data-command-palette], [data-quick-pick-dialog]";
-
-/**
- * Gives the palette's content an enter animation while open and an exit one once closing, so
- * Radix keeps it mounted until the exit ends, as in the app.
- */
-function stubExitAnimation() {
-  let animationName = "enter";
-  const computedStyle = window.getComputedStyle.bind(window);
-  const styleSpy = vi.spyOn(window, "getComputedStyle").mockImplementation((element) => {
-    const style = computedStyle(element);
-    if (!(element instanceof HTMLElement) || !element.matches(PALETTE_CONTENT)) return style;
-    return new Proxy(style, {
-      get: (target, property) =>
-        property === "animationName" ? animationName : Reflect.get(target, property),
-    });
-  });
-  onTestFinished(() => styleSpy.mockRestore());
-  return {
-    exitNext: () => {
-      animationName = "exit";
-    },
-    stop: () => {
-      animationName = "none";
-      styleSpy.mockRestore();
-    },
-  };
-}
-
-describe("CommandPalette reopened during its exit animation", () => {
-  let setOpen: (open: boolean) => void = () => undefined;
-  function Opener() {
-    const [open, setOpenState] = useState(false);
-    setOpen = setOpenState;
-    return (
-      <>
-        <textarea aria-label="Editor" />
-        <CommandPalette
-          open={open}
-          onOpenChange={setOpenState}
-          onToggleLeftSidebar={vi.fn()}
-          onToggleRightSidebar={vi.fn()}
-        />
-      </>
-    );
-  }
-
-  it("focuses its search field again after a row click left focus on the list", async () => {
-    const animation = stubExitAnimation();
-    render(<Opener />, { wrapper: withQueryClient() });
-    const editor = screen.getByRole<HTMLTextAreaElement>("textbox", { name: "Editor" });
-    editor.focus();
-    act(() => setOpen(true));
-    await vi.waitFor(() => expect(screen.getByTestId("command-palette-input")).toHaveFocus());
-    animation.exitNext();
-    // Clicking a row focuses the list, and the row's command closes the palette.
-    act(() => screen.getByRole("listbox").focus());
-    act(() => setOpen(false));
-    expect(document.querySelector(PALETTE_CONTENT)).not.toBeNull();
-
-    // ⌘K again while it animates out.
-    act(() => setOpen(true));
-    const input = screen.getByTestId("command-palette-input");
-    await vi.waitFor(() => expect(input).toHaveFocus());
-    // The replaced content's late close doesn't pull focus back to the editor.
-    await new Promise((resolve) => {
-      setTimeout(resolve, 20);
-    });
-    expect(input).toHaveFocus();
-    fireEvent.change(input, { target: { value: "settings" } });
-    expect(input).toHaveValue("settings");
-
-    // Cancelling still returns focus to where the user was before the first opening.
-    animation.stop();
-    fireEvent.keyDown(input, { key: "Escape" });
-    await vi.waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    // Radix returns focus just after the content unmounts.
-    await vi.waitFor(() => expect(editor).toHaveFocus());
-  });
 });

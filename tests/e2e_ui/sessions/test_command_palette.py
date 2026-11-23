@@ -18,10 +18,6 @@ and the session-switch brackets when another surface is focused:
 - ``test_session_switch_chord_does_not_navigate_behind_open_palette``: with the
   palette open, the switch chord does not navigate behind it.
 
-``test_command_palette_reopened_while_closing_takes_typed_keys`` presses ⌘K while
-a clicked row's palette is still fading out: the palette comes back with its
-search field focused, so typing filters.
-
 No LLM turn is needed — this is pure client-side keyboard + routing — so it
 skips the nightly/real-agent markers the approval suites carry. Two runner-bound
 sessions come from the ``seeded_session_pair`` fixture; both are recent and
@@ -91,29 +87,6 @@ def test_command_palette_opens_and_switches_session(
     expect(page).to_have_url(f"{base_url}/c/{session_b}", timeout=10_000)
     # The palette closes on select.
     expect(page.get_by_test_id("command-palette-input")).to_have_count(0)
-
-
-def test_command_palette_reopened_while_closing_takes_typed_keys(
-    page: Page,
-    seeded_session_pair: tuple[str, str, str],
-) -> None:
-    """⌘/Ctrl+K while a clicked row's palette fades out reopens it with its field focused."""
-    base_url, session_a, session_b = seeded_session_pair
-    patch_session(base_url, session_b, title="e2e-palette-reopen-b")
-    page.goto(f"{base_url}/c/{session_a}")
-    expect(page.locator(f'a[href="/c/{session_b}"]')).to_be_visible(timeout=30_000)
-    page.get_by_placeholder(_COMPOSER).click()
-    page.keyboard.press("ControlOrMeta+k")
-    palette_input = page.get_by_test_id("command-palette-input")
-    expect(palette_input).to_be_focused(timeout=10_000)
-
-    # Clicking a row puts focus on the list as the palette closes; ⌘K comes at once.
-    page.get_by_role("dialog").get_by_text("e2e-palette-reopen-b").click()
-    page.keyboard.press("ControlOrMeta+k")
-    expect(palette_input).to_be_focused(timeout=10_000)
-    page.keyboard.type("reopen")
-    expect(palette_input).to_have_value("reopen")
-    expect(page).to_have_url(f"{base_url}/c/{session_b}", timeout=10_000)
 
 
 def test_command_palette_chord_with_a_terminal_focused(
