@@ -8133,6 +8133,11 @@
             "title": "Proactive Agent Available",
             "type": "boolean"
           },
+          "project_mute": {
+            "default": true,
+            "title": "Project Mute",
+            "type": "boolean"
+          },
           "public_sharing_enabled": {
             "title": "Public Sharing Enabled",
             "type": "boolean"
@@ -12059,6 +12064,12 @@
             ],
             "description": "First-class project id when one exists, or `None` for a label-only project not yet promoted to the `projects` table.",
             "title": "Id"
+          },
+          "muted": {
+            "default": false,
+            "description": "Whether the owner muted notifications for every session in the project, read from its `config`; `False` for a label-only folder.",
+            "title": "Muted",
+            "type": "boolean"
           },
           "name": {
             "description": "Project name (the folder's display name and union key).",
