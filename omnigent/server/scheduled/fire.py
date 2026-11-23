@@ -2941,6 +2941,10 @@ class _ClaimedRunRecorder:
         set_current_session_id(conversation_id)
         await self._lease.attach_session(conversation_id)
 
+    async def hand_back_timer_firing(self, host_id: str) -> None:
+        """Return a timer's firing unsent, for the replica that owns *host_id* to claim."""
+        await self._lease.hand_back_timer_firing(host_id)
+
     async def finish(
         self,
         status: str,
@@ -3236,9 +3240,11 @@ async def _fire_timer(
     """Wake a timer's session with its hidden firing message.
 
     A session that was deleted, archived or closed, or that the timer's owner can no
-    longer send to, stops the timer instead: it is never woken or recreated. The
-    session's input policies check the wake as they would a message. A cancel stops
-    later firings; one already on its way may still arrive.
+    longer send to, stops the timer instead: it is never woken or recreated. A session
+    that moved to another host gets the firing back unsent, for the replica that owns
+    that host to claim at its next poll. The session's input policies check the wake as
+    they would a message. A cancel stops later firings; one already on its way may still
+    arrive.
     """
     session_id = task.session_id
     assert session_id is not None  # a timer always names its session
@@ -3251,6 +3257,12 @@ async def _fire_timer(
         await asyncio.to_thread(deps.scheduled_task_store.delete, task.id)
         return
     assert conv is not None
+    # Firings are claimed by the replica that owns the timer's saved host, which may no
+    # longer serve the session; a session without a host keeps the saved one.
+    if conv.host_id is not None and conv.host_id != task.host_id:
+        _logger.info("scheduled fire: timer %s follows its session to %s", task.id, conv.host_id)
+        await recorder.hand_back_timer_firing(conv.host_id)
+        return
     try:
         await dispatch(conv, task)
     except TimerWakeRefused as refused:

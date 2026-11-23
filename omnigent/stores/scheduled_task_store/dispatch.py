@@ -153,3 +153,20 @@ class ScheduledTaskDispatchStore(Protocol):
         claim. Startup and recovery may still record progress for that run.
         """
         ...
+
+    def hand_back_timer_firing(
+        self, run: ScheduledTaskRun, *, now: Callable[[], float], host_id: str
+    ) -> ScheduledTaskRun | None:
+        """Return a claimed timer firing unsent, for the replica that owns *host_id* to claim.
+
+        Under the task lock and the run's live startup lease, the timer takes *host_id* and
+        is due again a second later, so the next claim gets its own trigger key. A one-shot
+        that its claim completed is active again. The run records ``skipped``
+        (``timer_host_moved``), or ``timer_cancelled`` when the timer was deleted first.
+
+        :param run: The claimed firing, e.g. a ``StartupLease``'s run.
+        :param now: The clock the commit reads, e.g. ``time.time``.
+        :param host_id: The host the timer's session moved to, e.g. ``"host_2"``.
+        :returns: The finished run, or ``None`` when the run's lease no longer matches.
+        """
+        ...
