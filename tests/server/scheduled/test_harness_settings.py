@@ -67,6 +67,17 @@ async def test_sdk_agent_whose_spec_bypasses_approval_cannot_be_saved() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_continued_task_without_a_mode_wakes_the_session_in_its_own() -> None:
+    """Continuing a session inherits nothing from the spec: the session keeps its mode."""
+    await validate_scheduled_permission_support(
+        permission_mode=None,
+        agent=_AGENT,
+        agent_cache=_AgentCache("claude-sdk", "bypassPermissions"),
+        continues_session=True,
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("harness", "mode"),
     [("claude-native", "bypassPermissions"), ("codex-native", "full-access")],

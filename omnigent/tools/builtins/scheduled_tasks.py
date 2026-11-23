@@ -578,8 +578,8 @@ class SysReminderSetTool(Tool):
             "reminders; sys_scheduled_task_list does. Cancel one with "
             "sys_scheduled_task_delete and the returned "
             "scheduled_task_id. Works in top-level sessions you own on a "
-            "connected host, not in sub-agent sessions, side chats, managed sandboxes, or "
-            "sessions running in a permission mode that skips approval. For "
+            "connected host, not in sub-agent sessions, side chats or managed sandboxes, "
+            "and wakes the session in whatever permission mode it is in then. For "
             "a shorter wait inside an active turn, use sys_timer_set (when enabled)."
         )
 
