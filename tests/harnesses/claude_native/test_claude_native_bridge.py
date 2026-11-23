@@ -14067,8 +14067,13 @@ def test_model_command_requires_exact_fresh_status_for_a_descriptorless_current_
             "opus",
             "opus (system.ai.claude-opus-4-8)",
         ),
+        (
+            "system.ai.claude-opus-4-8[1M]",
+            "opus",
+            "opus (system.ai.claude-opus-4-8)",
+        ),
     ],
-    ids=["bare-private", "wrapped-public"],
+    ids=["bare-private", "wrapped-public", "wrapped-public-uppercase"],
 )
 @pytest.mark.parametrize("initial_model", ["marked", "plain", "different"])
 @pytest.mark.parametrize("selection_applied", [False, True])
@@ -14083,8 +14088,9 @@ def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
 ) -> None:
     composer = _SessionModelComposer()
     composer.options[-1] = model
+    bare_model = model.removesuffix("[1m]").removesuffix("[1M]")
     if initial_model != "different":
-        composer.model = model if initial_model == "marked" else model.removesuffix("[1m]")
+        composer.model = model if initial_model == "marked" else bare_model
     bridge_dir = _session_model_bridge(tmp_path, composer)
     claude_native_bridge.record_model_vocabulary(
         bridge_dir,
@@ -14105,7 +14111,7 @@ def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
 
     def capture(socket_path: str, target: str) -> str:
         pane = composer._capture_pane(socket_path, target)
-        if composer.overlay == "status" and composer.model in {model, model.removesuffix("[1m]")}:
+        if composer.overlay == "status" and composer.model in {model, bare_model}:
             return pane.replace(f"Model: {composer.model}", f"Model: {reported}")
         return pane
 

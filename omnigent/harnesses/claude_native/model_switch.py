@@ -615,11 +615,11 @@ class SessionOnlyModelSwitch:
     def status_matches(self, actual: str, *, exact_context: bool) -> bool:
         from omnigent.models.claude_model_vocabulary import CLAUDE_MODEL_ALIASES
 
-        expected = {self.choice.model}
+        expected = {claude_picker_model_key(self.choice.model)}
         canonical = public_claude_model_id(self.choice.model)
         if canonical:
             expected.add(canonical)
-        actual_ids = {actual}
+        actual_ids = {claude_picker_model_key(actual)}
         if (
             canonical
             and self.choice.structured
@@ -629,7 +629,7 @@ class SessionOnlyModelSwitch:
                 rf"{re.escape(self.choice.value)} \(([^()\r\n]+)\)", actual, re.IGNORECASE
             )
             if wrapped and public_claude_model_id(wrapped[1]):
-                actual_ids.add(wrapped[1])
+                actual_ids.add(claude_picker_model_key(wrapped[1]))
         if actual_ids & expected:
             return True
         if not exact_context and any(
@@ -831,7 +831,7 @@ class SessionOnlyModelSwitch:
                 )
             self.clear_owned_draft(self.owned_draft)
         before_selection: str | None = None
-        if hinted_current or self.choice.model.endswith("[1m]"):
+        if hinted_current or claude_picker_model_key(self.choice.model).endswith("[1m]"):
             current = self.local_status()
             before_selection = current
             if hinted_current and self.status_matches(current, exact_context=True):
@@ -891,7 +891,7 @@ class SessionOnlyModelSwitch:
         self.finish_commit()
         current = self.local_status()
         ambiguous_context = (
-            self.choice.model.endswith("[1m]")
+            claude_picker_model_key(self.choice.model).endswith("[1m]")
             and not self.status_matches(current, exact_context=True)
             and (
                 before_selection is None
