@@ -859,6 +859,28 @@ describe("AppShell page loading", () => {
     expect(screen.getByTestId("sidebar")).toBeVisible();
     expect(screen.queryByText("app loading")).toBeNull();
   });
+
+  it("keeps the previous page while a navigation waits for the next page's code", async () => {
+    mockConversations([]);
+    const loadNextPage = vi.fn(() => new Promise<never>(() => {}));
+    const NextPage = lazy(loadNextPage);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      shellTree(
+        client,
+        "/current",
+        <>
+          <Route path="current" element={<Link to="/next">Next page</Link>} />
+          <Route path="next" element={<NextPage />} />
+        </>,
+      ),
+    );
+    fireEvent.click(await screen.findByRole("link", { name: "Next page" }));
+    await waitFor(() => expect(loadNextPage).toHaveBeenCalled());
+    expect(screen.getByRole("link", { name: "Next page" })).toBeVisible();
+    expect(screen.getByTestId("sidebar")).toBeVisible();
+    expect(screen.queryByRole("status", { name: "Loading" })).toBeNull();
+  });
 });
 
 describe("AppShell header", () => {
