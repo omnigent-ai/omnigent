@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import builtins
 import sys
 import types
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, cast
 
 import pytest
@@ -206,6 +208,51 @@ def test_injected_client_cannot_be_combined_with_auth_selectors() -> None:
             workspace_host="https://workspace.example.com",
             workspace_client=cast("WorkspaceClient", _RecordingWorkspaceClient()),
         )
+
+
+def test_missing_optional_sdk_has_actionable_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_import = builtins.__import__
+
+    def import_without_sdk(
+        name: str,
+        globals: Mapping[str, object] | None = None,
+        locals: Mapping[str, object] | None = None,
+        fromlist: Sequence[str] | None = (),
+        level: int = 0,
+    ) -> object:
+        if name == "databricks.sdk":
+            raise ImportError("No module named 'databricks.sdk'")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_sdk)
+
+    with pytest.raises(ImportError, match=r"pip install 'omnigent\[databricks\]'"):
+        DatabricksManagedMemoryClient("support-memory")
+
+
+def test_injected_client_does_not_require_optional_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_import = builtins.__import__
+
+    def import_without_sdk(
+        name: str,
+        globals: Mapping[str, object] | None = None,
+        locals: Mapping[str, object] | None = None,
+        fromlist: Sequence[str] | None = (),
+        level: int = 0,
+    ) -> object:
+        if name == "databricks.sdk":
+            raise AssertionError("injected clients must not import databricks-sdk")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_sdk)
+    workspace_client = _RecordingWorkspaceClient()
+
+    client = DatabricksManagedMemoryClient(
+        "support-memory",
+        workspace_client=cast("WorkspaceClient", workspace_client),
+    )
+
+    assert client.get_store() == {"ok": True}
 
 
 @pytest.mark.parametrize("store_id", ["", "   "])
