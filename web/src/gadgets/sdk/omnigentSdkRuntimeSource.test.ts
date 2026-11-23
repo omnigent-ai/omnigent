@@ -204,7 +204,7 @@ describe("omnigent SDK runtime", () => {
       });
       expect(client.capabilities).toEqual(["data.read", "data.write"]);
       expect(client.ui.colorScheme).toBe("dark");
-      expect(client.sessions.canCreate).toBe(false);
+      expect("create" in client.sessions).toBe(false);
       expect(Object.isFrozen(client.context)).toBe(true);
     });
 
@@ -247,9 +247,6 @@ describe("omnigent SDK runtime", () => {
       const sentBefore = hostPort.peer?.posted.length ?? 0;
 
       await expect(client.data.collection("cards").create({ title: "x" })).rejects.toMatchObject({
-        code: "UNSUPPORTED",
-      });
-      await expect(client.sessions.create({ prompt: "hi" })).rejects.toMatchObject({
         code: "UNSUPPORTED",
       });
       expect(requestsOn(hostPort, sentBefore)).toEqual([]);

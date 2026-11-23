@@ -132,13 +132,7 @@ export interface OmnigentClientContext {
 export interface OmnigentSessions {
   /** False until the host grants `sessions.read` for this revision; calls then fail with `UNSUPPORTED`. */
   readonly canList: boolean;
-  /** False until the host grants `sessions.create`; Omnigent asks the viewer before each creation. */
-  readonly canCreate: boolean;
   list: (params?: Record<string, JsonValue>, options?: OmnigentCallOptions) => Promise<JsonValue>;
-  create: (
-    params: Record<string, JsonValue>,
-    options?: OmnigentMutationOptions,
-  ) => Promise<JsonValue>;
 }
 
 /** Opens Omnigent pages in a new tab. Each call must follow a click inside the app. */

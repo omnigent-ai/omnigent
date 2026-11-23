@@ -92,7 +92,7 @@ MAX_PINNED_GADGETS = 50
 MAX_SESSION_GADGETS = 20
 COMMENT_STATUSES = frozenset({"draft", "addressed"})
 MAX_COMMENT_CHARS = 4000
-_KNOWN_CAPABILITIES = frozenset({"data.read", "data.write", "sessions.read", "sessions.create"})
+_KNOWN_CAPABILITIES = frozenset({"data.read", "data.write", "sessions.read"})
 # The web app answers session reads with the viewer's own session list after asking
 # them; publishing a revision that requests new ones still needs manage permission.
 _SUPPORTED_CAPABILITIES = frozenset({"data.read", "data.write", "sessions.read"})

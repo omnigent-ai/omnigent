@@ -35,7 +35,7 @@ def publish_board(service: GadgetService) -> dict:
         {
             "html": "<main>Synthetic app fixture</main>",
             "sdk_version": 1,
-            "capabilities": ["data.read", "data.write", "sessions.create"],
+            "capabilities": ["data.read", "data.write", "sessions.read"],
             "collections": CARDS,
         },
     )
@@ -364,23 +364,35 @@ def test_schema_validation_and_session_capability_fail_closed(gadgets: Fixture) 
         rpc(service, app, "create", id="invalid", value={"title": 123}, operation_id="invalid")
     with pytest.raises(InvalidInput):
         rpc(service, app, "get", id="../escape")
-    assert "sessions.create" not in service.content(app["id"])["capabilities"]
     with pytest.raises(GadgetError) as error:
         service.rpc(app["id"], app["published_revision"], "sessions.v1.create", {})
     assert error.value.code == "UNSUPPORTED"
+    # A capability no server knows is refused when the revision is uploaded.
+    with pytest.raises(InvalidInput):
+        service.create_revision(
+            app["id"],
+            {
+                "html": "<main>x</main>",
+                "sdk_version": 1,
+                "capabilities": ["sessions.create"],
+                "collections": CARDS,
+            },
+        )
 
 
 def test_new_server_capabilities_do_not_automatically_expand_an_existing_publication(
     gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service = gadgets.service()
+    # Published while this server could not grant session reads yet.
+    monkeypatch.setattr(service_module, "_SUPPORTED_CAPABILITIES", frozenset({"data.read"}))
     app = publish_board(service)
     monkeypatch.setattr(
         service_module,
         "_SUPPORTED_CAPABILITIES",
-        frozenset({"data.read", "data.write", "sessions.create"}),
+        frozenset({"data.read", "data.write", "sessions.read"}),
     )
-    assert "sessions.create" not in service.content(app["id"])["capabilities"]
+    assert "sessions.read" not in service.content(app["id"])["capabilities"]
     # Approving a new capability needs manage; an editor cannot.
     gadgets.access.share(app, 2, EDIT)
     with pytest.raises(GadgetError):
@@ -390,7 +402,7 @@ def test_new_server_capabilities_do_not_automatically_expand_an_existing_publica
     service.publish(
         app["id"], {"revision_id": app["published_revision"], "if_version": app["version"]}
     )
-    assert "sessions.create" in service.content(app["id"])["capabilities"]
+    assert "sessions.read" in service.content(app["id"])["capabilities"]
 
 
 def test_external_frontend_changes_are_detected_before_serving(gadgets: Fixture) -> None:

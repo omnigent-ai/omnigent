@@ -41,7 +41,7 @@ export const GADGET_LIMITS = {
   maxJsonNodes: 16_384,
 } as const;
 
-export type GadgetCapability = "data.read" | "data.write" | "sessions.read" | "sessions.create";
+export type GadgetCapability = "data.read" | "data.write" | "sessions.read";
 
 export const GADGET_DATA_METHODS = [
   "data.v1.get",
@@ -50,7 +50,7 @@ export const GADGET_DATA_METHODS = [
   "data.v1.replace",
   "data.v1.delete",
 ] as const;
-export const GADGET_SESSION_METHODS = ["sessions.v1.list", "sessions.v1.create"] as const;
+export const GADGET_SESSION_METHODS = ["sessions.v1.list"] as const;
 /**
  * Open an Omnigent page. They need no capability: the page is one the viewer could open by
  * URL, nothing starts until the viewer acts on it, and the host opens it only right after a
@@ -106,7 +106,6 @@ export const GADGET_METHOD_CAPABILITY: Record<GadgetMethod, GadgetCapability | n
   "data.v1.replace": "data.write",
   "data.v1.delete": "data.write",
   "sessions.v1.list": "sessions.read",
-  "sessions.v1.create": "sessions.create",
   "navigation.v1.newSession": null,
   "navigation.v1.openSession": null,
   "navigation.v1.newAutomation": null,
@@ -120,7 +119,6 @@ export const GADGET_MUTATING_METHODS: ReadonlySet<GadgetMethod> = new Set<Gadget
   "data.v1.create",
   "data.v1.replace",
   "data.v1.delete",
-  "sessions.v1.create",
   "navigation.v1.newSession",
   "navigation.v1.openSession",
   "navigation.v1.newAutomation",

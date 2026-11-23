@@ -70,8 +70,6 @@ export interface StartGadgetBridgeOptions {
     params: Record<string, unknown>,
     signal: AbortSignal,
   ) => Promise<unknown>;
-  /** Asks the viewer before a session is created. Without it, creation is refused. */
-  confirmSessionCreate?: (params: Record<string, unknown>) => Promise<boolean>;
   /**
    * Opens the page for a navigation call. Returns false when it did not, for example because
    * the viewer did not just click inside the app. Without it, navigation calls are refused.
@@ -421,8 +419,7 @@ export function toRpcParams(
         if_version: requireString(params, "ifVersion", 4096),
         operation_id: requireString(params, "operationId", op),
       };
-    case "sessions.v1.list":
-    case "sessions.v1.create": {
+    case "sessions.v1.list": {
       const result: Record<string, unknown> = {};
       for (const [key, value] of Object.entries(params)) {
         if (!SESSION_PARAM_KEY.test(key)) {
@@ -485,7 +482,6 @@ export function toSdkResult(method: GadgetMethod, result: unknown): unknown {
       }
       return { id: result.id, version: result.version, deleted: true };
     case "sessions.v1.list":
-    case "sessions.v1.create":
       return isRecord(result) ? snakeToCamelKeys(result) : result;
     case "navigation.v1.newSession":
     case "navigation.v1.openSession":
@@ -567,7 +563,6 @@ export function startGadgetBridge(options: StartGadgetBridgeOptions): GadgetBrid
     port,
     context,
     callRpc,
-    confirmSessionCreate,
     openPage,
     requestAction,
     actionProgress,
@@ -737,15 +732,6 @@ export function startGadgetBridge(options: StartGadgetBridgeOptions): GadgetBrid
         return;
       }
       const rpcParams = toRpcParams(message.method, message.params);
-      if (message.method === "sessions.v1.create") {
-        const confirmed = confirmSessionCreate ? await confirmSessionCreate(rpcParams) : false;
-        if (!confirmed) {
-          throw new BridgeError(
-            "PERMISSION_DENIED",
-            "The viewer did not allow this app to create a session.",
-          );
-        }
-      }
       if (controller.signal.aborted) {
         throw new BridgeError("CANCELLED", "The call was cancelled.");
       }

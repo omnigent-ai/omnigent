@@ -210,7 +210,6 @@ const CAPABILITY_LABELS: Record<string, string> = {
   "data.read": "Read its data",
   "data.write": "Change its data",
   "sessions.read": "Read your sessions",
-  "sessions.create": "Start sessions (asks you first)",
 };
 
 /** The gadget's link, with Copy. */

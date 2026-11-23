@@ -8,7 +8,7 @@ comments.
 ## What a gadget is
 
 - **Revisions.** Immutable HTML documents written against the gadget SDK, each declaring the
-  capabilities it uses (`data.read`, `data.write`, `sessions.read`, `sessions.create`), its
+  capabilities it uses (`data.read`, `data.write`, `sessions.read`), its
   collections (JSON-schema shaped records with rules) and its actions. Publishing points the
   gadget at one revision.
 - **Records.** Documents in the gadget's collections, versioned for optimistic concurrency

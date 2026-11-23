@@ -106,7 +106,6 @@ const KNOWN_CAPABILITIES: ReadonlySet<string> = new Set<GadgetCapability>([
   "data.read",
   "data.write",
   "sessions.read",
-  "sessions.create",
 ]);
 
 function grantedCapabilities(content: GadgetContent): GadgetCapability[] {
@@ -212,8 +211,6 @@ export function GadgetFrame({
   const handshakeDoneRef = useRef(false);
   const loadsRef = useRef(0);
   const [mount, setMount] = useState(newMount);
-  const [confirmation, setConfirmation] = useState<PendingConfirmation | null>(null);
-  const confirmationRef = useRef<PendingConfirmation | null>(null);
   // The viewer's answer to letting this mount read their sessions, asked once per page load.
   const [sessionsAccess, setSessionsAccess] = useState<PendingConfirmation | null>(null);
   const sessionsAccessRef = useRef<Promise<boolean> | null>(null);
@@ -228,20 +225,6 @@ export function GadgetFrame({
   const htmlContent = useMemo(
     () => buildGadgetFrameDocument(content.html, buildOmnigentSdkBootstrapScript(mount)),
     [content.html, mount],
-  );
-
-  const confirmSessionCreate = useCallback(
-    () =>
-      new Promise<boolean>((resolve) => {
-        if (confirmationRef.current !== null) {
-          resolve(false);
-          return;
-        }
-        const pending = { resolve };
-        confirmationRef.current = pending;
-        setConfirmation(pending);
-      }),
-    [],
   );
 
   // Actions and navigation need a gesture inside the gadget (see `gadgetGestureGate`).
@@ -409,12 +392,6 @@ export function GadgetFrame({
     });
   }, []);
 
-  const settleConfirmation = useCallback((allowed: boolean) => {
-    confirmationRef.current?.resolve(allowed);
-    confirmationRef.current = null;
-    setConfirmation(null);
-  }, []);
-
   const connect = useCallback(
     (frameWindow: Window) => {
       handshakeDoneRef.current = true;
@@ -457,7 +434,6 @@ export function GadgetFrame({
                 },
                 signal,
               ),
-        confirmSessionCreate: preview ? undefined : confirmSessionCreate,
         openPage: preview ? undefined : openPage,
         requestAction: preview ? undefined : requestAction,
         // A preview has no actions to follow.
@@ -481,7 +457,6 @@ export function GadgetFrame({
     },
     [
       actionProgress,
-      confirmSessionCreate,
       listSessions,
       mount,
       openPage,
@@ -559,8 +534,6 @@ export function GadgetFrame({
       pendingHelloRef.current = undefined;
       bridgeRef.current?.dispose();
       bridgeRef.current = null;
-      confirmationRef.current?.resolve(false);
-      confirmationRef.current = null;
     },
     [],
   );
@@ -641,25 +614,6 @@ export function GadgetFrame({
             />
           ))}
       </div>
-      <Dialog
-        open={confirmation !== null}
-        onOpenChange={(open) => !open && settleConfirmation(false)}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Start an Omnigent session?</DialogTitle>
-            <DialogDescription>
-              {app.name} wants to start a new Omnigent session as you.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => settleConfirmation(false)}>
-              Cancel
-            </Button>
-            <Button onClick={() => settleConfirmation(true)}>Start session</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
       <Dialog
         open={sessionsAccess !== null}
         onOpenChange={(open) => !open && settleSessionsAccess(false)}

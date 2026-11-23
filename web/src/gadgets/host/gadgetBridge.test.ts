@@ -343,36 +343,14 @@ describe("startGadgetBridge", () => {
     );
   });
 
-  it.each([
-    { label: "declines", confirmed: false, expectedCalls: 0 },
-    { label: "allows", confirmed: true, expectedCalls: 1 },
-  ])("creates a session only after the viewer $label", async ({ confirmed, expectedCalls }) => {
-    const callRpc = vi.fn<CallRpc>().mockResolvedValue({ session_id: "s1" });
-    const confirmSessionCreate = vi
-      .fn<(params: Record<string, unknown>) => Promise<boolean>>()
-      .mockResolvedValue(confirmed);
-    const { port } = start({
-      callRpc,
-      confirmSessionCreate,
-      context: { ...CONTEXT, capabilities: ["sessions.create"] },
-    });
+  it("refuses a call to start a session, which no host supports", async () => {
+    const callRpc = vi.fn<CallRpc>();
+    const { port } = start({ callRpc });
 
-    port.fromFrame(
-      request("r1", "sessions.v1.create", { initialPrompt: "hi", operationId: "op-1" }),
-    );
+    port.fromFrame(request("r1", "sessions.v1.create", { initialPrompt: "hi" }));
 
-    await waitFor(() =>
-      expect(port.responseFor("r1")).toMatchObject(
-        confirmed
-          ? { ok: true, result: { sessionId: "s1" } }
-          : { ok: false, error: { code: "PERMISSION_DENIED" } },
-      ),
-    );
-    expect(confirmSessionCreate).toHaveBeenCalledWith({
-      initial_prompt: "hi",
-      operation_id: "op-1",
-    });
-    expect(callRpc).toHaveBeenCalledTimes(expectedCalls);
+    await waitFor(() => expect(port.responseFor("r1")).toMatchObject({ ok: false }));
+    expect(callRpc).not.toHaveBeenCalled();
   });
 
   describe("navigation", () => {

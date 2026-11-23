@@ -895,15 +895,8 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
       data: Object.freeze({ collection: makeCollection }),
       sessions: Object.freeze({
         canList: hasCapability('sessions.read'),
-        canCreate: hasCapability('sessions.create'),
         list: function (params, options) {
           return call('sessions.v1.list', params || {}, options);
-        },
-        create: function (params, options) {
-          return guarded(function () {
-            var operationId = operationIdFrom(options);
-            return call('sessions.v1.create', Object.assign({}, params, { operationId: operationId }), options, operationId);
-          });
         },
       }),
       navigation: Object.freeze({
