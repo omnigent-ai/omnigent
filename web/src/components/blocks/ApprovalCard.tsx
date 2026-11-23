@@ -63,6 +63,8 @@ import {
   exitPlanModePlan,
 } from "@/lib/askUserQuestion";
 import { askUserQuestionSignature } from "@/lib/askUserQuestionDrafts";
+import { replaceSentMentions } from "@/lib/composerMentions";
+import { mentionPillMarkdown } from "@/lib/mentionPills";
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
@@ -89,6 +91,7 @@ import {
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
 import { FileEditDiffView } from "./FileEditBody";
 import { ToolValueView } from "./ToolValueView";
+import { ProseMarkdown } from "./ChatMarkdown";
 
 const AUTO_RESOLVED_DETAIL =
   "This request was answered outside this view, for example in the " +
@@ -104,6 +107,17 @@ const QUESTION_TITLES = [
 
 // A workflow question comes from whichever harness runs the workflow; its
 // message names the task waiting on it.
+/**
+ * A submitted answer as the user bubble shows a sent message: session markers become pills and
+ * the tool hint is hidden. Multi-select answers are each converted, then joined.
+ */
+function answerMarkdown(answer: unknown): string {
+  const parts = Array.isArray(answer) ? answer : [answer];
+  return parts
+    .map((part) => replaceSentMentions(String(part), mentionPillMarkdown).trimEnd())
+    .join(", ");
+}
+
 function questionPromptTitle(policyName: string, phase: string, message: string): string {
   if (phase === WORKFLOW_QUESTION_PHASE && message) return message;
   const match = QUESTION_TITLES.find(
@@ -955,7 +969,7 @@ export function ApprovalCard({
                   <li key={q} className="flex flex-wrap items-baseline gap-x-1.5">
                     <span className="text-muted-foreground">{q}</span>
                     <span className="font-medium">
-                      {Array.isArray(ans) ? ans.join(", ") : String(ans)}
+                      <ProseMarkdown>{answerMarkdown(ans)}</ProseMarkdown>
                     </span>
                   </li>
                 ))}

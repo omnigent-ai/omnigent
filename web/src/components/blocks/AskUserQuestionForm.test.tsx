@@ -865,6 +865,66 @@ describe("AskUserQuestionForm — prompt editor", () => {
     expect(onReject).toHaveBeenCalledExactlyOnceWith();
   });
 
+  const sentAnswer = (title: string, id: string) =>
+    `Base it on the fix from [Session: "${title}" id=${id} subagent=no]\n\n${SESSION_MENTION_HINT}`;
+
+  it("shows a submitted answer's session as a pill, without the marker or hint", async () => {
+    sessionList.loaded = [sessionRow("de02c3f0", "Fix flaky CI job")];
+    const { container } = render(
+      <ApprovalCard
+        elicitationId="elic_persisted"
+        message="Claude wants to call AskUserQuestion"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview=""
+        requestedSchema={{}}
+        status="responded"
+        response={{
+          action: "accept",
+          content: { "Which framework?": sentAnswer("Fix flaky CI job", "de02c3f0") },
+        }}
+        askUserQuestion={{ questions: [framework] }}
+      />,
+    );
+    expect(screen.getByTestId("mention-pill")).toHaveTextContent("@Fix flaky CI job");
+    expect(container.textContent).toContain("Base it on the fix from");
+    expect(container.textContent).not.toContain("[Session:");
+    expect(container.textContent).not.toContain("Tagged sessions");
+  });
+
+  it("shows the session pill once the card is answered from the editor", async () => {
+    sessionList.loaded = [sessionRow("de02c3f0", "Fix flaky CI job")];
+    const onSubmit = vi.fn();
+    const card = (response: { action: "accept"; content: Record<string, unknown> } | null) => (
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <ApprovalCard
+          elicitationId="elic_live"
+          message="Claude wants to call AskUserQuestion"
+          phase="pre_tool_use"
+          policyName="claude_native_permission"
+          contentPreview=""
+          requestedSchema={{}}
+          status={response ? "responded" : "pending"}
+          response={response}
+          askUserQuestion={{ questions: [framework] }}
+          onSubmit={onSubmit}
+        />
+      </CapabilitiesProvider>
+    );
+    const { rerender } = render(card(null));
+    const editor = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(editor)!, "Base it on the fix from @Fix"));
+    fireEvent.keyDown(editor, { key: "Enter" });
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    const [, , content] = onSubmit.mock.calls[0]!;
+    // The card's answered state, as the store rebuilds it from the submitted verdict.
+    rerender(card({ action: "accept", content }));
+    expect(screen.getByTestId("mention-pill")).toHaveTextContent("@Fix flaky CI job");
+    expect(document.body.textContent).not.toContain("[Session:");
+    expect(document.body.textContent).not.toContain("Tagged sessions");
+  });
+
   it("keeps a tagged session when the card remounts with its draft", async () => {
     sessionList.loaded = [sessionRow("s_ci", "Fix CI")];
     const elicitationId = nextElicitationId();
