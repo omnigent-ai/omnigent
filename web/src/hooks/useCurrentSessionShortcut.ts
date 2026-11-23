@@ -4,6 +4,7 @@ import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { matchesShortcut, type ShortcutId } from "@/lib/shortcuts/registry";
+import { useBindShortcutTarget } from "@/lib/shortcuts/shortcutTargets";
 
 // Surfaces that own their keystrokes, so a session shortcut pressed there is left alone.
 const KEY_OWNING_SURFACES =
@@ -12,14 +13,17 @@ const KEY_OWNING_SURFACES =
 /**
  * Runs `onTrigger` when `shortcutId`'s chord is pressed anywhere in the app,
  * including a focused composer, but not inside terminals, code editors, or open
- * menus and dialogs. Embedded, only presses from inside the app count.
+ * menus and dialogs. Embedded, only presses from inside the app count. `target` names the
+ * session the chord acts on, so menus show it only on that session's rows.
  */
 export function useCurrentSessionShortcut(
   shortcutId: ShortcutId,
   onTrigger: () => void,
   enabled = true,
   isMac = isMacPlatform(),
+  target?: string | null,
 ): void {
+  useBindShortcutTarget(shortcutId, target, enabled);
   const latest = useRef(onTrigger);
   latest.current = onTrigger;
   const isEmbedded = useIsEmbedded();

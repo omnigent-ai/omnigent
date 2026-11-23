@@ -6,9 +6,18 @@ import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
 import { isFocusInDialogOrMenu } from "@/lib/hotkeys";
 import { matchesShortcut } from "@/lib/shortcuts/registry";
+import { useBindShortcutTarget } from "@/lib/shortcuts/shortcutTargets";
 
-/** Run `onAdd` on the add-sibling chord while `enabled`; terminals, editors and dialogs keep it. */
-export function useAddSiblingSessionHotkey(onAdd: () => void, enabled: boolean): void {
+/**
+ * Run `onAdd` on the add-sibling chord while `enabled`; terminals, editors and dialogs keep it.
+ * `sessionId` is the session it adds beside, so menus show ⌘⌥A only on that session's rows.
+ */
+export function useAddSiblingSessionHotkey(
+  onAdd: () => void,
+  enabled: boolean,
+  sessionId?: string,
+): void {
+  useBindShortcutTarget("session.addSibling", sessionId, enabled);
   const latest = useRef(onAdd);
   latest.current = onAdd;
   const isEmbedded = useIsEmbedded();

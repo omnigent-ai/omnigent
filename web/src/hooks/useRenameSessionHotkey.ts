@@ -10,11 +10,17 @@ export function isRenameSessionHotkey(
   return matchesShortcut(event, "session.rename", { mac: isMac });
 }
 
-/** Bind alongside the owner-only title editor so unavailable sessions keep their keys. */
+/**
+ * Bind alongside the owner-only title editor so unavailable sessions keep their keys.
+ * `sessionId` is the session it renames, so menus show ⌘⌥R only on that session's rows.
+ */
 export function useRenameSessionHotkey(
   onRename: () => void,
-  enabled = true,
-  isMac = isMacPlatform(),
+  {
+    sessionId,
+    enabled = true,
+    isMac = isMacPlatform(),
+  }: { sessionId?: string; enabled?: boolean; isMac?: boolean } = {},
 ): void {
-  useCurrentSessionShortcut("session.rename", onRename, enabled, isMac);
+  useCurrentSessionShortcut("session.rename", onRename, enabled, isMac, sessionId);
 }

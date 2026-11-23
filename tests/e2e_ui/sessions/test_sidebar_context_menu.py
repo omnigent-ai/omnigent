@@ -18,6 +18,8 @@ This guards the wiring the mocked unit test can't exercise end-to-end:
 
 from __future__ import annotations
 
+import re
+
 from playwright.sync_api import Locator, Page, expect
 
 
@@ -74,3 +76,34 @@ def test_right_click_opens_session_actions_menu(
     page.get_by_test_id("rename-conversation").click()
     expect(page.get_by_test_id("rename-conversation-input")).to_be_visible()
     expect(page).to_have_url(f"{base_url}/c/{session_id}")
+
+
+def test_rename_shows_its_shortcut_only_on_the_open_sessions_row(
+    page: Page,
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """The row menus show ⌘⌥R on Rename where that chord renames the row's session.
+
+    The header title binds the chord for the open session, so only that row's
+    right-click menu shows it; another session's row offers Rename without it.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session_pair: ``(base_url, open_id, other_id)``.
+    """
+    base_url, open_id, other_id = seeded_session_pair
+    page.goto(f"{base_url}/c/{open_id}")
+    expect(page.get_by_test_id("header-title")).to_be_visible()
+
+    _row_link(page, open_id).click(button="right")
+    rename = page.get_by_test_id("rename-conversation")
+    expect(rename).to_be_visible()
+    expect(rename).to_have_attribute("aria-keyshortcuts", re.compile(r"^(Meta|Control)\+Alt\+R$"))
+    expect(rename.locator("kbd").last).to_have_text("R")
+    page.keyboard.press("Escape")
+    expect(rename).to_have_count(0)
+
+    _row_link(page, other_id).click(button="right")
+    expect(rename).to_be_visible()
+    expect(rename).not_to_have_attribute("aria-keyshortcuts", re.compile(".+"))
+    expect(rename.locator("kbd")).to_have_count(0)
+    page.keyboard.press("Escape")

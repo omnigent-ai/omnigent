@@ -402,6 +402,9 @@ import {
 import { isCanvasPathname } from "@/canvas/canvasNavigation";
 import { projectHomePath, projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
 import { getEmbedRoot } from "../lib/host";
+import { MenuShortcut } from "@/components/ui/menu-item";
+import { type ShortcutId, shortcutAriaKeys, shortcutKeys } from "@/lib/shortcuts/registry";
+import { useTargetedShortcut } from "@/lib/shortcuts/shortcutTargets";
 import { canCreateProject, projectsMatching } from "./projectChoices";
 import {
   ARCHIVE_SESSION_KEYS,
@@ -5203,6 +5206,8 @@ interface MenuItemProps {
   // Radix's menu `onSelect` receives a native Event in both families.
   onSelect?: (event: Event) => void;
   "data-testid"?: string;
+  "aria-keyshortcuts"?: string;
+  shortcut?: ShortcutId;
 }
 
 interface MenuComponents {
@@ -5322,6 +5327,10 @@ export function ConversationMenuItems({
   reorder?: { previousId?: string; nextId?: string };
 }) {
   const info = useServerInfo();
+  // A row lists a chord only while that chord acts on this row's session.
+  const addSiblingShortcut = useTargetedShortcut("session.addSibling", conversation.id);
+  const renameShortcut = useTargetedShortcut("session.rename", conversation.id);
+  const unreadShortcut = useTargetedShortcut("session.toggleUnread", conversation.id);
   const isMuted = isConversationMuted(conversation);
   const setMuted = useSetConversationMuted();
   const atPinCap = useContext(PinCapacityContext);
@@ -5440,10 +5449,17 @@ export function ConversationMenuItems({
     <>
       {!kanbanCard && isOwner && !isArchived && info !== "loading" && info.sibling_sessions && (
         <>
-          <C.Item asChild data-testid="add-sibling-session">
+          <C.Item
+            asChild
+            data-testid="add-sibling-session"
+            aria-keyshortcuts={
+              addSiblingShortcut ? shortcutAriaKeys(addSiblingShortcut) : undefined
+            }
+          >
             <Link to={`/?sibling=${encodeURIComponent(conversation.id)}`} onClick={onNavigate}>
               <PlusIcon className="size-3.5" />
               Add nested agent
+              {addSiblingShortcut && <MenuShortcut keys={shortcutKeys(addSiblingShortcut)} />}
             </Link>
           </C.Item>
           <C.Separator />
@@ -5525,6 +5541,7 @@ export function ConversationMenuItems({
         <C.Item
           className="mobile-touch-target"
           data-testid="rename-conversation"
+          shortcut={renameShortcut}
           onSelect={() => {
             trackClick("sidebar.conversation.rename", "button");
             setIsEditing(true);
@@ -5564,6 +5581,7 @@ export function ConversationMenuItems({
         <C.Item
           className="mobile-touch-target"
           data-testid="mark-unread-conversation"
+          shortcut={unreadShortcut}
           onSelect={() => {
             onMarkUnread();
             setMenuOpen(false);
@@ -5577,6 +5595,7 @@ export function ConversationMenuItems({
         <C.Item
           className="mobile-touch-target"
           data-testid="mark-read-conversation"
+          shortcut={unreadShortcut}
           onSelect={() => {
             onMarkRead();
             setMenuOpen(false);

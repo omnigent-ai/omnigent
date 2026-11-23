@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 
 import { isMacPlatform } from "@/lib/hotkeys";
 import { matchesShortcut } from "@/lib/shortcuts/registry";
+import { useBindShortcutTarget } from "@/lib/shortcuts/shortcutTargets";
 
 type ViewMode = "chat" | "terminal";
 
@@ -25,6 +26,12 @@ export function useViewModeToggleHotkey(
 ): void {
   const latest = useRef(options);
   latest.current = options;
+  // The view the chord switches to now, so only that view's menu row shows it.
+  useBindShortcutTarget(
+    "view.mode",
+    options.view === "chat" ? "terminal" : "chat",
+    options.enabled,
+  );
 
   useEffect(() => {
     if (!options.enabled) return;

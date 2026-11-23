@@ -1,8 +1,9 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { DropdownMenu, DropdownMenuContent } from "@/components/ui/dropdown-menu";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { shortcutTargetsStore } from "@/lib/shortcuts/shortcutTargets";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import {
   TerminalFirstContextProvider,
@@ -79,6 +80,20 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+});
+
+describe("ViewModeMenuItems chord", () => {
+  it("lists the toggle chord on the view it switches to, and only while it's bound", () => {
+    renderMenuItems(makeCtx({ view: "chat" }));
+    const chat = screen.getByTestId("view-mode-menu-chat");
+    const terminal = screen.getByTestId("view-mode-menu-terminal");
+    expect(terminal).not.toHaveAttribute("aria-keyshortcuts");
+
+    act(() => shortcutTargetsStore.setState({ targets: { "view.mode": "terminal" } }));
+    expect(terminal).toHaveAttribute("aria-keyshortcuts", "Control+Alt+\\");
+    expect(chat).not.toHaveAttribute("aria-keyshortcuts");
+    act(() => shortcutTargetsStore.setState({ targets: {} }));
+  });
 });
 
 describe("ViewModeToggle", () => {

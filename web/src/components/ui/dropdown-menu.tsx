@@ -4,7 +4,8 @@ import * as DropdownMenuPrimitive from "radix-ui/dropdown-menu";
 import { getEmbedRoot } from "@/lib/host";
 import { cn } from "@/lib/utils";
 import { CheckIcon, ChevronRightIcon } from "lucide-react";
-import { MenuItem } from "./menu-item";
+import type { ShortcutId } from "@/lib/shortcuts/registry";
+import { MenuItem, withMenuShortcut } from "./menu-item";
 import { MobileMenuGlassSurface } from "@/components/MobileMenuGlassSurface";
 import { withReadlineListSteps } from "@/lib/listNavigationKeys";
 
@@ -67,10 +68,14 @@ function DropdownMenuItem({
   className,
   inset,
   variant = "default",
+  shortcut,
+  children,
   ...props
 }: React.ComponentProps<typeof DropdownMenuPrimitive.Item> & {
   inset?: boolean;
   variant?: "default" | "destructive";
+  /** A binding whose chord runs this row's action on this row's target; its keys end the row. */
+  shortcut?: ShortcutId;
 }) {
   return (
     <MenuItem
@@ -85,6 +90,7 @@ function DropdownMenuItem({
         data-inset={inset}
         data-variant={variant}
         {...props}
+        {...withMenuShortcut(children, shortcut)}
       />
     </MenuItem>
   );

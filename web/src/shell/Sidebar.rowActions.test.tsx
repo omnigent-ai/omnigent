@@ -586,6 +586,20 @@ describe("rename shortcut", () => {
     });
   });
 
+  it("lists ⌘⌥R on the row's Rename only while the header's chord renames that session", () => {
+    const { unmount } = renderSidebar("conv_1", undefined, { header });
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    expect(screen.getByTestId("rename-conversation")).toHaveAttribute(
+      "aria-keyshortcuts",
+      "Control+Alt+R",
+    );
+    unmount();
+
+    renderSidebar("conv_1");
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    expect(screen.getByTestId("rename-conversation")).not.toHaveAttribute("aria-keyshortcuts");
+  });
+
   it("falls back to the header title while the sidebar is closed", () => {
     renderSidebar("conv_1", undefined, { open: false, header });
 

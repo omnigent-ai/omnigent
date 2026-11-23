@@ -36,5 +36,6 @@ export function useToggleUnreadHotkey(
     },
     conversation !== null,
     isMac,
+    conversation?.id,
   );
 }

@@ -22,9 +22,12 @@ export function HeaderTitle({ conversationId, title }: { conversationId: string;
   const rename = useRenameConversation();
   const [editing, setEditing] = useState(false);
   // The shortcut prefers the session's sidebar row, where users rename several in a row.
-  useRenameSessionHotkey(() => {
-    if (!startSidebarRename(conversationId)) setEditing(true);
-  }, !editing && !rename.isPending);
+  useRenameSessionHotkey(
+    () => {
+      if (!startSidebarRename(conversationId)) setEditing(true);
+    },
+    { sessionId: conversationId, enabled: !editing && !rename.isPending },
+  );
 
   if (!editing) {
     return (

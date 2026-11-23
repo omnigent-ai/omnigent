@@ -6,6 +6,8 @@ import { cn } from "@/lib/utils";
 import { CheckIcon, ChevronRightIcon } from "lucide-react";
 import { MobileMenuGlassSurface } from "@/components/MobileMenuGlassSurface";
 import { withReadlineListSteps } from "@/lib/listNavigationKeys";
+import type { ShortcutId } from "@/lib/shortcuts/registry";
+import { withMenuShortcut } from "./menu-item";
 
 function ContextMenu({ ...props }: React.ComponentProps<typeof ContextMenuPrimitive.Root>) {
   return <ContextMenuPrimitive.Root data-slot="context-menu" {...props} />;
@@ -61,10 +63,14 @@ function ContextMenuItem({
   className,
   inset,
   variant = "default",
+  shortcut,
+  children,
   ...props
 }: React.ComponentProps<typeof ContextMenuPrimitive.Item> & {
   inset?: boolean;
   variant?: "default" | "destructive";
+  /** A binding whose chord runs this row's action on this row's target; its keys end the row. */
+  shortcut?: ShortcutId;
 }) {
   return (
     <ContextMenuPrimitive.Item
@@ -76,6 +82,7 @@ function ContextMenuItem({
         className,
       )}
       {...props}
+      {...withMenuShortcut(children, shortcut)}
     />
   );
 }

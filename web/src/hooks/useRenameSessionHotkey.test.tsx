@@ -52,7 +52,7 @@ describe("isRenameSessionHotkey", () => {
 describe("useRenameSessionHotkey", () => {
   it("renames from a focused composer and removes its listener on unmount", () => {
     const rename = vi.fn();
-    const { unmount } = renderHook(() => useRenameSessionHotkey(rename, true, false));
+    const { unmount } = renderHook(() => useRenameSessionHotkey(rename, { isMac: false }));
     const composer = document.createElement("textarea");
     document.body.appendChild(composer);
     composer.focus();
@@ -72,7 +72,7 @@ describe("useRenameSessionHotkey", () => {
     const first = vi.fn();
     const current = vi.fn();
     const { rerender } = renderHook(
-      ({ rename, enabled }) => useRenameSessionHotkey(rename, enabled, false),
+      ({ rename, enabled }) => useRenameSessionHotkey(rename, { enabled, isMac: false }),
       { initialProps: { rename: first, enabled: true } },
     );
     rerender({ rename: current, enabled: true });
@@ -89,7 +89,7 @@ describe("useRenameSessionHotkey", () => {
 
   it("ignores held, composing, and already handled keys", () => {
     const rename = vi.fn();
-    renderHook(() => useRenameSessionHotkey(rename, true, false));
+    renderHook(() => useRenameSessionHotkey(rename, { isMac: false }));
     window.dispatchEvent(event({ repeat: true }));
     window.dispatchEvent(event({ isComposing: true }));
     const handled = event();
@@ -102,7 +102,7 @@ describe("useRenameSessionHotkey", () => {
     "leaves focused %s controls alone",
     (surface) => {
       const rename = vi.fn();
-      renderHook(() => useRenameSessionHotkey(rename, true, false));
+      renderHook(() => useRenameSessionHotkey(rename, { isMac: false }));
       const owner = document.createElement("div");
       if (surface === "xterm" || surface === "monaco-editor") owner.className = surface;
       else owner.setAttribute("role", surface);
@@ -124,7 +124,9 @@ describe("useRenameSessionHotkey", () => {
     root.appendChild(composer);
     document.body.appendChild(root);
     setEmbedRoot(root);
-    renderHook(() => useRenameSessionHotkey(rename, true, false), { wrapper: EmbeddedProvider });
+    renderHook(() => useRenameSessionHotkey(rename, { isMac: false }), {
+      wrapper: EmbeddedProvider,
+    });
 
     const outside = event();
     document.body.dispatchEvent(outside);

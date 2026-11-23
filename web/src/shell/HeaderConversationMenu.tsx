@@ -21,7 +21,6 @@ import {
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
-  ARIA_MOD_KEY,
   ARCHIVE_SESSION_KEYS,
   FORK_SESSION_KEYS,
   CompactShortcutKeys,
@@ -72,6 +71,7 @@ import { type OpenSessionCommandId, useOpenSessionPaletteCommands } from "./open
 import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useAddSiblingSessionHotkey } from "@/hooks/useAddSiblingSessionHotkey";
+import { useTargetedShortcut } from "@/lib/shortcuts/shortcutTargets";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useDesktopCommand } from "@/lib/desktopCommands";
@@ -184,7 +184,11 @@ export function HeaderConversationMenu({
     setAutomationOpen(false);
   }, [conversation.id]);
 
-  useAddSiblingSessionHotkey(() => navigate(addAgentPath), !!canAddAgent);
+  useAddSiblingSessionHotkey(() => navigate(addAgentPath), !!canAddAgent, conversation.id);
+  // A row lists a chord only while that chord acts on this session.
+  const addSiblingShortcut = useTargetedShortcut("session.addSibling", conversation.id);
+  const renameShortcut = useTargetedShortcut("session.rename", conversation.id);
+  const unreadShortcut = useTargetedShortcut("session.toggleUnread", conversation.id);
 
   const closeMenu = () => {
     setMenuOpen(false);
@@ -335,7 +339,7 @@ export function HeaderConversationMenu({
           <DropdownMenuItem
             data-testid="add-sibling-session"
             className={itemClass}
-            aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+A`}
+            shortcut={addSiblingShortcut}
             onSelect={() => navigate(addAgentPath)}
           >
             <PlusIcon className="size-3.5" />
@@ -420,6 +424,7 @@ export function HeaderConversationMenu({
       <DropdownMenuItem
         data-testid="header-rename-conversation"
         className={itemClass}
+        shortcut={renameShortcut}
         onSelect={() => setRenameOpen(true)}
       >
         <PencilIcon className="size-3.5" />
@@ -430,6 +435,7 @@ export function HeaderConversationMenu({
         <DropdownMenuItem
           data-testid="header-mark-unread-conversation"
           className={itemClass}
+          shortcut={unreadShortcut}
           onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
         >
           <MailIcon className="size-3.5" />

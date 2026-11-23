@@ -21,6 +21,7 @@ import { toast } from "sonner";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
 import { usePaletteCommandsStore } from "@/store/paletteCommands";
+import { shortcutTargetsStore } from "@/lib/shortcuts/shortcutTargets";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 
 const mocks = vi.hoisted(() => ({
@@ -162,6 +163,15 @@ function renderMenu(
   return render(menuTree(overrides, true, queryClient));
 }
 
+/** Each menu row's text without its key caps, in order. */
+function rowLabels(): (string | undefined)[] {
+  return screen.getAllByRole("menuitem").map((item) => {
+    const row = item.cloneNode(true) as HTMLElement;
+    row.querySelectorAll('[data-slot="shortcut-keys"]').forEach((keys) => keys.remove());
+    return row.textContent?.trim();
+  });
+}
+
 function openMenu() {
   fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
     button: 0,
@@ -175,7 +185,10 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  shortcutTargetsStore.setState({ targets: {} });
+});
 
 describe("HeaderConversationMenu", () => {
   it.each([false, true])(
@@ -223,7 +236,7 @@ describe("HeaderConversationMenu", () => {
     openMenu();
     // Rename and Move session live in the kebab on desktop too, alongside the
     // breadcrumb title (HeaderTitle) and folder tag (HeaderProjectTag) shortcuts.
-    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+    expect(rowLabels()).toEqual([
       "Add nested agent",
       "Pin",
       "Share",
@@ -237,6 +250,33 @@ describe("HeaderConversationMenu", () => {
     ]);
     expect(screen.getByTestId("header-move-to-project")).toBeInTheDocument();
     expect(screen.getByTestId("header-rename-conversation")).toBeInTheDocument();
+  });
+
+  it("lists ⌘⌥R and ⌘⌥U only while those chords act on this session", () => {
+    renderMenu();
+    openMenu();
+    const rename = screen.getByTestId("header-rename-conversation");
+    const unread = screen.getByTestId("header-mark-unread-conversation");
+    expect(rename).not.toHaveAttribute("aria-keyshortcuts");
+    expect(unread).not.toHaveAttribute("aria-keyshortcuts");
+
+    act(() =>
+      shortcutTargetsStore.setState({
+        targets: { "session.rename": CONVERSATION.id, "session.toggleUnread": "another-session" },
+      }),
+    );
+    expect(rename).toHaveAttribute("aria-keyshortcuts", "Control+Alt+R");
+    expect(rename.querySelector('[data-slot="shortcut-keys"]')).toHaveTextContent("CtrlAltR");
+    expect(unread).not.toHaveAttribute("aria-keyshortcuts");
+  });
+
+  it("lists ⌘⌥A on Add nested agent, whose chord this menu binds for its session", () => {
+    renderMenu();
+    openMenu();
+    expect(screen.getByTestId("add-sibling-session")).toHaveAttribute(
+      "aria-keyshortcuts",
+      "Control+Alt+A",
+    );
   });
 
   it("hides Mark as unread for a muted session", () => {
@@ -771,7 +811,7 @@ describe("HeaderConversationMenu", () => {
     renderMenu();
     openMenu();
 
-    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+    expect(rowLabels()).toEqual([
       "Add nested agent",
       "Pin",
       "Share",
@@ -795,7 +835,7 @@ describe("HeaderConversationMenu", () => {
     });
     openMenu();
 
-    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+    expect(rowLabels()).toEqual([
       "Add nested agent",
       "Terminal",
       "Pin",

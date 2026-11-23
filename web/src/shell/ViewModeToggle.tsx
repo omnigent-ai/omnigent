@@ -1,3 +1,4 @@
+import { useTargetedShortcut } from "@/lib/shortcuts/shortcutTargets";
 import { CheckIcon, Loader2Icon, MessagesSquareIcon, TerminalIcon } from "lucide-react";
 import { ARIA_MOD_KEY, VIEW_MODE_TOGGLE_KEYS } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
@@ -145,6 +146,9 @@ function ViewModeSegment({
  */
 export function ViewModeMenuItems() {
   const ctx = useTerminalFirst();
+  // The chord switches to the other view, so only that row shows it, and only while it's bound.
+  const toChat = useTargetedShortcut("view.mode", "chat");
+  const toTerminal = useTargetedShortcut("view.mode", "terminal");
   if (!ctx || !ctx.isTerminalFirst || ctx.isShellView) return null;
 
   const { view, setView, terminalStartingUp } = ctx;
@@ -156,6 +160,7 @@ export function ViewModeMenuItems() {
         className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
         onSelect={() => setView("chat")}
         data-testid="view-mode-menu-chat"
+        shortcut={view === "chat" ? undefined : toChat}
       >
         <MessagesSquareIcon className="size-4" />
         Chat
@@ -165,6 +170,7 @@ export function ViewModeMenuItems() {
         className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
         onSelect={() => setView("terminal")}
         data-testid="view-mode-menu-terminal"
+        shortcut={view === "terminal" ? undefined : toTerminal}
       >
         {terminalStartingUp ? (
           <Loader2Icon className="size-4 animate-spin" aria-hidden />
