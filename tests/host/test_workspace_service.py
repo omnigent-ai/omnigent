@@ -73,7 +73,7 @@ from omnigent.host.workspace_service import (
 from omnigent.host.workspace_tokens import mint_token
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry, deliver_workspace_reply
-from omnigent.workspace_fs import WorkspaceReader
+from omnigent.workspace_fs import WorkspaceReader, single_child_chain
 from tests._helpers.polling import poll_until_async
 from tests.server.routes.test_shell_permission_gate import _StubAgentStore, _StubConversationStore
 
@@ -318,6 +318,74 @@ async def test_list_directory_resumes_after_the_cursor_entry_is_removed(
     names = [e.name for e in first.entries] + [e.name for e in rest.entries]
     assert len(names) == len(set(names))
     assert sorted(names) == sorted({e.name for e in first.entries} | set(os.listdir(tmp_path)))
+
+
+async def test_list_directory_reports_single_child_directory_chains(
+    tmp_path: Path, client_for: ClientFor
+) -> None:
+    """A tree shows "com/example/app" on one row; only asked-for listings carry the leaf."""
+    (tmp_path / "com" / "example" / "app").mkdir(parents=True)
+    (tmp_path / "com" / "example" / "app" / "Main.java").write_text("")
+    for name in ("one", "two"):
+        (tmp_path / "split" / name).mkdir(parents=True)
+    (tmp_path / "empty").mkdir()
+    (tmp_path / "src" / "lib").mkdir(parents=True)
+    client = client_for(tmp_path)
+
+    collapsed = await client.list_directory(
+        ListDirectoryRequest(collapse_single_child_directories=True)
+    )
+    nested = await client.list_directory(
+        ListDirectoryRequest(path="com", collapse_single_child_directories=True)
+    )
+    plain = await client.list_directory(ListDirectoryRequest())
+
+    leaves = {e.name: e.leaf_directory_path for e in collapsed.entries}
+    assert leaves == {"com": "com/example/app", "split": "", "empty": "", "src": "src/lib"}
+    assert [(e.path, e.leaf_directory_path) for e in nested.entries] == [
+        ("com/example", "com/example/app")
+    ]
+    assert all(e.leaf_directory_path == "" for e in plain.entries)
+
+
+def test_single_child_chains_stop_where_the_helper_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file, a second entry, a symlink or the depth cap ends a chain; a listed link has none."""
+    (tmp_path / "file_inside" / "a").mkdir(parents=True)
+    (tmp_path / "file_inside" / "a" / "x.txt").write_text("")
+    (tmp_path / "only_file").mkdir()
+    (tmp_path / "only_file" / "x.txt").write_text("")
+    (tmp_path / "hidden" / ".git").mkdir(parents=True)
+    (tmp_path / "linked" / "a").mkdir(parents=True)
+    (tmp_path / "linked" / "a" / "to_src").symlink_to(tmp_path / "file_inside")
+    (tmp_path / "link_to_chain").symlink_to(tmp_path / "file_inside")
+    (tmp_path / "deep" / "1" / "2" / "3" / "4").mkdir(parents=True)
+    monkeypatch.setattr("omnigent.workspace_fs._MAX_DIRECTORY_CHAIN", 2)
+    reader = WorkspaceReader(tmp_path)
+
+    page = reader.list_directory("", limit=100, after=None, collapse_single_child_directories=True)
+
+    leaves = {e["name"]: e.get("leaf_directory_path") for e in page.data}
+    assert leaves == {
+        "file_inside": "file_inside/a",
+        "only_file": None,
+        "hidden": "hidden/.git",
+        "linked": "linked/a",
+        "link_to_chain": None,
+        "deep": "deep/1/2",
+    }
+
+
+def test_a_single_child_chain_stops_at_an_unreadable_directory(tmp_path: Path) -> None:
+    (tmp_path / "top" / "locked" / "inner").mkdir(parents=True)
+    (tmp_path / "top" / "locked").chmod(0)
+    try:
+        if os.access(tmp_path / "top" / "locked", os.R_OK):
+            pytest.skip("running as a user that reads any directory")
+        assert single_child_chain(tmp_path / "top") == ["locked"]
+    finally:
+        (tmp_path / "top" / "locked").chmod(0o755)
 
 
 async def test_read_file_flags_a_truncated_stream_like_rest(
@@ -622,9 +690,11 @@ async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: 
 
     response = await client.get_capabilities(GetCapabilitiesRequest())
 
-    # SearchText is listed exactly where ripgrep is installed.
+    # SearchText is listed exactly where ripgrep is installed. The server's route passes
+    # the host's list on unchanged, optional features included.
     assert set(response.capabilities) ^ (_RG_METHODS - _WITH_RG) == {
         "ListDirectory",
+        "list_directory.collapse_single_child_directories",
         "ReadFile",
         "StatPath",
         "ReadLinkText",
@@ -654,7 +724,13 @@ async def test_capabilities_leave_out_methods_whose_tool_is_missing(
 
     response = await client.get_capabilities(GetCapabilitiesRequest())
 
-    assert set(response.capabilities) == {"ListDirectory", "ReadFile", "StatPath", "ReadLinkText"}
+    assert set(response.capabilities) == {
+        "ListDirectory",
+        "list_directory.collapse_single_child_directories",
+        "ReadFile",
+        "StatPath",
+        "ReadLinkText",
+    }
 
 
 async def test_capabilities_leave_out_fuzzy_search_where_paths_cant_be_ranked(
