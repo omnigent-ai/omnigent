@@ -7,10 +7,13 @@ import { PageLoading } from "@/components/PageLoading";
 import { Spinner } from "@/components/ui/spinner";
 import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
-import { useLocation, useNavigate } from "@/lib/routing";
+import { Outlet, useLocation, useNavigate, useParams } from "@/lib/routing";
 import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
+import { useProjectKanbanBoardPreference } from "@/lib/projectKanbanPreferences";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
+import { FLOATING_COMPOSER_PATH } from "@/lib/floatingComposer/floatingComposerRoute";
+import { isElectronShell } from "@/lib/nativeBridge";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 
 // Bind a page component to its analytics page-view id. Declaring the id here,
@@ -50,6 +53,14 @@ const ApprovePage = withPageView(
   "approve",
   lazy(() => import("@/pages/ApprovePage").then((m) => ({ default: m.ApprovePage }))),
 );
+const FloatingComposerPage = withPageView(
+  "floating_composer",
+  lazy(() =>
+    import("@/shell/floatingComposer/FloatingComposerPage").then((m) => ({
+      default: m.FloatingComposerPage,
+    })),
+  ),
+);
 const InboxPage = withPageView(
   "inbox",
   lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage }))),
@@ -57,6 +68,10 @@ const InboxPage = withPageView(
 // The shell owns the board so selecting a conversation never unmounts it.
 const CanvasLandingPage = withPageView("canvas", () => null);
 const GridPage = withPageView("grid", () => null);
+const ProjectHomePage = withPageView(
+  "project_home",
+  lazy(() => import("@/pages/ProjectHomePage").then((m) => ({ default: m.ProjectHomePage }))),
+);
 const TasksPage = lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage })));
 const UsagePage = withPageView(
   "usage",
@@ -91,6 +106,17 @@ function FeatureGatedPage({ feature, children }: { feature: FeatureKey; children
     );
   }
   return isFeatureEnabled(info, feature) ? children : <NotFoundPage />;
+}
+
+// With the board turned off in Settings, a project link opens that project's composer.
+function ProjectHomeRoute() {
+  const boardEnabled = useProjectKanbanBoardPreference();
+  const { projectName = "" } = useParams<{ projectName: string }>();
+  const navigate = useNavigate();
+  useEffect(() => {
+    if (!boardEnabled) navigate(`/?project=${encodeURIComponent(projectName)}`, { replace: true });
+  }, [boardEnabled, navigate, projectName]);
+  return boardEnabled ? <ProjectHomePage /> : null;
 }
 
 function AppRedirect({ to }: { to: string }) {
@@ -186,6 +212,15 @@ function AppRoutes({ basename }: AppProps) {
           </>
         )}
         <Route path={`${prefix}/approve/:sessionId/:elicitationId`} element={<ApprovePage />} />
+        {/* The desktop's floating New Agent panel: the composer alone, without the shell. */}
+        <Route
+          path={`${prefix}${FLOATING_COMPOSER_PATH}`}
+          element={
+            <FeatureGatedPage feature="floating_composer">
+              {isElectronShell() ? <FloatingComposerPage /> : <NotFoundPage />}
+            </FeatureGatedPage>
+          }
+        />
         <Route element={<AppShell />}>
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
@@ -198,6 +233,14 @@ function AppRoutes({ basename }: AppProps) {
             }
           />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
+          <Route
+            path={`${prefix}/projects/:projectName`}
+            element={
+              <FeatureGatedPage feature="project_kanban">
+                <ProjectHomeRoute />
+              </FeatureGatedPage>
+            }
+          />
           <Route
             path={`${prefix}/canvas`}
             element={
@@ -214,19 +257,31 @@ function AppRoutes({ basename }: AppProps) {
               </FeatureGatedPage>
             }
           />
-          <Route path={`${prefix}/tasks`} element={<TasksPage />} />
           <Route
-            path={`${prefix}/tasks/templates`}
-            element={<TasksPage key="templates" templatesOnly />}
-          />
-          <Route
-            path={`${prefix}/tasks/:taskId`}
             element={
-              <FeatureGatedPage feature="automations_v2">
-                <TaskDetailPage />
-              </FeatureGatedPage>
+              info === "loading" ? (
+                <PageLoading />
+              ) : info.automations_enabled === false ? (
+                <NotFoundPage />
+              ) : (
+                <Outlet />
+              )
             }
-          />
+          >
+            <Route path={`${prefix}/tasks`} element={<TasksPage />} />
+            <Route
+              path={`${prefix}/tasks/templates`}
+              element={<TasksPage key="templates" templatesOnly />}
+            />
+            <Route
+              path={`${prefix}/tasks/:taskId`}
+              element={
+                <FeatureGatedPage feature="automations_v2">
+                  <TaskDetailPage />
+                </FeatureGatedPage>
+              }
+            />
+          </Route>
           <Route
             path={`${prefix}/workflows`}
             element={

@@ -16,6 +16,7 @@ import {
   within,
 } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
+import type * as IdentityApi from "@/lib/identity";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -23,6 +24,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
+import { PROJECT_KANBAN_BOARD_STORAGE_KEY } from "@/lib/projectKanbanPreferences";
+import { fetchDatabricksStatus } from "@/lib/databricksIntegration";
+import { fetchGithubStatus } from "@/lib/githubIntegration";
 import {
   useProjectFolderCollapse,
   useProjectFolderPageSize,
@@ -31,7 +35,15 @@ import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/ses
 import * as host from "@/lib/host";
 import * as adminView from "@/lib/adminView";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
+import { UPDATE_MODE_ENTRY } from "@/pages/settings/search/catalog/updates";
+import { settingsDescriptionId } from "@/pages/settings/search/settingsControl";
+import { useSettingsAvailability } from "@/pages/settings/search/useSettingsAvailability";
 import { UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
+import {
+  CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
+  useCodeBlockWordWrap,
+  writeCodeBlockWordWrap,
+} from "@/lib/codeWrapPreferences";
 import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
@@ -49,6 +61,7 @@ const mocks = vi.hoisted(() => ({
   accountsEnabled: true,
   importSessionsPanel: vi.fn(() => null),
   enabledConnections: [] as string[],
+  archiveWorktreeCleanup: false,
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
   // header mode. Gates the Account section.
   loginUrl: "/login" as string | null,
@@ -58,7 +71,11 @@ const mocks = vi.hoisted(() => ({
   adminViewSupported: true as boolean | undefined,
   bootFallback: false,
   sessionTitleInstructions: false,
+  projectKanban: false,
+  floatingComposer: false,
   nestedAgents: false,
+  advisorAvailable: false,
+  authenticatedFetch: vi.fn(),
   // Identity from the mode-agnostic `/v1/me` probe (resolveIdentity returns
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
@@ -94,8 +111,29 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
           admin_view: mocks.adminViewSupported,
           sibling_sessions: mocks.nestedAgents,
           enabled_connections: mocks.enabledConnections,
+          archive_worktree_cleanup: mocks.archiveWorktreeCleanup,
           session_title_instructions: mocks.sessionTitleInstructions,
+          proactive_agent_available: mocks.advisorAvailable,
+          features: {
+            project_kanban: mocks.projectKanban,
+            floating_composer: mocks.floatingComposer,
+          },
         },
+}));
+vi.mock("@/lib/githubIntegration", () => ({
+  fetchGithubStatus: vi.fn(async () => ({ connected: false, login: null, install_url: null })),
+  beginGithubConnect: vi.fn(),
+  disconnectGithub: vi.fn(),
+}));
+vi.mock("@/lib/databricksIntegration", () => ({
+  fetchDatabricksStatus: vi.fn(async () => ({
+    enabled: true,
+    connected: false,
+    workspace_host: null,
+    databricks_user: null,
+  })),
+  beginDatabricksConnect: vi.fn(),
+  disconnectDatabricks: vi.fn(),
 }));
 vi.mock("@/components/SessionTitleInstructionsControl", () => ({
   SessionTitleInstructionsControl: () => <div data-testid="mock-session-title-instructions" />,
@@ -107,12 +145,19 @@ vi.mock("@/lib/accountsApi", () => ({
   logout: vi.fn(),
   changePassword: vi.fn(),
 }));
-vi.mock("@/lib/identity", () => ({
+const identityUpdates = vi.hoisted(() => new Set<() => void>());
+
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityApi>()),
+  authenticatedFetch: (...args: unknown[]) => mocks.authenticatedFetch(...args),
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
   getCurrentIsAdmin: () => mocks.effectiveAdmin ?? mocks.me?.is_admin ?? false,
   getCurrentAdminEligibility: () => mocks.me?.is_admin ?? false,
   getCurrentUserId: () => mocks.me?.id ?? null,
-  subscribeIdentity: () => () => {},
+  subscribeIdentity: (listener: () => void) => {
+    identityUpdates.add(listener);
+    return () => identityUpdates.delete(listener);
+  },
 }));
 vi.mock("@/hooks/useConversations", async () => {
   // A stateful mock that emulates useInfiniteQuery pagination: it tracks how
@@ -196,13 +241,17 @@ vi.mock("@/components/ui/select", async () => {
   }) => {
     const kids = Children.toArray(children);
     const trigger = kids.find((c) => isValidElement(c) && c.type === SelectTrigger);
-    const testId =
+    const triggerProps: Record<string, unknown> =
       isValidElement(trigger) && trigger.props && typeof trigger.props === "object"
-        ? (trigger.props as Record<string, unknown>)["data-testid"]
-        : undefined;
+        ? (trigger.props as Record<string, unknown>)
+        : {};
+    const stringProp = (name: string) =>
+      typeof triggerProps[name] === "string" ? triggerProps[name] : undefined;
     return (
       <select
-        data-testid={typeof testId === "string" ? testId : undefined}
+        data-testid={stringProp("data-testid")}
+        aria-label={stringProp("aria-label")}
+        aria-labelledby={stringProp("aria-labelledby")}
         value={value}
         disabled={disabled}
         onChange={(e) => onValueChange(e.target.value)}
@@ -257,6 +306,21 @@ function LocationProbe() {
   return <span data-testid="location">{useLocation().pathname}</span>;
 }
 
+/** Whether Settings search offers the Admin view row, read beside the page that shows it. */
+function AdminViewSearchProbe() {
+  return (
+    <span data-testid="search-offers-admin-view">
+      {String(useSettingsAvailability().adminView)}
+    </span>
+  );
+}
+
+/** Search offers Admin view exactly where the page shows its switch. */
+function expectSearchToMatchAdminViewSwitch() {
+  const shown = screen.queryByRole("switch", { name: "Admin view" }) !== null;
+  expect(screen.getByTestId("search-offers-admin-view")).toHaveTextContent(String(shown));
+}
+
 function renderPage(path = "/settings") {
   // The Appearance section lists the agent catalog (picker visibility), so the
   // page needs a query client like it has in the real app. Retries off so a
@@ -272,6 +336,7 @@ function renderPage(path = "/settings") {
           <MemoryRouter initialEntries={[path]}>
             <SettingsPage />
             <LocationProbe />
+            <AdminViewSearchProbe />
           </MemoryRouter>
         </Embed>
       </TooltipProvider>
@@ -280,6 +345,7 @@ function renderPage(path = "/settings") {
 }
 
 beforeEach(() => {
+  identityUpdates.clear();
   mocks.setTheme.mockReset();
   mocks.archiveMutate.mockReset();
   mocks.deleteMutate.mockReset();
@@ -293,9 +359,14 @@ beforeEach(() => {
   mocks.adminViewSupported = true;
   mocks.bootFallback = false;
   mocks.sessionTitleInstructions = false;
+  mocks.projectKanban = false;
+  mocks.floatingComposer = false;
   mocks.nestedAgents = false;
+  mocks.advisorAvailable = false;
+  mocks.authenticatedFetch.mockReset();
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
+  mocks.archiveWorktreeCleanup = false;
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.effectiveAdmin = undefined;
@@ -329,6 +400,34 @@ describe("Import sessions", () => {
     expect(screen.getByRole("heading", { name: "Import from a machine" })).toBeTruthy();
     expect(mocks.importSessionsPanel).toHaveBeenCalled();
     expect(screen.queryByRole("heading", { name: "Harness imports" })).toBeNull();
+  });
+});
+
+describe("Omni Advisor", () => {
+  it("shows a settings load failure with a retry instead of dropping the switch", async () => {
+    mocks.advisorAvailable = true;
+    mocks.authenticatedFetch.mockRejectedValueOnce(new Error("offline")).mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          workspace_enabled: true,
+          user_enabled: true,
+          enabled: true,
+          can_manage_workspace: false,
+        }),
+        { status: 200 },
+      ),
+    );
+    renderPage();
+
+    const group = await screen.findByTestId("settings-group-proactive-agent");
+    expect(await within(group).findByRole("alert")).toHaveTextContent(
+      "Couldn’t load Omni Advisor settings.",
+    );
+    expect(within(group).queryByRole("switch")).toBeNull();
+
+    fireEvent.click(within(group).getByRole("button", { name: "Retry" }));
+    expect(await within(group).findByRole("switch", { name: "Omni Advisor" })).toBeChecked();
+    expect(mocks.authenticatedFetch).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -402,6 +501,7 @@ describe("SettingsPage", () => {
       try {
         renderPage("/settings/general");
         expect(screen.queryByRole("switch", { name: "Admin view" })).toBeNull();
+        expectSearchToMatchAdminViewSwitch();
       } finally {
         document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
       }
@@ -413,6 +513,7 @@ describe("SettingsPage", () => {
     vi.spyOn(host, "isDatabricksWorkspace").mockReturnValue(true);
     renderPage("/settings/general");
     expect(screen.queryByRole("switch", { name: "Admin view" })).toBeNull();
+    expectSearchToMatchAdminViewSwitch();
   });
 
   it.each([
@@ -433,6 +534,7 @@ describe("SettingsPage", () => {
       try {
         renderPage("/settings/general");
         const control = screen.getByRole("switch", { name: "Admin view" });
+        expectSearchToMatchAdminViewSwitch();
         expect(control).toHaveAttribute("aria-checked", String(enabled));
         fireEvent.click(control);
         expect(update).toHaveBeenCalledWith(!enabled);
@@ -498,6 +600,77 @@ describe("SettingsPage", () => {
     expect(
       await screen.findByRole("switch", { name: "Show Omnigent from anywhere" }),
     ).toBeInTheDocument();
+  });
+
+  it("offers the New Agent shortcut only with floating_composer on and a shell that takes its id", async () => {
+    const getGlobalShortcut = vi.fn(async (id?: string) =>
+      id === "floatingComposer"
+        ? { enabled: true, accelerator: "CommandOrControl+Shift+Space" }
+        : { enabled: false, accelerator: "Alt+Space" },
+    );
+    const shell = (floatingComposerShortcut: boolean) => {
+      const getDesktopFeatures = vi.fn(async () => ({
+        floatingComposer: true,
+        floatingComposerShortcut,
+      }));
+      (window as unknown as Record<string, unknown>).omnigentDesktop = {
+        kind: "electron",
+        setBadgeCount: vi.fn(),
+        notify: vi.fn(),
+        getGlobalShortcut,
+        setGlobalShortcut: vi.fn(),
+        getDesktopFeatures,
+      };
+      return getDesktopFeatures;
+    };
+    const newAgent = { name: "Open New Agent from anywhere" };
+
+    // An older shell would read and save "show" for any id.
+    mocks.floatingComposer = true;
+    const oldShellFeatures = shell(false);
+    renderPage("/settings/general");
+    expect(
+      await screen.findByRole("switch", { name: "Show Omnigent from anywhere" }),
+    ).toBeInTheDocument();
+    // Let the New Agent row's own check answer before asserting it stayed away.
+    await waitFor(() => expect(oldShellFeatures).toHaveBeenCalled());
+    await act(async () => {});
+    expect(screen.queryByRole("switch", newAgent)).toBeNull();
+    expect(getGlobalShortcut).not.toHaveBeenCalledWith("floatingComposer");
+    cleanup();
+
+    mocks.floatingComposer = false;
+    shell(true);
+    renderPage("/settings/general");
+    await screen.findByRole("switch", { name: "Show Omnigent from anywhere" });
+    expect(screen.queryByRole("switch", newAgent)).toBeNull();
+    cleanup();
+
+    mocks.floatingComposer = true;
+    shell(true);
+    renderPage("/settings/general");
+    expect(await screen.findByRole("switch", newAgent)).toBeChecked();
+    expect(getGlobalShortcut).toHaveBeenCalledWith("floatingComposer");
+  });
+
+  it("offers the kanban board switch under Composer only when the server has the board", () => {
+    renderPage("/settings/general");
+    expect(screen.queryByTestId("settings-group-projects")).toBeNull();
+    cleanup();
+
+    mocks.projectKanban = true;
+    renderPage("/settings/general");
+    const projects = screen.getByTestId("settings-group-projects");
+    expect(screen.getByTestId("settings-group-composer").nextElementSibling).toBe(projects);
+    const toggle = within(projects).getByRole("switch", { name: "Kanban board views" });
+    expect(toggle).toBeChecked();
+
+    fireEvent.click(toggle);
+    expect(toggle).not.toBeChecked();
+    expect(localStorage.getItem(PROJECT_KANBAN_BOARD_STORAGE_KEY)).toBe("false");
+    fireEvent.click(toggle);
+    expect(toggle).toBeChecked();
+    expect(localStorage.getItem(PROJECT_KANBAN_BOARD_STORAGE_KEY)).toBeNull();
   });
 
   it("renders session auto-rename enabled by default", async () => {
@@ -664,7 +837,7 @@ describe("SettingsPage", () => {
   it("renders the Appearance section and applies a theme on card click", () => {
     renderPage("/settings/appearance");
     const heading = screen.getByRole("heading", { name: "Appearance" });
-    expect(heading).toHaveClass("settings-page-title", "font-medium");
+    expect(heading).toHaveClass("font-medium");
     expect(heading).not.toHaveClass("font-semibold");
     expect(heading.closest("section")?.parentElement).toHaveClass("max-w-4xl", "px-4", "md:px-8");
     expect(screen.getByRole("button", { name: "About Interface font size" })).toHaveClass(
@@ -1287,6 +1460,10 @@ describe("SettingsPage", () => {
     });
     fireEvent.click(screen.getByTestId("heavier-code-text-toggle"));
     localStorage.setItem("omnigent:hidden-picker-agents", '["polly"]');
+    // Code block wrap is toggled from a code block, not this page.
+    act(() => writeCodeBlockWordWrap(false));
+    const codeWrap = renderHook(() => useCodeBlockWordWrap());
+    expect(codeWrap.result.current).toBe(false);
 
     // Sanity: the non-default choices were persisted.
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
@@ -1325,6 +1502,8 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
     expect(localStorage.getItem("omnigent:code-font-size")).toBeNull();
     expect(localStorage.getItem("omnigent:code-font-weight")).toBeNull();
+    expect(localStorage.getItem(CODE_BLOCK_WORD_WRAP_STORAGE_KEY)).toBeNull();
+    expect(codeWrap.result.current).toBe(true);
 
     // Color theme is back to Omnigent.
     expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");
@@ -1601,6 +1780,23 @@ describe("SettingsPage", () => {
     expect(screen.queryByText("alice")).toBeNull();
   });
 
+  it("shows account identity after a transient probe recovers without remounting", async () => {
+    mocks.me = null;
+    const view = renderPage("/settings/account");
+    await act(async () => {});
+    expect(screen.queryByText("alice")).not.toBeInTheDocument();
+
+    mocks.me = { id: "alice", is_admin: true };
+    act(() => {
+      for (const listener of identityUpdates) listener();
+    });
+
+    expect(await screen.findByText("alice")).toBeInTheDocument();
+    expect(screen.getByText("(admin)")).toBeInTheDocument();
+    view.unmount();
+    expect(identityUpdates.size).toBe(0);
+  });
+
   it("persists an Updates mode change through the desktop bridge", async () => {
     const { bridge } = installUpdateBridge();
 
@@ -1614,6 +1810,23 @@ describe("SettingsPage", () => {
     await waitFor(() => {
       expect(bridge.setConfig).toHaveBeenCalledWith({ mode: "manual" });
     });
+  });
+
+  it("renders each Updates row from its Settings catalog entry", async () => {
+    installUpdateBridge();
+
+    renderPage("/settings/updates");
+    expect(await screen.findByRole("heading", { name: "Updates" })).toBeInTheDocument();
+
+    for (const id of ["update-mode", "install-updates-on-quit", "check-for-updates"]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(document.getElementById(settingsDescriptionId(UPDATE_MODE_ENTRY))).toHaveTextContent(
+      UPDATE_MODE_ENTRY.description,
+    );
+    expect(
+      screen.getByRole("switch", { name: "Install downloaded updates on next quit" }),
+    ).toBeInTheDocument();
   });
 
   it("surfaces manual update-check failures in Settings", async () => {
@@ -1734,6 +1947,236 @@ describe("SettingsPage", () => {
     fireEvent.change(input, { target: { value: "" } });
     expect(input.value).toBe("");
     expect(localStorage.getItem("omnigent:default-base-branch")).toBeNull();
+  });
+
+  it("renders the Archived sessions rows from their Settings catalog entries", () => {
+    mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];
+    renderPage("/settings/archived");
+
+    expect(document.querySelector('[data-settings-item="archived-sessions"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-control="archived-sessions:select"]'),
+    ).not.toBeNull();
+    expect(
+      screen.getByRole("combobox", { name: "Mark archived sessions as expired after" }),
+    ).toBeInTheDocument();
+    const row = screen.getByTestId("archived-row");
+    expect(row.querySelector('[data-settings-row-action="delete"]')).not.toBeNull();
+    expect(row.querySelector('[data-settings-row-action="unarchive"]')).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Select" }));
+    expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
+  });
+
+  it("renders the Account rows and the password dialog from their Settings catalog entries", async () => {
+    renderPage("/settings/account");
+    await screen.findByRole("button", { name: "Sign out" });
+    expect(document.querySelector('[data-settings-item="account-sign-out"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-control="account-password:change"]'),
+    ).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Change password" }));
+    expect(screen.getByPlaceholderText("Current password")).toHaveAccessibleName(
+      "Current password",
+    );
+    expect(screen.getByPlaceholderText("New password")).toHaveAccessibleName("New password");
+    expect(screen.getByPlaceholderText("Confirm new password")).toHaveAccessibleName(
+      "Confirm new password",
+    );
+    expect(
+      document.querySelector('[data-settings-control="account-password:currentPassword"]'),
+    ).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-control="account-password:submit"]'),
+    ).not.toBeNull();
+  });
+
+  it("renders the Git rows from their Settings catalog entries", () => {
+    renderPage("/settings/git");
+    for (const id of ["always-use-worktree", "default-base-branch"]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document
+        .querySelector('[data-settings-control="default-base-branch:"]')
+        ?.getAttribute("aria-labelledby"),
+    ).toBe("settings-default-base-branch-label");
+    expect(
+      screen.getByRole("switch", { name: "Always use a random worktree" }),
+    ).toHaveAccessibleDescription(
+      "Use a fresh, randomly named worktree for new sessions in Git workspaces. Project settings override this default.",
+    );
+    expect(screen.getByRole("textbox", { name: "Default base branch" })).toBeInTheDocument();
+  });
+
+  it("renders the delete-worktrees row only when the server enables worktree cleanup", () => {
+    renderPage("/settings/git");
+    expect(document.querySelector('[data-settings-item="delete-worktrees-on-archive"]')).toBeNull();
+
+    cleanup();
+    mocks.archiveWorktreeCleanup = true;
+    renderPage("/settings/git");
+    expect(
+      document.querySelector('[data-settings-item="delete-worktrees-on-archive"]'),
+    ).not.toBeNull();
+    expect(
+      document
+        .querySelector('[data-settings-control="delete-worktrees-on-archive:"]')
+        ?.getAttribute("aria-labelledby"),
+    ).toBe("settings-delete-worktrees-on-archive-label");
+  });
+
+  it("renders the Appearance theme rows from their Settings catalog entries", () => {
+    renderPage("/settings/appearance");
+    for (const id of ["theme-mode", "terminal-theme", "color-theme"]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document
+        .querySelector('[data-settings-control="theme-mode:"]')
+        ?.getAttribute("aria-labelledby"),
+    ).toBe("settings-theme-mode-label");
+    expect(
+      document
+        .querySelector('[data-settings-control="color-theme:accent"]')
+        ?.getAttribute("aria-label"),
+    ).toMatch(/^Accent: #/);
+    expect(
+      document.querySelector('[data-settings-control="color-theme:translucentSidebars"]'),
+    ).toHaveAttribute("aria-label", "Translucent sidebars");
+  });
+
+  it("renders the typography rows and their controls from their Settings catalog entries", () => {
+    renderPage("/settings/appearance");
+    for (const id of [
+      "ui-font-size",
+      "ui-font-family",
+      "code-font-size",
+      "code-font-family",
+      "code-font-weight",
+    ]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document.querySelector('[data-settings-control="ui-font-size:decrease"]'),
+    ).toHaveAttribute("aria-label", "Decrease interface font size");
+    expect(
+      document.querySelector('[data-settings-control="code-font-weight:toggle"]'),
+    ).toHaveAttribute("aria-label", "Use heavier code text");
+  });
+
+  it("names the Settings data buttons and opens their dialogs as its overlays", async () => {
+    renderPage("/settings/appearance");
+    expect(document.querySelector('[data-settings-item="appearance-data"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-control="appearance-data:export"]'),
+    ).toHaveAttribute("aria-label", "Export");
+    fireEvent.click(screen.getByTestId("reset-appearance-button"));
+    const dialog = await screen.findByRole("dialog", { name: "Reset appearance?" });
+    expect(dialog).toHaveAttribute("data-settings-overlay-owner", "appearance-data:reset");
+    expect(
+      document.querySelector('[data-settings-control="appearance-data:confirmReset"]'),
+    ).toHaveAttribute("aria-label", "Reset");
+  });
+
+  it("renders the chat default rows from their Settings catalog entries", async () => {
+    renderPage("/settings/appearance");
+    for (const id of [
+      "transcript-view-default",
+      "hide-unconfigured-harnesses",
+      "picker-visibility",
+      "show-final-answer",
+      "peer-session-messages",
+    ]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document.querySelector('[data-settings-control="picker-visibility:edit"]'),
+    ).toHaveAttribute("aria-label", "Edit");
+    expect(
+      document.querySelector('[data-settings-control="hide-unconfigured-harnesses:"]'),
+    ).toHaveAttribute("aria-labelledby", "settings-hide-unconfigured-harnesses-label");
+  });
+
+  it("renders the sidebar rows and their pins from their Settings catalog entries", () => {
+    renderPage("/settings/appearance");
+    for (const id of [
+      "workspace-panel-default",
+      "workspace-tabs",
+      "default-workspace-tab",
+      "session-row-quick-actions",
+      "project-folder-pagination",
+    ]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document.querySelector('[data-settings-control="workspace-tabs:pinPullRequests"]'),
+    ).toHaveAttribute("aria-label", "Pin Pull Requests");
+    expect(
+      document.querySelector('[data-settings-control="project-folder-pagination:pageSize"]'),
+    ).toHaveAttribute("aria-label", 'Sessions to show before "Show more"');
+  });
+
+  it("renders the General composer, session and sub-agent rows from their Settings catalog entries", () => {
+    renderPage("/settings/general");
+    for (const id of [
+      "submit-with-mod-enter",
+      "always-steer",
+      "background-session-titles",
+      "open-subagents-in-panel",
+    ]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document
+        .querySelector('[data-settings-control="always-steer:"]')
+        ?.getAttribute("aria-labelledby"),
+    ).toBe("settings-always-steer-label");
+  });
+
+  it("renders the General terminal clipboard row from its Settings catalog entry", () => {
+    renderPage("/settings/general");
+    expect(document.querySelector('[data-settings-item="terminal-clipboard"]')).not.toBeNull();
+  });
+
+  it("renders the Sandbox Integrations rows from their Settings catalog entries", async () => {
+    mocks.enabledConnections = ["github", "databricks"];
+    renderPage("/settings/integrations");
+    expect(await screen.findByTestId("github-connect")).toBeInTheDocument();
+    expect(await screen.findByTestId("databricks-workspace")).toBeInTheDocument();
+    for (const id of ["github-connection", "databricks-connection"]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document.querySelector('[data-settings-control="databricks-connection:workspace"]'),
+    ).not.toBeNull();
+    expect(screen.getByRole("textbox", { name: "Databricks workspace host" })).toBeInTheDocument();
+  });
+
+  it("keeps the GitHub and Databricks rows on the page while their status is checking", () => {
+    mocks.enabledConnections = ["github", "databricks"];
+    renderPage("/settings/integrations");
+    for (const id of ["github-connection", "databricks-connection"]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+  });
+
+  it("keeps the integration rows on the page when their status can't be read", async () => {
+    mocks.enabledConnections = ["github", "databricks"];
+    vi.mocked(fetchGithubStatus).mockRejectedValueOnce(new Error("offline"));
+    vi.mocked(fetchDatabricksStatus).mockRejectedValueOnce(new Error("offline"));
+    renderPage("/settings/integrations");
+    expect(
+      await screen.findByText("GitHub status is unavailable.", { selector: "p" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Databricks status is unavailable.", { selector: "p" }),
+    ).toBeInTheDocument();
+    expect(
+      document.querySelector('[data-settings-item="github-connection"]')?.textContent,
+    ).toContain("GitHub status is unavailable.");
+    expect(
+      document.querySelector('[data-settings-item="databricks-connection"]')?.textContent,
+    ).toContain("Databricks status is unavailable.");
   });
 
   it("lists archived sessions and unarchives on click", () => {

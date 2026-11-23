@@ -48,7 +48,7 @@ from omnigent.host.frames import HostSkillsFrame
 from omnigent.host.skills import HostSkillDiscovery
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import ResolvedSpec
-from omnigent.spec.types import SkillSpec, ToolGroupsConfig
+from omnigent.spec.types import AgentSpec, ExecutorSpec, ToolGroupsConfig
 
 _MARKETPLACE = "testmarket"
 _PLUGIN = "myplugin"
@@ -125,26 +125,6 @@ def _seed_plugin_home(home: Path) -> None:
     )
 
 
-class _ExecutorStub:
-    """Minimal ``ExecutorSpec`` stand-in exposing ``harness_kind``."""
-
-    def __init__(self, harness: str) -> None:
-        """:param harness: The session's harness, e.g. ``"codex-native"``."""
-        self.harness_kind = harness
-
-
-class _SpecStub:
-    """Minimal ``AgentSpec`` stand-in for runner skill discovery, journal group off."""
-
-    def __init__(self, harness: str) -> None:
-        """:param harness: Harness id driving per-harness skill discovery."""
-        self.skills: list[SkillSpec] = []
-        self.skills_filter: str = "all"
-        self.executor = _ExecutorStub(harness)
-        # Keeps Omnigent's own skills out of the lists these tests compare.
-        self.tool_groups = ToolGroupsConfig(journal=False)
-
-
 class _ServerClient:
     """Fake Omnigent server client returning a fixed session snapshot."""
 
@@ -172,16 +152,25 @@ class _ServerClient:
 
 def _make_app(harness: str, workspace: Path) -> Any:
     """
-    Build a runner app whose spec resolver returns a stub spec.
+    Build a runner app whose spec resolver returns a real agent spec.
 
     :param harness: The session's harness id, e.g. ``"codex-native"``.
     :param workspace: Session workspace (host-skill discovery root).
     :returns: The configured runner FastAPI app.
     """
-    entry = ResolvedSpec(spec=_SpecStub(harness), workdir=workspace)
+    spec = AgentSpec(
+        spec_version=1,
+        name="plugin-skills",
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+        skills=[],
+        skills_filter="all",
+        # Keeps Omnigent's own skills out of the lists these tests compare.
+        tool_groups=ToolGroupsConfig(journal=False),
+    )
+    entry = ResolvedSpec(spec=spec, workdir=workspace)
 
-    async def _spec_resolver(agent_id: str, session_id: str | None) -> Any:
-        """Return the stub resolved spec."""
+    async def _spec_resolver(agent_id: str, session_id: str | None) -> ResolvedSpec:
+        """Return the resolved spec."""
         del agent_id, session_id
         return entry
 

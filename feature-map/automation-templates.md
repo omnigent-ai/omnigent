@@ -47,6 +47,10 @@ to customize.
   Instructions for the task session, and Advanced's summary shows One task session.
   The choice is saved in the prompt, survives switching integrations, and isn't
   offered on edit. Archiving the task session makes the next match start a new one.
+  With a workflow chosen, One task session is disabled, since each match runs the
+  workflow in a new session. Saving a workflow trigger that used one task session
+  from the trigger form switches it to a session for each match; one that opens as
+  its prompt text can't be saved until the workflow is removed.
 - `prompt-editing`: the rendered template prompt is never shown or editable; there is
   no System prompt, Preview prompt, or Edit as prompt. A trigger saves its form state
   as a one-line `<!-- omnigent-trigger v1 {...} -->` header above the rendered prompt.
@@ -63,7 +67,8 @@ to customize.
   update future worker instructions without rebinding the polling session.
   Permissions offers only modes that keep approval, and only on servers that advertise
   `session_create_permission_modes`. New templates give workers the automation's mode when
-  it keeps approval and the server supports it; otherwise workers use their agent's default.
+  it keeps approval and the server supports it; otherwise the server chooses their mode, as
+  `session-orchestration`'s `create` describes.
   Existing worker sessions retain their settings. Customized creation calls in a single
   Instructions field keep **Edit worker instructions**, which focuses that field. Edits
   that remove the template signature or add ambiguous section headings show a notice
@@ -150,6 +155,13 @@ to customize.
   Custom schedule remains available for other recurrence patterns.
   The shared modal supports ten-minute connected-host schedules in
   either session mode and continued-sandbox schedules; new sandbox sessions stay hourly.
+- `rrule-editor`: the schedule picker opens with a Visual | RRULE toggle (RRULE needs
+  `automations_v2`). RRULE takes one rule line, seeded from the current schedule, with
+  the timezone below it and the end under Ends; the form checks only its shape, and the
+  server reports why a rule can't run on save. A saved rule the visual controls can't show,
+  such as hourly 9 AM to 5 PM on weekdays, opens on RRULE, and an edit that leaves it alone
+  saves it unchanged. Summaries show such rules as written. Rules with `COUNT=1` stay
+  unsupported in the form.
 - `capabilities`: Jira, Slack, GitHub, Linear, and PagerDuty templates require session continuity
   and orchestration. Unsupported servers still allow creation from scratch.
 - `tools-note`: the form says which tools the agent needs where the task runs,
@@ -187,6 +199,16 @@ to customize.
   **Start a new session for each match**. With `automations_v2` on a server
   supporting sub-hour schedules, use Repeat → Interval
   for a connected host or a continued sandbox session.
+- **MCP services:** when the server's MCP registry is on and `/v1/info` reports
+  `scheduled_task_mcp_services`, Advanced has an MCP services row that opens
+  the new-chat service list and its sign-in. A new automation starts with none,
+  and picking or switching triggers never changes them. A trigger whose
+  service is in the catalog shows "Uses <service> MCP" when it is selected,
+  otherwise a yellow "Add <service> MCP" button that signs in if needed (or
+  opens MCP settings for a pasted-token service) and selects it. Create stays
+  disabled, and Advanced opens, while a selected service needs sign-in or the
+  list can't load. An edit that keeps a continued session locks the row, since
+  that session keeps its services.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
   the same workspace and sandbox Repository controls apply. Unrelated edits
   preserve a continued session when the repository is unchanged or a legacy

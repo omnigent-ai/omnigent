@@ -1,14 +1,16 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { showToast } from "@/components/ui/toast";
+import { SessionDescendantRuns } from "@/components/workflows/WorkflowRunRow";
 import type { WorkflowSessionRequest } from "@/components/workflows/WorkflowSessionDialog";
 import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
-import { useDeleteWorkflow } from "@/hooks/useSavedWorkflows";
+import { useDeleteWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import {
   useWorkflow,
+  useWorkflowRunDescendants,
   useWorkflowRuns,
   type WorkflowDetail,
   WorkflowNotFoundError,
@@ -26,9 +28,12 @@ import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
 import type * as RoutingModule from "@/lib/routing";
 import { sessionJournalKey, type JournalEntry, type StepProgress } from "@/lib/sessionJournal";
-import { getSession, sendUserMessage } from "@/lib/sessionsApi";
-import { taskActionMessage } from "@/lib/workflow";
+import { ApiError, getSession, sendUserMessage } from "@/lib/sessionsApi";
+import { stopPlanMessage, taskActionMessage } from "@/lib/workflow";
 import type * as SessionsApi from "@/lib/sessionsApi";
+import { useChatStore } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
+import { usePlanStops } from "@/store/planStops";
 import { openTasksTab } from "@/store/sessionTasksActions";
 import type * as TasksActions from "@/store/sessionTasksActions";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
@@ -41,9 +46,17 @@ import { WorkflowDetailPage } from "./WorkflowDetailPage";
 
 vi.mock("@/hooks/useWorkflow", async (importOriginal) => {
   const actual = await importOriginal<typeof WorkflowHooks>();
-  return { ...actual, useWorkflow: vi.fn(), useWorkflowRuns: vi.fn() };
+  return {
+    ...actual,
+    useWorkflow: vi.fn(),
+    useWorkflowRuns: vi.fn(),
+    useWorkflowRunDescendants: vi.fn(),
+  };
 });
-vi.mock("@/hooks/useSessionJournal", () => ({ useSessionJournal: vi.fn() }));
+vi.mock("@/hooks/useSessionJournal", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionJournalHooks>()),
+  useSessionJournal: vi.fn(),
+}));
 vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: vi.fn() }));
 vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
@@ -59,11 +72,20 @@ vi.mock("@/components/workflows/WorkflowPlanningChat", () => ({
   WorkflowPlanningChat: ({
     workflow,
     onClose,
+    expanded,
+    onExpandedChange,
   }: {
     workflow: WorkflowDetail;
     onClose: () => void;
+    expanded?: boolean;
+    onExpandedChange?: (expanded: boolean) => void;
   }) => (
     <div data-testid="planning-chat" data-session={workflow.planning_session_id}>
+      {onExpandedChange && (
+        <button type="button" onClick={() => onExpandedChange(!expanded)}>
+          {expanded ? "Collapse planning chat" : "Expand planning chat"}
+        </button>
+      )}
       <button type="button" onClick={onClose}>
         Close planning chat
       </button>
@@ -113,6 +135,17 @@ vi.mock("@/components/workflows/WorkflowSessionDialog", () => ({
 vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
   CreateScheduledTaskDialog: (props: { open: boolean; lockedWorkflow?: SavedWorkflow | null }) =>
     props.open ? <div data-testid="new-automation-dialog">{props.lockedWorkflow?.name}</div> : null,
+}));
+// The share dialog has its own tests; here it names the workflow it shares.
+vi.mock("@/components/PermissionsModal", () => ({
+  PermissionsModal: (props: { open: boolean; workflow?: { id: string; name: string } }) =>
+    props.open ? <div data-testid="workflow-share-dialog">{props.workflow?.name}</div> : null,
+}));
+// The automations list has its own tests; here it names the workflow it lists.
+vi.mock("@/components/workflows/WorkflowAutomations", () => ({
+  WorkflowAutomations: ({ workflowId }: { workflowId: string }) => (
+    <div data-testid="workflow-automations-section" data-workflow={workflowId} />
+  ),
 }));
 const navigate = vi.fn();
 vi.mock("@/lib/routing", async (importOriginal) => {
@@ -181,7 +214,25 @@ function mockWorkflow(state: Partial<ReturnType<typeof useWorkflow>>) {
   return refetch;
 }
 
+function mockDescendantPages(pages: WorkflowRun[][] | null) {
+  vi.mocked(useWorkflowRunDescendants).mockImplementation(
+    (_workflowId, _run, enabled) =>
+      ({
+        data:
+          enabled && pages
+            ? { pages: pages.map((runs) => ({ runs, nextCursor: null })), pageParams: [] }
+            : undefined,
+        hasNextPage: false,
+        isFetching: false,
+        isError: false,
+        fetchNextPage: vi.fn(),
+        refetch: vi.fn(),
+      }) as unknown as ReturnType<typeof useWorkflowRunDescendants>,
+  );
+}
+
 function mockRuns(runs: WorkflowRun[], state: Record<string, unknown> = {}) {
+  mockDescendantPages(null);
   const fetchNextPage = vi.fn();
   vi.mocked(useWorkflowRuns).mockReturnValue({
     data: { pages: [{ runs, nextCursor: null }], pageParams: [null] },
@@ -193,6 +244,17 @@ function mockRuns(runs: WorkflowRun[], state: Record<string, unknown> = {}) {
     ...state,
   } as unknown as ReturnType<typeof useWorkflowRuns>);
   return fetchNextPage;
+}
+
+function mockSavedWorkflows(workflows: SavedWorkflow[]) {
+  vi.mocked(useSavedWorkflows).mockReturnValue({
+    workflows,
+    isLoading: false,
+    isError: false,
+    refresh: vi.fn(),
+    reload: vi.fn(),
+    pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
+  });
 }
 
 const deleteWorkflow = vi.fn();
@@ -294,6 +356,7 @@ describe("WorkflowDetailPage", () => {
       expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
       expect(screen.getByTestId("workflow-detail-run")).toBeDisabled();
       expect(screen.getByTestId("workflow-detail-create-automation")).toBeDisabled();
+      expect(screen.queryByTestId("workflow-automations-section")).toBeNull();
       if (mobile) {
         fireEvent.click(screen.getByRole("button", { name: "Close planning chat" }));
         expect(screen.queryByTestId("planning-chat")).toBeNull();
@@ -310,11 +373,15 @@ describe("WorkflowDetailPage", () => {
       else expect(screen.getByTestId("planning-chat")).toBeInTheDocument();
       expect(screen.queryByText("Draft")).toBeNull();
       expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+      expect(screen.getByTestId("workflow-automations-section")).toHaveAttribute(
+        "data-workflow",
+        WORKFLOW.id,
+      );
 
       cleanup();
       renderPage();
       await screen.findByTestId("workflow-detail-title");
-      fireEvent.click(screen.getByRole("button", { name: "Edit workflow" }));
+      fireEvent.click(screen.getByRole("button", { name: "Edit plan with agent" }));
       expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
       expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
       const edited = [
@@ -327,6 +394,861 @@ describe("WorkflowDetailPage", () => {
       await waitFor(() => expect(stored.steps).toEqual(edited));
     },
   );
+
+  it("expands the planner over the page in place, on wide screens only", () => {
+    mockWorkflow({ data: { ...WORKFLOW, steps: [], is_draft: true } });
+    mockRuns([]);
+    const { rerender } = renderPage();
+    const setPhone = (phone: boolean) => {
+      vi.mocked(useIsMobileViewport).mockReturnValue(phone);
+      rerender(<WorkflowDetailPage />);
+    };
+    const page = screen.getByTestId("workflow-detail-page");
+    const planner = screen.getByRole("complementary", { name: "Workflow planning chat" });
+    const panel = screen.getByTestId("workflow-planner-panel");
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand planning chat" }));
+    expect(panel).toHaveClass("absolute", "inset-0");
+    expect(page).toHaveClass("invisible");
+    // The aside still reserves its width, so the hidden page doesn't reflow.
+    expect(planner).toHaveClass("w-[42%]");
+    expect(planner).not.toHaveClass("absolute");
+    fireEvent.click(screen.getByRole("button", { name: "Collapse planning chat" }));
+    expect(panel).not.toHaveClass("absolute");
+    expect(page).not.toHaveClass("invisible");
+
+    // Every close path, including the phone sheet after the window narrows,
+    // reopens the planner beside the page.
+    const closeButton = () =>
+      fireEvent.click(screen.getByRole("button", { name: "Close planning chat" }));
+    const dismissSheet = () =>
+      fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    for (const [phone, close] of [
+      [false, closeButton],
+      [true, closeButton],
+      [true, dismissSheet],
+    ] as const) {
+      fireEvent.click(screen.getByRole("button", { name: "Expand planning chat" }));
+      setPhone(phone);
+      // Phones already show the planner as a near-full-screen sheet.
+      if (phone) expect(screen.queryByRole("button", { name: "Expand planning chat" })).toBeNull();
+      close();
+      expect(screen.queryByTestId("planning-chat")).toBeNull();
+      setPhone(false);
+      fireEvent.click(screen.getByRole("button", { name: "Create plan" }));
+      expect(page).not.toHaveClass("invisible");
+    }
+  });
+
+  it("opens the planning chat ready to type, and flashes it when pressed while open", () => {
+    const planner = "e".repeat(32);
+    mockWorkflow({ data: { ...WORKFLOW, planning_session_id: planner } });
+    mockRuns([]);
+    // Pressed before the planning session loads, the request waits for its composer.
+    vi.mocked(useSession).mockReturnValue({ session: null, isLoading: true, error: null });
+    vi.useFakeTimers();
+    try {
+      const { rerender } = renderPage();
+      const edit = screen.getByRole("button", { name: "Edit plan with agent" });
+
+      fireEvent.click(edit);
+      expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
+      expect(useChatStore.getState().sideChatComposers[planner]?.autoFocus).toBe(true);
+      expect(screen.queryByTestId("workflow-planning-chat-flash")).toBeNull();
+
+      // The real composer drops the request as it takes focus.
+      useChatStore.getState().clearSideChatComposer(planner);
+      vi.mocked(useSession).mockReturnValue({
+        session: { id: planner, archived: false, labels: {} } as Session,
+        isLoading: false,
+        error: null,
+      });
+      rerender(<WorkflowDetailPage />);
+      fireEvent.click(edit);
+      expect(useChatStore.getState().sideChatComposers[planner]?.autoFocus).toBe(true);
+      expect(screen.getByTestId("workflow-planning-chat-flash")).toBeInTheDocument();
+      act(() => vi.runOnlyPendingTimers());
+      expect(screen.queryByTestId("workflow-planning-chat-flash")).toBeNull();
+    } finally {
+      useChatStore.getState().clearSideChatComposer(planner);
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["archived", { session: { archived: true, labels: {} } as Session, error: null }],
+    ["deleted", { session: null, error: new ApiError("Session not found", 404, null) }],
+  ])("queues no composer focus for a %s planning session", (_, state) => {
+    const planner = "f".repeat(32);
+    mockWorkflow({ data: { ...WORKFLOW, planning_session_id: planner } });
+    mockRuns([]);
+    vi.mocked(useSession).mockReturnValue({ ...state, isLoading: false });
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit plan with agent" }));
+    expect(screen.getByTestId("planning-chat")).toBeInTheDocument();
+    expect(useChatStore.getState().sideChatComposers[planner]).toBeUndefined();
+  });
+
+  it("saves a chosen proposal's description with its steps, but not over a later edit", async () => {
+    const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+    vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+    mockRuns([]);
+    let now = 100;
+    let stored: WorkflowDetail = {
+      ...WORKFLOW,
+      description: "Pull the board's open tickets and group them",
+      steps: [],
+      is_draft: true,
+      planning_session_id: "a".repeat(32),
+      updated_at: now,
+    };
+    const patches: unknown[] = [];
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+      if (options?.method === "PATCH") {
+        const body = JSON.parse(String(options.body));
+        patches.push(body);
+        now += 100;
+        // As the server does, a description keeps the source it was saved with.
+        stored = {
+          ...stored,
+          steps: body.steps,
+          description: body.description ?? stored.description,
+          description_source:
+            body.description === undefined
+              ? stored.description_source
+              : (body.description_source ?? null),
+          is_draft: false,
+          updated_at: now,
+        };
+      }
+      return new Response(JSON.stringify(stored));
+    });
+    const proposal: JournalEntry = {
+      id: "proposal",
+      position: 1,
+      created_at: 150,
+      scheduled_task_run_id: null,
+      step: null,
+      author: { type: "agent" },
+      kind: "plan",
+      content: { steps: WORKFLOW.steps, description: WORKFLOW.description },
+    };
+    let entries = [proposal];
+    vi.mocked(useSessionJournal).mockImplementation(() => ({
+      entries,
+      isLoading: false,
+      error: null,
+      hasOlder: false,
+      loadingOlder: false,
+      loadOlder: vi.fn(),
+      retry: vi.fn(),
+    }));
+    const description = () => screen.getByTestId("workflow-detail-description").textContent;
+    const proposed = () => screen.getByTestId("workflow-detail-proposed-description").textContent;
+    const saveAndReload = async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved plan"));
+      cleanup();
+      renderPage();
+      await screen.findByTestId("workflow-detail-title");
+    };
+    renderPage();
+
+    // The draft's description stays beside the proposal's until that is chosen.
+    await screen.findByTestId("workflow-detail-title");
+    expect(description()).toBe("Pull the board's open tickets and group them");
+    expect(proposed()).toBe(WORKFLOW.description);
+    fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
+    await saveAndReload();
+    // Each new description names the one it replaces, so the server keeps a newer one.
+    expect(patches).toEqual([
+      {
+        steps: WORKFLOW.steps,
+        description: WORKFLOW.description,
+        expected_description: "Pull the board's open tickets and group them",
+        description_source: "proposal",
+      },
+    ]);
+    expect(description()).toBe(WORKFLOW.description);
+    expect(screen.queryByRole("radiogroup")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+
+    // A newer proposal can revise the description alone.
+    const revision = {
+      ...proposal,
+      id: "revision",
+      position: 2,
+      created_at: 250,
+      content: { steps: WORKFLOW.steps, description: "Fixes one flaky test." },
+    };
+    entries = [proposal, revision];
+    cleanup();
+    renderPage();
+    await screen.findByTestId("workflow-detail-title");
+    expect(proposed()).toBe("Fixes one flaky test.");
+    expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
+    fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
+    await saveAndReload();
+    expect(patches[1]).toEqual({
+      steps: WORKFLOW.steps,
+      description: "Fixes one flaky test.",
+      expected_description: WORKFLOW.description,
+      description_source: "revision",
+    });
+
+    // An edit in the same second as the newest proposal stands; Save plan applies only its steps.
+    const edited = [
+      ...WORKFLOW.steps,
+      { id: "report", name: "Report", goal: null, depends_on: [] },
+    ];
+    entries = [
+      proposal,
+      revision,
+      {
+        ...proposal,
+        id: "report",
+        position: 3,
+        created_at: 400,
+        content: { steps: edited, description: "Fixes flaky tests and reports them." },
+      },
+    ];
+    now = 400;
+    stored = {
+      ...stored,
+      description: "Edited by hand",
+      description_source: null,
+      updated_at: now,
+    };
+    cleanup();
+    renderPage();
+    await screen.findByTestId("workflow-detail-title");
+    expect(description()).toBe("Edited by hand");
+    expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
+    await saveAndReload();
+    expect(patches[2]).toEqual({ steps: edited });
+    expect(description()).toBe("Edited by hand");
+  });
+
+  it("keeps a newer proposal's description unsaved when an older save lands after it", async () => {
+    const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+    vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+    mockRuns([]);
+    let stored: WorkflowDetail = {
+      ...WORKFLOW,
+      steps: [],
+      is_draft: true,
+      planning_session_id: "a".repeat(32),
+      updated_at: 100,
+    };
+    const patches: { description?: string }[] = [];
+    let releaseFirstSave = () => {};
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+      if (options?.method === "PATCH") {
+        const body = JSON.parse(String(options.body));
+        patches.push(body);
+        if (patches.length === 1)
+          await new Promise<void>((resolve) => {
+            releaseFirstSave = resolve;
+          });
+        stored = {
+          ...stored,
+          steps: body.steps,
+          description: body.description ?? stored.description,
+          description_source:
+            body.description === undefined
+              ? stored.description_source
+              : (body.description_source ?? null),
+          is_draft: false,
+          updated_at: 300 + patches.length,
+        };
+      }
+      return new Response(JSON.stringify(stored));
+    });
+    const first: JournalEntry = {
+      id: "first",
+      position: 1,
+      created_at: 150,
+      scheduled_task_run_id: null,
+      step: null,
+      author: { type: "agent" },
+      kind: "plan",
+      content: { steps: WORKFLOW.steps, description: "Fixes one flaky test." },
+    };
+    const journal = {
+      entries: [first],
+      isLoading: false,
+      error: null,
+      hasOlder: false,
+      loadingOlder: false,
+      loadOlder: vi.fn(),
+      retry: vi.fn(),
+    };
+    vi.mocked(useSessionJournal).mockImplementation(() => journal);
+    const { rerender } = renderPage();
+    await screen.findByTestId("workflow-detail-title");
+
+    // The agent revises only the description while the first proposal's save is in flight,
+    // and that save lands after the revision was written.
+    fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+    await waitFor(() => expect(patches).toHaveLength(1));
+    journal.entries = [
+      first,
+      {
+        ...first,
+        id: "second",
+        position: 2,
+        created_at: 200,
+        content: { steps: WORKFLOW.steps, description: "Fixes flaky tests." },
+      },
+    ];
+    rerender(<WorkflowDetailPage />);
+    await act(async () => releaseFirstSave());
+
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes"));
+    const description = () => screen.getByTestId("workflow-detail-description").textContent;
+    const proposed = () => screen.getByTestId("workflow-detail-proposed-description").textContent;
+    // Choosing one proposal's wording doesn't choose a different, newer one.
+    expect(description()).toBe("Fixes one flaky test.");
+    expect(proposed()).toBe("Fixes flaky tests.");
+    expect(screen.getByRole("radio", { name: /^Keep current/ })).toBeChecked();
+
+    // Reopened, the page still tells the newer proposal from the one it saved.
+    cleanup();
+    renderPage();
+    await screen.findByTestId("workflow-detail-title");
+    expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
+    expect(proposed()).toBe("Fixes flaky tests.");
+    fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved plan"));
+    expect(patches.map((patch) => patch.description)).toEqual([
+      "Fixes one flaky test.",
+      "Fixes flaky tests.",
+    ]);
+
+    // Another client's description from the same second as that save stands after a refetch.
+    stored = { ...stored, description: "Edited elsewhere.", description_source: null };
+    cleanup();
+    renderPage();
+    await screen.findByTestId("workflow-detail-title");
+    expect(description()).toBe("Edited elsewhere.");
+    expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+  });
+
+  describe("with a description saved from an older proposal", () => {
+    const saved: JournalEntry = {
+      id: "saved",
+      position: 1,
+      created_at: 150,
+      scheduled_task_run_id: null,
+      step: null,
+      author: { type: "agent" },
+      kind: "plan",
+      content: { steps: WORKFLOW.steps, description: "Fixes one flaky test." },
+    };
+    const edited = [
+      ...WORKFLOW.steps,
+      { id: "report", name: "Report", goal: null, depends_on: [] },
+    ];
+    const description = () => screen.getByTestId("workflow-detail-description").textContent;
+    const proposed = () => screen.getByTestId("workflow-detail-proposed-description").textContent;
+
+    // The server's answers to where an entry sits in the journal.
+    const placedAfter = (position: number) =>
+      Promise.resolve(new Response(JSON.stringify({ object: "list", data: [{ position }] })));
+    const notInJournal = () =>
+      Promise.resolve(
+        new Response(JSON.stringify({ error: { code: "stale_cursor", message: "stale_cursor" } }), {
+          status: 400,
+        }),
+      );
+    function serve(stored: () => WorkflowDetail, place: () => Promise<Response>) {
+      vi.mocked(authenticatedFetch).mockImplementation(async (path) =>
+        String(path).includes("/journal?") ? place() : new Response(JSON.stringify(stored())),
+      );
+    }
+
+    // Answers PATCH like the workflow store: a description applies only while the stored one is
+    // still `expected_description`, and keeps the proposal it was saved with as its source.
+    function serveLikeTheStore(initial: WorkflowDetail) {
+      const server = { stored: initial, patches: [] as Record<string, unknown>[] };
+      vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+        if (options?.method === "PATCH") {
+          const body = JSON.parse(String(options.body));
+          server.patches.push(body);
+          const { stored } = server;
+          const describes =
+            body.description !== undefined &&
+            (body.expected_description === undefined ||
+              body.expected_description === stored.description);
+          server.stored = {
+            ...stored,
+            steps: body.steps ?? stored.steps,
+            description: describes ? body.description : stored.description,
+            description_source: describes
+              ? (body.description_source ?? null)
+              : stored.description_source,
+            updated_at: (stored.updated_at ?? 0) + 100,
+          };
+        }
+        return new Response(JSON.stringify(server.stored));
+      });
+      return server;
+    }
+
+    async function renderJournal(entries: JournalEntry[], initial: WorkflowDetail) {
+      const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+      vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+      mockRuns([]);
+      const journal = {
+        entries,
+        isLoading: false,
+        error: null,
+        hasOlder: false,
+        loadingOlder: false,
+        loadOlder: vi.fn(),
+        retry: vi.fn(),
+      };
+      vi.mocked(useSessionJournal).mockImplementation(() => journal);
+      const server = serveLikeTheStore(initial);
+      const view = renderPage();
+      await screen.findByTestId("workflow-detail-title");
+      return { journal, server, view };
+    }
+
+    const reload = async () => {
+      cleanup();
+      const view = renderPage();
+      await screen.findByTestId("workflow-detail-title");
+      return view;
+    };
+
+    it("edits the chosen description by hand, and keeps that edit over a newer proposal", async () => {
+      const newer = {
+        ...saved,
+        id: "newer",
+        position: 2,
+        created_at: 250,
+        content: { steps: WORKFLOW.steps, description: "Fixes flaky tests." },
+      };
+      const { journal, server, view } = await renderJournal([saved, newer], {
+        ...WORKFLOW,
+        description: "Fixes one flaky test.",
+        description_source: "saved",
+        planning_session_id: "a".repeat(32),
+        updated_at: 200,
+      });
+      expect(proposed()).toBe("Fixes flaky tests.");
+      const editor = () => screen.getByRole("textbox", { name: "Workflow description" });
+
+      // The editor starts from the chosen description. Saved unedited, either offered wording
+      // stays a choice for Save plan instead of a write.
+      fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      expect(editor()).toHaveValue("Fixes flaky tests.");
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      expect(screen.getByRole("radio", { name: /^Use proposed/ })).toBeChecked();
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      fireEvent.change(editor(), { target: { value: "Fixes one flaky test." } });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      expect(screen.getByRole("radio", { name: /^Keep current/ })).toBeChecked();
+      expect(server.patches).toEqual([]);
+
+      // Saved with the plan, the proposal's wording then gives way to a hand edit.
+      fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(description()).toBe("Fixes flaky tests."));
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      fireEvent.change(editor(), { target: { value: "Fixes flaky tests, one at a time." } });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(description()).toBe("Fixes flaky tests, one at a time."));
+      expect(server.patches.at(-1)).toEqual({ description: "Fixes flaky tests, one at a time." });
+      expect(screen.queryByRole("radiogroup")).toBeNull();
+      expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+
+      // A newer proposal repeating the wording chosen earlier is reviewed afresh, so Save plan
+      // keeps the hand edit and records that proposal.
+      journal.entries = [
+        saved,
+        newer,
+        { ...newer, id: "repeat", position: 3, created_at: server.stored.updated_at! + 1 },
+      ];
+      view.rerender(<WorkflowDetailPage />);
+      expect(proposed()).toBe("Fixes flaky tests.");
+      expect(screen.getByRole("radio", { name: /^Keep current/ })).toBeChecked();
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(screen.queryByRole("radiogroup")).toBeNull());
+      expect(server.patches.at(-1)).toEqual({
+        steps: WORKFLOW.steps,
+        description: "Fixes flaky tests, one at a time.",
+        expected_description: "Fixes flaky tests, one at a time.",
+        description_source: "repeat",
+      });
+      await reload();
+      expect(description()).toBe("Fixes flaky tests, one at a time.");
+      expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+    });
+
+    it("keeps the current description unless the proposal's is chosen, and records that", async () => {
+      const declined = {
+        ...saved,
+        id: "declined",
+        position: 2,
+        created_at: 250,
+        content: { steps: edited, description: "Fixes flaky tests." },
+      };
+      const { journal, server } = await renderJournal([saved, declined], {
+        ...WORKFLOW,
+        description: "Fixes one flaky test.",
+        description_source: "saved",
+        planning_session_id: "a".repeat(32),
+        updated_at: 200,
+      });
+      expect(description()).toBe("Fixes one flaky test.");
+      expect(proposed()).toBe("Fixes flaky tests.");
+      expect(screen.getByRole("radio", { name: /^Keep current/ })).toBeChecked();
+      expect(screen.getByRole("radio", { name: /^Use proposed/ })).not.toBeChecked();
+
+      // Keeping it saves the steps and names the declined proposal, so it isn't offered again.
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved plan"));
+      expect(server.patches).toEqual([
+        {
+          steps: edited,
+          description: "Fixes one flaky test.",
+          expected_description: "Fixes one flaky test.",
+          description_source: "declined",
+        },
+      ]);
+      expect(description()).toBe("Fixes one flaky test.");
+      expect(screen.queryByRole("radiogroup")).toBeNull();
+      await reload();
+      expect(description()).toBe("Fixes one flaky test.");
+      expect(screen.queryByRole("radiogroup")).toBeNull();
+      expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+
+      // A newer proposal is offered, and its description saves once chosen.
+      const newer = {
+        ...declined,
+        id: "newer",
+        position: 3,
+        created_at: 350,
+        content: { steps: edited, description: "Finds and fixes flaky tests." },
+      };
+      journal.entries = [saved, declined, newer];
+      const view = await reload();
+      expect(proposed()).toBe("Finds and fixes flaky tests.");
+      expect(screen.getByRole("radio", { name: /^Keep current/ })).toBeChecked();
+      fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
+      // Each proposal is chosen afresh, even one repeating the chosen wording.
+      journal.entries = [saved, declined, newer, { ...newer, id: "newest", position: 4 }];
+      view.rerender(<WorkflowDetailPage />);
+      expect(screen.getByRole("radio", { name: /^Keep current/ })).toBeChecked();
+      fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(description()).toBe("Finds and fixes flaky tests."));
+      expect(server.patches[1]).toEqual({
+        steps: edited,
+        description: "Finds and fixes flaky tests.",
+        expected_description: "Fixes one flaky test.",
+        description_source: "newest",
+      });
+      expect(screen.queryByRole("radiogroup")).toBeNull();
+      expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+    });
+
+    it.each(["Keep current", "Use proposed"])(
+      "saves the steps but keeps a description another client saved meanwhile (%s)",
+      async (choice) => {
+        const newer = {
+          ...saved,
+          id: "newer",
+          position: 2,
+          created_at: 250,
+          content: { steps: edited, description: "Fixes flaky tests." },
+        };
+        const { server } = await renderJournal([saved, newer], {
+          ...WORKFLOW,
+          description: "Fixes one flaky test.",
+          description_source: "saved",
+          planning_session_id: "a".repeat(32),
+          updated_at: 200,
+        });
+        // Another client's edit after this page loaded clears the stored source.
+        server.stored = {
+          ...server.stored,
+          description: "Edited elsewhere.",
+          description_source: null,
+          updated_at: 300,
+        };
+
+        fireEvent.click(screen.getByRole("radio", { name: new RegExp(`^${choice}`) }));
+        fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+        await waitFor(() => expect(description()).toBe("Edited elsewhere."));
+        expect(server.patches).toEqual([
+          {
+            steps: edited,
+            description: choice === "Keep current" ? "Fixes one flaky test." : "Fixes flaky tests.",
+            expected_description: "Fixes one flaky test.",
+            description_source: "newer",
+          },
+        ]);
+        expect(server.stored.steps).toEqual(edited);
+        expect(screen.queryByRole("radiogroup")).toBeNull();
+        expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+      },
+    );
+
+    it("leaves the workflow runnable when an older server saves only the steps", async () => {
+      // An older server returns no description source and refuses the conditional fields.
+      let stored: WorkflowDetail = {
+        ...WORKFLOW,
+        description: "Fixes one flaky test.",
+        planning_session_id: "a".repeat(32),
+        updated_at: 200,
+      };
+      const newer = {
+        ...saved,
+        id: "newer",
+        position: 2,
+        created_at: 250,
+        content: { steps: edited, description: "Fixes flaky tests." },
+      };
+      await renderJournal([saved, newer], stored);
+      vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+        if (options?.method === "PATCH") {
+          const body = JSON.parse(String(options.body));
+          if ("expected_description" in body) {
+            const detail = [{ type: "extra_forbidden", loc: ["body", "expected_description"] }];
+            return new Response(JSON.stringify({ detail }), { status: 422 });
+          }
+          stored = { ...stored, steps: body.steps, updated_at: 300 };
+        }
+        return new Response(JSON.stringify(stored));
+      });
+      expect(screen.getByTestId("workflow-detail-run")).toBeDisabled();
+
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved plan"));
+      expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
+      expect(description()).toBe("Fixes one flaky test.");
+    });
+
+    it("keeps a newer description unsaved when a save that kept the old one lands after it", async () => {
+      const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+      vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+      mockRuns([]);
+      let stored: WorkflowDetail = {
+        ...WORKFLOW,
+        description: "Fixes one flaky test.",
+        planning_session_id: "a".repeat(32),
+        updated_at: 100,
+      };
+      const patches: Record<string, unknown>[] = [];
+      let releaseSave = () => {};
+      vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+        if (options?.method === "PATCH") {
+          const body = JSON.parse(String(options.body));
+          patches.push(body);
+          await new Promise<void>((resolve) => {
+            releaseSave = resolve;
+          });
+          stored = {
+            ...stored,
+            steps: body.steps,
+            description: body.description ?? stored.description,
+            description_source:
+              body.description === undefined
+                ? stored.description_source
+                : (body.description_source ?? null),
+            updated_at: 301,
+          };
+        }
+        return new Response(JSON.stringify(stored));
+      });
+      // The first proposal changes only the steps and keeps the saved wording.
+      const first = {
+        ...saved,
+        id: "first",
+        content: { steps: edited, description: "Fixes one flaky test." },
+      };
+      const journal = {
+        entries: [first],
+        isLoading: false,
+        error: null,
+        hasOlder: false,
+        loadingOlder: false,
+        loadOlder: vi.fn(),
+        retry: vi.fn(),
+      };
+      vi.mocked(useSessionJournal).mockImplementation(() => journal);
+      const { rerender } = renderPage();
+      await screen.findByTestId("workflow-detail-title");
+      // Its unchanged description leaves nothing to choose.
+      expect(screen.queryByRole("radiogroup")).toBeNull();
+
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(patches).toHaveLength(1));
+      journal.entries = [
+        first,
+        {
+          ...first,
+          id: "second",
+          position: 2,
+          created_at: 200,
+          content: { steps: edited, description: "Fixes flaky tests." },
+        },
+      ];
+      rerender(<WorkflowDetailPage />);
+      await act(async () => releaseSave());
+
+      await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes"));
+      expect(proposed()).toBe("Fixes flaky tests.");
+      expect(patches[0]).toMatchObject({
+        description: "Fixes one flaky test.",
+        description_source: "first",
+      });
+    });
+
+    it("offers a newer proposal when the saved one came from an earlier planning chat", async () => {
+      const stored: WorkflowDetail = {
+        ...WORKFLOW,
+        description: "Fixes one flaky test.",
+        description_source: "f".repeat(32),
+        planning_session_id: "a".repeat(32),
+        updated_at: 500,
+      };
+      const newer = {
+        ...saved,
+        id: "newer",
+        created_at: 600,
+        content: { steps: WORKFLOW.steps, description: "Fixes flaky tests." },
+      };
+      const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+      vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+      mockRuns([]);
+      vi.mocked(useSessionJournal).mockReturnValue({
+        entries: [newer],
+        isLoading: false,
+        error: null,
+        hasOlder: false,
+        loadingOlder: false,
+        loadOlder: vi.fn(),
+        retry: vi.fn(),
+      });
+      serve(() => stored, notInJournal);
+      renderPage();
+      await screen.findByTestId("workflow-detail-title");
+      await waitFor(() => expect(proposed()).toBe("Fixes flaky tests."));
+      expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
+    });
+
+    it("offers a newer proposal when the one saved is older than the loaded journal", async () => {
+      const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+      vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+      mockRuns([]);
+      const stored: WorkflowDetail = {
+        ...WORKFLOW,
+        description: "Fixes one flaky test.",
+        description_source: "e".repeat(32),
+        planning_session_id: "a".repeat(32),
+        // A rename after the newer proposal moved the workflow's last write past it.
+        updated_at: 500,
+      };
+      serve(
+        () => stored,
+        () => placedAfter(9),
+      );
+      const page = (hasOlder: boolean) => ({
+        entries: [
+          {
+            ...saved,
+            id: "newer",
+            position: 150,
+            created_at: 300,
+            content: { steps: WORKFLOW.steps, description: "Fixes flaky tests." },
+          },
+        ],
+        isLoading: false,
+        error: null,
+        hasOlder,
+        loadingOlder: false,
+        loadOlder: vi.fn(),
+        retry: vi.fn(),
+      });
+      vi.mocked(useSessionJournal).mockReturnValue(page(true));
+      renderPage();
+      await screen.findByTestId("workflow-detail-title");
+      await waitFor(() => expect(proposed()).toBe("Fixes flaky tests."));
+      expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
+
+      // A source the journal doesn't hold came from another planning chat: the workflow's
+      // last write is newer than the proposal, so the description stays.
+      let answered = false;
+      serve(
+        () => stored,
+        () => notInJournal().finally(() => (answered = true)),
+      );
+      cleanup();
+      vi.mocked(useSessionJournal).mockReturnValue(page(false));
+      renderPage();
+      await screen.findByTestId("workflow-detail-title");
+      await waitFor(() => expect(answered).toBe(true));
+      await act(async () => {});
+      expect(description()).toBe("Fixes one flaky test.");
+      expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+    });
+
+    it("keeps a description saved elsewhere while a stale journal lacks its proposal", async () => {
+      const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+      vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+      mockRuns([]);
+      // Another tab saved proposal "p2" after this tab cached a journal ending at "saved".
+      const stored: WorkflowDetail = {
+        ...WORKFLOW,
+        description: "Fixes flaky tests.",
+        description_source: "p2",
+        planning_session_id: "a".repeat(32),
+        updated_at: 500,
+      };
+      vi.mocked(useSessionJournal).mockReturnValue({
+        entries: [saved],
+        isLoading: false,
+        error: null,
+        hasOlder: true,
+        loadingOlder: false,
+        loadOlder: vi.fn(),
+        retry: vi.fn(),
+      });
+      const expectSaved = () => {
+        expect(description()).toBe("Fixes flaky tests.");
+        expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+        expect(screen.queryByRole("button", { name: "Save plan" })).toBeNull();
+      };
+
+      // Until the server places "p2", the cached proposal isn't offered.
+      let place = () => {};
+      const placed = new Response(
+        JSON.stringify({ object: "list", data: [{ position: saved.position }] }),
+      );
+      serve(
+        () => stored,
+        () =>
+          new Promise<Response>((resolve) => {
+            place = () => resolve(placed);
+          }),
+      );
+      renderPage();
+      await screen.findByTestId("workflow-detail-title");
+      expectSaved();
+      // Placed after the cached proposal, it keeps the saved description.
+      await act(async () => place());
+      await act(async () => {});
+      expectSaved();
+    });
+  });
 
   it("shows the workflow, its steps, and the sessions that ran it", () => {
     mockWorkflow({});
@@ -381,7 +1303,7 @@ describe("WorkflowDetailPage", () => {
       vi.useFakeTimers({ shouldAdvanceTime: true });
       try {
         renderPage(client);
-        fireEvent.click(screen.getByRole("button", { name: "Edit workflow" }));
+        fireEvent.click(screen.getByRole("button", { name: "Edit plan with agent" }));
         await act(async () =>
           vi.advanceTimersByTimeAsync(journalHooks.JOURNAL_FALLBACK_REFETCH_MS * 2),
         );
@@ -421,6 +1343,96 @@ describe("WorkflowDetailPage", () => {
     } finally {
       scroll.mockRestore();
       client.mockRestore();
+    }
+  });
+
+  it("edits the description in place, keeping the draft when a save fails", async () => {
+    const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+    vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+    mockRuns([]);
+    let stored: WorkflowDetail = { ...WORKFLOW };
+    const patches: unknown[] = [];
+    let rejectSave = true;
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+      if (options?.method === "PATCH") {
+        patches.push(JSON.parse(String(options.body)));
+        if (rejectSave)
+          return new Response(
+            JSON.stringify({ error: { message: "Try again", type: "server_error" } }),
+            { status: 500 },
+          );
+        stored = {
+          ...stored,
+          description: (patches.at(-1) as { description: string }).description,
+        };
+      }
+      return new Response(JSON.stringify(stored));
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    try {
+      renderPage();
+      await screen.findByTestId("workflow-detail-description");
+      const editorName = { name: "Workflow description" };
+
+      // An unchanged description closes on Escape without saving.
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      const unchanged = screen.getByRole("textbox", editorName);
+      expect(unchanged).toHaveValue(WORKFLOW.description);
+      expect(unchanged).toHaveFocus();
+      expect((unchanged as HTMLTextAreaElement).selectionStart).toBe(WORKFLOW.description.length);
+      fireEvent.keyDown(unchanged, { key: "Escape" });
+      expect(screen.queryByRole("textbox", editorName)).toBeNull();
+
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      const editor = screen.getByRole("textbox", editorName);
+      // The shortcut can't save an empty description, just as the button can't.
+      fireEvent.change(editor, { target: { value: "   " } });
+      fireEvent.keyDown(editor, { key: "Enter", ctrlKey: true });
+      expect(patches).toEqual([]);
+      fireEvent.change(editor, {
+        target: { value: "  Finds flaky tests and fixes the clear ones.  " },
+      });
+      // Keys that end an IME composition neither cancel nor save.
+      fireEvent.keyDown(editor, { key: "Escape", isComposing: true });
+      fireEvent.keyDown(editor, { key: "Enter", ctrlKey: true, isComposing: true });
+      expect(confirm).not.toHaveBeenCalled();
+      expect(patches).toEqual([]);
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      // Browsers blur a control as saving disables it; jsdom doesn't.
+      act(() => editor.blur());
+      expect(await screen.findByRole("alert")).toHaveTextContent("Couldn’t save the description");
+      expect(editor).toHaveFocus();
+      // Escape asks before discarding the edit.
+      fireEvent.keyDown(editor, { key: "Escape" });
+      expect(confirm).toHaveBeenCalledOnce();
+      expect(editor).toHaveValue("  Finds flaky tests and fixes the clear ones.  ");
+
+      rejectSave = false;
+      fireEvent.keyDown(editor, { key: "Enter", metaKey: true });
+      await waitFor(() => expect(screen.queryByRole("textbox", editorName)).toBeNull());
+      expect(patches).toEqual([
+        { description: "Finds flaky tests and fixes the clear ones." },
+        { description: "Finds flaky tests and fixes the clear ones." },
+      ]);
+      expect(screen.getByTestId("workflow-detail-description").textContent).toBe(
+        "Finds flaky tests and fixes the clear ones.",
+      );
+      expect(screen.queryByRole("alert")).toBeNull();
+
+      // Cancel discards an edit once confirmed.
+      confirm.mockReturnValue(true);
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      fireEvent.change(screen.getByRole("textbox", editorName), {
+        target: { value: "Something else" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      expect(screen.queryByRole("textbox", editorName)).toBeNull();
+      expect(screen.getByTestId("workflow-detail-description").textContent).toBe(
+        "Finds flaky tests and fixes the clear ones.",
+      );
+      expect(patches).toHaveLength(2);
+    } finally {
+      confirm.mockRestore();
     }
   });
 
@@ -591,6 +1603,43 @@ describe("WorkflowDetailPage", () => {
     expect(screen.getByTestId("workflow-graph-overlay")).toHaveTextContent("explore:stopped");
   });
 
+  it("shows a run as running while its sandbox launches, and a failed launch as failed", () => {
+    mockWorkflow({});
+    const session = "a".repeat(32);
+    const launching = { ...run(session, "Untitled session", {}), sandboxLaunching: true };
+    mockRuns([launching]);
+    // The sidebar lists the session as idle until its first message runs.
+    vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+      ...conversationPage([conversation(session)]).data!,
+      pageParams: [undefined],
+    });
+    const { rerender } = renderPage();
+    const row = screen.getByTestId("workflow-run");
+    expect(row).toHaveAttribute("data-run-state", "running");
+    expect(within(row).getByTestId("workflow-run-state")).toHaveTextContent("0 of 2 done");
+    expect(within(row).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+    expect(within(row).queryByTestId("plan-continue")).toBeNull();
+
+    // A failed launch streamed here ends the run's launch before the run list refreshes.
+    try {
+      act(() =>
+        conversationRegistry
+          .acquire(session)
+          .setState({ sandboxStatus: { stage: "failed", error: "No capacity" } }),
+      );
+      expect(row).toHaveAttribute("data-run-state", "stopped");
+    } finally {
+      act(() => conversationRegistry.clear());
+    }
+
+    mockRuns([{ ...launching, sandboxLaunching: false, sessionStatus: "failed" }]);
+    rerender(<WorkflowDetailPage />);
+    expect(row).toHaveAttribute("data-run-state", "failed");
+    expect(within(row).getByTestId("workflow-run-state")).toHaveTextContent(
+      "Session failed · 0 of 2 done",
+    );
+  });
+
   it.each([false, true])(
     "keeps a superseded run read-only while its session works (completed=%s)",
     async (completed) => {
@@ -630,6 +1679,87 @@ describe("WorkflowDetailPage", () => {
       );
     },
   );
+
+  describe("a run's Stop", () => {
+    const session = "a".repeat(32);
+    // The main agent works on one task; another failed, so its card offers Retry.
+    const running: WorkflowRun = {
+      ...run(session, "Fix the upload test", { started: 1, failed: 1 }, [
+        status("explore", "started"),
+        status("fix", "failed"),
+      ]),
+      sessionStatus: "running",
+    };
+
+    beforeEach(() => {
+      mockWorkflow({});
+      mockRuns([running]);
+    });
+    afterEach(() => usePlanStops.setState({ requests: {}, settledStops: {} }));
+
+    it("shows Stopping… from Stop until the run's session stops, then Continue", async () => {
+      vi.mocked(sendUserMessage).mockClear().mockResolvedValue({ queued: true });
+      const { rerender } = renderPage();
+      const row = screen.getByTestId("workflow-run");
+      fireEvent.click(within(row).getByRole("button", { name: "Stop" }));
+      expect(within(row).getByTestId("plan-stopping")).toBeDisabled();
+      await waitFor(() =>
+        expect(sendUserMessage).toHaveBeenCalledWith(
+          session,
+          stopPlanMessage(WORKFLOW.name),
+          `plan-${session}`,
+        ),
+      );
+      expect(within(row).getByTestId("plan-stopping")).toBeInTheDocument();
+
+      mockRuns([{ ...running, sessionStatus: "idle" }]);
+      rerender(<WorkflowDetailPage />);
+      expect(within(row).queryByTestId("plan-stopping")).toBeNull();
+      expect(within(row).getByRole("button", { name: "Continue the plan" })).toBeInTheDocument();
+    });
+
+    it("shows Stop again once the session takes another message while it stops", async () => {
+      vi.mocked(sendUserMessage).mockClear().mockResolvedValue({ queued: true });
+      onTestFinished(() => act(() => conversationRegistry.clear()));
+      renderPage();
+      const row = screen.getByTestId("workflow-run");
+      fireEvent.click(within(row).getByRole("button", { name: "Stop" }));
+      await waitFor(() => expect(sendUserMessage).toHaveBeenCalledTimes(1));
+      expect(within(row).getByTestId("plan-stopping")).toBeInTheDocument();
+      // The session's stream is still open from a visit to it, and shows the stop message.
+      act(() =>
+        conversationRegistry.acquire(session).setState({
+          blocks: [
+            {
+              type: "user_message",
+              ctx: {
+                agent: null,
+                depth: 0,
+                turn: 0,
+                timestamp: 0,
+                responseId: "t",
+                itemId: "stop",
+              },
+              content: [{ type: "input_text", text: stopPlanMessage(WORKFLOW.name) }],
+            },
+          ],
+        }),
+      );
+      expect(within(row).getByTestId("plan-stopping")).toBeInTheDocument();
+
+      // Retry is accepted before its message reaches the transcript.
+      fireEvent.focus(within(row).getAllByTestId("tasks-progress-segment")[1]!);
+      fireEvent.pointerDown(await screen.findByTestId("tasks-progress-menu"), { button: 0 });
+      fireEvent.click(screen.getByTestId("tasks-progress-retry"));
+      await waitFor(() => expect(within(row).getByRole("button", { name: "Stop" })).toBeEnabled());
+      expect(sendUserMessage).toHaveBeenLastCalledWith(
+        session,
+        taskActionMessage("retry", "Fix the test"),
+        `plan-${session}`,
+      );
+      expect(within(row).queryByTestId("plan-stopping")).toBeNull();
+    });
+  });
 
   it("sends a task's ⋯ action on a run's timeline card to the run's session", async () => {
     vi.mocked(sendUserMessage).mockResolvedValue({ queued: true });
@@ -739,6 +1869,184 @@ describe("WorkflowDetailPage", () => {
     expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
   });
 
+  it("lists the workflow runs below a run, saying who started the ones further down", () => {
+    mockWorkflow({});
+    const calledId = "c".repeat(32);
+    // The server names the workflows you own, loaded in the saved list or not.
+    mockSavedWorkflows([]);
+    const root = "a".repeat(32);
+    const ready = "b".repeat(32);
+    mockRuns([
+      {
+        ...run(root, "Land stack", { done: 1 }),
+        sessionStatus: "running",
+        descendantRuns: [
+          {
+            ...run(ready, "Ready #1", { done: 1 }, [status("explore", "done")]),
+            workflowId: calledId,
+            workflowName: "Ready a PR",
+            startedBy: { sessionId: root, title: "Land stack" },
+          },
+          {
+            ...run("d".repeat(32), "Fix flaky test", { done: 1 }, [status("explore", "done")]),
+            workflowId: "e".repeat(32),
+            workflowName: null,
+            startedBy: { sessionId: ready, title: "" },
+          },
+        ],
+      },
+      {
+        ...run("f".repeat(32), "Earlier stack", { done: 2 }),
+        descendantRuns: [run("0".repeat(32), "Ready #0", { done: 2 })],
+      },
+    ]);
+    renderPage();
+
+    const [current, earlier] = screen.getAllByTestId("workflow-run-descendants-toggle");
+    // A run still going shows the runs below it; a finished one starts folded.
+    expect(current).toHaveTextContent("Ran 2 workflows");
+    expect(current).toHaveAttribute("aria-expanded", "true");
+    expect(earlier).toHaveTextContent("Ran 1 workflow");
+    expect(earlier).toHaveAttribute("aria-expanded", "false");
+    const rows = within(screen.getByTestId("workflow-run-descendants")).getAllByTestId(
+      "workflow-run",
+    );
+    expect(rows.map((row) => row.querySelector("a")?.textContent)).toEqual([
+      "Ready #1",
+      "Fix flaky test",
+    ]);
+    // Only a run further down says who started it; only a run of your workflow
+    // opens that workflow or takes actions.
+    expect(within(rows[0]!).queryByTestId("workflow-run-started-by")).toBeNull();
+    const startedBy = within(rows[1]!).getByTestId("workflow-run-started-by");
+    expect(startedBy).toHaveTextContent("Started by Untitled session");
+    expect(startedBy).toHaveAttribute("href", `/c/${ready}`);
+    expect(within(rows[0]!).getByTestId("run-workflow-button")).toHaveAttribute(
+      "href",
+      `/workflows/${calledId}`,
+    );
+    expect(within(rows[1]!).queryByTestId("run-workflow-button")).toBeNull();
+    expect(within(rows[0]!).getByRole("button", { name: "Continue the plan" })).toBeInTheDocument();
+    expect(within(rows[1]!).queryByRole("button", { name: "Continue the plan" })).toBeNull();
+
+    fireEvent.click(earlier!);
+    expect(earlier).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getAllByTestId("workflow-run-descendants")).toHaveLength(2);
+  });
+
+  it("shows the rest of the workflow runs below a run on request", () => {
+    mockWorkflow({});
+    mockSavedWorkflows([]);
+    const listed = {
+      ...run("a".repeat(32), "Land stack", { done: 1 }),
+      descendantRuns: [run("b".repeat(32), "Ready #1", {})],
+      descendantRunCount: 3,
+      descendantRunsCursor: "b".repeat(32),
+    };
+    mockRuns([listed]);
+    mockDescendantPages([
+      [run("c".repeat(32), "Ready #2", {})],
+      [run("d".repeat(32), "Ready #3", {})],
+    ]);
+    renderPage();
+
+    const toggle = screen.getByTestId("workflow-run-descendants-toggle");
+    expect(toggle).toHaveTextContent("Ran 3 workflows");
+    fireEvent.click(toggle);
+    const list = screen.getByTestId("workflow-run-descendants");
+    const titles = () =>
+      within(list)
+        .getAllByTestId("workflow-run")
+        .map((row) => row.querySelector("a")?.textContent);
+    expect(titles()).toEqual(["Ready #1"]);
+    expect(useWorkflowRunDescendants).toHaveBeenLastCalledWith(WORKFLOW.id, listed, false);
+
+    fireEvent.click(within(list).getByTestId("workflow-run-descendants-more"));
+    expect(useWorkflowRunDescendants).toHaveBeenLastCalledWith(WORKFLOW.id, listed, true);
+    expect(titles()).toEqual(["Ready #1", "Ready #2", "Ready #3"]);
+    expect(within(list).queryByTestId("workflow-run-descendants-more")).toBeNull();
+  });
+
+  it("opens the list below a run when one past the first page is waiting", () => {
+    mockWorkflow({});
+    mockSavedWorkflows([]);
+    mockRuns([
+      {
+        ...run("a".repeat(32), "Land stack", { done: 2 }),
+        descendantRuns: [run("b".repeat(32), "Ready #1", { done: 2 })],
+        descendantRunCount: 21,
+        descendantRunsCursor: "b".repeat(32),
+        descendantRunsActive: true,
+      },
+    ]);
+    renderPage();
+
+    const toggle = screen.getByTestId("workflow-run-descendants-toggle");
+    expect(toggle).toHaveTextContent("Ran 21 workflows");
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("links a run another session started back to that session", () => {
+    mockWorkflow({});
+    const starter = "a".repeat(32);
+    mockRuns([
+      { ...run("b".repeat(32), "Ready #1", {}), startedBy: { sessionId: starter, title: "Stack" } },
+      run("c".repeat(32), "Ran directly", {}),
+    ]);
+    renderPage();
+
+    const [started, direct] = screen.getAllByTestId("workflow-run");
+    const link = within(started!).getByTestId("workflow-run-started-by");
+    expect(link).toHaveTextContent("Started by Stack");
+    expect(link).toHaveAttribute("href", `/c/${starter}`);
+    expect(within(direct!).queryByTestId("workflow-run-started-by")).toBeNull();
+    expect(screen.queryByTestId("workflow-run-descendants-toggle")).toBeNull();
+  });
+
+  it("lists the workflow runs below a session's current run in its Tasks tab", () => {
+    mockSavedWorkflows([]);
+    const session = "a".repeat(32);
+    mockRuns([
+      {
+        ...run(session, "Land stack", {}),
+        id: "plan-earlier",
+        isCurrent: false,
+        descendantRuns: [run("b".repeat(32), "Ready #0", {})],
+      },
+      { ...run(session, "Land stack", {}), descendantRuns: [run("c".repeat(32), "Ready #1", {})] },
+    ]);
+    const tasksTab = () =>
+      render(<SessionDescendantRuns sessionId={session} workflowId={WORKFLOW.id} />, {
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={new QueryClient()}>
+            <MemoryRouter>{children}</MemoryRouter>
+          </QueryClientProvider>
+        ),
+      });
+    tasksTab();
+    expect(useWorkflowRuns).toHaveBeenCalledWith(WORKFLOW.id, session);
+    fireEvent.click(screen.getByTestId("workflow-run-descendants-toggle"));
+    const rows = within(screen.getByTestId("tasks-descendant-runs")).getAllByTestId("workflow-run");
+    expect(rows.map((row) => row.querySelector("a")?.textContent)).toEqual(["Ready #1"]);
+    cleanup();
+
+    mockRuns([run(session, "Land stack", {})]);
+    tasksTab();
+    expect(screen.queryByTestId("tasks-descendant-runs")).toBeNull();
+    cleanup();
+
+    // A run the session's next automation occurrence already ended isn't its current run.
+    mockRuns([
+      {
+        ...run(session, "Land stack", {}),
+        isCurrent: false,
+        descendantRuns: [run("d".repeat(32), "Ready #2", {})],
+      },
+    ]);
+    tasksTab();
+    expect(screen.queryByTestId("tasks-descendant-runs")).toBeNull();
+  });
+
   it("says when nothing ran it yet, and loads older runs on request", () => {
     mockWorkflow({});
     mockRuns([]);
@@ -775,11 +2083,16 @@ describe("WorkflowDetailPage", () => {
       if (automations === "loading" || automations === false) {
         expect(screen.queryByTestId("workflow-detail-create-automation")).toBeNull();
         expect(screen.queryByTestId("new-automation-dialog")).toBeNull();
+        expect(screen.queryByTestId("workflow-automations-section")).toBeNull();
       } else {
+        expect(screen.getByTestId("workflow-automations-section")).toHaveAttribute(
+          "data-workflow",
+          WORKFLOW.id,
+        );
         fireEvent.click(screen.getByTestId("workflow-detail-create-automation"));
         expect(screen.getByTestId("new-automation-dialog")).toHaveTextContent("Triage flaky tests");
       }
-      fireEvent.click(screen.getByRole("button", { name: "Edit workflow" }));
+      fireEvent.click(screen.getByRole("button", { name: "Edit plan with agent" }));
       expect(screen.getByTestId("planning-chat")).toBeInTheDocument();
 
       // A capability refresh can disable an already-open creation dialog.
@@ -789,6 +2102,7 @@ describe("WorkflowDetailPage", () => {
       });
       rerender(<WorkflowDetailPage />);
       expect(screen.queryByTestId("new-automation-dialog")).toBeNull();
+      expect(screen.queryByTestId("workflow-automations-section")).toBeNull();
 
       fireEvent.click(screen.getByRole("button", { name: "Delete workflow" }));
       expect(deleteWorkflow).not.toHaveBeenCalled();
@@ -805,6 +2119,126 @@ describe("WorkflowDetailPage", () => {
       expect(showToast).toHaveBeenCalledWith("Couldn’t delete “Triage flaky tests”.");
     },
   );
+
+  describe("sharing", () => {
+    const SHARING_INFO = { ...FALLBACK_SERVER_INFO, workflow_sharing: true };
+    const SHARING_OFF = "Sharing has been disabled for this Omnigent server.";
+    const UNSHAREABLE =
+      "This workflow was saved before sharing was available. Clone it, then share the copy.";
+    const SHARED: WorkflowDetail = {
+      ...WORKFLOW,
+      planning_session_id: "d".repeat(32),
+      viewer_role: "viewer",
+      owner_display_name: "Alice",
+    };
+
+    it("lets its owner share it", () => {
+      vi.mocked(useServerInfo).mockReturnValue(SHARING_INFO);
+      mockWorkflow({});
+      mockRuns([]);
+      renderPage();
+
+      fireEvent.click(screen.getByRole("button", { name: "Share workflow" }));
+      expect(screen.getByTestId("workflow-share-dialog")).toHaveTextContent(WORKFLOW.name);
+    });
+
+    it.each([
+      ["a server that doesn't share workflows", FALLBACK_SERVER_INFO],
+      ["a single-user server", { ...SHARING_INFO, single_user: true }],
+    ])("offers no Share on %s", (_label, info) => {
+      vi.mocked(useServerInfo).mockReturnValue(info);
+      mockWorkflow({});
+      mockRuns([]);
+      renderPage();
+      expect(screen.queryByTestId("workflow-detail-share")).toBeNull();
+      expect(screen.getByTestId("workflow-detail-clone")).toBeEnabled();
+    });
+
+    it.each([
+      ["while sharing is off", "off" as const, true, SHARING_OFF],
+      ["on a workflow saved before sharing", undefined, false, UNSHAREABLE],
+      [
+        "on a workflow saved before sharing while sharing is off",
+        "off" as const,
+        false,
+        SHARING_OFF,
+      ],
+    ])("disables Share with its reason %s", async (_label, sharingMode, shareable, reason) => {
+      vi.mocked(useServerInfo).mockReturnValue({
+        ...SHARING_INFO,
+        ...(sharingMode && { sharing_mode: sharingMode }),
+      });
+      mockWorkflow({ data: { ...WORKFLOW, shareable } });
+      mockRuns([]);
+      renderPage();
+
+      const share = screen.getByRole("button", { name: "Share workflow" });
+      expect(share).toBeDisabled();
+      const wrapper = screen.getByRole("group", { name: "Share workflow" });
+      expect(wrapper).toContainElement(share);
+      fireEvent.focus(wrapper);
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
+      expect(screen.queryByTestId("workflow-share-dialog")).toBeNull();
+    });
+
+    it.each([
+      ["Edit plan with agent", "Only the workflow's owner can edit it."],
+      ["Delete workflow", "Only the workflow's owner can delete it."],
+      ["Share workflow", "Only the workflow's owner can share it."],
+    ])("disables %s on a workflow shared with the viewer", async (label, reason) => {
+      vi.mocked(useServerInfo).mockReturnValue(SHARING_INFO);
+      mockWorkflow({ data: SHARED });
+      mockRuns([]);
+      renderPage();
+
+      expect(screen.getByRole("button", { name: label })).toBeDisabled();
+      fireEvent.focus(screen.getByRole("group", { name: label }));
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
+    });
+
+    it("shows a workflow shared with the viewer read-only, with Run and Clone", () => {
+      vi.mocked(useServerInfo).mockReturnValue(SHARING_INFO);
+      mockWorkflow({ data: SHARED });
+      mockRuns([run("a".repeat(32), "My run", { done: 2 })]);
+      vi.mocked(useSession).mockClear();
+      renderPage();
+
+      expect(screen.getByTestId("workflow-detail-owner")).toHaveTextContent("Shared by Alice");
+      expect(screen.getByTestId("workflow-detail-clone")).toBeEnabled();
+      expect(screen.queryByRole("button", { name: "Edit description" })).toBeNull();
+      expect(screen.queryByTestId("workflow-detail-create-automation")).toBeNull();
+      expect(screen.queryByTestId("workflow-automations-section")).toBeNull();
+      // The planning chat is the owner's: it isn't loaded or offered.
+      expect(useSession).not.toHaveBeenCalledWith(SHARED.planning_session_id);
+      expect(screen.queryByTestId("planning-chat")).toBeNull();
+      expect(screen.getByTestId("workflow-runs")).toHaveTextContent("My run");
+
+      fireEvent.click(screen.getByTestId("workflow-detail-run"));
+      expect(screen.getByTestId("workflow-session-dialog")).toHaveTextContent(WORKFLOW.id);
+    });
+
+    it("clones a shared workflow into the viewer's own and opens the copy", async () => {
+      vi.mocked(useServerInfo).mockReturnValue(SHARING_INFO);
+      mockWorkflow({ data: SHARED });
+      mockRuns([]);
+      const copy = { ...WORKFLOW, id: "c".repeat(32), name: `${WORKFLOW.name} (copy)` };
+      vi.mocked(authenticatedFetch).mockReset();
+      vi.mocked(authenticatedFetch).mockImplementation(async (_url, init) =>
+        Response.json(init?.method === "POST" ? copy : SHARED),
+      );
+      renderPage();
+
+      fireEvent.click(screen.getByTestId("workflow-detail-clone"));
+      await waitFor(() => expect(navigate).toHaveBeenCalledWith(`/workflows/${copy.id}`));
+      const [, post] = vi.mocked(authenticatedFetch).mock.calls;
+      expect(post?.[0]).toBe("/v1/workflows");
+      expect(JSON.parse(String(post?.[1]?.body))).toEqual({
+        name: copy.name,
+        description: WORKFLOW.description,
+        steps: WORKFLOW.steps,
+      });
+    });
+  });
 
   it("tells a missing workflow from one that failed to load", () => {
     mockWorkflow({ data: undefined, isError: true, error: new WorkflowNotFoundError() });

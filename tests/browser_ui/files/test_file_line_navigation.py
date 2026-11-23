@@ -104,6 +104,11 @@ def seeded_session(browser_contract: BrowserContract) -> BrowserSession:
     browser_contract.json(
         "/v1/projects/order", {"ordered_project_ids": None, "sort_mode": "alphabetical"}
     )
+    browser_contract.json(
+        "/v1/scheduled-tasks/default-timezone",
+        lambda request: request.post_data_json,
+        method="PUT",
+    )
     browser_contract.json("/v1/harnesses", {"data": [], "setup_steps": {}})
     browser_contract.json("/v1/sessions/projects", [])
     browser_contract.json(
@@ -938,7 +943,7 @@ def test_markdown_comment_draft_survives_responsive_layouts(
         # Let CSS hide the old layout before React receives the new viewport.
         page.add_init_script("""
             const matchMedia = window.matchMedia.bind(window);
-            const query = '(max-width: 767.98px)';
+            const query = '(max-width: 1180.98px)';
             const media = matchMedia(query);
             let matches = media.matches;
             const deferred = new EventTarget();

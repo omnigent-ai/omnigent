@@ -41,10 +41,11 @@ from omnigent.entities.session_journal import (
     JournalEntryTooLargeError,
     JournalFullError,
     StepNotReadyError,
+    normalize_description,
     normalize_status,
     normalize_step_id,
 )
-from omnigent.entities.workflow import Workflow
+from omnigent.entities.workflow import InvalidWorkflowError, Workflow
 from omnigent.entities.workflow_questions import (
     normalize_questions,
     question_form,
@@ -66,6 +67,7 @@ from omnigent.server.journal_markers import (
 )
 from omnigent.server.routes._auth_helpers import get_user_id, require_access_and_level
 from omnigent.server.routes._errors import session_not_found
+from omnigent.server.routes.workflow_permissions import readable_workflow
 from omnigent.server.schemas import (
     ElicitationRequestEvent,
     ElicitationRequestParams,
@@ -116,6 +118,20 @@ def open_store(conversation_store: object) -> SessionJournalStore | None:
                 return None
             _stores[location] = store
         return store
+
+
+def titled_for_workflow_run(
+    conversation_store: ConversationStore, conversation_id: str, title: str | None
+) -> bool:
+    """Whether *title* is the name of the saved workflow the session's first run follows.
+
+    :param title: The session's title, e.g. ``"Release"``.
+    """
+    store = open_store(conversation_store)
+    if store is None or title is None:
+        return False
+    run = store.first_workflow_runs([conversation_id]).get(conversation_id)
+    return run is not None and run.content.get("name") == title
 
 
 def _require_store(conversation_store: ConversationStore) -> SessionJournalStore:
@@ -216,10 +232,20 @@ def entry_to_response(entry: JournalEntry) -> SessionJournalEntry:
 
 
 async def load_workflow_for_run(
-    conversation_store: ConversationStore, workflow_id: str, *, user_id: str | None
+    conversation_store: ConversationStore,
+    workflow_id: str,
+    *,
+    user_id: str | None,
+    permission_store: PermissionStore | None,
 ) -> Workflow:
-    """Load and validate the caller's saved plan before creating its session."""
-    workflow = await _load_workflow(conversation_store, workflow_id, user_id=user_id)
+    """Load and validate a saved plan the caller can run before creating its session.
+
+    :param permission_store: Lets someone a workflow is shared with run it; ``None``
+        allows only the owner's.
+    """
+    workflow = await _load_workflow(
+        conversation_store, workflow_id, user_id=user_id, permission_store=permission_store
+    )
     store = _require_store(conversation_store)
     with _journal_errors():
         await asyncio.to_thread(
@@ -229,21 +255,48 @@ async def load_workflow_for_run(
     return workflow
 
 
-async def _load_workflow(
-    conversation_store: ConversationStore, workflow_id: str, *, user_id: str | None
-) -> Workflow:
-    """Look up the caller's owned workflow with saved steps."""
+def _check_proposed_description(conversation_store: ConversationStore, description: str) -> None:
+    """Refuse a proposed description its workflow couldn't store, so Save plan can save it.
+
+    Text the journal itself refuses, such as a lone surrogate, is left for it to report.
+    """
+    try:
+        text = normalize_description(description)
+    except InvalidJournalEntryError:
+        return
     workflows = open_workflow_store(conversation_store)
+    if workflows is None:
+        return
+    try:
+        workflows.check_description(text)
+    except InvalidWorkflowError as exc:
+        raise OmnigentError(f"invalid_entry: {exc}", code=ErrorCode.INVALID_INPUT) from exc
+
+
+async def _load_workflow(
+    conversation_store: ConversationStore,
+    workflow_id: str,
+    *,
+    user_id: str | None,
+    permission_store: PermissionStore | None,
+) -> Workflow:
+    """Look up a workflow with saved steps that the caller owns or that is shared with them."""
+    workflows = open_workflow_store(conversation_store)
+    workflow = None
     try:
         uuid_to_bytes(workflow_id)
     except InvalidUuidError:
-        workflow = None
+        pass
     else:
-        workflow = (
-            await asyncio.to_thread(workflows.get, workflow_id, user_id=user_id)
-            if workflows is not None
-            else None
-        )
+        if workflows is not None:
+            found = await asyncio.to_thread(
+                readable_workflow,
+                workflows,
+                workflow_id,
+                user_id,
+                permission_store=permission_store,
+            )
+            workflow = found[0] if found is not None else None
     if workflow is None:
         raise OmnigentError(
             f"workflow_not_found: no saved workflow {workflow_id!r}",
@@ -472,12 +525,15 @@ def create_session_journal_router(
     ) -> SessionJournalEntry:
         """Append an entry written by the session's agent; only its runner calls this."""
         session = await _agent_session(request, session_id)
-        if body.kind == "plan" and set(body.content) != {"name", "steps"}:
+        if body.kind == "plan" and set(body.content) - {"description"} != {"name", "steps"}:
             # Only the server can attribute a plan to a saved workflow snapshot.
             raise OmnigentError(
-                "invalid_entry: a plan's content has exactly two fields, name and steps",
+                "invalid_entry: a plan's content has name and steps, and optionally description",
                 code=ErrorCode.INVALID_INPUT,
             )
+        description = body.content.get("description") if body.kind == "plan" else None
+        if isinstance(description, str) and description.strip():
+            await asyncio.to_thread(_check_proposed_description, conversation_store, description)
         if body.workflow_id is not None:
             await _require_workflow(request, body.kind, body.workflow_id)
         entry = await _append(
@@ -493,13 +549,16 @@ def create_session_journal_router(
         return (await asyncio.to_thread(_entries_to_responses, _store(), [entry]))[0]
 
     async def _require_workflow(request: Request, kind: str, workflow_id: str) -> None:
-        """Refuse a workflow on anything but a plan, or one that isn't the caller's."""
+        """Refuse a workflow on anything but a plan, or one the caller can't run."""
         if kind != "plan":
             raise OmnigentError(
                 "invalid_entry: only a plan names a workflow", code=ErrorCode.INVALID_INPUT
             )
         await _load_workflow(
-            conversation_store, workflow_id, user_id=get_user_id(request, auth_provider)
+            conversation_store,
+            workflow_id,
+            user_id=get_user_id(request, auth_provider),
+            permission_store=permission_store,
         )
 
     @router.post(

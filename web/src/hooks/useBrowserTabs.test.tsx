@@ -6,20 +6,29 @@ import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
-import { SESSION_HOST_PROTOCOL } from "@/lib/nativeBridge";
+import {
+  SESSION_HOST_PROTOCOL,
+  SSH_PREVIEW_PROTOCOL,
+  type BrowserNavigationResult,
+} from "@/lib/nativeBridge";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
+import { writeBrowserAgentToolsEnabled } from "@/components/BrowserPane/agentTools/preferences";
+import { loadTabs } from "@/components/BrowserPane/agentTools/tabStore";
+import { fakeMainTabs } from "@/components/BrowserPane/agentTools/fakeMainTabs";
 import {
   AGENT_BROWSER_TAB_ID,
   browserViewId,
   browserViewOwnerId,
+  closeBrowserView,
   openAgentBrowserTab,
   openBrowserTab,
   useBrowserTabs,
 } from "./useBrowserTabs";
 
 vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
+vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn(async () => []) }));
 
 // Unknown hosts stay public-only unless a test gives the session one.
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
@@ -186,6 +195,24 @@ describe("browserViewOwnerId", () => {
   });
 });
 
+describe("closeBrowserView", () => {
+  it("closes the session's view and says whether it went", async () => {
+    const browserClose = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({ ok: false });
+    await expect(closeBrowserView("session-a", "tab-1", { browserClose })).resolves.toBe(true);
+    expect(browserClose).toHaveBeenCalledWith(browserViewId("session-a", "tab-1"));
+    await expect(closeBrowserView("session-a", "tab-1", { browserClose })).resolves.toBe(false);
+  });
+
+  it("counts a failed close as kept, and has nothing to close without a view host", async () => {
+    const browserClose = vi.fn().mockRejectedValue(new Error("gone"));
+    await expect(closeBrowserView("session-a", "tab-1", { browserClose })).resolves.toBe(false);
+    await expect(closeBrowserView("session-a", "tab-1", undefined)).resolves.toBe(true);
+  });
+});
+
 describe("browser soft tabs", () => {
   it("persists a pending close even if the workspace unmounts", async () => {
     let finishClose!: (value: { ok: boolean }) => void;
@@ -281,6 +308,32 @@ describe("browser soft tabs", () => {
     });
     expect(outcome).toEqual({ ok: false, error });
     expect(result.current.tabs).toEqual([]);
+  });
+
+  it("reports a failure when the reopened tab can't be recorded, and closes its view", async () => {
+    const main = fakeMainTabs();
+    main.otherWindow("session-a", (r) => ({ ...r, tabs: ["kept"], selected: "kept" }));
+    const browserClose = vi.fn().mockResolvedValue({ ok: true });
+    Object.assign(window, {
+      omnigentDesktop: {
+        browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true }),
+        browserClose,
+        onBrowserTabsChanged: main.onBrowserTabsChanged,
+        browserTabs: async (args: Record<string, unknown>) =>
+          args.op === "update" ? { ok: false, error: "disk full" } : main.browserTabs(args),
+      },
+    });
+    writeBrowserAgentToolsEnabled(true);
+    await loadTabs("session-a");
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    await waitFor(() => expect(result.current.tabs).toEqual(["kept"]));
+    let outcome: { ok: boolean; error?: string } | undefined;
+    await act(async () => {
+      outcome = await result.current.reopen("https://example.com/");
+    });
+    expect(outcome).toEqual({ ok: false, error: "disk full" });
+    expect(browserClose).toHaveBeenCalledTimes(1);
+    expect(result.current.tabs).toEqual(["kept"]);
   });
 
   it("commits the incoming session's selection in its first render after a switch", () => {
@@ -562,29 +615,74 @@ describe("browser soft tabs", () => {
     );
   });
 
-  it("reopens with the host the session inherits, so its localhost pages can load", async () => {
-    const browserOpenOrNavigate = vi.fn().mockResolvedValue({ ok: true });
-    Object.assign(window, { omnigentDesktop: { browserOpenOrNavigate } });
-    vi.mocked(getSessionSlim).mockImplementation(
-      async (id: string) =>
-        ({
-          id,
-          hostId: id === "parent" ? "this-mac" : null,
-          parentSessionId: id === "session-a" ? "parent" : null,
-          labels: {},
-        }) as unknown as Session,
-    );
-    const { result } = renderHook(() => useBrowserTabs("session-a"));
-    await act(async () => {
-      await result.current.reopen("http://localhost:3000/");
-    });
-    expect(browserOpenOrNavigate).toHaveBeenCalledWith(
-      browserViewId("session-a", result.current.selected!),
-      "http://localhost:3000/",
-      undefined,
-      { force: true, sourceHostId: "this-mac", sessionHostProtocol: SESSION_HOST_PROTOCOL },
-    );
-  });
+  it.each(["older shell", "same host after consent", "moved host during consent"])(
+    "reopens with the host the session inherits: %s",
+    async (scenario) => {
+      const capable = scenario !== "older shell";
+      const moved = scenario === "moved host during consent";
+      let parentHost = "this-mac";
+      const browserOpenOrNavigate = vi.fn().mockResolvedValue({ ok: true });
+      if (capable) {
+        browserOpenOrNavigate.mockImplementationOnce(async () => {
+          if (moved) parentHost = "ungranted-host";
+          return { ok: false, retryWithFreshHost: true, navigationRetryToken: "reopen" };
+        });
+      }
+      Object.assign(window, {
+        omnigentDesktop: {
+          kind: "electron",
+          browserOpenOrNavigate,
+          getDesktopFeatures: capable ? async () => ({ sshLocalhostPreview: true }) : undefined,
+        },
+      });
+      vi.mocked(getSessionSlim).mockImplementation(
+        async (id: string) =>
+          ({
+            id,
+            hostId: id === "parent" ? parentHost : null,
+            parentSessionId: id === "session-a" ? "parent" : null,
+            labels: {},
+          }) as unknown as Session,
+      );
+      const { result } = renderHook(() => useBrowserTabs("session-a"));
+      let reopened: BrowserNavigationResult | undefined;
+      await act(async () => {
+        reopened = await result.current.reopen("http://localhost:3000/");
+      });
+      const viewId = browserOpenOrNavigate.mock.calls[0][0];
+      expect(viewId).toMatch(/^browser-tab:session-a:/);
+      expect(browserOpenOrNavigate).toHaveBeenCalledWith(
+        viewId,
+        "http://localhost:3000/",
+        undefined,
+        {
+          force: true,
+          sourceHostId: "this-mac",
+          sessionHostProtocol: SESSION_HOST_PROTOCOL,
+          ...(capable ? { sshPreviewProtocol: SSH_PREVIEW_PROTOCOL } : {}),
+        },
+      );
+      expect(browserOpenOrNavigate).toHaveBeenCalledTimes(capable && !moved ? 2 : 1);
+      if (capable && !moved) {
+        expect(browserOpenOrNavigate).toHaveBeenLastCalledWith(
+          viewId,
+          "http://localhost:3000/",
+          undefined,
+          expect.objectContaining({ navigationRetryToken: "reopen" }),
+        );
+      }
+      expect(getSessionSlim).toHaveBeenCalledTimes(capable ? 4 : 2);
+      expect(reopened?.ok).toBe(!moved);
+      if (moved) {
+        expect(reopened?.error).toContain("session host changed");
+        expect(result.current.tabs).toEqual([]);
+        expect(result.current.selected).toBeNull();
+      } else {
+        expect(viewId).toBe(browserViewId("session-a", result.current.selected!));
+        expect(result.current.tabs).toEqual([result.current.selected]);
+      }
+    },
+  );
 
   it("closes only the target view and selects a neighbor, then no browser", async () => {
     const browserClose = vi.fn().mockResolvedValue({ ok: true });

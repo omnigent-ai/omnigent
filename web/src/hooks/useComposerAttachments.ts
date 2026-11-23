@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { insertPastedText } from "@/lib/composerText";
+import type { ComposerPasteEvent } from "@/components/composer/engine/composerInput";
 
 export interface UseComposerAttachmentsOptions {
   /**
@@ -43,7 +44,7 @@ export interface ComposerAttachmentsApi {
    * text. Without a usable file, plain text is inserted as typed input
    * (see insertPastedText).
    */
-  onPaste: (e: React.ClipboardEvent<HTMLTextAreaElement>) => void;
+  onPaste: (e: ComposerPasteEvent) => void;
   clearError: () => void;
   clear: () => void;
 }
@@ -115,7 +116,7 @@ export function useComposerAttachments({
   }, []);
 
   const onPaste = useCallback(
-    (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    (e: ComposerPasteEvent) => {
       const pasted = clipboardFiles(e.clipboardData);
       if (pasted.length === 0) {
         insertPastedText(e);

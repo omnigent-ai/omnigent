@@ -37,18 +37,26 @@ outside the lock.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from urllib.parse import quote
 
 from omnigent.debug_logging import debug_event
+from omnigent.inner._subprocess_lifecycle import await_cleanup_task
+from omnigent.inner.claude_model_access import ClaudeModelAccess
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import OSEnvironment
-from omnigent.inner.terminal import TerminalInstance, create_terminal_instance
+from omnigent.inner.sandbox import _default_sandbox_for_platform
+from omnigent.inner.terminal import (
+    TerminalInstance,
+    build_terminal_os_env_spec,
+    create_terminal_instance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +238,9 @@ class TerminalRegistry:
         # Protects both ``_by_conversation`` and ``_instance_locks``.
         self._lock = threading.Lock()
         self.environment_resolver: Callable[[str, OSEnvSpec], OSEnvironment] | None = None
+        self.model_access_resolver: (
+            Callable[[str, Path], Awaitable[ClaudeModelAccess | None]] | None
+        ) = None
 
     def conversation_link_for_id(self, conversation_id: str) -> str:
         """
@@ -256,6 +267,7 @@ class TerminalRegistry:
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
         program_status_app: str | None = None,
+        model_access_factory: Callable[[], ClaudeModelAccess | None] | None = None,
     ) -> TerminalInstance:
         """Launch a terminal session, or return the existing one.
 
@@ -308,35 +320,93 @@ class TerminalRegistry:
         # registry lock across them would serialize all conversations'
         # terminal spawns globally. Instead we re-check after the
         # spawn completes.
+        environment_spec = build_terminal_os_env_spec(
+            spec,
+            parent_os_env_spec=parent_os_env,
+            cwd_override=cwd_override,
+            sandbox_override=sandbox_override,
+        )
+        model_access = None
+        if environment_spec.sandbox is None or environment_spec.sandbox.type != "none":
+            if self.model_access_resolver is not None:
+                model_access = await self.model_access_resolver(
+                    conversation_id, Path(environment_spec.cwd or ".").resolve(strict=False)
+                )
+            elif model_access_factory is not None:
+                model_access = await asyncio.to_thread(model_access_factory)
+        if model_access is not None and environment_spec.sandbox is None:
+            # Only SDK-owned terminals inherit implicit process containment.
+            environment_spec.sandbox = _default_sandbox_for_platform()
+            spec = replace(spec, os_env=environment_spec)
+            # The effective environment already contains the cwd override.
+            cwd_override = None
         parent_environment = None
-        environment_spec = spec.os_env if isinstance(spec.os_env, OSEnvSpec) else parent_os_env
-        if (
-            environment_spec is not None
-            and environment_spec.sandbox is not None
-            and any(p.copy_on_write for p in environment_spec.sandbox.write_path_specs)
+        if environment_spec.sandbox is not None and any(
+            p.copy_on_write for p in environment_spec.sandbox.write_path_specs
         ):
             if self.environment_resolver is None:
                 raise RuntimeError("copy_on_write terminals require a session resource registry")
-            parent_environment = self.environment_resolver(
-                conversation_id, parent_os_env or environment_spec
+            environment_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self.environment_resolver,
+                    conversation_id,
+                    parent_os_env or environment_spec,
+                )
             )
+            try:
+                parent_environment = await asyncio.shield(environment_task)
+            except BaseException:
+                with contextlib.suppress(BaseException):
+                    await await_cleanup_task(environment_task)
+                raise
         shared_environment_args = (
             {"parent_environment": parent_environment} if parent_environment else {}
         )
-        created = create_terminal_instance(
-            terminal_name,
-            session_key,
-            spec,
-            parent_os_env_spec=parent_os_env,
-            **shared_environment_args,
-            cwd_override=cwd_override,
-            sandbox_override=sandbox_override,
-            conversation_link=self.conversation_link_for_id(conversation_id),
+        build_task = asyncio.create_task(
+            asyncio.to_thread(
+                create_terminal_instance,
+                terminal_name,
+                session_key,
+                spec,
+                parent_os_env_spec=parent_os_env,
+                **shared_environment_args,
+                cwd_override=cwd_override,
+                sandbox_override=sandbox_override,
+                conversation_link=self.conversation_link_for_id(conversation_id),
+                model_access=model_access,
+            )
         )
-        stage = "terminal_spawn"
+        try:
+            created = await asyncio.shield(build_task)
+        except BaseException:
+            with contextlib.suppress(BaseException):
+                await await_cleanup_task(build_task)
+            if build_task.done() and not build_task.cancelled() and build_task.exception() is None:
+                await _close_unregistered_instance(build_task.result().instance)
+            raise
+        stage = "terminal_model_access"
         try:
             created.instance.program_status_app = program_status_app
             created.instance.lifecycle_trace.transfer_session(conversation_id)
+            policy = created.instance.sandbox_policy
+            if policy is not None and policy.active:
+                created.instance.model_access = model_access
+                if created.instance.model_access is not None:
+                    try:
+                        protection_task = asyncio.create_task(
+                            asyncio.to_thread(
+                                created.instance.model_access.protect_sources, policy, created.cwd
+                            )
+                        )
+                        try:
+                            created.instance.sandbox_policy = await asyncio.shield(protection_task)
+                        except BaseException:
+                            with contextlib.suppress(BaseException):
+                                await await_cleanup_task(protection_task)
+                            raise
+                    except ValueError as exc:
+                        raise RuntimeError(f"terminal model access rejected: {exc}") from exc
+            stage = "terminal_spawn"
             await created.instance.launch(cwd=created.cwd)
             stage = "terminal_liveness"
             if not await created.instance.is_alive():

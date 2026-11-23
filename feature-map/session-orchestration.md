@@ -18,15 +18,30 @@ MCP independent creation.
   the prefix. The title comes from sessions the sidebar, the viewed session's
   subagents or the session cache already hold, else one lookup; an unreadable
   sender reads "From another session". The prefix is a label, not proof of origin.
+- `recipient-attribution`: the sender's Chat shows each `sys_session_message`, and the first
+  task of a same-host, host or managed `sys_session_create`, as a collapsed "To @<destination>"
+  row in place of its tool row. The row never folds into the turn's steps; it expands to the
+  sent text, and the pill opens the destination. It appears once the server accepts the send
+  (a boolean `queued`), which is not proof of delivery or reading. "Not sent" needs a proven
+  refusal: a policy denial or the runner's `delivery: "refused"`. Any other error, or a turn
+  that ends mid-send, reads "Could not confirm send".
 - `read-results`: the manager reads history/status; replies are not forwarded.
   Existing owner-authorized reads remain allowed when a session is shared.
+  `sys_session_get_info` reports the session's `permission_mode` in its
+  harness's vocabulary, as `sys_session_create` takes it, including a switch
+  made while it runs to a mode that keeps approval. A mode that skips approval
+  shows only when the session launched in it, since anyone who can edit the
+  session can write the reported mode; `null` when the harness has no
+  permission modes or the mode is unknown. Coverage: `tests/e2e/test_session_info_permission_mode_e2e.py`.
 - `created-by`: independent workers record their creating session. The worker's
   Chat/Terminal header rechecks access when opened, hides attribution during the
   lookup, and links to the creator when accessible; otherwise it says "Created by
   another session". `sys_session_list` and `sys_session_get_info` expose
   `created_by_session_id` so managers can identify their workers across restarts;
   `sys_session_list` with `include_archived` also lists archived workers, each
-  marked `archived`.
+  marked `archived`. With `created_by_this_session`, the runner pages the global
+  `sessions` view itself and returns only the caller's workers in one call, up to
+  a scan limit; the `sub_agents` view is then empty.
 - `list-scope`: `sys_session_list`'s global `sessions` view lists only the
   caller's own sessions by default, like the sidebar's My view. Sessions other
   users shared with the caller appear only with `visibility: "shared"` (or
@@ -49,6 +64,17 @@ MCP independent creation.
   An optional `permission_mode` starts the session in a mode of its harness;
   modes that skip approval are refused, and on a server that doesn't advertise
   `session_create_permission_modes` the tool refuses the call before creating anything.
+  Without one, an independent session that runs its creator's harness, Claude
+  Code or Codex, starts in the mode the creator is in, so a workflow run's
+  nested agents work as unattended as the run; a mode that skips approval comes
+  only from the creator's launch settings and carries over only onto its own
+  host. An automation that sets a mode gives it to its run's workers first (see
+  `scheduled`), and a worker whose agent sets a mode keeps it. Coverage:
+  `tests/e2e/test_nested_agent_permission_mode_e2e.py`.
+  An optional `workflow_id` (agent_id only) starts the session as a run of one
+  of the owner's saved workflows, with that workflow's plan already in its
+  journal. With workflows disabled, or on a server that doesn't advertise
+  `session_create_workflow_id`, the tool refuses it before creating anything.
   With `sibling_sessions` enabled they share one sidebar family and do not appear
   as child agents; with it disabled they remain standalone.
   Managed creation uses the server's configured default sandbox provider. A
@@ -62,7 +88,14 @@ MCP independent creation.
   `project_name`. Project defaults do not override the worker's agent or placement.
 - `destinations`: Settings → Admin → General → **Nested agent destinations** limits new
   agents to the current host, the current host or a fresh managed sandbox, or
-  any available host. The server enforces the same choice for the composer,
+  any available host. The Admin → General page itself appears whenever the
+  server offers nested agents or Omni Advisor; on an Advisor-only deploy it
+  carries the Advisor workspace switch and no destinations group. Settings →
+  Admin → General → **Omni Advisor** turns the agent off for the whole
+  workspace: every viewer's Settings → General → **Omni Advisor** switch then
+  shows off and locked with a note that an admin turned it off, and the Inbox
+  drops its Omni Advisor tab. Turning it back on restores each viewer's own
+  choice. The server enforces the same choice for the composer,
   uploaded custom agents, direct API calls, MCP, later host launches, and runner reassignment. Failed
   relaunches retain the prior host so restricted sessions can retry. Any available host is the
   behavior-preserving default. For a standalone session in another project, the policy
@@ -141,7 +174,8 @@ MCP independent creation.
   messaging, or `/settings/sharing`, and toggle **Message other sessions**.
 - In an SDK session's Chat, ask the agent to send a task using
   `sys_session_message`, then inspect the destination's history. Its new user
-  bubble shows "From @<sender>"; click the pill to open the sender.
+  bubble shows "From @<sender>"; click the pill to open the sender. The sender's
+  Chat shows the send as "To @<destination>"; click the row to read the text.
 - In a native session's Chat or agent terminal, ask for the same operation;
   the native MCP relay supplies the tools.
 - In a session with creation tools enabled, ask for a worker with
@@ -190,7 +224,8 @@ MCP independent creation.
 
 ### Scripted review sessions
 
-With the server release flag `scripted_sessions` enabled (default off),
+With the server release flag `scripted_sessions` enabled (default on;
+`OMNIGENT_FEATURES=-scripted_sessions` turns it off),
 `sys_session_create` also accepts `placement="host"`, an owned connected
 `host_id`, an absolute `workspace`, and optional
 `git: {branch_name, base_branch}`. The workspace is the source repository;
@@ -215,7 +250,7 @@ requires checking the session before retrying.
 creating a project; `project=""` lists unfiled sessions. Keep the same filter
 when continuing a cursor. The sub-agent view is unchanged.
 
-For a manual check, enable `scripted_sessions` on a test server and obtain an
+For a manual check, use a test server with `scripted_sessions` left on and obtain an
 owned host ID from a session's `sys_session_get_info` response. Create a review
 session with `placement="host"`, that host ID, the repository path,
 `git={"branch_name":"review-example","base_branch":"main"}` and a project ID.

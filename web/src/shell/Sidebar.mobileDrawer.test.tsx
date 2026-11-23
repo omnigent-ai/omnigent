@@ -92,13 +92,15 @@ describe("mobile sidebar drawer", () => {
     );
   });
 
-  it("drops the peek strip and the scrim on the settings page, where Back is the only exit", () => {
-    renderSidebar({ route: "/settings" });
+  it("keeps the peek strip and the scrim on the settings page, so its content shows", () => {
+    const onClose = vi.fn();
+    renderSidebar({ route: "/settings", onClose });
 
-    expect(screen.queryByTestId("sidebar-scrim")).toBeNull();
-    expect(screen.getByRole("complementary", { name: "Conversations" })).not.toHaveClass(
+    expect(screen.getByRole("complementary", { name: "Conversations" })).toHaveClass(
       "max-md:right-14",
     );
+    fireEvent.click(screen.getByTestId("sidebar-scrim"));
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 
   it("keeps Settings in the profile footer and hides the desktop collapse toggle on mobile", async () => {
@@ -129,7 +131,8 @@ describe("mobile sidebar drawer", () => {
     const settings = await screen.findByTestId("sidebar-profile-settings");
 
     for (const button of [search, settings]) {
-      expect(button).toHaveClass("max-md:size-11", "max-md:text-foreground");
+      expect(button).toHaveClass("max-md:size-11", "text-muted-foreground");
+      expect(button).not.toHaveClass("max-md:text-foreground");
       expect(button.className).toMatch(/(?:^| )(?:max-md:)?rounded-full(?: |$)/);
       expect(button).not.toHaveClass("sidebar-glass-chip");
     }
@@ -375,7 +378,6 @@ describe("mobile sidebar drawer swipe to close", () => {
 
   it.each([
     ["the desktop layout", { mobile: false }, ""],
-    ["Settings", { mobile: true, route: "/settings" }, ""],
     // The native edge swipe owns the drawer while its progress is live.
     ["a native edge swipe", { mobile: true, dragProgress: 0.5 }, "translateX(-50%)"],
   ])("ignores the swipe during %s", (_label, { mobile, ...props }, transform) => {

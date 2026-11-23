@@ -79,7 +79,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
 from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
-from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.spec.types import AgentSpec, ExecutorSpec, ToolGroupsConfig
 from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
 from omnigent.terminals import TerminalRegistry
 from tests._helpers.managed_mcp import expand_entry_value
@@ -208,20 +208,27 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("instruction_spec", "env_denylist", "expected_env_unset"),
+    ("instruction_spec", "env_denylist", "expected_env_unset", "memory_guidance"),
     [
-        ("missing", None, []),
+        ("missing", None, [], None),
         (
             "missing",
             " OPENAI_API_KEY,ANTHROPIC_AUTH_TOKEN,OPENAI_API_KEY, ",
             ["ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"],
+            None,
         ),
-        ("empty", None, []),
-        ("raw", None, []),
-        ("resolved", None, []),
-        ("resolved-replace", None, []),
-        ("sdk-missing-replace", None, []),
-        ("resolved-sdk-empty-replace", None, []),
+        ("empty", None, [], None),
+        ("raw", None, [], None),
+        ("resolved", None, [], None),
+        ("resolved-replace", None, [], None),
+        ("sdk-missing-replace", None, [], None),
+        ("resolved-sdk-empty-replace", None, [], None),
+        # Memory guidance follows the startup instructions in both prompt modes,
+        # and replace mode still refuses to launch without author instructions.
+        ("resolved", None, [], "MEMORY GUIDANCE"),
+        ("resolved-replace", None, [], "MEMORY GUIDANCE"),
+        ("sdk-missing-replace", None, [], "MEMORY GUIDANCE"),
+        ("resolved-sdk-empty-replace", None, [], "MEMORY GUIDANCE"),
     ],
 )
 async def test_auto_create_pi_terminal_launches_required_terminal(
@@ -230,6 +237,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     env_denylist: str | None,
     expected_env_unset: list[str],
     instruction_spec: str,
+    memory_guidance: str | None,
 ) -> None:
     """Launch a required terminal with session-local authored instructions.
 
@@ -242,6 +250,13 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     import omnigent.runner.app as runner_app_mod
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+
+    async def _memory_guidance(*_args: Any, workspace: Any = None) -> str | None:
+        return memory_guidance
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration.memory_startup_guidance", _memory_guidance
+    )
     if env_denylist is None:
         monkeypatch.delenv("OMNIGENT_PI_ENV_UNSET", raising=False)
     else:
@@ -376,6 +391,9 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     )
     tool_names = {tool["name"] for tool in config["tools"]}
     assert {"list_comments", "sys_session_list"} <= tool_names
+    # Pi uses its own shell and file tools, so the extension gets no relayed
+    # sys_os_* that would be a second route to the workspace.
+    assert not {name for name in tool_names if name.startswith("sys_os_")}
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
     assert any(evt.get("type") == "session.resource.created" for evt in published)
     task = runner_app_mod._AUTO_FORWARDER_TASKS.pop("47f049b9d13df4db397c7f46859b825f")
@@ -402,6 +420,8 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
         if instruction_spec in {"raw", "resolved", "resolved-replace"}
         else WORKSPACE_IMAGE_INSTRUCTION
     )
+    if memory_guidance is not None:
+        expected = f"{expected}\n\n{memory_guidance}"
     assert path.read_text() == expected
     assert instructions not in args
 
@@ -2478,6 +2498,94 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_memory", "spec_memory", "preset", "expected"),
+    [
+        (True, True, None, "1"),
+        (False, True, None, None),
+        (True, False, None, None),
+        (True, True, "0", None),
+    ],
+    ids=["memory-on", "server-memory-off", "agent-memory-off", "already-set"],
+)
+async def test_auto_create_claude_terminal_turns_its_own_memory_off_with_omnigent_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server_memory: bool,
+    spec_memory: bool,
+    preset: str | None,
+    expected: str | None,
+) -> None:
+    """With Omnigent memory on, Claude Code launches with its own auto memory off.
+
+    Only when the server confirms memory is on, so a session never loses both, and
+    an explicit value in the runner's environment wins.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    if preset is None:
+        monkeypatch.delenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", preset)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry(SessionResourceRegistry):
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"memory": server_memory})
+        if request.url.path == "/v1/memory/entries":
+            return httpx.Response(200, json={"entries": [], "next_page_token": None})
+        return httpx.Response(200, json={"labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server", transport=httpx.MockTransport(_handle_request)
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="claude-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        tool_groups=ToolGroupsConfig(memory=spec_memory),
+    )
+
+    await _auto_create_claude_terminal(
+        "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        agent_spec=agent_spec,
+    )
+
+    assert captured["spec"].env.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY") == expected
+
+
+@pytest.mark.asyncio
 async def test_auto_create_claude_terminal_inherits_agent_sandbox(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2696,12 +2804,76 @@ async def test_auto_create_claude_terminal_points_a_managed_relay_entry_at_its_b
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "provider_env", "expected_launch", "subscription_auth"),
+    [
+        pytest.param(
+            "databricks-claude-opus-4-7",
+            {"ANTHROPIC_BASE_URL": "https://gateway.example.test/anthropic"},
+            "databricks-claude-opus-4-7[1m]",
+            False,
+            id="long-context",
+        ),
+        pytest.param(
+            "databricks-claude-opus-4-7",
+            {"ANTHROPIC_BASE_URL": "https://gateway.example.test/anthropic"},
+            "databricks-claude-opus-4-7",
+            True,
+            id="subscription-auth-default-window",
+        ),
+        pytest.param(
+            "databricks-claude-haiku-4-5",
+            {"ANTHROPIC_BASE_URL": "https://gateway.example.test/anthropic"},
+            "databricks-claude-haiku-4-5",
+            False,
+            id="haiku-default-window",
+        ),
+        pytest.param(
+            "databricks-claude-opus-4-5",
+            {"ANTHROPIC_BASE_URL": "https://gateway.example.test/anthropic"},
+            "databricks-claude-opus-4-5",
+            False,
+            id="older-opus-default-window",
+        ),
+        pytest.param(
+            "claude-opus-4-7", {}, "claude-opus-4-7", False, id="direct-api-default-endpoint"
+        ),
+        pytest.param(
+            "claude-opus-4-7",
+            {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+            "claude-opus-4-7",
+            False,
+            id="direct-api-explicit-endpoint",
+        ),
+        pytest.param(
+            "claude-opus-4-7",
+            {"CLAUDE_CODE_USE_BEDROCK": "1"},
+            "claude-opus-4-7",
+            False,
+            id="bedrock-default-endpoint",
+        ),
+        pytest.param(
+            "claude-opus-4-7",
+            {
+                "CLAUDE_CODE_USE_BEDROCK": "1",
+                "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock.example.test",
+            },
+            "claude-opus-4-7",
+            False,
+            id="bedrock-custom-endpoint",
+        ),
+    ],
+)
 async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    provider_env: dict[str, str],
+    expected_launch: str,
+    subscription_auth: bool,
 ) -> None:
     """
-    Host-spawned launch injects the ucode Databricks gateway config.
+    Host-spawned launches preserve the provider config and its context policy.
 
     On the daemon / web-UI path the runner — not the CLI — launches
     Claude, so it must reproduce the gateway auth the CLI normally
@@ -2738,18 +2910,18 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         _no_op_forwarder,
     )
 
-    gateway_env = {"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"}
     ucode = ClaudeNativeUcodeConfig(
-        env=dict(gateway_env),
+        env=dict(provider_env),
         api_key_helper="printf %s sk-sentinel-do-not-use",
-        model="databricks-claude-opus-4-7",
+        model=model,
+        subscription_auth=subscription_auth,
         routable_models=(
-            "databricks-claude-opus-4-7",
+            model,
             "databricks-claude-opus-4-8",
             "databricks-claude-sonnet-5",
         ),
         model_overrides={
-            "claude-opus-4-7": "databricks-claude-opus-4-7",
+            model.removeprefix("databricks-"): model,
             "claude-opus-4-8": "databricks-claude-opus-4-8",
             "claude-sonnet-5": "databricks-claude-sonnet-5",
         },
@@ -2784,25 +2956,29 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     # ENABLE_TOOL_SEARCH forces Claude Code to defer MCP tool schemas
     # instead of loading all 200+ bridge tools into startup context.
     assert spec.env == {
-        **gateway_env,
+        **provider_env,
         "CLAUDE_AGENT_SDK_CLIENT_APP": "omnigent",
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
         "CLAUDE_ENV_FILE": claude_tool_env_file(),
         "API_TIMEOUT_MS": "120000",
-        "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
+        **(
+            {"CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1"}
+            if provider_env.get("ANTHROPIC_BASE_URL") == "https://gateway.example.test/anthropic"
+            else {}
+        ),
     }
     assert spec.command == "claude"
     # The gateway default model is applied (no per-session override here).
     assert "--model" in spec.args
-    assert spec.args[spec.args.index("--model") + 1] == "databricks-claude-opus-4-7"
+    assert spec.args[spec.args.index("--model") + 1] == expected_launch
     # The apiKeyHelper is registered in private settings, not subprocess argv.
     assert all("sk-sentinel-do-not-use" not in arg for arg in spec.args)
     settings = _load_claude_invocation_settings(spec.args)
     assert settings["apiKeyHelper"] == "printf %s sk-sentinel-do-not-use"
     assert settings["modelOverrides"] == {
-        "claude-opus-4-7": "databricks-claude-opus-4-7",
+        model.removeprefix("databricks-"): model,
         "claude-opus-4-8": "databricks-claude-opus-4-8",
         "claude-sonnet-5": "databricks-claude-sonnet-5",
     }
@@ -3235,6 +3411,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
 
     # A missing transcript must not replay an already consumed initial prompt.
     synth_calls: list[str] = []
+    synth_costs: list[float | None] = []
 
     async def _fake_synth(
         client: Any,
@@ -3244,12 +3421,14 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         workspace: Path,
         bridge_dir: Path,
         resume_copy: bool = False,
+        resume_cost_usd: float | None = None,
     ) -> Path | None:
-        """Record the resume id and optionally provide a transcript."""
+        """Record the resume id and cost and optionally provide a transcript."""
         assert not resume_copy
         assert bridge_dir == bridge_dir_for_bridge_id(session_id)
         del client, session_id, workspace
         synth_calls.append(external_session_id)
+        synth_costs.append(resume_cost_usd)
         if not resume_transcript_available:
             return None
         transcript_path = tmp_path / f"{external_session_id}.jsonl"
@@ -3264,6 +3443,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     initial_prompt = "Reply with READY once.\nThen wait for a new instruction."
     snapshot: dict[str, Any] = {
         "terminal_launch_args": [initial_prompt, "--permission-mode", "auto", "--verbose"],
+        "native_usage_baseline": {"cumulative_cost_usd": 1.25},
     }
     if snapshot_external_id is not None:
         snapshot["external_session_id"] = snapshot_external_id
@@ -3340,8 +3520,12 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     # snapshot carried an external session id.
     if snapshot_external_id is not None:
         assert synth_calls == [snapshot_external_id]
+        # A cold resume keeps counting from the session's own cost.
+        assert synth_costs == [1.25]
     else:
         assert len(synth_calls) == int(fork_carry_history)
+        # A fork's rebuild starts its own count.
+        assert synth_costs == [None] * int(fork_carry_history)
 
     # Startup gets image guidance; session-title metadata stays out of it.
     assert (
@@ -3399,6 +3583,7 @@ async def test_auto_create_claude_terminal_resumes_a_copy_while_a_background_job
         workspace: Path,
         bridge_dir: Path,
         resume_copy: bool,
+        resume_cost_usd: float | None = None,
     ) -> Path:
         """Record the id the transcript is rebuilt under."""
         assert resume_copy
@@ -3466,6 +3651,7 @@ async def test_auto_create_claude_terminal_resumes_in_place_when_the_registry_ch
         workspace: Path,
         bridge_dir: Path,
         resume_copy: bool,
+        resume_cost_usd: float | None = None,
     ) -> Path:
         """Record the id the transcript is rebuilt under."""
         assert not resume_copy
@@ -3665,6 +3851,7 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
         workspace: Path,
         bridge_dir: Path,
         resume_copy: bool,
+        resume_cost_usd: float | None = None,
     ) -> Path:
         assert bridge_dir == bridge_dir_for_bridge_id(session_id)
         assert not resume_copy
@@ -5871,17 +6058,57 @@ class _RecordingCodexRegistry:
         )
 
 
+async def _launch_recorded_codex_tui(
+    tmp_path: Path,
+    *,
+    workspace: Path,
+    thread_id: str | None,
+    codex_cli_version: tuple[int, int, int] | None,
+    terminal_launch_args: list[str] | None = None,
+) -> Any:
+    from omnigent.runner.native.orchestration import (
+        _CodexNativeLaunchConfig,
+        _launch_codex_native_tui,
+    )
+
+    captured: dict[str, Any] = {}
+    app_server = SimpleNamespace(
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=[],
+        codex_cli_version=codex_cli_version,
+        codex_path="/opt/codex/bin/codex",
+        codex_home=tmp_path / "codex-home",
+        env={},
+    )
+    await _launch_codex_native_tui(
+        "conv_codex_launch",
+        _RecordingCodexRegistry(captured),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        app_server=app_server,  # type: ignore[arg-type]
+        launch_config=_CodexNativeLaunchConfig(
+            workspace=workspace,
+            policy_server_url="http://127.0.0.1:8000",
+            terminal_launch_args=terminal_launch_args,
+            model_override=None,
+            external_session_id=None,
+            fork_source_id=None,
+            fork_source_external_id=None,
+            fork_carry_history=False,
+            bypass_sandbox=False,
+        ),
+        bridge_dir=tmp_path / "bridge",
+        thread_id=thread_id,
+        agent_spec=None,
+    )
+    return captured["spec"]
+
+
 @pytest.mark.asyncio
 async def test_codex_tui_launch_keeps_user_config_when_process_cwd_is_gone(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A Codex TUI relaunch retains user launch settings after the runner cwd is gone."""
-    from omnigent.runner.native.orchestration import (
-        _CodexNativeLaunchConfig,
-        _launch_codex_native_tui,
-    )
-
     workspace = tmp_path / "workspace"
     (workspace / ".omnigent").mkdir(parents=True)
     (workspace / ".omnigent" / "config.yaml").write_text(
@@ -5899,40 +6126,176 @@ async def test_codex_tui_launch_keeps_user_config_when_process_cwd_is_gone(
 
     monkeypatch.setattr(Path, "cwd", missing_cwd)
 
-    captured: dict[str, Any] = {}
-    app_server = SimpleNamespace(
-        listen_url="ws://127.0.0.1:9876",
-        config_overrides=[],
-        codex_cli_version=None,
-        codex_path="/opt/codex/bin/codex",
-        codex_home=tmp_path / "codex-home",
-        env={},
-    )
-    await _launch_codex_native_tui(
-        "conv_codex_cwd_gone",
-        _RecordingCodexRegistry(captured),  # type: ignore[arg-type]
-        lambda _sid, _evt: None,
-        app_server=app_server,  # type: ignore[arg-type]
-        launch_config=_CodexNativeLaunchConfig(
-            workspace=workspace,
-            policy_server_url="http://127.0.0.1:8000",
-            terminal_launch_args=None,
-            model_override=None,
-            external_session_id=None,
-            fork_source_id=None,
-            fork_source_external_id=None,
-            fork_carry_history=False,
-            bypass_sandbox=False,
-        ),
-        bridge_dir=tmp_path / "bridge",
-        thread_id=None,
-        agent_spec=None,
+    spec = await _launch_recorded_codex_tui(
+        tmp_path, workspace=workspace, thread_id=None, codex_cli_version=None
     )
 
-    spec = captured["spec"]
     assert spec.command == "user-codex"
     assert spec.args[0] == "--user-arg"
     assert spec.os_env.cwd == str(workspace)
+
+
+_FULL_ACCESS_ARGS = ["--sandbox", "danger-full-access", "--ask-for-approval", "never"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permission_source", ["configured_args", "preset_with_newer_wrapper"])
+async def test_codex_tui_resume_omits_permission_overrides_for_configured_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    permission_source: str,
+) -> None:
+    """Resuming through a configured Codex launch sends no flags Codex 0.154+ rejects."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    if permission_source == "configured_args":
+        (config_home / "config.yaml").write_text(
+            "harness:\n  codex-native:\n    args: [" + ", ".join(_FULL_ACCESS_ARGS) + "]\n"
+        )
+        terminal_launch_args = None
+        probed_version = (0, 154, 0)
+    else:
+        # The wrapper runs a newer Codex than the PATH binary the app-server probed.
+        wrapper = tmp_path / "codex-wrapper"
+        wrapper.write_text('#!/bin/sh\necho "codex-cli 0.154.0"\n')
+        wrapper.chmod(0o755)
+        (config_home / "config.yaml").write_text(
+            f"harness:\n  codex-native:\n    command: {wrapper}\n"
+        )
+        terminal_launch_args = list(_FULL_ACCESS_ARGS)
+        probed_version = (0, 153, 4)
+
+    spec = await _launch_recorded_codex_tui(
+        tmp_path,
+        workspace=workspace,
+        thread_id="thread-resume",
+        codex_cli_version=probed_version,
+        terminal_launch_args=terminal_launch_args,
+    )
+
+    assert spec.args[-4:] == ["resume", "--remote", "ws://127.0.0.1:9876", "thread-resume"]
+    assert not {"--sandbox", "--ask-for-approval"} & set(spec.args), spec.args
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("wrapper_version", "app_server_version", "bypasses_hook_trust"),
+    [
+        ((0, 130, 0), (0, 153, 4), False),
+        ((0, 154, 0), (0, 130, 0), True),
+        (None, (0, 130, 0), False),
+    ],
+    ids=["older-wrapper", "newer-wrapper", "failed-probe-uses-app-server"],
+)
+async def test_codex_tui_resume_gates_hook_trust_on_wrapper_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wrapper_version: tuple[int, int, int] | None,
+    app_server_version: tuple[int, int, int],
+    bypasses_hook_trust: bool,
+) -> None:
+    """A wrapped resume gates hook trust on the wrapper's Codex, or the app-server's if unknown."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    wrapper = tmp_path / "codex-wrapper"
+
+    async def probe(command: str, *prefix: str) -> tuple[int, int, int] | None:
+        assert command == str(wrapper) and not prefix
+        return wrapper_version
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._codex_cli_version", probe)
+    (config_home / "config.yaml").write_text(
+        f"harness:\n  codex-native:\n    command: {wrapper}\n"
+    )
+
+    spec = await _launch_recorded_codex_tui(
+        tmp_path,
+        workspace=workspace,
+        thread_id="thread-resume",
+        codex_cli_version=app_server_version,
+    )
+
+    assert ("--dangerously-bypass-hook-trust" in spec.args) is bypasses_hook_trust, spec.args
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness_config", "resume", "expected", "probed_version"),
+    [
+        pytest.param(
+            "args: [--sandbox, danger-full-access]",
+            True,
+            (None, (), ("--sandbox", "danger-full-access"), (0, 153, 4)),
+            None,
+            id="codex-args",
+        ),
+        pytest.param(
+            "command: user-codex-wrapper\n    args: [codex, --]",
+            True,
+            ("user-codex-wrapper", ("codex", "--"), (), (0, 154, 0)),
+            (0, 154, 0),
+            id="wrapper-resume",
+        ),
+        pytest.param(
+            "command: user-codex-wrapper\n    args: [codex, --]",
+            True,
+            ("user-codex-wrapper", ("codex", "--"), (), (0, 153, 4)),
+            None,
+            id="unknown-wrapper-keeps-existing-fallback",
+        ),
+        pytest.param(
+            "command: user-codex-wrapper\n    args: [codex, --]",
+            False,
+            ("user-codex-wrapper", ("codex", "--"), (), (0, 153, 4)),
+            None,
+            id="wrapper-fresh",
+        ),
+    ],
+)
+async def test_resolve_codex_terminal_cli_probes_wrapper_only_on_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    harness_config: str,
+    resume: bool,
+    expected: tuple[object, ...],
+    probed_version: tuple[int, int, int] | None,
+) -> None:
+    """A resume probes a configured wrapper; configured args alone are Codex args."""
+    from omnigent.runner.native.orchestration import _resolve_codex_terminal_cli
+
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(f"harness:\n  codex-native:\n    {harness_config}\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    probes: list[tuple[str, ...]] = []
+
+    async def _probe(*argv: str) -> tuple[int, int, int] | None:
+        probes.append(argv)
+        return probed_version
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._codex_cli_version", _probe)
+
+    terminal_cli = await _resolve_codex_terminal_cli(
+        workspace=str(tmp_path),
+        app_server=SimpleNamespace(codex_cli_version=(0, 153, 4)),  # type: ignore[arg-type]
+        resume=resume,
+    )
+
+    assert (
+        terminal_cli.command,
+        terminal_cli.wrapper_args,
+        terminal_cli.codex_args,
+        terminal_cli.codex_cli_version,
+    ) == expected
+    assert probes == (
+        [("user-codex-wrapper", "codex", "--")] if terminal_cli.command and resume else []
+    )
 
 
 @pytest.mark.asyncio
@@ -6086,6 +6449,7 @@ async def _run_auto_create_claude_terminal_for_routing_class(
     session_id: str,
     routed: bool,
     auto_harness: bool = False,
+    custom_slot: str = "workspace-picker-row",
 ) -> Any:
     """Drive the claude-native launch and return the captured terminal spec.
 
@@ -6119,7 +6483,7 @@ async def _run_auto_create_claude_terminal_for_routing_class(
         env={
             "ANTHROPIC_BASE_URL": "https://gw.example/anthropic",
             "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5",
-            "ANTHROPIC_CUSTOM_MODEL_OPTION": "workspace-picker-row",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": custom_slot,
             "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Workspace pick",
         },
         api_key_helper="printf %s sk-sentinel-do-not-use",
@@ -6239,19 +6603,29 @@ async def test_a_plain_claude_native_launch_carries_no_spawn_routing(
     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "workspace-picker-row"
 
 
+@pytest.mark.parametrize("custom_slot", ["workspace-picker-row", "databricks-claude-opus-4-7"])
 async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, custom_slot: str
 ) -> None:
+    from omnigent.models.claude_model_vocabulary import claude_model_command_arg
+
     spec = await _run_auto_create_claude_terminal_for_routing_class(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f602",
         routed=True,
+        custom_slot=custom_slot,
     )
 
     assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
     assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
-    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
+    # The custom-slot pin tracks the launched 1M-capable Opus, so it carries the
+    # same [1m] window marker the launch model does.
+    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7[1m]"
+    assert (
+        claude_model_command_arg("databricks-claude-opus-4-7[1m]", spec.env)
+        == "databricks-claude-opus-4-7[1m]"
+    )
     # A pinned session's spawns stay on the claude family, so it gets neither
     # the routed-spawn note nor the pre-approvals the cross-family hop needs.
     assert spec.args[spec.args.index("--append-system-prompt") + 1] == WORKSPACE_IMAGE_INSTRUCTION
@@ -6280,7 +6654,8 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
     # The whole routed apparatus, not just the spawn note.
     assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
     assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
-    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
+    # The custom-slot pin tracks the launched 1M-capable Opus and carries [1m].
+    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7[1m]"
     # And the auto-harness extras, which only make sense alongside the router.
     assert "--append-system-prompt" in spec.args
     allowed = spec.args[spec.args.index("--allowedTools") + 1]
@@ -6399,7 +6774,8 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         assert args[args.index("--model") + 1] == selected_model
         assert pick_resets == []
     else:
-        assert args[args.index("--model") + 1] == "system.ai.claude-opus-5"
+        # The folded reset lands on the gateway default Opus, marked [1m].
+        assert args[args.index("--model") + 1] == "system.ai.claude-opus-5[1m]"
         assert pick_resets == [{"model_override": "default"}]
 
     await fake_client.aclose()
@@ -6664,7 +7040,7 @@ async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_rese
     ("pin", "custom_option", "expected_launch"),
     [
         ("system.ai.claude-opus-4-8[1m]", None, "claude-opus-4-8[1m]"),
-        ("sonnet_5", "system.ai.claude-sonnet-5", "claude-sonnet-5"),
+        ("sonnet_5", "system.ai.claude-sonnet-5", "claude-sonnet-5[1m]"),
     ],
     ids=["gateway-namespace-pin", "custom-slot-pin"],
 )

@@ -34,6 +34,7 @@ from omnigent.models.model_override import is_databricks_model_id
 from omnigent.policies.base import Policy
 from omnigent.policies.builtins.safety import SCHEDULED_TASK_APPROVAL_TOOLS
 from omnigent.policies.function import resolve_function_policy
+from omnigent.policies.registry import function_policy_handler_allowed
 from omnigent.policies.schema import (
     SESSION_COST_ASK_APPROVED_STATE_KEY,
     SESSION_COST_UNPRICED_APPROVED_KEY,
@@ -51,7 +52,11 @@ from omnigent.spec.types import (
     Phase,
     PolicySpec,
 )
-from omnigent.stores.conversation_store import ConversationStore, DailyCostState
+from omnigent.stores.conversation_store import (
+    SPAWN_TREE_READ_CAP,
+    ConversationStore,
+    DailyCostState,
+)
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
@@ -1214,10 +1219,10 @@ def _load_session_state(
     return dict(conv.session_state)
 
 
-# Page size for walking a spawn tree when summing sub-agent usage.
-# Sub-agent trees are small in practice, but we still paginate so a
-# large tree is not silently truncated (see load_session_usage).
-_SUBTREE_USAGE_PAGE_SIZE = 100
+# Page size for summing a spawn tree's usage: the root plus the sub-agents one
+# bounded tree read covers, so nearly every policy check reads its tree once.
+# Bigger trees still page, so none is silently truncated.
+_SUBTREE_USAGE_PAGE_SIZE = SPAWN_TREE_READ_CAP + 1
 
 # Usage counters summed across a conversation subtree. Restricted to the
 # known numeric keys the PolicyEngine reads so an unexpected key in one
@@ -1760,6 +1765,16 @@ def _load_default_policy_specs(
                 policy.type,
             )
             continue
+        if not function_policy_handler_allowed(policy.handler, policy.factory_params):
+            # A row whose handler is no longer registered would fail engine construction
+            # for every session; skip it so one stale row cannot take the server down.
+            _logger.warning(
+                "Skipping default policy %r (id=%r): handler %r is not registered.",
+                policy.name,
+                policy.id,
+                policy.handler,
+            )
+            continue
         specs.append(_stored_policy_to_spec(policy))
     _DEFAULT_POLICY_SPECS_CACHE[_DEFAULT_POLICY_SPECS_KEY] = (specs, loaded_at)
     return specs
@@ -1895,6 +1910,12 @@ def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec:
         (e.g. ``type="url"``).
     """
     if policy.type == "python":
+        # Persisted rows can predate the API handler allowlist.
+        if not function_policy_handler_allowed(policy.handler, policy.factory_params):
+            raise OmnigentError(
+                f"Policy handler {policy.handler!r} is not a registered policy handler",
+                code=ErrorCode.INVALID_INPUT,
+            )
         return FunctionPolicySpec(
             name=policy.name,
             # Session policies self-select: on=None means the

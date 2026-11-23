@@ -27,6 +27,7 @@ from omnigent.native.native_coding_agents import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import app as server_app
+from omnigent.server.proactive_agent import PROACTIVE_AGENT_NAME
 from omnigent.server.seeded_agents import SEEDED_AGENTS_ENV
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -567,7 +568,16 @@ async def test_info_harness_install_gate_overrides_feature_snapshot(
             {},
             {},
             {
-                "extensions": [".db", ".docx", ".pptx", ".sqlite", ".sqlite3", ".xlsx", ".zip"],
+                "extensions": [
+                    ".db",
+                    ".docx",
+                    ".mp4",
+                    ".pptx",
+                    ".sqlite",
+                    ".sqlite3",
+                    ".xlsx",
+                    ".zip",
+                ],
                 "all_types": False,
             },
         ),
@@ -586,7 +596,16 @@ async def test_info_harness_install_gate_overrides_feature_snapshot(
             {"filesystem_attachment_allowed_extensions": [".gz"]},
             {"filesystem_attachment_allowed_extensions": lambda: ["*"]},
             {
-                "extensions": [".db", ".docx", ".pptx", ".sqlite", ".sqlite3", ".xlsx", ".zip"],
+                "extensions": [
+                    ".db",
+                    ".docx",
+                    ".mp4",
+                    ".pptx",
+                    ".sqlite",
+                    ".sqlite3",
+                    ".xlsx",
+                    ".zip",
+                ],
                 "all_types": True,
             },
         ),
@@ -2348,11 +2367,17 @@ def test_ensure_default_agents_allowlist_recognizes_every_packaged_name(
     stores = (seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache)
     monkeypatch.setenv(SEEDED_AGENTS_ENV, "")
     packaged = server_app._ensure_default_agents(*stores)
-    assert {a.name for a in seed_stores.agent_store.list(limit=200).data} <= packaged
+
+    def seeded() -> set[str]:
+        # The proactive agent is seeded outside the allowlist and never listed.
+        rows = seed_stores.agent_store.list(limit=200).data
+        return {a.name for a in rows} - {PROACTIVE_AGENT_NAME}
+
+    assert seeded() <= packaged
 
     monkeypatch.setenv(SEEDED_AGENTS_ENV, ",".join(sorted(packaged)))
     assert server_app._ensure_default_agents(*stores) == frozenset()
-    assert {a.name for a in seed_stores.agent_store.list(limit=200).data} == packaged
+    assert seeded() == packaged
 
 
 def _build_api_only_app(db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FastAPI:

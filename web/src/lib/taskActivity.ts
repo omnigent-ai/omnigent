@@ -81,6 +81,11 @@ export function readTaskActivity(item: Record<string, unknown>): TaskActivity | 
   return null;
 }
 
+/** Whether the chat shows a marker: the agent's own tasks always, plan markers with workflows on. */
+export function showsTaskActivity(activity: TaskActivity, workflowsEnabled: boolean): boolean {
+  return workflowsEnabled || (activity.kind === "task" && activity.native);
+}
+
 /** How a task marker leads: "Started", "Completed", … */
 export function taskMarkerLabel(status: StepStatus): string {
   return {

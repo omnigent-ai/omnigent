@@ -31,13 +31,22 @@ const flushRadix = () =>
     });
   });
 
+function setAgentTurn(state: { sessionStatus?: "running" | "idle"; localSending?: boolean }) {
+  useChatStore.setState({
+    sessionStatus: state.sessionStatus ?? "idle",
+    status: state.localSending ? "streaming" : "idle",
+  });
+}
+
 beforeEach(() => {
   setBackground(0, [], null);
+  setAgentTurn({});
 });
 
 afterEach(() => {
-  setBackground(0, [], null);
   cleanup();
+  setBackground(0, [], null);
+  setAgentTurn({});
 });
 
 describe("BackgroundTaskIndicator", () => {
@@ -414,6 +423,108 @@ describe("BackgroundTaskIndicator", () => {
     expect(trigger).toHaveAttribute("type", "button");
     fireEvent.click(trigger);
     expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("carries the working state while the agent's turn runs", () => {
+    setBackground(1, [{ description: "Only task" }]);
+    setAgentTurn({ sessionStatus: "running" });
+    render(<BackgroundTaskIndicator />);
+    const trigger = badge("Agent working — 1 background task still running");
+    expect(trigger).toHaveTextContent("1");
+    expect(screen.getByTestId("background-task-working")).toBeInTheDocument();
+    // The working state renames the button only; the live region keeps the
+    // bare count so the transcript shimmer stays the sole working announcer.
+    expect(screen.getByRole("status")).toHaveTextContent(/^1 background task still running$/);
+  });
+
+  it("carries the working state while a local send is in flight", () => {
+    setBackground(2, [{ description: "One" }, { description: "Two" }]);
+    setAgentTurn({ localSending: true });
+    render(<BackgroundTaskIndicator />);
+    badge("Agent working — 2 background tasks still running");
+    expect(screen.getByTestId("background-task-working")).toBeInTheDocument();
+  });
+
+  it("drops the working state once the turn settles back to idle", () => {
+    setBackground(1, [{ description: "Only task" }]);
+    setAgentTurn({ sessionStatus: "running" });
+    render(<BackgroundTaskIndicator />);
+    badge("Agent working — 1 background task still running");
+
+    act(() => setAgentTurn({}));
+    badge("1 background task still running");
+    expect(screen.queryByTestId("background-task-working")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("1 background task still running");
+  });
+
+  it("renders nothing while the turn runs when no background task is left", () => {
+    // WHY: the working cue rides on the tally; with no tasks there is no badge to carry it.
+    setBackground(0, [], null);
+    setAgentTurn({ sessionStatus: "running" });
+    const { container } = render(<BackgroundTaskIndicator />);
+    expect(container).toBeEmptyDOMElement();
+    expect(screen.queryByTestId("background-task-working")).toBeNull();
+  });
+
+  it("removes the badge and its working state when the last task finishes mid-turn", () => {
+    setBackground(1, [{ description: "Only task" }]);
+    setAgentTurn({ sessionStatus: "running" });
+    const { container } = render(<BackgroundTaskIndicator />);
+    badge("Agent working — 1 background task still running");
+
+    act(() => setBackground(0, [], "conv-1"));
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("keeps the working state and the new count when tasks start mid-turn", () => {
+    setBackground(1, [{ description: "One" }]);
+    setAgentTurn({ sessionStatus: "running" });
+    render(<BackgroundTaskIndicator />);
+    badge("Agent working — 1 background task still running");
+
+    act(() => setBackground(2, [{ description: "One" }, { description: "Two" }]));
+    badge("Agent working — 2 background tasks still running");
+    expect(screen.getByRole("status")).toHaveTextContent(/^2 background tasks still running$/);
+  });
+
+  it("keeps the working badge the same size and style as the idle one", () => {
+    // WHY: the working form swaps the icon in place; a size or padding change would shift the
+    // composer row (and the phone header) each time a turn starts or ends.
+    setBackground(1, [{ description: "Only task" }]);
+    // Pin the idle baseline: a count change can carry a status from an earlier test's
+    // async store work, which would make this "idle" render already working.
+    setAgentTurn({});
+    render(<BackgroundTaskIndicator />);
+    const idle = badge("1 background task still running");
+    const idleClass = idle.className;
+    const idleIconClass = idle.querySelector("svg")?.getAttribute("class");
+
+    act(() => setAgentTurn({ sessionStatus: "running" }));
+    const working = badge("Agent working — 1 background task still running");
+    expect(working.className).toBe(idleClass);
+    expect(working.querySelector("svg")?.getAttribute("class")).toContain("size-3.5");
+    expect(idleIconClass).toContain("size-3.5");
+  });
+
+  it("stops the working spinner's animation under reduced motion", () => {
+    setBackground(1, [{ description: "Only task" }]);
+    setAgentTurn({ sessionStatus: "running" });
+    render(<BackgroundTaskIndicator />);
+    expect(screen.getByTestId("background-task-working")).toHaveClass(
+      "animate-spin",
+      "motion-reduce:animate-none",
+    );
+  });
+
+  it("keeps the working form on the phone header mount, which passes its own classes", () => {
+    // WHY: below the md breakpoint the badge is portaled into the mobile header with a
+    // caller-supplied class; the working state must survive that variant too.
+    setBackground(1, [{ description: "Only task" }]);
+    setAgentTurn({ sessionStatus: "running" });
+    render(<BackgroundTaskIndicator className="h-11 rounded-full bg-transparent" />);
+    const trigger = badge("Agent working — 1 background task still running");
+    expect(trigger).toHaveClass("h-11", "rounded-full", "bg-transparent", "shrink-0");
+    expect(screen.getByTestId("background-task-working")).toBeInTheDocument();
   });
 });
 

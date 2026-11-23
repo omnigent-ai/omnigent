@@ -57,6 +57,7 @@ from omnigent.inner.executor import (
     LiveMcpReconnectRefused,
     LiveMcpServerStatus,
     LiveMcpServerUnknown,
+    NativeTurnAcceptance,
 )
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.policies.types import FAIL_CLOSED_PHASES
@@ -83,6 +84,13 @@ from omnigent.server.schemas import (
 )
 
 _logger = logging.getLogger(__name__)
+
+
+class _HarnessCompletedEvent(CompletedEvent):
+    """Optional internal acceptance receipt, consumed by the runner."""
+
+    native_acceptance: NativeTurnAcceptance | None = None
+
 
 # Cadence for ``response.heartbeat`` SSE events while a turn is
 # streaming. Matches the existing Omnigent cadence at
@@ -501,6 +509,7 @@ class TurnContext:
         # to populate the usage field on the response.completed SSE.
         # ``None`` when the inner executor does not report usage.
         self.provider_usage: dict[str, Any] | None = None
+        self.native_acceptance: NativeTurnAcceptance | None = None
         # Idle-watchdog reset hook. ``_guarded_run_turn`` sets this to
         # push the per-turn idle deadline forward on each real progress
         # event so a long-but-active turn isn't killed mid-turn.
@@ -2116,8 +2125,11 @@ class HarnessApp:
         )
         terminal: ServerStreamEvent
         if status_value == "completed":
-            terminal = CompletedEvent(
-                type="response.completed", response=response, sequence_number=sequence
+            terminal = _HarnessCompletedEvent(
+                type="response.completed",
+                response=response,
+                sequence_number=sequence,
+                native_acceptance=ctx.native_acceptance,
             )
         elif status_value == "failed":
             terminal = FailedEvent(

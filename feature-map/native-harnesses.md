@@ -29,9 +29,25 @@ implements them separately, so a fix for one harness does not reach the others.
 - `agent-instructions`: supported native startup paths preserve authored instructions
   and add shared guidance for showing workspace screenshots; Pi authors can keep
   or replace its base prompt and disable automatic context files.
+- `long-term-memory`: on a server with memory on, Claude Code, Codex and Pi
+  sessions start with a note on the `memory_*` tools and a quoted index of up to
+  100 saved memories (path, short description, last-updated date; the session's
+  project first), and can save and recall memories across sessions and
+  harnesses. Claude Code's own auto memory is off in those sessions. With memory off, or against an older server, they get neither the
+  tools nor the note. `memory_search` is offered only when the server's memory
+  backend can search; the default backend cannot.
 - `pi-host-mcp`: managed Pi sessions (pi-native with an Omnigent provider, and the
   Pi gateway executor) also get the MCP servers configured for Claude Code, Codex
   and Cursor; the user's own `~/.pi/agent/mcp.json` entries win and it is not written.
+- `pi-claude-plugins`: with `OMNIGENT_FEATURES=pi_claude_plugins` in the environment of
+  the host or runner process that launches Pi, managed Pi sessions (pi-native and the
+  Pi gateway executor) load the skills, `/<plugin>:<command>` (the command name is the
+  path under `commands/`, or the frontmatter `name` when set, as plugin command discovery
+  names them)
+  prompts and Pi packages of the Claude Code plugins enabled for the user. Disabled
+  plugins stay out, and a resource the user's Pi settings already list by the same
+  path is not added again. Excluding one resource of a plugin is not supported yet:
+  disable the plugin in Claude Code to drop it.
 - `claude-managed-mcp-relay`: on a machine with Claude Code's enterprise
   `managed-mcp.json`, Claude Code refuses `--mcp-config`, so Claude native
   sessions (web-launched and `omnigent claude`) reach Omnigent's tools through
@@ -142,10 +158,11 @@ implements them separately, so a fix for one harness does not reach the others.
     system error that Codex reports outside a turn; during a turn, the turn's
     own outcome decides.
   - Background work shows the working spinner with the tooltip "Working in the
-    background". The composer lists running Claude background shells and Codex
-    background terminals as "1 background task" with each one's command. Claude's
-    list changes when a turn ends; Codex's changes within a few seconds of a
-    terminal starting or stopping.
+    background". Output from the ended turn that the viewer hasn't seen shows the
+    unread dot instead until the session is opened. The composer lists running
+    Claude background shells and Codex background terminals as "1 background
+    task" with each one's command. Claude's list changes when a turn ends;
+    Codex's changes within a few seconds of a terminal starting or stopping.
   - Answering a prompt in Chat or the Inbox clears "Needs response" from the
     row, its status group, the dock badge and the Inbox count at once. If the
     answer fails to send, the prompt shows again. A session the sidebar had not
@@ -153,7 +170,8 @@ implements them separately, so a fix for one harness does not reach the others.
     next session-list refresh instead.
 - `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups,
   including those sent while it works, stay in that thread, and closing it
-  leaves the parent usable.
+  leaves the parent usable. Sending another message or choosing Resume reopens
+  a closed side chat, restoring saved context when its native thread is gone.
 - `codex-async-questions`: each Codex `request_user_input_async` question shows
   a card in Chat and Inbox that leaves the composer usable, like the Codex TUI's
   queued-question picker. A card closes when the question is answered from the
@@ -243,6 +261,17 @@ check the same authored role is present once. For a custom Pi-native agent,
 `executor.system_prompt_mode: replace` replaces Pi's base prompt. Explicit agent
 instructions remain; these options do not restrict file access or extensions.
 The `omnigent pi` wrapper also appends its own startup instructions.
+
+**Long-term memory:** on a server started with `OMNIGENT_FEATURES=memory`, start
+a Claude Code session from New Chat or with `omnigent claude` and ask it to
+remember a preference; it calls `memory_write`. Then start a new Codex or Pi
+session, from New Chat or `omnigent codex` / `omnigent pi`, and ask about the
+preference without mentioning memory. Its startup instructions list the saved
+path, and it reads the memory with `memory_get`. The note and the path list are
+built once per launch, so a session started before the save finds the memory
+only with `memory_list` (or `memory_search` on a backend that can search). With
+memory off, the same sessions show no memory tools and no note. A session shared
+with someone who can add input refuses the memory tools.
 
 **Managed MCP config (Claude):** on a disposable machine whose Claude Code
 reads an enterprise `managed-mcp.json` containing the documented `omnigent`
@@ -681,6 +710,29 @@ Cross-harness journeys:
   checks authored instructions in actual scripted-provider requests before and
   after a real Pi fork with tool history. These checks do not prove browser
   launch, OS sandbox access or live-model adherence to the instructions.
+- **`long-term-memory`, Claude, Codex and Pi native:** start the instance's
+  server with `OMNIGENT_FEATURES=memory`. The shared startup composer used by
+  all three launches is covered by
+  `tests/runner/test_app_native_startup_instructions.py::test_startup_instructions_join_stable_text_notes_and_memory_in_order`
+  and, with memory off,
+  `tests/runner/test_app_native_startup_instructions.py::test_startup_instructions_without_memory_are_unchanged`.
+  `tests/runner/test_app_sessions_native_terminals_autocreate.py::test_auto_create_pi_terminal_launches_required_terminal`
+  checks that the Pi launch passes the note through.
+  `tests/runner/test_memory_guidance.py::test_saved_memories_are_listed_as_quoted_data_not_as_instructions`,
+  `tests/runner/test_memory_guidance.py::test_the_sessions_project_comes_first_then_the_user_and_feedback`
+  and `tests/runner/test_memory_guidance.py::test_without_search_the_guidance_never_mentions_memory_search`
+  cover the note's content.
+  `tests/runner/test_app_sessions_native_terminals_autocreate.py::test_auto_create_claude_terminal_turns_its_own_memory_off_with_omnigent_memory`
+  covers Claude Code launching with its own auto memory off.
+  `tests/runner/test_runner_entry.py::test_runner_offers_memory_tools_only_when_the_server_says_memory_is_available`,
+  `tests/runner/test_memory_tool_dispatch.py::test_without_backend_search_memory_search_is_neither_offered_nor_proxied`
+  and `tests/server/integration/test_memory_routes.py::test_by_default_the_routes_and_the_capability_are_off`
+  cover the tools following the server's memory and search settings. No test
+  drives a live cross-harness recall. By hand: in a Claude Code session ask it
+  to remember a preference, and confirm the entry with `GET /v1/memory/entries`.
+  Then, in a new Codex session, ask about it without mentioning memory. The
+  reply should name the preference after a `memory_get` call on the saved path,
+  and the Codex session's startup instructions should list that path.
 - **`side-chat`, Codex:**
   `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
   uses a real Codex CLI/app-server and the local mock model. It verifies inherited
@@ -1207,6 +1259,15 @@ Cross-harness journeys:
   `{"name": {"enabled": false}}` there turns it off. `~/.pi/agent` stays unchanged.
   A server whose env or headers use `${VAR}` connects only when the runner gets
   that variable, for example through `OMNIGENT_RUNNER_ENV_PASSTHROUGH=VAR`.
+- **`pi-claude-plugins`:** run `tests/inner/test_pi_claude_plugins.py` and
+  `tests/e2e/omnigent/test_pi_claude_plugins_e2e.py` (real Pi, mock model). Manually,
+  set `OMNIGENT_FEATURES=pi_claude_plugins` in the environment of the host or runner that
+  launches Pi (a server-only setting does not reach it), enable a marketplace
+  plugin with a skill and a command in Claude Code, then start `omnigent pi` with an
+  Omnigent provider. Run `/<plugin>:<command> focus`: the body expands with the
+  arguments. The skill is listed for the model and `/skill:<name>` works. Disable the
+  plugin in Claude Code and launch again: both are gone. `~/.pi/agent` stays unchanged.
+  Without the flag, nothing changes.
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.
@@ -1478,6 +1539,15 @@ the message arrives as a new turn about 15 minutes later, and that
   honor MCP progress notifications can still impose their own shorter deadline;
   the relay cancels its pending approval when the client disconnects. A timeout
   after execution starts has an unknown outcome and cannot undo a committed write.
+
+- Long-term memory is separate from a harness's own memory. With memory on,
+  Claude Code launches with its own auto memory off, but a
+  `CLAUDE_CODE_DISABLE_AUTO_MEMORY` value already in the runner's environment is
+  kept, and a Claude Code session started outside Omnigent still uses its own. Its
+  host-local notes can then answer a recall question by themselves and make
+  `long-term-memory` look like it works when it doesn't, so recall from a
+  different harness for a cross-harness check. Codex asks for approval before
+  each memory tool call unless it has been allowed for the session.
 
 - For user/project defaults and startup-argument precedence, use
   [Preferences and config defaults](./preferences.md). The read-only Startup

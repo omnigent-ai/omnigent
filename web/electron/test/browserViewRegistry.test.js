@@ -46,6 +46,34 @@ function makeRegistry() {
   return { registry, sent, attached, detached, visibility };
 }
 
+describe("browserViewRegistry — view cap", () => {
+  it("opens 20 views per window by default and refuses the 21st until one closes", () => {
+    const { registry, sent } = makeRegistry();
+    assert.equal(registry.cap, 20);
+    const ids = Array.from({ length: 20 }, (_, index) => `browser-tab:conv_1:tab${index}`);
+    for (const id of ids) {
+      assert.equal(registry.openOrNavigate(id, "https://example.com").ok, true, id);
+    }
+    assert.equal(registry.size(), 20);
+
+    const refused = registry.openOrNavigate("browser-tab:conv_1:extra", "https://example.com");
+    assert.deepEqual(refused, {
+      ok: false,
+      error: "browser view cap reached — close one",
+      cap: 20,
+    });
+    assert.equal(registry.has("browser-tab:conv_1:extra"), false);
+    assert.equal(sent.filter((s) => s.channel === "browser-view-created").length, 20);
+
+    registry.close(ids[0]);
+    assert.equal(
+      registry.openOrNavigate("browser-tab:conv_1:extra", "https://example.com").ok,
+      true,
+    );
+    assert.equal(registry.size(), 20);
+  });
+});
+
 describe("browserViewRegistry — first-navigate activation signal", () => {
   let ctx;
   beforeEach(() => {
@@ -450,6 +478,26 @@ function makeEventCapturingRegistry(extra = {}) {
 }
 
 describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every hop)", () => {
+  it("invalidates continuations on page-initiated navigation, but not redirects", () => {
+    const { registry, fire, windowOpen, loaded } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv", "https://example.com", undefined, { agent: true });
+    const pending = registry.beginAgentNavigation("conv");
+    fire("will-redirect", "https://example.com/redirect");
+    assert.equal(pending(), true);
+    fire("will-navigate", "https://example.com/newer");
+    assert.equal(pending(), false);
+    assert.equal(registry.beginAgentNavigation("conv", pending.retryToken), null);
+
+    const popupPending = registry.beginAgentNavigation("conv");
+    registry.setOpenTabSupported(true);
+    windowOpen("https://example.com/background", "background-tab");
+    assert.equal(popupPending(), true, "a separate tab does not supersede this view");
+    windowOpen("https://example.com/popup", "foreground-tab");
+    assert.equal(loaded.at(-1), "https://example.com/popup");
+    assert.equal(popupPending(), false);
+    assert.equal(registry.beginAgentNavigation("conv", popupPending.retryToken), null);
+  });
+
   it("uses the same live Arca context for initial URL, redirect, frame and popup", () => {
     let eligible = true;
     const context = { serverTarget: "selected-server", sourceHostId: "actual-host" };
