@@ -64,6 +64,7 @@ _METADATA_FILE = "gadget.json"
 _OWNER_HEAD = "head.json"
 _METADATA_KIND = "omnigent.gadget.v1"
 # A gadget directory without metadata this old is left over from an interrupted creation.
+_TRASH_ENTRIES_PER_CALL = 2000
 _ORPHAN_AGE_S = 60 * 60
 
 
@@ -517,8 +518,33 @@ class LocalGadgetStore(GadgetStore):
         with contextlib.suppress(OSError):
             if not os.listdir(owner_dir / segment):
                 self._drop_empty_segment(owner_dir, segment)
-        shutil.rmtree(trash, ignore_errors=True)
+        self._empty_trash()
         return True
+
+    def _empty_trash(self) -> None:
+        """Remove up to ``_TRASH_ENTRIES_PER_CALL`` files and directories from the trash.
+
+        A deletion moves a gadget out of sight at once; its files go a bounded number at a
+        time, so a large gadget never makes one request remove them all. Whatever is left
+        goes with later deletions, or when the store next starts.
+        """
+        root = self._root / ".trash"
+        budget = _TRASH_ENTRIES_PER_CALL
+        removed = 0
+        for directory, dirnames, filenames in os.walk(root, topdown=False):
+            for name in filenames:
+                if removed >= budget:
+                    return
+                with contextlib.suppress(OSError):
+                    os.unlink(os.path.join(directory, name))
+                removed += 1
+            if directory == str(root):
+                continue
+            if removed >= budget:
+                return
+            with contextlib.suppress(OSError):
+                os.rmdir(directory)
+            removed += 1
 
     def gadget_files(self, gadget_id: str) -> GadgetFiles:
         if _GADGET_ID.fullmatch(gadget_id) is None:
@@ -541,4 +567,4 @@ class LocalGadgetStore(GadgetStore):
             os.replace(self._user_dir(user_id, owner_registration), trash)
         except FileNotFoundError:
             return
-        shutil.rmtree(trash, ignore_errors=True)
+        self._empty_trash()

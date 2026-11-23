@@ -419,3 +419,27 @@ def test_an_owner_registration_is_its_own_account(store: LocalGadgetStore) -> No
         store.user_files(ALICE, owner_registration="g2").list_paths("shelf")
     store.delete_user_files(ALICE, owner_registration="g2")
     assert store.user_files(ALICE, owner_registration="g1").list_paths("shelf") == []
+
+
+def test_a_deleted_gadgets_files_are_removed_a_bounded_number_at_a_time(
+    store: LocalGadgetStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(local_module, "_TRASH_ENTRIES_PER_CALL", 5)
+    big = store.create(ALICE, "Board")
+    files = store.gadget_files(big.id)
+    files.mkdirs("data")
+    for n in range(12):
+        files.create_json(f"data/{n:02d}.json", {"n": n})
+    trash = tmp_path / "gadgets" / ".trash"
+
+    def left() -> int:
+        return sum(len(names) + len(dirs) for _, dirs, names in os.walk(trash))
+
+    # The gadget is gone at once; its files go five at a time, with each later deletion.
+    assert store.delete(big.id) is True
+    assert store.get(big.id) is None
+    assert left() > 0
+    while left():
+        before = left()
+        store.delete(store.create(ALICE, "Scratch").id)
+        assert left() < before

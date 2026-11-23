@@ -80,8 +80,12 @@ class DeletedAccountResources(Protocol):
     reaches what the deleted registration left behind.
     """
 
-    def delete_owned(self, user_id: str, registration: str | None) -> None:
-        """Delete everything the deleted registration *registration* of *user_id* owns there."""
+    def delete_owned(self, user_id: str, registration: str | None) -> bool:
+        """Delete some of what the deleted registration *registration* of *user_id* owns
+        there, in bounded work; ``True`` once nothing is left. Later calls go on."""
+
+    def resume(self) -> None:
+        """Go on, in bounded work, with cleanups earlier calls left unfinished."""
 
 
 _HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
@@ -661,6 +665,9 @@ class SqlAlchemyAccountStore:
             registration = account_registration(row.created_at) if row is not None else None
         if tombstoned:
             self._gadgets.delete_owned(user_id, registration)
+        else:
+            # Each registration also moves other deleted accounts' cleanups along.
+            self._gadgets.resume()
 
     def _owned_workflow_ids(
         self, session: Session, user_id: str, *, limit: int, lock: bool = False

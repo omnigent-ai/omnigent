@@ -1941,3 +1941,56 @@ def test_a_password_change_keeps_the_accounts_comments_and_actions_its_own(
         {"id": action["id"], "if_version": action["version"], "operation_id": "u1",
          "state": "running", "session_id": "s1"},
     )
+
+
+def test_a_large_accounts_gadgets_go_a_bounded_number_per_call_and_the_rest_later(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    from omnigent.gadgets import accounts as gadget_accounts
+
+    monkeypatch.setattr(gadget_accounts, "GADGETS_PER_CLEANUP", 2)
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    store, access, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    accounts.create_user_with_password("carol", "carol-hash")
+    permissions.ensure_user("bob")
+    old_alice = service("alice")
+    boards = [old_alice.create(f"Synthetic board {n}") for n in range(5)]
+    for board in boards:
+        permissions.grant_for_gadget("bob", board["id"], 1)
+    old_alice.pin(boards[0]["id"], {"pinned": True})
+    deleted_store = store.delete
+    deletions: list[str] = []
+
+    def counting_delete(gadget_id: str) -> bool:
+        deletions.append(gadget_id)
+        return deleted_store(gadget_id)
+
+    monkeypatch.setattr(store, "delete", counting_delete)
+
+    def left() -> list[str]:
+        return [g.id for g in store.iter_owned("alice", owner_registration=old_alice.registration)]
+
+    # Deleting the account removes one bounded batch; the rest stays detached and shared
+    # with no one until later calls finish it.
+    assert accounts.delete_user("alice") is True
+    assert len(deletions) == 2 and len(left()) == 3
+    assert access.shared_with("bob").items == []
+
+    # The name is registered again; its new gadget is never part of the old cleanup.
+    accounts.create_user_with_password("alice", "replacement-hash")
+    alice = service("alice")
+    mine = alice.create("New board")
+    assert len(deletions) <= 4
+
+    # Other accounts' deletions and registrations move the old cleanup along to the end.
+    for name in ("dave", "erin", "frank"):
+        accounts.create_user_with_password(name, f"{name}-hash")
+    assert left() == []
+    assert len(deletions) == 5
+    assert set(deletions) == {board["id"] for board in boards}
+    assert store.get(mine["id"]) is not None
+    assert alice.shelf()["pinned"] == []
+    assert [g["id"] for g in alice.list_owned()["items"]] == [mine["id"]]
+    assert permissions.list_for_gadget(boards[4]["id"]) == ([], None)
