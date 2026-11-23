@@ -54,13 +54,8 @@ export function WorkspaceRailEdgeHandle({
 }
 
 /**
- * The gutter beside floating panes: a pointer-only band over the gap, beside the rail since the
- * rail clips what leaves it, and placed by the rail's width. The rail's separator stays the
- * accessible one, so this band is hidden from assistive tech and takes no focus. It shows where
- * the rail docks and the panes float: the desktop layout, 48rem and wider.
- *
- * A closed rail keeps the band mounted but hidden: unmounting it would make the rail its
- * parent's last child, which restyles everything in the rail on every toggle.
+ * Pointer-only gutter drag target, 48rem and wider; the rail separator remains the accessible
+ * handle. Kept mounted so closing the rail does not make the rail its parent's last child.
  */
 export function WorkspaceRailGutterHandle({
   onMouseDown,

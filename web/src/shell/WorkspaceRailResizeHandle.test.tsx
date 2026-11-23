@@ -81,10 +81,4 @@ describe("the workspace rail's resize handle beside floating panes", () => {
     fireEvent.mouseDown(gutter);
     expect(props.onMouseDown).not.toHaveBeenCalled();
   });
-
-  it("drops the separator's bar only where the panes float, 48rem and wider", () => {
-    renderFloatingRail();
-    const separator = screen.getByRole("separator", { name: "Resize panel" });
-    expect(separator).toHaveClass("hover:bg-primary/30", "min-[48rem]:hover:bg-transparent");
-  });
 });

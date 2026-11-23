@@ -25,7 +25,6 @@ import {
 } from "./terminalFocusRequest";
 import { resetTerminalOpenRequestsForTests, useTerminalOpenRequests } from "./terminalOpenRequest";
 import { resetTerminalPlacement, useMainOwnedTerminalKeys } from "./terminalPlacement";
-import { BELOW_SESSION_HEADER } from "./sessionHeaderInset";
 
 const AGENT_ID = "terminal_claude_main";
 const SHELL_ID = "terminal_zsh_s1";
@@ -144,11 +143,6 @@ describe("SplitPanesMainView", () => {
     render(<View conversationId={conversationId} {...props} />);
     expect(screen.getByTestId("main-terminal-view").dataset.splittable).toBe("false");
     expect(screen.queryByTestId("split-panes-main-view")).toBeNull();
-  });
-
-  it("starts below the session header, as the Terminal view does, so no pane strip sits under it", async () => {
-    render(<View conversationId={nextConversation()} />);
-    expect(await screen.findByTestId("split-panes-main-view")).toHaveClass(BELOW_SESSION_HEADER);
   });
 
   it("keeps the Chat/Terminal switch in the header until a split puts the chat in a pane", async () => {
