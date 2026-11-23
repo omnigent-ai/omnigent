@@ -60,6 +60,7 @@ import {
   BellOffIcon,
   ArrowUpDownIcon,
   ArchiveRestoreIcon,
+  BotIcon,
   CheckIcon as CheckMarkIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
@@ -322,8 +323,10 @@ import {
   isSharedAutomationRun,
   sessionInSidebarFolder,
   sessionsListAcceptsDrop,
+  UNTITLED_CONVERSATION_LABEL,
   withAutomationFolder,
 } from "./sidebarNav";
+import { CREATED_BY_SESSION_LABEL_KEY, useSessionCreator } from "./CreatedBySession";
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { isRowFullyVisible } from "./sidebarRowVisibility";
 import { useHarnessLabels } from "@/lib/agentLabels";
@@ -4882,6 +4885,10 @@ function ConversationSection({
       ? conversationDisplayLabel(representative)
       : undefined;
   };
+  const familyParentId = (row: Conversation) => {
+    const representative = familyRepresentative(row);
+    return representative && representative.id !== row.id ? representative.id : undefined;
+  };
   const familyExpandedState = (row: Conversation) =>
     row.family &&
     familyRepresentative(row)?.id === row.id &&
@@ -5008,6 +5015,7 @@ function ConversationSection({
                   familyIndented={isNestedFamilyRow(conv)}
                   familyNestedCount={familyNestedCount(conv)}
                   familyParentTitle={familyParentTitle(conv)}
+                  familyParentId={familyParentId(conv)}
                   familyExpanded={familyExpandedState(conv)}
                   onToggleFamily={() => onToggleFamily(conv.family!.id)}
                   isActive={
@@ -5672,16 +5680,19 @@ function SessionMetaLine({
   );
 }
 
-// A label-left, value-right line in the session tooltip's details block.
+// A label-left, value-right line in the session tooltip's details block. A
+// `suffix` stays visible when a long value truncates.
 function SessionTooltipDetail({
   label,
   icon: Icon,
   testId,
+  suffix,
   children,
 }: {
   label: string;
   icon: LucideIcon;
   testId: string;
+  suffix?: string;
   children: ReactNode;
 }) {
   return (
@@ -5690,8 +5701,29 @@ function SessionTooltipDetail({
       <span className="flex min-w-0 items-center gap-1.5">
         <Icon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
         <span className="truncate">{children}</span>
+        {suffix && <span className="shrink-0 text-muted-foreground">{suffix}</span>}
       </span>
     </div>
+  );
+}
+
+// The session that started this one. The card mounts on open, so each opening
+// rechecks access; a creator the viewer can't read is never named.
+function SessionCreatorDetail({ sessionId }: { sessionId: string }) {
+  const { settled, creator } = useSessionCreator(sessionId);
+  return (
+    <SessionTooltipDetail
+      label="Created by"
+      icon={BotIcon}
+      testId="session-tooltip-creator"
+      suffix={settled && creator?.archived ? " · archived" : undefined}
+    >
+      {settled && creator ? (
+        creator.title || UNTITLED_CONVERSATION_LABEL
+      ) : (
+        <span className="text-muted-foreground">{settled ? "Another session" : "…"}</span>
+      )}
+    </SessionTooltipDetail>
   );
 }
 
@@ -5706,15 +5738,22 @@ function SessionTooltipDetailsBlock({ children }: { children: ReactNode }) {
 function SessionTooltipDetails({
   conversation,
   familyDetail,
+  familyParentId,
 }: {
   conversation: Conversation;
   familyDetail?: ReactNode;
+  familyParentId?: string;
 }) {
   const viewerId = useContext(ViewerIdContext);
   // Only a workspace-bound session has a checkout to read GitHub state from.
   const githubInfo = usePullRequestInfo(conversation.workspace ? conversation.id : undefined);
   const github = githubInfo.data;
-  // `owner` is null when permissions are off; there's no creator to name then.
+  // A session another session started names that creator; the owner then reads as "Owner".
+  const creatorId = conversation.labels?.[CREATED_BY_SESSION_LABEL_KEY] ?? null;
+  // The creator row replaces a "Nested in" row that would name the same session.
+  const shownFamilyDetail =
+    creatorId !== null && familyParentId === creatorId ? null : familyDetail;
+  // `owner` is null when permissions are off; there's no owner to name then.
   const owner = conversation.owner ?? null;
   const createdBy = owner !== null && isOwnedByViewer(conversation, viewerId) ? "You" : owner;
   // The server's stored first PR stands in while the host is offline.
@@ -5745,7 +5784,8 @@ function SessionTooltipDetails({
   const asOf = fromStored ? stateAsOf(stored?.state_checked_at) : null;
   const branch = conversation.git_branch ?? github?.branch ?? null;
   if (
-    !familyDetail &&
+    !shownFamilyDetail &&
+    creatorId === null &&
     createdBy === null &&
     repo === null &&
     prNumber === null &&
@@ -5755,10 +5795,11 @@ function SessionTooltipDetails({
   }
   return (
     <SessionTooltipDetailsBlock>
-      {familyDetail}
+      {shownFamilyDetail}
+      {creatorId !== null && <SessionCreatorDetail sessionId={creatorId} />}
       {createdBy !== null && (
         <SessionTooltipDetail
-          label="Created by"
+          label={creatorId === null ? "Created by" : "Owner"}
           icon={UserRoundIcon}
           testId="session-tooltip-owner"
         >
@@ -5882,12 +5923,14 @@ function SessionTooltipContent({
   hasError,
   shared,
   familyDetail,
+  familyParentId,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
   shared: SessionSharing | null;
   familyDetail?: ReactNode;
+  familyParentId?: string;
 }) {
   const serverInfo = useContext(ServerInfoContext);
   if (!isFeatureEnabled(serverInfo, "sidebar_grouping_ui")) {
@@ -5923,7 +5966,11 @@ function SessionTooltipContent({
           <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
         </span>
       </p>
-      <SessionTooltipDetails conversation={conversation} familyDetail={familyDetail} />
+      <SessionTooltipDetails
+        conversation={conversation}
+        familyDetail={familyDetail}
+        familyParentId={familyParentId}
+      />
       {shared !== null && <SessionSharedHint sharing={shared} />}
       {hasError && <SessionErrorHint />}
     </TooltipContent>
@@ -5940,6 +5987,7 @@ function ConversationRowImpl({
   familyExpanded,
   familyNestedCount,
   familyParentTitle,
+  familyParentId,
   onToggleFamily,
   isActive,
   inActiveGrid,
@@ -5965,6 +6013,8 @@ function ConversationRowImpl({
   familyNestedCount?: number;
   /** The family parent's title, for a nested session's tooltip. */
   familyParentTitle?: string;
+  /** The family parent's id, so a card that names it as creator can skip "Nested in". */
+  familyParentId?: string;
   onToggleFamily?: () => void;
   // Computed by the list owner against the resolved top-level root (so a
   // sub-agent view keeps its owning row highlighted). A prop, not a per-row
@@ -6651,6 +6701,7 @@ function ConversationRowImpl({
               hasError={sessionState?.kind === "error"}
               shared={sharing}
               familyDetail={familyDetail}
+              familyParentId={familyParentId}
             />
           </Tooltip>
         )
@@ -6711,6 +6762,7 @@ function ConversationRowImpl({
             hasError={sessionState?.kind === "error"}
             shared={sharing}
             familyDetail={familyDetail}
+            familyParentId={familyParentId}
           />
         </Tooltip>
       )}
@@ -6990,6 +7042,7 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
     prev.familyExpanded === next.familyExpanded &&
     prev.familyNestedCount === next.familyNestedCount &&
     prev.familyParentTitle === next.familyParentTitle &&
+    prev.familyParentId === next.familyParentId &&
     prev.isActive === next.isActive &&
     prev.inActiveGrid === next.inActiveGrid &&
     prev.gridSelected === next.gridSelected &&

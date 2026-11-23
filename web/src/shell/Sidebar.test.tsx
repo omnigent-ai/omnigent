@@ -13,7 +13,9 @@ import * as automationInboxHook from "@/hooks/useAutomationInbox";
 import * as proactiveInboxHook from "@/hooks/useProactiveInbox";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { MUTED_LABEL_KEY } from "@/lib/sessionMute";
+import * as sessionsApi from "@/lib/sessionsApi";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
+import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
 // Integration tests for the Sidebar's session list. The search box no
 // longer carries a filter funnel (agent-type filter + "Show archived"
 // toggle were removed). The sidebar fetches a single session list with
@@ -5476,6 +5478,130 @@ describe("Sidebar view options", () => {
       viewer.mockRestore();
     }
   });
+
+  it("names the session that started an agent-created session", async () => {
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("viewer@example.com");
+    const lookup = vi.spyOn(sessionsApi, "getSessionSlim").mockResolvedValue({
+      id: "conv_manager",
+      title: "Release manager",
+      archived: true,
+    } as Session);
+    onTestFinished(() => {
+      viewer.mockRestore();
+      lookup.mockRestore();
+    });
+    const family = { id: "conv_manager", representative_id: "conv_manager", pinned: false };
+    mockConversations([
+      conv("conv_manager", "Codex", { owner: "viewer@example.com", family, created_at: 1 }),
+      conv("conv_worker", "Codex", {
+        owner: "viewer@example.com",
+        family,
+        created_at: 2,
+        labels: { [CREATED_BY_SESSION_LABEL_KEY]: "conv_manager" },
+      }),
+    ]);
+    renderGroupingSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: "conv_worker" }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByTestId("session-tooltip-content");
+    await waitFor(() =>
+      expect(within(tooltip).getByTestId("session-tooltip-creator")).toHaveTextContent(
+        "Created byRelease manager · archived",
+      ),
+    );
+    expect(within(tooltip).getByTestId("session-tooltip-owner")).toHaveTextContent("OwnerYou");
+    // "Nested in" would name the creator again.
+    expect(within(tooltip).queryByTestId("session-tooltip-family")).toBeNull();
+    expect(lookup).toHaveBeenCalledWith("conv_manager");
+  });
+
+  it("does not name a creator the viewer can't read", async () => {
+    const lookup = vi
+      .spyOn(sessionsApi, "getSessionSlim")
+      .mockRejectedValue(new sessionsApi.ApiError("Not found", 404, null));
+    onTestFinished(() => lookup.mockRestore());
+    mockConversations([
+      conv("conv_worker", "Codex", { labels: { [CREATED_BY_SESSION_LABEL_KEY]: "conv_gone" } }),
+    ]);
+    renderGroupingSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: "conv_worker" }), {
+      pointerType: "mouse",
+    });
+    expect(await screen.findByText("Another session")).toBeInTheDocument();
+    expect(screen.getByTestId("session-tooltip-creator")).toHaveTextContent(
+      "Created byAnother session",
+    );
+  });
+
+  it("rechecks the creator each time the card opens, without showing a cached title", async () => {
+    let rejectRecheck!: (error: Error) => void;
+    const lookup = vi
+      .spyOn(sessionsApi, "getSessionSlim")
+      .mockResolvedValueOnce({ id: "conv_manager", title: "Release manager" } as Session)
+      .mockReturnValueOnce(
+        new Promise<Session>((_, reject) => {
+          rejectRecheck = reject;
+        }),
+      );
+    onTestFinished(() => lookup.mockRestore());
+    mockConversations([
+      conv("conv_worker", "Codex", { labels: { [CREATED_BY_SESSION_LABEL_KEY]: "conv_manager" } }),
+    ]);
+    renderGroupingSidebar();
+    const row = screen.getByRole("link", { name: "conv_worker" });
+
+    fireEvent.pointerMove(row, { pointerType: "mouse" });
+    expect(await screen.findByText("Release manager")).toBeInTheDocument();
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("session-tooltip-content")).toBeNull());
+
+    // Access was revoked after the first opening; the cached title must not reappear.
+    fireEvent.pointerLeave(row, { pointerType: "mouse" });
+    fireEvent.pointerMove(row, { pointerType: "mouse" });
+    const creator = await screen.findByTestId("session-tooltip-creator");
+    expect(creator).toHaveTextContent("Created by…");
+    await act(async () => rejectRecheck(new sessionsApi.ApiError("Forbidden", 403, null)));
+    await waitFor(() => expect(creator).toHaveTextContent("Created byAnother session"));
+    expect(screen.queryByText("Release manager")).toBeNull();
+    expect(lookup).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["legacy", "pinned"] as const)(
+    "keeps Nested in on the %s card, which doesn't name the creator",
+    async (surface) => {
+      const pinned = surface === "pinned";
+      const project: Record<string, string> = pinned ? { omni_project: "Customer X" } : {};
+      if (pinned) {
+        projectsMock.push("Customer X");
+        seedPins(["conv_manager"]);
+      }
+      const family = { id: "conv_manager", representative_id: "conv_manager", pinned };
+      mockConversations([
+        conv("conv_manager", "Codex", { labels: project, family, created_at: 1 }),
+        conv("conv_worker", "Codex", {
+          labels: { ...project, [CREATED_BY_SESSION_LABEL_KEY]: "conv_manager" },
+          family,
+          created_at: 2,
+        }),
+      ]);
+      if (pinned) renderGroupingSidebar();
+      else renderSidebar();
+
+      const link = screen.getByRole("link", { name: "conv_worker" });
+      if (pinned) fireEvent.focus(link);
+      else fireEvent.pointerMove(link, { pointerType: "mouse" });
+      const card = await screen.findByTestId(
+        pinned ? "pinned-project-flyout" : "session-tooltip-content",
+      );
+      expect(within(card).getByTestId("session-tooltip-family")).toHaveTextContent(
+        /^Nested in\s*conv_manager$/,
+      );
+      expect(within(card).queryByTestId("session-tooltip-creator")).toBeNull();
+    },
+  );
 });
 
 describe("sidebar_grouping_ui release flag", () => {

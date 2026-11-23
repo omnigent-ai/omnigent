@@ -34,7 +34,13 @@ MCP independent creation.
   session can write the reported mode; `null` when the harness has no
   permission modes or the mode is unknown. Coverage: `tests/e2e/test_session_info_permission_mode_e2e.py`.
 - `created-by`: independent workers record their creating session. The session
-  header does not show it. `sys_session_list` and `sys_session_get_info` expose
+  header does not show it. The worker's sidebar card looks the creator up through
+  an access-checked read each time it opens: its "Created by" row names the
+  creator with a bot icon, adds "· archived" for an archived one, or reads
+  "Another session"; the owner moves to an "Owner" row, and "Nested in" is
+  omitted when it would name the creator again
+  (`tests/e2e_ui/sessions/test_sidebar_session_creator.py`).
+  `sys_session_list` and `sys_session_get_info` expose
   `created_by_session_id` so managers can identify their workers across restarts;
   `sys_session_list` with `include_archived` also lists archived workers, each
   marked `archived`. With `created_by_this_session`, the runner pages the global
@@ -269,7 +275,9 @@ server's sandbox configuration (for example, Modal or Daytona). Other deployment
 can supply their own provider through the existing launcher interface.
 
 For `created-by`, extend the creation journey below: open the worker and verify
-its header has no "Created by" label, then ask the manager for its sessions and
+its header has no "Created by" label, and that its sidebar card names the manager
+under "Created by" ("· archived" once the manager is archived, "Another session"
+once it is deleted). Then ask the manager for its sessions and
 match `created_by_session_id`. Fork the worker and verify `sys_session_get_info`
 reports a null `created_by_session_id` for the fork. The API/runner contract is
 covered by `tests/server/integration/test_session_orchestration.py`; the header's
