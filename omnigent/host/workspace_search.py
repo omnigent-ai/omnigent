@@ -1,23 +1,27 @@
 """The workspace API's file and text searches on the host.
 
-SearchFiles answers in the REST file search's substring mode. Candidates come
-from Git through the hardened runner (tracked, and untracked unignored files)
-and, when ignored files are wanted or there is no repository, from the REST
-search's budgeted walk. SearchText runs the REST content search's ripgrep
-script and streams its matches. Directory scopes are literal workspace paths
-matched by whole components, never globs.
+SearchFiles answers in the REST file search's substring mode, and in fuzzy mode
+where the host can rank paths. Candidates come from Git through the hardened
+runner (tracked, and untracked unignored files) and, when ignored files are
+wanted or there is no repository, from the REST search's budgeted walk.
+SearchText runs the REST content search's ripgrep script and streams its
+matches. Directory scopes are literal workspace paths matched by whole
+components, never globs.
 """
 
 from __future__ import annotations
 
 import asyncio
+import bisect
 import contextlib
+import functools
+import heapq
 import logging
 import os
 import re
 import stat
 import sys
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,7 +32,9 @@ from google.protobuf.timestamp_pb2 import Timestamp
 from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     ENTRY_TYPE_DIRECTORY,
     ENTRY_TYPE_FILE,
+    FILE_SEARCH_MODE_FUZZY,
     FILE_SEARCH_MODE_SUBSTRING,
+    FILE_SEARCH_MODE_UNSPECIFIED,
     Entry,
     FileSearchResult,
     SearchFilesRequest,
@@ -38,7 +44,9 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     TextSearchMatch,
 )
 from omnigent.entities.environment_filesystem import FilesystemEntry, InvalidPath
-from omnigent.host.workspace_git.files import workspace_files
+from omnigent.host import workspace_fuzzy
+from omnigent.host.workspace_fuzzy import CorpusCache, PathCorpus, RankedPath
+from omnigent.host.workspace_git.files import FileListing, workspace_files
 from omnigent.host.workspace_git.runner import (
     Deadline,
     GitError,
@@ -51,12 +59,15 @@ from omnigent.runner.environment_filesystem import (
     _glob_to_regex,
     _lstat_beneath,
     _validate_path,
+    describe_indexed_path,
+    indexed_path_filter,
     merge_entries,
     paths_under,
     search_indexed_paths,
 )
 from omnigent.workspace_content_search import (
     MAX_MATCHES,
+    MAX_QUERY_LENGTH,
     MAX_SCRIPT_OUTPUT,
     SCRIPT_TIMEOUT_S,
     ContentSearchError,
@@ -76,6 +87,10 @@ _TEXT_MATCH_BATCH = 100
 # Backslash-escaped in an exclude, so ripgrep matches the directory's name literally;
 # a space too, since ripgrep reads globs as ignore lines, which drop a trailing one.
 _GLOB_METACHARACTERS = frozenset("\\*?[]{}! ")
+# Ranked paths beyond the limit, standing in for ones deleted since Git listed them.
+_SPARE_RANKED = 32
+# Fuzzy mode's file lists, reused while Git's listing is unchanged.
+_corpora = CorpusCache()
 
 
 def _beneath(path: str, directory: str) -> bool:
@@ -196,7 +211,9 @@ def _symlinks(root: Path, paths: Sequence[str]) -> set[str]:
     return {path for path in paths if (root / path).is_symlink()}
 
 
-def _result(entry: FilesystemEntry, *, is_symlink: bool) -> FileSearchResult:
+def _result(
+    entry: FilesystemEntry, *, is_symlink: bool, ranked: RankedPath | None = None
+) -> FileSearchResult:
     return FileSearchResult(
         entry=Entry(
             name=entry.name,
@@ -207,7 +224,9 @@ def _result(entry: FilesystemEntry, *, is_symlink: bool) -> FileSearchResult:
             if entry.modified_at is None
             else Timestamp(seconds=entry.modified_at),
             is_symlink=is_symlink,
-        )
+        ),
+        score=ranked.score if ranked else 0,
+        matched_indices=ranked.matched_indices if ranked else (),
     )
 
 
@@ -216,20 +235,28 @@ def _globs(patterns: Sequence[str]) -> list[str]:
 
 
 async def search_files(root: Path, request: SearchFilesRequest) -> SearchFilesResponse:
-    """Answer a substring-mode SearchFiles for the workspace at ``root``.
+    """Answer a SearchFiles for the workspace at ``root``.
 
-    :raises ConnectError: UNIMPLEMENTED for fuzzy mode, INVALID_ARGUMENT for a
-        bad path or scope, NOT_FOUND for a missing ``path``, UNAVAILABLE when
-        Git can't list the tracked files.
+    Fuzzy mode, the default, ranks files best first, and lists them in path
+    order for a blank query. It is served only where paths can be ranked.
+
+    :raises ConnectError: UNIMPLEMENTED for a mode this host doesn't serve,
+        INVALID_ARGUMENT for a bad path or scope, NOT_FOUND for a missing
+        ``path``, UNAVAILABLE when Git can't list the tracked files.
     """
-    if request.mode != FILE_SEARCH_MODE_SUBSTRING:
+    fuzzy = request.mode in (FILE_SEARCH_MODE_UNSPECIFIED, FILE_SEARCH_MODE_FUZZY)
+    if not (request.mode == FILE_SEARCH_MODE_SUBSTRING or (fuzzy and workspace_fuzzy.available())):
         raise ConnectError(Code.UNIMPLEMENTED, "Only substring file search is served here")
     base = _validated(request.path, "path")
     if not real_directory(root, base, "path"):
         raise ConnectError(Code.NOT_FOUND, f"Directory {base!r} not found")
     scope = DirectoryScope.parse(root, request.include_directories, request.exclude_directories)
-    query = request.query.strip().lower()
-    if not query:
+    query = request.query.strip() if fuzzy else request.query.strip().lower()
+    if fuzzy and len(query) > MAX_QUERY_LENGTH:
+        raise ConnectError(
+            Code.INVALID_ARGUMENT, f"Enter a query of at most {MAX_QUERY_LENGTH} characters"
+        )
+    if not query and not fuzzy:
         return SearchFilesResponse()
     limit = min(request.maximum_results or _DEFAULT_FILE_RESULTS, _MAX_FILE_RESULTS)
     include, exclude = _globs(request.include), _globs(request.exclude)
@@ -250,6 +277,22 @@ async def search_files(root: Path, request: SearchFilesRequest) -> SearchFilesRe
         )
     except GitError as exc:
         raise ConnectError(Code.UNAVAILABLE, f"Git couldn't list the workspace: {exc}") from exc
+    if fuzzy:
+        return await _search_fuzzy(
+            _FuzzySearch(
+                root=root,
+                base=base,
+                scope=scope,
+                query=query,
+                limit=limit,
+                include=include,
+                exclude=exclude,
+                include_git_ignored=request.include_git_ignored,
+                listing=listing,
+                in_scope=in_scope,
+                describe_link=describe_link,
+            )
+        )
     candidates: list[str] = []
     if listing is not None:
         candidates = paths_under([*listing.tracked, *(listing.untracked or [])], base)
@@ -287,6 +330,151 @@ async def search_files(root: Path, request: SearchFilesRequest) -> SearchFilesRe
         results=[_result(entry, is_symlink=entry.path in links) for entry in returned],
         truncated=len(merged) > limit,
         indexed_paths=len(candidates),
+        index_incomplete=walk_truncated or (listing is not None and listing.incomplete),
+        untracked_unavailable=listing is not None and listing.untracked is None,
+    )
+
+
+@dataclass(frozen=True)
+class _FuzzySearch:
+    """A validated fuzzy-mode SearchFiles; paths are relative to ``base``."""
+
+    root: Path
+    base: str
+    scope: DirectoryScope
+    query: str
+    limit: int
+    include: list[str]
+    exclude: list[str]
+    include_git_ignored: bool
+    listing: FileListing | None
+    in_scope: Callable[[str], bool]
+    describe_link: Callable[[str, os.stat_result], FilesystemEntry]
+
+
+def _git_corpora(search: _FuzzySearch) -> list[PathCorpus]:
+    """Corpora of the tracked and untracked files beneath ``base``, in path order."""
+    if search.listing is None:
+        return []
+    restricted = bool(
+        search.include or search.exclude or search.scope.includes or search.scope.excludes
+    )
+    kept = (
+        indexed_path_filter(search.include, search.exclude, search.in_scope)
+        if restricted
+        else None
+    )
+
+    def paths(source: list[str], tracked: list[str] | None = None) -> list[str]:
+        beneath = paths_under(source, search.base)
+        if tracked is not None:
+            # A file staged since the untracked list was read is in both lists.
+            beneath = [path for path in beneath if not _listed(tracked, prefix + path)]
+        return sorted(filter(kept, beneath) if kept else beneath)
+
+    prefix = f"{search.base}/" if search.base else ""
+    filters = (search.base, tuple(search.include), tuple(search.exclude), search.scope)
+    tracked, untracked = search.listing.tracked, search.listing.untracked
+    corpora = []
+    if tracked:
+        key = (search.root, "tracked", filters)
+        corpora.append(_corpora.corpus(key, (tracked,), functools.partial(paths, tracked)))
+    if untracked:
+        key = (search.root, "untracked", filters)
+        corpora.append(
+            _corpora.corpus(
+                key, (tracked, untracked), functools.partial(paths, untracked, tracked)
+            )
+        )
+    return corpora
+
+
+def _listed(paths: list[str], path: str) -> bool:
+    """Whether ``path`` is in ``paths``, which is in path order."""
+    index = bisect.bisect_left(paths, path)
+    return index < len(paths) and paths[index] == path
+
+
+def _first_files(
+    paths: Iterable[str], limit: int, describe: Callable[[str], FilesystemEntry | None]
+) -> tuple[list[FilesystemEntry], bool]:
+    """Describe ``paths`` in order until ``limit`` files; also whether more remain.
+
+    Paths deleted since they were listed, and directories, are skipped.
+    """
+    entries: list[FilesystemEntry] = []
+    for path in paths:
+        entry = describe(path)
+        if entry is None or entry.type != "file":
+            continue
+        if len(entries) == limit:
+            return entries, True
+        entries.append(entry)
+    return entries, False
+
+
+async def _search_fuzzy(search: _FuzzySearch) -> SearchFilesResponse:
+    """Rank files against the query, or list them in path order for a blank one."""
+    search_root = search.root / search.base
+    prefix = f"{search.base}/" if search.base else ""
+    corpora = await run_sync_on_thread(_git_corpora, search)
+    indexed = sum(len(corpus) for corpus in corpora)
+    walked: dict[str, FilesystemEntry] = {}
+    walk_truncated = False
+    if search.listing is None or search.include_git_ignored:
+        found, walk_truncated = await run_sync_on_thread(
+            walk_search,
+            search_root,
+            "",
+            [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in search.include],
+            [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in search.exclude],
+            # Above the budget, so a walk that stops early says so.
+            _SEARCH_SCAN_BUDGET + 1,
+            budget=_SEARCH_SCAN_BUDGET,
+            descend=lambda directory: search.scope.may_enter(prefix + directory),
+            emit=search.in_scope,
+            describe_link=search.describe_link,
+        )
+        listed = {path for corpus in corpora for path in corpus.paths}
+        walked = {e.path: e for e in found if e.type == "file" and e.path not in listed}
+        if walked:
+            corpora.append(await run_sync_on_thread(PathCorpus, sorted(walked)))
+
+    def describe(path: str) -> FilesystemEntry | None:
+        return walked.get(path) or describe_indexed_path(
+            search_root, path, describe_link=search.describe_link
+        )
+
+    ranked: dict[str, RankedPath] = {}
+    if search.query:
+        wanted = search.limit + _SPARE_RANKED
+        while True:
+            hits, more = await run_sync_on_thread(
+                workspace_fuzzy.rank, corpora, search.query, wanted
+            )
+            ranked = {hit.path: hit for hit in hits}
+            entries, truncated = await run_sync_on_thread(
+                _first_files, ranked, search.limit, describe
+            )
+            # Matches deleted since Git listed them neither fill the limit nor say more
+            # matched; rank further until a live file past the limit does, or none are left.
+            if truncated or not more:
+                break
+            wanted *= 4
+    else:
+        ordered = heapq.merge(*(corpus.paths for corpus in corpora))
+        entries, truncated = await run_sync_on_thread(
+            _first_files, ordered, search.limit, describe
+        )
+    links = await run_sync_on_thread(_symlinks, search_root, [e.path for e in entries])
+    listing = search.listing
+    return SearchFilesResponse(
+        results=[
+            _result(entry, is_symlink=entry.path in links, ranked=ranked.get(entry.path))
+            for entry in entries
+        ],
+        truncated=truncated,
+        indexed_paths=indexed,
         index_incomplete=walk_truncated or (listing is not None and listing.incomplete),
         untracked_unavailable=listing is not None and listing.untracked is None,
     )

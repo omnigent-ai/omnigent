@@ -76,6 +76,33 @@ async def test_untracked_files_are_reused_briefly_unless_retried(tmp_path: Path)
     assert retried is not None and "later.txt" in (retried.untracked or [])
 
 
+async def test_tracked_files_are_reused_until_the_index_changes(tmp_path: Path) -> None:
+    root = _repository(tmp_path / "repo")
+    files = WorkspaceFiles(root)
+    first = await files.list_files(Deadline(10))
+    again = await files.list_files(Deadline(10))
+    (root / "b.txt").write_text("x")
+    _git(root, "add", "b.txt")
+    changed = await files.list_files(Deadline(10))
+
+    assert first is not None and again is not None and changed is not None
+    assert again.tracked is first.tracked
+    assert changed.tracked == ["a.txt", "b.txt"]
+
+
+async def test_tracked_files_are_listed_every_time_without_an_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _fake_git(tmp_path, monkeypatch, 'printf "a.txt\\0"\n')
+    files = WorkspaceFiles(root)
+
+    first = await files.list_files(Deadline(10))
+    again = await files.list_files(Deadline(10))
+
+    assert first is not None and again is not None
+    assert again.tracked == first.tracked and again.tracked is not first.tracked
+
+
 async def test_an_untracked_listing_failure_leaves_the_tracked_list(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -17,6 +17,8 @@ from omnigent.runner.environment_filesystem import split_glob_list
 
 # The REST route's largest page, and the workspace API's.
 MAX_MATCHES = 500
+# Longest query or filter list a search accepts.
+MAX_QUERY_LENGTH = 4096
 # The whole run is bounded at this, after ripgrep's own 15 s.
 SCRIPT_TIMEOUT_S = 20
 MAX_SCRIPT_OUTPUT = 4 * 1024 * 1024
@@ -170,13 +172,13 @@ def content_search_script(
     :returns: Python source to run with ``python3 -I -c``.
     :raises ContentSearchError: When the query or filters are invalid.
     """
-    if not query.strip() or len(query) > 4096 or any(c in query for c in "\x00\r\n"):
+    if not query.strip() or len(query) > MAX_QUERY_LENGTH or any(c in query for c in "\x00\r\n"):
         raise ContentSearchError("Enter a single-line search query of 1–4096 characters.")
     if not 1 <= limit <= MAX_MATCHES:
         raise ContentSearchError("Search limit must be between 1 and 500.")
     glob_args = []
     for raw, prefix in ((include, ""), (exclude, "!")):
-        if len(raw) > 4096 or any(c in raw for c in "\x00\r\n"):
+        if len(raw) > MAX_QUERY_LENGTH or any(c in raw for c in "\x00\r\n"):
             raise ContentSearchError("Enter single-line file filters of at most 4096 characters.")
         for pattern in split_glob_list(raw):
             if pattern.startswith("!"):
