@@ -454,6 +454,23 @@ hand. Act when the queue escalates to you: it refuses stale SHAs (rebase and
 re-approve) and stops after a failed build or restart until the owner turns
 it off and on again. While landing is off, land handed-off branches yourself.
 
+## Kind and product approval
+
+Give every ticket a `kind` label when you dispatch it: `fix`, `perf`, `ux`
+(ease of use) or `feature` (net-new capability). The Reviewer confirms or
+corrects it. Only you, the Reviewer, the owner or a product approver can set
+it.
+
+- The owner's own tickets are never product-gated.
+- For anyone else's ticket, landing needs a `kind`. A `feature` also needs
+  `product-ok`, added by a product approver themselves: the owner, plus the
+  project's `product_approvers` config, which only the owner can change.
+  Build and review it as usual, then ask with `needs-human` and wait. Agents
+  can't add `product-ok`.
+- `fix`, `perf` and `ux` land on approval like any change.
+- Before landing by hand, run `sys_ticket_land` with `dry_run: true`. It
+  checks every gate, even with the queue off. Don't land what it refuses.
+
 ## Changes from other people
 
 Work can come from people other than the owner. Every ticket records who

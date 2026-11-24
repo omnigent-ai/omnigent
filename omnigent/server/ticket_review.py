@@ -17,6 +17,7 @@ from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.github_pr_intake import OWNER_OK_LABEL, is_outside_requester
 from omnigent.server.persona_mentions import Mention
+from omnigent.server.product_approval import KIND_LABEL, KINDS, PRODUCT_OK_LABEL, ticket_kind
 
 # The Review stage's id; this project's "Implemented" stage already uses ``review``.
 REVIEW_STAGE_ID = "code_review"
@@ -141,9 +142,18 @@ def reviewer_handoff_message(
         if is_outside_requester(requester)
         else ""
     )
+    kind = ticket_kind(ticket.get("labels"))
+    kind_note = (
+        f"Confirm the ticket's `{KIND_LABEL}` label (now "
+        f"{f'`{kind}`' if kind else 'unset'}; one of {', '.join(KINDS)}) and correct it with "
+        "sys_ticket_update, keeping other labels: `feature` is net-new capability; `fix`, "
+        "`perf` and `ux` (ease of use) are not. A feature requested by someone other than the "
+        f"owner (requester `{requester or 'unknown'}`) also needs `{PRODUCT_OK_LABEL}` from a "
+        "product approver before it lands.\n\n"
+    )
     return (
         f'Review requested on ticket "{ticket["title"]}" (`{ticket["id"]}`) by {worker}.\n\n'
-        f"{outside}"
+        f"{outside}{kind_note}"
         f"Handoff (branch, SHA, base and tests):\n{handoff}\n\n"
         f"Done-when and context, from the description:\n{description}\n\n"
         "Review it under your persona's rules. Post findings as one ticket comment, each "

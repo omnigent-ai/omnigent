@@ -302,12 +302,14 @@ class SysTicketLandTool(_TicketTool):
     help_text = (
         "Submit a Reviewer-approved commit to the project's landing queue. The server lands "
         "it only if the ticket's `approved` label is exactly this full SHA, any `risk` label "
-        "has an owner `risk-ok`, and the SHA fast-forwards the integration branch; otherwise "
-        "it refuses and says why (for example, rebase and get re-approval). Accepted lands "
-        "are batched: fast-forward, web rebuild if needed, one server restart. The ticket "
-        "then moves to the stage before completed and you're told to verify live. Never "
-        "pushes. Refused when the project's landing queue is off; then hand the branch and "
-        "SHA to your coordinator."
+        "has an owner `risk-ok`, an imported PR has the owner's `owner-ok`, a `kind=feature` "
+        "ticket the owner didn't request has a product approver's `product-ok`, and the SHA "
+        "fast-forwards the integration branch; otherwise it refuses and says why (for example, "
+        "rebase and get re-approval). Accepted lands are batched: fast-forward, web rebuild if "
+        "needed, one server restart. The ticket then moves to the stage before completed and "
+        "you're told to verify live. Never pushes. Refused when the project's landing queue is "
+        "off; then hand the branch and SHA to your coordinator. With dry_run it only runs "
+        "those gates and reports, even when the queue is off: run it before landing by hand."
     )
     arguments = LandTicket
 

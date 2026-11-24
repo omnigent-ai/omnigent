@@ -175,6 +175,7 @@ async def test_members_cannot_stand_in_for_the_owner_and_outside_prs_need_owner_
     world.tickets.unlabel("risk-ok", user_id="owner@example.com")
     world.tickets.label("risk-ok", "yes", user_id="owner@example.com")
     world.tickets.ticket["requested_by"] = "github:octocat"
+    world.tickets.label("kind", "fix", session_id="rs")
     with pytest.raises(OmnigentError, match="owner-ok"):
         await submit(world, sha)
     # An agent's owner-ok isn't adopted when the owner later edits other labels.
@@ -184,6 +185,33 @@ async def test_members_cannot_stand_in_for_the_owner_and_outside_prs_need_owner_
         await submit(world, sha)
     world.tickets.unlabel("owner-ok", user_id="owner@example.com")
     world.tickets.label("owner-ok", sha, user_id="owner@example.com")
+    assert (await submit(world, sha))["queued"]
+
+
+async def test_a_members_feature_waits_for_a_product_approver(world) -> None:
+    world.project.user_id = "owner@example.com"
+    world.project.config = {
+        "landing": {"enabled": True},
+        "product_approvers": ["approver@example.com"],
+    }
+    sha = feature(world, "f-product")
+    world.tickets.label("approved", sha, session_id="rs")
+    world.tickets.ticket["requested_by"] = "member@example.com"
+    with pytest.raises(OmnigentError, match="`kind`"):
+        await submit(world, sha)
+    world.tickets.label("kind", "fix", session_id="lead")
+    assert (await world.queue.submit(world.project, "t1", sha, None, dry_run=True))["ok"]
+    world.tickets.label("kind", "feature", session_id="rs")
+    for setter in ({"session_id": "lead"}, {"user_id": "member@example.com"}):
+        world.tickets.label("product-ok", "yes", **setter)
+        with pytest.raises(OmnigentError, match="product-ok"):
+            await world.queue.submit(world.project, "t1", sha, None, dry_run=True)
+        world.tickets.unlabel("product-ok")
+    world.tickets.label("product-ok", "yes", user_id="approver@example.com")
+    assert (await world.queue.submit(world.project, "t1", sha, None, dry_run=True))["ok"]
+    assert world.queue.pending == []  # a dry run never queues
+    world.tickets.unlabel("product-ok")
+    world.tickets.ticket["requested_by"] = "owner@example.com"  # the owner's own feature
     assert (await submit(world, sha))["queued"]
 
 
@@ -217,12 +245,17 @@ async def test_off_by_default_and_agent_config_writes_refused(world) -> None:
     with pytest.raises(OmnigentError, match="off for this project"):
         await submit(world, "a" * 40)
     from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
-    from omnigent.server.routes.projects import _refuse_agent_landing_write
+    from omnigent.server.routes.projects import _refuse_owner_config_write
 
     agent = SimpleNamespace(headers={ORCHESTRATION_SOURCE_HEADER: "s"})
+    person = SimpleNamespace(headers={})
     with pytest.raises(OmnigentError, match="Only the project owner"):
-        _refuse_agent_landing_write(agent, {"landing": {"enabled": True}}, {})
-    _refuse_agent_landing_write(agent, {"icon": "x"}, {})  # other config edits still work
+        _refuse_owner_config_write(agent, {"landing": {"enabled": True}}, {}, is_owner=True)
+    _refuse_owner_config_write(agent, {"icon": "x"}, {}, is_owner=True)  # other edits work
+    for key, value in (("landing", {"enabled": True}), ("product_approvers", ["a@example.com"])):
+        with pytest.raises(OmnigentError, match="Only the project owner"):
+            _refuse_owner_config_write(person, {key: value}, {}, is_owner=False)
+        _refuse_owner_config_write(person, {key: value}, {}, is_owner=True)
 
 
 def test_a_target_outside_the_repository_is_refused(world, tmp_path: Path) -> None:

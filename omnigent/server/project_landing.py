@@ -35,6 +35,12 @@ from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY
 from omnigent.entities.project_ticket import CommentOnTicket, TicketActor, UpdateTicket
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.github_pr_intake import OWNER_OK_LABEL, is_outside_requester
+from omnigent.server.product_approval import (
+    PRODUCT_OK_LABEL,
+    needs_product_ok,
+    product_approvers,
+    product_gate_problem,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -297,6 +303,16 @@ class LandingQueue:
             and event.get("user_id") == project.user_id
         )
 
+    @staticmethod
+    def _is_product_approver(project: Any, event: dict[str, Any] | None) -> bool:
+        """A person's own edit, by someone on the project's product-approver list."""
+        return (
+            event is not None
+            and event.get("session_id") is None
+            and event.get("agent_id") is None
+            and event.get("user_id") in product_approvers(project)
+        )
+
     async def _is_reviewer_or_owner(self, project: Any, event: dict[str, Any]) -> bool:
         if self._is_owner(project, event):
             return True
@@ -336,6 +352,18 @@ class LandingQueue:
                     f"The ticket has `risk: {labels[RISK_LABEL]}`; "
                     "the owner must add `risk-ok` first"
                 )
+        problem = product_gate_problem(project, ticket)
+        if problem is not None:
+            raise refuse(problem)
+        if needs_product_ok(project, ticket):
+            product_ok = setters.get((PRODUCT_OK_LABEL, labels.get(PRODUCT_OK_LABEL, "")), [])
+            if PRODUCT_OK_LABEL not in labels or not self._is_product_approver(
+                project, product_ok[0] if product_ok else None
+            ):
+                raise refuse(
+                    f"This is a feature requested by `{ticket.get('requested_by')}`, not the "
+                    f"owner: a product approver must add `{PRODUCT_OK_LABEL}` first"
+                )
         if is_outside_requester(ticket.get("requested_by")):
             owner_ok = setters.get((OWNER_OK_LABEL, sha), [])
             if labels.get(OWNER_OK_LABEL) != sha or not self._is_owner(
@@ -365,12 +393,16 @@ class LandingQueue:
 
     # -- submit ----------------------------------------------------------------
 
-    async def submit(self, project: Any, ticket_id: str, sha: str, who: TicketActor) -> dict:
+    async def submit(
+        self, project: Any, ticket_id: str, sha: str, who: TicketActor, *, dry_run: bool = False
+    ) -> dict:
         sha = sha.strip().lower()
         if not _SHA.fullmatch(sha):
             raise OmnigentError(
                 "Give the full 40-character commit SHA", code=ErrorCode.INVALID_INPUT
             )
+        if dry_run:
+            return await self.check_only(project, ticket_id, sha)
         if not landing_enabled(project.config):
             raise refuse(
                 "The landing queue is off for this project; hand the branch and SHA to your "
@@ -406,6 +438,17 @@ class LandingQueue:
         if self._batch is None or self._batch.done():
             self._batch = self._spawn(self._run_batch_later())
         return {"queued": True, "sha": sha, "branch": target.branch, "tip": tip}
+
+    async def check_only(self, project: Any, ticket_id: str, sha: str) -> dict:
+        """Run every landing gate for a hand-land, without queueing; refusals raise 409."""
+        tickets = self._notifications.tickets
+        ticket = await asyncio.to_thread(
+            tickets.get, project.id, ticket_id, user_id=project.user_id
+        )
+        ticket = ticket.get("ticket", ticket)
+        target = await asyncio.to_thread(resolve_target, project.config)
+        tip = await self._check(project, ticket, sha, target)
+        return {"ok": True, "dry_run": True, "sha": sha, "branch": target.branch, "tip": tip}
 
     def _spawn(self, coro: Any) -> asyncio.Task[Any]:
         task = asyncio.create_task(coro)

@@ -37,6 +37,7 @@ from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server import session_live_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC, AuthProvider
 from omnigent.server.persona_mentions import Mention, PersonaMentionTargets
+from omnigent.server.product_approval import OWNER_ONLY_CONFIG_KEYS
 from omnigent.server.project_identities import (
     ORCHESTRATOR_IDENTITY_ID,
     identity_response,
@@ -133,15 +134,25 @@ def _is_throwaway_project_name(name: str) -> bool:
     return name.startswith("zz-") or "throwaway" in name.lower()
 
 
-def _refuse_agent_landing_write(
-    request: Request, requested: dict[str, Any] | None, current: dict[str, Any] | None
+def _refuse_owner_config_write(
+    request: Request,
+    requested: dict[str, Any] | None,
+    current: dict[str, Any] | None,
+    *,
+    is_owner: bool,
 ) -> None:
-    """The landing queue lands and restarts on its own, so only the owner configures it."""
-    if requested is None or ORCHESTRATION_SOURCE_HEADER not in request.headers:
+    """The landing queue and product approvers are the owner's own settings.
+
+    Agents and other members of a shared project are refused when they change them.
+    """
+    if requested is None:
         return
-    if requested.get("landing") != (current or {}).get("landing"):
+    changed = [
+        key for key in OWNER_ONLY_CONFIG_KEYS if requested.get(key) != (current or {}).get(key)
+    ]
+    if changed and (ORCHESTRATION_SOURCE_HEADER in request.headers or not is_owner):
         raise OmnigentError(
-            "Only the project owner can change the landing queue settings",
+            "Only the project owner can change " + ", ".join(f"`{key}`" for key in changed),
             code=ErrorCode.FORBIDDEN,
         )
 
@@ -217,7 +228,7 @@ def create_projects_router(
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
         _refuse_agent_mandate_write(request, body.mandate)
-        _refuse_agent_landing_write(request, body.config, None)
+        _refuse_owner_config_write(request, body.config, None, is_owner=True)
         key = creation_key(request) if "Idempotency-Key" in request.headers else None
         project_id = creation_id("project", user_id, key) if key else uuid.uuid4().hex
         project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
@@ -369,9 +380,14 @@ def create_projects_router(
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
         _refuse_agent_mandate_write(request, body.mandate)
-        if body.config is not None and ORCHESTRATION_SOURCE_HEADER in request.headers:
+        if body.config is not None:
             stored = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
-            _refuse_agent_landing_write(request, body.config, stored.config if stored else None)
+            _refuse_owner_config_write(
+                request,
+                body.config,
+                stored.config if stored else None,
+                is_owner=stored is None or stored.user_id == user_id,
+            )
         session_id = None
         if body.main_session_id is not None:
             current = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)

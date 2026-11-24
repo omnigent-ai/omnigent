@@ -351,3 +351,9 @@ class LandTicketRequest(BaseModel):
         max_length=40,
         description="The full 40-character commit SHA the Reviewer approved.",
     )
+    dry_run: bool = Field(
+        default=False,
+        description="Only check every landing gate (approval, risk-ok, owner-ok, kind and "
+        "product-ok, fast-forward) and report, without queueing. Works when the queue is "
+        "off; run it before landing by hand.",
+    )

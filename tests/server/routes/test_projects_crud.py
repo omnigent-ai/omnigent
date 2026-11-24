@@ -688,6 +688,7 @@ async def test_review_routes_worker_and_reviewer_and_binds_approval_to_a_commit(
     assert moved.status_code == 200, moved.text
     [(session, handoff)] = await settle()
     assert session == reviewer and first in handoff and "Done when X" in handoff
+    assert "Confirm the ticket's `kind` label (now unset" in handoff
 
     labels = [{"key": "approved", "value": first}]
     refused = await project_client.patch(path, json={"labels": labels}, headers=as_worker)
@@ -701,6 +702,16 @@ async def test_review_routes_worker_and_reviewer_and_binds_approval_to_a_commit(
             tickets, json={"title": "Preset", "labels": sign_off}, headers=as_worker
         )
         assert preset.status_code == 403, preset.text
+    kind = [{"key": "kind", "value": "fix"}]
+    assert (
+        await project_client.patch(path, json={"labels": kind}, headers=as_worker)
+    ).status_code == 403
+    for headers in (as_worker, as_reviewer):
+        product = [*kind, {"key": "product-ok", "value": "yes"}]
+        denied = await project_client.patch(path, json={"labels": product}, headers=headers)
+        assert denied.status_code == 403, denied.text
+    kinded = await project_client.patch(path, json={"labels": kind}, headers=as_reviewer)
+    assert kinded.status_code == 200, kinded.text
     malformed = [{"key": "approved", "value": "abc"}]
     bad = await project_client.patch(path, json={"labels": malformed}, headers=as_reviewer)
     assert bad.status_code == 400

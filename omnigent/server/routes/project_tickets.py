@@ -36,7 +36,7 @@ from omnigent.runtime.project_ticket_instructions import (
     FINAL_UPDATE_REMINDER,
     PROJECT_TICKET_WORK_INSTRUCTION,
 )
-from omnigent.server import github_pr_intake, session_live_state
+from omnigent.server import github_pr_intake, product_approval, session_live_state
 from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_PUBLIC, AuthProvider
 from omnigent.server.persona_mentions import (
     ORCHESTRATOR_MENTION_ID,
@@ -341,28 +341,42 @@ def create_project_tickets_router(
         after_labels: list[dict[str, Any]],
         who: TicketActor,
     ) -> None:
-        """Owner sign-off labels are the owner's own edit.
+        """Sign-off labels are a person's own edit, and only the right person's.
 
-        ``owner-ok`` and ``risk-ok`` refuse any agent session and any person but the
-        owner; ``approved`` refuses people other than the owner (the Reviewer's session
-        is checked separately).
+        - ``owner-ok`` and ``risk-ok``: the owner only, never an agent.
+        - ``product-ok``: a product approver only, never an agent.
+        - ``approved``: people other than the owner are refused (the Reviewer's session
+          is checked separately).
+        - ``kind``: the orchestrator, the Reviewer, the owner or a product approver,
+          so a worker or member can't relabel a feature as a fix.
         """
+        keys = (
+            APPROVED_LABEL,
+            RISK_OK_LABEL,
+            github_pr_intake.OWNER_OK_LABEL,
+            product_approval.PRODUCT_OK_LABEL,
+            product_approval.KIND_LABEL,
+        )
         changed = [
             key
-            for key in (APPROVED_LABEL, RISK_OK_LABEL, github_pr_intake.OWNER_OK_LABEL)
+            for key in keys
             if label_value(after_labels, key) != label_value(before_labels, key)
         ]
         if not changed:
             return
-        agent_refused = [key for key in changed if key != APPROVED_LABEL]
-        if (who.session_id is not None or who.agent_id is not None) and agent_refused:
+        is_agent = who.session_id is not None or who.agent_id is not None
+        sign_offs = [
+            key
+            for key in changed
+            if key
+            in (RISK_OK_LABEL, github_pr_intake.OWNER_OK_LABEL, product_approval.PRODUCT_OK_LABEL)
+        ]
+        if is_agent and sign_offs:
             raise OmnigentError(
-                f"Only the project owner can set {', '.join(f'`{key}`' for key in agent_refused)}"
+                f"Only a person can set {', '.join(f'`{key}`' for key in sign_offs)}"
                 "; ask them on the ticket with needs-human",
                 code=ErrorCode.FORBIDDEN,
             )
-        if who.session_id is not None or who.agent_id is not None:
-            return
         notifications = getattr(request.app.state, "project_ticket_notifications", None)
         try:
             normalized = uuid_to_bytes(project_id).hex()
@@ -375,9 +389,41 @@ def create_project_tickets_router(
         )
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-        if project.user_id != who.user_id:
+        approvers = product_approval.product_approvers(project)
+        if product_approval.KIND_LABEL in changed:
+            if is_agent:
+                context = await review_context(request, project_id, who)
+                allowed = who.session_id is not None and (
+                    who.session_id == project.main_session_id
+                    or (context is not None and context[3])
+                )
+            else:
+                allowed = who.user_id in approvers
+            if not allowed:
+                raise OmnigentError(
+                    "Only the orchestrator, the Reviewer or a product approver can set `kind`",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            kind = product_approval.ticket_kind(after_labels)
+            if kind is not None and kind not in product_approval.KINDS:
+                raise OmnigentError(
+                    f"`kind` must be one of {', '.join(product_approval.KINDS)}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+        if is_agent:
+            return
+        if product_approval.PRODUCT_OK_LABEL in changed and who.user_id not in approvers:
             raise OmnigentError(
-                f"Only the project owner can set {', '.join(f'`{key}`' for key in changed)}",
+                "Only a product approver can set `product-ok`", code=ErrorCode.FORBIDDEN
+            )
+        owner_only = [
+            key
+            for key in changed
+            if key in (APPROVED_LABEL, RISK_OK_LABEL, github_pr_intake.OWNER_OK_LABEL)
+        ]
+        if owner_only and project.user_id != who.user_id:
+            raise OmnigentError(
+                f"Only the project owner can set {', '.join(f'`{key}`' for key in owner_only)}",
                 code=ErrorCode.FORBIDDEN,
             )
 
@@ -786,7 +832,7 @@ def create_project_tickets_router(
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         with _storage_errors():
-            return await queue.submit(project, ticket_id, body.sha, who)
+            return await queue.submit(project, ticket_id, body.sha, who, dry_run=body.dry_run)
 
     @router.post("/{ticket_id}/comments", status_code=201)
     async def comment(

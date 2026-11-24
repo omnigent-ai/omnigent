@@ -1672,6 +1672,38 @@ async def test_shared_member_requests_are_attributed_and_approval_stays_the_owne
         headers=_as_user(ALICE),
     )
     assert owner.status_code == 200, owner.text
+    path = f"{base}/{ticket['id']}"
+    for labels in ([{"key": "kind", "value": "fix"}], [{"key": "product-ok", "value": "yes"}]):
+        member = await client.patch(path, json={"labels": labels}, headers=_as_user(BOB))
+        assert member.status_code == 403, member.text
+    kinded = await client.patch(
+        path, json={"labels": [{"key": "kind", "value": "feature"}]}, headers=_as_user(ALICE)
+    )
+    assert kinded.status_code == 200, kinded.text
+    bad_kind = await client.patch(
+        path, json={"labels": [{"key": "kind", "value": "chore"}]}, headers=_as_user(ALICE)
+    )
+    assert bad_kind.status_code == 400, bad_kind.text
+    configured = await client.patch(
+        f"/v1/projects/{project['id']}",
+        json={"config": {"product_approvers": [BOB]}},
+        headers=_as_user(BOB),
+    )
+    assert configured.status_code == 403, configured.text
+    configured = await client.patch(
+        f"/v1/projects/{project['id']}",
+        json={"config": {"product_approvers": [BOB]}},
+        headers=_as_user(ALICE),
+    )
+    assert configured.status_code == 200, configured.text
+    approved_by_bob = await client.patch(
+        path,
+        json={
+            "labels": [{"key": "kind", "value": "feature"}, {"key": "product-ok", "value": "yes"}]
+        },
+        headers=_as_user(BOB),
+    )
+    assert approved_by_bob.status_code == 200, approved_by_bob.text
 
     url = "https://github.com/example-org/example-repo/pull/42"
     record = {
