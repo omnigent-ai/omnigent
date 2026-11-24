@@ -8,6 +8,16 @@ from typing import TypedDict
 
 from omnigent.harnesses.antigravity_native.launch import agy_binary_path
 
+# Orchestrator slugs carry a label (e.g. "Orchestrator (Carbon)") that does not
+# identify the planner model they run, so they are left out of the catalog.
+_ORCHESTRATOR_MODEL_PREFIX = "gemini-pro-orchestrator"
+
+
+def _is_orchestrator_model(model_id: str) -> bool:
+    return model_id == _ORCHESTRATOR_MODEL_PREFIX or model_id.startswith(
+        f"{_ORCHESTRATOR_MODEL_PREFIX}-"
+    )
+
 
 class AntigravityModelOption(TypedDict):
     """One picker row emitted by ``agy models``."""
@@ -22,6 +32,8 @@ def parse_agy_model_options(output: str) -> list[AntigravityModelOption]:
 
     ``agy`` writes a progress preamble before its data rows.  Ignore every
     non-tabbed line so additions to that preamble do not become picker choices.
+    ``gemini-pro-orchestrator*`` rows are excluded because their labels do not
+    name the model they run.
 
     :param output: Combined standard output from ``agy models``.
     :returns: Stable, de-duplicated model picker rows.
@@ -36,6 +48,8 @@ def parse_agy_model_options(output: str) -> list[AntigravityModelOption]:
         model_id = model_id.strip()
         display_name = display_name.strip()
         if not model_id or not display_name or model_id in seen:
+            continue
+        if _is_orchestrator_model(model_id):
             continue
         seen.add(model_id)
         rows.append(

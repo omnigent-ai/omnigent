@@ -42,6 +42,28 @@ def test_parse_agy_model_options_deduplicates_and_rejects_empty_output() -> None
         models.parse_agy_model_options("Fetching available models...\nmodel-without-label\n")
 
 
+def test_parse_agy_model_options_excludes_orchestrator_slugs() -> None:
+    """Orchestrator rows are dropped; look-alike ids that only share a stem stay."""
+    parsed = models.parse_agy_model_options(
+        "gemini-4-carbon-high\tGemini 4 Carbon (High)\n"
+        "gemini-pro-orchestrator-neon\tOrchestrator (Neon)\n"
+        "gemini-pro-orchestrator\tOrchestrator (Carbon)\n"
+        "gemini-pro-orchestrator-argon\tOrchestrator (Argon)\n"
+        "gemini-pro-orchestratorish\tNot An Orchestrator\n"
+    )
+
+    assert [option["id"] for option in parsed] == [
+        "gemini-4-carbon-high",
+        "gemini-pro-orchestratorish",
+    ]
+
+
+def test_parse_agy_model_options_rejects_orchestrator_only_output() -> None:
+    """A catalog of only orchestrator rows offers no launchable picker choice."""
+    with pytest.raises(ValueError, match="did not contain"):
+        models.parse_agy_model_options("gemini-pro-orchestrator\tOrchestrator (Carbon)\n")
+
+
 def test_list_agy_cli_model_options_invokes_resolved_binary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
