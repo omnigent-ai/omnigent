@@ -223,6 +223,7 @@ function FilesPlaceView({
         <FilesPageTree
           conversationId={conversationId}
           active={active}
+          commandsActive={commandsActive}
           activePath={place.path}
           sort={files.sort}
           showHidden={files.showHidden}

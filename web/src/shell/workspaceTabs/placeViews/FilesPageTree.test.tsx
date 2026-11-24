@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -107,6 +107,7 @@ function renderTree(
       <FilesPageTree
         conversationId="conv_1"
         active={active}
+        commandsActive={active}
         activePath="src/a.ts"
         sort="alpha"
         showHidden={showHidden}
@@ -321,6 +322,7 @@ describe("FilesPageTree", () => {
         <FilesPageTree
           conversationId="conv_1"
           active
+          commandsActive
           activePath=".github/ci.yml"
           sort="alpha"
           showHidden={false}
@@ -654,6 +656,7 @@ describe("FilesPageTree", () => {
         <FilesPageTree
           conversationId="conv_1"
           active={active}
+          commandsActive={active}
           activePath="src/a.ts"
           sort="alpha"
           showHidden={false}
@@ -685,6 +688,50 @@ describe("FilesPageTree", () => {
       expect(paletteLabels()).toContain("Clear Files Tree Filter");
       view.rerender(tabs(false, false));
       expect(paletteLabels()).toContain("Clear Files Tree Filter");
+    });
+
+    it("offers Clear Files Tree Filter only for the pane that owns the keyboard", () => {
+      vi.useFakeTimers();
+      vi.mocked(useWorkspaceAllFiles).mockReturnValue(listed([entry("src")]));
+      const pane = (conversationId: string, keyboardTarget: boolean) => (
+        <div data-testid={conversationId}>
+          <FilesPageTree
+            conversationId={conversationId}
+            active
+            commandsActive={keyboardTarget}
+            activePath="src/a.ts"
+            sort="alpha"
+            showHidden={false}
+            showIgnored
+            onFileSelect={vi.fn()}
+          />
+        </div>
+      );
+      // Two sessions' panes on screen; only the one without the keyboard filters its tree.
+      const panes = (firstOwnsKeyboard: boolean) => (
+        <TooltipProvider>
+          {pane("conv_first", firstOwnsKeyboard)}
+          {pane("conv_second", !firstOwnsKeyboard)}
+        </TooltipProvider>
+      );
+      const view = render(panes(true));
+      const second = within(screen.getByTestId("conv_second"));
+      fireEvent.click(second.getByRole("button", { name: "Filter Files Tree by Name" }));
+      fireEvent.change(second.getByRole("textbox", { name: "Name contains" }), {
+        target: { value: "app" },
+      });
+      act(() => vi.advanceTimersByTime(TREE_FILTER_DEBOUNCE_MS));
+      expect(paletteLabels()).not.toContain("Clear Files Tree Filter");
+
+      // The filtered pane takes the keyboard: its command clears its own session's filter.
+      view.rerender(panes(false));
+      const clear = Object.values(usePaletteCommandsStore.getState().groups)
+        .flatMap((group) => group.commands)
+        .filter((command) => command.label === "Clear Files Tree Filter");
+      expect(clear).toHaveLength(1);
+      act(() => void clear[0]!.run());
+      expect(second.getByRole("textbox", { name: "Name contains" })).toHaveValue("");
+      expect(paletteLabels()).not.toContain("Clear Files Tree Filter");
     });
 
     it("keeps the filter across a remount, and clears it from the strip", () => {

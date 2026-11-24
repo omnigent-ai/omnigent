@@ -50,6 +50,8 @@ export interface FilesPageTreeProps {
   conversationId: string;
   /** The tree is on screen, so it takes up the session's reveal requests. */
   active: boolean;
+  /** The tree's pane owns the keyboard, so ⌘K offers its commands; at most one pane does. */
+  commandsActive: boolean;
   /** The file the page shows, which the tree opens down to. */
   activePath: string | undefined;
   sort: ChangedSort;
@@ -145,6 +147,7 @@ function HeaderButton({
 export function FilesPageTree({
   conversationId,
   active,
+  commandsActive,
   activePath,
   sort,
   showHidden,
@@ -223,7 +226,7 @@ export function FilesPageTree({
   }, [revealKey, filterName, clearNameContains]);
   const clearCommands = useMemo(
     () =>
-      active && summary.active
+      commandsActive && summary.active
         ? [
             {
               id: "files.clear-tree-filter",
@@ -236,7 +239,7 @@ export function FilesPageTree({
         : [],
     // The command only needs to exist while a filter is on; `clear` is stable per session.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [active, summary.active, conversationId],
+    [commandsActive, summary.active, conversationId],
   );
   // Each mounted tree registers its own, so an inactive tab can't drop the active tab's row.
   const commandSource = useId();

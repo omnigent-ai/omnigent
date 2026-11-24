@@ -454,6 +454,13 @@ describe("Files tab", () => {
     expect(captured.tree!.showIgnored).toBe(true);
   });
 
+  it("gives the tree's ⌘K commands to the keyboard target only, while both trees stay on screen", () => {
+    renderView({ kind: "files", path: "a.ts" }, { keyboardTarget: false });
+    expect(captured.tree).toMatchObject({ active: true, commandsActive: false });
+    renderView({ kind: "files", path: "b.ts" }, { keyboardTarget: true });
+    expect(captured.tree).toMatchObject({ active: true, commandsActive: true });
+  });
+
   it("leaves ⌘K and ⇧⌘E to the keyboard target when two Files places are on screen", () => {
     renderView({ kind: "files", path: "a.ts" }, { keyboardTarget: false });
     renderView({ kind: "files", path: "b.ts" }, { keyboardTarget: true });
