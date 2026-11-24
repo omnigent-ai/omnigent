@@ -181,7 +181,9 @@ from omnigent.server.session_mcp_selection import (
 from omnigent.server.workflows import workflows_enabled
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+    SCHEDULED_TASK_LAUNCH_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_RUN_LABEL_KEY,
     SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
@@ -1429,10 +1431,22 @@ def session_approval_skipping_mode(conv: Conversation) -> str | None:
 def session_skips_scheduled_task_review(conv: Conversation) -> bool:
     """Whether *conv* creates and changes scheduled tasks without Omnigent's review.
 
-    A session in a mode that skips approval, or in Claude Code's auto mode, does: it
-    runs its other tools without asking a person either. As in
-    :func:`session_approval_skipping_mode`, the live Claude label wins over launch flags.
+    A session a person started, in a mode that skips approval or in Claude Code's auto
+    mode, does: it runs its other tools without asking a person either. A session that
+    another session or an automation started keeps the review, since the agent that
+    started it picked its mode. As in :func:`session_approval_skipping_mode`, the live
+    Claude label wins over launch flags.
     """
+    started_by_an_agent = conv.parent_conversation_id is not None or any(
+        key in conv.labels
+        for key in (
+            CREATED_BY_SESSION_LABEL_KEY,
+            SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+            SCHEDULED_TASK_LAUNCH_LABEL_KEY,
+        )
+    )
+    if started_by_an_agent:
+        return False
     if session_approval_skipping_mode(conv) is not None:
         return True
     claude_mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)

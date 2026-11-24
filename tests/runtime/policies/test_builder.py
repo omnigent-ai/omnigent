@@ -45,6 +45,9 @@ from omnigent.spec.types import (
 )
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_LAUNCH_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SPAWN_TREE_READ_CAP,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -140,6 +143,15 @@ _CLAUDE_MODE_LABEL = "omnigent.claude_native.permission_mode"
         ({CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"}, [], False),
         ({}, PERMISSION_LAUNCH_ARGS["codex-native"]["full-access"], False),
         ({}, PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"], True),
+        # A session another session or an automation started: the starting agent
+        # picked its mode, so it keeps the review.
+        ({_CLAUDE_MODE_LABEL: "auto", CREATED_BY_SESSION_LABEL_KEY: "conv_creator"}, [], True),
+        ({_CLAUDE_MODE_LABEL: "auto", SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1"}, [], True),
+        (
+            {_CLAUDE_MODE_LABEL: "bypassPermissions", SCHEDULED_TASK_LAUNCH_LABEL_KEY: "task_1"},
+            [],
+            True,
+        ),
     ],
 )
 def test_scheduled_task_review_follows_the_session_mode(
@@ -151,9 +163,9 @@ def test_scheduled_task_review_follows_the_session_mode(
 ) -> None:
     """The scheduled-task review gives way to its check when the session's mode doesn't ask.
 
-    That is a mode that skips approval, or Claude Code's auto mode; any other mode,
-    including Codex's approve-for-me reviewer, keeps the review. Adding a policy
-    always asks.
+    That is a mode that skips approval, or Claude Code's auto mode, in a session a
+    person started; any other mode, including Codex's approve-for-me reviewer, keeps
+    the review. Adding a policy always asks.
     """
     agent_dir = _write_spec(tmp_path, "spec_version: 1\nname: no-guardrails\n")
     conv = conversation_store.create_conversation()
@@ -168,6 +180,28 @@ def test_scheduled_task_review_follows_the_session_mode(
     )
     scheduled = "__ask_on_scheduled_task_change" if reviewed else "__check_scheduled_task_change"
     assert [p.spec.name for p in engine.policies] == ["__ask_on_add_policy", scheduled]
+
+
+def test_a_sub_agent_in_auto_mode_keeps_the_scheduled_task_review(
+    tmp_path: Path,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A sub-agent's mode was picked by its parent agent, so its scheduling still asks."""
+    agent_dir = _write_spec(tmp_path, "spec_version: 1\nname: no-guardrails\n")
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        parent_conversation_id=parent.id,
+        labels={_CLAUDE_MODE_LABEL: "auto"},
+    )
+    engine = build_policy_engine(
+        spec=parse(agent_dir),
+        conversation_id=child.id,
+        conversation_store=conversation_store,
+    )
+    assert [p.spec.name for p in engine.policies] == [
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
 
 
 def test_build_with_empty_guardrails_block(

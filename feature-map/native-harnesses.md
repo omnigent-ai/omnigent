@@ -1489,7 +1489,8 @@ approval expiry, and uncertain completion after a write. Execution-budget
 accounting is covered by `tests/runtime/test_tool_call_deadline.py`.
 
 For a human check in an isolated instance, use a native session in Chat, in a mode
-that asks for approval (auto and modes that skip approval create it unreviewed), to ask
+that asks for approval (in a session you started, auto and modes that skip approval
+create it unreviewed), to ask
 for an automation named "Approval deadline check" with harmless instructions
 and a first run well after the test. Leave its create approval pending for
 more than five minutes:

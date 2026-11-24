@@ -1602,6 +1602,67 @@ async def test_created_session_launches_in_the_requested_permission_mode(
     assert worker.terminal_launch_args == expected
 
 
+@pytest.mark.parametrize("placement", ["managed", "child"])
+async def test_a_session_an_agent_starts_in_auto_still_asks_before_scheduling(
+    auth_client, peers, db_uri, monkeypatch, placement
+):
+    """An asking session can't schedule unreviewed work through a session it starts in auto.
+
+    Claude Code's auto mode skips the scheduled-task review only in a session a person
+    started. Here the creating agent picked the mode, so the new session still asks.
+    """
+    import asyncio
+
+    from omnigent.server.routes.sessions import routes_core
+    from tests.server.helpers import policy_tool_call_request
+    from tests.server.integration.test_sessions_policy_evaluate import _drain_elicitation_id
+
+    source, _, _ = peers
+    worker_agent_id = await _upload_native_worker(auth_client, harness="claude-native")
+
+    async def launch(**kwargs):
+        pass
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    arguments = {"agent_id": worker_agent_id, "placement": placement, "permission_mode": "auto"}
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(arguments),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    created_id = result.get("conversation_id")
+    assert created_id, result
+    created = SqlAlchemyConversationStore(db_uri).get_conversation(created_id)
+    assert created.terminal_launch_args == PERMISSION_LAUNCH_ARGS["claude-native"]["auto"]
+    drain = asyncio.create_task(_drain_elicitation_id(created_id))
+    await asyncio.sleep(0.05)
+    task = {"name": "triage", "prompt": "Review every issue.", "permission_mode": None}
+    evaluate = asyncio.create_task(
+        auth_client.post(
+            f"/v1/sessions/{created_id}/policies/evaluate",
+            json=policy_tool_call_request("sys_scheduled_task_create", task),
+        )
+    )
+    try:
+        elicitation_id = await asyncio.wait_for(drain, timeout=5)
+        assert not evaluate.done()
+        response = await auth_client.post(
+            f"/v1/sessions/{created_id}/elicitations/{elicitation_id}/resolve",
+            json={"action": "decline"},
+        )
+        assert response.status_code == 202, response.text
+        response = await asyncio.wait_for(evaluate, timeout=5)
+        assert response.json()["result"] == "POLICY_ACTION_DENY"
+    finally:
+        for pending in (drain, evaluate):
+            if not pending.done():
+                pending.cancel()
+        await asyncio.gather(drain, evaluate, return_exceptions=True)
+
+
 @pytest.fixture
 def creator_client(auth_client, monkeypatch):
     """Alice's client with late runner binds stubbed; ``_codex_creator`` binds a runner."""
