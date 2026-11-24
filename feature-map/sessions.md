@@ -86,6 +86,13 @@ the header menu), and each place is a separate entry point.
   (`web/src/components/chat/TranscriptPaletteCommands.test.tsx`,
   `web/src/canvas/useCanvasHeaderPaletteCommands.test.tsx`,
   `web/src/grid/useGridPaletteCommands.test.tsx`).
+- `palette-pane-corners`: where floating panes can show (`workspace_sidebar_v2` or
+  `floating_panes` on, and not a touch device), the QuickPick palette lists the
+  **Pane corners** setting. **Automatic** follows the server's `floating_panes`
+  policy and names what it gives now; **Floating panes** and **Sharp corners**
+  override it on this device, and a reload keeps the choice. Settings →
+  Appearance offers the same choice (`web/src/shell/settingsCommands.test.ts`,
+  `tests/e2e_ui/sessions/test_floating_panes.py`).
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
@@ -269,8 +276,10 @@ the header menu), and each place is a separate entry point.
   live updates even before it appears in the loaded sidebar pages.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
   (Default / Status / Harness / Created / Updated), Display (All / My / Shared with me / Archived), Ordering
-  (Updated / Created / Custom) and Show (Updated / Environment / Repo / Branch) submenus,
-  saved per device. On phone layouts a submenu replaces the menu's list under a
+  (Updated / Created / Custom) and Show (Harness / Project / Updated / Environment / Repo /
+  Branch) submenus, saved per device. Show → Project names a row's project (its emoji, else a
+  folder glyph) under the title wherever the row isn't inside that project's folder: pins,
+  Shared with me, and every grouping but Default. On phone layouts a submenu replaces the menu's list under a
   back row with its name, and reopening the menu starts at the main list.
   Created ordering keeps sessions newest-created first as messages
   arrive;
@@ -789,7 +798,8 @@ and does not apply to the grid's shared panel. Covered by
 `web/electron/e2e/desktop_right_sidebar_widens_window.e2e.js`.
 While a side chat works, typing a follow-up turns Interrupt into Send, which
 queues or steers it as the main composer does; Escape still interrupts. Its queue
-strip offers edit, steer, reorder and delete, and Mod+Enter steers them all.
+strip offers edit, steer, reorder and delete. Mod+Enter steers them all, or
+queues the draft when Always steer is on.
 Closing the side chat discards the follow-ups queued on that device. Other
 devices keep their tabs and queued work. Closing still stops the chat's running
 turn, as before. A closed Codex side chat resumes on its next message or Resume,

@@ -333,8 +333,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   opens and focuses the new-session composer in browsers. Native shells use
   ⌘/Ctrl+N. Embedded apps require focus inside the app.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
-  can be steered into the running turn. Side-chat composers queue and steer the
-  same way, with their own queue strip.
+  can be steered into the running turn. Mod+Enter inverts Always steer for one
+  message: with it on, the draft waits in the queue until the turn ends; with it
+  off, the draft and the whole queue are steered. Side-chat composers queue and
+  steer the same way, with their own queue strip.
   A message sent mid-turn to a native session says the agent will read it
   after its current step in the timestamp row. The note stays visible, with
   truncation, on desktop and touch until the agent reads the message, while the
@@ -649,7 +651,8 @@ its tags and review comments as the full-screen composer does, and shows the
 review comments as chips. Sending while the session works queues the message on
 that session, as the full-screen composer does: it waits in the cell's queue strip
 (edit, steer, remove) and sends when the turn ends. With Always steer on it steers
-into the running turn instead, and Mod+Enter steers the whole queue. Editing a
+into the running turn instead, and Mod+Enter queues it; with it off, Mod+Enter
+steers the whole queue. Editing a
 queued message brings its tags back as tokens. The queue belongs to the session, so
 the full-screen view shows and flushes the same messages; a reload drops a cell's
 queued messages, where the full-screen composer restores its own. Escape does not

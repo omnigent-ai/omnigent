@@ -1340,6 +1340,29 @@ describe("side-chat interrupt", () => {
     expect(sessionsApi.interrupt).not.toHaveBeenCalled();
   });
 
+  it("queues a follow-up with Mod+Enter when Always steer is on, and sends it when the turn ends", async () => {
+    writeAlwaysSteer(true);
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "After this answer" } });
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
+
+    expect(send).not.toHaveBeenCalled();
+    expect(input).toHaveValue("");
+    expect(screen.getByRole("list", { name: "Queued messages" })).toHaveTextContent(
+      "After this answer",
+    );
+
+    act(() => conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" }));
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(send).toHaveBeenCalledWith(
+      "After this answer",
+      "agent_side",
+      undefined,
+      expect.objectContaining({ pinnedConversationId: childId }),
+    );
+  });
+
   it("reports a failed interrupt and allows retry without clearing the draft", async () => {
     vi.mocked(sessionsApi.interrupt).mockRejectedValueOnce(new Error("Host unavailable"));
     renderPane(<SideChatPane childId={childId} />);
@@ -2247,6 +2270,27 @@ describe("grid cell composer shares its session's draft", () => {
 
     expect(send.mock.calls.map(([text]) => text)).toEqual(["first", "second", "third"]);
     expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it("queues a cell's draft behind its backlog with Mod+Enter when Always steer is on", () => {
+    writeAlwaysSteer(true);
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+    useChatStore.setState({
+      queuedMessages: [
+        { queueId: "q_cell", text: "first", conversationId: childId, agentId: "agent_side" },
+      ],
+    });
+    gridCell();
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "after the turn" } });
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
+
+    expect(send).not.toHaveBeenCalled();
+    expect(input).toHaveValue("");
+    expect(useChatStore.getState().queuedMessages.map(({ text }) => text)).toEqual([
+      "first",
+      "after the turn",
+    ]);
   });
 
   it("posts a cell's send into its busy session when Always steer is on", () => {

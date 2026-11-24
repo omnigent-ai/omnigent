@@ -13,6 +13,7 @@ import {
   supportsGlobalShortcut,
   supportsWidenWindowForRightSidebar,
 } from "@/lib/nativeBridge";
+import { usePaneCorners } from "@/shell/useFloatingPanes";
 
 import type { SettingsAvailability } from "./catalog/types";
 
@@ -48,6 +49,7 @@ export function useSettingsAvailability(): SettingsAvailability {
   const projectKanban = isFeatureEnabled(info, "project_kanban");
   const sessionTitleInstructions = loaded?.session_title_instructions === true;
   const proactiveAgent = loaded?.proactive_agent_available === true;
+  const floatingPanes = usePaneCorners().available;
   return useMemo(
     () => ({
       globalShortcut,
@@ -63,6 +65,7 @@ export function useSettingsAvailability(): SettingsAvailability {
       projectKanban,
       sessionTitleInstructions,
       proactiveAgent,
+      floatingPanes,
     }),
     [
       globalShortcut,
@@ -79,6 +82,7 @@ export function useSettingsAvailability(): SettingsAvailability {
       projectKanban,
       sessionTitleInstructions,
       proactiveAgent,
+      floatingPanes,
     ],
   );
 }

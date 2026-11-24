@@ -3,6 +3,7 @@ import {
   HIDDEN_FILE_REASON,
   NO_ACTIVE_FILE_REASON,
   OUTSIDE_WORKSPACE_REASON,
+  missedRevealMessage,
   planActiveFileReveal,
 } from "./revealActiveFile";
 
@@ -67,5 +68,16 @@ describe("planActiveFileReveal", () => {
 
   it("judges hiddenness inside the browsed folder, even one that is itself hidden", () => {
     expect(plan(".github/workflows/ci.yml", ".github")).toMatchObject({ kind: "reveal" });
+  });
+});
+
+describe("missedRevealMessage", () => {
+  it("says Git may ignore the file while ignored files are hidden, and that it may be gone otherwise", () => {
+    expect(missedRevealMessage("logs/artifact.log", false)).toBe(
+      "artifact.log isn’t in the Files tree. Git may ignore it, and ignored files are hidden.",
+    );
+    expect(missedRevealMessage("logs/artifact.log", true)).toBe(
+      "artifact.log isn’t in the Files tree. It may have moved or been deleted.",
+    );
   });
 });

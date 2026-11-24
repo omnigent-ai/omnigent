@@ -192,6 +192,8 @@ export interface SettingsAvailability {
   projectKanban: boolean;
   /** The server lets people write their own session title instructions. */
   sessionTitleInstructions: boolean;
+  /** Floating panes can show here: sidebar v2 or `floating_panes` on, and no touch. */
+  floatingPanes: boolean;
   /** The server offers the proactive agent. */
   proactiveAgent: boolean;
 }

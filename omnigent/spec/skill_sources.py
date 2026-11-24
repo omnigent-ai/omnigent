@@ -280,7 +280,13 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
 
 # Skills Omnigent ships, each for agents that have the tool group it drives.
 FRAMEWORK_SKILLS_DIR = Path(__file__).resolve().parent.parent / "resources" / "skills"
-_FRAMEWORK_SKILL_GROUPS = {"workflow": "journal", "save-workflow": "journal"}
+_FRAMEWORK_SKILL_GROUPS = {
+    "workflow": "journal",
+    "save-workflow": "journal",
+    "import-memory": "memory",
+}
+# These also need the server's workflows feature; the others follow their tool group alone.
+WORKFLOW_FRAMEWORK_SKILLS = frozenset({"workflow", "save-workflow"})
 
 
 def framework_skill_names(spec: AgentSpec | None = None) -> list[str]:
@@ -296,13 +302,22 @@ def framework_skill_names(spec: AgentSpec | None = None) -> list[str]:
     ]
 
 
-def framework_skills(spec: AgentSpec) -> list[SkillSpec]:
+def framework_skills(spec: AgentSpec, *, workflows_enabled: bool = False) -> list[SkillSpec]:
     """The skills Omnigent ships for the agent's tool groups, e.g. ``workflow``.
 
     Like bundled skills, they ignore ``skills_filter``; an agent drops one by
-    turning its tool group off, e.g. ``tool_groups.journal: false``.
+    turning its tool group off, e.g. ``tool_groups.journal: false``. A memory
+    skill follows the memory group alone, so a caller whose server has no memory
+    must turn that group off first (``omnigent.memory_availability``).
+
+    :param workflows_enabled: Whether the server offers workflows; required for
+        the workflow skills only.
     """
-    names = set(framework_skill_names(spec))
+    names = {
+        name
+        for name in framework_skill_names(spec)
+        if workflows_enabled or name not in WORKFLOW_FRAMEWORK_SKILLS
+    }
     if not names or not FRAMEWORK_SKILLS_DIR.is_dir():
         return []
     return [
@@ -351,8 +366,11 @@ def resolve_session_skills(
             seen_dirs.add(resolved_dir)
         merged.append(skill)
     # Last, so an agent's or user's own skill of the same name wins.
-    if workflows_enabled:
-        merged.extend(skill for skill in framework_skills(spec) if skill.name not in seen)
+    merged.extend(
+        skill
+        for skill in framework_skills(spec, workflows_enabled=workflows_enabled)
+        if skill.name not in seen
+    )
     return merged
 
 

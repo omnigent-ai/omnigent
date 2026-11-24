@@ -85,7 +85,9 @@ const {
   useSessionWorktreesMock,
 } = vi.hoisted(() => ({
   projectsMock: [] as string[],
-  projectRowsRef: { current: undefined as { id: string; name: string }[] | undefined },
+  projectRowsRef: {
+    current: undefined as { id: string; name: string; icon?: string }[] | undefined,
+  },
   moveToProjectSpy: vi.fn(),
   deleteProjectSpy: vi.fn(),
   renameProjectSpy: vi.fn(),
@@ -4455,6 +4457,26 @@ describe("Sidebar open/close motion", () => {
   });
 });
 
+describe("Sidebar resize edge", () => {
+  it("draws a bar on its edge, and with floating panes only a cursor band across the gap from 48rem", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    const view = renderSidebar(true);
+    const edge = () => screen.getByRole("separator", { name: "Resize sidebar" });
+    expect(edge()).toHaveClass("w-1", "hover:bg-primary/30");
+    view.unmount();
+
+    const floating = { ...FALLBACK_SERVER_INFO.features, floating_panes: true };
+    renderSidebar(true, "/", undefined, { ...FALLBACK_SERVER_INFO, features: floating });
+    // Below 48rem the panes don't float, so the edge keeps its bar there.
+    expect(edge()).toHaveClass("cursor-col-resize", "w-1", "hover:bg-primary/30");
+    expect(edge()).toHaveClass(
+      "min-[48rem]:w-[calc(var(--pane-gap)+5px)]",
+      "min-[48rem]:hover:bg-transparent",
+    );
+    expect(edge()).not.toHaveClass("w-[calc(var(--pane-gap)+5px)]");
+  });
+});
+
 describe("Sidebar collapsed marker", () => {
   // The dark-mode glass rule in index.css keys its border/blur on
   // :not([data-collapsed]) — NOT on aria-hidden, which Radix also toggles
@@ -5092,6 +5114,48 @@ describe("Sidebar view options", () => {
       "environment",
       "branch",
     ]);
+  });
+
+  it("names each row's project under its title when Project is shown, except in its folder", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ show: ["project"] }));
+    projectRowsRef.current = [
+      { id: "p_Alpha", name: "Alpha", icon: "🧪" },
+      { id: "p_Plain", name: "Plain" },
+    ];
+    const filed = (project: string) => ({
+      project_id: `p_${project}`,
+      labels: { omni_project: project },
+    });
+    seedPins(["conv_pinned"]);
+    mockConversations([
+      conv("conv_pinned", "Codex", filed("Alpha")),
+      conv("conv_alpha", "Codex", filed("Alpha")),
+      conv("conv_plain", "Codex", filed("Plain")),
+      conv("conv_unfiled", "Codex"),
+    ]);
+    renderGroupingSidebar();
+    const meta = (id: string) =>
+      within(screen.getByText(id).closest("li")!).queryByTestId("session-row-meta");
+
+    // Default grouping: a pin has left its folder, so it names the project; folder rows don't.
+    expect(meta("conv_pinned")).toHaveTextContent(/^🧪Alpha$/);
+    fireEvent.click(screen.getByRole("button", { name: /^🧪Alpha/ }));
+    expect(meta("conv_alpha")).toBeNull();
+
+    // Grouped by Updated there are no folders, so every filed row names its project.
+    openViewSubmenu("session-grouping-menu");
+    fireEvent.click(screen.getByTestId("session-grouping-updated"));
+    expect(meta("conv_alpha")).toHaveTextContent(/^🧪Alpha$/);
+    // Without an emoji, the folder glyph stands beside the name.
+    expect(meta("conv_plain")).toHaveTextContent(/^Plain$/);
+    expect(within(meta("conv_plain")!).queryByTestId("project-icon")).toBeNull();
+    expect(meta("conv_plain")!.querySelector("svg")).toHaveClass("lucide-folder");
+    expect(meta("conv_unfiled")).toBeNull();
+
+    openViewSubmenu("session-show-menu");
+    fireEvent.click(screen.getByTestId("session-show-project"));
+    expect(meta("conv_alpha")).toBeNull();
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).show).toEqual([]);
   });
 
   it("leads each row with its harness icon when Harness is shown", () => {
@@ -6088,6 +6152,28 @@ describe("sidebar_grouping_ui release flag", () => {
     // The Shared filter lists them all, flat.
     showSharedTab();
     for (const run of SHARED_RUNS) expect(screen.getByText(run.id)).toBeInTheDocument();
+  });
+
+  it("names a shared run's own project in the automation folder when Project is shown", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ show: ["project"] }));
+    projectsMock.push("Alpha", "Omnigent Automation");
+    mockScopedConversations([
+      conv("conv_own_run", "Claude Code", {
+        labels: { ...RUN_LABELS, omni_project: "Omnigent Automation" },
+      }),
+      ...SHARED_RUNS,
+    ]);
+    renderGroupingSidebar();
+    selectSessionFilter("all");
+    fireEvent.click(screen.getByRole("button", { name: /^Omnigent Automation/ }));
+    const meta = (id: string) =>
+      within(within(automationFolder()).getByText(id).closest("li")!).queryByTestId(
+        "session-row-meta",
+      );
+    // Alice filed this run in her Alpha, not in this folder, so the row names Alpha.
+    expect(meta("conv_shared_run")).toHaveTextContent(/^Alpha$/);
+    // The viewer's own run is filed here, under the folder's name already.
+    expect(meta("conv_own_run")).toBeNull();
   });
 
   it("shows the folder where the viewer's project will go until they have it", () => {

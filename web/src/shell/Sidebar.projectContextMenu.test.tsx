@@ -640,6 +640,22 @@ describe("project folder inline rename", () => {
     if (path === "inline") expect(mocks.showToast).toHaveBeenCalledWith(error.message);
   });
 
+  it("lets the folder left behind by a partial rename show its name and rename again", async () => {
+    mocks.renameProject.mutateAsync.mockRejectedValueOnce(
+      new ProjectMembersNotMovedError("500 Internal Server Error"),
+    );
+    renderSidebar();
+
+    fireEvent.doubleClick(folderHeader());
+    fireEvent.change(inlineInput(), { target: { value: "Sprint 43" } });
+    fireEvent.keyDown(inlineInput(), { key: "Enter" });
+
+    await waitFor(() => expect(mocks.showToast).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "Sprint 43" })).toBeNull();
+    fireEvent.doubleClick(folderHeader());
+    expect(inlineInput()).toHaveValue(PROJECT_NAME);
+  });
+
   it("cancels on Escape without renaming", () => {
     renderSidebar();
 

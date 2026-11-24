@@ -7381,6 +7381,224 @@ describe("CreateScheduledTaskDialog workflow", () => {
     expect(updateMutateAsync.mock.calls[0][0].input.prompt).toBe(run("The download tests"));
   });
 
+  // A server that stores the saved workflow a schedule runs, and writes its prompt.
+  const STORED_WORKFLOW_INFO = {
+    features: { automations_v2: true, workflows: true },
+    scheduled_task_workflow_id: true,
+  };
+  const storedWorkflowTask = () =>
+    scheduledTask({
+      prompt: run("The upload tests"),
+      workflowId: WORKFLOW.id,
+      workflowDetails: "The upload tests",
+    });
+
+  it("sends a schedule's saved workflow as itself to a server that stores it", async () => {
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, {
+      info: STORED_WORKFLOW_INFO,
+    });
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    chooseWorkflow();
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    const created = mutateAsync.mock.calls[0][0];
+    expect(created).toMatchObject({ workflowId: WORKFLOW.id, workflowDetails: "" });
+    expect(created.prompt).toBeUndefined();
+  });
+
+  it("edits the details of a stored workflow's runs, not its prompt", async () => {
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={storedWorkflowTask()} />,
+      { info: STORED_WORKFLOW_INFO },
+    );
+    fireEvent.change(screen.getByLabelText("Additional instructions (optional)"), {
+      target: { value: "The download tests" },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const edited = updateMutateAsync.mock.calls[0][0].input;
+    expect(edited).toMatchObject({
+      workflowId: WORKFLOW.id,
+      workflowDetails: "The download tests",
+    });
+    expect(edited.prompt).toBeUndefined();
+  });
+
+  it("stops running a stored workflow only by clearing it", async () => {
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={storedWorkflowTask()} />,
+      { info: STORED_WORKFLOW_INFO },
+    );
+    fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+    fireEvent.click(screen.getByTestId("workflow-picker-clear"));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    // Its instructions become the prompt every run sends.
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      workflowId: null,
+      prompt: "The upload tests",
+    });
+  });
+
+  it("reads a stored workflow run with another harness's skill prefix", async () => {
+    const editingTask = { ...storedWorkflowTask(), prompt: "$" + run("The upload tests").slice(1) };
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={editingTask} />, {
+      info: STORED_WORKFLOW_INFO,
+    });
+    expect(screen.getByTestId("task-workflow-trigger")).toHaveTextContent("Triage flaky tests");
+    expect(screen.getByLabelText("Additional instructions (optional)")).toHaveValue(
+      "The upload tests",
+    );
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    // Neither the workflow nor its details changed, so the update leaves them be.
+    const edited = updateMutateAsync.mock.calls[0][0].input;
+    expect(edited).not.toHaveProperty("workflowId");
+    expect(edited.prompt).toBeUndefined();
+  });
+
+  it.each([
+    ["keeps an unchanged prompt's workflow", null],
+    ["stops the workflow when the prompt is replaced", "Summarize the day."],
+  ])("with workflows off, %s", async (_label, replacement) => {
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={storedWorkflowTask()} />,
+      { info: { scheduled_task_workflow_id: true } },
+    );
+    expect(screen.queryByTestId("task-workflow-trigger")).toBeNull();
+    if (replacement !== null) {
+      fireEvent.change(screen.getByTestId("task-prompt-input"), {
+        target: { value: replacement },
+      });
+    }
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const edited = updateMutateAsync.mock.calls[0][0].input;
+    if (replacement === null) {
+      expect(edited).not.toHaveProperty("workflowId");
+      expect(edited.prompt).toBe(run("The upload tests"));
+    } else {
+      expect(edited).toMatchObject({ workflowId: null, prompt: replacement });
+    }
+  });
+
+  it("saves a workflow run after a trigger header as the prompt it shows", async () => {
+    const editingTask = {
+      ...storedWorkflowTask(),
+      prompt: `<!-- omnigent-trigger v1 {} -->\n${run("The upload tests")}`,
+    };
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={editingTask} />, {
+      info: STORED_WORKFLOW_INFO,
+    });
+    fireEvent.change(screen.getByLabelText("Additional instructions (optional)"), {
+      target: { value: "The download tests" },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const edited = updateMutateAsync.mock.calls[0][0].input;
+    // The server can't rewrite a run below a header, so the prompt goes as the form shows it.
+    expect(edited).not.toHaveProperty("workflowId");
+    expect(edited.prompt).toBe(run("The download tests"));
+  });
+
+  it("saves a workflow run inside template text as the whole prompt", async () => {
+    // Template text around the run that no trigger opening marks, so it saves as typed.
+    const wrapped = renderTriggerPrompt(
+      "jira",
+      {
+        event: "created",
+        scope: "ES",
+        conditions: [],
+        instructions: run("The upload tests"),
+        linkBack: true,
+      },
+      { placement: "same_host", sessionLink: "https://omni.example.com/c/CONVERSATION_ID" },
+    ).replace("and starts one Omnigent session", "and opens one Omnigent session");
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={{ ...storedWorkflowTask(), prompt: wrapped }}
+      />,
+      { info: STORED_WORKFLOW_INFO },
+    );
+    fireEvent.change(screen.getByLabelText("Additional instructions (optional)"), {
+      target: { value: "The download tests" },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const edited = updateMutateAsync.mock.calls[0][0].input;
+    expect(edited).not.toHaveProperty("workflowId");
+    expect(edited.prompt).toBe(wrapped.replace("The upload tests", "The download tests"));
+  });
+
+  it("saves other edits to a stored workflow's schedule once the workflow is gone", async () => {
+    savedWorkflowsList.current = [];
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={storedWorkflowTask()} />,
+      { info: STORED_WORKFLOW_INFO },
+    );
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    // Unchanged, so the server needn't load the workflow to save the rest.
+    const edited = updateMutateAsync.mock.calls[0][0].input;
+    expect(edited.name).toBe("Renamed");
+    expect(edited).not.toHaveProperty("workflowId");
+    expect(edited).not.toHaveProperty("workflowDetails");
+    expect(edited.prompt).toBeUndefined();
+  });
+
+  it("saves the workflow a typed run message runs after the field is cleared", async () => {
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={storedWorkflowTask()} />,
+      { info: STORED_WORKFLOW_INFO },
+    );
+    fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+    fireEvent.click(screen.getByTestId("workflow-picker-clear"));
+    fireEvent.change(screen.getByTestId("task-prompt-input"), {
+      target: { value: run("The download tests") },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const edited = updateMutateAsync.mock.calls[0][0].input;
+    expect(edited).not.toHaveProperty("workflowId");
+    expect(edited.prompt).toBe(run("The download tests"));
+  });
+
+  it("stops running a stored workflow when its schedule becomes a trigger's prompt", async () => {
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={storedWorkflowTask()} />,
+      { info: STORED_WORKFLOW_INFO },
+    );
+    fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+    fireEvent.click(screen.getByTestId("workflow-picker-clear"));
+    const triggerPrompt =
+      "This automation watches Jira and starts one Omnigent session for each new issue.";
+    fireEvent.change(screen.getByTestId("task-prompt-input"), {
+      target: { value: triggerPrompt },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      workflowId: null,
+      prompt: triggerPrompt,
+    });
+  });
+
   it("stops showing saved instructions once they're saved empty", async () => {
     const view = renderWithWorkflows(
       <CreateScheduledTaskDialog
@@ -7578,7 +7796,10 @@ describe("CreateScheduledTaskDialog workflow", () => {
   );
 
   it("starts a session for each match of a workflow trigger, as a run of the workflow", async () => {
-    renderGithubTrigger(true, { session_create_workflow_id: true });
+    renderGithubTrigger(true, {
+      session_create_workflow_id: true,
+      scheduled_task_workflow_id: true,
+    });
     fireEvent.change(screen.getByTestId("task-trigger-scope"), { target: { value: "acme/app" } });
     chooseTriggerSessionMode("One task session");
     const sessionMode = screen.getByTestId("task-trigger-session-mode");
@@ -7608,6 +7829,8 @@ describe("CreateScheduledTaskDialog workflow", () => {
     expect(prompt).toContain(`workflow_id "${WORKFLOW.id}"`);
     // The polling session still continues; each match gets its own session.
     expect(mutateAsync.mock.calls[0][0]).toMatchObject({ sessionMode: "continue" });
+    // A trigger's workflow lives in its rendered prompt, not on the task.
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("workflowId");
   });
 
   it("reads typed trigger instructions as the server reads the prompt they'd save", async () => {

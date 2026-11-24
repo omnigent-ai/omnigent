@@ -14,6 +14,8 @@ vi.mock("@/hooks/useTouchClient", () => ({ useTouchClient: () => touch.client })
 
 const listeners = new Set<() => void>();
 let width = 1440;
+// The browser's default font size, which a media query's rem follows; 16px unless the person set it.
+let browserFontPx = 16;
 
 /** A window `next` px wide, as its media queries report it; coarse pointers never match. */
 function resizeTo(next: number) {
@@ -25,8 +27,9 @@ vi.spyOn(window, "matchMedia").mockImplementation(
   (query: string) =>
     ({
       get matches() {
-        const min = /min-width:\s*([\d.]+)px/.exec(query);
-        return min !== null && width >= Number(min[1]);
+        const min = /min-width:\s*([\d.]+)(px|rem)/.exec(query);
+        if (min === null) return false;
+        return width >= Number(min[1]) * (min[2] === "rem" ? browserFontPx : 1);
       },
       media: query,
       addEventListener: (_type: string, listener: () => void) => listeners.add(listener),
@@ -66,6 +69,7 @@ function shownWith(floatingPanes: boolean | undefined, sidebarV2 = floatingPanes
 
 afterEach(() => {
   touch.client = false;
+  browserFontPx = 16;
   resizeTo(1440);
   act(() => paneCornersPreference.write("automatic"));
 });
@@ -82,6 +86,17 @@ describe("useFloatingPanesShown", () => {
     resizeTo(767);
     expect(result.current).toBe(false);
     resizeTo(768);
+    expect(result.current).toBe(true);
+  });
+
+  it("floats the panes where index.css does with a larger browser font, from 48rem", () => {
+    browserFontPx = 20;
+    const { result } = shownWith(true);
+    resizeTo(800);
+    expect(result.current).toBe(false);
+    resizeTo(959);
+    expect(result.current).toBe(false);
+    resizeTo(960);
     expect(result.current).toBe(true);
   });
 

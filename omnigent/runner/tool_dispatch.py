@@ -5409,6 +5409,8 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "host_id",
     "execution_target",
     "project_id",
+    "workflow_id",
+    "workflow_details",
 )
 # Fields the update tool forwards to PATCH /v1/scheduled-tasks/{id}.
 _SCHEDULED_TASK_UPDATE_FIELDS = (
@@ -5429,6 +5431,8 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "execution_target",
     "state",
     "project_id",
+    "workflow_id",
+    "workflow_details",
 )
 _SCHEDULED_TASK_UUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 # IDs a deployment allocates in another form, limited to characters safe in one path segment.
@@ -5446,6 +5450,13 @@ _SCHEDULED_TASK_GATED_FIELDS = (
         ("mcp_services",),
         "scheduled_task_mcp_services",
         "does not support mcp_services; omit it to start runs without MCP services",
+    ),
+    (
+        ("workflow_id", "workflow_details"),
+        "scheduled_task_workflow_id",
+        "does not support workflow_id; to run a saved workflow, retry with the prompt "
+        "exactly '/workflow Run the saved workflow \"<name>\" (ID <id>).', optionally "
+        "followed by a blank line and this run's details",
     ),
 )
 
@@ -11049,6 +11060,7 @@ def _execute_skill_tool(
     :returns: Tool output string.
     """
     from omnigent.spec.skill_sources import framework_skills
+    from omnigent.spec.types import AgentSpec
     from omnigent.tools.builtins.load_skill import LoadSkillTool
     from omnigent.tools.builtins.read_skill_file import ReadSkillFileTool
 
@@ -11067,7 +11079,9 @@ def _execute_skill_tool(
         agent_root=runner_workspace,
         skills_filter=skills_filter,
         fallback_skills=(
-            framework_skills(agent_spec) if workflows_enabled and agent_spec is not None else []
+            framework_skills(agent_spec, workflows_enabled=workflows_enabled)
+            if isinstance(agent_spec, AgentSpec)
+            else []
         ),
     )
     tool: Tool = load_tool if tool_name == "load_skill" else ReadSkillFileTool(load_tool.skills)

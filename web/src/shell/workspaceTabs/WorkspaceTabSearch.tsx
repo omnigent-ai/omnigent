@@ -2,7 +2,7 @@
 // with a fuzzy search over them. Each row closes its tab, and a group's heading closes the group.
 // It opens from the layers button after ‹ › or from ⌘K's "Search tabs…", which share one command.
 
-import { LayersIcon, type LucideIcon, RotateCcwIcon, XIcon } from "lucide-react";
+import { ChevronDownIcon, LayersIcon, type LucideIcon, RotateCcwIcon, XIcon } from "lucide-react";
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -165,7 +165,13 @@ export function WorkspaceTabSearch({
   reopen,
   closing,
   onChoose,
+  trailing = false,
 }: {
+  /**
+   * With floating panes the button ends the strip: it shows a chevron, and the list lines up
+   * with its end. The strip that places it decides, so a drawer keeps the classic button.
+   */
+  trailing?: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   entries: readonly TabSearchEntry[];
@@ -184,11 +190,15 @@ export function WorkspaceTabSearch({
             className="size-6 shrink-0 text-muted-foreground hover:text-foreground"
             aria-label="All tabs"
           >
-            <LayersIcon className="size-4" />
+            {/* Floating panes open the list from a chevron, as a menu of the tabs. */}
+            {trailing ? <ChevronDownIcon className="size-4" /> : <LayersIcon className="size-4" />}
           </Button>
         </PopoverTrigger>
       </WorkspaceTabTooltip>
-      <PopoverContent align="start" className="w-[min(35rem,calc(100vw-2rem))] p-0">
+      <PopoverContent
+        align={trailing ? "end" : "start"}
+        className="w-[min(35rem,calc(100vw-2rem))] p-0"
+      >
         <SuppressBrowserView />
         <TabSearchPicker
           entries={entries}
