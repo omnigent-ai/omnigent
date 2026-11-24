@@ -116,6 +116,7 @@ from typing import Any, Literal
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.native.input_diagnostics import input_attributes, log_input_event
+from omnigent.runtime.message_sender import strip_message_sender
 
 # A pending entry is evicted this many seconds after it was recorded
 # if it was never drained by a matching persisted message. Covers the
@@ -883,10 +884,10 @@ def resolve_matching_text(
         ]
         # Two passes. An exact (whitespace-collapsed) match first, so two
         # messages that differ only in a marker-like phrase the person typed
-        # at the front stay distinct. Then, for entries carrying attachments:
-        # the executor pastes one generated marker line per file block ahead
-        # of the text, so drop exactly that many from the mirror and compare
-        # with the entry's own text — typed marker-like text still counts.
+        # at the front stay distinct. Then drop what the executor generated
+        # for an entry — one marker line per file block ahead of the text, and
+        # the line naming its sender — and compare with the entry's own text;
+        # typed marker-like text still counts.
         interrupted = [entry.interrupted for _pid, entry in ordered]
         match_index = _first_match(texts, exact_needle, interrupted)
         match_method = "normalized_text"
@@ -895,14 +896,17 @@ def resolve_matching_text(
             marker_matches: list[int] = []
             for index, (_pid, entry) in enumerate(ordered):
                 attachments = 0 if shell_command else _attachment_count(entry.content)
-                if attachments == 0 or not texts[index]:
+                mirror = strip_message_sender(text, entry.created_by)
+                if (attachments == 0 and mirror == text) or not texts[index]:
                     continue
                 if (
-                    _collapse_whitespace(_strip_generated_markers(text, attachments))
+                    _collapse_whitespace(_strip_generated_markers(mirror, attachments))
                     == texts[index]
                 ):
                     marker_matches.append(index)
             match_index = _prefer_live(marker_matches, interrupted)
+            if match_index is not None and not _attachment_count(ordered[match_index][1].content):
+                match_method = "sender_normalized_text"
         if match_index is None:
             return MatchedDrain(matched=None, skipped=[])
         # Bound one drain's work: report at most a cap's worth of skipped

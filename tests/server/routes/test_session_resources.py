@@ -12136,3 +12136,37 @@ async def test_host_write_timeout_preserves_comment_uncertainty(
         )
     else:
         assert response.json()["error"]["code"] == "runner_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_collaborator_message_names_its_sender_to_the_runner_only(
+    runner_globals_reset: None,
+) -> None:
+    """History keeps what the collaborator typed and records that the model saw their name."""
+    from omnigent.server.routes._sessions.orchestration import _forward_event_to_runner
+
+    store = _ConversationStore()
+    conv = store.get_conversation("79b22ebd2309e48fdeb450c65611d51b")
+    assert conv is not None
+    runner = _FakeRunnerClient(payload={})
+    typed = [{"type": "input_text", "text": "Review this"}]
+    body = SessionEventInput(type="message", data={"role": "user", "content": typed})
+
+    await _forward_event_to_runner(
+        conv.id,
+        conv,
+        body,
+        store,  # type: ignore[arg-type]
+        runner,  # type: ignore[arg-type]
+        created_by="bob@example.com",
+        message_sender="bob@example.com",
+    )
+
+    [item] = store.appended_items
+    assert item.data.content == typed
+    assert item.data.sender_in_context is True
+    [(_, forwarded)] = [call for call in runner.post_json_calls if call[0].endswith("/events")]
+    assert forwarded["content"] == [
+        {"type": "input_text", "text": '[Message sender: "bob@example.com"]'},
+        *typed,
+    ]

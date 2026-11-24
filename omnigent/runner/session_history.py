@@ -18,6 +18,7 @@ from omnigent.runner.app_support import (
     _SpecEntry,
 )
 from omnigent.runner.native import _unwrap_resolved_spec
+from omnigent.runtime.message_sender import with_message_sender
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger("omnigent.runner.app")
@@ -233,11 +234,14 @@ def build_session_history(
             ):
                 _skipped_types.append(str(item_type))
             if item_type == "message":
+                content = item.get("content", [])
+                if item.get("sender_in_context") is True and item.get("role", "user") == "user":
+                    content = with_message_sender(content, item.get("created_by"))
                 result.append(
                     {
                         "type": "message",
                         "role": item.get("role", "user"),
-                        "content": item.get("content", []),
+                        "content": content,
                         "id": item.get("id"),
                     }
                 )

@@ -384,6 +384,8 @@ class MessageData(BaseModel):
         server-expanded, e.g. skill instructions. Independent of ``is_meta``;
         client-settable by convention, not a trust signal. Also exempts the
         message from legacy markup cleanup on import.
+    :param sender_in_context: The model saw this user message prefixed with its
+        sender (``created_by``), so history replay names the sender again.
     :param subagent_return_id: Native task id of an explicitly completed child.
     :param phase: Assistant-only harness label for the message, e.g. Codex
         ``"commentary"`` (progress), ``"partial_answer"`` or ``"final_answer"``.
@@ -397,6 +399,7 @@ class MessageData(BaseModel):
     agent: str | None = Field(default=None, serialization_alias="model")
     is_meta: bool = Field(default=False, exclude_if=lambda value: value is False)
     user_authored: bool = Field(default=False, exclude_if=lambda value: value is False)
+    sender_in_context: bool = Field(default=False, exclude_if=lambda value: value is False)
     subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None

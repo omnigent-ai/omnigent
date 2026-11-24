@@ -696,6 +696,34 @@ def test_resolve_matching_text_drops_only_generated_leading_markers() -> None:
     assert pending_inputs.snapshot_for("conv_a") == []
 
 
+def test_resolve_matching_text_drops_the_sender_line_typed_for_its_entry() -> None:
+    """A collaborator's echo matches behind the line naming them, never another sender's."""
+    bob = "bob@example.com"
+    line = '[Message sender: "bob@example.com"]'
+    with_image = pending_inputs.record(
+        "conv_a",
+        [{"type": "input_image", "url": "img://1"}, _text_block("look")],
+        created_by=bob,
+    )
+    plain = pending_inputs.record("conv_a", [_text_block("same")], created_by=bob)
+    owner = pending_inputs.record("conv_a", [_text_block("same")], created_by="alice@example.com")
+
+    other = pending_inputs.resolve_matching_text(
+        "conv_a", '[Message sender: "eve@example.com"]\n\nsame'
+    )
+    first = pending_inputs.resolve_matching_text(
+        "conv_a", f"[Attached: /tmp/x.png]\n\n{line}\n\nlook"
+    )
+    second = pending_inputs.resolve_matching_text("conv_a", f"{line}\n\nsame")
+
+    assert other.matched is None
+    assert first.matched is not None and first.matched.pending_id == with_image
+    assert first.match_method == "attachment_normalized_text"
+    assert second.matched is not None and second.matched.pending_id == plain
+    assert second.match_method == "sender_normalized_text"
+    assert [row["pending_id"] for row in pending_inputs.snapshot_for("conv_a")] == [owner]
+
+
 def test_record_keeps_a_new_entry_when_every_other_entry_is_held() -> None:
     """A fresh record is never the eviction victim, even with the whole cap held."""
     cap = pending_inputs._MAX_ENTRIES_PER_CONVERSATION

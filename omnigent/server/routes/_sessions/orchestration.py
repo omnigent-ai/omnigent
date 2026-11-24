@@ -122,6 +122,7 @@ from omnigent.runtime import (
     pending_inputs,
 )
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.runtime.message_sender import with_message_sender
 from omnigent.runtime.policies.approval import (
     build_elicitation_request_event,
     resolve_ask_timeout,
@@ -384,6 +385,7 @@ from omnigent.server.routes._sessions.helpers import (
     _spec_harness,
     _stable_id_reuse_is_exact_retry,
     _stop_session_via_runner,
+    _strip_echoed_message_sender,
     _usage_by_model_for_display,
     _validate_session_workspace,
     _validate_terminal_launch_args,
@@ -3678,6 +3680,7 @@ async def _persist_external_conversation_item_unlocked(
                 pending_inputs.mark_uncertain(session_id)
         if drained is not None:
             cleared_pending_id = drained.pending_id
+            item = _strip_echoed_message_sender(item, drained.created_by)
             item = _merge_pending_file_blocks(item, drained.content)
             # A text match preserves the sender recorded at POST time. FIFO
             # settlement alone does not establish authorship of the mirror.
@@ -7660,6 +7663,7 @@ async def _forward_native_terminal_message(
     input_delivery: Mapping[str, object] | None = None,
     agent_revision: str | None = None,
     native_shell_authorized: bool = False,
+    message_sender: str | None = None,
 ) -> None:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -7686,6 +7690,9 @@ async def _forward_native_terminal_message(
     :param input_delivery: Queued input identifiers and original enqueue time.
     :param agent_revision: Effective spec revision used to invalidate runner caches.
     :param native_shell_authorized: Owner authorization for this shell delivery.
+    :param message_sender: Identity typed ahead of the message for the agent;
+        the mirrored transcript drops it again (see
+        :func:`_persist_external_conversation_item_unlocked`).
     :returns: None.
     :raises HTTPException: 502 when the runner or harness rejects
         the injection request.
@@ -7698,6 +7705,7 @@ async def _forward_native_terminal_message(
         input_delivery=input_delivery,
         agent_revision=agent_revision,
     )
+    event["content"] = with_message_sender(event["content"], message_sender)
     log_input_event(
         _logger,
         "native_input_forward_started",
@@ -8292,6 +8300,7 @@ async def _forward_event_to_runner(
     host_store: HostStore | None = None,
     agent_revision: str | None = None,
     startup_input_id: str | None = None,
+    message_sender: str | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -8325,13 +8334,22 @@ async def _forward_event_to_runner(
         ``None`` reads as unknown, which counts as backed.
     :param agent_revision: The agent's effective bundle and selection revision; the
         runner rebuilds the session's spec when it changes.
+    :param message_sender: Identity to name to the model, e.g. a collaborator
+        posting in someone else's session. Stored content stays as typed.
     :returns: The store-assigned id of the persisted item.
     """
     import uuid
 
     turn_id = f"turn_{uuid.uuid4().hex}"
+    sender_in_context = message_sender is not None
     # A web send is persisted under its client stable id (see _web_send_stable_id).
-    item = _build_new_item(body, turn_id, created_by=created_by, adopt_stable_id=True)
+    item = _build_new_item(
+        body,
+        turn_id,
+        created_by=created_by,
+        adopt_stable_id=True,
+        sender_in_context=sender_in_context,
+    )
     item = item.model_copy(update={"replaces_pending_id": startup_input_id})
 
     async def persist_input() -> list[ConversationItem]:
@@ -8346,7 +8364,9 @@ async def _forward_event_to_runner(
             and not _stable_id_reuse_is_exact_retry(persisted[0], item)
         ):
             # An edited restored draft reusing a stable ID is a new message.
-            replacement = _build_new_item(body, turn_id, created_by=created_by)
+            replacement = _build_new_item(
+                body, turn_id, created_by=created_by, sender_in_context=sender_in_context
+            )
             persisted = await asyncio.to_thread(
                 conversation_store.append, session_id, [replacement]
             )
@@ -8370,6 +8390,8 @@ async def _forward_event_to_runner(
     # harness don't have access to the server's file store — the
     # LLM endpoint needs the actual content, not an internal ID.
     forwarded_data = dict(body.data)
+    if sender_in_context and isinstance(forwarded_data.get("content"), list):
+        forwarded_data["content"] = with_message_sender(forwarded_data["content"], message_sender)
     if (
         file_store is not None
         and artifact_store is not None
@@ -9239,6 +9261,7 @@ async def _dispatch_session_event_to_runner_impl(
     background_titles_enabled: bool = True,
     agent_revision: str | None = None,
     startup_input: StartupInputContext | None = None,
+    message_sender: str | None = None,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -9300,6 +9323,9 @@ async def _dispatch_session_event_to_runner_impl(
         :func:`omnigent.runtime.pending_inputs.record` and applied
         to the item when the forwarder mirrors it back (see
         :func:`_persist_external_conversation_item`).
+    :param message_sender: Identity named to the model ahead of this message,
+        e.g. a collaborator posting in someone else's session. ``None`` sends
+        the message as typed.
     :param native_shell_authorized: Owner authorization for this shell delivery.
     :param runner_router: Router used to resolve the runner for the
         native-terminal parent-wake forward when a sub-agent fails to
@@ -9602,6 +9628,7 @@ async def _dispatch_session_event_to_runner_impl(
                 input_delivery=input_delivery,
                 agent_revision=agent_revision,
                 native_shell_authorized=native_shell_authorized,
+                message_sender=message_sender,
             )
             forwarded = True
             if pending_id is not None:
@@ -9675,6 +9702,7 @@ async def _dispatch_session_event_to_runner_impl(
         host_store=host_store,
         agent_revision=agent_revision,
         startup_input_id=startup_input.input_id if startup_input is not None else None,
+        message_sender=message_sender,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 

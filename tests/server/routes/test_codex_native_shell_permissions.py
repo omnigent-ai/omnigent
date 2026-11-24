@@ -14,6 +14,7 @@ from omnigent.runner.identity import (
     token_bound_runner_id,
 )
 from omnigent.runtime import pending_inputs, set_runner_client, set_runner_router
+from omnigent.runtime.message_sender import with_message_sender
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_MANAGE,
@@ -179,8 +180,32 @@ async def test_codex_editor_model_input_keeps_edit_access(
     assert response.status_code == 202, response.text
     messages = [payload for path, payload in runner.post_json_calls if path == _EVENT_PATH]
     assert len(messages) == 1
-    assert messages[0]["content"] == content
+    # Shell-looking input stays as typed; the editor's ordinary message names them.
+    assert messages[0]["content"] == with_message_sender(content, "editor@example.com")
     assert dict(runner.post_headers)[_EVENT_PATH] == {}
+
+
+@pytest.mark.parametrize(
+    ("caller", "named"), [("owner", False), ("editor", True), ("admin", True)]
+)
+async def test_only_collaborators_are_named_to_the_agent(
+    codex_client: tuple[httpx.AsyncClient, _ShellRunnerClient, Conversation],
+    caller: str,
+    named: bool,
+) -> None:
+    client, runner, _conv = codex_client
+    content = [{"type": "input_text", "text": "Explain this code"}]
+    response = await client.post(
+        _EVENT_PATH,
+        json=_message(content),
+        headers={"X-Forwarded-Email": f"{caller}@example.com"},
+    )
+    assert response.status_code == 202, response.text
+    [message] = [payload for path, payload in runner.post_json_calls if path == _EVENT_PATH]
+    sender = f"{caller}@example.com" if named else None
+    assert message["content"] == with_message_sender(content, sender)
+    # The queued bubble keeps what the person typed.
+    assert [row["content"] for row in pending_inputs.snapshot_for(_SESSION_ID)] == [content]
 
 
 @pytest.mark.parametrize(

@@ -5617,6 +5617,12 @@
             "title": "Role",
             "type": "string"
           },
+          "sender_in_context": {
+            "default": false,
+            "description": "The model saw this user message prefixed with its sender (`created_by`), so history replay names the sender again.",
+            "title": "Sender In Context",
+            "type": "boolean"
+          },
           "startup_options": {
             "anyOf": [
               {

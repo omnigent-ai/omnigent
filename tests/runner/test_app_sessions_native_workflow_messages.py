@@ -2704,3 +2704,53 @@ async def test_cold_forward_keeps_initiating_item_id(external_item: bool) -> Non
     )
     messages = _translate_input_to_messages(user_items)
     assert messages[-1]["input_item_id"] == "msg_current"
+
+
+@pytest.mark.asyncio
+async def test_history_reload_names_collaborators_the_model_saw() -> None:
+    """A reloaded history repeats a collaborator's sender line; untagged messages stay as typed."""
+    import asyncio as _aio
+
+    history = [
+        {
+            "id": "item_1",
+            "type": "message",
+            "role": "user",
+            "created_by": "alice@example.com",
+            "content": [{"type": "input_text", "text": "mine"}],
+        },
+        {
+            "id": "item_2",
+            "type": "message",
+            "role": "user",
+            "created_by": "bob@example.com",
+            "sender_in_context": True,
+            "content": [{"type": "input_text", "text": "theirs"}],
+        },
+    ]
+    app, _pm, hc = _build_recovery_app(history)
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "e65fe670b242ca2ea48eb8930779d5ff",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert resp.status_code == 201
+        await _aio.sleep(0.5)
+
+    assert len(hc.posted_bodies) == 1
+    users = [
+        item["content"]
+        for item in hc.posted_bodies[0].get("content", [])
+        if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "user"
+    ]
+    assert users == [
+        [{"type": "input_text", "text": "mine"}],
+        [
+            {"type": "input_text", "text": '[Message sender: "bob@example.com"]'},
+            {"type": "input_text", "text": "theirs"},
+        ],
+    ]

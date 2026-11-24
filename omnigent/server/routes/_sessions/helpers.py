@@ -116,6 +116,7 @@ from omnigent.runtime import (
     pending_inputs,
 )
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.runtime.message_sender import strip_message_sender
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server import presence, session_live_state, session_pull_requests, shutdown_state
@@ -5005,6 +5006,35 @@ def _merge_pending_file_blocks(
     return item.model_copy(update={"data": merged_data})
 
 
+def _strip_echoed_message_sender(
+    item: NewConversationItem,
+    sender: str | None,
+) -> NewConversationItem:
+    """
+    Drop the sender line typed ahead of a web message from its transcript echo.
+
+    :param item: The mirrored user-message item about to be persisted.
+    :param sender: ``created_by`` of the pending entry the echo matched.
+    :returns: A copy of *item* without that line, or *item* when it has none.
+    """
+    if not isinstance(item.data, MessageData):
+        return item
+    content: list[dict[str, Any]] = []
+    for block in item.data.content:
+        text = block.get("text") if isinstance(block, dict) else None
+        if not isinstance(text, str):
+            content.append(block)
+            continue
+        stripped = strip_message_sender(text, sender)
+        if stripped == text:
+            content.append(block)
+        elif stripped.strip():
+            content.append({**block, "text": stripped})
+    if content == item.data.content:
+        return item
+    return item.model_copy(update={"data": item.data.model_copy(update={"content": content})})
+
+
 def _message_text(content: list[dict[str, Any]]) -> str | None:
     """
     Extract joined text from message content blocks.
@@ -8496,6 +8526,7 @@ def _build_new_item(
     created_by: str | None = None,
     *,
     adopt_stable_id: bool = False,
+    sender_in_context: bool = False,
 ) -> NewConversationItem:
     """
     Construct a :class:`NewConversationItem` from a POSTed event.
@@ -8524,6 +8555,8 @@ def _build_new_item(
         client-minted ``stable_id`` it carries (see
         :func:`_web_send_stable_id`). Off by default so seeded and
         replayed items keep store-assigned ids.
+    :param sender_in_context: The model receives this user message prefixed
+        with *created_by*; only the server decides this, never the client.
     :returns: A :class:`NewConversationItem` ready for delivery
         or persistence.
     :raises OmnigentError: When ``body.data`` does not satisfy the
@@ -8536,6 +8569,10 @@ def _build_new_item(
             f"invalid data for {body.type!r} item: {exc}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+    if isinstance(data, MessageData):
+        data = data.model_copy(
+            update={"sender_in_context": sender_in_context and data.role == "user"}
+        )
     if isinstance(data, MessageData) and data.role == "user" and not data.is_meta:
         data = data.model_copy(update={"user_authored": True})
     return NewConversationItem(

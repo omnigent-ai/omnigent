@@ -4167,6 +4167,21 @@ def register_events_routes(
             if pending_background_title is not None:
                 pending_background_title.schedule(expected_seed_title=conv.title)
             return {"queued": True, "item_id": item_id}
+        # Name a collaborator to the agent; the owner's own messages go as typed.
+        message_sender = (
+            created_by
+            if created_by is not None
+            and body.type == "message"
+            and body.data.get("role", "user") == "user"
+            and not await asyncio.to_thread(
+                _is_session_owner,
+                created_by,
+                conv,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            )
+            else None
+        )
         dispatch = await _dispatch_session_event_to_runner(
             session_id,
             conv,
@@ -4178,6 +4193,7 @@ def register_events_routes(
             artifact_store=artifact_store,
             has_mcp_servers=_has_mcp_servers,
             created_by=created_by,
+            message_sender=message_sender,
             native_shell_authorized=native_shell_authorized,
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,

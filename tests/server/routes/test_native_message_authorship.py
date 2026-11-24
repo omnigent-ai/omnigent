@@ -9,7 +9,9 @@ import pytest
 
 from omnigent.harnesses.claude_native.bridge import read_transcript_items_since
 from omnigent.harnesses.claude_native.forwarder import _external_conversation_item_event
+from omnigent.inner.claude_native_executor import _content_to_text
 from omnigent.runtime import pending_inputs
+from omnigent.runtime.message_sender import with_message_sender
 from omnigent.server.routes._sessions.orchestration import _persist_external_conversation_item
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -92,3 +94,32 @@ async def test_native_authorship_survives_delivery_and_retries(
     await _persist_external_conversation_item(conv.id, conv, body, store, created_by=author)
     assert [row["pending_id"] for row in pending_inputs.snapshot_for(conv.id)] == pending
     assert len(store.list_items(conv.id, type="message").data) == 1
+
+
+@pytest.mark.asyncio
+async def test_collaborator_echo_is_stored_as_typed(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude records the sender line typed ahead of a collaborator's message; history does not."""
+    typed = [{"type": "input_text", "text": "Review this"}]
+    prompt = _content_to_text(with_message_sender(typed, "bob@example.com"), tmp_path)
+    transcript = tmp_path / "session.jsonl"
+    record = {
+        "uuid": "native-record",
+        "type": "user",
+        "message": {"role": "user", "content": prompt},
+    }
+    transcript.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    [parsed] = read_transcript_items_since(transcript, 0, agent_name="Claude")[2]
+    body = SessionEventInput.model_validate(_external_conversation_item_event(parsed))
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Review")
+    pending_inputs.record(conv.id, typed, created_by="bob@example.com")
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", Mock())
+
+    await _persist_external_conversation_item(conv.id, conv, body, store)
+
+    [item] = store.list_items(conv.id, type="message").data
+    assert item.data.content == typed
+    assert item.created_by == "bob@example.com"
+    assert pending_inputs.snapshot_for(conv.id) == []
