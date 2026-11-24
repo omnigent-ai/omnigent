@@ -2712,23 +2712,6 @@ describe("PullRequestPanel", () => {
     await user.keyboard("{Escape}");
   });
 
-  it("offers a non-owner no unlink on a PR's details", async () => {
-    const url = state.info!.data!.pr!.url;
-    Object.assign(state.info!.data!, {
-      owner_only_changes: true,
-      tracking_available: true,
-      selected_pr_url: url,
-      prs: [
-        { url, host: "github.com", repository: "acme/app", number: 6000, relationship: "attached" },
-      ],
-    });
-    renderPanel();
-    expect(await screen.findByRole("tab", { name: "Summary" })).toBeVisible();
-    expect(screen.queryByRole("button", { name: "Unlink PR" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Link a PR" })).toBeNull();
-    expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
-  });
-
   it("keeps a non-owner's PR changes hidden while the host is offline", async () => {
     const user = userEvent.setup();
     const url = "https://github.com/example/one/pull/42";
@@ -2748,7 +2731,7 @@ describe("PullRequestPanel", () => {
     expect(screen.getByRole("menuitem", { name: "Copy PR link" })).toBeEnabled();
   });
 
-  it("keeps a non-owner's PR changes hidden while another PR's details load", () => {
+  it("offers a non-owner no unlink on a PR's details, even while another PR's load", async () => {
     const url = state.info!.data!.pr!.url;
     Object.assign(state.info!.data!, {
       owner_only_changes: true,
@@ -2761,7 +2744,11 @@ describe("PullRequestPanel", () => {
     // A server that doesn't say who owns the session: only the PR info's marker decides.
     state.sessionOwner = null;
     const { rerender } = renderPanel();
+    expect(await screen.findByRole("tab", { name: "Summary" })).toBeVisible();
     expect(screen.getByText(/Only the session’s owner can change/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Unlink PR" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Link a PR" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
 
     state.info = { isLoading: true, error: null, isFetching: true };
     rerender(<PullRequestPanel conversationId="conv_1" />);
