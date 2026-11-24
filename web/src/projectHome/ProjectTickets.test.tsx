@@ -266,7 +266,7 @@ describe("ticket updates in Chat", () => {
       target: { value: "Keep this ticket draft" },
     });
     expect(screen.queryByText("Ask in Chat")).toBeNull();
-    fireEvent.click(await screen.findByRole("link", { name: "Open chat with: Maestro" }));
+    fireEvent.click(await screen.findByRole("link", { name: "Open chat with: Lead" }));
     expect(await screen.findByLabelText("Existing session chat")).toHaveTextContent("orchestrator");
     expect(projectsApi.createProject).not.toHaveBeenCalled();
     expect(screen.queryByRole("link", { name: "Back to ticket" })).toBeNull();
@@ -415,13 +415,19 @@ describe("Project ticket board", () => {
     expect(fetchConversationById).not.toHaveBeenCalled();
   });
 
-  it("shows five phases and human-input labels, without filter controls", async () => {
+  it("shows four phases and human-input labels, without filter controls", async () => {
     renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
     await screen.findByRole("region", { name: "Open" });
     const board = screen.getByRole("region", { name: "Shipping ticket board" });
+    expect(
+      within(board)
+        .getAllByRole("region")
+        .map((lane) => lane.getAttribute("aria-label")),
+    ).toEqual(["Open", "Working", "Review", "Done"]);
+    // The completed lane starts collapsed; expanding it shows its icon like the others.
+    fireEvent.click(within(board).getByRole("button", { name: "Expand Done" }));
     for (const [label, icon, color] of [
       ["Open", "circle-dashed", "text-muted-foreground"],
-      ["Planning", "clipboard-list", "text-session-active"],
       ["Working", "circle-dot", "text-session-active"],
       ["Review", "eye", "text-warning"],
       ["Done", "circle-check", "text-success"],
@@ -444,7 +450,8 @@ describe("Project ticket board", () => {
       ticket.labels = [
         { key: "source", value: "ISSUE-123" },
         { key: "status", value: "Waiting for the investigation to finish" },
-        { key: "assignee", value: "Unassigned" },
+        // A plain label: an `assignee` label renders as a person chip instead.
+        { key: "area", value: "Board" },
         ...(needsResponse ? [{ key: "needs-human", value: "approval" }] : []),
       ];
       const { rerender } = renderBoard(
@@ -462,7 +469,7 @@ describe("Project ticket board", () => {
       expect(
         within(card).getByLabelText(needsResponse ? "2 more labels" : "1 more label"),
       ).toHaveTextContent(needsResponse ? "+2" : "+1");
-      expect(within(card).queryByText("assignee: Unassigned")).toBeNull();
+      expect(within(card).queryByText("area: Board")).toBeNull();
       if (needsResponse) {
         expect(within(card).getByText("Needs response")).toHaveClass("bg-tag-pink");
         expect(badge.parentElement?.firstElementChild).toHaveTextContent("Needs response");
@@ -504,7 +511,7 @@ describe("Project ticket board", () => {
           onCreated={vi.fn()}
         />,
       );
-      expect(await screen.findByText("assignee: Unassigned")).toBeInTheDocument();
+      expect(await screen.findByText("area: Board")).toBeInTheDocument();
       expect(screen.getByText("source: ISSUE-123")).not.toHaveClass("truncate");
       expect(screen.getByText("status: Waiting for the investigation to finish")).not.toHaveClass(
         "truncate",
@@ -595,6 +602,8 @@ describe("Project ticket board", () => {
       .getByText("Investigating")
       .closest('[data-slot="hover-card-trigger"]')!;
     expect(badge).toHaveClass("bg-purple-500/10");
+    // The completed lane starts collapsed; expanded, it shows its configured icon.
+    fireEvent.click(screen.getByRole("button", { name: "Expand Resolved" }));
     expect(
       screen.getByRole("region", { name: "Resolved" }).querySelector(".lucide-rocket"),
     ).toHaveClass("text-session-active");
@@ -1375,7 +1384,8 @@ describe("Project ticket board", () => {
   it("surfaces load failures instead of showing an empty board", async () => {
     vi.mocked(api.listTickets).mockRejectedValue(new Error("Board unavailable"));
     renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
-    await waitFor(() => expect(screen.getAllByRole("alert")).toHaveLength(5));
+    // One alert per open lane; the completed lane starts collapsed to its count.
+    await waitFor(() => expect(screen.getAllByRole("alert")).toHaveLength(3));
     expect(screen.queryByText("No tickets")).toBeNull();
   });
 
@@ -1384,8 +1394,13 @@ describe("Project ticket board", () => {
     capabilities.stages = false;
     renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
     const card = await screen.findByRole("link", { name: "Open ticket: Ship the board" });
-    expect(screen.queryByRole("region", { name: "Planning" })).toBeNull();
-    expect(screen.queryByRole("region", { name: "Review" })).toBeNull();
+    // An older server gets the same four default lanes, without asking it for stages.
+    const board = screen.getByRole("region", { name: "Shipping ticket board" });
+    expect(
+      within(board)
+        .getAllByRole("region")
+        .map((lane) => lane.getAttribute("aria-label")),
+    ).toEqual(["Open", "Working", "Review", "Done"]);
     fireEvent.mouseEnter(card);
     expect(api.listRelatedTickets).not.toHaveBeenCalled();
     expect(api.getTicketStages).not.toHaveBeenCalled();
@@ -1491,7 +1506,7 @@ describe("Project ticket board", () => {
       ...ticket,
       id: "peer",
       title: "Related work",
-      stage_id: "planning",
+      stage_id: "in_progress",
     };
     const followup = { ...peer, id: "followup", title: "Follow-up work" };
     vi.mocked(api.listRelatedTickets)
@@ -1520,14 +1535,14 @@ describe("Project ticket board", () => {
       }),
     );
     expect(
-      await within(section).findByRole("link", { name: /Related work.*Planning/ }),
+      await within(section).findByRole("link", { name: /Related work.*Working/ }),
     ).toHaveAttribute("href", "/?ticket=peer");
     expect(within(section).queryByRole("alert")).toBeNull();
     expect(within(section).queryByRole("button", { name: "Link ticket" })).toBeNull();
     expect(within(section).queryByRole("button", { name: /Unlink/ })).toBeNull();
     fireEvent.click(within(section).getByRole("button", { name: "More related tickets" }));
     expect(
-      await within(section).findByRole("link", { name: /Follow-up work.*Planning/ }),
+      await within(section).findByRole("link", { name: /Follow-up work.*Working/ }),
     ).toHaveAttribute("href", "/?ticket=followup");
     expect(within(section).getAllByRole("link")).toHaveLength(2);
     expect(within(section).queryByRole("button", { name: "More related tickets" })).toBeNull();
@@ -1647,11 +1662,12 @@ describe("Project ticket board", () => {
     expect(reviewer).toHaveAttribute("href", "/c/reviewer");
     expect(reviewer.querySelector('[data-harness-icon="codex"]')).not.toBeNull();
     expect(await within(agents).findByText("Verifying the result")).toBeInTheDocument();
-    expect(within(agents).getAllByRole("link", { name: /Maestro/ })).toHaveLength(1);
+    // The Lead is listed once, by its persona name and avatar rather than its harness.
+    expect(within(agents).getAllByRole("link", { name: /Lead/ })).toHaveLength(1);
     expect(
       within(agents)
-        .getByRole("link", { name: "Open chat with: Maestro" })
-        .querySelector('[data-agent-icon="maestro"]'),
+        .getByRole("link", { name: "Open chat with: Lead" })
+        .querySelector('[data-persona="Lead"]'),
     ).not.toBeNull();
     expect(agents).not.toHaveTextContent("claude-native-ui");
     expect(agents).not.toHaveTextContent("codex-native-ui");
@@ -1683,7 +1699,7 @@ describe("Project ticket board", () => {
         onCreated={vi.fn()}
       />,
     );
-    await user.click(await screen.findByRole("link", { name: "Open chat with: Maestro" }));
+    await user.click(await screen.findByRole("link", { name: "Open chat with: Lead" }));
     expect(await screen.findByLabelText("Existing session chat")).toHaveTextContent("orchestrator");
     expect(screen.queryByRole("link", { name: "Back to ticket" })).toBeNull();
     expect(projectsApi.createProject).not.toHaveBeenCalled();
@@ -1710,7 +1726,7 @@ describe("Project ticket board", () => {
     expect(screen.queryByRole("button", { name: "Edit agent involvement" })).toBeNull();
     expect(api.setTicketSessionInvolvement).not.toHaveBeenCalled();
     expect(screen.queryByRole("region", { name: "Response needed" })).toBeNull();
-    expect(await screen.findByRole("link", { name: "Open chat with: Maestro" })).toHaveAttribute(
+    expect(await screen.findByRole("link", { name: "Open chat with: Lead" })).toHaveAttribute(
       "href",
       "/c/orchestrator",
     );
@@ -1787,9 +1803,9 @@ describe("Project ticket board", () => {
         expect(respond).toHaveTextContent("Running");
         expect(api.listTicketEvents).toHaveBeenCalledWith("project", "ticket", 0, undefined);
       }
-      expect(
-        within(agents).getByRole("link", { name: "Open chat with: Shipping orchestrator" }),
-      ).not.toHaveClass("bg-tag-pink");
+      expect(within(agents).getByRole("link", { name: "Open chat with: Lead" })).not.toHaveClass(
+        "bg-tag-pink",
+      );
       fireEvent.change(screen.getByLabelText("Add a comment"), { target: { value: "I approve" } });
       await user.click(screen.getByRole("button", { name: "Comment" }));
       await waitFor(() =>
@@ -1824,7 +1840,7 @@ describe("Project ticket board", () => {
         ...ticket,
         id: "first",
         title: "Plan part",
-        stage_id: "planning",
+        stage_id: "review",
       };
       const second: ProjectTicket = {
         ...ticket,
@@ -1852,6 +1868,8 @@ describe("Project ticket board", () => {
       }));
       renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
       const source = await screen.findByRole("link", { name: "Open ticket: Ship the board" });
+      // The completed lane starts collapsed; open it to see its related ticket.
+      fireEvent.click(await screen.findByRole("button", { name: "Expand Done" }));
       const neighbor = await screen.findByRole("link", { name: "Open ticket: Done part" });
       expect(api.listRelatedTickets).not.toHaveBeenCalled();
       expect(source).toHaveClass("hover:bg-primary/5", "focus-visible:bg-primary/5");

@@ -45,13 +45,26 @@ function renderEditor() {
   };
 }
 
+// A five-stage board with an occupied Planning stage, independent of the shipped
+// defaults, so these editor tests can rename, reorder and remove stages.
+const EDITED_STAGES: api.TicketStages = {
+  stages: [
+    { id: "open", name: "Open", instructions: "", is_complete: false },
+    { id: "planning", name: "Planning", instructions: "", is_complete: false },
+    { id: "in_progress", name: "Working", instructions: "", is_complete: false },
+    { id: "review", name: "Review", instructions: "", is_complete: false },
+    { id: "done", name: "Done", instructions: "", is_complete: true },
+  ],
+  initial_stage_id: "open",
+};
+
 beforeEach(() => {
   vi.resetAllMocks();
   projects.data = [{ id: "project", name: "Shipping" }];
   projects.isLoading = false;
   projects.error = null;
   vi.mocked(api.getTicketStages).mockResolvedValue({
-    ...structuredClone(api.DEFAULT_TICKET_STAGES),
+    ...structuredClone(EDITED_STAGES),
     occupied_stage_ids: ["planning"],
   });
   vi.mocked(api.updateTicketStages).mockImplementation(
@@ -183,10 +196,8 @@ describe("Project stage editor", () => {
     await waitFor(() => expect(onClose).toHaveBeenCalledOnce());
     expect(api.updateTicketStages).toHaveBeenCalledWith("project", {
       stages: [
-        { ...api.DEFAULT_TICKET_STAGES.stages[0], name: "New" },
-        ...api.DEFAULT_TICKET_STAGES.stages
-          .slice(1)
-          .map((stage) => ({ ...stage, is_complete: false })),
+        { ...EDITED_STAGES.stages[0], name: "New" },
+        ...EDITED_STAGES.stages.slice(1).map((stage) => ({ ...stage, is_complete: false })),
         {
           id: expect.stringMatching(/^stage-[a-z0-9]{12}$/),
           name: "Resolved",
@@ -203,7 +214,7 @@ describe("Project stage editor", () => {
     { index: 0, key: "ArrowDown", order: ["planning", "open", "in_progress", "review", "done"] },
     { index: 4, key: "ArrowUp", order: ["open", "planning", "in_progress", "done", "review"] },
   ])("derives start and completion after dragging stage $index", async ({ index, key, order }) => {
-    const configuration = structuredClone(api.DEFAULT_TICKET_STAGES);
+    const configuration = structuredClone(EDITED_STAGES);
     configuration.stages[index].color = "pink";
     configuration.stages[index].icon = "flag";
     vi.mocked(api.getTicketStages).mockResolvedValue(configuration);
@@ -229,7 +240,7 @@ describe("Project stage editor", () => {
     fireEvent.keyDown(handles[index], { key: " ", code: "Space" });
     await waitFor(() => {
       expect(screen.getByLabelText(`Stage name ${index + 1}`)).toHaveValue(
-        api.DEFAULT_TICKET_STAGES.stages.find((stage) => stage.id === order[index])?.name,
+        EDITED_STAGES.stages.find((stage) => stage.id === order[index])?.name,
       );
     });
     fireEvent.click(screen.getByRole("button", { name: "Save stages" }));
@@ -301,7 +312,7 @@ describe("Project stage editor", () => {
   it("keeps dirty fields after a failed save and a usage refresh, then retries", async () => {
     const user = userEvent.setup();
     vi.mocked(api.getTicketStages).mockResolvedValueOnce({
-      ...structuredClone(api.DEFAULT_TICKET_STAGES),
+      ...structuredClone(EDITED_STAGES),
       occupied_stage_ids: [],
     });
     vi.mocked(api.updateTicketStages).mockRejectedValueOnce(
@@ -334,6 +345,8 @@ describe("Project stage editor", () => {
 
   it("creates a label-only project on save and keeps the draft through its ID assignment", async () => {
     projects.data = [{ id: null, name: "Shipping" }];
+    // A label-only project starts from the shipped defaults, and its new row reports them.
+    vi.mocked(api.getTicketStages).mockResolvedValue(structuredClone(api.DEFAULT_TICKET_STAGES));
     vi.mocked(createProject).mockResolvedValue({ id: "created", name: "Shipping" });
     let rejectSave!: (error: Error) => void;
     vi.mocked(api.updateTicketStages).mockReturnValueOnce(

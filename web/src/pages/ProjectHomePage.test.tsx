@@ -1,3 +1,4 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { Link, MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -29,6 +30,8 @@ vi.mock("@/shell/NewChatDialog", () => ({
 }));
 vi.mock("@/projectHome/useProjectTickets", () => ({
   useProjectTicketsEnabled: () => mocks.ticketsEnabled,
+  // No project row, so the board's seen marker and file viewer stay idle.
+  useTicketProject: () => ({ projectId: null }),
 }));
 vi.mock("@/projectHome/ProjectOrchestrator", () => ({
   ProjectOrchestrator: ({ onClose }: { onClose?: () => void }) => (
@@ -107,18 +110,25 @@ function LocationProbe() {
 }
 
 function renderPage(entry: string) {
+  // The page reads project data through React Query, as in the app.
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
-    <MemoryRouter initialEntries={[entry]}>
-      <Routes>
-        <Route path="/projects/:projectName" element={<ProjectHomePage />} />
-        <Route
-          path="/projects/:projectName/orchestrator"
-          element={<ProjectHomePage orchestrator />}
-        />
-        <Route path="/c/:sessionId" element={<output data-testid="full-session">Session</output>} />
-      </Routes>
-      <LocationProbe />
-    </MemoryRouter>,
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={[entry]}>
+        <Routes>
+          <Route path="/projects/:projectName" element={<ProjectHomePage />} />
+          <Route
+            path="/projects/:projectName/orchestrator"
+            element={<ProjectHomePage orchestrator />}
+          />
+          <Route
+            path="/c/:sessionId"
+            element={<output data-testid="full-session">Session</output>}
+          />
+        </Routes>
+        <LocationProbe />
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 
@@ -265,7 +275,7 @@ describe("ProjectHomePage tickets", () => {
 
   it.each([
     ["?ticket=ticket-1", "Ticket details"],
-    ["/orchestrator", "Orchestrator side chat"],
+    ["/orchestrator", "Lead side chat"],
   ])("keeps the mobile %s panel full width", (target, panel) => {
     mocks.ticketsEnabled = true;
     mocks.isMobile = true;
@@ -280,7 +290,7 @@ describe("ProjectHomePage tickets", () => {
 
   it.each([
     ["?ticket=ticket-1", "Ticket details", "Close ticket ticket-1"],
-    ["/orchestrator", "Orchestrator side chat", "Close orchestrator"],
+    ["/orchestrator", "Lead side chat", "Close orchestrator"],
   ])(
     "opens %s beside the board and preserves the normal New session composer",
     (search, panel, close) => {
