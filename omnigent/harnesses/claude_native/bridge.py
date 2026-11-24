@@ -118,6 +118,8 @@ from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
 CLAUDE_STARTUP_CONTEXT_FILE = "startup_context.txt"
+# Changed project instructions the runner leaves for the next injected prompt.
+CLAUDE_INSTRUCTIONS_UPDATE_FILE = "pending_instructions_update.txt"
 CLAUDE_APPEND_SYSTEM_PROMPT_FILE = "append_system_prompt.md"
 # Inline prompts above this size move to a file; tmux caps a whole launch
 # command near 16 KiB, and the other args and env share that budget.
@@ -3315,6 +3317,26 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
     existing = [tool for tool in args[value_idx].split(",") if tool]
     args[value_idx] = ",".join(dict.fromkeys([*existing, *extra]))
     return args
+
+
+def write_instructions_update(bridge_dir: Path, text: str) -> None:
+    """Leave changed project instructions for the executor's next injected prompt."""
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    _write_private_file(bridge_dir / CLAUDE_INSTRUCTIONS_UPDATE_FILE, text)
+
+
+def read_instructions_update(bridge_dir: Path) -> str | None:
+    """Changed project instructions waiting for the next prompt, else ``None``."""
+    try:
+        text = (bridge_dir / CLAUDE_INSTRUCTIONS_UPDATE_FILE).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    return text.strip() or None
+
+
+def clear_instructions_update(bridge_dir: Path) -> None:
+    """Drop delivered project instructions so they ride only one prompt."""
+    (bridge_dir / CLAUDE_INSTRUCTIONS_UPDATE_FILE).unlink(missing_ok=True)
 
 
 def _resumes_transcript(args: list[str]) -> bool:

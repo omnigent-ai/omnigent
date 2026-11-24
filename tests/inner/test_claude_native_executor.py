@@ -1182,6 +1182,32 @@ async def test_enqueue_session_message_materializes_image(
 
 
 @pytest.mark.asyncio
+async def test_changed_project_instructions_ride_the_next_prompt_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The runner's left-behind instructions update joins one prompt's hidden context."""
+    from omnigent.harnesses.claude_native.bridge import (
+        CLAUDE_FRAMEWORK_CONTEXT_FILE,
+        CLAUDE_INSTRUCTIONS_UPDATE_FILE,
+    )
+
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", _stub_inject(sent))
+    executor = ClaudeNativeExecutor(tmp_path)
+    (tmp_path / CLAUDE_INSTRUCTIONS_UPDATE_FILE).write_text("Current mandate: say PINEAPPLE.")
+
+    assert await executor.enqueue_session_message("session-key", "what is 3+3?")
+    assert sent[-1]["content"] == "what is 3+3?"
+    assert (tmp_path / CLAUDE_FRAMEWORK_CONTEXT_FILE).read_text() == (
+        "Current mandate: say PINEAPPLE."
+    )
+    assert not (tmp_path / CLAUDE_INSTRUCTIONS_UPDATE_FILE).exists()
+    assert await executor.enqueue_session_message("session-key", "and 5+5?")
+    assert not (tmp_path / CLAUDE_FRAMEWORK_CONTEXT_FILE).exists()
+
+
+@pytest.mark.asyncio
 async def test_run_turn_malformed_data_uri_emits_visible_marker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

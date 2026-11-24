@@ -162,7 +162,10 @@ from omnigent.runner.native import orchestration as _native_runtime
 from omnigent.runner.native.interrupt import NativeInterruptRunner
 from omnigent.runner.native_controls import build_native_controls
 from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
-from omnigent.runner.project_orchestrator import append_project_instructions
+from omnigent.runner.project_orchestrator import (
+    append_project_instructions,
+    project_instructions_update,
+)
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
@@ -8133,6 +8136,21 @@ def create_runner_app(
                         session_id=conversation_id,
                         server_client=server_client,
                     )
+                if _session_harness_name(conversation_id) == "claude-native":
+                    # Claude reads project text only at launch; carry an edit to its next prompt.
+                    _instructions_update = await project_instructions_update(
+                        server_client, conversation_id
+                    )
+                    if _instructions_update:
+                        from omnigent.harnesses.claude_native.bridge import (
+                            write_instructions_update,
+                        )
+
+                        await asyncio.to_thread(
+                            write_instructions_update,
+                            await _claude_prompt_bridge_dir(conversation_id),
+                            _instructions_update,
+                        )
 
                 if conversation_id in _active_turns:
                     _native = _is_native_harness(conversation_id)

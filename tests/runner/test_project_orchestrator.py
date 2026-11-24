@@ -276,3 +276,41 @@ def test_sign_off_turns_name_the_label_and_the_approved_commit():
     event["payload"]["answered_ask"] = True
     assert "add needs-human back" in ticket_gate_label_for_worker_message("p1", event)
     assert "`" + "b" * 40 + "`" in ticket_gate_label_for_merger_message("p1", event, "b" * 40)
+
+
+async def test_a_running_session_gets_changed_project_text_once_on_its_next_turn():
+    from omnigent.runner.project_orchestrator import (
+        PROJECT_INSTRUCTIONS_UPDATED_NOTICE,
+        project_instructions_update,
+    )
+
+    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(projects=True))
+    snapshot = {"project_id": "project", "project_mandate": "Old rules."}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=snapshot)),
+        base_url="http://server.test",
+    ) as client:
+        assert await project_instructions_update(client, "running") is None  # never launched
+        await append_project_instructions("Author", client, "running", spec)
+        assert await project_instructions_update(client, "running") is None  # unchanged
+        snapshot["project_mandate"] = "New rules."
+        update = await project_instructions_update(client, "running")
+        assert update is not None and update.startswith(PROJECT_INSTRUCTIONS_UPDATED_NOTICE)
+        assert "New rules." in update and "Old rules." not in update
+        assert await project_instructions_update(client, "running") is None  # delivered once
+
+
+async def test_an_unreadable_snapshot_skips_the_update_notice_not_the_turn():
+    from omnigent.runner.project_orchestrator import project_instructions_update
+
+    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(projects=True))
+    responses = [httpx.Response(200, json={"project_id": "p", "project_mandate": "M."})]
+
+    def respond(_: httpx.Request) -> httpx.Response:
+        return responses.pop(0) if responses else httpx.Response(503)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server.test"
+    ) as client:
+        await append_project_instructions("Author", client, "flaky", spec)
+        assert await project_instructions_update(client, "flaky") is None

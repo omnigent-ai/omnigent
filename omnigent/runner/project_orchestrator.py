@@ -136,6 +136,48 @@ async def _project_session_snapshot(
     return snapshot if isinstance(snapshot, dict) else None
 
 
+# The project text each session was last given (with its spec), so a later turn can tell
+# a running or resumed native session when the mandate, charter or persona changed.
+_GIVEN_PROJECT_TEXT: dict[str, tuple[AgentSpec, str | None]] = {}
+_GIVEN_PROJECT_TEXT_MAX = 4096
+
+PROJECT_INSTRUCTIONS_UPDATED_NOTICE = (
+    "Omnigent: this session's project instructions changed since you last received them. "
+    "The current versions below replace the earlier ones (mandate, role charter or persona, "
+    "and related guidance); follow them from now on.\n\n"
+)
+
+
+def _remember_given_text(session_id: str, spec: AgentSpec, text: str | None) -> None:
+    if (
+        len(_GIVEN_PROJECT_TEXT) >= _GIVEN_PROJECT_TEXT_MAX
+        and session_id not in _GIVEN_PROJECT_TEXT
+    ):
+        _GIVEN_PROJECT_TEXT.pop(next(iter(_GIVEN_PROJECT_TEXT)))
+    _GIVEN_PROJECT_TEXT[session_id] = (spec, text)
+
+
+async def project_instructions_update(
+    server_client: httpx.AsyncClient | None, session_id: str
+) -> str | None:
+    """The current project text as a one-shot notice when it changed since it was last given.
+
+    Native harnesses get project text only at launch, so a running session misses later
+    edits. Called per forwarded turn; a failed read skips the notice rather than the turn.
+    """
+    known = _GIVEN_PROJECT_TEXT.get(session_id)
+    if known is None or server_client is None:
+        return None
+    spec, before = known
+    try:
+        current = await project_instructions(server_client, session_id, spec)
+    except (httpx.HTTPError, ValueError):
+        return None
+    if not current or current == before:
+        return None
+    return PROJECT_INSTRUCTIONS_UPDATED_NOTICE + current
+
+
 async def project_instructions(
     server_client: httpx.AsyncClient | None,
     session_id: str,
@@ -173,7 +215,9 @@ async def project_instructions(
         PROJECT_ORCHESTRATOR_INSTRUCTION if has_project_tools and designated is True else None,
         side_chat_instruction(snapshot.get("side_chat_parent_id")),
     )
-    return "\n\n".join(block for block in blocks if block) or None
+    text = "\n\n".join(block for block in blocks if block) or None
+    _remember_given_text(session_id, spec, text)
+    return text
 
 
 async def append_project_instructions(

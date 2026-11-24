@@ -29,6 +29,7 @@ from omnigent.harnesses.claude_native.bridge import (
     TmuxSessionNotAdvertised,
     cancellable_injection,
     claude_pane_ready,
+    clear_instructions_update,
     has_pending_user_prompt,
     inject_slash_command,
     inject_user_message,
@@ -37,6 +38,7 @@ from omnigent.harnesses.claude_native.bridge import (
     kill_session,
     read_active_session_id,
     read_claude_status_model,
+    read_instructions_update,
     read_launch_model,
     read_model_env,
     read_model_picker_values,
@@ -353,6 +355,8 @@ class ClaudeNativeExecutor(Executor):
         self._require_active_session()
         context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
         context_path.unlink(missing_ok=True)
+        update = read_instructions_update(self._bridge_dir)
+        notices = [*notices, update] if update else notices
         if notices:
             context_path.write_text("\n\n".join(notices), encoding="utf-8")
         try:
@@ -360,6 +364,8 @@ class ClaudeNativeExecutor(Executor):
         except BaseException:
             context_path.unlink(missing_ok=True)
             raise
+        if update:
+            clear_instructions_update(self._bridge_dir)
 
     def _require_active_session(self) -> None:
         """Reject queued input if /clear replaced its conversation while it waited."""
