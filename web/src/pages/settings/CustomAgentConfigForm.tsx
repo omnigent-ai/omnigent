@@ -19,6 +19,7 @@ import { useBrainHarnessLabels } from "@/lib/agentLabels";
 import {
   agentConfigDraft,
   agentConfigPatch,
+  agentPermissionModeOptions,
   type AgentConfigDraft,
   type MCPDraft,
 } from "@/lib/agentConfig";
@@ -48,6 +49,7 @@ export function CustomAgentConfigForm({
   const [conflict, setConflict] = useState(false);
   const [confirm, setConfirm] = useState<"reload" | "back" | null>(null);
   const [reloading, setReloading] = useState(false);
+  const [skipAcknowledged, setSkipAcknowledged] = useState(false);
   const busy = save.isPending || reloading;
 
   useEffect(() => {
@@ -67,6 +69,13 @@ export function CustomAgentConfigForm({
     }
   }
   const dirty = Boolean(validation || Object.keys(patch).length);
+  const permissionOptions = agentPermissionModeOptions(draft?.harness ?? "");
+  const selectedPermission = permissionOptions.find((mode) => mode.value === draft?.permissionMode);
+  // Choosing a mode that skips approval needs an explicit acknowledgement before saving.
+  const needsSkipAcknowledgement =
+    selectedPermission?.skipsApproval === true &&
+    draft?.permissionMode !== (revision?.config.permission_mode ?? "");
+  const skipBlocked = needsSkipAcknowledgement && !skipAcknowledged;
   useEffect(() => {
     if (!dirty) return;
     const warn = (event: BeforeUnloadEvent) => event.preventDefault();
@@ -82,6 +91,7 @@ export function CustomAgentConfigForm({
     else if (result.data) {
       setRevision(result.data);
       setDraft(agentConfigDraft(result.data.config));
+      setSkipAcknowledged(false);
       setConflict(false);
       setError(null);
       save.reset();
@@ -96,13 +106,14 @@ export function CustomAgentConfigForm({
   }
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (!revision || !dirty || validation || conflict || busy) return;
+    if (!revision || !dirty || validation || conflict || busy || skipBlocked) return;
     setError(null);
     try {
       const result = await save.mutateAsync({ etag: revision.etag, patch });
       toast.success("Agent saved");
       setRevision(result);
       setDraft(agentConfigDraft(result.config));
+      setSkipAcknowledged(false);
       save.reset();
     } catch (err) {
       if (err instanceof ApiError && err.status === 412) {
@@ -200,7 +211,18 @@ export function CustomAgentConfigForm({
                   {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "harness")}
                   className="h-9 w-full rounded-md border border-input bg-background px-3"
                   value={draft.harness}
-                  onChange={(e) => setDraft({ ...draft, harness: e.target.value })}
+                  onChange={(e) => {
+                    const harness = e.target.value;
+                    // A mode from another harness's vocabulary doesn't carry over.
+                    const keep = agentPermissionModeOptions(harness).some(
+                      (mode) => mode.value === draft.permissionMode,
+                    );
+                    setDraft({
+                      ...draft,
+                      harness,
+                      permissionMode: keep ? draft.permissionMode : "",
+                    });
+                  }}
                 >
                   {!Object.hasOwn(labels, draft.harness) && (
                     <option value={draft.harness}>{draft.harness || "Unspecified"}</option>
@@ -220,6 +242,59 @@ export function CustomAgentConfigForm({
                   onChange={(e) => setDraft({ ...draft, model: e.target.value })}
                 />
               </label>
+            </div>
+            <div className="space-y-1 text-ui">
+              <label htmlFor="agent-permission-mode">Default permissions</label>
+              <select
+                {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "permissionMode")}
+                id="agent-permission-mode"
+                aria-describedby="agent-permission-mode-note"
+                className="h-9 w-full rounded-md border border-input bg-background px-3"
+                value={draft.permissionMode}
+                disabled={permissionOptions.length === 0 && !draft.permissionMode}
+                onChange={(e) => {
+                  setSkipAcknowledged(false);
+                  setDraft({ ...draft, permissionMode: e.target.value });
+                }}
+              >
+                <option value="">Harness default</option>
+                {draft.permissionMode && !selectedPermission && (
+                  <option value={draft.permissionMode}>{draft.permissionMode}</option>
+                )}
+                {permissionOptions.map((mode) => (
+                  <option key={mode.value} value={mode.value}>
+                    {mode.label} — {mode.description}
+                  </option>
+                ))}
+              </select>
+              <p id="agent-permission-mode-note" className="text-xs text-muted-foreground">
+                {permissionOptions.length === 0
+                  ? "This harness has no permission modes to choose from here."
+                  : "New sessions of this agent start in this mode unless you pick another when you start one."}
+              </p>
+              {selectedPermission?.skipsApproval && (
+                <div
+                  role="alert"
+                  className="space-y-2 rounded-md border border-destructive/50 bg-destructive/10 p-3 text-destructive"
+                >
+                  <p className="font-medium">This mode never asks before acting.</p>
+                  <p className="text-xs">
+                    Sessions you start with this agent can edit files, run commands and reach the
+                    network without approval. Sessions that other agents start with it still ask,
+                    unless the agent starting them already runs without approval.
+                  </p>
+                  {needsSkipAcknowledgement && (
+                    <label className="flex items-center gap-2 text-xs">
+                      <input
+                        type="checkbox"
+                        checked={skipAcknowledged}
+                        onChange={(e) => setSkipAcknowledged(e.target.checked)}
+                      />
+                      I understand that this agent's sessions will run without asking.
+                    </label>
+                  )}
+                </div>
+              )}
             </div>
             <label className="space-y-1 text-ui">
               Instructions
@@ -314,7 +389,9 @@ export function CustomAgentConfigForm({
               {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "save")}
               type="submit"
               loading={save.isPending}
-              disabled={busy || !dirty || Boolean(validation) || conflict || !revision}
+              disabled={
+                busy || !dirty || Boolean(validation) || conflict || !revision || skipBlocked
+              }
             >
               Save changes
             </Button>

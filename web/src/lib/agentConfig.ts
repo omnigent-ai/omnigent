@@ -1,4 +1,10 @@
 import type { AgentConfig, AgentConfigPatch, MCPConfigPatch } from "./agentsApi";
+import { CLAUDE_NATIVE_PERMISSION_MODES } from "./claudePermissionMode";
+import {
+  APPROVAL_SKIPPING_PERMISSION_MODES,
+  CODEX_NATIVE_APPROVAL_MODES,
+  canonicalNativeHarness,
+} from "./nativeHarnessModes";
 
 export interface CredentialDraft {
   name: string;
@@ -26,7 +32,35 @@ export interface AgentConfigDraft {
   instructions: string;
   model: string;
   harness: string;
+  /** Default permission mode for the agent's sessions; "" leaves the harness default. */
+  permissionMode: string;
   servers: MCPDraft[];
+}
+
+export interface AgentPermissionModeOption {
+  value: string;
+  label: string;
+  description: string;
+  skipsApproval: boolean;
+}
+
+/**
+ * Modes the agent editor offers as an agent's default. Mirrors
+ * AGENT_DEFAULT_PERMISSION_MODES in omnigent/native/permission_modes.py.
+ */
+export function agentPermissionModeOptions(harness: string): AgentPermissionModeOption[] {
+  const modes =
+    canonicalNativeHarness(harness) === "claude-native"
+      ? CLAUDE_NATIVE_PERMISSION_MODES
+      : canonicalNativeHarness(harness) === "codex-native"
+        ? CODEX_NATIVE_APPROVAL_MODES
+        : [];
+  return modes.map(({ value, label, description }) => ({
+    value,
+    label,
+    description,
+    skipsApproval: APPROVAL_SKIPPING_PERMISSION_MODES.has(value),
+  }));
 }
 
 export function agentConfigDraft(config: AgentConfig): AgentConfigDraft {
@@ -35,6 +69,7 @@ export function agentConfigDraft(config: AgentConfig): AgentConfigDraft {
     instructions: config.instructions ?? "",
     model: config.model ?? "",
     harness: config.harness ?? "",
+    permissionMode: config.permission_mode ?? "",
     servers: Object.entries(config.mcp_servers).map(([name, server]) => ({
       key: name,
       name,
@@ -72,6 +107,8 @@ export function agentConfigPatch(config: AgentConfig, draft: AgentConfigDraft): 
       patch[field] = draft[field];
     }
   }
+  if (draft.permissionMode !== (config.permission_mode ?? ""))
+    patch.permission_mode = draft.permissionMode || null;
   const names = new Set<string>();
   const changes: [string, MCPConfigPatch | null][] = [];
   for (const row of draft.servers) {

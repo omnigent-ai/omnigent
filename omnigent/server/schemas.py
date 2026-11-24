@@ -256,6 +256,8 @@ class AgentConfigPatch(BaseModel):
     instructions: str | None = None
     model: str | None = Field(default=None, min_length=1)
     harness: str | None = Field(default=None, min_length=1)
+    # Default native permission mode for new sessions; null restores the harness default.
+    permission_mode: str | None = Field(default=None, min_length=1, max_length=64)
     mcp_servers: (
         dict[Annotated[str, Field(pattern=_MCP_SERVER_NAME_RE)], MCPServerPatch | None] | None
     ) = None
@@ -293,6 +295,7 @@ class AgentConfigObject(BaseModel):
     description: str | None = None
     harness: str | None = None
     model: str | None = None
+    permission_mode: str | None = None
     instructions: str | None = None
     mcp_servers: dict[str, AgentMCPConfig] = Field(default_factory=dict)
 

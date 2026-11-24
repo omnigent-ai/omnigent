@@ -606,16 +606,8 @@ async def test_scheduled_origin_allows_new_controls_children_and_reads(
         pytest.param(None, True, "running", None, None, {}, id="no-mode"),
         # The automation's own mode wins over a permissive worker spec...
         pytest.param("default", True, "running", {"yolo": True}, None, {}, id="default-over-spec"),
-        # ...which still applies when the automation sets no mode.
-        pytest.param(
-            None,
-            True,
-            "running",
-            {"yolo": True},
-            ["--dangerously-bypass-approvals-and-sandbox"],
-            {},
-            id="spec-without-mode",
-        ),
+        # ...and an agent-started worker never takes its spec's approval-skipping default.
+        pytest.param(None, True, "running", {"yolo": True}, None, {}, id="spec-skip-withheld"),
         pytest.param(
             "bypass",
             True,
@@ -1617,6 +1609,40 @@ async def _codex_creator(auth_client, auth_app, db_uri, monkeypatch, permission_
             {"permission_mode": "default"},
             None,
             id="worker-spec-default",
+        ),
+        # A worker agent's approval-skipping default never applies to a session an agent
+        # starts; it gets its creator's mode instead.
+        pytest.param(
+            "approve-for-me",
+            "managed",
+            None,
+            {"permission_mode": "full-access"},
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="worker-spec-skip-withheld",
+        ),
+        pytest.param(
+            "approve-for-me",
+            "managed",
+            None,
+            {"yolo": True},
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="worker-spec-yolo-withheld",
+        ),
+        pytest.param(
+            "full-access",
+            "managed",
+            None,
+            {"permission_mode": "full-access"},
+            None,
+            id="worker-spec-skip-off-host",
+        ),
+        pytest.param(
+            "full-access",
+            "same_host",
+            None,
+            {"permission_mode": "full-access"},
+            PERMISSION_LAUNCH_ARGS["codex-native"]["full-access"],
+            id="worker-spec-skip-creator-already-skips",
         ),
     ],
 )

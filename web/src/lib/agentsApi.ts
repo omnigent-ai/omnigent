@@ -47,6 +47,7 @@ export interface AgentConfig {
   instructions: string | null;
   model: string | null;
   harness: string | null;
+  permission_mode?: string | null;
   mcp_servers: Record<string, AgentMCPConfig>;
 }
 
@@ -65,6 +66,7 @@ export interface AgentConfigPatch {
   instructions?: string;
   model?: string;
   harness?: string;
+  permission_mode?: string | null;
   mcp_servers?: Record<string, MCPConfigPatch | null>;
 }
 

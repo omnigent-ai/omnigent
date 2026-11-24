@@ -120,6 +120,17 @@
             "title": "Name",
             "type": "string"
           },
+          "permission_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Permission Mode"
+          },
           "version": {
             "format": "int64",
             "title": "Version",
@@ -207,6 +218,19 @@
               }
             ],
             "title": "Model"
+          },
+          "permission_mode": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Permission Mode"
           }
         },
         "title": "AgentConfigPatch",

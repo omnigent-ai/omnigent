@@ -485,3 +485,46 @@ def test_model_and_harness_edits_require_compatible_executor(patch):
     with pytest.raises(HTTPException) as caught:
         edit_agent_bundle(bundle, AgentConfigPatch.model_validate(patch))
     assert caught.value.status_code == 409
+
+
+def _executor_config(bundle: bytes) -> dict:
+    config = yaml.load(_files(bundle)["config.yaml"], Loader=_ConfigYamlLoader)
+    return config["executor"]["config"]
+
+
+def test_permission_mode_is_set_projected_and_cleared():
+    bundle = bundle_files({"config.yaml": _CONFIG.replace(b"claude-sdk", b"claude-native")})
+    edited, spec = edit_agent_bundle(bundle, AgentConfigPatch(permission_mode="acceptEdits"))
+    assert _executor_config(edited)["permission_mode"] == "acceptEdits"
+    agent = Agent("id", 1, "example", "blob")
+    assert agent_config_object(agent, spec).permission_mode == "acceptEdits"
+    cleared, spec = edit_agent_bundle(edited, AgentConfigPatch(permission_mode=None))
+    assert "permission_mode" not in _executor_config(cleared)
+    assert agent_config_object(agent, spec).permission_mode is None
+
+
+@pytest.mark.parametrize(
+    ("harness", "mode"),
+    [
+        (b"claude-native", "approve-for-me"),
+        # Codex's bypass rides a session label, not the agent's launch args.
+        (b"codex-native", "bypass"),
+        (b"claude-sdk", "default"),
+    ],
+)
+def test_permission_mode_outside_the_harness_vocabulary_is_rejected(harness, mode):
+    bundle = bundle_files({"config.yaml": _CONFIG.replace(b"claude-sdk", harness)})
+    with pytest.raises(HTTPException) as caught:
+        edit_agent_bundle(bundle, AgentConfigPatch(permission_mode=mode))
+    assert caught.value.status_code == 422
+
+
+def test_harness_change_drops_a_mode_the_new_harness_lacks():
+    bundle = bundle_files({"config.yaml": _CONFIG.replace(b"claude-sdk", b"claude-native")})
+    edited, _ = edit_agent_bundle(bundle, AgentConfigPatch(permission_mode="plan"))
+    switched, _ = edit_agent_bundle(edited, AgentConfigPatch(harness="codex-native"))
+    assert _executor_config(switched) == {"harness": "codex-native"}
+    both, _ = edit_agent_bundle(
+        edited, AgentConfigPatch(harness="codex-native", permission_mode="read-only")
+    )
+    assert _executor_config(both)["permission_mode"] == "read-only"

@@ -388,9 +388,10 @@ function configResponses({
   fail = 0,
   etag = true,
   patchEtag = etag,
-}: { fail?: number; etag?: boolean; patchEtag?: boolean } = {}) {
+  config = {},
+}: { fail?: number; etag?: boolean; patchEtag?: boolean; config?: Partial<AgentConfig> } = {}) {
   const previous = vi.mocked(authenticatedFetch).getMockImplementation()!;
-  let current = { ...editableConfig };
+  let current = { ...editableConfig, ...config };
   let patchStatus = fail;
   vi.mocked(authenticatedFetch).mockImplementation(async (url, init) => {
     if (init?.method === "PATCH") {
@@ -424,6 +425,46 @@ async function openEditor() {
 }
 
 describe("editing custom agents", () => {
+  it("saves a default permission mode, and asks before one that skips approval", async () => {
+    configResponses({ config: { harness: "claude-native", permission_mode: null } });
+    await openEditor();
+    const select = screen.getByLabelText("Default permissions");
+    expect(select).toHaveAttribute("data-settings-control", "custom-agent-detail:permissionMode");
+    expect(select).toHaveValue("");
+    fireEvent.change(select, { target: { value: "bypassPermissions" } });
+    expect(screen.getByRole("alert")).toHaveTextContent("This mode never asks before acting.");
+    const save = screen.getByRole("button", { name: "Save changes" });
+    expect(save).toBeDisabled();
+    fireEvent.click(screen.getByRole("checkbox", { name: /run without asking/ }));
+    expect(save).toBeEnabled();
+    fireEvent.click(save);
+    await waitFor(() =>
+      expect(authenticatedFetch).toHaveBeenCalledWith(
+        "/v1/agents/a1",
+        expect.objectContaining({
+          method: "PATCH",
+          body: '{"permission_mode":"bypassPermissions"}',
+        }),
+      ),
+    );
+    // A saved skip-approval mode keeps its warning but needs no new acknowledgement.
+    await waitFor(() => expect(screen.queryByRole("checkbox")).toBeNull());
+    expect(screen.getByRole("alert")).toBeVisible();
+    fireEvent.change(select, { target: { value: "" } });
+    expect(screen.queryByRole("alert")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() =>
+      expect(authenticatedFetch).toHaveBeenCalledWith(
+        "/v1/agents/a1",
+        expect.objectContaining({ method: "PATCH", body: '{"permission_mode":null}' }),
+      ),
+    );
+  });
+  it("offers no permission modes for a harness without them", async () => {
+    configResponses();
+    await openEditor();
+    expect(screen.getByLabelText("Default permissions")).toBeDisabled();
+  });
   it("renders the create page from its Settings catalog entry, and keeps its names", async () => {
     vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
       const url = new URL(String(input), "http://localhost");

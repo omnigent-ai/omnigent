@@ -93,6 +93,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.native.permission_modes import APPROVAL_SKIPPING_PERMISSION_MODES
 from omnigent.onboarding.provider_config import harness_owns_its_credential
 from omnigent.policies.types import (
     ElicitationRequest,
@@ -12663,6 +12664,24 @@ def _spec_leaves_permission_mode_open(spec: AgentSpec | None) -> bool:
     return not any(key in spec.executor.config for key in _SPEC_PERMISSION_MODE_KEYS)
 
 
+def _spec_default_skips_approval(spec: AgentSpec | None) -> bool:
+    """
+    Whether *spec*'s own permission default would start a session that skips approval.
+
+    :param spec: The new session's agent spec, or ``None`` when it couldn't be loaded.
+    :returns: ``True`` for an approval-skipping ``permission_mode`` / ``exec_mode`` or
+        an enabled ``yolo``.
+    """
+    if spec is None:
+        return False
+    config = spec.executor.config
+    for key in ("permission_mode", "exec_mode"):
+        if config.get(key) in APPROVAL_SKIPPING_PERMISSION_MODES:
+            return True
+    yolo = config.get("yolo")
+    return yolo is True or (isinstance(yolo, str) and yolo.lower() == "true")
+
+
 def _creator_permission_launch_options(
     creator: Conversation,
     body: SessionCreateInput,
@@ -13401,6 +13420,7 @@ async def _create_session_from_existing_agent(
                 exc_info=True,
             )
 
+    spec_skip_withheld = False
     if (
         needs_launch_args_from_spec
         and own_spec is not None
@@ -13415,6 +13435,15 @@ async def _create_session_from_existing_agent(
                 f"invalid terminal_launch_args in agent spec: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+        # A session another session starts never gets an approval-skipping default from
+        # its agent's spec; it falls back to its creator's mode, as a spec that sets none.
+        if (
+            created_by is not None
+            and validated_launch_args is not None
+            and _spec_default_skips_approval(own_spec)
+        ):
+            validated_launch_args = None
+            spec_skip_withheld = True
 
     # Inherit the creator's mode only when the request, automation and readable spec
     # select none.
@@ -13423,7 +13452,7 @@ async def _create_session_from_existing_agent(
         needs_launch_args_from_spec
         and validated_launch_args is None
         and created_by is not None
-        and _spec_leaves_permission_mode_open(own_spec)
+        and (spec_skip_withheld or _spec_leaves_permission_mode_open(own_spec))
     ):
         creator_launch_options = await asyncio.to_thread(
             _creator_permission_launch_options,

@@ -68,6 +68,16 @@ APPROVAL_SKIPPING_PERMISSION_MODES: frozenset[str] = frozenset(
 )
 
 
+# Modes an agent's owner can pick in the agent editor as its sessions' default. Codex's
+# ``bypass`` rides a conversation label rather than launch args, so it isn't offered.
+AGENT_DEFAULT_PERMISSION_MODES: dict[str, tuple[str, ...]] = {
+    "claude-native": tuple(PERMISSION_LAUNCH_ARGS["claude-native"]),
+    "codex-native": tuple(
+        mode for mode in PERMISSION_LAUNCH_ARGS["codex-native"] if mode != "bypass"
+    ),
+}
+
+
 def created_session_launch_args(harness: str | None, mode: str) -> list[str] | None:
     """
     Launch args for a session created with ``permission_mode``, e.g. by ``sys_session_create``.

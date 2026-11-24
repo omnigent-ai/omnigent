@@ -15,6 +15,7 @@ from fastapi import HTTPException
 from omnigent.entities import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
+from omnigent.native.permission_modes import AGENT_DEFAULT_PERMISSION_MODES
 from omnigent.server.bundles import validate_agent_bundle
 from omnigent.server.routes.session_mcp_servers import (
     _find_mcp_location,
@@ -209,6 +210,8 @@ def _edit_agent_bundle(bundle: bytes, patch: AgentConfigPatch | None) -> tuple[b
                     executor["config"] = {**(executor.get("config") or {}), "harness": harness}
             if executor != (config.get("executor") or {}):
                 config["executor"] = executor
+        if fields & {"permission_mode", "harness"}:
+            _edit_permission_mode(config, spec, patch)
         if "instructions" in fields:
             instructions = patch.instructions or ""
             if instructions != (spec.instructions or ""):
@@ -249,6 +252,45 @@ def _edit_agent_bundle(bundle: bytes, patch: AgentConfigPatch | None) -> tuple[b
         return result, updated
 
 
+def _edit_permission_mode(
+    config: dict[str, Any], spec: AgentSpec, patch: AgentConfigPatch
+) -> None:
+    """Set or clear ``executor.config.permission_mode`` for the patched harness.
+
+    A harness change without a new mode drops a mode the new harness doesn't offer.
+    """
+    if spec.executor.type != "omnigent":
+        if "permission_mode" in patch.model_fields_set:
+            raise _not_editable("Permission mode edits require executor.type: omnigent")
+        return
+    executor = dict(config.get("executor") or {})
+    executor_config = dict(executor.get("config") or {})
+    harness = canonicalize_harness(executor_config.get("harness")) or ""
+    modes = AGENT_DEFAULT_PERMISSION_MODES.get(harness, ())
+    if "permission_mode" in patch.model_fields_set:
+        mode = patch.permission_mode
+        if mode is not None and mode not in modes:
+            supported = ", ".join(modes) if modes else "none"
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "invalid_input",
+                    "message": f"Permission mode {mode!r} is not offered for "
+                    f"{harness or 'this harness'} (supported: {supported})",
+                },
+            )
+    else:
+        current = executor_config.get("permission_mode")
+        mode = current if current in modes else None
+    if mode is None:
+        executor_config.pop("permission_mode", None)
+    else:
+        executor_config["permission_mode"] = mode
+    if executor_config != (executor.get("config") or {}):
+        executor["config"] = executor_config
+        config["executor"] = executor
+
+
 def agent_config_object(agent: Agent, spec: AgentSpec) -> AgentConfigObject:
     """Project editable fields, exposing credential names without their values."""
     try:
@@ -265,6 +307,7 @@ def _agent_config_object(agent: Agent, spec: AgentSpec) -> AgentConfigObject:
         description=agent.description if agent.description is not None else spec.description,
         harness=spec.executor.harness_kind,
         model=spec.executor.model,
+        permission_mode=_permission_mode_of(spec),
         instructions=spec.instructions,
         mcp_servers={
             server.name: AgentMCPConfig(
@@ -280,3 +323,10 @@ def _agent_config_object(agent: Agent, spec: AgentSpec) -> AgentConfigObject:
             for server in spec.mcp_servers
         },
     )
+
+
+def _permission_mode_of(spec: AgentSpec) -> str | None:
+    mode = (
+        spec.executor.config.get("permission_mode") if spec.executor.type == "omnigent" else None
+    )
+    return mode if isinstance(mode, str) and mode else None

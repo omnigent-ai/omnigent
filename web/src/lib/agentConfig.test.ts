@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentConfigDraft, agentConfigPatch } from "./agentConfig";
+import { agentConfigDraft, agentConfigPatch, agentPermissionModeOptions } from "./agentConfig";
 import type { AgentConfig } from "./agentsApi";
 
 const config: AgentConfig = {
@@ -128,5 +128,28 @@ describe("agent configuration patch", () => {
       model: "custom-model",
       mcp_servers: { local: { args: ["two words", "", "${ARG}", " space "] } },
     });
+  });
+});
+
+describe("agent permission mode", () => {
+  it("patches only a changed mode, clearing it with null", () => {
+    const withMode = { ...config, harness: "codex-native", permission_mode: "read-only" };
+    const draft = agentConfigDraft(withMode);
+    expect(draft.permissionMode).toBe("read-only");
+    expect(agentConfigPatch(withMode, draft)).toEqual({});
+    draft.permissionMode = "";
+    expect(agentConfigPatch(withMode, draft)).toEqual({ permission_mode: null });
+    draft.permissionMode = "approve-for-me";
+    expect(agentConfigPatch(withMode, draft)).toEqual({ permission_mode: "approve-for-me" });
+  });
+  it("lists each harness's own modes and flags the ones that skip approval", () => {
+    const claude = agentPermissionModeOptions("native-claude");
+    expect(claude.map((mode) => mode.value)).toContain("acceptEdits");
+    expect(claude.find((mode) => mode.value === "bypassPermissions")?.skipsApproval).toBe(true);
+    expect(claude.find((mode) => mode.value === "default")?.skipsApproval).toBe(false);
+    const codex = agentPermissionModeOptions("codex-native").map((mode) => mode.value);
+    expect(codex).toContain("full-access");
+    expect(codex).not.toContain("bypass");
+    expect(agentPermissionModeOptions("claude-sdk")).toEqual([]);
   });
 });
