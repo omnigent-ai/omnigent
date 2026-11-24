@@ -139,6 +139,13 @@ def task_workflow_id(task: ScheduledTask) -> str | None:
     return saved_workflow_id(task.prompt)
 
 
+def skill_prefix(prompt: str) -> str:
+    """The prefix that invokes a skill in *prompt*, ``"/"`` or ``"$"``, read past leading
+    whitespace as JavaScript trims it; empty for a prompt that opens with neither."""
+    opening = prompt.lstrip(_JS_WHITESPACE)[:1]
+    return opening if opening in ("/", "$") else ""
+
+
 def is_bare_saved_workflow_run(prompt: str) -> bool:
     """Whether *prompt* is a saved workflow's run message alone, which the server can
     rewrite, rather than one inside a trigger header or template text."""

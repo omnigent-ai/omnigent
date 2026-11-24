@@ -4417,6 +4417,35 @@ async def test_a_workflow_automation_saved_continuing_a_session_runs_until_edite
     assert (switched.json()["prompt"], switched.json()["session_mode"]) == (edited_prompt, "new")
 
 
+async def test_an_agent_switch_rewrites_a_continued_workflow_prompt_only_for_a_new_prefix(
+    workflows_client: httpx.AsyncClient, workflow_prompt: str, db_uri: str
+) -> None:
+    """Saved before workflows needed new sessions, the task keeps running as long as an
+    agent switch leaves its prompt as it is."""
+    from omnigent.native.native_coding_agents import PI_NATIVE_AGENT_NAME
+
+    prompt = f"  {workflow_prompt}\n"
+    task = SqlAlchemyScheduledTaskStore(db_uri).create(
+        scheduled_task_id=uuid.uuid4().hex,
+        user_id="alice@example.com",
+        **_create_body(prompt=prompt, session_mode="continue"),
+    )
+    url = f"/v1/scheduled-tasks/{task.id}"
+    for change in (
+        {"agent_id": builtin_agent_id(PI_NATIVE_AGENT_NAME)},
+        {"agent_id": builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME), "prompt": prompt},
+    ):
+        kept = await workflows_client.patch(url, json=change, headers=_headers())
+        assert kept.status_code == 200, kept.text
+        assert (kept.json()["prompt"], kept.json()["session_mode"]) == (prompt, "continue")
+    # Native Codex invokes the skill with $, which changes what each run sends.
+    rewritten = await workflows_client.patch(
+        url, json={"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME)}, headers=_headers()
+    )
+    assert rewritten.status_code == 400, rewritten.text
+    assert rewritten.json()["error"]["message"] == CONTINUED_SESSION_MESSAGE
+
+
 async def test_concurrent_edits_cant_combine_a_workflow_with_a_continued_session(
     workflows_client: httpx.AsyncClient, workflow_prompt: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4525,6 +4554,14 @@ async def test_only_an_explicit_null_stops_a_schedule_running_its_workflow(
     assert detailed.status_code == 200, detailed.text
     assert detailed.json()["prompt"] == f"{_workflow_run_prompt(workflow_id)}\n\nOnly bugs"
     assert detailed.json()["workflow_details"] == "Only bugs"
+    other_id = await _save_workflow(client, name="Other")
+    replaced = await client.patch(url, json={"workflow_id": other_id}, headers=_headers())
+    assert replaced.status_code == 200, replaced.text
+    assert replaced.json()["prompt"] == (
+        f'/workflow Run the saved workflow "Other" (ID {other_id}).\n\nOnly bugs'
+    )
+    restored = await client.patch(url, json={"workflow_id": workflow_id}, headers=_headers())
+    assert restored.status_code == 200, restored.text
     cleared = await client.patch(url, json={"workflow_details": None}, headers=_headers())
     assert cleared.status_code == 200, cleared.text
     assert (cleared.json()["prompt"], cleared.json()["workflow_id"]) == (
@@ -4672,11 +4709,14 @@ async def test_a_run_message_inside_other_text_keeps_it(
         **_create_body(prompt=prompt),
     )
     url = f"/v1/scheduled-tasks/{task.id}"
-    detailed = await client.patch(url, json={"workflow_details": "Only bugs"}, headers=_headers())
-    assert detailed.status_code == 400, detailed.text
-    assert (
-        detailed.json()["error"]["message"] == scheduled_tasks_routes._WORKFLOW_PROMPT_WRAPPED_MSG
-    )
+    other_id = await _save_workflow(client, name="Other")
+    for change in ({"workflow_details": "Only bugs"}, {"workflow_id": other_id}):
+        refused = await client.patch(url, json=change, headers=_headers())
+        assert refused.status_code == 400, refused.text
+        assert (
+            refused.json()["error"]["message"]
+            == scheduled_tasks_routes._WORKFLOW_PROMPT_WRAPPED_MSG
+        )
     switched = await client.patch(
         url, json={"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME)}, headers=_headers()
     )

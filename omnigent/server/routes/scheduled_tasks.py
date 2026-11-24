@@ -100,6 +100,7 @@ from omnigent.server.scheduled.workflow_automations import (
     saved_workflow_id,
     saved_workflow_run,
     saved_workflow_run_message,
+    skill_prefix,
     task_workflow_id,
     workflow_session_reuse_error,
     workflow_skill_prefix,
@@ -1329,7 +1330,7 @@ def create_scheduled_tasks_router(
             if prompt_changed:
                 raise OmnigentError(_PROMPT_WITH_WORKFLOW_MSG, code=ErrorCode.INVALID_INPUT)
             if target != current or (details_given and details != saved_details):
-                if target == current and not is_bare_saved_workflow_run(existing.prompt):
+                if current is not None and not is_bare_saved_workflow_run(existing.prompt):
                     raise OmnigentError(_WORKFLOW_PROMPT_WRAPPED_MSG, code=ErrorCode.INVALID_INPUT)
                 workflow = await _runnable_workflow(request, target, owner)
                 agent = await _target_agent(existing, fields, owner)
@@ -1347,18 +1348,17 @@ def create_scheduled_tasks_router(
             and fields.get("agent_id") not in (None, existing.agent_id)
             and is_bare_saved_workflow_run(existing.prompt)
         ):
-            # Another harness may invoke the workflow skill with another prefix.
             harness = await scheduled_agent_harness(
                 await _target_agent(existing, fields, owner), agent_cache
             )
-            fields["prompt"] = saved_workflow_run_message(
-                workflow_skill_prefix(harness),
-                saved_run.name,
-                saved_run.workflow_id,
-                saved_run.details,
-            )
-            fields["workflow_id"] = saved_run.workflow_id
-            return True
+            prefix = workflow_skill_prefix(harness)
+            # Only a harness that invokes the workflow skill another way needs a new prompt.
+            if skill_prefix(existing.prompt) != prefix:
+                fields["prompt"] = saved_workflow_run_message(
+                    prefix, saved_run.name, saved_run.workflow_id, saved_run.details
+                )
+                fields["workflow_id"] = saved_run.workflow_id
+                return True
         if not prompt_changed or prompt is None:
             return "workflow_id" in fields
         run = await asyncio.to_thread(saved_workflow_run, prompt)
@@ -1458,11 +1458,11 @@ def create_scheduled_tasks_router(
             if body.session_mode == "continue":
                 raise OmnigentError(CONTINUED_SESSION_MESSAGE, code=ErrorCode.INVALID_INPUT)
             workflow = await _runnable_workflow(request, body.workflow_id, owner)
-        elif body.prompt is None:  # The request model requires one without workflow_id.
-            raise OmnigentError(_PROMPT_OR_WORKFLOW_MSG, code=ErrorCode.INVALID_INPUT)
         else:
-            _refuse_workflow_reuse(await _workflow_reuse_problem(body.prompt, body.session_mode))
-            await _require_runnable_workflow(request, body.prompt, owner)
+            # The request model requires a prompt without workflow_id.
+            typed_prompt = body.prompt or ""
+            _refuse_workflow_reuse(await _workflow_reuse_problem(typed_prompt, body.session_mode))
+            await _require_runnable_workflow(request, typed_prompt, owner)
         await _validate_rrule_or_400(
             body.rrule,
             body.session_mode,

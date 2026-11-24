@@ -1158,9 +1158,7 @@ export function CreateScheduledTaskDialog({
   // Whether each match's session can start as a run of the trigger's saved workflow.
   const workflowIdSupported =
     workflowsEnabled && info !== "loading" && info.session_create_workflow_id === true;
-  // The server stores the saved workflow a schedule runs and writes the prompt for it.
-  // Whether the server takes the workflow a schedule runs as itself, whether or not
-  // workflows are offered here.
+  // The server stores a schedule's workflow and writes its prompt, even with workflows off here.
   const scheduledWorkflowSupported = info !== "loading" && info.scheduled_task_workflow_id === true;
   // The prompt when no trigger form is open: as typed, or an older trigger's instructions
   // inside its saved template text, whose creation call follows the workflow they run.

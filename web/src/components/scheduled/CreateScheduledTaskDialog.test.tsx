@@ -7758,7 +7758,10 @@ describe("CreateScheduledTaskDialog workflow", () => {
   );
 
   it("starts a session for each match of a workflow trigger, as a run of the workflow", async () => {
-    renderGithubTrigger(true, { session_create_workflow_id: true });
+    renderGithubTrigger(true, {
+      session_create_workflow_id: true,
+      scheduled_task_workflow_id: true,
+    });
     fireEvent.change(screen.getByTestId("task-trigger-scope"), { target: { value: "acme/app" } });
     chooseTriggerSessionMode("One task session");
     const sessionMode = screen.getByTestId("task-trigger-session-mode");
@@ -7788,6 +7791,8 @@ describe("CreateScheduledTaskDialog workflow", () => {
     expect(prompt).toContain(`workflow_id "${WORKFLOW.id}"`);
     // The polling session still continues; each match gets its own session.
     expect(mutateAsync.mock.calls[0][0]).toMatchObject({ sessionMode: "continue" });
+    // A trigger's workflow lives in its rendered prompt, not on the task.
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("workflowId");
   });
 
   it("reads typed trigger instructions as the server reads the prompt they'd save", async () => {
