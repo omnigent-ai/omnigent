@@ -59,6 +59,8 @@ vi.mock("@/hooks/useSession", async (importOriginal) => ({
   useActiveRootSessionId: () => ui.viewing,
 }));
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "viewer" }));
+const openWindow = vi.hoisted(() => vi.fn());
+vi.mock("@/hooks/useOpenSessionWindow", () => ({ useOpenSessionWindow: () => openWindow }));
 const readMarks = vi.hoisted(() => ({ unread: vi.fn(), read: vi.fn() }));
 vi.mock("@/hooks/useUnseenConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UnseenModule>()),
@@ -154,6 +156,12 @@ describe("SessionActionHost", () => {
     // Already read, so Mark as read doesn't apply.
     act(() => requestSessionAction(SESSION, "mark-read"));
     expect(readMarks.read).not.toHaveBeenCalled();
+  });
+
+  it("opens the session in a new window, as its row does", () => {
+    renderHost();
+    act(() => requestSessionAction(SESSION, "open-in-new-window"));
+    expect(openWindow).toHaveBeenCalledWith("c1");
   });
 
   it("leaves a session muted with its project muted, as its row's greyed item does", () => {

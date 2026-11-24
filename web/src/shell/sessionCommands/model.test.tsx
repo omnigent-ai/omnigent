@@ -48,6 +48,7 @@ const FACTS: SessionCommandFacts = {
   unread: false,
   muted: false,
   mutedByProject: false,
+  canOpenWindow: true,
   canCreateAutomation: true,
   currentProject: null,
   stoppable: true,
@@ -72,6 +73,7 @@ describe("sessionCommands", () => {
   it("lists the owner's actions in the row menu's order", () => {
     expect(listed(FACTS)).toEqual([
       "Add nested agent",
+      "Open in new window",
       "Pin",
       "Share",
       "Fork",
@@ -89,6 +91,7 @@ describe("sessionCommands", () => {
   it("greys the owner's actions for someone it's shared with, who leaves instead of deleting", () => {
     const shared = { ...FACTS, owner: false, canCreateAutomation: false };
     expect(listed(shared)).toEqual([
+      "Open in new window",
       "Pin",
       "Share",
       "Fork",
@@ -108,6 +111,7 @@ describe("sessionCommands", () => {
   it("greys the owner's actions, Delete and Leave while it can't tell whose the session is", () => {
     const unknown = { ...FACTS, owner: false, ownerUnknown: true, canCreateAutomation: false };
     expect(listed(unknown)).toEqual([
+      "Open in new window",
       "Pin",
       "Share",
       "Fork",
@@ -146,6 +150,10 @@ describe("sessionCommands", () => {
     expect(listed({ ...FACTS, muted: true })).toEqual(expect.arrayContaining(["Unmute"]));
     expect(listed({ ...FACTS, muted: true })).not.toContain("Mark as unread");
     expect(listed({ ...FACTS, muted: true, unread: true })).toContain("Mark as read");
+  });
+
+  it("offers a new window only where one can open, and not in the session's own window", () => {
+    expect(listed({ ...FACTS, canOpenWindow: false })).not.toContain("Open in new window");
   });
 
   it("greys Unmute as Muted with project when its project is muted, as the row does", () => {

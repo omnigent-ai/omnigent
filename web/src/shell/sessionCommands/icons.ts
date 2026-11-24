@@ -1,6 +1,7 @@
 // The icon each session action shows in ⌘K, as the row menu shows it.
 
 import {
+  AppWindowIcon,
   ArchiveIcon,
   ArchiveRestoreIcon,
   BellIcon,
@@ -24,6 +25,7 @@ import type { SessionCommandId } from "./model";
 
 export const SESSION_COMMAND_ICONS: Record<SessionCommandId, LucideIcon> = {
   "add-sibling": PlusIcon,
+  "open-in-new-window": AppWindowIcon,
   pin: PinIcon,
   unpin: PinOffIcon,
   share: ShareIcon,

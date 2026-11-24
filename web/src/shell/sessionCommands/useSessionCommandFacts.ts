@@ -6,6 +6,7 @@ import { useIsMutating } from "@tanstack/react-query";
 
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { type Conversation, useProjects } from "@/hooks/useConversations";
+import { useOpenSessionWindow } from "@/hooks/useOpenSessionWindow";
 import { useActiveRootSessionId } from "@/hooks/useSession";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import { SidebarDataContext } from "@/hooks/useSidebarData";
@@ -18,6 +19,7 @@ import { isIndentedSibling, isSessionPinned } from "@/lib/sessionFamilies";
 import { PIN_WRITE_MUTATION_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { isInMutedProject, isSessionMuted, useMutedProjects } from "@/lib/sessionMute";
 import { isSessionStoppable } from "@/lib/sessionStop";
+import { isOwnSessionWindow } from "@/lib/sessionWindow";
 import { PinCapacityContext } from "@/lib/sidebarConfig";
 
 import { useCommandContext } from "../commandContext";
@@ -38,7 +40,9 @@ export function useSessionCommandFacts(
   const { forkDisabledReason } = useSessionActionRestrictions(sessionId, conversation);
   // A project mute changes no session row, so its own store re-renders the facts.
   const mutedProjects = useMutedProjects();
-  const routedRoot = useActiveRootSessionId(useCommandContext().session?.id ?? null);
+  const routedId = useCommandContext().session?.id ?? null;
+  const routedRoot = useActiveRootSessionId(routedId);
+  const canOpenWindows = useOpenSessionWindow() !== null;
   const readState = useConversationReadState(
     sessionId ?? "",
     conversation?.updated_at ?? 0,
@@ -70,6 +74,8 @@ export function useSessionCommandFacts(
       unread: readState.unseen && (!active || readState.explicitlyUnread),
       muted: isSessionMuted(conversation),
       mutedByProject: mutedProjects.length > 0 && isInMutedProject(conversation),
+      // As the row decides it: never the session this window was opened for.
+      canOpenWindow: canOpenWindows && !isOwnSessionWindow(conversation.id, routedId ?? undefined),
       canCreateAutomation: canCreateAutomationFromSession({
         info: serverInfo,
         automationsEnabled: serverInfo !== "loading" && serverInfo.automations_enabled !== false,
@@ -96,6 +102,8 @@ export function useSessionCommandFacts(
     viewerId,
     projects,
     routedRoot,
+    routedId,
+    canOpenWindows,
     pinnedRows,
     atPinCapacity,
     pinSaving,

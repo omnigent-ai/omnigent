@@ -10,6 +10,7 @@ import {
   useSetConversationMuted,
   useTogglePinnedConversation,
 } from "@/hooks/useConversations";
+import { useOpenSessionWindow } from "@/hooks/useOpenSessionWindow";
 import { markConversationRead, markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -66,6 +67,7 @@ function SessionActionRunner({
   const queryClient = useQueryClient();
   const togglePinned = useTogglePinnedConversation();
   const setMuted = useSetConversationMuted();
+  const openSessionWindow = useOpenSessionWindow();
   const moveToProject = useMoveToProject();
   const actions = useSessionActions({
     conversation,
@@ -92,6 +94,9 @@ function SessionActionRunner({
     switch (command) {
       case "add-sibling":
         navigate(`/?sibling=${encodeURIComponent(id)}`);
+        return;
+      case "open-in-new-window":
+        openSessionWindow?.(id);
         return;
       case "pin":
         togglePinned.mutate({ id, pinned: true });
@@ -138,7 +143,17 @@ function SessionActionRunner({
         run.setLeaveOpen(true);
         return;
     }
-  }, [command, key, conversation, facts, navigate, queryClient, togglePinned, setMuted]);
+  }, [
+    command,
+    key,
+    conversation,
+    facts,
+    navigate,
+    queryClient,
+    togglePinned,
+    setMuted,
+    openSessionWindow,
+  ]);
 
   return (
     <>

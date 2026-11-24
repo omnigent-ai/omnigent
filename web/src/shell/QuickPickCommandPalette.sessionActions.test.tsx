@@ -123,6 +123,7 @@ describe("QuickPick ⌘K session actions", () => {
     openActions(input);
     await waitFor(() => expect(heading()).toBe("Actions for “Fix the parser”"));
     expect(optionNames()).toEqual([
+      "Open in new window",
       "Pin",
       "Share",
       "Fork",

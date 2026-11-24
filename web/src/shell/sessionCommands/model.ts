@@ -15,6 +15,7 @@ import {
 /** Every action, in the row menu's order. Toggles are two ids, so a stale row can't flip back. */
 export const SESSION_COMMAND_IDS = [
   "add-sibling",
+  "open-in-new-window",
   "pin",
   "unpin",
   "share",
@@ -57,6 +58,8 @@ export interface SessionCommandFacts {
   muted: boolean;
   /** It's filed in a project the viewer muted, which silences it until the project is unmuted. */
   mutedByProject: boolean;
+  /** This app can open it in a window of its own, and isn't that window already. */
+  canOpenWindow: boolean;
   /** The viewer may start an automation from it; see `canCreateAutomationFromSession`. */
   canCreateAutomation: boolean;
   /** The project it's filed under, if any. */
@@ -126,6 +129,7 @@ export const MUTED_BY_PROJECT_REASON = "Its project is muted. Unmute the project
 
 const KEYWORDS: Record<SessionCommandId, readonly string[]> = {
   "add-sibling": ["nested", "sibling", "new agent", "family"],
+  "open-in-new-window": ["window", "pop out", "separate"],
   pin: ["favorite", "keep", "top"],
   unpin: ["favorite", "remove pin"],
   share: ["permissions", "invite", "access"],
@@ -191,6 +195,7 @@ function pinAvailability(facts: SessionCommandFacts, pinning: boolean): CommandA
 
 const LABELS: Record<SessionCommandId, string> = {
   "add-sibling": "Add nested agent",
+  "open-in-new-window": "Open in new window",
   pin: "Pin",
   unpin: "Unpin",
   share: "Share",
@@ -216,6 +221,8 @@ function availabilityOf(id: SessionCommandId, facts: SessionCommandFacts): Comma
   switch (id) {
     case "add-sibling":
       return when(owner && !facts.archived && server.siblingSessions, AVAILABLE);
+    case "open-in-new-window":
+      return when(facts.canOpenWindow, AVAILABLE);
     case "pin":
       return pinAvailability(facts, true);
     case "unpin":
