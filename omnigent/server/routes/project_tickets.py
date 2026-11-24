@@ -400,16 +400,19 @@ def create_project_tickets_router(
         approvers = product_approval.product_approvers(project)
         if product_approval.KIND_LABEL in changed:
             if is_agent:
+                from omnigent.server.project_router import router_session_id
+
                 context = await review_context(request, project_id, who)
+                router = await router_session_id(request.app, project, restore=False)
                 allowed = who.session_id is not None and (
-                    who.session_id == project.main_session_id
-                    or (context is not None and context[3])
+                    who.session_id == router or (context is not None and context[3])
                 )
             else:
                 allowed = who.user_id in approvers
             if not allowed:
                 raise OmnigentError(
-                    "Only the orchestrator, the Reviewer or a product approver can set `kind`",
+                    "Only the project's router (its Lead by default), the Reviewer or a product "
+                    "approver can set `kind`",
                     code=ErrorCode.FORBIDDEN,
                 )
             kind = product_approval.ticket_kind(after_labels)

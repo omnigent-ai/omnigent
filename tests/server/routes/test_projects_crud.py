@@ -491,7 +491,7 @@ async def test_the_owner_routes_events_to_a_persona_and_can_remove_the_lead(
     chosen = await route({"router_identity_id": qa["id"], "lead_removed": True})
     assert chosen["router"] == {"identity_id": qa["id"], "name": "QA"}
     listed = (await project_client.get(f"{project}/identities")).json()["data"]
-    assert [(entry["name"], entry["router"]) for entry in listed] == [
+    assert sorted((entry["name"], entry["router"]) for entry in listed) == [
         ("PM", False),
         ("QA", True),
     ]
@@ -499,11 +499,26 @@ async def test_the_owner_routes_events_to_a_persona_and_can_remove_the_lead(
     assert snapshot.json()["project_router"] is True
     lead_session = await project_client.get(f"/v1/sessions/{created['main_session_id']}")
     assert lead_session.json()["project_router"] is False
+    # The router coordinates, so it sets `kind`; a worker or the removed Lead cannot.
+    ticket = (await project_client.post(f"{project}/tickets", json={"title": "T"})).json()
+    kind = {"labels": [{"key": "kind", "value": "fix"}]}
+    for session_id, status in (
+        (pm["active_session_id"], 403),
+        (created["main_session_id"], 403),
+        (qa["active_session_id"], 200),
+    ):
+        patched = await project_client.patch(
+            f"{project}/tickets/{ticket['id']}",
+            json=kind,
+            headers={ORCHESTRATION_SOURCE_HEADER: session_id},
+        )
+        assert patched.status_code == status, (session_id, patched.text)
     # A client config replace keeps the server-owned routing settings.
     await project_client.patch(project, json={"config": {"model": "m"}})
     assert (await project_client.get(project)).json()["router"]["name"] == "QA"
     first = await route({"router_identity_id": None, "lead_removed": True})
-    assert first["router"] == {"identity_id": pm["id"], "name": "PM"}
+    # Personas created in the same second order by id, so read the listing's first.
+    assert first["router"] == {"identity_id": listed[0]["id"], "name": listed[0]["name"]}
     removing = await project_client.put(
         f"{project}/routing", json={"router_identity_id": "orchestrator", "lead_removed": True}
     )
