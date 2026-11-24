@@ -84,11 +84,14 @@ const { registerBrowserTabsIpc } = require("./browserTabs");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { isBrowserViewFocused, sharedDesignTools } = require("./designTools");
+const { isTrustedRemoteContext, readTrustedRemoteHosts } = require("./trustedRemoteHosts");
+const { normalizedServerTarget } = require("./hostStatusIdentity");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const {
   createHostThisMachineChecker,
   SESSION_HOST_PROTOCOL,
   SSH_PREVIEW_PROTOCOL,
+  TRUSTED_REMOTE_PREVIEW_PROTOCOL,
 } = require("./hostIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
@@ -4762,6 +4765,12 @@ function createBrowserRegistryForWindow(win) {
             isDatabricksManagedServerUrl(target),
           serverTarget: target,
         }) ||
+        (context?.hostIsTrustedRemotePreview === true &&
+          isTrustedRemoteContext(
+            readTrustedRemoteHosts(loadSettings().trusted_remote_hosts),
+            context,
+            windows.get(win)?.serverUrl,
+          )) ||
         context?.hostIsThisMachine === true ||
         (context?.hostIsSshPreview === true &&
           sshPreviewHosts.allows(windows.get(win)?.serverUrl, context?.sourceHostId))
@@ -6087,6 +6096,7 @@ function registerIpc() {
       // v10 values); the SPA hides the toolbar button everywhere else.
       chromeCookieImport: process.platform === "darwin",
       sshLocalhostPreview: process.platform !== "win32",
+      trustedRemoteLocalhostPreview: true,
       // The floating New Agent panel is a macOS panel window.
       floatingComposer: process.platform === "darwin",
       // Settings can read and change the panel's shortcut by id.
@@ -6335,10 +6345,21 @@ function registerIpc() {
     getAgentContextForEvent: (event, opts) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       const sourceHostId = typeof opts?.sourceHostId === "string" ? opts.sourceHostId : null;
+      // Explicit grants follow the resolved server, including sign-in redirects.
+      const serverTarget = normalizedServerTarget(senderServerUrl(event));
       // Page supplies the session host ID; main verifies this machine's identity and live enrollment.
       return {
         serverTarget: arcaTarget(windowArcaServerUrl(win)),
         sourceHostId,
+        ...(opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
+        opts?.trustedRemotePreviewProtocol === TRUSTED_REMOTE_PREVIEW_PROTOCOL &&
+        isTrustedRemoteContext(
+          readTrustedRemoteHosts(loadSettings().trusted_remote_hosts),
+          { serverTarget, sourceHostId },
+          serverTarget,
+        )
+          ? { hostIsTrustedRemotePreview: true, serverTarget }
+          : {}),
         ...(opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
         opts?.sshPreviewProtocol === SSH_PREVIEW_PROTOCOL &&
         sshPreviewHosts.allows(windows.get(win)?.serverUrl, sourceHostId)
@@ -6421,13 +6442,24 @@ function registerIpc() {
       sourceHostId,
       rememberedArcaHostId,
       sourceIsArcaHost,
+      localhostBlocked = false,
+      trustedRemotePreviewProtocol,
     ) => {
       const previewHint = isLoopbackPreviewUrl(url)
         ? sshPreviewHosts.hint(senderServerUrl(event), sourceHostId)
         : null;
       if (previewHint) return previewHint;
       const targetContext = previewRecoveryTargetForEvent(event, url);
-      if (!targetContext) return null;
+      if (!targetContext) {
+        if (!localhostBlocked || !isLoopbackPreviewUrl(url) || !sourceHostId) return null;
+        if (trustedRemotePreviewProtocol !== TRUSTED_REMOTE_PREVIEW_PROTOCOL) {
+          return "This server's web app does not support settings-based localhost previews. Update it, then retry.";
+        }
+        const serverUrl = normalizedServerTarget(senderServerUrl(event));
+        if (!serverUrl) return null;
+        const entry = JSON.stringify({ server_url: serverUrl, host_id: sourceHostId });
+        return `To allow localhost previews from this session's host, add ${entry} to trusted_remote_hosts in the desktop settings.json, then retry the preview.`;
+      }
       if (typeof rememberedArcaHostId !== "string") {
         return "Open New session > Host > Run on Arca to restore its connection details, then retry the preview.";
       }

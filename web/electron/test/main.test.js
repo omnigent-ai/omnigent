@@ -903,6 +903,7 @@ describe("Arca extend IPC", () => {
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
         sshLocalhostPreview: true,
+        trustedRemoteLocalhostPreview: true,
         floatingComposer: true,
         floatingComposerShortcut: true,
       },
@@ -5820,6 +5821,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
         sshLocalhostPreview: true,
+        trustedRemoteLocalhostPreview: true,
         floatingComposer: true,
         floatingComposerShortcut: true,
       },
@@ -7970,5 +7972,101 @@ describe("session windows (src/main.js)", () => {
     assert.equal(openSessionWindow(h, "../settings"), false);
     assert.equal(openSessionWindow(h, { id: "conv_1" }), false);
     assert.equal(h.calls.windowOptions, undefined);
+  });
+});
+
+describe("settings-based remote previews", () => {
+  for (const redirected of [false, true]) {
+    it(`requires matching provenance and rereads settings (redirected: ${redirected})`, async (t) => {
+      const server = "https://server.example.com/preview";
+      const host = "sandbox-host";
+      const h = loadNavigationHarness({ serverUrl: server });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      h.api.createBrowserRegistryForWindow(h.win);
+      const deps = h.browserIpcDeps();
+      const event = { sender: h.webContents, senderFrame: { url: server } };
+      const opts = { sourceHostId: host, sessionHostProtocol: 1, trustedRemotePreviewProtocol: 1 };
+      const pickedServer = redirected ? "https://account.example.com/preview" : server;
+      await h.api.loadServerUrl(h.win, pickedServer);
+      h.api.setWindowServerUrl(h.win, server);
+      h.api.pinWindow(h.win, new URL(server).origin);
+      await h.win.loadURL(server);
+      const context = (options = opts) => deps.getAgentContextForEvent(event, options);
+      const allowed = h.browserRegistryDeps().allowsLocalhost;
+      const save = (serverUrl, hostId) =>
+        fs.writeFileSync(
+          h.settingsPath,
+          JSON.stringify({
+            trusted_remote_hosts: [{ server_url: serverUrl, host_id: hostId }],
+          }),
+        );
+      assert.equal(allowed(context()), false);
+      const hint = deps.getAgentNavigationHintForEvent(
+        event,
+        "http://localhost:5173",
+        host,
+        undefined,
+        false,
+        true,
+        1,
+      );
+      const advertised = JSON.parse(hint.match(/add (\{.*\}) to trusted_remote_hosts/)[1]);
+      assert.deepEqual(advertised, { server_url: server, host_id: host });
+      save(advertised.server_url, advertised.host_id);
+      assert.equal(context().serverTarget, server);
+      assert.equal(context().hostIsTrustedRemotePreview, true);
+      assert.equal(context().hostIsThisMachine, false);
+      assert.equal(allowed(context()), true);
+      for (const trustedRemotePreviewProtocol of [undefined, 0, 2]) {
+        assert.equal(allowed(context({ ...opts, trustedRemotePreviewProtocol })), false);
+      }
+      assert.equal(allowed(context({ ...opts, sourceHostId: "another-host" })), false);
+      const loaded = context();
+      h.api.setWindowServerUrl(h.win, "https://other.example.com");
+      assert.equal(allowed(loaded), false);
+      h.api.setWindowServerUrl(h.win, server);
+      assert.equal(allowed(loaded), true);
+      save("https://other.example.com", host);
+      assert.equal(allowed(loaded), false);
+      save(server, "another-host");
+      assert.equal(allowed(loaded), false);
+      fs.writeFileSync(h.settingsPath, "{}");
+      assert.equal(allowed(loaded), false);
+      assert.equal(context().hostIsTrustedRemotePreview, undefined);
+    });
+  }
+
+  it("offers an exact settings entry only for a denied localhost permission", (t) => {
+    const server = "https://server.example.com";
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const hint = (url, blocked, options = { trustedRemotePreviewProtocol: 1 }) =>
+      h
+        .browserIpcDeps()
+        .getAgentNavigationHintForEvent(
+          event,
+          url,
+          'host"quoted',
+          undefined,
+          false,
+          blocked,
+          options.trustedRemotePreviewProtocol,
+        );
+    assert.match(hint("http://localhost:5173", true), /trusted_remote_hosts/);
+    assert.ok(
+      hint("http://localhost:5173", true).includes(
+        JSON.stringify({
+          server_url: `${server}/`,
+          host_id: 'host"quoted',
+        }),
+      ),
+    );
+    assert.equal(hint("http://localhost:5173", false), null);
+    assert.equal(hint("https://example.com", true), null);
+    assert.match(hint("http://localhost:5173", true, {}), /web app.*Update it/);
+    assert.doesNotMatch(hint("http://localhost:5173", true, {}), /trusted_remote_hosts/);
   });
 });

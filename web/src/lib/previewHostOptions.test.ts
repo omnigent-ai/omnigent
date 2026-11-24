@@ -233,3 +233,20 @@ it.each([
 ])("recognizes preview URL %s: %s", (url, expected) => {
   expect(isLoopbackPreviewUrl(url)).toBe(expected);
 });
+
+it.each([false, true])(
+  "negotiates settings-based previews independently of SSH: %s",
+  async (ssh) => {
+    vi.mocked(getDesktopFeatures).mockResolvedValue({
+      trustedRemoteLocalhostPreview: true,
+      sshLocalhostPreview: ssh,
+    });
+    expect(await previewHostOptions("remote", "https://example.com")).toEqual({
+      sourceHostId: "remote",
+      sessionHostProtocol: 1,
+      trustedRemotePreviewProtocol: 1,
+      ...(ssh ? { sshPreviewProtocol: 1 } : {}),
+    });
+    expect(fetchHosts).not.toHaveBeenCalled();
+  },
+);
