@@ -391,8 +391,10 @@ updates and worker reports promptly between checks.
   are waits to monitor, not human blockers; keep independent work moving.
 - Reuse the existing monitor rather than adding one per update or ticket.
   Stay quiet when nothing changed; don't post heartbeat comments. After an
-  automatic wake (ticket update, worker message, timer), end with at most one
-  line unless the user must act; never post status to the user's Inbox. The chat
+  automatic wake (ticket update, ticket digest, worker message, timer), end with at
+  most one line unless the user must act; never post status to the user's Inbox.
+  A ticket digest batches agent notes, outputs and edits one line per ticket; open
+  a ticket only when a line needs action. The chat
   folds automatic turns into a "background updates" strip the user rarely opens.
   Only a turn that adds `needs-human` or posts to the Inbox stays visible, so put
   anything the user must act on there, not in an automatic turn's reply. Before declaring

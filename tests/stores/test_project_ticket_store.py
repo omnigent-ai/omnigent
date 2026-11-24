@@ -540,10 +540,10 @@ def test_description_stages_and_feedback_change_atomically(board, monkeypatch):
     assert review["comment_count"] == 2 and review["stage_id"] == "review"
     append = tickets._append
 
-    def fail_comment(session, project_row, ticket_row, who, kind, payload):
+    def fail_comment(session, project_row, ticket_row, who, kind, payload, **options):
         if kind == "comment":
             raise RuntimeError("feedback unavailable")
-        append(session, project_row, ticket_row, who, kind, payload)
+        append(session, project_row, ticket_row, who, kind, payload, **options)
 
     with monkeypatch.context() as patch:
         patch.setattr(tickets, "_append", fail_comment)

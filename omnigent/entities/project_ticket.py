@@ -37,6 +37,8 @@ EVENT_CODES = {"created": 0, "updated": 1, "comment": 2, "execution": 3, "output
 NOTIFICATION_PENDING = 0
 NOTIFICATION_QUEUED = 1
 NOTIFICATION_SKIPPED = 2
+# Pending, but batched into the orchestrator's next digest instead of waking it.
+NOTIFICATION_DIGEST = 3
 TICKET_PAGE_MAX = 100
 STAGE_EDIT_TICKET_MAX = 500
 

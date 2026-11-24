@@ -6,7 +6,12 @@ from uuid import uuid4
 import pytest
 
 from omnigent.entities import MessageData
-from omnigent.entities.project_ticket import CreateTicket, TicketActor
+from omnigent.entities.project_ticket import (
+    CommentOnTicket,
+    CreateTicket,
+    TicketActor,
+    UpdateTicket,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HostHelloFrame,
@@ -1365,18 +1370,18 @@ async def test_notification_enqueue_survives_crash_without_duplicate_message(
     service = project_app.state.project_ticket_notifications
     base = f"/v1/projects/{project['id']}/tickets"
     ticket = (await project_client.post(base, json={"title": "Durable update"})).json()
-    mark = service.tickets.mark_notified
+    mark = service.tickets.mark_notified_many
 
     def crash(*args):
         raise RuntimeError("crash after durable enqueue")
 
-    monkeypatch.setattr(service.tickets, "mark_notified", crash)
+    monkeypatch.setattr(service.tickets, "mark_notified_many", crash)
     await service.flush_page(project_app)
     queued = store.list_pending_inputs(session_id)
     assert len(queued) == 1
     assert "Durable update" in queued[0].data.content[0]["text"]
     assert service.tickets.pending_notifications()
-    monkeypatch.setattr(service.tickets, "mark_notified", mark)
+    monkeypatch.setattr(service.tickets, "mark_notified_many", mark)
     restarted = ProjectTicketNotifications(service.tickets, service.projects, service.inputs)
     await restarted.flush_page(project_app)
     assert len(store.list_pending_inputs(session_id)) == 1
@@ -1387,6 +1392,63 @@ async def test_notification_enqueue_survives_crash_without_duplicate_message(
         headers={ORCHESTRATION_SOURCE_HEADER: session_id},
     )
     assert service.tickets.pending_notifications() == []
+
+
+async def test_worker_notes_wait_for_digest_until_an_urgent_event_flushes_them(
+    project_client, project_app, db_uri
+):
+    project = (await project_client.post("/v1/projects", json={"name": "Quiet"})).json()
+    session_id = project["main_session_id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(session_id, uuid4().hex, "/tmp/project")
+    worker = store.create_conversation(project_id=project["id"]).id
+    service = project_app.state.project_ticket_notifications
+    service.digest_seconds = 3600
+    base = f"/v1/projects/{project['id']}/tickets"
+    ticket = (await project_client.post(base, json={"title": "Background work"})).json()
+    await service.flush_page(project_app)
+    assert len(store.list_pending_inputs(session_id)) == 1
+    owner = (await project_client.get(f"{base}/{ticket['id']}/events")).json()["data"][0]
+    tickets = service.tickets
+    actor = TicketActor(user_id=owner["user_id"], session_id=worker)
+    tickets.create(project["id"], CreateTicket(title="Worker-made ticket"), actor)
+    for index in range(3):
+        tickets.comment(
+            project["id"],
+            ticket["id"],
+            CommentOnTicket(
+                text=f"Worker note {index}",
+                outputs=[{"type": "link", "url": f"https://example.com/{index}"}],
+            ),
+            actor,
+        )
+    tickets.update(project["id"], ticket["id"], UpdateTicket(description="Edited"), actor)
+    await service.flush_page(project_app)
+    assert len(store.list_pending_inputs(session_id)) == 1
+
+    await service.flush_page(project_app, force_digest=True)
+    digest = store.list_pending_inputs(session_id)[-1].data.content[0]["text"]
+    assert digest.startswith("Ticket update digest")
+    assert "Digest of 8 background updates" in digest
+    assert f'- {ticket["id"]} "Background work": agent note ×3, output ×3, edited description' in (
+        digest
+    )
+    assert '"Worker-made ticket": created' in digest
+    assert digest.count(ticket["id"]) == 1 and "https://example.com/2" in digest
+    assert tickets.pending_notifications() == []
+
+    tickets.comment(project["id"], ticket["id"], CommentOnTicket(text="Later note"), actor)
+    tickets.update(
+        project["id"],
+        ticket["id"],
+        UpdateTicket(labels=[{"key": "needs-human"}], comment="Which option?"),
+        actor,
+    )
+    await service.flush_page(project_app)
+    urgent = store.list_pending_inputs(session_id)[-1].data.content[0]["text"]
+    assert urgent.startswith("Automatic ticket update")
+    assert "Which option?" in urgent and "Later note" in urgent
+    assert tickets.pending_notifications() == []
 
 
 @pytest.mark.parametrize("external_host", [False, True])
@@ -1405,7 +1467,8 @@ async def test_notifications_drain_through_normal_dispatch_after_reconnect(
     await project_client.post(f"{base}/{ticket['id']}/comments", json={"text": "First update"})
     service = project_app.state.project_ticket_notifications
     await service.flush_page(project_app)
-    assert len(store.list_pending_inputs(session_id)) == 2
+    # Both urgent events arrive as one batched turn.
+    assert len(store.list_pending_inputs(session_id)) == 1
     assert len(service.tickets.pending_notifications()) == (0 if external_host else 2)
 
     forwarded = []
@@ -1443,17 +1506,17 @@ async def test_notifications_drain_through_normal_dispatch_after_reconnect(
         await poll_until_async(
             lambda: (
                 late_update
-                and sum(event.get("type") == "message" for event in forwarded) >= 3
+                and sum(event.get("type") == "message" for event in forwarded) >= 2
                 and not store.list_pending_inputs(session_id)
             ),
             timeout_s=5,
         )
         turns = [event for event in forwarded if event.get("type") == "message"]
-        assert len(turns) == 3
-        assert len({turn["persisted_item_id"] for turn in turns}) == 3
+        assert len(turns) == 2
+        assert len({turn["persisted_item_id"] for turn in turns}) == 2
         assert "Persisted task" in json.dumps(turns[0])
-        assert "First update" in json.dumps(turns[1])
-        assert "Arrived while draining" in json.dumps(turns[2])
+        assert "First update" in json.dumps(turns[0])
+        assert "Arrived while draining" in json.dumps(turns[1])
         assert service.tickets.pending_notifications() == []
     finally:
         await inputs.shutdown()

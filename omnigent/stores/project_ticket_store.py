@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import and_, func, or_, select, union_all
+from sqlalchemy import and_, case, func, or_, select, union_all
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -31,6 +31,7 @@ from omnigent.db.utils import (
 from omnigent.entities.project_ticket import (
     EVENT_CODES,
     LEGACY_STATUS_CODES,
+    NOTIFICATION_DIGEST,
     NOTIFICATION_PENDING,
     NOTIFICATION_QUEUED,
     NOTIFICATION_SKIPPED,
@@ -134,6 +135,7 @@ def _note_audience(
 
 
 NEEDS_HUMAN_LABEL = "needs-human"
+_UNDELIVERED = (NOTIFICATION_PENDING, NOTIFICATION_DIGEST)
 
 
 def _has_needs_human(labels: Any) -> bool:
@@ -203,6 +205,24 @@ def _labeled_event(
     return event
 
 
+def _wakes_orchestrator(
+    kind: str, payload: dict[str, Any], actor: TicketActor, *, needs_human_changed: bool
+) -> bool:
+    """Whether an event needs an immediate orchestrator turn rather than the next digest."""
+    if actor.session_id is None and actor.agent_id is None:
+        return True
+    if needs_human_changed:
+        return True
+    if kind == "created":
+        return _has_needs_human(payload.get("labels"))
+    if kind == "updated":
+        changes = payload.get("changes")
+        return isinstance(changes, dict) and "stage_id" in changes
+    if kind in ("comment", "execution"):
+        return payload.get("audience") == "human" or payload.get("final") is True
+    return False
+
+
 def _require_complete(project: SqlProject, ticket: SqlProjectTicket) -> None:
     if not _stage(_stages(project), _stage_id(ticket)).is_complete:
         raise OmnigentError(
@@ -247,7 +267,7 @@ def _event(row: SqlProjectTicketEvent) -> dict[str, Any]:
         "agent_id": row.agent_id,
         "payload": payload,
         "created_at": row.created_at,
-        "notification_pending": row.notification_state == NOTIFICATION_PENDING,
+        "notification_pending": row.notification_state in _UNDELIVERED,
     }
 
 
@@ -299,7 +319,15 @@ class ProjectTicketStore:
         actor: TicketActor,
         kind: str,
         payload: dict[str, Any],
+        *,
+        needs_human_changed: bool = False,
     ) -> None:
+        if actor.session_id is not None and actor.session_id == _orchestrator_session_id(project):
+            state = NOTIFICATION_SKIPPED
+        elif _wakes_orchestrator(kind, payload, actor, needs_human_changed=needs_human_changed):
+            state = NOTIFICATION_PENDING
+        else:
+            state = NOTIFICATION_DIGEST
         session.add(
             SqlProjectTicketEvent(
                 workspace_id=project.workspace_id,
@@ -313,10 +341,7 @@ class ProjectTicketStore:
                 agent_id=actor.agent_id,
                 payload=payload,
                 created_at=now_epoch(),
-                notification_state=NOTIFICATION_SKIPPED
-                if actor.session_id is not None
-                and actor.session_id == _orchestrator_session_id(project)
-                else NOTIFICATION_PENDING,
+                notification_state=state,
             )
         )
         ticket.next_event_position += 1
@@ -775,6 +800,9 @@ class ProjectTicketStore:
                 and _has_needs_human(changes.get("labels"))
                 and not _has_needs_human(row.labels)
             )
+            needs_human_changed = body.labels is not None and _has_needs_human(
+                changes.get("labels")
+            ) != _has_needs_human(row.labels)
             for key, value in changes.items():
                 setattr(row, key, value)
             if target is not None:
@@ -790,6 +818,7 @@ class ProjectTicketStore:
                     actor,
                     "updated",
                     {"changes": changes, **({"stage": _stage_snapshot(target)} if target else {})},
+                    needs_human_changed=needs_human_changed,
                 )
             if body.final:
                 _require_complete(project, row)
@@ -1104,7 +1133,7 @@ class ProjectTicketStore:
                 SqlProjectTicketEvent.id,
             )
             stmt = select(SqlProjectTicketEvent).where(
-                SqlProjectTicketEvent.notification_state == NOTIFICATION_PENDING
+                SqlProjectTicketEvent.notification_state.in_(_UNDELIVERED)
             )
             if after is not None:
                 stmt = stmt.where(keyset_after(self._dialect_name, columns, after))
@@ -1118,6 +1147,81 @@ class ProjectTicketStore:
                 .limit(min(limit, 32))
             ).all()
             return [{**_event(row), "workspace_id": row.workspace_id} for row in rows]
+
+    def pending_notification_projects(self) -> builtins.list[dict[str, Any]]:
+        """Privileged delivery worker: projects with undelivered events, urgent or batched."""
+        with self._session("pending_ticket_notification_projects") as session:
+            urgent = func.max(
+                case(
+                    (SqlProjectTicketEvent.notification_state == NOTIFICATION_PENDING, 1), else_=0
+                )
+            )
+            rows = session.execute(
+                select(
+                    SqlProjectTicketEvent.workspace_id,
+                    SqlProjectTicketEvent.project_id,
+                    urgent,
+                    func.min(SqlProjectTicketEvent.created_at),
+                )
+                .where(SqlProjectTicketEvent.notification_state.in_(_UNDELIVERED))
+                .group_by(SqlProjectTicketEvent.workspace_id, SqlProjectTicketEvent.project_id)
+            ).all()
+            return [
+                {
+                    "workspace_id": workspace_id,
+                    "project_id": project_id,
+                    "urgent": bool(has_urgent),
+                    "oldest_at": oldest_at,
+                }
+                for workspace_id, project_id, has_urgent, oldest_at in rows
+            ]
+
+    def project_pending_notifications(
+        self, project_id: str, *, limit: int = 200
+    ) -> builtins.list[dict[str, Any]]:
+        """Undelivered events for one project in arrival order, each with its ticket title."""
+        with self._session("project_pending_ticket_notifications") as session:
+            rows = session.execute(
+                select(SqlProjectTicketEvent, SqlProjectTicket.title)
+                .join(
+                    SqlProjectTicket,
+                    and_(
+                        SqlProjectTicket.workspace_id == SqlProjectTicketEvent.workspace_id,
+                        SqlProjectTicket.project_id == SqlProjectTicketEvent.project_id,
+                        SqlProjectTicket.id == SqlProjectTicketEvent.ticket_id,
+                    ),
+                )
+                .where(
+                    SqlProjectTicketEvent.workspace_id == current_workspace_id(),
+                    SqlProjectTicketEvent.project_id == _identifier(project_id),
+                    SqlProjectTicketEvent.notification_state.in_(_UNDELIVERED),
+                )
+                .order_by(
+                    SqlProjectTicketEvent.created_at,
+                    SqlProjectTicketEvent.ticket_id,
+                    SqlProjectTicketEvent.position,
+                )
+                .limit(limit)
+            ).all()
+            return [
+                {
+                    **_event(row),
+                    "ticket_title": title,
+                    "urgent": row.notification_state == NOTIFICATION_PENDING,
+                }
+                for row, title in rows
+            ]
+
+    def mark_notified_many(self, project_id: str, events: builtins.list[tuple[str, str]]) -> None:
+        """Retire a delivered batch of ``(ticket_id, event_id)`` pairs in one transaction."""
+        with self._write("mark_ticket_notifications_queued") as session:
+            for ticket_id, event_id in events:
+                event = session.get(
+                    SqlProjectTicketEvent,
+                    (current_workspace_id(), project_id, ticket_id, event_id),
+                )
+                if event is not None and event.notification_state in _UNDELIVERED:
+                    event.notification_state = NOTIFICATION_QUEUED
 
     def mark_notified(self, project_id: str, ticket_id: str, event_id: str) -> None:
         with self._write("mark_ticket_notification_queued") as session:
