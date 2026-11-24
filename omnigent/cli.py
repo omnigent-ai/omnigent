@@ -8208,9 +8208,11 @@ def _session_command_server(server: str | None) -> str:
     :returns: The base URL, without a trailing slash.
     :raises click.ClickException: When no server is configured or running.
     """
+    from omnigent.session_cli import command_error
+
     base_url = _resolve_attach_server(server, _load_effective_config().get("server"))
     if base_url is None:
-        raise click.ClickException(
+        raise command_error(
             "No Omnigent server found: pass --server, or set the server in your config."
         )
     return base_url.rstrip("/")
@@ -8265,7 +8267,12 @@ def session_send(
     """
     import asyncio
 
-    from omnigent.session_cli import open_session_client, send_and_wait, send_message
+    from omnigent.session_cli import (
+        command_error,
+        open_session_client,
+        send_and_wait,
+        send_message,
+    )
 
     if message is not None and message_file is not None:
         raise click.UsageError("Pass --message or --message-file, not both.")
@@ -8308,7 +8315,7 @@ def session_send(
                 err=True,
             )
         if result.status == "failed":
-            raise click.ClickException(
+            raise command_error(
                 f"The turn failed. `{cli_invocation()} session read {session_id}` shows "
                 "what the session said."
             )

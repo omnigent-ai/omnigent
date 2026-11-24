@@ -7,6 +7,7 @@ import json
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
+import click
 import httpx
 import pytest
 import respx
@@ -571,6 +572,22 @@ def test_get_reports_a_session_it_cannot_show(
 
     assert result.exit_code == 1
     assert error in result.stderr
+
+
+def test_session_command_errors_skip_the_stale_host_hint(router: respx.MockRouter) -> None:
+    """`omnigent stop` can't fix a missing session, so the CLI shouldn't suggest it."""
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+    from omnigent.session_cli import open_session_client, session_info
+
+    router.get(_STATE_URL).mock(return_value=httpx.Response(404))
+
+    async def _get() -> None:
+        async with open_session_client(_BASE) as client:
+            await session_info(client, _SESSION, include_usage=False)
+
+    with pytest.raises(click.ClickException) as raised:
+        asyncio.run(_get())
+    assert suppresses_recovery_hint(raised.value)
 
 
 def _transcript(count: int) -> list[dict]:

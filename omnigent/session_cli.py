@@ -50,6 +50,22 @@ _STATE_PARAMS = {
 }
 
 
+def command_error(message: str) -> click.ClickException:
+    """
+    Build a ``session send|get|read`` error that ``omnigent stop`` can't fix.
+
+    The CLI otherwise appends its stale-host recovery hint to every error.
+
+    :param message: The error, e.g. ``"Session conv_abc123 was not found."``.
+    :returns: The exception to raise.
+    """
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+    error = click.ClickException(message)
+    setattr(error, SUPPRESS_RECOVERY_HINT_ATTR, True)
+    return error
+
+
 @dataclass(frozen=True)
 class TurnResult:
     """
@@ -115,15 +131,15 @@ async def send_message(client: httpx.AsyncClient, session_id: str, text: str) ->
             timeout=_SEND_TIMEOUT,
         )
     except httpx.HTTPError as exc:
-        raise click.ClickException(
+        raise command_error(
             f"The message could not be confirmed ({exc}). Check the session before "
             "sending it again."
         ) from exc
     if resp.status_code == 404:
-        raise click.ClickException(f"Session {session_id} was not found.")
+        raise command_error(f"Session {session_id} was not found.")
     refusal = message_refusal(resp, "the message")
     if refusal is not None:
-        raise click.ClickException(f"{refusal[:1].upper()}{refusal[1:]}.")
+        raise command_error(f"{refusal[:1].upper()}{refusal[1:]}.")
     item_id = response_object(resp).get("item_id")
     return item_id if isinstance(item_id, str) and item_id else None
 
@@ -295,16 +311,16 @@ async def send_and_wait(
             )
     except TimeoutError:
         if not posting:
-            raise click.ClickException(
+            raise command_error(
                 f"Timed out after {timeout_s:g}s reading session {session_id}; the message "
                 "was not sent."
             ) from None
         if not sent:
-            raise click.ClickException(
+            raise command_error(
                 f"Timed out after {timeout_s:g}s before the server confirmed the message. "
                 "Check the session before sending it again."
             ) from None
-        raise click.ClickException(
+        raise command_error(
             f"Timed out after {timeout_s:g}s waiting for session {session_id} to reply. "
             "The message stays with the session."
         ) from None
@@ -453,17 +469,17 @@ async def session_info(
     except (TypeError, ValueError):
         decoded = None
     if not isinstance(decoded, dict):
-        raise click.ClickException(f"Could not read session {session_id}.")
+        raise command_error(f"Could not read session {session_id}.")
     info = cast(JsonObject, decoded)
     error = info.get("error")
     if error == "session_not_found":
-        raise click.ClickException(f"Session {session_id} was not found.")
+        raise command_error(f"Session {session_id} was not found.")
     if error == "access_denied":
-        raise click.ClickException(
+        raise command_error(
             f"The server refused to show session {session_id}; check that you're signed in."
         )
     if error is not None:
-        raise click.ClickException(f"Could not read session {session_id}: {error}")
+        raise command_error(f"Could not read session {session_id}: {error}")
     return info
 
 
@@ -560,11 +576,11 @@ async def _read_json(
     try:
         resp = await client.get(url, params=params)
     except httpx.HTTPError as exc:
-        raise click.ClickException(f"Could not read session {session_id} ({exc}).") from exc
+        raise command_error(f"Could not read session {session_id} ({exc}).") from exc
     if resp.status_code == 404:
-        raise click.ClickException(f"Session {session_id} was not found.")
+        raise command_error(f"Session {session_id} was not found.")
     if resp.status_code >= 400:
-        raise click.ClickException(
+        raise command_error(
             f"Could not read session {session_id} ({resp.status_code}): {server_error(resp)}"
         )
     return response_object(resp)
