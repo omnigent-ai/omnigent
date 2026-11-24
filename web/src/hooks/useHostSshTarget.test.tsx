@@ -126,6 +126,22 @@ describe("useHostSshTarget", () => {
     await waitFor(() => expect(labelReads()).toHaveLength(2));
   });
 
+  it("reads a failed host again through the session whose menu asks next", async () => {
+    fetchMock.mockRejectedValue(new Error("This session can't read the file."));
+    const { rerender } = renderHook(
+      ({ session, wanted }: { session: string; wanted: boolean }) =>
+        useHostSshTargetDemand("host_1", session, wanted),
+      { wrapper, initialProps: { session: "conv_1", wanted: true } },
+    );
+    await waitFor(() => expect(client.getQueryState(HOST_KEY)?.status).toBe("error"));
+    serveUnnamedMachine();
+    // A menu in another session on the host closes, then opens.
+    rerender({ session: "conv_2", wanted: false });
+    rerender({ session: "conv_2", wanted: true });
+    await waitFor(() => expect(client.getQueryState(HOST_KEY)?.status).toBe("success"));
+    expect(labelReads().map(([conversationId]) => conversationId)).toEqual(["conv_1", "conv_2"]);
+  });
+
   it("reads nothing for an offline host or one its provider names", async () => {
     stubHost({ status: "offline", sandbox_provider: null });
     renderTwoSessions(true).unmount();
