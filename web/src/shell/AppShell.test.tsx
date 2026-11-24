@@ -351,6 +351,7 @@ const forkSessionMock = vi.mocked(forkSession);
 const getSessionSlimMock = vi.mocked(getSessionSlim);
 
 import { AppShell } from "./AppShell";
+import { setSplitBesideChat } from "./chatPaneToolbarHost";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
 import { bindConversationForTest, useChatStore } from "@/store/chatStore";
@@ -1201,6 +1202,25 @@ describe("AppShell header", () => {
         );
       },
     );
+
+    it("drops the row while a split floats beside the chat as its own cards, and brings it back", async () => {
+      windowWidth(1440);
+      terminalFirstSession();
+      renderShell(
+        "/c/conv_terminal",
+        serverInfo({ features: { floating_panes: true, workspace_sidebar_v2: true } }),
+      );
+      const column = () => document.querySelector("[data-main-view]");
+
+      expect(await screen.findByRole("group", { name: "Chat pane" })).toBeInTheDocument();
+      expect(column()).toHaveAttribute("data-main-view", "chat");
+      act(() => setSplitBesideChat("conv_terminal", true));
+      expect(strip()).toBeNull();
+      expect(column()).toHaveAttribute("data-main-view", "terminal");
+      act(() => setSplitBesideChat("conv_terminal", false));
+      expect(screen.getByRole("group", { name: "Chat pane" })).toContainElement(viewSwitch());
+      expect(column()).toHaveAttribute("data-main-view", "chat");
+    });
 
     it.each([
       ["without floating panes", undefined, 1440, { "omnigent.ui": "terminal" }],
