@@ -86,6 +86,18 @@ export interface ProjectTicket {
   new_update_count?: number;
   /** Position of the first new comment or update, or null when nothing is new. */
   first_new_position?: number | null;
+  /** The pinned result while the ticket stays complete; only on single-ticket reads. */
+  final_update?: TicketFinalUpdate | null;
+  /** Complete without a final update yet; only on single-ticket reads. */
+  needs_final_update?: boolean;
+}
+export interface TicketFinalUpdate {
+  event_id: string;
+  position: number;
+  text: string;
+  user_id: string | null;
+  session_id: string | null;
+  created_at: number;
 }
 export interface TicketEvent {
   id: string;
@@ -119,11 +131,12 @@ export interface TicketSession {
 }
 export type TicketChanges = Partial<
   Pick<ProjectTicket, "title" | "description" | "stage_id" | "labels">
-> & { comment?: string };
+> & { comment?: string; final?: boolean };
 export interface TicketComment {
   text: string;
   kind?: "comment" | "execution";
   outputs?: TicketOutput[];
+  final?: boolean;
 }
 
 function path(projectId: string, ticketId?: string): string {

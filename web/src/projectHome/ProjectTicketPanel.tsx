@@ -44,6 +44,7 @@ import {
   ticketEventStage,
   type ProjectTicket,
   type TicketEvent,
+  type TicketFinalUpdate,
   type TicketOutput,
   type TicketLabel,
 } from "@/lib/projectTicketsApi";
@@ -495,6 +496,12 @@ function TicketDetails({
                   </Button>
                 )}
               </section>
+              {ticket.final_update && (
+                <TicketFinalUpdateSection
+                  update={ticket.final_update}
+                  fallbackSessionId={projectSessionId}
+                />
+              )}
             </div>
           )}
           {!editing && <TicketError error={update.error} />}
@@ -1086,6 +1093,35 @@ function TicketNewDivider({ dividerRef }: { dividerRef: Ref<HTMLLIElement> }) {
   );
 }
 
+/** The completed ticket's plain-language result, pinned under the description and never folded. */
+function TicketFinalUpdateSection({
+  update,
+  fallbackSessionId,
+}: {
+  update: TicketFinalUpdate;
+  fallbackSessionId: string | null;
+}) {
+  return (
+    <section
+      aria-label="Final update"
+      className="space-y-2 rounded-lg border border-border/60 bg-muted/30 px-3 py-2.5"
+    >
+      <h3 className="flex items-baseline justify-between gap-3 text-[length:calc(var(--text-ui)+2px)] font-bold">
+        Final update
+        <time
+          className="shrink-0 text-sm font-normal text-muted-foreground tabular-nums"
+          dateTime={new Date(update.created_at * 1000).toISOString()}
+        >
+          {absoluteTime(update.created_at * 1000)}
+        </time>
+      </h3>
+      <TicketFileLinks sessionId={update.session_id ?? fallbackSessionId}>
+        <TicketCommentBody body={update.text} />
+      </TicketFileLinks>
+    </section>
+  );
+}
+
 function TicketActivityItem({
   event,
   nowMs,
@@ -1148,7 +1184,11 @@ function TicketActivityItem({
           <div className="min-w-0 flex-1 wrap-anywhere">
             <span className={note ? "font-medium" : undefined}>{actor}</span>
             {note ? (
-              event.kind === "execution" && <span className="ml-2">Work update</span>
+              event.payload.final === true ? (
+                <span className="ml-2">Final update</span>
+              ) : (
+                event.kind === "execution" && <span className="ml-2">Work update</span>
+              )
             ) : (
               <>
                 {" "}
