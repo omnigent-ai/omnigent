@@ -6850,6 +6850,8 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByRole("menuitemcheckbox", { name: "Low" })).toBeTruthy();
     expect(screen.getByRole("menuitemcheckbox", { name: "High" })).toBeTruthy();
     expect(screen.queryByRole("menuitemcheckbox", { name: "Medium" })).toBeNull();
+    // Every agy effort row is an exact launch id; no no-op Default row.
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-default")).toBeNull();
     pickPrimaryOption("model", "GPT-OSS 120B Medium");
     expect(screen.queryByTestId("new-chat-landing-agent-efforts")).toBeNull();
     pickPrimaryOption("model", "Gemini 3.8 Flash");

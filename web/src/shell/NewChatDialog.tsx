@@ -4617,14 +4617,19 @@ function NewChatLandingContent({
           testId: "new-chat-landing-agent-efforts",
           header: selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort",
           choices: [
-            {
-              key: "__default__",
-              label: "Default",
-              checked: !routingOn && pickedEffort === "",
-              disabled: routingOn,
-              onSelect: () => selectPickerEffort(EFFORT_SELECT_NONE),
-              testId: "new-chat-landing-agent-effort-default",
-            },
+            // Each agy effort is an exact launch id, so there is no separate default.
+            ...(antigravityHostCatalog
+              ? []
+              : [
+                  {
+                    key: "__default__",
+                    label: "Default",
+                    checked: !routingOn && pickedEffort === "",
+                    disabled: routingOn,
+                    onSelect: () => selectPickerEffort(EFFORT_SELECT_NONE),
+                    testId: "new-chat-landing-agent-effort-default",
+                  },
+                ]),
             ...pickerEffortOptions.map((option) => ({
               key: option.value,
               label: option.label,
