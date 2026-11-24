@@ -8,6 +8,7 @@ import {
   readProjectTicketsSeen,
   useMarkProjectTicketsSeen,
   useNewTicketCount,
+  useNewTicketsOnOpen,
 } from "./projectTicketsSeen";
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -59,4 +60,25 @@ it("never moves the marker backwards and ignores servers without the field", asy
   await waitFor(() => expect(summary).toHaveBeenCalled());
   expect(result.current).toBe(0);
   expect(readProjectTicketsSeen("p2")).toBeUndefined();
+});
+
+it("marks tickets created since the board was last opened until each is opened", () => {
+  markProjectTicketsSeen("p1", 500);
+  const older = { id: "old", created_at: 400 };
+  const created = { id: "new", created_at: 600 };
+  const view = renderHook(({ open }) => useNewTicketsOnOpen("p1", open), {
+    initialProps: { open: null as string | null },
+  });
+  // Opening the board advances the marker; the visit still knows what was new.
+  markProjectTicketsSeen("p1", 600);
+  view.rerender({ open: null });
+  expect(view.result.current(older)).toBe(false);
+  expect(view.result.current(created)).toBe(true);
+  view.rerender({ open: "new" });
+  expect(view.result.current(created)).toBe(false);
+});
+
+it("marks nothing on a board the viewer has never opened", () => {
+  const { result } = renderHook(() => useNewTicketsOnOpen("p9", null));
+  expect(result.current({ id: "t", created_at: 1 })).toBe(false);
 });

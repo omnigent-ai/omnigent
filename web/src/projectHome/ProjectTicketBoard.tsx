@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
 import {
   DndContext,
   DragOverlay,
@@ -42,6 +42,9 @@ import {
 } from "./useProjectTickets";
 
 const NO_TICKET_FILTER: string[] = [];
+const NOT_NEW = () => false;
+// Whether a card is new since the viewer last opened the board (see useNewTicketsOnOpen).
+const NewTicketContext = createContext<(ticket: ProjectTicket) => boolean>(NOT_NEW);
 
 function collapsedStageKey(projectId: string, stageId: string) {
   return `omnigent.ticketBoard.collapsed.${projectId}.${stageId}`;
@@ -78,11 +81,13 @@ export function ProjectTicketBoard({
   selectedTicketId,
   overlayClearance,
   ticketIds = NO_TICKET_FILTER,
+  isNewTicket = NOT_NEW,
 }: {
   projectName: string;
   selectedTicketId: string | null;
   overlayClearance?: string;
   ticketIds?: string[];
+  isNewTicket?: (ticket: ProjectTicket) => boolean;
 }) {
   const { projectId, projects } = useTicketProject(projectName);
   if (projects.isLoading) return <Spinner className="m-6" aria-label="Loading project" />;
@@ -93,14 +98,16 @@ export function ProjectTicketBoard({
       </div>
     );
   return (
-    <TicketBoard
-      key={`${projectId}:${ticketIds.join(",")}`}
-      projectId={projectId}
-      projectName={projectName}
-      selectedTicketId={selectedTicketId}
-      overlayClearance={overlayClearance}
-      ticketIds={ticketIds}
-    />
+    <NewTicketContext.Provider value={isNewTicket}>
+      <TicketBoard
+        key={`${projectId}:${ticketIds.join(",")}`}
+        projectId={projectId}
+        projectName={projectName}
+        selectedTicketId={selectedTicketId}
+        overlayClearance={overlayClearance}
+        ticketIds={ticketIds}
+      />
+    </NewTicketContext.Provider>
   );
 }
 
@@ -475,12 +482,22 @@ function TicketCard({
 
 function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
   const now = useNow();
+  const isNew = useContext(NewTicketContext)(ticket);
   return (
     <>
       <div className="flex items-start gap-2">
         <h3 className="min-w-0 flex-1 text-ui leading-snug font-medium wrap-anywhere">
           {ticket.title}
         </h3>
+        {isNew && (
+          <span
+            data-testid="ticket-new"
+            title="New since you last opened this board"
+            className="mt-0.5 shrink-0 rounded-full bg-primary-cta px-1.5 text-xs leading-5 font-semibold text-primary-cta-foreground"
+          >
+            New
+          </span>
+        )}
         {ticket.has_running_agents === true && (
           <span role="img" aria-label="Running" className="mt-0.5 shrink-0">
             <RunningDot />

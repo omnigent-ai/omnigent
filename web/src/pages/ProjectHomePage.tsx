@@ -22,7 +22,7 @@ import {
 import { ProjectKanbanBoard } from "@/projectHome/ProjectKanbanBoard";
 import { ProjectSessionPanel } from "@/projectHome/ProjectSessionPanel";
 import { ProjectTicketBoard } from "@/projectHome/ProjectTicketBoard";
-import { useMarkProjectTicketsSeen } from "@/projectHome/projectTicketsSeen";
+import { useMarkProjectTicketsSeen, useNewTicketsOnOpen } from "@/projectHome/projectTicketsSeen";
 import { ProjectTicketPanel } from "@/projectHome/ProjectTicketPanel";
 import { ProjectOrchestrator, ProjectPersonaChat } from "@/projectHome/ProjectOrchestrator";
 import { useProjectIdentities } from "@/projectHome/useProjectIdentities";
@@ -75,6 +75,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
     useProjectIdentities(personaSessionId ? projectId : null).data?.find(
       (identity) => identity.active_session_id === personaSessionId,
     )?.name ?? "Persona";
+  const isNewTicket = useNewTicketsOnOpen(projectId, panelTicketId);
   useMarkProjectTicketsSeen(projectId, tickets && !hideBoard);
   const closePanel = useCallback(() => {
     setTicketExpanded(false);
@@ -178,6 +179,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
               <ProjectTicketBoard
                 projectName={projectName}
                 selectedTicketId={panelTicketId}
+                isNewTicket={isNewTicket}
                 ticketIds={ticketSelectionIds(searchParams)}
                 overlayClearance={composerOpen ? "10rem" : undefined}
               />

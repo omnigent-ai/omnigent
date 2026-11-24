@@ -1,4 +1,4 @@
-import { useEffect, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { getTicketCreationSummary } from "@/lib/projectTicketsApi";
@@ -104,4 +104,47 @@ export function useMarkProjectTicketsSeen(projectId: string | null, active: bool
   useEffect(() => {
     if (projectId && active && latest !== undefined) markProjectTicketsSeen(projectId, latest ?? 0);
   }, [projectId, active, latest]);
+}
+
+/**
+ * Which tickets count as new on this visit to a project's board: created after the
+ * seen marker as it stood when the board opened, and not opened since. Opening the
+ * board clears the sidebar badge, so this keeps the tickets it counted findable.
+ */
+export function useNewTicketsOnOpen(
+  projectId: string | null,
+  openTicketId: string | null,
+): (ticket: { id: string; created_at: number }) => boolean {
+  const [opened, setOpened] = useState<{
+    projectId: string | null;
+    since: number | undefined;
+    viewed: ReadonlySet<string>;
+  }>(() => ({
+    projectId,
+    since: projectId ? readProjectTicketsSeen(projectId) : undefined,
+    viewed: new Set(),
+  }));
+  let current = opened;
+  if (opened.projectId !== projectId) {
+    // Captured before the board's effect advances the marker.
+    current = {
+      projectId,
+      since: projectId ? readProjectTicketsSeen(projectId) : undefined,
+      viewed: new Set(),
+    };
+    setOpened(current);
+  }
+  useEffect(() => {
+    if (openTicketId === null) return;
+    setOpened((state) =>
+      state.viewed.has(openTicketId)
+        ? state
+        : { ...state, viewed: new Set([...state.viewed, openTicketId]) },
+    );
+  }, [openTicketId]);
+  const { since, viewed } = current;
+  return useCallback(
+    (ticket) => since !== undefined && ticket.created_at > since && !viewed.has(ticket.id),
+    [since, viewed],
+  );
 }
