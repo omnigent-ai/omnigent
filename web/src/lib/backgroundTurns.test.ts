@@ -15,14 +15,17 @@ function ticketUpdate(itemId: string, ticketId = TICKET): Bubble {
   );
 }
 
-function assistant(stableId: string, items: RenderItem[] = []): Bubble {
+function assistant(stableId: string, items: RenderItem[] = [], withText = true): Bubble {
+  const reply: RenderItem[] = withText
+    ? [{ kind: "text", itemId: null, text: "noted", final: true }]
+    : [];
   return {
     kind: "assistant",
     responseId: stableId,
     stableId,
     lifecycle: "completed",
     error: null,
-    items: [{ kind: "text", itemId: null, text: "noted", final: true }, ...items],
+    items: [...reply, ...items],
   };
 }
 
@@ -99,6 +102,27 @@ describe("foldBackgroundTurns", () => {
     expect(rows.map((row) => row.kind)).toEqual([
       "user",
       "assistant",
+      "user",
+      "assistant",
+      "background_updates",
+    ]);
+  });
+
+  it("keeps the reply to a person that lands after queued automatic inputs", () => {
+    const toolsOnly = assistant("a1", [toolCall("Skill", {})], false);
+    const rows = foldBackgroundTurns([
+      user("h1", "Please acknowledge"),
+      toolsOnly,
+      ticketUpdate("t1"),
+      ticketUpdate("t2"),
+      assistant("a2"),
+      ticketUpdate("t3"),
+      assistant("a3"),
+    ]);
+    expect(rows.map((row) => row.kind)).toEqual([
+      "user",
+      "assistant",
+      "background_updates",
       "user",
       "assistant",
       "background_updates",

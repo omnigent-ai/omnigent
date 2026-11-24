@@ -86,6 +86,13 @@ function reportsNeedsHuman(bubble: Bubble): boolean {
   }
 }
 
+function hasText(bubble: Bubble): boolean {
+  return (
+    bubble.kind === "assistant" &&
+    bubble.items.some((item) => item.kind === "text" && item.text.trim().length > 0)
+  );
+}
+
 function turnAsksHuman(turn: Bubble[]): boolean {
   return (
     reportsNeedsHuman(turn[0]!) ||
@@ -142,19 +149,26 @@ export function foldBackgroundTurns(bubbles: Bubble[]): Bubble[] {
     }
     run = [];
   };
+  // A person's message not yet answered in text: inputs queued during that turn can
+  // land before the reply, so the next automatic turn with text may hold the answer.
+  let awaitingReply = false;
   let index = 0;
   while (index < bubbles.length) {
     const bubble = bubbles[index]!;
     if (automaticInputKind(bubble) === null) {
       flushRun();
       out.push(bubble);
+      if (bubble.kind === "user") awaitingReply = true;
+      else if (hasText(bubble)) awaitingReply = false;
       index += 1;
       continue;
     }
     let end = index + 1;
     while (end < bubbles.length && isTurnBody(bubbles[end]!)) end += 1;
     const turn = bubbles.slice(index, end);
-    if (turnAsksHuman(turn)) {
+    const answersPerson = awaitingReply && turn.some(hasText);
+    if (answersPerson) awaitingReply = false;
+    if (answersPerson || turnAsksHuman(turn)) {
       flushRun();
       out.push(...turn);
     } else {
