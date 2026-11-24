@@ -34,8 +34,10 @@ function sessionTagToken(session: SessionMention): string {
   return session.token ?? `@${session.title}`;
 }
 
+const NO_ATTACHMENTS: PastedAttachment[] = [];
+
 function attachmentsOf(tags: TaggedMentions): PastedAttachment[] {
-  return tags.attachments ?? [];
+  return tags.attachments ?? NO_ATTACHMENTS;
 }
 
 function tagTokens(tags: TaggedMentions): string[] {

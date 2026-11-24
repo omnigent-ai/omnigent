@@ -268,19 +268,21 @@ export function composerInlineMentions(
   ];
 }
 
-const SPACE_RE = /\s/;
-const PUNCTUATION_RE = /[.,;:!?)\]}'"]/;
+// Characters that end a token. Only "." also needs what follows it: it is part of a filename.
+const TOKEN_END_RE = /[\s.,;:!?)\]}'"]/;
 
 /**
- * Whether a token ending at ``end`` is complete. Whitespace or the text end always ends it.
- * Punctuation ends it only when no word character follows, so ``@Plan`` is not ``@Plan.png``.
+ * Whether a token ending at ``end`` is complete. A "." ends it only when whitespace, the text
+ * end or more punctuation follows, so ``@Plan`` is not ``@Plan.png``. Other end characters
+ * (``@Plan's``, ``@Plan:``, ``@Plan,x``) end it as they always have.
  */
 function endsToken(text: string, end: number): boolean {
   const next = text[end];
-  if (next === undefined || SPACE_RE.test(next)) return true;
-  if (!PUNCTUATION_RE.test(next)) return false;
+  if (next === undefined) return true;
+  if (!TOKEN_END_RE.test(next)) return false;
+  if (next !== ".") return true;
   const after = text[end + 1];
-  return after === undefined || SPACE_RE.test(after) || PUNCTUATION_RE.test(after);
+  return after === undefined || TOKEN_END_RE.test(after);
 }
 
 /** Where a known token sits in composer text. */

@@ -1791,6 +1791,15 @@ describe("grid cell composer shares its session's draft", () => {
     expect(sent[1]).toBe(chipShot);
   });
 
+  it("gives a cell's tray files distinct names when they share one", () => {
+    const first = new File(["1"], "image.png", { type: "image/png" });
+    const second = new File(["2"], "image.png", { type: "image/png" });
+    bridgedCell({ text: "Two shots", files: [first, second] });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    const sent = send.mock.calls[0]![2] as File[];
+    expect(sent.map((file) => file.name)).toEqual(["image.png", "image (2).png"]);
+  });
+
   it("sends a tagged skill command as an ordinary message, not as a local command", () => {
     conversationRegistry
       .acquire(childId)

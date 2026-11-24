@@ -115,17 +115,23 @@ describe("unique tokens across files and sessions", () => {
 describe("token boundaries", () => {
   const plan = [{ token: "@Plan", marker: "[Session]" }];
 
-  it("does not end a token at punctuation that a word character follows", () => {
+  it("does not end a token at a dot that a word character follows", () => {
     expect(findMentionTokens("@Plan.png", ["@Plan"])).toEqual([]);
-    expect(findMentionTokens("@Plan-v2", ["@Plan"])).toEqual([]);
+    expect(findMentionTokens("@readme.md.bak", ["@readme.md"])).toEqual([]);
     expect(expandMentionTokens("Send @Plan.png", plan)).toBe("Send @Plan.png");
   });
 
-  it("ends a token at punctuation followed by space, end of text, or more punctuation", () => {
-    expect(expandMentionTokens("Ask @Plan. Then @Plan, and @Plan..", plan)).toBe(
-      "Ask [Session]. Then [Session], and [Session]..",
+  it("ends a token at a dot followed by space, end of text, or more punctuation", () => {
+    expect(expandMentionTokens("Ask @Plan. Then @Plan.. and @Plan.,", plan)).toBe(
+      "Ask [Session]. Then [Session].. and [Session].,",
     );
     expect(findMentionTokens("@Plan.\nnext", ["@Plan"]).map((range) => range.end)).toEqual([5]);
+  });
+
+  it("ends a token at the other punctuation as it always has, possessive included", () => {
+    expect(expandMentionTokens("Ask @Plan's plan, @Plan:x and @Plan,x", plan)).toBe(
+      "Ask [Session]'s plan, [Session]:x and [Session],x",
+    );
   });
 
   it("keeps a literal filename that starts with a session token as typed", () => {

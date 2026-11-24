@@ -147,6 +147,7 @@ import {
   recallSessionMentions,
   type MentionState,
   type TaggedMentions,
+  findMentionTokens,
 } from "@/lib/composerMentions";
 import { clearLocalReviewContexts } from "@/lib/localReviewContext";
 import {
@@ -1166,16 +1167,23 @@ function SideChatComposer({
     ...quotes.map((replyQuote) => replyQuote.before),
   ]);
   // A pasted chip the shared draft still shows sends its file with the tray's.
-  // A tray file that shares a chip's name is renamed for the send, since the cell's tray is local.
+  // Tray files are renamed for the send where they clash with a chip, a literal spelling in the
+  // text, or an earlier tray file: the cell's tray is local, so the composer's namespace is rebuilt.
   const chipTokens = (sharedTags?.attachments ?? []).map((attachment) => attachment.token);
+  const takenForSend = [...chipTokens];
+  const literalText = [text, ...quotes.map((replyQuote) => replyQuote.before)].join("\n");
+  const sendableTrayFiles = files.map((file) => {
+    const unique = uniqueAttachmentName(
+      attachmentFilename(file),
+      (candidate) =>
+        takenForSend.includes(`@${candidate}`) ||
+        findMentionTokens(literalText, [`@${candidate}`]).length > 0,
+    );
+    takenForSend.push(`@${unique}`);
+    return unique === file.name ? file : new File([file], unique, { type: file.type });
+  });
   const attachedFiles = [
-    ...files.map((file) => {
-      const name = attachmentFilename(file);
-      const unique = uniqueAttachmentName(name, (candidate) =>
-        chipTokens.includes(`@${candidate}`),
-      );
-      return unique === file.name ? file : new File([file], unique, { type: file.type });
-    }),
+    ...sendableTrayFiles,
     ...(sharedTags?.attachments ?? []).map((attachment) => attachment.file),
   ];
   const canSend =
