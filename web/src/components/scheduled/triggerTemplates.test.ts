@@ -911,6 +911,17 @@ describe("Slack thread replies", () => {
     expect(prompt).toContain(
       "If a send times out or its result is unclear, don't retry it: set the thread's through as for an accepted send, so those replies are never sent twice, say in your reply that they may not have reached that session",
     );
+    // A run that sent a batch and stopped before its reply recorded it: the next run finds the
+    // earlier send, accepted or unclear, and moves past those replies instead of sending again.
+    const recover =
+      "If the last message you wrote before this run's message isn't the reply you read your check time from, an earlier run stopped before recording its thread sends.";
+    expect(prompt).toContain(recover);
+    expect(prompt).toContain(
+      "look through your own calls in this session since that reply, and the latest items of the thread's session (sys_session_get_history, tail_items 50), for a message from your session whose first line names this thread. Treat every reply up to the newest ts such a message names as already handled, whether that send was accepted or unclear",
+    );
+    expect(prompt.indexOf(recover)).toBeLessThan(
+      prompt.indexOf("For each thread with replies left, send its session one message"),
+    );
     // Pending entries name top-level messages; a thread send there would be read back as one.
     const threadStep = prompt.split("\n").find((line) => line.includes("Then send new replies"));
     expect(threadStep).not.toContain("Delivery pending:");
