@@ -1,4 +1,11 @@
-import { useId, useRef, useState, type ComponentProps, type KeyboardEvent } from "react";
+import {
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ComponentProps,
+  type KeyboardEvent,
+} from "react";
 import { UserRoundIcon } from "lucide-react";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
@@ -27,6 +34,14 @@ export function MentionTextarea({
   const identities = useProjectIdentities(projectId);
   const [query, setQuery] = useState<{ start: number; query: string } | null>(null);
   const [active, setActive] = useState(0);
+  const pendingCaret = useRef<number | null>(null);
+  useLayoutEffect(() => {
+    const target = containerRef.current?.querySelector("textarea");
+    if (pendingCaret.current === null || !target) return;
+    target.focus();
+    target.setSelectionRange(pendingCaret.current, pendingCaret.current);
+    pendingCaret.current = null;
+  }, [value]);
   const needle = query?.query.toLowerCase() ?? "";
   const suggestions = query
     ? (identities.data ?? [])
@@ -50,12 +65,10 @@ export function MentionTextarea({
     if (!target || !query) return;
     const caret = target.selectionStart ?? value.length;
     const next = insertMention(value, caret, query.start, name);
+    // Placed in the same commit as the new value, before any further keystroke lands.
+    pendingCaret.current = next.caret;
     onValueChange(next.text);
     setQuery(null);
-    requestAnimationFrame(() => {
-      target.focus();
-      target.setSelectionRange(next.caret, next.caret);
-    });
   };
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (open && !event.metaKey && !event.ctrlKey) {
@@ -101,13 +114,14 @@ export function MentionTextarea({
         }}
         onKeyDown={handleKeyDown}
       />
+      {/* The composer sits at the bottom of the panel, so the list opens upward. */}
       {open && (
         <ul
           id={listId}
           role="listbox"
           aria-label="Mention a persona"
           data-testid="persona-mention-suggestions"
-          className="absolute left-2 top-full z-50 mt-1 min-w-44 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md"
+          className="absolute bottom-full left-2 z-50 mb-1 min-w-44 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md"
         >
           {suggestions.map((identity, index) => (
             <li

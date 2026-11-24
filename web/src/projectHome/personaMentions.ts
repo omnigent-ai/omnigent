@@ -51,7 +51,8 @@ export function insertMention(
   start: number,
   name: string,
 ): { text: string; caret: number } {
-  const inserted = `@${name} `;
   const after = text.slice(caret).replace(/^\S*/, "");
-  return { text: text.slice(0, start) + inserted + after, caret: start + inserted.length };
+  // Reuse a following space rather than doubling it; the caret lands after it.
+  const inserted = after.startsWith(" ") ? `@${name}` : `@${name} `;
+  return { text: text.slice(0, start) + inserted + after, caret: start + name.length + 2 };
 }

@@ -37,7 +37,8 @@ describe("persona mention helpers", () => {
   it("finds the @query at the caret and inserts the chosen name", () => {
     expect(mentionQueryAt("cc @p", 5)).toEqual({ start: 3, query: "p" });
     expect(mentionQueryAt("mail a@b", 8)).toBeNull();
-    expect(insertMention("cc @p rest", 5, 3, "PM")).toEqual({ text: "cc @PM  rest", caret: 7 });
+    expect(insertMention("cc @p rest", 5, 3, "PM")).toEqual({ text: "cc @PM rest", caret: 7 });
+    expect(insertMention("cc @p", 5, 3, "PM")).toEqual({ text: "cc @PM ", caret: 7 });
   });
 
   it("bolds recorded mentions outside code and reads them from a payload", () => {
@@ -80,12 +81,16 @@ describe("MentionTextarea", () => {
       "PM",
       "Designer",
     ]);
-    fireEvent.change(input, { target: { value: "cc @de", selectionStart: 6 } });
+    fireEvent.change(input, {
+      target: { value: "cc @de please look", selectionStart: 6, selectionEnd: 6 },
+    });
     expect(screen.getAllByTestId("persona-mention-option").map((o) => o.textContent)).toEqual([
       "Designer",
     ]);
     fireEvent.keyDown(input, { key: "Enter" });
-    expect(input.value).toBe("cc @Designer ");
+    expect(input.value).toBe("cc @Designer please look");
+    // The caret sits after the mention as soon as the value renders, not a frame later.
+    expect([input.selectionStart, input.selectionEnd]).toEqual([13, 13]);
     expect(screen.queryByTestId("persona-mention-suggestions")).toBeNull();
   });
 });
