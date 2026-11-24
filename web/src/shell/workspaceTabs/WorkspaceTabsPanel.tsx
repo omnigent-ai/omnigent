@@ -134,6 +134,7 @@ import {
   recentPullRequestUrl,
 } from "./recentPullRequestRow";
 import { useRecentPullRequestFacts } from "./useRecentPullRequestFacts";
+import { shellLabelList } from "./useTabsShellClose";
 import { FileTypeIcon } from "@/shell/FileTypeIcon";
 import { WorkspaceHistoryChevrons } from "./WorkspaceHistoryChevrons";
 import { LOCAL_CHANGES_LABEL, type PlaceIcon, placeTitle, truncateMiddle } from "./placeTitle";
@@ -762,6 +763,15 @@ function WorkspaceTabsPanelImpl({
       return closed;
     };
   };
+  /** One message for a close, however many of its shells kept running. */
+  const reportShellsStillRunning = (keys: readonly string[]) => {
+    const names = shellLabelList(keys.map(terminalLabel));
+    const state = keys.length > 1 ? "They're still running." : "It's still running.";
+    toast.error(`Couldn't close ${names}. ${state}`, {
+      duration: Number.POSITIVE_INFINITY,
+      closeButton: true,
+    });
+  };
   /**
    * How closing a bound tab treats its resource: a shell asks, then ends, before its
    * tab goes; a browser view is released after. A side chat or sub-agent tab only
@@ -772,7 +782,11 @@ function WorkspaceTabsPanelImpl({
     if (binding?.kind === "terminal") {
       return {
         confirm: () => confirmCloseShell(binding.key),
-        teardown: () => endShell(binding.key),
+        teardown: async () => {
+          const ended = await endShell(binding.key);
+          if (!ended) reportShellsStillRunning([binding.key]);
+          return ended;
+        },
       };
     }
     return { release: releaseFor(tab) };
@@ -801,10 +815,7 @@ function WorkspaceTabsPanelImpl({
         teardownFor: endShell,
       })
       .then((result) => {
-        if (!result.ok && "failed" in result) {
-          const names = result.failed.map(terminalLabel).join(", ");
-          toast.error(`Couldn't close ${names}. Try again.`);
-        }
+        if (!result.ok && "failed" in result) reportShellsStillRunning(result.failed);
         return result;
       })
       .finally(() => release?.());

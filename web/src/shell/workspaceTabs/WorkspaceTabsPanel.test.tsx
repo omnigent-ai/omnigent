@@ -14,7 +14,7 @@ import { toast } from "sonner";
 import { isPinnedTab } from "./pinnedTabs";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
@@ -123,6 +123,8 @@ vi.mock("../panesViewGate", async (importOriginal) => ({
 }));
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+// A shell that couldn't end is still running, so its toast stays until the person dismisses it.
+const STAYS_UNTIL_DISMISSED = { duration: Number.POSITIVE_INFINITY, closeButton: true };
 
 type PanelOverrides = Partial<WorkspaceTabsPanelProps> & { conversationId: string };
 
@@ -1000,7 +1002,10 @@ describe("a shell's tab", () => {
       const { store } = await splitAB("s-group-partial", { endShell });
       await userEvent.click(await screen.findByRole("button", { name: "Close term_a:s +1" }));
       await waitFor(() =>
-        expect(failed).toHaveBeenCalledWith("Couldn't close term_b:s. Try again."),
+        expect(failed).toHaveBeenCalledExactlyOnceWith(
+          "Couldn't close term_b:s. It's still running.",
+          STAYS_UNTIL_DISMISSED,
+        ),
       );
       // a's tab went; b's and c's stay, with the selection on one of them and history agreeing.
       const remaining = store.tabs().map((tab) => ("binding" in tab ? tab.binding : undefined));
@@ -1012,6 +1017,22 @@ describe("a shell's tab", () => {
       expect(store.tabs().some((tab) => tab.id === selected)).toBe(true);
       expect(store.history.state.visits[store.history.state.cursor]?.tabId).toBe(selected);
       failed.mockRestore();
+    });
+
+    it("names every shell that kept running in one message", async () => {
+      const failed = vi.spyOn(toast, "error").mockImplementation(() => "");
+      onTestFinished(() => failed.mockRestore());
+      const endShell = vi.fn(async () => false);
+      const { store } = await splitAB("s-group-all-fail", { endShell });
+      await userEvent.click(await screen.findByRole("button", { name: "Close term_a:s +1" }));
+      await waitFor(() => expect(endShell).toHaveBeenCalledTimes(2));
+      await waitFor(() =>
+        expect(failed).toHaveBeenCalledExactlyOnceWith(
+          "Couldn't close term_a:s and term_b:s. They're still running.",
+          STAYS_UNTIL_DISMISSED,
+        ),
+      );
+      expect(store.tabs()).toHaveLength(3);
     });
 
     it("ends every shell the split names, though a member has no tab", async () => {
@@ -1220,6 +1241,25 @@ describe("a shell's tab", () => {
         expect(isPinnedTab(store.findTab(tabOf("terminal:term_b"))!)).toBe(false),
       );
     });
+  });
+
+  it("keeps a shell's tab that won't end, and says so once, naming it", async () => {
+    const failed = vi.spyOn(toast, "error").mockImplementation(() => "");
+    onTestFinished(() => failed.mockRestore());
+    const endShell = vi.fn(async () => false);
+    const { store, select } = await openShells("s-shell-close-fails", ["term_a", "term_b"], {
+      endShell,
+    });
+    select("term_a");
+    await userEvent.click(await screen.findByRole("button", { name: "Close term_a:s" }));
+    await waitFor(() =>
+      expect(failed).toHaveBeenCalledExactlyOnceWith(
+        "Couldn't close term_a:s. It's still running.",
+        STAYS_UNTIL_DISMISSED,
+      ),
+    );
+    expect(endShell).toHaveBeenCalledExactlyOnceWith("terminal:term_a");
+    expect(store.tabs()).toHaveLength(2);
   });
 
   it("keeps only the selected shell attached while the sidebar is closed", async () => {
