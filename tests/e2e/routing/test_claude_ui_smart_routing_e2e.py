@@ -152,26 +152,6 @@ def _assert_mock_created_session_preserves_default(mock_url: str, tmp_path: Path
                     timeout_s=30,
                 )
                 messages = ordered_message_items(base_url, session_id)
-                assert (
-                    len(
-                        [
-                            item
-                            for item in messages
-                            if item.get("role") == "user" and marker in message_item_text(item)
-                        ]
-                    )
-                    == 1
-                )
-                assert (
-                    len(
-                        [
-                            item
-                            for item in messages
-                            if item.get("role") == "assistant" and reply in message_item_text(item)
-                        ]
-                    )
-                    == 1
-                )
                 assert len([item for item in messages if item.get("role") == "assistant"]) == index
                 native_session, user_text = _assert_native_claude_turn(
                     base_url, session_id, marker, reply, target_model

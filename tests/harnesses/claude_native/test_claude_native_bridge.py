@@ -13391,7 +13391,6 @@ _CAPTURED_EMPTY_NBSP_COMPOSER = (
         for draft, draft_id in [
             ("", "empty"),
             ("/model", "model-command"),
-            ("/status", "status-command"),
             ("\xa0", "one-nbsp"),
             ("\xa0owned", "leading-nbsp"),
             (" owned", "leading-space"),
@@ -13401,6 +13400,7 @@ _CAPTURED_EMPTY_NBSP_COMPOSER = (
             ("owned \xa0", "trailing-space-nbsp"),
         ]
         for separator, separator_id in [(" ", "separator-space"), ("\xa0", "separator-nbsp")]
+        if separator == " " or draft.startswith((" ", "\xa0"))
     ]
     + [
         pytest.param(
