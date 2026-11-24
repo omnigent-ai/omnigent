@@ -2,12 +2,13 @@
 
 import type { ShortcutEnvironment, ShortcutId } from "@/lib/shortcuts/registry";
 
-import { chordMatcher } from "./chordQuery";
+import { type ChordSearchScope, chordMatcher } from "./chordQuery";
 import { type SettingsSearchMatcher, textMatcher } from "./settingsSearchIndex";
 
 export function settingsSearchMatchers(
   environment: ShortcutEnvironment,
   listedShortcutRows: ReadonlySet<ShortcutId>,
+  scope: ChordSearchScope,
 ): readonly SettingsSearchMatcher[] {
-  return [chordMatcher(environment, listedShortcutRows), textMatcher];
+  return [chordMatcher(environment, listedShortcutRows, scope), textMatcher];
 }

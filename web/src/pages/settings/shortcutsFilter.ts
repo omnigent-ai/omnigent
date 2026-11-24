@@ -49,7 +49,10 @@ export function filterShortcutPage(
   const listed = new Set<ShortcutId>(
     groups.flatMap((group) => group.items.flatMap((row) => row.shortcutId ?? [])),
   );
-  const pressed = chord ? rowsForChord(chord, environment, listed) : new Set<ShortcutId>();
+  // The searchable page comes with ⌘K's QuickPick.
+  const pressed = chord
+    ? rowsForChord(chord, environment, listed, { quickPick: true })
+    : new Set<ShortcutId>();
   return groups.flatMap((group) => {
     const items = group.items.filter((row) => {
       if (row.shortcutId !== undefined && pressed.has(row.shortcutId)) return true;

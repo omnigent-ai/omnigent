@@ -24,7 +24,12 @@ import {
   supportsDesktopCommands,
 } from "@/lib/nativeBridge";
 import { matchesShortcut } from "@/lib/shortcuts/registry";
-import { type ShortcutPageGroup, shortcutPageGroups } from "@/lib/shortcuts/shortcutPage";
+import {
+  type ShortcutPageContext,
+  type ShortcutPageGroup,
+  shortcutPageGroups,
+} from "@/lib/shortcuts/shortcutPage";
+import { isSearchedShortcutRow } from "@/pages/settings/search/shortcutEntries";
 import { ShortcutSettingsRow } from "@/pages/settings/search/ShortcutSettingsRow";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
@@ -37,19 +42,14 @@ export function openKeyboardShortcuts(): void {
   window.dispatchEvent(new Event(KEYBOARD_SHORTCUTS_EVENT));
 }
 
-/**
- * The shortcut reference shared by the dialog and Settings page. The dialog
- * keeps the compact inline list; Settings uses section headings with bordered
- * list cards to match the rest of its content.
- */
-/** The Keyboard shortcuts page's groups here, computed at render so tests can vary the runtime. */
-export function useShortcutPageGroups(): ShortcutPageGroup[] {
+/** What the Keyboard shortcuts page lists here, computed at render so tests can vary the runtime. */
+export function useShortcutPageContext(): ShortcutPageContext {
   // Feature-based, stable per session; computed at render so tests can vary it.
   const isMobileViewport = useIsMobileViewport();
   const preventsKeyboardSubmit = isMobileViewport;
   const serverInfo = useServerInfo();
   const alwaysSteer = useAlwaysSteer();
-  return shortcutPageGroups({
+  return {
     native: isNativeShell(),
     electron: isElectronShell(),
     browser: supportsBrowser(),
@@ -62,9 +62,19 @@ export function useShortcutPageGroups(): ShortcutPageGroup[] {
     desktopCommands: supportsDesktopCommands(),
     siblingSessions: serverInfo !== "loading" && serverInfo.sibling_sessions === true,
     quickPick: isFeatureEnabled(serverInfo, "quick_pick_palette"),
-  });
+  };
 }
 
+/** The Keyboard shortcuts page's groups here. */
+export function useShortcutPageGroups(): ShortcutPageGroup[] {
+  return shortcutPageGroups(useShortcutPageContext());
+}
+
+/**
+ * The shortcut reference shared by the dialog and Settings page. The dialog
+ * keeps the compact inline list; Settings uses section headings with bordered
+ * list cards to match the rest of its content.
+ */
 export function KeyboardShortcutsList({
   variant = "compact",
   groups: shownGroups,
@@ -73,7 +83,8 @@ export function KeyboardShortcutsList({
   /** The groups to list, such as the Settings page's filtered ones; every group otherwise. */
   groups?: readonly ShortcutPageGroup[];
 }) {
-  const allGroups = useShortcutPageGroups();
+  const context = useShortcutPageContext();
+  const allGroups = shortcutPageGroups(context);
   const groups = shownGroups ?? allGroups;
   const settings = variant === "settings";
   return (
@@ -115,8 +126,8 @@ export function KeyboardShortcutsList({
                   </span>
                 </>
               );
-              // Settings lists each row so search can reveal it; the shortcut dialog doesn't.
-              return settings ? (
+              // Settings lists each row search finds so it can reveal it; the dialog doesn't.
+              return settings && isSearchedShortcutRow(item, context) ? (
                 <ShortcutSettingsRow
                   key={item.label}
                   row={item}
