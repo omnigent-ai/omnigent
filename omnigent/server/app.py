@@ -4675,6 +4675,18 @@ def create_app(
                 prefix="/v1",
                 tags=["project tickets"],
             )
+            from omnigent.server.routes.project_status import create_project_status_router
+
+            app.include_router(
+                create_project_status_router(
+                    project_store,
+                    ticket_store,
+                    conversation_store,
+                    auth_provider=auth_provider,
+                ),
+                prefix="/v1",
+                tags=["projects"],
+            )
             from omnigent.server.routes.ticket_requests import create_ticket_requests_router
 
             app.include_router(

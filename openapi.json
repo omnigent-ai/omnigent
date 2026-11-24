@@ -7309,6 +7309,265 @@
         "title": "ProjectSessionCreateRequest",
         "type": "object"
       },
+      "ProjectStatusMember": {
+        "description": "One member's numbers: a person, an agent identity, or the other-agents pool.",
+        "properties": {
+          "cost_per_merged_pr_cents": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Per Merged Pr Cents"
+          },
+          "identity_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Identity Id"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "human",
+              "identity",
+              "agents"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "prs_merged": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prs Merged"
+          },
+          "spend_cents": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spend Cents"
+          },
+          "tickets_done": {
+            "format": "int64",
+            "title": "Tickets Done",
+            "type": "integer"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          }
+        },
+        "required": [
+          "key",
+          "kind",
+          "name",
+          "user_id",
+          "identity_id",
+          "tickets_done",
+          "prs_merged",
+          "spend_cents",
+          "cost_per_merged_pr_cents"
+        ],
+        "title": "ProjectStatusMember",
+        "type": "object"
+      },
+      "ProjectStatusSources": {
+        "properties": {
+          "prs_merged": {
+            "enum": [
+              "available",
+              "unavailable"
+            ],
+            "title": "Prs Merged",
+            "type": "string"
+          },
+          "spend": {
+            "enum": [
+              "available",
+              "unavailable"
+            ],
+            "title": "Spend",
+            "type": "string"
+          }
+        },
+        "required": [
+          "spend",
+          "prs_merged"
+        ],
+        "title": "ProjectStatusSources",
+        "type": "object"
+      },
+      "ProjectStatusSummary": {
+        "description": "A project's status over a UTC window; money is in integer US cents.",
+        "properties": {
+          "generated_at": {
+            "format": "int64",
+            "title": "Generated At",
+            "type": "integer"
+          },
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectStatusMember"
+            },
+            "title": "Members",
+            "type": "array"
+          },
+          "object": {
+            "const": "project.status_summary",
+            "title": "Object",
+            "type": "string"
+          },
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          },
+          "since_day_utc": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Since Day Utc"
+          },
+          "sources": {
+            "$ref": "#/components/schemas/ProjectStatusSources"
+          },
+          "time_zone": {
+            "const": "UTC",
+            "title": "Time Zone",
+            "type": "string"
+          },
+          "today_utc": {
+            "title": "Today Utc",
+            "type": "string"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/ProjectStatusTotals"
+          },
+          "window": {
+            "enum": [
+              "7d",
+              "30d",
+              "all"
+            ],
+            "title": "Window",
+            "type": "string"
+          }
+        },
+        "required": [
+          "object",
+          "project_id",
+          "window",
+          "time_zone",
+          "today_utc",
+          "since_day_utc",
+          "generated_at",
+          "totals",
+          "members",
+          "sources"
+        ],
+        "title": "ProjectStatusSummary",
+        "type": "object"
+      },
+      "ProjectStatusTotals": {
+        "description": "Window totals. `None` means the metric's source isn't available.",
+        "properties": {
+          "cost_per_merged_pr_cents": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Per Merged Pr Cents"
+          },
+          "members": {
+            "format": "int64",
+            "title": "Members",
+            "type": "integer"
+          },
+          "prs_merged": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prs Merged"
+          },
+          "spend_cents": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spend Cents"
+          },
+          "tickets_done": {
+            "format": "int64",
+            "title": "Tickets Done",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tickets_done",
+          "prs_merged",
+          "spend_cents",
+          "cost_per_merged_pr_cents",
+          "members"
+        ],
+        "title": "ProjectStatusTotals",
+        "type": "object"
+      },
       "ProposeMandateRequest": {
         "additionalProperties": false,
         "description": "Request body for `POST /v1/projects/{project_id}/mandate/proposals`.",
@@ -22817,6 +23076,66 @@
           }
         },
         "summary": "Revoke Project Share",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/status/summary": {
+      "get": {
+        "description": "Tickets done, PRs merged, spend and per-member numbers for a window.\n\nAny project member may read it. A window of N days is today (UTC) plus\nthe N-1 UTC days before it.",
+        "operationId": "project_status_summary_v1_projects__project_id__status_summary_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "7d, 30d or all, in UTC days.",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "default": "7d",
+              "description": "7d, 30d or all, in UTC days.",
+              "enum": [
+                "7d",
+                "30d",
+                "all"
+              ],
+              "title": "Window",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectStatusSummary"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Project Status Summary",
         "tags": [
           "projects"
         ]

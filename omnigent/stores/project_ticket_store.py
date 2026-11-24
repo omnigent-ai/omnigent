@@ -426,6 +426,45 @@ class ProjectTicketStore:
         with self._session("require_project_access") as session:
             self._project(session, project_id, user_id)
 
+    def completed_moves(
+        self, project_id: str, *, user_id: str | None, since_epoch: int | None
+    ) -> builtins.list[dict[str, Any]]:
+        """Every move of a ticket into a completed stage since *since_epoch* (inclusive).
+
+        Readable by any project member. Each row is ``{"ticket_id", "user_id",
+        "session_id", "created_at"}``: who moved it, for per-member counts.
+        """
+        with self._session("list_ticket_completed_moves") as session:
+            self._project(session, project_id, user_id)
+            stmt = select(SqlProjectTicketEvent).where(
+                SqlProjectTicketEvent.workspace_id == current_workspace_id(),
+                SqlProjectTicketEvent.project_id == _identifier(project_id),
+                SqlProjectTicketEvent.kind == EVENT_CODES["updated"],
+            )
+            if since_epoch is not None:
+                stmt = stmt.where(SqlProjectTicketEvent.created_at >= since_epoch)
+            moves = []
+            for row in session.scalars(stmt.order_by(SqlProjectTicketEvent.created_at)):
+                payload = row.payload or {}
+                changes = payload.get("changes")
+                stage = payload.get("stage")
+                if not (
+                    isinstance(changes, dict)
+                    and "stage_id" in changes
+                    and isinstance(stage, dict)
+                    and stage.get("is_complete") is True
+                ):
+                    continue
+                moves.append(
+                    {
+                        "ticket_id": row.ticket_id,
+                        "user_id": row.user_id,
+                        "session_id": row.session_id,
+                        "created_at": row.created_at,
+                    }
+                )
+            return moves
+
     @classmethod
     def _human_asks(cls, session: Session, ticket: SqlProjectTicket) -> builtins.list[_HumanAsk]:
         return cls._human_asks_for(session, ticket, ticket.id)
