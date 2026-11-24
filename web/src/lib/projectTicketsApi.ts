@@ -96,6 +96,8 @@ export interface ProjectTicket {
   final_update?: TicketFinalUpdate | null;
   /** Complete without a final update yet; only on single-ticket reads. */
   needs_final_update?: boolean;
+  /** Sign-off labels the open ask waits on that the viewer may add; single-ticket reads. */
+  sign_offs?: TicketLabel[];
 }
 export interface TicketFinalUpdate {
   event_id: string;

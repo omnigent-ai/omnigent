@@ -122,3 +122,40 @@ def owner_sign_off_pending(labels: list[dict[str, Any]] | None, requested_by: st
     return (RISK_LABEL in keys and RISK_OK_LABEL not in keys) or (
         is_outside_requester(requested_by) and OWNER_OK_LABEL not in keys
     )
+
+
+def sign_offs_for(
+    project: Any, ticket: dict[str, Any], viewer: str | None
+) -> list[dict[str, Any]]:
+    """The sign-off labels a ticket's open ``needs-human`` ask waits on that *viewer* may add.
+
+    Each is ``{"key", "value"}`` as it would be added: ``risk-ok`` on a ``risk`` ticket and
+    ``owner-ok`` (bound to the approved SHA) on an outside PR for the owner, and
+    ``product-ok`` on another requester's feature for product approvers.
+    """
+    from omnigent.server.github_pr_intake import is_outside_requester
+
+    labels = ticket.get("labels") or []
+    values = {label.get("key"): label.get("value") for label in labels}
+    if "needs-human" not in values:
+        return []
+    # Single-user servers have no user ID: there the one person is the owner.
+    owner = viewer == project.user_id
+    offers: list[dict[str, Any]] = []
+    if owner and RISK_LABEL in values and RISK_OK_LABEL not in values:
+        offers.append({"key": RISK_OK_LABEL, "value": None})
+    if (
+        needs_product_ok(project, ticket)
+        and PRODUCT_OK_LABEL not in values
+        and (owner or viewer in product_approvers(project))
+    ):
+        offers.append({"key": PRODUCT_OK_LABEL, "value": None})
+    approved = values.get("approved")
+    if (
+        owner
+        and is_outside_requester(ticket.get("requested_by"))
+        and OWNER_OK_LABEL not in values
+        and approved
+    ):
+        offers.append({"key": OWNER_OK_LABEL, "value": approved})
+    return offers

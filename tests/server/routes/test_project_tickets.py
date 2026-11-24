@@ -1911,3 +1911,37 @@ async def test_a_persons_sign_off_label_clears_the_ask_and_wakes_the_asker_and_m
     assert heard("A person added `risk-ok`", worker) and heard("needs-human ask", worker)
     assert heard(f"Its approved commit is `{sha}`", merger)
     assert not heard("A person added `risk-ok`", project["main_session_id"])
+
+
+async def test_the_owner_sees_a_one_click_sign_off_and_taking_it_answers_the_ask(
+    project_client, db_uri
+):
+    project = (await project_client.post("/v1/projects", json={"name": "One click"})).json()
+    store = SqlAlchemyConversationStore(db_uri)
+    worker = store.create_conversation(project_id=project["id"]).id
+    base = f"/v1/projects/{project['id']}/tickets"
+    ticket = (await project_client.post(base, json={"title": "Risky"})).json()
+    path = f"{base}/{ticket['id']}"
+    owner = (await project_client.get(f"{path}/events")).json()["data"][0]["user_id"]
+    tickets = ProjectTicketStore(db_uri)
+    asked = [{"key": "risk", "value": "auth"}, {"key": "needs-human"}]
+    tickets.update(
+        project["id"],
+        ticket["id"],
+        UpdateTicket(labels=asked, comment="OK to land?"),
+        TicketActor(user_id=owner, session_id=worker),
+    )
+
+    shown = (await project_client.get(path)).json()
+    assert shown["sign_offs"] == [{"key": "risk-ok", "value": None}]
+    as_agent = await project_client.get(path, headers={ORCHESTRATION_SOURCE_HEADER: worker})
+    assert "sign_offs" not in as_agent.json()
+
+    # The button sends the current labels plus the offered one, as the owner.
+    taken = await project_client.patch(
+        path, json={"labels": [*shown["labels"], *shown["sign_offs"]]}
+    )
+    assert taken.status_code == 200, taken.text
+    after = (await project_client.get(path)).json()
+    assert {label["key"] for label in after["labels"]} == {"risk", "risk-ok"}
+    assert after["sign_offs"] == []

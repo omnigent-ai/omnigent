@@ -824,9 +824,11 @@ def create_project_tickets_router(
             ticket["agent_guidance"] = PROJECT_TICKET_WORK_INSTRUCTION
         # The only people whose `product-ok` counts, so agents ask them and nobody else.
         with contextlib.suppress(OmnigentError):
-            ticket["product_approvers"] = product_approval.approver_list(
-                await load_project(request, project_id, who)
-            )
+            project = await load_project(request, project_id, who)
+            ticket["product_approvers"] = product_approval.approver_list(project)
+            # One-click approvals: the sign-offs this person may give the open ask.
+            if who.session_id is None:
+                ticket["sign_offs"] = product_approval.sign_offs_for(project, ticket, who.user_id)
         await enrich(project_id, [ticket], who)
         return ticket
 

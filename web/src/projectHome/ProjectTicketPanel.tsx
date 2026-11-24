@@ -454,6 +454,20 @@ function TicketDetails({
                   <TooltipContent>Edit ticket</TooltipContent>
                 </Tooltip>
               </div>
+              <TicketSignOffs
+                ticket={ticket}
+                pending={update.isPending || comment.isPending}
+                onApprove={(label) => {
+                  update.reset();
+                  update.mutate({ id: ticketId, changes: { labels: [...ticket.labels, label] } });
+                }}
+                onDecline={(label) =>
+                  comment.mutate({
+                    id: ticketId,
+                    body: { text: `Not adding \`${label.key}\` yet.` },
+                  })
+                }
+              />
               <div className="flex flex-wrap items-center gap-2">
                 <Select
                   value={ticket.stage_id}
@@ -542,6 +556,40 @@ function TicketDetails({
         )
       )}
     </div>
+  );
+}
+
+/** One-click answers to an ask waiting on the viewer's sign-off, such as `risk-ok`. */
+function TicketSignOffs({
+  ticket,
+  pending,
+  onApprove,
+  onDecline,
+}: {
+  ticket: ProjectTicket;
+  pending: boolean;
+  onApprove: (label: TicketLabel) => void;
+  onDecline: (label: TicketLabel) => void;
+}) {
+  const offers = ticket.sign_offs ?? [];
+  if (offers.length === 0) return null;
+  return (
+    <section
+      aria-label="Your sign-off"
+      className="space-y-2 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3"
+    >
+      <p className="text-sm font-medium">This ticket is waiting on your sign-off.</p>
+      {offers.map((label) => (
+        <div key={label.key} className="flex flex-wrap items-center gap-2">
+          <Button size="sm" disabled={pending} onClick={() => onApprove(label)}>
+            Approve: add {label.key}
+          </Button>
+          <Button size="sm" variant="ghost" disabled={pending} onClick={() => onDecline(label)}>
+            Decline
+          </Button>
+        </div>
+      ))}
+    </section>
   );
 }
 
