@@ -5614,7 +5614,6 @@ function NewChatLandingContent({
     mentionTokens,
     resetMentions,
     noteTextChange: noteMentionTextChange,
-    adjustInsert,
     handleTokenBackspace,
     handleKeyDown: handleMentionKeyDown,
     dismiss: dismissMention,
@@ -7609,7 +7608,6 @@ function NewChatLandingContent({
                 value: message,
                 ...highlight.input,
                 mentionTokens,
-                adjustInsert,
                 onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
                 onChange: (e) => {
                   noteMentionTextChange(e);

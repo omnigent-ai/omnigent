@@ -3,7 +3,7 @@
 // need a page reload before it succeeds.
 
 import type { ComponentType } from "react";
-import { findMentionTokens } from "@/lib/composerMentions";
+import { findMentionTokens, separateMentionEdges } from "@/lib/composerMentions";
 import { currentShortcutEnvironment } from "@/lib/shortcuts/registry";
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { MENTION_TOKEN_CLASS } from "@/components/composer/MentionTokenOverlay";
@@ -34,6 +34,7 @@ export function codeMirrorComposerEnvironment(): CodeMirrorComposerEnvironment {
     inputIdAttribute: COMPOSER_INPUT_ID_ATTRIBUTE,
     registerSurface: registerComposerSurface,
     findMentionTokens,
+    separateMentionEdges,
     mentionTokenClass: MENTION_TOKEN_CLASS,
     commandTokenClass: COMMAND_TOKEN_CLASS,
   };

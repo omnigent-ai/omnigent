@@ -1,9 +1,18 @@
 import type { ComposerAttachment } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
-import type {
-  ComposerInsert,
-  ComposerInsertAdjustment,
-} from "@/components/composer/engine/composerInput";
+
+/** Text landing in `[start, end)` of a draft, as a typed or pasted insert. */
+export interface ComposerInsert {
+  start: number;
+  end: number;
+  text: string;
+}
+
+/** The text to insert instead, and where the caret lands inside it. */
+export interface ComposerInsertAdjustment {
+  text: string;
+  caret: number;
+}
 
 /**
  * Pure ``@``-mention utilities (workspace files and other sessions) shared by the in-session composer

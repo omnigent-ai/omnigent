@@ -512,7 +512,6 @@ export function ComposerEngineInput({
     className,
     mentionTokens,
     commandToken,
-    adjustInsert,
     autoFocus,
     ...rest
   } = input;
@@ -538,7 +537,6 @@ export function ComposerEngineInput({
         inputId={inputId}
         heightMode={heightMode}
         mentionTokens={mentionTokens}
-        adjustInsert={adjustInsert}
         commandToken={commandToken}
         autoFocus={autoFocusOnMount}
         onKeyDown={handleKeyDown}

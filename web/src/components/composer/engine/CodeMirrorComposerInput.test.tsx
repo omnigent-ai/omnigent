@@ -11,14 +11,12 @@ import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { MENTION_TOKEN_CLASS } from "@/components/composer/MentionTokenOverlay";
-import { separateMentionEdges } from "@/lib/composerMentions";
 import { insertComposerText } from "@/lib/composerText";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
 import { COMPOSER_EDITING_KEYMAP, leadingCommandSpan } from "./CodeMirrorComposerInput";
 import {
   isComposerInput,
   isHistoryInput,
-  type ComposerInsert,
   type ComposerInputEvent,
   type ComposerKeyboardEvent,
   type ComposerPasteEvent,
@@ -362,34 +360,24 @@ describe("CodeMirrorComposerInput change events", () => {
 });
 
 describe("CodeMirrorComposerInput mention edges", () => {
-  const tokens = ["@readme.md"];
-  const adjustInsert = (value: string, insert: ComposerInsert) =>
-    separateMentionEdges(value, insert, tokens);
-
-  it("adds the space to a typed insert beside a token", () => {
-    const { content } = mount({ value: "Read @readme.md", mentionTokens: tokens, adjustInsert });
+  const painted = ["@readme.md"];
+  function insertAt(from: number, insert: string, userEvent: string, tokens: string[]) {
+    const { content } = mount({ value: "Read @readme.md", mentionTokens: tokens });
     const editor = EditorView.findFromDOM(content)!;
-    act(
-      () =>
-        void editor.dispatch({
-          changes: { from: 15, insert: "x" },
-          userEvent: "input.type",
-        }),
-    );
-    expect(editor.state.doc.toString()).toBe("Read @readme.md x");
+    act(() => void editor.dispatch({ changes: { from, insert }, userEvent }));
+    return editor.state.doc.toString();
+  }
+
+  it("adds the space to a typed insert beside a painted token", () => {
+    expect(insertAt(15, "x", "input.type", painted)).toBe("Read @readme.md x");
   });
 
-  it("leaves an IME composition insert beside a token unchanged", () => {
-    const { content } = mount({ value: "Read @readme.md", mentionTokens: tokens, adjustInsert });
-    const editor = EditorView.findFromDOM(content)!;
-    act(
-      () =>
-        void editor.dispatch({
-          changes: { from: 15, insert: "x" },
-          userEvent: "input.type.compose",
-        }),
-    );
-    expect(editor.state.doc.toString()).toBe("Read @readme.mdx");
+  it("adds no space beside a token the editor does not paint", () => {
+    expect(insertAt(15, "x", "input.type", [])).toBe("Read @readme.mdx");
+  });
+
+  it("leaves an IME composition insert beside a painted token unchanged", () => {
+    expect(insertAt(15, "x", "input.type.compose", painted)).toBe("Read @readme.mdx");
   });
 });
 
@@ -475,7 +463,7 @@ describe("CodeMirrorComposerInput mention tokens", () => {
     expect(tokenMarks(view.container)).toEqual([]);
   });
 
-  it("marks a token typed after mount, and drops it once the text no longer matches", () => {
+  it("marks a token typed after mount, and drops it once an edit breaks the match", () => {
     const { container, target } = mount({ mentionTokens: ["@a.ts"] });
     expect(tokenMarks(container)).toEqual([]);
 
@@ -485,7 +473,7 @@ describe("CodeMirrorComposerInput mention tokens", () => {
     expect(tokenMarks(container)).toHaveLength(1);
 
     act(() => {
-      insertComposerText(target(), "x", "@a.ts".length, "@a.ts".length);
+      insertComposerText(target(), "", 0, 1);
     });
     expect(tokenMarks(container)).toEqual([]);
   });

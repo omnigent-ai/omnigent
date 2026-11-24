@@ -2,7 +2,6 @@ import { type RefObject, useEffect, useLayoutEffect, useRef, useState } from "re
 import {
   historyDirectionOf,
   type ComposerInputEvent,
-  type ComposerInsertAdjuster,
   type ComposerKeyboardEvent,
   type ComposerTextTarget,
 } from "@/components/composer/engine/composerInput";
@@ -15,7 +14,6 @@ import {
   mentionTokenAtCaret,
   newFileMentionToken,
   NO_SESSION_MENTIONS,
-  separateMentionEdges,
   SESSION_MENTION_CAP,
   type MentionItem,
   type MentionState,
@@ -167,11 +165,6 @@ export interface MentionBrowser {
   noteTextChange: (event: ComposerInputEvent) => void;
   /** Backspace at or inside a token deletes it whole; returns true when it did. */
   handleTokenBackspace: (e: ComposerKeyboardEvent) => boolean;
-  /**
-   * Adds the space that keeps a tag matched when an insert lands against its token. Only the
-   * CodeMirror engine applies it; the textarea inserts as it always has.
-   */
-  adjustInsert: ComposerInsertAdjuster;
   /** Handle a key event for the open menu; returns true when it consumed it. */
   handleKeyDown: (e: ComposerKeyboardEvent) => boolean;
   /** Dismiss the menu (e.g. on blur). */
@@ -378,9 +371,6 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
       }
     }
   };
-
-  const adjustInsert: ComposerInsertAdjuster = (value, insert) =>
-    separateMentionEdges(value, insert, mentionTokens);
 
   const resetMentions = (mentions?: TaggedMentions) => {
     releasedRef.current = NO_TAGS;
@@ -619,7 +609,6 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     ownedMentionTokens,
     resetMentions,
     noteTextChange,
-    adjustInsert,
     handleTokenBackspace,
     handleKeyDown,
     dismiss,

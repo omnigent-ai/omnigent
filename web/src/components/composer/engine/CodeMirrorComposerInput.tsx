@@ -33,13 +33,13 @@ import {
   type RefObject,
 } from "react";
 
+import type { ComposerInsert, ComposerInsertAdjustment } from "@/lib/composerMentions";
 import { cn } from "@/lib/utils";
 
 import type {
   ComposerEditorSurface,
   ComposerInputEvent,
   ComposerInputHeightMode,
-  ComposerInsertAdjuster,
   ComposerInputProps,
   ComposerKeyboardEvent,
   ComposerTextTarget,
@@ -59,6 +59,12 @@ export interface CodeMirrorComposerEnvironment {
   registerSurface: (surface: ComposerEditorSurface) => () => void;
   /** Where each tagged @-mention token sits in the text, in text order. */
   findMentionTokens: (text: string, tokens: readonly string[]) => readonly TokenSpan[];
+  /** Adds the space an insert needs so the painted tokens it touches stay whole. */
+  separateMentionEdges: (
+    value: string,
+    insert: ComposerInsert,
+    tokens: readonly string[],
+  ) => ComposerInsertAdjustment | null;
   /** The class that paints a mention token, shared with the textarea's mirror. */
   mentionTokenClass: string;
   /** The class that paints the leading command, shared with the textarea's mirror. */
@@ -87,28 +93,34 @@ function historyDirectionOfTransactions(
 }
 
 /**
- * Rewrites a single typed or pasted insert in the same transaction, so undo removes the insert and
- * the space it added together. IME composition is skipped, so its commit is not adjusted.
+ * Rewrites a user input (typing, paste, completion, dictation) in the same transaction, so undo
+ * removes the insert and any space it added together. IME composition is skipped. Only the
+ * tokens this editor paints are kept whole.
  */
 function adjustedInsertTransaction(
   transaction: Transaction,
-  adjust: ComposerInsertAdjuster | undefined,
+  separateMentionEdges: CodeMirrorComposerEnvironment["separateMentionEdges"],
 ): TransactionSpec | Transaction {
   if (
-    !adjust ||
     !transaction.docChanged ||
     !transaction.isUserEvent("input") ||
     transaction.isUserEvent("input.type.compose")
   ) {
     return transaction;
   }
+  const paintedTokens = transaction.startState.facet(mentionTokensFacet);
+  if (paintedTokens.length === 0) return transaction;
   const inserts: { start: number; end: number; text: string }[] = [];
   transaction.changes.iterChanges((start, end, _fromB, _toB, inserted) => {
     inserts.push({ start, end, text: inserted.toString() });
   });
   const insert = inserts.length === 1 ? inserts[0] : undefined;
   if (!insert) return transaction;
-  const adjusted = adjust(transaction.startState.doc.toString(), insert);
+  const adjusted = separateMentionEdges(
+    transaction.startState.doc.toString(),
+    insert,
+    paintedTokens,
+  );
   if (!adjusted) return transaction;
   const isolation = transaction.annotation(isolateHistory);
   const addToHistory = transaction.annotation(Transaction.addToHistory);
@@ -556,7 +568,7 @@ function CodeMirrorComposer({
           compartments.history.of(history()),
           EditorView.lineWrapping,
           EditorState.transactionFilter.of((transaction) =>
-            adjustedInsertTransaction(transaction, latest.current.adjustInsert),
+            adjustedInsertTransaction(transaction, environment.separateMentionEdges),
           ),
           compartments.attributes.of(attributes(initial, environment)),
           compartments.placeholder.of(placeholderText(initial.placeholder ?? "")),

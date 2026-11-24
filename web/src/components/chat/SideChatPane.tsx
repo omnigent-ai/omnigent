@@ -1230,7 +1230,6 @@ function SideChatComposer({
     attachSession,
     handleKeyDown: handleMentionKeyDown,
     handleTokenBackspace,
-    adjustInsert,
     dismiss: dismissMention,
   } = useMentionBrowser({
     mention,
@@ -1590,7 +1589,6 @@ function SideChatComposer({
             setInputFocused(false);
             dismissMention();
           },
-          adjustInsert,
           placeholder: fullSession ? "Reply to this session..." : "Ask a side question...",
           rows: gridComposer ? 1 : undefined,
           heightMode: quotes.length ? "unbounded" : "compact",

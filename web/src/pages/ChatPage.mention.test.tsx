@@ -11,7 +11,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UseSidebarDataModule from "@/hooks/useSidebarData";
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { ReactElement } from "react";
+import { createRef, type ComponentRef, type ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { handleSessionEvent, useChatStore } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -1341,9 +1341,36 @@ describe.each(["textarea", "codemirror"] as const)(
         fireEvent.click(screen.getByTitle("Attach readme.md"));
         caretAt("Read @readme.md".length);
         typeKey("x");
+        expect(valueOf()).toBe("Read @readme.md x ");
+        expect(tokens()).toEqual(["@readme.md"]);
 
         undoTo("Read @readme.md ");
         expect(tokens()).toEqual(["@readme.md"]);
+      },
+    );
+
+    it.runIf(engine === "codemirror")(
+      "adds no space beside a pill in reply-quote mode, where the editor paints no pills",
+      async () => {
+        const ref = createRef<ComponentRef<typeof Composer>>();
+        render(
+          <CapabilitiesProvider info={codeMirrorInfo}>
+            <TooltipProvider>
+              <Composer {...composerProps()} ref={ref} />
+            </TooltipProvider>
+          </CapabilitiesProvider>,
+        );
+        await waitFor(() => expect(composerInput()).toHaveClass("cm-content"));
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        act(() => ref.current?.appendReplyQuote("Quoted text"));
+
+        const before = composerTargetOf(screen.getByLabelText("Reply text before quote 1"))!;
+        expect(before.value).toBe("Read @readme.md ");
+        act(() =>
+          insertComposerText(before, "x", "Read @readme.md".length, "Read @readme.md".length),
+        );
+        expect(before.value).toBe("Read @readme.mdx ");
       },
     );
 
