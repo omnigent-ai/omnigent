@@ -166,6 +166,19 @@ describe("useSessionNumberHotkeys", () => {
     expect(navigate).toHaveBeenCalledWith("/c/b");
   });
 
+  it("reads an encoded session id as the router decodes it", () => {
+    render(["123", "b"], "/canvas/c/%31%32%33");
+    press("1");
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("opens the session from a path outside the server's base path", () => {
+    window.__OMNIGENT_BASE_PATH__ = "/omnigent";
+    render(ids, "/c/a");
+    press("1");
+    expect(navigate).toHaveBeenCalledWith("/c/a");
+  });
+
   it("knows the session under an embedding host's mount", () => {
     rebasePath.mockImplementation((path) => `/mount${path}`);
     render(ids, "/mount/c/a");
