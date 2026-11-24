@@ -49,14 +49,13 @@ function UploadingAttachment({
   image: boolean;
 }) {
   const Icon = attachmentIcon(image);
-  const percent =
-    upload.total === null || upload.total <= 0
-      ? null
-      : Math.min(100, Math.floor((upload.loaded / upload.total) * 100));
+  // One known total drives both the bar and the label, so they cannot disagree.
+  const total = upload.total !== null && upload.total > 0 ? upload.total : null;
+  const percent = total === null ? null : Math.min(100, Math.floor((upload.loaded / total) * 100));
   const sizeLabel =
-    upload.total === null || upload.total <= 0
+    total === null
       ? formatFileSize(upload.size)
-      : `${formatFileSize(Math.min(upload.loaded, upload.total))} of ${formatFileSize(upload.total)}`;
+      : `${formatFileSize(Math.min(upload.loaded, total))} of ${formatFileSize(total)}`;
   return (
     <div
       data-testid="uploading-attachment"

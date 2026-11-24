@@ -415,10 +415,6 @@ function fetchReportingUpload(
   if (signal?.aborted) return Promise.reject(abortReason(signal));
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
-    request.open(init?.method ?? "GET", url);
-    request.responseType = "arraybuffer";
-    request.withCredentials = init?.credentials === "include";
-    new Headers(init?.headers).forEach((value, name) => request.setRequestHeader(name, value));
     const onAbort = () => request.abort();
     signal?.addEventListener("abort", onAbort, { once: true });
     const settle = () => signal?.removeEventListener("abort", onAbort);
@@ -458,9 +454,13 @@ function fetchReportingUpload(
       reject(abortReason(signal));
     };
     try {
+      request.open(init?.method ?? "GET", url);
+      request.responseType = "arraybuffer";
+      request.withCredentials = init?.credentials === "include";
+      new Headers(init?.headers).forEach((value, name) => request.setRequestHeader(name, value));
       request.send((init?.body ?? null) as XMLHttpRequestBodyInit | null);
     } catch {
-      // A body XHR refuses (e.g. a ReadableStream) fails as `fetch` would, and releases the signal.
+      // Setup or a body XHR refuses (an invalid header, a ReadableStream) fails as `fetch` would.
       settle();
       reject(new TypeError("Failed to fetch"));
     }
