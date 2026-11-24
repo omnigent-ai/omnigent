@@ -117,7 +117,7 @@ export function useComposerAttachments({
     onRemovedRef.current?.();
   }, [policy]);
 
-  // Validate and surface the rejections; returns the files that passed.
+  // Also sets or clears attachmentError.
   const validateIncoming = useCallback((incoming: File[]): File[] => {
     const { accepted, errors } = validateAttachments(incoming, policyRef.current);
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
@@ -142,10 +142,10 @@ export function useComposerAttachments({
   const addFiles = useCallback(
     (incoming: File[]) => {
       const accepted = validateIncoming(incoming);
-      if (accepted.length > 0) {
-        setFiles((prev) => [...prev, ...nameIncoming(accepted, prev)]);
-        onAcceptedRef.current?.(accepted);
-      }
+      if (accepted.length === 0) return;
+      const named = nameIncoming(accepted, filesRef.current);
+      setFiles((prev) => [...prev, ...named]);
+      onAcceptedRef.current?.(named);
     },
     [validateIncoming, nameIncoming],
   );

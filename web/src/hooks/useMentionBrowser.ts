@@ -507,6 +507,8 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     target: ComposerTextTarget,
     trayFiles: readonly File[],
   ) => {
+    // A target that is not live cannot take the chip's text, so no chip is inserted.
+    if (!target.isConnected) return;
     const added: PastedAttachment[] = [];
     const addedNames: string[] = [];
     for (const file of files) {

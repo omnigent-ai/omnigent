@@ -216,7 +216,7 @@ describe("session drafts", () => {
       "a tray file that repeats a chip's name is renamed",
       { message: "", files: [], chips: [["@a.png", new File(["a"], "a.png")]] },
       { text: "see @a.png", files: [new File(["b"], "a.png")], chips: [] },
-      { message: "see @a.png", names: ["a (2).png", "a.png"], chipTokens: ["@a.png"] },
+      { message: "see @a (2).png", names: ["a (2).png", "a.png"], chipTokens: ["@a.png"] },
     ],
     [
       "a chip that repeats another chip's name avoids a spelling already typed",

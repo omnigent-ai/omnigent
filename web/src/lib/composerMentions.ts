@@ -357,8 +357,10 @@ export function presentTaggedMentions(
   return attachments.length > 0 ? { files, sessions, attachments } : { files, sessions };
 }
 
+const NO_ATTACHMENTS: PastedAttachment[] = [];
+
 function attachmentsOf(tags: TaggedMentions): PastedAttachment[] {
-  return tags.attachments ?? [];
+  return tags.attachments ?? NO_ATTACHMENTS;
 }
 
 /** Replace each token in ``text`` with its marker, in place. */

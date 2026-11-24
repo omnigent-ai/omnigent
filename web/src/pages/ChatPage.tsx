@@ -3190,12 +3190,13 @@ function ComposerImpl(
   attachPastedFilesRef.current = attachPastedFiles;
   tagTokensRef.current = ownedMentionTokens;
   // Pasted chips send their files with the tray's; a chip's file goes only while its token is in the draft.
+  // Chips are read from the same live scan as liveMentions, so an overlapping longer token counts once.
+  const liveTokens = new Set(liveMentions.map((liveMention) => liveMention.token));
   const attachedFiles = [
     ...files,
-    ...presentMentions(mentionedAttachments, [
-      draft.text,
-      ...draft.quotes.map((quote) => quote.before),
-    ]).map((attachment) => attachment.file),
+    ...mentionedAttachments
+      .filter((attachment) => liveTokens.has(attachment.token))
+      .map((attachment) => attachment.file),
   ];
   const sendContext = { mentions: liveMentions, reviewComments: localReviewComments };
   // Review comments are appended at send, which can make a bare `!` a command.

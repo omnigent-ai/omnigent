@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import {
+  findMentionTokens,
   mergeTaggedDrafts,
   nameAttachmentFile,
   readTaggedMentions,
@@ -173,16 +174,18 @@ export function recoverFailedSessionDraft<
   });
   // The temporary draft's tray files are the incoming ones: each takes a name no tag or earlier
   // tray file uses.
+  let mergedText = merged.text;
   const incoming: File[] = [];
   for (const file of temporaryDraft.files) {
-    incoming.push(
-      nameAttachmentFile(file, {
-        tokens: tagTokensOf(merged.mentions),
-        trayNames: [...originalDraft.files, ...incoming].map(attachmentFilename),
-      }),
-    );
+    const named = nameAttachmentFile(file, {
+      tokens: tagTokensOf(merged.mentions),
+      trayNames: [...originalDraft.files, ...incoming].map(attachmentFilename),
+    });
+    // A typed @name refers to the tray file it was typed for, so its spellings follow the rename.
+    if (named !== file) mergedText = respellMention(mergedText, `@${file.name}`, `@${named.name}`);
+    incoming.push(named);
   }
-  const message = [originalDraft.message, merged.text]
+  const message = [originalDraft.message, mergedText]
     .filter((part) => part.trim() !== "")
     .join("\n\n");
   return {
@@ -191,6 +194,15 @@ export function recoverFailedSessionDraft<
     files: [...originalDraft.files, ...incoming],
     ...(merged.mentions ? { mentions: merged.mentions } : {}),
   };
+}
+
+/** ``text`` with each whole ``from`` mention spelled as ``to`` instead. */
+function respellMention(text: string, from: string, to: string): string {
+  let out = text;
+  for (const range of findMentionTokens(text, [from]).reverse()) {
+    out = out.slice(0, range.start) + to + out.slice(range.end);
+  }
+  return out;
 }
 
 /** Move an unsent draft when a temporary conversation receives its real id. */

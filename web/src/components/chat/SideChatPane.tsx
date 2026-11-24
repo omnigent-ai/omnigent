@@ -1166,9 +1166,7 @@ function SideChatComposer({
     text,
     ...quotes.map((replyQuote) => replyQuote.before),
   ]);
-  // A pasted chip the shared draft still shows sends its file with the tray's.
-  // A chip's file goes out with the tray's, under the names they were given.
-  // shortcut: a tray file added later with a chip's exact name is sent under that name too, a rare duplicate; renaming would rewrite the typed reference, so no reconciliation.
+  // A chip's file goes out with the tray's. shortcut: a chip that was undone in the main composer is not in this shared draft, so a tray file picked here can share its name until redo.
   const attachedFiles = [
     ...files,
     ...(sharedTags?.attachments ?? []).map((attachment) => attachment.file),
@@ -1185,7 +1183,7 @@ function SideChatComposer({
     const { accepted, errors } = validateAttachments(incoming, attachmentPolicy);
     errors.forEach((message) => toast.error(message));
     if (!accepted.length) return;
-    // An accepted file takes a name no tag of the draft uses, and no earlier tray file's.
+    // Rename accepted files to avoid clashing with draft tags or earlier tray files.
     setFiles((current) => {
       const named: File[] = [];
       for (const file of accepted) {

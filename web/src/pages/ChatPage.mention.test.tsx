@@ -1473,7 +1473,7 @@ describe("Composer pasted chips", () => {
 
   it("keeps a large text paste inline when its .txt file is over the upload limit", async () => {
     await renderCodeMirrorComposer();
-    const oversized = "x".repeat(ATTACHMENT_SIZE_LIMITS_MB.file * 1024 * 1024 + 1);
+    const oversized = "x".repeat(ATTACHMENT_SIZE_LIMITS_MB.text * 1024 * 1024 + 1);
     paste({ text: oversized });
     expect(valueOf()).toBe(oversized);
     expect(tokens()).toEqual([]);
