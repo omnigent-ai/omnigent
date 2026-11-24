@@ -99,7 +99,7 @@ function renderTree(
   const onFileSelect = vi.fn();
   const onShowHidden = vi.fn();
   const onShowIgnored = vi.fn();
-  render(
+  const tree = (ignored: boolean) => (
     <TooltipProvider>
       <FilesPageTree
         conversationId="conv_1"
@@ -108,13 +108,23 @@ function renderTree(
         sort="alpha"
         showHidden={showHidden}
         onShowHidden={onShowHidden}
-        showIgnored={showIgnored}
+        showIgnored={ignored}
         onShowIgnored={onShowIgnored}
         onFileSelect={onFileSelect}
       />
-    </TooltipProvider>,
+    </TooltipProvider>
   );
-  return { onFileSelect, onShowHidden, onShowIgnored };
+  const view = render(tree(showIgnored));
+  return {
+    onFileSelect,
+    onShowHidden,
+    onShowIgnored,
+    /** Switch ignored files, with `next` as the listing that answers then. */
+    setShowIgnored: (ignored: boolean, next: Partial<FilesResult>) => {
+      vi.mocked(useWorkspaceAllFiles).mockReturnValue(next as FilesResult);
+      view.rerender(tree(ignored));
+    },
+  };
 }
 
 /** The folder each render asked the workspace to list. */
@@ -415,6 +425,35 @@ describe("FilesPageTree", () => {
       renderTree(listed([entry("README.md")], true), false, { showIgnored: false });
       fireEvent.click(filterButton());
       typeName("artifact");
+      expect(searches().at(-1)?.[4]).toEqual({ enabled: true, hideIgnored: true });
+    });
+
+    it("searches without what Git ignores while the listing hasn't said whether it can", () => {
+      vi.useFakeTimers();
+      renderTree({ isPending: true, isError: false, data: undefined } as never, false, {
+        showIgnored: false,
+      });
+      fireEvent.click(filterButton());
+      typeName("artifact");
+      expect(searches().at(-1)?.[4]).toEqual({ enabled: true, hideIgnored: true });
+    });
+
+    it("drops matches kept from a search with ignored files once they're switched off", () => {
+      vi.useFakeTimers();
+      const withIgnored = { files: [entry("build/out.o")], truncated: false, hasMore: false };
+      vi.mocked(useWorkspaceFileSearch).mockReturnValue({ data: withIgnored } as never);
+      const { setShowIgnored } = renderTree(listed([entry("README.md")]));
+      fireEvent.click(filterButton());
+      typeName("out");
+      expect(screen.getByRole("button", { name: "build/out.o" })).toBeInTheDocument();
+
+      // The new search hasn't answered: React Query still hands back the old matches.
+      vi.mocked(useWorkspaceFileSearch).mockReturnValue({
+        data: withIgnored,
+        isPlaceholderData: true,
+      } as never);
+      setShowIgnored(false, { isPending: true, isError: false, data: undefined });
+      expect(screen.queryByRole("button", { name: "build/out.o" })).toBeNull();
       expect(searches().at(-1)?.[4]).toEqual({ enabled: true, hideIgnored: true });
     });
 

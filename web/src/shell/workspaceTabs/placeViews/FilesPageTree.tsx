@@ -159,7 +159,9 @@ export function FilesPageTree({
   const { session } = useSession(conversationId);
   const canBrowseOutside = isOwnerLevel(session?.permissionLevel ?? null);
   const files = useWorkspaceAllFiles(conversationId, { hideIgnored: !showIgnored }, location);
-  const listingHidesIgnored = files.data?.available === true && files.data.ignoredHidden === true;
+  // Until the listing answers, assume its host can leave ignored files out, so none show early.
+  const hostListsIgnored = files.data?.available === true && files.data.ignoredHidden !== true;
+  const searchHidesIgnored = !showIgnored && !hostListsIgnored;
   const changes = useWorkspaceChangedFiles(conversationId);
   const reveal = useTreeActiveReveal({
     conversationId,
@@ -244,16 +246,18 @@ export function FilesPageTree({
     filters.applied.include,
     filters.applied.exclude,
     // The matches leave out what Git ignores where the listing does, on a host that can.
-    { enabled: summary.active, hideIgnored: listingHidesIgnored },
+    { enabled: summary.active, hideIgnored: searchHidesIgnored },
     location,
   );
   // Typing keeps the previous matches in view, but a new root's search starts from none:
-  // matches from the old folder would open the wrong paths.
-  const settledLocation = useRef<string | null>(null);
+  // matches from the old folder would open the wrong paths. Switching ignored files off
+  // starts from none too, so the old search's ignored matches don't linger.
+  const settledSearch = useRef<string | null>(null);
+  const searchScope = `${location}\0${searchHidesIgnored}`;
   useEffect(() => {
-    if (search.data && !search.isPlaceholderData) settledLocation.current = location;
+    if (search.data && !search.isPlaceholderData) settledSearch.current = searchScope;
   });
-  const matchesFromOtherFolder = search.isPlaceholderData && settledLocation.current !== location;
+  const matchesFromOtherSearch = search.isPlaceholderData && settledSearch.current !== searchScope;
   // A listing with nothing to show mounts no tree, so a reveal it holds is missed here.
   const emptyListing =
     !summary.active &&
@@ -336,7 +340,7 @@ export function FilesPageTree({
         </Button>
       </div>
     );
-    const result = matchesFromOtherFolder ? undefined : search.data;
+    const result = matchesFromOtherSearch ? undefined : search.data;
     // The host can't search, or the search waits, never starting, on an unreachable workspace.
     const unsearchable =
       result?.unavailable || (!result && search.isPending && search.fetchStatus === "idle");
