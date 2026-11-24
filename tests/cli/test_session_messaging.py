@@ -35,6 +35,15 @@ def _tool_call(item_id: str) -> dict:
     return {"id": item_id, "type": "function_call", "name": "shell", "arguments": "{}"}
 
 
+def _error(item_id: str) -> dict:
+    return {
+        "id": item_id,
+        "type": "error",
+        "code": "host_launch_failed",
+        "message": "host refused",
+    }
+
+
 def _shown(item: dict) -> dict:
     """What the CLI prints for *item*."""
     return {
@@ -131,6 +140,7 @@ def router(monkeypatch: pytest.MonkeyPatch) -> Iterator[respx.MockRouter]:
     monkeypatch.setattr("omnigent.host.local_server._read_local_server_pid_file", lambda: None)
     monkeypatch.setattr("omnigent.session_cli._WAIT_FIRST_INTERVAL_S", 0.001)
     monkeypatch.setattr("omnigent.session_cli._WAIT_MAX_INTERVAL_S", 0.005)
+    monkeypatch.setattr("omnigent.session_cli._SETTLE_S", 0.002)
     with respx.mock(assert_all_called=False) as mock_router:
         yield mock_router
 
@@ -233,6 +243,54 @@ def test_wait_json_lists_every_message_after_the_sent_one(router: respx.MockRout
     }
 
 
+def test_wait_json_keeps_replies_when_another_sender_follows(router: respx.MockRouter) -> None:
+    """Every message after the sent one is returned, not just those after the newest user one."""
+    reply_a = _message("msg_3", "assistant", "Reply to the CLI")
+    from_web = _message("msg_4", "user", "A message from the web")
+    reply_b = _message("msg_5", "assistant", "Reply to the web")
+    _FakeSession(
+        states=[({"status": "running"}, [reply_a, from_web, reply_b]), ({"status": "idle"}, [])]
+    ).install(router)
+
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["messages"] == [
+        _shown(reply_a),
+        _shown(from_web),
+        _shown(reply_b),
+    ]
+
+
+def test_wait_ends_a_turn_that_leaves_no_reply(router: respx.MockRouter) -> None:
+    """A turn stopped before any text, or one that only calls tools, still ends the wait."""
+    _FakeSession(
+        states=[({"status": "running"}, [_tool_call("call_1")]), ({"status": "idle"}, [])]
+    ).install(router)
+
+    plain = _invoke(["send", _SESSION, "-m", "Fix it", "--wait"])
+
+    assert plain.exit_code == 0, plain.output
+    assert plain.stdout == ""
+    assert "turn ended without a reply" in plain.stderr
+
+
+def test_wait_takes_a_reply_mirrored_after_the_turn_ends(router: respx.MockRouter) -> None:
+    """A native terminal can report idle before its last reply reaches the transcript."""
+    _FakeSession(
+        states=[
+            ({"status": "running"}, []),
+            ({"status": "idle"}, [_LOOKING]),
+            ({"status": "idle"}, [_FIXED]),
+        ]
+    ).install(router)
+
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout == "Fixed the flaky test\n"
+
+
 def test_wait_returns_a_fast_turn_seen_only_by_its_reply(router: respx.MockRouter) -> None:
     """A turn that starts and ends between two polls never reads as running."""
     _FakeSession(states=[({"status": "idle"}, [_FIXED])]).install(router)
@@ -320,6 +378,11 @@ _OLD_ERROR = {"code": "executor_error", "message": "rate limited"}
             ],
             id="fails-with-a-new-error",
         ),
+        pytest.param(
+            {"status": "failed", "last_task_error": _OLD_ERROR},
+            [({"status": "failed", "last_task_error": _OLD_ERROR}, [_error("err_new")])],
+            id="fails-to-launch-again-with-the-same-error",
+        ),
     ],
 )
 def test_wait_reports_a_failed_turn(
@@ -340,6 +403,8 @@ def test_wait_retrying_a_failed_session_ignores_its_old_failure(
     """The last turn's failure stays on the session until the new turn starts."""
     old_failure = {"status": "failed", "last_task_error": _OLD_ERROR}
     _FakeSession(
+        # The failed turn's error item follows its message, the newest one before the send.
+        items=[_message("msg_1", "user", "Task"), _error("err_old")],
         baseline=old_failure,
         states=[(old_failure, []), ({"status": "running"}, []), ({"status": "idle"}, [_FIXED])],
     ).install(router)
@@ -368,6 +433,17 @@ def test_wait_timeout_bounds_slow_reads(router: respx.MockRouter) -> None:
 
     assert result.exit_code == 1
     assert "Timed out after 0.25s waiting for session conv_worker to reply" in result.stderr
+
+
+def test_wait_timeout_before_the_send_says_nothing_was_sent(router: respx.MockRouter) -> None:
+    session = _FakeSession(state_delay_s=5.0)
+    session.install(router)
+
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--timeout", "0.05"])
+
+    assert result.exit_code == 1
+    assert "reading session conv_worker; the message was not sent" in result.stderr
+    assert [kind for kind, _ in session.calls] == ["state"]
 
 
 def test_wait_timeout_covers_a_send_the_server_holds(router: respx.MockRouter) -> None:
@@ -479,13 +555,22 @@ def test_get_prints_a_readable_summary(router: respx.MockRouter) -> None:
     assert "cost:" not in without_usage.stdout
 
 
-def test_get_reports_an_unknown_session(router: respx.MockRouter) -> None:
-    router.get(_STATE_URL).mock(return_value=httpx.Response(404))
+@pytest.mark.parametrize(
+    ("status", "error"),
+    [
+        (404, f"Session {_SESSION} was not found."),
+        (401, f"The server refused to show session {_SESSION}; check that you're signed in."),
+    ],
+)
+def test_get_reports_a_session_it_cannot_show(
+    router: respx.MockRouter, status: int, error: str
+) -> None:
+    router.get(_STATE_URL).mock(return_value=httpx.Response(status))
 
     result = _invoke(["get", _SESSION])
 
     assert result.exit_code == 1
-    assert f"Session {_SESSION} was not found." in result.stderr
+    assert error in result.stderr
 
 
 def _transcript(count: int) -> list[dict]:

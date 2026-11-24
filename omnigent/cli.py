@@ -8253,9 +8253,9 @@ def session_send(
     The message is queued like one typed in the web UI, so a busy session takes
     it when it gets to it. Without --wait the command exits once the message is
     queued. With --wait it prints the session's final reply once the session is
-    idle again (--json adds every message after yours). It stops early when the
-    turn fails, exiting 1, or when the session waits for an approval or an
-    answer.
+    idle again (--json adds every message after yours); a turn that ends without
+    one prints nothing and says so on stderr. It stops early when the turn fails,
+    exiting 1, or when the session waits for an approval or an answer.
 
     \b
     Examples:
@@ -8299,6 +8299,8 @@ def session_send(
             click.echo(json.dumps(report))
         elif result.reply is not None:
             click.echo(result.reply)
+        if result.status == "idle" and result.reply is None:
+            click.echo(f"Session {session_id}'s turn ended without a reply.", err=True)
         if result.pending_approvals:
             click.echo(
                 f"Session {session_id} is waiting for you ({result.pending_approvals} "

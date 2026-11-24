@@ -36,6 +36,9 @@ _READ_TIMEOUT = httpx.Timeout(30.0)
 #: turn costs about one session read every few seconds.
 _WAIT_FIRST_INTERVAL_S = 1.0
 _WAIT_MAX_INTERVAL_S = 10.0
+#: A native terminal can report its turn's end before the last reply is mirrored
+#: into the transcript, so the end is confirmed by a second read this much later.
+_SETTLE_S = 2.0
 #: The items API's largest page.
 _ITEMS_PAGE_LIMIT = 1000
 _STATE_PARAMS = {
@@ -175,16 +178,31 @@ async def _messages_after(
     """
     Return every message after *after* (or every message), oldest first.
     """
-    messages: list[JsonObject] = []
-    params: dict[str, str | int] = {"limit": _ITEMS_PAGE_LIMIT, "order": "asc", "type": "message"}
+    items = await _items_after(client, session_id, after, "message")
+    return [message for item in items if (message := project_message(item)) is not None]
+
+
+async def _items_after(
+    client: httpx.AsyncClient, session_id: str, after: str | None, item_type: str
+) -> list[JsonObject]:
+    """
+    Return every *item_type* item after *after* (or from the start), oldest first.
+
+    Filters locally as well, because older servers ignore the ``type`` filter.
+    """
+    found: list[JsonObject] = []
+    params: dict[str, str | int] = {"limit": _ITEMS_PAGE_LIMIT, "order": "asc", "type": item_type}
     if after is not None:
         params["after"] = after
     while True:
         page = await _read_json(client, session_id, f"/v1/sessions/{session_id}/items", params)
-        messages.extend(_page_messages(page))
+        data = page.get("data")
+        for item in data if isinstance(data, list) else []:
+            if isinstance(item, dict) and item.get("type") == item_type:
+                found.append(cast(JsonObject, item))
         last_id = page.get("last_id")
         if page.get("has_more") is not True or not isinstance(last_id, str):
-            return messages
+            return found
         params = {**params, "after": last_id}
 
 
@@ -258,17 +276,29 @@ async def send_and_wait(
     :raises click.ClickException: When the send fails, the session can't be read,
         or time runs out.
     """
-    sent = False
+    posting = sent = False
     try:
         async with asyncio.timeout(timeout_s):
             baseline = await _read_json(
                 client, session_id, f"/v1/sessions/{session_id}", _STATE_PARAMS
             )
             after = await latest_message_id(client, session_id)
+            posting = True
             message_id = await send_message(client, session_id, text)
             sent = True
-            result = await _wait_for_reply(client, session_id, after=after, baseline=baseline)
+            result = await _wait_for_reply(
+                client,
+                session_id,
+                after=after,
+                baseline=baseline,
+                sent=_SentMessage(message_id, text),
+            )
     except TimeoutError:
+        if not posting:
+            raise click.ClickException(
+                f"Timed out after {timeout_s:g}s reading session {session_id}; the message "
+                "was not sent."
+            ) from None
         if not sent:
             raise click.ClickException(
                 f"Timed out after {timeout_s:g}s before the server confirmed the message. "
@@ -281,30 +311,48 @@ async def send_and_wait(
     return message_id, result
 
 
+@dataclass(frozen=True)
+class _SentMessage:
+    """
+    The message ``session send`` posted, to find it in the transcript.
+
+    :param item_id: The stored message's id, or ``None`` while the server holds it
+        as a startup input.
+    :param text: The message text.
+    """
+
+    item_id: str | None
+    text: str
+
+
 async def _wait_for_reply(
     client: httpx.AsyncClient,
     session_id: str,
     *,
     after: str | None,
     baseline: JsonObject,
+    sent: _SentMessage,
 ) -> TurnResult:
     """
     Poll until the sent message's turn ends, fails, or waits for a person.
 
     A status read can predate the turn: a session reads idle, or still reads its
     last turn's failure, until the runner reports the new turn. So the turn has
-    ended only when the session is idle, nothing waits for its terminal, and an
-    assistant message follows the newest user message past *after*, with the turn
-    seen first, as ``running`` or as a reply in an earlier read. A failure counts
-    once it can't be the old one: the session wasn't failed before the send, has
-    shown another status since, or reports a different error.
+    ended only once it was seen, as ``running`` or as a reply to the sent message,
+    and the session then reads idle with nothing waiting for its terminal. Two
+    transcript reads ``_SETTLE_S`` apart must agree, because a native terminal can
+    report the end before its last reply is mirrored. A failure counts once it can't
+    be the old one: the session wasn't failed before the send, has shown another
+    status since, reports a different error, or has an error item after the message.
 
     :param after: The newest message id before the send, or ``None``.
     :param baseline: The session's state read before the send.
+    :param sent: The posted message.
     """
+    loop = asyncio.get_running_loop()
     interval = _WAIT_FIRST_INTERVAL_S
-    turn_seen = False
-    left_failed = False
+    turn_seen = left_failed = False
+    settling: tuple[list[object], float] | None = None
     while True:
         state = await _read_json(client, session_id, f"/v1/sessions/{session_id}", _STATE_PARAMS)
         raw_status = state.get("status")
@@ -312,44 +360,71 @@ async def _wait_for_reply(
         prompts = state.get("pending_elicitations")
         approvals = len(prompts) if isinstance(prompts, list) else 0
         if approvals:
-            replies = await _messages_after_send(client, session_id, after)
-            return TurnResult(status, approvals, replies or [])
+            found = await _messages_after_sent(client, session_id, after, sent)
+            return TurnResult(status, approvals, found[1] if found else [])
         if status == "failed":
+            found = await _messages_after_sent(client, session_id, after, sent)
             if (
                 baseline.get("status") != "failed"
                 or left_failed
                 or state.get("last_task_error") != baseline.get("last_task_error")
+                or (
+                    found is not None and await _items_after(client, session_id, found[0], "error")
+                )
             ):
-                replies = await _messages_after_send(client, session_id, after)
-                return TurnResult(status, 0, replies or [])
+                return TurnResult(status, 0, found[1] if found else [])
         else:
             left_failed = True
-        turn_seen = turn_seen or status == "running"
-        if status == "idle" and not state.get("pending_inputs"):
-            replies = await _messages_after_send(client, session_id, after)
-            replied = bool(replies) and any(message["role"] == "assistant" for message in replies)
-            if replied and turn_seen:
-                return TurnResult(status, 0, replies)
-            # A reply read after this idle status shows the turn had started, so the
-            # next idle read is current; without one, wait to see the turn again.
-            turn_seen = replied
-        await asyncio.sleep(interval)
+        if status == "running":
+            turn_seen, settling = True, None
+        elif status == "idle" and not state.get("pending_inputs"):
+            found = await _messages_after_sent(client, session_id, after, sent)
+            replies = found[1] if found is not None else None
+            # Read after this idle status, a reply shows the turn had started.
+            if replies and any(message["role"] == "assistant" for message in replies):
+                turn_seen = True
+            if turn_seen and replies is not None:
+                tail = [message["id"] for message in replies]
+                now = loop.time()
+                if settling is not None and settling[0] == tail and now - settling[1] >= _SETTLE_S:
+                    return TurnResult(status, 0, replies)
+                if settling is None or settling[0] != tail:
+                    settling = (tail, now)
+        else:
+            settling = None
+        await asyncio.sleep(_SETTLE_S if settling is not None else interval)
         interval = min(interval * 1.5, _WAIT_MAX_INTERVAL_S)
 
 
-async def _messages_after_send(
-    client: httpx.AsyncClient, session_id: str, after: str | None
-) -> list[JsonObject] | None:
+async def _messages_after_sent(
+    client: httpx.AsyncClient, session_id: str, after: str | None, sent: _SentMessage
+) -> tuple[str, list[JsonObject]] | None:
     """
-    Return the messages after the newest user message past *after*.
+    Find the sent message after *after* and return its id and every message after it.
 
-    :returns: Those messages, or ``None`` while the sent message isn't stored yet.
+    The ack's item id finds it. A startup input has none yet, so the first user
+    message with the same text is taken, else the first user message.
+
+    :returns: ``(message id, later messages)``, or ``None`` while it isn't stored.
     """
-    messages = await list_messages(client, session_id, after=after)
-    user_positions = [index for index, message in enumerate(messages) if message["role"] == "user"]
-    if not user_positions:
+    messages = await _messages_after(client, session_id, after)
+    position = next(
+        (index for index, message in enumerate(messages) if message["id"] == sent.item_id),
+        None,
+    )
+    if position is None:
+        users = [index for index, message in enumerate(messages) if message["role"] == "user"]
+        matching = [
+            index for index in users if str(messages[index]["text"]).strip() == sent.text.strip()
+        ]
+        candidates = matching or users
+        if not candidates:
+            return None
+        position = candidates[0]
+    message_id = messages[position]["id"]
+    if not isinstance(message_id, str):
         return None
-    return messages[user_positions[-1] + 1 :]
+    return (message_id, messages[position + 1 :])
 
 
 async def session_info(
@@ -381,8 +456,12 @@ async def session_info(
         raise click.ClickException(f"Could not read session {session_id}.")
     info = cast(JsonObject, decoded)
     error = info.get("error")
-    if error in ("session_not_found", "access_denied"):
+    if error == "session_not_found":
         raise click.ClickException(f"Session {session_id} was not found.")
+    if error == "access_denied":
+        raise click.ClickException(
+            f"The server refused to show session {session_id}; check that you're signed in."
+        )
     if error is not None:
         raise click.ClickException(f"Could not read session {session_id}: {error}")
     return info

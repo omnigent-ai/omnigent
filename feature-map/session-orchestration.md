@@ -48,13 +48,16 @@ MCP independent creation.
   still printed, with a non-zero exit (`tests/cli/test_session_create.py`,
   `tests/e2e/test_session_create_cli_e2e.py`).
 - `cli-messaging`: `omnigent session send <id>` queues a message like a web composer
-  send. With `--wait` it returns once the session is idle, no input still waits for
-  its terminal, and an assistant message follows the newest user message, with the
-  turn seen first (as `running` or a reply in an earlier read), so an idle read from
-  before the turn doesn't end the wait. It prints the final reply (`--json` adds every
-  message after the sent one) and stops early, with the status shown, when a prompt
-  waits for a person or the turn fails (exit 1). A failure already on the session
-  before the send doesn't count. `--timeout` bounds the whole exchange, send included.
+  send. With `--wait` it returns once the turn was seen (as `running`, or as a reply
+  to the sent message) and the session then reads idle with no input waiting for its
+  terminal, confirmed by a second transcript read 2s later, since a native terminal
+  can report the end before its last reply is mirrored. An idle read from before the
+  turn doesn't end the wait. It prints the final reply, or nothing with a stderr note
+  when the turn left none; `--json` adds every message after the sent one. It stops
+  early, with the status shown, when a prompt waits for a person or the turn fails
+  (exit 1). A failure already on the session before the send counts only with a new
+  status, a different error, or an error item after the message. `--timeout` bounds
+  the whole exchange, send included.
   `omnigent session get <id>` prints the fields `sys_session_get_info` returns plus
   the URL, with cost and tokens under `--usage`. `omnigent session read <id>` prints
   the newest messages oldest first, without tool calls (`--last N`, `--after <message
@@ -270,6 +273,29 @@ MCP independent creation.
   with `sys_session_create`. Covered by
   `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_polling_manager_task`.
 
+### Scripting workers from a shell
+
+A script drives workers with `omnigent session` commands, acting as the signed-in
+user; each request goes to the replica holding the session's host:
+
+- `omnigent session create --agent claude --title T --message-file task.md` starts a
+  session on this machine's host in the current directory (`--host-id` with an
+  absolute `--workspace` for another owned host, `--project-id` to file it) and prints
+  its id; `--json` adds its URL.
+- `omnigent session send <id> -m "..." --wait` hands it the next task and prints the
+  final reply when the turn ends; `--json` gives `status`, `pending_approvals`, `reply`
+  and every message after the sent one, and `--timeout SECONDS` bounds it.
+- `omnigent session get <id>` shows its status, approvals waiting, host, workspace
+  and last activity (`--usage` adds cost and tokens, `--json` the
+  `sys_session_get_info` fields plus the URL).
+- `omnigent session read <id>` shows its newest messages (`--last N`, `--after <message
+  id>` for only what's new, `--json`).
+
+For a manual check, create a worker with a short task, then `send --wait` a follow-up
+and confirm the reply prints when the turn ends. `read` should show both exchanges
+and `get --usage` an idle session with its cost. Repeat `send --wait --timeout 1` on a
+slow task and confirm it times out promptly.
+
 ### Scripted review sessions
 
 With the server release flag `scripted_sessions` enabled (default on;
@@ -373,6 +399,12 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   `tests/runner/test_session_orchestration.py`, and
   `tests/server/integration/test_session_orchestration.py`; persisted settings and
   storage failures are covered by `tests/server/routes/test_sessions_sharing_mode.py`.
+- CLI scripting (no browser): `uv run --no-sync pytest tests/cli/test_session_create.py
+  tests/cli/test_session_messaging.py` covers request shapes, outputs and the reply-wait
+  rules against a fake server, and `uv run --no-sync pytest
+  tests/e2e/test_session_create_cli_e2e.py` (mock LLM, no credentials) runs `create`,
+  `send --wait`, `read` and `get` as separate processes with a real host daemon and
+  runner.
 - Live sandbox provisioning and native terminal-entered prompts require separate
   verification; local process checks do not cover them.
 - Admin/UI component tests cover all three destination modes; server integration
