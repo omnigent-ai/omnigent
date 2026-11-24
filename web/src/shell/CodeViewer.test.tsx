@@ -584,6 +584,8 @@ describe("CodeViewer markdown preview copy", () => {
       "After",
       "> Quoted line\n\nAfter",
     ],
+    ["an escape on a quote's next line", "> a\n> \\>b", "a", ">b", "a\n\\>b"],
+    ["an entity on a quote's next line", "> a\n> &gt;b", "a", ">b", "a\n&gt;b"],
     ["a code block's text", "```js\nconst answer = 42;\n```", "const", "42;", "const answer = 42;"],
     [
       "lines of code inside a quote",
@@ -662,6 +664,21 @@ describe("CodeViewer markdown preview copy", () => {
     expect(setData).toHaveBeenCalledWith(
       "text/html",
       "<ul><li>first <strong>item</strong></li>\n<li>second</li></ul>",
+    );
+  });
+
+  it("copies a rendered diagram's whole fence, comments included, across it", () => {
+    const fence = "```mermaid\ngraph TD\n%% a diagram comment\nA-->B\n```";
+    renderViewer(`Before\n\n${fence}\n\nAfter`, true, "doc.md", { viewMode: "preview" });
+    const start = previewText("Before");
+    const end = previewText("After");
+    const range = document.createRange();
+    range.setStart(start.node, start.offset);
+    range.setEnd(end.node, end.offset + "After".length);
+    window.getSelection()?.addRange(range);
+    expect(fireCopyEvent(start.node)).toHaveBeenCalledWith(
+      "text/plain",
+      `Before\n\n${fence}\n\nAfter`,
     );
   });
 

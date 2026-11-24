@@ -1014,11 +1014,16 @@ function nextCharacterSource(
   return null;
 }
 
+// A continuation line's container syntax: indentation and quote markers. Prose
+// can't hold an unescaped `>` there, so none of it is the line's own text.
+const CONTAINER_PREFIX = /[ \t]*(?:>[ \t]?[ \t]*)*/y;
+
 /**
  * The source behind each character of *text*, found in *stretch* of *source*.
  * Characters match in order, keeping escapes and references whole and skipping
- * syntax such as quote prefixes and trimmed indentation. *literal* text (code)
- * matches its characters as written. Null when a character isn't found.
+ * syntax such as markers and, for prose, each continuation line's container
+ * prefix. *literal* text (code) matches its characters as written. Null when a
+ * character isn't found.
  */
 function alignText(
   text: string,
@@ -1029,6 +1034,11 @@ function alignText(
   const characters: SourceSpan[] = [];
   let at = stretch.start;
   while (characters.length < text.length) {
+    if (!literal && at > stretch.start && source[at - 1] === "\n") {
+      CONTAINER_PREFIX.lastIndex = at;
+      CONTAINER_PREFIX.exec(source);
+      at = Math.min(CONTAINER_PREFIX.lastIndex, stretch.end);
+    }
     const next = nextCharacterSource(text, characters.length, source, {
       from: at,
       to: stretch.end,
@@ -1130,16 +1140,11 @@ function widenOverLeftElements(
 
 /**
  * The Markdown source behind a selection in the rendered preview, mapped
- * through the offsets `rehypeSourceOffsets` stamped on its elements.
- *
- * A selection inside one text node copies its characters' own source, so a
- * code block's lines come without a quote's `>`. Otherwise it copies a slice of
- * source: a partially selected bold, italic, link or code span widens to its
- * whole source, each block the selection covers from its edge copies whole,
- * markers included, and one entered mid-text starts or ends mid-line. A code
- * block copies whole when the selection leaves it, and a table once the
- * selection spans its cells or leaves it. A slice reaching raw HTML or a link
- * definition is never copied, since it could carry text the preview hides.
+ * through the offsets `rehypeSourceOffsets` stamped on its elements. A selection
+ * inside one text node joins its characters' own source; one across nodes copies
+ * a slice of source, widened over the elements it leaves (see
+ * `widenOverLeftElements` and `tableAcrossCells`). A rendered construct such as a
+ * diagram or formula copies its whole source, comments included.
  *
  * :param range: The selection, e.g. `window.getSelection().getRangeAt(0)`.
  * :param root: The element holding the rendered document.
