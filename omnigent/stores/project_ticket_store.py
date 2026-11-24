@@ -721,12 +721,21 @@ class ProjectTicketStore:
                 limit=limit + 1,
                 requested_by=requested_by,
             )
-            return {
+            page: dict[str, Any] = {
                 **configuration.model_dump(),
                 "data": [_ticket(row) for row in rows[:limit]],
                 "has_more": len(rows) > limit,
                 "last_id": rows[min(limit, len(rows)) - 1].id if rows else None,
             }
+            if after is None:
+                # The first page carries the full match count, so a board lane can show
+                # its real size without paging through every ticket.
+                page["total"] = (
+                    self._stage_count(session, project, stage_id, requested_by=requested_by)
+                    if page["has_more"]
+                    else len(page["data"])
+                )
+            return page
 
     def summary(
         self,
@@ -1138,6 +1147,29 @@ class ProjectTicketStore:
                 return True
             had = has
         return False
+
+    def _stage_count(
+        self,
+        session: Session,
+        project: SqlProject,
+        stage_id: str | None,
+        *,
+        requested_by: str | None = None,
+    ) -> int:
+        """Count the tickets ``_stage_rows`` would list, on the same index."""
+        stmt = (
+            select(func.count())
+            .select_from(SqlProjectTicket)
+            .where(
+                SqlProjectTicket.workspace_id == project.workspace_id,
+                SqlProjectTicket.project_id == project.id,
+            )
+        )
+        if requested_by is not None:
+            stmt = stmt.where(SqlProjectTicket.requested_by == requested_by)
+        if stage_id is not None:
+            stmt = stmt.where(SqlProjectTicket.stage_id == stage_id)
+        return int(session.scalar(stmt) or 0)
 
     def _stage_rows(
         self,

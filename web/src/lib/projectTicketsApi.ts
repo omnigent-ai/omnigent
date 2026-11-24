@@ -122,6 +122,8 @@ export interface TicketPage<T> {
   data: T[];
   has_more: boolean;
   last_id: string | null;
+  /** Every matching ticket, on a list's first page; absent on later pages and older servers. */
+  total?: number;
 }
 export interface TicketSummary {
   needs_response_count: number;

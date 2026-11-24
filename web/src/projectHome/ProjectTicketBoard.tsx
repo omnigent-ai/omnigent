@@ -285,6 +285,9 @@ function TicketColumn({
   const query = useTickets(projectId, stage.id, filteredTickets === undefined, mine);
   const tickets = filteredTickets ?? query.data?.pages.flatMap((page) => page.data) ?? [];
   const hasNextPage = filteredTickets === undefined && query.hasNextPage;
+  // The server's total for the lane; older servers only report what has loaded, plus "+".
+  const total = filteredTickets === undefined ? query.data?.pages[0]?.total : undefined;
+  const count = total ?? `${tickets.length}${hasNextPage ? "+" : ""}`;
   const { setNodeRef, isOver } = useDroppable({ id: stage.id, disabled });
   const [collapsedPreference, toggleCollapsed] = useStageCollapsed(projectId, stage);
   const collapsed = collapsedPreference && !filteredTickets?.length;
@@ -323,10 +326,7 @@ function TicketColumn({
             <CircleAlertIcon />
           </Button>
         ) : (
-          <span className="text-sm font-medium text-muted-foreground tabular-nums">
-            {tickets.length}
-            {hasNextPage ? "+" : ""}
-          </span>
+          <span className="text-sm font-medium text-muted-foreground tabular-nums">{count}</span>
         )}
         <button
           type="button"
@@ -352,8 +352,7 @@ function TicketColumn({
         <TicketStageBadge stage={stage} showInstructionsOnHover />
         {/* Pinned to the badge's height so a complete stage's collapse button can't lower its row. */}
         <span className="flex h-5 items-center gap-1 tabular-nums">
-          {tickets.length}
-          {hasNextPage ? "+" : ""}
+          {count}
           {stage.is_complete && (
             <Button
               variant="ghost"

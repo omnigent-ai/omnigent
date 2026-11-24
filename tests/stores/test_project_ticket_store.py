@@ -447,6 +447,11 @@ def test_pagination_and_outbox_order(board):
     )
     assert page["has_more"] and not rest["has_more"]
     assert {row["id"] for row in page["data"] + rest["data"]} == {row["id"] for row in created}
+    # The first page counts every match; later pages don't repeat it.
+    assert page["total"] == 4 and "total" not in rest
+    assert tickets.list(project.id, user_id="alice", stage_id="open")["total"] == 4
+    assert tickets.list(project.id, user_id="alice", stage_id="done", limit=2)["total"] == 0
+    assert tickets.list(project.id, user_id="alice", limit=1, requested_by="bob")["total"] == 0
     ticket_id = created[0]["id"]
     for text in ("One", "Two", "Three"):
         tickets.comment(project.id, ticket_id, CommentOnTicket(text=text), actor)
