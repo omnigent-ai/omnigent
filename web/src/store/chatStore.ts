@@ -3088,8 +3088,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       return state?.pendingUserMessages.some((p) => p.tempId === tempId && p.initialDraft);
     };
 
-    // Upload progress and Cancel belong to a composer send; Cancel stops the upload and, until
-    // the fence below, gives the message back to the composer instead of posting it.
+    // Composer sends only: Cancel stops the upload and, before the fence below, parks the message.
     const interactive = !opts?.external;
     const uploadAbort = new AbortController();
     const uploads = { uploading: false, cancelled: false, file: undefined as File | undefined };
@@ -3292,7 +3291,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (initialDraft && !initialDispatched && !initialSendPending()) return;
       const { message, code } = describeSendFailure(err);
       endProgress();
-      const cancelled = uploads.cancelled;
+      // A stop counts only when the upload itself was aborted: a press during the cleanup of a
+      // real failure must not replace that failure's reason.
+      const cancelled =
+        uploads.cancelled && (err as { name?: unknown } | null)?.name === "AbortError";
       if (opts?.external && !posting) {
         // Never posted (held back, or its upload failed or was stopped): drop only this
         // attempt's bubble and latch. A turn seen starting since isn't this send's to end.

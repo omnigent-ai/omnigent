@@ -4910,6 +4910,45 @@ describe("chatStore — a stopped upload keeps its message until the user acts",
     expect(useChatStore.getState().failedUploads[0]?.uploadFailure?.fileId).toBeUndefined();
   });
 
+  it("a Cancel during the cleanup of a real failure keeps the server's reason", async () => {
+    const first = new File(["one"], "one.txt", { type: "text/plain" });
+    const second = new File(["two"], "two.txt", { type: "text/plain" });
+    let releaseCleanup: () => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/resources/files") && init?.method === "POST") {
+        return fetchMock.mock.calls.filter(
+          ([u, i]) => String(u).endsWith("/resources/files") && i?.method === "POST",
+        ).length === 1
+          ? mockResponse({ id: "file_one" })
+          : mockResponse({ detail: "Unsupported attachment type" }, { ok: false, status: 415 });
+      }
+      if (url.includes("/resources/files/") && init?.method === "DELETE") {
+        return new Promise<Response>((resolve) => {
+          releaseCleanup = () => resolve(mockResponse({ deleted: true }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    void useChatStore.getState().send("read these", "agent_xyz", [first, second]);
+    await flush();
+    const message = useChatStore.getState().pendingUserMessages[0]!;
+    const cancel =
+      useUploadProgressStore.getState().uploads[
+        uploadProgressKey(message.tempId, pendingFileId(message))
+      ]!.cancel!;
+
+    // The second file failed; the first one's cleanup is still running when Cancel is pressed.
+    await flush();
+    cancel();
+    releaseCleanup();
+    await flush();
+
+    expect(useChatStore.getState().failedUploads[0]?.uploadFailure).toMatchObject({
+      message: "Unsupported attachment type",
+    });
+  });
+
   it("Remove drops the message and leaves the composer's own draft alone", async () => {
     const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
     const parked = await parkFailedUpload("read this", file);
@@ -5209,6 +5248,35 @@ describe("chatStore — first message during native model startup", () => {
       expect(useChatStore.getState().blocks.filter((b) => b.type === "error")).toEqual([]);
     },
   );
+
+  it("a held first message whose upload fails restores its text, files and error without a stop", async () => {
+    const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+    const baseFetch = fetchMock.getMockImplementation()!;
+    let releaseUpload!: () => void;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/resources/files")) {
+        return new Promise<Response>((resolve) => {
+          releaseUpload = () => resolve(mockResponse({}, { ok: false, status: 500 }));
+        });
+      }
+      return baseFetch(input, init);
+    });
+    begin([file]);
+    await settle();
+    reportModel();
+    await settle();
+    releaseUpload();
+    await settle();
+
+    // The held first message keeps the ordinary failure path: its text and file come back
+    // into the composer draft with the error shown, and nothing is posted.
+    expect(eventBodies()).toEqual([]);
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: original,
+      files: [file],
+    });
+    expect(useChatStore.getState().blocks.some((b) => b.type === "error")).toBe(true);
+  });
 
   it.each([false, true])(
     "never posts an initial message canceled during upload (failed=%s)",

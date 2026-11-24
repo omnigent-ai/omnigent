@@ -457,7 +457,13 @@ function fetchReportingUpload(
       settle();
       reject(abortReason(signal));
     };
-    request.send((init?.body ?? null) as XMLHttpRequestBodyInit | null);
+    try {
+      request.send((init?.body ?? null) as XMLHttpRequestBodyInit | null);
+    } catch {
+      // A body XHR refuses (e.g. a ReadableStream) fails as `fetch` would, and releases the signal.
+      settle();
+      reject(new TypeError("Failed to fetch"));
+    }
   });
 }
 
