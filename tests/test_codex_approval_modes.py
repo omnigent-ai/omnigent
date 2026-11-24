@@ -139,6 +139,31 @@ def test_preset_from_thread_settings_none_for_unmapped() -> None:
     assert codex_permission_preset_from_thread_settings({}) is None
 
 
+@pytest.mark.parametrize(
+    ("sandbox_policy", "expected"),
+    [
+        # What Codex reports for `--ask-for-approval never` (or a config
+        # `approval_policy = "never"`) without a full-access sandbox: no prompts,
+        # but `.git` stays read-only and the network is blocked.
+        ({"type": "workspaceWrite", "networkAccess": False}, None),
+        ({"type": "workspace-write"}, None),
+        ({"type": "externalSandbox"}, None),
+        ({"type": "readOnly"}, "read-only"),
+    ],
+)
+def test_preset_from_thread_settings_never_on_restricted_sandbox_is_not_full_access(
+    sandbox_policy: dict, expected: str | None
+) -> None:
+    """Approval ``never`` alone must not read back as Full Access."""
+    settings = {
+        "approvalPolicy": "never",
+        "approvalsReviewer": "user",
+        "sandboxPolicy": sandbox_policy,
+        "activePermissionProfile": None,
+    }
+    assert codex_permission_preset_from_thread_settings(settings) == expected
+
+
 @pytest.mark.parametrize("sandbox_type", [{}, []])
 def test_preset_from_thread_settings_ignores_non_string_sandbox_type(sandbox_type: object) -> None:
     """An unsupported sandbox type leaves the remaining preset signals usable."""
