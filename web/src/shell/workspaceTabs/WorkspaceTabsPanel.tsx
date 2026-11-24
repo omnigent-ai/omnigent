@@ -763,11 +763,6 @@ function WorkspaceTabsPanelImpl({
       return closed;
     };
   };
-  /**
-   * How closing a bound tab treats its resource: a shell asks, then ends, before its
-   * tab goes; a browser view is released after. A side chat or sub-agent tab only
-   * hides; the chat keeps running and can be opened again.
-   */
   /** One message for a close, however many of its shells kept running. */
   const reportShellsStillRunning = (keys: readonly string[]) => {
     const names = shellLabelList(keys.map(terminalLabel));
@@ -777,6 +772,11 @@ function WorkspaceTabsPanelImpl({
       closeButton: true,
     });
   };
+  /**
+   * How closing a bound tab treats its resource: a shell asks, then ends, before its
+   * tab goes; a browser view is released after. A side chat or sub-agent tab only
+   * hides; the chat keeps running and can be opened again.
+   */
   const closeStepsFor = (tab: WorkspaceTab) => {
     const binding = tab.binding;
     if (binding?.kind === "terminal") {
