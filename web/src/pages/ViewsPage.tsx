@@ -257,14 +257,15 @@ function ViewDetail({ viewId }: { viewId: string }) {
     queryKey: ["work-view", viewId],
     queryFn: () => getWorkView(viewId),
     enabled: viewId !== "new",
+    refetchOnMount: "always",
   });
-  if (viewId !== "new" && saved.isPending)
+  if (viewId !== "new" && (saved.isPending || !saved.isFetchedAfterMount))
     return (
       <div className="flex justify-center p-12">
         <Spinner aria-label="Loading view" />
       </div>
     );
-  if (saved.error)
+  if (saved.error && !saved.data)
     return (
       <div className="space-y-3 p-8">
         <p role="alert" className="text-destructive">
@@ -280,7 +281,19 @@ function ViewDetail({ viewId }: { viewId: string }) {
     );
   const editorKey =
     viewId === "new" ? `${searchParams.get("type")}:${searchParams.get("project")}` : viewId;
-  return <ViewEditor key={editorKey} saved={saved.data} />;
+  return (
+    <>
+      {saved.error && (
+        <p role="alert" className="px-5 py-3 text-sm text-destructive">
+          Couldn’t refresh this view. {saved.error.message}
+          <Button variant="ghost" onClick={() => void saved.refetch()}>
+            Retry
+          </Button>
+        </p>
+      )}
+      <ViewEditor key={editorKey} saved={saved.data} />
+    </>
+  );
 }
 
 function ViewEditor({ saved }: { saved?: SavedWorkView }) {
@@ -291,7 +304,7 @@ function ViewEditor({ saved }: { saved?: SavedWorkView }) {
   const projectOptions = (projects.data ?? []).flatMap((project) =>
     project.id ? [{ id: project.id, name: project.name }] : [],
   );
-  const [value, setValue] = useState<ViewInput>(() => {
+  const [initialValue] = useState<ViewInput>(() => {
     if (saved) return viewInput(saved);
     const requestedType = searchParams.get("type");
     const initial = newView(
@@ -301,13 +314,14 @@ function ViewEditor({ saved }: { saved?: SavedWorkView }) {
     if (project && /^[0-9a-f]{32}$/.test(project)) initial.filters.project_ids = [project];
     return initial;
   });
-  const [baseline, setBaseline] = useState(() => JSON.stringify(saved ? viewInput(saved) : null));
+  const [draft, setDraft] = useState<ViewInput | null>(null);
+  const value = draft ?? (saved ? viewInput(saved) : initialValue);
+  const baseline = JSON.stringify(saved ? viewInput(saved) : null);
   const save = useMutation({
-    mutationFn: () => saveWorkView(value, saved?.id),
+    mutationFn: (input: ViewInput) => saveWorkView(input, saved?.id),
     onSuccess: async (view) => {
-      setBaseline(JSON.stringify(viewInput(view)));
-      setValue(viewInput(view));
       queryClient.setQueryData(["work-view", view.id], view);
+      setDraft(saved ? null : viewInput(view));
       await queryClient.invalidateQueries({ queryKey: ["work-views"] });
       if (!saved) navigate(`/views/${view.id}`, { replace: true });
     },
@@ -333,7 +347,10 @@ function ViewEditor({ saved }: { saved?: SavedWorkView }) {
         <ChevronRightIcon className="size-4 text-muted-foreground" />
         <span className="truncate">{saved?.name ?? "New view"}</span>
       </header>
-      <div className="m-4 rounded-xl border border-border/70 bg-background shadow-sm">
+      <fieldset
+        disabled={save.isPending}
+        className="m-4 min-w-0 rounded-xl border border-border/70 bg-background shadow-sm"
+      >
         <div className="flex flex-wrap items-start gap-3 px-5 pt-5 pb-4">
           <LayersIcon className="mt-2 size-5 shrink-0 text-muted-foreground" />
           <div className="min-w-40 flex-1 space-y-1">
@@ -341,7 +358,7 @@ function ViewEditor({ saved }: { saved?: SavedWorkView }) {
               aria-label="View name"
               value={value.name}
               maxLength={120}
-              onChange={(event) => setValue({ ...value, name: event.target.value })}
+              onChange={(event) => setDraft({ ...value, name: event.target.value })}
               placeholder="Name your view"
               className="h-10 border-transparent px-1 text-lg font-medium shadow-none"
             />
@@ -349,7 +366,7 @@ function ViewEditor({ saved }: { saved?: SavedWorkView }) {
               aria-label="View description"
               value={value.description}
               maxLength={1000}
-              onChange={(event) => setValue({ ...value, description: event.target.value })}
+              onChange={(event) => setDraft({ ...value, description: event.target.value })}
               placeholder="Description (optional)"
               className="border-transparent px-1 text-sm text-muted-foreground shadow-none"
             />
@@ -364,7 +381,7 @@ function ViewEditor({ saved }: { saved?: SavedWorkView }) {
             </Button>
             <Button
               disabled={!value.name.trim() || save.isPending || baseline === JSON.stringify(value)}
-              onClick={() => save.mutate()}
+              onClick={() => save.mutate(value)}
             >
               {save.isPending ? "Saving…" : saved ? "Save changes" : "Create view"}
             </Button>
@@ -373,7 +390,7 @@ function ViewEditor({ saved }: { saved?: SavedWorkView }) {
         <ViewControls
           value={value}
           projects={projectOptions}
-          onChange={setValue}
+          onChange={setDraft}
           showEntityTabs={!saved}
         />
         {save.error && (
@@ -381,7 +398,7 @@ function ViewEditor({ saved }: { saved?: SavedWorkView }) {
             {save.error.message}
           </p>
         )}
-      </div>
+      </fieldset>
       <div className="px-4 pb-4">
         {projects.error && (
           <p role="alert" className="mb-3 text-sm text-destructive">

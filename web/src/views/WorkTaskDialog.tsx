@@ -46,6 +46,7 @@ export function WorkTaskDialog({
     queryKey: ["work-task", taskId],
     queryFn: () => getWorkTask(taskId),
     enabled: taskId !== "new",
+    refetchOnMount: "always",
   });
   return (
     <Dialog
@@ -63,9 +64,17 @@ export function WorkTaskDialog({
               : "Keep the outcome and its agent sessions together."}
           </DialogDescription>
         </DialogHeader>
-        {taskId !== "new" && task.isPending ? (
+        {task.error && task.data && (
+          <p role="alert" className="text-sm text-destructive">
+            Couldn’t refresh this task. {task.error.message}
+            <Button variant="ghost" onClick={() => void task.refetch()}>
+              Retry
+            </Button>
+          </p>
+        )}
+        {taskId !== "new" && (task.isPending || !task.isFetchedAfterMount) ? (
           <Spinner aria-label="Loading task" />
-        ) : task.error ? (
+        ) : task.error && !task.data ? (
           <div role="alert">
             {task.error.message}
             <Button variant="ghost" onClick={() => void task.refetch()}>
@@ -101,18 +110,23 @@ function TaskForm({
   onSaved: (id: string) => void;
 }) {
   const queryClient = useQueryClient();
-  const [body, setBody] = useState<WorkTaskInput>(() => ({
+  const [draft, setDraft] = useState<WorkTaskInput | null>(null);
+  const body: WorkTaskInput = draft ?? {
     title: task?.title ?? "",
     description: task?.description ?? "",
     status: task?.status ?? "todo",
     priority: task?.priority ?? 0,
     project_id: task ? task.project_id : (initialProjectId ?? null),
-  }));
-  const update = (changes: Partial<WorkTaskInput>) =>
-    setBody((previous) => ({ ...previous, ...changes }));
+  };
+  const update = (changes: Partial<WorkTaskInput>) => setDraft({ ...body, ...changes });
   const save = useMutation({
-    mutationFn: () => saveWorkTask(body, task?.id),
+    mutationFn: (input: WorkTaskInput) => saveWorkTask(input, task?.id),
     onSuccess: async (saved) => {
+      queryClient.setQueryData<WorkTask>(["work-task", saved.id], (previous) => ({
+        ...saved,
+        sessions: previous?.sessions ?? [],
+      }));
+      if (task) setDraft(null);
       await queryClient.invalidateQueries({ queryKey: ["view-results"] });
       await queryClient.invalidateQueries({ queryKey: ["work-task", saved.id] });
       onSaved(saved.id);
@@ -121,67 +135,68 @@ function TaskForm({
   return (
     <div className="space-y-5">
       <form
-        className="space-y-4"
         onSubmit={(event) => {
           event.preventDefault();
-          if (body.title.trim() && !save.isPending) save.mutate();
+          if (body.title.trim() && !save.isPending) save.mutate(body);
         }}
       >
-        <Input
-          autoFocus
-          aria-label="Task title"
-          placeholder="Task title"
-          maxLength={200}
-          value={body.title}
-          onChange={(event) => update({ title: event.target.value })}
-          className="h-11 text-lg font-medium"
-        />
-        <Textarea
-          aria-label="Task description"
-          placeholder="Describe the outcome and any useful context…"
-          maxLength={12000}
-          value={body.description}
-          onChange={(event) => update({ description: event.target.value })}
-          className="min-h-32"
-        />
-        <div className="flex flex-wrap gap-3">
-          <ViewSelect
-            label="Task status"
-            value={body.status}
-            options={TASK_STATUSES}
-            onChange={(status) => update({ status: status as WorkTaskInput["status"] })}
+        <fieldset disabled={save.isPending} className="min-w-0 space-y-4">
+          <Input
+            autoFocus
+            aria-label="Task title"
+            placeholder="Task title"
+            maxLength={200}
+            value={body.title}
+            onChange={(event) => update({ title: event.target.value })}
+            className="h-11 text-lg font-medium"
           />
-          <ViewSelect
-            label="Task priority"
-            value={String(body.priority)}
-            options={PRIORITIES}
-            onChange={(priority) => update({ priority: Number(priority) })}
+          <Textarea
+            aria-label="Task description"
+            placeholder="Describe the outcome and any useful context…"
+            maxLength={12000}
+            value={body.description}
+            onChange={(event) => update({ description: event.target.value })}
+            className="min-h-32"
           />
-          <ViewSelect
-            label="Task project"
-            value={body.project_id ?? "none"}
-            options={{
-              none: "No project",
-              ...Object.fromEntries(projects.map((project) => [project.id, project.name])),
-            }}
-            onChange={(project_id) =>
-              update({ project_id: project_id === "none" ? null : project_id })
-            }
-          />
-        </div>
-        {save.error && (
-          <p role="alert" className="text-sm text-destructive">
-            {save.error.message}
-          </p>
-        )}
-        <div className="flex justify-end gap-2">
-          <Button variant="ghost" type="button" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button type="submit" disabled={!body.title.trim() || save.isPending}>
-            {save.isPending ? "Saving…" : task ? "Save task" : "Create task"}
-          </Button>
-        </div>
+          <div className="flex flex-wrap gap-3">
+            <ViewSelect
+              label="Task status"
+              value={body.status}
+              options={TASK_STATUSES}
+              onChange={(status) => update({ status: status as WorkTaskInput["status"] })}
+            />
+            <ViewSelect
+              label="Task priority"
+              value={String(body.priority)}
+              options={PRIORITIES}
+              onChange={(priority) => update({ priority: Number(priority) })}
+            />
+            <ViewSelect
+              label="Task project"
+              value={body.project_id ?? "none"}
+              options={{
+                none: "No project",
+                ...Object.fromEntries(projects.map((project) => [project.id, project.name])),
+              }}
+              onChange={(project_id) =>
+                update({ project_id: project_id === "none" ? null : project_id })
+              }
+            />
+          </div>
+          {save.error && (
+            <p role="alert" className="text-sm text-destructive">
+              {save.error.message}
+            </p>
+          )}
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" type="button" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={!body.title.trim() || save.isPending}>
+              {save.isPending ? "Saving…" : task ? "Save task" : "Create task"}
+            </Button>
+          </div>
+        </fieldset>
       </form>
       {task && <TaskSessions task={task} />}
     </div>

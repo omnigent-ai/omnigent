@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -48,7 +48,7 @@ function renderPage(path: string) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const rendered = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[path]}>
         <Routes>
@@ -59,6 +59,7 @@ function renderPage(path: string) {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...rendered, client };
 }
 
 beforeEach(() => {
@@ -179,6 +180,98 @@ it("saves and reopens filters and display independently of membership", async ()
   expect(screen.queryByRole("group", { name: "View item type" })).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Filters (1)" })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Display options" })).toBeInTheDocument();
+});
+
+it("refreshes a cached view before editing and preserves a draft during background refresh", async () => {
+  const user = userEvent.setup();
+  const { client } = renderPage("/views/saved");
+  expect(await screen.findByLabelText("View name")).toHaveValue("My work");
+  await user.click(screen.getByRole("link", { name: "Views" }));
+  await screen.findByRole("link", { name: "My work" });
+  saved = { ...saved, name: "Updated elsewhere", favorite: true };
+  await user.click(screen.getByRole("link", { name: "My work" }));
+  await waitFor(() => expect(screen.getByLabelText("View name")).toHaveValue(saved.name));
+  expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+  fireEvent.change(screen.getByLabelText("View name"), { target: { value: "My draft" } });
+  vi.mocked(api.getWorkView).mockRejectedValueOnce(new Error("Connection lost"));
+  await act(() => client.invalidateQueries({ queryKey: ["work-view", saved.id] }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Couldn’t refresh this view");
+  expect(screen.getByLabelText("View name")).toHaveValue("My draft");
+  saved = { ...saved, name: "Another remote update" };
+  await act(() => client.invalidateQueries({ queryKey: ["work-view", saved.id] }));
+  expect(screen.getByLabelText("View name")).toHaveValue("My draft");
+  await user.click(screen.getByRole("button", { name: "Save changes" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled());
+  expect(saved.name).toBe("My draft");
+  expect(saved.favorite).toBe(true);
+});
+
+it.each(["new", "saved"])("locks the %s view's inputs until saving finishes", async (viewId) => {
+  let finishSave!: (view: api.SavedWorkView) => void;
+  vi.mocked(api.saveWorkView).mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finishSave = resolve;
+      }),
+  );
+  const user = userEvent.setup();
+  renderPage(`/views/${viewId}`);
+  fireEvent.change(await screen.findByLabelText("View name"), { target: { value: "Submitted" } });
+  await user.click(
+    screen.getByRole("button", { name: viewId === "new" ? "Create view" : "Save changes" }),
+  );
+  expect(screen.getByLabelText("View name")).toBeDisabled();
+  expect(screen.getByLabelText("Filter by name")).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Display options" })).toBeDisabled();
+  saved = { ...saved, ...vi.mocked(api.saveWorkView).mock.calls[0][0] };
+  await act(async () => finishSave(saved));
+  await waitFor(() => expect(screen.getByLabelText("View name")).toBeEnabled());
+  expect(screen.getByLabelText("View name")).toHaveValue("Submitted");
+});
+
+it("refreshes a cached task without replacing unsaved edits when its sessions refresh", async () => {
+  const user = userEvent.setup();
+  const { client } = renderPage(`/work-tasks?task=${task.id}`);
+  expect(await screen.findByLabelText("Task title")).toHaveValue("Ship release");
+  await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
+  task = { ...task, title: "Updated elsewhere", description: "New context" };
+  await user.click(await screen.findByRole("button", { name: /Ship release/ }));
+  await waitFor(() => expect(screen.getByLabelText("Task title")).toHaveValue(task.title));
+  expect(screen.getByLabelText("Task description")).toHaveValue("New context");
+  fireEvent.change(screen.getByLabelText("Task title"), { target: { value: "My draft" } });
+  vi.mocked(api.getWorkTask).mockRejectedValueOnce(new Error("Connection lost"));
+  await act(() => client.invalidateQueries({ queryKey: ["work-task", task.id] }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Couldn’t refresh this task");
+  expect(screen.getByLabelText("Task title")).toHaveValue("My draft");
+  task = { ...task, title: "Another remote update" };
+  await act(() => client.invalidateQueries({ queryKey: ["work-task", task.id] }));
+  expect(screen.getByLabelText("Task title")).toHaveValue("My draft");
+  await user.click(screen.getByRole("button", { name: "Save task" }));
+  await waitFor(() => expect(task.title).toBe("My draft"));
+  expect(task.description).toBe("New context");
+});
+
+it.each(["new", record.id])("locks task inputs while saving %s", async (taskId) => {
+  let finishSave!: (value: api.WorkTask) => void;
+  vi.mocked(api.saveWorkTask).mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finishSave = resolve;
+      }),
+  );
+  const user = userEvent.setup();
+  renderPage(`/work-tasks?task=${taskId}`);
+  fireEvent.change(await screen.findByLabelText("Task title"), { target: { value: "Submitted" } });
+  await user.click(
+    screen.getByRole("button", { name: taskId === "new" ? "Create task" : "Save task" }),
+  );
+  expect(screen.getByLabelText("Task title")).toBeDisabled();
+  expect(screen.getByLabelText("Task description")).toBeDisabled();
+  expect(screen.getByRole("combobox", { name: "Task status" })).toBeDisabled();
+  task = { ...task, ...vi.mocked(api.saveWorkTask).mock.calls[0][0] };
+  await act(async () => finishSave(task));
+  await waitFor(() => expect(screen.getByLabelText("Task title")).toBeEnabled());
+  expect(screen.getByLabelText("Task title")).toHaveValue("Submitted");
 });
 
 it("edits grouped filter chips and removes only the selected field before saving", async () => {
