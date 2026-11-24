@@ -2947,3 +2947,56 @@ it.each([false, true])(
     }
   },
 );
+
+describe("sending a side-chat reply to the main chat", () => {
+  function seedReply(status: "idle" | "running" = "idle") {
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "claude-native",
+      sessionStatus: status,
+      blocks: itemsToBlocks([
+        {
+          id: "ask",
+          response_id: "turn",
+          type: "message",
+          role: "user",
+          status: "completed",
+          content: [{ type: "input_text", text: "What changed?" }],
+        },
+        {
+          id: "reply",
+          response_id: "turn",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "The codename is now MARLIN." }],
+        },
+      ]),
+    });
+  }
+
+  it("queues the latest reply to the parent session once", async () => {
+    mockSession.snapshot = { sideChatParentId: "conv_main", agentId: "agent_main" };
+    seedReply();
+    renderPane(<SideChatPane childId={childId} />);
+    const button = screen.getByRole("button", { name: "Send to main" });
+    await userEvent.click(button);
+    expect(send).toHaveBeenCalledWith(
+      "[From my side chat]\nThe codename is now MARLIN.",
+      "agent_main",
+      [],
+      { pinnedConversationId: "conv_main" },
+    );
+    expect(screen.getByRole("button", { name: "Sent to main" })).toBeDisabled();
+  });
+
+  it("is not offered while the side chat is working or in a read-only pane", () => {
+    mockSession.snapshot = { sideChatParentId: "conv_main", agentId: "agent_main" };
+    seedReply("running");
+    renderPane(<SideChatPane childId={childId} />);
+    expect(screen.queryByRole("button", { name: "Send to main" })).toBeNull();
+    cleanup();
+    seedReply();
+    renderPane(<SideChatPane childId={childId} readOnly />);
+    expect(screen.queryByRole("button", { name: "Send to main" })).toBeNull();
+  });
+});

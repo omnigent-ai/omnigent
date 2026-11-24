@@ -13,7 +13,7 @@ import {
   type KeyboardEvent,
   type ReactNode,
 } from "react";
-import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
+import { CornerUpLeftIcon, MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { getCurrentAuthorId } from "@/lib/identity";
@@ -33,6 +33,7 @@ import {
   JumpToTopButton,
   WorkingIndicatorRow,
   bubbleKey,
+  collectBubbleMarkdown,
   computeIsWorking,
   computeIsTurnActive,
   reorderCommittedRequestElicitations,
@@ -137,6 +138,50 @@ interface CopiedBlock {
 
 /** Leading side-chat id characters on items it copied; the server's `SIDE_CHAT_COPY_ID_PREFIX_LEN`. */
 const SIDE_CHAT_COPY_ID_PREFIX_LEN = 12;
+
+/** Prefix marking a reply the user sent back from a side chat to its main session. */
+export const SEND_TO_MAIN_PREFIX = "[From my side chat]";
+
+/** Send a side chat's latest reply to its main session, queued behind any running turn. */
+function SendToMainButton({ childId, bubble }: { childId: string; bubble: Bubble | undefined }) {
+  const { session } = useSession(isPendingSideChat(childId) ? null : childId);
+  const parentId = session?.sideChatParentId ?? parentIdFromLabels(session?.labels) ?? null;
+  const { session: parent } = useSession(parentId);
+  const [sentText, setSentText] = useState<string | null>(null);
+  const text = bubble?.kind === "assistant" ? collectBubbleMarkdown(bubble.items).trim() : "";
+  if (!parentId || !parent?.agentId || !text) return null;
+  const sent = sentText === text;
+  return (
+    <div className="flex justify-start">
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        disabled={sent}
+        data-testid="side-chat-send-to-main"
+        title="Send this reply to the main chat. It waits until the main chat's current turn ends."
+        onClick={() => {
+          setSentText(text);
+          useChatStore
+            .getState()
+            .send(`${SEND_TO_MAIN_PREFIX}\n${text}`, parent.agentId, [], {
+              pinnedConversationId: parentId,
+            })
+            .then(
+              () => toast("Sent to the main chat. It will read it after its current turn."),
+              () => {
+                setSentText(null);
+                toast("Couldn't send to the main chat. Try again.");
+              },
+            );
+        }}
+      >
+        <CornerUpLeftIcon />
+        {sent ? "Sent to main" : "Send to main"}
+      </Button>
+    </div>
+  );
+}
 
 /** A `pending:` tab has no child session yet; its first send creates the fork. */
 function isPendingSideChat(id: string): boolean {
@@ -672,6 +717,9 @@ export function SideChatPane({
                     ))}
                   </EditSentMessageContext.Provider>
                   <WorkingIndicatorRow key={childId} show={showsWorkingRow} />
+                  {!fullSession && !readOnly && !showsWorking && (
+                    <SendToMainButton childId={childId} bubble={rows[lastAssistantIndex]} />
+                  )}
                   {!showsWorkingRow && launch !== null && (
                     <RunnerStartingIndicator variant="row" status={launch} />
                   )}

@@ -1,10 +1,19 @@
 import { useEffect, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Maximize2Icon, RotateCcwIcon, XIcon } from "lucide-react";
+import { Maximize2Icon, MessagesSquareIcon, RotateCcwIcon, XIcon } from "lucide-react";
 import { FullSessionChat } from "@/components/chat/FullSessionChat";
 import { useAgentChatPresentation } from "@/components/chat/useAgentChatPresentation";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { useSessionAgent } from "@/hooks/useAgents";
+import { useCanStartSideChat } from "@/hooks/usePermissions";
+import { useSession } from "@/hooks/useSession";
+import {
+  newPendingSideChatId,
+  SIDE_CHAT_COMMAND_PREFIX,
+  supportsSideChat,
+  usesNativeSideChatFork,
+} from "@/lib/sideChat";
+import { useChatStore } from "@/store/chatStore";
 import { getSessionSlim, rolloverOrchestrator } from "@/lib/sessionsApi";
 import { showToast } from "@/components/ui/toast";
 import { mergeTaggedDrafts } from "@/lib/composerMentions";
@@ -139,6 +148,7 @@ export function ProjectOrchestrator({
             <RotateCcwIcon />
           </Button>
         )}
+        {sessionId && !canReplace && <LeadSideChatButton sessionId={sessionId} />}
         {sessionId && (
           <Button variant="ghost" size="icon-sm" asChild>
             <Link
@@ -192,6 +202,39 @@ export function ProjectPersonaChat({
       </header>
       <OrchestratorChat key={sessionId} sessionId={sessionId} />
     </section>
+  );
+}
+
+/** Opens a side chat with the Lead in its full session, without interrupting the Lead. */
+function LeadSideChatButton({ sessionId }: { sessionId: string }) {
+  const navigate = useNavigate();
+  const { session } = useSession(sessionId);
+  const canStart = useCanStartSideChat(sessionId, session?.permissionLevel ?? null);
+  if (!supportsSideChat(session?.harness, canStart)) return null;
+  return (
+    <Button
+      variant="ghost"
+      size="icon-sm"
+      aria-label="Side chat with the Lead"
+      title="Side chat: talk to a private copy of the Lead without interrupting it"
+      data-testid="lead-side-chat"
+      onClick={() => {
+        if (usesNativeSideChatFork(session?.harness)) {
+          // Codex forks in-process from a typed /side, so prefill the command.
+          const existing = getSessionDraft(sessionId) ?? { text: "", files: [] };
+          setSessionDraft(sessionId, { ...existing, text: SIDE_CHAT_COMMAND_PREFIX });
+        } else {
+          // The rail opens this empty tab on the Lead's page; its first send creates the fork.
+          const pendingId = newPendingSideChatId();
+          const store = useChatStore.getState();
+          store.requestSideChatFocus(pendingId);
+          store.openSideChatWithDraft(pendingId, "", sessionId);
+        }
+        navigate(`/c/${encodeURIComponent(sessionId)}`);
+      }}
+    >
+      <MessagesSquareIcon />
+    </Button>
   );
 }
 
