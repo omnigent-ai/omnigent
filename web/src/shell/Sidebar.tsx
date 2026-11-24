@@ -362,6 +362,7 @@ import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
 import { projectHomePath, projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
 import { useProjectTicketsEnabled } from "@/projectHome/useProjectTickets";
+import { useNewTicketCount } from "@/projectHome/projectTicketsSeen";
 import { getEmbedRoot } from "../lib/host";
 import { canCreateProject, projectsMatching } from "./projectChoices";
 import {
@@ -1798,6 +1799,8 @@ function ProjectFolder({
   const { registerFolder, sortBy, customOrder, applyLocalResolutions, view } = useSidebarData();
   const viewerId = useViewerId();
   const hideWorkers = useHideTicketWorkers(view);
+  const ticketsEnabled = useProjectTicketsEnabled();
+  const newTicketCount = useNewTicketCount(projectId, ticketsEnabled && !placeholder);
   const query = useProjectSessions(
     name,
     expanded && !placeholder,
@@ -2038,6 +2041,7 @@ function ProjectFolder({
         }
         active={headerActive}
         marker={marker}
+        titleBadge={newTicketCount > 0 ? <NewTicketBadge count={newTicketCount} /> : undefined}
         conversations={draftRow ? [draftRow, ...display.rows] : display.rows}
         heldConversations={
           expanded
@@ -2141,6 +2145,21 @@ function slideOpenAppendedRows(list: HTMLElement, fromHeight: number, fromCount:
   for (const row of Array.from(list.children).slice(fromCount)) {
     row.animate([{ opacity: 0 }, { opacity: 1 }], SHOW_MORE_MOTION);
   }
+}
+
+/** Count of tickets added to a project's board since the viewer last opened it. */
+function NewTicketBadge({ count }: { count: number }) {
+  const label = `${count} new ${count === 1 ? "ticket" : "tickets"}`;
+  return (
+    <span
+      data-testid="project-new-tickets"
+      title={label}
+      aria-label={label}
+      className="ml-1.5 inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-primary-cta px-1 text-xs text-primary-cta-foreground tabular-nums"
+    >
+      {count > 99 ? "99+" : count}
+    </span>
+  );
 }
 
 /**
@@ -4017,6 +4036,7 @@ function SectionHeader({
   status,
   icon,
   marker,
+  titleBadge,
   active = false,
   hasAction,
   hasPersistentAction,
@@ -4032,6 +4052,7 @@ function SectionHeader({
   status?: ReactNode;
   icon?: ReactNode;
   marker?: SessionState | null;
+  titleBadge?: ReactNode;
   /** Whether this header represents the current page context. */
   active?: boolean;
   /** Whether the section also renders header controls overlaid at the right
@@ -4157,6 +4178,7 @@ function SectionHeader({
       ) : null}
       {/* Project folder names sit heavier than their session rows. */}
       <span className={cn("min-w-0 truncate", icon && "font-medium")}>{title}</span>
+      {titleBadge}
       {/* Trailing chevron, rotating on expand. Headers without a leading icon
             reveal it on desktop hover/focus; icon headers show it only on mobile
             (no hover) since desktop swaps the folder for the chevron above. */}
@@ -4679,6 +4701,7 @@ function ConversationSection({
   title,
   icon,
   marker,
+  titleBadge,
   active,
   conversations,
   heldConversations,
@@ -4713,6 +4736,8 @@ function ConversationSection({
   icon?: ReactNode;
   /** When collapsed, the aggregate marker of hidden rows (same badge as a row). */
   marker?: SessionState | null;
+  /** Shown right after the title, collapsed or not (e.g. a project's new tickets). */
+  titleBadge?: ReactNode;
   /** Whether this section header represents the current page context. */
   active?: boolean;
   conversations: Conversation[];
@@ -4818,6 +4843,7 @@ function ConversationSection({
             status={headerStatus}
             icon={icon}
             marker={marker}
+            titleBadge={titleBadge}
             active={active}
             hasAction={headerAction != null}
             hasPersistentAction={persistentHeaderAction != null}

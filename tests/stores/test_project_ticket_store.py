@@ -289,6 +289,7 @@ def test_response_summary_counts_labels_across_stages_and_projects(board):
     assert tickets.summary(project.id, user_id="alice") == {
         "needs_response_count": 0,
         "is_complete": True,
+        "latest_created_at": None,
     }
     flagged = []
     for stage, value in (("open", "approval"), ("in_progress", ""), ("done", None)):
@@ -312,10 +313,7 @@ def test_response_summary_counts_labels_across_stages_and_projects(board):
             project.id, CreateTicket(title="Other", labels=[{"key": "needs-human"}]), actor
         )
         assert tickets.summary(project.id, user_id="alice")["needs_response_count"] == 1
-    assert tickets.summary(project.id, user_id="alice") == {
-        "needs_response_count": 3,
-        "is_complete": True,
-    }
+    assert tickets.summary(project.id, user_id="alice")["needs_response_count"] == 3
     tickets.update(project.id, flagged[0], UpdateTicket(labels=[]), actor)
     assert tickets.summary(project.id, user_id="alice")["needs_response_count"] == 2
     with pytest.raises(OmnigentError, match="Project not found"):
@@ -342,10 +340,9 @@ def test_response_summary_reports_a_bounded_indexed_partial_count(board, db_uri,
 
     event.listen(engine, "before_cursor_execute", capture)
     try:
-        assert tickets.summary(project.id, user_id="alice") == {
-            "needs_response_count": 2,
-            "is_complete": False,
-        }
+        summary = tickets.summary(project.id, user_id="alice")
+        assert summary["needs_response_count"] == 2
+        assert summary["is_complete"] is False
     finally:
         event.remove(engine, "before_cursor_execute", capture)
     assert len(queries) == 1
@@ -356,6 +353,26 @@ def test_response_summary_reports_a_bounded_indexed_partial_count(board, db_uri,
         plan = connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
     assert any("SEARCH" in row[3] and "ix_project_tickets_created" in row[3] for row in plan)
     assert not any("TEMP B-TREE" in row[3] for row in plan)
+
+
+def test_summary_reports_ticket_creation_for_new_ticket_badges(board, monkeypatch):
+    tickets, projects, project = board
+    actor = TicketActor("alice")
+    assert (
+        tickets.summary(project.id, user_id="alice", created_after=0)["created_after_count"] == 0
+    )
+    for created_at in (100, 200, 300):
+        monkeypatch.setattr(project_ticket_store, "now_epoch", lambda value=created_at: value)
+        tickets.create(project.id, CreateTicket(title=str(created_at)), actor)
+    other = projects.create(uuid4().hex, "Other", "alice")
+    tickets.create(other.id, CreateTicket(title="Elsewhere"), actor)
+    summary = tickets.summary(project.id, user_id="alice", created_after=100)
+    assert summary["latest_created_at"] == 300
+    assert summary["created_after_count"] == 2
+    assert "created_after_count" not in tickets.summary(project.id, user_id="alice")
+    assert (
+        tickets.summary(project.id, user_id="alice", created_after=300)["created_after_count"] == 0
+    )
 
 
 def test_activity_sessions_are_scoped_bounded_indexed_reads(board, db_uri, monkeypatch):

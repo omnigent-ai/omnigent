@@ -119,6 +119,10 @@ export interface TicketPage<T> {
 export interface TicketSummary {
   needs_response_count: number;
   is_complete: boolean;
+  /** Newest ticket's creation time (epoch seconds); absent on older servers. */
+  latest_created_at?: number | null;
+  /** Tickets created after the requested `created_after`; present only when it was sent. */
+  created_after_count?: number;
 }
 export interface EventPage {
   data: TicketEvent[];
@@ -171,8 +175,9 @@ export function getTicket(projectId: string, ticketId: string) {
   return request<ProjectTicket>(path(projectId, ticketId)).then(normalizeTicket);
 }
 
-export function getTicketSummary(projectId: string) {
-  return request<TicketSummary>(`${path(projectId)}/summary`);
+export function getTicketSummary(projectId: string, createdAfter?: number) {
+  const query = createdAfter === undefined ? "" : `?created_after=${createdAfter}`;
+  return request<TicketSummary>(`${path(projectId)}/summary${query}`);
 }
 
 function normalizeTicket(ticket: ProjectTicket & { status?: string }): ProjectTicket {

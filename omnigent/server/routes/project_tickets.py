@@ -727,9 +727,15 @@ def create_project_tickets_router(
         return configuration
 
     @router.get("/summary")
-    async def ticket_summary(request: Request, project_id: str) -> dict[str, Any]:
+    async def ticket_summary(
+        request: Request,
+        project_id: str,
+        created_after: int | None = Query(None, ge=0),
+    ) -> dict[str, Any]:
         who = await actor(request, project_id)
-        return await asyncio.to_thread(store.summary, project_id, user_id=who.user_id)
+        return await asyncio.to_thread(
+            store.summary, project_id, user_id=who.user_id, created_after=created_after
+        )
 
     @router.get("/cost")
     async def project_cost(

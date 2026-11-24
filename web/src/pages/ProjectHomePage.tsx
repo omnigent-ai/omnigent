@@ -19,6 +19,7 @@ import {
 import { ProjectKanbanBoard } from "@/projectHome/ProjectKanbanBoard";
 import { ProjectSessionPanel } from "@/projectHome/ProjectSessionPanel";
 import { ProjectTicketBoard } from "@/projectHome/ProjectTicketBoard";
+import { useMarkProjectTicketsSeen } from "@/projectHome/projectTicketsSeen";
 import { ProjectTicketPanel } from "@/projectHome/ProjectTicketPanel";
 import { ProjectOrchestrator } from "@/projectHome/ProjectOrchestrator";
 import { ProjectFileViewerHost } from "@/projectHome/ProjectFileViewer";
@@ -56,6 +57,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
   useEffect(() => setTicketExpanded(false), [projectName, panelTicketId]);
   const replaceSearchParams = useReplaceSearchParams();
   const { projectId } = useTicketProject(projectName);
+  useMarkProjectTicketsSeen(projectId, tickets && !hideBoard);
   const closePanel = useCallback(() => {
     setTicketExpanded(false);
     const next = new URLSearchParams(searchParams);

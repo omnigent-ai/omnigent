@@ -588,26 +588,41 @@ class ProjectTicketStore:
                 "last_id": rows[min(limit, len(rows)) - 1].id if rows else None,
             }
 
-    def summary(self, project_id: str, *, user_id: str | None) -> dict[str, Any]:
+    def summary(
+        self, project_id: str, *, user_id: str | None, created_after: int | None = None
+    ) -> dict[str, Any]:
+        """Summarize the board: open human requests and, for new-ticket badges, ticket creation.
+
+        :param created_after: Epoch seconds; when set, also count tickets created after it.
+        """
         with self._session("ticket_response_summary") as session:
             project = self._project(session, project_id, user_id)
+            in_project = (
+                SqlProjectTicket.workspace_id == project.workspace_id,
+                SqlProjectTicket.project_id == project.id,
+            )
             # Labels are encrypted; bound the read to the newest tickets and report partial counts.
-            labels = session.scalars(
-                select(SqlProjectTicket.labels)
-                .where(
-                    SqlProjectTicket.workspace_id == project.workspace_id,
-                    SqlProjectTicket.project_id == project.id,
-                )
+            rows = session.execute(
+                select(SqlProjectTicket.labels, SqlProjectTicket.created_at)
+                .where(*in_project)
                 .order_by(SqlProjectTicket.created_at.desc(), SqlProjectTicket.id.desc())
                 .limit(TICKET_SUMMARY_SCAN_MAX + 1)
             ).all()
-            return {
+            summary: dict[str, Any] = {
                 "needs_response_count": sum(
-                    any(label.get("key") == "needs-human" for label in ticket_labels)
-                    for ticket_labels in labels[:TICKET_SUMMARY_SCAN_MAX]
+                    any(label.get("key") == "needs-human" for label in row.labels)
+                    for row in rows[:TICKET_SUMMARY_SCAN_MAX]
                 ),
-                "is_complete": len(labels) <= TICKET_SUMMARY_SCAN_MAX,
+                "is_complete": len(rows) <= TICKET_SUMMARY_SCAN_MAX,
+                "latest_created_at": rows[0].created_at if rows else None,
             }
+            if created_after is not None:
+                summary["created_after_count"] = session.scalar(
+                    select(func.count())
+                    .select_from(SqlProjectTicket)
+                    .where(*in_project, SqlProjectTicket.created_at > created_after)
+                )
+            return summary
 
     def _stage_rows(
         self,
