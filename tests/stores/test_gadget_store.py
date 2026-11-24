@@ -253,19 +253,65 @@ def test_reopening_removes_what_an_interrupted_deletion_left(tmp_path: Path) -> 
     store = LocalGadgetStore(str(location))
     kept = store.create(ALICE, "Board")
     (location / ".trash" / "leftover" / "files").mkdir(parents=True)
+    # Creates that stopped before their metadata: each left its note.
+    old = 1_000_000_000
     orphan = location / "gadgets" / ("a" * 32)
     (orphan / "files" / "data").mkdir(parents=True)
     fresh = location / "gadgets" / ("b" * 32)
     (fresh / "files").mkdir(parents=True)
-    old = 1_000_000_000
-    os.utime(orphan, (old, old))
+    for gadget_id, stamp in (("a" * 32, old), ("b" * 32, None)):
+        note = location / ".creating" / gadget_id
+        note.touch()
+        if stamp is not None:
+            os.utime(note, (stamp, stamp))
 
     LocalGadgetStore(str(location))
     assert not (location / ".trash" / "leftover").exists()
     assert not orphan.exists()
+    assert not (location / ".creating" / ("a" * 32)).exists()
     # Maybe a create still in progress, and live gadgets, are left alone.
     assert fresh.exists()
     assert (location / "gadgets" / kept.id / "gadget.json").exists()
+
+
+def test_a_start_cleans_up_a_bounded_amount_and_never_lists_every_gadget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.stores.gadget_store import local
+
+    location = tmp_path / "gadgets"
+    store = LocalGadgetStore(str(location))
+    for _ in range(5):
+        store.create(ALICE, "Board")
+    # A large deleted tree, and many creates that stopped long ago.
+    for n in range(50):
+        (location / ".trash" / "big" / f"d{n}").mkdir(parents=True)
+        (location / ".trash" / "big" / f"d{n}" / "f.json").write_text("{}")
+    old = 1_000_000_000
+    (location / ".creating").mkdir(exist_ok=True)
+    for n in range(80):
+        note = location / ".creating" / f"{n:032x}"
+        note.touch()
+        os.utime(note, (old, old))
+    monkeypatch.setattr(local, "_TRASH_ENTRIES_PER_CALL", 30)
+    listed: list[str] = []
+    real_scandir = os.scandir
+
+    def watching(path):  # type: ignore[no-untyped-def]
+        listed.append(os.fspath(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(local.os, "scandir", watching)
+    LocalGadgetStore(str(location))
+    # One step: some of the trash and some notes, and the gadgets directory isn't listed.
+    assert not any(path.endswith("/gadgets") for path in listed)
+    assert (location / ".trash" / "big").exists()
+    assert 0 < len(list((location / ".creating").iterdir())) < 80
+    # Later steps finish it.
+    for _ in range(20):
+        LocalGadgetStore(str(location))
+    assert not (location / ".trash" / "big").exists()
+    assert list((location / ".creating").iterdir()) == []
 
 
 def test_deleting_a_users_files_empties_their_scope(store: LocalGadgetStore) -> None:
@@ -310,10 +356,36 @@ def test_delete_tree_removes_a_file_or_a_directory_at_once(store: LocalGadgetSto
     files.delete_tree("data/cards/c1")
     assert files.list_paths("data/cards") == []
     files.delete_tree("data/cards/missing")  # nothing to delete is not an error
-    # The emptied path can be used again.
+    # The emptied path can be used again, even while the trash still holds the old tree.
     files.mkdirs("data/cards/c1")
     files.create_json("data/cards/c1/00000001.json", {"n": 2})
     assert files.read_json("data/cards/c1/00000001.json") == {"n": 2}
+
+
+def test_delete_tree_detaches_at_once_and_removes_files_a_step_at_a_time(
+    store: LocalGadgetStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.stores.gadget_store import local
+
+    monkeypatch.setattr(local, "_TRASH_ENTRIES_PER_CALL", 5)
+    files = store.gadget_files(store.create(ALICE, "Board").id)
+    files.mkdirs("data/big")
+    for n in range(40):
+        files.create_json(f"data/big/{n:03d}.json", {"n": n})
+    files.delete_tree("data/big")
+    # Gone from the scope at once; its files go a few at a time.
+    with pytest.raises(NotFound):
+        files.list_paths("data/big")
+    trash = tmp_path / "gadgets" / ".trash"
+    assert sum(1 for _ in trash.rglob("*.json")) > 30
+    files.mkdirs("data/big")
+    files.create_json("data/big/000.json", {"n": "new"})
+    assert files.read_json("data/big/000.json") == {"n": "new"}
+    # Later deletions each remove a few more until the trash is empty.
+    for n in range(20):
+        files.create_json(f"data/tmp{n}.json", {})
+        files.delete_tree(f"data/tmp{n}.json")
+    assert not any(trash.rglob("*.json"))
 
 
 def _owned_pages(store: LocalGadgetStore, owner: str, limit: int) -> list[list[str]]:

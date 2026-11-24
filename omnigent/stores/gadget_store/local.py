@@ -8,7 +8,8 @@ Layout under ``storage_location`` (by default ``<data_dir>/gadgets``)::
     owners/<owner key>/sNNNNNNNN/<id>  # empty marker: which gadgets a user owns
     users/<user key>/...             # one user's GadgetFiles scope (their shelf)
     .tmp/                            # staging for atomic writes; never listed
-    .trash/                          # deleted scopes being removed; emptied on start
+    .trash/                          # deleted scopes, removed a bounded amount at a time
+    .creating/<id>                   # a create in progress; cleaned up if it stopped
     .locks/<owner key>.lock          # held while one process changes an owner's head
 
 Owner and user keys are SHA-256 prefixes of the user ID and, for an account with a
@@ -35,7 +36,6 @@ import heapq
 import json
 import os
 import re
-import shutil
 import tempfile
 import threading
 import time
@@ -76,6 +76,8 @@ _METADATA_KIND = "omnigent.gadget.v1"
 # A gadget directory without metadata this old is left over from an interrupted creation.
 _TRASH_ENTRIES_PER_CALL = 2000
 _ORPHAN_AGE_S = 60 * 60
+# Creation notes looked at per cleanup step (each create and each start runs one).
+_SWEEP_NOTES_PER_STEP = 32
 
 
 def _user_key(user_id: str, registration: str | None = None) -> str:
@@ -121,6 +123,32 @@ def _replace_file(tmp_dir: Path, target: Path, value: dict) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+def _drain_trash(trash: Path, budget: int | None = None) -> int:
+    """Remove up to *budget* files and directories from *trash*; how many went.
+
+    Deleting moves things into the trash in one rename, so they disappear at once; their
+    files then go a bounded number at a time, on later deletions and starts, so one request
+    never removes a large tree.
+    """
+    budget = _TRASH_ENTRIES_PER_CALL if budget is None else budget
+    removed = 0
+    for directory, _dirnames, filenames in os.walk(trash, topdown=False):
+        for name in filenames:
+            if removed >= budget:
+                return removed
+            with contextlib.suppress(OSError):
+                os.unlink(os.path.join(directory, name))
+            removed += 1
+        if directory == str(trash):
+            continue
+        if removed >= budget:
+            return removed
+        with contextlib.suppress(OSError):
+            os.rmdir(directory)
+        removed += 1
+    return removed
 
 
 class LocalGadgetFiles(GadgetFiles):
@@ -223,11 +251,7 @@ class LocalGadgetFiles(GadgetFiles):
             os.replace(target, trash)
         except (FileNotFoundError, NotADirectoryError):
             return
-        if trash.is_dir():
-            shutil.rmtree(trash, ignore_errors=True)
-        else:
-            with contextlib.suppress(OSError):
-                trash.unlink()
+        _drain_trash(trash.parent)
 
     def list_paths(self, path: str) -> list[str]:
         target = self._resolve(path)
@@ -296,24 +320,33 @@ class LocalGadgetStore(GadgetStore):
         self._sweep()
 
     def _sweep(self) -> None:
-        """Remove what an interrupted deletion or creation left: trash, and gadget
-        directories without metadata that are old enough not to be a create in progress."""
-        shutil.rmtree(self._root / ".trash", ignore_errors=True)
+        """One bounded step of cleanup: some of the trash, and gadgets whose creation
+        stopped before their metadata was written.
+
+        A create notes itself in ``.creating`` first and clears the note once the gadget is
+        complete, so only those notes are looked at, at most :data:`_SWEEP_NOTES_PER_STEP`
+        of them, never the whole ``gadgets`` directory.
+        """
+        _drain_trash(self._root / ".trash")
         cutoff = time.time() - _ORPHAN_AGE_S
         try:
-            entries = list(os.scandir(self._root / "gadgets"))
+            notes = os.scandir(self._root / ".creating")
         except FileNotFoundError:
             return
-        for entry in entries:
-            if _GADGET_ID.fullmatch(entry.name) is None or not entry.is_dir(follow_symlinks=False):
-                continue
-            directory = Path(entry.path)
-            with contextlib.suppress(OSError):
-                if (
-                    not (directory / _METADATA_FILE).exists()
-                    and directory.stat().st_mtime < cutoff
-                ):
-                    shutil.rmtree(directory, ignore_errors=True)
+        with notes:
+            for examined, note in enumerate(notes):
+                if examined >= _SWEEP_NOTES_PER_STEP:
+                    break
+                with contextlib.suppress(OSError):
+                    if note.stat().st_mtime >= cutoff:
+                        continue  # Maybe a create still in progress.
+                    if _GADGET_ID.fullmatch(note.name) is not None:
+                        directory = self._gadget_dir(note.name)
+                        if directory.is_dir() and not (directory / _METADATA_FILE).exists():
+                            trash = self._root / ".trash" / f"orphan-{uuid.uuid4().hex}"
+                            trash.parent.mkdir(parents=True, exist_ok=True)
+                            os.replace(directory, trash)
+                    os.unlink(note.path)
 
     def _gadget_dir(self, gadget_id: str) -> Path:
         return self._root / "gadgets" / gadget_id
@@ -427,6 +460,11 @@ class LocalGadgetStore(GadgetStore):
             owner_registration=owner_registration,
         )
         owner_dir = self._owner_dir(owner_id, owner_registration)
+        # Noted first, so a create that stops before its metadata is found and cleaned up
+        # without listing every gadget (see _sweep).
+        note = self._root / ".creating" / gadget.id
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.touch()
         with self._owner_index(owner_dir):
             segment = self._segment_with_room(owner_dir)
             (owner_dir / segment).mkdir(parents=True, exist_ok=True)
@@ -436,6 +474,9 @@ class LocalGadgetStore(GadgetStore):
                 self._tmp_dir, directory / _METADATA_FILE, self._metadata(gadget, segment)
             )
             (owner_dir / segment / gadget.id).touch()
+        with contextlib.suppress(OSError):
+            note.unlink()
+        self._sweep()
         return gadget
 
     def get(self, gadget_id: str) -> Gadget | None:
@@ -564,29 +605,7 @@ class LocalGadgetStore(GadgetStore):
         return True
 
     def _empty_trash(self) -> None:
-        """Remove up to ``_TRASH_ENTRIES_PER_CALL`` files and directories from the trash.
-
-        A deletion moves a gadget out of sight at once; its files go a bounded number at a
-        time, so a large gadget never makes one request remove them all. Whatever is left
-        goes with later deletions, or when the store next starts.
-        """
-        root = self._root / ".trash"
-        budget = _TRASH_ENTRIES_PER_CALL
-        removed = 0
-        for directory, _dirnames, filenames in os.walk(root, topdown=False):
-            for name in filenames:
-                if removed >= budget:
-                    return
-                with contextlib.suppress(OSError):
-                    os.unlink(os.path.join(directory, name))
-                removed += 1
-            if directory == str(root):
-                continue
-            if removed >= budget:
-                return
-            with contextlib.suppress(OSError):
-                os.rmdir(directory)
-            removed += 1
+        _drain_trash(self._root / ".trash")
 
     def gadget_files(self, gadget_id: str) -> GadgetFiles:
         if _GADGET_ID.fullmatch(gadget_id) is None:

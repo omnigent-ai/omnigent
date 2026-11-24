@@ -5033,7 +5033,14 @@ def server(
     gadget_location = cfg.get("gadget_location") or _default_gadget_location()
     if config_path and not Path(gadget_location).is_absolute():
         gadget_location = str(Path(config_path).parent / gadget_location)
-    gadget_store = LocalGadgetStore(gadget_location)
+    # Built only when gadgets are on: opening the store runs its cleanup.
+    from omnigent.server.feature_flags import Feature, resolve_feature_flags
+
+    gadget_store = (
+        LocalGadgetStore(gadget_location)
+        if resolve_feature_flags().enabled(Feature.GADGETS)
+        else None
+    )
 
     # Initialize the runtime with store references so workflow code
     # can access them via getter functions (get_agent_cache(), etc.).
