@@ -18,9 +18,11 @@ def _skills(spec: AgentSpec, *, workflows: bool) -> set[str]:
 
 
 def test_the_skill_comes_with_the_gadget_tool_group_not_with_workflows() -> None:
-    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(journal=False))
+    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(journal=False, memory=False))
     assert _skills(spec, workflows=False) == {"gadget"}
-    assert _skills(AgentSpec(spec_version=1), workflows=True) == {
+    assert _skills(
+        AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(memory=False)), workflows=True
+    ) == {
         "gadget",
         "workflow",
         "save-workflow",
