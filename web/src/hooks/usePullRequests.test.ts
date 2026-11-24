@@ -289,8 +289,9 @@ describe("pollAcceptsCachedAnswer", () => {
   const key = ["github-info", "conv"];
   const info = { object: "session.github.info", available: true } as PullRequestInfo;
 
-  // The PR info queries' stale time.
-  function polledQuery(refetchInterval: number | false, staleTime = 30_000) {
+  const prInfoStaleTime = 30_000;
+
+  function polledQuery(refetchInterval: number | false, staleTime = prInfoStaleTime) {
     const client = new QueryClient();
     client.setQueryData(key, info);
     const observer = new QueryObserver(client, {

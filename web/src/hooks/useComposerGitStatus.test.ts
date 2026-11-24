@@ -12,6 +12,7 @@ const usePullRequestInfosMock = vi.fn<(id: string | undefined, urls: string[]) =
   () => [],
 );
 const useSessionPullRequestsMock = vi.fn(() => ({ data: undefined as unknown }));
+const refreshPullRequestsMock = vi.fn(() => Promise.resolve());
 
 vi.mock("@/hooks/useSessionWorktrees", () => ({
   useSessionWorktrees: (
@@ -24,6 +25,7 @@ vi.mock("@/hooks/usePullRequests", () => ({
   usePullRequestInfo: (id: string | undefined) => usePullRequestInfoMock(id),
   usePullRequestInfos: (id: string | undefined, urls: string[]) =>
     usePullRequestInfosMock(id, urls),
+  useRefreshPullRequestInfo: () => refreshPullRequestsMock,
 }));
 vi.mock("@/hooks/useSessionPullRequests", async (importOriginal) => ({
   storedListToShow: (await importOriginal<typeof UseSessionPullRequestsModule>()).storedListToShow,
@@ -76,6 +78,7 @@ afterEach(() => {
   usePullRequestInfosMock.mockReturnValue([]);
   useSessionPullRequestsMock.mockReset();
   useSessionPullRequestsMock.mockReturnValue({ data: undefined });
+  refreshPullRequestsMock.mockClear();
 });
 
 const FORGE_DISPLAY = {
@@ -540,7 +543,7 @@ describe("useComposerGitStatus", () => {
     expect(prefix()).toBe("#");
   });
 
-  it("refresh() refetches both sources and surfaces fetching", () => {
+  it("refresh() rereads both sources and surfaces fetching", () => {
     const wtRefetch = vi.fn();
     const ghRefetch = vi.fn();
     const detailRefetch = vi.fn();
@@ -557,14 +560,13 @@ describe("useComposerGitStatus", () => {
     const { result, rerender } = run();
     expect(result.current.refreshing).toBe(true);
     const refresh = result.current.refresh;
-    const latestDetailRefetch = vi.fn();
-    usePullRequestInfosMock.mockReturnValue([{ refetch: latestDetailRefetch }]);
     rerender();
     expect(result.current.refresh).toBe(refresh);
     refresh();
     expect(wtRefetch).toHaveBeenCalledTimes(1);
-    expect(ghRefetch).toHaveBeenCalledTimes(1);
+    // PR info is invalidated rather than refetched, so it reads GitHub fresh.
+    expect(refreshPullRequestsMock).toHaveBeenCalledTimes(1);
+    expect(ghRefetch).not.toHaveBeenCalled();
     expect(detailRefetch).not.toHaveBeenCalled();
-    expect(latestDetailRefetch).toHaveBeenCalledTimes(1);
   });
 });

@@ -15,7 +15,11 @@ vi.mock("@/store/chatStore", () => ({
 
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
-import { usePullRequestInfo, usePullRequestInfos } from "./usePullRequests";
+import {
+  usePullRequestInfo,
+  usePullRequestInfos,
+  useRefreshPullRequestInfo,
+} from "./usePullRequests";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
 const hostOnlineMock = vi.mocked(useSessionHostOnline);
@@ -201,6 +205,29 @@ describe("PR info reads that may take the runner's previous answer", () => {
 
     // Load, poll, Refresh, reopen 32 s later, poll.
     expect(fetchMock.mock.calls.map(allowsCached)).toEqual([false, true, false, false, true]);
+  });
+
+  it("a user refresh within the poll's fresh window still reads GitHub fresh", async () => {
+    vi.useFakeTimers();
+    stubChatStore("conv_live", "idle");
+    fetchMock.mockResolvedValue(pullRequestInfoResponse({ tracking_available: true }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let refresh: (() => Promise<unknown>) | undefined;
+    function RefreshProbe() {
+      usePullRequestInfo("conv_live", { poll: true });
+      refresh = useRefreshPullRequestInfo("conv_live");
+      return null;
+    }
+    render(
+      <QueryClientProvider client={client}>
+        <RefreshProbe />
+      </QueryClientProvider>,
+    );
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+    await act(() => refresh!());
+
+    // Load, poll, then the refresh 0 s after that poll.
+    expect(fetchMock.mock.calls.map(allowsCached)).toEqual([false, true, false]);
   });
 
   it("reads list rows fresh on every poll and after reopening", async () => {

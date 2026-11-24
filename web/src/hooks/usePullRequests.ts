@@ -47,7 +47,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useEffect, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useSyncExternalStore } from "react";
 import {
   appendReviewReply,
   type ReviewComment,
@@ -496,7 +496,8 @@ const PULL_REQUEST_LIST_POLL_MS = 30_000;
  * Mount, focus and reopen refetches run only once data is stale, and Refresh, turn
  * end and edits invalidate first, so a fetch of valid data that is still fresh for
  * an active polling observer is that observer's timer. Polls slower than the stale
- * time, such as list rows, read the forge every time.
+ * time, such as list rows, read the forge every time. A user refresh must invalidate
+ * too ({@link useRefreshPullRequestInfo}); a plain `refetch()` would count as a poll.
  */
 export function pollAcceptsCachedAnswer(
   query: Query<PullRequestInfo> | undefined,
@@ -789,6 +790,22 @@ export function usePullRequestInfoSnapshot(rawConversationId: string | undefined
 }
 
 /** Linked PR details at the list cadence; the session's base query handles turn-end refresh. */
+/**
+ * Read a session's PR info again from GitHub, as the panel's Refresh does. The
+ * queries are invalidated first, so none of these reads takes the runner's previous answer.
+ */
+export function useRefreshPullRequestInfo(rawConversationId: string | undefined) {
+  const queryClient = useQueryClient();
+  const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
+  return useCallback(
+    () =>
+      conversationId
+        ? queryClient.invalidateQueries({ queryKey: pullRequestInfoQueryKey(conversationId) })
+        : Promise.resolve(),
+    [queryClient, conversationId],
+  );
+}
+
 export function usePullRequestInfos(rawConversationId: string | undefined, prUrls: string[]) {
   const context = usePullRequestQueryContext(rawConversationId);
   return useQueries({
