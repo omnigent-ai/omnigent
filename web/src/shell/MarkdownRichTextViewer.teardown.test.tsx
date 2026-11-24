@@ -141,7 +141,11 @@ vi.mock("./TipTapCommentExtension", () => ({
 }));
 vi.mock("./MarkdownCommentPlugin", () => ({ MarkdownCommentPlugin: () => null }));
 vi.mock("./MarkdownEditorToolbar", () => ({ ToolbarPlugin: () => null }));
-vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn().mockReturnValue(true) }));
+vi.mock("@/hooks/usePermissions", () => {
+  const useCanEdit = vi.fn().mockReturnValue(true);
+  // Outside project files, commenting follows edit permission.
+  return { useCanEdit, useCanComment: (conversationId: string) => useCanEdit(conversationId) };
+});
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
 // The pre-write conflict check GETs the live file before every save.
 vi.mock("@/hooks/useFileContent", async (importOriginal) => ({

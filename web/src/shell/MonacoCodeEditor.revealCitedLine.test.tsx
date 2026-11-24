@@ -136,7 +136,11 @@ vi.mock("./monacoSetup", () => ({
 }));
 vi.mock("./useMonacoCommentLayer", () => ({ useMonacoCommentLayer: () => null }));
 vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "light" }) }));
-vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn().mockReturnValue(true) }));
+vi.mock("@/hooks/usePermissions", () => {
+  const useCanEdit = vi.fn().mockReturnValue(true);
+  // Outside project files, commenting follows edit permission.
+  return { useCanEdit, useCanComment: (conversationId: string) => useCanEdit(conversationId) };
+});
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),

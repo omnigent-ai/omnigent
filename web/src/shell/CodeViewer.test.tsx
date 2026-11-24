@@ -14,7 +14,11 @@ import { highlightCode } from "@/components/ai-elements/code-block";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
-vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
+vi.mock("@/hooks/usePermissions", () => {
+  const useCanEdit = vi.fn();
+  // Outside project files, commenting follows edit permission.
+  return { useCanEdit, useCanComment: (conversationId: string) => useCanEdit(conversationId) };
+});
 const slugRuns = vi.hoisted(() => ({ count: 0 }));
 vi.mock("rehype-slug", async (importOriginal) => {
   const actual = await importOriginal<typeof rehypeSlugModule>();
