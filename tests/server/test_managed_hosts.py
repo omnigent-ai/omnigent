@@ -30,7 +30,9 @@ from omnigent.onboarding.sandboxes.base import (
     SandboxHostLauncher,
     render_host_config_write_command,
 )
-from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s as blaxel_managed_token_ttl_s
+from omnigent.onboarding.sandboxes.baseten import (
+    managed_token_ttl_s as baseten_managed_token_ttl_s,
+)
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.onboarding.sandboxes.lambda_microvm import (
     managed_token_ttl_s as lambda_microvm_managed_token_ttl_s,
@@ -81,7 +83,7 @@ from omnigent.stores.host_store import Host, HostStore
 from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
-    install_fake_blaxel_launcher,
+    install_fake_baseten_launcher,
     install_fake_boxlite_launcher,
     install_fake_daytona_launcher,
     install_fake_e2b_launcher,
@@ -458,15 +460,15 @@ def test_parse_daytona_without_section_defaults(
     assert fake.env is None
 
 
-def test_parse_valid_blaxel_config_builds_parameterized_factory(
+def test_parse_valid_baseten_config_builds_parameterized_factory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = parse_sandbox_config(
         {
-            "provider": "blaxel",
+            "provider": "baseten",
             "server_url": "https://srv.example.com/",
-            "blaxel": {
-                "image": "blaxel/omnigent-host:test-tag",
+            "baseten": {
+                "image": "my-omnigent-host:test-tag",
                 "env": ["OPENAI_API_KEY"],
                 "region": "us-test-1",
                 "memory_mb": 8192,
@@ -478,63 +480,69 @@ def test_parse_valid_blaxel_config_builds_parameterized_factory(
     assert cfg is not None
     cfg = cfg.default
     assert cfg.server_url == "https://srv.example.com"
-    assert cfg.token_ttl_s == blaxel_managed_token_ttl_s("24h")
+    assert cfg.token_ttl_s == baseten_managed_token_ttl_s("24h")
     assert cfg.managed_launch_supported is True
     fake = FakeSandboxLauncher()
-    install_fake_blaxel_launcher(monkeypatch, fake)
+    install_fake_baseten_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
-    assert fake.image == "blaxel/omnigent-host:test-tag"
+    assert fake.image == "my-omnigent-host:test-tag"
     assert fake.env == ["OPENAI_API_KEY"]
     assert fake.region == "us-test-1"
     assert fake.memory_mb == 8192
     assert fake.ttl == "24h"
 
 
-def test_parse_blaxel_without_section_uses_launcher_fallbacks(
+def test_parse_baseten_without_section_uses_launcher_fallbacks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cfg = parse_sandbox_config({"provider": "blaxel", "server_url": "https://s.example"})
+    cfg = parse_sandbox_config({"provider": "baseten", "server_url": "https://s.example"})
 
     assert cfg is not None
     cfg = cfg.default
     fake = FakeSandboxLauncher()
-    install_fake_blaxel_launcher(monkeypatch, fake)
+    install_fake_baseten_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
     assert fake.image is None
     assert fake.env is None
     assert fake.region is None
     assert fake.memory_mb is None
     assert fake.ttl is None
-    assert cfg.token_ttl_s == blaxel_managed_token_ttl_s()
+    assert cfg.token_ttl_s == baseten_managed_token_ttl_s()
 
 
-def test_parse_blaxel_token_ttl_tracks_configured_sandbox_ttl() -> None:
+def test_parse_baseten_token_ttl_tracks_configured_sandbox_ttl() -> None:
     """
     A managed session sized past the 24h default raises the sandbox age and
     the launch-token lifetime together, so the token never expires while
-    Blaxel still keeps the host alive.
+    Baseten still keeps the host alive.
     """
     cfg = parse_sandbox_config(
         {
-            "provider": "blaxel",
+            "provider": "baseten",
             "server_url": "https://s.example",
-            "blaxel": {"ttl": "7d"},
+            "baseten": {"ttl": "7d"},
         }
     )
 
     assert cfg is not None
     cfg = cfg.default
     assert cfg.token_ttl_s == 7 * 24 * 3600 + 3600
-    assert cfg.token_ttl_s > blaxel_managed_token_ttl_s()
+    assert cfg.token_ttl_s > baseten_managed_token_ttl_s()
 
 
-def test_parse_blaxel_rejects_malformed_sandbox_ttl() -> None:
-    with pytest.raises(ValueError, match=re.escape("sandbox.blaxel.ttl")):
+def test_parse_blaxel_provider_points_to_baseten() -> None:
+    with pytest.raises(ValueError, match=re.escape("use 'provider: baseten'")):
+        parse_sandbox_config({"provider": "blaxel", "server_url": "https://s.example"})
+
+
+@pytest.mark.parametrize("ttl", ["forever", "1m"])
+def test_parse_baseten_rejects_unusable_sandbox_ttl(ttl: str) -> None:
+    with pytest.raises(ValueError, match=re.escape("sandbox.baseten.ttl")):
         parse_sandbox_config(
             {
-                "provider": "blaxel",
+                "provider": "baseten",
                 "server_url": "https://s.example",
-                "blaxel": {"ttl": "forever"},
+                "baseten": {"ttl": ttl},
             }
         )
 
@@ -1885,22 +1893,22 @@ def test_parse_microsandbox_public_server_keeps_explicit_host_ports(
             {"provider": "daytona", "server_url": "https://s", "daytona": {"env": ["", "X"]}},
             "sandbox.daytona.env",
         ),
-        # blaxel section present but malformed.
-        ({"provider": "blaxel", "server_url": "https://s", "blaxel": "x"}, "sandbox.blaxel"),
+        # baseten section present but malformed.
+        ({"provider": "baseten", "server_url": "https://s", "baseten": "x"}, "sandbox.baseten"),
         (
-            {"provider": "blaxel", "server_url": "https://s", "blaxel": {"image": " "}},
-            "OMNIGENT_BLAXEL_HOST_IMAGE",
+            {"provider": "baseten", "server_url": "https://s", "baseten": {"image": " "}},
+            "OMNIGENT_BASETEN_HOST_IMAGE",
         ),
         (
-            {"provider": "blaxel", "server_url": "https://s", "blaxel": {"memory_mb": 0}},
-            "sandbox.blaxel.memory_mb",
+            {"provider": "baseten", "server_url": "https://s", "baseten": {"memory_mb": 0}},
+            "sandbox.baseten.memory_mb",
         ),
         (
-            {"provider": "blaxel", "server_url": "https://s", "blaxel": {"region": " "}},
-            "sandbox.blaxel.region",
+            {"provider": "baseten", "server_url": "https://s", "baseten": {"region": " "}},
+            "sandbox.baseten.region",
         ),
         (
-            {"provider": "blaxel", "server_url": "https://s", "blaxel": {"timeout": 10}},
+            {"provider": "baseten", "server_url": "https://s", "baseten": {"timeout": 10}},
             "unknown key",
         ),
         # boxlite section present but malformed.
@@ -2647,8 +2655,8 @@ async def test_lifespan_gates_one_deployment_wide_managed_sandbox_reaper(
         # Launch-capable provider configured → the web UI may offer the
         # sandbox option, labeled with the provider name ("Modal Sandbox").
         ({"provider": "modal", "server_url": "https://s.example.com"}, True, "modal"),
-        # Blaxel supports managed launch and must be exposed to the web UI.
-        ({"provider": "blaxel", "server_url": "https://s.example.com"}, True, "blaxel"),
+        # Baseten supports managed launch and must be exposed to the web UI.
+        ({"provider": "baseten", "server_url": "https://s.example.com"}, True, "baseten"),
         # No `sandbox:` section → a managed create would 400; the option
         # must not be advertised and no provider is named.
         (None, False, None),
@@ -3735,7 +3743,7 @@ async def test_launch_entrypoint_provider_cleans_up_on_launch_failure(db_uri: st
 
 
 class _ReusedIdFakeLauncher(FakeSandboxLauncher):
-    provider: ClassVar[str] = "blaxel"
+    provider: ClassVar[str] = "baseten"
 
     def provision(self, name: str) -> str:
         self.provisioned_names.append(name)
@@ -5575,7 +5583,7 @@ def test_parse_multi_provider_token_ttl_overrides_shared_value() -> None:
             "providers": [
                 {"provider": "modal", "token_ttl_s": 600},
                 {"provider": "daytona", "token_ttl_s": None},
-                {"provider": "blaxel", "token_ttl_s": None, "blaxel": {"ttl": "24h"}},
+                {"provider": "baseten", "token_ttl_s": None, "baseten": {"ttl": "24h"}},
             ],
         }
     )
@@ -5583,7 +5591,7 @@ def test_parse_multi_provider_token_ttl_overrides_shared_value() -> None:
     assert [entry.token_ttl_s for entry in config.offered()] == [
         600,
         DAYTONA_MANAGED_TOKEN_TTL_S,
-        blaxel_managed_token_ttl_s("24h"),
+        baseten_managed_token_ttl_s("24h"),
     ]
 
 

@@ -18,10 +18,10 @@ disable-search-path-heuristics = true
 # Optional/proprietary integrations are intentionally absent from the
 # standard development environment.
 ignore-missing-imports = [
+    "baseten",
+    "baseten.*",
     "boxlite",
     "boxlite.*",
-    "blaxel",
-    "blaxel.*",
     "copilot",
     "copilot.*",
     "cursor_sdk",

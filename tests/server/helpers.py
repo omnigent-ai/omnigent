@@ -443,12 +443,12 @@ def install_fake_daytona_launcher(
     monkeypatch.setattr(daytona_mod, "DaytonaSandboxLauncher", _ctor)
 
 
-def install_fake_blaxel_launcher(
+def install_fake_baseten_launcher(
     monkeypatch: Any,
     fake: FakeSandboxLauncher,
 ) -> None:
-    """Substitute the fake for ``BlaxelSandboxLauncher``."""
-    import omnigent.onboarding.sandboxes.blaxel as blaxel_mod
+    """Substitute the fake for ``BasetenSandboxLauncher``."""
+    import omnigent.onboarding.sandboxes.baseten as baseten_mod
 
     def _ctor(
         *,
@@ -465,7 +465,7 @@ def install_fake_blaxel_launcher(
         fake.ttl = ttl
         return fake
 
-    monkeypatch.setattr(blaxel_mod, "BlaxelSandboxLauncher", _ctor)
+    monkeypatch.setattr(baseten_mod, "BasetenSandboxLauncher", _ctor)
 
 
 def install_fake_boxlite_launcher(

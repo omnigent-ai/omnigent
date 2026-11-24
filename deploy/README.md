@@ -81,7 +81,7 @@ deploy/
 │   ├── src/index.js      server deploy target. See its README.md.
 │   └── README.md
 │
-├── blaxel/            ← Blaxel sandbox-provider guide + managed-host config;
+├── baseten/           ← Baseten sandbox-provider guide + managed-host config;
 │   └── README.md         NOT a server deploy target.
 │
 ├── islo/              ← Islo sandbox-provider guide (gateway credential
@@ -338,10 +338,10 @@ omnigent run path/to/agent.yaml --server https://your-host
 
 Don't want a laptop to be the host? Run the host in a cloud sandbox instead.
 
-**From the CLI (Modal, Daytona, Blaxel, Islo, or E2B).** Install the provider extra when needed (`pip install 'omnigent[modal]'`, `'omnigent[daytona]'`, `'omnigent[blaxel]'`, or `'omnigent[e2b]'`; Islo uses the built-in HTTP client). Authenticate with `modal token new`, `DAYTONA_API_KEY`, Blaxel's `BL_WORKSPACE` and `BL_API_KEY`, `ISLO_API_KEY`, or `E2B_API_KEY`. Then run:
+**From the CLI (Modal, Daytona, Baseten, Islo, or E2B).** Install the provider extra when needed (`pip install 'omnigent[modal]'`, `'omnigent[daytona]'`, `'omnigent[baseten]'`, or `'omnigent[e2b]'`; Islo uses the built-in HTTP client). Authenticate with `modal token new`, `DAYTONA_API_KEY`, `BASETEN_API_KEY`, `ISLO_API_KEY`, or `E2B_API_KEY`. Then run:
 
 ```bash
-omnigent sandbox create --provider modal     # or --provider daytona / blaxel / islo / e2b
+omnigent sandbox create --provider modal     # or --provider daytona / baseten / islo / e2b
 omnigent sandbox connect --provider modal --sandbox-id <id> --server https://your-host
 ```
 
@@ -354,7 +354,7 @@ omnigent sandbox connect --provider modal --sandbox-id <id> --server https://you
 > rather than a registry image — build it once first; see
 > [`e2b/README.md`](e2b/README.md).
 
-**Server-managed (Modal, Daytona, Blaxel, Islo, E2B, or Gensee).** With
+**Server-managed (Modal, Daytona, Baseten, Islo, E2B, or Gensee).** With
 *managed hosts*, creating a session with `"host_type": "managed"` (e.g.
 `POST /v1/sessions {"agent_id": ..., "host_type": "managed"}`) makes the
 server provision a sandbox, start a host in it, and run the session there.
@@ -374,7 +374,7 @@ sandbox:
 
 Modal credentials come from the server's environment (`MODAL_TOKEN_ID` /
 `MODAL_TOKEN_SECRET`, or a mounted `~/.modal.toml`), not the config file.
-Daytona reads `DAYTONA_API_KEY`. Blaxel reads `BL_WORKSPACE` and `BL_API_KEY`.
+Daytona reads `DAYTONA_API_KEY`. Baseten reads `BASETEN_API_KEY` and optional `BASETEN_TEAM_ID`.
 Islo reads `ISLO_API_KEY` and optional `ISLO_BASE_URL`. E2B reads `E2B_API_KEY`.
 Gensee reads `GENSEE_CONTROLLER_API_TOKEN`; see
 [`gensee/README.md`](gensee/README.md) for its managed-only configuration.
@@ -384,7 +384,7 @@ no user credentials ever enter the sandbox.
 
 **Host token expiry.** Set `sandbox.token_ttl_s` to control the token validity
 window in seconds. Omitted or `null` keeps the provider default (seven days
-for most providers; Modal uses 25 hours, and Blaxel, E2B, and CoreWeave derive
+for most providers; Modal uses 25 hours, and Baseten, E2B, and CoreWeave derive
 it from sandbox lifetime). Values must be integers from `300` to `31536000`
 (5 minutes to 365 days). Allow enough time for sandbox startup and repository
 setup before the first host connection.
@@ -435,7 +435,7 @@ for a later sweep, while the session history and durable host binding stay
 available for a fresh sandbox generation. Both
 `terminate_after_offline_days` and `sweep_interval_s` must be positive integers.
 
-**The host image.** Most sandboxes boot from the official prebaked host image (`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host` target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in seconds instead of installing Omnigent at boot. The image ships the coding-harness CLIs (`claude`, `codex`, `pi`, `kiro-cli`). Blaxel uses `blaxel/omnigent-host:latest`, which combines this host runtime with Blaxel's required `sandbox-api`. E2B uses its provider template. Gensee uses a provider-managed runtime rather than this registry-image setting. To use a custom image with a provider that accepts one, build the same `host` target and point the provider config at it:
+**The host image.** Most sandboxes boot from the official prebaked host image (`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host` target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in seconds instead of installing Omnigent at boot. The image ships the coding-harness CLIs (`claude`, `codex`, `pi`, `kiro-cli`). Baseten builds this image into your team on first use and adds its sandbox API. E2B uses its provider template. Gensee uses a provider-managed runtime rather than this registry-image setting. To use a custom image with a provider that accepts one, build the same `host` target and point the provider config at it:
 
 ```bash
 docker build -f docker/Dockerfile --target host \
@@ -451,7 +451,7 @@ sandbox:
     image: docker.io/<you>/omnigent-host:latest
 ```
 
-For private registries, set `OMNIGENT_MODAL_REGISTRY_SECRET` on the server to the name of a Modal secret holding `REGISTRY_USERNAME` and `REGISTRY_PASSWORD`. For CLI-launched sandboxes, `OMNIGENT_MODAL_HOST_IMAGE`, `OMNIGENT_DAYTONA_HOST_IMAGE`, `OMNIGENT_BLAXEL_HOST_IMAGE`, or `OMNIGENT_ISLO_HOST_IMAGE` overrides the image.
+For private registries, set `OMNIGENT_MODAL_REGISTRY_SECRET` on the server to the name of a Modal secret holding `REGISTRY_USERNAME` and `REGISTRY_PASSWORD`. For CLI-launched sandboxes, `OMNIGENT_MODAL_HOST_IMAGE`, `OMNIGENT_DAYTONA_HOST_IMAGE`, `OMNIGENT_BASETEN_HOST_IMAGE`, or `OMNIGENT_ISLO_HOST_IMAGE` overrides the image.
 
 **LLM credentials for managed sessions.** A fresh sandbox has no API keys.
 Park your provider credentials in a [Modal secret](https://modal.com/secrets)
@@ -479,7 +479,7 @@ sandbox:
     secrets: [omnigent-llm]
 ```
 
-For Daytona, Blaxel, and Islo, list server environment variable names under `sandbox.daytona.env`, `sandbox.blaxel.env`, or `sandbox.islo.env`. The launcher copies the current server values into each sandbox:
+For Daytona, Baseten, and Islo, list server environment variable names under `sandbox.daytona.env`, `sandbox.baseten.env`, or `sandbox.islo.env`. The launcher copies the current server values into each sandbox:
 
 ```yaml
 sandbox:
@@ -504,7 +504,7 @@ a Modal secret (GitLab: add `GIT_USERNAME=oauth2`). The host image's git
 credential helper picks it up for the clone and for the agent's later
 fetch/push.
 
-See the [`modal`](modal/README.md), [`daytona`](daytona/README.md), [`blaxel`](blaxel/README.md), and [`islo`](islo/README.md) guides for provider setup and troubleshooting.
+See the [`modal`](modal/README.md), [`daytona`](daytona/README.md), [`baseten`](baseten/README.md), and [`islo`](islo/README.md) guides for provider setup and troubleshooting.
 
 ## Auth
 

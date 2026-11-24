@@ -33,7 +33,7 @@ stores into ``create_app``):
    ``<data_dir>/config.yaml``)::
 
        sandbox:
-         # lakebox|databricks|modal|daytona|blaxel|boxlite|cwsandbox|islo|
+         # databricks|modal|daytona|baseten|boxlite|cwsandbox|islo|
          # e2b|openshell|kubernetes|microsandbox|gensee
          provider: modal
          server_url: https://omnigent.example.com
@@ -90,11 +90,11 @@ stores into ``create_app``):
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES whose
                                              # values are injected as
                                              # sandbox env
-         blaxel:                  # optional block (provider: blaxel)
-           image: blaxel/omnigent-host:TAG  # optional fixed tag override
+         baseten:                 # optional block (provider: baseten)
+           image: my-omnigent-host:latest  # optional Baseten image override
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES
-           region: us-was-1       # optional
-           memory_mb: 4096        # optional; default: 4096
+           region: us-pdx-1       # optional; default: closest region
+           memory_mb: 4096        # optional; default: 4096 (2 vCPU)
            ttl: 24h               # optional; default maximum age: 24h
          islo:                    # optional block (provider: islo)
            image: docker.io/me/omnigent-host:latest  # default: official image
@@ -140,10 +140,9 @@ stores into ``create_app``):
    ``provider`` + ``server_url`` is a complete config. Gensee instead starts a
    provider-managed runtime. Registry-backed
    providers use ``ghcr.io/omnigent-ai/omnigent-host:latest`` (see
-   :data:`omnigent.onboarding.sandboxes.base.DEFAULT_HOST_IMAGE`); Blaxel uses
-   ``blaxel/omnigent-host:latest``, which adds its required ``sandbox-api``.
-   Both defaults remain overridable. Use a private immutable Blaxel image when
-   a production rollout must stay on fixed image contents.
+   :data:`omnigent.onboarding.sandboxes.base.DEFAULT_HOST_IMAGE`); Baseten builds
+   that image into the team on first use and adds its sandbox API. All
+   defaults remain overridable.
    Provider credentials are NOT in this file
    (12-factor): the Modal launcher reads ``MODAL_TOKEN_ID`` /
    ``MODAL_TOKEN_SECRET`` (or ``~/.modal.toml``) and the Daytona
@@ -152,9 +151,8 @@ stores into ``create_app``):
    reads ``ISLO_API_KEY`` (plus optional ``ISLO_BASE_URL``) from the
    server process environment. Gensee reads the environment variable named by
    ``sandbox.gensee.api_token_env`` (``GENSEE_CONTROLLER_API_TOKEN`` by
-   default). The Blaxel launcher reads ``BL_WORKSPACE``
-   and ``BL_API_KEY`` or the local ``bl login`` profile. The OpenShell
-   launcher needs no API key:
+   default). The Baseten launcher reads ``BASETEN_API_KEY`` (plus optional
+   ``BASETEN_TEAM_ID``). The OpenShell launcher needs no API key:
    it connects to the gateway made active with ``openshell gateway
    select`` (``$OPENSHELL_GATEWAY`` / ``~/.config/openshell/active_gateway``,
    or ``sandbox.openshell.cluster``), so the server process needs
@@ -248,7 +246,7 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "databricks",
         "modal",
         "daytona",
-        "blaxel",
+        "baseten",
         "boxlite",
         "cwsandbox",
         "islo",
@@ -266,7 +264,7 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
         "databricks",
         "modal",
         "daytona",
-        "blaxel",
+        "baseten",
         "boxlite",
         "cwsandbox",
         "islo",
@@ -313,10 +311,10 @@ MODAL_MANAGED_TOKEN_TTL_S = 25 * 3600
 # credentials while authenticated heartbeats keep active sandboxes usable.
 DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
-# The blaxel launch-token TTL is NOT a constant: Blaxel reaps a sandbox at its
-# configured max age (sandbox.blaxel.ttl, 24h by default), so the TTL is derived
-# from that age at parse time via blaxel.managed_token_ttl_s(). It always sits
-# above the age, so a live sandbox can re-authenticate its tunnel across
+# The baseten launch-token TTL is NOT a constant: Baseten deletes a sandbox at
+# its configured max age (sandbox.baseten.ttl, 24h by default), so the TTL is
+# derived from that age at parse time via baseten.managed_token_ttl_s(). It
+# always sits above the age, so a live sandbox can re-authenticate its tunnel across
 # reconnects while a token leaked from a reaped sandbox cannot.
 
 # Launch-token lifetime for the YAML boxlite path. Boxlite boxes have no
@@ -1811,6 +1809,11 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     :raises ValueError: When the mapping is malformed.
     """
     provider = raw.get("provider")
+    if provider == "blaxel":
+        raise ValueError(
+            "server config 'sandbox.provider: blaxel' is no longer supported: Blaxel "
+            "is now part of Baseten, so use 'provider: baseten' (see deploy/baseten/README.md)"
+        )
     community = _community_sandbox_providers()
     if not isinstance(provider, str) or (
         provider not in SUPPORTED_SANDBOX_PROVIDERS and provider not in community
@@ -1864,30 +1867,30 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             _parse_daytona_image(raw), _parse_daytona_env(raw)
         )
         token_ttl_s = DAYTONA_MANAGED_TOKEN_TTL_S
-    elif provider == "blaxel":
-        from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s
+    elif provider == "baseten":
+        from omnigent.onboarding.sandboxes.baseten import managed_token_ttl_s
 
-        section = _parse_provider_section(raw, "blaxel")
+        section = _parse_provider_section(raw, "baseten")
         if section is not None:
             _reject_unknown_keys(
                 section,
                 {"image", "env", "region", "memory_mb", "ttl"},
-                "sandbox.blaxel",
+                "sandbox.baseten",
             )
-        blaxel_ttl = _parse_provider_string(raw, "blaxel", "ttl")
-        launcher_factory = _blaxel_launcher_factory(
-            image=_parse_blaxel_image(raw),
-            env=_parse_provider_env(raw, "blaxel"),
-            region=_parse_provider_string(raw, "blaxel", "region"),
-            memory_mb=_parse_provider_positive_int(raw, "blaxel", "memory_mb"),
-            ttl=blaxel_ttl,
+        baseten_ttl = _parse_provider_string(raw, "baseten", "ttl")
+        launcher_factory = _baseten_launcher_factory(
+            image=_parse_baseten_image(raw),
+            env=_parse_provider_env(raw, "baseten"),
+            region=_parse_provider_string(raw, "baseten", "region"),
+            memory_mb=_parse_provider_positive_int(raw, "baseten", "memory_mb"),
+            ttl=baseten_ttl,
         )
-        # Derived from sandbox.blaxel.ttl so the token always outlives the
-        # sandbox age at which Blaxel reaps the host.
+        # Derived from sandbox.baseten.ttl so the token always outlives the
+        # sandbox age at which Baseten deletes the host.
         try:
-            token_ttl_s = managed_token_ttl_s(blaxel_ttl)
+            token_ttl_s = managed_token_ttl_s(baseten_ttl)
         except ValueError as exc:
-            raise ValueError(f"server config 'sandbox.blaxel.ttl' is invalid: {exc}") from exc
+            raise ValueError(f"server config 'sandbox.baseten.ttl' is invalid: {exc}") from exc
     elif provider == "boxlite":
         section = _boxlite_section(raw)
         _reject_unknown_keys(
@@ -2304,7 +2307,7 @@ def _daytona_launcher_factory(
     return _build
 
 
-def _blaxel_launcher_factory(
+def _baseten_launcher_factory(
     *,
     image: str | None,
     env: list[str] | None,
@@ -2312,13 +2315,13 @@ def _blaxel_launcher_factory(
     memory_mb: int | None,
     ttl: str | None,
 ) -> Callable[[], SandboxHostLauncher]:
-    """Build the launcher factory for the YAML ``provider: blaxel`` path."""
+    """Build the launcher factory for the YAML ``provider: baseten`` path."""
 
     def _build() -> SandboxHostLauncher:
-        """Construct the Blaxel launcher; the optional SDK remains lazy."""
-        from omnigent.onboarding.sandboxes.blaxel import BlaxelSandboxLauncher
+        """Construct the Baseten launcher; the optional SDK remains lazy."""
+        from omnigent.onboarding.sandboxes.baseten import BasetenSandboxLauncher
 
-        return BlaxelSandboxLauncher(
+        return BasetenSandboxLauncher(
             image=image,
             env=env,
             region=region,
@@ -2329,9 +2332,9 @@ def _blaxel_launcher_factory(
     return _build
 
 
-def _parse_blaxel_image(raw: dict[str, object]) -> str | None:
-    """Extract an optional Blaxel image override for the public default."""
-    section = _parse_provider_section(raw, "blaxel")
+def _parse_baseten_image(raw: dict[str, object]) -> str | None:
+    """Extract an optional Baseten image override for the built default."""
+    section = _parse_provider_section(raw, "baseten")
     if section is None:
         return None
     image = section.get("image")
@@ -2339,9 +2342,9 @@ def _parse_blaxel_image(raw: dict[str, object]) -> str | None:
         return None
     if not isinstance(image, str) or not image.strip():
         raise ValueError(
-            "server config 'sandbox.blaxel.image' must be a non-empty Blaxel image id, "
-            "e.g. 'blaxel/omnigent-host:<tag>' (or omit it to use the "
-            "public image or OMNIGENT_BLAXEL_HOST_IMAGE override)"
+            "server config 'sandbox.baseten.image' must be a non-empty Baseten image "
+            "reference, e.g. 'my-omnigent-host:latest' (or omit it to build the public "
+            "host image, or set OMNIGENT_BASETEN_HOST_IMAGE)"
         )
     return image.strip()
 

@@ -67,7 +67,7 @@ def test_plugin_state_loads_builtins() -> None:
     state = plugin_state()
     assert isinstance(state, SandboxProviderPluginState)
     assert "modal" in state
-    assert "blaxel" in state
+    assert "baseten" in state
     assert "gensee" in state
     assert "kubernetes" in state
     assert "lambda_microvm" in state
@@ -110,7 +110,7 @@ def test_available_providers_returns_builtins() -> None:
     reset_plugin_state_for_tests()
     names = available_providers()
     assert "modal" in names
-    assert "blaxel" in names
+    assert "baseten" in names
     assert "gensee" in names
     assert "kubernetes" in names
 
@@ -137,11 +137,11 @@ def test_instantiate_loads_built_in_provider() -> None:
     assert launcher.provider == "modal"
 
 
-def test_instantiate_loads_blaxel_without_optional_sdk() -> None:
-    """The lazy Blaxel module imports before the optional SDK is installed."""
+def test_instantiate_loads_baseten_without_optional_sdk() -> None:
+    """The lazy Baseten module imports before the optional SDK is installed."""
     reset_plugin_state_for_tests()
-    launcher = instantiate("blaxel")
-    assert launcher.provider == "blaxel"
+    launcher = instantiate("baseten")
+    assert launcher.provider == "baseten"
 
 
 def test_instantiate_loads_microsandbox_without_optional_sdk() -> None:
