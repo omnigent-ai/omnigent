@@ -3255,7 +3255,7 @@ describe("useMoveToNest", () => {
       expect(result.current.isError).toBe(rejected);
       if (rejected) {
         expect(queryClient.getQueryData(key)).toEqual(original);
-        // Only the move's family is undone; the streamed fields stay.
+        // Rollback must not clobber fields streamed in while the PATCH was pending.
         expect(queryClient.getQueryData(headBackfillKey)).toEqual(streamed);
       }
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", head.id] });
@@ -3293,10 +3293,13 @@ describe("useMoveToNest", () => {
   it("leaves a head's own in-flight move tombstone in place", async () => {
     const row = conversation({ id: "moved" });
     const head = conversation({ id: "head", title: "Head", project_id: "project" });
-    // The head's unfile never answers; the nest move succeeds.
-    fetchMock
-      .mockReturnValueOnce(new Promise<Response>(() => {}))
-      .mockResolvedValueOnce(mockResponse({ ...row, project_id: "project" }));
+    // The head's unfile never answers; the nest move answers when the test says.
+    let respond!: (response: Response) => void;
+    fetchMock.mockReturnValueOnce(new Promise<Response>(() => {})).mockReturnValueOnce(
+      new Promise<Response>((done) => {
+        respond = done;
+      }),
+    );
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     queryClient.setQueryData(["conversations", "", false], infinitePage([head, row]));
     vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
@@ -3308,8 +3311,16 @@ describe("useMoveToNest", () => {
     result.current.project.mutate({ id: head.id, project: "" });
     await waitFor(() => expect(withMoveTombstone(head).project_id).toBeNull());
     result.current.nest.mutate({ id: row.id, destination: head });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    // The head's own tombstone carries the new nest while it is pending.
+    expect(withMoveTombstone(head)).toMatchObject({
+      project_id: null,
+      family: { id: "head", representative_id: "head" },
+    });
+    respond(mockResponse({ ...row, project_id: "project" }));
     await waitFor(() => expect(result.current.nest.isSuccess).toBe(true));
     expect(withMoveTombstone(head).project_id).toBeNull();
+    expect(withMoveTombstone(head).family).toBeUndefined();
   });
 });
 

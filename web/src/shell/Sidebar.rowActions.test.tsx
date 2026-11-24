@@ -1193,10 +1193,14 @@ describe("two-step move menu", () => {
       },
     };
     const subAgent = { ...CONV, id: "child", title: "Member child", parent_session_id: "remote" };
-    mocks.searchRows = [remote, subAgent];
+    // Search lags the sidebar: it still sees the loaded nest's head as standalone.
+    const stale = { ...destination, title: "Member destination", family: null };
+    mocks.searchRows = [remote, subAgent, stale];
     fireEvent.change(search, { target: { value: "Member" } });
     const remoteItem = await screen.findByRole("menuitem", { name: "Remote nest" });
     expect(screen.queryByRole("menuitem", { name: "Member child" })).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Destination nest" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Member destination" })).toBeNull();
     fireEvent.click(remoteItem);
     expect(mocks.moveToNest.mutate).toHaveBeenCalledWith({ id: CONV.id, destination: remote });
     view.unmount();

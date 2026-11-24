@@ -7832,13 +7832,16 @@ function NestPickerMenu({
   // One entry per nest, plus one per standalone session that would lead a new nest.
   const nestKey = (row: Conversation) =>
     row.family ? `family:${row.family.id}` : `session:${row.id}`;
+  // Search can lag the sidebar's rows (e.g. a just-made nest), so a hit uses the loaded row.
+  const loaded = new Map(nests.destinations.map((row) => [row.id, row]));
+  const searched = query === search.trim() ? (result.data?.pages.flatMap((p) => p.data) ?? []) : [];
   const destinations = [
     ...new Map(
       [
         ...nests.destinations.filter((row) =>
           label(row).toLowerCase().includes(search.trim().toLowerCase()),
         ),
-        ...(query === search.trim() ? (result.data?.pages.flatMap((p) => p.data) ?? []) : []),
+        ...searched.map((row) => loaded.get(row.id) ?? row),
       ]
         .filter(
           (row) =>

@@ -2655,8 +2655,8 @@ export function useMoveToNest() {
           ?.name ??
         projectLabel ??
         null;
-      // A nest a standalone head left keeps its id until the server re-keys it, so the
-      // new nest then shows once the refetch lands instead of merging with that one.
+      // The head's former nest may still use its id until the server re-keys it; skip the
+      // optimistic family so the two don't merge.
       const staleNest =
         !!destination && !destination.family && isCachedFamilyId(queryClient, destination.id);
       const move: MoveTombstone = {
@@ -2714,7 +2714,7 @@ export function useMoveToNest() {
       showToast(error.message);
       if (!previous) return;
       unmarkSessionMoving(id, previous.move);
-      if (previous.head?.markedId) unmarkSessionMoving(previous.head.markedId, previous.move);
+      if (previous.head) releaseNestHead(previous.head, previous.move);
       for (const [key, data] of previous.queries) if (data) queryClient.setQueryData(key, data);
       restoreOpenSessionRow(queryClient, id, previous.backfill);
       if (previous.head) restoreNestHeadFamily(queryClient, previous.head);
@@ -2723,6 +2723,7 @@ export function useMoveToNest() {
     onSuccess: (updated, _variables, previous) => {
       if (!previous) return;
       if (previous.move.family !== undefined) previous.move.family = updated.family ?? null;
+      if (previous.head?.lent) previous.head.lent.entry.family = previous.move.family;
       previous.move.projectId = updated.project_id ?? null;
       previous.move.projectLabel = updated.labels?.[PROJECT_LABEL_KEY] || undefined;
       previous.move.project =
@@ -2745,7 +2746,7 @@ export function useMoveToNest() {
       );
       if (!previous) return;
       unmarkSessionMoving(id, previous.move);
-      if (previous.head?.markedId) unmarkSessionMoving(previous.head.markedId, previous.move);
+      if (previous.head) releaseNestHead(previous.head, previous.move);
     },
   });
 }
@@ -2766,6 +2767,8 @@ function isCachedFamilyId(queryClient: QueryClient, familyId: string): boolean {
 interface NestHeadPaint {
   /** The head's id while it carries the move's tombstone; `null` when it keeps its own. */
   markedId: string | null;
+  /** The head's own in-flight move, lent this move's family while it is pending; else `null`. */
+  lent: { entry: MoveTombstone; family: MoveTombstone["family"] } | null;
   /** The head's row as it looks leading the nest. */
   row: Conversation;
   /** The head's family before the move, restored on its open-session row if the move fails. */
@@ -2774,7 +2777,8 @@ interface NestHeadPaint {
 
 /**
  * Show a standalone `destination` leading the nest `move` creates; `null` when it has a nest.
- * A head with its own move in flight keeps that tombstone, so only its cached rows change.
+ * A head with its own move in flight keeps that tombstone, which carries the new family until
+ * this move ends.
  */
 function paintNestHead(
   queryClient: QueryClient,
@@ -2782,15 +2786,24 @@ function paintNestHead(
   move: MoveTombstone,
 ): NestHeadPaint | null {
   if (!destination || destination.family) return null;
-  const markedId = movingSessions.has(destination.id) ? null : destination.id;
+  const own = movingSessions.get(destination.id);
+  const markedId = own ? null : destination.id;
   if (markedId) markSessionMoving(markedId, move);
+  const lent = own ? { entry: own, family: own.family } : null;
+  if (own) own.family = move.family;
   const cached = findCachedConversationRow(queryClient, destination.id) ?? destination;
   const row = { ...withMoveTombstone(cached), family: move.family };
   const backfillKey = ["conversation-backfill", destination.id];
   if (queryClient.getQueryData<Conversation | null>(backfillKey)) {
     queryClient.setQueryData(backfillKey, row);
   }
-  return { markedId, row, previousFamily: cached.family };
+  return { markedId, lent, row, previousFamily: cached.family };
+}
+
+/** End a move's hold on its head: drop the move's tombstone, or hand back a lent one. */
+function releaseNestHead(head: NestHeadPaint, move: MoveTombstone): void {
+  if (head.markedId) unmarkSessionMoving(head.markedId, move);
+  if (head.lent) head.lent.entry.family = head.lent.family;
 }
 
 /** Undo a failed move's family on the head's open-session row, keeping newer streamed fields. */
