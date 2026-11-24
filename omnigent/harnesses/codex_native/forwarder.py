@@ -8418,6 +8418,32 @@ async def _post_collab_agent_statuses(
         ap_status = _omnigent_status_from_collab_state(state)
         if ap_status is None:
             continue
+        queued = _QueuedChildEvent(
+            deliver=functools.partial(
+                _post_collab_agent_status,
+                client,
+                child_session_id=child_session_id,
+                thread_id=thread_id,
+                ap_status=ap_status,
+                forwarder_state=forwarder_state,
+            ),
+            enqueued_at=asyncio.get_running_loop().time(),
+        )
+        forwarder_state.child_stream(client, thread_id, child_session_id).enqueue(
+            queued, forwarder_state.child_delivery_slots
+        )
+
+
+async def _post_collab_agent_status(
+    client: httpx.AsyncClient,
+    *,
+    child_session_id: str,
+    thread_id: str,
+    ap_status: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """Recheck a queued snapshot while holding the child's publication lock."""
+    async with _conversation_item_delivery_scope(child_session_id):
         own_status = forwarder_state.child_turn_status(thread_id)
         if own_status is not None and ap_status != own_status:
             _logger.info(
@@ -8427,7 +8453,7 @@ async def _post_collab_agent_statuses(
                 own_status,
                 thread_id,
             )
-            continue
+            return
         await _post_status(client, child_session_id, ap_status)
 
 
@@ -9521,12 +9547,13 @@ async def _post_status(
     if compaction_model is not None and selected_model is not None:
         data["compaction_model"] = compaction_model
         data["selected_model"] = selected_model
-    response = await _post_session_event(
-        client,
-        session_id,
-        event_type="external_session_status",
-        data=data,
-    )
+    async with _conversation_item_delivery_scope(session_id):
+        response = await _post_session_event(
+            client,
+            session_id,
+            event_type="external_session_status",
+            data=data,
+        )
     _log_failed_session_event_post("external_session_status", response)
     return response is not None and response.status_code < 400
 
