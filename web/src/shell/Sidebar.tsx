@@ -455,6 +455,9 @@ const ProjectIconsContext = createContext<Map<string, string>>(new Map());
 const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
 // The filter menu's "Show" toggles: which optional metadata each row renders.
 const SidebarShowContext = createContext<readonly SidebarShowField[]>([]);
+// True when no project folders frame the rows (any grouping but Default), so
+// each row names its own project.
+const ShowRowProjectContext = createContext(false);
 // Row-invariant values resolved once at the list owner and shared, so a row
 // doesn't run `useIsMobileViewport` (a matchMedia-on-every-render store) or
 // `useViewerId` (an identity-resolve effect) per instance.
@@ -503,6 +506,7 @@ function SidebarRowDataProvider({
   projectIconsById,
   hostsById,
   show,
+  showProject,
   isMobile,
   viewerId,
   serverInfo,
@@ -515,6 +519,7 @@ function SidebarRowDataProvider({
   projectIconsById: Map<string, string>;
   hostsById: ReadonlyMap<string, Host>;
   show: readonly SidebarShowField[];
+  showProject: boolean;
   isMobile: boolean;
   viewerId: string | null;
   serverInfo: ReturnType<typeof useServerInfo>;
@@ -534,7 +539,9 @@ function SidebarRowDataProvider({
                   <RowActivationContext.Provider value={onActivate}>
                     <SessionReorderContext.Provider value={onReorder}>
                       <NestMoveContext.Provider value={nestMoves}>
-                        {children}
+                        <ShowRowProjectContext.Provider value={showProject}>
+                          {children}
+                        </ShowRowProjectContext.Provider>
                       </NestMoveContext.Provider>
                     </SessionReorderContext.Provider>
                   </RowActivationContext.Provider>
@@ -3629,6 +3636,7 @@ function ConversationList({
       projectIconsById={projectIconsById}
       hostsById={hostsById}
       show={view.show}
+      showProject={grouped}
       isMobile={isMobile}
       viewerId={viewerId}
       serverInfo={serverInfo}
@@ -5776,31 +5784,48 @@ function SessionSharedHint({ sharing }: { sharing: SessionSharing }) {
   );
 }
 
-// A row's second line: the "Show" environment and branch, each omitted when empty.
+// A row's second line: its project when no folder shows it, then the "Show"
+// environment, repo and branch, each omitted when empty.
 function SessionMetaLine({
+  project,
   environment,
   repo,
   branch,
 }: {
+  project: { name: string; icon: string | null } | null;
   environment: ReactNode;
   repo: string | null;
   branch: string | null;
 }) {
-  const parts: { key: string; icon: LucideIcon; value: ReactNode }[] = [];
-  if (environment != null) parts.push({ key: "environment", icon: LaptopIcon, value: environment });
-  if (repo !== null) parts.push({ key: "repo", icon: FolderGit2Icon, value: repo });
-  if (branch !== null) parts.push({ key: "branch", icon: GitBranchIcon, value: branch });
+  const metaIcon = (Icon: LucideIcon) => <Icon aria-hidden className="size-3.5 shrink-0" />;
+  const parts: { key: string; icon: ReactNode; value: ReactNode }[] = [];
+  if (project !== null) {
+    parts.push({
+      key: "project",
+      icon: <ProjectRowIcon icon={project.icon} />,
+      value: (
+        <>
+          <span className="sr-only">Project: </span>
+          {project.name}
+        </>
+      ),
+    });
+  }
+  if (environment != null)
+    parts.push({ key: "environment", icon: metaIcon(LaptopIcon), value: environment });
+  if (repo !== null) parts.push({ key: "repo", icon: metaIcon(FolderGit2Icon), value: repo });
+  if (branch !== null) parts.push({ key: "branch", icon: metaIcon(GitBranchIcon), value: branch });
   if (parts.length === 0) return null;
   return (
     <span
       data-testid="session-row-meta"
       className="flex w-full min-w-0 items-center gap-1.5 text-sm text-muted-foreground"
     >
-      {parts.map(({ key, icon: Icon, value }, i) => (
+      {parts.map(({ key, icon, value }, i) => (
         <Fragment key={key}>
           {i > 0 && <span aria-hidden>·</span>}
           <span className="flex min-w-0 items-center gap-1">
-            <Icon aria-hidden className="size-3.5 shrink-0" />
+            {icon}
             <span className={key === "environment" ? "sr-only" : "truncate"}>{value}</span>
           </span>
         </Fragment>
@@ -6274,7 +6299,7 @@ function ConversationRowImpl({
   // native `title` tooltip.
   const projectFlyoutName = !isMobile && isPinned ? currentProject : null;
   // First-class projects can carry a chosen emoji; label-only projects have
-  // none, so the flyout falls back to the folder glyph for those.
+  // none, so the flyout and meta line fall back to the folder glyph for those.
   const projectIconsById = useContext(ProjectIconsContext);
   const projectFlyoutIcon =
     conversation.project_id != null
@@ -6404,10 +6429,14 @@ function ConversationRowImpl({
   ) : null;
   const metaRepo = show.includes("repo") ? sessionRepoName(conversation) : null;
   const metaBranch = useSessionBranch(conversation, show.includes("branch"));
+  const metaProject =
+    useContext(ShowRowProjectContext) && currentProject !== null
+      ? { name: currentProject, icon: projectFlyoutIcon }
+      : null;
   // Overlays (checkbox, badges, controls; each also `-translate-y-1/2`) center on
   // the row, or on the title line — padding + half its 20px box — above a meta line.
   const overlayTop =
-    metaEnvironment !== null || metaRepo !== null || metaBranch !== null
+    metaProject !== null || metaEnvironment !== null || metaRepo !== null || metaBranch !== null
       ? "top-4 md:top-3.5"
       : "top-1/2";
 
@@ -6598,8 +6627,13 @@ function ConversationRowImpl({
           {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
         </span>
       </div>
-      {/* Row 2: the "Show" metadata, each part omitted when it has no value. */}
-      <SessionMetaLine environment={metaEnvironment} repo={metaRepo} branch={metaBranch} />
+      {/* Row 2: the project (outside folders) and "Show" metadata; empty parts are omitted. */}
+      <SessionMetaLine
+        project={metaProject}
+        environment={metaEnvironment}
+        repo={metaRepo}
+        branch={metaBranch}
+      />
     </>
   );
 

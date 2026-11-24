@@ -85,7 +85,9 @@ const {
   useSessionWorktreesMock,
 } = vi.hoisted(() => ({
   projectsMock: [] as string[],
-  projectRowsRef: { current: undefined as { id: string; name: string }[] | undefined },
+  projectRowsRef: {
+    current: undefined as { id: string; name: string; icon?: string }[] | undefined,
+  },
   moveToProjectSpy: vi.fn(),
   deleteProjectSpy: vi.fn(),
   renameProjectSpy: vi.fn(),
@@ -4697,8 +4699,8 @@ describe("Sidebar view options", () => {
           .map((link) => link.textContent),
       ).toEqual(
         ordering === "created"
-          ? ["conv_shared_sdk", "conv_custom_sdk", "conv_project_native"]
-          : ["conv_project_native", "conv_custom_sdk", "conv_shared_sdk"],
+          ? ["conv_shared_sdk", "conv_custom_sdk", "conv_project_nativeProject: Customer X"]
+          : ["conv_project_nativeProject: Customer X", "conv_custom_sdk", "conv_shared_sdk"],
       );
       for (const [title, id] of [
         ["Claude Code", "conv_wrapper"],
@@ -5064,9 +5066,14 @@ describe("Sidebar view options", () => {
       renderGroupingSidebar();
       if (grouping === "default")
         fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+      // The Default folder names the project; other groupings name it on the row.
+      const filed =
+        grouping === "default"
+          ? ["conv_project_new", "conv_project_old"]
+          : ["conv_project_newProject: Customer X", "conv_project_oldProject: Customer X"];
       expect(
         screen.getAllByRole("link", { name: /^conv_/ }).map((link) => link.textContent),
-      ).toEqual(["conv_project_new", "conv_project_old", "conv_new", "conv_old"]);
+      ).toEqual([...filed, "conv_new", "conv_old"]);
     },
   );
 
@@ -5228,6 +5235,45 @@ describe("Sidebar view options", () => {
     // A session with no repo label omits the row entirely.
     const local = screen.getByText("conv_local").closest("li")!;
     expect(within(local).queryByTestId("session-row-meta")).toBeNull();
+  });
+
+  it("names each row's project under its title when grouped by Updated", () => {
+    localStorage.setItem(
+      "omnigent:sidebar-view",
+      JSON.stringify({ grouping: "updated", show: ["branch"] }),
+    );
+    projectRowsRef.current = [{ id: "p_launch", name: "Launch", icon: "🚀" }];
+    mockConversations([
+      conv("conv_emoji", "Codex", { project_id: "p_launch", git_branch: "fix/retries" }),
+      conv("conv_label", "Codex", { labels: { omni_project: "Customer X" } }),
+      conv("conv_unfiled", "Codex"),
+    ]);
+    renderGroupingSidebar();
+
+    // The project leads the meta line, ahead of the Show fields, with its emoji.
+    const emojiRow = within(screen.getByText("conv_emoji").closest("li")!);
+    expect(emojiRow.getByTestId("session-row-meta")).toHaveTextContent(
+      /^🚀Project: Launch·fix\/retries$/,
+    );
+    expect(emojiRow.getByTestId("project-icon")).toHaveTextContent("🚀");
+    expect(emojiRow.getByText("Launch")).toHaveClass("truncate");
+    // jsdom's name computation drops the space a browser keeps after "Project:".
+    expect(emojiRow.getByRole("link")).toHaveAccessibleName(/^conv_emoji Project:\s?Launch/);
+    expect(emojiRow.getByTestId("quick-pin-conversation").closest(".absolute")).toHaveClass(
+      "top-4",
+    );
+    // A label-only project has no emoji, so it takes the folder glyph.
+    const labelRow = within(screen.getByText("conv_label").closest("li")!);
+    const labelMeta = labelRow.getByTestId("session-row-meta");
+    expect(labelMeta).toHaveTextContent(/^Project: Customer X$/);
+    expect(labelRow.queryByTestId("project-icon")).toBeNull();
+    expect(labelMeta.querySelector(".lucide-folder")).not.toBeNull();
+    // An unfiled session stays a single line.
+    const unfiled = within(screen.getByText("conv_unfiled").closest("li")!);
+    expect(unfiled.queryByTestId("session-row-meta")).toBeNull();
+    expect(unfiled.getByTestId("quick-pin-conversation").closest(".absolute")).toHaveClass(
+      "top-1/2",
+    );
   });
 
   it("adds the harness and on-demand repo, PR and branch to the session tooltip", async () => {
