@@ -20,9 +20,16 @@ from omnigent.server.project_orchestrator import (
     ticket_batch_message,
     ticket_comment_for_worker_message,
 )
-from omnigent.server.project_router import router_session_id, router_session_ids
+from omnigent.server.project_router import (
+    choose_router,
+    project_identities,
+    router_session_id,
+    router_session_ids,
+)
 from omnigent.server.session_delivery import deliver_to_session
 from omnigent.server.startup_inputs import ManagedStartupInputs
+from omnigent.server.ticket_responder import ROUTER, assignee_name, responder_order
+from omnigent.server.ticket_review import REVIEWER_NAME
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.project_ticket_store import ProjectTicketStore
 
@@ -163,23 +170,64 @@ class ProjectTicketNotifications:
         )
 
     async def _route_to_workers(self, app: Any, project: Project, event: dict[str, Any]) -> bool:
-        """Hand a person's comment to the ticket's linked worker sessions."""
-        session_ids = await asyncio.to_thread(
-            self.tickets.ticket_session_ids, project.id, event["ticket_id"]
+        """Hand a person's comment to the one agent it is most likely meant for.
+
+        ``@Name`` mentions are delivered by the comment route; a comment that names the
+        router is left for the router. Otherwise the first candidate from
+        :func:`responder_order` that is live gets it, and the rest aren't woken.
+
+        :returns: ``True`` when a non-router session will answer it.
+        """
+        identities = await project_identities(app, project)
+        mentioned = {
+            entry.get("id")
+            for entry in event["payload"].get("mentions") or []
+            if isinstance(entry, dict)
+        }
+        if mentioned:
+            router = choose_router(project, identities)
+            return router.identity_id not in mentioned
+        session_ids, context = await asyncio.gather(
+            asyncio.to_thread(self.tickets.ticket_session_ids, project.id, event["ticket_id"]),
+            asyncio.to_thread(
+                self.tickets.person_comment_context,
+                project.id,
+                event["ticket_id"],
+                event["position"],
+            ),
+        )
+        by_name = {identity.name.casefold(): identity for identity in identities}
+        reviewer = by_name.get(REVIEWER_NAME.casefold())
+        wanted = assignee_name(context["labels"])
+        assignee = by_name.get(wanted.casefold()) if wanted else None
+        order = responder_order(
+            linked=session_ids,
+            routers=await router_session_ids(app, project),
+            reviewer=reviewer.active_session_id if reviewer else None,
+            assignee=assignee.active_session_id if assignee else None,
+            asker=context["asker"],
+            commenters=context["commenters"],
         )
         text = ticket_comment_for_worker_message(project.id, event)
-        # The router hears about every event in its digest instead.
-        router_sessions = await router_session_ids(app, project)
-        delivered = False
-        for session_id in session_ids:
-            if session_id in router_sessions:
-                continue
-            stable_id = hashlib.sha256(f"{event['id']}:{session_id}".encode()).hexdigest()[:32]
-            if await self.deliver_to_session(
-                app, project, session_id, stable_id=stable_id, text=text
+        for session_id in order:
+            if session_id is ROUTER:
+                return False
+            conversation = await asyncio.to_thread(
+                self.inputs.conversations.get_conversation, session_id
+            )
+            if (
+                conversation is None
+                or conversation.archived
+                or conversation.project_id != project.id
             ):
-                delivered = True
-        return delivered
+                continue
+            # Only the first live candidate gets the turn; if nothing will drain it,
+            # the router answers instead of another worker.
+            stable_id = hashlib.sha256(f"{event['id']}:{session_id}".encode()).hexdigest()[:32]
+            return await self.deliver_to_session(
+                app, project, session_id, stable_id=stable_id, text=text
+            )
+        return False
 
     async def _deliver_project(self, app: Any, project_id: str, *, digest_due: bool) -> None:
         events = await asyncio.to_thread(self.tickets.project_pending_notifications, project_id)

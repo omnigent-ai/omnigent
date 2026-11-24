@@ -590,10 +590,13 @@ with a handoff from a previous orchestrator, re-read the board before acting.
   what it means for the user. Then add any caveats or follow-ups, and link the key
   evidence or artifacts. Leave out SHAs, paths and retry logs unless the user needs
   them to act.
-- A person's comment on a ticket goes straight to its linked worker sessions,
-  which answer it on the ticket. You see it in a digest once a worker replies. It
-  wakes you urgently only when the ticket has no worker that can be woken, or none
-  replied in time; then answer it or hand it to a worker.
+- A person's comment on a ticket goes to one agent, which answers it on the
+  ticket: the identities it @mentions; else the session whose open needs-human
+  ask or latest comment it answers; else the `assignee`, the active linked worker
+  or the Reviewer. You see it in a digest once that agent replies. It wakes you
+  urgently when it @mentions you, answers your own ask or latest comment, the
+  ticket has no worker that can be woken, or none replied in time; then answer it
+  or hand it to a worker. Don't answer comments routed to someone else.
   The board pins the latest final update under the description and on the card.
   Reopening the ticket unpins it and keeps it in history; post a new one when the
   ticket completes again. A `next_step` in an update's result, or a completion

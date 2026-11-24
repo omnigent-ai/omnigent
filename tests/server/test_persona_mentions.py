@@ -54,17 +54,6 @@ async def test_owner_mentions_always_deliver_and_agents_skip_themselves_and_loop
         project, ticket, "Please look", PERSONAS, event_id="e1", author_session_id=None, **common
     )
     assert owner == {"orchestrator": "unavailable", "pm": "delivered", "lead": "delivered"}
-    linked = await deliver_mentions(
-        project,
-        ticket,
-        "Please look",
-        [PM],
-        event_id="e0",
-        author_session_id=None,
-        already_notified=frozenset({"pm-session"}),
-        **common,
-    )
-    assert linked == {"pm": "linked"}
     agent = await deliver_mentions(
         project,
         ticket,

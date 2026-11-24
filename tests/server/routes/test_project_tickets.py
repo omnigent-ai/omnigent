@@ -1509,6 +1509,75 @@ async def test_person_comments_go_to_the_tickets_worker_and_fall_back_to_the_orc
     assert tickets.pending_notifications() == []
 
 
+async def test_a_person_comment_wakes_one_agent_not_every_linked_session(
+    project_client, project_app, db_uri
+):
+    project = (await project_client.post("/v1/projects", json={"name": "One voice"})).json()
+    lead = project["main_session_id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    first, second = (store.create_conversation(project_id=project["id"]).id for _ in range(2))
+    for session_id in (lead, first, second):
+        store.set_host_id(session_id, uuid4().hex, "/tmp/project")
+    service = project_app.state.project_ticket_notifications
+    service.digest_seconds = service.worker_reply_seconds = 3600
+    tickets = service.tickets
+    base = f"/v1/projects/{project['id']}/tickets"
+    ticket = (await project_client.post(base, json={"title": "Who answers"})).json()
+    path = f"{base}/{ticket['id']}"
+    await service.flush_page(project_app)
+    owner = (await project_client.get(f"{path}/events")).json()["data"][0]["user_id"]
+    as_first = TicketActor(user_id=owner, session_id=first)
+    as_second = TicketActor(user_id=owner, session_id=second)
+    tickets.link_session(project["id"], ticket["id"], first, "attach", as_first)
+    tickets.link_session(project["id"], ticket["id"], second, "attach", as_second)
+
+    def heard(text: str, session_id: str) -> bool:
+        return any(
+            text in part.get("text", "")
+            for pending in store.list_pending_inputs(session_id)
+            for part in pending.data.content
+        )
+
+    async def person_says(text: str) -> set[str]:
+        await project_client.post(f"{path}/comments", json={"text": text})
+        await service.flush_page(project_app)
+        await asyncio.gather(*ticket_routes._mention_tasks)
+        return {s for s in (lead, first, second) if heard(text, s)}
+
+    # Nobody has spoken yet: one linked worker answers alone.
+    [alone] = await person_says("Status?")
+    assert alone in (first, second)
+    # A reply to the older worker's comment goes back to it.
+    tickets.comment(project["id"], ticket["id"], CommentOnTicket(text="Tried A"), as_first)
+    assert await person_says("Why A?") == {first}
+    # An open needs-human ask is answered to the session that raised it.
+    tickets.update(
+        project["id"],
+        ticket["id"],
+        UpdateTicket(labels=[{"key": "needs-human"}], comment="Ship B or C?"),
+        as_second,
+    )
+    tickets.comment(project["id"], ticket["id"], CommentOnTicket(text="Still on A"), as_first)
+    assert await person_says("Ship C.") == {second}
+    tickets.update(project["id"], ticket["id"], UpdateTicket(labels=[]), as_second)
+    # Answering the Lead's own comment goes to the Lead, not the workers.
+    await project_client.post(
+        f"{path}/comments",
+        json={"text": "Paused this until Friday."},
+        headers={ORCHESTRATION_SOURCE_HEADER: lead},
+    )
+    await service.flush_page(project_app, force_digest=True)
+    assert await person_says("Why Friday?") == {lead}
+    # An @mention goes only to the named identity, even when workers are linked.
+    pm = (
+        await project_client.post(
+            f"/v1/projects/{project['id']}/identities", json={"name": "PM", "instructions": "x"}
+        )
+    ).json()["active_session_id"]
+    assert await person_says("@PM can you scope C?") == set()
+    assert heard("@PM can you scope C?", pm) and heard("A person addressed you", pm)
+
+
 async def test_final_update_must_read_as_written_for_a_person(project_client):
     project = (await project_client.post("/v1/projects", json={"name": "Finals"})).json()
     base = f"/v1/projects/{project['id']}/tickets"

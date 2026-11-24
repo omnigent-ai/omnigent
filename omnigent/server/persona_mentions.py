@@ -88,6 +88,15 @@ def mention_message(
     excerpt = text if len(text) <= _COMMENT_EXCERPT_CHARS else text[:_COMMENT_EXCERPT_CHARS] + "…"
     quoted = "\n".join(f"> {line}" for line in excerpt.splitlines() or [""])
     link = f"/projects/{urllib.parse.quote(project.name)}?ticket={ticket['id']}"
+    if author_session_id is None:
+        return (
+            f'A person addressed you on ticket "{ticket["title"]}" (`{ticket["id"]}`):\n\n'
+            f"{quoted}\n\n"
+            f"Open it: {link}\n"
+            "Only the agents they @mentioned were asked to answer. Read it with "
+            "sys_ticket_get, then reply on the ticket with sys_ticket_comment in plain "
+            "language for them, and act on it if it asks for work."
+        )
     return (
         f'You were cc\'d by {author} on ticket "{ticket["title"]}" (`{ticket["id"]}`):\n\n'
         f"{quoted}\n\n"
@@ -128,17 +137,15 @@ async def deliver_mentions(
     open_session: OpenSession,
     deliver: Deliver,
     limiter: MentionRateLimiter,
-    already_notified: frozenset[str] = frozenset(),
 ) -> dict[str, str]:
     """Deliver one comment to each mentioned persona's session.
 
     *open_session* returns the persona's current session, restoring it if needed;
     *deliver* enqueues ``(session_id, stable_id, text)``. Owner comments always
     deliver; agent comments skip the author's own session and are rate-limited.
-    Sessions in *already_notified* get the comment another way and are skipped.
 
     :returns: Persona id to outcome: ``delivered``, ``queued``, ``self``,
-        ``linked``, ``rate_limited``, ``unavailable`` or ``failed``.
+        ``rate_limited``, ``unavailable`` or ``failed``.
     """
     message = mention_message(project, ticket, text, author_session_id=author_session_id)
     outcomes: dict[str, str] = {}
@@ -147,9 +154,6 @@ async def deliver_mentions(
             session_id = await open_session(mention)
             if session_id is None:
                 outcomes[mention.id] = "unavailable"
-                continue
-            if session_id in already_notified:
-                outcomes[mention.id] = "linked"
                 continue
             if author_session_id is not None:
                 if session_id == author_session_id:

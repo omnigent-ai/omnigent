@@ -1593,6 +1593,41 @@ class ProjectTicketStore:
                 ).all()
             )
 
+    def person_comment_context(
+        self, project_id: str, ticket_id: str, before_position: int
+    ) -> dict[str, Any]:
+        """Delivery worker: who a person's comment at *before_position* most likely answers.
+
+        :returns: ``labels``, ``stage_id``, ``asker`` (the session that raised a still-open
+            needs-human, if any) and ``commenters`` (sessions that commented earlier, most
+            recent first).
+        """
+        with self._session("ticket_person_comment_context") as session:
+            ticket = self._row(session, project_id, ticket_id)
+            asks = self._human_asks(session, ticket)
+            open_ask = asks[-1] if asks and asks[-1].end is None else None
+            authors = session.scalars(
+                select(SqlProjectTicketEvent.session_id)
+                .where(
+                    SqlProjectTicketEvent.workspace_id == ticket.workspace_id,
+                    SqlProjectTicketEvent.project_id == ticket.project_id,
+                    SqlProjectTicketEvent.ticket_id == ticket.id,
+                    SqlProjectTicketEvent.kind.in_(NEW_COMMENT_KINDS),
+                    SqlProjectTicketEvent.session_id.is_not(None),
+                    SqlProjectTicketEvent.position < before_position,
+                )
+                .order_by(SqlProjectTicketEvent.position.desc())
+                .limit(200)
+            ).all()
+            return {
+                "labels": builtins.list(ticket.labels or []),
+                "stage_id": ticket.stage_id,
+                "asker": open_ask.session_id
+                if open_ask is not None and _has_needs_human(ticket.labels)
+                else None,
+                "commenters": builtins.list(dict.fromkeys(authors)),
+            }
+
     def mark_awaiting_worker(self, project_id: str, ticket_id: str, event_id: str) -> None:
         """A person's comment reached the ticket's workers; hold it until one replies."""
         with self._write("mark_ticket_comment_awaiting_worker") as session:

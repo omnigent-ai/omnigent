@@ -57,10 +57,12 @@ def ticket_comment_for_worker_message(project_id: str, event: dict[str, Any]) ->
         f'A person commented on ticket {event["ticket_id"]} "{title}" in project '
         f"{project_id}, which you are linked to:\n\n"
         f"{event['payload'].get('text', '')}\n\n"
+        "You are the one agent asked to answer it; the ticket's other agents were not woken. "
         "Reply on the ticket yourself with sys_ticket_comment; while this comment is open your "
         "reply is shown to them as a human-facing comment, so write it in plain language. Then "
         "act on it if it asks for work. The orchestrator is only told in its digest once you "
-        "reply. If it isn't yours to handle, say so on the ticket and message your coordinator."
+        "reply. If it is meant for another agent, say so on the ticket and @mention that "
+        "identity or message your coordinator."
     )
 
 

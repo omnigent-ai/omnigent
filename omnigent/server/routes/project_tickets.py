@@ -192,16 +192,7 @@ def _spawn_mention_delivery(
             wanted = [entry for entry in mentions if entry.id != router_id]
             if not wanted:
                 return
-        # A person's comment already reaches the ticket's linked sessions as worker routing.
-        linked = (
-            frozenset(
-                await asyncio.to_thread(
-                    notifications.tickets.ticket_session_ids, project.id, ticket["id"]
-                )
-            )
-            if who.session_id is None
-            else frozenset()
-        )
+        # A person's comment with mentions goes only to the named identities, linked or not.
         outcomes = await deliver_mentions(
             project,
             ticket,
@@ -212,7 +203,6 @@ def _spawn_mention_delivery(
             open_session=lambda mention: targets.open(request, project, mention),
             deliver=deliver,
             limiter=_mention_limiter,
-            already_notified=linked,
         )
         _logger.info("Ticket %s mentions: %s", ticket["id"], outcomes)
 
