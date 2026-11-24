@@ -6,6 +6,7 @@ import builtins
 import re
 import uuid
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import and_, case, func, or_, select, union_all, update
@@ -53,12 +54,17 @@ from omnigent.entities.project_ticket import (
 from omnigent.entities.project_ticket_legacy import legacy_ticket_notes
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
-from omnigent.stores.project_store.access import project_role
-from omnigent.stores.project_store.sqlalchemy_store import router_session_id_for_row
+from omnigent.stores.project_store.access import accessible_project_ids, project_role
+from omnigent.stores.project_store.sqlalchemy_store import (
+    _decode_config,
+    router_session_id_for_row,
+)
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 TICKET_ACTIVITY_SESSION_MAX = 100
 TICKET_SUMMARY_SCAN_MAX = 1000
+# The Inbox lists at most this many open needs-human asks per viewer.
+HUMAN_REQUEST_MAX = 100
 # Outputs ride along with a comment, so only these kinds count as new activity.
 NEW_COMMENT_KINDS = (EVENT_CODES["comment"], EVENT_CODES["execution"])
 NEW_UPDATE_KINDS = (EVENT_CODES["created"], EVENT_CODES["updated"])
@@ -639,6 +645,122 @@ class ProjectTicketStore:
                     .where(*in_project, SqlProjectTicket.created_at > created_after)
                 )
             return summary
+
+    def human_requests(self, *, user_id: str | None) -> dict[str, Any]:
+        """Open ``needs-human`` asks across the viewer's projects that are routed to them.
+
+        An ask is routed by :func:`human_request_routing` and stays listed until the
+        label is removed or any of its routed people acts on the ticket (a comment
+        or an edit), which clears it for all of them.
+        """
+        from omnigent.server.product_approval import human_request_routing
+
+        with self._session("list_viewer_human_requests") as session:
+            projects = session.scalars(
+                select(SqlProject).where(
+                    SqlProject.workspace_id == current_workspace_id(),
+                    SqlProject.id.in_(accessible_project_ids(user_id)),
+                )
+            ).all()
+            requests: builtins.list[dict[str, Any]] = []
+            complete = True
+            for project in projects:
+                # Labels are encrypted; bound the scan to the newest tickets like summary().
+                rows = session.scalars(
+                    select(SqlProjectTicket)
+                    .where(
+                        SqlProjectTicket.workspace_id == project.workspace_id,
+                        SqlProjectTicket.project_id == project.id,
+                    )
+                    .order_by(SqlProjectTicket.created_at.desc(), SqlProjectTicket.id.desc())
+                    .limit(TICKET_SUMMARY_SCAN_MAX + 1)
+                ).all()
+                complete = complete and len(rows) <= TICKET_SUMMARY_SCAN_MAX
+                stages = _stages(project)
+                routing_project = SimpleNamespace(
+                    user_id=project.user_id, config=_decode_config(project.config)
+                )
+                for ticket in rows[:TICKET_SUMMARY_SCAN_MAX]:
+                    if not _has_needs_human(ticket.labels):
+                        continue
+                    reason, responders = human_request_routing(routing_project, ticket.labels)
+                    if user_id not in responders:
+                        continue
+                    request = self._open_human_request(session, ticket, responders)
+                    if request is None:
+                        continue
+                    requests.append(
+                        {
+                            **request,
+                            "project_id": project.id,
+                            "project_name": project.name,
+                            "ticket_id": ticket.id,
+                            "title": ticket.title,
+                            "stage": _stage_snapshot(_stage(stages, _stage_id(ticket))),
+                            "reason": reason,
+                            "responders": sorted(r for r in responders if r is not None),
+                        }
+                    )
+            requests.sort(key=lambda item: item["raised_at"], reverse=True)
+            return {
+                "data": requests[:HUMAN_REQUEST_MAX],
+                "has_more": len(requests) > HUMAN_REQUEST_MAX,
+                "is_complete": complete,
+            }
+
+    def _open_human_request(
+        self, session: Session, ticket: SqlProjectTicket, responders: set[str | None]
+    ) -> dict[str, Any] | None:
+        """The ask's raise time and question, or ``None`` once a routed person acted."""
+        asks = self._human_asks(session, ticket)
+        ask = asks[-1] if asks and asks[-1].end is None else None
+        start = ask.start if ask is not None else -1
+        scope = (
+            SqlProjectTicketEvent.workspace_id == ticket.workspace_id,
+            SqlProjectTicketEvent.project_id == ticket.project_id,
+            SqlProjectTicketEvent.ticket_id == ticket.id,
+        )
+        people = [r for r in responders if r is not None]
+        answered = session.scalar(
+            select(SqlProjectTicketEvent.position)
+            .where(
+                *scope,
+                SqlProjectTicketEvent.position > start,
+                SqlProjectTicketEvent.session_id.is_(None),
+                SqlProjectTicketEvent.agent_id.is_(None),
+                SqlProjectTicketEvent.kind.in_((*NEW_UPDATE_KINDS, *NEW_COMMENT_KINDS)),
+                SqlProjectTicketEvent.user_id.in_(people)
+                if people
+                else SqlProjectTicketEvent.user_id.is_(None),
+            )
+            .limit(1)
+        )
+        if answered is not None:
+            return None
+        raised = (
+            session.scalar(
+                select(SqlProjectTicketEvent).where(
+                    *scope, SqlProjectTicketEvent.position == start
+                )
+            )
+            if start >= 0
+            else None
+        )
+        question_position = self._latest_ask_position(session, ticket, asks)
+        question = (
+            session.scalar(
+                select(SqlProjectTicketEvent).where(
+                    *scope, SqlProjectTicketEvent.position == question_position
+                )
+            )
+            if question_position is not None
+            else None
+        )
+        return {
+            "raised_at": raised.created_at if raised is not None else ticket.updated_at,
+            "raised_by_session_id": ask.session_id if ask is not None else None,
+            "question": (question.payload.get("text") or "")[:500] if question else None,
+        }
 
     def _stage_rows(
         self,

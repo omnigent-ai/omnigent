@@ -43,6 +43,7 @@ import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { useIdentityReady, useViewerId } from "./useViewerId";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { useAutomationInbox } from "./useAutomationInbox";
+import { useTicketRequests } from "./useTicketRequests";
 import { useProactiveInbox } from "./useProactiveInbox";
 import { useCommentInbox } from "./useCommentInbox";
 import {
@@ -251,8 +252,10 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const comments = useCommentInbox(inboxRows);
   const automationInbox = useAutomationInbox(identityReady);
   const proactiveInbox = useProactiveInbox(identityReady);
+  const ticketRequests = useTicketRequests(identityReady);
   const inboxCount =
     sumPendingApprovals(inboxRows) +
+    ticketRequests.items.length +
     comments.items.length +
     automationInbox.items.length +
     proactiveInbox.unreadCount;
@@ -354,6 +357,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     inboxCountCapped,
     comments,
     automationInbox,
+    ticketRequests,
     proactiveInbox,
     watchedIds,
     registerFolder,

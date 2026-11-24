@@ -1628,8 +1628,15 @@ def register_events_routes(
             from omnigent.server.session_orchestration import orchestration_message
 
             body = orchestration_message(source.id, body.data.get("message"))
-        if human_input:
-            # The turn answering this person is the one worth an Inbox entry.
+        if human_input and await asyncio.to_thread(
+            _is_session_owner,
+            user_id,
+            conv,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ):
+            # Only the owner's Inbox lists the session, so another person's
+            # question must not surface its answer there as an FYI.
             session_live_state.mark_attention_pending(session_id)
         native_shell_authorized = False
         if (

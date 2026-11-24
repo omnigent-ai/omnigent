@@ -68,3 +68,22 @@ def needs_product_ok(project: Any, ticket: dict[str, Any]) -> bool:
         not requested_by_owner(project, ticket)
         and ticket_kind(ticket.get("labels")) == FEATURE_KIND
     )
+
+
+# Why a ticket's open ``needs-human`` ask is routed to the people it is.
+REQUEST_PRODUCT_OK = "product-ok"
+REQUEST_OWNER = "owner"
+
+
+def human_request_routing(
+    project: Any, labels: list[dict[str, Any]] | None
+) -> tuple[str, set[str | None]]:
+    """Who answers a ticket's ``needs-human`` ask, and why.
+
+    A feature still missing ``product-ok`` waits on any product approver (the owner
+    plus ``product_approvers``); every other ask, including ``risk-ok``, waits on the owner.
+    """
+    keys = {label.get("key") for label in labels or []}
+    if ticket_kind(labels) == FEATURE_KIND and PRODUCT_OK_LABEL not in keys:
+        return REQUEST_PRODUCT_OK, {*product_approvers(project), project.user_id}
+    return REQUEST_OWNER, {project.user_id}

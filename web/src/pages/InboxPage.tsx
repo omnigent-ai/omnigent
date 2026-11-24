@@ -86,6 +86,8 @@ import { Textarea } from "@/components/ui/textarea";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useSidebarData } from "@/hooks/useSidebarData";
+import type { TicketRequest } from "@/lib/ticketRequestsApi";
+import { projectHomePath, ticketPanelSearch } from "@/projectHome/projectHomeNavigation";
 import {
   clearUnreadOverride,
   isConversationUnseen,
@@ -221,6 +223,7 @@ type InboxEntry =
   | { kind: "comment"; key: string; at: number; item: CommentInboxItem }
   | { kind: "unread"; key: string; at: number; item: UnreadInboxItem }
   | { kind: "automation"; key: string; at: number; item: AutomationFailure }
+  | { kind: "ticket"; key: string; at: number; item: TicketRequest }
   | { kind: "suggestion"; key: string; at: number; item: Suggestion };
 
 const TILE_TONES = {
@@ -248,6 +251,7 @@ export function InboxPage() {
     serverInboxRows: allRows,
     comments: commentInbox,
     automationInbox,
+    ticketRequests,
     identityReady,
   } = useSidebarData();
   const navigate = useNavigate();
@@ -401,6 +405,7 @@ export function InboxPage() {
   const visibleComments = showUnread ? commentInbox.items : [];
   const visibleUnread = showUnread ? unreadItems : [];
   const visibleAutomations = showUnread ? automationInbox.items : [];
+  const visibleTicketRequests = showApprovals ? ticketRequests.items : [];
   const listedSuggestionIds = new Set(proactiveInbox.items.map((item) => item.id));
   // Only the Unread list drops a suggestion once it is read; elsewhere a
   // dismissal or action hides the card at once.
@@ -416,18 +421,24 @@ export function InboxPage() {
         : listedSuggestions
       : [];
   const visibleCount =
+    visibleTicketRequests.length +
     visibleApprovals.length +
     visibleComments.length +
     visibleUnread.length +
     visibleAutomations.length +
     visibleSuggestions.length;
   const totalCount =
+    ticketRequests.items.length +
     items.length +
     commentInbox.items.length +
     unreadItems.length +
     automationInbox.items.length +
     proactiveInbox.items.length;
   const summary = [
+    ticketRequests.items.length > 0 &&
+      (ticketRequests.items.length === 1
+        ? "1 ticket needs your response"
+        : `${ticketRequests.items.length} tickets need your response`),
     items.length > 0 && (items.length === 1 ? "1 approval" : `${items.length} approvals`),
     commentInbox.items.length > 0 &&
       (commentInbox.items.length === 1 ? "1 comment" : `${commentInbox.items.length} comments`),
@@ -450,6 +461,12 @@ export function InboxPage() {
   const emptyState = EMPTY_STATES[filter];
 
   const groups = groupInboxEntries<InboxEntry>([
+    ...visibleTicketRequests.map((item) => ({
+      kind: "ticket" as const,
+      key: `ticket:${item.project_id}:${item.ticket_id}`,
+      at: item.raised_at,
+      item,
+    })),
     ...visibleSuggestions.map((item) => ({
       kind: "suggestion" as const,
       key: `suggestion:${item.id}`,
@@ -695,6 +712,48 @@ export function InboxPage() {
                 {action.label}
               </Button>
             ))}
+          </InboxActions>
+        </InboxCard>
+      );
+    }
+    if (entry.kind === "ticket") {
+      const { item } = entry;
+      const others = item.responders.length - 1;
+      const waitingOn =
+        item.reason === "product-ok"
+          ? `Waiting on a product OK from you${others > 0 ? ` or ${others === 1 ? "1 other approver" : `${others} other approvers`}` : ""}.`
+          : "Waiting on your answer.";
+      return (
+        <InboxCard
+          key={entry.key}
+          testId="inbox-ticket-request"
+          dataKind="ticket"
+          tile={<KindTile icon={HandIcon} tone="yellow" />}
+          kindLabel="Needs your response"
+          title={item.title}
+          preview={item.question ?? item.project_name}
+          at={entry.at}
+          unread
+          expanded={expanded}
+          onToggle={onToggle}
+        >
+          <p className="text-ui font-medium">{item.title}</p>
+          <p className="text-sm text-muted-foreground">
+            {item.project_name} · {item.stage.name}
+          </p>
+          {item.question && (
+            <p className="text-ui whitespace-pre-wrap text-muted-foreground">{item.question}</p>
+          )}
+          <p className="text-sm text-muted-foreground">{waitingOn}</p>
+          <InboxActions>
+            <Button asChild size="xs" className={PRIMARY_ACTION}>
+              <Link
+                to={`${projectHomePath(item.project_name)}${ticketPanelSearch(item.ticket_id)}`}
+                componentId="inbox.ticket.open"
+              >
+                Open ticket <ArrowRightIcon className="size-3.5" />
+              </Link>
+            </Button>
           </InboxActions>
         </InboxCard>
       );

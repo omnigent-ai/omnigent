@@ -307,6 +307,36 @@ describe("collectUnreadInboxItems", () => {
     expect(collectUnreadInboxItems(rows, unseenAfter(1_000), marked, false)).toHaveLength(6);
   });
 
+  it("lists another person's finished session only for its owner", () => {
+    // A project member's session reaches the viewer at manage/edit level, not as owner.
+    const rows = [
+      makeRow({
+        id: "mine",
+        status: "idle",
+        updated_at: 3_000,
+        attention_at: 2_500,
+        permission_level: 4,
+      }),
+      makeRow({
+        id: "member",
+        status: "idle",
+        updated_at: 3_000,
+        attention_at: 2_500,
+        permission_level: 2,
+      }),
+      makeRow({
+        id: "managed",
+        status: "idle",
+        updated_at: 3_000,
+        attention_at: 2_500,
+        permission_level: 3,
+      }),
+    ];
+    const marked = (id: string) => id === "managed";
+    const items = collectUnreadInboxItems(rows, unseenAfter(1_000), marked, true);
+    expect(items.map((i) => i.row.id).sort()).toEqual(["managed", "mine"]);
+  });
+
   it("skips archived rows and rows already listed as approvals", () => {
     // A session with a pending prompt shows as its approval card; listing it
     // again as unread would put one session in the inbox twice.

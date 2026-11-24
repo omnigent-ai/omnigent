@@ -36,7 +36,7 @@ from omnigent.runtime.project_ticket_instructions import (
     FINAL_UPDATE_REMINDER,
     PROJECT_TICKET_WORK_INSTRUCTION,
 )
-from omnigent.server import github_pr_intake, product_approval, session_live_state
+from omnigent.server import github_pr_intake, product_approval
 from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_PUBLIC, AuthProvider
 from omnigent.server.persona_mentions import (
     Mention,
@@ -70,13 +70,6 @@ from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.conversation_store import SessionActivity
 from omnigent.stores.project_ticket_store import ProjectTicketStore
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
-
-# The label an agent adds when a person must act on a ticket.
-NEEDS_HUMAN_LABEL = "needs-human"
-
-
-def _has_needs_human(ticket: dict[str, Any]) -> bool:
-    return any(label.get("key") == NEEDS_HUMAN_LABEL for label in ticket.get("labels") or [])
 
 
 @contextmanager
@@ -772,14 +765,6 @@ def create_project_tickets_router(
         request: Request, project_id: str, ticket_id: str, body: UpdateTicket
     ) -> dict[str, Any]:
         who = await actor(request, project_id)
-        raises_human_request = (
-            who.session_id is not None
-            and body.labels is not None
-            and any(label.key == NEEDS_HUMAN_LABEL for label in body.labels)
-        )
-        if raises_human_request:
-            before = await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
-            raises_human_request = not _has_needs_human(before)
         before = await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
         context = None
         if body.labels is not None:
@@ -815,9 +800,8 @@ def create_project_tickets_router(
             and before.get("stage_id") != REVIEW_STAGE_ID,
             context=context,
         )
-        if raises_human_request and who.session_id is not None:
-            # The asking session's chat holds the question, so it belongs in the Inbox.
-            session_live_state.raise_attention(who.session_id)
+        # A needs-human ask reaches its responders as a ticket request in their Inbox
+        # (GET /v1/inbox/ticket-requests), not through the asking session.
         if who.session_id is not None and body.stage_id is not None:
             current = await asyncio.to_thread(
                 store.get, project_id, ticket_id, user_id=who.user_id

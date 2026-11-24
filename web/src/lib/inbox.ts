@@ -6,6 +6,7 @@
 import type { Comment } from "@/hooks/useComments";
 import type { Conversation } from "@/hooks/useConversations";
 import type { ElicitationRequest } from "./events";
+import { isOwnerLevel } from "./permissionsApi";
 import { parseEvent } from "./sse";
 
 /** One pending approval prompt, paired with the session that owns it. */
@@ -77,7 +78,8 @@ export interface UnreadInboxItem {
  * free of the read-state store). A session qualifies only when its
  * `attention_at` (a person-started turn ended, or it asked for human input)
  * is unseen, so automatic orchestrator and worker turns stay out of the Inbox
- * and its badge; one the viewer marked unread still counts. When the server
+ * and its badge, and only the session's owner is asked; one the viewer marked
+ * unread still counts. When the server
  * lacks the `session_attention` capability, any unseen output qualifies.
  * Rows with pending approvals are skipped — they're already listed as
  * approval items, and one session shouldn't appear twice.
@@ -89,10 +91,14 @@ export function collectUnreadInboxItems(
   attentionSupported = false,
 ): UnreadInboxItem[] {
   // A row without a stamp (0, null, or built client-side) never needed the viewer.
+  // Only the session's owner is asked: project members and people it was shared
+  // with would otherwise get each other's finished turns as FYIs.
   const needsViewer = (row: Conversation) =>
     !attentionSupported ||
     isMarkedUnread(row.id) ||
-    (!!row.attention_at && isUnseen(row.id, row.attention_at, row.status));
+    (!!row.attention_at &&
+      isOwnerLevel(row.permission_level ?? null) &&
+      isUnseen(row.id, row.attention_at, row.status));
   return rows
     .filter(
       (row) =>
