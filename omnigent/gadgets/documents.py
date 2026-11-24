@@ -16,7 +16,8 @@ Layout under ``root_path``::
 A record's revisions are numbered across segments of
 ``StoreLimits.revisions_per_segment`` files: the first segment sits in the
 record directory itself and each later one in an ``sNNNNNNNN`` subdirectory, so
-finding the head lists at most two directories however long the history grows.
+no directory grows past a segment's size and any revision's path follows from
+its number.
 
 There is no mutable head file and no overwrite or delete primitive in
 :class:`GadgetFiles`. A writer reads the record, derives the single successor
@@ -59,8 +60,10 @@ Guarantees
   remover that resumes late never deletes the record created again after it.
   The guarantees above hold for the retention period; a retry arriving after a
   record was removed is a new request.
-* ``get`` verifies the newest revision, its predecessor link and the revision
-  numbering of the record directory. ``verify_record`` verifies the whole chain.
+* ``get`` verifies the newest revision and its predecessor link; it finds the newest by
+  reading revisions by number (a doubling probe, then bisection), so a read costs about
+  ``2 * log2(revisions)`` file reads and no directory listing. ``verify_record`` verifies
+  the whole chain and the numbering of the record's directories.
 * Version tokens and list cursors are opaque, versioned and scoped to the
   store root, collection and record, so a token from another record or store
   fails with :class:`InvalidInput` instead of matching by accident.
@@ -545,6 +548,8 @@ class ImmutableDocumentStore:
         head = self._load_head(ref)
         if head is None:
             return None
+        if self._count_revisions(ref) != head.count:
+            raise self._corrupt(ref, "revision numbering has a gap or duplicate")
         successor = head.latest
         for number in range(head.count - 1, 0, -1):
             revision = self._read_revision(ref, number)
@@ -975,17 +980,126 @@ class ImmutableDocumentStore:
         )
 
     def _load_head(self, ref: _Ref) -> _Head | None:
-        count = self._count_revisions(ref)
+        """The record's newest revision and the one before it, verified against each other.
+
+        Finds the newest segment by reading each segment's first revision at 1, 2, 4, 8,
+        ... segments and bisecting, then lists only that segment's directory, so a read
+        costs about ``2 * log2(segments)`` file reads and one listing of at most a segment
+        however long the history grows. Checking every revision is :meth:`verify_record`'s
+        job.
+        """
+        seen: dict[int, Any] = {}
+        count = self._find_count(ref, seen)
         if count == 0:
             return None
-        latest = self._read_revision(ref, count)
+
+        def revision(number: int) -> _Revision:
+            if number in seen:
+                return self._parse_revision(ref, seen[number], number)
+            return self._read_revision(ref, number)
+
+        latest = revision(count)
         previous = None
         if count > 1:
-            previous = self._read_revision(ref, count - 1)
+            previous = revision(count - 1)
             self._check_link(ref, previous, latest)
         return _Head(count=count, latest=latest, previous=previous)
 
+    def _revision_exists(self, ref: _Ref, number: int, seen: dict[int, Any] | None = None) -> bool:
+        try:
+            raw = self._files.read_json(self._revision_path(ref, number))
+        except NotFound:
+            return False
+        if seen is not None:
+            seen[number] = raw
+        return True
+
+    def _find_count(self, ref: _Ref, seen: dict[int, Any]) -> int:
+        per_segment = self._limits.revisions_per_segment
+        most = self._limits.max_segments_per_record
+
+        def started(segment: int) -> bool:
+            return self._revision_exists(ref, (segment - 1) * per_segment + 1, seen)
+
+        if not started(1):
+            # Never written, or removed; anything else under the record is damage.
+            try:
+                leftover = self._files.list_paths(ref.directory)
+            except NotFound:
+                return 0
+            if leftover:
+                raise self._corrupt(ref, "record has revisions but not its first one")
+            return 0
+        low, high = 1, 2
+        while high <= most and started(high):
+            low, high = high, high * 2
+        if high > most and started(most + 1):
+            raise self._corrupt(ref, "record has more revisions than the store allows")
+        high = min(high, most + 1)
+        while high - low > 1:
+            middle = (low + high) // 2
+            if started(middle):
+                low = middle
+            else:
+                high = middle
+        return self._count_in_segment(ref, low, seen)
+
+    def _count_in_segment(self, ref: _Ref, last: int, seen: dict[int, Any]) -> int:
+        """Revisions up to the end of segment *last*, the newest one with a revision,
+        checking that segment's numbering and that no later segment holds revisions."""
+        per_segment = self._limits.revisions_per_segment
+        if last == 1:
+            # The first segment shares the record directory with the segment directories,
+            # of which only an empty second one (a writer that stopped after creating it)
+            # can be there now.
+            try:
+                entries = self._files.list_paths(ref.directory)
+            except NotFound:
+                return 0
+            if len(entries) > per_segment + 1:
+                raise self._corrupt(ref, "unexpected entries in record directory")
+            numbers: set[int] = set()
+            for entry in entries:
+                name = posixpath.basename(str(entry).rstrip("/"))
+                if (match := _REVISION_NAME_RE.fullmatch(name)) is not None:
+                    numbers.add(int(match.group(1)))
+                elif _SEGMENT_NAME_RE.fullmatch(name) is not None:
+                    if int(name[1:]) != 2 or not self._segment_empty(ref, 2):
+                        raise self._corrupt(ref, "revision segments have a gap")
+                else:
+                    raise self._corrupt(ref, "unexpected entry in record directory")
+            if numbers != set(range(1, len(numbers) + 1)):
+                raise self._corrupt(ref, "revision numbering has a gap or duplicate")
+            return len(numbers)
+        base = (last - 1) * per_segment
+        try:
+            names = self._files.list_paths(self._segment_directory(ref, last))
+        except NotFound:
+            raise self._corrupt(ref, "revision segment cannot be read") from None
+        later: set[int] = set()
+        for entry in names:
+            match = _REVISION_NAME_RE.fullmatch(posixpath.basename(str(entry).rstrip("/")))
+            if match is None:
+                raise self._corrupt(ref, "unexpected entry in revision segment")
+            later.add(int(match.group(1)))
+        if later != set(range(base + 1, base + len(later) + 1)) or len(later) > per_segment:
+            raise self._corrupt(ref, "revision numbering has a gap or duplicate")
+        if not self._segment_empty(ref, last + 1):
+            raise self._corrupt(ref, "revision segments have a gap")
+        # The segment before must be full: its last revision is there.
+        if not self._revision_exists(ref, base, seen):
+            raise self._corrupt(ref, "revision segments have a gap")
+        return base + len(later)
+
+    def _segment_empty(self, ref: _Ref, segment: int) -> bool:
+        try:
+            return not self._files.list_paths(self._segment_directory(ref, segment))
+        except NotFound:
+            return True
+
     def _count_revisions(self, ref: _Ref) -> int:
+        """The record's revision count from its directories, checking their numbering and
+        layout; only :meth:`verify_record` pays for this full check."""
         try:
             entries = self._files.list_paths(ref.directory)
         except NotFound:

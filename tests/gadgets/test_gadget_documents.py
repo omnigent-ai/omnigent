@@ -95,6 +95,25 @@ def test_a_long_history_rolls_into_segments_and_stays_readable(env: Env) -> None
     assert again.version == versions[9]
 
 
+def test_reading_a_record_examines_a_bounded_number_of_entries_as_its_history_grows(
+    tmp_path: Path,
+) -> None:
+    limits = StoreLimits(**{**vars(WIDE), "revisions_per_segment": 10})
+    files, docs, _clock = _counting(tmp_path, limits)
+    version = docs.create("cards", "c1", {"n": 0}, "op-0", ACTOR).version
+    costs: dict[int, int] = {}
+    for n in range(1, 400):
+        version = docs.replace("cards", "c1", {"n": n}, version, f"op-{n}", ACTOR).version
+        if n + 1 in (10, 100, 400):
+            files.reset()
+            assert docs.get("cards", "c1").value == {"n": n}  # type: ignore[union-attr]
+            costs[n + 1] = files.examined
+    # 40 segments of 10: a read lists one segment and probes segment starts, never the
+    # record's directory with every segment in it.
+    assert all(cost <= 10 + 2 * 7 + 4 for cost in costs.values()), costs
+    assert costs[400] - costs[10] <= 2 * 6, costs
+
+
 def test_a_record_stops_at_its_total_revision_limit_and_stays_readable(env: Env) -> None:
     version = env.write("c1", 12)
     with pytest.raises(CapacityExceeded):
@@ -122,10 +141,19 @@ def test_tampered_revisions_and_numbering_gaps_fail_closed(env: Env) -> None:
     with pytest.raises(CorruptData):
         env.docs.verify_record("cards", "c1")
 
+    # A gap in the newest segment fails a read; one in an older, full segment is found by
+    # verifying the record, since a read lists only the newest segment.
     env.write("c2", 5)
-    (env.root / "cards" / "c2" / "00000002.json").unlink()
+    (env.root / "cards" / "c2" / "s00000002" / "00000004.json").unlink()
     with pytest.raises(CorruptData):
         env.docs.get("cards", "c2")
+
+
+def test_a_gap_in_an_older_segment_is_found_by_verifying_the_record(env: Env) -> None:
+    env.write("c1", 5)
+    (env.root / "cards" / "c1" / "00000002.json").unlink()
+    with pytest.raises(CorruptData):
+        env.docs.verify_record("cards", "c1")
 
 
 def test_a_gap_between_segments_fails_closed(tmp_path: Path) -> None:
@@ -605,9 +633,9 @@ def test_a_late_create_retry_after_a_delete_is_answered_without_reading_the_hist
 
     assert replay.value == {"n": 0}
     assert docs.get("cards", "c1") is None
-    # The record's directory is listed to find its newest revision; of its 41 revisions,
-    # only the newest few and the one the index names are read.
-    assert files.reads < 10
+    # Of its 41 revisions only the newest few, the one the index names and a probe for a
+    # second segment are read.
+    assert files.reads <= 10
 
 
 @pytest.mark.parametrize("retried_at_once", [False, True])
