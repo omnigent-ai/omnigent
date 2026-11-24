@@ -3201,7 +3201,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           reuse: new Map(
             (opts?.inheritedUploads ?? []).map((upload) => [upload.file, upload.block]),
           ),
-          deferPublish: true,
+          // Only a send that can park keeps its uploads private; an owner's retry must reuse them.
+          deferPublish:
+            !opts?.external && opts?.onError === undefined && initialDraft === undefined,
           onProgress: (file, loaded, total) =>
             reportUploadProgress(uploadKeyOf(file), loaded, total),
         }),
