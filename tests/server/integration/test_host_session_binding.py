@@ -50,7 +50,7 @@ from omnigent.server.startup_inputs import STARTUP_LABEL, STARTUP_WITHDRAWN
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
-from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
+from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, ConversationNotFoundError
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -3751,6 +3751,7 @@ async def test_managed_launch_waits_for_runner_a_message_relaunched(
     """A message that replaces a slow first runner leaves the fresh sandbox serving it."""
     from omnigent.server.managed_hosts import launch_managed_host
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
 
     host_store = HostStore(db_uri)
     conversations = SqlAlchemyConversationStore(db_uri)
@@ -3779,6 +3780,7 @@ async def test_managed_launch_waits_for_runner_a_message_relaunched(
     assert launch is not None
     stages: list[tuple[str, str | None]] = []
     awaited: list[str] = []
+    timeouts: list[float] = []
 
     async def _launch_runner(launched: Conversation, *_args: object, **_kwargs: object) -> object:
         conversations.replace_runner_id(launched.id, "runner_slow_first")
@@ -3790,8 +3792,8 @@ async def test_managed_launch_waits_for_runner_a_message_relaunched(
 
     class _TunnelRegistry:
         async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> object | None:
-            del timeout_s
             awaited.append(runner_id)
+            timeouts.append(timeout_s)
             if runner_id == "runner_slow_first":
                 # A message rebinds the session while the first runner is still starting;
                 # the host stops the runner it replaced, so that one never connects.
@@ -3818,6 +3820,8 @@ async def test_managed_launch_waits_for_runner_a_message_relaunched(
     )
 
     assert awaited == ["runner_slow_first", "runner_message_relaunch"]
+    # The replacement may still be booting; the launch waits as long as its message does.
+    assert timeouts[1] >= routes_events._relaunch_connect_timeout_s(acknowledged=True)
     assert launch.settled.is_set()
     assert launch.error is None
     assert stages[-1] == ("ready", None)
@@ -3829,9 +3833,15 @@ async def test_managed_launch_waits_for_runner_a_message_relaunched(
     assert fake.terminated == []
 
 
-@pytest.mark.parametrize("binding", ["other_host", "move_claim", "unbound", "same_runner"])
-async def test_managed_runner_wait_does_not_follow_a_binding_it_cannot_serve(binding: str) -> None:
-    """Only a new runner on the launch's own host takes over the wait."""
+@pytest.mark.parametrize(
+    "binding",
+    ["other_host", "move_claim", "unbound", "same_runner", "deleted", "read_past_deadline"],
+)
+async def test_managed_runner_wait_does_not_follow_a_binding_it_cannot_serve(
+    binding: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a new runner on the launch's host, read before the deadline, takes over."""
     from omnigent.server.managed_hosts import new_move_claim
     from omnigent.server.routes import sessions as sessions_module
 
@@ -3840,8 +3850,19 @@ async def test_managed_runner_wait_does_not_follow_a_binding_it_cannot_serve(bin
         "move_claim": SimpleNamespace(host_id="host_launch", runner_id=new_move_claim()),
         "unbound": SimpleNamespace(host_id="host_launch", runner_id=None),
         "same_runner": SimpleNamespace(host_id="host_launch", runner_id="runner_launched"),
+        "deleted": None,
+        "read_past_deadline": SimpleNamespace(host_id="host_launch", runner_id="runner_replaced"),
     }[binding]
     awaited: list[str] = []
+    if binding == "read_past_deadline":
+        monkeypatch.setattr(sessions_module, "_MANAGED_RUNNER_REPLACEMENT_WAIT_S", 0.05)
+
+    def _read_binding(session_id: str) -> SimpleNamespace:
+        if bound is None:
+            raise ConversationNotFoundError(session_id)
+        if binding == "read_past_deadline":
+            time.sleep(0.2)
+        return bound
 
     class _TunnelRegistry:
         async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> None:
@@ -3854,7 +3875,7 @@ async def test_managed_runner_wait_does_not_follow_a_binding_it_cannot_serve(bin
         _TunnelRegistry(),  # type: ignore[arg-type]
         ManagedLaunchTracker(),
         settle_failure=False,
-        conversation_store=SimpleNamespace(get_conversation=lambda _sid: bound),  # type: ignore[arg-type]
+        conversation_store=SimpleNamespace(get_profile_host_binding=_read_binding),  # type: ignore[arg-type]
         host_id="host_launch",
     )
 
@@ -4078,7 +4099,7 @@ async def test_managed_relaunch_failure_leaves_the_host_identity_alone(
         conversation_store=SimpleNamespace(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
             clear_host_binding=lambda _sid, **_kwargs: conv,
-            get_conversation=lambda _sid: conv,
+            get_profile_host_binding=lambda _sid: conv,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
         host_registry=_HostRegistry(),  # type: ignore[arg-type]

@@ -165,6 +165,7 @@ from omnigent.server.routes._session_create_validation import (
 # ``__all__`` and the facade's explicit re-exports, preserving its real runtime
 # bindings so a facade-level monkeypatch is honoured in this module too.
 from omnigent.server.routes._sessions.common import (  # noqa: F401
+    _ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR,
     _ACP_SUBAGENT_DESCRIPTION_LABEL_KEY,
     _ACP_SUBAGENT_ID_LABEL_KEY,
     _ANTIGRAVITY_NATIVE_HARNESS,
@@ -7547,12 +7548,17 @@ async def _wait_for_managed_runner_tunnel(
         if runner is not None:
             return True
         awaited_runner_ids.add(runner_id)
-        remaining_s = follow_deadline - time.monotonic()
-        if conversation_store is None or host_id is None or remaining_s <= 0:
+        if conversation_store is None or host_id is None or time.monotonic() >= follow_deadline:
             break
-        bound = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        try:
+            bound = await asyncio.to_thread(
+                conversation_store.get_profile_host_binding, session_id
+            )
+        except ConversationNotFoundError:
+            break
+        remaining_s = follow_deadline - time.monotonic()
         if (
-            bound is None
+            remaining_s <= 0
             or bound.host_id != host_id
             or bound.runner_id is None
             or bound.runner_id in awaited_runner_ids
@@ -7567,7 +7573,12 @@ async def _wait_for_managed_runner_tunnel(
             extra={"session_id": session_id},
         )
         runner_id = bound.runner_id
-        connect_timeout_s = min(_facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S, remaining_s)
+        # The message that relaunched it waits this long for a confirmed spawn.
+        connect_timeout_s = min(
+            _facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S
+            * _ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR,
+            remaining_s,
+        )
     _logger.error(
         "Managed runner connection timed out",
         extra=debug_event(
