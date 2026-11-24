@@ -181,6 +181,23 @@ Restart the server. If `OMNIGENT_GITHUB_APP_CLIENT_ID`/`_CLIENT_SECRET` are set
 but no redirect URI can be resolved (neither `OMNIGENT_GITHUB_APP_REDIRECT_URI`
 nor `OMNIGENT_DOMAIN`), the feature logs a warning and **stays disabled**.
 
+### GitHub Enterprise Server
+
+Register the App on your GitHub Enterprise Server instance instead of
+github.com (the steps above are the same, under your host), then also set:
+
+```bash
+OMNIGENT_GITHUB_HOST=ghe.example.com              # bare host name, optionally :port
+# Optional; defaults to https://$OMNIGENT_GITHUB_HOST/api/v3, where GHES serves its API.
+OMNIGENT_GITHUB_API_URL=https://ghe.example.com/api/v3
+```
+
+The connection's OAuth and API calls, the repository picker, the managed
+sandbox's initial clone and its git credential broker, and the sandbox's `gh`
+configuration then all use that host. Only the server needs the setting: it
+tells each sandbox the host through the credential broker. A malformed value
+fails server startup. Unset, everything targets github.com exactly as before.
+
 > The at-rest encryption of stored tokens is the credential store's concern
 > (`OMNIGENT_CREDENTIAL_*` / KMS), not GitHub's — see
 > [`designs/CREDENTIAL_STORE.md`](../designs/CREDENTIAL_STORE.md).
