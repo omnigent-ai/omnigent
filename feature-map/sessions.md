@@ -743,7 +743,10 @@ after stopping; this relaunches the parent and both use one runner. Sending to
 an existing side chat or choosing Resume after the parent's runner exited (for
 example, on its idle timeout) also relaunches the parent, then moves the side
 chat to that runner. Close a side
-chat with its tab's close button; the parent and sibling chats keep running.
+chat with its tab's close button or its tab menu's Close; the parent and sibling
+chats keep running. Close other tabs and Close all tabs, in the tab menu or the
+rail's panel picker (⌄), stop every side chat they close, while sub-agent tabs
+they close are only hidden.
 On another device, open the same parent: saved side chats appear in the existing
 Workspace tab strip or mobile Side chats drawer. Discovery fetches up to 20 chats
 without changing the active panel or tab. Tabs closed on this device stay closed
