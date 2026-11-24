@@ -878,7 +878,7 @@ describe("Slack thread replies", () => {
     // Slack sets bot_id on what a person posts through an app (such as a Slack MCP), so a
     // bot_id alone mustn't drop a person's follow-up.
     expect(prompt).toContain(
-      "a reply with a bot_id is a bot's only when its user is a bot: check each such user with users.info",
+      "A reply with a bot_id and no user is a bot's. A person can post through an app, so a reply with a bot_id and a user is a bot's only when that user is a bot: check each such user with users.info",
     );
     // Only a confirmed bot is left out: a failed lookup defers the thread rather than moving
     // through past what may be a person's reply.
@@ -911,14 +911,13 @@ describe("Slack thread replies", () => {
     expect(prompt).toContain(
       "If a send times out or its result is unclear, don't retry it: set the thread's through as for an accepted send, so those replies are never sent twice, say in your reply that they may not have reached that session",
     );
-    // A run that sent a batch and stopped before its reply recorded it: the next run finds the
-    // earlier send, accepted or unclear, and moves past those replies instead of sending again.
+    // A run that sent a batch and stopped before its reply recorded it, even with a skipped run
+    // after it that rewrote the old state: every send checks for an earlier one, accepted or
+    // unclear, and moves past those replies instead of sending again.
     const recover =
-      "If the last message you wrote before this run's message isn't the reply you read your check time from, an earlier run stopped before recording its thread sends.";
+      "An earlier run can send replies and stop before its reply records them, so before sending a thread's replies, look through your own earlier calls in this session that sent replies to that thread, and the latest items of the thread's session (sys_session_get_history, tail_items 50), for a message from your session whose first line names this thread. Treat every reply up to the newest ts such a message names as already handled, whether that send was accepted or unclear";
     expect(prompt).toContain(recover);
-    expect(prompt).toContain(
-      "look through your own calls in this session since that reply, and the latest items of the thread's session (sys_session_get_history, tail_items 50), for a message from your session whose first line names this thread. Treat every reply up to the newest ts such a message names as already handled, whether that send was accepted or unclear",
-    );
+    expect(prompt).not.toContain("If the last message you wrote before this run's message isn't");
     expect(prompt.indexOf(recover)).toBeLessThan(
       prompt.indexOf("For each thread with replies left, send its session one message"),
     );
