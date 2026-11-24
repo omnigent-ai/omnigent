@@ -2148,6 +2148,52 @@ async def test_move_cancelled_during_its_detach_restores_the_whole_binding(
     assert env.app.state.managed_launches.get(session_id) is None
 
 
+async def test_keyed_move_failing_at_detach_leaves_no_requested_host_id(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A keyed move that names no host id and fails while detaching the old host
+    rolls back without a requested host id, so routing keeps to the old host.
+
+    Clients route a host-less session by that label, so one left behind would
+    steer them to a sandbox host that never launched.
+    """
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+    from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+    from omnigent.server.routes import _host_launch
+
+    env = managed_session_env
+    monkeypatch.setattr(_host_launch, "_host_sharded", True)
+    session_id = await _session_released_from_laptop(env, agent_name="keyed-move-detach-agent")
+    clear_host_binding = env.conv_store.clear_host_binding
+
+    def failing_detach(conversation_id: str, **kwargs: Any) -> Conversation:
+        if kwargs.get("keep_runner"):
+            raise RuntimeError("detach failed")
+        return clear_host_binding(conversation_id, **kwargs)
+
+    monkeypatch.setattr(env.conv_store, "clear_host_binding", failing_detach)
+
+    with pytest.raises(RuntimeError, match="detach failed"):
+        await env.client.post(
+            f"/v1/sessions/{session_id}/managed-host",
+            json={},
+            headers={OMNIGENT_SLICE_KEY_HEADER: _LAPTOP_HOST_ID},
+        )
+
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert (conv.host_id, conv.workspace, conv.git_branch, conv.runner_id) == (
+        _LAPTOP_HOST_ID,
+        "/Users/alice/repo",
+        "feature/x",
+        None,
+    )
+    assert REQUESTED_HOST_ID_LABEL_KEY not in conv.labels
+    assert env.app.state.managed_launches.get(session_id) is None
+
+
 async def test_relaunch_admitted_before_a_move_claims_keeps_the_claim(
     managed_session_env: ManagedSessionEnv,
 ) -> None:
