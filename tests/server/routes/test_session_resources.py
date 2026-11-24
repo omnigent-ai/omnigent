@@ -3915,6 +3915,41 @@ async def test_a_listed_session_is_imported_from_its_runner_in_the_background(
 
 
 @pytest.mark.asyncio
+async def test_background_pr_refreshes_and_plain_reads_ask_the_runner_for_a_fresh_read(
+    runner_globals_reset: None, db_uri: str
+) -> None:
+    """Only a client's poll may take the runner's earlier read; refreshes after turns may not."""
+    from omnigent.server.session_pull_requests import PullRequestRefresher
+
+    del runner_globals_reset
+    SqlAlchemyConversationStore(db_uri).create_conversation(conversation_id=_PR_SESSION)
+    conversation_store = _ConversationStore()
+    conversation_store.storage_location = db_uri  # type: ignore[attr-defined]
+    conversation_store._conversations[_PR_SESSION].runner_id = "runner_pr"
+    refresher = PullRequestRefresher()
+    app = _sessions_app(conversation_store, pull_request_refresher=refresher)
+    runner = _FakeRunnerClient(payload=_pr_info())
+    set_runner_router(_OnlineRunnerRouter(runner))  # type: ignore[arg-type]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://server"
+    ) as client:
+        refresher.request(_PR_SESSION)
+        await asyncio.sleep(0)
+        while refresher._running:
+            await asyncio.gather(*refresher._running.values())
+        plain = await client.get(f"/v1/sessions/{_PR_SESSION}/resources/github")
+    assert plain.status_code == 200, plain.text
+    gets = [url for method, url in runner.calls if method == "GET"]
+    github_reads = [
+        params or {}
+        for url, params in zip(gets, runner.get_params, strict=True)
+        if url.endswith("/resources/github")
+    ]
+    assert len(github_reads) == 2
+    assert all("allow_cached" not in params for params in github_reads)
+
+
+@pytest.mark.asyncio
 async def test_pull_request_list_pages_by_url(pr_client: httpx.AsyncClient) -> None:
     set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=_pr_info())))  # type: ignore[arg-type]
     await pr_client.get(f"/v1/sessions/{_PR_SESSION}/resources/github")
