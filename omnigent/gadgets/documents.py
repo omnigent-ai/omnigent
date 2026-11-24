@@ -107,7 +107,8 @@ import json
 import math
 import posixpath
 import re
-from collections.abc import Callable, Mapping, Sequence
+import threading
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final
@@ -450,6 +451,10 @@ def _request_digest(
 
 # ---------------------------------------------------------------------------
 # Store
+
+
+# Record locks the current thread holds; see ImmutableDocumentStore._load_head.
+_HELD_RECORD_LOCKS = threading.local()
 
 
 class ImmutableDocumentStore:
@@ -915,9 +920,17 @@ class ImmutableDocumentStore:
             self._index_create(ref, operation_id, number)
         return self._result(ref, self._parse_revision(ref, body, number))
 
-    def _record_lock(self, ref: _Ref) -> contextlib.AbstractContextManager[bool]:
+    @contextlib.contextmanager
+    def _record_lock(self, ref: _Ref) -> Iterator[bool]:
         """The lock every writer, remover and claim release of the record holds."""
-        return self._files.exclusive(f"{self._root}/.removing/{ref.collection}/{ref.doc_id}")
+        with self._files.exclusive(
+            f"{self._root}/.removing/{ref.collection}/{ref.doc_id}"
+        ) as held:
+            _HELD_RECORD_LOCKS.depth = getattr(_HELD_RECORD_LOCKS, "depth", 0) + 1
+            try:
+                yield held
+            finally:
+                _HELD_RECORD_LOCKS.depth -= 1
 
     def _still_chained(self, ref: _Ref, number: int, prev_digest: str) -> bool:
         """Whether revision ``number - 1`` is still the one with *prev_digest*."""
@@ -1049,6 +1062,27 @@ class ImmutableDocumentStore:
         )
 
     def _load_head(self, ref: _Ref) -> _Head | None:
+        """The record's newest revision and the one before it, verified against each other.
+
+        Read without the record's lock, a writer adding a revision between the probes and
+        the listing can make a sound record look damaged. A read that finds damage is
+        therefore taken once more under the lock writers hold, and only damage seen there
+        is reported. A thread already holding a record lock reads again without it instead,
+        because the lock files are shared by several records.
+        """
+        try:
+            return self._read_head(ref)
+        except CorruptData:
+            if getattr(_HELD_RECORD_LOCKS, "depth", 0):
+                return self._read_head(ref)
+            with self._record_lock(ref) as held:
+                if not held:
+                    raise Conflict(
+                        "document is busy; retry shortly", reason="concurrent_write"
+                    ) from None
+                return self._read_head(ref)
+
+    def _read_head(self, ref: _Ref) -> _Head | None:
         """The record's newest revision and the one before it, verified against each other.
 
         Finds the newest segment by reading each segment's first revision at 1, 2, 4, 8,

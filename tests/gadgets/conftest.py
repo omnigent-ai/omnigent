@@ -66,6 +66,13 @@ class HookedFiles(GadgetFiles):
         self.inner = inner
         self.store = store
 
+    def exclusive(self, name: str):  # type: ignore[override]
+        # The wrapped store's real lock, so tests exercise its exclusion, unless a test
+        # models a store without one.
+        if not self.store.locks:
+            return super().exclusive(name)
+        return self.inner.exclusive(name)
+
     def read_json(self, path: str) -> dict:
         return self.inner.read_json(path)
 
@@ -93,6 +100,7 @@ class HookedFiles(GadgetFiles):
 
 class HookedStore(LocalGadgetStore):
     before_create: Callable[[str], None] | None = None
+    locks = True
     after_list: Callable[[str, list[str]], None] | None = None
 
     def gadget_files(self, gadget_id: str) -> GadgetFiles:

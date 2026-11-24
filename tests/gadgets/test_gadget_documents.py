@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -391,6 +392,58 @@ def test_a_live_create_keeps_its_claim(env: Env) -> None:
     assert env.docs.get("cards", "b") == created
 
 
+class _CreatedWhileReading(GadgetFiles):
+    """A scope where another writer creates a record just after a reader found it missing."""
+
+    def __init__(self, inner: GadgetFiles, on_miss: Callable[[str], None]) -> None:
+        self.inner = inner
+        self.supports_delete = inner.supports_delete
+        self.on_miss = on_miss
+
+    def exclusive(self, name: str):  # type: ignore[override]
+        return self.inner.exclusive(name)
+
+    def read_json(self, path: str) -> dict:
+        try:
+            return self.inner.read_json(path)
+        except NotFound:
+            self.on_miss(path)
+            raise
+
+    def create_json(self, path: str, value: dict) -> None:
+        self.inner.create_json(path, value)
+
+    def list_paths(self, path: str) -> list[str]:
+        return self.inner.list_paths(path)
+
+    def list_page(self, path: str, *, after: str | None, limit: int) -> tuple[list[str], bool]:
+        return self.inner.list_page(path, after=after, limit=limit)
+
+    def mkdirs(self, path: str) -> None:
+        self.inner.mkdirs(path)
+
+    def delete_tree(self, path: str) -> None:
+        self.inner.delete_tree(path)
+
+
+def test_a_record_created_while_it_is_being_read_is_not_reported_damaged(env: Env) -> None:
+    created: list[str] = []
+
+    def create_now(path: str) -> None:
+        # The reader has just found the first revision missing; the record appears before
+        # it lists the record's directory.
+        if not created and path.endswith("/cards/c1/00000001.json"):
+            created.append(path)
+            env.docs.create("cards", "c1", {"n": 1}, "c1-1", ACTOR)
+
+    reader = ImmutableDocumentStore(
+        _CreatedWhileReading(env.files, create_now), "data", limits=SMALL, clock=env.clock
+    )
+    got = reader.get("cards", "c1")
+    assert created
+    assert got is not None and got.value == {"n": 1}
+
+
 def test_a_late_remover_never_deletes_the_record_created_again(env: Env) -> None:
     a = env.docs.create("cards", "a", {"n": 1}, "op-a", ACTOR)
     env.docs.delete("cards", "a", a.version, "del-a", ACTOR)
@@ -551,6 +604,10 @@ class CountingFiles(GadgetFiles):
         self.examined = 0
         self.reads = 0
         self.full_listings: list[str] = []
+
+    def exclusive(self, name: str):  # type: ignore[override]
+        # The wrapped store's real lock, so tests exercise its exclusion.
+        return self.inner.exclusive(name)
 
     def reset(self) -> None:
         self.examined = 0

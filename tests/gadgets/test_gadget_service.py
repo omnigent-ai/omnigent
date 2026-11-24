@@ -267,6 +267,9 @@ def test_losing_publication_does_not_bind_a_schema_during_a_real_cas_race(
                 first["id"], {"revision_id": winner["id"], "if_version": first["version"]}
             )
 
+    # The winner can only slip in between the loser's check and its write on a store
+    # without record locks; with them, the second publish waits instead.
+    gadgets.store.locks = False
     gadgets.store.before_create = publish_winner_first
     with pytest.raises(Conflict):
         service.publish(first["id"], {"revision_id": loser["id"], "if_version": first["version"]})
