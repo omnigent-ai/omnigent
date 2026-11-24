@@ -89,7 +89,11 @@ export function useTicketImageUpload(resolveProjectId: () => Promise<string>) {
   const nextId = useRef(0);
 
   const upload = (files: File[]) => {
-    const added = files.map((file) => ({ id: nextId.current++, file, markdown: null }));
+    const added: PendingTicketImage[] = files.map((file) => ({
+      id: nextId.current++,
+      file,
+      markdown: null,
+    }));
     setError(null);
     setImages((previous) => [...previous, ...added]);
     void (async () => {
