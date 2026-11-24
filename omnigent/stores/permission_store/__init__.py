@@ -888,18 +888,6 @@ class PermissionStore(ABC):
         """
         return [], None
 
-    def gadget_grantee_spelling(self, gadget_id: str, user_id: str) -> str | None:
-        """The ID a gadget holds *user_id*'s grant under, in any letter case.
-
-        So re-sharing with ``Bob@Example.com`` updates ``bob@example.com``'s grant
-        instead of adding a second one. One lookup, whatever the gadget's grant count.
-        The default matches the exact ID only; stores that keep grants override it.
-
-        :param user_id: A canonical grantee ID from :meth:`validate_grants`.
-        :returns: The stored ID, or ``None`` when the gadget holds no grant for it.
-        """
-        return user_id if self.resolve_gadget_access([user_id], gadget_id) is not None else None
-
     def resolve_gadget_access(
         self,
         principals: Sequence[str],  # noqa: ARG002

@@ -147,29 +147,19 @@ def test_store_without_gadget_grants_keeps_gadgets_private() -> None:
     assert minimal.delete_for_gadget(_gadget()) == 0
 
 
-def test_a_grantee_is_found_under_its_stored_spelling(store: SqlAlchemyPermissionStore) -> None:
-    gadget, other = _gadget(), _gadget()
-    for user_id in ("bob@example.com", "Carol@Example.com"):
+def test_grantee_ids_that_differ_only_in_case_are_separate_principals(
+    store: SqlAlchemyPermissionStore,
+) -> None:
+    # Authorization matches IDs exactly, so grants do too; a store that treats such IDs
+    # as one person canonicalizes them in validate_grants.
+    if store._engine.dialect.name == "mysql":
+        pytest.skip("MySQL's default collation compares these IDs as equal, as for every grant")
+    gadget = _gadget()
+    for user_id, level in (("UserA", LEVEL_READ), ("usera", LEVEL_MANAGE)):
         store.ensure_user(user_id)
-        store.grant_for_gadget(user_id, gadget, LEVEL_READ)
-    assert store.gadget_grantee_spelling(gadget, "bob@example.com") == "bob@example.com"
-    assert store.gadget_grantee_spelling(gadget, "BOB@example.COM") == "bob@example.com"
-    assert store.gadget_grantee_spelling(gadget, "carol@example.com") == "Carol@Example.com"
-    assert store.gadget_grantee_spelling(gadget, "dave@example.com") is None
-    assert store.gadget_grantee_spelling(other, "bob@example.com") is None
-
-    # Non-ASCII letters match in any case too, on every database; SQLite's lower() alone
-    # folds only ASCII.
-    store.ensure_user("Ömer@Example.com")
-    store.grant_for_gadget("Ömer@Example.com", gadget, LEVEL_READ)
-    assert store.gadget_grantee_spelling(gadget, "ömer@example.com") == "Ömer@Example.com"
-
-
-def test_the_default_store_finds_only_the_exact_grantee() -> None:
-    store = _minimal_store(
-        resolve_gadget_access=lambda self, principals, gadget_id: (
-            LEVEL_READ if list(principals) == ["bob@example.com"] else None
-        )
-    )
-    assert store.gadget_grantee_spelling("g", "bob@example.com") == "bob@example.com"
-    assert store.gadget_grantee_spelling("g", "BOB@example.com") is None
+        store.grant_for_gadget(user_id, gadget, level)
+    assert store.resolve_gadget_access(["UserA"], gadget) == LEVEL_READ
+    assert store.resolve_gadget_access(["usera"], gadget) == LEVEL_MANAGE
+    store.revoke_for_gadget("usera", gadget)
+    assert store.resolve_gadget_access(["UserA"], gadget) == LEVEL_READ
+    assert store.resolve_gadget_access(["usera"], gadget) is None

@@ -34,7 +34,6 @@ from omnigent.db.db_models import (
     SqlWorkflow,
     SqlWorkflowShare,
     current_workspace_id,
-    gadget_grantee_key,
 )
 from omnigent.db.enum_codecs import encode_scheduled_task_state
 from omnigent.db.utils import (
@@ -1766,29 +1765,6 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 limit=limit,
                 after_user_id=after_user_id,
             )
-
-    def gadget_grantee_spelling(self, gadget_id: str, user_id: str) -> str | None:
-        """The stored ID of *user_id*'s grant in any letter case. See base class.
-
-        Prefers the exact ID; served by ``ix_gadget_shares_gadget_user_key``. The key is
-        folded in Python (:func:`gadget_grantee_key`), so non-ASCII letters match in any case
-        on every database, which SQL ``lower()`` doesn't do on SQLite.
-        """
-        with self._session("gadget_grantee_spelling") as session:
-            rows = session.execute(
-                select(SqlGadgetShare.user_id)
-                .where(
-                    SqlGadgetShare.workspace_id == current_workspace_id(),
-                    SqlGadgetShare.gadget_id == gadget_id,
-                    SqlGadgetShare.user_key == gadget_grantee_key(user_id),
-                )
-                .order_by(SqlGadgetShare.user_id)
-                .limit(2)
-            ).scalars()
-            matches = list(rows)
-        if user_id in matches:
-            return user_id
-        return matches[0] if matches else None
 
     def resolve_gadget_access(self, principals: Sequence[str], gadget_id: str) -> int | None:
         """Return the highest level any principal holds. See base class for contract."""

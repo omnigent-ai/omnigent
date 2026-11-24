@@ -88,10 +88,12 @@ def stores_gadget_grants(permission_store: PermissionStore | None) -> bool:
 
 
 def _grantee_to_remove(store: PermissionStore, gadget_id: str, user_id: str) -> str:
-    """The spelling under which the gadget holds *user_id*'s grant (see workflows).
+    """The spelling under which the gadget holds *user_id*'s grant, as for workflows.
 
-    The same case-insensitive match a grant uses, so a revoke in another letter case
-    removes the grant it would have replaced instead of answering 204 and keeping it.
+    As given when that holds a grant, as a listed ID does, so a store that renames or
+    refuses the principal since can't block the removal. Otherwise the store's
+    canonical form, or as given when the lookup fails. IDs are matched exactly, as
+    authorization matches them, so ``UserA`` and ``usera`` stay separate principals.
     """
     if store.resolve_gadget_access([user_id], gadget_id) is not None:
         return user_id
@@ -101,8 +103,8 @@ def _grantee_to_remove(store: PermissionStore, gadget_id: str, user_id: str) -> 
         _logger.warning(
             "could not resolve %r to remove it; using it as given", user_id, exc_info=True
         )
-        grantee = user_id
-    return store.gadget_grantee_spelling(gadget_id, grantee) or grantee
+        return user_id
+    return grantee
 
 
 def _permission_object(grant: GadgetPermission, names: dict[str, str]) -> GadgetPermissionObject:
@@ -215,8 +217,8 @@ def register_gadget_permissions_routes(
             store.validate_grants, [(user_id, body.level)]
         )
         grantee = grantee.strip()
-        # In any letter case: the owner already has every permission.
-        if grantee.casefold() == gadget.owner_id.casefold():
+        # On the canonical ID, which is how the store names the owner and the public.
+        if grantee == gadget.owner_id:
             raise OmnigentError(
                 "A gadget's owner cannot be granted access to it", code=ErrorCode.INVALID_INPUT
             )
@@ -226,11 +228,6 @@ def register_gadget_permissions_routes(
                 "Gadgets cannot be shared publicly or with the local user; name a user or group",
                 code=ErrorCode.INVALID_INPUT,
             )
-        # The ID the gadget already holds a grant under for this person in another letter
-        # case, so one person keeps one grant.
-        grantee = (
-            await asyncio.to_thread(store.gadget_grantee_spelling, gadget.id, grantee) or grantee
-        )
         target = await asyncio.to_thread(store.get_user, grantee)
         with target_account_scope(grantee, target.account_generation if target else None):
             await asyncio.to_thread(store.ensure_user, grantee)

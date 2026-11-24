@@ -310,10 +310,7 @@ export function PermissionsModal(props: PermissionsModalProps) {
         : undefined;
       const existingGrant = currentPermissions?.find((p) => p.user_id === trimmed);
       // Granting a gadget grantee less than they have would quietly take access away.
-      // The server matches a gadget grantee whatever the letter case.
-      const listed = gadget
-        ? permissions?.find((p) => p.user_id.toLowerCase() === trimmed.toLowerCase())
-        : undefined;
+      const listed = gadget ? permissions?.find((p) => p.user_id === trimmed) : undefined;
       if (listed && listed.level > parseInt(newLevel, 10)) {
         const name = listed.display_name ?? listed.user_id;
         const current = GADGET_LEVELS.find((level) => level.value === listed.level)?.label;

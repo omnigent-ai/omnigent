@@ -498,7 +498,7 @@ async def test_a_revoked_viewers_shelf_drops_the_gadget_and_its_new_name(
         ({"user_id": BOB, "level": 1.0}, "level"),
         ({"user_id": BOB}, "level"),
         ({"user_id": "  ", "level": 1}, "Name a user or group"),
-        ({"user_id": " Alice@Example.COM ", "level": 1}, "owner cannot be granted"),
+        ({"user_id": f" {ALICE} ", "level": 1}, "owner cannot be granted"),
     ],
 )
 async def test_refused_grants_say_why_in_the_gadget_error_shape(
@@ -539,58 +539,77 @@ async def test_grantee_ids_are_trimmed_and_one_person_keeps_one_grant(
     assert spaced.status_code == 200, spaced.text
     assert spaced.json()["user_id"] == BOB
     assert stores.permissions.get_user(f"  {BOB} ") is None
-    upper = await client.put(
-        f"{base}/permissions", json={"user_id": BOB.upper(), "level": 2}, headers=_as(ALICE)
+    again = await client.put(
+        f"{base}/permissions", json={"user_id": BOB, "level": 2}, headers=_as(ALICE)
     )
-    assert upper.json()["user_id"] == BOB and upper.json()["level"] == 2
+    assert again.json()["user_id"] == BOB and again.json()["level"] == 2
     grants, _ = stores.permissions.list_for_gadget(gadget["id"])
     assert [(grant.user_id, grant.level) for grant in grants] == [(BOB, 2)]
 
 
-async def test_a_re_share_in_another_case_updates_a_non_ascii_grantees_grant(
+async def test_ids_that_differ_only_in_case_are_separate_grantees(
     client: httpx.AsyncClient, stores: SimpleNamespace
 ) -> None:
-    grantee = "Ömer@Example.com"
-    stores.permissions.ensure_user(grantee)
+    # Authorization matches principal IDs exactly, so sharing does too: granting or
+    # revoking `usera` never changes what `UserA` holds.
+    for user_id in ("UserA", "usera"):
+        stores.permissions.ensure_user(user_id)
+    gadget = await _published(client)
+    base = f"/v1/gadgets/{gadget['id']}"
+    reader = await client.put(
+        f"{base}/permissions", json={"user_id": "UserA", "level": 1}, headers=_as(ALICE)
+    )
+    assert reader.status_code == 200, reader.text
+    manager = await client.put(
+        f"{base}/permissions", json={"user_id": "usera", "level": 3}, headers=_as(ALICE)
+    )
+    assert manager.status_code == 200, manager.text
+    assert manager.json()["user_id"] == "usera"
+    assert stores.permissions.resolve_gadget_access(["UserA"], gadget["id"]) == 1
+    assert stores.permissions.resolve_gadget_access(["usera"], gadget["id"]) == 3
+
+    revoked = await client.delete(f"{base}/permissions/usera", headers=_as(ALICE))
+    assert revoked.status_code == 204, revoked.text
+    assert stores.permissions.resolve_gadget_access(["usera"], gadget["id"]) is None
+    assert stores.permissions.resolve_gadget_access(["UserA"], gadget["id"]) == 1
+    # Revoking an ID that holds no grant leaves the other spelling's grant alone too.
+    missing = await client.delete(f"{base}/permissions/USERA", headers=_as(ALICE))
+    assert missing.status_code == 204
+    assert stores.permissions.resolve_gadget_access(["UserA"], gadget["id"]) == 1
+
+
+async def test_a_store_that_canonicalizes_aliases_keeps_one_grant_per_person(
+    client: httpx.AsyncClient, stores: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A deployment whose principals are case-insensitive says so in validate_grants;
+    # the routes then share, re-share and revoke under its canonical ID.
+    def lowercase(grants: Any) -> list[tuple[str, int]]:
+        return [(user_id.lower(), level) for user_id, level in grants]
+
+    monkeypatch.setattr(stores.permissions, "validate_grants", lowercase)
     gadget = await _published(client)
     base = f"/v1/gadgets/{gadget['id']}"
     first = await client.put(
-        f"{base}/permissions", json={"user_id": grantee, "level": 2}, headers=_as(ALICE)
+        f"{base}/permissions", json={"user_id": BOB.upper(), "level": 1}, headers=_as(ALICE)
     )
     assert first.status_code == 200, first.text
-    lower = await client.put(
-        f"{base}/permissions",
-        json={"user_id": "ömer@example.com", "level": 1},
-        headers=_as(ALICE),
+    assert first.json()["user_id"] == BOB
+    again = await client.put(
+        f"{base}/permissions", json={"user_id": "Bob@Example.com", "level": 2}, headers=_as(ALICE)
     )
-    assert lower.status_code == 200, lower.text
-    assert lower.json()["user_id"] == grantee
+    assert again.json()["user_id"] == BOB and again.json()["level"] == 2
     grants, _ = stores.permissions.list_for_gadget(gadget["id"])
-    assert [(grant.user_id, grant.level) for grant in grants] == [(grantee, 1)]
-    # The lower level is what the grantee now holds; no second grant keeps the old one.
-    assert stores.permissions.resolve_gadget_access([grantee], gadget["id"]) == 1
-
-
-async def test_a_revoke_in_another_case_removes_the_grant_held_under_the_stored_id(
-    client: httpx.AsyncClient, stores: SimpleNamespace
-) -> None:
-    grantee = "Ömer@Example.com"
-    stores.permissions.ensure_user(grantee)
-    gadget = await _published(client)
-    base = f"/v1/gadgets/{gadget['id']}"
-    granted = await client.put(
-        f"{base}/permissions", json={"user_id": grantee, "level": 2}, headers=_as(ALICE)
+    assert [(grant.user_id, grant.level) for grant in grants] == [(BOB, 2)]
+    owner = await client.put(
+        f"{base}/permissions", json={"user_id": ALICE.upper(), "level": 1}, headers=_as(ALICE)
     )
-    assert granted.status_code == 200, granted.text
-    revoked = await client.delete(f"{base}/permissions/ömer@EXAMPLE.com", headers=_as(ALICE))
-    assert revoked.status_code == 204, revoked.text
-    # Gone under the ID the grant was stored with, not only under the spelling revoked.
-    assert stores.permissions.resolve_gadget_access([grantee], gadget["id"]) is None
-    grants, _ = stores.permissions.list_for_gadget(gadget["id"])
-    assert grants == []
+    assert owner.status_code == 400 and "owner cannot be granted" in owner.text
+    revoked = await client.delete(f"{base}/permissions/{BOB.upper()}", headers=_as(ALICE))
+    assert revoked.status_code == 204
+    assert stores.permissions.resolve_gadget_access([BOB], gadget["id"]) is None
 
 
-async def test_a_grant_finds_an_existing_spelling_without_reading_the_grant_list(
+async def test_a_re_share_does_not_read_the_grant_list(
     client: httpx.AsyncClient, stores: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     gadget = await _published(client)
@@ -601,11 +620,11 @@ async def test_a_grant_finds_an_existing_spelling_without_reading_the_grant_list
         raise AssertionError("one grant must not page through the gadget's grants")
 
     monkeypatch.setattr(stores.permissions, "list_for_gadget", no_listing)
-    upper = await client.put(
-        f"{base}/permissions", json={"user_id": BOB.upper(), "level": 2}, headers=_as(ALICE)
+    again = await client.put(
+        f"{base}/permissions", json={"user_id": BOB, "level": 2}, headers=_as(ALICE)
     )
-    assert upper.status_code == 200, upper.text
-    assert upper.json()["user_id"] == BOB and upper.json()["level"] == 2
+    assert again.status_code == 200, again.text
+    assert again.json()["user_id"] == BOB and again.json()["level"] == 2
 
 
 async def test_a_grant_racing_the_gadgets_deletion_leaves_no_grant(
