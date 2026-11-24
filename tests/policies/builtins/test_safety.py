@@ -880,7 +880,6 @@ def test_ask_on_scheduled_task_change_keeps_full_prompt_and_settings_visible() -
                 "agent_id": "ag_1",
             },
         ),
-        # The server replaces the prompt an update resends with the one that runs the workflow.
         ("sys_scheduled_task_update", {"scheduled_task_id": "st_1", "prompt": "Summarize."}),
     ],
     ids=["create", "update"],
@@ -914,7 +913,47 @@ def test_ask_on_scheduled_task_change_shows_the_saved_workflow_it_runs(
     assert instructions.startswith("Runs the saved workflow 0123456789abcdef0123456789abcdef")
     assert details in instructions
     assert "workflow_details=" not in reason
-    assert "Summarize." not in instructions
+
+
+@pytest.mark.parametrize(
+    "workflow_id",
+    ["0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210"],
+    ids=["unchanged-workflow", "another-workflow"],
+)
+def test_an_update_that_keeps_a_workflows_specifics_shows_them(workflow_id: str) -> None:
+    """Left out of the update, the current prompt's specifics stay in effect, so they show."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    saved = (
+        '/workflow Run the saved workflow "Triage" (ID 0123456789abcdef0123456789abcdef).'
+        "\n\nOnly the upload tests"
+    )
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_update",
+            "data": {
+                "name": "sys_scheduled_task_update",
+                "arguments": {
+                    "scheduled_task_id": "st_1",
+                    "prompt": saved,
+                    "permission_mode": None,
+                    "state": "active",
+                    "workflow_id": workflow_id,
+                },
+            },
+        }
+    )
+    instructions = result["reason"].split("Full automation instructions:\n", 1)[1]
+    assert instructions.startswith(f"Runs the saved workflow {workflow_id}.")
+    assert saved in instructions
+
+
+def test_a_create_with_a_null_workflow_id_is_an_ordinary_create() -> None:
+    from omnigent.policies.builtins.safety import scheduled_task_review_error
+
+    args = {"name": "n", "prompt": "Review every issue.", "permission_mode": None}
+    assert scheduled_task_review_error({**args, "workflow_id": None}, action="create") is None
 
 
 def test_a_workflow_create_is_asked_only_for_its_permission_mode() -> None:

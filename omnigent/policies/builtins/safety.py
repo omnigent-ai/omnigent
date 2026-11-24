@@ -469,7 +469,7 @@ def scheduled_task_review_error(
 ) -> str | None:
     """Validate review values, allowing omitted fields only for legacy callers."""
     # The server writes the prompt of a task created to run a saved workflow.
-    runs_workflow = action == "create" and "workflow_id" in args
+    runs_workflow = action == "create" and args.get("workflow_id") is not None
     required = (
         _SCHEDULED_TASK_REVIEW_FIELDS - {"prompt"}
         if runs_workflow
@@ -511,13 +511,18 @@ def scheduled_task_review_error(
 def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str) -> str:
     """Render supplied instructions in full and identify legacy omissions."""
     workflow_id = args.get("workflow_id")
-    if action == "create" and "prompt" not in args and "workflow_id" in args:
+    supplied = args.get("prompt", "(unchanged; not supplied by legacy caller)")
+    if action == "create" and "prompt" not in args and workflow_id is not None:
         prompt: object = f"Runs the saved workflow {workflow_id}"
     elif action == "update" and workflow_id:
-        # The server replaces a resent prompt with the one that runs the workflow.
-        prompt = f"Runs the saved workflow {workflow_id}; the server writes its prompt"
+        # The specifics an update leaves out stay as the current prompt has them.
+        prompt = (
+            f"Runs the saved workflow {workflow_id}. The server writes the prompt that runs "
+            "it, keeping the specifics of the current prompt below unless workflow_details "
+            f"replaces them.\n{supplied}"
+        )
     else:
-        prompt = args.get("prompt", "(unchanged; not supplied by legacy caller)")
+        prompt = supplied
     if "workflow_details" in args:
         details = args["workflow_details"] or "(none)"
         prompt = f"{prompt}\nSpecifics for each run of its saved workflow:\n{details}"
