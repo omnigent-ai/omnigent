@@ -118,6 +118,10 @@ from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
 CLAUDE_STARTUP_CONTEXT_FILE = "startup_context.txt"
+CLAUDE_APPEND_SYSTEM_PROMPT_FILE = "append_system_prompt.md"
+# Inline prompts above this size move to a file; tmux caps a whole launch
+# command near 16 KiB, and the other args and env share that budget.
+_INLINE_APPEND_SYSTEM_PROMPT_MAX_BYTES = 6 * 1024
 
 _logger = logging.getLogger(__name__)
 _INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
@@ -3322,11 +3326,13 @@ def _merge_append_system_prompt(
     value in place, or a new flag carries it. The scan stops at a bare ``--``.
     Caller prompt files stay in Claude's sandbox. With a file flag, deliver only
     ``extra`` through SessionStart so older CLIs do not receive a second flag.
+    A merged prompt too large for a tmux command moves to a private file flag.
 
     :param args: Claude CLI argument list to mutate-and-return.
     :param extra: Instructions Omnigent appends, e.g. the agent's instructions.
     :param bridge_dir: Owner-only directory for generated startup context.
-    :returns: ``args`` with inline instructions merged, or caller file flags intact.
+    :returns: ``args`` with instructions merged inline or into a file flag, or
+        caller file flags intact.
     """
     startup_context = bridge_dir / CLAUDE_STARTUP_CONTEXT_FILE
     if not extra:
@@ -3353,12 +3359,27 @@ def _merge_append_system_prompt(
         _write_private_file(startup_context, extra)
         return args
     startup_context.unlink(missing_ok=True)
-    if location is None:
-        args.extend([flag, extra])
+    prompt_file = bridge_dir / CLAUDE_APPEND_SYSTEM_PROMPT_FILE
+    existing = "" if location is None else args[location[0]][location[1] :]
+    merged = f"{extra}\n\n{existing}" if existing else extra
+    if len(merged.encode("utf-8")) <= _INLINE_APPEND_SYSTEM_PROMPT_MAX_BYTES:
+        prompt_file.unlink(missing_ok=True)
+        if location is None:
+            args.extend([flag, merged])
+        else:
+            value_idx, offset = location
+            args[value_idx] = args[value_idx][:offset] + merged
         return args
-    value_idx, offset = location
-    existing = args[value_idx][offset:]
-    args[value_idx] = args[value_idx][:offset] + (f"{extra}\n\n{existing}" if existing else extra)
+    # tmux rejects a launch command over ~16 KiB ("command too long"), so a
+    # large prompt travels as a file and the inline flag is dropped.
+    _write_private_file(prompt_file, merged)
+    if location is not None:
+        value_idx, offset = location
+        if offset:
+            del args[value_idx]
+        else:
+            del args[value_idx - 1 : value_idx + 1]
+    args.extend([file_flag, str(prompt_file)])
     return args
 
 

@@ -4770,6 +4770,36 @@ def test_augment_claude_args_appends_caller_system_prompt(
 
 @pytest.mark.parametrize(
     "user_args",
+    [(), ("--append-system-prompt", "Caller."), ("--append-system-prompt=Caller.",)],
+    ids=["no-user-prompt", "user-prompt-separate-value", "user-prompt-joined-value"],
+)
+def test_augment_claude_args_moves_large_system_prompt_to_file(
+    tmp_path: Path, user_args: tuple[str, ...]
+) -> None:
+    """A prompt too large for a tmux launch command is passed as a private file."""
+    large_prompt = "x" * 20_000
+    args = augment_claude_args(
+        user_args,
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt=large_prompt,
+    )
+
+    assert not any(arg.startswith("--append-system-prompt") and "-file" not in arg for arg in args)
+    prompt_file = Path(args[args.index("--append-system-prompt-file") + 1])
+    expected = f"{large_prompt}\n\nCaller." if user_args else large_prompt
+    assert prompt_file.read_text(encoding="utf-8") == expected
+    assert prompt_file.stat().st_mode & 0o077 == 0
+
+    # A later small prompt goes inline again and removes the stale file.
+    augment_claude_args(
+        (), bridge_dir=tmp_path, python_executable="/venv/bin/python", append_system_prompt="Hi."
+    )
+    assert not prompt_file.exists()
+
+
+@pytest.mark.parametrize(
+    "user_args",
     [
         ("--append-system-prompt-file", "profile.md"),
         ("--append-system-prompt-file=profile.md",),
