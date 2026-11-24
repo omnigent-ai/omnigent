@@ -28,7 +28,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from tests.debug_log_helpers import capture_debug_rows
-from tests.server.helpers import start_session_stream_collector
+from tests.server.helpers import SessionStreamCollector, start_session_stream_collector
 
 # Wall-clock ceiling for awaiting relay tasks / stream events. Generous on
 # purpose: the relay runs as a background task on a shared, 8-worker xdist
@@ -344,6 +344,84 @@ async def test_subagent_activity_waits_for_final_idle_after_buffered_turns(
         "session.subagent.returned",
     ]
     assert items[-1].data.resource["status"] == outcome
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled", "incomplete"])
+@pytest.mark.asyncio
+async def test_relay_counts_the_usage_of_every_turn_end(db_uri: str, outcome: str) -> None:
+    """A turn's usage counts in the session's usage however the turn ends.
+
+    A turn that fails or is stopped made its model calls too, so the relay adds
+    the usage on every terminal response as it does on ``response.completed``,
+    and publishes the new totals to the live badge and the parent's subtree badge.
+    Only a completed turn replaces the context-window labels.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    session = store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
+    store.set_labels(session.id, {"omnigent.last_context_tokens": "1000"})
+    release = asyncio.Event()
+    release.set()
+    usage = {
+        "input_tokens": 300,
+        "output_tokens": 40,
+        "total_tokens": 340,
+        "context_tokens": 45678,
+        "model": "claude-sonnet-5",
+        "cost_usd": 0.25,
+    }
+    events = [
+        {"type": "response.in_progress", "response": {"id": "turn", "model": "test"}},
+        {
+            "type": f"response.{outcome}",
+            "response": {"id": "turn", "status": outcome, "usage": usage},
+        },
+        {"type": "session.status", "status": "failed" if outcome == "failed" else "idle"},
+    ]
+
+    async def next_usage_event(collector: SessionStreamCollector) -> dict[str, Any] | None:
+        for _ in range(50):
+            event = await collector.next_event()
+            if event["type"] == "session.usage":
+                return event
+        return None
+
+    collector = await start_session_stream_collector(session.id)
+    parent_collector = await start_session_stream_collector(parent.id)
+    try:
+        await _relay_runner_stream_once(
+            session.id,
+            _ScriptedRunnerClient(release, events),
+            store,  # type: ignore[arg-type]
+        )
+        usage_event = await next_usage_event(collector)
+        parent_usage_event = await next_usage_event(parent_collector)
+    finally:
+        await collector.stop()
+        await parent_collector.stop()
+        session_stream.close(session.id)
+        session_stream.close(parent.id)
+
+    refreshed = store.get_conversation(session.id)
+    assert refreshed is not None
+    assert refreshed.session_usage.get("input_tokens") == 300
+    assert refreshed.session_usage.get("output_tokens") == 40
+    assert usage_event is not None, "the turn end published no session.usage event"
+    assert usage_event["total_cost_usd"] == 0.25
+    assert usage_event["usage_by_model"]["claude-sonnet-5"]["input_tokens"] == 300
+    completed = outcome == "completed"
+    assert refreshed.labels.get("omnigent.last_context_tokens") == (
+        "45678" if completed else "1000"
+    )
+    assert ("context_tokens" in usage_event) is completed
+    parent_row = store.get_conversation(parent.id)
+    assert parent_row is not None
+    assert parent_row.session_usage.get("input_tokens") is None
+    assert parent_usage_event is not None, "the parent's subtree badge was not updated"
+    assert parent_usage_event["total_cost_usd"] == 0.25
 
 
 @pytest.mark.parametrize(
@@ -4508,3 +4586,49 @@ async def test_relay_leaves_a_turn_on_an_offline_host_to_the_disconnect_hold(
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize(
+    "outcome", ["unfinished", "idle", "completed", "failed", "cancelled", "waiting"]
+)
+@pytest.mark.asyncio
+async def test_relay_persists_recoverable_turn_and_terminal_fence(
+    db_uri: str, outcome: str, configured: bool, native: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import Mock
+
+    from omnigent.server import session_live_state
+    from omnigent.server.host_session_recovery import HostSessionRecoverer
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    store = SqlAlchemyConversationStore(db_uri)
+    recoverer = HostSessionRecoverer(
+        store, Mock(), Mock(), Mock(), Mock(), deployment_gate=lambda: False
+    )
+    monkeypatch.setattr(
+        session_live_state, "_host_session_recoverer", recoverer if configured else None
+    )
+    conv = store.create_conversation(
+        host_id="a" * 32,
+        runner_id="runner",
+        workspace="/workspace",
+        labels={"omnigent.wrapper": "codex-native-ui"} if native else None,
+    )
+    release = asyncio.Event()
+    release.set()
+    events = [{"type": "response.in_progress", "response": {"id": "turn"}}]
+    if outcome in {"idle", "waiting"}:
+        events.append({"type": "session.status", "status": outcome, "response_id": "turn"})
+    elif outcome != "unfinished":
+        events.append({"type": f"response.{outcome}", "response": {"id": "turn"}})
+    await _relay_runner_stream_once(
+        conv.id, _ScriptedRunnerClient(release, events), store, runner_id="runner"
+    )
+    state = store.get_session_recovery(conv.id)
+    if not configured or native:
+        assert state is None
+        return
+    assert state.response_id == "turn"
+    assert state.phase == ("active" if outcome in {"unfinished", "idle"} else "stopped")

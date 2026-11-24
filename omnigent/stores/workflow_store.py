@@ -2,15 +2,18 @@
 
 Workflows are rows of ``workflows`` in the database that holds the session
 metadata. Every read and write is scoped to the caller: another owner's
-workflow reads as missing. A unique owner-and-name index arbitrates competing saves.
-Every workflow query is served by, and on MySQL pinned to, the primary key or
-``uq_workflows_user_id_name``. Description and plan codecs run in batches in the store.
+workflow reads as missing. :meth:`WorkflowStore.get_many` is the exception, for
+callers that already checked the caller's grant on each workflow. A unique
+owner-and-name index arbitrates competing saves. Every workflow query is served
+by, and on MySQL pinned to, the primary key or ``uq_workflows_user_id_name``.
+Description and plan codecs run in batches in the store.
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import logging
 import uuid
 from collections.abc import Sequence
 from typing import Any, TypeVar
@@ -41,6 +44,8 @@ from omnigent.entities.workflow import (
 )
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
+
+_logger = logging.getLogger(__name__)
 
 WORKFLOW_PAGE_MAX = 200
 _OWNER_NAME_INDEX = "uq_workflows_user_id_name"
@@ -85,9 +90,12 @@ def _is_name_conflict(error: IntegrityError) -> bool:
     )
 
 
-def _plan_text(steps: list[dict[str, Any]]) -> str:
-    """Serialize the plan before applying the deployment's storage codec."""
-    return json.dumps({"steps": steps}, ensure_ascii=False, separators=(",", ":"))
+def _plan_text(steps: list[dict[str, Any]], description_source: str | None = None) -> str:
+    """Serialize the plan, and the proposal its description came from, before the codec."""
+    plan: dict[str, Any] = {"steps": steps}
+    if description_source is not None:
+        plan["description_source"] = description_source
+    return json.dumps(plan, ensure_ascii=False, separators=(",", ":"))
 
 
 class WorkflowStore:
@@ -134,6 +142,51 @@ class WorkflowStore:
                 )
         return stored
 
+    def check_description(self, description: str) -> None:
+        """Refuse a description too large to store, such as one a planning chat proposes.
+
+        :param description: e.g. ``"Triage flaky tests."``; checked as it would be stored.
+        :raises InvalidWorkflowError: If its stored form is over the limit.
+        """
+        self._stored_texts(description.strip(), None)
+
+    def allocate_workflow_id(self, *, user_id: str | None, name: str) -> str:
+        """Return the ID for a workflow :meth:`create` is about to save.
+
+        :meth:`create` calls this once the fields are valid, before it writes the row,
+        and calls :meth:`release_workflow_id` if the write fails. A deployment may
+        allocate IDs another way, e.g. from an external object, but they must be bare
+        32-char lowercase hex: ``workflows.id`` and ``session_journal_entries.workflow_id``
+        hold them as 16-byte UUIDs, and agent tools and the web app read them in that form.
+
+        :param user_id: The workflow's owner; ``None`` in single-user mode.
+        :param name: The workflow's name, e.g. ``"nightly-build"``.
+        :returns: A new workflow ID; by default a UUID4.
+        """
+        del user_id, name
+        return uuid.uuid4().hex
+
+    def release_workflow_id(self, workflow_id: str) -> None:
+        """Give back an ID from :meth:`allocate_workflow_id` whose workflow was never saved.
+
+        :meth:`create` calls this at most once per ID, when its write raised. A write
+        that raises after its commit succeeded (a dropped connection, say) leaves a
+        saved workflow with the ID, so a deployment should first check that none has it.
+        Best-effort: :meth:`create` logs what this raises and raises its own error. A
+        no-op by default.
+
+        :param workflow_id: The allocated ID.
+        """
+        del workflow_id
+
+    def _release_unsaved_id(self, workflow_id: str) -> None:
+        """Release an ID whose workflow wasn't saved; a failure is only logged."""
+        try:
+            self.release_workflow_id(workflow_id)
+        except Exception:
+            # The save's own error still reaches the caller.
+            _logger.exception("could not release the unused workflow ID %s", workflow_id)
+
     def _workflows(self, rows: Sequence[SqlWorkflow]) -> list[Workflow]:
         """Decode a page's descriptions and plans in one call."""
         texts = (
@@ -142,21 +195,25 @@ class WorkflowStore:
             else []
         )
         pairs = zip(texts[::2], texts[1::2], strict=True)
-        return [
-            Workflow(
-                id=row.id,
-                user_id=row.user_id,
-                name=row.name,
-                description=description.decode("utf-8")
-                if isinstance(description, bytes)
-                else description,
-                created_at=row.created_at,
-                updated_at=row.updated_at,
-                steps=json.loads(plan)["steps"],
-                planning_session_id=row.planning_session_id,
+        workflows = []
+        for row, (description, plan) in zip(rows, pairs, strict=True):
+            saved = json.loads(plan)
+            workflows.append(
+                Workflow(
+                    id=row.id,
+                    user_id=row.user_id,
+                    name=row.name,
+                    description=description.decode("utf-8")
+                    if isinstance(description, bytes)
+                    else description,
+                    created_at=row.created_at,
+                    updated_at=row.updated_at,
+                    steps=saved["steps"],
+                    planning_session_id=row.planning_session_id,
+                    description_source=saved.get("description_source"),
+                )
             )
-            for row, (description, plan) in zip(rows, pairs, strict=True)
-        ]
+        return workflows
 
     def create(
         self, *, user_id: str | None, name: object, description: object, steps: object
@@ -167,7 +224,8 @@ class WorkflowStore:
         :param name: One line, e.g. ``"nightly-build"``.
         :param description: What the workflow is for.
         :param steps: The graph, in the journal plan's step format.
-        :returns: The saved workflow, with its steps.
+        :returns: The saved workflow, with its steps, under an ID from
+            :meth:`allocate_workflow_id`.
         :raises InvalidWorkflowError: If a field is invalid or the steps are too large.
         :raises WorkflowNameTakenError: If the owner already uses the name.
         """
@@ -177,7 +235,7 @@ class WorkflowStore:
         stored_description, stored_plan = self._stored_texts(text, _plan_text(workflow_steps))
         now = now_epoch()
         workflow = Workflow(
-            id=uuid.uuid4().hex,
+            id=self.allocate_workflow_id(user_id=user_id, name=workflow_name),
             user_id=RESERVED_USER_LOCAL if user_id is None else user_id,
             name=workflow_name,
             description=text,
@@ -204,8 +262,9 @@ class WorkflowStore:
 
         try:
             return run_write_transaction(self._session_immediate, "create_workflow", write)
-        except IntegrityError as exc:
-            if _is_name_conflict(exc):
+        except Exception as exc:
+            self._release_unsaved_id(workflow.id)
+            if isinstance(exc, IntegrityError) and _is_name_conflict(exc):
                 raise WorkflowNameTakenError("a workflow with this name already exists") from exc
             raise
 
@@ -221,6 +280,61 @@ class WorkflowStore:
                 )
             ).scalar_one_or_none()
             return None if row is None else self._workflows([row])[0]
+
+    def get_many(self, workflow_ids: Sequence[str]) -> dict[str, Workflow]:
+        """Return the workflows with these IDs, with their steps, whoever owns them.
+
+        Not scoped to an owner: for callers that checked the caller's grant on each
+        workflow, such as a list of the workflows shared with them. Missing IDs are
+        left out, and one that can't name a workflow finds none.
+
+        :param workflow_ids: Workflow IDs, e.g. a page of grants' workflows.
+        :returns: The workflows found, by ID.
+        """
+        wanted = []
+        for workflow_id in dict.fromkeys(workflow_ids):
+            try:
+                wanted.append(uuid_to_bytes(workflow_id).hex())
+            except InvalidUuidError:
+                continue
+        if not wanted:
+            return {}
+        with self._session("get_workflows_by_id") as session:
+            rows = session.scalars(
+                _using(
+                    select(SqlWorkflow)
+                    .where(
+                        SqlWorkflow.workspace_id == current_workspace_id(),
+                        SqlWorkflow.id.in_(wanted),
+                    )
+                    .options(undefer(SqlWorkflow.plan)),
+                    "PRIMARY",
+                )
+            ).all()
+            return {workflow.id: workflow for workflow in self._workflows(rows)}
+
+    def names(self, workflow_ids: Sequence[str], *, user_id: str | None) -> dict[str, str]:
+        """Name those of the workflows the owner has, by ID; one primary-key read each.
+
+        :param workflow_ids: Workflow IDs, e.g. those a page of runs follows.
+        :param user_id: The owner, or ``None`` in single-user mode.
+        """
+        wanted = list(dict.fromkeys(workflow_ids))
+        if not wanted:
+            return {}
+        with self._session("get_workflow_names") as session:
+            rows = session.execute(
+                _using(
+                    select(SqlWorkflow.id, SqlWorkflow.name).where(
+                        SqlWorkflow.workspace_id == current_workspace_id(),
+                        SqlWorkflow.id.in_(wanted),
+                        SqlWorkflow.user_id
+                        == (RESERVED_USER_LOCAL if user_id is None else user_id),
+                    ),
+                    "PRIMARY",
+                )
+            ).all()
+        return {row.id: row.name for row in rows}
 
     def list_page(
         self,
@@ -290,6 +404,8 @@ class WorkflowStore:
         user_id: str | None,
         name: object = None,
         description: object = None,
+        expected_description: str | None = None,
+        description_source: str | None = None,
         steps: object = None,
         planning_session_id: str | None = None,
     ) -> Workflow | None:
@@ -299,6 +415,11 @@ class WorkflowStore:
         :param user_id: The owner, or ``None`` in single-user mode.
         :param name: A new name, or ``None`` to keep it.
         :param description: A new description, or ``None`` to keep it.
+        :param expected_description: Apply *description* only while the stored
+            description is still this text, so a newer one written meanwhile stays.
+        :param description_source: The journal entry ID of the planning-chat proposal
+            *description* was saved from or kept over; a description written without
+            one clears it.
         :param steps: New steps replacing the old ones, or ``None`` to keep them.
         :param planning_session_id: An owner-checked planning session, or ``None`` to keep it.
         :returns: The updated workflow, or ``None`` if the owner has no such workflow.
@@ -320,20 +441,30 @@ class WorkflowStore:
             if row is None:
                 return None
             current = self._workflows([row])[0]
+            stale = (
+                expected_description is not None and expected_description != current.description
+            )
+            describes = description is not None and not stale
+            source = description_source if describes else current.description_source
+            # Another planning chat's journal can't hold the proposal the description came from.
+            if not describes and planning_session_id not in (None, current.planning_session_id):
+                source = None
             workflow_name, text, workflow_steps = normalize_workflow(
                 name=row.name if name is None else name,
-                description=current.description if description is None else description,
+                description=description if describes else current.description,
                 steps=current.steps if steps is None else steps,
             )
+            # The plan keeps the description's source, so a new source rewrites it.
+            rewrites_plan = steps is not None or source != current.description_source
             stored = self._stored_texts(
-                text, None if steps is None else _plan_text(workflow_steps)
+                text, _plan_text(workflow_steps, source) if rewrites_plan else None
             )
             values: dict[str, Any] = {
                 "name": workflow_name,
                 "description": stored[0],
                 "updated_at": now_epoch(),
             }
-            if steps is not None:
+            if rewrites_plan:
                 values["plan"] = stored[1]
             if planning_session_id is not None:
                 values["planning_session_id"] = planning_session_id
@@ -356,6 +487,7 @@ class WorkflowStore:
                 updated_at=values["updated_at"],
                 steps=workflow_steps,
                 planning_session_id=values.get("planning_session_id", row.planning_session_id),
+                description_source=source,
             )
 
         try:

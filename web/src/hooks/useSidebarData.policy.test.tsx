@@ -25,7 +25,12 @@ import {
   useProjectSessions,
   type Conversation,
 } from "./useConversations";
-import { SidebarDataProvider, useSidebarData, useSidebarView } from "./useSidebarData";
+import {
+  SidebarDataProvider,
+  useSidebarData,
+  useSidebarView,
+  type SidebarListQuery,
+} from "./useSidebarData";
 import { useArchivedSessions } from "./useScopeCache";
 import { useDirectorySessions } from "./useDirectorySessions";
 
@@ -684,4 +689,32 @@ it("keeps Custom on its base's caches and saves cutoff-second arrivals through s
     "arrival",
     "mine",
   ]);
+});
+
+it("lists every loaded Shared row on All only while Shared with me is its own section", async () => {
+  view = "all";
+  config = { ...config, inboxIncludesShared: true };
+  // A page of newer own sessions with more to load, and one older shared session.
+  fetchMock.mockImplementation(async (url: string) => {
+    const p = params(url);
+    if (p.has("pinned")) return response([]);
+    return p.get("visibility") === "shared"
+      ? response([{ ...row("shared-older", true), updated_at: 50 }])
+      : response([row("mine")], true);
+  });
+  const ids = (query: SidebarListQuery) => query.data?.pages[0]?.data.map((r) => r.id);
+  const { result, rerender } = renderHook(useSidebarData, { wrapper });
+  await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
+  // The flag-off sidebar mixes both scopes into one list, which stops at Mine's tail.
+  expect(ids(result.current.all)).toEqual(["mine"]);
+  groupingUi = true;
+  rerender();
+  expect(result.current.splitShared).toBe(true);
+  expect(ids(result.current.all)).toEqual(["mine", "shared-older"]);
+  // The Inbox still lists both scopes together.
+  expect(ids(result.current.inbox)).toEqual(["mine"]);
+  // Grouping folds Shared into the groups, so All is one mixed list again.
+  act(() => result.current.updateView({ grouping: "status" }));
+  expect(result.current.splitShared).toBe(false);
+  expect(ids(result.current.all)).toEqual(["mine"]);
 });

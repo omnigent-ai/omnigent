@@ -11,9 +11,12 @@ import {
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
+import type { StepProgress } from "@/lib/sessionJournal";
 import type * as SessionsApi from "@/lib/sessionsApi";
+import { usePlanStops } from "@/store/planStops";
 
-import { RunPlanButton, useRunTaskMenus } from "./RunTasks";
+import { RunGraphButton, RunPlanButton, RunWorkflowButton, useRunTaskMenus } from "./RunTasks";
 
 const api = vi.hoisted(() => ({ interrupt: vi.fn(), sendUserMessage: vi.fn() }));
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
@@ -44,6 +47,7 @@ describe("RunPlanButton", () => {
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
+    usePlanStops.setState({ requests: {}, settledStops: {} });
   });
 
   it("asks a stopped run's session to continue the plan, then refreshes the runs", async () => {
@@ -96,6 +100,8 @@ describe("RunPlanButton", () => {
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["workflow-runs", "wf_1"] });
       expect(api.interrupt).not.toHaveBeenCalled();
       expect(screen.getByRole("button", { name: "Stop" })).toBeEnabled();
+      // The run's controls no longer show it stopping.
+      expect(usePlanStops.getState().requests.sess_1).toBeUndefined();
     },
   );
 
@@ -108,24 +114,29 @@ describe("RunPlanButton", () => {
     expect(api.interrupt).not.toHaveBeenCalled();
   });
 
-  it("uses the same coordinated stop from a run's task menus", async () => {
+  it("uses the same coordinated stop from a run's task menus, and none while it stops", async () => {
     api.sendUserMessage.mockResolvedValue({ queued: true });
     const client = new QueryClient();
-    const { result } = renderHook(() => useRunTaskMenus("sess_1", [], "plan_1"), {
-      wrapper: ({ children }) => (
-        <QueryClientProvider client={client}>
-          <MemoryRouter>{children}</MemoryRouter>
-        </QueryClientProvider>
-      ),
-    });
-    const menu = result.current?.({
+    const { result, rerender } = renderHook(
+      ({ stopping }) => useRunTaskMenus("sess_1", [], "plan_1", stopping),
+      {
+        initialProps: { stopping: false },
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={client}>
+            <MemoryRouter>{children}</MemoryRouter>
+          </QueryClientProvider>
+        ),
+      },
+    );
+    const running: StepProgress = {
       step: { id: "review", name: "Review changes", goal: null, depends_on: [] },
       state: "running",
       status: null,
       startedAt: 1,
       native: false,
       activeForm: null,
-    });
+    };
+    const menu = result.current?.(running);
     expect(menu?.action).toBe("stop");
     await act(async () => menu?.onSelect());
 
@@ -136,5 +147,76 @@ describe("RunPlanButton", () => {
     );
     expect(api.sendUserMessage.mock.calls[0]![1]).toContain("recursively");
     expect(api.interrupt).not.toHaveBeenCalled();
+    // The run's controls show it stopping.
+    await waitFor(() =>
+      expect(usePlanStops.getState().requests.sess_1).toMatchObject({ sent: true }),
+    );
+    rerender({ stopping: true });
+    expect(result.current?.(running)).toBeUndefined();
+  });
+
+  it("keeps a run's Stop when a task's message sent before it lands after it", async () => {
+    let landRetry!: () => void;
+    api.sendUserMessage
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            landRetry = () => resolve({ queued: true });
+          }),
+      )
+      .mockResolvedValue({ queued: true });
+    const client = new QueryClient();
+    const { result } = renderHook(() => useRunTaskMenus("sess_1", [], "plan_1"), {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={client}>
+          <MemoryRouter>{children}</MemoryRouter>
+        </QueryClientProvider>
+      ),
+    });
+    const task: StepProgress = {
+      step: { id: "review", name: "Review changes", goal: null, depends_on: [] },
+      state: "failed",
+      status: null,
+      startedAt: 1,
+      native: false,
+      activeForm: null,
+    };
+    act(() => result.current?.(task)?.onSelect());
+    await waitFor(() => expect(api.sendUserMessage).toHaveBeenCalledTimes(1));
+    await act(async () => result.current?.({ ...task, state: "running" })?.onSelect());
+    await waitFor(() =>
+      expect(usePlanStops.getState().requests.sess_1).toMatchObject({ sent: true }),
+    );
+
+    await act(async () => landRetry());
+    expect(usePlanStops.getState().requests.sess_1).toMatchObject({ sent: true });
+  });
+});
+
+describe("RunWorkflowButton and RunGraphButton", () => {
+  afterEach(cleanup);
+
+  it("render the same box, placed as the row places them, with their own icons", () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <RunWorkflowButton workflowId="wf_1" className="relative -my-1" />
+          <RunGraphButton runName="the run" className="relative -my-1" onClick={() => {}} />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    const workflowLink = screen.getByTestId("run-workflow-button");
+    const graphButton = screen.getByTestId("run-graph-button");
+    // A link beside a button: the same classes keep their boxes and icons level.
+    expect(workflowLink.tagName).toBe("A");
+    expect(graphButton.tagName).toBe("BUTTON");
+    expect(workflowLink.className).toBe(graphButton.className);
+    expect(workflowLink).toHaveAttribute("data-size", "icon-sm");
+    expect(graphButton).toHaveAttribute("data-size", "icon-sm");
+    expect(workflowLink).toHaveClass("-my-1", "items-center", "justify-center");
+    expect(workflowLink.querySelector("svg")).toHaveClass("lucide-workflow");
+    // The graph button keeps the diagrams' fullscreen glyph, unlike the workflow's boxes.
+    const { container: fullscreenGlyph } = render(<FullscreenIcon />);
+    expect(graphButton.innerHTML).toBe(fullscreenGlyph.innerHTML);
   });
 });

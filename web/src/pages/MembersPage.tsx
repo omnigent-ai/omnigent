@@ -46,11 +46,24 @@ import {
   listUsers,
   resetUserPassword,
 } from "@/lib/accountsApi";
-import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import {
+  getCurrentIsAdmin,
+  getCurrentUserId,
+  resolveIdentity,
+  subscribeIdentity,
+} from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { withBasePath } from "@/lib/basePath";
 import { isSingleUserMode } from "@/lib/capabilities";
+import { MEMBERS_INVITE_ENTRY, MEMBERS_LIST_ENTRY } from "@/pages/settings/search/catalog/members";
+import { SettingsItem } from "@/pages/settings/search/SettingsItem";
+import { settingsControlProps } from "@/pages/settings/search/settingsControl";
+import {
+  SettingsDataRegion,
+  settingsOverlayProps,
+  settingsRowOverlayProps,
+} from "@/pages/settings/search/settingsOwnership";
 
 export function MembersPage() {
   const info = useServerInfo();
@@ -90,25 +103,26 @@ export function MembersPage() {
     setUsers(list);
   }, []);
 
-  // Initial load: identity probe + members list. Skipped in single-user
-  // mode since no auth endpoints exist. isSingleUser is a stable boolean
-  // so it is safe as a dep without risking infinite re-renders.
+  // Follow identity recovery while this page remains open.
   useEffect(() => {
     if (isSingleUser || capabilitiesLoading) return;
-    void (async () => {
-      const userId = await resolveIdentity();
-      if (userId === null) {
-        // Not authenticated — resolveIdentity already redirects to the
-        // provider's login URL when one exists (OIDC/accounts). Nothing
-        // more to do; leave the loading state.
-        return;
-      }
+    let active = true;
+    const update = (userId: string | null) => {
+      if (!active || userId === null) return;
       setMeId(userId);
-      const isAdmin = getCurrentIsAdmin();
-      setMeIsAdmin(isAdmin);
-      if (isAdmin) await refresh();
-    })();
-  }, [refresh, isSingleUser, capabilitiesLoading]);
+      setMeIsAdmin(getCurrentIsAdmin());
+    };
+    const unsubscribe = subscribeIdentity(() => update(getCurrentUserId()));
+    void resolveIdentity().then(update);
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [isSingleUser, capabilitiesLoading]);
+
+  useEffect(() => {
+    if (!isSingleUser && !capabilitiesLoading && meIsAdmin) void refresh();
+  }, [refresh, isSingleUser, capabilitiesLoading, meId, meIsAdmin]);
 
   if (isSingleUser) {
     return (
@@ -117,7 +131,7 @@ export function MembersPage() {
         contentClassName="px-4 md:px-8"
         extraBottom="2.5rem"
       >
-        <h1 className="settings-page-title mb-2 text-2xl font-medium">Members</h1>
+        <h1 className="mb-2 text-2xl font-medium">Members</h1>
         <p className="text-ui text-muted-foreground">
           Member management is not available in single-user mode.
         </p>
@@ -146,7 +160,7 @@ export function MembersPage() {
         contentClassName="px-4 md:px-8"
         extraBottom="2.5rem"
       >
-        <h1 className="settings-page-title mb-2 text-2xl font-medium">Members</h1>
+        <h1 className="mb-2 text-2xl font-medium">Members</h1>
         <p className="text-ui text-muted-foreground">
           You don't have permission to manage members.
         </p>
@@ -199,103 +213,125 @@ export function MembersPage() {
   return (
     <PageScroll maxWidthClassName="max-w-4xl" contentClassName="px-4 md:px-8" extraBottom="2.5rem">
       <div className="mb-6 flex items-center justify-between">
-        <h1 className="settings-page-title text-2xl font-medium">Members</h1>
+        <h1 className="text-2xl font-medium">Members</h1>
         {/* Invite mints a password-backed account — accounts mode only.
         Under OIDC, accounts are provisioned by the IdP on first login, so
         there's nothing to invite here. */}
         {manageable && (
-          <Button onClick={() => setShowCreateInvite(true)}>
-            <UserPlusIcon /> Invite member
-          </Button>
+          <SettingsItem entry={MEMBERS_INVITE_ENTRY}>
+            <Button
+              {...settingsControlProps(MEMBERS_INVITE_ENTRY, "invite")}
+              onClick={() => setShowCreateInvite(true)}
+            >
+              <UserPlusIcon /> Invite member
+            </Button>
+          </SettingsItem>
         )}
       </div>
 
-      {!manageable && (
-        <p className="mb-4 text-sm text-muted-foreground">
-          Users are added on first sign-in through your identity provider. This list is read-only.
-        </p>
-      )}
+      <SettingsItem entry={MEMBERS_LIST_ENTRY}>
+        {!manageable && (
+          <p className="mb-4 text-sm text-muted-foreground">
+            Users are added on first sign-in through your identity provider. This list is read-only.
+          </p>
+        )}
 
-      {loadError !== null && (
-        <div
-          role="alert"
-          className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
-        >
-          {loadError}
-        </div>
-      )}
+        {loadError !== null && (
+          <div
+            role="alert"
+            className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
+          >
+            {loadError}
+          </div>
+        )}
 
-      {users !== null && users.length > 0 && (
-        <div className="overflow-hidden rounded-md border border-border">
-          <table className="w-full text-ui">
-            <thead className="bg-muted/40 text-left text-sm uppercase text-muted-foreground">
-              <tr>
-                <th className="px-3 py-2 font-medium">Username</th>
-                <th className="px-3 py-2 font-medium">Role</th>
-                <th className="px-3 py-2 font-medium">Last login</th>
-                {manageable && <th className="px-3 py-2 text-right font-medium">Actions</th>}
-              </tr>
-            </thead>
-            <tbody>
-              {users.map((u) => (
-                <tr key={u.id} className="border-t border-border">
-                  <td className="px-3 py-2 align-middle">
-                    <span className="font-medium">{u.id}</span>
-                    {u.id === meId && (
-                      <span className="ml-2 text-sm text-muted-foreground">(you)</span>
-                    )}
-                    {!u.has_password && (
-                      <Badge variant="outline" className="ml-2">
-                        External
-                      </Badge>
-                    )}
-                  </td>
-                  <td className="px-3 py-2 align-middle">
-                    {u.is_admin ? <Badge>Admin</Badge> : <Badge variant="secondary">Member</Badge>}
-                  </td>
-                  <td className="px-3 py-2 align-middle text-muted-foreground">
-                    {formatEpoch(u.last_login_at)}
-                  </td>
-                  {manageable && (
-                    <td className="px-3 py-2 text-right">
-                      <div className="flex justify-end gap-1">
-                        <Button
-                          variant="ghost"
-                          size="xs"
-                          title="Reset password"
-                          onClick={() => void onResetPassword(u.id)}
-                          disabled={pendingAction || !u.has_password}
-                        >
-                          <KeyRoundIcon /> Reset
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="xs"
-                          title="Remove user"
-                          onClick={() => setDeleteCandidate(u.id)}
-                          disabled={pendingAction || u.id === meId}
-                        >
-                          <Trash2Icon /> Remove
-                        </Button>
-                      </div>
-                    </td>
-                  )}
+        {users !== null && users.length > 0 && (
+          <SettingsDataRegion
+            entry={MEMBERS_LIST_ENTRY}
+            region="members"
+            className="overflow-hidden rounded-md border border-border"
+          >
+            <table className="w-full text-ui">
+              <thead className="bg-muted/40 text-left text-sm uppercase text-muted-foreground">
+                <tr>
+                  <th className="px-3 py-2 font-medium">Username</th>
+                  <th className="px-3 py-2 font-medium">Role</th>
+                  <th className="px-3 py-2 font-medium">Last login</th>
+                  {manageable && <th className="px-3 py-2 text-right font-medium">Actions</th>}
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {users.map((u) => (
+                  <tr key={u.id} className="border-t border-border">
+                    <td className="px-3 py-2 align-middle">
+                      <span className="font-medium">{u.id}</span>
+                      {u.id === meId && (
+                        <span className="ml-2 text-sm text-muted-foreground">(you)</span>
+                      )}
+                      {!u.has_password && (
+                        <Badge variant="outline" className="ml-2">
+                          External
+                        </Badge>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 align-middle">
+                      {u.is_admin ? (
+                        <Badge>Admin</Badge>
+                      ) : (
+                        <Badge variant="secondary">Member</Badge>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 align-middle text-muted-foreground">
+                      {formatEpoch(u.last_login_at)}
+                    </td>
+                    {manageable && (
+                      <td className="px-3 py-2 text-right">
+                        <div className="flex justify-end gap-1">
+                          <Button
+                            data-settings-row-action="resetPassword"
+                            variant="ghost"
+                            size="xs"
+                            title="Reset password"
+                            onClick={() => void onResetPassword(u.id)}
+                            disabled={pendingAction || !u.has_password}
+                          >
+                            <KeyRoundIcon /> Reset
+                          </Button>
+                          <Button
+                            data-settings-row-action="remove"
+                            variant="ghost"
+                            size="xs"
+                            title="Remove user"
+                            onClick={() => setDeleteCandidate(u.id)}
+                            disabled={pendingAction || u.id === meId}
+                          >
+                            <Trash2Icon /> Remove
+                          </Button>
+                        </div>
+                      </td>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </SettingsDataRegion>
+        )}
+
+        {users !== null && users.length === 0 && (
+          <p className="text-ui text-muted-foreground">No members yet.</p>
+        )}
+
+        <div className="mt-3 flex items-center justify-end">
+          <Button
+            {...settingsControlProps(MEMBERS_LIST_ENTRY, "refresh")}
+            variant="ghost"
+            size="sm"
+            onClick={() => void refresh()}
+          >
+            <RefreshCwIcon /> Refresh
+          </Button>
         </div>
-      )}
-
-      {users !== null && users.length === 0 && (
-        <p className="text-ui text-muted-foreground">No members yet.</p>
-      )}
-
-      <div className="mt-3 flex items-center justify-end">
-        <Button variant="ghost" size="sm" onClick={() => void refresh()}>
-          <RefreshCwIcon /> Refresh
-        </Button>
-      </div>
+      </SettingsItem>
 
       {/* ── Create invite modal ───────────────────────────────────── */}
       <Dialog
@@ -306,7 +342,7 @@ export function MembersPage() {
           if (!open) setActionError(null);
         }}
       >
-        <DialogContent>
+        <DialogContent {...settingsOverlayProps(MEMBERS_INVITE_ENTRY, "invite")}>
           <DialogHeader>
             <DialogTitle>Invite a member</DialogTitle>
             <DialogDescription>
@@ -316,6 +352,7 @@ export function MembersPage() {
           </DialogHeader>
           <label className="flex items-center gap-2 text-ui">
             <input
+              {...settingsControlProps(MEMBERS_INVITE_ENTRY, "grantAdmin")}
               type="checkbox"
               checked={inviteAsAdmin}
               onChange={(e) => setInviteAsAdmin(e.target.checked)}
@@ -333,13 +370,18 @@ export function MembersPage() {
           )}
           <DialogFooter>
             <Button
+              data-settings-dialog-action="Cancel"
               variant="ghost"
               onClick={() => setShowCreateInvite(false)}
               disabled={pendingAction}
             >
               Cancel
             </Button>
-            <Button onClick={() => void onCreateInvite()} loading={pendingAction}>
+            <Button
+              {...settingsControlProps(MEMBERS_INVITE_ENTRY, "create")}
+              onClick={() => void onCreateInvite()}
+              loading={pendingAction}
+            >
               Create invite
             </Button>
           </DialogFooter>
@@ -353,7 +395,7 @@ export function MembersPage() {
           if (!open) setInviteResult(null);
         }}
       >
-        <DialogContent>
+        <DialogContent {...settingsOverlayProps(MEMBERS_INVITE_ENTRY, "invite")}>
           <DialogHeader>
             <DialogTitle>Invite URL</DialogTitle>
             <DialogDescription>
@@ -362,9 +404,11 @@ export function MembersPage() {
               only once.
             </DialogDescription>
           </DialogHeader>
-          {inviteResult !== null && <CopyableValue value={rebaseUrl(inviteResult.register_url)} />}
+          {inviteResult !== null && <InviteUrlField value={rebaseUrl(inviteResult.register_url)} />}
           <DialogFooter>
-            <Button onClick={() => setInviteResult(null)}>Done</Button>
+            <Button data-settings-dialog-action="Done" onClick={() => setInviteResult(null)}>
+              Done
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -376,16 +420,20 @@ export function MembersPage() {
           if (!open) setResetResult(null);
         }}
       >
-        <DialogContent>
+        <DialogContent {...settingsRowOverlayProps(MEMBERS_LIST_ENTRY, "members", "resetPassword")}>
           <DialogHeader>
             <DialogTitle>New password for {resetResult?.id}</DialogTitle>
             <DialogDescription>
               Send this password to the user out-of-band (e.g. Slack DM). It is shown only once.
             </DialogDescription>
           </DialogHeader>
-          {resetResult !== null && <CopyableValue value={resetResult.new_password} />}
+          {resetResult !== null && (
+            <NewPasswordField userId={resetResult.id} value={resetResult.new_password} />
+          )}
           <DialogFooter>
-            <Button onClick={() => setResetResult(null)}>Done</Button>
+            <Button data-settings-row-action="done" onClick={() => setResetResult(null)}>
+              Done
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -401,7 +449,7 @@ export function MembersPage() {
           }
         }}
       >
-        <DialogContent>
+        <DialogContent {...settingsRowOverlayProps(MEMBERS_LIST_ENTRY, "members", "remove")}>
           <DialogHeader>
             <DialogTitle>Remove {deleteCandidate}?</DialogTitle>
             <DialogDescription>
@@ -420,6 +468,7 @@ export function MembersPage() {
           )}
           <DialogFooter>
             <Button
+              data-settings-row-action="cancel"
               variant="ghost"
               onClick={() => setDeleteCandidate(null)}
               disabled={pendingAction}
@@ -427,6 +476,7 @@ export function MembersPage() {
               Cancel
             </Button>
             <Button
+              data-settings-row-action="remove"
               variant="destructive"
               onClick={() => void onConfirmDelete()}
               loading={pendingAction}
@@ -440,33 +490,64 @@ export function MembersPage() {
   );
 }
 
-/**
- * A read-only field paired with a one-click copy button.
- *
- * Used for both invite URLs and reset-issued passwords; both are
- * single-use sensitive values that need a frictionless copy path
- * since the user typically pastes them into Slack within seconds.
- */
-function CopyableValue({ value }: { value: string }) {
+function useCopyValue(value: string) {
   const [copied, setCopied] = useState(false);
-  const onCopy = async () => {
+  const copy = async () => {
     try {
       await navigator.clipboard.writeText(value);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
     } catch {
-      // No clipboard permission — the input is still selectable.
+      // No clipboard permission — the field is still selectable.
     }
   };
+  return { copied, copy };
+}
+
+/** The invite's single-use URL, read-only and selected on focus, with its copy button. */
+function InviteUrlField({ value }: { value: string }) {
+  const { copied, copy } = useCopyValue(value);
   return (
     <div className="flex items-center gap-2">
       <Input
+        {...settingsControlProps(MEMBERS_INVITE_ENTRY, "inviteUrl")}
         value={value}
         readOnly
         className="font-mono text-sm"
         onFocus={(e) => e.currentTarget.select()}
       />
-      <Button variant="outline" size="sm" onClick={() => void onCopy()} aria-label="Copy">
+      <Button
+        {...settingsControlProps(MEMBERS_INVITE_ENTRY, "copyInviteUrl")}
+        variant="outline"
+        size="sm"
+        onClick={() => void copy()}
+      >
+        <CopyIcon /> {copied ? "Copied" : "Copy"}
+      </Button>
+    </div>
+  );
+}
+
+/** A reset's new password for `userId`, read-only and selected on focus, with its copy button. */
+function NewPasswordField({ userId, value }: { userId: string; value: string }) {
+  const { copied, copy } = useCopyValue(value);
+  return (
+    <div className="flex items-center gap-2">
+      <Input
+        data-settings-row-field="password"
+        aria-label={`New password for ${userId}`}
+        value={value}
+        readOnly
+        className="font-mono text-sm"
+        onFocus={(e) => e.currentTarget.select()}
+      />
+      <Button
+        data-settings-row-action="copy"
+        aria-label="Copy password"
+        variant="outline"
+        size="sm"
+        onClick={() => void copy()}
+      >
         <CopyIcon /> {copied ? "Copied" : "Copy"}
       </Button>
     </div>

@@ -13,14 +13,17 @@ elsewhere.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import shutil
+import threading
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -31,6 +34,104 @@ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
 _TEST_HARNESS_NAME = "executor_adapter_fixture"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_executor_adapter_harness"
+
+
+@pytest.mark.parametrize("close_fails", [False, True])
+async def test_threaded_executor_factory_cancellation_closes_completed_startup(
+    caplog: pytest.LogCaptureFixture, close_fails: bool
+) -> None:
+    """A cancelled first turn must reap a proxy-owning executor built on a thread."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    started = threading.Event()
+    release = threading.Event()
+    executor = AsyncMock(spec=Executor)
+    if close_fails:
+        executor.close.side_effect = RuntimeError("injected close failure")
+
+    def build_executor() -> Executor:
+        started.set()
+        assert release.wait(timeout=5)
+        return executor
+
+    adapter = ExecutorAdapter(executor_factory=build_executor, executor_factory_on_thread=True)
+    startup = asyncio.create_task(adapter._ensure_executor_for_turn())
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        startup.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await startup
+        executor.close.assert_awaited_once()
+        assert adapter._executor is None
+        assert (
+            "Failed to close executor built for a cancelled turn" in caplog.text
+        ) is close_fails
+    finally:
+        release.set()
+
+
+async def test_shutdown_closes_executor_built_after_shutdown_begins() -> None:
+    """Shutdown must wait for a factory already building the first executor."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    started = threading.Event()
+    release = threading.Event()
+    executor = AsyncMock(spec=Executor)
+
+    def build_executor() -> Executor:
+        started.set()
+        assert release.wait(timeout=5)
+        return executor
+
+    adapter = ExecutorAdapter(executor_factory=build_executor, executor_factory_on_thread=True)
+    startup = asyncio.create_task(adapter._ensure_executor_for_turn())
+    shutdown: asyncio.Task[None] | None = None
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        shutdown = asyncio.create_task(adapter.on_shutdown())
+        await asyncio.sleep(0)
+        assert adapter._shutdown_started
+        assert not shutdown.done()
+        release.set()
+        with pytest.raises(RuntimeError, match="shutting down"):
+            await asyncio.wait_for(startup, 5)
+        await asyncio.wait_for(shutdown, 5)
+        executor.close.assert_awaited_once()
+        executor.close_session.assert_not_awaited()
+        assert adapter._executor is None
+    finally:
+        release.set()
+        await asyncio.gather(startup, return_exceptions=True)
+        if shutdown is not None:
+            await asyncio.gather(shutdown, return_exceptions=True)
+
+
+async def test_threaded_executor_factory_is_shared_by_overlapping_first_turns() -> None:
+    """Only one Claude executor may own the first turn's proxy and launcher."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    started = threading.Event()
+    release = threading.Event()
+    built: list[Executor] = []
+    executor = AsyncMock(spec=Executor)
+
+    def build_executor() -> Executor:
+        built.append(executor)
+        started.set()
+        assert release.wait(timeout=5)
+        return executor
+
+    adapter = ExecutorAdapter(executor_factory=build_executor, executor_factory_on_thread=True)
+    first = asyncio.create_task(adapter._ensure_executor_for_turn())
+    second = asyncio.create_task(adapter._ensure_executor_for_turn())
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        release.set()
+        assert await asyncio.gather(first, second) == [executor, executor]
+        assert built == [executor]
+    finally:
+        release.set()
 
 
 def _start_turn_body() -> dict[str, Any]:
@@ -161,8 +262,12 @@ def use_error_with_usage(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def use_provider_auth_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "provider_auth_failure")
+def use_provider_auth_failure(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> str:
+    script = request.param
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", script)
+    return script
 
 
 @pytest.fixture
@@ -188,9 +293,12 @@ def use_capture_messages(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Pat
 # ── Tests ──────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("native_acceptance", [False, True], ids=["legacy", "native-acceptance"])
 async def test_text_chunk_translates_to_output_text_delta(
     use_text_only: None,
     manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+    native_acceptance: bool,
 ) -> None:
     """A TextChunk from the inner executor → response.output_text.delta.
 
@@ -200,6 +308,15 @@ async def test_text_chunk_translates_to_output_text_delta(
     text-delta event followed by response.completed.
     """
     conv_id = "conv_text"
+    acceptance = {
+        "session_id": conv_id,
+        "thread_id": "thread_text",
+        "response_id": "codex_turn_text",
+    }
+    if native_acceptance:
+        monkeypatch.setenv("MOCK_EXECUTOR_NATIVE_ACCEPTANCE", json.dumps(acceptance))
+    else:
+        monkeypatch.delenv("MOCK_EXECUTOR_NATIVE_ACCEPTANCE", raising=False)
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
     events: list[_ParsedSSEEvent] = []
     async with client.stream(
@@ -225,6 +342,12 @@ async def test_text_chunk_translates_to_output_text_delta(
     # If a future change makes TurnComplete.response emit a
     # delta, this test should be updated.
     assert "response.completed" in event_names
+    assert events[0].data["response"]["id"] == events[-1].data["response"]["id"]
+    assert events[-1].data["response"]["id"] != acceptance["response_id"]
+    if native_acceptance:
+        assert events[-1].data["native_acceptance"] == acceptance
+    else:
+        assert "native_acceptance" not in events[-1].data
 
 
 async def test_tool_call_translates_to_paired_function_call_items(
@@ -414,6 +537,156 @@ async def test_executor_error_terminates_with_response_failed(
     assert "mock error" in error_detail["message"]
 
 
+@pytest.mark.parametrize(
+    ("policy", "message", "error_code", "failure_stage"),
+    [
+        (
+            '{"fork": "/private/host/scan"}',
+            "The requested sandbox policy is invalid.",
+            "HarnessSandboxValidationError",
+            None,
+        ),
+        (
+            '{"sandbox": {"type": "linux_bwrap"}}',
+            "The selected harness cannot enforce os_env.sandbox",
+            "UnsupportedHarnessSandboxError",
+            None,
+        ),
+        (
+            '{"sandbox": {"type": "linux_bwrap"}}',
+            "The requested sandbox could not be prepared.",
+            "HarnessSandboxPreparationError",
+            "factory",
+        ),
+        (
+            '{"sandbox": {"type": "linux_bwrap"}}',
+            "The requested sandbox could not be prepared.",
+            "HarnessSandboxPreparationError",
+            "turn",
+        ),
+    ],
+    ids=[
+        "invalid-schema",
+        "unsupported-policy",
+        "factory-preparation-error",
+        "turn-preparation-error",
+    ],
+)
+async def test_executor_policy_failure_releases_turn_for_corrected_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    policy: str,
+    message: str,
+    error_code: str,
+    failure_stage: str | None,
+) -> None:
+    """Policy failures settle the turn and permit a same-session corrected retry."""
+    import asyncio
+    import os
+    from unittest.mock import AsyncMock, Mock
+
+    from omnigent.inner import antigravity_harness
+    from omnigent.inner.executor import ExecutorEvent, MockExecutor, TextChunk, TurnComplete
+    from omnigent.inner.sandbox import HarnessSandboxPreparationError
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [TextChunk(text="fake retry response"), TurnComplete(response="fake retry response")]
+    )
+    constructor = Mock(return_value=executor)
+    monkeypatch.setattr(antigravity_harness, "AntigravityExecutor", constructor)
+    policy_env = "HARNESS_ANTIGRAVITY_OS_ENV"
+    builder = antigravity_harness._build_antigravity_executor
+    private_diagnostic = "/private/host/scan"
+    monkeypatch.setenv(policy_env, policy)
+    factory = Mock(wraps=builder)
+    preparation_failure = HarnessSandboxPreparationError(
+        f"Containment setup failed: {private_diagnostic}"
+    )
+    if failure_stage == "factory":
+        factory.side_effect = preparation_failure
+    elif failure_stage == "turn":
+        failed_executor = MockExecutor()
+
+        async def fail_turn(**_kwargs: object) -> AsyncIterator[ExecutorEvent]:
+            raise preparation_failure
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(failed_executor, "run_turn", fail_turn)
+        failed_executor.close = AsyncMock()
+        failed_executor.close_session = AsyncMock()
+        factory.side_effect = lambda: failed_executor
+    session_id = "conv_factory_policy_retry"
+    adapter = ExecutorAdapter(executor_factory=factory, session_key=session_id)
+    app = adapter.build()
+    app.state.conversation_id = session_id
+    app.state.harness_auth_token = "spawn-token"
+    try:
+        async with (
+            asyncio.timeout(5),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://harness",
+                headers={"Authorization": "Bearer spawn-token"},
+            ) as client,
+        ):
+            event_url = f"/v1/sessions/{session_id}/events"
+            async with client.stream("POST", event_url, json=_start_turn_body()) as response:
+                assert response.status_code == 200
+                failed_events = [event async for event in _stream_iter(response)]
+            assert [event.event for event in failed_events] == [
+                "response.created",
+                "response.in_progress",
+                "response.failed",
+            ]
+            failed = failed_events[-1].data["response"]
+            assert failed["status"] == "failed"
+            assert failed["error"]["code"] == error_code
+            assert message in failed["error"]["message"]
+            assert private_diagnostic not in json.dumps([event.data for event in failed_events])
+            if error_code == "HarnessSandboxPreparationError" or private_diagnostic in policy:
+                assert private_diagnostic in caplog.text
+            factory.assert_called_once_with()
+            constructor.assert_not_called()
+            assert adapter._executor is None
+            assert adapter._current_ctx is None
+            assert adapter._current_agent is None
+            assert adapter._active_turn_ctx is None
+            assert adapter._in_flight == {}
+
+            if failure_stage is not None:
+                factory.side_effect = constructor
+            else:
+                monkeypatch.setenv(policy_env, '{"sandbox": {"type": "none"}}')
+            async with client.stream("POST", event_url, json=_start_turn_body()) as response:
+                assert response.status_code == 200
+                retry_events = [event async for event in _stream_iter(response)]
+            assert retry_events[0].event == "response.created"
+            assert retry_events[0].data["response"]["id"] != failed["id"]
+            assert retry_events[-1].event == "response.completed"
+            assert retry_events[-1].data["response"]["status"] == "completed"
+            assert any(
+                event.event == "response.output_text.delta"
+                and event.data["delta"] == "fake retry response"
+                for event in retry_events
+            )
+            if failure_stage is not None:
+                assert json.loads(policy) == json.loads(os.environ[policy_env])
+            if failure_stage == "turn":
+                failed_executor.close_session.assert_awaited_once_with(session_id)
+                failed_executor.close.assert_awaited_once_with()
+            assert factory.call_count == 2
+            constructor.assert_called_once()
+            assert adapter._executor is executor
+            assert adapter._current_ctx is None
+            assert adapter._current_agent is None
+            assert adapter._active_turn_ctx is None
+            assert adapter._in_flight == {}
+    finally:
+        await adapter.on_shutdown()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("preserve_session", [False, True])
 @pytest.mark.parametrize("retryable", [False, True])
@@ -506,8 +779,13 @@ async def test_executor_error_usage_reaches_response_failed(
     assert events[-1].data["response"]["error"] is not None
 
 
+@pytest.mark.parametrize(
+    "use_provider_auth_failure",
+    ["provider_auth_failure", "claude_preparation_auth_failure"],
+    indirect=True,
+)
 async def test_provider_auth_required_survives_adapter_and_sse_envelope(
-    use_provider_auth_failure: None,
+    use_provider_auth_failure: str,
     manager: HarnessProcessManager,
 ) -> None:
     conv_id = "conv_provider_auth"
@@ -521,7 +799,7 @@ async def test_provider_auth_required_survives_adapter_and_sse_envelope(
 
     assert events[-1].event == "response.failed"
     error = events[-1].data["response"]["error"]
-    assert error == {
+    expected = {
         "code": "PROVIDER_AUTH_REQUIRED",
         "message": (
             "Provider authentication required for host "
@@ -535,6 +813,14 @@ async def test_provider_auth_required_survives_adapter_and_sse_envelope(
         ),
         "remediation": "ucode configure",
     }
+    if use_provider_auth_failure == "claude_preparation_auth_failure":
+        expected.update(
+            message="Claude model authentication is unavailable; sign in again and retry.",
+            title="Claude authentication required",
+            cause="The selected Claude credential is missing or expired.",
+        )
+        expected.pop("remediation")
+    assert error == expected
     assert "stderr" not in str(error).lower()
     assert "token" not in str(error).lower()
 
@@ -543,11 +829,12 @@ async def test_turn_cancelled_terminates_with_response_cancelled(
     use_cancelled: None,
     manager: HarnessProcessManager,
 ) -> None:
-    """TurnCancelled -> response.cancelled terminal event.
+    """TurnCancelled -> response.cancelled terminal event, with the turn's usage.
 
     Provider-side cancellation is not driven by an inbound interrupt event, so
     the adapter must mark the turn context cancelled itself. Otherwise the
-    scaffold sees a clean return and emits response.completed.
+    scaffold sees a clean return and emits response.completed. The model calls
+    the turn made were spent, so their usage rides on the terminal event.
     """
     conv_id = "conv_cancelled"
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
@@ -562,6 +849,8 @@ async def test_turn_cancelled_terminates_with_response_cancelled(
     terminal_response = events[-1].data["response"]
     assert terminal_response["status"] == "cancelled"
     assert terminal_response.get("error") is None
+    assert terminal_response["usage"]["input_tokens"] == 300
+    assert terminal_response["usage"]["output_tokens"] == 40
 
 
 # ── Error-code classification ──────────────────────────────────
@@ -3178,6 +3467,10 @@ async def test_interrupt_drops_inner_session_synchronously() -> None:
     )
 
 
+# Usage that an interrupted native turn reports as it ends, e.g. the Claude CLI's final result.
+_INTERRUPTED_TURN_USAGE = {"input_tokens": 2641, "output_tokens": 512, "total_tokens": 3153}
+
+
 class _KeptSessionExecutor(Executor):
     """Executor that keeps its native session across an interrupt.
 
@@ -3215,7 +3508,7 @@ class _KeptSessionExecutor(Executor):
     async def run_turn(self, messages, tools, system_prompt, config=None):
         import asyncio
 
-        from omnigent.inner.executor import ExecutorError, TextChunk, TurnComplete
+        from omnigent.inner.executor import ExecutorError, TextChunk, TurnCancelled, TurnComplete
 
         try:
             self.turn_started.set()
@@ -3227,6 +3520,17 @@ class _KeptSessionExecutor(Executor):
                 yield TurnComplete(response="partial")
             elif self.stop_outcome == "errors":
                 yield ExecutorError(message="native session crashed")
+            elif self.stop_outcome == "cancels_with_usage":
+                yield TurnCancelled(usage=dict(_INTERRUPTED_TURN_USAGE))
+            elif self.stop_outcome == "completes_with_usage":
+                yield TurnComplete(response="partial", usage=dict(_INTERRUPTED_TURN_USAGE))
+            elif self.stop_outcome == "errors_with_usage":
+                yield ExecutorError(
+                    message="native session crashed", usage=dict(_INTERRUPTED_TURN_USAGE)
+                )
+            elif self.stop_outcome == "streams_then_cancels_with_usage":
+                yield TextChunk(text=" more")
+                yield TurnCancelled(usage=dict(_INTERRUPTED_TURN_USAGE))
             elif self.stop_outcome == "keeps_streaming":
                 yield TextChunk(text=" more")
                 await asyncio.Event().wait()
@@ -3259,8 +3563,19 @@ class _KeptSessionExecutor(Executor):
         self.closed.append(session_key)
 
 
+class _DroppedSessionExecutor(_KeptSessionExecutor):
+    """Executor that drops its native session on an interrupt."""
+
+    def resumes_after_interrupt(self) -> bool:
+        return False
+
+
 async def _interrupt_kept_session_turn(
-    stop_outcome: str, *, blocking_close: bool = False, blocking_interrupt: bool = False
+    stop_outcome: str,
+    *,
+    blocking_close: bool = False,
+    blocking_interrupt: bool = False,
+    executor_type: type[_KeptSessionExecutor] = _KeptSessionExecutor,
 ):
     """Start a turn on a :class:`_KeptSessionExecutor`, interrupt it, and return the pieces."""
     import asyncio
@@ -3269,7 +3584,7 @@ async def _interrupt_kept_session_turn(
     from omnigent.runtime.harnesses._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest
 
-    executor = _KeptSessionExecutor(
+    executor = executor_type(
         stop_outcome, blocking_close=blocking_close, blocking_interrupt=blocking_interrupt
     )
     adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
@@ -3282,6 +3597,37 @@ async def _interrupt_kept_session_turn(
 
     response = await asyncio.wait_for(adapter._handle_interrupt_event(), timeout=5)
     return adapter, executor, run_task, response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop_outcome", "executor_type"),
+    [
+        ("cancels_with_usage", _KeptSessionExecutor),
+        ("streams_then_cancels_with_usage", _KeptSessionExecutor),
+        ("completes_with_usage", _KeptSessionExecutor),
+        ("errors_with_usage", _KeptSessionExecutor),
+        ("cancels_with_usage", _DroppedSessionExecutor),
+    ],
+)
+async def test_interrupted_turn_keeps_the_usage_it_reports_as_it_ends(
+    stop_outcome: str, executor_type: type[_KeptSessionExecutor]
+) -> None:
+    """The usage that an interrupted turn reports as it ends reaches its terminal event.
+
+    A stop interrupts the turn; the native turn then ends, by cancelling, completing
+    or failing, with the usage of the model calls it made, at once or after more output.
+    Those calls were spent, so ``response.cancelled`` carries it, whether or not the
+    executor keeps its session.
+    """
+    adapter, _, run_task, response = await _interrupt_kept_session_turn(
+        stop_outcome, executor_type=executor_type
+    )
+    ctx = adapter._in_flight["resp_1"]
+
+    assert response.status_code == 204
+    await run_task
+    assert ctx.provider_usage == _INTERRUPTED_TURN_USAGE
 
 
 @pytest.mark.asyncio

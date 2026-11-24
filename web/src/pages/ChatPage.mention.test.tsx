@@ -11,9 +11,9 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UseSidebarDataModule from "@/hooks/useSidebarData";
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { ReactElement } from "react";
+import { createRef, type ComponentRef, type ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { useChatStore } from "@/store/chatStore";
+import { handleSessionEvent, useChatStore } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 
@@ -165,6 +165,15 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
 
 import { Composer, detectMentionAt, mentionMarkerFor } from "./ChatPage";
 import { SESSION_MENTION_CAP, SESSION_MENTION_HINT } from "@/lib/composerMentions";
+import * as CodeMirrorModule from "@/components/composer/engine/CodeMirrorComposerInput";
+import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
+import { composerTargetOf } from "@/components/composer/engine/composerInput";
+import { redo, undo } from "@codemirror/commands";
+import { EditorView } from "@codemirror/view";
+import { insertComposerText } from "@/lib/composerText";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { ATTACHMENT_SIZE_LIMITS_MB } from "@/lib/attachments";
 
 function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) {
   return {
@@ -583,6 +592,31 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     );
   });
 
+  it("re-adds a file on 'Attach to agent' when a released session's longer spelling stays literal", () => {
+    const onSend = vi.fn();
+    sessions.loaded = [sessionRow("s_readme", "readme.md")];
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("compare @readme");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    append("with @readme");
+    fireEvent.click(screen.getByTitle("Tag session readme.md"));
+    const [, sessionToken] = tokens();
+    // Clear the draft, which releases both tags, then paste the session's spelling back by hand.
+    type("");
+    type(`see ${sessionToken} `);
+    expect(tokens()).toEqual([]);
+    act(() => {
+      useChatStore.setState({ pendingComposerAttachments: [{ path: "readme.md", isDir: false }] });
+    });
+    // The file is tagged again instead of lost; no session rides along.
+    expect(tokens()).toContain("@readme.md");
+    fireEvent.submit(textarea().closest("form")!);
+    const sent = onSend.mock.calls[0]![0] as string;
+    expect(sent).toContain("[Attached: readme.md]");
+    expect(sent).not.toContain("[Session:");
+    expect(sent).not.toContain(SESSION_MENTION_HINT);
+  });
+
   it("keeps the highlighted file when session results land above it", async () => {
     sessions.searchHits = [sessionRow("s_readme", "readme cleanup")];
     renderWithTooltips(<Composer {...composerProps()} />);
@@ -896,6 +930,32 @@ describe("Composer @-session mentions", () => {
       );
     });
 
+    it("forgets a retracted restore's tags, so the next draft tags a same-title session plainly", () => {
+      renderWithTooltips(<Composer {...composerProps()} />);
+      const stableId = "9".repeat(32);
+      const failed = `Ask [Session: "Alpha planning" id=s_other subagent=no] to review\n\n${SESSION_MENTION_HINT}`;
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: { conversationId: currentId, text: failed, files: [], stableId },
+        }),
+      );
+      expect(tokens()).toEqual(["@Alpha planning"]);
+      // The send was delivered after all, so the untouched restored draft is retracted.
+      act(() =>
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: stableId,
+          itemType: "message",
+          data: { role: "user", content: [{ type: "input_text", text: failed }] },
+        }),
+      );
+      expect(textarea().value).toBe("");
+
+      type("@alpha");
+      fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+      expect(tokens()).toEqual(["@Alpha planning"]);
+    });
+
     it("merges a failed send into newer input without retargeting either tag", () => {
       const onSend = vi.fn();
       renderWithTooltips(<Composer {...composerProps({ onSend })} />);
@@ -1025,5 +1085,836 @@ describe("Composer @-session mentions", () => {
     type("@src/");
     expect(screen.queryAllByTestId(/^session-mention-item-/)).toHaveLength(0);
     expect(screen.getByTitle("Attach server.ts")).toBeInTheDocument();
+  });
+});
+
+describe("Composer @-file mentions with the CodeMirror composer", () => {
+  const codeMirrorInfo = { ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: true } };
+  beforeEach(() => {
+    resetWorkspaceMock();
+    declaredMentions.harnesses = new Set();
+    localStorage.clear();
+    useChatStore.setState({
+      conversationId: "conv_codemirror_mention",
+      sessionHarness: "claude-native",
+      pendingComposerAttachments: [],
+    });
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+  });
+  afterEach(() => {
+    cleanup();
+    resetCodeMirrorComposerLoadForTests();
+    vi.restoreAllMocks();
+  });
+
+  it("shows an attached file as a pill inside the editor", async () => {
+    renderWithTooltips(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...composerProps()} />
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    const editor = screen.getByLabelText("Message the agent");
+
+    act(() => insertComposerText(composerTargetOf(editor)!, "@"));
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+
+    expect(editor.closest('[data-composer-engine="codemirror"]')).not.toBeNull();
+    expect(
+      Array.from(
+        editor.querySelectorAll('[data-testid="composer-mention-token"]'),
+        (token) => token.textContent,
+      ),
+    ).toEqual(["@readme.md"]);
+  });
+});
+
+describe.each(["textarea", "codemirror"] as const)(
+  "Composer @-mention edits and undo on the %s engine",
+  (engine) => {
+    const codeMirrorInfo = {
+      ...FALLBACK_SERVER_INFO,
+      features: { chat_composer_codemirror: true },
+    };
+    let convSeq = 0;
+    beforeEach(() => {
+      resetWorkspaceMock();
+      declaredMentions.harnesses = new Set();
+      localStorage.clear();
+      useChatStore.setState({
+        conversationId: `conv_undo_${engine}_${++convSeq}`,
+        sessionHarness: "claude-native",
+        pendingComposerAttachments: [],
+      });
+      resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    });
+    afterEach(() => {
+      cleanup();
+      resetCodeMirrorComposerLoadForTests();
+      vi.restoreAllMocks();
+    });
+
+    async function renderComposer(props: ReturnType<typeof composerProps>) {
+      const ui = (
+        <TooltipProvider>
+          <Composer {...props} />
+        </TooltipProvider>
+      );
+      if (engine === "textarea") {
+        render(ui);
+        return;
+      }
+      render(<CapabilitiesProvider info={codeMirrorInfo}>{ui}</CapabilitiesProvider>);
+      await waitFor(() => expect(composerInput()).toHaveClass("cm-content"));
+    }
+    const composerInput = () => screen.getByLabelText("Message the agent");
+    const valueOf = () => composerTargetOf(composerInput())!.value;
+    const caretOf = () => composerTargetOf(composerInput())!.selectionStart;
+    const caretAt = (offset: number) =>
+      act(() => composerTargetOf(composerInput())!.setSelectionRange(offset, offset));
+    const typeAt = (text: string, offset = valueOf().length) =>
+      act(() => insertComposerText(composerTargetOf(composerInput())!, text, offset, offset));
+    /** A key typed at the caret: a CodeMirror typed transaction, or a textarea insert. */
+    const typeKey = (text: string) =>
+      act(() => {
+        if (engine === "codemirror") {
+          const view = EditorView.findFromDOM(composerInput())!;
+          const { from, to } = view.state.selection.main;
+          view.dispatch({
+            changes: { from, to, insert: text },
+            selection: { anchor: from + text.length },
+            userEvent: "input.type",
+          });
+          return;
+        }
+        insertComposerText(composerTargetOf(composerInput())!, text);
+      });
+
+    /** ⌘Z. jsdom has no native textarea undo, so its browser undo is the input event it fires. */
+    function undoTo(text: string) {
+      stepHistory(text, "historyUndo", (editor) => undo(editor));
+    }
+    /** ⌘⇧Z. */
+    function redoTo(text: string) {
+      stepHistory(text, "historyRedo", (editor) => redo(editor));
+    }
+    function stepHistory(
+      text: string,
+      inputType: string,
+      stepCodeMirror: (editor: EditorView) => boolean,
+    ) {
+      if (engine === "codemirror") {
+        act(() => void stepCodeMirror(EditorView.findFromDOM(composerInput())!));
+      } else {
+        act(() => {
+          const field = composerInput() as HTMLTextAreaElement;
+          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(
+            field,
+            text,
+          );
+          field.dispatchEvent(new InputEvent("input", { bubbles: true, inputType }));
+        });
+      }
+      expect(valueOf()).toBe(text);
+    }
+
+    it("brings a deleted pill back on ⌘Z, still tagged, so the file attaches on send", async () => {
+      const props = composerProps();
+      await renderComposer(props);
+      typeAt("Read @rea");
+      fireEvent.click(screen.getByTitle("Attach readme.md"));
+      expect(tokens()).toEqual(["@readme.md"]);
+
+      caretAt("Read @readme.md".length);
+      fireEvent.keyDown(composerInput(), { key: "Backspace" });
+      expect(valueOf()).toBe("Read  ");
+      expect(tokens()).toEqual([]);
+
+      undoTo("Read @readme.md ");
+      expect(tokens()).toEqual(["@readme.md"]);
+
+      fireEvent.submit(composerInput().closest("form")!);
+      expect(props.onSend).toHaveBeenCalledWith("Read [Attached: readme.md]", undefined);
+    });
+
+    it("re-picks a deleted file from the menu, then undoes and redoes its next deletion", async () => {
+      const props = composerProps();
+      await renderComposer(props);
+      typeAt("Read @rea");
+      fireEvent.click(screen.getByTitle("Attach readme.md"));
+      caretAt("Read @readme.md".length);
+      fireEvent.keyDown(composerInput(), { key: "Backspace" });
+
+      typeAt("@rea", "Read ".length);
+      fireEvent.click(screen.getByTitle("Attach readme.md"));
+      expect(tokens()).toEqual(["@readme.md"]);
+      caretAt("Read @readme.md".length);
+      fireEvent.keyDown(composerInput(), { key: "Backspace" });
+      expect(tokens()).toEqual([]);
+
+      undoTo("Read @readme.md ");
+      expect(tokens()).toEqual(["@readme.md"]);
+      redoTo("Read  ");
+      expect(tokens()).toEqual([]);
+      undoTo("Read @readme.md ");
+      fireEvent.submit(composerInput().closest("form")!);
+      expect(props.onSend).toHaveBeenCalledWith("Read [Attached: readme.md]", undefined);
+    });
+
+    it("takes the pill away again on ⌘⇧Z redo", async () => {
+      await renderComposer(composerProps());
+      typeAt("Read @rea");
+      fireEvent.click(screen.getByTitle("Attach readme.md"));
+      caretAt("Read @readme.md".length);
+      fireEvent.keyDown(composerInput(), { key: "Backspace" });
+      undoTo("Read @readme.md ");
+
+      redoTo("Read  ");
+      expect(tokens()).toEqual([]);
+    });
+
+    it("leaves the caret after the token and its space when a file is picked mid-text", async () => {
+      await renderComposer(composerProps());
+      typeAt("Read more");
+      typeAt("@rea", "Read ".length);
+      fireEvent.click(screen.getByTitle("Attach readme.md"));
+
+      expect(valueOf()).toBe("Read @readme.md more");
+      expect(caretOf()).toBe("Read @readme.md ".length);
+    });
+
+    it.runIf(engine === "textarea")(
+      "releases the pill when text is typed right after it",
+      async () => {
+        await renderComposer(composerProps());
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        caretAt("Read @readme.md".length);
+        typeKey("x");
+
+        expect(valueOf()).toBe("Read @readme.mdx ");
+        expect(tokens()).toEqual([]);
+      },
+    );
+
+    it.runIf(engine === "codemirror")(
+      "keeps a pill when text is typed right after it, and still attaches it on send",
+      async () => {
+        const props = composerProps();
+        await renderComposer(props);
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        caretAt("Read @readme.md".length);
+        typeKey("x");
+
+        expect(valueOf()).toBe("Read @readme.md x ");
+        expect(tokens()).toEqual(["@readme.md"]);
+        fireEvent.submit(composerInput().closest("form")!);
+        expect(props.onSend).toHaveBeenCalledWith("Read [Attached: readme.md] x", undefined);
+      },
+    );
+
+    it.runIf(engine === "codemirror")(
+      "keeps a pill when text is typed right before it, with the caret after the typed text",
+      async () => {
+        const props = composerProps();
+        await renderComposer(props);
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        caretAt("Read ".length);
+        typeKey("x");
+
+        expect(valueOf()).toBe("Read x @readme.md ");
+        expect(caretOf()).toBe("Read x".length);
+        expect(tokens()).toEqual(["@readme.md"]);
+        fireEvent.submit(composerInput().closest("form")!);
+        expect(props.onSend).toHaveBeenCalledWith("Read x [Attached: readme.md]", undefined);
+      },
+    );
+
+    it.runIf(engine === "codemirror")(
+      "undoes text typed beside a pill, and the space it added, in one step with the pill kept",
+      async () => {
+        await renderComposer(composerProps());
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        caretAt("Read @readme.md".length);
+        typeKey("x");
+        expect(valueOf()).toBe("Read @readme.md x ");
+        expect(tokens()).toEqual(["@readme.md"]);
+
+        undoTo("Read @readme.md ");
+        expect(tokens()).toEqual(["@readme.md"]);
+      },
+    );
+
+    it.runIf(engine === "codemirror")(
+      "adds no space beside a pill in reply-quote mode, where the editor paints no pills",
+      async () => {
+        const ref = createRef<ComponentRef<typeof Composer>>();
+        render(
+          <CapabilitiesProvider info={codeMirrorInfo}>
+            <TooltipProvider>
+              <Composer {...composerProps()} ref={ref} />
+            </TooltipProvider>
+          </CapabilitiesProvider>,
+        );
+        await waitFor(() => expect(composerInput()).toHaveClass("cm-content"));
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        act(() => ref.current?.appendReplyQuote("Quoted text"));
+
+        const before = composerTargetOf(screen.getByLabelText("Reply text before quote 1"))!;
+        expect(before.value).toBe("Read @readme.md ");
+        act(() =>
+          insertComposerText(before, "x", "Read @readme.md".length, "Read @readme.md".length),
+        );
+        expect(before.value).toBe("Read @readme.mdx ");
+      },
+    );
+
+    it.runIf(engine === "codemirror")(
+      "places the caret after a typed @ that lands before a pill",
+      async () => {
+        await renderComposer(composerProps());
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        caretAt("Read ".length);
+        typeKey("@");
+
+        expect(valueOf()).toBe("Read @ @readme.md ");
+        expect(caretOf()).toBe("Read @".length);
+        expect(tokens()).toEqual(["@readme.md"]);
+      },
+    );
+
+    it.runIf(engine === "codemirror")(
+      "steps undo and redo back through a completed mention and a folder drill-in",
+      async () => {
+        await renderComposer(composerProps());
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        typeAt("then @sr");
+        fireEvent.click(screen.getByTitle("Open src"));
+        const drilled = "Read @readme.md then @src/";
+        expect(valueOf()).toBe(drilled);
+
+        undoTo("Read @readme.md then @sr");
+        expect(caretOf()).toBe("Read @readme.md then @sr".length);
+        undoTo("Read @readme.md ");
+        expect(caretOf()).toBe("Read @readme.md ".length);
+        undoTo("Read @rea");
+        expect(caretOf()).toBe("Read @rea".length);
+
+        redoTo("Read @readme.md ");
+        expect(caretOf()).toBe("Read @readme.md ".length);
+        redoTo("Read @readme.md then @sr");
+        expect(caretOf()).toBe("Read @readme.md then @sr".length);
+        redoTo(drilled);
+        expect(caretOf()).toBe(drilled.length);
+      },
+    );
+
+    it.runIf(engine === "codemirror")(
+      "keeps a deleted pill's retyped text literal rather than re-tagging it",
+      async () => {
+        const props = composerProps();
+        await renderComposer(props);
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        caretAt("Read @readme.md".length);
+        fireEvent.keyDown(composerInput(), { key: "Backspace" });
+
+        typeAt("@readme.md ");
+        expect(valueOf()).toBe("Read  @readme.md ");
+        expect(tokens()).toEqual([]);
+        fireEvent.submit(composerInput().closest("form")!);
+        expect(props.onSend).toHaveBeenCalledWith("Read  @readme.md", undefined);
+      },
+    );
+  },
+);
+
+// With the CodeMirror flag off, the textarea composer keeps its own tray and mention behaviour.
+describe("Composer on the textarea engine with the flag off", () => {
+  beforeEach(() => {
+    resetWorkspaceMock();
+    declaredMentions.harnesses = new Set();
+    localStorage.clear();
+    useChatStore.setState({
+      conversationId: `conv_textarea_parity_${Math.random()}`,
+      sessionHarness: "claude-native",
+      pendingComposerAttachments: [],
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("keeps two picked files with the same name under both names", () => {
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    const picker = document.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(picker, {
+      target: { files: [new File(["1"], "image.png", { type: "image/png" })] },
+    });
+    fireEvent.change(picker, {
+      target: { files: [new File(["2"], "image.png", { type: "image/png" })] },
+    });
+    fireEvent.submit(textarea().closest("form")!);
+    const sent = onSend.mock.calls[0]![1] as File[];
+    expect(sent.map((file) => file.name)).toEqual(["image.png", "image.png"]);
+  });
+
+  it("expands a literal @Plan.png beside a session tagged @Plan", () => {
+    sessions.loaded = [sessionRow("s_plan", "Plan")];
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("Ask @Pl");
+    fireEvent.click(screen.getByTitle("Tag session Plan"));
+    append("and @Plan.png");
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend.mock.calls[0]![0]).toBe(
+      `Ask [Session: "Plan" id=s_plan subagent=no] and [Session: "Plan" id=s_plan subagent=no].png\n\n${SESSION_MENTION_HINT}`,
+    );
+  });
+});
+
+describe("Composer pasted chips", () => {
+  const codeMirrorInfo = { ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: true } };
+  let convSeq = 0;
+  beforeEach(() => {
+    resetWorkspaceMock();
+    declaredMentions.harnesses = new Set();
+    localStorage.clear();
+    useChatStore.setState({
+      conversationId: `conv_chips_${++convSeq}`,
+      sessionHarness: "claude-native",
+      pendingComposerAttachments: [],
+    });
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+  });
+  afterEach(() => {
+    cleanup();
+    resetCodeMirrorComposerLoadForTests();
+    vi.restoreAllMocks();
+  });
+
+  async function renderCodeMirrorComposer(
+    onSend = vi.fn(),
+    overrides: Partial<Parameters<typeof Composer>[0]> = {},
+  ) {
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <TooltipProvider>
+          <Composer {...composerProps({ onSend, ...overrides })} />
+        </TooltipProvider>
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() => expect(composerInput()).toHaveClass("cm-content"));
+    return onSend;
+  }
+  const composerInput = () => screen.getByLabelText("Message the agent");
+  const valueOf = () => composerTargetOf(composerInput())!.value;
+  const caretAt = (offset: number) =>
+    act(() => composerTargetOf(composerInput())!.setSelectionRange(offset, offset));
+  const typeAt = (text: string, offset = valueOf().length) =>
+    act(() => insertComposerText(composerTargetOf(composerInput())!, text, offset, offset));
+  const editorView = () => EditorView.findFromDOM(composerInput())!;
+  /** A paste as the clipboard carries it: text and/or file entries. */
+  function pasteOf({ text, files = [] }: { text?: string; files?: File[] }) {
+    const items = [
+      ...(text === undefined
+        ? []
+        : [{ kind: "string", type: "text/plain", getAsFile: () => null }]),
+      ...files.map((file) => ({ kind: "file", type: file.type, getAsFile: () => file })),
+    ];
+    return {
+      clipboardData: {
+        items,
+        getData: (format: string) => (format === "text/plain" ? (text ?? "") : ""),
+      },
+    };
+  }
+  const paste = (payload: Parameters<typeof pasteOf>[0]) =>
+    fireEvent.paste(composerInput(), pasteOf(payload));
+  const sentFiles = (onSend: ReturnType<typeof vi.fn>) =>
+    onSend.mock.calls[0]![1] as File[] | undefined;
+
+  it("inserts one named chip per pasted image at its caret, and sends both files", async () => {
+    const onSend = await renderCodeMirrorComposer();
+    const shot = new File(["a"], "shot.png", { type: "image/png" });
+    const diagram = new File(["b"], "diagram.png", { type: "image/png" });
+    typeAt("Compare  with the old one");
+    caretAt("Compare ".length);
+    paste({ files: [shot] });
+    caretAt(valueOf().length);
+    paste({ files: [diagram] });
+
+    expect(valueOf()).toBe("Compare @shot.png with the old one @diagram.png ");
+    expect(tokens()).toEqual(["@shot.png", "@diagram.png"]);
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(onSend.mock.calls[0]![0]).toBe("Compare @shot.png with the old one @diagram.png");
+    expect(sentFiles(onSend)).toEqual([shot, diagram]);
+  });
+
+  it("drops a deleted chip's file from the send", async () => {
+    const onSend = await renderCodeMirrorComposer();
+    typeAt("Look ");
+    paste({ files: [new File(["a"], "shot.png", { type: "image/png" })] });
+    caretAt("Look @shot.png".length);
+    fireEvent.keyDown(composerInput(), { key: "Backspace" });
+    expect(tokens()).toEqual([]);
+
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(onSend).toHaveBeenCalledWith("Look", undefined);
+  });
+
+  it("brings a Backspace-deleted chip back on undo with the same File", async () => {
+    const onSend = await renderCodeMirrorComposer();
+    typeAt("Look ");
+    const shot = new File(["a"], "shot.png", { type: "image/png" });
+    paste({ files: [shot] });
+    caretAt("Look @shot.png".length);
+    fireEvent.keyDown(composerInput(), { key: "Backspace" });
+    expect(tokens()).toEqual([]);
+
+    act(() => void undo(editorView()));
+    expect(tokens()).toEqual(["@shot.png"]);
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(sentFiles(onSend)![0]).toBe(shot);
+  });
+
+  it("keeps a live chip's file in its session when the composer switches sessions and back", async () => {
+    const sessionA = useChatStore.getState().conversationId!;
+    const onSend = vi.fn();
+    const tree = (
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <TooltipProvider>
+          <Composer {...composerProps({ onSend })} />
+        </TooltipProvider>
+      </CapabilitiesProvider>
+    );
+    const view = render(tree);
+    await waitFor(() => expect(composerInput()).toHaveClass("cm-content"));
+    typeAt("Look ");
+    paste({ files: [new File(["a"], "shot.png", { type: "image/png" })] });
+
+    // Switch to session B without unmounting the composer.
+    act(() => useChatStore.setState({ conversationId: `${sessionA}_other` }));
+    view.rerender(tree);
+    expect(valueOf()).toBe("");
+    expect(tokens()).toEqual([]);
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(onSend).not.toHaveBeenCalled();
+
+    // Back on A, the chip's text is literal and its file is still in the tray.
+    act(() => useChatStore.setState({ conversationId: sessionA }));
+    view.rerender(tree);
+    expect(valueOf()).toBe("Look @shot.png ");
+    expect(tokens()).toEqual([]);
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(sentFiles(onSend)!.map((file) => file.name)).toEqual(["shot.png"]);
+  });
+
+  it("⌘Z removes a fresh chip with its file, and ⌘⇧Z brings both back for the send", async () => {
+    const onSend = await renderCodeMirrorComposer();
+    const shot = new File(["a"], "shot.png", { type: "image/png" });
+    typeAt("Look ");
+    paste({ files: [shot] });
+    expect(valueOf()).toBe("Look @shot.png ");
+
+    act(() => void undo(editorView()));
+    expect(valueOf()).toBe("Look ");
+    expect(tokens()).toEqual([]);
+
+    act(() => void redo(editorView()));
+    expect(valueOf()).toBe("Look @shot.png ");
+    expect(tokens()).toEqual(["@shot.png"]);
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(sentFiles(onSend)).toEqual([shot]);
+    expect(sentFiles(onSend)![0]).toBe(shot);
+  });
+
+  it("attaches a large text paste as a .txt chip", async () => {
+    const onSend = await renderCodeMirrorComposer();
+    const log = "line\n".repeat(49) + "line";
+    paste({ text: log });
+    expect(valueOf()).toBe("@pasted-text.txt ");
+    expect(tokens()).toEqual(["@pasted-text.txt"]);
+
+    fireEvent.submit(composerInput().closest("form")!);
+    const [text] = sentFiles(onSend)!;
+    expect(text!.name).toBe("pasted-text.txt");
+    expect(text!.type).toBe("text/plain");
+    expect(text!.size).toBe(log.length);
+  });
+
+  it("keeps a small text paste inline", async () => {
+    await renderCodeMirrorComposer();
+    paste({ text: "hello world" });
+    expect(valueOf()).toBe("hello world");
+    expect(tokens()).toEqual([]);
+  });
+
+  it("keeps a pasted file in the tray when the composer refuses the chip's insert", async () => {
+    await renderCodeMirrorComposer(undefined, { disabled: true });
+    paste({ files: [new File(["s"], "shot.png", { type: "image/png" })] });
+    // The paste's default was cancelled, so the file must not be lost: it lands in the tray.
+    expect(tokens()).toEqual([]);
+    expect(screen.getByAltText("shot.png")).toBeInTheDocument();
+  });
+
+  it("inserts nothing for a rejected file and shows the rejection", async () => {
+    await renderCodeMirrorComposer();
+    paste({ files: [new File(["x"], "setup.exe", { type: "application/x-msdownload" })] });
+    expect(valueOf()).toBe("");
+    expect(tokens()).toEqual([]);
+    expect(screen.getByText(/"setup.exe" can't be attached/)).toBeInTheDocument();
+
+    // A mixed paste inserts its accepted file as a chip, and its rejection stays visible: the insert
+    // itself must not clear the batch's error, and the earlier error is replaced.
+    paste({
+      files: [
+        new File(["s"], "shot.png", { type: "image/png" }),
+        new File(["x"], "setup2.exe", { type: "application/x-msdownload" }),
+      ],
+    });
+    expect(valueOf()).toBe("@shot.png ");
+    expect(tokens()).toEqual(["@shot.png"]);
+    expect(screen.getByText(/"setup2.exe" can't be attached/)).toBeInTheDocument();
+    expect(screen.queryByText(/"setup.exe"/)).toBeNull();
+  });
+
+  it("keeps a newer chip's file when a failed send merges into newer input", async () => {
+    const onSend = await renderCodeMirrorComposer();
+    typeAt("first ");
+    const newer = new File(["n"], "shot.png", { type: "image/png" });
+    paste({ files: [newer] });
+    // A failed send recovers while the newer chip is still in the composer.
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: useChatStore.getState().conversationId!,
+          text: "Ask again",
+          files: [],
+          recovered: true,
+        },
+      }),
+    );
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(onSend.mock.calls[0]![0]).toBe("first @shot.png \n\nAsk again");
+    expect(sentFiles(onSend)).toHaveLength(1);
+    expect(sentFiles(onSend)![0]).toBe(newer);
+  });
+
+  it("sends a file whose name has line breaks under a canonical name its reference matches", async () => {
+    const onSend = await renderCodeMirrorComposer();
+    paste({
+      files: [
+        new File(["1"], "note\r.txt", { type: "text/plain" }),
+        new File(["2"], "a\r\nb.txt", { type: "text/plain" }),
+        new File(["3"], "c\nd.txt", { type: "text/plain" }),
+      ],
+    });
+    expect(tokens()).toEqual(["@note .txt", "@a b.txt", "@c d.txt"]);
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(onSend.mock.calls[0]![0]).toBe("@note .txt @a b.txt @c d.txt");
+    expect(sentFiles(onSend)!.map((file) => file.name)).toEqual([
+      "note .txt",
+      "a b.txt",
+      "c d.txt",
+    ]);
+  });
+
+  it("replaces a selected range with the chip", async () => {
+    await renderCodeMirrorComposer();
+    typeAt("Look at THIS now");
+    act(() => composerTargetOf(composerInput())!.setSelectionRange(8, 12));
+    paste({ files: [new File(["s"], "shot.png", { type: "image/png" })] });
+    expect(valueOf()).toBe("Look at @shot.png now");
+    expect(tokens()).toEqual(["@shot.png"]);
+  });
+
+  it("keeps a chip's file as a tray file when the composer remounts with the saved draft", async () => {
+    const onSend = await renderCodeMirrorComposer();
+    typeAt("Look ");
+    paste({ files: [new File(["a"], "shot.png", { type: "image/png" })] });
+    cleanup();
+
+    // A saved draft carries the chip's file as a tray file, and its text as plain literal text.
+    await renderCodeMirrorComposer(onSend);
+    expect(tokens()).toEqual([]);
+    expect(valueOf()).toBe("Look @shot.png ");
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(sentFiles(onSend)!.map((file) => file.name)).toEqual(["shot.png"]);
+  });
+
+  it("keeps a large text paste inline when its .txt file is over the upload limit", async () => {
+    // A small stubbed limit: the .txt is rejected just as a 10 MB one would be, without the bulk.
+    const limits: { text: number } = ATTACHMENT_SIZE_LIMITS_MB;
+    const textLimit = limits.text;
+    limits.text = 0.0001;
+    onTestFinished(() => {
+      limits.text = textLimit;
+    });
+    await renderCodeMirrorComposer();
+    const oversized = "x".repeat(4000);
+    paste({ text: oversized });
+    expect(valueOf()).toBe(oversized);
+    expect(tokens()).toEqual([]);
+    expect(screen.queryByText(/is too large/)).toBeNull();
+  });
+
+  it("sends a pasted file whose name starts with a session's title as written", async () => {
+    sessions.loaded = [sessionRow("s_plan", "Plan")];
+    const onSend = await renderCodeMirrorComposer();
+    typeAt("Ask @Pl");
+    fireEvent.click(screen.getByTitle("Tag session Plan"));
+    paste({ files: [new File(["p"], "Plan.png", { type: "image/png" })] });
+
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(onSend.mock.calls[0]![0]).toBe(
+      `Ask [Session: "Plan" id=s_plan subagent=no] @Plan.png\n\n${SESSION_MENTION_HINT}`,
+    );
+  });
+
+  it("keeps the chips of one multi-file paste on the caret's line before a newline", async () => {
+    await renderCodeMirrorComposer();
+    typeAt("Compare\nthen");
+    caretAt("Compare".length);
+    paste({
+      files: [
+        new File(["a"], "a.png", { type: "image/png" }),
+        new File(["b"], "b.png", { type: "image/png" }),
+      ],
+    });
+    expect(valueOf()).toBe("Compare @a.png @b.png\nthen");
+    expect(tokens()).toEqual(["@a.png", "@b.png"]);
+  });
+
+  it("names a re-pasted file apart from a literal spelling and tray file it repeats", async () => {
+    const onSend = await renderCodeMirrorComposer();
+    const shot = new File(["a"], "shot.png", { type: "image/png" });
+    // A failed send restores its text as literal spellings, with its files back in the tray.
+    act(() =>
+      useChatStore.setState({
+        rewindPrefill: {
+          conversationId: useChatStore.getState().conversationId!,
+          text: "Look @shot.png",
+          files: [shot],
+          replyDraft: undefined,
+        },
+      }),
+    );
+    await waitFor(() => expect(valueOf()).toBe("Look @shot.png"));
+    caretAt(valueOf().length);
+    paste({ files: [new File(["b"], "shot.png", { type: "image/png" })] });
+    expect(tokens()).toEqual(["@shot (2).png"]);
+
+    caretAt("Look @shot.png @shot (2).png".length);
+    fireEvent.keyDown(composerInput(), { key: "Backspace" });
+    expect(tokens()).toEqual([]);
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(sentFiles(onSend)).toHaveLength(1);
+    expect(sentFiles(onSend)![0]).toBe(shot);
+  });
+
+  // Each row is one sequence of actions and the send it must produce: names follow the rules for
+  // chips and picks, and the typed text keeps the references the user made.
+  type AttachmentStep =
+    | { paste: string }
+    | { pick: string }
+    | { type: string }
+    | { backspace: string }
+    | { remount: true }
+    | "undo"
+    | "redo";
+  const attachmentSequences: [string, AttachmentStep[], { text: string; names: string[] }][] = [
+    [
+      "a chip, then a picked file with its name",
+      [{ paste: "a.png" }, { pick: "a.png" }],
+      { text: "@a.png", names: ["a (2).png", "a.png"] },
+    ],
+    [
+      "a picked file, then a chip with its name",
+      [{ pick: "a.png" }, { paste: "a.png" }],
+      { text: "@a (2).png", names: ["a.png", "a (2).png"] },
+    ],
+    [
+      "a deleted chip's name stays reserved for undo, so a picked file takes the next name",
+      [{ paste: "a.png" }, { backspace: "@a.png" }, { pick: "a.png" }],
+      { text: "", names: ["a (2).png"] },
+    ],
+    [
+      "an undone chip's name is kept, so a picked file avoids it until redo",
+      [{ paste: "a.png" }, "undo", { pick: "a.png" }, "redo"],
+      { text: "@a.png", names: ["a (2).png", "a.png"] },
+    ],
+    [
+      "a typed spelling is kept literal and a chip takes the next name",
+      [{ type: "look @b.png " }, { paste: "b.png" }],
+      { text: "look @b.png @b (2).png", names: ["b (2).png"] },
+    ],
+    [
+      "a repeated chip takes the next name, and keeps its file's name",
+      [{ paste: "image.png" }, { paste: "image.png" }],
+      { text: "@image.png @image (2).png", names: ["image.png", "image (2).png"] },
+    ],
+    [
+      "a pick repeating a tray file keeps its name when no chip clashes",
+      [{ type: "look " }, { paste: "a.png" }, { remount: true }, { pick: "a.png" }],
+      { text: "look @a.png", names: ["a.png", "a.png"] },
+    ],
+    [
+      "a deleted first chip leaves the second chip's name as it was",
+      [{ paste: "a.png" }, { paste: "a.png" }, { backspace: "@a.png" }],
+      { text: " @a (2).png", names: ["a (2).png"] },
+    ],
+  ];
+
+  it.each(attachmentSequences)(
+    "names pasted chips and picks as the rules say, across %s",
+    async (_, steps, want) => {
+      const onSend = await renderCodeMirrorComposer();
+      for (const step of steps) {
+        if (step === "undo") act(() => void undo(editorView()));
+        else if (step === "redo") act(() => void redo(editorView()));
+        else if ("paste" in step)
+          paste({ files: [new File(["x"], step.paste, { type: "image/png" })] });
+        else if ("pick" in step) {
+          const picker = document.querySelector('input[type="file"]') as HTMLInputElement;
+          fireEvent.change(picker, {
+            target: { files: [new File(["y"], step.pick, { type: "image/png" })] },
+          });
+        } else if ("remount" in step) {
+          cleanup();
+          // oxlint-disable-next-line no-await-in-loop -- steps run in order, each after the last.
+          await renderCodeMirrorComposer(onSend);
+        } else if ("type" in step) typeAt(step.type);
+        else {
+          const token = step.backspace;
+          caretAt(valueOf().indexOf(token) + token.length);
+          fireEvent.keyDown(composerInput(), { key: "Backspace" });
+        }
+      }
+      fireEvent.submit(composerInput().closest("form")!);
+      const sent = onSend.mock.calls.at(-1)!;
+      const files = (sent[1] as File[] | undefined) ?? [];
+      const names = files.map((file) => file.name);
+      expect(names).toEqual(want.names);
+      expect(sent[0]).toBe(want.text);
+    },
+  );
+
+  it("leaves a large text paste inline on the textarea engine", () => {
+    render(<Composer {...composerProps()} />);
+    const log = "line\n".repeat(49) + "line";
+    paste({ text: log });
+    expect(textarea().value).toBe(log);
+    expect(screen.queryByText("pasted-text.txt")).toBeNull();
   });
 });

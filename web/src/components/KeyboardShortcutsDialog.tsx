@@ -1,11 +1,6 @@
-// A read-only "Keyboard shortcuts" overlay listing the shortcuts that already
-// exist in the chat surface. The rows come from `@/lib/shortcutCatalog`, which
-// mirrors the live behavior. Nothing here binds new behavior except the
-// dialog's own opener (⌘/Ctrl + /), which this component registers.
-//
-// Self-contained: it owns its open state and listens for its opener directly
-// (a window keydown for ⌘/Ctrl+/, plus a custom event so a menu entry can open
-// it without prop-drilling). Mount it once near the app shell.
+// Read-only "Keyboard shortcuts" overlay; rows come from the registry-backed shortcutPage.
+// It binds only its own opener (⌘/Ctrl + /) and the menu event that opens it.
+// Mount it once near the app shell.
 
 import { useEffect, useState } from "react";
 
@@ -17,8 +12,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -28,8 +23,9 @@ import {
   supportsBrowser,
   supportsDesktopCommands,
 } from "@/lib/nativeBridge";
-import { shortcutGroupsFor } from "@/lib/shortcutCatalog";
 import { matchesShortcut } from "@/lib/shortcuts/registry";
+import { type ShortcutPageGroup, shortcutPageGroups } from "@/lib/shortcuts/shortcutPage";
+import { ShortcutSettingsRow } from "@/pages/settings/search/ShortcutSettingsRow";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
 // account menu) can open it without threading state through the tree.
@@ -46,28 +42,34 @@ export function openKeyboardShortcuts(): void {
  * keeps the compact inline list; Settings uses section headings with bordered
  * list cards to match the rest of its content.
  */
-export function KeyboardShortcutsList({
-  variant = "compact",
-}: {
-  variant?: "compact" | "settings";
-}) {
+/** The Keyboard shortcuts page's groups here, computed at render so tests can vary the runtime. */
+export function useShortcutPageGroups(): ShortcutPageGroup[] {
   // Feature-based, stable per session; computed at render so tests can vary it.
   const isMobileViewport = useIsMobileViewport();
-  const isCoarsePointer = useIsCoarsePointer();
-  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
+  const preventsKeyboardSubmit = isMobileViewport;
   const serverInfo = useServerInfo();
-  const groups = shortcutGroupsFor({
+  const alwaysSteer = useAlwaysSteer();
+  return shortcutPageGroups({
     native: isNativeShell(),
     electron: isElectronShell(),
     browser: supportsBrowser(),
     submitWithModEnter: readSubmitWithModEnter(),
     preventsKeyboardSubmit,
+    alwaysSteer,
     contentSearch: !isMobileViewport && isFeatureEnabled(serverInfo, "workspace_content_search"),
     grids: !isMobileViewport && isFeatureEnabled(serverInfo, "grid_sessions_display_ui"),
     splitTerminal: !isMobileViewport && isFeatureEnabled(serverInfo, "splittable_terminal_view_ui"),
     desktopCommands: supportsDesktopCommands(),
     siblingSessions: serverInfo !== "loading" && serverInfo.sibling_sessions === true,
   });
+}
+
+export function KeyboardShortcutsList({
+  variant = "compact",
+}: {
+  variant?: "compact" | "settings";
+}) {
+  const groups = useShortcutPageGroups();
   const settings = variant === "settings";
   return (
     <div className={settings ? "flex flex-col gap-10" : undefined}>
@@ -86,31 +88,44 @@ export function KeyboardShortcutsList({
             ) : null}
           </h3>
           <ul className={settings ? "rounded-xl border border-border bg-card px-4" : undefined}>
-            {group.items.map((item) => (
-              <li
-                key={item.label}
-                className={
-                  settings
-                    ? "flex items-center justify-between gap-4 border-b border-border py-4 last:border-b-0"
-                    : "flex items-center justify-between gap-4 border-b border-border/60 py-2.5 last:border-b-0"
-                }
-              >
-                <span className="text-ui text-foreground">{item.label}</span>
-                <span className="flex shrink-0 items-center gap-1">
-                  {item.keys.map((key) => (
-                    <Kbd key={`${item.label}-${key}`}>{key}</Kbd>
-                  ))}
-                  {item.alternateKeys ? (
-                    <>
-                      <span className="px-0.5 text-sm text-muted-foreground/70">or</span>
-                      {item.alternateKeys.map((key) => (
-                        <Kbd key={`${item.label}-alternate-${key}`}>{key}</Kbd>
-                      ))}
-                    </>
-                  ) : null}
-                </span>
-              </li>
-            ))}
+            {group.items.map((item) => {
+              const className = settings
+                ? "flex items-center justify-between gap-4 border-b border-border py-4 last:border-b-0"
+                : "flex items-center justify-between gap-4 border-b border-border/60 py-2.5 last:border-b-0";
+              const content = (
+                <>
+                  <span className="text-ui text-foreground">{item.label}</span>
+                  <span className="flex shrink-0 items-center gap-1">
+                    {item.keys.map((key) => (
+                      <Kbd key={`${item.label}-${key}`}>{key}</Kbd>
+                    ))}
+                    {item.alternateKeys ? (
+                      <>
+                        <span className="px-0.5 text-sm text-muted-foreground/70">or</span>
+                        {item.alternateKeys.map((key) => (
+                          <Kbd key={`${item.label}-alternate-${key}`}>{key}</Kbd>
+                        ))}
+                      </>
+                    ) : null}
+                  </span>
+                </>
+              );
+              // Settings lists each row so search can reveal it; the shortcut dialog doesn't.
+              return settings ? (
+                <ShortcutSettingsRow
+                  key={item.label}
+                  row={item}
+                  group={group}
+                  className={className}
+                >
+                  {content}
+                </ShortcutSettingsRow>
+              ) : (
+                <li key={item.label} className={className}>
+                  {content}
+                </li>
+              );
+            })}
           </ul>
         </section>
       ))}

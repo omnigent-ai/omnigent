@@ -127,14 +127,25 @@ host.
 **Freshness.** Summaries carry `state_checked_at`. A listed session whose first
 request is open (or unknown) and older than five minutes is refreshed in the
 background, at most once per five minutes, when its tunnel is on the serving
-replica; clients show older states as stale. After a turn ends the server
-refreshes the session once, unless a client's read already covered that turn.
+replica; clients show older states as stale. A refresh stores every linked
+request's state, not only the selected one's: when the runner or host refreshes
+the titles of the other requests (each at most every five minutes), a provider
+that implements the optional `PullRequestStatusFacet.pr_status` reads the state
+and draft flag in the same call, and adds `state` and `is_draft` to those
+entries of `prs`. The server stores them as of its request, like the selected
+request's state. Providers with only `pr_title` keep reporting titles alone.
+After a turn ends the server refreshes the session once, unless a client's read
+already covered that turn.
 
 **Limits.** A session keeps at most 50 linked requests and 50 unlinks. Their
 identities must fit 12,000 stored bytes, checked when a request is added:
 linking at the limit fails with 409 before the host is asked, and reports past
 it are ignored. Titles and states fill the rest of the 16,000-byte document and
 are trimmed first when it overflows, so refreshing them never removes a link.
+The web reads individual linked requests' live status two at a time across all
+sessions, in display order, so a session with many linked requests fills in
+gradually. The request open in a details view goes first, on one extra slot
+that stays taken until its read settles.
 
 **Unlinking.** `DELETE /v1/sessions/{id}/pull-requests?url=` unlinks on the
 server whether or not the host is online, and passes the unlink to the runner or

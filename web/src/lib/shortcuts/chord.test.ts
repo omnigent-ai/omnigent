@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { type Chord, chordMatches, type KeyChordInput } from "./chord";
+import {
+  type Chord,
+  chordAriaShortcut,
+  chordKeys,
+  chordMatches,
+  type KeyChordInput,
+} from "./chord";
 
 function press(init: Partial<KeyChordInput> & { key: string }): KeyChordInput {
   return { metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, ...init };
@@ -106,5 +112,57 @@ describe("chordMatches", () => {
       value: (key: string) => key === "AltGraph",
     });
     expect(chordMatches(rename, event, false)).toBe(false);
+  });
+});
+
+describe("chordKeys", () => {
+  it("draws modifiers as symbols on macOS and words elsewhere, in a fixed order", () => {
+    const chord: Chord = { mod: true, alt: true, shift: true, code: "BracketLeft" };
+    expect(chordKeys(chord, true)).toEqual(["⌘", "⌥", "⇧", "["]);
+    expect(chordKeys(chord, false)).toEqual(["Ctrl", "Alt", "⇧", "["]);
+    expect(chordKeys({ ctrl: true, shift: true, code: "KeyM" }, true)).toEqual(["⌃", "⇧", "M"]);
+    expect(chordKeys({ ctrl: true, code: "Backquote" }, false)).toEqual(["Ctrl", "`"]);
+    expect(chordKeys({ mod: true, ctrl: true, code: "KeyM" }, false)).toEqual(["Ctrl", "M"]);
+    expect(chordKeys({ mod: true, ctrl: true, code: "KeyM" }, true)).toEqual(["⌘", "⌃", "M"]);
+  });
+
+  it("labels keys by their cap", () => {
+    expect(chordKeys({ mod: true, key: "k" }, true)).toEqual(["⌘", "K"]);
+    expect(chordKeys({ key: "ArrowLeft" }, true)).toEqual(["←"]);
+    expect(chordKeys({ key: "ArrowRight" }, true)).toEqual(["→"]);
+    expect(chordKeys({ mod: true, key: " " }, true)).toEqual(["⌘", "Space"]);
+    expect(chordKeys({ code: "Period" }, true)).toEqual(["Period"]);
+    expect(chordKeys({ key: "constructor" }, true)).toEqual(["constructor"]);
+    expect(chordKeys({ mod: true, key: "Enter" }, true)).toEqual(["⌘", "↵"]);
+    expect(chordKeys({ key: "Escape" }, true)).toEqual(["Esc"]);
+    expect(chordKeys({ ctrl: true, key: "Tab" }, true)).toEqual(["⌃", "Tab"]);
+    expect(chordKeys({ mod: true, alt: true, code: "Backslash" }, true)).toEqual(["⌘", "⌥", "\\"]);
+    expect(chordKeys({ mod: true, alt: true, code: "Minus" }, true)).toEqual(["⌘", "⌥", "-"]);
+    expect(chordKeys({ mod: true, alt: true, code: "Comma" }, true)).toEqual(["⌘", "⌥", ","]);
+    expect(chordKeys({ mod: true, alt: true, code: "Digit1" }, true)).toEqual(["⌘", "⌥", "1"]);
+  });
+
+  it("shows Backspace as its key cap", () => {
+    expect(chordKeys({ mod: true, key: "Backspace" }, true)).toEqual(["⌘", "⌫"]);
+    expect(chordKeys({ mod: true, key: "Backspace" }, false)).toEqual(["Ctrl", "⌫"]);
+  });
+});
+
+describe("chordAriaShortcut", () => {
+  it("names the physical modifiers for aria-keyshortcuts", () => {
+    expect(chordAriaShortcut({ mod: true, alt: true, code: "KeyR" }, true)).toBe("Meta+Alt+R");
+    expect(chordAriaShortcut({ mod: true, alt: true, code: "KeyR" }, false)).toBe("Control+Alt+R");
+    expect(chordAriaShortcut({ mod: true, shift: true, key: "o" }, true)).toBe("Meta+Shift+O");
+    expect(chordAriaShortcut({ mod: true, alt: true, code: "Backslash" }, true)).toBe(
+      "Meta+Alt+\\",
+    );
+    expect(chordAriaShortcut({ key: "1" }, true)).toBe("1");
+  });
+
+  it("spells keys by their aria names rather than their caps", () => {
+    expect(chordAriaShortcut({ mod: true, key: "Backspace" }, true)).toBe("Meta+Backspace");
+    expect(chordAriaShortcut({ mod: true, key: "Backspace" }, false)).toBe("Control+Backspace");
+    expect(chordAriaShortcut({ key: "Escape" }, true)).toBe("Escape");
+    expect(chordAriaShortcut({ mod: true, key: "Enter" }, true)).toBe("Meta+Enter");
   });
 });

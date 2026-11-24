@@ -45,13 +45,14 @@ def _open_long_line_file(page: Page, session: BrowserSession) -> Locator:
     return editor
 
 
-def _tail_fits_in_editor(editor: Locator) -> bool:
-    """Whether the long line's last word ends inside the editor's visible width."""
+def _tail_fits_in_editor(editor: Locator) -> bool | None:
+    """Whether the tail fits, or None while Monaco has no measurable tail."""
     tail = editor.locator(".view-line span span", has_text=_TAIL_MARKER).last
     tail.wait_for(state="attached")
     editor_box = editor.bounding_box()
     tail_box = tail.bounding_box()
-    assert editor_box is not None and tail_box is not None
+    if editor_box is None or tail_box is None:
+        return None
     return tail_box["x"] + tail_box["width"] <= editor_box["x"] + editor_box["width"]
 
 
@@ -68,7 +69,9 @@ def test_wrap_lines_soft_wraps_a_long_code_line(
 ) -> None:
     """Wrapping brings a long line's end into view and keeps the unsaved edit and selection."""
     editor = _open_long_line_file(page, seeded_session)
-    assert not _tail_fits_in_editor(editor), "the long line should run past the pane by default"
+    assert _tail_fits_in_editor(editor) is False, (
+        "the long line should initially extend past the pane"
+    )
 
     editor.locator(".view-line", has_text="def handle").click()
     page.keyboard.press("End")
@@ -88,7 +91,7 @@ def test_wrap_lines_soft_wraps_a_long_code_line(
     expect(editor.locator(".selected-text").first).to_be_attached()
 
     _toggle_wrap_lines(page)
-    poll_until(lambda: not _tail_fits_in_editor(editor), timeout_s=10)
+    poll_until(lambda: _tail_fits_in_editor(editor) is False, timeout_s=10)
 
 
 def test_wrap_lines_choice_survives_a_reload(page: Page, seeded_session: BrowserSession) -> None:

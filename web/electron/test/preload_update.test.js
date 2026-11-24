@@ -8,6 +8,7 @@ const PRELOAD = fs.readFileSync(path.join(__dirname, "../src/preload.js"), "utf8
 
 function loadPreload({ platform = "linux", fullScreen = false } = {}) {
   const exposed = new Map();
+  // Each channel's listeners, as ipcRenderer keeps them: several can share a channel.
   const listeners = new Map();
   const windowListeners = new Map();
   const invokes = [];
@@ -15,17 +16,18 @@ function loadPreload({ platform = "linux", fullScreen = false } = {}) {
   const attributes = new Set();
   let updateStatus = { state: "idle" };
   const ipcRenderer = {
-    invoke: async (channel, args) => {
-      invokes.push({ channel, args });
+    invoke: async (channel, args, ...rest) => {
+      invokes.push({ channel, args, ...(rest.some((arg) => arg !== undefined) ? { rest } : {}) });
       if (channel === "omnigent:get-update-status") return updateStatus;
       if (channel === "omnigent:is-full-screen") return fullScreen;
       return null;
     },
     send: (channel, args) => sends.push({ channel, args }),
-    on: (channel, listener) => listeners.set(channel, listener),
-    removeListener: (channel, listener) => {
-      if (listeners.get(channel) === listener) listeners.delete(channel);
+    on: (channel, listener) => {
+      if (!listeners.has(channel)) listeners.set(channel, new Set());
+      listeners.get(channel).add(listener);
     },
+    removeListener: (channel, listener) => listeners.get(channel)?.delete(listener),
   };
   vm.runInNewContext(PRELOAD, {
     console,
@@ -57,14 +59,62 @@ function loadPreload({ platform = "linux", fullScreen = false } = {}) {
     setStatus: (status) => {
       updateStatus = status;
     },
-    emit: (channel, payload) => listeners.get(channel)?.({}, payload),
+    emit: (channel, payload) => {
+      for (const listener of listeners.get(channel) ?? []) listener({}, payload);
+    },
     emitWindow: (name) => windowListeners.get(name)?.(),
     hasAttribute: (name) => attributes.has(name),
-    hasListener: (channel) => listeners.has(channel),
+    hasListener: (channel) => (listeners.get(channel)?.size ?? 0) > 0,
     invokes,
     sends,
   };
 }
+
+describe("floating panel launch offers", () => {
+  const OFFER = "omnigent:floating-composer:launch-offer";
+  const TAKERS = "omnigent:floating-composer:launch-takers";
+  const takerSignals = (h) =>
+    h.sends.filter((send) => send.channel === TAKERS).map((send) => send.args);
+
+  it("tells the shell when the first subscriber comes and the last one goes, once each", () => {
+    const h = loadPreload();
+    const first = h.desktop.floatingComposer.onLaunchOffer(() => {});
+    const second = h.desktop.floatingComposer.onLaunchOffer(() => {});
+    assert.deepEqual(takerSignals(h), [true]);
+    first();
+    first();
+    assert.deepEqual(takerSignals(h), [true], "a second unsubscribe changes nothing");
+    assert.equal(h.hasListener(OFFER), true, "the second subscriber still hears offers");
+    second();
+    second();
+    assert.deepEqual(takerSignals(h), [true, false]);
+    assert.equal(h.hasListener(OFFER), false);
+  });
+
+  it("hands each offer to every live subscriber, and none to one that has left", () => {
+    const h = loadPreload();
+    const heard = [];
+    const stopFirst = h.desktop.floatingComposer.onLaunchOffer((offer) =>
+      heard.push(["first", offer]),
+    );
+    h.desktop.floatingComposer.onLaunchOffer((offer) => heard.push(["second", offer]));
+    h.emit(OFFER, { offerId: 1, sessionId: "conv_1" });
+    stopFirst();
+    h.emit(OFFER, { offerId: 2, sessionId: "conv_2" });
+    assert.deepEqual(heard, [
+      ["first", { offerId: 1, sessionId: "conv_1" }],
+      ["second", { offerId: 1, sessionId: "conv_1" }],
+      ["second", { offerId: 2, sessionId: "conv_2" }],
+    ]);
+  });
+
+  it("subscribes nothing without a callback, and tells the shell nothing", () => {
+    const h = loadPreload();
+    const stop = h.desktop.floatingComposer.onLaunchOffer(undefined);
+    stop();
+    assert.deepEqual(takerSignals(h), []);
+  });
+});
 
 describe("macOS fullscreen titlebar bridge", () => {
   it("tracks native fullscreen state on initial load and shell events", async () => {
@@ -224,7 +274,7 @@ describe("desktop command bridge", () => {
     assert.equal(h.hasListener("omnigent:desktop-command"), false);
   });
 
-  it("reports command state as plain values and asks main to close the window or quit", async () => {
+  it("reports command state as plain values and asks main to open a session window, close the window or quit", async () => {
     const h = loadPreload();
     h.desktop.setDesktopCommandState({
       commands: ["close", 3],
@@ -245,6 +295,9 @@ describe("desktop command bridge", () => {
 
     await h.desktop.closeWindow();
     assert.deepEqual(h.invokes.at(-1), { channel: "omnigent:close-window", args: undefined });
+
+    await h.desktop.openSessionWindow("conv_1");
+    assert.deepEqual(h.invokes.at(-1), { channel: "omnigent:open-session-window", args: "conv_1" });
 
     await h.desktop.confirmQuit({ dontAskAgain: "yes" });
     assert.deepEqual(JSON.parse(JSON.stringify(h.invokes.at(-1))), {
@@ -306,6 +359,46 @@ describe("global show shortcut bridge", () => {
     assert.equal(h.invokes.at(-1).channel, "omnigent:record-global-shortcut");
     await h.desktop.cancelGlobalShortcutRecording();
     assert.equal(h.invokes.at(-1).channel, "omnigent:cancel-global-shortcut-recording");
+  });
+
+  it("lets the floating panel hear that it took the keyboard, until it stops listening", () => {
+    const h = loadPreload({ platform: "darwin" });
+    const channel = "omnigent:floating-composer:shown";
+    assert.equal(typeof h.desktop.floatingComposer.onShown("not a function"), "function");
+    assert.equal(h.hasListener(channel), false);
+    let heard = 0;
+    const unsubscribe = h.desktop.floatingComposer.onShown(() => (heard += 1));
+    h.emit(channel);
+    assert.equal(heard, 1);
+    unsubscribe();
+    assert.equal(h.hasListener(channel), false);
+  });
+
+  it("forwards the floating panel's ready signal on its own channel", () => {
+    const h = loadPreload({ platform: "darwin" });
+    h.desktop.floatingComposer.ready();
+    assert.equal(h.sends.at(-1).channel, "omnigent:floating-composer:ready");
+  });
+
+  it("names the shortcut by id for the shell to check, and drops ids that aren't strings", async () => {
+    const h = loadPreload();
+    const sent = () => JSON.parse(JSON.stringify(h.invokes.at(-1)));
+
+    await h.desktop.getGlobalShortcut("floatingComposer");
+    assert.deepEqual(sent(), { channel: "omnigent:get-global-shortcut", args: "floatingComposer" });
+    await h.desktop.setGlobalShortcut({ enabled: false }, "floatingComposer");
+    assert.deepEqual(sent(), {
+      channel: "omnigent:set-global-shortcut",
+      args: { enabled: false },
+      rest: ["floatingComposer"],
+    });
+    await h.desktop.recordGlobalShortcut("floatingComposer");
+    assert.deepEqual(sent(), {
+      channel: "omnigent:record-global-shortcut",
+      args: "floatingComposer",
+    });
+    await h.desktop.getGlobalShortcut({ id: "floatingComposer" });
+    assert.deepEqual(sent(), { channel: "omnigent:get-global-shortcut" });
   });
 });
 

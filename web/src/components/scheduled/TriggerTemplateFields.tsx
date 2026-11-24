@@ -1,7 +1,7 @@
 // Trigger-template fields shown in place of the scheduled-task prompt.
 
 import { useState, type ReactNode } from "react";
-import { InfoIcon, PlusIcon, TriangleAlertIcon, XIcon } from "lucide-react";
+import { InfoIcon, PlugIcon, PlusIcon, TriangleAlertIcon, XIcon } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -17,6 +17,11 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Label } from "@/components/scheduled/Label";
+import {
+  WORKFLOW_DETAILS_LABEL,
+  WORKFLOW_DETAILS_PLACEHOLDER,
+} from "@/components/scheduled/WorkflowField";
 import {
   MAX_INSTRUCTIONS_CHARS,
   MAX_SESSIONS_PER_RUN,
@@ -85,15 +90,36 @@ function WarningTag({
   );
 }
 
+/** The server's MCP service for a trigger's source, when it offers one. */
+export interface TriggerMcpService {
+  title: string;
+  /** Whether the task's runs use it. Off covers both turned off and not signed in. */
+  selected: boolean;
+  signingIn: boolean;
+  /** Why the last sign-in failed, so a blocked popup isn't silent. */
+  error: string | null;
+  /** Where to connect a service with no sign-in popup, such as a pasted token. */
+  settingsHref?: string;
+  /** Turn the service on, signing in first when needed. */
+  onAdd: () => void;
+}
+
+const TRIGGER_MCP_ADD_CLASS_NAME =
+  "h-5 gap-1 rounded-md border-amber-300 bg-amber-50 px-2 text-xs text-amber-800 hover:bg-amber-100 hover:text-amber-900 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-300 dark:hover:bg-amber-500/20";
+
 export function TriggerTemplateFields({
   source,
   fields,
   onChange,
   onSelectOpenChange,
   toolsProvided = false,
+  mcpService,
   taskSessionMode = "new",
   workflowField = null,
   instructionsAreDetails = false,
+  instructionsMaxChars = MAX_INSTRUCTIONS_CHARS,
+  instructionsUpgradeHint = null,
+  hideInstructions = false,
 }: {
   source: TriggerSource;
   fields: TriggerFields;
@@ -106,8 +132,16 @@ export function TriggerTemplateFields({
   toolsProvided?: boolean;
   /** The dialog's Workflow field, shown above the instructions. */
   workflowField?: ReactNode;
-  /** A workflow was chosen, so the instructions are each run's details. */
+  /** A workflow was chosen, so the instructions are optional details for its runs. */
   instructionsAreDetails?: boolean;
+  /** Runs follow the chosen workflow as saved, so there are no instructions to edit. */
+  hideInstructions?: boolean;
+  /** The matching MCP service, which replaces the warning that one is needed. */
+  mcpService?: TriggerMcpService;
+  /** From triggerMessageBudget: smaller where the server or host is older. */
+  instructionsMaxChars?: number;
+  /** What to update for the full budget, shown with the length error. */
+  instructionsUpgradeHint?: string | null;
 }) {
   const template = TRIGGER_TEMPLATES[source];
   const Icon = template.icon;
@@ -121,10 +155,11 @@ export function TriggerTemplateFields({
   const scope = triggerScope(source, fields.event);
   const conditionFields = triggerConditionFields(source, fields.event);
   const scopeEntries = triggerScopeEntries(source, fields);
-  const instructionsTooLong = fields.instructions.trim().length > MAX_INSTRUCTIONS_CHARS;
-  const instructionsTooLongMessage = `Keep instructions to ${MAX_INSTRUCTIONS_CHARS.toLocaleString("en-US")} characters or fewer so each ${
+  const instructionsTooLong =
+    !hideInstructions && fields.instructions.trim().length > instructionsMaxChars;
+  const instructionsTooLongMessage = `Keep instructions to ${instructionsMaxChars.toLocaleString("en-US")} characters or fewer so each ${
     taskSessionMode === "continue" ? "message to the task session" : "session's first message"
-  } has room for the item.`;
+  } has room for the item.${instructionsUpgradeHint ? ` ${instructionsUpgradeHint}` : ""}`;
   const [activeSection, setActiveSection] = useState<"trigger" | "instructions">("trigger");
   const fullTriggerDescription = triggerEventDescription(source, fields.event);
   const firstSentenceEnd = fullTriggerDescription.indexOf(". ");
@@ -134,6 +169,9 @@ export function TriggerTemplateFields({
       : fullTriggerDescription.slice(0, firstSentenceEnd + 1);
   const triggerDetails =
     firstSentenceEnd === -1 ? "" : fullTriggerDescription.slice(firstSentenceEnd + 2);
+  const addMcpHint = mcpService
+    ? `Runs only work if the agent can reach ${mcpService.title}. Add your ${mcpService.title} MCP service, or give the agent its tools another way.`
+    : "";
   const toolsWarning = `This only works if the agent has ${template.toolsExample} where this task runs. Without one, each run stops and says so in its reply.`;
   const sourceWarning = `Anyone who can ${authorAction} may direct the agent using your tools and permissions. Only use trusted sources.${fields.linkBack ? ` Links are posted with your ${triggerServiceName(source)} account.` : ""}`;
 
@@ -174,7 +212,7 @@ export function TriggerTemplateFields({
             className="h-7 flex-none px-3"
           >
             Instructions
-            {fields.instructions.trim() === "" && (
+            {fields.instructions.trim() === "" && !instructionsAreDetails && (
               <span aria-hidden="true" data-testid="task-trigger-instructions-required">
                 *
               </span>
@@ -251,12 +289,54 @@ export function TriggerTemplateFields({
                   </TooltipProvider>
                 </div>
                 <div className="flex flex-wrap gap-1.5">
-                  {!toolsProvided && (
+                  {mcpService?.selected ? (
                     <WarningTag
-                      label="MCP required"
-                      message={toolsWarning}
-                      testId="task-trigger-tools-note"
+                      label={`Uses ${mcpService.title} MCP`}
+                      message={`Every run, and each session it starts, uses your ${mcpService.title} MCP service.`}
+                      testId="task-trigger-mcp-note"
                     />
+                  ) : mcpService?.settingsHref ? (
+                    <Button
+                      asChild
+                      variant="outline"
+                      size="sm"
+                      className={TRIGGER_MCP_ADD_CLASS_NAME}
+                    >
+                      <a
+                        href={mcpService.settingsHref}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        title={addMcpHint}
+                        data-testid="task-trigger-mcp-add"
+                      >
+                        <PlugIcon aria-hidden="true" className="size-3" />
+                        {`Add ${mcpService.title} MCP`}
+                      </a>
+                    </Button>
+                  ) : mcpService ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className={TRIGGER_MCP_ADD_CLASS_NAME}
+                      disabled={mcpService.signingIn}
+                      onClick={mcpService.onAdd}
+                      title={addMcpHint}
+                      data-testid="task-trigger-mcp-add"
+                    >
+                      <PlugIcon aria-hidden="true" className="size-3" />
+                      {mcpService.signingIn
+                        ? `Signing in to ${mcpService.title}…`
+                        : `Add ${mcpService.title} MCP`}
+                    </Button>
+                  ) : (
+                    !toolsProvided && (
+                      <WarningTag
+                        label="MCP required"
+                        message={toolsWarning}
+                        testId="task-trigger-tools-note"
+                      />
+                    )
                   )}
                   <WarningTag
                     label="Untrusted source"
@@ -265,6 +345,15 @@ export function TriggerTemplateFields({
                     warning
                   />
                 </div>
+                {mcpService?.error && (
+                  <p
+                    role="alert"
+                    className="text-xs text-destructive"
+                    data-testid="task-trigger-mcp-sign-in-error"
+                  >
+                    {mcpService.error}
+                  </p>
+                )}
               </div>
             </div>
             <div
@@ -593,38 +682,43 @@ export function TriggerTemplateFields({
             data-testid="task-trigger-instructions-panel"
           >
             {workflowField}
-            <div className="flex flex-col gap-1.5">
-              <Textarea
-                id="task-trigger-instructions"
-                aria-label={
-                  instructionsAreDetails
-                    ? "Additional instructions"
-                    : taskSessionMode === "continue"
-                      ? "Instructions for the task session"
-                      : "Instructions for each session"
-                }
-                value={fields.instructions}
-                rows={3}
-                placeholder={
-                  instructionsAreDetails
-                    ? "Optional. Instructions to customize the workflow."
-                    : template.instructionsPlaceholder
-                }
-                data-testid="task-trigger-instructions"
-                componentId="tasks.scheduled.trigger_instructions"
-                className="min-h-[240px] resize-none text-ui"
-                onChange={(e) => onChange({ ...fields, instructions: e.target.value })}
-              />
-              {instructionsTooLong && (
-                <p
-                  className="text-sm text-destructive"
-                  role="alert"
-                  data-testid="task-trigger-too-long"
-                >
-                  {instructionsTooLongMessage}
-                </p>
-              )}
-            </div>
+            {!hideInstructions && (
+              <div className="flex flex-col gap-1.5">
+                {instructionsAreDetails && (
+                  <Label htmlFor="task-trigger-instructions">{WORKFLOW_DETAILS_LABEL}</Label>
+                )}
+                <Textarea
+                  id="task-trigger-instructions"
+                  aria-label={
+                    instructionsAreDetails
+                      ? undefined
+                      : taskSessionMode === "continue"
+                        ? "Instructions for the task session"
+                        : "Instructions for each session"
+                  }
+                  value={fields.instructions}
+                  rows={3}
+                  placeholder={
+                    instructionsAreDetails
+                      ? WORKFLOW_DETAILS_PLACEHOLDER
+                      : template.instructionsPlaceholder
+                  }
+                  data-testid="task-trigger-instructions"
+                  componentId="tasks.scheduled.trigger_instructions"
+                  className="min-h-[240px] resize-none text-ui"
+                  onChange={(e) => onChange({ ...fields, instructions: e.target.value })}
+                />
+                {instructionsTooLong && (
+                  <p
+                    className="text-sm text-destructive"
+                    role="alert"
+                    data-testid="task-trigger-too-long"
+                  >
+                    {instructionsTooLongMessage}
+                  </p>
+                )}
+              </div>
+            )}
           </div>
         </TabsContent>
       </Tabs>
