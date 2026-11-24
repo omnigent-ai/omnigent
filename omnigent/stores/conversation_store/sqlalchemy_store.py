@@ -157,6 +157,7 @@ from omnigent.stores.conversation_store.overrides import (
     encode_session_overrides as _encode_session_overrides,
 )
 from omnigent.stores.host_store import delete_unused_host_in_session, lock_host_for_binding
+from omnigent.stores.project_store.access import project_conversation_ids
 from omnigent.stores.sandbox_profile_store import (
     PROFILE_LABEL_KEYS,
     PROFILE_LABEL_PREFIX,
@@ -4196,6 +4197,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         include_archived: bool = False,
         archived_only: bool = False,
         project: str | None = None,
+        project_owner: str | None = None,
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
@@ -4257,6 +4259,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None`` disables the filter. The name→id resolution is scoped to
             ``owned_by`` (projects are owner-private), so pass ``owned_by``
             alongside a specific name for the first-class half to resolve.
+        :param project_owner: Owner whose first-class project the ``project``
+            name resolves against, for a project shared with the viewer.
+            ``None`` resolves against ``owned_by``.
         :param pinned: When ``True``, restrict to sessions ``pinned_owner`` has
             pinned (their per-user ``omnigent.pinned.<user>`` label — the
             sidebar's Pinned section). ``False`` (default) disables the filter.
@@ -4333,6 +4338,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                             )
                         ).scalars()
                     )
+                    if acl_user is not None:
+                        # Sessions filed in projects the viewer owns or was shared.
+                        accessible_set |= set(
+                            meta_sess.execute(project_conversation_ids(acl_user)).scalars()
+                        )
                 if owned_by is not None or shared_only:
                     # shared_only needs the owned set to subtract from the
                     # accessible set; use accessible_by as the user anchor when
@@ -4414,13 +4424,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # prefetch path.
                 if accessible_by is not None:
                     stmt = stmt.where(
-                        select(SqlSessionPermission.conversation_id)
-                        .where(
-                            SqlSessionPermission.workspace_id == SqlConversation.workspace_id,
-                            SqlSessionPermission.conversation_id == SqlConversation.id,
-                            SqlSessionPermission.user_id == accessible_by,
+                        or_(
+                            select(SqlSessionPermission.conversation_id)
+                            .where(
+                                SqlSessionPermission.workspace_id == SqlConversation.workspace_id,
+                                SqlSessionPermission.conversation_id == SqlConversation.id,
+                                SqlSessionPermission.user_id == accessible_by,
+                            )
+                            .exists(),
+                            # Sessions filed in projects the viewer owns or was shared.
+                            SqlConversation.id.in_(project_conversation_ids(accessible_by)),
                         )
-                        .exists()
                     )
                 if shared_only:
                     # shared_only = accessible but NOT owned: an anti-semi-join
@@ -4561,7 +4575,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                         .where(
                             SqlConversationMetadata.workspace_id == current_workspace_id(),
                             SqlProject.workspace_id == current_workspace_id(),
-                            SqlProject.user_id == owned_by,
+                            SqlProject.user_id
+                            == (project_owner if project_owner is not None else owned_by),
                             SqlProject.name == project,
                         )
                     )
@@ -4722,6 +4737,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlSessionPermission.user_id == viewer,
                 )
             ).first()
+            if granted is None:
+                granted = meta_sess.execute(
+                    project_conversation_ids(viewer).where(SqlConversationMetadata.id == cursor_id)
+                ).first()
         if granted is None:
             raise StaleCursorError(cursor_id)
 

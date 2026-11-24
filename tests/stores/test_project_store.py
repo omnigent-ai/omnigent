@@ -743,3 +743,26 @@ def test_apply_order_deduplicates_and_appends_unranked_projects() -> None:
     assert apply_project_order(
         ["b", "c", "a"], ["a", "deleted", "a"], project_id=str, project_name=str
     ) == ["a", "b", "c"]
+
+
+# ── shares ────────────────────────────────────────────────────────────────
+
+
+def test_share_grants_member_access_until_revoked(store: SqlAlchemyProjectStore) -> None:
+    """A member reads and edits a shared project; only the owner manages shares or deletes."""
+    store.create(_uid("shared"), "Shared", "alice@example.com")
+    assert store.get(_uid("shared"), user_id="bob@example.com") is None
+
+    store.add_share(_uid("shared"), "bob@example.com", user_id="alice@example.com")
+    assert [p.id for p in store.list(user_id="bob@example.com")] == [_uid("shared")]
+    renamed = store.update(_uid("shared"), user_id="bob@example.com", name="Renamed")
+    assert renamed is not None and renamed.user_id == "alice@example.com"
+    with pytest.raises(OmnigentError) as denied:
+        store.add_share(_uid("shared"), "carol@example.com", user_id="bob@example.com")
+    assert denied.value.code == ErrorCode.FORBIDDEN
+    assert store.delete(_uid("shared"), user_id="bob@example.com") is False
+    assert store.get(_uid("shared"), user_id="carol@example.com") is None
+
+    assert store.remove_share(_uid("shared"), "bob@example.com", user_id="alice@example.com")
+    assert store.get(_uid("shared"), user_id="bob@example.com") is None
+    assert store.list_shares(_uid("shared"), user_id="alice@example.com") == []

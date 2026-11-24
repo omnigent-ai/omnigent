@@ -6,8 +6,9 @@ the ``projects`` table. Session→project membership lives on the conversation's
 metadata row (``project_id``) and is managed by the conversation store, not
 here.
 
-Projects have no ACL of their own (PRD §9): every method is scoped by
-``user_id`` so a caller only ever sees and mutates their own projects.
+Every method is scoped by ``user_id``: a caller sees and edits projects they
+own or that the owner shared with them (``project_shares``). Deleting a project
+and managing its shares stay owner-only.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from collections.abc import Callable
 from typing import Any, Literal, TypedDict, TypeVar
 
 from omnigent.entities import Project
-from omnigent.entities.project import MandateProposal, ProjectIdentity
+from omnigent.entities.project import MandateProposal, ProjectIdentity, ProjectShare
 
 
 class ProjectOrderPreference(TypedDict):
@@ -207,6 +208,20 @@ class ProjectStore(ABC):
         :raises OmnigentError: ``NOT_FOUND`` for an unknown proposal,
             ``INVALID_INPUT`` when accepting would exceed the mandate limit.
         """
+        raise NotImplementedError
+
+    # -- Shares: users the owner shared the project with --
+
+    def list_shares(self, project_id: str, *, user_id: str | None) -> builtins.list[ProjectShare]:
+        """List the users a project is shared with; readable by any member."""
+        raise NotImplementedError
+
+    def add_share(self, project_id: str, member_id: str, *, user_id: str | None) -> ProjectShare:
+        """Share a project with *member_id*. Owner-only; idempotent."""
+        raise NotImplementedError
+
+    def remove_share(self, project_id: str, member_id: str, *, user_id: str | None) -> bool:
+        """Revoke *member_id*'s share. Owner-only; ``False`` when absent."""
         raise NotImplementedError
 
     # -- Identities: named persistent roles, each with one active session --

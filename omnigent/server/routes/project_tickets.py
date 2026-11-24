@@ -270,10 +270,13 @@ def create_project_tickets_router(
             permissions.list_for_sessions, session_ids, user_id=RESERVED_USER_PUBLIC
         )
         is_admin = await asyncio.to_thread(permissions.is_admin, who.user_id)
+        # Members of a shared project see every session filed in it.
+        via_project = await asyncio.to_thread(permissions.project_levels, who.user_id, session_ids)
         return [
             sid
             for sid in session_ids
-            if _permission_level_from_grants(
+            if sid in via_project
+            or _permission_level_from_grants(
                 who.user_id, grants.get(sid, []) + public_grants.get(sid, []), is_admin
             )
             is not None

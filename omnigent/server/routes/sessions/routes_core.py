@@ -3010,6 +3010,35 @@ def register_core_routes(
             include_archived_param = include_archived
             archived_only_param = False
 
+        project_owner_param: str | None = None
+        if (
+            project
+            and user_id is not None
+            and owned_by_param == user_id
+            and project_store is not None
+            and effective_visibility in ("all", "archived")
+        ):
+            # A shared project's folder lists every member's sessions in it,
+            # resolving the name against the owner's projects.
+            named = [
+                entry
+                for entry in await asyncio.to_thread(project_store.list, user_id=user_id)
+                if entry.name == project
+            ]
+            own = next((entry for entry in named if entry.user_id == user_id), None)
+            shared_project = (
+                named[0]
+                if named and own is None
+                else own
+                if own is not None
+                and await asyncio.to_thread(project_store.list_shares, own.id, user_id=user_id)
+                else None
+            )
+            if shared_project is not None:
+                owned_by_param = None
+                accessible_by_param = user_id
+                project_owner_param = shared_project.user_id
+
         def _read_page() -> _SessionPageReads:
             # One read-only burst over a single pool checkout per engine: the
             # page query, family projection and every per-row enrichment read
@@ -3036,6 +3065,7 @@ def register_core_routes(
                     include_archived=include_archived_param,
                     archived_only=archived_only_param,
                     project=project,
+                    project_owner=project_owner_param,
                     pinned=pinned,
                     # Pins are per-user: filter to the caller's own pin key.
                     pinned_owner=user_id,

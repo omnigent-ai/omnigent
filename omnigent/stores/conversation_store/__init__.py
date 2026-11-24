@@ -1047,6 +1047,7 @@ class ConversationStore(ABC):
         include_archived: bool = False,
         archived_only: bool = False,
         project: str | None = None,
+        project_owner: str | None = None,
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
@@ -1159,6 +1160,9 @@ class ConversationStore(ABC):
             the filter. The name→id resolution is owner-scoped (projects are
             owner-private), so pass ``owned_by`` alongside a specific name.
             See ``designs/PROJECTS_PRD.md``.
+        :param project_owner: Owner whose first-class project the ``project``
+            name resolves against, for a project shared with the viewer.
+            ``None`` resolves against ``owned_by``.
         :param pinned: When ``True``, only return sessions ``pinned_owner`` has
             pinned (their per-user ``omnigent.pinned.<user>`` label — the
             sidebar's Pinned section). ``False`` (default) disables the filter.

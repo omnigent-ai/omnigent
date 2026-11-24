@@ -413,6 +413,25 @@ class PermissionStore(ABC):
         """
         ...
 
+    def project_levels(
+        self,
+        user_id: str | None,  # noqa: ARG002 — default store has no projects
+        conversation_ids: Sequence[str],  # noqa: ARG002
+    ) -> dict[str, int]:
+        """Levels *user_id* holds on sessions through project membership.
+
+        A project's members get edit on every session filed in it; its owner gets
+        manage on sessions members start. Stores without projects return ``{}``.
+
+        :param user_id: The caller, or ``None``.
+        :param conversation_ids: Sessions to resolve.
+        :returns: Level per session that the caller reaches through a project.
+        """
+        return {}
+
+    def invalidate_access_cache(self) -> None:  # noqa: B027 — optional hook
+        """Drop any cached access decisions; called when a project share changes."""
+
     @abstractmethod
     def has_any_grants(self, conversation_id: str) -> bool:
         """Check whether a session has any permission rows at all.

@@ -18,6 +18,7 @@ from omnigent.db.db_models import (
     SqlPreference,
     SqlProject,
     SqlProjectIdentity,
+    SqlProjectShare,
     SqlProjectTicket,
     SqlProjectTicketEvent,
     SqlProjectTicketLink,
@@ -41,10 +42,12 @@ from omnigent.entities.project import (
     PROJECT_MANDATE_MAX_BYTES,
     MandateProposal,
     ProjectIdentity,
+    ProjectShare,
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore
+from omnigent.stores.project_store.access import accessible_project_ids, project_role
 
 # Max serialized length of a project's config blob. The value is persisted
 # verbatim and reflected back on every read, so an unbounded blob is a mild
@@ -388,20 +391,20 @@ class SqlAlchemyProjectStore(ProjectStore):
         return run_write_transaction(self._session_immediate, "insert_project", write)
 
     def get(self, project_id: str, *, user_id: str | None) -> Project | None:
-        """Return an owned project by id, or ``None`` if not found."""
+        """Return a project the caller owns or was shared, or ``None`` if not found."""
         with self._session("select_project_by_id") as session:
             row = session.get(SqlProject, (current_workspace_id(), project_id))
-            if row is None or row.user_id != user_id:
+            if project_role(session, row, user_id) is None:
                 return None
             return _to_entity(row)
 
     def list(self, *, user_id: str | None) -> list[Project]:
-        """List the owner's projects ordered by ``created_at ASC, id ASC``."""
+        """List owned and shared projects ordered by ``created_at ASC, id ASC``."""
         with self._session("list_projects") as session:
             stmt = (
                 select(SqlProject)
                 .where(SqlProject.workspace_id == current_workspace_id())
-                .where(SqlProject.user_id == user_id)
+                .where(SqlProject.id.in_(accessible_project_ids(user_id)))
                 .order_by(asc(SqlProject.created_at), asc(SqlProject.id))
             )
             rows = session.execute(stmt).scalars().all()
@@ -417,11 +420,11 @@ class SqlAlchemyProjectStore(ProjectStore):
             stmt = (
                 select(SqlProject)
                 .where(SqlProject.workspace_id == current_workspace_id())
-                .where(SqlProject.user_id == user_id)
+                .where(SqlProject.id.in_(accessible_project_ids(user_id)))
             )
             if after_id is not None:
                 after = session.get(SqlProject, (current_workspace_id(), after_id))
-                if after is None or after.user_id != user_id:
+                if project_role(session, after, user_id) is None:
                     raise ValueError("after must be the id of one of your projects")
                 stmt = stmt.where(
                     tuple_(SqlProject.created_at, SqlProject.id) > (after.created_at, after.id)
@@ -461,7 +464,7 @@ class SqlAlchemyProjectStore(ProjectStore):
             row = session.get(
                 SqlProject, (current_workspace_id(), project_id), with_for_update=True
             )
-            if row is None or row.user_id != user_id:
+            if row is None or project_role(session, row, user_id) is None:
                 return None
             changed = False
             current_main = row.main_session_id or row.legacy_orchestrator_session_id
@@ -481,7 +484,9 @@ class SqlAlchemyProjectStore(ProjectStore):
                         _with_retired(_client_config(_decode_config(row.config)), retired)
                     )
             if name is not None and row.name != name:
-                if self._name_taken(session, user_id=user_id, name=name, exclude_id=project_id):
+                if self._name_taken(
+                    session, user_id=row.user_id, name=name, exclude_id=project_id
+                ):
                     raise OmnigentError(
                         f"A project named {name!r} already exists",
                         code=ErrorCode.ALREADY_EXISTS,
@@ -564,6 +569,12 @@ class SqlAlchemyProjectStore(ProjectStore):
                 )
             for identity in self._identity_rows(session, project_id):
                 session.delete(identity)
+            session.execute(
+                delete(SqlProjectShare).where(
+                    SqlProjectShare.workspace_id == current_workspace_id(),
+                    SqlProjectShare.project_id == project_id,
+                )
+            )
             session.delete(row)
             return True
 
@@ -594,7 +605,7 @@ class SqlAlchemyProjectStore(ProjectStore):
             row = session.get(
                 SqlProject, (current_workspace_id(), project_id), with_for_update=True
             )
-            if row is None or row.user_id != user_id:
+            if row is None or project_role(session, row, user_id) is None:
                 return None
             pending = _decode_proposals(row.mandate_proposals)
             if len(pending) >= MANDATE_PROPOSALS_MAX_PENDING:
@@ -619,7 +630,7 @@ class SqlAlchemyProjectStore(ProjectStore):
             row = session.get(
                 SqlProject, (current_workspace_id(), project_id), with_for_update=True
             )
-            if row is None or row.user_id != user_id:
+            if row is None or project_role(session, row, user_id) is None:
                 return None
             pending = _decode_proposals(row.mandate_proposals)
             proposal = next((entry for entry in pending if entry.id == proposal_id), None)
@@ -666,11 +677,86 @@ class SqlAlchemyProjectStore(ProjectStore):
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         return project
 
+    # -- Shares --
+
+    def _require_owner(self, session: Session, project_id: str, user_id: str | None) -> SqlProject:
+        row = session.get(SqlProject, (current_workspace_id(), project_id))
+        role = project_role(session, row, user_id)
+        if row is None or role is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        if role != "owner":
+            raise OmnigentError(
+                "Only the project owner can manage its shares", code=ErrorCode.FORBIDDEN
+            )
+        return row
+
+    def list_shares(self, project_id: str, *, user_id: str | None) -> builtins.list[ProjectShare]:
+        with self._session("list_project_shares") as session:
+            row = session.get(SqlProject, (current_workspace_id(), project_id))
+            if project_role(session, row, user_id) is None:
+                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+            rows = session.scalars(
+                select(SqlProjectShare)
+                .where(
+                    SqlProjectShare.workspace_id == current_workspace_id(),
+                    SqlProjectShare.project_id == project_id,
+                )
+                .order_by(asc(SqlProjectShare.created_at), asc(SqlProjectShare.user_id))
+            ).all()
+            return [
+                ProjectShare(user_id=r.user_id, created_at=r.created_at, created_by=r.created_by)
+                for r in rows
+            ]
+
+    def add_share(self, project_id: str, member_id: str, *, user_id: str | None) -> ProjectShare:
+        def write(session: Session) -> ProjectShare:
+            require_active_account(session, user_id)
+            row = self._require_owner(session, project_id, user_id)
+            if member_id == row.user_id:
+                raise OmnigentError(
+                    "The owner already has access to this project", code=ErrorCode.INVALID_INPUT
+                )
+            existing = session.get(
+                SqlProjectShare, (current_workspace_id(), project_id, member_id)
+            )
+            if existing is None:
+                existing = SqlProjectShare(
+                    workspace_id=current_workspace_id(),
+                    project_id=project_id,
+                    user_id=member_id,
+                    created_at=now_epoch(),
+                    created_by=user_id,
+                )
+                session.add(existing)
+                session.flush()
+            return ProjectShare(
+                user_id=existing.user_id,
+                created_at=existing.created_at,
+                created_by=existing.created_by,
+            )
+
+        return run_write_transaction(self._session_immediate, "add_project_share", write)
+
+    def remove_share(self, project_id: str, member_id: str, *, user_id: str | None) -> bool:
+        def write(session: Session) -> bool:
+            require_active_account(session, user_id)
+            self._require_owner(session, project_id, user_id)
+            result = session.execute(
+                delete(SqlProjectShare).where(
+                    SqlProjectShare.workspace_id == current_workspace_id(),
+                    SqlProjectShare.project_id == project_id,
+                    SqlProjectShare.user_id == member_id,
+                )
+            )
+            return bool(result.rowcount)
+
+        return run_write_transaction(self._session_immediate, "remove_project_share", write)
+
     # -- Identities --
 
     def _owned_project(self, session: Session, project_id: str, user_id: str | None) -> bool:
         row = session.get(SqlProject, (current_workspace_id(), project_id))
-        return row is not None and row.user_id == user_id
+        return project_role(session, row, user_id) is not None
 
     def _identity_rows(
         self, session: Session, project_id: str
@@ -776,7 +862,7 @@ class SqlAlchemyProjectStore(ProjectStore):
             project = session.get(
                 SqlProject, (current_workspace_id(), project_id), with_for_update=True
             )
-            if project is None or project.user_id != user_id:
+            if project is None or project_role(session, project, user_id) is None:
                 raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
             existing = session.get(
                 SqlProjectIdentity, (current_workspace_id(), project_id, identity_id)
@@ -824,7 +910,7 @@ class SqlAlchemyProjectStore(ProjectStore):
             project = session.get(
                 SqlProject, (current_workspace_id(), project_id), with_for_update=True
             )
-            if project is None or project.user_id != user_id:
+            if project is None or project_role(session, project, user_id) is None:
                 return None
             row = session.get(
                 SqlProjectIdentity, (current_workspace_id(), project_id, identity_id)
@@ -960,14 +1046,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                     .values(value=_encode_order(preference))
                 )
                 return preference
-            owned = set(
-                session.scalars(
-                    select(SqlProject.id).where(
-                        SqlProject.workspace_id == workspace_id,
-                        SqlProject.user_id == user_id,
-                    )
-                )
-            )
+            owned = set(session.scalars(accessible_project_ids(user_id)))
             if len(set(ids)) != len(ids) or not set(ids).issubset(owned):
                 raise OmnigentError("Invalid project order", code=ErrorCode.INVALID_INPUT)
             preference: ProjectOrderPreference = {

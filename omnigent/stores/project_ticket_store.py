@@ -53,6 +53,7 @@ from omnigent.entities.project_ticket import (
 from omnigent.entities.project_ticket_legacy import legacy_ticket_notes
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.stores.project_store.access import project_role
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 TICKET_ACTIVITY_SESSION_MAX = 100
@@ -328,7 +329,7 @@ class ProjectTicketStore:
             SqlProject.id == _identifier(project_id),
         )
         project = session.scalar(stmt.with_for_update() if write else stmt)
-        if project is None or project.user_id != user_id:
+        if project_role(session, project, user_id) is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         if write:
             require_active_account(session, user_id)

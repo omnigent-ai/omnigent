@@ -21,6 +21,8 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from omnigent.db.account_authority import account_generation, lock_account, require_active_account
 from omnigent.db.db_models import (
+    SqlConversationMetadata,
+    SqlProject,
     SqlScheduledTask,
     SqlScheduledTaskShare,
     SqlSessionPermission,
@@ -38,6 +40,8 @@ from omnigent.entities import Account, ResolvedAccess, ScheduledTaskPermission, 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server import session_sharing
 from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_MANAGE,
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
@@ -51,6 +55,7 @@ from omnigent.stores.permission_store import (
     PermissionStore,
     require_grantee_id_fits,
 )
+from omnigent.stores.project_store.access import accessible_project_ids
 
 # Sentinel rows excluded from list_users() — never real, actionable
 # actors. Mirrors accounts_store._HIDDEN_LIST_USERS so the admin user
@@ -892,6 +897,9 @@ class SqlAlchemyPermissionStore(PermissionStore):
         grant = self.get(user_id, conversation_id)
         if grant is not None and grant.level >= required_level:
             return True
+        project_level = self.project_levels(user_id, [conversation_id]).get(conversation_id)
+        if project_level is not None and project_level >= required_level:
+            return True
 
         public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
         public_level = effective_public_level(public_grant.level if public_grant else None)
@@ -916,6 +924,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
             level
             for level in (
                 grant.level if grant is not None else None,
+                self.project_levels(user_id, [conversation_id]).get(conversation_id),
                 effective_public_level(public_grant.level if public_grant else None),
             )
             if level is not None
@@ -1020,11 +1029,19 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 SqlSessionPermission,
                 (workspace_id, RESERVED_USER_PUBLIC, conversation_id),
             )
+            grant_levels = [
+                level
+                for level in (
+                    user_grant.level if user_grant is not None else None,
+                    self._project_levels(session, user_id, [conversation_id]).get(conversation_id),
+                )
+                if level is not None
+            ]
             access = ResolvedAccess(
                 is_admin=user_row is not None
                 and user_row.deleted_at is None
                 and user_row.is_admin,
-                user_grant_level=user_grant.level if user_grant is not None else None,
+                user_grant_level=max(grant_levels) if grant_levels else None,
                 public_grant_level=public_grant.level if public_grant is not None else None,
             )
         # Cache only a positive standing: a no-access result is left uncached so
@@ -1037,6 +1054,45 @@ class SqlAlchemyPermissionStore(PermissionStore):
         ):
             self._resolve_cache_store(conversation_id, user_id, access, generation)
         return access
+
+    @staticmethod
+    def _project_levels(
+        session: Session, user_id: str, conversation_ids: Sequence[str]
+    ) -> dict[str, int]:
+        """Levels *user_id* holds through project membership, keyed by session."""
+        if not conversation_ids:
+            return {}
+        rows = session.execute(
+            select(SqlConversationMetadata.id, SqlProject.user_id)
+            .join(
+                SqlProject,
+                (SqlProject.workspace_id == SqlConversationMetadata.workspace_id)
+                & (SqlProject.id == SqlConversationMetadata.project_id),
+            )
+            .where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id.in_(list(conversation_ids)),
+                SqlProject.id.in_(accessible_project_ids(user_id)),
+            )
+        ).all()
+        # The owner manages sessions members start; members edit every project session.
+        return {
+            conversation_id: LEVEL_MANAGE if owner == user_id else LEVEL_EDIT
+            for conversation_id, owner in rows
+        }
+
+    def project_levels(
+        self, user_id: str | None, conversation_ids: Sequence[str]
+    ) -> dict[str, int]:
+        """Project-membership levels. See base class for contract."""
+        if user_id is None or not conversation_ids:
+            return {}
+        with self._session("select_project_session_levels") as session:
+            return self._project_levels(session, user_id, conversation_ids)
+
+    def invalidate_access_cache(self) -> None:
+        """Drop cached access decisions after a project share changes."""
+        self._invalidate_resolve_cache_all()
 
     def has_any_grants(self, conversation_id: str) -> bool:
         """Check for any permission rows. See base class for contract."""

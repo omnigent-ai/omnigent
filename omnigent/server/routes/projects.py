@@ -30,11 +30,12 @@ from omnigent.entities.project import (
     PROJECT_IDENTITY_LABEL_KEY,
     MandateProposal,
     ProjectIdentity,
+    ProjectShare,
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server import session_live_state
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC, AuthProvider
 from omnigent.server.persona_mentions import Mention, PersonaMentionTargets
 from omnigent.server.project_identities import (
     ORCHESTRATOR_IDENTITY_ID,
@@ -62,6 +63,7 @@ from omnigent.server.schemas import (
     ProjectOrderRequest,
     ProjectOrderResponse,
     ProposeMandateRequest,
+    ShareProjectRequest,
     UpdateProjectRequest,
 )
 from omnigent.server.session_orchestration import require_named_source_private
@@ -94,6 +96,7 @@ def _to_response(project: Project) -> dict[str, Any]:
         "mandate": project.mandate,
         "mandate_proposals": [_proposal_response(entry) for entry in project.mandate_proposals],
         "main_session_id": project.main_session_id,
+        "owner_user_id": project.user_id,
         # Deprecated response alias; remove in 0.25.0.
         "orchestrator_session_id": project.main_session_id,
     }
@@ -107,6 +110,22 @@ def _proposal_response(proposal: MandateProposal) -> dict[str, Any]:
         "created_at": proposal.created_at,
         "session_id": proposal.session_id,
     }
+
+
+def _share_response(share: ProjectShare) -> dict[str, Any]:
+    """Serialize a share as a ``ProjectShareObject``."""
+    return {
+        "object": "project.share",
+        "user_id": share.user_id,
+        "created_at": share.created_at,
+        "created_by": share.created_by,
+    }
+
+
+def _refuse_agent_share_write(request: Request) -> None:
+    """Sharing is a person's decision: agent tools may never add or revoke a share."""
+    if ORCHESTRATION_SOURCE_HEADER in request.headers:
+        raise OmnigentError("Only the project owner can share a project", code=ErrorCode.FORBIDDEN)
 
 
 def _is_throwaway_project_name(name: str) -> bool:
@@ -149,9 +168,10 @@ def create_projects_router(
     """
     router = APIRouter()
 
-    async def response(project: Project) -> dict[str, Any]:
+    async def response(project: Project, viewer: str | None) -> dict[str, Any]:
         return {
             **_to_response(project),
+            "shared": project.user_id != viewer,
             "main_session_state": await main_session_state(
                 project, conversation_store, permission_store
             ),
@@ -226,7 +246,7 @@ def create_projects_router(
         # Push the change to the owner's other connected clients so their
         # sidebars pick up the new folder without a reload.
         announce_projects_changed(user_id)
-        return await response(project)
+        return await response(project, user_id)
 
     @router.get("/projects")
     async def list_projects(
@@ -261,7 +281,7 @@ def create_projects_router(
                 raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
             return {
                 "object": "list",
-                "data": [await response(p) for p in page],
+                "data": [await response(p, user_id) for p in page],
                 "first_id": page[0].id if page else None,
                 "last_id": page[-1].id if page else None,
                 "has_more": has_more,
@@ -276,7 +296,7 @@ def create_projects_router(
             )
 
         projects = await asyncio.to_thread(read_projects)
-        return {"object": "list", "data": [await response(p) for p in projects]}
+        return {"object": "list", "data": [await response(p, user_id) for p in projects]}
 
     @router.get(
         "/projects/order", response_model=None, responses={200: {"model": ProjectOrderResponse}}
@@ -314,7 +334,7 @@ def create_projects_router(
         project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-        return await response(project)
+        return await response(project, user_id)
 
     @router.patch("/projects/{project_id}")
     async def update_project(
@@ -359,7 +379,7 @@ def create_projects_router(
         # (another tab, the mobile app) if it is pushed; nothing else refreshes
         # their projects cache until a full reload.
         announce_projects_changed(user_id)
-        return await response(project)
+        return await response(project, user_id)
 
     @router.post("/projects/{project_id}/mandate/proposals")
     async def propose_mandate_addition(
@@ -395,7 +415,10 @@ def create_projects_router(
             # The owner must accept or dismiss it, so the proposing session needs their eyes.
             session_live_state.raise_attention(source_session)
         announce_projects_changed(user_id)
-        return {"proposal": _proposal_response(proposal), "project": await response(project)}
+        return {
+            "proposal": _proposal_response(proposal),
+            "project": await response(project, user_id),
+        }
 
     async def resolve_proposal(
         request: Request, project_id: str, proposal_id: str, *, accept: bool
@@ -416,7 +439,7 @@ def create_projects_router(
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         announce_projects_changed(user_id)
-        return await response(project)
+        return await response(project, user_id)
 
     @router.post("/projects/{project_id}/mandate/proposals/{proposal_id}/accept")
     async def accept_mandate_proposal(
@@ -770,6 +793,66 @@ def create_projects_router(
         )
         return {"session_id": identity.active_session_id, "created": created}
 
+    # -- Shares: the owner gives other users read/write access to the project --
+
+    @router.get("/projects/{project_id}/shares")
+    async def list_project_shares(request: Request, project_id: str) -> dict[str, Any]:
+        """List the users a project is shared with; any member may read it."""
+        user_id = require_user(request, auth_provider)
+        project = await _owned_project(project_id, user_id)
+        shares = await asyncio.to_thread(project_store.list_shares, project.id, user_id=user_id)
+        return {
+            "object": "list",
+            "owner_user_id": project.user_id,
+            "data": [_share_response(share) for share in shares],
+        }
+
+    @router.post("/projects/{project_id}/shares")
+    async def share_project(
+        request: Request, project_id: str, body: ShareProjectRequest
+    ) -> dict[str, Any]:
+        """Share a project with another user. Owner-only and never from an agent tool.
+
+        The member can then open the board, tickets, files and every session in
+        the project. Their actions in owner-created sessions run on the owner's
+        agents and hosts.
+        """
+        user_id = require_user(request, auth_provider)
+        _refuse_agent_share_write(request)
+        if user_id is None:
+            raise OmnigentError(
+                "Sharing needs a server with user sign-in", code=ErrorCode.INVALID_INPUT
+            )
+        member_id = body.user_id.strip()
+        if not member_id or member_id in (RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL):
+            raise OmnigentError("Share with a signed-in user's ID", code=ErrorCode.INVALID_INPUT)
+        share = await asyncio.to_thread(
+            project_store.add_share, project_id, member_id, user_id=user_id
+        )
+        if permission_store is not None:
+            permission_store.invalidate_access_cache()
+        announce_projects_changed(user_id)
+        announce_projects_changed(member_id)
+        return _share_response(share)
+
+    @router.delete("/projects/{project_id}/shares/{member_id}")
+    async def revoke_project_share(
+        request: Request, project_id: str, member_id: str
+    ) -> dict[str, Any]:
+        """Revoke a user's share. Owner-only and never from an agent tool."""
+        user_id = require_user(request, auth_provider)
+        _refuse_agent_share_write(request)
+        removed = await asyncio.to_thread(
+            project_store.remove_share, project_id, member_id, user_id=user_id
+        )
+        if not removed:
+            raise OmnigentError("Share not found", code=ErrorCode.NOT_FOUND)
+        if permission_store is not None:
+            permission_store.invalidate_access_cache()
+        announce_projects_changed(user_id)
+        announce_projects_changed(member_id)
+        return {"user_id": member_id, "object": "project.share.deleted", "deleted": True}
+
     @router.delete("/projects/{project_id}")
     async def delete_project(
         request: Request,
@@ -796,6 +879,11 @@ def create_projects_router(
         """
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
+        existing = await _owned_project(project_id, user_id)
+        if existing.user_id != user_id:
+            raise OmnigentError(
+                "Only the project owner can delete a project", code=ErrorCode.FORBIDDEN
+            )
         if delete_tickets:
             if ORCHESTRATION_SOURCE_HEADER in request.headers:
                 raise OmnigentError(

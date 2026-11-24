@@ -6475,8 +6475,44 @@ class ProjectObject(BaseModel):
     main_session_state: Literal["absent", "missing", "archived", "active", "unavailable"] = (
         "absent"
     )
+    # The owning user; ``None`` in single-user mode.
+    owner_user_id: str | None = None
+    # True when the project is shared with the caller rather than owned by them.
+    shared: bool = False
     # Deprecated response alias; remove in 0.25.0.
     orchestrator_session_id: str | None = None
+
+
+class ProjectShareObject(BaseModel):
+    """A user a project is shared with; members read and write everything in it.
+
+    :param user_id: The member, e.g. ``"alice@example.com"``.
+    :param created_at: Unix epoch seconds when the share was added.
+    :param created_by: The owner who added it.
+    """
+
+    object: Literal["project.share"] = "project.share"
+    user_id: str
+    created_at: int
+    created_by: str | None = None
+
+
+class ProjectShareList(BaseModel):
+    """Response for ``GET /v1/projects/{project_id}/shares``."""
+
+    object: Literal["list"] = "list"
+    owner_user_id: str | None = None
+    data: list[ProjectShareObject]
+
+
+class ShareProjectRequest(BaseModel):
+    """Body for ``POST /v1/projects/{project_id}/shares``.
+
+    :param user_id: The user to share with, as the server identifies them
+        (e.g. the email the sign-in proxy asserts).
+    """
+
+    user_id: str = Field(min_length=1, max_length=128)
 
 
 class ProjectList(BaseModel):

@@ -15185,6 +15185,23 @@
         "title": "SetSharingRequest",
         "type": "object"
       },
+      "ShareProjectRequest": {
+        "description": "Body for `POST /v1/projects/{project_id}/shares`.",
+        "properties": {
+          "user_id": {
+            "description": "The user to share with, as the server identifies them (e.g. the email the sign-in proxy asserts).",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id"
+        ],
+        "title": "ShareProjectRequest",
+        "type": "object"
+      },
       "SideChatList": {
         "description": "Paginated list of side chats; `data` is a page of `SideChatSummary`.",
         "properties": {
@@ -22414,6 +22431,158 @@
           }
         },
         "summary": "Accept Mandate Proposal",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/shares": {
+      "get": {
+        "description": "List the users a project is shared with; any member may read it.",
+        "operationId": "list_project_shares_v1_projects__project_id__shares_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Project Shares V1 Projects  Project Id  Shares Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Project Shares",
+        "tags": [
+          "projects"
+        ]
+      },
+      "post": {
+        "description": "Share a project with another user. Owner-only and never from an agent tool.\n\nThe member can then open the board, tickets, files and every session in\nthe project. Their actions in owner-created sessions run on the owner's\nagents and hosts.",
+        "operationId": "share_project_v1_projects__project_id__shares_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShareProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Share Project V1 Projects  Project Id  Shares Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Share Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/shares/{member_id}": {
+      "delete": {
+        "description": "Revoke a user's share. Owner-only and never from an agent tool.",
+        "operationId": "revoke_project_share_v1_projects__project_id__shares__member_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "member_id",
+            "required": true,
+            "schema": {
+              "title": "Member Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Revoke Project Share V1 Projects  Project Id  Shares  Member Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Project Share",
         "tags": [
           "projects"
         ]

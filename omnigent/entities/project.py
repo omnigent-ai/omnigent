@@ -121,3 +121,17 @@ class ProjectIdentity:
     created_by_session_id: str | None = None
     created_at: int = 0
     updated_at: int | None = None
+
+
+@dataclass(frozen=True)
+class ProjectShare:
+    """A user the owner shared a project with.
+
+    :param user_id: The member, e.g. ``"alice@example.com"``.
+    :param created_at: Unix epoch seconds when the share was added.
+    :param created_by: The owner who added it, or ``None`` in single-user mode.
+    """
+
+    user_id: str
+    created_at: int
+    created_by: str | None

@@ -85,6 +85,51 @@ export interface Project {
   mandate?: string | null;
   /** Proposed mandate additions awaiting the owner, oldest first. */
   mandate_proposals?: MandateProposal[];
+  /** The owning user; `null` in single-user mode. */
+  owner_user_id?: string | null;
+  /** True when another user owns the project and shared it with the caller. */
+  shared?: boolean;
+}
+
+/** A user the owner shared a project with; members read and write everything in it. */
+export interface ProjectShare {
+  user_id: string;
+  created_at: number;
+  created_by?: string | null;
+}
+
+export interface ProjectShareList {
+  owner_user_id: string | null;
+  data: ProjectShare[];
+}
+
+function sharesPath(projectId: string, userId?: string): string {
+  const base = `/v1/projects/${encodeURIComponent(projectId)}/shares`;
+  return userId === undefined ? base : `${base}/${encodeURIComponent(userId)}`;
+}
+
+/** List the users a project is shared with. Any member may read it. */
+export async function listProjectShares(projectId: string): Promise<ProjectShareList> {
+  const res = await authenticatedFetch(sharesPath(projectId));
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as ProjectShareList;
+}
+
+/** Share a project with another user by their sign-in ID. Owner-only. */
+export async function shareProject(projectId: string, userId: string): Promise<ProjectShare> {
+  const res = await authenticatedFetch(sharesPath(projectId), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId }),
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as ProjectShare;
+}
+
+/** Revoke a user's share. Owner-only. */
+export async function revokeProjectShare(projectId: string, userId: string): Promise<void> {
+  const res = await authenticatedFetch(sharesPath(projectId, userId), { method: "DELETE" });
+  if (!res.ok) throw await apiErrorFromResponse(res);
 }
 
 /** A proposed addition to a project's mandate; it applies only once the owner accepts it. */

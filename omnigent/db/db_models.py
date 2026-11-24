@@ -886,8 +886,8 @@ class SqlProject(OmnigentBase):
     here; there is no DB foreign key (Rule R032).
 
     Ownership is stamped on the row via ``user_id`` (like ``scheduled_tasks``),
-    not derived from a permission table the way session ownership is — projects
-    have no ACL of their own and are never shared.
+    not derived from a permission table the way session ownership is. The owner
+    may share the project with other users (``project_shares``).
 
     :param id: Uuid16 primary key (bare 32-char hex in Python).
     :param name: Human-readable project name; unique per owner, enforced in the
@@ -966,6 +966,21 @@ class SqlProject(OmnigentBase):
             "id",
         ),
     )
+
+
+class SqlProjectShare(OmnigentBase):
+    """A user the owner shared a project with; members read and write everything in it."""
+
+    __tablename__ = "project_shares"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    project_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # "Projects shared with me" for the sidebar and session access checks.
+    __table_args__ = (Index("ix_project_shares_user", "workspace_id", "user_id", "project_id"),)
 
 
 class SqlProjectIdentity(OmnigentBase):
