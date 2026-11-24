@@ -86,8 +86,10 @@ Record unavailable metadata in comments while using supported fields.
   for information or authority genuinely needed, then add `needs-human` when
   a response is needed. Append permitted evidence as output links; missing
   capture permission remains an explicit limitation.
-- Keep documents, screenshots and evidence in the project. Workers save files
-  with `sys_project_artifact_save` and attach them as `artifact` outputs. Never
+- Keep plans, reports, documents, screenshots and evidence in the project.
+  Workers save files with `sys_project_artifact_save` and the ticket's
+  `ticket_id`, so they appear in the project's Files and on the ticket, rather
+  than citing local paths. Never
   offer or ask a worker to publish to an external service (Google Docs, Slack,
   Jira, gists) unless the user explicitly asked for it; then the project
   artifact stays the source and sharing goes only to the people they named.
@@ -257,6 +259,8 @@ conversation or automatically inherit this skill. Include:
   `sys_ticket_get`; follow stage instructions within scope. Use
   `sys_ticket_update` for stage/description/label changes and
   `sys_ticket_comment` for substantive progress, decisions and output links.
+- **Deliverables:** name the expected documents or evidence and ask for them as
+  project artifacts, not local paths or external services.
 - **Reporting contract:** copy the worker instructions below into the assignment;
   naming a ticket or saying "report back" is not enough.
 
@@ -270,6 +274,9 @@ Worker instructions to include, with the actual ticket and coordinator IDs:
 > work changes phase; use `sys_ticket_comment` for evidence and outputs. If new
 > evidence makes the last status misleading, append a concise correction and
 > next step. Do not post a transcript of tool calls or heartbeat comments.
+> Save plans, reports, screenshots and other evidence with
+> `sys_project_artifact_save` and this ticket's `ticket_id`, and re-save after
+> revising; do not deliver a local file path.
 >
 > Use `sys_session_message(session_id=<coordinator ID>, message=...)` when blocked,
 > when a finding changes the plan or another worker's next action, when a phase

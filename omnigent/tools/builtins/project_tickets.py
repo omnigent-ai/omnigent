@@ -260,7 +260,8 @@ class SaveProjectArtifact(BaseModel):
 class SysProjectArtifactSaveTool(_TicketTool):
     tool_name = "sys_project_artifact_save"
     help_text = (
-        "Save a workspace file (document, screenshot, log or other evidence, up to 50 MB) to "
+        "Save a workspace file (plan, report, document, screenshot, log or other evidence, "
+        "up to 50 MB) to "
         "this project's Files so the user can open it from the project and its tickets. "
         "With ticket_id, also posts a ticket comment with the file as an artifact output. "
         "Returns the artifact's id and url; pass {type: artifact, url} in a later "
