@@ -77,6 +77,9 @@ _SUBCOMMAND_OPTIONS = {
     "diff": ("--no-ext-diff", "--no-textconv"),
     "log": ("--no-show-signature", "--no-color", "--no-ext-diff", "--no-textconv"),
 }
+# check-ignore refuses literal pathspecs; it gets raw "./"-prefixed stdin names with
+# --no-index. Every other command keeps literal pathspecs.
+_MAGIC_PATHSPEC_SUBCOMMANDS = frozenset({"check-ignore"})
 
 # Tests add variables here, such as GIT_TRACE2_EVENT, to observe Git.
 test_environment: dict[str, str] = {}
@@ -214,11 +217,13 @@ def trusted_search_path() -> str:
     return os.pathsep.join(entry for entry in entries if os.path.isabs(entry))
 
 
-def _environment() -> dict[str, str]:
+def _environment(*, literal_pathspecs: bool = True) -> dict[str, str]:
     environment = {name: os.environ[name] for name in _INHERITED_VARIABLES if name in os.environ}
     environment["PATH"] = trusted_search_path()
     environment.update(_FIXED_VARIABLES)
     environment.update(test_environment)
+    if not literal_pathspecs:
+        environment.pop("GIT_LITERAL_PATHSPECS", None)
     return environment
 
 
@@ -244,15 +249,26 @@ def failure(output: GitOutput, command: str) -> GitError:
     return GitError(GitProblem.FAILED, summary or f"git {command} exited with {output.returncode}")
 
 
-async def _read_capped(stream: asyncio.StreamReader, limit: int) -> tuple[bytes, bool]:
-    """Read to the end, or until more than ``limit`` bytes arrived."""
+async def _read_capped(
+    stream: asyncio.StreamReader, limit: int, sink: Callable[[bytes], None] | None = None
+) -> tuple[bytes, bool]:
+    """Read to the end, or until more than ``limit`` bytes arrived.
+
+    :param sink: Takes each chunk as it arrives, instead of it being kept.
+    """
     kept = bytearray()
+    received = 0
     while chunk := await stream.read(_READ_CHUNK):
-        room = limit - len(kept)
-        if len(chunk) > room:
-            kept += chunk[:room]
+        overflowed = len(chunk) > limit - received
+        if overflowed:
+            chunk = chunk[: limit - received]
+        received += len(chunk)
+        if sink is None:
+            kept += chunk
+        else:
+            sink(chunk)
+        if overflowed:
             return bytes(kept), True
-        kept += chunk
     return bytes(kept), False
 
 
@@ -322,6 +338,14 @@ def _available_exit_watchers() -> list[Callable[[int], Awaitable[None]]]:
 
 
 _EXIT_WATCHERS = _available_exit_watchers()
+
+
+def runs_on_this_host() -> bool:
+    """Whether this host can own Git's processes: POSIX process groups and an exit watcher.
+
+    Native Windows has neither, so callers that can do without Git skip it there.
+    """
+    return hasattr(os, "killpg") and bool(_EXIT_WATCHERS)
 
 
 async def _exit_of(pid: int) -> None:
@@ -470,6 +494,8 @@ async def _run(
     stdin: bytes | None = None,
     stdout_bytes: int = SMALL_OUTPUT_BYTES,
     allow_partial: bool = False,
+    stdout_sink: Callable[[bytes], None] | None = None,
+    literal_pathspecs: bool = True,
 ) -> GitOutput:
     """Start one Git child once ``slots`` allow it, and clean up its process group."""
     if deadline.expired():
@@ -488,7 +514,10 @@ async def _run(
         argv += arguments
         try:
             process = await start_owned_process(
-                argv, cwd=working_directory, env=_environment(), stdin=stdin
+                argv,
+                cwd=working_directory,
+                env=_environment(literal_pathspecs=literal_pathspecs),
+                stdin=stdin,
             )
         except OSError:
             raise GitError(GitProblem.UNAVAILABLE) from None
@@ -496,7 +525,7 @@ async def _run(
         draining = asyncio.ensure_future(_drain(process.stderr))
         try:
             async with asyncio.timeout(deadline.remaining()):
-                stdout, overflowed = await _read_capped(process.stdout, stdout_bytes)
+                stdout, overflowed = await _read_capped(process.stdout, stdout_bytes, stdout_sink)
                 if overflowed and not allow_partial:
                     raise GitError(GitProblem.OUTPUT_TOO_LARGE)
                 if overflowed:
@@ -697,11 +726,14 @@ class GitRepository:
         stdin: bytes | None = None,
         stdout_bytes: int = SMALL_OUTPUT_BYTES,
         allow_partial: bool = False,
+        stdout_sink: Callable[[bytes], None] | None = None,
     ) -> GitOutput:
         """Run a command on this repository and return its output whatever its exit status.
 
         :param allow_partial: Keep the output up to the cap, with ``overflowed``
             set, instead of failing with OUTPUT_TOO_LARGE.
+        :param stdout_sink: Takes the output in chunks as it arrives, up to the cap,
+            so a large listing is never held whole; ``stdout`` is then empty.
         """
         assert self._slots is not None
         subcommand, *rest = arguments
@@ -721,4 +753,6 @@ class GitRepository:
             stdin=stdin,
             stdout_bytes=stdout_bytes,
             allow_partial=allow_partial,
+            stdout_sink=stdout_sink,
+            literal_pathspecs=subcommand not in _MAGIC_PATHSPEC_SUBCOMMANDS,
         )

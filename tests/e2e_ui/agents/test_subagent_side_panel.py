@@ -22,6 +22,7 @@ from tests._helpers.polling import poll_until
 from tests._helpers.session import bind_session_runner, send_user_text
 from tests.e2e_ui.conftest import (
     configure_mock_llm,
+    open_right_rail,
     seed_committed_items,
     seed_committed_turn,
 )
@@ -265,6 +266,8 @@ def test_transcript_and_agents_tab_reuse_one_tab_and_close_keeps_child_running(
 
     rail.get_by_role("button", name=f"Close {_CHILD_NAME}", exact=True).click()
     expect(child_tab).to_have_count(0)
+    # Closing the last open tab hides the rail; reopen it to check the child.
+    open_right_rail(page)
     agents_tab.click()
     expect(row.get_by_test_id("subagent-status-avatar")).to_have_attribute(
         "data-activity", "working"

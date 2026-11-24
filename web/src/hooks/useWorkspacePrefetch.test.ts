@@ -17,6 +17,7 @@ vi.mock("./useWorkspaceChangedFiles", async (importOriginal) => ({
 }));
 
 import type * as WorkspaceChangedFilesModule from "./useWorkspaceChangedFiles";
+import { workspaceDirectoryQuery } from "./useWorkspaceChangedFiles";
 import {
   FILE_PREFETCH_MAX_BYTES,
   PREFETCH_DWELL_MS,
@@ -43,10 +44,16 @@ function renderPrefetch() {
   const wrapper = ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client }, children);
   const { result, rerender, unmount } = renderHook(
-    () => useWorkspacePrefetch({ conversationId: SESSION, location: "", refreshToken: 0 }),
-    { wrapper },
+    ({ hideIgnored }: { hideIgnored: boolean }) =>
+      useWorkspacePrefetch({ conversationId: SESSION, location: "", refreshToken: 0, hideIgnored }),
+    { wrapper, initialProps: { hideIgnored: false } },
   );
-  return { client, rerender, unmount, prefetch: () => result.current };
+  return {
+    client,
+    rerender: (hideIgnored = false) => rerender({ hideIgnored }),
+    unmount,
+    prefetch: () => result.current,
+  };
 }
 
 beforeEach(() => {
@@ -89,6 +96,36 @@ describe("useWorkspacePrefetch on pause", () => {
       await act(() => vi.advanceTimersByTimeAsync(PREFETCH_DWELL_MS));
     }
     expect(httpsPaths()).toEqual(["/src"]);
+  });
+
+  it("keeps a folder's listings with and without ignored files apart", async () => {
+    const { prefetch, rerender, client } = renderPrefetch();
+    const visit = async () => {
+      act(() => prefetch().intend({ kind: "directory", path: "src" }));
+      await act(() => vi.advanceTimersByTimeAsync(PREFETCH_DWELL_MS));
+    };
+    await visit();
+    rerender(true);
+    await visit();
+    // Each listing is fresh in its own cache entry now, so neither is asked for again.
+    await visit();
+    rerender(false);
+    await visit();
+
+    expect(httpsPaths()).toEqual(["/src", "/src"]);
+    const cached = (hideIgnored: boolean) =>
+      client.getQueryData(workspaceDirectoryQuery(SESSION, "src", "", 0, hideIgnored).queryKey);
+    expect(cached(false)).toBeDefined();
+    expect(cached(true)).toBeDefined();
+  });
+
+  it("drops a pause under way when ignored files are shown or hidden", async () => {
+    const { prefetch, rerender } = renderPrefetch();
+    act(() => prefetch().intend({ kind: "directory", path: "src" }));
+    await act(() => vi.advanceTimersByTimeAsync(PREFETCH_DWELL_MS / 2));
+    rerender(true);
+    await act(() => vi.advanceTimersByTimeAsync(PREFETCH_DWELL_MS));
+    expect(authenticatedFetch).not.toHaveBeenCalled();
   });
 
   it("loads a small file's contents, but not a large, unknown-size, or video file", async () => {

@@ -275,6 +275,7 @@ const PAGE_CONTEXT: ShortcutPageContext = {
   browser: true,
   submitWithModEnter: false,
   preventsKeyboardSubmit: false,
+  alwaysSteer: false,
   contentSearch: true,
   grids: true,
   splitTerminal: true,
@@ -287,6 +288,7 @@ const SHOWN: SettingsAvailability = {
   floatingComposerShortcut: true,
   widenWindowForRightSidebar: true,
   inAppBrowser: true,
+  desktopAppHandoff: true,
   adminView: true,
   accountsEnabled: true,
   archiveWorktreeCleanup: true,
@@ -294,6 +296,7 @@ const SHOWN: SettingsAvailability = {
   integrationProviders: { github: true, databricks: true },
   projectKanban: true,
   sessionTitleInstructions: true,
+  floatingPanes: true,
   proactiveAgent: true,
 };
 

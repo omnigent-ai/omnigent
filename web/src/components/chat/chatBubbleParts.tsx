@@ -5,6 +5,7 @@
 import {
   createContext,
   memo,
+  Fragment,
   useCallback,
   useContext,
   useEffect,
@@ -26,6 +27,7 @@ import {
   Loader2Icon,
   PencilIcon,
   SplitIcon,
+  SquareTerminalIcon,
   XIcon,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -90,6 +92,7 @@ import {
   isPendingBlockingElicitation,
   isTextBlock,
   keyedAttachments,
+  PENDING_FILE_PREFIX,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { isCommandListed } from "@/store/paletteCommands";
@@ -113,6 +116,7 @@ import { useForkDialog } from "@/shell/ForkDialogContext";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/components/SessionImage";
+import { FailedAttachment, PendingAttachment } from "./PendingAttachment";
 import { UndeliveredMessageNotice } from "@/components/chat/UndeliveredMessageNotice";
 import { EditSentMessageContext } from "@/components/chat/editSentMessage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
@@ -310,6 +314,7 @@ export function buildPendingBubbles(
       // Stamped once at send time; absent for snapshot-replayed entries,
       // which show no timestamp rather than a re-stamped render time.
       ...(p.createdAtS !== undefined ? { createdAtS: p.createdAtS } : {}),
+      ...(p.uploadFailure !== undefined ? { uploadFailure: p.uploadFailure } : {}),
     };
   });
 }
@@ -356,6 +361,18 @@ export function placeUndeliveredBubbles(committed: Bubble[], undelivered: Bubble
   return [...committed.slice(0, notice), ...undelivered, ...committed.slice(notice)];
 }
 
+/** Submission order within one second: the optimistic bubble's sequence number from its temp id. */
+function sendSequence(message: PendingUserMessage): number {
+  const match = /_(\d+)$/.exec(message.tempId);
+  return match ? Number(match[1]) : 0;
+}
+
+/** Whether `later` was submitted after `earlier`: send time first, then the sequence within a second. */
+function sendsAfter(earlier: PendingUserMessage, later: PendingUserMessage): boolean {
+  const byTime = (later.createdAtS ?? 0) - (earlier.createdAtS ?? 0);
+  return byTime > 0 || (byTime === 0 && sendSequence(later) > sendSequence(earlier));
+}
+
 /**
  * Add a conversation's uncommitted user messages to its committed bubbles: the
  * undelivered startup messages, and the optimistic sends they don't replace.
@@ -364,20 +381,27 @@ export function placeUndeliveredBubbles(committed: Bubble[], undelivered: Bubble
  * @param pendingUserMessages - The conversation's optimistic sends.
  * @param failedInputs - The snapshot's undelivered startup messages.
  * @param selfAuthor - The viewer's attribution id, or null.
+ * @param failedUploads - Sends whose upload failed before posting, shown in send order.
  */
 export function withUncommittedUserBubbles(
   committed: Bubble[],
   pendingUserMessages: PendingUserMessage[],
   failedInputs: PendingInput[],
   selfAuthor: string | null,
+  failedUploads: PendingUserMessage[] = [],
 ): Bubble[] {
   const withUndelivered = placeUndeliveredBubbles(
     committed,
     buildUndeliveredBubbles(failedInputs, selfAuthor),
   );
-  const pending = withoutFailedInputs(pendingUserMessages, failedInputs);
-  if (pending.length === 0) return withUndelivered;
-  return mergePendingBubbles(withUndelivered, buildPendingBubbles(pending, selfAuthor));
+  // Pending sends keep their own order; each parked upload goes where its send time falls.
+  const uncommitted = [...withoutFailedInputs(pendingUserMessages, failedInputs)];
+  for (const failed of failedUploads) {
+    const at = uncommitted.findIndex((p) => sendsAfter(failed, p));
+    uncommitted.splice(at === -1 ? uncommitted.length : at, 0, failed);
+  }
+  if (uncommitted.length === 0) return withUndelivered;
+  return mergePendingBubbles(withUndelivered, buildPendingBubbles(uncommitted, selfAuthor));
 }
 
 // A committed bubble that exists ONLY to render one or more
@@ -691,7 +715,7 @@ export function WorkingIndicator() {
     );
   }
   // Background shells outliving a finished turn keep the session in progress,
-  // but the agent isn't thinking: show a plain spinner instead of the shimmer.
+  // but the agent isn't thinking: show the static terminal glyph, not a spinner.
   // The main composer's pill announces the count; side chats have no pill.
   if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) {
     const label = `${bgCount} background task${bgCount === 1 ? "" : "s"} running`;
@@ -705,7 +729,7 @@ export function WorkingIndicator() {
         <Message from="assistant" data-testid="background-tasks-indicator" aria-hidden="true">
           <MessageContent>
             <div className="flex items-center gap-1.5 py-0.5 text-muted-foreground">
-              <RunningDot className="size-3.5" />
+              <SquareTerminalIcon aria-hidden strokeWidth={1.5} className="size-3.5 shrink-0" />
               <span className="text-sm font-mono">{label}</span>
             </div>
           </MessageContent>
@@ -1244,11 +1268,24 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                       />
                     );
                   }
+                  if (preview.kind !== "pending") {
+                    return <ImageAttachmentPlaceholder key={key} label={preview.label} />;
+                  }
                   return (
-                    <ImageAttachmentPlaceholder
+                    <PendingAttachment
                       key={key}
-                      label={preview.label}
-                      pending={preview.kind === "pending"}
+                      messageId={bubble.itemId}
+                      fileId={img.file_id ?? ""}
+                      name={preview.label}
+                      image
+                      failure={bubble.uploadFailure}
+                      fallback={
+                        // Siblings of a failed message are not uploading: no spinner.
+                        <ImageAttachmentPlaceholder
+                          label={preview.label}
+                          pending={bubble.uploadFailure === undefined}
+                        />
+                      }
                     />
                   );
                 })}
@@ -1288,13 +1325,27 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 {fileChips.length > 0 && (
                   <div className="flex flex-wrap gap-1.5">
                     {keyedAttachments(fileChips, (att) => att.file_id ?? att.filename).map(
-                      ({ key, item: att }) => (
-                        <AttachmentChip
-                          key={key}
-                          icon={FileTextIcon}
-                          label={attachmentLabel(att)}
-                        />
-                      ),
+                      ({ key, item: att }) => {
+                        const chip = (
+                          <AttachmentChip icon={FileTextIcon} label={attachmentLabel(att)} />
+                        );
+                        if (
+                          typeof att.file_id !== "string" ||
+                          !att.file_id.startsWith(PENDING_FILE_PREFIX)
+                        ) {
+                          return <Fragment key={key}>{chip}</Fragment>;
+                        }
+                        return (
+                          <PendingAttachment
+                            key={key}
+                            messageId={bubble.itemId}
+                            fileId={att.file_id}
+                            name={attachmentLabel(att)}
+                            failure={bubble.uploadFailure}
+                            fallback={chip}
+                          />
+                        );
+                      },
                     )}
                   </div>
                 )}
@@ -1344,6 +1395,11 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
           </div>
         </div>
+        {bubble.uploadFailure !== undefined && bubble.uploadFailure.fileId === undefined && (
+          <div className="flex justify-end pt-1">
+            <FailedAttachment name="this message" failure={bubble.uploadFailure} image={false} />
+          </div>
+        )}
         {bubble.undelivered && (
           <UndeliveredMessageNotice sessionId={sessionId} text={text} content={bubble.content} />
         )}

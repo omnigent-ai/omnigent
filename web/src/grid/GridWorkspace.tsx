@@ -42,6 +42,7 @@ import { cn } from "@/lib/utils";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { readDefaultWorkspacePanelOpen } from "@/lib/workspacePanelPreferences";
 import { SidebarEditRow } from "@/shell/SidebarEditRow";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import {
   SIDEBAR_ROW,
   SIDEBAR_ACTIVE_HIGHLIGHT,
@@ -130,6 +131,7 @@ function GridSidebarRow({
         <SidebarEditRow
           initialTitle={grid.name ?? ""}
           label="Rename grid"
+          maxLength={USER_SESSION_TITLE_MAX_CHARS}
           onCancel={() => setEditing(false)}
           onCommit={(name) => {
             grids.renameGrid(grid.id, name);

@@ -96,6 +96,16 @@ export class SingleSelection {
     }
   }
 
+  /** Leaves no row selected, leaving focus where it is. */
+  clear(): void {
+    this.applying++;
+    try {
+      for (const selected of this.tree.getSelectedPaths()) this.tree.getItem(selected)?.deselect();
+    } finally {
+      this.applying--;
+    }
+  }
+
   private keepOnly(path: string): void {
     for (const selected of this.tree.getSelectedPaths()) {
       if (selected !== path) this.tree.getItem(selected)?.deselect();

@@ -18,6 +18,7 @@ import {
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import type * as IdentityApi from "@/lib/identity";
+import { PANE_CORNERS_STORAGE_KEY, paneCornersPreference } from "@/lib/paneCornersPreference";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -76,6 +77,7 @@ const mocks = vi.hoisted(() => ({
   sessionTitleInstructions: false,
   projectKanban: false,
   floatingComposer: false,
+  workspaceSidebarV2: false,
   nestedAgents: false,
   advisorAvailable: false,
   authenticatedFetch: vi.fn(),
@@ -120,6 +122,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
           features: {
             project_kanban: mocks.projectKanban,
             floating_composer: mocks.floatingComposer,
+            workspace_sidebar_v2: mocks.workspaceSidebarV2,
           },
         },
 }));
@@ -370,6 +373,7 @@ beforeEach(() => {
   mocks.sessionTitleInstructions = false;
   mocks.projectKanban = false;
   mocks.floatingComposer = false;
+  mocks.workspaceSidebarV2 = false;
   mocks.nestedAgents = false;
   mocks.advisorAvailable = false;
   mocks.authenticatedFetch.mockReset();
@@ -1402,6 +1406,19 @@ describe("SettingsPage", () => {
     expect(select.value).toBe("github");
     expect(document.documentElement.getAttribute("data-theme")).toBe("github");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
+  });
+
+  it("saves this device's Pane corners choice from its dropdown, where the design exists", () => {
+    mocks.workspaceSidebarV2 = true;
+    onTestFinished(() => void paneCornersPreference.write("automatic"));
+    renderPage("/settings/appearance");
+    const select = screen.getByTestId("pane-corners-select") as HTMLSelectElement;
+    expect(select.value).toBe("automatic");
+
+    fireEvent.change(select, { target: { value: "floating" } });
+    expect(select.value).toBe("floating");
+    expect(paneCornersPreference.read()).toBe("floating");
+    expect(localStorage.getItem(PANE_CORNERS_STORAGE_KEY)).toContain("floating");
   });
 
   it("creates and applies a custom theme when a guided color control changes", () => {

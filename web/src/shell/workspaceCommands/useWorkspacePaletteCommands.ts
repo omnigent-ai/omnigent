@@ -6,6 +6,7 @@ import {
   BotIcon,
   FileDiffIcon,
   FolderTreeIcon,
+  GitMergeIcon,
   GitPullRequestIcon,
   GlobeIcon,
   ListChecksIcon,
@@ -45,6 +46,10 @@ const TAB_ACTION_ICONS: Record<WorkspaceTabAction, LucideIcon> = {
   "move-right": ArrowRightIcon,
   "toggle-pin": PinIcon,
   "search-tabs": SearchIcon,
+  "close-merged-pull-requests": GitMergeIcon,
+  "close-pull-request-tabs": XIcon,
+  "close-file-tabs": XIcon,
+  "close-page-tabs": XIcon,
 };
 
 /** The icon a workspace command shows in ⌘K. */

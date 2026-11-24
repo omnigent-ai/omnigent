@@ -212,6 +212,13 @@ describe("Files tab", () => {
       { place: { kind: "files", path: "src/c.ts" } },
       { opener: "user", disposition: "new" },
     );
+    // A breadcrumb pick steps the same tab, through the navigation its unsaved-edit guard holds.
+    onNavigate.mockClear();
+    captured.viewer!.onOpenFile!("src/d.ts");
+    expect(onNavigate.mock.calls).toEqual([
+      [{ kind: "files", path: "src/d.ts" }, { replace: false }],
+    ]);
+    expect(onOpen).toHaveBeenCalledTimes(1);
   });
 
   it("shows the file at its cited lines and opens its changes there for Show changes", () => {
@@ -401,6 +408,7 @@ describe("Files tab", () => {
       "Sort Files Tree by Size",
       "Sort Files Tree by Type",
       "Hide Hidden Files",
+      "Show Git-Ignored Files",
     ]);
     act(() => listed.find((row) => row.label === "Sort Files Tree by Type")!.run());
     expect(fileSettings.onSortChange).toHaveBeenCalledWith("type");
@@ -416,7 +424,41 @@ describe("Files tab", () => {
       "Sort Files Tree by Last edited",
       "Sort Files Tree by Size",
       "Show Hidden Files",
+      "Show Git-Ignored Files",
     ]);
+  });
+
+  it("shows git-ignored files from the options and ⌘K, off by default and kept per device", async () => {
+    renderView({ kind: "files", path: "a.ts" });
+    expect(captured.tree!.showIgnored).toBe(false);
+    const options = () =>
+      within(screen.getByTestId("file-viewer")).getByRole("button", { name: "Files tree options" });
+
+    await userEvent.click(options());
+    const showIgnored = screen.getByRole("menuitemcheckbox", { name: "Show git-ignored files" });
+    expect(showIgnored).not.toBeChecked();
+    await userEvent.click(showIgnored);
+    expect(captured.tree!.showIgnored).toBe(true);
+    expect(window.localStorage.getItem("omnigent:files-tree-show-ignored")).toBe("true");
+
+    const hide = registeredPaletteCommands().find((row) => row.id === "files-tree-ignored")!;
+    expect(hide.label).toBe("Hide Git-Ignored Files");
+    act(() => hide.run());
+    expect(captured.tree!.showIgnored).toBe(false);
+    expect(window.localStorage.getItem("omnigent:files-tree-show-ignored")).not.toBe("true");
+  });
+
+  it("shows git-ignored files when a tree with nothing else asks", () => {
+    renderView({ kind: "files", path: "a.ts" });
+    act(() => captured.tree!.onShowIgnored!());
+    expect(captured.tree!.showIgnored).toBe(true);
+  });
+
+  it("gives the tree's ⌘K commands to the keyboard target only, while both trees stay on screen", () => {
+    renderView({ kind: "files", path: "a.ts" }, { keyboardTarget: false });
+    expect(captured.tree).toMatchObject({ active: true, commandsActive: false });
+    renderView({ kind: "files", path: "b.ts" }, { keyboardTarget: true });
+    expect(captured.tree).toMatchObject({ active: true, commandsActive: true });
   });
 
   it("leaves ⌘K and ⇧⌘E to the keyboard target when two Files places are on screen", () => {

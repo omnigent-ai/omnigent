@@ -39,8 +39,11 @@ export function resolveFileTreeGitStatusState(
     const canonicalPath = canonicalGitStatusPath(path);
     if (canonicalPath === null) continue;
     statusByPath.set(canonicalPath, status);
-    if (canonicalPath.endsWith("/") && status === "ignored")
-      ignoredDirectoryPaths.add(canonicalPath);
+    if (status === "ignored") {
+      // An ignored entry isn't a change, so its folders get no dot for it.
+      if (canonicalPath.endsWith("/")) ignoredDirectoryPaths.add(canonicalPath);
+      continue;
+    }
     for (const ancestorPath of getAncestorDirectoryPaths(canonicalPath))
       directoriesWithChanges.add(ancestorPath);
   }

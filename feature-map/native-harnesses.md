@@ -157,8 +157,10 @@ implements them separately, so a fix for one harness does not reach the others.
     stopped by its usage or budget limit fails the session, and so does a
     system error that Codex reports outside a turn; during a turn, the turn's
     own outcome decides.
-  - Background work shows the working spinner with the tooltip "Working in the
-    background". Output from the ended turn that the viewer hasn't seen shows the
+  - Background work shows a static terminal icon, not the working spinner, with
+    the tooltip "Working in the background", so a dev server left running doesn't
+    read as a busy turn. Chat ends with the same icon and "1 background task
+    running". Output from the ended turn that the viewer hasn't seen shows the
     unread dot instead until the session is opened. The composer lists running
     Claude background shells and Codex background terminals as "1 background
     task" with each one's command. Claude's list changes when a turn ends;
@@ -287,8 +289,8 @@ launched `omnigent claude` session is a separate launch path; inspect its linked
 Chat session as well as the local terminal.
 
 **Sidebar status rules:** keep the sidebar in view. In a Claude session, ask
-for `sleep 60` in a background shell and let the turn end: the row keeps its
-spinner until the sleep exits. In a Codex session, set a goal with several
+for `sleep 60` in a background shell and let the turn end: the row shows the
+terminal icon until the sleep exits. In a Codex session, set a goal with several
 steps, then have Codex start `python3 -m http.server 8765` in the background:
 the row stays working between turns and while the server runs, and goes idle
 once both end. While the server runs, the composer shows "1 background task"

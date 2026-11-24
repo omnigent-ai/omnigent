@@ -20,6 +20,7 @@ from omnigent.native import native_cost_popup
 from omnigent.runner.app import create_runner_app
 from omnigent.runner.native import orchestration as native_runtime
 from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.terminals import pane_reaper
 from omnigent.terminals.pane_reaper import (
     _DEFAULT_IDLE_TIMEOUT_S,
     _IDLE_TIMEOUT_ENV,
@@ -244,18 +245,19 @@ def test_every_native_harness_but_kimi_is_offered_to_the_reaper() -> None:
     assert pane_names >= NATIVE_PANE_TERMINAL_NAMES
 
 
-@pytest.mark.parametrize("live_work", ["approval_wait", "background_agent"])
+@pytest.mark.parametrize("live_work", ["approval_wait", "background_agent", "background_shell"])
 async def test_runner_busy_check_spares_a_pane_with_live_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     live_work: str,
 ) -> None:
     """
-    The runner's busy check treats an approval wait or a background agent as busy.
+    The runner's busy check treats an approval wait or background work as busy.
 
     A pane parked on a permission prompt, or whose settled turn left a background
-    agent working, has no active turn, no ``running`` status, no attached client
-    and no output, so every other signal reads idle and the reaper would kill it.
+    agent or shell working, has no active turn, no ``running`` status, no attached
+    client and no output, so every other signal reads idle and the reaper would
+    kill it.
     """
     # Bound by name when the app is built, so stub before building: no tmux here.
     monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
@@ -278,16 +280,37 @@ async def test_runner_busy_check_spares_a_pane_with_live_work(
 
     assert not await reaper._is_busy(pane)
 
+    background_shell = resources._session_background_publisher
+    assert background_shell is not None
     if live_work == "approval_wait":
         marker = claude_native_bridge.approval_wait_marker_path("conv_parked")
         marker.parent.mkdir(parents=True)
         claude_native_bridge.touch_approval_wait_marker(marker)
-    else:
+    elif live_work == "background_agent":
         agent_sessions.add("conv_parked")
+    else:
+        # Claude reports ``shell`` (idle) while a background command outlives the turn.
+        background_shell("conv_parked", True)
     assert await reaper._is_busy(pane)
     # Another session's live work does not spare this pane.
     other = PaneRef("conv_other", pane.terminal_id, "claude", pane.socket_path)
     assert not await reaper._is_busy(other)
+
+    if live_work == "background_shell":
+        # A shell alone holds the pane for a bounded time, so a forgotten server
+        # cannot pin it forever; other work and each new shell re-arm that hold.
+        hold_since = app.state.background_shell_pane_hold_since
+        hold_since["conv_parked"] -= pane_reaper.BACKGROUND_SHELL_PANE_HOLD_S
+        assert not await reaper._is_busy(pane)
+        agent_sessions.add("conv_parked")
+        assert await reaper._is_busy(pane)
+        agent_sessions.discard("conv_parked")
+        assert await reaper._is_busy(pane)
+        hold_since["conv_parked"] -= pane_reaper.BACKGROUND_SHELL_PANE_HOLD_S
+        background_shell("conv_parked", False)
+        assert not await reaper._is_busy(pane)
+        background_shell("conv_parked", True)
+        assert await reaper._is_busy(pane)
 
 
 async def test_runner_busy_check_counts_a_viewer_only_on_recent_input(

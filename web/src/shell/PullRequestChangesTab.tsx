@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import { toast } from "sonner";
+import { MiddleTruncatedName } from "@/components/file-tree/MiddleTruncatedName";
 import { Button } from "@/components/ui/button";
 import { TabsContent } from "@/components/ui/tabs";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
@@ -170,9 +171,10 @@ const treeIndent = (depth: number) => depth * TREE_INDENT_STEP + TREE_BASE_PAD;
 
 /**
  * One node in the sidebar file tree — a collapsible folder or a file leaf.
- * Names truncate on the LEFT (rtl) so the end of the path — the most specific
- * part — stays visible; the name isn't `flex-1`, so short names still sit
- * beside their icon rather than drifting right.
+ * A file's name truncates in the middle, keeping its start and extension, as
+ * the file trees do. A folder's compacted path truncates on the LEFT (rtl) so
+ * its deepest folder stays visible. Names aren't `flex-1`, so short names
+ * still sit beside their icon rather than drifting right.
  */
 function SidebarNode({
   node,
@@ -213,9 +215,7 @@ function SidebarNode({
         </span>
         {viewed && <span className="sr-only">Viewed, </span>}
         <StatusIcon aria-hidden className={cn("size-3.5 shrink-0", meta.className)} />
-        <span className={cn("min-w-0 truncate [direction:rtl]", viewed && "text-muted-foreground")}>
-          <bdi>{node.name}</bdi>
-        </span>
+        <MiddleTruncatedName name={node.name} className={cn(viewed && "text-muted-foreground")} />
         <span className="ml-auto flex shrink-0 items-center">
           <DiffStat file={node.file} />
         </span>

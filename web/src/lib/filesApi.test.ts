@@ -7,6 +7,26 @@ import { deleteSessionFile, uploadFile } from "./filesApi";
 
 afterEach(() => vi.resetAllMocks());
 
+describe("uploadFile transport options", () => {
+  it("passes the abort signal and the progress listener to the request", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValue(
+      new Response(JSON.stringify({ id: "file_2" }), { status: 201 }),
+    );
+    const controller = new AbortController();
+    const onUploadProgress = vi.fn();
+
+    await uploadFile("session_1", new File(["x"], "a.txt"), {
+      signal: controller.signal,
+      onUploadProgress,
+    });
+
+    expect(vi.mocked(authenticatedFetch).mock.calls[0]![1]).toMatchObject({
+      signal: controller.signal,
+      onUploadProgress,
+    });
+  });
+});
+
 describe("uploadFile filenames", () => {
   it.each([
     ["screenshot.png", "screenshot.png"],

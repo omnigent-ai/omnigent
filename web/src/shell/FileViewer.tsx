@@ -391,6 +391,8 @@ interface FileViewerProps {
    * when the viewer is embedded inside the inline right panel.
    */
   frameless?: boolean;
+  /** Shown in place of the header's path, such as the tabs sidebar's breadcrumbs. */
+  pathHeader?: ReactNode;
   /** The same frameless viewer fills the mobile viewport without remounting. */
   mobileOverlay?: boolean;
   /** Only the active viewport mounts the diff editor and synchronizes the URL. */
@@ -454,6 +456,7 @@ function FileViewerBody({
   permissionLevel,
   comparisonDiff,
   frameless,
+  pathHeader,
   mobileOverlay = false,
   viewport,
   onCommentsOpenChange,
@@ -1853,31 +1856,33 @@ function FileViewerBody({
             </div>
           )}
           {/* Always show the file path/name in the toolbar, in every view. */}
-          <TooltipProvider>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  aria-label={`Copy file path: ${path}`}
-                  className="min-w-0 cursor-pointer truncate rounded text-left font-mono text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  onClick={() => {
-                    const absolutePath = absoluteWorkspacePath(path, workspaceRoot);
-                    if (absolutePath === null) {
-                      toast.error("Workspace path unavailable");
-                      return;
-                    }
-                    void copyText(absolutePath).then(
-                      () => toast.success("File path copied"),
-                      () => toast.error("Failed to copy file path"),
-                    );
-                  }}
-                >
-                  {path}
-                </button>
-              </TooltipTrigger>
-              <TooltipContent>Copy file path</TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
+          {pathHeader ?? (
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label={`Copy file path: ${path}`}
+                    className="min-w-0 cursor-pointer truncate rounded text-left font-mono text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    onClick={() => {
+                      const absolutePath = absoluteWorkspacePath(path, workspaceRoot);
+                      if (absolutePath === null) {
+                        toast.error("Workspace path unavailable");
+                        return;
+                      }
+                      void copyText(absolutePath).then(
+                        () => toast.success("File path copied"),
+                        () => toast.error("Failed to copy file path"),
+                      );
+                    }}
+                  >
+                    {path}
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent>Copy file path</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          )}
         </div>
         <div
           className="relative flex min-w-0 items-center justify-end gap-1"

@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const bridge = vi.hoisted(() => ({
@@ -8,7 +8,10 @@ const bridge = vi.hoisted(() => ({
   filePicker: vi.fn(),
   announceSupport: vi.fn(),
   ready: vi.fn(),
+  // Like the shell's, it returns an unsubscribe.
+  onShown: vi.fn((_listener: () => void) => () => {}),
 }));
+const landing = vi.hoisted(() => ({ shown: 0 }));
 vi.mock("@/lib/nativeBridge", () => ({ floatingComposerBridge: () => bridge }));
 vi.mock("./floatingLaunch", () => ({ launchFromPanel: vi.fn() }));
 vi.mock("@/lib/branding", () => ({ useLogoUrl: () => null }));
@@ -19,6 +22,13 @@ vi.mock("@/shell/NewChatDialog", async () => {
     NewChatLandingScreen: function FakeLanding() {
       const presentation = useComposerPresentation();
       const [text, setText] = useState("");
+      useEffect(
+        () =>
+          presentation.kind === "floating"
+            ? presentation.subscribeShown(() => (landing.shown += 1))
+            : undefined,
+        [presentation],
+      );
       return (
         <>
           <textarea
@@ -127,6 +137,62 @@ describe("FloatingComposerPage", () => {
     } finally {
       Object.assign(bridge, { ready });
       vi.unstubAllGlobals();
+    }
+  });
+
+  it("hands the shell's word that the panel took the keyboard to the composer", () => {
+    landing.shown = 0;
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    const stopListening = vi.fn();
+    vi.mocked(bridge.onShown).mockReturnValueOnce(stopListening);
+    try {
+      const page = render(<FloatingComposerPage />);
+      expect(landing.shown).toBe(0);
+      const shown = vi.mocked(bridge.onShown).mock.calls.at(-1)![0];
+      act(() => shown());
+      expect(landing.shown).toBe(1);
+      // With the shell saying so, a window focus alone doesn't move the keyboard.
+      act(() => window.dispatchEvent(new Event("focus")));
+      expect(landing.shown).toBe(1);
+      page.unmount();
+      expect(stopListening).toHaveBeenCalledTimes(1);
+    } finally {
+      visibility.mockRestore();
+    }
+  });
+
+  it("gives the composer the keyboard on its first render when the panel is already up", () => {
+    landing.shown = 0;
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    try {
+      render(<FloatingComposerPage />);
+      expect(landing.shown).toBe(1);
+    } finally {
+      visibility.mockRestore();
+    }
+  });
+
+  it("with an older shell, stands in only when the window takes focus with nothing focused", () => {
+    landing.shown = 0;
+    const onShown = bridge.onShown;
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    try {
+      Reflect.deleteProperty(bridge, "onShown");
+      render(<FloatingComposerPage />);
+      act(() => {
+        (document.activeElement as HTMLElement | null)?.blur();
+        window.dispatchEvent(new Event("focus"));
+      });
+      expect(landing.shown).toBe(1);
+      // Something in the panel has the keyboard: a window focus doesn't take it away.
+      act(() => {
+        screen.getByRole("button", { name: "Launch" }).focus();
+        window.dispatchEvent(new Event("focus"));
+      });
+      expect(landing.shown).toBe(1);
+    } finally {
+      Object.assign(bridge, { onShown });
+      visibility.mockRestore();
     }
   });
 

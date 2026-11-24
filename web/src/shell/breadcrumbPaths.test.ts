@@ -3,6 +3,7 @@ import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import {
   breadcrumbSegments,
   breadcrumbText,
+  canBrowseBreadcrumbs,
   folderTitle,
   listingTreePaths,
   parentFolder,
@@ -69,6 +70,14 @@ describe("segment folders", () => {
     const [top, name] = breadcrumbSegments("/tmp/notes.md");
     expect(segmentFolder(top)).toBe("/");
     expect(segmentFolder(name)).toBe("/tmp");
+  });
+
+  it("lists a Windows path's segments beside their siblings at every depth", () => {
+    const segments = breadcrumbSegments("docs\\sub\\notes.md");
+    expect(segments.map(segmentFolder)).toEqual(["", "docs", "docs/sub"]);
+    expect(
+      segments.map((segment) => pathWithinFolder(segment.path, segmentFolder(segment))),
+    ).toEqual(["docs", "sub", "notes.md"]);
   });
 
   it("selects the segment itself within the listed folder", () => {
@@ -148,5 +157,17 @@ describe("workspaceFolderName", () => {
     [undefined, "Workspace"],
   ])("names root %s %s", (root, expected) => {
     expect(workspaceFolderName(root)).toBe(expected);
+  });
+});
+
+describe("canBrowseBreadcrumbs", () => {
+  it.each([
+    ["src/app.ts", true],
+    ["/home/dev/app.ts", true],
+    ["C:\\Users\\dev\\app.ts", false],
+    ["C:/Users/dev/app.ts", false],
+    ["\\\\server\\share\\app.ts", false],
+  ])("lists the folders of %s: %s", (path, browsable) => {
+    expect(canBrowseBreadcrumbs(path)).toBe(browsable);
   });
 });

@@ -117,6 +117,14 @@ The change that routes the sidebar to v2 adds one server feature flag,
 default and listed in `/v1/info`; `OMNIGENT_FEATURES=workspace_sidebar_v2`
 turns it on. With it off, the sidebar is unchanged.
 
+`floating_panes` follows it. While a deployment doesn't name it, it takes
+`workspace_sidebar_v2`'s value, so turning sidebar v2 on brings floating panes
+too. `-floating_panes` turns floating panes off and `floating_panes` turns them
+on, whatever sidebar v2 does. With floating panes, a session's chat and the
+workspace sidebar are rounded cards on the left sidebar's color, below one top
+row, from 48rem wide in a browser and the desktop app alike. Grids, touch
+clients and narrower windows keep the edge-to-edge layout.
+
 ## Data
 
 The sidebar reads through the workspace API

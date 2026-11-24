@@ -157,6 +157,19 @@ function subscribeOwner(listener: () => void): () => void {
   return () => ownerListeners.delete(listener);
 }
 
+/**
+ * Whether the split ``targetId`` lists its commands in ⌘K now: it's the view whose panes last
+ * had the keyboard, or no view has yet and it's the default one.
+ */
+export function usePaneCommandsListed(
+  targetId: string,
+  enabled: boolean,
+  defaultForPalette: boolean,
+): boolean {
+  const owner = useSyncExternalStore(subscribeOwner, () => paletteOwner);
+  return enabled && (owner === targetId || (owner === null && defaultForPalette));
+}
+
 /** Forget which view lists its commands, for tests. */
 export function resetPanePaletteOwnerForTests(): void {
   setPaletteOwner(null);
@@ -290,8 +303,7 @@ export function useTerminalPaneHotkeys({
       if (paletteOwner === target.id) setPaletteOwner(null);
     };
   }, [enabled, focus, target.id]);
-  const owner = useSyncExternalStore(subscribeOwner, () => paletteOwner);
-  const listsCommands = enabled && (owner === target.id || (owner === null && defaultForPalette));
+  const listsCommands = usePaneCommandsListed(target.id, enabled, defaultForPalette);
 
   /** The pane ⌘K acts on as a command runs, or null once it's gone from the split. */
   const commandPane = (): string | null => {
@@ -336,7 +348,7 @@ export function useTerminalPaneHotkeys({
     zoomedKey,
     paneKey: targetKey,
     sizing: () => focus.sizing(),
-    root: panesRef.current,
+    rootRef: panesRef,
   });
 
   const splitAvailability = availability(

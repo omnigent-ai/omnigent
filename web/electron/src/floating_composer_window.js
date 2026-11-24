@@ -15,6 +15,8 @@
 const { FLOATING_COMPOSER_SIZE, placeFloatingComposer } = require("./floating_composer_frame");
 
 const FLOATING_COMPOSER_PATH = "/compose/floating";
+/** Sent to the panel's page each time the panel takes the keyboard, so its prompt does too. */
+const FLOATING_COMPOSER_SHOWN_CHANNEL = "omnigent:floating-composer:shown";
 const FRAME_SETTINGS_KEY = "floating_composer_frames";
 const SESSION_PATH = /^\/c\/[A-Za-z0-9_-]{1,128}$/;
 /** App pages the panel's own links lead to; they open in a main window. */
@@ -39,6 +41,53 @@ function floatingComposerSessionPath(sessionPath) {
  */
 function floatingComposerAppPagePath(pagePath) {
   return typeof pagePath === "string" && APP_PAGE_PATHS.has(pagePath) ? pagePath : null;
+}
+
+/** The most a launch's attachments may total; the panel checks the same cap before reading them. */
+const FLOATING_LAUNCH_MAX_BYTES = 25 * 1024 * 1024;
+
+/**
+ * The first message a panel launch hands to a main window, rebuilt from its checked fields, or
+ * null. A skill launch carries no attachments, as the panel's own delivery sends none.
+ *
+ * @param {unknown} message
+ * @returns {{ text: string, skill: { name: string, args: string } | null, files: { name: string, type: string, bytes: Uint8Array }[] } | null}
+ */
+function floatingComposerLaunchMessage(message) {
+  if (!message || typeof message !== "object") return null;
+  const { text } = message;
+  const skill = message.skill ?? null;
+  if (typeof text !== "string") return null;
+  if (skill !== null) {
+    if (
+      typeof skill !== "object" ||
+      typeof skill.name !== "string" ||
+      typeof skill.args !== "string"
+    ) {
+      return null;
+    }
+    // The page's store drops a blank prompt, so a blank skill launch can't be sent.
+    if (text.trim() === "") return null;
+    return { text, skill: { name: skill.name, args: skill.args }, files: [] };
+  }
+  if (!Array.isArray(message.files)) return null;
+  const files = [];
+  let totalBytes = 0;
+  for (const file of message.files) {
+    if (
+      !file ||
+      typeof file.name !== "string" ||
+      typeof file.type !== "string" ||
+      !(file.bytes instanceof Uint8Array)
+    ) {
+      return null;
+    }
+    totalBytes += file.bytes.byteLength;
+    if (totalBytes > FLOATING_LAUNCH_MAX_BYTES) return null;
+    files.push({ name: file.name, type: file.type, bytes: file.bytes });
+  }
+  if (text.trim() === "" && files.length === 0) return null;
+  return { text, skill: null, files };
 }
 
 /** How long the panel takes to fade in when it opens; closing is instant. */
@@ -229,7 +278,10 @@ function createFloatingComposerController(deps) {
    * to whatever app had it.
    */
   function takeKeyboard(panel) {
+    if (panel.isDestroyed()) return;
     panel.webContents.focus();
+    // To its current document only; a page still loading focuses its prompt once it renders.
+    if (!panel.webContents.isDestroyed()) panel.webContents.send(FLOATING_COMPOSER_SHOWN_CHANNEL);
   }
 
   function serverUrlFor(win) {
@@ -480,11 +532,13 @@ module.exports = {
   FLOATING_COMPOSER_PRELOAD_DELAY_MS,
   FLOATING_COMPOSER_READY_FALLBACK_MS,
   FLOATING_COMPOSER_PATH,
+  FLOATING_COMPOSER_SHOWN_CHANNEL,
   FRAME_SETTINGS_KEY,
   createFloatingComposerController,
   createFloatingComposerPreloader,
   fadeInFloatingComposer,
   floatingComposerAppPagePath,
+  floatingComposerLaunchMessage,
   floatingComposerSessionPath,
   floatingComposerWindowOptions,
 };
