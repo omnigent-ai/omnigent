@@ -204,6 +204,16 @@ AUDIENCE_DESCRIPTION = (
     "orchestrator are for the human, worker comments are agent notes that the board folds "
     "away. A worker sets human only for a question or request the human must answer."
 )
+FINAL_DESCRIPTION = (
+    "Mark this comment as the ticket's final update: the plain-language result the board pins "
+    "under the description while the ticket stays in its completed stage. Only valid when the "
+    "ticket is, or this edit moves it, in the completed stage; always for the human."
+)
+
+
+def _require_human_final(final: bool, audience: str | None) -> None:
+    if final and audience == "agents":
+        raise ValueError("a final update is for the human; omit audience or set it to human")
 
 
 class UpdateTicket(BaseModel):
@@ -218,6 +228,14 @@ class UpdateTicket(BaseModel):
     labels: list[TicketLabel] | None = Field(default=None, max_length=20)
     comment: str | None = Field(default=None, min_length=1, max_length=2000)
     audience: TicketCommentAudience | None = Field(default=None, description=AUDIENCE_DESCRIPTION)
+    final: bool = Field(default=False, description=FINAL_DESCRIPTION)
+
+    @model_validator(mode="after")
+    def final_needs_comment(self) -> UpdateTicket:
+        if self.final and self.comment is None:
+            raise ValueError("final requires a comment")
+        _require_human_final(self.final, self.audience)
+        return self
 
     @field_validator("title", "comment")
     @classmethod
@@ -247,6 +265,12 @@ class CommentOnTicket(BaseModel):
     kind: Literal["comment", "execution"] = "comment"
     outputs: list[TicketOutput] = Field(default_factory=list, max_length=10)
     audience: TicketCommentAudience | None = Field(default=None, description=AUDIENCE_DESCRIPTION)
+    final: bool = Field(default=False, description=FINAL_DESCRIPTION)
+
+    @model_validator(mode="after")
+    def final_is_for_human(self) -> CommentOnTicket:
+        _require_human_final(self.final, self.audience)
+        return self
 
     @field_validator("text")
     @classmethod

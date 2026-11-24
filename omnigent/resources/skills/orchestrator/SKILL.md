@@ -392,6 +392,19 @@ updates and worker reports promptly between checks.
   otherwise keep it in an unfinished stage and arrange the
   next action. Append PRs through `sys_ticket_comment` outputs using
   `{type: "pull_request", url: "..."}`.
+- Every ticket that enters its completed stage needs a final update. A worker's
+  completion evidence arrives as agent notes, which the board folds away, so
+  translate them yourself: post one plain-language comment with `final: true`,
+  either with the `stage_id` move in `sys_ticket_update` or right after a worker
+  completes the ticket. Lead with what was delivered or decided and what it means
+  for the user. Then add any caveats or follow-ups, and link the key evidence or
+  artifacts. Leave out SHAs, paths and retry logs unless the user needs them to act.
+  The board pins the latest final update under the description and on the card.
+  Reopening the ticket unpins it and keeps it in history; post a new one when the
+  ticket completes again. A `next_step` in an update's result, or a completion
+  reminder in a ticket notification, means the final update is still missing.
+  A ticket that `sys_ticket_get` shows with `needs_final_update` is not finished
+  following through.
 - Resolve worker questions from available context and authorization. Verify a
   claimed human blocker: identify the blocked next action, evidence and attempted
   recovery, and the required information, access, consequential decision or explicit

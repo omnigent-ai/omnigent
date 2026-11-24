@@ -25,7 +25,10 @@ from omnigent.entities.project_ticket import (
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.runtime.project_ticket_instructions import PROJECT_TICKET_WORK_INSTRUCTION
+from omnigent.runtime.project_ticket_instructions import (
+    FINAL_UPDATE_REMINDER,
+    PROJECT_TICKET_WORK_INSTRUCTION,
+)
 from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_PUBLIC, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._sessions.common import _session_status_cache
@@ -295,6 +298,12 @@ def create_project_tickets_router(
         if raises_human_request and who.session_id is not None:
             # The asking session's chat holds the question, so it belongs in the Inbox.
             session_live_state.raise_attention(who.session_id)
+        if who.session_id is not None and body.stage_id is not None:
+            current = await asyncio.to_thread(
+                store.get, project_id, ticket_id, user_id=who.user_id
+            )
+            if current["needs_final_update"]:
+                ticket["next_step"] = FINAL_UPDATE_REMINDER
         wake(request)
         return ticket
 

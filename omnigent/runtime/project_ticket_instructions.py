@@ -34,6 +34,13 @@ PROJECT_TICKET_WORK_INSTRUCTION = (
     "audience human only on a question or request the human must answer, written the same way. "
     "Format necessary technical identifiers as inline code. State a blocker's impact and the "
     "exact action needed in the ticket. "
+    "Every ticket that enters its completed stage gets a final update: one plain-language "
+    "comment for the human, posted with final=true, saying what was delivered or decided, "
+    "what it means for the user, any caveats or follow-ups, and links to the key evidence or "
+    "artifacts. The board pins it under the description until the ticket is reopened. The "
+    "project orchestrator writes it, translating the workers' notes; a worker that completes "
+    "a ticket sends its evidence to the coordinator and leaves the final update to it, unless "
+    "the project has no orchestrator. "
     "Include the useful result or snippet; link lengthy supporting details to a "
     "specific session message only when its durable message link is known. Never invent "
     "message IDs or present a session-only link as a specific-message link. Without a reliable "
@@ -82,4 +89,12 @@ PROJECT_TICKET_WORK_INSTRUCTION = (
     "the work to resolve an ambiguous boundary. Stage changes never grant approval or "
     "satisfy human/permission prompts. Keep needs-human until its request is resolved. "
     "Do not add stage-check timers."
+)
+
+FINAL_UPDATE_REMINDER = (
+    "This ticket is in its completed stage without a final update. The project orchestrator "
+    "posts one for the human with final=true: what was delivered or decided, what it means "
+    "for the user, caveats or follow-ups, and links to key evidence or artifacts. If you are "
+    "the orchestrator, or the project has none, post it now; a worker sends its completion "
+    "evidence to the coordinator instead."
 )

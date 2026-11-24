@@ -203,6 +203,25 @@ def _labeled_event(
     return event
 
 
+def _require_complete(project: SqlProject, ticket: SqlProjectTicket) -> None:
+    if not _stage(_stages(project), _stage_id(ticket)).is_complete:
+        raise OmnigentError(
+            "A final update is only for a ticket in its completed stage; "
+            "move it there in the same edit or post an ordinary comment",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
+def _reopens(row: SqlProjectTicketEvent) -> bool:
+    """A stage change that left the ticket outside a completed stage."""
+    stage = row.payload.get("stage")
+    return (
+        row.kind == EVENT_CODES["updated"]
+        and isinstance(stage, dict)
+        and not stage.get("is_complete", False)
+    )
+
+
 def _event(row: SqlProjectTicketEvent) -> dict[str, Any]:
     payload = dict(row.payload)
     # Project historical field names without changing the stored event.
@@ -389,8 +408,43 @@ class ProjectTicketStore:
 
     def get(self, project_id: str, ticket_id: str, *, user_id: str | None) -> dict[str, Any]:
         with self._session("get_ticket") as session:
-            self._project(session, project_id, user_id)
-            return _ticket(self._row(session, project_id, ticket_id))
+            project = self._project(session, project_id, user_id)
+            row = self._row(session, project_id, ticket_id)
+            complete = _stage(_stages(project), _stage_id(row)).is_complete
+            final_update = self._final_update(session, row) if complete else None
+            return {
+                **_ticket(row),
+                "final_update": final_update,
+                "needs_final_update": complete and final_update is None,
+            }
+
+    @staticmethod
+    def _final_update(session: Session, ticket: SqlProjectTicket) -> dict[str, Any] | None:
+        """The latest final update since the ticket last entered its completed stage."""
+        # Payloads are encrypted, so replay this ticket's edits and comments here.
+        rows = session.scalars(
+            select(SqlProjectTicketEvent)
+            .where(
+                SqlProjectTicketEvent.workspace_id == ticket.workspace_id,
+                SqlProjectTicketEvent.project_id == ticket.project_id,
+                SqlProjectTicketEvent.ticket_id == ticket.id,
+                SqlProjectTicketEvent.kind.in_((*NEW_UPDATE_KINDS, *NEW_COMMENT_KINDS)),
+            )
+            .order_by(SqlProjectTicketEvent.position.desc())
+        )
+        for row in rows:
+            if _reopens(row):
+                return None
+            if row.kind in NEW_COMMENT_KINDS and row.payload.get("final") is True:
+                return {
+                    "event_id": row.id,
+                    "position": row.position,
+                    "text": row.payload.get("text", ""),
+                    "user_id": row.user_id,
+                    "session_id": row.session_id,
+                    "created_at": row.created_at,
+                }
+        return None
 
     def list(
         self,
@@ -718,7 +772,7 @@ class ProjectTicketStore:
     def update(
         self, project_id: str, ticket_id: str, body: UpdateTicket, actor: TicketActor
     ) -> dict[str, Any]:
-        changes = body.model_dump(exclude_none=True, exclude={"comment", "audience"})
+        changes = body.model_dump(exclude_none=True, exclude={"comment", "audience", "final"})
 
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)
@@ -745,17 +799,25 @@ class ProjectTicketStore:
                     "updated",
                     {"changes": changes, **({"stage": _stage_snapshot(target)} if target else {})},
                 )
+            if body.final:
+                _require_complete(project, row)
             if body.comment:
                 audience = self._comment_audience(
                     session, project, row, actor, body.audience, adds_needs_human=adds_needs_human
                 )
+                if body.final:
+                    audience = "human"
                 self._append(
                     session,
                     project,
                     row,
                     actor,
                     "comment",
-                    {"text": body.comment, "audience": audience},
+                    {
+                        "text": body.comment,
+                        "audience": audience,
+                        **({"final": True} if body.final else {}),
+                    },
                 )
                 row.comment_count += 1
                 if audience == "human":
@@ -770,10 +832,17 @@ class ProjectTicketStore:
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)
             row = self._row(session, project_id, ticket_id, write=True)
-            audience = self._comment_audience(session, project, row, actor, body.audience)
-            self._append(
-                session, project, row, actor, body.kind, {"text": body.text, "audience": audience}
+            if body.final:
+                _require_complete(project, row)
+            audience = (
+                "human"
+                if body.final
+                else self._comment_audience(session, project, row, actor, body.audience)
             )
+            payload: dict[str, Any] = {"text": body.text, "audience": audience}
+            if body.final:
+                payload["final"] = True
+            self._append(session, project, row, actor, body.kind, payload)
             for output in body.outputs:
                 self._append(session, project, row, actor, "output", output.model_dump())
             row.comment_count += 1

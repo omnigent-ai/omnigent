@@ -1913,6 +1913,12 @@
             "description": "Who the comment is for. Omit for the default: comments from people and the project orchestrator are for the human, worker comments are agent notes that the board folds away. A worker sets human only for a question or request the human must answer.",
             "title": "Audience"
           },
+          "final": {
+            "default": false,
+            "description": "Mark this comment as the ticket's final update: the plain-language result the board pins under the description while the ticket stays in its completed stage. Only valid when the ticket is, or this edit moves it, in the completed stage; always for the human.",
+            "title": "Final",
+            "type": "boolean"
+          },
           "kind": {
             "default": "comment",
             "enum": [
@@ -16781,6 +16787,12 @@
               }
             ],
             "title": "Description"
+          },
+          "final": {
+            "default": false,
+            "description": "Mark this comment as the ticket's final update: the plain-language result the board pins under the description while the ticket stays in its completed stage. Only valid when the ticket is, or this edit moves it, in the completed stage; always for the human.",
+            "title": "Final",
+            "type": "boolean"
           },
           "labels": {
             "anyOf": [
