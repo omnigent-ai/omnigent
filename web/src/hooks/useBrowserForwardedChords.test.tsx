@@ -3,8 +3,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { BrowserForwardedKeydown } from "@/lib/nativeBridge";
 
+import { workspaceTabActionCommands } from "@/shell/workspaceCommands/model";
+import { useWorkspaceTabChords } from "@/shell/workspaceCommands/useWorkspaceTabChords";
+
 import { useCommandPaletteHotkey } from "./useCommandPaletteHotkey";
 import {
+  TABS_SIDEBAR_FORWARDED_SHORTCUTS,
   forwardedChordsFor,
   tabsSidebarForwardedShortcuts,
   useBrowserForwardedChords,
@@ -128,6 +132,24 @@ describe("useBrowserForwardedChords", () => {
     // The key came from the page, so the app's last focused field doesn't keep focus.
     expect(document.activeElement).not.toBe(stale);
     stale.remove();
+  });
+
+  it("replays a forwarded ⌘⌥W where the tabs sidebar's Close tab hears it", () => {
+    const bridge = capableBridge();
+    const facts = { canReopen: true, selectedIndex: 0, tabCount: 2, sidebarOpen: true };
+    const run = vi.fn();
+    renderHook(() => {
+      useWorkspaceTabChords(
+        { conversationId: "c", commands: workspaceTabActionCommands(facts), facts, run },
+        true,
+      );
+      useBrowserForwardedChords(TABS_SIDEBAR_FORWARDED_SHORTCUTS, true);
+    });
+
+    act(() => bridge.forward({ ...COMMAND_K, key: "w", code: "KeyW", altKey: true }));
+    expect(run.mock.calls.map(([command]) => (command as { action: string }).action)).toEqual([
+      "close-tab",
+    ]);
   });
 
   it("asks for nothing without a desktop bridge, on a shell missing either method, or with an empty list", () => {

@@ -97,12 +97,16 @@ describe("agent key presses and the recent-session switcher", () => {
 
 describe("agent key presses and the app chords a page hands to the shell", () => {
   it("keeps an agent's Ctrl+K in the page, and still forwards the user's", async () => {
-    const { registry, listeners, sent, entry } = makeRegistry();
+    const { registry, listeners, sent, keys, entry } = makeRegistry();
     registry.setForwardedChords([
       { key: "k", metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
     ]);
     const chords = () => sent.filter((item) => item.channel === "browser-forwarded-input");
     await performBrowserInput(entry, "press_key", { key: "Control+k" });
+    assert.ok(
+      keys.some((k) => k.type !== "keyUp" && k.key === "k" && (k.modifiers & 2) !== 0),
+      "the agent's K went out, with Control held",
+    );
     assert.deepEqual(chords(), [], "the agent's chord reached the page only");
     await new Promise((resolve) => {
       setTimeout(resolve, AGENT_INPUT_GRACE_MS + 50);
